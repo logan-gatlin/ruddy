@@ -171,6 +171,43 @@ fn generated_module_executes_values_functions_records_and_sums_in_node() {
 }
 
 #[test]
+fn generated_module_executes_tuple_values_projections_and_patterns() {
+    if Command::new("node").arg("--version").output().is_err() {
+        return;
+    }
+    let artifact = compiled(
+        "let pair : { 0: Nat, 1: String } = { 000: 42n, 1: \"answer\" }\n\
+         let singleton = (true,)\n\
+         let first = pair.0\n\
+         let second = pair.1\n\
+         let swap : (Nat, String) -> (String, Nat) = fn value => match value with \
+         | { 0: number, 1: text } => (text, number) end\n",
+    );
+    let module = js::generate(&artifact).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("tuples.mjs");
+    fs::write(&path, module).unwrap();
+
+    let probe = format!(
+        "const app = await import({}); const swapped = app.swap(app.pair); console.log(JSON.stringify([app.pair[0], app.pair[1], app.singleton[0], app.first, app.second, swapped[0], swapped[1]]));",
+        serde_json::to_string(path.to_str().unwrap()).unwrap()
+    );
+    let output = Command::new("node")
+        .args(["--input-type=module", "--eval", &probe])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        "[42,\"answer\",true,42,\"answer\",\"answer\",42]"
+    );
+}
+
+#[test]
 fn generated_runtime_preserves_arithmetic_switch_record_effect_and_literal_semantics() {
     if Command::new("node").arg("--version").output().is_err() {
         return;

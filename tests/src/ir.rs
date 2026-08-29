@@ -237,10 +237,10 @@ fn displays_structs_and_unit() {
     );
     // `()` the value and `()` the type both lower to the struct with no
     // fields, so both read back as `{}` rather than as what was written.
-    assert_eq!(display_program("let u = ()"), "let u = {}");
+    assert_eq!(display_program("let u = ()"), "let u = ()");
     assert_eq!(
         display_program("type T = { items: Nat, next: () }"),
-        "type T = { items: Nat, next: {} }"
+        "type T = { items: Nat, next: () }"
     );
 }
 
@@ -293,24 +293,24 @@ fn displays_arrows() {
     );
     assert_eq!(
         display_program("type G = Nat -> (Nat -> ())"),
-        "type G = Nat -> Nat -> {}"
+        "type G = Nat -> Nat -> ()"
     );
     // The one grouping the printer has to reconstruct: an arrow on the left
     // of an arrow, which would otherwise re-parse as the right half of one.
     assert_eq!(
         display_program("type H = (Nat -> Nat) -> ()"),
-        "type H = (Nat -> Nat) -> {}"
+        "type H = (Nat -> Nat) -> ()"
     );
     // A struct is atomic on either side, and its fields are types in their
     // own right.
     assert_eq!(
         display_program("type K = { f: Nat -> Nat, g: () -> Nat }"),
-        "type K = { f: Nat -> Nat, g: {} -> Nat }"
+        "type K = { f: Nat -> Nat, g: () -> Nat }"
     );
     // A declaration reads the same as a primitive wherever a type may stand.
     assert_eq!(
         display_program("type A = ()  type B = A -> A"),
-        "type A = {}\ntype B = A -> A"
+        "type A = ()\ntype B = A -> A"
     );
 }
 
@@ -396,7 +396,7 @@ fn a_quoted_projection_lowers_to_its_decoded_label() {
 
 #[test]
 fn displays_ascriptions() {
-    assert_eq!(display_program("let x : () = ()"), "let x : {} = {}");
+    assert_eq!(display_program("let x : () = ()"), "let x : () = ()");
     assert_eq!(
         display_program("let fst : { x: Nat, y: Nat } -> Nat = fn p => p.x"),
         "let fst : { x: Nat, y: Nat } -> Nat = fn p => p.x"
@@ -405,18 +405,18 @@ fn displays_ascriptions() {
     // in scope for it exactly as it would be in a `type` body.
     assert_eq!(
         display_program("type T = ()  let u : T = ()"),
-        "type T = {}\nlet u : T = {}"
+        "type T = ()\nlet u : T = ()"
     );
     // Printing hoists types the way lowering does, so an interleaved program
     // comes back in the order the builder saw it — and re-lowering the
     // rendering, which `display_program` does, lands on the same program.
     assert_eq!(
         display_program("let u : T = ()  type T = ()"),
-        "type T = {}\nlet u : T = {}"
+        "type T = ()\nlet u : T = ()"
     );
     assert_eq!(
         display_program("type A = ()  let x : B = ()  type B = A  let y : A = ()"),
-        "type A = {}\ntype B = A\nlet x : B = {}\nlet y : A = {}"
+        "type A = ()\ntype B = A\nlet x : B = ()\nlet y : A = ()"
     );
 }
 
@@ -519,7 +519,7 @@ fn unit_is_the_empty_struct() {
     assert_eq!(mint.symbols().count(), 1);
     assert_eq!(
         display_program("type T = () -> ()  let u : () = ()"),
-        "type T = {} -> {}\nlet u : {} = {}"
+        "type T = () -> ()\nlet u : () = ()"
     );
 
     // Punctuation is not a name, so — unlike `Nat` — no declaration can
@@ -546,7 +546,7 @@ fn unit_is_the_empty_struct() {
 fn displays_types_before_terms() {
     assert_eq!(
         display_program("let x = ()  type T = { f: () }  let y = ()"),
-        "type T = { f: {} }\nlet x = {}\nlet y = {}"
+        "type T = { f: () }\nlet x = ()\nlet y = ()"
     );
 }
 
@@ -770,6 +770,22 @@ fn duplicate_term_fields_are_rejected() {
     assert_eq!(fields.len(), 1);
     assert_eq!(fields["x"].name_span.start, 20);
     assert!(matches!(fields["x"].value.kind, TermKind::Ident(s) if mint.name(s) == "a"));
+}
+
+#[test]
+fn bare_numeric_and_quoted_canonical_labels_are_duplicates() {
+    for src in [
+        "let p = fn a b => { 001: a, \"1\": b }",
+        "type T = { 001: Nat, \"1\": Nat }",
+    ] {
+        let (_, out) = build_src(src);
+        assert_eq!(out.errors.len(), 1, "errors for {src:?}: {:#?}", out.errors);
+        assert!(matches!(out.errors[0].kind, ErrorKind::DuplicateField));
+        assert_eq!(
+            out.errors[0].span.start,
+            src.rfind("\"1\"").expect("the duplicate")
+        );
+    }
 }
 
 /// A repeat in a struct *type* is the same complaint, in the same place, as a
@@ -2852,7 +2868,7 @@ fn a_struct_let_statement_makes_a_definition_per_field() {
     );
     // `let {} = e` is the unit pattern by another spelling: exactly no
     // fields.
-    assert_eq!(lowered("let {} = {}"), "let %unit : {} = {}");
+    assert_eq!(lowered("let {} = {}"), "let %unit : () = ()");
     // With the `..` there is no demand beyond the projections': the pattern
     // is open, and the temporary is bare.
     assert_eq!(
@@ -2906,7 +2922,7 @@ fn a_struct_let_expression_chains_through_a_temporary() {
     // `()` constrains the value to unit through an annotated fresh binding.
     assert_eq!(
         lowered("let u = let () = {} in 1n"),
-        "let u = let %unit : {} = {} in 1n"
+        "let u = let %unit : () = () in 1n"
     );
 }
 
@@ -3237,7 +3253,7 @@ fn a_sole_catch_all_keeps_its_shape() {
     // much a catch-all as a bare name.
     assert_eq!(
         lowered("let f = fn v => match v with {} => 1n end"),
-        "let f = fn v => match v with | {} => 1n end"
+        "let f = fn v => match v with | () => 1n end"
     );
 }
 
@@ -3405,7 +3421,7 @@ fn overlapping_arms_are_clean() {
 fn a_rest_marker_survives_normalization() {
     assert_eq!(
         lowered("let f = fn v => match v with {x, ..} => x | {} => 0n end"),
-        "let f = fn v => match v with | { x: x, .. } => x | {} => 0n end"
+        "let f = fn v => match v with | { x: x, .. } => x | () => 0n end"
     );
     assert_eq!(
         lowered("let f = fn v => match v with {..} => 1n end"),
@@ -3423,6 +3439,116 @@ fn a_rest_marker_survives_normalization() {
     };
     assert!(rest.is_some());
     assert_eq!(fields.keys().collect::<Vec<_>>(), ["x"]);
+}
+
+/// Nonempty tuples disappear at the IR boundary as closed structs with
+/// canonical zero-based decimal fields. The generated field spans come from
+/// their elements, and tuple patterns use the same exact struct shape.
+#[test]
+fn tuples_lower_to_canonical_structs() {
+    let (mint, out) = built("let value : (Nat, String) = (1n, \"x\")");
+    let symbol = term_symbol(&mint, &out, "value");
+    let TermKind::Struct(fields) = &out.program.terms[&symbol].value.kind else {
+        panic!("a tuple expression lowers to a struct");
+    };
+    assert_eq!(
+        fields.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["0", "1"]
+    );
+    assert!(matches!(fields["0"].value.kind, TermKind::Natural(1)));
+    assert!(matches!(fields["1"].value.kind, TermKind::String(ref value) if value == "x"));
+    assert_eq!(fields["0"].name_span, fields["0"].value.span);
+    assert_eq!(fields["1"].name_span, fields["1"].value.span);
+
+    let annotation = out.program.terms[&symbol]
+        .annotation
+        .as_ref()
+        .expect("the tuple type annotation");
+    let TypeKind::Struct { fields, tail } = &annotation.ty.tracked else {
+        panic!("a tuple type lowers to a struct type");
+    };
+    assert!(tail.is_none());
+    assert_eq!(
+        fields.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["0", "1"]
+    );
+    for field in fields.values() {
+        let TypeField::Written {
+            name_span,
+            when,
+            value,
+        } = field
+        else {
+            panic!("tuple fields are present");
+        };
+        assert!(when.is_none());
+        assert_eq!(*name_span, value.span);
+    }
+
+    let (mint, out) =
+        built("let pick = fn value => match value with | (first, (_, second)) => second end");
+    let TermKind::Fn { body, .. } = term_value(&mint, &out, "pick") else {
+        panic!("pick is a function");
+    };
+    let TermKind::Match { arms, .. } = &body.kind else {
+        panic!("pick matches its argument");
+    };
+    let PatternKind::Struct { fields, rest } = &arms[0].0.tracked else {
+        panic!("a tuple pattern lowers to a struct pattern");
+    };
+    assert!(rest.is_none());
+    assert_eq!(
+        fields.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["0", "1"]
+    );
+    let PatternKind::Struct {
+        fields: nested,
+        rest: nested_rest,
+    } = &fields["1"].value.tracked
+    else {
+        panic!("a nested tuple remains a nested canonical struct");
+    };
+    assert!(nested_rest.is_none());
+    assert_eq!(
+        nested.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["0", "1"]
+    );
+    assert!(matches!(nested["0"].value.tracked, PatternKind::Wildcard));
+    let PatternKind::Bind(second) = nested["1"].value.tracked else {
+        panic!("the second element binds second");
+    };
+    assert!(matches!(arms[0].1.kind, TermKind::Ident(symbol) if symbol == second.tracked));
+}
+
+/// Both surface-pattern walks recurse through tuple elements: top-level tuple
+/// destructuring declares every binder, and the lowering walk diagnoses a
+/// duplicate across nested tuple/struct boundaries rather than losing it.
+#[test]
+fn tuple_pattern_walks_are_exhaustive() {
+    let (mint, out) = built("let (first, second) = (1n, 2n)");
+    assert!(
+        out.program
+            .terms
+            .keys()
+            .any(|symbol| mint.name(*symbol) == "first")
+    );
+    assert!(
+        out.program
+            .terms
+            .keys()
+            .any(|symbol| mint.name(*symbol) == "second")
+    );
+
+    let (_, out) = build_src(
+        "let f = fn value => match value with | (same, { nested: (other, same) }) => same end",
+    );
+    assert_eq!(
+        out.errors
+            .iter()
+            .filter(|error| matches!(error.kind, ErrorKind::DuplicateBinding { .. }))
+            .count(),
+        1
+    );
 }
 
 /// One pattern binding one name twice is reported at the repeat, in any
@@ -3475,16 +3601,16 @@ fn a_struct_pattern_naming_a_field_twice_is_refused() {
 #[test]
 fn pattern_let_corners() {
     // `let () = e` as a statement: one fresh definition annotated unit.
-    assert_eq!(lowered("let () = {}"), "let %unit : {} = {}");
+    assert_eq!(lowered("let () = {}"), "let %unit : () = ()");
     // With a written annotation, the annotation is the contract on the value
     // and the unit demand goes on a second binding of it.
     assert_eq!(
         lowered("let () : {} = {}"),
-        "let %value : {} = {}\nlet %unit : {} = %value"
+        "let %value : () = ()\nlet %unit : () = %value"
     );
     assert_eq!(
         lowered("let u = let () : {} = {} in 1n"),
-        "let u = let %value : {} = {} in let %unit : {} = %value in 1n"
+        "let u = let %value : () = () in let %unit : () = %value in 1n"
     );
 
     // A statement pattern repeating a name: the repeat is the pattern's own
@@ -3505,13 +3631,13 @@ fn pattern_let_corners() {
     // nothing — there is nothing for it to bind.
     let (printed, errors) = lowered_with_errors("let #None = {}");
     assert_eq!(errors, ["binding-can-fail@4"], "{errors:#?}");
-    assert_eq!(printed, "let %value = {}");
+    assert_eq!(printed, "let %value = ()");
 
     // A refused binding still binds the names inside its calm corners — the
     // nested struct's — and points at the tag past a field that is fine.
     let (printed, errors) = lowered_with_errors("let a = let {p: {q}, r: #Bad} = {} in q");
     assert_eq!(errors, ["binding-can-fail@24"], "{errors:#?}");
-    assert_eq!(printed, "let a = let %value = {} in let q = <error> in q");
+    assert_eq!(printed, "let a = let %value = () in let q = <error> in q");
 }
 
 /// A `where` clause survives lowering as the formula it was written as, over
@@ -8240,7 +8366,7 @@ fn externs_bind_terms_without_becoming_initializer_groups() {
     );
     assert_eq!(
         display_program(source),
-        "extern log : String -> {} = console.log\nlet written = log \"hello\""
+        "extern log : String -> () = console.log\nlet written = log \"hello\""
     );
 
     for source in [

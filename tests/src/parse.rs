@@ -4,7 +4,8 @@ use std::fmt::{self, Write};
 
 use ruddy::{
     parse::{
-        ErrorKind, ForeignPath, Path, Place, StmtKind, SumCase, Type, TypeField, TypeKind, parse,
+        ErrorKind, ExprKind, ForeignPath, Path, PatternKind, Place, StmtKind, SumCase, Type,
+        TypeField, TypeKind, parse,
     },
     token::lex,
     tracking::FileID,
@@ -48,6 +49,61 @@ fn parse_print(src: &str) -> String {
     );
     assert_eq!(out.stmts.len(), 1, "stmts: {:#?}", out.stmts);
     print::ast::stmt(&out.stmts[0].tracked).to_string()
+}
+
+#[test]
+fn parses_expression_pattern_and_type_tuples() {
+    let out = parse(
+        lex(
+            "let (a, b,) : (A, B,) = (f x, y,)\nlet grouped = (x)\nlet one = (x,)",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    assert!(out.errors.is_empty(), "errors: {:#?}", out.errors);
+    assert_eq!(out.stmts.len(), 3);
+
+    let StmtKind::Let {
+        pattern,
+        ty: Some(ty),
+        body,
+    } = &out.stmts[0].tracked
+    else {
+        panic!("expected ascribed tuple let: {:#?}", out.stmts[0]);
+    };
+    assert!(matches!(&pattern.tracked, PatternKind::Tuple(items) if items.len() == 2));
+    assert!(matches!(&ty.ty.tracked, TypeKind::Tuple(items) if items.len() == 2));
+    assert!(matches!(&body.tracked.tracked, ExprKind::Tuple(items) if items.len() == 2));
+
+    let StmtKind::Let { body, .. } = &out.stmts[1].tracked else {
+        unreachable!()
+    };
+    assert!(matches!(&body.tracked.tracked, ExprKind::Ident { .. }));
+    let StmtKind::Let { body, .. } = &out.stmts[2].tracked else {
+        unreachable!()
+    };
+    assert!(matches!(&body.tracked.tracked, ExprKind::Tuple(items) if items.len() == 1));
+}
+
+#[test]
+fn parses_numeric_projection_canonically() {
+    let out = parse(lex("let value = pair.001", FileID::GENERATED).tokens);
+    assert!(out.errors.is_empty(), "errors: {:#?}", out.errors);
+    let StmtKind::Let { body, .. } = &out.stmts[0].tracked else {
+        unreachable!()
+    };
+    assert!(matches!(
+        &body.tracked.tracked,
+        ExprKind::Project { field, .. } if field.tracked == "1"
+    ));
+}
+
+#[test]
+fn malformed_tuple_elements_are_reported() {
+    for src in ["let x = (,)", "let x = (a,, b)", "let x = (a,"] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        assert!(!out.errors.is_empty(), "expected an error for {src:?}");
+    }
 }
 
 #[test]
@@ -626,6 +682,43 @@ fn quoted_field_labels_parse_everywhere_and_print_canonically() {
     }
 }
 
+#[test]
+fn bare_numeric_field_labels_parse_canonically_everywhere() {
+    for (src, printed) in [
+        ("let v = { 001: x, 3: 4 }", "let v = { 1: x, 3: 4 }"),
+        (
+            "let v = match x with | { 001: y, 2: z } => y end",
+            "let v = match x with | { 1: y, 2: z } => y end",
+        ),
+        (
+            "let x : { 001 when 'p: Nat, \\02, 3: Nat } = y",
+            "let x : { 1 when 'p: Nat, \\2, 3: Nat } = y",
+        ),
+        // A quoted canonical numeric label now has a shorter bare spelling,
+        // but a leading-zero string cannot be printed bare without changing
+        // its identity through numeric canonicalization.
+        (
+            "let v = { \"1\": x, \"001\": y }",
+            "let v = { 1: x, \"001\": y }",
+        ),
+    ] {
+        assert_eq!(parse_one(src), printed, "{src:?}");
+    }
+}
+
+#[test]
+fn a_numeric_pattern_field_requires_a_colon() {
+    for src in [
+        "let v = match x with | { 0 } => x end",
+        "let v = match x with | { 0, rest: y } => y end",
+        "let v = match x with | { 0: } => x end",
+    ] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        assert!(!out.errors.is_empty(), "{src:?} parsed without complaint");
+        assert!(out.stmts.is_empty(), "{src:?}: {:#?}", out.stmts);
+    }
+}
+
 /// Unlike an identifier field, a quoted pattern label cannot pun: no source
 /// binding can have the arbitrary decoded spelling, so `:` and a subpattern
 /// are required. Identifier puns remain unchanged.
@@ -1101,7 +1194,7 @@ fn every_position_that_can_fail_reports_before_it_does() {
         "let v = #A {",
         // Pattern atoms, nested pattern payloads, and delimiters.
         "let #A ( = value",
-        "let { 1n } = value",
+        "let { 1 } = value",
         "let { field: } = value",
         "let ( = value",
         "let (name = value",
@@ -1480,7 +1573,7 @@ fn parses_every_kind_of_pattern() {
         ),
         (
             "let a = match x with {} => 1n end",
-            "let a = match x with | {} => 1n end",
+            "let a = match x with | () => 1n end",
         ),
         // A trailing comma among the fields is allowed, as in a struct
         // expression.

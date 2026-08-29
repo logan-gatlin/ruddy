@@ -21,6 +21,35 @@ let a : Pair Nat Nat -> Nat -> Nat = f
     (identifier)))
 
 ================================================================================
+Tuple types are closed and may contain full types
+================================================================================
+
+let pair : (A -> B, Pair C D,) = value
+let singleton : (A,) = value
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (annotation
+      (tuple_type
+        (function_type
+          (identifier)
+          (identifier))
+        (type_application
+          (identifier)
+          (identifier)
+          (identifier))))
+    (identifier))
+  (let_definition
+    (identifier)
+    (annotation
+      (tuple_type
+        (identifier)))
+    (identifier)))
+
+================================================================================
 A struct type, with a when clause, an absent field and a tail
 ================================================================================
 
@@ -250,3 +279,27 @@ type Cases 'r = #"some case" Nat | \#"gone case" | ..'r
           (tag))
         (rest
           (type_variable))))))
+
+================================================================================
+Bare numeric labels work in struct types and absences
+================================================================================
+
+type Record = { 001 when 'p: Nat, \02, 3: String }
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (type_definition
+    (identifier)
+    (annotation
+      (struct_type
+        (struct_type_field
+          (numeric_field)
+          (when_clause
+            (type_variable))
+          (identifier))
+        (absent_field
+          (numeric_field))
+        (struct_type_field
+          (numeric_field)
+          (identifier))))))

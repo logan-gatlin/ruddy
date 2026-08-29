@@ -18,9 +18,9 @@ use ruddy::{
 };
 
 use crate::print::{
-    Entry, Grouped, Mark, Prec, Shape, label, string, write_applied, write_apply, write_arrow,
-    write_binary, write_effects, write_let, write_match, write_project, write_row, write_struct,
-    write_sum, write_tag, write_unary,
+    Entry, Grouped, Mark, Prec, Shape, label, string, tuple_field_order, write_applied,
+    write_apply, write_arrow, write_binary, write_effects, write_let, write_match, write_project,
+    write_row, write_struct, write_sum, write_tag, write_tuple, write_unary,
 };
 
 /// Pairs a node with the mint that can name its symbols. Printing an IR node
@@ -258,6 +258,14 @@ impl Grouped for Show<'_, TermKind> {
             | TermKind::Error => Prec::Atom,
         }
     }
+
+    fn ends_in_numeric_projection(&self) -> bool {
+        matches!(
+            self.node,
+            TermKind::Project { field, .. }
+                if ruddy::ui::canonical_tuple_index(&field.tracked).is_some()
+        )
+    }
 }
 
 /// A normalized pattern groups exactly as the surface pattern it prints as —
@@ -310,6 +318,21 @@ impl fmt::Display for Show<'_, PatternKind> {
             // rendered as a tail with nothing after it, exactly as it was
             // written.
             PatternKind::Struct { fields, rest } => {
+                if rest.is_none() {
+                    if fields.is_empty() {
+                        return f.write_str("()");
+                    }
+                    if let Some(order) = tuple_field_order(fields.keys().map(String::as_str)) {
+                        return write_tuple(
+                            f,
+                            order.into_iter().map(|insertion| {
+                                let field =
+                                    &fields.get_index(insertion).expect("tuple field index").1;
+                                self.show(&field.value)
+                            }),
+                        );
+                    }
+                }
                 let fields = self.pairs(fields).map(|(name, sub)| Entry::Written {
                     name,
                     mark: None,
@@ -401,7 +424,21 @@ impl fmt::Display for Show<'_, TermKind> {
                 &self.show(&**value),
                 &self.show(&**body),
             ),
-            TermKind::Struct(fields) => write_struct(f, self.pairs(fields)),
+            TermKind::Struct(fields) => {
+                if fields.is_empty() {
+                    f.write_str("()")
+                } else if let Some(order) = tuple_field_order(fields.keys().map(String::as_str)) {
+                    write_tuple(
+                        f,
+                        order.into_iter().map(|insertion| {
+                            let field = &fields.get_index(insertion).expect("tuple field index").1;
+                            self.show(&field.value)
+                        }),
+                    )
+                } else {
+                    write_struct(f, self.pairs(fields))
+                }
+            }
             // A case carrying nothing prints as nothing, which is what it was
             // written as: lowering left the payload absent rather than filling
             // in the unit it means. See [`TermKind::Tag`].
@@ -530,6 +567,26 @@ impl fmt::Display for Show<'_, TypeKind> {
                 )
             }
             TypeKind::Struct { fields, tail } => {
+                if tail.is_none() && fields.is_empty() {
+                    return f.write_str("()");
+                }
+                if tail.is_none()
+                    && fields
+                        .values()
+                        .all(|field| matches!(field, TypeField::Written { when: None, .. }))
+                    && let Some(order) = tuple_field_order(fields.keys().map(String::as_str))
+                {
+                    return write_tuple(
+                        f,
+                        order.into_iter().map(|insertion| {
+                            let field = fields.get_index(insertion).expect("tuple field index").1;
+                            let TypeField::Written { value, .. } = field else {
+                                unreachable!("tuple fields were checked as written")
+                            };
+                            self.show(value)
+                        }),
+                    );
+                }
                 let fields = fields.iter().map(|(name, field)| match field {
                     TypeField::Written { when, value, .. } => Entry::Written {
                         name,

@@ -321,6 +321,11 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
         .child(expr_role_node(ids, "Predicate", predicate))
         .child(expr_role_node(ids, "Then", consequent))
         .child(expr_role_node(ids, "Else", alternative)),
+        ExprKind::Tuple(elements) => Node {
+            label: "Tuple".into(),
+            ..node
+        }
+        .children(elements.iter().map(|element| expr_node(ids, element))),
         ExprKind::Struct(fields) => Node {
             label: "Struct".into(),
             ..node
@@ -512,6 +517,11 @@ fn pattern_node(ids: &mut Ids, pattern: &Pattern) -> Node {
                 None => tag_node,
             }
         }
+        PatternKind::Tuple(elements) => Node {
+            label: "Tuple".into(),
+            ..node
+        }
+        .children(elements.iter().map(|element| pattern_node(ids, element))),
         PatternKind::Struct { fields, rest } => {
             let mut kids: Vec<Node> = fields
                 .iter()
@@ -754,6 +764,11 @@ fn type_node(ids: &mut Ids, ty: &Type) -> Node {
                 None => arrow,
             }
         }
+        TypeKind::Tuple(elements) => Node {
+            label: "Tuple".into(),
+            ..node
+        }
+        .children(elements.iter().map(|element| type_node(ids, element))),
         TypeKind::Apply { head, args } => Node {
             label: "Apply".into(),
             ..node

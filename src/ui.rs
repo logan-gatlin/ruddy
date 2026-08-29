@@ -91,6 +91,13 @@ pub const DECLARED_HERE: &str = "declared here";
 /// directly.
 pub trait Grouped: fmt::Display {
     fn prec(&self) -> Prec;
+
+    /// Whether this node's surface spelling ends in a numeric projection.
+    /// Another numeric projection must parenthesize such a base: `.0.0` is
+    /// deliberately lexed as one malformed decimal-like field.
+    fn ends_in_numeric_projection(&self) -> bool {
+        false
+    }
 }
 
 /// A reference groups as what it points at, so a printer can hand out borrowed
@@ -98,6 +105,10 @@ pub trait Grouped: fmt::Display {
 impl<T: Grouped + ?Sized> Grouped for &T {
     fn prec(&self) -> Prec {
         (**self).prec()
+    }
+
+    fn ends_in_numeric_projection(&self) -> bool {
+        (**self).ends_in_numeric_projection()
     }
 }
 
@@ -303,7 +314,10 @@ pub fn write_string(f: &mut fmt::Formatter<'_>, value: &str) -> fmt::Result {
 
 /// Write a field label in its shortest unambiguous source spelling.
 pub fn write_field_label(f: &mut fmt::Formatter<'_>, name: &str) -> fmt::Result {
-    if bare_identifier(name) {
+    let canonical_numeric = name
+        .parse::<u64>()
+        .is_ok_and(|value| value.to_string() == name);
+    if bare_identifier(name) || canonical_numeric {
         f.write_str(name)
     } else {
         write_string(f, name)
@@ -389,6 +403,7 @@ impl fmt::Display for Kind {
             Kind::Underscore => f.write_str("_"),
             Kind::Natural(value) => write!(f, "{value}n"),
             Kind::Integer(value) => write!(f, "{value}i"),
+            Kind::NumericField(value) => write!(f, "{value}"),
             Kind::Real(value) => write!(f, "{value}"),
             Kind::String(value) => write_string(f, value),
             Kind::Boolean(value) => write!(f, "{value}"),
@@ -457,7 +472,8 @@ impl Grouped for parse::PatternKind {
             | parse::PatternKind::String(_)
             | parse::PatternKind::Boolean(_)
             | parse::PatternKind::Unit
-            | parse::PatternKind::Struct { .. } => Prec::Atom,
+            | parse::PatternKind::Struct { .. }
+            | parse::PatternKind::Tuple(_) => Prec::Atom,
         }
     }
 }
@@ -477,6 +493,9 @@ impl fmt::Display for parse::PatternKind {
             parse::PatternKind::String(value) => write_string(f, value),
             parse::PatternKind::Boolean(value) => write!(f, "{value}"),
             parse::PatternKind::Unit => f.write_str("()"),
+            parse::PatternKind::Tuple(elements) => {
+                write_tuple(f, elements.iter().map(|element| &element.tracked))
+            }
             parse::PatternKind::Tag { name, payload } => write_tag(
                 f,
                 &name.tracked,
@@ -485,7 +504,25 @@ impl fmt::Display for parse::PatternKind {
             ),
             parse::PatternKind::Struct { fields, rest } => {
                 if fields.is_empty() && rest.is_none() {
-                    return f.write_str("{}");
+                    return f.write_str("()");
+                }
+                if rest.is_none()
+                    && let Some(order) =
+                        tuple_field_order(fields.keys().map(|name| name.tracked.as_str()))
+                    && fields.values().all(Option::is_some)
+                {
+                    return write_tuple(
+                        f,
+                        order.into_iter().map(|insertion| {
+                            &fields
+                                .get_index(insertion)
+                                .expect("tuple field index")
+                                .1
+                                .as_ref()
+                                .expect("tuple fields were checked as explicit")
+                                .tracked
+                        }),
+                    );
                 }
                 f.write_str("{ ")?;
                 let mut first = true;
@@ -1226,6 +1263,7 @@ enum SemanticJob<'a> {
     Effects(&'a Row),
     Tail(&'a Rest),
     Field(&'a str, &'a RowField),
+    TupleField(&'a RowField),
     Case(&'a str, &'a RowField, bool),
     Effect(&'a str, &'a Presence),
     Text(&'static str),
@@ -1314,8 +1352,31 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
             SemanticJob::Fields(row) => {
                 let (fields, rest) = flattened_row(row);
                 let tail = semantic_tail(Shape::Struct, rest);
+                let tuple = if tail.is_none()
+                    && fields
+                        .iter()
+                        .all(|(_, field)| matches!(field.presence, Presence::Present))
+                {
+                    tuple_field_order(fields.iter().map(|(name, _)| *name))
+                } else {
+                    None
+                };
+                if let Some(order) = tuple {
+                    f.write_str("(")?;
+                    work.push(SemanticJob::Text(")"));
+                    if order.len() == 1 {
+                        work.push(SemanticJob::Text(","));
+                    }
+                    for (at, insertion) in order.into_iter().enumerate().rev() {
+                        work.push(SemanticJob::TupleField(fields[insertion].1));
+                        if at != 0 {
+                            work.push(SemanticJob::Text(", "));
+                        }
+                    }
+                    continue;
+                }
                 if fields.is_empty() && tail.is_none() {
-                    f.write_str("{}")?;
+                    f.write_str("()")?;
                     continue;
                 }
                 f.write_str("{ ")?;
@@ -1382,6 +1443,9 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                 write_field_label(f, name)?;
                 write_semantic_mark(f, &field.presence, false)?;
                 f.write_str(": ")?;
+                work.push(SemanticJob::Ty(&field.ty, false));
+            }
+            SemanticJob::TupleField(field) => {
                 work.push(SemanticJob::Ty(&field.ty, false));
             }
             SemanticJob::Case(name, field, strip_interface) => {
@@ -2265,6 +2329,68 @@ pub fn write_struct<K: fmt::Display, V: fmt::Display>(
     write_row(f, fields, None)
 }
 
+/// Return the insertion indices that put canonical tuple field names in
+/// positional order.
+///
+/// A tuple lowered into a struct has exactly the decimal keys `0` through
+/// `len - 1`. This check deliberately rejects leading zeroes, gaps, and every
+/// other numeric-looking spelling, and returns indices rather than reordered
+/// names so callers can retrieve values (and their spans) from their own map.
+/// At least one field is required: the empty struct is unit, not a tuple.
+///
+/// The result is independent of map insertion order. That matters after rows
+/// have passed through unification, where the labels remain the same but their
+/// storage order is not surface syntax.
+pub fn tuple_field_order<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<Vec<usize>> {
+    let names: Vec<&str> = names.into_iter().collect();
+    if names.is_empty() {
+        return None;
+    }
+    let mut order = vec![usize::MAX; names.len()];
+    for (insertion, name) in names.into_iter().enumerate() {
+        let position = canonical_tuple_index(name)?;
+        if position >= order.len() {
+            return None;
+        }
+        if std::mem::replace(&mut order[position], insertion) != usize::MAX {
+            return None;
+        }
+    }
+    order
+        .iter()
+        .all(|index| *index != usize::MAX)
+        .then_some(order)
+}
+
+/// Decode an exact canonical tuple field name. Numeric-looking struct labels
+/// such as `00` remain ordinary quoted labels rather than changing meaning
+/// when printed as projections.
+pub fn canonical_tuple_index(name: &str) -> Option<usize> {
+    let index = name.parse::<usize>().ok()?;
+    (index.to_string() == name).then_some(index)
+}
+
+/// Render tuple elements in canonical surface syntax. A singleton keeps the
+/// trailing comma that distinguishes it from grouping.
+pub fn write_tuple<V: fmt::Display>(
+    f: &mut fmt::Formatter<'_>,
+    elements: impl IntoIterator<Item = V>,
+) -> fmt::Result {
+    f.write_str("(")?;
+    let mut count = 0;
+    for element in elements {
+        if count > 0 {
+            f.write_str(", ")?;
+        }
+        write!(f, "{element}")?;
+        count += 1;
+    }
+    if count == 1 {
+        f.write_str(",")?;
+    }
+    f.write_str(")")
+}
+
 // These pieces do not depend on `K` or `V`. Keeping them outside `write_row`
 // also keeps one monomorphization from owning a form only another one renders.
 fn write_row_mark(f: &mut fmt::Formatter<'_>, mark: Option<&Mark>) -> fmt::Result {
@@ -2522,11 +2648,21 @@ pub fn write_match<P: fmt::Display, B: fmt::Display>(
 }
 
 /// Render `base.field`. Projection binds tighter than everything that follows a
-/// space, so only the forms that extend rightward need grouping.
+/// space, so only the forms that extend rightward need grouping. Consecutive
+/// numeric projections are the exception: the lexer deliberately rejects
+/// `.0.0` as decimal-like malformed syntax, so the base is parenthesized.
 pub fn write_project(f: &mut fmt::Formatter<'_>, base: &impl Grouped, field: &str) -> fmt::Result {
-    write_grouped(f, base.prec() < Prec::Atom, base)?;
+    let index = canonical_tuple_index(field);
+    write_grouped(
+        f,
+        base.prec() < Prec::Atom || (index.is_some() && base.ends_in_numeric_projection()),
+        base,
+    )?;
     f.write_str(".")?;
-    write_field_label(f, field)
+    match index {
+        Some(index) => write!(f, "{index}"),
+        None => write_field_label(f, field),
+    }
 }
 
 /// Render `body`, wrapping it in parentheses when leaving them off would make

@@ -246,6 +246,10 @@ pub enum ExprKind {
         alternative: Box<Expr>,
     },
     Struct(IndexMap<TrackedString, Expr>),
+    /// `(a, b)` — a positional struct, retained in the surface tree so the
+    /// spelling can be reproduced. The empty tuple remains [`Unit`](Self::Unit)
+    /// and a singleton requires its trailing comma.
+    Tuple(Vec<Expr>),
     /// `#Some 1` — one case of a sum, with what it carries.
     ///
     /// The payload is optional because `#None` is how a case that carries
@@ -393,6 +397,9 @@ pub enum PatternKind {
         /// The span is the `..`'s own, for the debugger to point at.
         rest: Option<Span>,
     },
+    /// `(a, b)` — an exact positional struct pattern. The elements retain
+    /// their tuple spelling until lowering assigns decimal field names.
+    Tuple(Vec<Pattern>),
     /// `#Name [<pattern>]` — one case of a sum. The payload pattern is
     /// taken greedily, exactly as [`Parser::tag_expr`] takes a payload, so
     /// `#A #B x` is `#A` carrying `(#B x)`. Written bare, the case
@@ -453,6 +460,8 @@ pub enum TypeKind {
         head: Box<Type>,
         args: Vec<Type>,
     },
+    /// `(A, B)` — a closed positional struct type with unconditional fields.
+    Tuple(Vec<Type>),
     Ident {
         name: Path,
     },
@@ -936,13 +945,14 @@ impl Parser {
     }
 
     /// Read a structural field label. Unlike bindings and paths, field labels
-    /// may be arbitrary decoded strings; both spellings share the same map-key
-    /// representation so duplicate detection naturally equates `foo` and
-    /// `"foo"`.
+    /// may be arbitrary decoded strings or canonical numeric labels; every
+    /// spelling shares the same map-key representation so duplicate detection
+    /// naturally equates `foo` with `"foo"` and `001` with `"1"`.
     fn field_label(&mut self) -> Option<TrackedString> {
         let name = match self.peek() {
             Some(tok) => match &tok.tracked {
                 Kind::Identifier(name) | Kind::String(name) => Some(tok.span.track(name.clone())),
+                Kind::NumericField(value) => Some(tok.span.track(value.to_string())),
                 _ => None,
             },
             None => None,
@@ -1448,7 +1458,17 @@ impl Parser {
             if self.at_wildcard() {
                 return self.wildcard(Place::Projection);
             }
-            let field = self.field_label()?;
+            let field = match self.peek() {
+                Some(tok) => match tok.tracked {
+                    Kind::NumericField(value) => {
+                        let field = tok.span.track(value.to_string());
+                        self.advance();
+                        field
+                    }
+                    _ => self.field_label()?,
+                },
+                None => return self.unexpected(),
+            };
             let span = base.span.merge(field.span);
             base = span.track(ExprKind::Project {
                 base: Box::new(base),
@@ -1602,18 +1622,29 @@ impl Parser {
         Some(span.track(ExprKind::Operation { effect, selector }))
     }
 
-    /// `( <expr> )` — grouping only. The parentheses override application's
-    /// left-associativity while parsing and are then discarded: the inner node
-    /// is returned as-is, widened to cover the delimiters, so no grouping node
-    /// exists to reach the IR. An empty pair is the unit expression.
+    /// A grouped expression or tuple. A comma after the first expression is
+    /// the discriminator, so `(x)` remains grouping while `(x,)` is a
+    /// singleton tuple. Remaining elements are full expressions and a final
+    /// trailing comma is accepted.
     fn paren_expr(&mut self) -> Option<Expr> {
         let open = self.eat(&Kind::LeftParen).expect("the caller peeked `(`");
         if let Some(close) = self.eat_if(&Kind::RightParen) {
             return Some(open.span.merge(close.span).track(ExprKind::Unit));
         }
-        let inner = self.expr()?;
+        let first = self.expr()?;
+        if self.eat_if(&Kind::Comma).is_none() {
+            let close = self.eat(&Kind::RightParen)?;
+            return Some(open.span.merge(close.span).track(first.tracked));
+        }
+        let mut elements = vec![first];
+        while !self.at(&Kind::RightParen) {
+            elements.push(self.expr()?);
+            if self.eat_if(&Kind::Comma).is_none() {
+                break;
+            }
+        }
         let close = self.eat(&Kind::RightParen)?;
-        Some(open.span.merge(close.span).track(inner.tracked))
+        Some(open.span.merge(close.span).track(ExprKind::Tuple(elements)))
     }
 
     /// `fn <arg>* => <expr>` — an anonymous function with zero or more
@@ -1943,12 +1974,15 @@ impl Parser {
                 };
                 return self.wildcard(place);
             }
-            let quoted = matches!(self.peek(), Some(tok) if matches!(tok.tracked, Kind::String(_)));
+            let requires_colon = matches!(
+                self.peek(),
+                Some(tok) if matches!(tok.tracked, Kind::String(_) | Kind::NumericField(_))
+            );
             let name = self.field_label()?;
-            // Only identifiers may pun. A quoted label always introduces an
-            // explicit sub-pattern, even when its decoded value is identifier-
-            // shaped, so quote provenance need not survive this point.
-            let value = if quoted {
+            // Only identifiers may pun. Quoted and numeric labels always
+            // introduce an explicit sub-pattern, since neither can name the
+            // source binder a pun would create.
+            let value = if requires_colon {
                 self.eat(&Kind::Colon)?;
                 Some(self.pattern()?)
             } else {
@@ -1970,17 +2004,31 @@ impl Parser {
         Some(span.track(PatternKind::Struct { fields, rest }))
     }
 
-    /// `( <pattern> )` — grouping only, discarded exactly as
-    /// [`paren_expr`](Self::paren_expr) discards it. An empty pair is the unit
-    /// pattern.
+    /// A grouped pattern or exact tuple pattern, disambiguated by the comma
+    /// after its first element exactly as an expression tuple is.
     fn paren_pattern(&mut self) -> Option<Pattern> {
         let open = self.eat(&Kind::LeftParen).expect("the caller peeked `(`");
         if let Some(close) = self.eat_if(&Kind::RightParen) {
             return Some(open.span.merge(close.span).track(PatternKind::Unit));
         }
-        let inner = self.pattern()?;
+        let first = self.pattern()?;
+        if self.eat_if(&Kind::Comma).is_none() {
+            let close = self.eat(&Kind::RightParen)?;
+            return Some(open.span.merge(close.span).track(first.tracked));
+        }
+        let mut elements = vec![first];
+        while !self.at(&Kind::RightParen) {
+            elements.push(self.pattern()?);
+            if self.eat_if(&Kind::Comma).is_none() {
+                break;
+            }
+        }
         let close = self.eat(&Kind::RightParen)?;
-        Some(open.span.merge(close.span).track(inner.tracked))
+        Some(
+            open.span
+                .merge(close.span)
+                .track(PatternKind::Tuple(elements)),
+        )
     }
 
     /// The `<arg>+ =>` header of a function: gather the arguments — names, and
@@ -2711,16 +2759,27 @@ impl Parser {
         Some(span.track(TypeKind::Struct { fields, tail }))
     }
 
-    /// `( <type> )` — the type-level counterpart of
-    /// [`paren_expr`](Self::paren_expr), discarded just the same.
+    /// A grouped type or closed tuple type, using a comma as the discriminator
+    /// and accepting a trailing comma.
     fn paren_type(&mut self) -> Option<Type> {
         let open = self.eat(&Kind::LeftParen).expect("the caller peeked `(`");
         if let Some(close) = self.eat_if(&Kind::RightParen) {
             return Some(open.span.merge(close.span).track(TypeKind::Unit));
         }
-        let inner = self.type_expr()?;
+        let first = self.type_expr()?;
+        if self.eat_if(&Kind::Comma).is_none() {
+            let close = self.eat(&Kind::RightParen)?;
+            return Some(open.span.merge(close.span).track(first.tracked));
+        }
+        let mut elements = vec![first];
+        while !self.at(&Kind::RightParen) {
+            elements.push(self.type_expr()?);
+            if self.eat_if(&Kind::Comma).is_none() {
+                break;
+            }
+        }
         let close = self.eat(&Kind::RightParen)?;
-        Some(open.span.merge(close.span).track(inner.tracked))
+        Some(open.span.merge(close.span).track(TypeKind::Tuple(elements)))
     }
 
     /// Like [`eat`], but silent on mismatch: consume the token only if it

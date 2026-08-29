@@ -250,6 +250,34 @@ let c = {}
     (struct_expression)))
 
 ================================================================================
+Tuples are distinguished from grouping by their comma
+================================================================================
+
+let pair = (f x, y)
+let singleton = (x,)
+let projected = pair.001
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (tuple_expression
+      (application
+        (identifier)
+        (identifier))
+      (identifier)))
+  (let_definition
+    (identifier)
+    (tuple_expression
+      (identifier)))
+  (let_definition
+    (identifier)
+    (projection
+      (identifier)
+      (numeric_field))))
+
+================================================================================
 Parentheses group and are then discarded
 ================================================================================
 
@@ -323,3 +351,83 @@ let invalid = # "case"
     (ERROR
       (UNEXPECTED ' '))
     (string)))
+
+================================================================================
+ASCII and Unicode suffixed numeric projections are one malformed field
+================================================================================
+
+let ascii = p.0n
+let unicode = p.0²
+let valid = p.001
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (projection
+      (identifier)
+      (ERROR)))
+  (let_definition
+    (identifier)
+    (projection
+      (identifier)
+      (ERROR)))
+  (let_definition
+    (identifier)
+    (projection
+      (identifier)
+      (numeric_field))))
+
+================================================================================
+Adjacent numeric projections require grouping or whitespace
+================================================================================
+
+let invalid = p.0.0
+let printed = (p.0).0
+let spaced = p.0 .0
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (projection
+      (identifier)
+      (ERROR)))
+  (let_definition
+    (identifier)
+    (projection
+      (parenthesized_expression
+        (projection
+          (identifier)
+          (numeric_field)))
+      (numeric_field)))
+  (let_definition
+    (identifier)
+    (projection
+      (projection
+        (identifier)
+        (numeric_field))
+      (numeric_field))))
+
+================================================================================
+Bare numeric struct fields are structural labels
+================================================================================
+
+let record = { 001: 2, x: (3, 4) }
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (struct_expression
+      (struct_field
+        (numeric_field)
+        (natural))
+      (struct_field
+        (identifier)
+        (tuple_expression
+          (natural)
+          (natural))))))

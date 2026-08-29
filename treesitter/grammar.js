@@ -52,6 +52,16 @@ function sepBy1(sep, rule) {
   return seq(rule, repeat(seq(sep, rule)));
 }
 
+/** A structural field label, including compiler-invalid numeric forms. */
+function fieldLabel($) {
+  return choice(
+    $.identifier,
+    $.string,
+    $.numeric_field,
+    alias($._malformed_numeric_field, $.ERROR),
+  );
+}
+
 module.exports = grammar({
   name: 'ruddy',
 
@@ -349,7 +359,12 @@ module.exports = grammar({
     _atom_projection: $ => prec.left(PREC.projection, seq(
       field('base', choice($._atom, alias($._atom_projection, $.projection))),
       '.',
-      field('field', choice($.identifier, $.string)),
+      field('field', choice(
+        $.identifier,
+        $.string,
+        $.numeric_field,
+        alias($._malformed_numeric_field, $.ERROR),
+      )),
     )),
 
     _atom: $ => choice(
@@ -360,6 +375,7 @@ module.exports = grammar({
       $.boolean,
       $.unit,
       $.struct_expression,
+      $.tuple_expression,
       $.tag_expression,
       $.operation,
       $.parenthesized_expression,
@@ -375,7 +391,12 @@ module.exports = grammar({
         $.handle_expression,
       )),
       '.',
-      field('field', choice($.identifier, $.string)),
+      field('field', choice(
+        $.identifier,
+        $.string,
+        $.numeric_field,
+        alias($._malformed_numeric_field, $.ERROR),
+      )),
     )),
 
     /** `fn <arg>+ => <expr>` — the body runs as far right as it can. */
@@ -473,7 +494,7 @@ module.exports = grammar({
     ),
 
     struct_field: $ => seq(
-      field('name', choice($.identifier, $.string)),
+      field('name', fieldLabel($)),
       ':',
       field('value', $._expression),
     ),
@@ -494,6 +515,19 @@ module.exports = grammar({
       field('effect', choice($.effect_label, $.effect_path)),
     ),
 
+    /** `(a, b)` — a positional struct; a singleton keeps its comma. */
+    tuple_expression: $ => seq(
+      '(',
+      field('element', $._expression),
+      ',',
+      optional(seq(
+        field('element', $._expression),
+        repeat(seq(',', field('element', $._expression))),
+        optional(','),
+      )),
+      ')',
+    ),
+
     parenthesized_expression: $ => seq('(', $._expression, ')'),
 
     // ── Patterns ──────────────────────────────────────────────────────────
@@ -506,6 +540,7 @@ module.exports = grammar({
       $.boolean,
       $.unit,
       $.struct_pattern,
+      $.tuple_pattern,
       $.tag_pattern,
       $.parenthesized_pattern,
     ),
@@ -524,8 +559,9 @@ module.exports = grammar({
     ),
 
     /**
-     * A field, or a bare identifier punning one to itself. Quoted labels never
-     * pun: `{"field name": p}` must say which pattern receives the field.
+     * A field, or a bare identifier punning one to itself. Quoted and numeric
+     * labels never pun: `{"field name": p}` and `{0: p}` must say which
+     * pattern receives the field.
      */
     struct_pattern_field: $ => choice(
       seq(
@@ -533,7 +569,11 @@ module.exports = grammar({
         optional(seq(':', field('pattern', $._pattern))),
       ),
       seq(
-        field('name', $.string),
+        field('name', choice(
+          $.string,
+          $.numeric_field,
+          alias($._malformed_numeric_field, $.ERROR),
+        )),
         ':',
         field('pattern', $._pattern),
       ),
@@ -547,6 +587,19 @@ module.exports = grammar({
       field('name', $.tag),
       optional(field('payload', $._pattern)),
     )),
+
+    /** `(a, b)` — an exact positional struct pattern. */
+    tuple_pattern: $ => seq(
+      '(',
+      field('element', $._pattern),
+      ',',
+      optional(seq(
+        field('element', $._pattern),
+        repeat(seq(',', field('element', $._pattern))),
+        optional(','),
+      )),
+      ')',
+    ),
 
     parenthesized_pattern: $ => seq('(', $._pattern, ')'),
 
@@ -653,6 +706,7 @@ module.exports = grammar({
       $.hole,
       $.unit,
       $.struct_type,
+      $.tuple_type,
       $.parenthesized_type,
     ),
 
@@ -668,14 +722,14 @@ module.exports = grammar({
     ),
 
     struct_type_field: $ => seq(
-      field('name', choice($.identifier, $.string)),
+      field('name', fieldLabel($)),
       optional(field('when', $.when_clause)),
       ':',
       field('type', $._type),
     ),
 
     /** `\name` — the label is definitely not there. */
-    absent_field: $ => seq('\\', field('name', choice($.identifier, $.string))),
+    absent_field: $ => seq('\\', field('name', fieldLabel($))),
 
     /**
      * `..` or `..'r` — what is known about the labels not written out. Bare it
@@ -689,6 +743,19 @@ module.exports = grammar({
 
     /** The same clause where there is no colon to end it: `(when 'a)`. */
     parenthesized_when: $ => seq('(', $.when_clause, ')'),
+
+    /** `(A, B)` — a closed positional struct type. */
+    tuple_type: $ => seq(
+      '(',
+      field('element', $._type),
+      ',',
+      optional(seq(
+        field('element', $._type),
+        repeat(seq(',', field('element', $._type))),
+        optional(','),
+      )),
+      ')',
+    ),
 
     parenthesized_type: $ => seq('(', $._type, ')'),
 
@@ -758,6 +825,20 @@ module.exports = grammar({
      * is intentional: the lexer diagnoses `1x` as one malformed literal.
      */
     natural: _ => new RegExp(/[0-9]+(?:\.[0-9]+)?[\p{Alphabetic}\p{N}_]*/.source, 'u'),
+
+    /** A decimal positional field in a projection or structural label. */
+    numeric_field: _ => /[0-9]+/,
+
+    /**
+     * A number-shaped field that the compiler consumes as one invalid token.
+     * Besides suffixes such as `.0n` and `.0²`, this includes an adjacent
+     * decimal tail: `p.0.0` is one malformed field, while `(p.0).0` is two
+     * valid projections. The set subtraction keeps another ASCII digit in the
+     * valid field token, so `.001` is not mistaken for a malformed suffix.
+     */
+    _malformed_numeric_field: _ => new RustRegex(
+      String.raw`[0-9]+(?:\.[0-9]+[\p{Alphabetic}\p{N}_]*|(?:[\p{Alphabetic}_]|[\p{N}&&[^0-9]])[\p{Alphabetic}\p{N}_]*)`,
+    ),
 
     /** A double-quoted UTF-8 string with the escapes token::lex accepts. */
     string: _ => token(seq('"', repeat(choice(/[^"\\\n]/, /\\["\\nrt]/)), '"')),

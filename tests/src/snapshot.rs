@@ -1005,6 +1005,25 @@ fn a_natural_reaches_every_stage() {
     assert_eq!(class.value, "number");
 }
 
+/// A positional projection is numeric syntax too, even though its token is
+/// contextual rather than a literal expression.
+#[test]
+fn a_numeric_field_is_coloured_as_a_number() {
+    let snapshot = snapshot("let first = fn p => p.0\n");
+    assert!(snapshot.diagnostics.is_empty());
+
+    let field = nodes(&snapshot.stages[0])
+        .into_iter()
+        .find(|node| node.label == "NumericField" && node.text == "0")
+        .expect("the tokens tab renders the numeric field");
+    let class = field
+        .fields
+        .iter()
+        .find(|field| field.name == "_class")
+        .expect("the editor is told what to paint it");
+    assert_eq!(class.value, "number");
+}
+
 /// The three forms phase 0 adds, in one line, checked through every panel
 /// that renders them. A stage that stopped matching on one of them would
 /// fail to compile; this is the check that it renders it too.
@@ -1167,9 +1186,9 @@ fn unit_is_the_empty_struct_in_the_ir() {
     assert_eq!(
         unit_nodes("ir"),
         [
-            ("Struct".into(), "{}".into()),
-            ("Ascribed Struct".into(), "{}".into()),
-            ("Struct".into(), "{}".into()),
+            ("Struct".into(), "()".into()),
+            ("Ascribed Struct".into(), "()".into()),
+            ("Struct".into(), "()".into()),
         ] as [(String, String); 3]
     );
 }
@@ -2840,7 +2859,7 @@ fn every_stage_reports_on_a_source_using_effects() {
     let types = stage_named(&snapshot, "types");
     let meanings: Vec<&str> = nodes(types).iter().map(|node| node.text.as_str()).collect();
     assert!(
-        meanings.contains(&"{} -> Nat + !Log"),
+        meanings.contains(&"() -> Nat + !Log"),
         "the Types tab lost the row: {meanings:?}"
     );
     // An alias does not survive into the type language, so `Runner`'s

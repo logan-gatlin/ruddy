@@ -613,7 +613,7 @@ fn a_printed_closed_type_reads_back_as_the_type_it_was_printed_from() {
         // The empty struct is unit, and prints as the one spelling this
         // language has for it. See `Ty::Unit` for why it is `{}` and not
         // `()`.
-        ("", Rc::new(Ty::unit()), "{}"),
+        ("", Rc::new(Ty::unit()), "()"),
         (
             "",
             Rc::new(Ty::Struct(Row {
@@ -1147,7 +1147,7 @@ fn a_case_settled_absent_is_not_part_of_the_sum() {
         .collect(),
         rest: Rest::Closed,
     })));
-    assert_eq!(open.to_string(), "#A { x: {}, ..'a }");
+    assert_eq!(open.to_string(), "#A { x: (), ..'a }");
 
     // The two forms that write no case at all keep the leading bar, which is
     // the only thing that makes either read back as a sum.
@@ -2010,11 +2010,11 @@ fn flattened_rows_print_with_outer_wins_and_hide_interface_keys() {
 
     assert_eq!(
         Ty::Struct(outer.clone()).to_string(),
-        "{ \"Log\u{1f}generated-interface\": {} }"
+        "{ \"Log\u{1f}generated-interface\": () }"
     );
     assert_eq!(
         outer.to_string(),
-        "{ \"Log\u{1f}generated-interface\": {} }"
+        "{ \"Log\u{1f}generated-interface\": () }"
     );
     // In a normalized applied effect-interface position, every More layer
     // participates in identity stripping; a legacy separator alone remains
@@ -2054,7 +2054,7 @@ fn flattened_rows_print_with_outer_wins_and_hide_interface_keys() {
         rest: Rest::Closed,
     };
     assert_eq!(absent.to_string(), "∅");
-    assert_eq!(Ty::Struct(absent.clone()).to_string(), "{}");
+    assert_eq!(Ty::Struct(absent.clone()).to_string(), "()");
     assert_eq!(Ty::Sum(absent).to_string(), "|");
 }
 
