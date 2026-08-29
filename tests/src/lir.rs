@@ -2745,6 +2745,54 @@ fn extern_callbacks_capture_only_the_evidence_their_result_spine_requires() {
 }
 
 #[test]
+fn callback_evidence_joins_conditional_then_definite_occurrences() {
+    let source = "effect Needed = { get: () -> Nat }\n\
+         extern install : fn(fn(()) -> (() -> () + !Needed) + !Needed (when 'needed)) -> () + !Needed = host.install";
+    let printed = listing(source);
+    let callback = printed
+        .lines()
+        .find(|line| line.starts_with("fn install#extern#callback#"))
+        .expect("the callback adapter is emitted");
+    assert_eq!(
+        callback.matches(": struct").count(),
+        1,
+        "the definite occurrence promotes the repeated requirement:\n{printed}"
+    );
+    let first_adapter = printed
+        .split("\n\n")
+        .find(|part| part.starts_with("fn install#extern#callback#1"))
+        .expect("the first callback adapter is printed");
+    assert!(
+        first_adapter.find("struct { Needed:") < first_adapter.find(" = call "),
+        "the promoted evidence is repacked for the outer conditional arrow before its call:\n{printed}"
+    );
+}
+
+#[test]
+fn callback_evidence_joins_definite_then_conditional_occurrences() {
+    let source = "effect Needed = { get: () -> Nat }\n\
+         extern install : fn(fn(()) -> (() -> () + !Needed (when 'needed)) + !Needed) -> () + !Needed = host.install";
+    let printed = listing(source);
+    let callback = printed
+        .lines()
+        .find(|line| line.starts_with("fn install#extern#callback#"))
+        .expect("the callback adapter is emitted");
+    assert_eq!(
+        callback.matches(": struct").count(),
+        1,
+        "the definite occurrence stays dominant:\n{printed}"
+    );
+    let first_adapter = printed
+        .split("\n\n")
+        .find(|part| part.starts_with("fn install#extern#callback#1"))
+        .expect("the first callback adapter is printed");
+    assert!(
+        first_adapter.find(" = call ") < first_adapter.find("struct { Needed:"),
+        "the first definite occurrence remains direct evidence at its call:\n{printed}"
+    );
+}
+
+#[test]
 fn conditional_callback_bundles_capture_only_their_named_possibilities() {
     let source = "effect Needed = { get: () -> Nat }\n\
          effect Spare = { get: () -> Nat }\n\
@@ -2761,6 +2809,51 @@ fn conditional_callback_bundles_capture_only_their_named_possibilities() {
     assert!(
         bundles.iter().all(|line| !line.contains("Spare:")),
         "unrelated definite evidence was captured in a conditional bundle:\n{printed}"
+    );
+}
+
+#[test]
+fn restricted_callback_bundles_project_shared_open_tails() {
+    let source = "effect Needed = { get: () -> Nat }\n\
+         effect Spare = { get: () -> Nat }\n\
+         extern install : fn(fn(()) -> () + !Needed (when 'needed)) -> () + !Needed (when 'needed) + ..'effects = host.install\n\
+         let pass : (() -> () + !Needed (when 'needed)) -> () + !Needed (when 'needed) + ..'effects =
+           fn callback => install callback";
+    let printed = listing(source);
+    assert!(
+        printed
+            .lines()
+            .any(|line| line.contains("project ") && line.contains(", \"Needed\"")),
+        "the requested conditional effect is projected from the shared open tail:\n{printed}"
+    );
+    assert!(
+        !printed
+            .lines()
+            .filter(|line| line.contains("closure install#extern#callback#"))
+            .any(|line| line.contains("Spare")),
+        "opaque tail contents are not captured wholesale:\n{printed}"
+    );
+}
+
+#[test]
+fn restricted_callback_bundles_drop_unrelated_conditional_tail_effects() {
+    let source = "effect Needed = { get: () -> Nat }\n\
+         effect Spare = { get: () -> Nat }\n\
+         extern install : fn(fn(()) -> () + !Needed (when 'needed)) -> () + !Needed (when 'needed) + ..'effects = host.install\n\
+         let pass : (() -> () + !Needed (when 'needed)) -> () + !Needed (when 'needed) + !Spare (when 'spare) + ..'effects =
+           fn callback => install callback";
+    let printed = listing(source);
+    let projected: Vec<_> = printed
+        .lines()
+        .filter(|line| line.contains("project ") && line.contains("Needed"))
+        .collect();
+    assert!(!projected.is_empty(), "Needed is projected:\n{printed}");
+    assert!(
+        !printed
+            .lines()
+            .filter(|line| line.contains(" = struct {") && line.contains("Needed:"))
+            .any(|line| line.contains("Spare:")),
+        "the unrelated conditional effect is absent from the restricted bundle:\n{printed}"
     );
 }
 

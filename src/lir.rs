@@ -1240,11 +1240,24 @@ impl Lower<'_> {
             };
             let row = flat(row);
             for (name, field) in &row.labels {
-                if possible(&field.presence) {
-                    required
-                        .labels
-                        .entry(name.clone())
-                        .or_insert_with(|| field.clone());
+                if !possible(&field.presence) {
+                    continue;
+                }
+                match required.labels.entry(name.clone()) {
+                    indexmap::map::Entry::Vacant(entry) => {
+                        entry.insert(field.clone());
+                    }
+                    indexmap::map::Entry::Occupied(mut entry) => {
+                        // The callback may perform the same effect at several
+                        // returned arrows. Its requirement is their union: a
+                        // definite occurrence dominates either traversal
+                        // order, while conditional occurrences remain one
+                        // possible bundle entry (their particular formula is
+                        // immaterial to the evidence representation).
+                        if definite(&field.presence) {
+                            entry.get_mut().presence = Presence::Present;
+                        }
+                    }
                 }
             }
             // Conditional labels need a bundle, but they do not make the
@@ -2360,6 +2373,68 @@ impl Lower<'_> {
         include_tails: bool,
         body: &mut Body,
     ) -> Temp {
+        // A restricted conditional bundle is a projection, never a forwarded
+        // ambient tail. Rebuild exactly the requested keys: named evidence wins
+        // as usual, and a key known only through an opaque tail is projected
+        // from the layered tails. Forwarding or merging those tails themselves
+        // would expose every unrelated effect they happen to contain.
+        if let Some(names) = only {
+            let held: Vec<(usize, Temp)> = if include_tails {
+                self.frames
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(at, frame)| frame.tails.iter().map(move |(_, temp)| (at, *temp)))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let mut tails: Vec<Temp> = held
+                .into_iter()
+                .map(|(at, temp)| self.thread(at, temp))
+                .collect();
+            let tail = match tails.as_slice() {
+                [] => None,
+                [tail] => Some(*tail),
+                _ => Some(self.emit(
+                    body,
+                    Span::default(),
+                    Rep::Struct,
+                    Op::Merge(std::mem::take(&mut tails)),
+                )),
+            };
+            let entries: IndexMap<String, Temp> = names
+                .iter()
+                .map(|name| {
+                    let value = if self
+                        .frames
+                        .iter()
+                        .any(|frame| frame.evidence.contains_key(name))
+                    {
+                        self.evidence_of(name)
+                    } else {
+                        self.emit(
+                            body,
+                            Span::default(),
+                            Rep::Struct,
+                            Op::Project {
+                                base: tail.expect(
+                                    "accepted conditional evidence is named or supplied by a tail",
+                                ),
+                                field: FieldKey::named(name.clone()),
+                            },
+                        )
+                    };
+                    (name.clone(), value)
+                })
+                .collect();
+            return self.emit(
+                body,
+                Span::default(),
+                Rep::Struct,
+                Op::Struct(named_fields(entries)),
+            );
+        }
+
         let found = include_tails
             .then(|| {
                 self.frames
@@ -2399,7 +2474,7 @@ impl Lower<'_> {
         let mut names: Vec<String> = Vec::new();
         for frame in &self.frames {
             for name in frame.evidence.keys() {
-                if only.is_none_or(|allowed| allowed.contains(name)) && !names.contains(name) {
+                if !names.contains(name) {
                     names.push(name.clone());
                 }
             }
