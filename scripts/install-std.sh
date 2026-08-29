@@ -28,22 +28,59 @@ lock=$home/.std.install.lock
 lock_owned=false
 temp_tag=$$.$RANDOM.$RANDOM
 probe=
+probe_assigned=false
 staging=
+staging_assigned=false
+old_tree=
 cleanup() {
   status=$?
-  # Before the commit this removes the uninstalled tree. After an exchange,
-  # this same path names the previous installation instead.
-  [[ -z $staging ]] || rm -rf -- "$staging"
-  [[ -z $probe ]] || rm -rf -- "$probe"
-  # Process-tagged templates also cover a signal after mktemp creates a directory
-  # but before command substitution assigns its path to the variables above.
-  rm -rf -- "$home/.std.exchange.$temp_tag".* "$home/.std.install.$temp_tag".*
+  # EXIT traps inherit errexit. Disable it after saving the command status so
+  # one failed best-effort deletion cannot prevent the owned-lock release.
+  trap - EXIT
+  set +e
+  cleanup_failed=false
+
+  if [[ -n $staging ]] && ! rm -rf -- "$staging"; then
+    printf 'warning: could not remove uninstalled standard-library tree %q\n' "$staging" >&2
+    cleanup_failed=true
+  fi
+  if [[ -n $old_tree ]] && ! rm -rf -- "$old_tree"; then
+    printf 'warning: installed the new standard library but could not remove previous tree %q; remove it manually\n' "$old_tree" >&2
+    cleanup_failed=true
+  fi
+  if [[ -n $probe ]] && ! rm -rf -- "$probe"; then
+    printf 'warning: could not remove standard-library exchange probe %q\n' "$probe" >&2
+    cleanup_failed=true
+  fi
+  # Process-tagged templates cover a signal after mktemp creates a directory
+  # but before command substitution assigns its path. Do not retry assigned
+  # paths here: their specific diagnostics above must accurately report whether
+  # an old tree still needs manual removal.
+  if [[ $probe_assigned == false ]] && ! rm -rf -- "$home/.std.exchange.$temp_tag".*; then
+    echo 'warning: could not remove an unassigned standard-library exchange probe' >&2
+    cleanup_failed=true
+  fi
+  if [[ $staging_assigned == false ]] && ! rm -rf -- "$home/.std.install.$temp_tag".*; then
+    echo 'warning: could not remove an unassigned standard-library installer tree' >&2
+    cleanup_failed=true
+  fi
   if [[ $lock_owned == true ]]; then
-    # Only the process whose mkdir succeeded removes the lock. Removing the
-    # owner before the directory is safe: no contender can create the lock
-    # until rmdir completes, and this process performs no later lock operation.
-    rm -f -- "$lock/owner"
-    rmdir -- "$lock" 2>/dev/null || true
+    # Attempt both operations independently. In particular, failure to remove
+    # a temporary/old tree or owner file must never skip the final rmdir.
+    if ! rm -f -- "$lock/owner"; then
+      printf 'warning: could not remove standard-library installer lock owner %q\n' "$lock/owner" >&2
+      cleanup_failed=true
+    fi
+    if ! rmdir -- "$lock"; then
+      printf 'warning: could not release standard-library installer lock %q; remove it manually after verifying no installer is running\n' "$lock" >&2
+      cleanup_failed=true
+    fi
+  fi
+
+  # Preserve an original failure (including signal-derived statuses), but make
+  # an otherwise successful install fail when its promised cleanup did not.
+  if ((status == 0)) && [[ $cleanup_failed == true ]]; then
+    status=1
   fi
   exit "$status"
 }
@@ -99,6 +136,7 @@ if [[ -e $home/std || -L $home/std ]]; then
   # probe is beside the destination, so it exercises the same filesystem and
   # the same renameat2(RENAME_EXCHANGE) operation as the eventual commit.
   probe=$(mktemp -d "$home/.std.exchange.$temp_tag.XXXXXX")
+  probe_assigned=true
   mkdir "$probe/left" "$probe/right"
   if ! mv --exchange --no-copy -T -- "$probe/left" "$probe/right"; then
     echo 'cannot atomically replace the Ruddy standard library: this Linux filesystem does not support directory exchange' >&2
@@ -110,6 +148,7 @@ if [[ -e $home/std || -L $home/std ]]; then
 fi
 
 staging=$(mktemp -d "$home/.std.install.$temp_tag.XXXXXX")
+staging_assigned=true
 
 # Copy only the manifest and Ruddy source tree. In particular, build products,
 # repository metadata, and editor files never become part of the installation.
@@ -143,9 +182,12 @@ if [[ $replacement == true ]]; then
   # aside and then renaming staging, the namespace therefore always contains
   # either complete tree. The capability was exercised above before staging.
   mv --exchange --no-copy -T -- "$staging" "$home/std"
+  old_tree=$staging
+  staging=
 else
   # With no destination, ordinary mv is a same-filesystem directory rename.
   # Avoid GNU-only flags so the first installation remains portable.
   mv "$staging" "$home/std"
+  staging=
 fi
 printf 'installed Ruddy standard library in %s\n' "$home/std"

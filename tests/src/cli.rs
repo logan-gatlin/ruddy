@@ -206,6 +206,81 @@ fn bundled_std_installer_replaces_only_source_files() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn bundled_std_installer_releases_lock_when_old_tree_cleanup_fails() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let home = root.path().join("home");
+    let bin = root.path().join("bin");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(home.join("std")).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(source.join("Ruddy.toml"), "new").unwrap();
+    fs::write(source.join("main.hc"), "new main").unwrap();
+    fs::write(home.join("std/Ruddy.toml"), "old").unwrap();
+    fs::write(home.join("std/main.hc"), "old main").unwrap();
+
+    let real_rm = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v rm"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let fake_rm = bin.join("rm");
+    fs::write(
+        &fake_rm,
+        "#!/bin/sh\nfor arg do\n  case $arg in\n    \"$FAIL_HOME\"/.std.install.*)\n      if [ -f \"$arg/Ruddy.toml\" ] && grep -qx old \"$arg/Ruddy.toml\"; then\n        echo 'injected old-tree removal failure' >&2\n        exit 88\n      fi\n      ;;\n  esac\ndone\nexec \"$REAL_RM\" \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_rm, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("scripts/install-std.sh");
+    let output = Command::new(script)
+        .arg(&source)
+        .env("RUDDY_HOME", &home)
+        .env("FAIL_HOME", &home)
+        .env("REAL_RM", real_rm.trim())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert_eq!(
+        fs::read_to_string(home.join("std/Ruddy.toml")).unwrap(),
+        "new"
+    );
+    assert!(!home.join(".std.install.lock").exists());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("installed the new standard library but could not remove previous tree"),
+        "{stderr}"
+    );
+    assert!(fs::read_dir(&home).unwrap().any(|entry| {
+        let path = entry.unwrap().path();
+        path.file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(".std.install.")
+            && fs::read_to_string(path.join("Ruddy.toml")).is_ok_and(|contents| contents == "old")
+    }));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn bundled_std_installer_discovery_failure_preserves_existing_installation() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -256,7 +331,7 @@ fn bundled_std_installer_discovery_failure_preserves_existing_installation() {
         .env_remove("HOME")
         .output()
         .unwrap();
-    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(73));
     assert_eq!(
         fs::read_to_string(home.join("std/Ruddy.toml")).unwrap(),
         "old"
