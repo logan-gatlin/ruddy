@@ -281,6 +281,10 @@ async function openDoc(name) {
   renderFiles();
   saveUi();
   renderTitlebar();
+  // Dependency compilation resolves from the saved document directory. Create
+  // it before the first compile so a new or locally recovered document can use
+  // its standard library immediately.
+  if (!server) await saveNow();
   await compileNow();
   editor.focus();
 }
@@ -490,7 +494,7 @@ function setLink(link) {
 
 // ── title bar ────────────────────────────────────────────────────────────
 
-function parseDependencies(input) {
+function parseDependencies(input, allowStd = false) {
   if (!input.trim()) return {};
   const dependencies = {};
   for (const [index, raw] of input.split(",").entries()) {
@@ -503,6 +507,9 @@ function parseDependencies(input) {
     const bundleName = (at < 0 ? alias : left.slice(at + 1)).trim();
     if (equals <= 0 || !alias || !bundleName || !source) {
       throw new Error(`Dependency ${index + 1} must be written as alias=folder, alias@bundle=folder, or alias=https://git-url[#branch=name|#tag=name|#rev=commit].`);
+    }
+    if (alias === "std" && !allowStd) {
+      throw new Error("Dependency alias std is reserved; use the standard-library control instead.");
     }
     if (Object.hasOwn(dependencies, alias)) throw new Error(`Dependency ${alias} is declared more than once.`);
 
@@ -584,7 +591,7 @@ function wireTitlebar() {
     try {
       if (!value || value === "default") state.std = null;
       else if (value === "off" || value === "false") state.std = false;
-      else state.std = parseDependencies(value.startsWith("@") ? `std${value}` : `std=${value}`).std;
+      else state.std = parseDependencies(value.startsWith("@") ? `std${value}` : `std=${value}`, true).std;
     } catch (error) {
       window.alert(error.message);
       return;

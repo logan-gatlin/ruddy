@@ -39,12 +39,14 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-# `source/.` includes dotfiles while keeping the staging directory itself on the
-# destination filesystem, so the final rename cannot cross a mount boundary.
-cp -R "$source/." "$staging/"
-# Build products are local state, not part of the installed source project.
-# Remove a directory or symlink with that name without following it.
-rm -rf "$staging/build"
+# Copy only the manifest and Ruddy source tree. In particular, build products,
+# repository metadata, and editor files never become part of the installation.
+cp "$source/Ruddy.toml" "$staging/Ruddy.toml"
+while IFS= read -r -d '' file; do
+  relative=${file#"$source"/}
+  mkdir -p "$staging/$(dirname "$relative")"
+  cp "$file" "$staging/$relative"
+done < <(find "$source" -path "$source/build" -prune -o -type f -name '*.hc' -print0)
 
 if [[ -e $home/std || -L $home/std ]]; then
   backup=$(mktemp -d "$home/.std.backup.XXXXXX")

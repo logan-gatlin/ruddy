@@ -38,6 +38,16 @@ struct Manifest {
     dependencies: IndexMap<String, DependencySpec>,
 }
 
+fn validate_dependencies(dependencies: &IndexMap<String, DependencySpec>) -> io::Result<()> {
+    if dependencies.contains_key("std") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "dependency alias `std` is reserved; configure the top-level `std` field instead",
+        ));
+    }
+    Ok(())
+}
+
 /// The longest path a file inside a document may have. Long enough for a module
 /// nested deeper than anyone will nest one, short enough that no request can ask
 /// the filesystem to think about a path of its own devising.
@@ -186,6 +196,7 @@ pub fn write(
     dependencies: &IndexMap<String, DependencySpec>,
     files: &[FileSpec],
 ) -> io::Result<u128> {
+    validate_dependencies(dependencies)?;
     let dir = path(root, name).ok_or_else(bad_name)?;
     fs::create_dir_all(&dir)?;
     let manifest = Manifest {
@@ -220,12 +231,15 @@ pub fn write(
 fn read_manifest(dir: &Path) -> io::Result<Manifest> {
     let path = dir.join(MANIFEST);
     let source = fs::read_to_string(&path)?;
-    toml::from_str(&source).map_err(|error| {
+    let manifest: Manifest = toml::from_str(&source).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("could not parse manifest {}: {error}", path.display()),
         )
-    })
+    })?;
+    validate_dependencies(&manifest.dependencies)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(manifest)
 }
 
 /// Resolve a dependency path relative to a scratch project and prove that its

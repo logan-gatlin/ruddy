@@ -12,7 +12,7 @@ cd ruddy
 just install
 ```
 
-This installs the `ruddy` executable into Cargo's binary directory and installs the standard-library project at `$RUDDY_HOME/std`. A non-empty `RUDDY_HOME` selects the Ruddy data directory; otherwise it is `$HOME/.ruddy`. Re-running `just install` replaces the installed standard library from this checkout without exposing a partially copied project. Ensure Cargo's binary directory (usually `$HOME/.cargo/bin`) is on `PATH`.
+This installs the `ruddy` executable into Cargo's binary directory and installs the matching standard-library source project at `$RUDDY_HOME/std`. A non-empty `RUDDY_HOME` selects the Ruddy data directory; otherwise it is `$HOME/.ruddy`. Re-running `just install` destructively replaces the previous std tree, but stages the new manifest and `.hc` sources beside it and uses same-filesystem renames and rollback so a failed copy never exposes a partial installation. `cargo install --locked --path ./cli` alone installs only the binary. Ensure Cargo's binary directory (usually `$HOME/.cargo/bin`) is on `PATH`.
 
 ## Projects and dependencies
 
@@ -36,7 +36,7 @@ Git repositories are fetched and checked out with pure-Rust `gix` and Rustls—R
 
 ### Standard library
 
-Every project implicitly receives a dependency named `std`, resolved from `$RUDDY_HOME/std`. The dependency is injected before declared dependencies and is available with qualified names such as `std::identity` and `std::Option`. The installed library currently provides `Option`, `Result`, and small function combinators; its source project lives in [`std/`](std/).
+Every project implicitly receives a dependency named `std`, resolved from `$RUDDY_HOME/std`. The dependency is injected before declared dependencies and is available through qualified `std::…` names. The bundled `std@0.1.0` is initially empty; its source project lives in [`std/`](std/).
 
 A project can disable this dependency or replace it with any normal path or Git dependency using the top-level `std` field:
 
@@ -46,12 +46,20 @@ std = false
 
 # Or select another std project (instead of `false`):
 # std = "../my-std"
+# std = { path = "../foundation", bundle = "foundation" }
 # std = { git = "https://example.com/my-std.git", tag = "v1.0.0" }
+# std = { git = "https://example.com/foundation.git", rev = "0123456", bundle = "foundation" }
 
 [dependencies]
 ```
 
-`std = true` is invalid: omit the field to use the installed library. The alias `std` is reserved and cannot also appear in `[dependencies]`. Each dependency project resolves its own `std` setting, so a custom or bootstrap library should generally declare `std = false` to avoid depending on the installed library itself. If the default installation is missing or invalid, Ruddy reports how to install, override, or disable it.
+The optional `bundle` is the dependency project's actual manifest name when that differs from the source alias: the second example is still referenced as `std::…`, but its artifact identity is `foundation`. Relative paths are resolved from the manifest that declares them. Git overrides use the normal shared cache and selectors, and every transitive resolution is recorded in the root project's lockfile rather than a dependency-local lockfile.
+
+`std = true` is invalid: omit the field to use the installed library. The source alias `std` is reserved and cannot also appear in `[dependencies]`, though another alias may legally target a bundle actually named `std`. `ruddy new` deliberately omits the setting and uses the installed default.
+
+Each manifest—including transitive path and Git dependencies—resolves its own `std` setting. A custom or bootstrap library should generally declare `std = false` to avoid depending on the installed library itself. Canonical projects are still deduplicated, multiple std bundle identities or versions may coexist, and the usual error applies if the same name and version come from different locations. If the default installation is missing, unreadable, malformed, or names the wrong bundle, Ruddy reports how to run `just install`, configure an override, or set `std = false`.
+
+The debugger persists the same default, disabled, or custom setting. Its title-bar **std** toggle disables the effective setting without forgetting a custom specification, then restores that specification when re-enabled; std is shown first in **Dependencies** and flows through Artifact, Linked Artifact, and JavaScript. The debugger may read the exact canonical installed `$RUDDY_HOME/std` tree outside its scratch folder. Custom local overrides remain confined to the scratch sandbox, while Git std overrides use the existing trusted checkout boundary.
 
 ## JavaScript target
 

@@ -96,11 +96,62 @@ fn std_manifest_forms_are_strict_and_contextual() {
 }
 
 #[test]
+fn bundled_std_installer_replaces_only_source_files() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let home = root.path().join("home");
+    fs::create_dir_all(source.join("Nested")).unwrap();
+    fs::create_dir_all(source.join("build")).unwrap();
+    fs::create_dir_all(home.join("std")).unwrap();
+    fs::write(source.join("Ruddy.toml"), "manifest").unwrap();
+    fs::write(source.join("main.hc"), "").unwrap();
+    fs::write(source.join("Nested/module.hc"), "let value = 0n\n").unwrap();
+    fs::write(source.join("build/app.artifact"), "artifact").unwrap();
+    fs::write(source.join("notes.txt"), "notes").unwrap();
+    fs::write(home.join("std/old.hc"), "old").unwrap();
+
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("scripts/install-std.sh");
+    let output = Command::new(&script)
+        .arg(&source)
+        .env("RUDDY_HOME", &home)
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(home.join("std/Ruddy.toml")).unwrap(),
+        "manifest"
+    );
+    assert!(home.join("std/main.hc").is_file());
+    assert!(home.join("std/Nested/module.hc").is_file());
+    assert!(!home.join("std/old.hc").exists());
+    assert!(!home.join("std/build").exists());
+    assert!(!home.join("std/notes.txt").exists());
+
+    fs::remove_file(source.join("main.hc")).unwrap();
+    let output = Command::new(script)
+        .arg(&source)
+        .env("RUDDY_HOME", &home)
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(home.join("std/Nested/module.hc").is_file());
+}
+
+#[test]
 fn automatic_std_environment_behavior_is_isolated() {
     let parent = tempfile::tempdir().unwrap();
     let home = parent.path().join("home");
 
-    for mode in ["default", "custom", "disabled"] {
+    for mode in ["default", "relative", "custom", "disabled"] {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args([
@@ -110,10 +161,13 @@ fn automatic_std_environment_behavior_is_isolated() {
             ])
             .env("RUDDY_TEST_STD_MODE", mode)
             .env("RUDDY_TEST_STD_ROOT", parent.path())
+            .current_dir(parent.path())
             .env_remove("HOME")
             .env_remove("RUDDY_HOME");
         if mode == "default" {
             command.env("HOME", &home);
+        } else if mode == "relative" {
+            command.env("RUDDY_HOME", "relative-home");
         }
         let output = command.output().unwrap();
         assert!(
@@ -134,9 +188,12 @@ fn automatic_std_environment_child() {
     fs::write(root.join("main.hc"), "let main = 0n\n").unwrap();
 
     match mode.as_str() {
-        "default" => {
+        "default" | "relative" => {
             let standard = ruddy_cli::ruddy_home().unwrap().join("std");
+            assert!(standard.is_absolute());
             write_project(&standard, "std", "1.0.0", &[]);
+            fs::create_dir(standard.join("build")).unwrap();
+            fs::write(standard.join("build/sentinel"), "keep").unwrap();
             fs::write(
                 root.join("Ruddy.toml"),
                 "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\n",
@@ -152,9 +209,16 @@ fn automatic_std_environment_child() {
                     .collect::<Vec<_>>(),
                 ["std", "app"]
             );
+            assert_eq!(
+                graph.projects[0].source,
+                ruddy_cli::ProjectSource::InstalledStd
+            );
             let artifact = build_project(&root).unwrap();
             assert_eq!(artifact, root.join("build/app.artifact"));
-            assert!(!standard.join("build").exists());
+            assert_eq!(
+                fs::read_to_string(standard.join("build/sentinel")).unwrap(),
+                "keep"
+            );
 
             fs::remove_file(standard.join("Ruddy.toml")).unwrap();
             let found = compile(&root).unwrap_err().to_string();
@@ -1577,10 +1641,7 @@ fn manifest_targets_select_root_javascript_output() {
     let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
     fs::write(
         app.join("Ruddy.toml"),
-        manifest.replace(
-            "root = \"main.hc\"\nstd = false",
-            "root = \"main.hc\"\nstd = false\ntarget = \"lib\"",
-        ),
+        manifest.replace("std = false", "std = false\ntarget = \"lib\""),
     )
     .unwrap();
     build_project(&app).unwrap();
