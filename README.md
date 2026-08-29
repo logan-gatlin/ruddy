@@ -12,7 +12,7 @@ cd ruddy
 just install
 ```
 
-This installs the `ruddy` executable into Cargo's binary directory and installs the matching standard-library source project at `$RUDDY_HOME/std`. A non-empty `RUDDY_HOME` selects the Ruddy data directory; otherwise it is `$HOME/.ruddy`. Re-running `just install` destructively replaces the previous std tree, but stages the new manifest and `.hc` sources beside it and uses same-filesystem renames and rollback so a failed copy never exposes a partial installation. `cargo install --locked --path ./cli` alone installs only the binary. Ensure Cargo's binary directory (usually `$HOME/.cargo/bin`) is on `PATH`.
+This installs the `ruddy` executable into Cargo's binary directory and installs the matching standard-library source project at `$RUDDY_HOME/std`. A non-empty `RUDDY_HOME` selects the Ruddy data directory; otherwise it is `$HOME/.ruddy`. Re-running `just install` destructively replaces the previous std tree, but stages the new manifest and `.hc` sources beside it and atomically exchanges the complete trees on Linux, so readers always see either the old or new installation and an interrupted copy leaves the old one intact. `cargo install --locked --path ./cli` alone installs only the binary. Ensure Cargo's binary directory (usually `$HOME/.cargo/bin`) is on `PATH`.
 
 ## Projects and dependencies
 

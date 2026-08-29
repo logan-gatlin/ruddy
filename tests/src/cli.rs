@@ -146,6 +146,127 @@ fn bundled_std_installer_replaces_only_source_files() {
     assert!(home.join("std/Nested/module.hc").is_file());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn bundled_std_installer_never_hides_an_existing_installation() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    use std::{thread, time::Duration};
+
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let home = root.path().join("home");
+    let barrier = root.path().join("commit-barrier");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(home.join("std")).unwrap();
+    fs::write(source.join("Ruddy.toml"), "new").unwrap();
+    fs::write(source.join("main.hc"), "").unwrap();
+    fs::write(home.join("std/Ruddy.toml"), "old").unwrap();
+
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("scripts/install-std.sh");
+    let mut child = Command::new(script)
+        .arg(&source)
+        .env("RUDDY_HOME", &home)
+        .env("_RUDDY_INSTALL_STD_TEST_BARRIER", &barrier)
+        .env_remove("HOME")
+        .spawn()
+        .unwrap();
+    for _ in 0..500 {
+        if barrier.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(barrier.exists(), "installer did not finish staging");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let observations = Arc::new(AtomicUsize::new(0));
+    let observer_home = home.clone();
+    let observer_stop = Arc::clone(&stop);
+    let observer_observations = Arc::clone(&observations);
+    let observer = thread::spawn(move || {
+        while !observer_stop.load(Ordering::Acquire) {
+            let manifest = fs::read_to_string(observer_home.join("std/Ruddy.toml"))
+                .expect("std must remain visible throughout replacement");
+            assert!(manifest == "old" || manifest == "new", "{manifest:?}");
+            observer_observations.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    while observations.load(Ordering::Relaxed) == 0 {
+        thread::yield_now();
+    }
+    fs::remove_file(&barrier).unwrap();
+    let status = child.wait().unwrap();
+    stop.store(true, Ordering::Release);
+    observer.join().unwrap();
+
+    assert!(status.success());
+    assert_eq!(
+        fs::read_to_string(home.join("std/Ruddy.toml")).unwrap(),
+        "new"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bundled_std_installer_interruption_preserves_existing_installation() {
+    use std::{thread, time::Duration};
+
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let home = root.path().join("home");
+    let barrier = root.path().join("commit-barrier");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(home.join("std")).unwrap();
+    fs::write(source.join("Ruddy.toml"), "new").unwrap();
+    fs::write(source.join("main.hc"), "").unwrap();
+    fs::write(home.join("std/Ruddy.toml"), "old").unwrap();
+
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("scripts/install-std.sh");
+    let mut child = Command::new(script)
+        .arg(&source)
+        .env("RUDDY_HOME", &home)
+        .env("_RUDDY_INSTALL_STD_TEST_BARRIER", &barrier)
+        .env_remove("HOME")
+        .spawn()
+        .unwrap();
+    for _ in 0..500 {
+        if barrier.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(barrier.exists(), "installer did not finish staging");
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(!child.wait().unwrap().success());
+
+    assert_eq!(
+        fs::read_to_string(home.join("std/Ruddy.toml")).unwrap(),
+        "old"
+    );
+    assert!(fs::read_dir(&home).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".std.install.")
+    }));
+}
+
 #[test]
 fn automatic_std_environment_behavior_is_isolated() {
     let parent = tempfile::tempdir().unwrap();
