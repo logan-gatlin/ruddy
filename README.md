@@ -84,7 +84,28 @@ main;
 util.map;
 ```
 
+### Extern function ABI
+
 Ruddy `extern` declarations are resolved by walking their dotted target from `globalThis` during module initialization; the embedding environment must provide those values. Function externs are bound to the object owning the final path segment, so host methods retain their `this` receiver.
+
+Ruddy functions are curried, but JavaScript APIs commonly accept several arguments in one call. In an extern annotation, `fn(...) -> ...` records that foreign calling convention without changing the Ruddy type:
+
+```ruddy
+extern add : fn(Nat, Nat) -> Nat = host.add
+extern now : fn() -> Nat = host.now
+
+let add_two = add 2n
+let answer = add_two 40n
+let timestamp = now ()
+```
+
+`fn(A, B) -> R` is visible to Ruddy as the curried type `A -> B -> R`. A trailing comma is permitted. `fn() -> R` is called by applying Ruddy unit and invokes the host with no arguments. An effect on a marked function belongs to its final curried arrow, so partial application remains pure: `fn(A, B) -> R + !E` means `A -> B -> R + !E`.
+
+The existing arrow syntax deliberately retains the existing host-curried ABI. For example, `extern add : Nat -> Nat -> Nat = host.add` expects `host.add(a)(b)`, including when an ordinary type alias reveals the arrow. Use `fn(Nat, Nat) -> Nat` to call `host.add(a, b)`. The `fn(...)` ABI notation is available only in extern annotations and in direct, possibly parenthesized parameter or result positions of another marked function; it is not a general Ruddy type constructor.
+
+Function conversion is recursive at that boundary. Marked function parameters expose a Ruddy callback to the host as an n-ary function, marked results adapt an n-ary host function back into a curried Ruddy value, and ordinary-arrow function parameters and results use the host-curried convention. This also applies to nested direct function parameters and results.
+
+Effect rows on externs still constrain Ruddy calls, but raw host functions receive only the source-visible arguments—never Ruddy handler evidence. An effectful callback passed to the host must require no effects beyond those available on the containing extern call; otherwise compilation fails. The adapter captures the necessary handler evidence. A host that retains such a callback is responsible for invoking it only while the originating handler remains dynamically active.
 
 Ruddy `Nat`, `Int`, and `Real` values use JavaScript `Number`; integers beyond 2^53 can therefore lose precision. Natural subtraction saturates at zero, integer division truncates toward zero, and real division uses ordinary JavaScript division.
 
