@@ -5175,21 +5175,19 @@ fn nested_callback_results_keep_their_own_existential_boundary() {
 }
 
 /// An arrow's conditional effect is produced at the invocation boundary while
-/// its return field is produced inside that boundary. When one presence links
-/// both, ownership expands to the smallest boundary containing the pair.
+/// its return field is produced inside that boundary. One source presence may
+/// not be widened to the invocation boundary: doing so would erase the exact
+/// package lifetime of the returned value.
 #[test]
-fn result_and_effect_occurrences_share_the_enclosing_call_boundary() {
+fn result_and_effect_occurrences_do_not_merge_package_boundaries() {
     let source = "effect Log = { op: () -> () }\n\
                   let mixed : Nat -> { x when 'p: Nat } + !Log (when 'p) = fn n => { x: n }";
-    let (mint, out) = built(source);
-    let annotation = annotation_of(&mint, &out, "mixed");
-    let PresenceOwnership::Existential { boundary } = annotation.variables[0].ownership else {
-        panic!("the correlated result and effect should be producer-owned");
-    };
-    assert_eq!(
-        &source[boundary.start..boundary.end()],
-        "Nat -> { x when 'p: Nat } + !Log (when 'p)"
-    );
+    let (_, out) = build_src(source);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert!(matches!(
+        out.errors[0].kind,
+        ErrorKind::IncompatiblePresenceOwnership { ref name } if name == "p"
+    ));
 }
 
 /// A formula is written about presences, and a presence is what a `when` puts
@@ -5677,13 +5675,13 @@ fn imported_schemes_preserve_and_sanitize_existential_ownership() {
         presences: 1,
         existentials: vec![0],
         formula: a::Formula::True,
-        body: artifact_struct(vec![(
+        body: a::Type::Package(Box::new(artifact_struct(vec![(
             "choice".into(),
             a::RowField {
                 presence: a::Presence::Bound(0),
                 ty: a::Type::Nat,
             },
-        )]),
+        )]))),
     };
     dependency.header.values[1].scheme.existentials = vec![9];
 
