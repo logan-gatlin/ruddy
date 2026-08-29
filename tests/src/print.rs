@@ -92,6 +92,26 @@ fn tuples_print_canonically_in_both_trees() {
     }
 }
 
+/// The lexer intentionally rejects an unspaced `.0.0` as decimal-like
+/// malformed syntax. Printers therefore retain the grouping that makes nested
+/// numeric projections valid, in both trees and on every subsequent pass.
+#[test]
+fn nested_numeric_projections_print_to_a_fixed_point() {
+    for source in [
+        "let pick = fn p => (p.0).0",
+        "let deep = fn p => ((p.0).0).0",
+        "let mixed = fn p => (p.0).0.name",
+    ] {
+        let (ast, ir) = printed(source);
+        assert_eq!(ast, source, "{source}: AST");
+        assert_eq!(ir, source, "{source}: IR");
+
+        let (ast_again, ir_again) = printed(&ir);
+        assert_eq!(ast_again, ir, "{source}: AST fixed point");
+        assert_eq!(ir_again, ir, "{source}: IR fixed point");
+    }
+}
+
 #[test]
 fn canonical_tuple_fields_are_exact_and_insertion_order_independent() {
     assert_eq!(ruddy::ui::tuple_field_order(["1", "0"]), Some(vec![1, 0]));

@@ -4107,6 +4107,10 @@
         "required": true,
         "types": [
           {
+            "type": "ERROR",
+            "named": true
+          },
+          {
             "type": "identifier",
             "named": true
           },
@@ -5417,6 +5421,10 @@
   {
     "type": "=>",
     "named": false
+  },
+  {
+    "type": "ERROR",
+    "named": true
   },
   {
     "type": "\\",

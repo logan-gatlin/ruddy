@@ -965,6 +965,15 @@
                 {
                   "type": "SYMBOL",
                   "name": "numeric_field"
+                },
+                {
+                  "type": "ALIAS",
+                  "content": {
+                    "type": "SYMBOL",
+                    "name": "_malformed_numeric_field"
+                  },
+                  "named": true,
+                  "value": "ERROR"
                 }
               ]
             }
@@ -1077,6 +1086,15 @@
                 {
                   "type": "SYMBOL",
                   "name": "numeric_field"
+                },
+                {
+                  "type": "ALIAS",
+                  "content": {
+                    "type": "SYMBOL",
+                    "name": "_malformed_numeric_field"
+                  },
+                  "named": true,
+                  "value": "ERROR"
                 }
               ]
             }
@@ -3236,6 +3254,11 @@
     "numeric_field": {
       "type": "PATTERN",
       "value": "[0-9]+"
+    },
+    "_malformed_numeric_field": {
+      "type": "PATTERN",
+      "value": "[0-9]+[\\p{Alphabetic}\\p{N}_]+",
+      "flags": "u"
     },
     "string": {
       "type": "TOKEN",

@@ -258,6 +258,14 @@ impl Grouped for Show<'_, TermKind> {
             | TermKind::Error => Prec::Atom,
         }
     }
+
+    fn ends_in_numeric_projection(&self) -> bool {
+        matches!(
+            self.node,
+            TermKind::Project { field, .. }
+                if ruddy::ui::canonical_tuple_index(&field.tracked).is_some()
+        )
+    }
 }
 
 /// A normalized pattern groups exactly as the surface pattern it prints as —
