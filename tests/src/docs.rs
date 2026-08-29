@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use indexmap::IndexMap;
 use ruddy_debug::{
     docs::{delete, dependency_path, path, read, valid_file_path, valid_name, write},
-    wire::{FileSpec, RunConfig},
+    wire::{DependencySpec, FileSpec, RunConfig, StdConfig},
 };
 
 #[test]
@@ -106,6 +106,7 @@ fn a_document_round_trips_through_the_disk() {
         "1.2.3",
         "main.hc",
         &run,
+        &Default::default(),
         &dependencies,
         &files,
     )
@@ -117,6 +118,7 @@ fn a_document_round_trips_through_the_disk() {
     assert_eq!(doc.version, "1.2.3");
     assert_eq!(doc.root, "main.hc");
     assert_eq!(doc.run, run);
+    assert_eq!(doc.std, StdConfig::default());
     assert!(matches!(
         &doc.dependencies["base"],
         ruddy_debug::wire::DependencySpec::Path(path)
@@ -141,6 +143,38 @@ fn a_document_round_trips_through_the_disk() {
 }
 
 #[test]
+fn the_reserved_std_alias_is_never_persisted_as_a_declared_dependency() {
+    let root = scratch("reserved-std");
+    let dependencies = IndexMap::from([("std".into(), DependencySpec::from("../standard"))]);
+    let found = write(
+        &root,
+        "demo",
+        "demo",
+        "0.1.0",
+        "main.hc",
+        &RunConfig::default(),
+        &StdConfig::default(),
+        &dependencies,
+        &[file("main.hc", "")],
+    )
+    .unwrap_err();
+    assert_eq!(found.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(found.to_string().contains("alias `std` is reserved"));
+    assert!(!root.join("demo").exists());
+
+    std::fs::create_dir_all(root.join("demo")).unwrap();
+    std::fs::write(root.join("demo/main.hc"), "").unwrap();
+    std::fs::write(
+        root.join("demo/Ruddy.toml"),
+        "name = \"demo\"\nversion = \"0.1.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nstd = \"../standard\"\n",
+    )
+    .unwrap();
+    let found = read(&root, "demo").unwrap_err();
+    assert_eq!(found.kind(), std::io::ErrorKind::InvalidData);
+    assert!(found.to_string().contains("duplicate key"));
+}
+
+#[test]
 fn the_configured_root_is_ordered_before_other_files() {
     let root = scratch("configured-root-order");
     write(
@@ -150,6 +184,7 @@ fn the_configured_root_is_ordered_before_other_files() {
         "0.1.0",
         "start.hc",
         &RunConfig::default(),
+        &Default::default(),
         &IndexMap::new(),
         &[file("main.hc", ""), file("start.hc", "")],
     )
@@ -179,6 +214,7 @@ fn a_write_deletes_a_file_dropped_from_the_set() {
         "0.1.0",
         "main.hc",
         &RunConfig::default(),
+        &Default::default(),
         &IndexMap::new(),
         &[
             file("main.hc", "module Math\n"),
@@ -194,6 +230,7 @@ fn a_write_deletes_a_file_dropped_from_the_set() {
         "0.1.0",
         "main.hc",
         &RunConfig::default(),
+        &Default::default(),
         &IndexMap::new(),
         &[file("main.hc", "")],
     )
@@ -215,6 +252,42 @@ fn scratch(name: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("the scratch directory is created");
     root
+}
+
+#[test]
+fn standard_library_configuration_round_trips_and_defaults_to_installed() {
+    let root = scratch("std-configuration");
+    let files = [file("main.hc", "")];
+    for configuration in [
+        StdConfig::Disabled,
+        StdConfig::Dependency(DependencySpec::from("../custom-std")),
+    ] {
+        write(
+            &root,
+            "demo",
+            "demo",
+            "0.1.0",
+            "main.hc",
+            &RunConfig::default(),
+            &configuration,
+            &IndexMap::new(),
+            &files,
+        )
+        .unwrap();
+        assert_eq!(read(&root, "demo").unwrap().std, configuration);
+    }
+
+    let source = std::fs::read_to_string(root.join("demo/Ruddy.toml")).unwrap();
+    assert!(
+        source.contains("[dependencies]\nstd = \"../custom-std\""),
+        "{source}"
+    );
+    std::fs::write(
+        root.join("demo/Ruddy.toml"),
+        "name = \"demo\"\nversion = \"0.1.0\"\nroot = \"main.hc\"\n[dependencies]\n",
+    )
+    .unwrap();
+    assert_eq!(read(&root, "demo").unwrap().std, StdConfig::Default);
 }
 
 #[test]

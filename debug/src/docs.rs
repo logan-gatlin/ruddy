@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     snapshot::ROOT,
-    wire::{DependencySpec, Doc, DocMeta, FileSpec, RunConfig},
+    wire::{DependencySpec, Doc, DocMeta, FileSpec, RunConfig, StdConfig},
 };
 
 const EXTENSION: &str = "hc";
@@ -33,7 +33,25 @@ struct Manifest {
     root: String,
     #[serde(default, skip_serializing_if = "RunConfig::is_default")]
     run: RunConfig,
-    dependencies: IndexMap<String, DependencySpec>,
+    dependencies: ManifestDependencies,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct ManifestDependencies {
+    #[serde(default, skip_serializing_if = "StdConfig::is_default")]
+    std: StdConfig,
+    #[serde(flatten)]
+    declared: IndexMap<String, DependencySpec>,
+}
+
+fn validate_dependencies(dependencies: &IndexMap<String, DependencySpec>) -> io::Result<()> {
+    if dependencies.contains_key("std") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "dependency alias `std` is reserved for the standard-library setting",
+        ));
+    }
+    Ok(())
 }
 
 /// The longest path a file inside a document may have. Long enough for a module
@@ -156,7 +174,8 @@ pub fn read(root: &Path, name: &str) -> io::Result<Doc> {
         version: manifest.version,
         root: manifest.root,
         run: manifest.run,
-        dependencies: manifest.dependencies,
+        std: manifest.dependencies.std,
+        dependencies: manifest.dependencies.declared,
         files,
         modified_ms: modified_ms(&fs::metadata(&dir)?),
     })
@@ -168,6 +187,10 @@ pub fn read(root: &Path, name: &str) -> io::Result<Doc> {
 /// not in it is deleted, so what comes back from [`read`] is what was sent. A
 /// file the page renamed is a write and a delete rather than a move, which is
 /// the same thing from here and one fewer operation to get wrong.
+// The arguments mirror the manifest fields and file payload at the server
+// boundary; keeping them explicit prevents storage identity and bundle identity
+// (both strings named `name` on the wire) from being accidentally interchanged.
+#[allow(clippy::too_many_arguments)]
 pub fn write(
     root: &Path,
     name: &str,
@@ -175,9 +198,11 @@ pub fn write(
     version: &str,
     configured_root: &str,
     run: &RunConfig,
+    std: &StdConfig,
     dependencies: &IndexMap<String, DependencySpec>,
     files: &[FileSpec],
 ) -> io::Result<u128> {
+    validate_dependencies(dependencies)?;
     let dir = path(root, name).ok_or_else(bad_name)?;
     fs::create_dir_all(&dir)?;
     let manifest = Manifest {
@@ -185,7 +210,10 @@ pub fn write(
         version: version.to_string(),
         root: configured_root.to_string(),
         run: run.clone(),
-        dependencies: dependencies.clone(),
+        dependencies: ManifestDependencies {
+            std: std.clone(),
+            declared: dependencies.clone(),
+        },
     };
     let source = toml::to_string(&manifest).map_err(io::Error::other)?;
     fs::write(dir.join(MANIFEST), source)?;
@@ -211,12 +239,15 @@ pub fn write(
 fn read_manifest(dir: &Path) -> io::Result<Manifest> {
     let path = dir.join(MANIFEST);
     let source = fs::read_to_string(&path)?;
-    toml::from_str(&source).map_err(|error| {
+    let manifest: Manifest = toml::from_str(&source).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("could not parse manifest {}: {error}", path.display()),
         )
-    })
+    })?;
+    validate_dependencies(&manifest.dependencies.declared)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(manifest)
 }
 
 /// Resolve a dependency path relative to a scratch project and prove that its

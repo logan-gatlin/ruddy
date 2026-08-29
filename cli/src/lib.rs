@@ -359,14 +359,14 @@ fn install_project(directory: &Path) -> Result<InstalledBuild, CliError> {
     // reading an artifact back from disk.
     let javascript = (target == Target::Js)
         .then(|| {
-            ruddy_js::generate(&linked)
+            ruddy::backend::js::generate(&linked)
                 .map_err(|error| CliError::one(format!("could not generate JavaScript: {error}")))
         })
         .transpose()?;
     let mut root_artifact = None;
     let mut root_javascript = None;
     for (index, project) in graph.projects.into_iter().enumerate() {
-        if project.source == ProjectSource::GitCache {
+        if project.source != ProjectSource::Local {
             continue;
         }
         let build = project.directory.join(BUILD_DIRECTORY);
@@ -975,10 +975,106 @@ struct Manifest {
     target: Target,
     #[serde(default)]
     run: RunConfig,
-    dependencies: IndexMap<String, ManifestDependency>,
+    dependencies: ManifestDependencies,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ManifestDependencies {
+    /// The implicit dependency available under the reserved source alias `std`.
+    #[serde(default)]
+    std: StdConfig,
+    #[serde(flatten)]
+    declared: IndexMap<String, ManifestDependency>,
 }
 
 pub type ManifestDependency = DependencySpec;
+
+/// Configuration for the implicit `std` dependency in a Ruddy manifest.
+///
+/// An omitted `[dependencies].std` entry uses [`StdConfig::Default`], `false`
+/// disables standard library injection, and dependency syntax selects an override.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum StdConfig {
+    /// Resolve `std` from `$RUDDY_HOME/std` (or `$HOME/.ruddy/std`).
+    #[default]
+    Default,
+    /// Do not inject a standard-library dependency for this project.
+    Disabled,
+    /// Resolve `std` using the normal path or Git dependency machinery.
+    Dependency(DependencySpec),
+}
+
+impl StdConfig {
+    /// Whether this setting is the omitted, default-installed standard library.
+    pub const fn is_default(&self) -> bool {
+        matches!(self, Self::Default)
+    }
+
+    /// Whether standard-library injection is disabled.
+    pub const fn is_disabled(&self) -> bool {
+        matches!(self, Self::Disabled)
+    }
+
+    /// The configured override, if any.
+    pub const fn dependency(&self) -> Option<&DependencySpec> {
+        match self {
+            Self::Dependency(specification) => Some(specification),
+            Self::Default | Self::Disabled => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for StdConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = StdConfig;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("false, a standard-library path string, or a dependency table")
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                if value {
+                    Err(E::custom(
+                        "`std = true` is invalid; omit `std` from `[dependencies]` to use the default standard library",
+                    ))
+                } else {
+                    Ok(StdConfig::Disabled)
+                }
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(StdConfig::Dependency(DependencySpec::from(value)))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
+                Ok(StdConfig::Dependency(DependencySpec::from(value)))
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                map: M,
+            ) -> Result<Self::Value, M::Error> {
+                DependencySpec::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(StdConfig::Dependency)
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+impl Serialize for StdConfig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Disabled => serializer.serialize_bool(false),
+            Self::Dependency(specification) => specification.serialize(serializer),
+            Self::Default => Err(serde::ser::Error::custom(
+                "the default std setting must be represented by omitting the field",
+            )),
+        }
+    }
+}
 
 /// A path or HTTPS Git dependency as accepted in `Ruddy.toml` and debugger requests.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1063,7 +1159,8 @@ impl DependencySpec {
             GitSelector::Default
         })
     }
-    fn validate(&self) -> Result<(), CompileError> {
+    /// Validate source exclusivity, HTTPS Git URLs, and selectors.
+    pub fn validate(&self) -> Result<(), CompileError> {
         let Self::Detailed(detail) = self else {
             return Ok(());
         };
@@ -1176,10 +1273,12 @@ impl From<&str> for DependencySpec {
 /// The storage provenance of a compiled project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectSource {
-    /// An explicitly compiled root or a dependency outside Ruddy's Git cache.
+    /// An explicitly compiled root or a configured local path dependency.
     Local,
     /// A non-root project inside Ruddy's immutable global Git cache.
     GitCache,
+    /// The implicitly selected standard library installed under Ruddy home.
+    InstalledStd,
 }
 
 /// One successfully compiled project in a dependency graph.
@@ -1298,13 +1397,70 @@ where
     I: IntoIterator<Item = (A, DependencySpec)>,
     A: Into<String>,
 {
-    let sandbox = fs::canonicalize(sandbox.as_ref()).map_err(|error| {
+    compile_sandboxed_dependency_specs_inner(
+        dependencies
+            .into_iter()
+            .map(|(alias, specification)| (alias.into(), specification, false)),
+        project.as_ref(),
+        sandbox.as_ref(),
+    )
+}
+
+/// Resolve a debugger project's implicit standard library and declarations.
+///
+/// Custom local roots remain inside `sandbox`. The only extra trusted tree is
+/// the exact canonical `$RUDDY_HOME/std` root when `std` is defaulted; a custom
+/// specification that happens to use the same alias receives no exception.
+pub fn compile_sandboxed_project_dependencies<I, A>(
+    std: &StdConfig,
+    dependencies: I,
+    project: impl AsRef<Path>,
+    sandbox: impl AsRef<Path>,
+) -> Result<(CompiledGraph, Vec<Dependency>, Vec<PathBuf>), CompileError>
+where
+    I: IntoIterator<Item = (A, DependencySpec)>,
+    A: Into<String>,
+{
+    let mut specifications = Vec::new();
+    match std {
+        StdConfig::Default => {
+            let specification = ruddy_home()
+                .map(|home| DependencySpec::Path(home.join("std")))
+                .map_err(default_std_error)?;
+            specifications.push(("std".to_string(), specification, true));
+        }
+        StdConfig::Disabled => {}
+        StdConfig::Dependency(specification) => {
+            specifications.push(("std".to_string(), specification.clone(), false));
+        }
+    }
+    for (alias, specification) in dependencies {
+        let alias = alias.into();
+        if alias == "std" {
+            return Err(CompileError::one(
+                "dependency alias `std` is reserved for the standard-library setting under `[dependencies]`",
+            ));
+        }
+        specifications.push((alias, specification, false));
+    }
+    compile_sandboxed_dependency_specs_inner(specifications, project.as_ref(), sandbox.as_ref())
+}
+
+fn compile_sandboxed_dependency_specs_inner<I>(
+    dependencies: I,
+    project: &Path,
+    sandbox: &Path,
+) -> Result<(CompiledGraph, Vec<Dependency>, Vec<PathBuf>), CompileError>
+where
+    I: IntoIterator<Item = (String, DependencySpec, bool)>,
+{
+    let sandbox = fs::canonicalize(sandbox).map_err(|error| {
         CompileError::one(format!(
             "could not resolve sandbox folder {}: {error}",
-            sandbox.as_ref().display()
+            sandbox.display()
         ))
     })?;
-    let project = canonical_project_in(project.as_ref(), Some(&sandbox))?;
+    let project = canonical_project_in(project, Some(&sandbox))?;
     let resolver = git::Resolver::new(&project)?;
     let mut compiler = GraphCompiler {
         sandbox: Some(sandbox),
@@ -1313,8 +1469,7 @@ where
     };
     let mut direct = Vec::new();
     let mut paths = Vec::new();
-    for (alias, specification) in dependencies {
-        let alias = alias.into();
+    for (alias, specification, installed_default) in dependencies {
         specification.validate()?;
         if !source_identifier(&alias) {
             return Err(CompileError::one(format!(
@@ -1323,7 +1478,14 @@ where
         }
         let expected = specification.bundle(&alias).to_string();
         let directory = if let Some(path) = specification.path() {
-            canonical_project_in(&project.join(path), compiler.sandbox.as_deref())?
+            if installed_default {
+                let directory =
+                    canonical_project(&project.join(path)).map_err(default_std_error)?;
+                compiler.installed_std_roots.push(directory.clone());
+                directory
+            } else {
+                canonical_project_in(&project.join(path), compiler.sandbox.as_deref())?
+            }
         } else {
             let path = compiler
                 .resolver
@@ -1339,17 +1501,38 @@ where
             compiler
                 .git_roots
                 .iter()
+                .chain(compiler.installed_std_roots.iter())
                 .find(|root| directory.starts_with(root))
                 .map(PathBuf::as_path)
                 .or(compiler.sandbox.as_deref()),
-        )?;
+        )
+        .map_err(|error| {
+            if installed_default {
+                default_std_error(error)
+            } else {
+                error
+            }
+        })?;
         if manifest.name != expected {
-            return Err(CompileError::one(format!(
+            let error = CompileError::one(format!(
                 "dependency key `{expected}` resolves to project `{}` instead",
                 manifest.name
-            )));
+            ));
+            return Err(if installed_default {
+                default_std_error(error)
+            } else {
+                error
+            });
         }
-        let index = compiler.visit(directory.clone(), Some((expected, PathBuf::new())))?;
+        let index = compiler
+            .visit(directory.clone(), Some((expected, PathBuf::new())))
+            .map_err(|error| {
+                if installed_default {
+                    default_std_error(error)
+                } else {
+                    error
+                }
+            })?;
         let artifact = &compiler.projects[index].artifact;
         direct.push(Dependency {
             name: artifact.header.identity.name.clone(),
@@ -1441,6 +1624,7 @@ struct GraphCompiler {
     root: Option<PathBuf>,
     git_cache_root: Option<PathBuf>,
     git_roots: Vec<PathBuf>,
+    installed_std_roots: Vec<PathBuf>,
     completed: HashMap<PathBuf, usize>,
     identities: HashMap<(String, String), PathBuf>,
     active: Vec<(PathBuf, String)>,
@@ -1455,6 +1639,7 @@ impl Default for GraphCompiler {
             root: None,
             git_cache_root: git::canonical_checkouts_root(),
             git_roots: Vec::new(),
+            installed_std_roots: Vec::new(),
             completed: HashMap::new(),
             identities: HashMap::new(),
             active: Vec::new(),
@@ -1489,6 +1674,11 @@ impl GraphCompiler {
         let boundary = self
             .git_roots
             .iter()
+            .chain(
+                self.installed_std_roots
+                    .iter()
+                    .filter(|_| self.sandbox.is_some()),
+            )
             .find(|root| directory.starts_with(root))
             .cloned()
             .or_else(|| self.sandbox.clone());
@@ -1513,17 +1703,41 @@ impl GraphCompiler {
             .unwrap_or_else(|| manifest.name.clone());
         self.active.push((directory.clone(), active_name));
 
-        let mut dependency_artifacts = Vec::with_capacity(manifest.dependencies.len());
-        for (alias, specification) in &manifest.dependencies {
+        // Synthesize std before declared dependencies for deterministic graph,
+        // header, and source-import order. Each visited manifest makes this
+        // decision independently, including path and Git dependencies.
+        let mut dependencies = Vec::with_capacity(manifest.dependencies.declared.len() + 1);
+        match &manifest.dependencies.std {
+            StdConfig::Default => {
+                let specification = ruddy_home()
+                    .map(|home| DependencySpec::Path(home.join("std")))
+                    .map_err(default_std_error)?;
+                dependencies.push(("std".to_string(), specification, true));
+            }
+            StdConfig::Disabled => {}
+            StdConfig::Dependency(specification) => {
+                dependencies.push(("std".to_string(), specification.clone(), false));
+            }
+        }
+        dependencies.extend(
+            manifest
+                .dependencies
+                .declared
+                .iter()
+                .map(|(alias, specification)| (alias.clone(), specification.clone(), false)),
+        );
+
+        let mut dependency_artifacts = Vec::with_capacity(dependencies.len());
+        for (alias, specification, installed_default) in &dependencies {
             let expected = specification.bundle(alias).to_string();
             if let Err(error) = specification.validate() {
                 self.active.pop();
-                return Err(dependency_error(
-                    &expected,
-                    Path::new("<source>"),
-                    &directory,
-                    error,
-                ));
+                let error = dependency_error(&expected, Path::new("<source>"), &directory, error);
+                return Err(if *installed_default {
+                    default_std_error(error)
+                } else {
+                    error
+                });
             }
             if !source_identifier(alias) {
                 self.active.pop();
@@ -1536,7 +1750,27 @@ impl GraphCompiler {
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| PathBuf::from(specification.git().unwrap_or("<source>")));
             let child = if let Some(path) = specification.path() {
-                canonical_project_in(&directory.join(path), boundary.as_deref())
+                // The installed default is the one narrowly trusted tree in a
+                // sandboxed build. Configured path overrides remain confined to
+                // the declaring project's existing boundary.
+                let candidate = directory.join(path);
+                let child = canonical_project_in(
+                    &candidate,
+                    if *installed_default {
+                        None
+                    } else {
+                        boundary.as_deref()
+                    },
+                );
+                if *installed_default {
+                    child.inspect(|child| {
+                        if !self.installed_std_roots.contains(child) {
+                            self.installed_std_roots.push(child.clone());
+                        }
+                    })
+                } else {
+                    child
+                }
             } else {
                 self.resolver
                     .as_mut()
@@ -1554,28 +1788,56 @@ impl GraphCompiler {
                     })
             }
             .map_err(|error: CompileError| {
-                dependency_error(&expected, &declared, &directory, error)
+                let error = dependency_error(&expected, &declared, &directory, error);
+                if *installed_default {
+                    default_std_error(error)
+                } else {
+                    error
+                }
             })?;
             let child_boundary = self
                 .git_roots
                 .iter()
+                .chain(
+                    self.installed_std_roots
+                        .iter()
+                        .filter(|_| self.sandbox.is_some()),
+                )
                 .find(|root| child.starts_with(root))
                 .map(PathBuf::as_path)
                 .or(self.sandbox.as_deref());
-            let child_manifest = load_manifest(&child, child_boundary)
-                .map_err(|error| dependency_error(&expected, &declared, &directory, error))?;
+            let child_manifest = load_manifest(&child, child_boundary).map_err(|error| {
+                let error = dependency_error(&expected, &declared, &directory, error);
+                if *installed_default {
+                    default_std_error(error)
+                } else {
+                    error
+                }
+            })?;
             if child_manifest.name != expected {
                 self.active.pop();
-                return Err(CompileError::one(format!(
+                let error = CompileError::one(format!(
                     "dependency `{expected}` declared as `{}` by {} contains project `{}` instead",
                     declared.display(),
                     directory.join(MANIFEST).display(),
                     child_manifest.name
-                )));
+                ));
+                return Err(if *installed_default {
+                    default_std_error(error)
+                } else {
+                    error
+                });
             }
             let index = self
                 .visit(child, Some((expected.clone(), declared.clone())))
-                .map_err(|error| dependency_error(&expected, &declared, &directory, error))?;
+                .map_err(|error| {
+                    let error = dependency_error(&expected, &declared, &directory, error);
+                    if *installed_default {
+                        default_std_error(error)
+                    } else {
+                        error
+                    }
+                })?;
             let child_artifact = &self.projects[index].artifact;
             dependency_artifacts.push((alias.clone(), child_artifact.clone()));
         }
@@ -1600,6 +1862,12 @@ impl GraphCompiler {
         self.projects.push(CompiledProject {
             source: if self.root.as_ref() == Some(&directory) {
                 ProjectSource::Local
+            } else if self
+                .installed_std_roots
+                .iter()
+                .any(|root| directory.starts_with(root))
+            {
+                ProjectSource::InstalledStd
             } else if self
                 .git_roots
                 .iter()
@@ -1650,6 +1918,20 @@ fn canonical_project_in(directory: &Path, sandbox: Option<&Path>) -> Result<Path
         )));
     }
     Ok(canonical)
+}
+
+fn default_std_error(error: CompileError) -> CompileError {
+    CompileError::diagnostics(
+        error
+            .messages
+            .into_iter()
+            .map(|message| {
+                format!(
+                    "{message}\nhelp: install the Ruddy standard library in $RUDDY_HOME/std, configure `[dependencies].std` to another dependency, or set it to `false`"
+                )
+            })
+            .collect(),
+    )
 }
 
 fn dependency_error(
@@ -1899,12 +2181,13 @@ fn load_manifest(directory: &Path, sandbox: Option<&Path>) -> Result<Manifest, C
             path.display()
         ))
     })?;
-    toml::from_str(&source).map_err(|error| {
+    let manifest: Manifest = toml::from_str(&source).map_err(|error| {
         CompileError::one(format!(
             "could not parse manifest {}: {error}",
             path.display()
         ))
-    })
+    })?;
+    Ok(manifest)
 }
 
 /// A bundle complaint rendered from the project boundary. The loader keeps

@@ -154,14 +154,15 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     }
     let identity = configured.as_ref().map(ToString::to_string);
 
-    // Resolve and compile saved dependency projects. Configuration failures are
-    // recoverable so the active project's source phases remain inspectable.
+    // Resolve and compile saved dependency projects, including the standard
+    // library synthesized ahead of explicit declarations. Configuration
+    // failures are recoverable so active source phases remain inspectable.
     let dependency_started = Instant::now();
     let mut dependency_artifacts = Vec::new();
     let mut dependency_aliases = Vec::new();
     let mut dependency_interfaces = Vec::new();
     let mut linked_interfaces = Vec::new();
-    if !req.dependencies.is_empty() {
+    if !req.std.is_disabled() || !req.dependencies.is_empty() {
         match scratch {
             None => diagnostics.push(raw(
                 "dependencies",
@@ -186,13 +187,19 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
                     .dependencies
                     .iter()
                     .map(|(alias, specification)| (alias.clone(), specification.clone()));
-                match ruddy_cli::compile_sandboxed_dependency_specs(
+                match ruddy_cli::compile_sandboxed_project_dependencies(
+                    &req.std,
                     specifications,
                     &project,
                     scratch,
                 ) {
                     Ok((graph, direct, direct_paths)) => {
-                        dependency_aliases = req.dependencies.keys().cloned().collect();
+                        dependency_aliases = if req.std.is_disabled() {
+                            Vec::new()
+                        } else {
+                            vec!["std".to_string()]
+                        };
+                        dependency_aliases.extend(req.dependencies.keys().cloned());
                         linked_interfaces = graph
                             .projects
                             .iter()
@@ -423,7 +430,7 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     let mut js_panicked = false;
     let js = linked.as_ref().and_then(|linked| {
         let started = Instant::now();
-        let out = guard("js", &mut panicked, || ruddy_js::generate(linked));
+        let out = guard("js", &mut panicked, || ruddy::backend::js::generate(linked));
         js_panicked = out.is_none();
         micros.js = started.elapsed().as_micros() as u64;
         match out {
@@ -472,6 +479,7 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
         js: js.as_deref(),
         js_error: js_error.as_deref(),
         js_panicked,
+        standard_library: &req.std,
         dependency_declarations: &req.dependencies,
         dependency_aliases: &dependency_aliases,
         dependencies: &dependency_artifacts,

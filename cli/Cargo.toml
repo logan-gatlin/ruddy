@@ -20,7 +20,6 @@ futures-concurrency = "7"
 futures-lite = "2"
 indexmap = { version = "2", features = ["serde"] }
 ruddy = { path = ".." }
-ruddy-js = { path = "../backend/js" }
 serde = { version = "1", features = ["derive"] }
 toml = { version = "0.9", features = ["preserve_order"] }
 
