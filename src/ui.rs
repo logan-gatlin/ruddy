@@ -2058,6 +2058,7 @@ impl inference::ErrorKind {
             inference::ErrorKind::Unhandled { .. } => "unhandled-effect",
             inference::ErrorKind::NotAllowed { .. } => "effect-not-allowed",
             inference::ErrorKind::CallbackEffectsNotCovered => "callback-effects-not-covered",
+            inference::ErrorKind::PolymorphicExternBoundary => "polymorphic-extern-boundary",
         }
     }
 }
@@ -2180,6 +2181,10 @@ impl fmt::Display for inference::ErrorKind {
             inference::ErrorKind::CallbackEffectsNotCovered => write!(
                 f,
                 "callback effects are not covered by the containing extern call",
+            ),
+            inference::ErrorKind::PolymorphicExternBoundary => write!(
+                f,
+                "an extern boundary leaf must have a fixed runtime representation",
             ),
         }
     }

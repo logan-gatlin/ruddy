@@ -7695,6 +7695,56 @@ fn an_extern_publishes_its_declared_scheme_and_instantiates_at_uses() {
 }
 
 #[test]
+fn polymorphic_extern_boundary_leaves_are_rejected_before_callback_instantiation() {
+    let source = "effect Tick = Nat -> Nat\n\
+                  extern run : fn('a) -> Nat = host.run\n\
+                  let called = handle run (fn n => !Tick n) with\n\
+                    | !Tick n => n\n\
+                  end";
+    let (_, lowered, output) = infer_src(source);
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    assert!(matches!(
+        output.errors.as_slice(),
+        [ruddy::inference::Error {
+            kind: ruddy::inference::ErrorKind::PolymorphicExternBoundary,
+            ..
+        }]
+    ));
+    assert_eq!(output.errors[0].kind.code(), "polymorphic-extern-boundary");
+    assert!(
+        output.errors[0]
+            .kind
+            .to_string()
+            .contains("fixed runtime representation")
+    );
+
+    // A forwarding alias does not make the representation any less
+    // polymorphic, including when the unsafe leaf is a host result.
+    let (_, lowered, output) = infer_src(
+        "type Identity 'a = 'a\n\
+         extern make : fn(Nat) -> Identity 'a = host.make",
+    );
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    assert!(matches!(
+        output.errors.as_slice(),
+        [ruddy::inference::Error {
+            kind: ruddy::inference::ErrorKind::PolymorphicExternBoundary,
+            ..
+        }]
+    ));
+}
+
+#[test]
+fn fixed_representation_polymorphism_remains_valid_at_extern_boundaries() {
+    let (_, lowered, output) = infer_src(
+        "extern echo : fn({ value: 'a }) -> { value: 'a } = host.echo\n\
+         let answer = (echo { value: 42n }).value",
+    );
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+}
+
+#[test]
 fn extern_callback_coverage_uses_semantic_rows_and_aliases() {
     let (_, lowered, invalid) = infer_src(
         "effect Fail = { abort: () -> () }\n\
