@@ -555,7 +555,7 @@ fn bundled_std_installer_serializes_concurrent_first_installs() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn bundled_std_installer_reclaims_a_stale_lock() {
+fn bundled_std_installer_preserves_a_stale_lock_for_manual_recovery() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("source");
     let home = root.path().join("home");
@@ -569,24 +569,99 @@ fn bundled_std_installer_reclaims_a_stale_lock() {
         .parent()
         .unwrap()
         .join("scripts/install-std.sh");
-    let output = Command::new(script)
+    let output = Command::new(&script)
+        .arg(&source)
+        .env("RUDDY_HOME", &home)
+        .env("_RUDDY_INSTALL_STD_TEST_LOCK_ATTEMPTS", "1")
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("timed out waiting"), "{stderr}");
+    assert!(
+        stderr.contains("after verifying that no installer is running"),
+        "{stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(home.join(".std.install.lock/owner")).unwrap(),
+        "999999999\n"
+    );
+    assert!(!home.join("std").exists());
+
+    // Manual recovery is intentionally separate from observation, so the
+    // installer can never unlink a newer claimant based on stale metadata.
+    fs::remove_dir_all(home.join(".std.install.lock")).unwrap();
+    let retry = Command::new(script)
         .arg(&source)
         .env("RUDDY_HOME", &home)
         .env_remove("HOME")
         .output()
         .unwrap();
     assert!(
-        output.status.success(),
+        retry.status.success(),
         "{}",
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&retry.stderr)
     );
     assert!(home.join("std/main.hc").is_file());
-    assert!(!home.join(".std.install.lock").exists());
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn bundled_std_installer_recovers_an_empty_unpublished_owner() {
+fn bundled_std_installer_never_reaps_a_new_owner_after_waiting() {
+    use std::{thread, time::Duration};
+
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let home = root.path().join("home");
+    let lock = home.join(".std.install.lock");
+    let barrier = root.path().join("lock-wait-barrier");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&lock).unwrap();
+    fs::write(source.join("Ruddy.toml"), "manifest").unwrap();
+    fs::write(source.join("main.hc"), "main").unwrap();
+    fs::write(lock.join("owner"), "stale owner\n").unwrap();
+
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("scripts/install-std.sh");
+    let mut child = Command::new(script)
+        .arg(&source)
+        .env("RUDDY_HOME", &home)
+        .env("_RUDDY_INSTALL_STD_TEST_LOCK_ATTEMPTS", "1")
+        .env("_RUDDY_INSTALL_STD_TEST_LOCK_WAIT_BARRIER", &barrier)
+        .env_remove("HOME")
+        .spawn()
+        .unwrap();
+    for _ in 0..500 {
+        if barrier.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        barrier.exists(),
+        "installer did not reach lock wait barrier"
+    );
+
+    // Atomically publish replacement metadata while the contender is paused at
+    // exactly the point where the former implementation had observed an owner.
+    fs::write(lock.join("replacement"), "new owner\n").unwrap();
+    fs::rename(lock.join("replacement"), lock.join("owner")).unwrap();
+    fs::remove_file(&barrier).unwrap();
+
+    assert!(!child.wait().unwrap().success());
+    assert_eq!(
+        fs::read_to_string(lock.join("owner")).unwrap(),
+        "new owner\n"
+    );
+    assert!(!home.join("std").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bundled_std_installer_does_not_reap_an_empty_lock() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("source");
     let home = root.path().join("home");
@@ -605,19 +680,18 @@ fn bundled_std_installer_recovers_an_empty_unpublished_owner() {
     let output = Command::new(script)
         .arg(&source)
         .env("RUDDY_HOME", &home)
+        .env("_RUDDY_INSTALL_STD_TEST_LOCK_ATTEMPTS", "1")
         .env_remove("HOME")
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("remove it with: rm -rf"));
+    assert_eq!(fs::read_to_string(lock.join("owner")).unwrap(), "");
     assert_eq!(
-        fs::read_to_string(home.join("std/main.hc")).unwrap(),
-        "main"
+        fs::read_to_string(lock.join("candidate.abandoned")).unwrap(),
+        "999999 abandoned\n"
     );
-    assert!(!lock.exists());
+    assert!(!home.join("std").exists());
 }
 
 #[cfg(target_os = "linux")]

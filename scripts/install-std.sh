@@ -27,8 +27,6 @@ mkdir -p "$home"
 lock=$home/.std.install.lock
 lock_owned=false
 temp_tag=$$.$RANDOM.$RANDOM
-candidate=$lock/candidate.$temp_tag
-quarantine=$lock/reaping.$temp_tag
 probe=
 staging=
 cleanup() {
@@ -41,10 +39,12 @@ cleanup() {
   # but before command substitution assigns its path to the variables above.
   rm -rf -- "$home/.std.exchange.$temp_tag".* "$home/.std.install.$temp_tag".*
   if [[ $lock_owned == true ]]; then
+    # Only the process whose mkdir succeeded removes the lock. Removing the
+    # owner before the directory is safe: no contender can create the lock
+    # until rmdir completes, and this process performs no later lock operation.
     rm -f -- "$lock/owner"
+    rmdir -- "$lock" 2>/dev/null || true
   fi
-  rm -f -- "$candidate" "$quarantine"
-  rmdir -- "$lock" 2>/dev/null || true
   exit "$status"
 }
 trap cleanup EXIT
@@ -54,34 +54,34 @@ trap 'exit 143' TERM
 
 # A first install and a concurrent first install must not both decide that std
 # is absent: the second `mv staging std` would otherwise put staging *inside*
-# std. Publish a completely written, uniquely named candidate as `owner` with
-# an atomic hard link. A crash can therefore leave either no owner or a complete
-# one, never the empty owner that create-then-write would expose.
-while true; do
-  mkdir -p -- "$lock"
-  if ! printf '%s %s\n' "$$" "$temp_tag" >"$candidate" 2>/dev/null; then
-    sleep 0.01
-    continue
-  fi
-  if ln -- "$candidate" "$lock/owner" 2>/dev/null; then
+# std. mkdir is the portable atomic claim. Never reclaim a lock automatically:
+# PID checks and pathname removal cannot prove that the directory is still the
+# object that was inspected, and can therefore remove a newer installer's lock.
+lock_attempts=${_RUDDY_INSTALL_STD_TEST_LOCK_ATTEMPTS:-1000}
+if [[ ! $lock_attempts =~ ^[1-9][0-9]*$ ]]; then
+  echo '_RUDDY_INSTALL_STD_TEST_LOCK_ATTEMPTS must be a positive integer' >&2
+  exit 1
+fi
+for ((attempt = 1; ; attempt++)); do
+  if mkdir -- "$lock" 2>/dev/null; then
     lock_owned=true
-    # These can only be abandoned attempts: a current contender recreates its
-    # candidate if cleanup races its link. The owner link itself remains valid.
-    rm -f -- "$lock"/candidate.* "$lock"/reaping.*
+    printf 'pid=%s\n' "$$" >"$lock/owner"
     break
   fi
-
-  owner=$(cat "$lock/owner" 2>/dev/null || true)
-  owner_pid=${owner%% *}
-  if [[ ! $owner =~ ^[0-9]+\ [^[:space:]]+$ ]] || ! kill -0 "$owner_pid" 2>/dev/null; then
-    # Renaming claims exactly the owner we inspected and makes room for a new
-    # claimant in one operation. If another reaper wins, this simply fails;
-    # unlike deleting by pathname, it can never delete a newly published owner.
-    if mv -- "$lock/owner" "$quarantine" 2>/dev/null; then
-      rm -f -- "$quarantine"
-    fi
+  # Tests use this barrier to replace owner metadata after acquisition failed,
+  # exercising the historical observe-then-reap race deterministically.
+  if ((attempt == 1)) && [[ -n ${_RUDDY_INSTALL_STD_TEST_LOCK_WAIT_BARRIER:-} ]]; then
+    : >"$_RUDDY_INSTALL_STD_TEST_LOCK_WAIT_BARRIER"
+    while [[ -e $_RUDDY_INSTALL_STD_TEST_LOCK_WAIT_BARRIER ]]; do
+      sleep 0.01
+    done
   fi
-  rm -f -- "$candidate"
+  if ((attempt >= lock_attempts)); then
+    printf 'timed out waiting for standard-library installer lock %q\n' "$lock" >&2
+    echo 'another installer may still be running; the lock may also remain after an abnormal exit' >&2
+    printf 'after verifying that no installer is running, remove it with: rm -rf -- %q\n' "$lock" >&2
+    exit 1
+  fi
   sleep 0.01
 done
 
