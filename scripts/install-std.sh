@@ -21,17 +21,11 @@ fi
 
 mkdir -p "$home"
 staging=$(mktemp -d "$home/.std.install.XXXXXX")
-backup=
-committed=false
 cleanup() {
   status=$?
-  if [[ $committed != true && -n $backup && -e $backup && ! -e $home/std ]]; then
-    mv "$backup" "$home/std" || true
-  fi
-  rm -rf "$staging"
-  if [[ $committed == true && -n $backup ]]; then
-    rm -rf "$backup"
-  fi
+  # Before the commit this removes the uninstalled tree. After an exchange,
+  # this same path names the previous installation instead.
+  rm -rf -- "$staging"
   exit "$status"
 }
 trap cleanup EXIT
@@ -48,12 +42,22 @@ while IFS= read -r -d '' file; do
   cp "$file" "$staging/$relative"
 done < <(find "$source" -path "$source/build" -prune -o -type f -name '*.hc' -print0)
 
-if [[ -e $home/std || -L $home/std ]]; then
-  backup=$(mktemp -d "$home/.std.backup.XXXXXX")
-  rmdir "$backup"
-  mv "$home/std" "$backup"
+# Tests use this barrier to interrupt a fully staged install before its commit.
+# It is intentionally private and has no effect unless explicitly requested.
+if [[ -n ${_RUDDY_INSTALL_STD_TEST_BARRIER:-} ]]; then
+  : >"$_RUDDY_INSTALL_STD_TEST_BARRIER"
+  while [[ -e $_RUDDY_INSTALL_STD_TEST_BARRIER ]]; do
+    sleep 0.01
+  done
 fi
 
-mv "$staging" "$home/std"
-committed=true
+if [[ -e $home/std || -L $home/std ]]; then
+  # GNU mv implements this with renameat2(RENAME_EXCHANGE) on Linux. Unlike
+  # moving std aside and then renaming staging, the namespace therefore always
+  # contains either the complete old tree or the complete new tree. --no-copy
+  # forbids a non-atomic fallback, and -T makes both operands the trees to swap.
+  mv --exchange --no-copy -T -- "$staging" "$home/std"
+else
+  mv --no-copy -T -- "$staging" "$home/std"
+fi
 printf 'installed Ruddy standard library in %s\n' "$home/std"
