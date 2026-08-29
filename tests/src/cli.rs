@@ -1070,10 +1070,10 @@ fn configured_std_is_injected_first_and_is_source_visible() {
     );
     fs::write(
         directory.path().join("standard/main.hc"),
-        "let answer = 42n\n",
+        "module prelude =\n  let answer = 42n\nend\n",
     )
     .unwrap();
-    fs::write(directory.path().join("main.hc"), "let main = std::answer\n").unwrap();
+    fs::write(directory.path().join("main.hc"), "let main = answer\n").unwrap();
     fs::write(
         directory.path().join("Ruddy.toml"),
         "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = { path = \"standard\", bundle = \"foundation\" }\n",
@@ -1097,8 +1097,21 @@ fn configured_std_is_injected_first_and_is_source_visible() {
         compile(directory.path())
             .unwrap()
             .print()
-            .contains("foundation@2.1.0::answer")
+            .contains("foundation@2.1.0::prelude::answer")
     );
+}
+
+#[test]
+fn disabled_std_does_not_open_an_implicit_prelude() {
+    let directory = project();
+    fs::write(directory.path().join("main.hc"), "let main = answer\n").unwrap();
+    fs::write(
+        directory.path().join("Ruddy.toml"),
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
+    )
+    .unwrap();
+    let found = error(&directory);
+    assert!(found.contains("undefined term"), "{found}");
 }
 
 #[test]

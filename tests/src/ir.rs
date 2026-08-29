@@ -5535,6 +5535,221 @@ fn artifact_scheme(body: a::Type) -> a::Scheme {
     }
 }
 
+fn prelude_artifact(bundle: &str) -> a::Artifact {
+    let qualified = |name: &str| format!("{bundle}@1.0.0::prelude::{name}");
+    a::Artifact {
+        header: a::Header {
+            identity: a::Identity {
+                name: bundle.into(),
+                version: "1.0.0".into(),
+            },
+            dependencies: Vec::new(),
+            values: vec![
+                a::Value {
+                    name: qualified("shared"),
+                    scheme: artifact_scheme(artifact_type(a::Type::Nat)),
+                },
+                a::Value {
+                    name: qualified("Tools::inside"),
+                    scheme: artifact_scheme(artifact_type(a::Type::Nat)),
+                },
+            ],
+            types: vec![
+                a::DeclaredType {
+                    name: qualified("Shared"),
+                    params: Vec::new(),
+                    scheme: artifact_scheme(artifact_type(a::Type::String)),
+                },
+                a::DeclaredType {
+                    name: qualified("Nat"),
+                    params: Vec::new(),
+                    scheme: artifact_scheme(artifact_type(a::Type::String)),
+                },
+            ],
+            effects: vec![a::DeclaredEffect {
+                name: qualified("Shared"),
+                identity: Some(a::EffectIdentity {
+                    name: "Shared".into(),
+                    interface: "shared:{}->{}".into(),
+                }),
+                kind: a::EffectKind::Operations(Vec::new()),
+            }],
+        },
+        lir: a::Lir {
+            externs: Vec::new(),
+            functions: Vec::new(),
+            globals: Vec::new(),
+        },
+    }
+}
+
+fn build_imported(src: &str, alias: &str, dependency: &a::Artifact) -> (Mint, Output) {
+    let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    let imports = [DependencyImport {
+        alias,
+        artifact: dependency,
+    }];
+    let mut mint = dummy_mint();
+    let out = build_with_dependency_imports(&mut mint, parsed.stmts, &imports, &[]);
+    (mint, out)
+}
+
+#[test]
+fn configured_std_prelude_opens_only_direct_members_in_every_namespace() {
+    let dependency = prelude_artifact("foundation");
+    let src = "let bare = shared\n\
+               let qualified = std::prelude::shared\n\
+               type Alias = Shared\n\
+               effect Alias = !Shared\n\
+               let child = Tools::inside\n\
+               module Nested =\n  let value = shared\nend";
+    let (mint, out) = build_imported(src, "std", &dependency);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+
+    let external = |symbol| out.program.external_names.get(&symbol).map(String::as_str);
+    let TermKind::Ident(bare) = term_value(&mint, &out, "bare") else {
+        panic!("bare prelude term did not lower to an identifier")
+    };
+    let TermKind::Ident(qualified) = term_value(&mint, &out, "qualified") else {
+        panic!("qualified prelude term did not lower to an identifier")
+    };
+    assert_eq!(bare, qualified);
+    assert_eq!(external(*bare), Some("foundation@1.0.0::prelude::shared"));
+    assert!(matches!(
+        out.program.types[&type_symbol(&mint, &out, "Alias")].value.tracked,
+        TypeKind::Ident(symbol)
+            if external(symbol) == Some("foundation@1.0.0::prelude::Shared")
+    ));
+    assert!(
+        matches!(effect_of(&mint, &out, "Alias"), Effect::Alias(names)
+        if names.values().any(|named| external(named.symbol) == Some("foundation@1.0.0::prelude::Shared")))
+    );
+    let TermKind::Ident(child) = term_value(&mint, &out, "child") else {
+        panic!("prelude child module was not available")
+    };
+    assert_eq!(
+        external(*child),
+        Some("foundation@1.0.0::prelude::Tools::inside")
+    );
+    let nested_value = out
+        .program
+        .terms
+        .iter()
+        .find(|(symbol, _)| mint.name(**symbol) == "value")
+        .map(|(_, declaration)| &declaration.value.kind)
+        .expect("nested value");
+    assert!(
+        matches!(nested_value, TermKind::Ident(symbol) if external(*symbol) == Some("foundation@1.0.0::prelude::shared"))
+    );
+}
+
+#[test]
+fn std_prelude_does_not_flatten_descendants_and_requires_the_source_alias() {
+    let dependency = prelude_artifact("std");
+    let (_, out) = build_imported("let bad = inside", "other", &dependency);
+    assert!(matches!(
+        out.errors.as_slice(),
+        [ruddy::ir::Error {
+            kind: ErrorKind::Undefined {
+                namespace: Namespace::Terms
+            },
+            ..
+        }]
+    ));
+
+    let dependency = prelude_artifact("foundation");
+    let (_, out) = build_imported("let bad = inside", "std", &dependency);
+    assert!(matches!(
+        out.errors.as_slice(),
+        [ruddy::ir::Error {
+            kind: ErrorKind::Undefined {
+                namespace: Namespace::Terms
+            },
+            ..
+        }]
+    ));
+
+    let mut no_prelude = prelude_artifact("foundation");
+    for value in &mut no_prelude.header.values {
+        value.name = value.name.replace("::prelude::", "::library::");
+    }
+    for ty in &mut no_prelude.header.types {
+        ty.name = ty.name.replace("::prelude::", "::library::");
+    }
+    for effect in &mut no_prelude.header.effects {
+        effect.name = effect.name.replace("::prelude::", "::library::");
+    }
+    let (_, out) = build_imported("let bad = shared", "std", &no_prelude);
+    assert!(matches!(
+        out.errors.as_slice(),
+        [ruddy::ir::Error {
+            kind: ErrorKind::Undefined {
+                namespace: Namespace::Terms
+            },
+            ..
+        }]
+    ));
+}
+
+#[test]
+fn user_and_lexical_declarations_shadow_std_prelude_without_duplicates() {
+    let dependency = prelude_artifact("foundation");
+    let src = "let shared = 1n\n\
+               let root = shared\n\
+               module M =\n  let shared = 2n\n  let nested = shared\nend\n\
+               let lexical = fn shared => shared";
+    let (mint, out) = build_imported(src, "std", &dependency);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let root_shared = term_symbol(&mint, &out, "shared");
+    assert!(
+        matches!(term_value(&mint, &out, "root"), TermKind::Ident(symbol) if *symbol == root_shared)
+    );
+    let nested = out
+        .program
+        .terms
+        .iter()
+        .find(|(symbol, _)| mint.name(**symbol) == "nested")
+        .unwrap()
+        .1;
+    let module_shared = out
+        .program
+        .terms
+        .iter()
+        .find(|(symbol, declaration)| {
+            mint.name(**symbol) == "shared"
+                && matches!(declaration.value.kind, TermKind::Natural(2))
+        })
+        .map(|(symbol, _)| *symbol)
+        .unwrap();
+    assert!(matches!(nested.value.kind, TermKind::Ident(symbol) if symbol == module_shared));
+    let TermKind::Fn { arg, body } = term_value(&mint, &out, "lexical") else {
+        panic!("lexical test is a lambda")
+    };
+    assert!(matches!(body.kind, TermKind::Ident(symbol) if symbol == arg.tracked));
+}
+
+#[test]
+fn std_prelude_type_precedes_primitives_but_user_types_precede_the_prelude() {
+    let dependency = prelude_artifact("foundation");
+    let (mint, out) = build_imported("type Alias = Nat", "std", &dependency);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(matches!(
+        out.program.types[&type_symbol(&mint, &out, "Alias")].value.tracked,
+        TypeKind::Ident(symbol)
+            if out.program.external_names.get(&symbol).map(String::as_str)
+                == Some("foundation@1.0.0::prelude::Nat")
+    ));
+
+    let (mint, out) = build_imported("type Nat = String\ntype Alias = Nat", "std", &dependency);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let local = type_symbol(&mint, &out, "Nat");
+    assert!(matches!(
+        out.program.types[&type_symbol(&mint, &out, "Alias")].value.tracked,
+        TypeKind::Ident(symbol) if symbol == local
+    ));
+}
+
 fn effect_artifact(bundle: &str, interface: &str) -> a::Artifact {
     a::Artifact {
         header: a::Header {
