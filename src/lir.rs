@@ -1090,6 +1090,7 @@ impl Lower<'_> {
                 let id = self.marked_extern_level(
                     raw,
                     Vec::new(),
+                    Vec::new(),
                     ty.clone(),
                     arity,
                     parameters.is_empty(),
@@ -1134,13 +1135,8 @@ impl Lower<'_> {
             temp: raw,
             rep: Rep::Fn,
         }];
-        for _ in 0..shape(&row).arity() {
-            let temp = self.fresh(Rep::Struct);
-            params.push(Param {
-                temp,
-                rep: Rep::Struct,
-            });
-        }
+        self.frames.push(Frame::default());
+        self.evidence_params(&row, &mut params);
         let argument = self.fresh(self.rep(&from));
         params.push(Param {
             temp: argument,
@@ -1150,7 +1146,7 @@ impl Lower<'_> {
         let ordinary = Span::default().track(crate::ir::ExternTypeKind::Ordinary(
             Span::default().track(crate::ir::TypeKind::Error),
         ));
-        let argument = self.ruddy_to_host(&ordinary, &from, argument, &mut body);
+        let argument = self.ruddy_to_host(&ordinary, &from, argument, &row, &mut body);
         let result = self.emit(
             &mut body,
             Span::default(),
@@ -1161,6 +1157,7 @@ impl Lower<'_> {
             },
         );
         let result = self.host_to_ruddy(&ordinary, &to, result, &mut body);
+        self.frames.pop().expect("the extern frame just pushed");
         self.fill(
             id,
             Function {
@@ -1184,72 +1181,71 @@ impl Lower<'_> {
         abi: &crate::ir::ExternType,
         ty: &Rc<Ty>,
         value: Temp,
+        available: &Row,
         body: &mut Body,
     ) -> Temp {
         use crate::ir::ExternTypeKind;
         match &abi.tracked {
-            ExternTypeKind::Group(inner) => self.ruddy_to_host(inner, ty, value, body),
+            ExternTypeKind::Group(inner) => self.ruddy_to_host(inner, ty, value, available, body),
             ExternTypeKind::Function {
                 parameters, result, ..
             } => {
-                let id = self.marked_callback(ty.clone(), parameters.clone(), *result.clone());
-                self.emit(
-                    body,
-                    abi.span,
-                    Rep::Fn,
-                    Op::Closure {
-                        func: id,
-                        captures: vec![value],
-                    },
-                )
+                let evidence = self.evidence_args(available, available, body);
+                let id = self.marked_callback(
+                    ty.clone(),
+                    parameters.clone(),
+                    *result.clone(),
+                    available.clone(),
+                );
+                let mut captures = vec![value];
+                captures.extend(evidence);
+                self.emit(body, abi.span, Rep::Fn, Op::Closure { func: id, captures })
             }
             ExternTypeKind::Ordinary(_) if self.rep(ty) == Rep::Fn => {
-                let id = self.ordinary_callback(ty.clone());
-                self.emit(
-                    body,
-                    abi.span,
-                    Rep::Fn,
-                    Op::Closure {
-                        func: id,
-                        captures: vec![value],
-                    },
-                )
+                let evidence = self.evidence_args(available, available, body);
+                let id = self.ordinary_callback(ty.clone(), available.clone());
+                let mut captures = vec![value];
+                captures.extend(evidence);
+                self.emit(body, abi.span, Rep::Fn, Op::Closure { func: id, captures })
             }
             ExternTypeKind::Ordinary(_) => value,
         }
     }
 
-    fn ordinary_callback(&mut self, ty: Rc<Ty>) -> FuncId {
+    fn ordinary_callback(&mut self, ty: Rc<Ty>, available: Row) -> FuncId {
         let id = self.slot(format!("{}#callback#{}", self.stem, self.serial));
         self.serial += 1;
         let closure = self.fresh(Rep::Fn);
-        let (from, to, _) = self.arrow(&ty);
+        let (from, to, row) = self.arrow(&ty);
         let raw_argument = self.fresh(self.rep(&from));
-        let params = vec![
-            Param {
-                temp: closure,
-                rep: Rep::Fn,
-            },
-            Param {
-                temp: raw_argument,
-                rep: self.rep(&from),
-            },
-        ];
+        let mut params = vec![Param {
+            temp: closure,
+            rep: Rep::Fn,
+        }];
+        self.frames.push(Frame::default());
+        self.evidence_params(&available, &mut params);
+        params.push(Param {
+            temp: raw_argument,
+            rep: self.rep(&from),
+        });
         let ordinary = Span::default().track(crate::ir::ExternTypeKind::Ordinary(
             Span::default().track(crate::ir::TypeKind::Error),
         ));
         let mut body = Body::default();
         let argument = self.host_to_ruddy(&ordinary, &from, raw_argument, &mut body);
+        let mut args = self.evidence_args(&row, &row, &mut body);
+        args.push(argument);
         let result = self.emit(
             &mut body,
             Span::default(),
             self.rep(&to),
             Op::Call {
                 callee: Callee::Indirect(closure),
-                args: vec![argument],
+                args,
             },
         );
-        let result = self.ruddy_to_host(&ordinary, &to, result, &mut body);
+        let result = self.ruddy_to_host(&ordinary, &to, result, &row, &mut body);
+        self.frames.pop().expect("the callback frame just pushed");
         self.fill(
             id,
             Function {
@@ -1270,6 +1266,7 @@ impl Lower<'_> {
         ty: Rc<Ty>,
         parameter_abis: Vec<crate::ir::ExternType>,
         result_abi: crate::ir::ExternType,
+        available: Row,
     ) -> FuncId {
         let id = self.slot(format!("{}#callback#{}", self.stem, self.serial));
         self.serial += 1;
@@ -1278,11 +1275,13 @@ impl Lower<'_> {
             temp: closure,
             rep: Rep::Fn,
         }];
+        self.frames.push(Frame::default());
+        self.evidence_params(&available, &mut params);
         let mut raw_parameters = Vec::new();
         let mut arrows = Vec::new();
         let mut cursor = ty;
         for _ in 0..parameter_abis.len().max(1) {
-            let (from, to, _) = self.arrow(&cursor);
+            let (from, to, row) = self.arrow(&cursor);
             if !parameter_abis.is_empty() {
                 let temp = self.fresh(self.rep(&from));
                 params.push(Param {
@@ -1291,7 +1290,7 @@ impl Lower<'_> {
                 });
                 raw_parameters.push(temp);
             }
-            arrows.push((from, to.clone()));
+            arrows.push((from, to.clone(), row));
             cursor = to;
         }
 
@@ -1304,32 +1303,38 @@ impl Lower<'_> {
                 Rep::Unit,
                 Op::Struct(IndexMap::new()),
             );
+            let mut args = self.evidence_args(&arrows[0].2, &arrows[0].2, &mut body);
+            args.push(unit);
             current = self.emit(
                 &mut body,
                 Span::default(),
                 self.rep(&cursor),
                 Op::Call {
                     callee: Callee::Indirect(current),
-                    args: vec![unit],
+                    args,
                 },
             );
         } else {
-            for ((abi, raw), (from, to)) in
+            for ((abi, raw), (from, to, row)) in
                 parameter_abis.iter().zip(raw_parameters).zip(arrows.iter())
             {
                 let argument = self.host_to_ruddy(abi, from, raw, &mut body);
+                let mut args = self.evidence_args(row, row, &mut body);
+                args.push(argument);
                 current = self.emit(
                     &mut body,
                     Span::default(),
                     self.rep(to),
                     Op::Call {
                         callee: Callee::Indirect(current),
-                        args: vec![argument],
+                        args,
                     },
                 );
             }
         }
-        let result = self.ruddy_to_host(&result_abi, &cursor, current, &mut body);
+        let result_row = &arrows.last().expect("a marked callback has an arrow").2;
+        let result = self.ruddy_to_host(&result_abi, &cursor, current, result_row, &mut body);
+        self.frames.pop().expect("the callback frame just pushed");
         self.fill(
             id,
             Function {
@@ -1350,6 +1355,7 @@ impl Lower<'_> {
         &mut self,
         _outer_raw: Temp,
         carried: Vec<Rep>,
+        carried_types: Vec<Rc<Ty>>,
         ty: Rc<Ty>,
         arity: usize,
         nullary: bool,
@@ -1371,13 +1377,8 @@ impl Lower<'_> {
             gathered.push(temp);
         }
         let (from, to, row) = self.arrow(&ty);
-        for _ in 0..shape(&row).arity() {
-            let temp = self.fresh(Rep::Struct);
-            params.push(Param {
-                temp,
-                rep: Rep::Struct,
-            });
-        }
+        self.frames.push(Frame::default());
+        self.evidence_params(&row, &mut params);
         let argument_rep = self.rep(&from);
         let argument = self.fresh(argument_rep);
         params.push(Param {
@@ -1386,11 +1387,16 @@ impl Lower<'_> {
         });
         let mut body = Body::default();
         if !nullary {
-            let argument = self.ruddy_to_host(&parameter_abis[step], &from, argument, &mut body);
             gathered.push(argument);
         }
 
         let value = if step + 1 == arity {
+            let gathered = gathered
+                .into_iter()
+                .zip(carried_types.iter().chain(std::iter::once(&from)))
+                .zip(parameter_abis.iter())
+                .map(|((argument, ty), abi)| self.ruddy_to_host(abi, ty, argument, &row, &mut body))
+                .collect();
             let result = self.emit(
                 &mut body,
                 Span::default(),
@@ -1404,9 +1410,12 @@ impl Lower<'_> {
         } else {
             let mut next_carried = carried;
             next_carried.push(argument_rep);
+            let mut next_types = carried_types;
+            next_types.push(from);
             let next = self.marked_extern_level(
                 raw,
                 next_carried,
+                next_types,
                 to.clone(),
                 arity,
                 false,
@@ -1426,6 +1435,7 @@ impl Lower<'_> {
                 },
             )
         };
+        self.frames.pop().expect("the extern frame just pushed");
         self.fill(
             id,
             Function {

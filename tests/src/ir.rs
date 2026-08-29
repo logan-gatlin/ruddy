@@ -8448,27 +8448,6 @@ fn extern_abi_retains_resolved_arity_callback_nesting_and_effects() {
 }
 
 #[test]
-fn extern_callbacks_must_be_covered_by_the_containing_call_effects() {
-    let (_, invalid) = build_src(
-        "effect Fail = { abort: () -> () }\n\
-         extern install : fn(fn(()) -> () + !Fail) -> () = host.install",
-    );
-    assert!(matches!(
-        invalid.errors.as_slice(),
-        [ruddy::ir::Error {
-            kind: ErrorKind::CallbackEffectsNotCovered,
-            ..
-        }]
-    ));
-
-    let (_, valid) = build_src(
-        "effect Fail = { abort: () -> () }\n\
-         extern install : fn(fn(()) -> () + !Fail) -> () + !Fail = host.install",
-    );
-    assert!(valid.errors.is_empty(), "{:#?}", valid.errors);
-}
-
-#[test]
 fn invalid_names_inside_an_extern_abi_are_diagnosed_once_and_shape_is_retained() {
     let (_, output) =
         build_src("extern broken : fn(Missing) -> fn() -> Other + !Absent = host.broken");
