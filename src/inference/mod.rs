@@ -2968,7 +2968,10 @@ impl Table {
         // lexical value. Nested package nodes are separate production
         // boundaries and must remain fresh even when the same scheme also owns
         // an arrow-value effect at its root.
-        enum Work { Ty(Rc<Ty>), Row(Row) }
+        enum Work {
+            Ty(Rc<Ty>),
+            Row(Row),
+        }
         let mut root_slots = IndexSet::new();
         let mut work = match &**scheme.body() {
             Ty::Package(body) => vec![Work::Ty(body.clone())],
@@ -4227,13 +4230,7 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
             crate::ir::PresenceOwnership::Universal => None,
         })
         .collect();
-    let ty = lower_scoped(
-        mint,
-        table,
-        &mut tails,
-        &annotation.ty,
-        Some(&boundaries),
-    );
+    let ty = lower_scoped(mint, table, &mut tails, &annotation.ty, Some(&boundaries));
     // A tail stands for the fields its row did not write out, and this is where
     // that is first true of a written one: `{ x: Nat, ..h }` says the hole `h`
     // has no `x`. A rigid needs none of it — nothing can ever be bound to one,
@@ -4269,7 +4266,10 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
     let subst = Subst {
         types: HashMap::new(),
         presences: presence_subst,
-        rigids: at.iter().map(|(id, index)| (*id, presences + index)).collect(),
+        rigids: at
+            .iter()
+            .map(|(id, index)| (*id, presences + index))
+            .collect(),
     };
     let scheme = Scheme::existential(
         presences + at.len() as u32,
