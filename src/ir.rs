@@ -241,9 +241,7 @@ fn resolved_extern_type(written: parse::ExternType, resolved: &Type) -> ExternTy
             resolved_extern_type(*inner, resolved),
         ))),
         parse::ExternTypeKind::Function {
-            parameters,
-            result,
-            ..
+            parameters, result, ..
         } => {
             let mut cursor = resolved.clone();
             let mut resolved_parameters = Vec::with_capacity(parameters.len());
@@ -288,6 +286,100 @@ fn resolved_extern_type(written: parse::ExternType, resolved: &Type) -> ExternTy
             })
         }
     }
+}
+
+/// Check the evidence contract at every callback boundary. Rows have already
+/// had aliases expanded, so coverage is a direct semantic subset check.
+fn validate_callback_effects(abi: &ExternType, errors: &mut Vec<Error>) {
+    fn same_tail(left: &Row, right: &Row) -> bool {
+        match (left, right) {
+            (Row::Anything, Row::Anything) => true,
+            (Row::Named(left), Row::Named(right)) => left == right,
+            (
+                Row::Param {
+                    symbol: left_symbol,
+                    index: left_index,
+                },
+                Row::Param {
+                    symbol: right_symbol,
+                    index: right_index,
+                },
+            ) => left_symbol == right_symbol && left_index == right_index,
+            _ => false,
+        }
+    }
+
+    fn covered(required: &EffectRow, available: &EffectRow) -> bool {
+        let labels = required
+            .effects
+            .iter()
+            .all(|(id, required)| match required {
+                EffectLabel::Absent { .. } => true,
+                EffectLabel::Written { when, .. } => {
+                    let Some(EffectLabel::Written {
+                        when: available_when,
+                        ..
+                    }) = available.effects.get(id)
+                    else {
+                        return false;
+                    };
+                    match (when.as_deref(), available_when.as_deref()) {
+                        (_, None) => true,
+                        (Some(required), Some(available)) => required.name == available.name,
+                        (None, Some(_)) => false,
+                    }
+                }
+            });
+        labels
+            && match (&required.tail, &available.tail) {
+                (None, _) => true,
+                (Some(required), Some(available)) => same_tail(&required.of, &available.of),
+                (Some(_), None) => false,
+            }
+    }
+
+    fn callback_rows(abi: &ExternType, rows: &mut Vec<(Span, EffectRow)>) {
+        match &abi.tracked {
+            ExternTypeKind::Group(inner) => callback_rows(inner, rows),
+            ExternTypeKind::Function { effects, .. } => {
+                rows.push((abi.span, (**effects).clone()));
+            }
+            ExternTypeKind::Ordinary(ty) => {
+                let mut cursor = ty;
+                while let TypeKind::Arrow { to, effects, .. } = &cursor.tracked {
+                    rows.push((cursor.span, (**effects).clone()));
+                    cursor = to;
+                }
+            }
+        }
+    }
+
+    fn boundary(abi: &ExternType, errors: &mut Vec<Error>) {
+        match &abi.tracked {
+            ExternTypeKind::Group(inner) => boundary(inner, errors),
+            ExternTypeKind::Ordinary(_) => {}
+            ExternTypeKind::Function {
+                parameters,
+                result,
+                effects,
+            } => {
+                for parameter in parameters {
+                    let mut rows = Vec::new();
+                    callback_rows(parameter, &mut rows);
+                    if rows.iter().any(|(_, required)| !covered(required, effects)) {
+                        errors.push(Error {
+                            span: parameter.span,
+                            kind: ErrorKind::CallbackEffectsNotCovered,
+                        });
+                    }
+                    boundary(parameter, errors);
+                }
+                boundary(result, errors);
+            }
+        }
+    }
+
+    boundary(abi, errors);
 }
 
 /// A target path is neither a Ruddy module path nor a projection expression.
@@ -1314,6 +1406,9 @@ pub enum ErrorKind {
     /// handler on the stack. The mirror case needs no rule, because the row
     /// already tracks it.
     RaiseInFunction,
+    /// A function passed to foreign code may perform effects for which the
+    /// containing extern call cannot provide evidence.
+    CallbackEffectsNotCovered,
 }
 
 /// What made a binding's pattern able to fail: the first tag or literal found
@@ -2323,6 +2418,7 @@ fn build_with_dependency_imports_inner(
                 // independently would duplicate diagnostics and, more subtly,
                 // mint different annotation-variable identities.
                 let abi = resolved_extern_type(abi, &annotation.ty);
+                validate_callback_effects(&abi, &mut b.errors);
                 if let Some(symbol) = symbol {
                     program.externs.insert(
                         symbol,
