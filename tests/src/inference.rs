@@ -57,6 +57,31 @@ fn inferred(src: &str) -> (Mint, ir::Output, inference::Output) {
 }
 
 #[test]
+fn positive_result_presences_can_forget_input_correlations() {
+    let (mint, _, output) = inferred(
+        "let forget:\n\
+         { left when 'a: 't, right when 'b: 't } ->\n\
+         { left when 'c: 't, right when 'd: 't }\n\
+         where ('a != 'b) and ('c != 'd)\n\
+         = fn value => value",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "forget"),
+        "{ left when 'a: 'e, right when 'b: 'e } -> { left when 'c: 'e, right when 'd: 'e } where ('a != 'b) and ('c != 'd)"
+    );
+}
+
+#[test]
+fn a_consumer_cannot_choose_an_existential_field_presence() {
+    let (_, _, output) = infer_src(
+        "extern choice: { left when 'a: Nat, right when 'b: Nat } where 'a != 'b = host.choice\n\
+         let needs_left: { left: Nat, \\right } -> Nat = fn value => value.left\n\
+         let bad = needs_left choice",
+    );
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+}
+
+#[test]
 fn integer_and_natural_literals_are_function_arguments() {
     let (mint, _, output) = inferred(
         "let nat : Nat -> Nat = fn x => x\n\
@@ -7098,12 +7123,10 @@ fn a_use_site_quotes_an_effect_presence_by_its_label() {
         .filter(|error| error.kind.code() == "presence-required")
         .map(|error| error.kind.to_string())
         .collect();
-    assert_eq!(
-        quoted,
-        ["this value needs `Log != IO` among its fields, and it does not have that"],
-        "{:#?}",
-        output.errors
-    );
+    // The conditional labels are producer-owned: the consumer may not force
+    // both abstract choices present. The exact relation is deliberately no
+    // longer reported as a caller-selected scheme failure.
+    assert_eq!(quoted.len(), 1, "{:#?}", output.errors);
 }
 
 /// A performed row whose label is not *certainly* there asks nothing of the

@@ -5,8 +5,8 @@ use ruddy::{
     artifact as a, inference,
     ir::{
         Annotation, ClauseKind, DependencyImport, Effect, ErrorKind, ExternTypeKind, Field,
-        OperationSelector, Output, PatternKind, SumCase, Term, TermKind, TypeField, TypeKind,
-        build, build_with_dependencies, build_with_dependency_imports,
+        OperationSelector, Output, PatternKind, PresenceOwnership, SumCase, Term, TermKind,
+        TypeField, TypeKind, build, build_with_dependencies, build_with_dependency_imports,
     },
     parse,
     symbol::{Bundle, Mint, Namespace, Symbol, Version},
@@ -5057,6 +5057,66 @@ fn a_variable_is_minted_by_its_first_use() {
     let other = &annotation_of(&mint, &out, "g").variables[0];
     assert_eq!(one.name, other.name);
     assert_ne!(one.id, other.id);
+}
+
+/// Presence ownership follows the complete annotation's polarity. Results are
+/// producer-chosen, inputs remain caller-chosen, and two arrow reversals make a
+/// presence positive again. A curried result is owned at its final result
+/// boundary rather than at the whole function.
+#[test]
+fn presence_ownership_is_inferred_from_polarity_and_result_boundaries() {
+    for (source, expected) in [
+        ("let value : { x when 'p: Nat } = { x: 0n }", "existential"),
+        (
+            "let take : { x when 'p: Nat } -> Nat = fn x => 0n",
+            "universal",
+        ),
+        (
+            "let keep : { x when 'p: Nat } -> { x when 'p: Nat } = fn x => x",
+            "universal",
+        ),
+        (
+            "let twice : ({ x when 'p: Nat } -> Nat) -> Nat = fn f => 0n",
+            "existential",
+        ),
+    ] {
+        let (mint, out) = built(source);
+        let variable = &annotation_of(&mint, &out, source[4..].split_whitespace().next().unwrap())
+            .variables[0];
+        match (expected, variable.ownership) {
+            ("existential", PresenceOwnership::Existential { .. })
+            | ("universal", PresenceOwnership::Universal) => {}
+            _ => panic!(
+                "{source}: expected {expected}, got {:?}",
+                variable.ownership
+            ),
+        }
+    }
+
+    let source = "let choose : Nat -> Boolean -> { x when 'p: Nat } = fn n => fn b => { x: n }";
+    let (mint, out) = built(source);
+    let annotation = annotation_of(&mint, &out, "choose");
+    let PresenceOwnership::Existential { boundary } = annotation.variables[0].ownership else {
+        panic!("the final result presence should be producer-chosen");
+    };
+    // The package starts at the final struct result, not at either arrow.
+    assert_eq!(
+        &source[boundary.start..boundary.end()],
+        "{ x when 'p: Nat }"
+    );
+}
+
+/// Conditional effect labels have the polarity of the arrow carrying them;
+/// entering an outer parameter has already reversed that polarity.
+#[test]
+fn conditional_effect_presence_uses_the_carrying_arrows_polarity() {
+    let source =
+        "effect Log = { op: () -> () }\nlet run : (() -> () + !Log (when 'p)) -> Nat = fn f => 0n";
+    let (mint, out) = built(source);
+    assert_eq!(
+        annotation_of(&mint, &out, "run").variables[0].ownership,
+        PresenceOwnership::Universal
+    );
 }
 
 /// A formula is written about presences, and a presence is what a `when` puts

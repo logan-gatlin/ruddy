@@ -285,6 +285,9 @@ pub enum Formula {
 pub struct Scheme {
     count: u32,
     presences: u32,
+    /// Presence positions opened as abstract producer-owned identities rather
+    /// than flexible caller-chosen variables.
+    existentials: IndexSet<u32>,
     body: Rc<Ty>,
     /// What has to hold of the presences this scheme quantifies. A constrained
     /// scheme in the HM(X) sense: instantiating one conjoins this, with fresh
@@ -985,6 +988,7 @@ impl Scheme {
         Self {
             count,
             presences: 0,
+            existentials: IndexSet::new(),
             body,
             formula: Formula::True,
         }
@@ -996,9 +1000,36 @@ impl Scheme {
         Self {
             count,
             presences,
+            existentials: IndexSet::new(),
             body,
             formula,
         }
+    }
+
+    /// Construct a constrained scheme with producer-owned presence positions.
+    pub fn existential(
+        count: u32,
+        presences: u32,
+        existentials: IndexSet<u32>,
+        body: Rc<Ty>,
+        formula: Formula,
+    ) -> Self {
+        debug_assert!(existentials.iter().all(|index| *index < presences));
+        Self {
+            count,
+            presences,
+            existentials,
+            body,
+            formula,
+        }
+    }
+
+    pub fn is_existential(&self, index: u32) -> bool {
+        self.existentials.contains(&index)
+    }
+
+    pub fn existentials(&self) -> &IndexSet<u32> {
+        &self.existentials
     }
 
     /// How many variables the scheme quantifies, of every sort together. Zero

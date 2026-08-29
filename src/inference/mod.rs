@@ -1004,6 +1004,10 @@ struct Table {
     /// its parameter sat in is an ordinary row and the condition has to have
     /// been said already.
     params: HashMap<Symbol, Vec<ParamKind>>,
+    /// Producer-owned annotation presences. Unification may establish a
+    /// witness equation for these while checking the producer, but must not
+    /// overwrite their identity: publication has to conceal that equation.
+    existential_witnesses: HashSet<TyVar>,
     /// What the program has required of its presences so far. Grown by
     /// generation (a match's coverage), by instantiation (a constrained
     /// scheme's formula) and by lowering (an annotation's `where` clause), and
@@ -2781,7 +2785,19 @@ impl Table {
         );
         let mut promised_atoms = Vec::new();
         promised.atoms(&mut promised_atoms);
-        let mut check_atoms = promised_atoms.clone();
+        // Producer-owned presences are witnesses, not inputs the body may
+        // demand from every caller. Eliminate them from the body's side before
+        // checking the universal contract; their package formula remains in
+        // `allowed`, where the producer's witness equations are checked for
+        // consistency without publishing those equations.
+        let mut check_atoms: Vec<Atom> = promised_atoms
+            .iter()
+            .copied()
+            .filter(|atom| match atom {
+                Atom::Var(var) => !self.existential_witnesses.contains(var),
+                Atom::Bound(_) => true,
+            })
+            .collect();
         let mut guard_atoms = Vec::new();
         guard.atoms(&mut guard_atoms);
         // A local annotation mints its own presences, disjoint from the
@@ -2910,7 +2926,15 @@ impl Table {
         // is minted in its own alphabet, for the reason [`Scheme`] gives.
         let fresh: Vec<Assigned> = (0..scheme.count())
             .map(|at| match at < scheme.presences() {
-                true => Assigned::Presence(self.fresh_presence()),
+                true => {
+                    let presence = self.fresh_presence();
+                    if scheme.is_existential(at)
+                        && let Presence::Var(var) = &presence
+                    {
+                        self.existential_witnesses.insert(*var);
+                    }
+                    Assigned::Presence(presence)
+                }
                 false => Assigned::Ty(self.fresh_type()),
             })
             .collect();
@@ -3299,8 +3323,19 @@ impl Table {
         self.quantify(ty, &mut subst, level);
         let body = self.zonk(ty, &subst);
         let formula = quantify_formula(&formula, &subst);
+        let existentials = subst
+            .presences
+            .iter()
+            .filter_map(|(var, index)| self.existential_witnesses.contains(var).then_some(*index))
+            .collect();
         (
-            Scheme::constrained(subst.next(), subst.presences.len() as u32, body, formula),
+            Scheme::existential(
+                subst.next(),
+                subst.presences.len() as u32,
+                existentials,
+                body,
+                formula,
+            ),
             subst,
         )
     }
@@ -3402,9 +3437,16 @@ impl Table {
             // there is nothing here left to shift.
             rigids: HashMap::new(),
         };
-        Scheme::constrained(
+        let mut existentials = scheme.existentials().clone();
+        existentials.extend(
+            shifted.presences.iter().filter_map(|(var, index)| {
+                self.existential_witnesses.contains(var).then_some(*index)
+            }),
+        );
+        Scheme::existential(
             base + shifted.next(),
             scheme.presences() + free,
+            existentials,
             self.zonk(&shift(scheme.body(), free), &shifted),
             quantify_formula(scheme.formula(), &shifted),
         )
@@ -4039,6 +4081,13 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
             // nothing here is skolemized.
             Sense::Presence => {
                 let presence = table.fresh_presence();
+                if matches!(
+                    variable.ownership,
+                    crate::ir::PresenceOwnership::Existential { .. }
+                ) && let Presence::Var(var) = &presence
+                {
+                    table.existential_witnesses.insert(*var);
+                }
                 tails.presences.insert(variable.name.clone(), presence);
             }
         }
