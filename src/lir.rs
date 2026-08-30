@@ -73,9 +73,9 @@ fn named_fields(fields: IndexMap<String, Temp>) -> IndexMap<FieldKey, Temp> {
 /// earlier phase accepted, and lowering an accepted program cannot fail.
 #[derive(Debug, Clone)]
 pub struct Output {
-    /// Target-provided globals. Unlike [`Global`], these have no initializer:
-    /// a backend imports them from their dotted target instead of evaluating a
-    /// Ruddy block for them.
+    /// Target-provided globals. Unlike [`Global`], these have no Ruddy
+    /// initializer: a backend interprets their target source instead of
+    /// evaluating a Ruddy block for them.
     pub externs: Vec<Extern>,
     /// Every lifted `fn`, handler arm and generated wrapper, in the order they
     /// were lifted. Flat: no function nests inside another.
