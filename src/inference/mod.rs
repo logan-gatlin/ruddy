@@ -2726,10 +2726,28 @@ fn attach_ordinary_explanations(
                     // endpoints. Other exact introduction/forbidden evidence is
                     // overlaid below; intermediates keep a neutral payload.
                     match (&constraint.kind, subject) {
-                        (ConstraintKind::Performs { .. }, Subject::PerformedEffects) => {
+                        (
+                            ConstraintKind::Performs {
+                                ambient_label_spans,
+                                ..
+                            },
+                            Subject::PerformedEffects,
+                        ) if row
+                            .as_ref()
+                            .is_some_and(|row| ambient_label_spans.contains_key(&row.label)) =>
+                        {
                             ExplanationFactPayload::LabelIntroduction
                         }
-                        (ConstraintKind::Performs { .. }, Subject::AmbientEffects) => {
+                        (
+                            ConstraintKind::Performs {
+                                ambient_label_spans,
+                                ..
+                            },
+                            Subject::AmbientEffects,
+                        ) if row
+                            .as_ref()
+                            .is_some_and(|row| ambient_label_spans.contains_key(&row.label)) =>
+                        {
                             ExplanationFactPayload::LabelForbidden
                         }
                         _ => ExplanationFactPayload::RequiresType,
@@ -2780,6 +2798,7 @@ fn attach_ordinary_explanations(
                 });
             }
         }
+        let mut exact_row_endpoints = None;
         if let ErrorKind::RepeatedField {
             introduction: Some(introduction),
             forbidden: Some(forbidden),
@@ -2790,18 +2809,21 @@ fn attach_ordinary_explanations(
             // Keep the complete causal slice. Exact row-fact provenance either
             // corrects the corresponding sliced fact in place or adds a missing
             // endpoint; it must never replace the intermediate path.
+            let mut endpoints = Vec::with_capacity(2);
             for (origin, payload) in [
                 (introduction, ExplanationFactPayload::LabelIntroduction),
                 (forbidden, ExplanationFactPayload::LabelForbidden),
             ] {
-                if let Some(fact) = full_facts.iter_mut().find(|fact| {
+                let at = if let Some(at) = full_facts.iter().position(|fact| {
                     fact.span == origin.span
                         && fact.constraint == origin.constraint
                         && fact.origin == origin.origin
                         && fact.subject == origin.subject
                 }) {
-                    fact.payload = payload;
+                    full_facts[at].payload = payload;
+                    at
                 } else {
+                    let at = full_facts.len();
                     full_facts.push(ExplanationFact {
                         span: origin.span,
                         constraint: origin.constraint,
@@ -2809,8 +2831,11 @@ fn attach_ordinary_explanations(
                         subject: origin.subject,
                         payload,
                     });
-                }
+                    at
+                };
+                endpoints.push(at);
             }
+            exact_row_endpoints = Some([endpoints[0], endpoints[1]]);
         }
         // A reason without a written endpoint cannot support source labels.
         // Keep the established diagnostic rather than inventing context.
@@ -2839,15 +2864,18 @@ fn attach_ordinary_explanations(
             )),
             _ => None,
         };
-        let opposing_endpoints = opposing_roles.and_then(|(first, second)| {
-            let first = candidates
-                .iter()
-                .copied()
-                .find(|at| full_facts[*at].payload == first)?;
-            let second = candidates.iter().copied().find(|at| {
-                full_facts[*at].payload == second && full_facts[*at].span != full_facts[first].span
-            })?;
-            Some([first, second])
+        let opposing_endpoints = exact_row_endpoints.or_else(|| {
+            opposing_roles.and_then(|(first, second)| {
+                let first = candidates
+                    .iter()
+                    .copied()
+                    .find(|at| full_facts[*at].payload == first)?;
+                let second = candidates.iter().copied().find(|at| {
+                    full_facts[*at].payload == second
+                        && full_facts[*at].span != full_facts[first].span
+                })?;
+                Some([first, second])
+            })
         });
         // Row prose is causal only when independently grounded evidence names
         // both the demand/introduction and the use which limits/forbids it.

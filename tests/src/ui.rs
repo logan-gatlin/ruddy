@@ -997,15 +997,55 @@ fn repeated_labels_keep_the_full_intermediate_path_and_exact_endpoints() {
     let introduced = explanation
         .full_facts
         .iter()
-        .position(|fact| fact.payload == inference::ExplanationFactPayload::LabelIntroduction)
+        .position(|fact| {
+            (fact.span.start..fact.span.end()) == (199..208)
+                && fact.origin == inference::ConstraintOrigin::ApplicationArgument
+                && fact.subject == inference::Subject::Argument
+                && fact.payload == inference::ExplanationFactPayload::LabelIntroduction
+        })
         .expect("exact introduction endpoint");
     let forbidden = explanation
         .full_facts
         .iter()
-        .position(|fact| fact.payload == inference::ExplanationFactPayload::LabelForbidden)
+        .position(|fact| {
+            (fact.span.start..fact.span.end()) == (180..185)
+                && fact.origin == inference::ConstraintOrigin::ApplicationArgument
+                && fact.subject == inference::Subject::Argument
+                && fact.payload == inference::ExplanationFactPayload::LabelForbidden
+        })
         .expect("exact forbidden endpoint");
-    assert!(explanation.abridged.contains(&introduced));
-    assert!(explanation.abridged.contains(&forbidden));
+    assert_eq!(explanation.abridged, [introduced, forbidden]);
+}
+
+#[test]
+fn unrelated_performed_calls_do_not_claim_repeated_label_introduction() {
+    let source = concat!(
+        "effect Log = { write: Nat -> () }\n",
+        "effect Tick = { tick: () -> () }\n",
+        "let bad = fn _ => handle !Log.write 1n with | !Log.write n =>\n",
+        "  (fn action => action ()) (fn _ => let _ = !Tick.tick () in !Log.write n)\n",
+        "end\n",
+    );
+    let errors = inference_fixture_errors(source);
+    let [error] = errors.as_slice() else {
+        panic!("unrelated performed-call fixture must have one error: {errors:#?}");
+    };
+    let explanation = error.explanation.as_ref().expect("repeated effect cause");
+    let introductions: Vec<_> = explanation
+        .full_facts
+        .iter()
+        .filter(|fact| fact.payload == inference::ExplanationFactPayload::LabelIntroduction)
+        .collect();
+    assert_eq!(introductions.len(), 1, "{explanation:#?}");
+    assert_eq!(
+        introductions[0].span.start..introductions[0].span.end(),
+        131..203
+    );
+    assert!(explanation.full_facts.iter().any(|fact| {
+        (fact.span.start..fact.span.end()) == (190..202)
+            && fact.subject == inference::Subject::PerformedEffects
+            && fact.payload == inference::ExplanationFactPayload::RequiresType
+    }));
 }
 
 #[test]
