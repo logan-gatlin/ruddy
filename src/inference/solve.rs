@@ -17,7 +17,7 @@ use crate::{
 use super::{
     Batch, Constraint, ConstraintKind, DeferredRequirement, Effect, Error, ErrorCause, ErrorId,
     ErrorKind, Goal, GuardedArm, GuardedObligation, GuardedOrigin, Known, Named, Origin, ReasonId,
-    ReasonOrigin, Refinement, RefinementFact, Rule, Side, Slot, Step, Table,
+    ReasonOrigin, RecursiveCycleShape, Refinement, RefinementFact, Rule, Side, Slot, Step, Table,
 };
 
 /// What a set of labels says about the ones it does not name.
@@ -2177,7 +2177,13 @@ impl Solve<'_> {
                     expected.tail.value(expected.labels.clone()),
                     actual.tail.value(actual.labels.clone()),
                 ];
-                self.fail(span, Rule::Occurs, goal, error, &abandoned);
+                self.fail_recursive(
+                    span,
+                    goal,
+                    error,
+                    &abandoned,
+                    RecursiveCycleShape::Containment,
+                );
                 return Vec::new();
             }
         }
@@ -2796,7 +2802,7 @@ impl Solve<'_> {
     /// decides it: absent is the one answer both sides allow, and it is the
     /// answer [`Solve::absorb`] gives the same label against a closed row.
     fn assign(&mut self, span: Span, goal: Goal, var: TyVar, value: Assigned) {
-        if self.table.occurs(var, &value) {
+        if let Some(route) = self.table.occurs(var, &value) {
             let error = Error {
                 id: ErrorId::pending(),
                 cause: ErrorCause::Direct,
@@ -2805,7 +2811,7 @@ impl Solve<'_> {
                 explanation: None,
             };
             let abandoned = [value.variable(var), value];
-            self.fail(span, Rule::Occurs, goal, error, &abandoned);
+            self.fail_recursive(span, goal, error, &abandoned, route);
             return;
         }
         // Binding a shared structural variable still installs the ordinary
@@ -3066,13 +3072,29 @@ impl Solve<'_> {
     ///
     /// The error carries its own span rather than taking `span`, because the
     /// two need not be the same.
-    fn fail(
+    fn fail(&mut self, span: Span, rule: Rule, goal: Goal, error: Error, abandoned: &[Assigned]) {
+        self.fail_with_route(span, rule, goal, error, abandoned, None);
+    }
+
+    fn fail_recursive(
+        &mut self,
+        span: Span,
+        goal: Goal,
+        error: Error,
+        abandoned: &[Assigned],
+        route: RecursiveCycleShape,
+    ) {
+        self.fail_with_route(span, Rule::Occurs, goal, error, abandoned, Some(route));
+    }
+
+    fn fail_with_route(
         &mut self,
         span: Span,
         rule: Rule,
         goal: Goal,
         mut error: Error,
         abandoned: &[Assigned],
+        recursive: Option<RecursiveCycleShape>,
     ) {
         let kind = error.kind.clone();
         let error_id = self.table.error_id();
@@ -3097,6 +3119,7 @@ impl Solve<'_> {
             depth: self.depth,
             rule,
             goal,
+            recursive,
             effect: Effect::Failed(kind),
         });
         for value in abandoned {
@@ -3390,6 +3413,7 @@ impl Solve<'_> {
             depth: self.depth,
             rule,
             goal,
+            recursive: None,
             effect: Effect::Bound {
                 var,
                 value,
@@ -3418,6 +3442,7 @@ impl Solve<'_> {
             depth: self.depth,
             rule,
             goal,
+            recursive: None,
             effect,
         });
         reason

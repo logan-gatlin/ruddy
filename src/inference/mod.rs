@@ -521,6 +521,9 @@ pub struct Step {
     /// presences, and neither of those is a question about types. So a goal is
     /// three-sorted where a constraint is one.
     pub goal: Goal,
+    /// Exact structural route selected by the occurs walk, captured before
+    /// recovery rewrites the graph. `None` for every non-recursive step.
+    pub recursive: Option<RecursiveCycleShape>,
     pub effect: Effect,
 }
 
@@ -2652,194 +2655,6 @@ fn all_constraints(
     out
 }
 
-/// Inspect the exact structural path which made an occurs check fail. Source
-/// ancestry is deliberately not part of this decision: an application can be
-/// above a field-containment cycle without being the edge that closes it.
-fn recursive_cycle_edges(goal: &Goal, bindings: &HashMap<TyVar, Assigned>) -> (bool, bool) {
-    #[derive(Clone, Copy, Default)]
-    struct Edges {
-        containment: bool,
-        call_input: bool,
-    }
-    enum Work {
-        Type(Rc<Ty>, Edges),
-        Row(Rc<Row>, Edges),
-    }
-
-    let (target, mut work) = match goal {
-        Goal::Type { expected, actual } => match (&**expected, &**actual) {
-            (Ty::Var(var), _) => (*var, vec![Work::Type(actual.clone(), Edges::default())]),
-            (_, Ty::Var(var)) => (*var, vec![Work::Type(expected.clone(), Edges::default())]),
-            // The row-lacks occurs check retains the two containing struct or
-            // sum values as its goal rather than manufacturing a bare tail
-            // goal. Their structural constructor is the cycle-closing edge.
-            _ if matches!(&**expected, Ty::Struct(_) | Ty::Sum(_))
-                || matches!(&**actual, Ty::Struct(_) | Ty::Sum(_)) =>
-            {
-                return (true, false);
-            }
-            _ => return (false, false),
-        },
-        Goal::Row { expected, actual } => {
-            let bare = |row: &Row| {
-                row.labels
-                    .is_empty()
-                    .then_some(())
-                    .and_then(|()| match row.rest {
-                        Rest::Var(var) => Some(var),
-                        _ => None,
-                    })
-            };
-            match (bare(expected), bare(actual)) {
-                (Some(var), _) => (
-                    var,
-                    vec![Work::Row(
-                        actual.clone(),
-                        Edges {
-                            containment: true,
-                            call_input: false,
-                        },
-                    )],
-                ),
-                (_, Some(var)) => (
-                    var,
-                    vec![Work::Row(
-                        expected.clone(),
-                        Edges {
-                            containment: true,
-                            call_input: false,
-                        },
-                    )],
-                ),
-                // A recursive failure whose direct goal is already row-shaped
-                // closed through that row even when the tail variable is nested
-                // below a `More` segment.
-                _ => return (true, false),
-            }
-        }
-        Goal::Presence { .. } => return (false, false),
-    };
-
-    let mut seen_types = HashSet::new();
-    let mut seen_rows = HashSet::new();
-    // Retain visited allocations while pointer identities are in the sets, so
-    // a subsequently constructed embedded row cannot reuse an old address.
-    let mut retained_types = Vec::new();
-    let mut retained_rows = Vec::new();
-    let mut found = Edges::default();
-    while let Some(part) = work.pop() {
-        match part {
-            Work::Type(ty, edges) => {
-                let key = (
-                    Rc::as_ptr(&ty) as usize,
-                    edges.containment,
-                    edges.call_input,
-                );
-                if !seen_types.insert(key) {
-                    continue;
-                }
-                retained_types.push(ty.clone());
-                match &*ty {
-                    Ty::Var(var) if *var == target => {
-                        found.containment |= edges.containment;
-                        found.call_input |= edges.call_input;
-                    }
-                    Ty::Var(var) => match bindings.get(var) {
-                        Some(Assigned::Ty(bound)) => {
-                            work.push(Work::Type(bound.clone(), edges));
-                        }
-                        Some(Assigned::Row(bound)) => {
-                            work.push(Work::Row(bound.clone(), edges));
-                        }
-                        Some(Assigned::Presence(_)) | None => {}
-                    },
-                    Ty::Arrow(from, to, effects) => {
-                        work.push(Work::Row(
-                            Rc::new(effects.clone()),
-                            Edges {
-                                containment: true,
-                                ..edges
-                            },
-                        ));
-                        work.push(Work::Type(to.clone(), edges));
-                        work.push(Work::Type(
-                            from.clone(),
-                            Edges {
-                                call_input: true,
-                                ..edges
-                            },
-                        ));
-                    }
-                    Ty::Package(body) => work.push(Work::Type(body.clone(), edges)),
-                    Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(
-                        Rc::new(row.clone()),
-                        Edges {
-                            containment: true,
-                            ..edges
-                        },
-                    )),
-                    Ty::Named { args, .. } => {
-                        work.extend(args.iter().cloned().map(|arg| Work::Type(arg, edges)));
-                    }
-                    _ => {}
-                }
-            }
-            Work::Row(row, edges) => {
-                let key = (
-                    Rc::as_ptr(&row) as usize,
-                    edges.containment,
-                    edges.call_input,
-                );
-                if !seen_rows.insert(key) {
-                    continue;
-                }
-                retained_rows.push(row.clone());
-                for field in row.labels.values() {
-                    if matches!(field.presence, Presence::Var(var) if var == target) {
-                        found.containment = true;
-                    }
-                    work.push(Work::Type(
-                        field.ty.clone(),
-                        Edges {
-                            containment: true,
-                            ..edges
-                        },
-                    ));
-                }
-                match &row.rest {
-                    Rest::Var(var) if *var == target => found.containment = true,
-                    Rest::Var(var) => match bindings.get(var) {
-                        Some(Assigned::Row(bound)) => work.push(Work::Row(
-                            bound.clone(),
-                            Edges {
-                                containment: true,
-                                ..edges
-                            },
-                        )),
-                        Some(Assigned::Ty(bound)) => work.push(Work::Type(
-                            bound.clone(),
-                            Edges {
-                                containment: true,
-                                ..edges
-                            },
-                        )),
-                        Some(Assigned::Presence(_)) | None => {}
-                    },
-                    Rest::More(more) => work.push(Work::Row(
-                        more.clone(),
-                        Edges {
-                            containment: true,
-                            ..edges
-                        },
-                    )),
-                    _ => {}
-                }
-            }
-        }
-    }
-    (found.containment, found.call_input)
-}
-
 fn attach_ordinary_explanations(
     errors: &mut [Error],
     constraints: &IndexMap<Symbol, Vec<Constraint>>,
@@ -3190,39 +3005,14 @@ fn attach_ordinary_explanations(
                         && (leaf.0 == TypeDescription::Function
                             || leaf.1 == TypeDescription::Function)
                 });
-        let recursive = (kind == Some(ContradictionKind::RecursiveValue)).then(|| {
-            let closing_step = match error.cause {
-                ErrorCause::Step(id) => steps.get(&id),
-                ErrorCause::Batch(_) | ErrorCause::Direct => None,
-            };
-            let bindings: HashMap<_, _> = closing_step
-                .into_iter()
-                .flat_map(|closing| {
-                    steps.values().filter_map(move |step| match &step.effect {
-                        Effect::Bound { var, value, .. } if step.id < closing.id => {
-                            Some((*var, value.clone()))
-                        }
-                        _ => None,
-                    })
-                })
-                .collect();
-            let (has_containment, has_call_input_edge) = closing_step
-                .map(|step| recursive_cycle_edges(&step.goal, &bindings))
-                .unwrap_or_default();
-            let closing_is_argument = closing_step
-                .and_then(|step| step.constraint)
-                .and_then(|id| constraints.get(&id))
-                .is_some_and(|constraint| {
-                    constraint.origin == ConstraintOrigin::ApplicationArgument
-                });
-            if has_containment {
-                RecursiveCycleShape::Containment
-            } else if closing_is_argument && has_call_input_edge {
-                RecursiveCycleShape::CallInput
-            } else {
-                RecursiveCycleShape::Neutral
-            }
-        });
+        let recursive =
+            (kind == Some(ContradictionKind::RecursiveValue)).then(|| match error.cause {
+                ErrorCause::Step(id) => steps
+                    .get(&id)
+                    .and_then(|step| step.recursive)
+                    .unwrap_or(RecursiveCycleShape::Neutral),
+                ErrorCause::Batch(_) | ErrorCause::Direct => RecursiveCycleShape::Neutral,
+            });
         error.explanation = Some(InferenceExplanation {
             full_facts,
             abridged,
@@ -4438,17 +4228,20 @@ impl Table {
     /// [`resolve`](Self::resolve) or [`canon`](Self::canon). Those readers are
     /// right for equality but flatten away the bound-variable edges which form
     /// the causal route around a cycle. On the first route back to `var`, this
-    /// records exactly those edges' reasons. [`Solve::fail`] joins them to the
-    /// active constraint reason, so the explanation keeps both the iterative
-    /// path and the source operation which closed it.
+    /// returns that route's source-facing shape and records exactly its binding
+    /// reasons. [`Solve::fail`] joins them to the active constraint reason, so
+    /// the explanation keeps both the iterative path and the source operation
+    /// which closed it.
     ///
     /// The explicit work and trace stacks keep deeply nested types bounded by
-    /// heap space. A field whose presence resolves absent is skipped: its
-    /// payload denotes nothing and cannot participate in a real cycle. Shared
+    /// heap space. A field whose presence resolves absent, or whose imported,
+    /// quantified, or recovered presence makes its payload unavailable, is
+    /// skipped: that payload denotes nothing locally and cannot participate in
+    /// a real cycle. Shared
     /// row-tail cycles with no intervening binding are caught earlier by
     /// [`Solve::labels`]; their closing constraint still enters the same
     /// structured explanation path.
-    fn occurs(&self, var: TyVar, value: &Assigned) -> bool {
+    fn occurs(&self, var: TyVar, value: &Assigned) -> Option<RecursiveCycleShape> {
         // Do not flatten the value before searching it. Flattening is useful
         // for equality, but it loses which bound-variable edges led back to
         // `var` and records reads from innocent sibling branches. This raw,
@@ -4476,7 +4269,13 @@ impl Table {
             }
         }
 
-        let mut work = vec![(assigned_part(value), None)];
+        #[derive(Clone, Copy, Default)]
+        struct Route {
+            call_input: bool,
+            containment: bool,
+        }
+
+        let mut work = vec![(assigned_part(value), None, Route::default())];
         let mut traces: Vec<Trace> = Vec::new();
         let mut seen_tys = HashSet::new();
         let mut seen_rows = HashSet::new();
@@ -4488,7 +4287,7 @@ impl Table {
         // Presence resolution in a field has a continuation: two fields may
         // share one presence variable but carry different payloads.
         let mut seen_field_presences = HashSet::new();
-        while let Some((part, trace)) = work.pop() {
+        while let Some((part, trace, route)) = work.pop() {
             let found_target = match part {
                 Part::Ty(ty) => {
                     if let Ty::Var(found) = &*ty {
@@ -4502,7 +4301,7 @@ impl Table {
                                 reason: *by,
                                 parent: trace,
                             });
-                            work.push((assigned_part(value), Some(next)));
+                            work.push((assigned_part(value), Some(next), route));
                             false
                         } else {
                             false
@@ -4512,19 +4311,45 @@ impl Table {
                     } else {
                         visited_tys.push(ty.clone());
                         match &*ty {
-                            Ty::Package(body) => work.push((Part::Ty(body.clone()), trace)),
+                            Ty::Package(body) => work.push((Part::Ty(body.clone()), trace, route)),
                             Ty::Arrow(from, to, effects) => {
                                 // Reverse pushes preserve written order: input,
-                                // output, then effects.
-                                work.push((Part::Row(Rc::new(effects.clone())), trace));
-                                work.push((Part::Ty(to.clone()), trace));
-                                work.push((Part::Ty(from.clone()), trace));
+                                // output, then effects. This ordering is semantic:
+                                // the first exact route wins, not a union of sibling routes.
+                                work.push((
+                                    Part::Row(Rc::new(effects.clone())),
+                                    trace,
+                                    Route {
+                                        containment: true,
+                                        ..route
+                                    },
+                                ));
+                                work.push((Part::Ty(to.clone()), trace, route));
+                                work.push((
+                                    Part::Ty(from.clone()),
+                                    trace,
+                                    Route {
+                                        call_input: true,
+                                        ..route
+                                    },
+                                ));
                             }
                             Ty::Struct(row) | Ty::Sum(row) => {
-                                work.push((Part::Row(Rc::new(row.clone())), trace));
+                                work.push((
+                                    Part::Row(Rc::new(row.clone())),
+                                    trace,
+                                    Route {
+                                        containment: true,
+                                        ..route
+                                    },
+                                ));
                             }
-                            Ty::Named { args, .. } => work
-                                .extend(args.iter().rev().cloned().map(|ty| (Part::Ty(ty), trace))),
+                            Ty::Named { args, .. } => work.extend(
+                                args.iter()
+                                    .rev()
+                                    .cloned()
+                                    .map(|ty| (Part::Ty(ty), trace, route)),
+                            ),
                             Ty::Var(_)
                             | Ty::Nat
                             | Ty::Int
@@ -4550,13 +4375,19 @@ impl Table {
                             work.push((
                                 Part::Field(field.ty.clone(), field.presence.clone()),
                                 trace,
+                                Route {
+                                    containment: true,
+                                    ..route
+                                },
                             ));
                         }
                         if matches!(&row.rest, Rest::Var(found) if *found == var) {
                             true
                         } else {
                             match &row.rest {
-                                Rest::More(more) => work.push((Part::Row(more.clone()), trace)),
+                                Rest::More(more) => {
+                                    work.push((Part::Row(more.clone()), trace, route))
+                                }
                                 Rest::Var(found) if seen_vars.insert(*found) => {
                                     if let Slot::Bound {
                                         value: Assigned::Row(row),
@@ -4568,7 +4399,7 @@ impl Table {
                                             reason: *by,
                                             parent: trace,
                                         });
-                                        work.push((Part::Row(row.clone()), Some(next)));
+                                        work.push((Part::Row(row.clone()), Some(next), route));
                                     }
                                 }
                                 Rest::Var(_)
@@ -4596,7 +4427,7 @@ impl Table {
                                 reason: *by,
                                 parent: trace,
                             });
-                            work.push((Part::Presence(presence.clone()), Some(next)));
+                            work.push((Part::Presence(presence.clone()), Some(next), route));
                             false
                         } else {
                             false
@@ -4607,13 +4438,14 @@ impl Table {
                 }
                 Part::Field(ty, presence) => match presence {
                     Presence::Absent => false,
-                    Presence::Present
-                    | Presence::Undecided
-                    | Presence::Recovered(_)
-                    | Presence::Bound(_) => {
-                        work.push((Part::Ty(ty), trace));
+                    Presence::Present => {
+                        work.push((Part::Ty(ty), trace, route));
                         false
                     }
+                    // These presences do not make a payload locally available.
+                    // In particular, recovery placeholders must not turn an
+                    // abandoned sibling into a real occurs route.
+                    Presence::Undecided | Presence::Recovered(_) | Presence::Bound(_) => false,
                     Presence::Var(found) if found == var => true,
                     Presence::Var(found)
                         if seen_field_presences.insert((Rc::as_ptr(&ty) as usize, found)) =>
@@ -4628,9 +4460,9 @@ impl Table {
                                 reason: *by,
                                 parent: trace,
                             });
-                            work.push((Part::Field(ty, next_presence.clone()), Some(next)));
+                            work.push((Part::Field(ty, next_presence.clone()), Some(next), route));
                         } else {
-                            work.push((Part::Ty(ty), trace));
+                            work.push((Part::Ty(ty), trace, route));
                         }
                         false
                     }
@@ -4647,10 +4479,16 @@ impl Table {
                 for reason in path.into_iter().rev() {
                     self.note_binding_read(reason);
                 }
-                return true;
+                return Some(if route.containment {
+                    RecursiveCycleShape::Containment
+                } else if route.call_input {
+                    RecursiveCycleShape::CallInput
+                } else {
+                    RecursiveCycleShape::Neutral
+                });
             }
         }
-        false
+        None
     }
 
     /// Lower the level of everything `value` mentions to no more than `var`'s
@@ -9279,10 +9117,8 @@ mod existential_regressions {
         let target = table.mint(VarSort::Type, Subject::Term);
         let first = table.mint(VarSort::Type, Subject::Term);
         let second = table.mint(VarSort::Type, Subject::Term);
-        let sibling = table.mint(VarSort::Type, Subject::Term);
         let first_reason = table.reason(ReasonOrigin::Recovery, Vec::new());
         let second_reason = table.reason(ReasonOrigin::Recovery, Vec::new());
-        let sibling_reason = table.reason(ReasonOrigin::Recovery, Vec::new());
         table.vars[first as usize] = Slot::Bound {
             value: Assigned::Ty(Rc::new(Ty::plain(Ty::Var(second)))),
             by: first_reason,
@@ -9291,20 +9127,58 @@ mod existential_regressions {
             value: Assigned::Ty(Rc::new(Ty::plain(Ty::Var(target)))),
             by: second_reason,
         };
-        table.vars[sibling as usize] = Slot::Bound {
-            value: Assigned::Ty(Rc::new(Ty::Nat)),
-            by: sibling_reason,
-        };
+        // The input closes the first exact route. A containment route in the
+        // result is an innocent sibling and must not override call advice.
         let candidate = Assigned::Ty(Rc::new(Ty::Arrow(
             Rc::new(Ty::plain(Ty::Var(first))),
-            Rc::new(Ty::plain(Ty::Var(sibling))),
+            Rc::new(Ty::Struct(Row {
+                labels: [(
+                    "sibling".into(),
+                    RowField::present(Rc::new(Ty::Var(target))),
+                )]
+                .into_iter()
+                .collect(),
+                rest: Rest::Closed,
+            })),
             Row::closed(),
         )));
 
         table.enter_solver_scope();
         table.begin_solver_act();
-        assert!(table.occurs(target, &candidate));
+        assert_eq!(
+            table.occurs(target, &candidate),
+            Some(RecursiveCycleShape::CallInput)
+        );
         assert_eq!(table.take_binding_reads(), [first_reason, second_reason]);
+
+        // An absent call-input sibling has no payload. The later present
+        // containment route is therefore the exact route returned.
+        let absent_sibling = Assigned::Ty(Rc::new(Ty::Arrow(
+            Rc::new(Ty::Struct(Row {
+                labels: [(
+                    "gone".into(),
+                    RowField {
+                        ty: Rc::new(Ty::Var(target)),
+                        presence: Presence::Absent,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                rest: Rest::Closed,
+            })),
+            Rc::new(Ty::Struct(Row {
+                labels: [("kept".into(), RowField::present(Rc::new(Ty::Var(target))))]
+                    .into_iter()
+                    .collect(),
+                rest: Rest::Closed,
+            })),
+            Row::closed(),
+        )));
+        assert_eq!(
+            table.occurs(target, &absent_sibling),
+            Some(RecursiveCycleShape::Containment)
+        );
+        assert!(table.take_binding_reads().is_empty());
         table.end_solver_act();
         table.leave_solver_scope();
     }
@@ -9320,7 +9194,7 @@ mod existential_regressions {
 
         table.enter_solver_scope();
         table.begin_solver_act();
-        assert!(!table.occurs(target, &Assigned::Ty(shared)));
+        assert!(table.occurs(target, &Assigned::Ty(shared)).is_none());
         assert!(table.take_binding_reads().is_empty());
         table.end_solver_act();
         table.leave_solver_scope();
@@ -9345,12 +9219,19 @@ mod existential_regressions {
 
         table.enter_solver_scope();
         table.begin_solver_act();
-        assert!(!table.occurs(target, &Assigned::Ty(Rc::new(Ty::Var(first)))));
+        assert!(
+            table
+                .occurs(target, &Assigned::Ty(Rc::new(Ty::Var(first))))
+                .is_none()
+        );
         assert!(table.take_binding_reads().is_empty());
         // A failed search must not suppress or pollute the next independent
         // search in the same solver act.
         let direct = Assigned::Ty(Rc::new(Ty::Var(target)));
-        assert!(table.occurs(target, &direct));
+        assert_eq!(
+            table.occurs(target, &direct),
+            Some(RecursiveCycleShape::Neutral)
+        );
         assert!(table.take_binding_reads().is_empty());
         table.end_solver_act();
         table.leave_solver_scope();
@@ -9397,17 +9278,26 @@ mod existential_regressions {
 
         table.enter_solver_scope();
         table.begin_solver_act();
-        assert!(table.occurs(
-            row_target,
-            &Assigned::Row(Rc::new(Row::of(Rest::Var(row_first))))
-        ));
+        assert_eq!(
+            table.occurs(
+                row_target,
+                &Assigned::Row(Rc::new(Row::of(Rest::Var(row_first))))
+            ),
+            Some(RecursiveCycleShape::Neutral)
+        );
         assert_eq!(table.take_binding_reads(), [row_reason]);
-        assert!(table.occurs(
-            presence_target,
-            &Assigned::Presence(Presence::Var(presence_first))
-        ));
+        assert_eq!(
+            table.occurs(
+                presence_target,
+                &Assigned::Presence(Presence::Var(presence_first))
+            ),
+            Some(RecursiveCycleShape::Neutral)
+        );
         assert_eq!(table.take_binding_reads(), [presence_reason]);
-        assert!(table.occurs(ty_target, &siblings));
+        assert_eq!(
+            table.occurs(ty_target, &siblings),
+            Some(RecursiveCycleShape::CallInput)
+        );
         assert_eq!(table.take_binding_reads(), [left_reason]);
 
         let shared_presence = table.mint(VarSort::Presence, Subject::Term);
@@ -9437,8 +9327,42 @@ mod existential_regressions {
             .collect(),
             rest: Rest::Closed,
         }));
-        assert!(table.occurs(ty_target, &shared_fields));
+        assert_eq!(
+            table.occurs(ty_target, &shared_fields),
+            Some(RecursiveCycleShape::Containment)
+        );
         assert_eq!(table.take_binding_reads(), [shared_presence_reason]);
+
+        let absent_presence = table.mint(VarSort::Presence, Subject::Term);
+        let absent_reason = table.reason(ReasonOrigin::Recovery, Vec::new());
+        table.vars[absent_presence as usize] = Slot::Bound {
+            value: Assigned::Presence(Presence::Absent),
+            by: absent_reason,
+        };
+        for unavailable in [
+            Presence::Var(absent_presence),
+            Presence::Recovered(77),
+            Presence::Bound(0),
+            Presence::Undecided,
+        ] {
+            let unavailable_payload = Assigned::Row(Rc::new(Row {
+                labels: [(
+                    "gone".into(),
+                    RowField {
+                        ty: Rc::new(Ty::Var(ty_target)),
+                        presence: unavailable,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                rest: Rest::Closed,
+            }));
+            assert!(
+                table.occurs(ty_target, &unavailable_payload).is_none(),
+                "an unavailable field payload is not an occurs route"
+            );
+            assert!(table.take_binding_reads().is_empty());
+        }
         table.end_solver_act();
         table.leave_solver_scope();
     }
@@ -9464,7 +9388,7 @@ mod existential_regressions {
                         rest: Rest::Closed,
                     }));
                 }
-                assert!(table.occurs(var, &Assigned::Ty(nested.clone())));
+                assert!(table.occurs(var, &Assigned::Ty(nested.clone())).is_some());
                 // The property under test is the explicit walk, not recursive
                 // destruction of a deliberately pathological Rc tree.
                 std::mem::forget(nested);

@@ -890,8 +890,10 @@ fn recursive_types_have_grounded_structured_cycle_explanations() {
             inference::RecursiveCycleShape::Containment,
         ),
         // Two independently written uses close the cycle across a binding.
+        // The field-containing sibling must not override the first exact
+        // self-call route when choosing repair advice.
         (
-            "let bad = fn f => let keep = f in { call: keep f, value: f }",
+            "let bad = fn f => let keep = f in { call: keep f, value: { self: f } }",
             inference::RecursiveCycleShape::CallInput,
         ),
         // One shared row tail cannot absorb the extra field on one side. The
