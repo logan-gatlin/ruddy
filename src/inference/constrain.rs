@@ -217,6 +217,11 @@ fn covered(
 }
 
 impl Constrain<'_> {
+    fn emit(&mut self, span: Span, kind: ConstraintKind) {
+        let id = self.table.constraint_id();
+        self.out.push(Constraint { id, span, kind });
+    }
+
     /// Record that `actual` — the type a term turned out to have — has to be
     /// the type the context demanded of it. The walk's only verb: it says so
     /// and moves on, which is the whole of what generation does.
@@ -228,13 +233,13 @@ impl Constrain<'_> {
     /// `expected, actual` pair got applications backwards and told the reader
     /// their annotation was the mistake.
     fn checks(&mut self, span: Span, actual: &Rc<Ty>, expected: &Rc<Ty>) {
-        self.out.push(Constraint {
+        self.emit(
             span,
-            kind: ConstraintKind::Equal {
+            ConstraintKind::Equal {
                 expected: expected.clone(),
                 actual: actual.clone(),
             },
-        });
+        );
     }
 
     /// Hold every as-yet unowned batch generated since `from` inert in its
@@ -373,9 +378,9 @@ impl Constrain<'_> {
                 self.infer_term(body);
                 let rest = std::mem::replace(&mut self.out, outer);
 
-                self.out.push(Constraint {
+                self.emit(
                     span,
-                    kind: ConstraintKind::Let {
+                    ConstraintKind::Let {
                         symbol: name.tracked,
                         bound,
                         level,
@@ -384,7 +389,7 @@ impl Constrain<'_> {
                         value: required,
                         body: rest,
                     },
-                });
+                );
                 // What the expression evaluates to is what its body evaluates
                 // to; the value is what the name is, not what the `let` is.
                 body.ty.clone()
@@ -468,14 +473,14 @@ impl Constrain<'_> {
                         (result, does)
                     }
                 };
-                self.out.push(Constraint {
+                self.emit(
                     span,
-                    kind: ConstraintKind::Performs {
+                    ConstraintKind::Performs {
                         performed,
                         ambient: self.ambient.row.clone(),
                         inside: self.ambient.inside,
                     },
-                });
+                );
                 result
             }
             // A `fn` mints the row its own arrow carries and walks its body at
@@ -589,15 +594,15 @@ impl Constrain<'_> {
             TermKind::Project { base, field } => {
                 self.infer_term(base);
                 let result = self.table.fresh_type();
-                self.out.push(Constraint {
-                    span: field.span,
-                    kind: ConstraintKind::Project {
+                self.emit(
+                    field.span,
+                    ConstraintKind::Project {
                         base: base.ty.clone(),
                         field: field.tracked.clone(),
                         result: result.clone(),
                         base_span: base.span,
                     },
-                });
+                );
                 result
             }
             // The scrutinee is what the written matrix, read column-wise,
@@ -696,15 +701,15 @@ impl Constrain<'_> {
                                 ty: body.ty.clone(),
                             });
                         }
-                        self.out.push(Constraint {
+                        self.emit(
                             span,
-                            kind: ConstraintKind::Match {
+                            ConstraintKind::Match {
                                 scrutinee: expected,
                                 result: result.clone(),
                                 arms: guarded,
                                 store_end: self.table.store.batches.len(),
                             },
-                        });
+                        );
                     }
                     // A mixed tag/literal column keeps the old flat equality
                     // constraints exactly.
@@ -1211,14 +1216,14 @@ impl Constrain<'_> {
                     Formula::True,
                 );
                 self.table.deferred.insert(requirement);
-                self.out.push(Constraint {
+                self.emit(
                     span,
-                    kind: ConstraintKind::Instance {
+                    ConstraintKind::Instance {
                         symbol,
                         ty: ty.clone(),
                         requirement,
                     },
-                });
+                );
                 ty
             }
         }

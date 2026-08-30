@@ -104,8 +104,9 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         if batch.flipped {
             flipped = Some(at);
         }
-        let mut node =
-            Node::new(ids.next(), batch.origin.code(), batch.formula.to_string()).at(batch.span);
+        let mut node = Node::new(ids.next(), batch.origin.code(), batch.formula.to_string())
+            .at(batch.span)
+            .field("_batch_id", batch.id.get().to_string());
         if batch.flipped {
             node = node.error();
         }

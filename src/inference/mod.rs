@@ -190,6 +190,34 @@ pub struct Output {
 /// not care what order it is asked in, but *which batch made the store
 /// unsatisfiable* does — so the batches are kept as a sequence, replayed in it,
 /// and the first one that flips the verdict owns the error. See [`Batch`].
+macro_rules! inference_id {
+    ($name:ident) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name(u64);
+
+        impl $name {
+            pub fn get(self) -> u64 {
+                self.0
+            }
+
+            #[doc(hidden)]
+            pub const fn synthetic(value: u64) -> Self {
+                Self(value)
+            }
+
+            #[allow(dead_code)]
+            fn pending() -> Self {
+                Self(u64::MAX)
+            }
+        }
+    };
+}
+
+inference_id!(ConstraintId);
+inference_id!(StepId);
+inference_id!(ErrorId);
+inference_id!(BatchId);
+
 #[derive(Debug, Clone, Default)]
 pub struct Store {
     pub batches: Vec<Batch>,
@@ -199,6 +227,8 @@ pub struct Store {
 /// said.
 #[derive(Debug, Clone)]
 pub struct Batch {
+    /// Stable identity allocated when this source-order slot is reserved.
+    pub id: BatchId,
     /// Top-level definition whose generation/solve emitted this batch.
     pub definition: Option<Symbol>,
     /// Where the program said it: the match, the use site, or the annotation.
@@ -365,6 +395,10 @@ pub struct Named {
 /// replay does not.
 #[derive(Debug, Clone)]
 pub struct Step {
+    /// Stable identity in this inference run. Retired, never reused, on rollback.
+    pub id: StepId,
+    /// The constraint whose solve produced this step.
+    pub constraint: Option<ConstraintId>,
     /// The definition being solved. Solving runs per definition, so this is
     /// what divides one solve from the next in the flat list.
     pub definition: Symbol,
@@ -529,6 +563,8 @@ pub enum Effect {
 /// said so.
 #[derive(Debug, Clone)]
 pub struct Constraint {
+    /// Stable identity in generation order, including nested constraints.
+    pub id: ConstraintId,
     pub span: Span,
     pub kind: ConstraintKind,
 }
@@ -631,8 +667,22 @@ pub enum ConstraintKind {
 
 #[derive(Debug, Clone)]
 pub struct Error {
+    /// Stable identity in report order. Source sorting moves but never renumbers it.
+    pub id: ErrorId,
     pub span: Span,
     pub kind: ErrorKind,
+}
+
+impl Error {
+    /// Construct an error for focused semantic/UI tests. Inference replaces
+    /// this pending identity before publishing an [`Output`].
+    pub fn new(span: Span, kind: ErrorKind) -> Self {
+        Self {
+            id: ErrorId::pending(),
+            span,
+            kind,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1083,6 +1133,13 @@ struct Table {
     /// disagreement, a scheme's `where` clause — is suppressed, because all of
     /// them would be the same contradiction said again.
     unsat: bool,
+    /// Append-only identity arenas. These counters are deliberately absent from
+    /// `snapshot`/`restore`: speculative records are retired on rollback rather
+    /// than letting a later record inherit an observed identity.
+    next_constraint_id: u64,
+    next_step_id: u64,
+    next_error_id: u64,
+    next_batch_id: u64,
 }
 
 /// Which quantified position each thing a scheme closes over was given, in the
@@ -1137,6 +1194,7 @@ pub fn structural_family_for_tests(
         nominal: &nominal,
         definition,
         depth: 0,
+        constraint: None,
         assumed: Vec::new(),
         schemes: HashMap::new(),
         locals: &mut locals,
@@ -1307,6 +1365,7 @@ fn callback_coverage_constraints(
             callback_rows(aliases, callback)
                 .into_iter()
                 .map(|required| Constraint {
+                    id: ConstraintId::pending(),
                     span,
                     kind: ConstraintKind::CallbackCoverage {
                         required,
@@ -1500,6 +1559,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
         // assumptions into later declarations.
         if !sat::satisfiable(&lowered.formula) {
             errors.push(Error {
+                id: ErrorId::pending(),
                 span: annotation.ty.span,
                 kind: ErrorKind::ClauseImpossible {
                     formula: crate::ui::in_labels(&lowered.formula, &lowered.names),
@@ -1510,16 +1570,21 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             polymorphic_extern_boundary(&aliases, &decl.value.abi, lowered.scheme.body())
         {
             errors.push(Error {
+                id: ErrorId::pending(),
                 span,
                 kind: ErrorKind::PolymorphicExternBoundary,
             });
         } else {
-            let (coverage, conditional) =
+            let (mut coverage, conditional) =
                 callback_coverage_constraints(&aliases, &decl.value.abi, &lowered.ty);
+            for constraint in &mut coverage {
+                constraint.id = table.constraint_id();
+            }
             if sat::entails(&lowered.formula, &conditional) {
                 extern_coverage.push((*symbol, coverage));
             } else {
                 errors.push(Error {
+                    id: ErrorId::pending(),
                     span: decl.value.abi.span,
                     kind: ErrorKind::CallbackEffectsNotCovered,
                 });
@@ -1550,6 +1615,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             nominal: &nominal,
             definition: symbol,
             depth: 0,
+            constraint: None,
             assumed: Vec::new(),
             schemes: HashMap::new(),
             locals: &mut locals,
@@ -1719,6 +1785,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 nominal: &nominal,
                 definition: scoped.symbol,
                 depth: 0,
+                constraint: None,
                 assumed: Vec::new(),
                 schemes: HashMap::new(),
                 locals: &mut locals,
@@ -1806,6 +1873,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 )
             {
                 errors.push(Error {
+                    id: ErrorId::pending(),
                     span: annotation.ty.span,
                     kind: ErrorKind::AnnotationAllows { allowed, required },
                 });
@@ -1833,6 +1901,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                     )
                 {
                     errors.push(Error {
+                        id: ErrorId::pending(),
                         span: annotated.span,
                         kind: ErrorKind::AnnotationAllows { allowed, required },
                     });
@@ -1908,6 +1977,13 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     schemes.sort_by(|one, _, other, _| position[one].cmp(&position[other]));
     constraints.sort_by(|one, _, other, _| position[one].cmp(&position[other]));
     promises.sort_by(|one, _, other, _| position[one].cmp(&position[other]));
+
+    // Error identity follows report order before the stable source sort. A
+    // speculative error has already been truncated at this point, so its
+    // pending value is never published or reused.
+    for error in &mut errors {
+        error.id = table.error_id();
+    }
 
     // Constraints are solved in the order the walk emitted them, which is not
     // quite the order anyone reads a file in — a body's demands come before
@@ -2019,12 +2095,37 @@ fn report_flip(table: &mut Table, errors: &mut Vec<Error>) {
         }
     };
     errors.push(Error {
+        id: ErrorId::pending(),
         span: batch.span,
         kind,
     });
 }
 
 impl Table {
+    fn constraint_id(&mut self) -> ConstraintId {
+        let id = ConstraintId(self.next_constraint_id);
+        self.next_constraint_id += 1;
+        id
+    }
+
+    fn step_id(&mut self) -> StepId {
+        let id = StepId(self.next_step_id);
+        self.next_step_id += 1;
+        id
+    }
+
+    fn error_id(&mut self) -> ErrorId {
+        let id = ErrorId(self.next_error_id);
+        self.next_error_id += 1;
+        id
+    }
+
+    fn batch_id(&mut self) -> BatchId {
+        let id = BatchId(self.next_batch_id);
+        self.next_batch_id += 1;
+        id
+    }
+
     /// What is known now, to be handed back to [`restore`](Self::restore) if
     /// what follows turns out not to have been asked.
     ///
@@ -2621,7 +2722,9 @@ impl Table {
     /// patterns phase asks its reachability questions of, whether or not the
     /// arms happened to relate anything.
     fn require(&mut self, span: Span, origin: Origin, formula: Formula) {
+        let id = self.batch_id();
         self.store.batches.push(Batch {
+            id,
             definition: self.definition,
             span,
             origin,
@@ -2669,6 +2772,7 @@ impl Table {
             .enumerate()
             .filter(|(at, _)| !self.empty_batches.contains(at))
             .map(|(_, batch)| Batch {
+                id: batch.id,
                 definition: batch.definition,
                 span: batch.span,
                 origin: self.settled_origin(&batch.origin),
@@ -3464,6 +3568,7 @@ impl Table {
             }
             let span = self.rigids[&id];
             errors.push(Error {
+                id: ErrorId::pending(),
                 span,
                 kind: ErrorKind::RigidEscapes { name },
             });
@@ -5937,5 +6042,23 @@ mod existential_regressions {
             .unwrap()
             .join()
             .expect("publication shift stays on its explicit stack");
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::Table;
+
+    #[test]
+    fn rollback_retires_allocated_identities_instead_of_reusing_them() {
+        let mut table = Table::default();
+        let known = table.snapshot();
+        let abandoned_step = table.step_id();
+        let abandoned_batch = table.batch_id();
+
+        table.restore(known);
+
+        assert_ne!(table.step_id(), abandoned_step);
+        assert_ne!(table.batch_id(), abandoned_batch);
     }
 }

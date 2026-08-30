@@ -578,6 +578,7 @@ fn a_constraint_reads_as_what_it_demands() {
     let span = Span::generated(0, 1);
 
     let equal = Constraint {
+        id: inference::ConstraintId::synthetic(0),
         span,
         kind: ConstraintKind::Equal {
             expected: nat.clone(),
@@ -626,11 +627,7 @@ fn every_inference_error_exposes_a_complete_structured_diagnostic() {
     assert_eq!(kinds.len(), 17);
 
     for kind in kinds {
-        let diagnostic = inference::Error {
-            span: use_span,
-            kind,
-        }
-        .diagnostic();
+        let diagnostic = inference::Error::new(use_span, kind).diagnostic();
         assert_eq!(diagnostic.primary.span, use_span, "{}", diagnostic.code);
         assert!(!diagnostic.code.is_empty());
         assert!(!diagnostic.title.is_empty(), "{}", diagnostic.code);
@@ -654,7 +651,7 @@ fn every_inference_error_exposes_a_complete_structured_diagnostic() {
 fn inference_diagnostic_prose_avoids_solver_jargon() {
     let span = Span::generated(0, 1);
     for kind in inference_error_kinds(span) {
-        let diagnostic = inference::Error { span, kind }.diagnostic();
+        let diagnostic = inference::Error::new(span, kind).diagnostic();
         let prose = std::iter::once(diagnostic.title.as_str())
             .chain(std::iter::once(diagnostic.primary.message.as_str()))
             .chain(diagnostic.related.iter().map(|note| note.message.as_str()))
@@ -715,15 +712,15 @@ fn rigid_field_diagnostics_name_the_caller_chosen_set_by_shape() {
         (Shape::Sum, "Some", "matches case", "cases"),
         (Shape::Effect, "Log", "requires effect", "effects"),
     ] {
-        let diagnostic = inference::Error {
-            span: use_span,
-            kind: TypeError::RigidField {
+        let diagnostic = inference::Error::new(
+            use_span,
+            TypeError::RigidField {
                 shape,
                 field: field.to_string(),
                 name: "r".into(),
                 declared,
             },
-        }
+        )
         .diagnostic();
 
         assert_eq!(diagnostic.code, "rigid-field");
@@ -2581,6 +2578,7 @@ fn the_scoping_constraints_read_as_what_they_do() {
     let symbol = mint.local(None, Namespace::Terms, "x");
 
     let bound = Constraint {
+        id: inference::ConstraintId::synthetic(0),
         span: Span::generated(0, 1),
         kind: ConstraintKind::Let {
             symbol,

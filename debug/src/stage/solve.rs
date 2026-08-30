@@ -47,6 +47,13 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                 .field("_rule", step.rule.to_string())
                 .field("_effect", effect.clone())
                 .field("_depth", step.depth.to_string())
+                .field("_step_id", step.id.get().to_string())
+                .field(
+                    "_constraint_id",
+                    step.constraint
+                        .map(|id| id.get().to_string())
+                        .unwrap_or_default(),
+                )
                 .field("_def", mint.name(step.definition).to_string());
 
             // The two fields the page accumulates, present only on the steps

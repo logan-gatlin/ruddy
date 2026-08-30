@@ -2400,6 +2400,46 @@ fn a_raw_dump_carries_only_its_own_tab() {
 }
 
 #[test]
+fn inference_stage_rows_serialize_compiler_identities() {
+    let snapshot = snapshot(
+        "extern choose: { left when 'a: Nat, right when 'b: Nat } where 'a != 'b = host.choose\n\
+         let picked = choose\n\
+         let bad = (1n).missing\n",
+    );
+    let stage = |id| snapshot.stages.iter().find(|stage| stage.id == id).unwrap();
+    let field = |node: &Node, name| {
+        node.fields
+            .iter()
+            .find(|field| field.name == name)
+            .map(|field| field.value.clone())
+    };
+
+    let constraint_ids: std::collections::HashSet<_> = nodes(stage("constraints"))
+        .into_iter()
+        .filter_map(|node| field(node, "_constraint_id"))
+        .collect();
+    assert!(!constraint_ids.is_empty());
+
+    let solve = nodes(stage("solve"));
+    let step_ids: std::collections::HashSet<_> = solve
+        .iter()
+        .filter_map(|node| field(node, "_step_id"))
+        .collect();
+    assert_eq!(step_ids.len(), solve.len());
+    assert!(
+        solve.iter().all(
+            |node| field(node, "_constraint_id").is_some_and(|id| constraint_ids.contains(&id))
+        )
+    );
+
+    let batches = nodes(stage("presence"))
+        .into_iter()
+        .filter_map(|node| field(node, "_batch_id"))
+        .collect::<std::collections::HashSet<_>>();
+    assert!(!batches.is_empty());
+}
+
+#[test]
 fn the_types_raw_dump_asserts_package_and_owned_metadata() {
     let snapshot = snapshot(
         "extern choose: { left when 'a: Nat, right when 'b: Nat } where 'a != 'b = host.choose\n",

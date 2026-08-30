@@ -15,9 +15,9 @@ use crate::{
 };
 
 use super::{
-    Batch, Constraint, ConstraintKind, DeferredRequirement, Effect, Error, ErrorKind, Goal,
-    GuardedArm, GuardedObligation, GuardedOrigin, Known, Named, Origin, Refinement, RefinementFact,
-    Rule, Side, Slot, Step, Table,
+    Batch, Constraint, ConstraintKind, DeferredRequirement, Effect, Error, ErrorId, ErrorKind,
+    Goal, GuardedArm, GuardedObligation, GuardedOrigin, Known, Named, Origin, Refinement,
+    RefinementFact, Rule, Side, Slot, Step, Table,
 };
 
 /// What a set of labels says about the ones it does not name.
@@ -301,6 +301,9 @@ pub struct Solve<'a> {
     pub definition: Symbol,
     /// How deep inside a decomposition the solver currently is.
     pub depth: u32,
+    /// Constraint currently being expanded; absent for work started directly
+    /// at a non-constraint boundary.
+    pub constraint: Option<super::ConstraintId>,
     /// The goals about two declared types that the goals currently open were
     /// reached by unfolding, innermost last.
     ///
@@ -341,6 +344,7 @@ impl Solve<'_> {
     /// nothing has to wait for a later round to know what its base is.
     pub fn run(&mut self, constraints: &[Constraint]) {
         for constraint in constraints {
+            let previous = self.constraint.replace(constraint.id);
             let span = constraint.span;
             match &constraint.kind {
                 ConstraintKind::Project {
@@ -396,6 +400,7 @@ impl Solve<'_> {
                     }
                 }
             }
+            self.constraint = previous;
         }
     }
 
@@ -423,6 +428,7 @@ impl Solve<'_> {
                     actual: exposed.clone(),
                 };
                 let error = Error {
+                    id: ErrorId::pending(),
                     span: base_span,
                     kind: ErrorKind::NotAStruct { base: exposed },
                 };
@@ -436,6 +442,7 @@ impl Solve<'_> {
             }
             Ty::Rigid { id, name } => {
                 let error = Error {
+                    id: ErrorId::pending(),
                     span: field_span,
                     kind: ErrorKind::RigidField {
                         shape: Shape::Struct,
@@ -1145,6 +1152,7 @@ impl Solve<'_> {
             formula.clone(),
         );
         Batch {
+            id: batch.id,
             definition: batch.definition,
             span: batch.span,
             origin,
@@ -1211,7 +1219,17 @@ impl Solve<'_> {
                 false => ErrorKind::Unhandled { effect },
             };
             let abandoned = [Assigned::Row(Rc::new(want.clone()))];
-            self.fail(span, Rule::Performs, goal, Error { span, kind }, &abandoned);
+            self.fail(
+                span,
+                Rule::Performs,
+                goal,
+                Error {
+                    id: ErrorId::pending(),
+                    span,
+                    kind,
+                },
+                &abandoned,
+            );
             return;
         }
         // A closed row is opened with a fresh tail, which is what makes the row
@@ -1352,7 +1370,9 @@ impl Solve<'_> {
             Some(mut batch) => {
                 // Application generation may have aimed the reserved slot at
                 // the argument; retain that source attribution.
-                batch.span = self.table.store.batches[requirement].span;
+                let reserved = &self.table.store.batches[requirement];
+                batch.id = reserved.id;
+                batch.span = reserved.span;
                 let replacement = self.guarded_batch(batch);
                 self.table.store.batches[requirement] = replacement;
             }
@@ -1952,6 +1972,7 @@ impl Solve<'_> {
         found: &Rc<Ty>,
     ) -> bool {
         let error = Error {
+            id: ErrorId::pending(),
             span,
             kind: ErrorKind::RigidBroken {
                 found: found.clone(),
@@ -1967,6 +1988,7 @@ impl Solve<'_> {
 
     fn mismatch(&mut self, span: Span, goal: Goal, lhs: &Rc<Ty>, rhs: &Rc<Ty>) -> bool {
         let error = Error {
+            id: ErrorId::pending(),
             span,
             kind: ErrorKind::Mismatch {
                 expected: lhs.clone(),
@@ -2034,6 +2056,7 @@ impl Solve<'_> {
                 only_have.clear();
             } else {
                 let error = Error {
+                    id: ErrorId::pending(),
                     span,
                     kind: ErrorKind::Recursive,
                 };
@@ -2283,7 +2306,11 @@ impl Solve<'_> {
                     span,
                     Rule::Presence { shape },
                     goal,
-                    Error { span, kind },
+                    Error {
+                        id: ErrorId::pending(),
+                        span,
+                        kind,
+                    },
                     &abandoned,
                 );
                 None
@@ -2533,6 +2560,7 @@ impl Solve<'_> {
             // it settles absent below, the one answer the promise leaves open.
             if let (Presence::Present, Some((rigid, id))) = (&presence, &rigid) {
                 let error = Error {
+                    id: ErrorId::pending(),
                     span,
                     kind: ErrorKind::RigidField {
                         shape,
@@ -2565,7 +2593,11 @@ impl Solve<'_> {
                         base: self.frozen(base),
                         field: name.clone(),
                     };
-                    let error = Error { span, kind };
+                    let error = Error {
+                        id: ErrorId::pending(),
+                        span,
+                        kind,
+                    };
                     let abandoned = [Assigned::Ty(field.ty.clone())];
                     self.fail(span, Rule::Presence { shape }, goal, error, &abandoned);
                 }
@@ -2579,7 +2611,11 @@ impl Solve<'_> {
                         base: self.frozen(base),
                         field: name.clone(),
                     };
-                    let error = Error { span, kind };
+                    let error = Error {
+                        id: ErrorId::pending(),
+                        span,
+                        kind,
+                    };
                     let abandoned = [Assigned::Ty(field.ty.clone())];
                     self.fail(span, Rule::Presence { shape }, goal, error, &abandoned);
                 }
@@ -2634,6 +2670,7 @@ impl Solve<'_> {
     fn assign(&mut self, span: Span, goal: Goal, var: TyVar, value: Assigned) {
         if self.table.occurs(var, &value) {
             let error = Error {
+                id: ErrorId::pending(),
                 span,
                 kind: ErrorKind::Recursive,
             };
@@ -2664,6 +2701,7 @@ impl Solve<'_> {
                 .find(|(_, presence)| matches!(presence, Presence::Present))
             {
                 let error = Error {
+                    id: ErrorId::pending(),
                     span,
                     kind: ErrorKind::RepeatedField {
                         shape,
@@ -3019,7 +3057,10 @@ impl Solve<'_> {
     }
 
     fn step(&mut self, span: Span, rule: Rule, goal: Goal, effect: Effect) {
+        let id = self.table.step_id();
         self.steps.push(Step {
+            id,
+            constraint: self.constraint,
             definition: self.definition,
             span,
             depth: self.depth,

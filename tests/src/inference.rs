@@ -8324,3 +8324,39 @@ fn explicit_variant_edges_are_solved_in_both_directions() {
         );
     }
 }
+
+#[test]
+fn inference_records_have_stable_direct_identities() {
+    use std::collections::HashSet;
+
+    let (_, _, output) = infer_src("let bad = (1n).missing");
+    let constraint_ids: HashSet<_> = output
+        .constraints
+        .values()
+        .flatten()
+        .map(|constraint| constraint.id)
+        .collect();
+    assert!(!constraint_ids.is_empty());
+
+    let step_ids: HashSet<_> = output.steps.iter().map(|step| step.id).collect();
+    assert_eq!(step_ids.len(), output.steps.len());
+    assert!(output.steps.iter().all(|step| {
+        step.constraint
+            .is_none_or(|constraint| constraint_ids.contains(&constraint))
+    }));
+
+    let batch_ids: HashSet<_> = output.store.batches.iter().map(|batch| batch.id).collect();
+    assert_eq!(batch_ids.len(), output.store.batches.len());
+
+    let error_ids: HashSet<_> = output.errors.iter().map(|error| error.id).collect();
+    assert_eq!(error_ids.len(), output.errors.len());
+    assert!(output.errors.iter().all(|error| error.id.get() != u64::MAX));
+}
+
+#[test]
+fn source_sorting_moves_errors_without_renumbering_their_identities() {
+    let (_, _, output) = infer_src("let a = { dep: b, bad: (true).missing }\nlet b = (1n).missing");
+    assert_eq!(output.errors.len(), 2, "{:#?}", output.errors);
+    assert!(output.errors[0].span.start < output.errors[1].span.start);
+    assert!(output.errors[0].id.get() > output.errors[1].id.get());
+}

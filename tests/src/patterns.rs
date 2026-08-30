@@ -181,6 +181,7 @@ fn unrelated_same_span_batches_do_not_hide_match_coverage() {
         altered.store.batches.insert(
             0,
             inference::Batch {
+                id: inference::BatchId::synthetic(0),
                 definition,
                 span,
                 origin,
