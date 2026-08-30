@@ -1916,6 +1916,13 @@ fn smallest_incompatible(
 
         let descriptions = (describe_type(&left), describe_type(&right));
         fallback = descriptions;
+        // A name left here has no declaration we can honestly inspect. Even
+        // when both sides spell the same name, its arguments are not known to
+        // be the declaration's semantic parameters, so they cannot supply a
+        // more specific mismatch.
+        if matches!(&*left, Ty::Named { .. }) || matches!(&*right, Ty::Named { .. }) {
+            return descriptions;
+        }
         match (&*left, &*right) {
             (Ty::Arrow(l_from, l_to, l_effects), Ty::Arrow(r_from, r_to, r_effects)) => {
                 push_row_payloads(&mut work, l_effects, r_effects);
@@ -1927,22 +1934,6 @@ fn smallest_incompatible(
                 push_row_payloads(&mut work, left, right);
                 if left.labels.keys().ne(right.labels.keys()) {
                     return descriptions;
-                }
-            }
-            (
-                Ty::Named {
-                    symbol: l_symbol,
-                    args: l_args,
-                    ..
-                },
-                Ty::Named {
-                    symbol: r_symbol,
-                    args: r_args,
-                    ..
-                },
-            ) if l_symbol == r_symbol && l_args.len() == r_args.len() => {
-                for (left, right) in l_args.iter().zip(r_args.iter()).rev() {
-                    work.push((left.clone(), right.clone()));
                 }
             }
             (Ty::Nat, Ty::Nat)
@@ -7111,21 +7102,43 @@ mod existential_regressions {
 
         let missing_left = mint.global(None, Namespace::Types, "MissingLeft").unwrap();
         let missing_right = mint.global(None, Namespace::Types, "MissingRight").unwrap();
-        let missing = |symbol, name: &'static str| {
+        let missing = |symbol, name: &'static str, args: Rc<[Rc<Ty>]>| {
             Rc::new(Ty::Named {
                 symbol,
                 name: name.into(),
-                args: Rc::from([]),
+                args,
             })
         };
         assert_eq!(
             smallest_incompatible(
                 &aliases,
-                &missing(missing_left, "MissingLeft"),
-                &missing(missing_right, "MissingRight"),
+                &missing(missing_left, "MissingLeft", Rc::from([])),
+                &missing(missing_right, "MissingRight", Rc::from([])),
             ),
             (TypeDescription::DeclaredType, TypeDescription::DeclaredType),
             "missing semantic definitions must keep the declared-type fallback"
+        );
+        assert_eq!(
+            smallest_incompatible(
+                &aliases,
+                &missing(missing_left, "MissingLeft", Rc::from([Rc::new(Ty::Nat)])),
+                &missing(
+                    missing_left,
+                    "MissingLeft",
+                    Rc::from([Rc::new(Ty::Boolean)]),
+                ),
+            ),
+            (TypeDescription::DeclaredType, TypeDescription::DeclaredType),
+            "arguments of the same unavailable alias have no honest semantics"
+        );
+        assert_eq!(
+            smallest_incompatible(
+                &aliases,
+                &missing(missing_left, "MissingLeft", Rc::from([Rc::new(Ty::Nat)])),
+                &Rc::new(Ty::Boolean),
+            ),
+            (TypeDescription::DeclaredType, TypeDescription::Boolean),
+            "one unavailable alias must remain declared without hiding the other side"
         );
     }
 
