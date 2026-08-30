@@ -2650,6 +2650,14 @@ fn attach_ordinary_explanations(
             ErrorCause::Step(id) => steps.get(&id).map(|step| step.reason),
             ErrorCause::Batch(_) | ErrorCause::Direct => None,
         };
+        let repeated_origins = match &error.kind {
+            ErrorKind::RepeatedField {
+                introduction,
+                forbidden,
+                ..
+            } => Some((introduction.as_ref(), forbidden.as_ref())),
+            _ => None,
+        };
 
         // Iterative, parent-order DFS. IDs are immutable and parents precede
         // children, so this is deterministic even when bindings share causes.
@@ -2719,35 +2727,25 @@ fn attach_ordinary_explanations(
                 // range even when no independently written second operand exists.
                 endpoints[0].1 = Some(constraint.span);
             }
-            for (subject, span, side) in endpoints {
+            for &(subject, span, side) in &endpoints {
                 let Some(span) = span else { continue };
                 let payload = if kind == Some(ContradictionKind::RepeatedLabel) {
-                    // An effects application explicitly carries both resolved
-                    // endpoints. Other exact introduction/forbidden evidence is
-                    // overlaid below; intermediates keep a neutral payload.
-                    match (&constraint.kind, subject) {
-                        (
-                            ConstraintKind::Performs {
-                                ambient_label_spans,
-                                ..
-                            },
-                            Subject::PerformedEffects,
-                        ) if row
-                            .as_ref()
-                            .is_some_and(|row| ambient_label_spans.contains_key(&row.label)) =>
-                        {
+                    // A same-label effects application can be an intermediate in
+                    // another repeated-effect path. Assign endpoint roles only
+                    // when every available piece of row-fact provenance agrees;
+                    // label membership alone is not causal evidence.
+                    let matches = |origin: &RowFactOrigin| {
+                        origin.constraint == *id
+                            && origin.reason == constraint.reason
+                            && origin.origin == constraint.origin
+                            && origin.subject == subject
+                            && origin.span == span
+                    };
+                    match repeated_origins {
+                        Some((Some(introduction), _)) if matches(introduction) => {
                             ExplanationFactPayload::LabelIntroduction
                         }
-                        (
-                            ConstraintKind::Performs {
-                                ambient_label_spans,
-                                ..
-                            },
-                            Subject::AmbientEffects,
-                        ) if row
-                            .as_ref()
-                            .is_some_and(|row| ambient_label_spans.contains_key(&row.label)) =>
-                        {
+                        Some((_, Some(forbidden))) if matches(forbidden) => {
                             ExplanationFactPayload::LabelForbidden
                         }
                         _ => ExplanationFactPayload::RequiresType,

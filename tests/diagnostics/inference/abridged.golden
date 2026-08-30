@@ -78,11 +78,9 @@ help: remove case `#A` from the named side
 help: or keep it out of the `..` remainder
 
 ## repeated-field-effect
-[repeated-field] effect `!Log` cannot be both named and included by `..`
-primary: this use introduces effect `!Log`
-related: this `..` remainder already follows named effect `!Log`
-help: remove effect `!Log` from the named side
-help: or keep it out of the `..` remainder
+[repeated-field] `..` covers only the effects a type does not already name, and here it would have to cover `!Log`
+primary: effect `!Log` is already named outside `..`
+help: remove the repeated effect, or remove it from the remainder
 
 ## presence-required
 [presence-required] this value needs `x != y` among its fields, and it does not have that

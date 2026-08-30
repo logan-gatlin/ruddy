@@ -912,11 +912,6 @@ fn row_explanations_keep_both_source_sides_and_normalize_solver_direction() {
             109..116,
             103..108,
         ),
-        (
-            include_str!("../diagnostics/inference/repeated-field-effect.hc"),
-            96..108,
-            80..84,
-        ),
     ] {
         let errors = inference_fixture_errors(source);
         let [error] = errors.as_slice() else {
@@ -952,6 +947,17 @@ fn row_explanations_keep_both_source_sides_and_normalize_solver_direction() {
         assert!(selected.contains(&inference::ExplanationFactPayload::LabelIntroduction));
         assert!(selected.contains(&inference::ExplanationFactPayload::LabelForbidden));
     }
+
+    let errors = inference_fixture_errors(include_str!(
+        "../diagnostics/inference/repeated-field-effect.hc"
+    ));
+    let [effect_error] = errors.as_slice() else {
+        panic!("repeated effect fixture must have one error: {errors:#?}");
+    };
+    assert!(
+        effect_error.explanation.is_none(),
+        "a repeated effect without an exact forbidden origin must not invent one: {effect_error:#?}"
+    );
 
     // A genuinely deep tail-binding chain, rather than one wide row, keeps
     // provenance iterative and parents the original lack through every hop.
@@ -1018,7 +1024,7 @@ fn repeated_labels_keep_the_full_intermediate_path_and_exact_endpoints() {
 }
 
 #[test]
-fn unrelated_performed_calls_do_not_claim_repeated_label_introduction() {
+fn same_label_performs_facts_do_not_invent_repeated_endpoints() {
     let source = concat!(
         "effect Log = { write: Nat -> () }\n",
         "effect Tick = { tick: () -> () }\n",
@@ -1028,24 +1034,84 @@ fn unrelated_performed_calls_do_not_claim_repeated_label_introduction() {
     );
     let errors = inference_fixture_errors(source);
     let [error] = errors.as_slice() else {
-        panic!("unrelated performed-call fixture must have one error: {errors:#?}");
+        panic!("same-label intermediate fixture must have one error: {errors:#?}");
+    };
+    let inference::ErrorKind::RepeatedField {
+        introduction: Some(introduction),
+        forbidden,
+        ..
+    } = &error.kind
+    else {
+        panic!("same-label intermediate must retain its exact origin: {error:#?}");
+    };
+    assert_eq!(introduction.span.start..introduction.span.end(), 190..202);
+    assert!(forbidden.is_none());
+    assert!(
+        error.explanation.is_none(),
+        "an unrelated same-!Log Performs fact must not fabricate the missing endpoint: {error:#?}"
+    );
+}
+
+#[test]
+fn repeated_effects_keep_full_facts_and_exact_abridged_endpoints() {
+    let source = concat!(
+        "effect Log = { write: Nat -> () }\n",
+        "let split : (() -> () + !Log + ..'r) -> (() -> () + ..'r) -> Nat = fn whole => fn rest => 0n\n",
+        "let bad = fn action => split action (fn _ => !Log.write 0n)\n",
+    );
+    let errors = inference_fixture_errors(source);
+    let [error] = errors.as_slice() else {
+        panic!("exact repeated-effect fixture must have one error: {errors:#?}");
     };
     let explanation = error.explanation.as_ref().expect("repeated effect cause");
-    let introductions: Vec<_> = explanation
+    let facts: Vec<_> = explanation
         .full_facts
         .iter()
-        .filter(|fact| fact.payload == inference::ExplanationFactPayload::LabelIntroduction)
+        .map(|fact| {
+            (
+                fact.span.start..fact.span.end(),
+                fact.origin,
+                fact.subject,
+                fact.payload,
+            )
+        })
         .collect();
-    assert_eq!(introductions.len(), 1, "{explanation:#?}");
     assert_eq!(
-        introductions[0].span.start..introductions[0].span.end(),
-        131..203
+        facts,
+        [
+            (
+                150..162,
+                inference::ConstraintOrigin::ApplicationArgument,
+                inference::Subject::Parameter,
+                inference::ExplanationFactPayload::RequiresType,
+            ),
+            (
+                167..185,
+                inference::ConstraintOrigin::ApplicationArgument,
+                inference::Subject::Argument,
+                inference::ExplanationFactPayload::RequiresType,
+            ),
+            (
+                150..155,
+                inference::ConstraintOrigin::ApplicationArgument,
+                inference::Subject::Parameter,
+                inference::ExplanationFactPayload::RequiresType,
+            ),
+            (
+                156..162,
+                inference::ConstraintOrigin::ApplicationArgument,
+                inference::Subject::Argument,
+                inference::ExplanationFactPayload::LabelForbidden,
+            ),
+            (
+                172..185,
+                inference::ConstraintOrigin::ApplicationEffects,
+                inference::Subject::PerformedEffects,
+                inference::ExplanationFactPayload::LabelIntroduction,
+            ),
+        ]
     );
-    assert!(explanation.full_facts.iter().any(|fact| {
-        (fact.span.start..fact.span.end()) == (190..202)
-            && fact.subject == inference::Subject::PerformedEffects
-            && fact.payload == inference::ExplanationFactPayload::RequiresType
-    }));
+    assert_eq!(explanation.abridged, [3, 4]);
 }
 
 #[test]
