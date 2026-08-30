@@ -1891,6 +1891,7 @@ struct MismatchWork {
     right: Rc<Ty>,
     alias_path: Option<usize>,
     alias_work: usize,
+    root: bool,
 }
 
 struct AliasGoal {
@@ -2173,8 +2174,11 @@ fn smallest_incompatible_counted_with_mask(
         right: right.clone(),
         alias_path: None,
         alias_work: MAX_ALIAS_WORK,
+        root: true,
     }];
     let fallback = (describe_type(left), describe_type(right));
+    let mut unfolded_fallback = None;
+    let mut incomplete_alias_walk = false;
     // Recursive declarations return to the same applications. Arguments are
     // part of the goal: the same pair of names can occur at independent
     // substitutions in sibling fields, and suppressing one must not suppress
@@ -2195,6 +2199,7 @@ fn smallest_incompatible_counted_with_mask(
         mut right,
         mut alias_path,
         mut alias_work,
+        root,
     }) = work.pop()
     {
         while let Ty::Package(inner) = &*left {
@@ -2242,11 +2247,13 @@ fn smallest_incompatible_counted_with_mask(
                 .into();
             let Some(left_fingerprint) = fingerprints.arguments(&left_args, &mut alias_work) else {
                 *operations += MAX_ALIAS_WORK - alias_work;
+                incomplete_alias_walk = true;
                 continue;
             };
             let Some(right_fingerprint) = fingerprints.arguments(&right_args, &mut alias_work)
             else {
                 *operations += MAX_ALIAS_WORK - alias_work;
+                incomplete_alias_walk = true;
                 continue;
             };
             let mut goal_hash = DefaultHasher::new();
@@ -2291,6 +2298,7 @@ fn smallest_incompatible_counted_with_mask(
             let depth = alias_path.map_or(0, |index| alias_goals[index].depth);
             if seen || alias_work == 0 {
                 *operations += MAX_ALIAS_WORK - alias_work;
+                incomplete_alias_walk = true;
                 continue;
             }
             alias_goals.push(AliasGoal {
@@ -2310,8 +2318,38 @@ fn smallest_incompatible_counted_with_mask(
         if matches!(&*right, Ty::Named { symbol, .. } if aliases.contains_key(symbol)) {
             right = unfold(aliases, &right);
         }
+        // An alias may publish a packaged container. Packages are transparent
+        // to mismatch structure, including when they only become visible after
+        // opening the declaration.
+        while let Ty::Package(inner) = &*left {
+            left = inner.clone();
+        }
+        while let Ty::Package(inner) = &*right {
+            right = inner.clone();
+        }
 
         let descriptions = (describe_type(&left), describe_type(&right));
+        // The input pair is known to be incompatible. Once its declarations
+        // have been opened, their semantic container is the honest fallback if
+        // payload walking finds no narrower leaf (for example, an arrow whose
+        // only disagreement is its effect row). Child jobs are not themselves
+        // known to be incompatible, so they must not replace this root fallback
+        // merely because an equal child also happens to be an alias.
+        if root
+            && matches!(
+                descriptions,
+                (
+                    TypeDescription::Function
+                        | TypeDescription::Struct
+                        | TypeDescription::TaggedValue,
+                    TypeDescription::Function
+                        | TypeDescription::Struct
+                        | TypeDescription::TaggedValue
+                )
+            )
+        {
+            unfolded_fallback = Some(descriptions);
+        }
         // A name left here has no declaration we can honestly inspect. Even
         // when both sides spell the same name, its arguments are not known to
         // be the declaration's semantic parameters, so they cannot supply a
@@ -2339,12 +2377,14 @@ fn smallest_incompatible_counted_with_mask(
                     right: r_to.clone(),
                     alias_path,
                     alias_work,
+                    root: false,
                 });
                 work.push(MismatchWork {
                     left: l_from.clone(),
                     right: r_from.clone(),
                     alias_path,
                     alias_work,
+                    root: false,
                 });
             }
             (Ty::Struct(left), Ty::Struct(right)) | (Ty::Sum(left), Ty::Sum(right)) => {
@@ -2364,7 +2404,11 @@ fn smallest_incompatible_counted_with_mask(
             _ => return descriptions,
         }
     }
-    fallback
+    if incomplete_alias_walk {
+        fallback
+    } else {
+        unfolded_fallback.unwrap_or(fallback)
+    }
 }
 
 /// Remove head aliases that only select one of their arguments. This consumes
@@ -2464,6 +2508,7 @@ fn push_row_payloads(
             right,
             alias_path,
             alias_work: *alias_work,
+            root: false,
         });
     }
     true
@@ -7643,6 +7688,139 @@ mod existential_regressions {
             ),
             (TypeDescription::DeclaredType, TypeDescription::Boolean),
             "one unavailable alias must remain declared without hiding the other side"
+        );
+    }
+
+    #[test]
+    fn mismatch_alias_function_keeps_unfolded_fallback_for_effect_disagreement() {
+        use crate::symbol::{Bundle, Mint, Namespace, Version};
+
+        let bundle = Bundle::new("function-fallback", Version::new(1, 0, 0)).unwrap();
+        let mut mint = Mint::new(bundle);
+        let left_name = mint.global(None, Namespace::Types, "Left").unwrap();
+        let right_name = mint.global(None, Namespace::Types, "Right").unwrap();
+        let unit = Rc::new(Ty::unit());
+        let arrow = |effect: &'static str| {
+            Rc::new(Ty::Arrow(
+                unit.clone(),
+                unit.clone(),
+                Row {
+                    labels: [(effect.into(), RowField::present(Rc::new(Ty::unit())))]
+                        .into_iter()
+                        .collect(),
+                    rest: Rest::Closed,
+                },
+            ))
+        };
+        let aliases = [
+            (left_name, Scheme::new(0, arrow("read"))),
+            (right_name, Scheme::new(0, arrow("write"))),
+        ]
+        .into_iter()
+        .collect();
+        let named = |symbol, name: &'static str| {
+            Rc::new(Ty::Named {
+                symbol,
+                name: name.into(),
+                args: Rc::from([]),
+            })
+        };
+
+        assert_eq!(
+            smallest_incompatible(
+                &aliases,
+                &named(left_name, "Left"),
+                &named(right_name, "Right"),
+            ),
+            (TypeDescription::Function, TypeDescription::Function),
+            "an effect-only disagreement must not fall back to the aliases' spelling"
+        );
+    }
+
+    #[test]
+    fn mismatch_alias_containers_keep_unfolded_fallback_without_payload_leaf() {
+        use crate::symbol::{Bundle, Mint, Namespace, Version};
+
+        let bundle = Bundle::new("container-fallback", Version::new(1, 0, 0)).unwrap();
+        let mut mint = Mint::new(bundle);
+        let struct_left = mint.global(None, Namespace::Types, "StructLeft").unwrap();
+        let struct_right = mint.global(None, Namespace::Types, "StructRight").unwrap();
+        let sum_left = mint.global(None, Namespace::Types, "SumLeft").unwrap();
+        let sum_right = mint.global(None, Namespace::Types, "SumRight").unwrap();
+        let hidden_row = |presence, ty| Row {
+            labels: [(
+                "hidden".into(),
+                RowField {
+                    presence,
+                    ty: Rc::new(ty),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            rest: Rest::Closed,
+        };
+        let aliases = [
+            (
+                struct_left,
+                Scheme::new(
+                    0,
+                    Rc::new(Ty::Struct(hidden_row(Presence::Absent, Ty::Nat))),
+                ),
+            ),
+            (
+                struct_right,
+                Scheme::new(
+                    0,
+                    Rc::new(Ty::Struct(hidden_row(Presence::Absent, Ty::Boolean))),
+                ),
+            ),
+            (
+                sum_left,
+                Scheme::new(
+                    0,
+                    Rc::new(Ty::Package(Rc::new(Ty::Sum(hidden_row(
+                        Presence::Recovered(1),
+                        Ty::Nat,
+                    ))))),
+                ),
+            ),
+            (
+                sum_right,
+                Scheme::new(
+                    0,
+                    Rc::new(Ty::Package(Rc::new(Ty::Sum(hidden_row(
+                        Presence::Recovered(1),
+                        Ty::Boolean,
+                    ))))),
+                ),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let named = |symbol, name: &'static str| {
+            Rc::new(Ty::Named {
+                symbol,
+                name: name.into(),
+                args: Rc::from([]),
+            })
+        };
+
+        assert_eq!(
+            smallest_incompatible(
+                &aliases,
+                &named(struct_left, "StructLeft"),
+                &named(struct_right, "StructRight"),
+            ),
+            (TypeDescription::Struct, TypeDescription::Struct)
+        );
+        assert_eq!(
+            smallest_incompatible(
+                &aliases,
+                &named(sum_left, "SumLeft"),
+                &named(sum_right, "SumRight"),
+            ),
+            (TypeDescription::TaggedValue, TypeDescription::TaggedValue),
+            "packages exposed by aliases must remain transparent while preserving the sum fallback"
         );
     }
 
