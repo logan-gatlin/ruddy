@@ -1,0 +1,138 @@
+## not-a-struct
+[not-a-struct] `Nat` is not a struct, so it has no fields to read
+primary: this field access requires a struct
+help: change this value to a struct, or change/remove the field access
+
+## type-mismatch
+[type-mismatch] type mismatch: expected `Nat`, found `()`
+primary: these two uses require incompatible types
+help: change either use so both require the same type
+
+## recursive-type
+[recursive-type] this type would have to contain itself
+primary: this use makes the type refer back to itself
+help: remove the self-reference or introduce a finite wrapper type
+
+## missing-field
+[missing-field] no field `y` on `{ x: Nat }`
+primary: this requires field `y`
+help: add field `y`, or change the use that requires it
+
+## extra-field-struct
+[extra-field] extra field `y`: the type `{ x: Nat }` lists every field it allows
+primary: this introduces field `y` where it is not allowed
+help: remove field `y`, or allow it in the other type
+
+## extra-field-sum
+[extra-field] extra case `#None`: the type `#Some Nat` lists every case it allows
+primary: this introduces case `#None` where it is not allowed
+help: remove case `#None`, or allow it in the other type
+
+## rigid-broken
+[rigid-broken] this is `{ value: Nat }`, but `'a` stands for whatever type the caller picks
+primary: this use narrows a choice that belongs to the caller
+related: declared here
+help: change the body so it works for every choice allowed by the annotation
+
+## rigid-field-struct
+[rigid-field] this reads field `x`, but `'a` stands for whatever other struct fields the caller chooses, so `x` cannot be assumed
+primary: this assumes one of the struct fields chosen by the caller
+related: the caller's choice of struct fields starts here
+help: change the body so it does not assume which struct fields the caller chooses
+
+## rigid-field-sum
+[rigid-field] this matches case `#B`, but `'r` stands for whatever other cases the caller chooses, so `#B` cannot be assumed
+primary: this assumes one of the cases chosen by the caller
+related: the caller's choice of cases starts here
+help: change the body so it does not assume which cases the caller chooses
+
+## rigid-field-effect
+[rigid-field] this requires effect `!Log`, but `'effects` stands for whatever other effects the caller chooses, so `!Log` cannot be assumed
+primary: this assumes one of the effects chosen by the caller
+related: the caller's choice of effects starts here
+help: change the body so it does not assume which effects the caller chooses
+
+## rigid-escapes
+[rigid-escapes] `'a` stands for whatever the caller picks, so it can't be part of a type outside the annotation that declared it
+primary: this type carries a caller choice outside its annotation
+help: keep the value inside the annotation that introduces this choice
+
+## repeated-field-struct
+[repeated-field] `..` covers only the fields a type does not already name, and here it would have to cover `x`
+primary: field `x` is already named outside `..`
+help: remove the repeated field, or remove it from the remainder
+
+## repeated-field-sum
+[repeated-field] `..` covers only the cases a type does not already name, and here it would have to cover `#A`
+primary: case `#A` is already named outside `..`
+help: remove the repeated case, or remove it from the remainder
+
+## repeated-field-effect
+[repeated-field] `..` covers only the effects a type does not already name, and here it would have to cover `!Log`
+primary: effect `!Log` is already named outside `..`
+help: remove the repeated effect, or remove it from the remainder
+
+## presence-required
+[presence-required] this value needs `x != y` among its fields, and it does not have that
+primary: this value does not meet the required combination
+help: change the value or loosen the required combination
+
+## presence-impossible
+[presence-impossible] nothing can satisfy `'x != 'y`: what this definition does with the type has already ruled it out
+primary: the annotation and definition rule out every combination
+help: change the annotation or change how the definition uses the value
+
+## clause-impossible
+[clause-impossible] nothing can satisfy `'x and not 'x`: this clause rules out every value at once
+primary: this clause rules out every combination
+help: remove one of the conflicting requirements in this clause
+
+## annotation-allows-more
+[annotation-allows-more] the annotation allows `'x or 'y`, but the definition requires `'x != 'y`
+primary: this annotation promises more combinations than the body accepts
+help: strengthen the annotation or loosen the body
+
+## unhandled-effect
+[unhandled-effect] nothing can handle `!Log` here: a definition's value is computed outside every handler
+primary: effect `!Log` has no enclosing handler
+help: handle this effect, or perform it inside a function
+
+## effect-not-allowed
+[effect-not-allowed] this function performs `!Log`, which its type does not allow
+primary: effect `!Log` is not listed by this function
+help: add the effect to the function type, or handle it here
+
+## callback-effects-not-covered
+[callback-effects-not-covered] this callback may perform effects the containing extern call does not allow
+primary: this callback may perform effects the extern call does not allow
+help: allow those effects on the extern call, or handle them inside the callback
+
+## polymorphic-extern-boundary
+[polymorphic-extern-boundary] host code needs one fixed kind of value at this extern position
+primary: host code needs one fixed kind of value at this position
+help: use a fixed type here, or keep the generic value behind a Ruddy wrapper
+
+## repeated-calls
+[type-mismatch] type mismatch: expected `Nat`, found `()`
+primary: these two uses require incompatible types
+help: change either use so both require the same type
+
+## branches
+[type-mismatch] type mismatch: expected `Nat`, found `()`
+primary: these two uses require incompatible types
+help: change either use so both require the same type
+
+## non-function
+[type-mismatch] type mismatch: expected `? -> ?`, found `Nat`
+primary: these two uses require incompatible types
+help: change either use so both require the same type
+
+## cross-definition
+[type-mismatch] type mismatch: expected `Nat`, found `()`
+primary: these two uses require incompatible types
+help: change either use so both require the same type
+
+## long-alias
+[type-mismatch] type mismatch: expected `Nat`, found `()`
+primary: these two uses require incompatible types
+help: change either use so both require the same type

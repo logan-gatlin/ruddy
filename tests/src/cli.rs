@@ -48,6 +48,39 @@ fn error(directory: &TempDir) -> String {
 }
 
 #[test]
+fn inference_diagnostics_keep_the_shared_structured_fields_at_the_cli_boundary() {
+    let directory = tempfile::tempdir().unwrap();
+    write_project(directory.path(), "diagnostics", "0.1.0", &[]);
+    fs::write(
+        directory.path().join("main.hc"),
+        include_str!("../diagnostics/inference/rigid-field-struct.hc"),
+    )
+    .unwrap();
+    let failure = compile(directory.path()).expect_err("the fixture does not type-check");
+    let [diagnostic] = failure.diagnostics() else {
+        panic!("expected one diagnostic: {failure}");
+    };
+    assert_eq!(diagnostic.code(), "rigid-field");
+    assert_eq!(
+        diagnostic.message(),
+        "this reads field `x`, but `'a` stands for whatever other struct fields the caller chooses, so `x` cannot be assumed"
+    );
+    assert_eq!(
+        diagnostic.help(),
+        ["change the body so it does not assume which struct fields the caller chooses"]
+    );
+    let rendered = diagnostic.render(false);
+    assert!(
+        rendered.contains("this assumes one of the struct fields chosen by the caller"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("the caller's choice of struct fields starts here"),
+        "{rendered}"
+    );
+}
+
+#[test]
 fn shared_std_configuration_accepts_only_false_or_dependency_syntax() {
     let disabled: ruddy_cli::StdConfig = toml::Value::Boolean(false).try_into().unwrap();
     assert!(disabled.is_disabled());

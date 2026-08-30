@@ -788,6 +788,178 @@ fn guarded_origins_keep_their_source_and_premise_readable() {
 /// rather than a string the test would have to re-derive the grouping rules to
 /// predict — which would be the rules under test standing in as their own
 /// expectation.
+fn inference_fixture_diagnostics(source: &str) -> Vec<ui::Diagnostic> {
+    let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
+    assert!(
+        parsed.errors.is_empty(),
+        "parse errors: {:#?}",
+        parsed.errors
+    );
+    let bundle = Bundle::new("diagnostics", Version::new(0, 1, 0)).expect("valid bundle");
+    let mut mint = Mint::new(bundle);
+    let mut built = ir::build(&mut mint, parsed.stmts);
+    assert!(built.errors.is_empty(), "IR errors: {:#?}", built.errors);
+    inference::infer(&mint, &mut built.program)
+        .errors
+        .into_iter()
+        .map(|error| error.diagnostic())
+        .collect()
+}
+
+/// Source-owned examples pin the diagnostic a reader is meant to see, rather
+/// than only constructing semantic payloads. Spans are deliberately omitted
+/// from this abridged form: the corpus owns source shapes, while later
+/// provenance phases will improve and then pin the causal locations.
+#[test]
+fn inference_source_corpus_matches_abridged_structured_goldens() {
+    let fixtures = [
+        (
+            "not-a-struct",
+            include_str!("../diagnostics/inference/not-a-struct.hc"),
+        ),
+        (
+            "type-mismatch",
+            include_str!("../diagnostics/inference/type-mismatch.hc"),
+        ),
+        (
+            "recursive-type",
+            include_str!("../diagnostics/inference/recursive-type.hc"),
+        ),
+        (
+            "missing-field",
+            include_str!("../diagnostics/inference/missing-field.hc"),
+        ),
+        (
+            "extra-field-struct",
+            include_str!("../diagnostics/inference/extra-field-struct.hc"),
+        ),
+        (
+            "extra-field-sum",
+            include_str!("../diagnostics/inference/extra-field-sum.hc"),
+        ),
+        (
+            "rigid-broken",
+            include_str!("../diagnostics/inference/rigid-broken.hc"),
+        ),
+        (
+            "rigid-field-struct",
+            include_str!("../diagnostics/inference/rigid-field-struct.hc"),
+        ),
+        (
+            "rigid-field-sum",
+            include_str!("../diagnostics/inference/rigid-field-sum.hc"),
+        ),
+        (
+            "rigid-field-effect",
+            include_str!("../diagnostics/inference/rigid-field-effect.hc"),
+        ),
+        (
+            "rigid-escapes",
+            include_str!("../diagnostics/inference/rigid-escapes.hc"),
+        ),
+        (
+            "repeated-field-struct",
+            include_str!("../diagnostics/inference/repeated-field-struct.hc"),
+        ),
+        (
+            "repeated-field-sum",
+            include_str!("../diagnostics/inference/repeated-field-sum.hc"),
+        ),
+        (
+            "repeated-field-effect",
+            include_str!("../diagnostics/inference/repeated-field-effect.hc"),
+        ),
+        (
+            "presence-required",
+            include_str!("../diagnostics/inference/presence-required.hc"),
+        ),
+        (
+            "presence-impossible",
+            include_str!("../diagnostics/inference/presence-impossible.hc"),
+        ),
+        (
+            "clause-impossible",
+            include_str!("../diagnostics/inference/clause-impossible.hc"),
+        ),
+        (
+            "annotation-allows-more",
+            include_str!("../diagnostics/inference/annotation-allows-more.hc"),
+        ),
+        (
+            "unhandled-effect",
+            include_str!("../diagnostics/inference/unhandled-effect.hc"),
+        ),
+        (
+            "effect-not-allowed",
+            include_str!("../diagnostics/inference/effect-not-allowed.hc"),
+        ),
+        (
+            "callback-effects-not-covered",
+            include_str!("../diagnostics/inference/callback-effects-not-covered.hc"),
+        ),
+        (
+            "polymorphic-extern-boundary",
+            include_str!("../diagnostics/inference/polymorphic-extern-boundary.hc"),
+        ),
+        (
+            "repeated-calls",
+            include_str!("../diagnostics/inference/repeated-calls.hc"),
+        ),
+        (
+            "branches",
+            include_str!("../diagnostics/inference/branches.hc"),
+        ),
+        (
+            "non-function",
+            include_str!("../diagnostics/inference/non-function.hc"),
+        ),
+        (
+            "cross-definition",
+            include_str!("../diagnostics/inference/cross-definition.hc"),
+        ),
+        (
+            "long-alias",
+            include_str!("../diagnostics/inference/long-alias.hc"),
+        ),
+    ];
+
+    let mut found = String::new();
+    let mut seen = HashSet::new();
+    for (name, source) in fixtures {
+        writeln!(found, "## {name}").unwrap();
+        let diagnostics = inference_fixture_diagnostics(source);
+        assert!(!diagnostics.is_empty(), "{name} produced no diagnostic");
+        for diagnostic in diagnostics {
+            seen.insert(diagnostic.code);
+            writeln!(found, "[{}] {}", diagnostic.code, diagnostic.title).unwrap();
+            writeln!(found, "primary: {}", diagnostic.primary.message).unwrap();
+            for related in diagnostic.related {
+                writeln!(found, "related: {}", related.message).unwrap();
+            }
+            for help in diagnostic.help {
+                writeln!(found, "help: {help}").unwrap();
+            }
+            for note in diagnostic.notes {
+                writeln!(found, "note: {note}").unwrap();
+            }
+        }
+        writeln!(found).unwrap();
+    }
+    found.pop();
+    let expected: HashSet<_> = inference_error_kinds(Span::generated(0, 1))
+        .into_iter()
+        .map(|kind| kind.code())
+        .collect();
+    assert_eq!(
+        seen, expected,
+        "the source corpus must reach every ErrorKind"
+    );
+    assert_eq!(
+        found,
+        include_str!("../diagnostics/inference/abridged.golden")
+    );
+}
+
 fn round_trip(prelude: &str, printed: &str) -> String {
     let source = format!("{prelude}let f : {{ v: {printed} }} -> Nat = fn r => 1n\n");
     let lexed = token::lex(&source, FileID::GENERATED);

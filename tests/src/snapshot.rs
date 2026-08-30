@@ -1722,6 +1722,22 @@ fn a_row_error_reaches_the_strip_and_the_solve_tab() {
         panic!("expected one error: {:#?}", rigid.diagnostics);
     };
     assert_eq!(diagnostic.code, "rigid-field");
+    assert_eq!(
+        diagnostic.message,
+        "this reads field `x`, but `'a` stands for whatever other struct fields the caller chooses, so `x` cannot be assumed"
+    );
+    assert_eq!(
+        diagnostic.label,
+        "this assumes one of the struct fields chosen by the caller"
+    );
+    assert_eq!(
+        diagnostic.help,
+        ["change the body so it does not assume which struct fields the caller chooses"]
+    );
+    assert_eq!(
+        diagnostic.related[0].message,
+        "the caller's choice of struct fields starts here"
+    );
     let field = rigid_source.rfind('x').unwrap();
     assert_eq!(diagnostic.span, at([field, field + 1]));
     let declared = rigid_source.find("'a").unwrap();
