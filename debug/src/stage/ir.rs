@@ -146,12 +146,7 @@ fn decl_node<T>(
 
 /// One target-provided declaration: the target remains data, never a term.
 fn extern_node(ids: &mut Ids, _: &Cx, _: &Mint, external: &Extern) -> Node {
-    Node::new(
-        ids.next(),
-        "Target",
-        format!("{:?}", external.target.tracked),
-    )
-    .at(external.target.span)
+    Node::new(ids.next(), "Target", external.target.to_string()).at(external.target.span)
 }
 
 /// One `effect` declaration's cases: an operation with its two sides under it,

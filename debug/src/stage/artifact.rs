@@ -94,8 +94,10 @@ pub fn render(spec: &Spec, cx: &Cx, artifact: &Artifact, micros: u64) -> Stage {
             ids.next(),
             "extern",
             format!(
-                "{} = {:?} · {:?}",
-                external.name, external.target, external.rep
+                "{} = {} · {:?}",
+                external.name,
+                crate::print::string(&external.target),
+                external.rep
             ),
         ));
     }

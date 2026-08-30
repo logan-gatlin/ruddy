@@ -18,7 +18,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         .externs
         .iter()
         .map(|(symbol, decl)| {
-            let target = format!("{:?}", decl.value.target.tracked);
+            let target = decl.value.target.to_string();
             let mut node = with_symbol(
                 Node::new(
                     ids.next(),

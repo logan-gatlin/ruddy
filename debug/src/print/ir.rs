@@ -182,7 +182,7 @@ impl fmt::Display for Show<'_, Program> {
             if let Some(annotation) = &decl.annotation {
                 write!(f, "{}", self.show(annotation))?;
             }
-            write!(f, " = {:?}", decl.value.target.tracked)?;
+            write!(f, " = {}", decl.value.target)?;
         }
         for (symbol, decl) in &self.node.terms {
             if !first {

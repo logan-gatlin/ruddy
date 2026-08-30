@@ -102,10 +102,10 @@ pub fn program(output: &Output, labels: &Labels) -> String {
 /// imports the value from this target expression.
 pub fn extern_header(external: &Extern) -> String {
     format!(
-        "extern {}: {} = {:?}",
+        "extern {}: {} = {}",
         external.name,
         rep(external.rep),
-        external.target
+        super::string(&external.target)
     )
 }
 
