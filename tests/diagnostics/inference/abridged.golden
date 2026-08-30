@@ -1,9 +1,7 @@
 ## not-a-struct
-[not-a-struct] a natural number cannot provide struct fields
-primary: this value supplies a non-struct type here
-related: this field access requires a struct
-help: change the value to a struct
-help: or change/remove the field access
+[not-a-struct] `Nat` is not a struct, so it has no fields to read
+primary: this field access requires a struct
+help: change this value to a struct, or change/remove the field access
 
 ## type-mismatch
 [type-mismatch] a natural number and a struct cannot be the same type
@@ -18,11 +16,9 @@ primary: this use makes the type refer back to itself
 help: remove the self-reference or introduce a finite wrapper type
 
 ## missing-field
-[missing-field] field `y` is required by one use but excluded by another
-primary: this use requires field `y`
-related: this use limits the type so field `y` is unavailable
-help: allow field `y` in the limiting use
-help: or change the use that requires field `y`
+[missing-field] no field `y` on `{ x: Nat }`
+primary: this use conflicts over field `y`
+help: allow field `y`, or change the use that requires it
 
 ## extra-field-struct
 [extra-field] field `y` is required by one use but excluded by another

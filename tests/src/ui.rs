@@ -944,7 +944,13 @@ fn row_explanations_keep_both_source_sides_and_normalize_solver_direction() {
         assert_eq!(introduced.span.start..introduced.span.end(), introduction);
         assert_eq!(lacked.span.start..lacked.span.end(), forbidden);
         assert_ne!(introduced.span, lacked.span);
-        assert!(explanation.cause.reasons.len() >= explanation.abridged.len());
+        let selected: HashSet<_> = explanation
+            .abridged
+            .iter()
+            .map(|at| explanation.full_facts[*at].payload)
+            .collect();
+        assert!(selected.contains(&inference::ExplanationFactPayload::LabelIntroduction));
+        assert!(selected.contains(&inference::ExplanationFactPayload::LabelForbidden));
     }
 
     // A genuinely deep tail-binding chain, rather than one wide row, keeps
@@ -959,43 +965,105 @@ fn row_explanations_keep_both_source_sides_and_normalize_solver_direction() {
     deep.push_str(&format!("let close : {{}} -> Nat = {previous}\n"));
     let errors = inference_fixture_errors(&deep);
     assert_eq!(errors.len(), 1, "deep closed rows retain one complaint");
-    assert!(errors[0].explanation.is_some());
+    let explanation = errors[0].explanation.as_ref().expect("deep row cause");
+    let selected: HashSet<_> = explanation
+        .abridged
+        .iter()
+        .map(|at| explanation.full_facts[*at].payload)
+        .collect();
+    assert!(selected.contains(&inference::ExplanationFactPayload::LabelDemand));
+    assert!(selected.contains(&inference::ExplanationFactPayload::ClosedRow));
 }
 
 #[test]
-fn required_and_forbidden_row_roles_do_not_follow_solver_direction() {
-    for source in [
-        "let direct : {} -> Nat = fn p => p.x\n",
-        "let projected = fn p => p.x\nlet indirect : {} -> Nat = projected\n",
+fn repeated_labels_keep_the_full_intermediate_path_and_exact_endpoints() {
+    let mut source = String::from(
+        "let id = fn value => value\nlet split : { x: Nat, ..'r } -> { ..'r } -> Nat = fn whole => fn rest => 0n\n",
+    );
+    let mut partial = "split value".to_string();
+    for _ in 0..12 {
+        partial = format!("id ({partial})");
+    }
+    source.push_str(&format!("let bad = fn value => ({partial}) {{ x: 1n }}\n"));
+    let errors = inference_fixture_errors(&source);
+    let [error] = errors.as_slice() else {
+        panic!("repeated intermediate fixture must have one error: {errors:#?}");
+    };
+    let explanation = error.explanation.as_ref().expect("repeated row cause");
+    assert!(
+        explanation.full_facts.len() > 2,
+        "the full slice must retain facts between the exact endpoints: {explanation:#?}"
+    );
+    let introduced = explanation
+        .full_facts
+        .iter()
+        .position(|fact| fact.payload == inference::ExplanationFactPayload::LabelIntroduction)
+        .expect("exact introduction endpoint");
+    let forbidden = explanation
+        .full_facts
+        .iter()
+        .position(|fact| fact.payload == inference::ExplanationFactPayload::LabelForbidden)
+        .expect("exact forbidden endpoint");
+    assert!(explanation.abridged.contains(&introduced));
+    assert!(explanation.abridged.contains(&forbidden));
+}
+
+#[test]
+fn row_roles_follow_the_resolved_rejected_side() {
+    for (source, demand_subject, limiter_subject) in [
+        (
+            "let f = fn p => p.x\nlet bad = f {}\n",
+            inference::Subject::Parameter,
+            inference::Subject::Argument,
+        ),
+        (
+            "let f : ({} -> Nat) -> Nat = fn callback => 1n\nlet bad = f (fn p => p.x)\n",
+            inference::Subject::Argument,
+            inference::Subject::Parameter,
+        ),
+        (
+            "let projected = fn p => p.x\nlet indirect : {} -> Nat = projected\n",
+            inference::Subject::Term,
+            inference::Subject::Annotation,
+        ),
     ] {
         let errors = inference_fixture_errors(source);
         let [error] = errors.as_slice() else {
             panic!("direction-neutral fixture must have one error: {errors:#?}");
         };
         let explanation = error.explanation.as_ref().expect("row cause");
-        let roles: HashSet<_> = explanation
+        let selected: Vec<_> = explanation
             .abridged
             .iter()
-            .map(|at| explanation.full_facts[*at].payload)
+            .map(|at| &explanation.full_facts[*at])
             .collect();
         assert!(
-            roles.contains(&inference::ExplanationFactPayload::LabelDemand),
+            selected.iter().any(|fact| {
+                fact.payload == inference::ExplanationFactPayload::LabelDemand
+                    && fact.subject == demand_subject
+            }),
             "{explanation:#?}"
         );
         assert!(
-            roles.contains(&inference::ExplanationFactPayload::ClosedRow),
+            selected.iter().any(|fact| {
+                fact.payload == inference::ExplanationFactPayload::ClosedRow
+                    && fact.subject == limiter_subject
+            }),
             "{explanation:#?}"
-        );
-        let spans: HashSet<_> = explanation
-            .abridged
-            .iter()
-            .map(|at| explanation.full_facts[*at].span)
-            .collect();
-        assert!(
-            spans.len() >= 2,
-            "roles need independently written endpoints"
         );
     }
+}
+
+#[test]
+fn a_lone_projection_does_not_invent_closed_row_evidence() {
+    let errors = inference_fixture_errors("let direct : {} -> Nat = fn p => p.x\n");
+    let [error] = errors.as_slice() else {
+        panic!("lone projection fixture must have one error: {errors:#?}");
+    };
+    assert!(
+        error.explanation.is_none(),
+        "the projection has demand spans but no independently grounded limiter"
+    );
 }
 
 #[test]

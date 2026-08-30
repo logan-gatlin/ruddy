@@ -1348,7 +1348,7 @@ enum Binding {
 /// field settled absent, a mismatch — has to know which way round to say
 /// itself, or a complaint about an annotation would read as one about the
 /// term.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Side {
     Expected,
     Actual,
@@ -2638,6 +2638,14 @@ fn attach_ordinary_explanations(
             ),
             _ => continue,
         };
+        // Presence failures retain which side supplied the required label after
+        // solving. Source roles must follow that evidence rather than assuming,
+        // for example, that every application argument is the demand.
+        let required_side = match error.kind {
+            ErrorKind::MissingField { .. } => Some(Side::Expected),
+            ErrorKind::ExtraField { .. } => Some(Side::Actual),
+            _ => None,
+        };
         let seed = match error.cause {
             ErrorCause::Step(id) => steps.get(&id).map(|step| step.reason),
             ErrorCause::Batch(_) | ErrorCause::Direct => None,
@@ -2675,6 +2683,7 @@ fn attach_ordinary_explanations(
                 (
                     constraint.subjects.primary,
                     constraint.subjects.primary_span,
+                    Some(Side::Expected),
                 ),
                 (
                     constraint
@@ -2682,6 +2691,7 @@ fn attach_ordinary_explanations(
                         .secondary
                         .unwrap_or(constraint.subjects.primary),
                     constraint.subjects.secondary_span,
+                    Some(Side::Actual),
                 ),
             ];
             // A projection's two source ranges live in its structured payload:
@@ -2689,8 +2699,8 @@ fn attach_ordinary_explanations(
             // supplies the other side. Do not invent spans for its fresh result.
             if let ConstraintKind::Project { base_span, .. } = &constraint.kind {
                 endpoints = vec![
-                    (Subject::ProjectionBase, Some(*base_span)),
-                    (Subject::PatternDemand, Some(constraint.span)),
+                    (Subject::ProjectionBase, Some(*base_span), None),
+                    (Subject::PatternDemand, Some(constraint.span), None),
                 ];
             } else if let ConstraintKind::Performs {
                 ambient_label_spans,
@@ -2701,63 +2711,61 @@ fn attach_ordinary_explanations(
                 && let Some(ambient_span) = ambient_label_spans.get(&row.label)
             {
                 endpoints = vec![
-                    (Subject::PerformedEffects, Some(constraint.span)),
-                    (Subject::AmbientEffects, Some(*ambient_span)),
+                    (Subject::PerformedEffects, Some(constraint.span), None),
+                    (Subject::AmbientEffects, Some(*ambient_span), None),
                 ];
-            } else if kind.is_some() && endpoints.iter().all(|(_, span)| span.is_none()) {
+            } else if kind.is_some() && endpoints.iter().all(|(_, span, _)| span.is_none()) {
                 // Unary/scoping constraints still own their written operation's
                 // range even when no independently written second operand exists.
                 endpoints[0].1 = Some(constraint.span);
             }
-            for (subject, span) in endpoints {
+            for (subject, span, side) in endpoints {
                 let Some(span) = span else { continue };
                 let payload = if kind == Some(ContradictionKind::RepeatedLabel) {
-                    match subject {
-                        Subject::AmbientEffects => ExplanationFactPayload::LabelForbidden,
-                        _ => ExplanationFactPayload::LabelIntroduction,
+                    // An effects application explicitly carries both resolved
+                    // endpoints. Other exact introduction/forbidden evidence is
+                    // overlaid below; intermediates keep a neutral payload.
+                    match (&constraint.kind, subject) {
+                        (ConstraintKind::Performs { .. }, Subject::PerformedEffects) => {
+                            ExplanationFactPayload::LabelIntroduction
+                        }
+                        (ConstraintKind::Performs { .. }, Subject::AmbientEffects) => {
+                            ExplanationFactPayload::LabelForbidden
+                        }
+                        _ => ExplanationFactPayload::RequiresType,
                     }
                 } else {
-                    match (constraint.origin, subject) {
-                        (ConstraintOrigin::Projection, Subject::PatternDemand)
-                        | (ConstraintOrigin::Pattern, Subject::PatternDemand)
+                    match (&constraint.kind, constraint.origin, subject, side) {
+                        // A projection contributes two views of one requirement:
+                        // the written access and the base it demands the field of.
+                        // It never supplies evidence that a row is closed.
+                        (ConstraintKind::Project { .. }, ConstraintOrigin::Projection, _, _)
                             if kind.is_some() =>
                         {
                             ExplanationFactPayload::LabelDemand
                         }
-                        (ConstraintOrigin::Projection, Subject::ProjectionBase)
-                            if kind.is_some() =>
+                        (ConstraintKind::Equal { .. }, _, _, Some(side))
+                            if matches!(kind, Some(ContradictionKind::LabelUnavailable))
+                                && required_side.is_some() =>
                         {
-                            ExplanationFactPayload::ClosedRow
+                            if Some(side) == required_side {
+                                ExplanationFactPayload::LabelDemand
+                            } else {
+                                ExplanationFactPayload::ClosedRow
+                            }
                         }
-                        (ConstraintOrigin::Pattern, Subject::PatternDemand)
+                        (_, ConstraintOrigin::Pattern, Subject::PatternDemand, _)
                             if matches!(kind, Some(ContradictionKind::LabelUnavailable)) =>
                         {
                             ExplanationFactPayload::LabelDemand
                         }
-                        (ConstraintOrigin::ApplicationArgument, Subject::Argument)
-                        | (ConstraintOrigin::MatchScrutinee, Subject::MatchScrutinee)
-                        | (ConstraintOrigin::ContextualCheck, Subject::Term)
-                            if matches!(kind, Some(ContradictionKind::LabelUnavailable)) =>
-                        {
-                            ExplanationFactPayload::LabelDemand
-                        }
-                        (ConstraintOrigin::ApplicationArgument, Subject::Parameter)
-                        | (ConstraintOrigin::ContextualCheck, Subject::Annotation)
-                        | (ConstraintOrigin::Binding, Subject::Annotation)
-                            if matches!(kind, Some(ContradictionKind::LabelUnavailable)) =>
-                        {
-                            ExplanationFactPayload::ClosedRow
-                        }
-                        _ if matches!(kind, Some(ContradictionKind::LabelUnavailable)) => {
-                            ExplanationFactPayload::ClosedRow
-                        }
-                        (ConstraintOrigin::ApplicationCallee, Subject::Callee) => {
+                        (_, ConstraintOrigin::ApplicationCallee, Subject::Callee, _) => {
                             ExplanationFactPayload::UsedAsFunction
                         }
-                        (ConstraintOrigin::ApplicationArgument, _) => {
+                        (_, ConstraintOrigin::ApplicationArgument, _, _) => {
                             ExplanationFactPayload::SuppliesArgument
                         }
-                        (ConstraintOrigin::MatchArm | ConstraintOrigin::Match, _) => {
+                        (_, ConstraintOrigin::MatchArm | ConstraintOrigin::Match, _, _) => {
                             ExplanationFactPayload::BranchResult
                         }
                         _ => ExplanationFactPayload::RequiresType,
@@ -2779,22 +2787,30 @@ fn attach_ordinary_explanations(
         } = &error.kind
             && introduction.span != forbidden.span
         {
-            full_facts = vec![
-                ExplanationFact {
-                    span: introduction.span,
-                    constraint: introduction.constraint,
-                    origin: introduction.origin,
-                    subject: introduction.subject,
-                    payload: ExplanationFactPayload::LabelIntroduction,
-                },
-                ExplanationFact {
-                    span: forbidden.span,
-                    constraint: forbidden.constraint,
-                    origin: forbidden.origin,
-                    subject: forbidden.subject,
-                    payload: ExplanationFactPayload::LabelForbidden,
-                },
-            ];
+            // Keep the complete causal slice. Exact row-fact provenance either
+            // corrects the corresponding sliced fact in place or adds a missing
+            // endpoint; it must never replace the intermediate path.
+            for (origin, payload) in [
+                (introduction, ExplanationFactPayload::LabelIntroduction),
+                (forbidden, ExplanationFactPayload::LabelForbidden),
+            ] {
+                if let Some(fact) = full_facts.iter_mut().find(|fact| {
+                    fact.span == origin.span
+                        && fact.constraint == origin.constraint
+                        && fact.origin == origin.origin
+                        && fact.subject == origin.subject
+                }) {
+                    fact.payload = payload;
+                } else {
+                    full_facts.push(ExplanationFact {
+                        span: origin.span,
+                        constraint: origin.constraint,
+                        origin: origin.origin,
+                        subject: origin.subject,
+                        payload,
+                    });
+                }
+            }
         }
         // A reason without a written endpoint cannot support source labels.
         // Keep the established diagnostic rather than inventing context.
@@ -2810,45 +2826,52 @@ fn attach_ordinary_explanations(
                 candidates.push(at);
             }
         }
-        // The failed requirement is first in the reason walk and its oldest
-        // conflicting source requirement is last. Keep both even on long paths,
-        // filling the bounded ordinary view with nearby causal context.
-        let mut abridged: Vec<_> = candidates.iter().take(4).copied().collect();
-        if candidates.len() > 4 {
-            abridged[3] = *candidates.last().unwrap();
+        let opposing_roles = match kind {
+            Some(ContradictionKind::RepeatedLabel) => Some((
+                ExplanationFactPayload::LabelIntroduction,
+                ExplanationFactPayload::LabelForbidden,
+            )),
+            Some(
+                ContradictionKind::LabelUnavailable | ContradictionKind::ProjectionOnNonStruct,
+            ) => Some((
+                ExplanationFactPayload::LabelDemand,
+                ExplanationFactPayload::ClosedRow,
+            )),
+            _ => None,
+        };
+        let opposing_endpoints = opposing_roles.and_then(|(first, second)| {
+            let first = candidates
+                .iter()
+                .copied()
+                .find(|at| full_facts[*at].payload == first)?;
+            let second = candidates.iter().copied().find(|at| {
+                full_facts[*at].payload == second && full_facts[*at].span != full_facts[first].span
+            })?;
+            Some([first, second])
+        });
+        // Row prose is causal only when independently grounded evidence names
+        // both the demand/introduction and the use which limits/forbids it.
+        if opposing_roles.is_some() && opposing_endpoints.is_none() {
+            continue;
         }
+
+        // Row contradictions have two complete source-facing facts. Keep those
+        // exact endpoints in the ordinary view regardless of how many neutral
+        // intermediate facts the full slice retains.
+        let mut abridged: Vec<_> = if let Some(endpoints) = opposing_endpoints {
+            endpoints.into()
+        } else {
+            let mut nearby: Vec<_> = candidates.iter().take(4).copied().collect();
+            if candidates.len() > 4 {
+                nearby[3] = *candidates.last().unwrap();
+            }
+            nearby
+        };
+        abridged.sort_unstable();
+        abridged.dedup();
         // Keep the failed source endpoint primary; the other genuinely written
         // causes remain related labels even when their reasons precede it.
         abridged.sort_by_key(|at| full_facts[*at].span != error.span);
-        // These row families promise labels on both causal sides. If recovery
-        // retained only one written endpoint, keep the honest family fallback.
-        if kind.is_some() {
-            let distinct: HashSet<_> = candidates.iter().map(|at| full_facts[*at].span).collect();
-            let opposing = match kind {
-                Some(ContradictionKind::RepeatedLabel) => {
-                    full_facts
-                        .iter()
-                        .any(|fact| fact.payload == ExplanationFactPayload::LabelIntroduction)
-                        && full_facts
-                            .iter()
-                            .any(|fact| fact.payload == ExplanationFactPayload::LabelForbidden)
-                }
-                Some(
-                    ContradictionKind::LabelUnavailable | ContradictionKind::ProjectionOnNonStruct,
-                ) => {
-                    full_facts
-                        .iter()
-                        .any(|fact| fact.payload == ExplanationFactPayload::LabelDemand)
-                        && full_facts
-                            .iter()
-                            .any(|fact| fact.payload == ExplanationFactPayload::ClosedRow)
-                }
-                _ => true,
-            };
-            if distinct.len() < 2 || !opposing {
-                continue;
-            }
-        }
         let leaf = match &error.kind {
             ErrorKind::Mismatch { expected, actual } => {
                 smallest_incompatible(aliases, expected, actual)
