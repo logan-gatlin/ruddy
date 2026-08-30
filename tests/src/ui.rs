@@ -894,10 +894,19 @@ fn recursive_types_have_grounded_structured_cycle_explanations() {
             "let bad = fn f => let keep = f in { call: keep f, value: f }",
             inference::RecursiveCycleShape::CallInput,
         ),
-        // One shared row tail cannot absorb the extra field on one side.
+        // One shared row tail cannot absorb the extra field on one side. The
+        // call is the source operation, but the actual cycle closes through
+        // the row, so containment advice takes precedence.
         (
             "let use : { x: Nat, ..'r } -> { x: Nat, y: Nat, ..'r } -> Nat = fn a => fn b => 1n  let bad = fn p => use p p",
-            inference::RecursiveCycleShape::CallInput,
+            inference::RecursiveCycleShape::Containment,
+        ),
+        // The closing constraint is an application argument, but the argument
+        // contains the value in a field rather than passing it directly to
+        // itself.
+        (
+            "let bad = fn f => f { self: f }",
+            inference::RecursiveCycleShape::Containment,
         ),
         // A recursive result with neither a call-input nor row containment.
         (

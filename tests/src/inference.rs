@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use indexmap::IndexMap;
 use ruddy::{
-    inference::{self, ConstraintKind, Effect, ErrorKind, Rule},
+    inference::{self, ConstraintKind, Effect, ErrorCause, ErrorKind, Rule},
     ir::{self, Decl, Term, TermKind},
     parse,
     symbol::{Bundle, Mint, Namespace, Symbol, Version},
@@ -1402,6 +1402,58 @@ fn nested_projections_solve_in_one_pass() {
 /// itself, because a person wrote down what it is; a term may not ask the
 /// solver to invent a type that contains itself, because nothing they could
 /// write is what it would be.
+#[test]
+fn compact_exponential_dag_failure_recovers_in_linear_work() {
+    const DEPTH: usize = 28;
+    let mut mint = dummy_mint();
+    let definition = mint
+        .global(None, Namespace::Terms, "dag-failure")
+        .expect("a test definition");
+    let started = std::time::Instant::now();
+    let (errors, steps) = inference::compact_dag_failure_for_tests(definition, DEPTH);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "compact DAG recovery expanded an exponential tree"
+    );
+    let [error] = errors.as_slice() else {
+        panic!("one direct mismatch was expected: {errors:#?}");
+    };
+    assert!(matches!(
+        error.kind,
+        ErrorKind::Mismatch {
+            expected: _,
+            actual: _
+        }
+    ));
+    let ErrorCause::Step(failed_id) = error.cause else {
+        panic!("the mismatch must name its failed solver step")
+    };
+    let failed = steps
+        .iter()
+        .find(|step| step.id == failed_id)
+        .expect("the error cause resolves");
+    assert!(matches!(
+        failed.effect,
+        Effect::Failed(ErrorKind::Mismatch { .. })
+    ));
+    let recoveries: Vec<_> = steps
+        .iter()
+        .filter(|step| step.rule == Rule::Recover)
+        .collect();
+    assert_eq!(recoveries.len(), 1, "the shared leaf is recovered once");
+    assert!(matches!(
+        recoveries[0].effect,
+        Effect::Bound {
+            because: Some(cause),
+            ..
+        } if cause == failed.reason
+    ));
+    assert!(
+        steps.len() <= 3,
+        "recovery emitted duplicate effects: {steps:#?}"
+    );
+}
+
 #[test]
 fn self_application_is_recursive_not_divergent() {
     let (_, _, output) = infer_src("let w = fn x => x x");

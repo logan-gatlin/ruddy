@@ -3117,7 +3117,7 @@ impl Solve<'_> {
     fn recover(&mut self, span: Span, value: &Assigned, because: ReasonId) {
         match value {
             Assigned::Ty(ty) => self.recover_ty(span, ty, because),
-            Assigned::Row(row) => self.recover_row(span, row, because),
+            Assigned::Row(row) => self.recover_parts(span, None, Some(row.clone()), because),
             Assigned::Presence(presence) => self.recover_presence(span, presence, because),
         }
     }
@@ -3132,28 +3132,41 @@ impl Solve<'_> {
     /// [`recover`](Self::recover) over a sum's cases: every label, and then the
     /// tail saying what else the row might have had.
     fn recover_row(&mut self, span: Span, row: &Row, because: ReasonId) {
-        self.recover_parts(span, None, Some(row.clone()), because);
+        self.recover_parts(span, None, Some(Rc::new(row.clone())), because);
     }
 
-    /// Iterative recovery for imported semantic trees. A failure can abandon a
-    /// value whose artifact contains 30,000 arrows, names, rows, or field
+    /// Iterative recovery for imported semantic graphs. A failure can abandon
+    /// a value whose artifact contains 30,000 arrows, names, rows, or field
     /// payloads; recovery still has to settle every variable and presence in
     /// it without borrowing the native call stack from the malformed input.
+    /// Rc identities and variable identities are visited once. This matters
+    /// for compact artifacts whose two children repeatedly share the same
+    /// node: walking their expanded tree would make failure recovery
+    /// exponential even though the artifact itself is small.
     fn recover_parts(
         &mut self,
         span: Span,
         ty: Option<Rc<Ty>>,
-        row: Option<Row>,
+        row: Option<Rc<Row>>,
         because: ReasonId,
     ) {
         enum Work {
             Type(Rc<Ty>),
-            Row(Row),
-            Presence(Presence),
+            Row(Rc<Row>),
+            Presence(Presence, Option<Rc<Ty>>),
             Rest(Rest),
         }
 
         let mut work = Vec::new();
+        let mut types = HashSet::new();
+        let mut rows = HashSet::new();
+        // Pointer sets are identities only while their allocations remain
+        // alive; retain each visited node so allocator reuse cannot suppress a
+        // later, distinct embedded row.
+        let mut retained_types = Vec::new();
+        let mut retained_rows = Vec::new();
+        let mut variables = HashSet::new();
+        let mut presence_absence = HashMap::new();
         if let Some(row) = row {
             work.push(Work::Row(row));
         }
@@ -3161,59 +3174,137 @@ impl Solve<'_> {
             work.push(Work::Type(ty));
         }
         while let Some(part) = work.pop() {
+            let fresh = match &part {
+                Work::Type(ty) => types.insert(Rc::as_ptr(ty) as usize),
+                Work::Row(row) => rows.insert(Rc::as_ptr(row) as usize),
+                Work::Presence(_, _) | Work::Rest(_) => true,
+            };
+            if !fresh {
+                continue;
+            }
+            match &part {
+                Work::Type(ty) => retained_types.push(ty.clone()),
+                Work::Row(row) => retained_rows.push(row.clone()),
+                Work::Presence(_, _) | Work::Rest(_) => {}
+            }
             // Recovery is a traversal of independent settling rules. A bound
             // component which needs no settling must not lend its read to the
             // next component that does.
             self.table.begin_solver_rule();
             match part {
-                Work::Type(ty) => {
-                    let ty = self.table.resolve(&ty);
-                    match &*ty {
-                        Ty::Var(var) => {
+                Work::Type(ty) => match &*ty {
+                    Ty::Var(var) if variables.insert(*var) => match &self.table.vars[*var as usize]
+                    {
+                        Slot::Bound {
+                            value: Assigned::Ty(inner),
+                            by,
+                        } => {
+                            self.table.note_binding_read(*by);
+                            work.push(Work::Type(inner.clone()));
+                        }
+                        Slot::Unbound { .. } => {
                             self.settle(span, *var, Assigned::Ty(Rc::new(Ty::Undecided)), because)
                         }
-                        Ty::Arrow(from, to, effects) => {
-                            work.push(Work::Row(effects.clone()));
-                            work.push(Work::Type(to.clone()));
-                            work.push(Work::Type(from.clone()));
-                        }
-                        Ty::Package(body) => work.push(Work::Type(body.clone())),
-                        Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(row.clone())),
-                        Ty::Named { args, .. } => {
-                            work.extend(args.iter().rev().cloned().map(Work::Type));
-                        }
-                        Ty::Nat
-                        | Ty::Int
-                        | Ty::Real
-                        | Ty::String
-                        | Ty::Boolean
-                        | Ty::Bound(_)
-                        | Ty::Rigid { .. }
-                        | Ty::Undecided => {}
+                        Slot::Bound { .. } => {}
+                    },
+                    Ty::Var(_) => {}
+                    Ty::Arrow(from, to, effects) => {
+                        work.push(Work::Row(Rc::new(effects.clone())));
+                        work.push(Work::Type(to.clone()));
+                        work.push(Work::Type(from.clone()));
                     }
-                }
+                    Ty::Package(body) => work.push(Work::Type(body.clone())),
+                    Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(Rc::new(row.clone()))),
+                    Ty::Named { args, .. } => {
+                        work.extend(args.iter().rev().cloned().map(Work::Type));
+                    }
+                    Ty::Nat
+                    | Ty::Int
+                    | Ty::Real
+                    | Ty::String
+                    | Ty::Boolean
+                    | Ty::Bound(_)
+                    | Ty::Rigid { .. }
+                    | Ty::Undecided => {}
+                },
                 Work::Row(row) => {
-                    let (labels, rest) = self.table.canon(&row).into_parts();
-                    work.push(Work::Rest(rest));
-                    for field in labels.into_values().rev() {
-                        let presence = self.table.presence_of(&field.presence);
-                        if !matches!(presence, Presence::Absent) {
-                            work.push(Work::Type(field.ty));
+                    work.push(Work::Rest(row.rest.clone()));
+                    for field in row.labels.values().rev() {
+                        work.push(Work::Presence(
+                            field.presence.clone(),
+                            Some(field.ty.clone()),
+                        ));
+                    }
+                }
+                Work::Presence(mut presence, payload) => {
+                    let mut chain = Vec::new();
+                    let absent = loop {
+                        match presence {
+                            Presence::Var(var) => {
+                                if let Some(absent) = presence_absence.get(&var) {
+                                    break *absent;
+                                }
+                                if !variables.insert(var) {
+                                    break false;
+                                }
+                                chain.push(var);
+                                match &self.table.vars[var as usize] {
+                                    Slot::Bound {
+                                        value: Assigned::Presence(inner),
+                                        by,
+                                    } => {
+                                        self.table.note_binding_read(*by);
+                                        presence = inner.clone();
+                                    }
+                                    Slot::Unbound { .. } => {
+                                        self.settle(
+                                            span,
+                                            var,
+                                            Assigned::Presence(Presence::Undecided),
+                                            because,
+                                        );
+                                        break false;
+                                    }
+                                    Slot::Bound { .. } => break false,
+                                }
+                            }
+                            Presence::Absent => break true,
+                            _ => break false,
                         }
-                        work.push(Work::Presence(presence));
+                    };
+                    for var in chain {
+                        presence_absence.insert(var, absent);
+                    }
+                    if !absent && let Some(payload) = payload {
+                        work.push(Work::Type(payload));
                     }
                 }
-                Work::Presence(presence) => self.recover_presence(span, &presence, because),
-                Work::Rest(rest) => {
-                    if let Rest::Var(var) = self.table.canon(&Row::of(rest)).rest {
-                        self.settle(
-                            span,
-                            var,
-                            Assigned::Row(Rc::new(Row::of(Rest::Undecided))),
-                            because,
-                        );
+                Work::Rest(rest) => match rest {
+                    Rest::More(more) => work.push(Work::Row(more)),
+                    Rest::Var(var) if variables.insert(var) => {
+                        match &self.table.vars[var as usize] {
+                            Slot::Bound {
+                                value: Assigned::Row(inner),
+                                by,
+                            } => {
+                                self.table.note_binding_read(*by);
+                                work.push(Work::Row(inner.clone()));
+                            }
+                            Slot::Unbound { .. } => self.settle(
+                                span,
+                                var,
+                                Assigned::Row(Rc::new(Row::of(Rest::Undecided))),
+                                because,
+                            ),
+                            Slot::Bound { .. } => {}
+                        }
                     }
-                }
+                    Rest::Var(_)
+                    | Rest::Closed
+                    | Rest::Bound(_)
+                    | Rest::Rigid { .. }
+                    | Rest::Undecided => {}
+                },
             }
             self.table.end_solver_act();
         }
@@ -3221,8 +3312,26 @@ impl Solve<'_> {
 
     /// [`recover`](Self::recover) over a presence.
     fn recover_presence(&mut self, span: Span, presence: &Presence, because: ReasonId) {
-        if let Presence::Var(var) = self.table.presence_of(presence) {
-            self.settle(span, var, Assigned::Presence(Presence::Undecided), because);
+        let mut presence = presence.clone();
+        let mut visited = HashSet::new();
+        while let Presence::Var(var) = presence {
+            if !visited.insert(var) {
+                return;
+            }
+            match &self.table.vars[var as usize] {
+                Slot::Bound {
+                    value: Assigned::Presence(inner),
+                    by,
+                } => {
+                    self.table.note_binding_read(*by);
+                    presence = inner.clone();
+                }
+                Slot::Unbound { .. } => {
+                    self.settle(span, var, Assigned::Presence(Presence::Undecided), because);
+                    return;
+                }
+                Slot::Bound { .. } => return,
+            }
         }
     }
 

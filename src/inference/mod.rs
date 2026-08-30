@@ -1629,6 +1629,59 @@ impl Subst {
     }
 }
 
+/// Run a real failing equality over a compact, exponentially expanding type
+/// DAG. Integration regressions use this to cover recovery independently of
+/// source parsing, which cannot express shared Rc identity.
+#[doc(hidden)]
+pub fn compact_dag_failure_for_tests(definition: Symbol, depth: usize) -> (Vec<Error>, Vec<Step>) {
+    let mut table = Table::default();
+    let leaf = table.fresh_type_for(Subject::Term);
+    let mut dag = leaf;
+    for _ in 0..depth {
+        dag = Rc::new(Ty::Arrow(dag.clone(), dag, Row::closed()));
+    }
+    let constraint_id = ConstraintId::synthetic(0);
+    let reason = table.reason(ReasonOrigin::Constraint(constraint_id), Vec::new());
+    let constraints = [Constraint {
+        id: constraint_id,
+        reason,
+        span: Span::default(),
+        origin: ConstraintOrigin::ContextualCheck,
+        subjects: ConstraintSubjects::pair(Subject::Context, Subject::Term),
+        kind: ConstraintKind::Equal {
+            expected: Rc::new(Ty::Nat),
+            actual: dag,
+        },
+    }];
+    let mut errors = Vec::new();
+    let mut steps = Vec::new();
+    let aliases = IndexMap::new();
+    let nominal = HashSet::new();
+    let mut locals = IndexMap::new();
+    let mut refinements = Vec::new();
+    Solve {
+        table: &mut table,
+        errors: &mut errors,
+        steps: &mut steps,
+        aliases: &aliases,
+        nominal: &nominal,
+        definition,
+        depth: 0,
+        constraint: None,
+        constraint_reason: None,
+        assumed: Vec::new(),
+        schemes: HashMap::new(),
+        locals: &mut locals,
+        guard: None,
+        active_refinement: None,
+        guard_reasons: Vec::new(),
+        refinements: &mut refinements,
+        generated_end: constraints.len(),
+    }
+    .run(&constraints);
+    (errors, steps)
+}
+
 /// Exercise the match-result family builder without constructing a source
 /// program. This is public so integration regressions can feed it semantic
 /// types whose depth would make source syntax itself the thing under test.
@@ -2599,6 +2652,194 @@ fn all_constraints(
     out
 }
 
+/// Inspect the exact structural path which made an occurs check fail. Source
+/// ancestry is deliberately not part of this decision: an application can be
+/// above a field-containment cycle without being the edge that closes it.
+fn recursive_cycle_edges(goal: &Goal, bindings: &HashMap<TyVar, Assigned>) -> (bool, bool) {
+    #[derive(Clone, Copy, Default)]
+    struct Edges {
+        containment: bool,
+        call_input: bool,
+    }
+    enum Work {
+        Type(Rc<Ty>, Edges),
+        Row(Rc<Row>, Edges),
+    }
+
+    let (target, mut work) = match goal {
+        Goal::Type { expected, actual } => match (&**expected, &**actual) {
+            (Ty::Var(var), _) => (*var, vec![Work::Type(actual.clone(), Edges::default())]),
+            (_, Ty::Var(var)) => (*var, vec![Work::Type(expected.clone(), Edges::default())]),
+            // The row-lacks occurs check retains the two containing struct or
+            // sum values as its goal rather than manufacturing a bare tail
+            // goal. Their structural constructor is the cycle-closing edge.
+            _ if matches!(&**expected, Ty::Struct(_) | Ty::Sum(_))
+                || matches!(&**actual, Ty::Struct(_) | Ty::Sum(_)) =>
+            {
+                return (true, false);
+            }
+            _ => return (false, false),
+        },
+        Goal::Row { expected, actual } => {
+            let bare = |row: &Row| {
+                row.labels
+                    .is_empty()
+                    .then_some(())
+                    .and_then(|()| match row.rest {
+                        Rest::Var(var) => Some(var),
+                        _ => None,
+                    })
+            };
+            match (bare(expected), bare(actual)) {
+                (Some(var), _) => (
+                    var,
+                    vec![Work::Row(
+                        actual.clone(),
+                        Edges {
+                            containment: true,
+                            call_input: false,
+                        },
+                    )],
+                ),
+                (_, Some(var)) => (
+                    var,
+                    vec![Work::Row(
+                        expected.clone(),
+                        Edges {
+                            containment: true,
+                            call_input: false,
+                        },
+                    )],
+                ),
+                // A recursive failure whose direct goal is already row-shaped
+                // closed through that row even when the tail variable is nested
+                // below a `More` segment.
+                _ => return (true, false),
+            }
+        }
+        Goal::Presence { .. } => return (false, false),
+    };
+
+    let mut seen_types = HashSet::new();
+    let mut seen_rows = HashSet::new();
+    // Retain visited allocations while pointer identities are in the sets, so
+    // a subsequently constructed embedded row cannot reuse an old address.
+    let mut retained_types = Vec::new();
+    let mut retained_rows = Vec::new();
+    let mut found = Edges::default();
+    while let Some(part) = work.pop() {
+        match part {
+            Work::Type(ty, edges) => {
+                let key = (
+                    Rc::as_ptr(&ty) as usize,
+                    edges.containment,
+                    edges.call_input,
+                );
+                if !seen_types.insert(key) {
+                    continue;
+                }
+                retained_types.push(ty.clone());
+                match &*ty {
+                    Ty::Var(var) if *var == target => {
+                        found.containment |= edges.containment;
+                        found.call_input |= edges.call_input;
+                    }
+                    Ty::Var(var) => match bindings.get(var) {
+                        Some(Assigned::Ty(bound)) => {
+                            work.push(Work::Type(bound.clone(), edges));
+                        }
+                        Some(Assigned::Row(bound)) => {
+                            work.push(Work::Row(bound.clone(), edges));
+                        }
+                        Some(Assigned::Presence(_)) | None => {}
+                    },
+                    Ty::Arrow(from, to, effects) => {
+                        work.push(Work::Row(
+                            Rc::new(effects.clone()),
+                            Edges {
+                                containment: true,
+                                ..edges
+                            },
+                        ));
+                        work.push(Work::Type(to.clone(), edges));
+                        work.push(Work::Type(
+                            from.clone(),
+                            Edges {
+                                call_input: true,
+                                ..edges
+                            },
+                        ));
+                    }
+                    Ty::Package(body) => work.push(Work::Type(body.clone(), edges)),
+                    Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(
+                        Rc::new(row.clone()),
+                        Edges {
+                            containment: true,
+                            ..edges
+                        },
+                    )),
+                    Ty::Named { args, .. } => {
+                        work.extend(args.iter().cloned().map(|arg| Work::Type(arg, edges)));
+                    }
+                    _ => {}
+                }
+            }
+            Work::Row(row, edges) => {
+                let key = (
+                    Rc::as_ptr(&row) as usize,
+                    edges.containment,
+                    edges.call_input,
+                );
+                if !seen_rows.insert(key) {
+                    continue;
+                }
+                retained_rows.push(row.clone());
+                for field in row.labels.values() {
+                    if matches!(field.presence, Presence::Var(var) if var == target) {
+                        found.containment = true;
+                    }
+                    work.push(Work::Type(
+                        field.ty.clone(),
+                        Edges {
+                            containment: true,
+                            ..edges
+                        },
+                    ));
+                }
+                match &row.rest {
+                    Rest::Var(var) if *var == target => found.containment = true,
+                    Rest::Var(var) => match bindings.get(var) {
+                        Some(Assigned::Row(bound)) => work.push(Work::Row(
+                            bound.clone(),
+                            Edges {
+                                containment: true,
+                                ..edges
+                            },
+                        )),
+                        Some(Assigned::Ty(bound)) => work.push(Work::Type(
+                            bound.clone(),
+                            Edges {
+                                containment: true,
+                                ..edges
+                            },
+                        )),
+                        Some(Assigned::Presence(_)) | None => {}
+                    },
+                    Rest::More(more) => work.push(Work::Row(
+                        more.clone(),
+                        Edges {
+                            containment: true,
+                            ..edges
+                        },
+                    )),
+                    _ => {}
+                }
+            }
+        }
+    }
+    (found.containment, found.call_input)
+}
+
 fn attach_ordinary_explanations(
     errors: &mut [Error],
     constraints: &IndexMap<Symbol, Vec<Constraint>>,
@@ -2950,33 +3191,34 @@ fn attach_ordinary_explanations(
                             || leaf.1 == TypeDescription::Function)
                 });
         let recursive = (kind == Some(ContradictionKind::RecursiveValue)).then(|| {
-            let has_call_input = constraint_slice.iter().any(|id| {
-                constraints.get(id).is_some_and(|constraint| {
+            let closing_step = match error.cause {
+                ErrorCause::Step(id) => steps.get(&id),
+                ErrorCause::Batch(_) | ErrorCause::Direct => None,
+            };
+            let bindings: HashMap<_, _> = closing_step
+                .into_iter()
+                .flat_map(|closing| {
+                    steps.values().filter_map(move |step| match &step.effect {
+                        Effect::Bound { var, value, .. } if step.id < closing.id => {
+                            Some((*var, value.clone()))
+                        }
+                        _ => None,
+                    })
+                })
+                .collect();
+            let (has_containment, has_call_input_edge) = closing_step
+                .map(|step| recursive_cycle_edges(&step.goal, &bindings))
+                .unwrap_or_default();
+            let closing_is_argument = closing_step
+                .and_then(|step| step.constraint)
+                .and_then(|id| constraints.get(&id))
+                .is_some_and(|constraint| {
                     constraint.origin == ConstraintOrigin::ApplicationArgument
-                        && (matches!(
-                            constraint.subjects.primary,
-                            Subject::Argument | Subject::Parameter
-                        ) || matches!(
-                            constraint.subjects.secondary,
-                            Some(Subject::Argument | Subject::Parameter)
-                        ))
-                })
-            });
-            let has_containment = constraint_slice.iter().any(|id| {
-                constraints.get(id).is_some_and(|constraint| {
-                    matches!(constraint.kind, ConstraintKind::Project { .. })
-                        || matches!(
-                            &constraint.kind,
-                            ConstraintKind::Equal { expected, actual }
-                                if matches!(&**expected, Ty::Struct(_) | Ty::Sum(_))
-                                    || matches!(&**actual, Ty::Struct(_) | Ty::Sum(_))
-                        )
-                })
-            });
-            if has_call_input {
-                RecursiveCycleShape::CallInput
-            } else if has_containment {
+                });
+            if has_containment {
                 RecursiveCycleShape::Containment
+            } else if closing_is_argument && has_call_input_edge {
+                RecursiveCycleShape::CallInput
             } else {
                 RecursiveCycleShape::Neutral
             }
