@@ -1028,6 +1028,9 @@ pub struct RowContradiction {
 pub enum ContradictionKind {
     IncompatibleTypes,
     ValueUsedAsFunction,
+    /// A finite value would have to contain itself, or a callable value would
+    /// have to accept itself as one of its own inputs.
+    RecursiveValue,
     ProjectionOnNonStruct,
     LabelUnavailable,
     RepeatedLabel,
@@ -2636,6 +2639,12 @@ fn attach_ordinary_explanations(
                     label: field.clone(),
                 }),
             ),
+            ErrorKind::Recursive => (
+                TypeDescription::Undecided,
+                TypeDescription::Undecided,
+                Some(ContradictionKind::RecursiveValue),
+                None,
+            ),
             _ => continue,
         };
         // Presence failures retain which side supplied the required label after
@@ -2722,6 +2731,21 @@ fn attach_ordinary_explanations(
                     (Subject::PerformedEffects, Some(constraint.span), None),
                     (Subject::AmbientEffects, Some(*ambient_span), None),
                 ];
+            } else if kind == Some(ContradictionKind::RecursiveValue) {
+                // A recursive cycle needs both source concepts even when one
+                // operand is semantic context (most notably a definition's
+                // pre-minted result variable). The closing constraint's own
+                // written range grounds that role; no solver-variable range is
+                // invented. Keeping both subjects also makes a one-edge cycle
+                // a useful two-fact explanation rather than a lone headline.
+                for (_, span, _) in &mut endpoints {
+                    if span.is_none() {
+                        *span = Some(constraint.span);
+                    }
+                }
+                if constraint.subjects.secondary.is_none() {
+                    endpoints[1].0 = Subject::Context;
+                }
             } else if kind.is_some() && endpoints.iter().all(|(_, span, _)| span.is_none()) {
                 // Unary/scoping constraints still own their written operation's
                 // range even when no independently written second operand exists.
@@ -4126,47 +4150,192 @@ impl Table {
     /// that is. One variable space, so a row-tail variable hiding inside a row is
     /// as much a cycle as one hiding inside a type.
     ///
-    /// Asked by listing every variable the value mentions and then looking for
-    /// this one, rather than by asking "is this it?" at each position in turn.
-    /// The question is one question, and asking it once is what keeps the walk
-    /// a walk: the positions differ in where they look, not in what they are
-    /// looking for.
+    /// The walk deliberately follows the raw tree instead of calling
+    /// [`resolve`](Self::resolve) or [`canon`](Self::canon). Those readers are
+    /// right for equality but flatten away the bound-variable edges which form
+    /// the causal route around a cycle. On the first route back to `var`, this
+    /// records exactly those edges' reasons. [`Solve::fail`] joins them to the
+    /// active constraint reason, so the explanation keeps both the iterative
+    /// path and the source operation which closed it.
     ///
-    /// Which is also the only form of it this codebase can hold itself to. Asked
-    /// per position, the comparison at a row's tail and the one at a presence
-    /// could never answer yes — the paragraph below is why — so two of the
-    /// walk's own branches would be unreachable, and a rule with a branch nobody
-    /// can exercise is a rule nobody can rely on. One comparison, at the end, is
-    /// a comparison both answers of which a program can produce. Walking the
-    /// whole value to reach it is what that costs, and this is not the place the
-    /// solver's time goes.
-    ///
-    /// It is answered yes only about a row-tail variable, and that is a fact about
-    /// the solver rather than a hole in the walk. Two reasons, and between them
-    /// they cover every route here:
-    ///
-    /// - A variable's sort is fixed where it was minted and never changes, so a
-    ///   presence variable is never the same variable as a row or type one. Most
-    ///   of what this walk turns up is therefore of the wrong sort to be the one
-    ///   being bound, and no comparison across two sorts can say yes.
-    /// - The same-sort cases are turned away before a binding is ever proposed.
-    ///   Two sides that share an open end and differ in labels either way round
-    ///   are refused in [`Solve::labels`], where the complaint can name both
-    ///   types instead of one variable; two tails that flatten to the same
-    ///   variable are [`Rule::Same`] in [`Solve::rests`]; two presences that are
-    ///   the same variable are [`Rule::Same`] in [`Solve::presences`], and both
-    ///   of its callers — [`Solve::field`] and [`Solve::absorb`] — put each
-    ///   presence through [`Table::presence_of`] first, so no chain of aliases
-    ///   arrives back at the variable being bound.
-    ///
-    /// The walk stays whole regardless. Those interceptions are where they are
-    /// because they word a better complaint, not because this cannot answer;
-    /// a rule with a hole in it is a rule nobody can rely on, and the next
-    /// person to move one of them should find this check already correct.
+    /// The explicit work and trace stacks keep deeply nested types bounded by
+    /// heap space. A field whose presence resolves absent is skipped: its
+    /// payload denotes nothing and cannot participate in a real cycle. Shared
+    /// row-tail cycles with no intervening binding are caught earlier by
+    /// [`Solve::labels`]; their closing constraint still enters the same
+    /// structured explanation path.
     fn occurs(&self, var: TyVar, value: &Assigned) -> bool {
-        let mut mentioned = Vec::new();
-        self.mentions(value, &mut mentioned);
-        mentioned.contains(&var)
+        // Do not flatten the value before searching it. Flattening is useful
+        // for equality, but it loses which bound-variable edges led back to
+        // `var` and records reads from innocent sibling branches. This raw,
+        // iterative walk follows one concrete route and retains precisely the
+        // binding reasons on that route in the active solver rule. The failed
+        // step then joins those reasons to the current constraint reason,
+        // preserving both the cycle path and its source-level closing edge.
+        #[derive(Clone)]
+        enum Part {
+            Ty(Rc<Ty>),
+            Row(Row),
+            Presence(Presence),
+            Field(Rc<Ty>, Presence),
+        }
+        struct Trace {
+            reason: ReasonId,
+            parent: Option<usize>,
+        }
+
+        let first = match value {
+            Assigned::Ty(ty) => Part::Ty(ty.clone()),
+            Assigned::Row(row) => Part::Row((**row).clone()),
+            Assigned::Presence(presence) => Part::Presence(presence.clone()),
+        };
+        let mut work: Vec<(Part, Option<usize>)> = vec![(first, None)];
+        let mut traces: Vec<Trace> = Vec::new();
+        while let Some((part, trace)) = work.pop() {
+            match part {
+                Part::Ty(ty) => match &*ty {
+                    Ty::Var(found) if *found == var => {
+                        let mut path = Vec::new();
+                        let mut at = trace;
+                        while let Some(index) = at {
+                            path.push(traces[index].reason);
+                            at = traces[index].parent;
+                        }
+                        path.reverse();
+                        for reason in path {
+                            self.note_binding_read(reason);
+                        }
+                        return true;
+                    }
+                    Ty::Var(found) => {
+                        if let Slot::Bound { value, by } = &self.vars[*found as usize] {
+                            let next = traces.len();
+                            traces.push(Trace {
+                                reason: *by,
+                                parent: trace,
+                            });
+                            let part = match value {
+                                Assigned::Ty(ty) => Part::Ty(ty.clone()),
+                                Assigned::Row(row) => Part::Row((**row).clone()),
+                                Assigned::Presence(presence) => Part::Presence(presence.clone()),
+                            };
+                            work.push((part, Some(next)));
+                        }
+                    }
+                    Ty::Package(body) => work.push((Part::Ty(body.clone()), trace)),
+                    Ty::Arrow(from, to, effects) => {
+                        work.push((Part::Row(effects.clone()), trace));
+                        work.push((Part::Ty(to.clone()), trace));
+                        work.push((Part::Ty(from.clone()), trace));
+                    }
+                    Ty::Struct(row) | Ty::Sum(row) => {
+                        work.push((Part::Row(row.clone()), trace));
+                    }
+                    Ty::Named { args, .. } => {
+                        work.extend(args.iter().rev().cloned().map(|ty| (Part::Ty(ty), trace)));
+                    }
+                    Ty::Nat
+                    | Ty::Int
+                    | Ty::Real
+                    | Ty::String
+                    | Ty::Boolean
+                    | Ty::Bound(_)
+                    | Ty::Rigid { .. }
+                    | Ty::Undecided => {}
+                },
+                Part::Row(row) => {
+                    // Push payloads first so the row tail, the direct route for
+                    // shared-row cycles, is examined before them.
+                    for field in row.labels.values().rev() {
+                        work.push((Part::Field(field.ty.clone(), field.presence.clone()), trace));
+                    }
+                    match &row.rest {
+                        Rest::More(more) => work.push((Part::Row((**more).clone()), trace)),
+                        Rest::Var(found) if *found == var => {
+                            let mut path = Vec::new();
+                            let mut at = trace;
+                            while let Some(index) = at {
+                                path.push(traces[index].reason);
+                                at = traces[index].parent;
+                            }
+                            path.reverse();
+                            for reason in path {
+                                self.note_binding_read(reason);
+                            }
+                            return true;
+                        }
+                        Rest::Var(found) => {
+                            if let Slot::Bound {
+                                value: Assigned::Row(row),
+                                by,
+                            } = &self.vars[*found as usize]
+                            {
+                                let next = traces.len();
+                                traces.push(Trace {
+                                    reason: *by,
+                                    parent: trace,
+                                });
+                                work.push((Part::Row((**row).clone()), Some(next)));
+                            }
+                        }
+                        Rest::Closed | Rest::Undecided | Rest::Bound(_) | Rest::Rigid { .. } => {}
+                    }
+                }
+                Part::Presence(presence) => {
+                    if let Presence::Var(found) = presence {
+                        if found == var {
+                            let mut path = Vec::new();
+                            let mut at = trace;
+                            while let Some(index) = at {
+                                path.push(traces[index].reason);
+                                at = traces[index].parent;
+                            }
+                            path.reverse();
+                            for reason in path {
+                                self.note_binding_read(reason);
+                            }
+                            return true;
+                        }
+                        if let Slot::Bound {
+                            value: Assigned::Presence(presence),
+                            by,
+                        } = &self.vars[found as usize]
+                        {
+                            let next = traces.len();
+                            traces.push(Trace {
+                                reason: *by,
+                                parent: trace,
+                            });
+                            work.push((Part::Presence(presence.clone()), Some(next)));
+                        }
+                    }
+                }
+                Part::Field(ty, presence) => match presence {
+                    Presence::Absent => {}
+                    Presence::Present
+                    | Presence::Undecided
+                    | Presence::Recovered(_)
+                    | Presence::Bound(_) => {
+                        work.push((Part::Ty(ty), trace));
+                    }
+                    Presence::Var(found) => match &self.vars[found as usize] {
+                        Slot::Bound {
+                            value: Assigned::Presence(next_presence),
+                            by,
+                        } => {
+                            let next = traces.len();
+                            traces.push(Trace {
+                                reason: *by,
+                                parent: trace,
+                            });
+                            work.push((Part::Field(ty, next_presence.clone()), Some(next)));
+                        }
+                        _ => work.push((Part::Ty(ty), trace)),
+                    },
+                },
+            }
+        }
+        false
     }
 
     /// Lower the level of everything `value` mentions to no more than `var`'s
@@ -4182,10 +4351,9 @@ impl Table {
     /// the variables minted inside a let would quantify it; generalizing the
     /// ones still at or above the let's level does not.
     ///
-    /// Walked the way the occurs check is walked, and by the same walk: the two
-    /// ask about the variables one value mentions, and asking once per position
-    /// is what would make either of them a rule with a branch nobody can
-    /// exercise. See [`Table::occurs`].
+    /// Unlike [`Table::occurs`], this needs every mentioned variable rather
+    /// than one exact causal route, so the exhaustive mention collector remains
+    /// the appropriate walk here.
     fn demote(&mut self, var: TyVar, value: &Assigned) {
         let level = self.levels[var as usize];
         let mut mentioned = Vec::new();
@@ -8788,6 +8956,73 @@ mod existential_regressions {
             .unwrap()
             .join()
             .expect("smallest mismatch leaf stays on its explicit stack");
+    }
+
+    #[test]
+    fn recursive_cycle_retains_only_the_exact_binding_path() {
+        let mut table = Table::default();
+        let target = table.mint(VarSort::Type, Subject::Term);
+        let first = table.mint(VarSort::Type, Subject::Term);
+        let second = table.mint(VarSort::Type, Subject::Term);
+        let sibling = table.mint(VarSort::Type, Subject::Term);
+        let first_reason = table.reason(ReasonOrigin::Recovery, Vec::new());
+        let second_reason = table.reason(ReasonOrigin::Recovery, Vec::new());
+        let sibling_reason = table.reason(ReasonOrigin::Recovery, Vec::new());
+        table.vars[first as usize] = Slot::Bound {
+            value: Assigned::Ty(Rc::new(Ty::plain(Ty::Var(second)))),
+            by: first_reason,
+        };
+        table.vars[second as usize] = Slot::Bound {
+            value: Assigned::Ty(Rc::new(Ty::plain(Ty::Var(target)))),
+            by: second_reason,
+        };
+        table.vars[sibling as usize] = Slot::Bound {
+            value: Assigned::Ty(Rc::new(Ty::Nat)),
+            by: sibling_reason,
+        };
+        let candidate = Assigned::Ty(Rc::new(Ty::Arrow(
+            Rc::new(Ty::plain(Ty::Var(first))),
+            Rc::new(Ty::plain(Ty::Var(sibling))),
+            Row::closed(),
+        )));
+
+        table.enter_solver_scope();
+        table.begin_solver_act();
+        assert!(table.occurs(target, &candidate));
+        assert_eq!(table.take_binding_reads(), [first_reason, second_reason]);
+        table.end_solver_act();
+        table.leave_solver_scope();
+    }
+
+    #[test]
+    fn recursive_cycle_detection_is_stack_safe_at_thirty_thousand_fields() {
+        std::thread::Builder::new()
+            .name("deep-recursive-cycle".into())
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                let mut table = Table::default();
+                let target = table.fresh_type_for(Subject::Term);
+                let Ty::Var(var) = &*target else {
+                    unreachable!()
+                };
+                let var = *var;
+                let mut nested = target;
+                for at in 0..30_000 {
+                    nested = Rc::new(Ty::Struct(Row {
+                        labels: [(format!("f{at}"), RowField::present(nested))]
+                            .into_iter()
+                            .collect(),
+                        rest: Rest::Closed,
+                    }));
+                }
+                assert!(table.occurs(var, &Assigned::Ty(nested.clone())));
+                // The property under test is the explicit walk, not recursive
+                // destruction of a deliberately pathological Rc tree.
+                std::mem::forget(nested);
+            })
+            .unwrap()
+            .join()
+            .expect("recursive-cycle detection stays on its explicit stack");
     }
 
     #[test]

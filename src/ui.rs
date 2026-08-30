@@ -2586,6 +2586,27 @@ fn explanation_fact(
     contradiction: &inference::Contradiction,
 ) -> String {
     use inference::ExplanationFactPayload as P;
+    if contradiction.kind == inference::ContradictionKind::RecursiveValue {
+        return match (fact.origin, fact.subject) {
+            (inference::ConstraintOrigin::ApplicationCallee, _)
+            | (_, inference::Subject::Callee | inference::Subject::CallShape) => {
+                "this call requires the value to accept an input".into()
+            }
+            (inference::ConstraintOrigin::ApplicationArgument, inference::Subject::Argument) => {
+                "this input is required to be the value itself".into()
+            }
+            (inference::ConstraintOrigin::ApplicationArgument, _) => {
+                "this call requires the input to accept itself".into()
+            }
+            (inference::ConstraintOrigin::Projection, inference::Subject::PatternDemand) => {
+                "this field requires the value to contain itself".into()
+            }
+            (_, inference::Subject::Argument | inference::Subject::Parameter) => {
+                "this input is required to contain itself".into()
+            }
+            _ => "this use requires the value to contain itself".into(),
+        };
+    }
     match fact.payload {
         P::UsedAsFunction => "this expression is called as a function".into(),
         P::SuppliesArgument => match fact.subject {
@@ -2659,6 +2680,7 @@ fn mismatch_title(contradiction: &inference::Contradiction) -> String {
             format!("{value} cannot be called as a function")
         }
         K::IncompatibleTypes => format!("{left} and {right} cannot be the same type"),
+        K::RecursiveValue => "this value would have to contain or accept itself".into(),
         K::ProjectionOnNonStruct => format!("{left} cannot provide struct fields"),
         K::LabelUnavailable => {
             let row = contradiction
@@ -2755,9 +2777,15 @@ impl inference::Error {
                 }
             }
             E::Recursive => {
-                diagnostic = diagnostic
-                    .label("this use makes the type refer back to itself")
-                    .help("remove the self-reference or introduce a finite wrapper type")
+                if let Some(explanation) = &self.explanation {
+                    diagnostic = causal_diagnostic(diagnostic, explanation)
+                        .help("change the call so a value is not passed to itself")
+                        .help("or change the value or field so it no longer contains itself");
+                } else {
+                    diagnostic = diagnostic
+                        .label("this use requires the value to contain or accept itself")
+                        .help("change the call, value, or field to remove the self-reference");
+                }
             }
             E::MissingField { shape, field, .. } | E::ExtraField { shape, field, .. } => {
                 let (noun, field) = about(*shape, field);
@@ -2809,7 +2837,7 @@ impl inference::Error {
                 if let Some(explanation) = &self.explanation {
                     diagnostic = causal_diagnostic(diagnostic, explanation)
                         .help(format!("remove {noun} `{field}` from the named side"))
-                        .help(format!("or keep it out of the `..` remainder"));
+                        .help("or keep it out of the `..` remainder");
                 } else {
                     diagnostic = diagnostic
                         .label(format!("{noun} `{field}` is already named outside `..`"))

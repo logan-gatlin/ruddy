@@ -1733,6 +1733,22 @@ fn a_type_error_is_a_diagnostic() {
         std::collections::HashSet::from(["label-introduction", "label-forbidden"]),
     );
     assert!(explanation.abridged.iter().all(|fact| fact.span.is_some()));
+
+    let recursive = snapshot("let bad = fn f => f f\n");
+    let explanation = recursive.diagnostics[0]
+        .inference_explanation
+        .as_ref()
+        .expect("recursive cycle keeps its debugger explanation");
+    assert_eq!(explanation.contradiction.kind, "recursive-value");
+    assert!((2..=4).contains(&explanation.abridged.len()));
+    assert!(explanation.full.len() >= explanation.abridged.len());
+    assert!(explanation.abridged.iter().all(|fact| fact.span.is_some()));
+    assert!(!explanation.cause.constraint_ids.is_empty());
+    assert!(!explanation.cause.reason_ids.is_empty());
+    assert_eq!(
+        explanation.contradiction.repairs,
+        ["change-first-use", "change-second-use"]
+    );
 }
 
 /// Projection failures keep their shape-specific diagnostics and spans in the

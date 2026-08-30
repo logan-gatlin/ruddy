@@ -872,6 +872,74 @@ fn ordinary_mismatch_explanations_keep_full_and_abridged_causal_evidence() {
 }
 
 #[test]
+fn recursive_types_have_grounded_structured_cycle_explanations() {
+    let cases = [
+        // Direct self-application.
+        "let bad = fn f => f f",
+        // The cycle closes below another function application.
+        "let id = fn x => x  let bad = fn f => id (f f)",
+        // A value nested through a field contains itself.
+        "let bad = { outer: { inner: bad } }",
+        // Two independently written uses close the cycle across a binding.
+        "let bad = fn f => let keep = f in { call: keep f, value: f }",
+        // One shared row tail cannot absorb the extra field on one side.
+        "let use : { x: Nat, ..'r } -> { x: Nat, y: Nat, ..'r } -> Nat = fn a => fn b => 1n  let bad = fn p => use p p",
+    ];
+
+    for source in cases {
+        let errors = inference_fixture_errors(source);
+        let [error] = errors.as_slice() else {
+            panic!("expected one recursive error for {source}: {errors:#?}");
+        };
+        assert!(matches!(error.kind, inference::ErrorKind::Recursive));
+        let explanation = error
+            .explanation
+            .as_ref()
+            .unwrap_or_else(|| panic!("missing recursive explanation for {source}"));
+        assert_eq!(
+            explanation.contradiction.kind,
+            inference::ContradictionKind::RecursiveValue
+        );
+        assert!(
+            (2..=4).contains(&explanation.abridged.len()),
+            "{source}: {explanation:#?}"
+        );
+        assert!(explanation.full_facts.len() >= explanation.abridged.len());
+        assert!(!explanation.cause.constraints.is_empty());
+        assert!(!explanation.cause.reasons.is_empty());
+        assert_eq!(
+            explanation.contradiction.repairs,
+            [
+                inference::RepairDirection::ChangeFirstUse,
+                inference::RepairDirection::ChangeSecondUse,
+            ]
+        );
+
+        let rendered = error.diagnostic();
+        let text = std::iter::once(rendered.title.as_str())
+            .chain(std::iter::once(rendered.primary.message.as_str()))
+            .chain(rendered.related.iter().map(|note| note.message.as_str()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains("contain") || text.contains("accept"),
+            "{source}: {rendered:#?}"
+        );
+        for forbidden in ["occurs", "?", "~", "solver"] {
+            assert!(
+                !text.contains(forbidden),
+                "recursive explanation leaked `{forbidden}` for {source}: {rendered:#?}"
+            );
+        }
+        assert_eq!(
+            rendered.help.len(),
+            2,
+            "repairs must name both editable sides"
+        );
+    }
+}
+
+#[test]
 fn row_explanations_keep_both_source_sides_and_normalize_solver_direction() {
     let projection = include_str!("../diagnostics/inference/projection-closed-later.hc");
     let errors = inference_fixture_errors(projection);

@@ -718,6 +718,7 @@ fn wire_explanation(
             kind: match contradiction.kind {
                 inference::ContradictionKind::IncompatibleTypes => "incompatible-types",
                 inference::ContradictionKind::ValueUsedAsFunction => "value-used-as-function",
+                inference::ContradictionKind::RecursiveValue => "recursive-value",
                 inference::ContradictionKind::ProjectionOnNonStruct => "projection-on-non-struct",
                 inference::ContradictionKind::LabelUnavailable => "label-unavailable",
                 inference::ContradictionKind::RepeatedLabel => "repeated-label",
