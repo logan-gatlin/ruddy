@@ -149,15 +149,9 @@ fn extern_node(ids: &mut Ids, _: &Cx, _: &Mint, external: &Extern) -> Node {
     Node::new(
         ids.next(),
         "Target",
-        external
-            .target
-            .segments
-            .iter()
-            .map(|segment| segment.tracked.as_str())
-            .collect::<Vec<_>>()
-            .join("."),
+        format!("{:?}", external.target.tracked),
     )
-    .at(external.target.span())
+    .at(external.target.span)
 }
 
 /// One `effect` declaration's cases: an operation with its two sides under it,

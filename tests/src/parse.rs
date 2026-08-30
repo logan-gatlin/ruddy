@@ -4,8 +4,8 @@ use std::fmt::{self, Write};
 
 use ruddy::{
     parse::{
-        ErrorKind, ExprKind, ExternTypeKind, ForeignPath, Path, PatternKind, Place, StmtKind,
-        SumCase, Type, TypeField, TypeKind, parse,
+        ErrorKind, ExprKind, ExternTypeKind, Path, PatternKind, Place, StmtKind, SumCase, Type,
+        TypeField, TypeKind, parse,
     },
     token::lex,
     tracking::FileID,
@@ -1244,8 +1244,7 @@ fn every_position_that_can_fail_reports_before_it_does() {
     }
 }
 
-/// Display implementations must propagate failures from the caller's writer,
-/// including failures between and within qualified path segments.
+/// Path display must propagate failures from the caller's writer.
 #[test]
 fn paths_propagate_formatter_failures() {
     struct FailsAfter(usize);
@@ -1265,12 +1264,6 @@ fn paths_propagate_formatter_failures() {
             .span(0, name.len())
             .track(name.to_string())
     };
-    let foreign = ForeignPath {
-        segments: vec![segment("host"), segment("call")],
-    };
-    assert!(write!(&mut FailsAfter(0), "{foreign}").is_err());
-    assert!(write!(&mut FailsAfter(1), "{foreign}").is_err());
-
     let qualified = Path {
         modules: vec![segment("Module")],
         name: segment("value"),
@@ -2340,8 +2333,8 @@ fn a_module_body_recovers_at_its_end() {
 }
 
 #[test]
-fn an_extern_declares_a_dotted_foreign_target_of_any_type() {
-    let source = "extern answer : Nat = host.answer";
+fn an_extern_declares_a_string_foreign_target_of_any_type() {
+    let source = "extern answer : Nat = \"host.answer\"";
     assert_eq!(parse_one(source), source);
     let output = parse(lex(source, FileID::GENERATED).tokens);
     let StmtKind::Extern {
@@ -2352,19 +2345,13 @@ fn an_extern_declares_a_dotted_foreign_target_of_any_type() {
     };
     assert_eq!(name.tracked, "answer");
     assert!(matches!(ty.ty.tracked, TypeKind::Ident { .. }));
-    assert_eq!(
-        target
-            .segments
-            .iter()
-            .map(|segment| segment.tracked.as_str())
-            .collect::<Vec<_>>(),
-        ["host", "answer"]
-    );
+    assert_eq!(target.tracked, "host.answer");
+    assert_eq!(target.span, FileID::GENERATED.span(22, 13));
 
     for source in [
         "extern answer = host.answer",
         "extern answer : Nat",
-        "extern answer : Nat = host.",
+        "extern answer : Nat = host",
     ] {
         let output = parse(lex(source, FileID::GENERATED).tokens);
         assert!(
@@ -2376,7 +2363,7 @@ fn an_extern_declares_a_dotted_foreign_target_of_any_type() {
 
 #[test]
 fn extern_fn_abi_desugars_to_curried_arrows_and_retains_arity() {
-    let source = "extern add : fn(Nat, Nat,) -> Nat + !IO = host.add";
+    let source = "extern add : fn(Nat, Nat,) -> Nat + !IO = \"host.add\"";
     let output = parse(lex(source, FileID::GENERATED).tokens);
     assert!(output.errors.is_empty(), "{:#?}", output.errors);
     let StmtKind::Extern { ty, abi, .. } = &output.stmts[0].tracked else {
@@ -2414,7 +2401,7 @@ fn extern_fn_abi_desugars_to_curried_arrows_and_retains_arity() {
 #[test]
 fn extern_fn_abi_supports_nullary_nested_grouped_and_where_forms() {
     let source =
-        "extern build : fn() -> (fn(Nat, String) -> Nat) + !Outer where 'a = 'a = host.build";
+        "extern build : fn() -> (fn(Nat, String) -> Nat) + !Outer where 'a = 'a = \"host.build\"";
     let output = parse(lex(source, FileID::GENERATED).tokens);
     assert!(output.errors.is_empty(), "{:#?}", output.errors);
     let StmtKind::Extern { ty, abi, .. } = &output.stmts[0].tracked else {
@@ -2440,8 +2427,8 @@ fn fn_abi_syntax_is_extern_only_and_directly_nested() {
     for source in [
         "let f : fn(Nat) -> Nat = value",
         "type F = fn(Nat) -> Nat",
-        "extern bad : { callback: fn(Nat) -> Nat } = host.bad",
-        "extern bad : fn(Nat -> fn(String) -> Nat) -> Nat = host.bad",
+        "extern bad : { callback: fn(Nat) -> Nat } = \"host.bad\"",
+        "extern bad : fn(Nat -> fn(String) -> Nat) -> Nat = \"host.bad\"",
     ] {
         let output = parse(lex(source, FileID::GENERATED).tokens);
         assert!(
@@ -2450,8 +2437,7 @@ fn fn_abi_syntax_is_extern_only_and_directly_nested() {
         );
     }
 
-    let source =
-        "extern bad : fn(Nat,, String) -> Nat = host.bad\nextern good : fn(Nat) -> Nat = host.good";
+    let source = "extern bad : fn(Nat,, String) -> Nat = \"host.bad\"\nextern good : fn(Nat) -> Nat = \"host.good\"";
     let output = parse(lex(source, FileID::GENERATED).tokens);
     assert!(!output.errors.is_empty());
     assert_eq!(output.stmts.len(), 1, "recovery skipped the next extern");

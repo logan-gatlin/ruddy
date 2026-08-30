@@ -91,7 +91,7 @@ pub struct Output {
 pub struct Extern {
     pub symbol: Symbol,
     pub name: String,
-    pub target: Vec<String>,
+    pub target: String,
     pub span: Span,
     pub rep: Rep,
 }
@@ -1057,14 +1057,8 @@ impl Lower<'_> {
             externs.push(Extern {
                 symbol,
                 name: name.clone(),
-                target: decl
-                    .value
-                    .target
-                    .segments
-                    .iter()
-                    .map(|segment| segment.tracked.clone())
-                    .collect(),
-                span: decl.value.target.span(),
+                target: decl.value.target.tracked.clone(),
+                span: decl.value.target.span,
                 rep: self.rep(&ty),
             });
 
@@ -1077,7 +1071,7 @@ impl Lower<'_> {
                 let mut body = Body::default();
                 let raw = self.emit(
                     &mut body,
-                    decl.value.target.span(),
+                    decl.value.target.span,
                     self.rep(&ty),
                     Op::Extern {
                         symbol,
@@ -1089,7 +1083,7 @@ impl Lower<'_> {
                     symbol,
                     name,
                     body: body.seal(Terminator {
-                        span: decl.value.target.span(),
+                        span: decl.value.target.span,
                         kind: End::Ret(value),
                     }),
                     span: decl.name_span,

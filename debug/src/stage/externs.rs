@@ -18,14 +18,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         .externs
         .iter()
         .map(|(symbol, decl)| {
-            let target = decl
-                .value
-                .target
-                .segments
-                .iter()
-                .map(|part| part.tracked.as_str())
-                .collect::<Vec<_>>()
-                .join(".");
+            let target = format!("{:?}", decl.value.target.tracked);
             let mut node = with_symbol(
                 Node::new(
                     ids.next(),
@@ -52,7 +45,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                     crate::print::lir::rep(external.rep),
                 ));
             }
-            node.child(Node::new(ids.next(), "Target", target).at(decl.value.target.span()))
+            node.child(Node::new(ids.next(), "Target", target).at(decl.value.target.span))
         })
         .collect();
     if nodes.is_empty() {

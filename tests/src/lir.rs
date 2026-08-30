@@ -2714,15 +2714,21 @@ fn a_function_an_indirect_call_returns_is_called_in_turn() {
 
 #[test]
 fn extern_values_are_imports_not_global_initializers() {
-    let (output, labels) = lowered_labelled("extern answer : Nat = host.answer\nlet next = answer");
+    let (output, labels) =
+        lowered_labelled("extern answer : Nat = \"host\\n.answer\"\nlet next = answer");
     assert_eq!(output.externs.len(), 1);
     let external = &output.externs[0];
     assert_eq!(external.name, "answer");
-    assert_eq!(external.target, ["host", "answer"]);
+    assert_eq!(external.target, "host\n.answer");
+    assert_eq!((external.span.start, external.span.width), (22, 15));
     assert_eq!(external.rep, lir::Rep::Nat);
     assert_eq!(output.globals.len(), 1, "externs have no initializer block");
     assert_eq!(output.globals[0].name, "next");
     let printed = print::lir::program(&output, &labels);
+    assert!(
+        printed.contains("extern answer: nat = \"host\\n.answer\""),
+        "the decoded target is rendered quoted and escaped:\n{printed}"
+    );
     assert!(
         printed.contains("global answer"),
         "the use reads the import:\n{printed}"
@@ -2732,8 +2738,8 @@ fn extern_values_are_imports_not_global_initializers() {
 #[test]
 fn recursive_ordinary_extern_adapters_close_cycles_in_both_directions() {
     let source = "type Loop = () -> Loop\n\
-         extern loop : Loop = host.loop\n\
-         extern install : fn(Loop) -> () = host.install";
+         extern loop : Loop = \"host.loop\"\n\
+         extern install : fn(Loop) -> () = \"host.install\"";
     let printed = listing(source);
     let adapters: Vec<_> = printed
         .lines()
@@ -2765,7 +2771,7 @@ fn extern_callbacks_capture_only_the_evidence_their_result_spine_requires() {
     let source = "effect Needed = { get: () -> Nat }\n\
          effect Spare = { get: () -> Nat }\n\
          type Callback = () -> (() -> Nat + !Needed)\n\
-         extern install : fn(Callback) -> () + !Needed + !Spare = host.install";
+         extern install : fn(Callback) -> () + !Needed + !Spare = \"host.install\"";
     let printed = listing(source);
     let callback = printed
         .lines()
@@ -2788,7 +2794,7 @@ fn extern_callbacks_capture_only_the_evidence_their_result_spine_requires() {
 #[test]
 fn callback_evidence_joins_conditional_then_definite_occurrences() {
     let source = "effect Needed = { get: () -> Nat }\n\
-         extern install : fn(fn(()) -> (() -> () + !Needed) + !Needed (when 'needed)) -> () + !Needed = host.install";
+         extern install : fn(fn(()) -> (() -> () + !Needed) + !Needed (when 'needed)) -> () + !Needed = \"host.install\"";
     let printed = listing(source);
     let callback = printed
         .lines()
@@ -2812,7 +2818,7 @@ fn callback_evidence_joins_conditional_then_definite_occurrences() {
 #[test]
 fn callback_evidence_joins_definite_then_conditional_occurrences() {
     let source = "effect Needed = { get: () -> Nat }\n\
-         extern install : fn(fn(()) -> (() -> () + !Needed (when 'needed)) + !Needed) -> () + !Needed = host.install";
+         extern install : fn(fn(()) -> (() -> () + !Needed (when 'needed)) + !Needed) -> () + !Needed = \"host.install\"";
     let printed = listing(source);
     let callback = printed
         .lines()
@@ -2837,7 +2843,7 @@ fn callback_evidence_joins_definite_then_conditional_occurrences() {
 fn conditional_callback_bundles_capture_only_their_named_possibilities() {
     let source = "effect Needed = { get: () -> Nat }\n\
          effect Spare = { get: () -> Nat }\n\
-         extern install : fn(fn(()) -> () + !Needed (when 'needed)) -> () + !Needed + !Spare + ..'effects = host.install";
+         extern install : fn(fn(()) -> () + !Needed (when 'needed)) -> () + !Needed + !Spare + ..'effects = \"host.install\"";
     let printed = listing(source);
     let bundles: Vec<_> = printed
         .lines()
@@ -2857,7 +2863,7 @@ fn conditional_callback_bundles_capture_only_their_named_possibilities() {
 fn conditional_named_evidence_overlays_the_same_shared_open_tail() {
     let source = "effect Needed = { get: () -> Nat }\n\
          effect Spare = { get: () -> Nat }\n\
-         extern install : fn(fn(()) -> () + !Needed (when 'needed) + ..'effects) -> () + !Needed + ..'effects = host.install\n\
+         extern install : fn(fn(()) -> () + !Needed (when 'needed) + ..'effects) -> () + !Needed + ..'effects = \"host.install\"\n\
          let call : () -> () + !Spare = fn _ => handle install (fn _ => let n = !Needed.get () in {}) with | !Needed.get _ => 0n end";
     let printed = listing(source);
     let marked = printed
@@ -2882,7 +2888,7 @@ fn conditional_named_evidence_overlays_the_same_shared_open_tail() {
 fn restricted_callback_bundles_project_shared_open_tails() {
     let source = "effect Needed = { get: () -> Nat }\n\
          effect Spare = { get: () -> Nat }\n\
-         extern install : fn(fn(()) -> () + !Needed (when 'needed)) -> () + !Needed (when 'needed) + ..'effects = host.install\n\
+         extern install : fn(fn(()) -> () + !Needed (when 'needed)) -> () + !Needed (when 'needed) + ..'effects = \"host.install\"\n\
          let pass : (() -> () + !Needed (when 'needed)) -> () + !Needed (when 'needed) + ..'effects =
            fn callback => install callback";
     let printed = listing(source);
@@ -2908,7 +2914,7 @@ fn restricted_callback_bundles_project_shared_open_tails() {
 fn restricted_callback_bundles_drop_unrelated_conditional_tail_effects() {
     let source = "effect Needed = { get: () -> Nat }\n\
          effect Spare = { get: () -> Nat }\n\
-         extern install : fn(fn(()) -> () + !Needed (when 'needed)) -> () + !Needed (when 'needed) + ..'effects = host.install\n\
+         extern install : fn(fn(()) -> () + !Needed (when 'needed)) -> () + !Needed (when 'needed) + ..'effects = \"host.install\"\n\
          let pass : (() -> () + !Needed (when 'needed)) -> () + !Needed (when 'needed) + !Spare (when 'spare) + ..'effects =
            fn callback => install callback";
     let printed = listing(source);
