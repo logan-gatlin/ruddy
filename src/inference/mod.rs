@@ -76,7 +76,8 @@ mod solve;
 
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, hash_map::DefaultHasher},
+    hash::{Hash, Hasher},
     ops::Range,
     rc::Rc,
 };
@@ -1889,6 +1890,7 @@ struct MismatchWork {
     left: Rc<Ty>,
     right: Rc<Ty>,
     alias_path: Option<usize>,
+    alias_work: usize,
 }
 
 struct AliasGoal {
@@ -1898,6 +1900,214 @@ struct AliasGoal {
     right_args: Rc<[Rc<Ty>]>,
     parent: Option<usize>,
     depth: usize,
+    fingerprint: u64,
+}
+
+/// Memoized, stack-safe hashes used only to reject unequal alias goals cheaply.
+/// Hash matches are still checked with `same_finite_syntax`, so collisions can
+/// cost work but cannot alter a diagnostic.
+#[derive(Default)]
+struct MismatchFingerprints {
+    types: HashMap<*const Ty, (Rc<Ty>, u64)>,
+}
+
+enum MismatchFingerprintWork {
+    Type(Rc<Ty>),
+    Finish(*const Ty, Rc<Ty>, u8, usize, Option<Symbol>),
+    Row(Row),
+    FinishRow(Vec<(String, Presence, bool)>, Rest, usize),
+}
+
+impl MismatchFingerprints {
+    fn arguments(&mut self, args: &[Rc<Ty>], work_left: &mut usize) -> Option<u64> {
+        fn tagged(tag: u8, parts: impl IntoIterator<Item = u64>) -> u64 {
+            let mut hash = DefaultHasher::new();
+            tag.hash(&mut hash);
+            for part in parts {
+                part.hash(&mut hash);
+            }
+            hash.finish()
+        }
+        fn presence_hash(p: &Presence) -> u64 {
+            match p {
+                Presence::Present => tagged(0, []),
+                Presence::Absent => tagged(1, []),
+                Presence::Undecided => tagged(2, []),
+                Presence::Var(id) => tagged(3, [u64::from(*id)]),
+                Presence::Bound(id) => tagged(4, [u64::from(*id)]),
+                Presence::Recovered(id) => tagged(5, [u64::from(*id)]),
+            }
+        }
+        fn rest_leaf_hash(rest: &Rest) -> Option<u64> {
+            Some(match rest {
+                Rest::Closed => tagged(0, []),
+                Rest::Undecided => tagged(1, []),
+                Rest::Var(id) => tagged(2, [u64::from(*id)]),
+                Rest::Bound(id) => tagged(3, [u64::from(*id)]),
+                Rest::Rigid { id, .. } => tagged(4, [u64::from(*id)]),
+                Rest::More(_) => return None,
+            })
+        }
+
+        let mut pending: Vec<_> = args
+            .iter()
+            .rev()
+            .cloned()
+            .map(MismatchFingerprintWork::Type)
+            .collect();
+        let mut values = Vec::new();
+        while let Some(next) = pending.pop() {
+            if *work_left == 0 {
+                return None;
+            }
+            *work_left -= 1;
+            match next {
+                MismatchFingerprintWork::Type(ty) => {
+                    let key = Rc::as_ptr(&ty);
+                    if let Some((_, hash)) = self.types.get(&key) {
+                        values.push(*hash);
+                        continue;
+                    }
+                    match &*ty {
+                        Ty::Nat => values.push(tagged(0, [])),
+                        Ty::Int => values.push(tagged(1, [])),
+                        Ty::Real => values.push(tagged(2, [])),
+                        Ty::String => values.push(tagged(3, [])),
+                        Ty::Boolean => values.push(tagged(4, [])),
+                        Ty::Var(id) => values.push(tagged(5, [u64::from(*id)])),
+                        Ty::Bound(id) => values.push(tagged(6, [u64::from(*id)])),
+                        Ty::Rigid { id, .. } => values.push(tagged(7, [u64::from(*id)])),
+                        Ty::Undecided => values.push(tagged(8, [])),
+                        Ty::Arrow(from, to, row) => {
+                            pending.push(MismatchFingerprintWork::Finish(
+                                key,
+                                ty.clone(),
+                                9,
+                                3,
+                                None,
+                            ));
+                            pending.push(MismatchFingerprintWork::Row(row.clone()));
+                            pending.push(MismatchFingerprintWork::Type(to.clone()));
+                            pending.push(MismatchFingerprintWork::Type(from.clone()));
+                            continue;
+                        }
+                        Ty::Package(inner) => {
+                            pending.push(MismatchFingerprintWork::Finish(
+                                key,
+                                ty.clone(),
+                                10,
+                                1,
+                                None,
+                            ));
+                            pending.push(MismatchFingerprintWork::Type(inner.clone()));
+                            continue;
+                        }
+                        Ty::Struct(row) | Ty::Sum(row) => {
+                            let tag = if matches!(&*ty, Ty::Struct(_)) {
+                                11
+                            } else {
+                                12
+                            };
+                            pending.push(MismatchFingerprintWork::Finish(
+                                key,
+                                ty.clone(),
+                                tag,
+                                1,
+                                None,
+                            ));
+                            pending.push(MismatchFingerprintWork::Row(row.clone()));
+                            continue;
+                        }
+                        Ty::Named { symbol, args, .. } => {
+                            pending.push(MismatchFingerprintWork::Finish(
+                                key,
+                                ty.clone(),
+                                13,
+                                args.len(),
+                                Some(*symbol),
+                            ));
+                            pending.extend(
+                                args.iter()
+                                    .rev()
+                                    .cloned()
+                                    .map(MismatchFingerprintWork::Type),
+                            );
+                            continue;
+                        }
+                    }
+                    self.types.insert(key, (ty, *values.last().unwrap()));
+                }
+                MismatchFingerprintWork::Finish(key, ty, tag, count, symbol) => {
+                    let parts = values.split_off(values.len() - count);
+                    let mut hash = DefaultHasher::new();
+                    tag.hash(&mut hash);
+                    symbol.hash(&mut hash);
+                    parts.hash(&mut hash);
+                    let hash = hash.finish();
+                    self.types.insert(key, (ty, hash));
+                    values.push(hash);
+                }
+                MismatchFingerprintWork::Row(row) => {
+                    let mut fields = Vec::with_capacity(row.labels.len());
+                    for (name, field) in &row.labels {
+                        let payload = !matches!(field.presence, Presence::Absent);
+                        fields.push((
+                            name.clone(),
+                            field.presence.clone(),
+                            payload,
+                            field.ty.clone(),
+                        ));
+                    }
+                    // Finite syntax treats labels as a map, independently of
+                    // the source insertion order.
+                    fields.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+                    let payloads = fields.iter().filter(|field| field.2).count();
+                    let completion = fields
+                        .iter()
+                        .map(|(n, p, has, _)| (n.clone(), p.clone(), *has))
+                        .collect();
+                    pending.push(MismatchFingerprintWork::FinishRow(
+                        completion,
+                        row.rest.clone(),
+                        payloads,
+                    ));
+                    if let Rest::More(more) = &row.rest {
+                        pending.push(MismatchFingerprintWork::Row((**more).clone()));
+                    }
+                    pending.extend(
+                        fields
+                            .into_iter()
+                            .rev()
+                            .filter(|field| field.2)
+                            .map(|field| MismatchFingerprintWork::Type(field.3)),
+                    );
+                }
+                MismatchFingerprintWork::FinishRow(fields, rest, payloads) => {
+                    let rest_more = matches!(rest, Rest::More(_));
+                    let count = payloads + usize::from(rest_more);
+                    let parts = values.split_off(values.len() - count);
+                    let mut parts = parts.into_iter();
+                    let mut hash = DefaultHasher::new();
+                    fields.len().hash(&mut hash);
+                    for (name, presence, payload) in fields {
+                        name.hash(&mut hash);
+                        presence_hash(&presence).hash(&mut hash);
+                        if payload {
+                            parts.next().unwrap().hash(&mut hash);
+                        }
+                    }
+                    if rest_more {
+                        parts.next().unwrap().hash(&mut hash);
+                    } else {
+                        rest_leaf_hash(&rest).unwrap().hash(&mut hash);
+                    }
+                    values.push(hash.finish());
+                }
+            }
+        }
+        let parts = values.split_off(values.len() - args.len());
+        Some(tagged(14, parts))
+    }
 }
 
 /// Pick the first incompatible semantic leaf on an explicit stack. The walk
@@ -1909,10 +2119,22 @@ fn smallest_incompatible(
     left: &Rc<Ty>,
     right: &Rc<Ty>,
 ) -> (TypeDescription, TypeDescription) {
+    let mut operations = 0;
+    smallest_incompatible_counted(aliases, left, right, &mut operations)
+}
+
+fn smallest_incompatible_counted(
+    aliases: &IndexMap<Symbol, Scheme>,
+    left: &Rc<Ty>,
+    right: &Rc<Ty>,
+    operations: &mut usize,
+) -> (TypeDescription, TypeDescription) {
+    const MAX_ALIAS_WORK: usize = 1_048_576;
     let mut work = vec![MismatchWork {
         left: left.clone(),
         right: right.clone(),
         alias_path: None,
+        alias_work: MAX_ALIAS_WORK,
     }];
     let fallback = (describe_type(left), describe_type(right));
     // Recursive declarations return to the same applications. Arguments are
@@ -1923,14 +2145,15 @@ fn smallest_incompatible(
     // indices make paths persistent without recursive destruction or cloning.
     let mut alias_goals: Vec<AliasGoal> = Vec::new();
     let mut forwarding = Forwarding::default();
-    // Malformed imported declarations can manufacture a fresh substitution on
-    // every turn. Bound each DFS branch independently: exhausting one growing
-    // branch must still leave queued siblings their full diagnostic walk.
-    const MAX_ALIAS_GOALS: usize = 4096;
+    let mut fingerprints = MismatchFingerprints::default();
+    // Malformed imported declarations can manufacture fresh, ever larger
+    // substitutions. Charge fingerprint nodes and ancestor probes to a strict
+    // branch-local budget; queued siblings retain the budget at their fork.
     while let Some(MismatchWork {
         mut left,
         mut right,
         mut alias_path,
+        mut alias_work,
     }) = work.pop()
     {
         while let Ty::Package(inner) = &*left {
@@ -1976,11 +2199,31 @@ fn smallest_incompatible(
                 .map(|arg| canonical_alias_argument(aliases, &mut forwarding, arg))
                 .collect::<Vec<_>>()
                 .into();
+            let Some(left_fingerprint) = fingerprints.arguments(&left_args, &mut alias_work) else {
+                *operations += MAX_ALIAS_WORK - alias_work;
+                continue;
+            };
+            let Some(right_fingerprint) = fingerprints.arguments(&right_args, &mut alias_work)
+            else {
+                *operations += MAX_ALIAS_WORK - alias_work;
+                continue;
+            };
+            let mut goal_hash = DefaultHasher::new();
+            left_symbol.hash(&mut goal_hash);
+            right_symbol.hash(&mut goal_hash);
+            left_fingerprint.hash(&mut goal_hash);
+            right_fingerprint.hash(&mut goal_hash);
+            let fingerprint = goal_hash.finish();
             let mut ancestor = alias_path;
             let mut seen = false;
             while let Some(index) = ancestor {
+                if alias_work == 0 {
+                    break;
+                }
+                alias_work -= 1;
                 let goal = &alias_goals[index];
-                if goal.left_symbol == *left_symbol
+                if goal.fingerprint == fingerprint
+                    && goal.left_symbol == *left_symbol
                     && goal.right_symbol == *right_symbol
                     && goal.left_args.len() == left_args.len()
                     && goal.right_args.len() == right_args.len()
@@ -2001,7 +2244,8 @@ fn smallest_incompatible(
                 ancestor = goal.parent;
             }
             let depth = alias_path.map_or(0, |index| alias_goals[index].depth);
-            if seen || depth == MAX_ALIAS_GOALS {
+            if seen || alias_work == 0 {
+                *operations += MAX_ALIAS_WORK - alias_work;
                 continue;
             }
             alias_goals.push(AliasGoal {
@@ -2011,6 +2255,7 @@ fn smallest_incompatible(
                 right_args,
                 parent: alias_path,
                 depth: depth + 1,
+                fingerprint,
             });
             alias_path = Some(alias_goals.len() - 1);
         }
@@ -2031,21 +2276,23 @@ fn smallest_incompatible(
         }
         match (&*left, &*right) {
             (Ty::Arrow(l_from, l_to, l_effects), Ty::Arrow(r_from, r_to, r_effects)) => {
-                push_row_payloads(&mut work, l_effects, r_effects, alias_path);
+                push_row_payloads(&mut work, l_effects, r_effects, alias_path, alias_work);
                 // Source order: parameter, result, then effects.
                 work.push(MismatchWork {
                     left: l_to.clone(),
                     right: r_to.clone(),
                     alias_path,
+                    alias_work,
                 });
                 work.push(MismatchWork {
                     left: l_from.clone(),
                     right: r_from.clone(),
                     alias_path,
+                    alias_work,
                 });
             }
             (Ty::Struct(left), Ty::Struct(right)) | (Ty::Sum(left), Ty::Sum(right)) => {
-                push_row_payloads(&mut work, left, right, alias_path);
+                push_row_payloads(&mut work, left, right, alias_path, alias_work);
                 if left.labels.keys().ne(right.labels.keys()) {
                     return descriptions;
                 }
@@ -2098,6 +2345,7 @@ fn push_row_payloads(
     left: &Row,
     right: &Row,
     alias_path: Option<usize>,
+    alias_work: usize,
 ) {
     // Reverse insertion order so the first written common label is visited
     // first by the LIFO work list. Presence/rest incompatibilities have no type
@@ -2112,6 +2360,7 @@ fn push_row_payloads(
             left: left.clone(),
             right: right.clone(),
             alias_path,
+            alias_work,
         });
     }
 }
@@ -7445,6 +7694,50 @@ mod existential_regressions {
             smallest_incompatible(&aliases, &named, &named),
             (TypeDescription::DeclaredType, TypeDescription::DeclaredType),
             "pure growth must stop at the per-branch bound"
+        );
+    }
+
+    #[test]
+    fn self_growing_alias_mismatch_has_a_strict_operation_bound() {
+        use crate::symbol::{Bundle, Mint, Namespace, Version};
+
+        let bundle = Bundle::new("self-growing-leaf", Version::new(1, 0, 0)).unwrap();
+        let mut mint = Mint::new(bundle);
+        let grow = mint.global(None, Namespace::Types, "Grow").unwrap();
+        // Recovery input equivalent to `type Grow 'a = Grow { x: 'a }`.
+        // Every opening has a distinct, one-node-larger argument, so an
+        // ancestor-by-ancestor deep equality walk is superlinear.
+        let larger = Rc::new(Ty::Struct(Row {
+            labels: [("x".into(), RowField::present(Rc::new(Ty::Bound(0))))]
+                .into_iter()
+                .collect(),
+            rest: Rest::Closed,
+        }));
+        let recursive = Rc::new(Ty::Named {
+            symbol: grow,
+            name: "Grow".into(),
+            args: Rc::from([larger]),
+        });
+        let body = Rc::new(Ty::Struct(Row {
+            labels: [("next".into(), RowField::present(recursive))]
+                .into_iter()
+                .collect(),
+            rest: Rest::Closed,
+        }));
+        let aliases = [(grow, Scheme::new(1, body))].into_iter().collect();
+        let named = Rc::new(Ty::Named {
+            symbol: grow,
+            name: "Grow".into(),
+            args: Rc::from([Rc::new(Ty::Nat)]),
+        });
+        let mut operations = 0;
+        assert_eq!(
+            smallest_incompatible_counted(&aliases, &named, &named, &mut operations),
+            (TypeDescription::DeclaredType, TypeDescription::DeclaredType)
+        );
+        assert_eq!(
+            operations, 1_048_576,
+            "self-growth must stop exactly at the branch budget"
         );
     }
 
