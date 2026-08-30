@@ -463,7 +463,7 @@ input {
   align-items: center;
   gap: 2px;
   flex: none;
-  height: 26px;
+  height: 48px;
   padding: 0 6px;
   border-bottom: 1px solid var(--line);
   background: var(--bg);
@@ -472,16 +472,23 @@ input {
 }
 
 /* Tabs are separated chips rather than words in a row: every one of them is a
-   name, and without an edge between them the bar reads as one string. */
-/* The tabs give way before the controls do: a filter box pushed off the edge is
-   worse than a tab strip you have to scroll. */
+   name, and without an edge between them the bar reads as one string.
+
+   Two tabs stack in each column before the strip moves right. This doubles the
+   stages visible at once without shrinking their names, while preserving the
+   horizontal escape hatch for narrower panes. The tabs still give way before
+   the controls do: a filter pushed off the edge is worse than a strip you have
+   to scroll. */
 .tabs {
   display: flex;
-  align-items: center;
-  gap: 4px;
-  flex: 0 1 auto;
+  flex-flow: column wrap;
+  align-content: flex-start;
+  gap: 2px 4px;
+  flex: 1 1 0;
   min-width: 0;
+  height: 40px;
   overflow-x: auto;
+  overflow-y: hidden;
   scrollbar-width: none;
 }
 .tabs::-webkit-scrollbar {
@@ -530,8 +537,8 @@ input {
 }
 
 .pane-bar .grow {
-  flex: 1 1 8px;
-  min-width: 8px;
+  flex: none;
+  min-width: 0;
 }
 
 .views {
@@ -681,6 +688,37 @@ pre.raw {
 }
 pre.raw .hi {
   color: var(--fg);
+}
+
+/* Ariadne writes terminal colours; the browser maps those roles onto the
+   debugger palette so the report remains legible in both colour schemes. */
+pre.terminal {
+  color: var(--fg);
+}
+.ansi-31 {
+  color: var(--error);
+}
+.ansi-32,
+.ansi-256-115 {
+  color: var(--ok);
+}
+.ansi-33 {
+  color: var(--symbol);
+}
+.ansi-34,
+.ansi-36 {
+  color: var(--accent);
+}
+.ansi-35,
+.ansi-256-147 {
+  color: var(--keyword);
+}
+.ansi-256-240,
+.ansi-256-246 {
+  color: var(--fg-faint);
+}
+.ansi-256-249 {
+  color: var(--fg-dim);
 }
 
 .pane-note {

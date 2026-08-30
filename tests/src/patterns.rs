@@ -434,7 +434,7 @@ fn a_qualifying_column_is_exhaustive_by_its_constraint() {
 /// store allowed before it.
 #[test]
 fn a_scrutinee_that_contradicts_the_coverage_is_unhandled() {
-    let src = "let bad = match {x: 1n, y: 2n} with {x} => {} | {y} => {} end";
+    let src = "let bad = match {x: 1n, y: 2n} with | {x} => {} | {y} => {} end";
     let (out, inferred, checks) = checked(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);

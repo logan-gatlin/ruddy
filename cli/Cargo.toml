@@ -11,6 +11,7 @@ name = "ruddy"
 path = "src/main.rs"
 
 [dependencies]
+ariadne = "0.6"
 boa_engine = "0.22"
 boa_runtime = { version = "0.22", features = ["all", "process"] }
 clap = { version = "4", features = ["derive"] }

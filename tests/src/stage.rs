@@ -219,6 +219,31 @@ fn position(id: &str) -> Option<usize> {
     REGISTRY.iter().position(|spec: &Spec| spec.id == id)
 }
 
+/// The Errors tab expands the terse strip through the CLI's Ariadne renderer:
+/// source context, both ends of a related diagnostic, and terminal colour all
+/// travel together rather than being reconstructed by the page.
+#[test]
+fn the_errors_tab_shows_expanded_colored_cli_diagnostics() {
+    let errors = stage("errors", "let x = ()\nlet x = ()\n");
+    assert_eq!(errors.view, View::Terminal);
+    assert_eq!(errors.views, [View::Terminal]);
+    assert_eq!(errors.status, Status::Partial);
+    assert_eq!(errors.summary, "1 error");
+    let plain = errors.debug.clone();
+    let rendered = errors.text.expect("the expanded report");
+    assert!(rendered.contains("\x1b[31m"), "{rendered:?}");
+    assert!(rendered.contains("[duplicate-term] Error"), "{rendered}");
+    assert!(!rendered.contains("[ir/"), "{rendered}");
+    assert!(!plain.contains('\x1b'), "{plain:?}");
+    assert!(plain.contains("1 │let x = ()"), "{plain}");
+    assert!(plain.contains("2 │let x = ()"), "{plain}");
+    assert!(plain.contains("first defined here"), "{plain}");
+
+    let clean = stage("errors", "let x = ()\n");
+    assert_eq!(clean.status, Status::Ok);
+    assert_eq!(clean.text.as_deref(), Some("no errors"));
+}
+
 /// The Patterns tab: one section per match, the solved scrutinee type on the
 /// match's row, one row per arm wearing its verdict, and the coverage line —
 /// exhaustive, or the witness — with the skipped honesty when the typing
@@ -255,7 +280,7 @@ fn the_patterns_tab_renders_verdicts_and_coverage() {
     // error it reports.
     let nodes = tab(
         "patterns",
-        "let bad = match {x: 1n, y: 2n} with {x} => {} | {y} => {} end",
+        "let bad = match {x: 1n, y: 2n} with | {x} => {} | {y} => {} end",
     );
     let coverage = nodes[0]
         .children
@@ -925,6 +950,8 @@ fn artifact_stage_renders_one_dependency() {
     ]);
     let cx = Cx {
         files: &[],
+        sources: &[],
+        diagnostics: &[],
         bundle: None,
         program: None,
         inference: None,

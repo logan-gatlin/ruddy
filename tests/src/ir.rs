@@ -3068,12 +3068,12 @@ fn a_wildcard_is_exempt_from_the_duplicate_binder_check() {
         "let f = fn e => match e with | #Pair { a: _, b: _ } => 1n | _ => 2n end"
     );
     assert_eq!(
-        lowered("let f = fn e => match e with { a: _, b: x } => x end"),
+        lowered("let f = fn e => match e with | { a: _, b: x } => x end"),
         "let f = fn e => match e with | { a: _, b: x } => x end"
     );
 
     // The same pattern with a name where the wildcards were still fails.
-    let (_, errors) = lowered_with_errors("let f = fn e => match e with { a: x, b: x } => x end");
+    let (_, errors) = lowered_with_errors("let f = fn e => match e with | { a: x, b: x } => x end");
     assert_eq!(errors.len(), 1, "{errors:#?}");
     assert!(errors[0].starts_with("duplicate-binding@"), "{errors:#?}");
 }
@@ -3137,16 +3137,16 @@ fn a_wildcard_does_not_make_a_refutable_binding_calm() {
 #[test]
 fn a_wildcard_arm_lowers_wherever_it_was_written() {
     assert_eq!(
-        lowered("let f = fn n => match n with _ => 1n | 0n => 2n end"),
+        lowered("let f = fn n => match n with | _ => 1n | 0n => 2n end"),
         "let f = fn n => match n with | _ => 1n | 0n => 2n end"
     );
     assert_eq!(
-        lowered("let f = fn e => match e with _ => 1n | _ => 2n end"),
+        lowered("let f = fn e => match e with | _ => 1n | _ => 2n end"),
         "let f = fn e => match e with | _ => 1n | _ => 2n end"
     );
     // Last, it is what a named catch-all is: an ordinary final arm.
     assert_eq!(
-        lowered("let f = fn n => match n with 0n => 1n | _ => 2n end"),
+        lowered("let f = fn n => match n with | 0n => 1n | _ => 2n end"),
         "let f = fn n => match n with | 0n => 1n | _ => 2n end"
     );
 }
@@ -3233,26 +3233,26 @@ fn nested_arms_stay_written() {
 }
 
 /// The sole irrefutable arm is legal and stays a match: one arm, binding the
-/// whole value — `match e with x => b end` means `let x = e in b`, and the
+/// whole value — `match e with | x => b end` means `let x = e in b`, and the
 /// meaning is typing's to give.
 #[test]
 fn a_sole_catch_all_keeps_its_shape() {
     assert_eq!(
-        lowered("let same = fn v => match v with w => w end"),
+        lowered("let same = fn v => match v with | w => w end"),
         "let same = fn v => match v with | w => w end"
     );
     assert_eq!(
-        lowered("let f = fn v => match v with {x} => x end"),
+        lowered("let f = fn v => match v with | {x} => x end"),
         "let f = fn v => match v with | { x: x } => x end"
     );
     assert_eq!(
-        lowered("let f = fn v => match v with () => 1n end"),
+        lowered("let f = fn v => match v with | () => 1n end"),
         "let f = fn v => match v with | () => 1n end"
     );
     // `{}` reaches into nothing: it binds nothing, tests nothing, and is as
     // much a catch-all as a bare name.
     assert_eq!(
-        lowered("let f = fn v => match v with {} => 1n end"),
+        lowered("let f = fn v => match v with | {} => 1n end"),
         "let f = fn v => match v with | () => 1n end"
     );
 }
@@ -3317,7 +3317,7 @@ fn a_match_is_a_shape_for_the_circularity_walk() {
     let (_, errors) =
         lowered_with_errors("let a = let x = match x with | #A y => y | r => r end in x");
     assert!(errors.is_empty(), "{errors:#?}");
-    let (_, errors) = lowered_with_errors("let x = match x with w => w end");
+    let (_, errors) = lowered_with_errors("let x = match x with | w => w end");
     assert!(errors.is_empty(), "{errors:#?}");
 }
 
@@ -3420,14 +3420,14 @@ fn overlapping_arms_are_clean() {
 #[test]
 fn a_rest_marker_survives_normalization() {
     assert_eq!(
-        lowered("let f = fn v => match v with {x, ..} => x | {} => 0n end"),
+        lowered("let f = fn v => match v with | {x, ..} => x | {} => 0n end"),
         "let f = fn v => match v with | { x: x, .. } => x | () => 0n end"
     );
     assert_eq!(
-        lowered("let f = fn v => match v with {..} => 1n end"),
+        lowered("let f = fn v => match v with | {..} => 1n end"),
         "let f = fn v => match v with | { .. } => 1n end"
     );
-    let (mint, out) = built("let f = fn v => match v with {x, ..} => x end");
+    let (mint, out) = built("let f = fn v => match v with | {x, ..} => x end");
     let TermKind::Fn { body, .. } = term_value(&mint, &out, "f") else {
         panic!("f is a function");
     };
@@ -10758,6 +10758,8 @@ fn deeply_nested_imported_semantics_are_preserved_on_a_small_stack() {
             let symbols = std::collections::HashMap::new();
             let cx = ruddy_debug::stage::Cx {
                 files: &[],
+                sources: &[],
+                diagnostics: &[],
                 bundle: None,
                 program: Some(&program),
                 inference: Some(&inferred),

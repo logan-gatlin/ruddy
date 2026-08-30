@@ -37,18 +37,32 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
 
     let mut all: Vec<(&str, &str, String)> = Vec::new();
     for kind in [
-        LexError::Unrecognized,
-        LexError::MalformedNatural,
+        LexError::InvalidCharacter { character: '@' },
+        LexError::MalformedTag,
+        LexError::MalformedEffectLabel,
+        LexError::MalformedVariable,
+        LexError::NumberFollowedByName,
+        LexError::DecimalWithWholeSuffix { suffix: 'n' },
+        LexError::MalformedNumericField,
         LexError::NaturalTooLarge,
-        LexError::MalformedString,
+        LexError::IntegerTooLarge,
+        LexError::RealTooLarge,
+        LexError::NumericFieldTooLarge,
+        LexError::UnknownStringEscape { escape: 'q' },
+        LexError::MissingClosingQuote,
     ] {
         all.push(("lex", kind.code(), kind.to_string()));
     }
 
-    // Every kind and, for the wildcard, every position it can be worded for:
-    // one meaning, five phrasings, and each has to hold to the phrase rules.
+    // Every kind. The expected category supplies the specific code and prose;
+    // focused tests below cover its context-sensitive forms.
     for kind in [
-        parse::ErrorKind::Unexpected,
+        parse::ErrorKind::Expected {
+            expected: parse::Expected::Value,
+            found: parse::Found::Token,
+            related: None,
+            context: None,
+        },
         parse::ErrorKind::Wildcard {
             place: parse::Place::Value,
         },
@@ -307,7 +321,10 @@ fn every_complaint_is_a_phrase_a_reporter_can_place() {
             .chars()
             .next()
             .unwrap_or_else(|| panic!("{phase}/{code} says something"));
-        assert!(!first.is_ascii_uppercase(), "{phase}/{code}: {message}");
+        assert!(
+            !first.is_ascii_uppercase() || message.starts_with("Ruddy "),
+            "{phase}/{code}: {message}"
+        );
         assert!(!message.ends_with('.'), "{phase}/{code}: {message}");
     }
 }
@@ -316,6 +333,50 @@ fn every_complaint_is_a_phrase_a_reporter_can_place() {
 /// and a test greps for one — so two kinds sharing a code would silently
 /// conflate them. Checked across the whole compiler rather than per phase: the
 /// strip mixes every phase's diagnostics into one list.
+#[test]
+fn numeric_lexer_complaints_name_the_number_category_written() {
+    for (kind, code, message) in [
+        (
+            LexError::NumberFollowedByName,
+            "number-joined-to-name",
+            "a number cannot run directly into a name",
+        ),
+        (
+            LexError::DecimalWithWholeSuffix { suffix: 'i' },
+            "decimal-marked-whole",
+            "`i` is only used with whole numbers",
+        ),
+        (
+            LexError::MalformedNumericField,
+            "invalid-field-number",
+            "a numbered field can contain only digits",
+        ),
+        (
+            LexError::NaturalTooLarge,
+            "whole-number-too-large",
+            "this whole number is too large",
+        ),
+        (
+            LexError::IntegerTooLarge,
+            "integer-too-large",
+            "this integer is too large",
+        ),
+        (
+            LexError::RealTooLarge,
+            "number-too-large",
+            "this number is too large",
+        ),
+        (
+            LexError::NumericFieldTooLarge,
+            "field-number-too-large",
+            "this field number is too large",
+        ),
+    ] {
+        assert_eq!(kind.code(), code);
+        assert_eq!(kind.to_string(), message);
+    }
+}
+
 #[test]
 fn no_two_kinds_of_error_are_coded_the_same() {
     let all = diagnostics();
@@ -2399,10 +2460,72 @@ fn no_complaint_speaks_in_pattern_jargon() {
     }
 }
 
-/// The misplaced wildcard is one meaning worded five ways: every position's
-/// phrasing opens with what `_` stands for, every wording is distinct, all
-/// share one code, and each holds to the phrase rules like any diagnostic.
-/// The wording per position is pinned so a reworded meaning cannot slip by.
+#[test]
+fn parse_expectations_are_worded_for_their_source_context() {
+    let primary = Span::generated(8, 1);
+    let related = Span::generated(4, 1);
+    let error = |expected, kind| parse::Error {
+        span: primary,
+        kind: parse::ErrorKind::Expected {
+            expected,
+            found: parse::Found::Token,
+            related: Some(parse::Related {
+                span: related,
+                kind,
+            }),
+            context: None,
+        },
+    };
+    let said = |expected, kind| error(expected, kind).to_string();
+
+    assert_eq!(
+        said(
+            parse::Expected::Punctuation("}"),
+            parse::RelatedKind::Opener
+        ),
+        "add `}` to close this part"
+    );
+    assert_eq!(
+        said(parse::Expected::Value, parse::RelatedKind::Operator),
+        "write a value after this"
+    );
+    assert_eq!(
+        said(parse::Expected::Effect, parse::RelatedKind::Separator),
+        "write an effect name after this"
+    );
+
+    // A token after an unclosed delimiter belongs to the surrounding syntax;
+    // do not blame it as unusable. Name the insertion before it and retain the
+    // opener as the related source location.
+    for (mark, code) in [
+        (")", "expected-closing-parenthesis"),
+        ("}", "expected-closing-brace"),
+    ] {
+        let diagnostic = error(
+            parse::Expected::Punctuation(mark),
+            parse::RelatedKind::Opener,
+        )
+        .diagnostic();
+        assert_eq!(diagnostic.code, code);
+        assert_eq!(diagnostic.title, format!("add `{mark}` to close this part"));
+        assert_eq!(
+            diagnostic.primary.message,
+            format!("write `{mark}` before this")
+        );
+        assert_eq!(
+            diagnostic.related,
+            vec![ui::Annotation {
+                span: related,
+                message: "opened here".into(),
+            }]
+        );
+    }
+}
+
+/// The misplaced discard is one meaning worded five ways. Every wording is
+/// distinct, all share one code, and each holds to the phrase rules like any
+/// diagnostic. The wording per position is pinned so a reworded meaning cannot
+/// slip by.
 #[test]
 fn a_misplaced_wildcard_is_worded_for_its_position() {
     let span = Span::generated(0, 1);
@@ -2411,34 +2534,34 @@ fn a_misplaced_wildcard_is_worded_for_its_position() {
             span,
             kind: parse::ErrorKind::Wildcard { place },
         };
-        assert_eq!(error.code(), "misplaced-wildcard", "{place:?}");
+        assert_eq!(error.code(), "misplaced-discard", "{place:?}");
         error.to_string()
     };
 
     assert_eq!(
         said(parse::Place::Value),
-        "`_` stands for a value being thrown away, so it can't be used as a value here"
+        "`_` throws a value away, so it cannot be read here"
     );
     assert_eq!(
         said(parse::Place::Field),
-        "`_` stands for a value being thrown away, so it can't be a field's name"
+        "a field needs a name other than `_`"
     );
     assert_eq!(
         said(parse::Place::Pun),
-        "`_` stands for a value being thrown away, and a field written bare binds to its own name, so there is no name here to bind"
+        "write a field name, or give the field a value after `:`"
     );
     assert_eq!(
         said(parse::Place::Projection),
-        "`_` stands for a value being thrown away, so it can't name a field to read"
+        "write the name of the field to read"
     );
     assert_eq!(
         said(parse::Place::Type),
-        "`_` stands for a value being thrown away, so it can't be used as a type"
+        "this place needs a name rather than `_`"
     );
 
-    // One meaning, five phrasings: each opens with what `_` stands for, no
-    // two are the same sentence, and each is a placeable phrase — no leading
-    // capital, no trailing period — that names no machinery.
+    // One meaning, five phrasings: no two are the same sentence, and each is a
+    // placeable phrase — no leading capital, no trailing period — that names
+    // no machinery.
     let places = [
         parse::Place::Value,
         parse::Place::Field,
@@ -2449,10 +2572,6 @@ fn a_misplaced_wildcard_is_worded_for_its_position() {
     let wordings: HashSet<String> = places.iter().map(|place| said(*place)).collect();
     assert_eq!(wordings.len(), places.len(), "{wordings:?}");
     for wording in &wordings {
-        assert!(
-            wording.starts_with("`_` stands for a value being thrown away"),
-            "{wording}"
-        );
         assert!(!wording.ends_with('.'), "{wording}");
         assert!(!wording.to_lowercase().contains("wildcard"), "{wording}");
     }

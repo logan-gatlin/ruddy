@@ -122,6 +122,7 @@ pub fn label(kind: &Kind) -> &'static str {
         Kind::Real(_) => "Real",
         Kind::String(_) => "String",
         Kind::Boolean(_) => "Boolean",
+        Kind::Invalid => "Invalid",
     }
 }
 

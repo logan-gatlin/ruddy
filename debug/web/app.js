@@ -12,6 +12,7 @@ import { createDiagnostics } from "./diagnostics.js";
 const COMPILE_AFTER = 120;
 const SAVE_AFTER = 1000;
 const UI_KEY = "ruddy-debug/ui";
+const CLIENT_ID = crypto.randomUUID();
 const docKey = (name) => `ruddy-debug/doc/${name}`;
 
 /// The root file of every bundle, which the server decides and the page only
@@ -50,6 +51,8 @@ const state = {
   /// looking a second ago, not something worth outliving the tab.
   where: {},
   revision: 0,
+  /// Optimistic generation shared by browser compiles and agent edits.
+  sessionRevision: 0,
   snapshot: null,
   build: null,
   buildError: null,
@@ -101,6 +104,7 @@ const app = {
 
   setSelection(mark) {
     state.selection = mark;
+    scheduleSharedView();
     // A span names a file as well as a range now, and revealing a range in a
     // file that is not on screen reveals nothing — so the file comes first.
     if (mark?.span && mark.origin !== "editor") {
@@ -201,6 +205,7 @@ const app = {
   },
 
   save: saveUi,
+  shareView: scheduleSharedView,
 };
 
 // ── boot ─────────────────────────────────────────────────────────────────
@@ -228,6 +233,7 @@ app.on("input", (text) => {
 });
 
 app.on("caret", (byte) => {
+  scheduleSharedView();
   if (!state.follow) return;
   const span = { file: app.fileIndex(), range: [byte, byte] };
   app.setSelection({ origin: "editor", span, symbol: null, stage: null, node: null });
@@ -433,9 +439,20 @@ async function compileNow() {
         ...(state.std === null ? {} : { std: state.std }),
         dependencies: state.dependencies,
         revision,
+        session_revision: state.sessionRevision,
+        client_id: CLIENT_ID,
+        view: sharedView(),
       }),
     });
     const snapshot = await response.json();
+    // The source changed after this request left the browser. Pull the winner
+    // instead of letting an in-flight compile undo a human or agent edit.
+    if (response.headers.get("X-Session-Accepted") === "false") {
+      await syncSharedSession();
+      return;
+    }
+    const sharedRevision = Number(response.headers.get("X-Session-Revision"));
+    if (Number.isFinite(sharedRevision)) state.sessionRevision = sharedRevision;
     // A slower earlier compile must never overwrite a newer one.
     if (snapshot.revision !== state.revision) return;
     state.snapshot = snapshot;
@@ -465,9 +482,12 @@ async function connect() {
       const first = seq === null;
       seq = update.seq;
 
-      for (const { event } of update.events) {
+      for (const { event, data } of update.events) {
         if (event === "rebuilding") rebuilding = true;
         if (event === "reload-web") location.reload();
+        if (event === "session-changed" && data.revision > state.sessionRevision) {
+          await syncSharedSession();
+        }
       }
       setLink(rebuilding ? "busy" : "live");
 
@@ -475,7 +495,12 @@ async function connect() {
         await refreshStatus();
         rebuilding = false;
         setLink("live");
-        if (!first && state.build !== null) await compileNow();
+        if (!first && state.build !== null) {
+          // A restarted server has no in-memory session yet. Rejoin from zero;
+          // the scratch document and this browser still hold the source.
+          state.sessionRevision = 0;
+          await compileNow();
+        }
         state.build = update.build;
         renderTitlebar();
       }
@@ -495,6 +520,51 @@ async function refreshStatus() {
   const status = await get("/status").catch(() => null);
   state.buildError = status?.build_error ?? null;
   app.emit("status");
+}
+
+/// Pull an agent edit into the live editor. The server response carries the
+/// exact snapshot the agent saw after editing, so source and every panel move
+/// together rather than waiting for a second compile.
+async function syncSharedSession(shared = null) {
+  shared ??= await get("/session").catch(() => null);
+  if (!shared || shared.session_revision < state.sessionRevision) return;
+
+  const request = shared.request;
+  const view = shared.view ?? {};
+  state.sessionRevision = shared.session_revision;
+  state.doc = request.document;
+  state.name = request.name;
+  state.version = request.version;
+  state.root = request.root;
+  state.std = request.std ?? null;
+  state.dependencies = request.dependencies ?? {};
+  state.files = request.files;
+  state.snapshot = shared.snapshot;
+  state.revision = Math.max(state.revision, shared.snapshot.revision);
+  state.build = shared.snapshot.build;
+
+  const wanted = state.files.findIndex((file) => file.path === view.active_file);
+  state.active = wanted >= 0 ? wanted : 0;
+  state.tabs = view.tabs?.length ? view.tabs : state.tabs;
+  state.views = view.views ?? state.views;
+  state.split = view.split ?? state.split;
+  state.pane = view.pane ?? 0;
+  state.selection = view.selection ?? null;
+  state.offsets = null;
+  state.lines = null;
+
+  const file = active();
+  editor.setValue(file?.source ?? "", {
+    caret: app.byteToChar(view.caret ?? 0),
+    top: state.where[file?.path]?.top ?? 0,
+    left: state.where[file?.path]?.left ?? 0,
+  });
+  renderFiles();
+  cacheLocally();
+  saveUi();
+  app.emit("layout");
+  app.emit("file");
+  app.emit("snapshot");
 }
 
 function setLink(link) {
@@ -966,6 +1036,7 @@ function selectFile(index) {
   // Not a new snapshot — the same one, read for a different file. The editor
   // repaints from it and the strip tells the diagnostics which paths to name.
   app.emit("file");
+  scheduleSharedView();
 }
 
 function remember() {
@@ -1094,6 +1165,36 @@ function loadUi() {
 function saveUi() {
   const { doc, follow, split, tabs, views, width } = state;
   localStorage.setItem(UI_KEY, JSON.stringify({ doc, follow, split, tabs, views, width }));
+  scheduleSharedView();
+}
+
+function sharedView() {
+  const where = editor.where();
+  return {
+    active_file: active()?.path ?? "",
+    caret: app.charToByte(where.caret),
+    tabs: state.tabs,
+    views: state.views,
+    split: state.split,
+    pane: state.pane,
+    panes: panes.view(),
+    selection: state.selection,
+  };
+}
+
+let sharedViewTimer = null;
+function scheduleSharedView() {
+  clearTimeout(sharedViewTimer);
+  sharedViewTimer = setTimeout(async () => {
+    if (!state.snapshot) return;
+    await fetch("/session/view", {
+      method: "PUT",
+      body: JSON.stringify({
+        session_revision: state.sessionRevision,
+        view: sharedView(),
+      }),
+    }).catch(() => null);
+  }, 80);
 }
 
 // ── offsets ──────────────────────────────────────────────────────────────
@@ -1169,6 +1270,11 @@ async function get(path) {
 
 // A document named on the command line beats the one this browser had open.
 const startup = await get("/status").catch(() => null);
+const shared = await get("/session").catch(() => null);
 state.buildError = startup?.build_error ?? null;
+state.sessionRevision = shared?.session_revision ?? 0;
 await refreshDocs();
-await openDoc(startup?.doc ?? state.doc);
+await openDoc(startup?.doc ?? shared?.request?.document ?? state.doc);
+if (shared && (!startup?.doc || startup.doc === shared.request.document)) {
+  await syncSharedSession(shared);
+}

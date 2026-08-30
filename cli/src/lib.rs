@@ -6,12 +6,14 @@ use std::{
     ffi::{OsStr, OsString},
     fmt, fs,
     fs::OpenOptions,
-    io::Write as _,
+    io::{IsTerminal as _, Write as _},
+    ops::Range,
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
     rc::Rc,
 };
 
+use ariadne::{Color, Config, IndexType, Label, Report, ReportKind, sources};
 use boa_engine::{
     Context, JsError, JsValue, Module, Source,
     builtins::promise::{OperationType, Promise, PromiseState},
@@ -34,6 +36,7 @@ use ruddy::{
     inference, ir, lir, patterns,
     symbol::{Bundle, Mint, Version},
     tracking::{FileManager, Span},
+    ui,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1993,48 +1996,32 @@ fn compile_one(
 
     let mut files = FileManager::new();
     let loaded = bundle::load(&mut files, &disk, name);
-    let mut mint = Mint::new(identity);
-    let imports: Vec<_> = dependencies
-        .iter()
-        .map(|(alias, artifact)| ir::DependencyImport { alias, artifact })
-        .collect();
-    let mut built = ir::build_with_dependency_imports(&mut mint, loaded.stmts, &imports, &linked);
-    let inferred = inference::infer(&mint, &mut built.program);
-    let checked = patterns::check(&built.program, &inferred);
 
-    let errors = loaded
+    // Parser recovery is useful for finding more syntax complaints, but its
+    // placeholder statements are not an input to semantic phases. Apart from
+    // avoiding cascades, this keeps IR, inference and pattern checking from
+    // having to make promises about malformed syntax trees.
+    let frontend_errors = loaded
         .loaded
         .iter()
         .map(|file| file.lex_errors.len() + file.parse_errors.len())
         .sum::<usize>()
-        + loaded.errors.len()
-        + built.errors.len()
-        + inferred.errors.len()
-        + checked.errors.len();
-
-    if errors != 0 {
-        let mut diagnostics = Vec::with_capacity(errors);
+        + loaded.errors.len();
+    if frontend_errors != 0 {
+        let mut diagnostics = Vec::with_capacity(frontend_errors);
         for file in &loaded.loaded {
-            for error in &file.lex_errors {
-                diagnostics.push(diagnostic(
-                    &mut files,
-                    "lex",
-                    error.kind.code(),
-                    error.span,
-                    &error.kind,
-                    source_directory,
-                ));
-            }
-            for error in &file.parse_errors {
-                diagnostics.push(diagnostic(
-                    &mut files,
-                    "parse",
-                    error.code(),
-                    error.span,
-                    error,
-                    source_directory,
-                ));
-            }
+            let mut source_errors: Vec<_> = file
+                .lex_errors
+                .iter()
+                .map(|error| error.diagnostic())
+                .chain(file.parse_errors.iter().map(|error| error.diagnostic()))
+                .collect();
+            source_errors.sort_by_key(|error| error.primary.span.start);
+            diagnostics.extend(
+                source_errors
+                    .iter()
+                    .map(|error| source_diagnostic(&mut files, error, source_directory)),
+            );
         }
         for error in &loaded.errors {
             diagnostics.push(diagnostic(
@@ -2049,6 +2036,21 @@ fn compile_one(
                 source_directory,
             ));
         }
+        return Err(CompileError::diagnostics(diagnostics));
+    }
+
+    let mut mint = Mint::new(identity);
+    let imports: Vec<_> = dependencies
+        .iter()
+        .map(|(alias, artifact)| ir::DependencyImport { alias, artifact })
+        .collect();
+    let mut built = ir::build_with_dependency_imports(&mut mint, loaded.stmts, &imports, &linked);
+    let inferred = inference::infer(&mint, &mut built.program);
+    let checked = patterns::check(&built.program, &inferred);
+
+    let errors = built.errors.len() + inferred.errors.len() + checked.errors.len();
+    if errors != 0 {
+        let mut diagnostics = Vec::with_capacity(errors);
         for error in &built.errors {
             diagnostics.push(diagnostic(
                 &mut files,
@@ -2218,6 +2220,182 @@ impl fmt::Display for BundleMessage<'_> {
     }
 }
 
+/// One source file available while rendering a compiler diagnostic.
+#[derive(Debug, Clone, Copy)]
+pub struct DiagnosticSource<'a> {
+    pub path: &'a str,
+    pub source: &'a str,
+}
+
+/// One highlighted source range in a rendered compiler diagnostic.
+#[derive(Debug, Clone)]
+pub struct DiagnosticLabel<'a> {
+    pub source: usize,
+    pub range: Range<usize>,
+    pub message: &'a str,
+}
+
+/// Render the source diagnostic shared by the CLI and debugger.
+///
+/// `primary` is absent for failures that do not belong to source text, such as
+/// project configuration and linking errors. Related labels use a distinct
+/// colour so the place that explains an error remains visually separate from
+/// the place that raised it.
+pub fn render_diagnostic(
+    phase: &str,
+    code: &str,
+    message: &str,
+    available: &[DiagnosticSource<'_>],
+    primary: Option<&DiagnosticLabel<'_>>,
+    related: &[DiagnosticLabel<'_>],
+    color: bool,
+) -> String {
+    render_diagnostic_with_advice(
+        phase,
+        code,
+        message,
+        available,
+        primary,
+        related,
+        None,
+        &[],
+        color,
+    )
+}
+
+/// Render a diagnostic with optional actionable help and explanatory notes.
+///
+/// The shorter [`render_diagnostic`] entry point remains for callers whose
+/// diagnostic model does not yet carry advice.
+pub fn render_diagnostic_with_advice(
+    phase: &str,
+    code: &str,
+    message: &str,
+    available: &[DiagnosticSource<'_>],
+    primary: Option<&DiagnosticLabel<'_>>,
+    related: &[DiagnosticLabel<'_>],
+    help: Option<&str>,
+    notes: &[&str],
+    color: bool,
+) -> String {
+    let _ = phase;
+    let kind = format!("error[{code}]");
+    let Some(primary) = primary else {
+        let mut rendered = if color {
+            format!("\x1b[31m{kind}:\x1b[0m {message}")
+        } else {
+            format!("{kind}: {message}")
+        };
+        if let Some(help) = help {
+            rendered.push_str(&format!("\nhelp: {help}"));
+        }
+        for note in notes {
+            rendered.push_str(&format!("\nnote: {note}"));
+        }
+        return rendered;
+    };
+    let source = available
+        .get(primary.source)
+        .expect("a diagnostic's primary source exists");
+    let mut report = Report::build(
+        ReportKind::Error,
+        (source.path.to_string(), primary.range.clone()),
+    )
+    .with_code(code)
+    .with_config(
+        Config::default()
+            .with_index_type(IndexType::Byte)
+            .with_compact(true)
+            .with_color(color),
+    )
+    .with_message(message);
+
+    let mut primary_label =
+        Label::new((source.path.to_string(), primary.range.clone())).with_color(Color::Red);
+    // The report title already states the error. A label repeats text only
+    // when it contributes distinct, location-specific information.
+    if !primary.message.is_empty() && primary.message != message {
+        primary_label = primary_label.with_message(primary.message);
+    }
+    report = report.with_label(primary_label);
+    for label in related {
+        let source = available
+            .get(label.source)
+            .expect("a diagnostic's related source exists");
+        let mut related_label =
+            Label::new((source.path.to_string(), label.range.clone())).with_color(Color::Blue);
+        if !label.message.is_empty() {
+            related_label = related_label.with_message(label.message);
+        }
+        report = report.with_label(related_label);
+    }
+    if let Some(help) = help {
+        report = report.with_help(help);
+    }
+    for note in notes {
+        report = report.with_note(note);
+    }
+
+    let mut rendered = Vec::new();
+    report
+        .finish()
+        .write(
+            sources(
+                available
+                    .iter()
+                    .map(|source| (source.path.to_string(), source.source)),
+            ),
+            &mut rendered,
+        )
+        .expect("writing a diagnostic to memory cannot fail");
+    String::from_utf8(rendered)
+        .expect("Ariadne diagnostics are UTF-8")
+        .trim_end()
+        .to_owned()
+}
+
+fn source_diagnostic(
+    files: &mut FileManager,
+    diagnostic: &ui::Diagnostic,
+    source_directory: &Path,
+) -> String {
+    let file = files.get_file(diagnostic.primary.span.file_id);
+    let path = source_directory.join(&file.path);
+    let path = path.to_string_lossy();
+    let available = [DiagnosticSource {
+        path: path.as_ref(),
+        source: &file.content,
+    }];
+    let primary = DiagnosticLabel {
+        source: 0,
+        range: diagnostic.primary.span.start..diagnostic.primary.span.end(),
+        message: &diagnostic.primary.message,
+    };
+    let related: Vec<_> = diagnostic
+        .related
+        .iter()
+        .filter(|label| label.span.file_id == diagnostic.primary.span.file_id)
+        .map(|label| DiagnosticLabel {
+            source: 0,
+            range: label.span.start..label.span.end(),
+            message: &label.message,
+        })
+        .collect();
+    let help = diagnostic.help.first().map(String::as_str);
+    let notes: Vec<_> = diagnostic.notes.iter().map(String::as_str).collect();
+    render_diagnostic_with_advice(
+        "",
+        diagnostic.code,
+        &diagnostic.title,
+        &available,
+        Some(&primary),
+        &related,
+        help,
+        &notes,
+        stderr_color(),
+    )
+}
+
 fn diagnostic(
     files: &mut FileManager,
     phase: &str,
@@ -2227,18 +2405,40 @@ fn diagnostic(
     source_directory: &Path,
 ) -> String {
     let file = files.get_file(span.file_id);
-    let before = file.content.get(..span.start).unwrap_or(&file.content);
-    let line = before.bytes().filter(|byte| *byte == b'\n').count() + 1;
-    let column = before
-        .rsplit('\n')
-        .next()
-        .unwrap_or_default()
-        .chars()
-        .count()
-        + 1;
     let path = source_directory.join(&file.path);
-    format!(
-        "{}:{line}:{column}: error[{phase}/{code}]: {message}",
-        path.display()
+    let path = path.to_string_lossy();
+    let message = message.to_string();
+    let available = [DiagnosticSource {
+        path: path.as_ref(),
+        source: &file.content,
+    }];
+    let primary = DiagnosticLabel {
+        source: 0,
+        range: span.start..span.end(),
+        message: &message,
+    };
+    render_diagnostic(
+        phase,
+        code,
+        &message,
+        &available,
+        Some(&primary),
+        &[],
+        stderr_color(),
     )
+}
+
+/// Keep redirected output plain while respecting the conventional overrides.
+/// The debugger asks [`render_diagnostic`] for colour explicitly because its
+/// destination is a browser rather than this process's standard error stream.
+fn stderr_color() -> bool {
+    if std::env::var_os("NO_COLOR").is_some()
+        || std::env::var_os("CLICOLOR").is_some_and(|value| value == "0")
+    {
+        return false;
+    }
+    if std::env::var_os("CLICOLOR_FORCE").is_some_and(|value| value != "0") {
+        return true;
+    }
+    std::io::stderr().is_terminal() && std::env::var_os("TERM").is_none_or(|value| value != "dumb")
 }

@@ -5194,7 +5194,7 @@ fn columns_type_as_unions_across_arms() {
 /// `()` as a pattern demands unit of its position, in a match as on a `let`.
 #[test]
 fn a_unit_pattern_demands_unit() {
-    let (mint, _, output) = inferred("let f = fn v => match v with () => 1n end");
+    let (mint, _, output) = inferred("let f = fn v => match v with | () => 1n end");
     assert_eq!(scheme(&mint, &output, "f"), "() -> Nat");
 }
 
@@ -5210,7 +5210,7 @@ fn an_empty_match_eliminates_the_empty_sum() {
 /// type, so bodies that cannot agree are the mismatch, reported at the body.
 #[test]
 fn arm_bodies_unify_with_the_match() {
-    let (mint, _, output) = inferred("let sole = fn v => match v with w => w end");
+    let (mint, _, output) = inferred("let sole = fn v => match v with | w => w end");
     assert_eq!(scheme(&mint, &output, "sole"), "'a -> 'a");
 
     let (_, _, output) = infer_src("let f = fn v => match v with | #A x => 0n | #B y => {} end");
@@ -5439,7 +5439,7 @@ fn a_wildcard_struct_leaf_still_demands_its_field() {
     let (mint, _, output) = inferred("let use_y = fn p => let {x: _, y} = p in y");
     assert_eq!(scheme(&mint, &output, "use_y"), "{ x: 'a, y: 'b } -> 'b");
 
-    let (mint, _, output) = inferred("let use_y = fn p => match p with {x: _, y} => y end");
+    let (mint, _, output) = inferred("let use_y = fn p => match p with | {x: _, y} => y end");
     assert_eq!(scheme(&mint, &output, "use_y"), "{ x: 'a, y: 'b } -> 'b");
 }
 
@@ -5495,11 +5495,11 @@ fn the_motivating_program_infers_optional_fields() {
 /// named fields, and a use site with one more is refused.
 #[test]
 fn an_exact_column_closes_the_row() {
-    let (mint, _, output) = inferred("let f = fn v => match v with {a, b} => a end");
+    let (mint, _, output) = inferred("let f = fn v => match v with | {a, b} => a end");
     assert_eq!(scheme(&mint, &output, "f"), "{ a: 'a, b: 'b } -> 'a");
 
     let (_, _, output) = infer_src(
-        "let f = fn v => match v with {a, b} => a end\n\
+        "let f = fn v => match v with | {a, b} => a end\n\
          let bad = f { a: 1n, b: 2n, c: 3n }",
     );
     assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
@@ -5514,7 +5514,7 @@ fn an_exact_column_closes_the_row() {
 #[test]
 fn a_rest_or_binder_entry_opens_the_row() {
     let (mint, _, output) = inferred(
-        "let f = fn v => match v with {a, ..} => a end\n\
+        "let f = fn v => match v with | {a, ..} => a end\n\
          let ok = f { a: 1n, b: 2n }",
     );
     assert_eq!(scheme(&mint, &output, "f"), "{ a: 'a, ..'b } -> 'a");
@@ -5573,7 +5573,7 @@ fn an_exact_let_pattern_is_exact() {
 /// as on a `let`, so the two spellings demand the same thing and mix freely.
 #[test]
 fn unit_and_empty_braces_demand_the_same() {
-    let (mint, _, output) = inferred("let f = fn v => match v with {} => 1n end");
+    let (mint, _, output) = inferred("let f = fn v => match v with | {} => 1n end");
     assert_eq!(scheme(&mint, &output, "f"), "() -> Nat");
 
     let (mint, _, output) = inferred("let g = fn v => match v with | {a} => a | () => 0n end");

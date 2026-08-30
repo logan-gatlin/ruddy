@@ -27,7 +27,7 @@ pub struct Loc {
     pub range: Range,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CompileRequest {
     /// The bundle identity supplied by project configuration in a normal
     /// compilation. Defaults keep cached requests from older debugger pages
@@ -162,6 +162,8 @@ pub enum View {
     List,
     Tree,
     Text,
+    /// ANSI-coloured terminal text, converted to themed spans by the page.
+    Terminal,
     /// A timeline with a cursor: the nodes are a sequence the reader walks one
     /// at a time rather than a shape they read all at once.
     Steps,
@@ -245,6 +247,13 @@ pub struct Diagnostic {
     /// Stable and greppable; the page filters on it.
     pub code: &'static str,
     pub message: String,
+    /// Location-specific explanation, kept separate from the headline.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub label: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub help: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
     pub span: Option<Loc>,
     /// Secondary spans, e.g. the first definition a duplicate repeats.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -308,6 +317,56 @@ pub struct Doc {
     pub dependencies: IndexMap<String, DependencySpec>,
     pub files: Vec<FileSpec>,
     pub modified_ms: u128,
+}
+
+/// The browser context attached to the shared debugging session. The snapshot
+/// contains everything that can be inspected; this says which part the human
+/// is currently inspecting.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct SessionView {
+    #[serde(default)]
+    pub active_file: String,
+    #[serde(default)]
+    pub caret: usize,
+    #[serde(default)]
+    pub tabs: Vec<String>,
+    #[serde(default)]
+    pub views: HashMap<String, String>,
+    #[serde(default)]
+    pub split: bool,
+    #[serde(default)]
+    pub pane: usize,
+    /// Per-pane rendered context: stage/view, filter, step cursor, scroll, and
+    /// the node ids actually visible after filtering and collapsing.
+    #[serde(default)]
+    pub panes: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub selection: Option<serde_json::Value>,
+}
+
+/// The body accepted by `PUT /session`: one optimistic source-file edit.
+#[derive(Debug, Deserialize)]
+pub struct SessionEdit {
+    pub base_revision: u64,
+    pub document: String,
+    pub path: String,
+    pub source: String,
+}
+
+/// An agent-readable copy of the live browser session.
+#[derive(Debug, Serialize)]
+pub struct SharedSession {
+    pub protocol: u32,
+    pub session_revision: u64,
+    pub request: CompileRequest,
+    pub view: SessionView,
+    pub snapshot: Snapshot,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SessionViewUpdate {
+    pub session_revision: u64,
+    pub view: SessionView,
 }
 
 #[derive(Debug, Deserialize)]

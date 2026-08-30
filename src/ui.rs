@@ -49,6 +49,7 @@ use crate::{
     ir, parse, patterns,
     symbol::{Bundle, LOCAL_SEGMENT, Mint, Namespace, Symbol},
     token::{self, Kind},
+    tracking::Span,
     types::{
         Assigned, Atom, EffectId, Formula, Presence, Prim, Rest, Row, RowField, Scheme, Sense,
         Shape, Ty,
@@ -243,15 +244,163 @@ struct Named<'a> {
     labels: &'a [(String, Presence)],
 }
 
+/// One piece of source text explained by a diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Annotation {
+    pub span: Span,
+    pub message: String,
+}
+
+/// A compiler complaint before a terminal, browser, or editor lays it out.
+///
+/// Compiler phases keep deciding facts, this module turns those facts into
+/// reader-facing words, and reporters only decide presentation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Diagnostic {
+    pub code: &'static str,
+    pub title: String,
+    pub primary: Annotation,
+    pub related: Vec<Annotation>,
+    pub help: Vec<String>,
+    pub notes: Vec<String>,
+}
+
+impl Diagnostic {
+    fn new(code: &'static str, title: impl Into<String>, span: Span) -> Self {
+        Self {
+            code,
+            title: title.into(),
+            primary: Annotation {
+                span,
+                message: String::new(),
+            },
+            related: Vec::new(),
+            help: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    fn label(mut self, message: impl Into<String>) -> Self {
+        self.primary.message = message.into();
+        self
+    }
+
+    fn help(mut self, message: impl Into<String>) -> Self {
+        self.help.push(message.into());
+        self
+    }
+}
+
 impl token::ErrorKind {
     /// A stable, greppable name for this kind of error. Reporters key on it
     /// rather than on the message, which is prose and may be reworded.
     pub fn code(&self) -> &'static str {
         match self {
-            token::ErrorKind::Unrecognized => "unrecognized-character",
-            token::ErrorKind::MalformedNatural => "malformed-natural",
-            token::ErrorKind::NaturalTooLarge => "natural-too-large",
-            token::ErrorKind::MalformedString => "malformed-string",
+            token::ErrorKind::InvalidCharacter { .. } => "character-not-used",
+            token::ErrorKind::MalformedTag => "tag-needs-name",
+            token::ErrorKind::MalformedEffectLabel => "effect-needs-name",
+            token::ErrorKind::MalformedVariable => "variable-needs-name",
+            token::ErrorKind::NumberFollowedByName => "number-joined-to-name",
+            token::ErrorKind::DecimalWithWholeSuffix { .. } => "decimal-marked-whole",
+            token::ErrorKind::MalformedNumericField => "invalid-field-number",
+            token::ErrorKind::NaturalTooLarge => "whole-number-too-large",
+            token::ErrorKind::IntegerTooLarge => "integer-too-large",
+            token::ErrorKind::RealTooLarge => "number-too-large",
+            token::ErrorKind::NumericFieldTooLarge => "field-number-too-large",
+            token::ErrorKind::UnknownStringEscape { .. } => "unknown-string-escape",
+            token::ErrorKind::MissingClosingQuote => "missing-closing-quote",
+        }
+    }
+}
+
+impl token::Error {
+    pub fn diagnostic(&self) -> Diagnostic {
+        use token::ErrorKind as E;
+        match self.kind {
+            E::InvalidCharacter { character } => Diagnostic::new(
+                self.kind.code(),
+                format!("Ruddy does not use `{character}`"),
+                self.span,
+            )
+            .label("remove this character"),
+            E::MalformedTag => Diagnostic::new(
+                self.kind.code(),
+                "`#` must be followed by a name or quoted text",
+                self.span,
+            )
+            .label("the name cannot start here"),
+            E::MalformedEffectLabel => Diagnostic::new(
+                self.kind.code(),
+                "`!` must be followed by a name",
+                self.span,
+            )
+            .label("the name cannot start here"),
+            E::MalformedVariable => Diagnostic::new(
+                self.kind.code(),
+                "`'` must be followed by a name",
+                self.span,
+            )
+            .label("the name cannot start here"),
+            E::NumberFollowedByName => Diagnostic::new(
+                self.kind.code(),
+                "a number cannot run directly into a name",
+                self.span,
+            )
+            .label("the number and name are joined")
+            .help("add a space, or start the whole name with a letter"),
+            E::DecimalWithWholeSuffix { suffix } => Diagnostic::new(
+                self.kind.code(),
+                format!("`{suffix}` is only used with whole numbers"),
+                self.span,
+            )
+            .label("this number has a decimal point")
+            .help(format!("remove the decimal part or remove `{suffix}`")),
+            E::MalformedNumericField => Diagnostic::new(
+                self.kind.code(),
+                "a numbered field can contain only digits",
+                self.span,
+            )
+            .label("this is not a field number")
+            .help("remove the suffix or decimal part"),
+            E::NaturalTooLarge => Diagnostic::new(
+                self.kind.code(),
+                "this whole number is too large",
+                self.span,
+            )
+            .help("the largest allowed value is `18446744073709551615n`"),
+            E::IntegerTooLarge => {
+                Diagnostic::new(self.kind.code(), "this integer is too large", self.span)
+                    .help("the largest allowed value is `9223372036854775807i`")
+            }
+            E::RealTooLarge => {
+                Diagnostic::new(self.kind.code(), "this number is too large", self.span)
+            }
+            E::NumericFieldTooLarge => Diagnostic::new(
+                self.kind.code(),
+                "this field number is too large",
+                self.span,
+            ),
+            E::UnknownStringEscape { escape } => Diagnostic::new(
+                self.kind.code(),
+                format!("`\\{escape}` has no special meaning in a string"),
+                self.span,
+            )
+            .label("this escape is not supported")
+            .help("use `\\\"`, `\\\\`, `\\n`, `\\r`, or `\\t`"),
+            E::MissingClosingQuote => {
+                let mut diagnostic = Diagnostic::new(
+                    self.kind.code(),
+                    "this string is missing its closing `\"`",
+                    self.span.file_id.span(self.span.end(), 0),
+                )
+                .label("add `\"` here")
+                .help("strings must start and finish on the same line");
+                diagnostic.related.push(Annotation {
+                    span: self.span.file_id.span(self.span.start, 1),
+                    message: "the string starts here".into(),
+                });
+                diagnostic
+            }
         }
     }
 }
@@ -338,14 +487,11 @@ pub fn write_tag_label(f: &mut fmt::Formatter<'_>, name: &str) -> fmt::Result {
 
 impl fmt::Display for token::ErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            token::ErrorKind::Unrecognized => "unrecognized character",
-            token::ErrorKind::MalformedNatural => "malformed natural number",
-            // The bound is worth naming: it is the one limit here that a
-            // person can do arithmetic against.
-            token::ErrorKind::NaturalTooLarge => "natural number too large to fit in 64 bits",
-            token::ErrorKind::MalformedString => "malformed string literal",
-        })
+        let error = token::Error {
+            span: Span::default(),
+            kind: *self,
+        };
+        f.write_str(&error.diagnostic().title)
     }
 }
 
@@ -409,49 +555,181 @@ impl fmt::Display for Kind {
             Kind::Real(value) => write!(f, "{value}"),
             Kind::String(value) => write_string(f, value),
             Kind::Boolean(value) => write!(f, "{value}"),
+            // Invalid input is never printed as source: its original spelling
+            // remains in the file and its diagnostic owns the explanation.
+            Kind::Invalid => f.write_str("<invalid>"),
+        }
+    }
+}
+
+impl parse::Expected {
+    fn words(self) -> String {
+        match self {
+            Self::Statement => "a definition".into(),
+            Self::Name => "a name".into(),
+            Self::Value => "a value".into(),
+            Self::Type => "a type".into(),
+            Self::Pattern => "a name or shape to take apart".into(),
+            Self::Field => "a field name".into(),
+            Self::Argument => "at least one argument name".into(),
+            Self::Clause => "a condition".into(),
+            Self::Effect => "an effect name".into(),
+            Self::Case => "another case".into(),
+            Self::FunctionType => "a function type such as `Nat -> Nat`".into(),
+            Self::EndOfClause => "the end of this condition".into(),
+            Self::Keyword(word) | Self::Punctuation(word) => format!("`{word}`"),
+        }
+    }
+
+    fn code(self) -> &'static str {
+        match self {
+            Self::Statement => "expected-definition",
+            Self::Name => "expected-name",
+            Self::Value => "expected-value",
+            Self::Type => "expected-type",
+            Self::Pattern => "expected-name-or-shape",
+            Self::Field => "expected-field-name",
+            Self::Argument => "expected-argument",
+            Self::Clause => "expected-condition",
+            Self::Effect => "expected-effect",
+            Self::Case => "expected-case",
+            Self::FunctionType => "expected-function-type",
+            Self::EndOfClause => "expected-condition-end",
+            Self::Keyword("=") | Self::Punctuation("=") => "expected-equals",
+            Self::Keyword("=>") | Self::Punctuation("=>") => "expected-function-arrow",
+            Self::Keyword("end") => "expected-end",
+            Self::Keyword("with") => "expected-with",
+            Self::Keyword("then") => "expected-then",
+            Self::Keyword("else") => "expected-else",
+            Self::Keyword("in") => "expected-in",
+            Self::Keyword(_) => "expected-word",
+            Self::Punctuation(")") => "expected-closing-parenthesis",
+            Self::Punctuation("}") => "expected-closing-brace",
+            Self::Punctuation(_) => "expected-punctuation",
         }
     }
 }
 
 impl parse::Error {
-    /// A stable, greppable name for this kind of error, the way every other
-    /// phase's are coded. One code for the wildcard wherever it landed: what
-    /// went wrong is the `_`, and the position only polishes the wording.
+    /// A stable, greppable name for this kind of error.
     pub fn code(&self) -> &'static str {
         match self.kind {
-            parse::ErrorKind::Unexpected => "unexpected-token",
-            parse::ErrorKind::Wildcard { .. } => "misplaced-wildcard",
+            parse::ErrorKind::Expected { expected, .. } => expected.code(),
+            parse::ErrorKind::Wildcard { .. } => "misplaced-discard",
+        }
+    }
+
+    pub fn diagnostic(&self) -> Diagnostic {
+        match self.kind {
+            parse::ErrorKind::Expected {
+                expected,
+                found,
+                related,
+                context,
+            } => {
+                let words = expected.words();
+                let title = match (expected, related, context) {
+                    (
+                        parse::Expected::Punctuation("|"),
+                        _,
+                        Some(parse::Related {
+                            kind: parse::RelatedKind::Construct("match"),
+                            ..
+                        }),
+                    ) => "each match case must begin with `|`".into(),
+                    (
+                        parse::Expected::Keyword("end"),
+                        _,
+                        Some(parse::Related {
+                            kind: parse::RelatedKind::Construct(name),
+                            ..
+                        }),
+                    ) => format!("this {name} needs a closing `end`"),
+                    (
+                        parse::Expected::Punctuation(mark),
+                        Some(parse::Related {
+                            kind: parse::RelatedKind::Opener,
+                            ..
+                        }),
+                        _,
+                    ) => format!("add `{mark}` to close this part"),
+                    (
+                        _,
+                        Some(parse::Related {
+                            kind: parse::RelatedKind::Operator | parse::RelatedKind::Separator,
+                            ..
+                        }),
+                        _,
+                    ) => format!("write {words} after this"),
+                    _ => format!("expected {words} here"),
+                };
+                let mut diagnostic = Diagnostic::new(expected.code(), title, self.span);
+                diagnostic.primary.message = match (expected, found, context) {
+                    (parse::Expected::Punctuation("|"), parse::Found::Token, Some(_)) => {
+                        "add `|` before this case".into()
+                    }
+                    (parse::Expected::Keyword("end"), parse::Found::Token, Some(_)) => {
+                        "write `end` before this".into()
+                    }
+                    (parse::Expected::Punctuation(mark), parse::Found::Token, _) => {
+                        format!("write `{mark}` before this")
+                    }
+                    (_, parse::Found::End, _) => format!("write {words} here"),
+                    (_, parse::Found::Token, _) => "this cannot be used here".into(),
+                };
+                if let Some(related) = related
+                    && !(matches!(expected, parse::Expected::Keyword("end"))
+                        && context.is_some()
+                        && matches!(related.kind, parse::RelatedKind::Anchor))
+                {
+                    diagnostic.related.push(Annotation {
+                        span: related.span,
+                        message: match related.kind {
+                            parse::RelatedKind::Opener => "opened here".into(),
+                            parse::RelatedKind::Separator => {
+                                "this mark promises more after it".into()
+                            }
+                            parse::RelatedKind::Operator => {
+                                "this operation needs a value after it".into()
+                            }
+                            parse::RelatedKind::Anchor => "the missing part belongs here".into(),
+                            parse::RelatedKind::Construct(name) => {
+                                format!("this {name} starts here")
+                            }
+                        },
+                    });
+                }
+                if let Some(context) = context {
+                    diagnostic.related.push(Annotation {
+                        span: context.span,
+                        message: match context.kind {
+                            parse::RelatedKind::Construct(name) => {
+                                format!("this {name} starts here")
+                            }
+                            _ => "this part starts here".into(),
+                        },
+                    });
+                }
+                diagnostic
+            }
+            parse::ErrorKind::Wildcard { place } => {
+                let title = match place {
+                    parse::Place::Value => "`_` throws a value away, so it cannot be read here",
+                    parse::Place::Field => "a field needs a name other than `_`",
+                    parse::Place::Pun => "write a field name, or give the field a value after `:`",
+                    parse::Place::Projection => "write the name of the field to read",
+                    parse::Place::Type => "this place needs a name rather than `_`",
+                };
+                Diagnostic::new("misplaced-discard", title, self.span)
+                    .label("`_` does not provide a name here")
+            }
         }
     }
 }
 
-/// What the parser could not read, in a phrase. The wildcard's five wordings
-/// are one meaning — `_` stands for a value being thrown away, so it can't be
-/// *used* — said in the noun of the position it landed in.
 impl fmt::Display for parse::Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.kind {
-            parse::ErrorKind::Unexpected => f.write_str("unexpected token"),
-            parse::ErrorKind::Wildcard { place } => f.write_str(match place {
-                parse::Place::Value => {
-                    "`_` stands for a value being thrown away, so it can't be used as a value here"
-                }
-                parse::Place::Field => {
-                    "`_` stands for a value being thrown away, so it can't be a field's name"
-                }
-                // A pun binds a field to its own name, so what is missing here
-                // is the name — the value never gets a say.
-                parse::Place::Pun => {
-                    "`_` stands for a value being thrown away, and a field written bare binds to its own name, so there is no name here to bind"
-                }
-                parse::Place::Projection => {
-                    "`_` stands for a value being thrown away, so it can't name a field to read"
-                }
-                parse::Place::Type => {
-                    "`_` stands for a value being thrown away, so it can't be used as a type"
-                }
-            }),
-        }
+        f.write_str(&self.diagnostic().title)
     }
 }
 
@@ -2677,9 +2955,8 @@ pub fn write_let(
 /// Nothing here needs grouping. The scrutinee ends at the `with` however far
 /// right it runs, each arm's body ends at the next `|` or the `end` — none of
 /// the three begins an atom — and the `end` closes the whole form. The
-/// leading `|` is written on every arm, first included; the grammar makes it
-/// optional there, so the printed form re-parses, and a match with no arms is
-/// `match <scrutinee> with end` with no bar at all.
+/// leading `|` is written on every arm, first included, as the grammar
+/// requires. A match with no arms is `match <scrutinee> with end` with no bar.
 pub fn write_match<P: fmt::Display, B: fmt::Display>(
     f: &mut fmt::Formatter<'_>,
     scrutinee: &dyn fmt::Display,

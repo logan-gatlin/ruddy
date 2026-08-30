@@ -484,12 +484,12 @@ module.exports = grammar({
       field('consequent', $._expression),
     )),
 
-    /** `match <expr> with [|] <arm> (| <arm>)* end` */
+    /** `match <expr> with | <arm> (| <arm>)* end` */
     match_expression: $ => seq(
       'match',
       field('scrutinee', $._expression),
       'with',
-      optional(seq(optional('|'), sepBy1('|', $.match_arm))),
+      optional(seq('|', sepBy1('|', $.match_arm))),
       'end',
     ),
 

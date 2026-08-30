@@ -15,6 +15,12 @@ use ruddy_debug::{
 
 const DEMO: &str = include_str!("../../demo.hc");
 
+fn clean_demo() -> &'static str {
+    DEMO.split_once("\nlet bad = @")
+        .expect("the demo's deliberate frontend errors")
+        .0
+}
+
 /// A bundle of three files, one per shape a module's body can come from: an
 /// inline module, a module beside its parent, and a module inside the directory
 /// its parent's name spells.
@@ -741,6 +747,7 @@ fn every_stage_reports_on_the_demo() {
     assert_eq!(
         ids,
         [
+            "errors",
             "tokens",
             "dependencies",
             "ast",
@@ -762,11 +769,32 @@ fn every_stage_reports_on_the_demo() {
     assert_eq!(snapshot.revision, 3);
     assert!(snapshot.panic.is_none());
     for stage in &snapshot.stages {
-        // The demo ends in three deliberate mistakes, and LIR runs on accepted
-        // programs alone — so its tab is the one that reports `Skipped` here,
-        // with a summary saying so and no rows behind it.
-        if matches!(stage.id, "lir" | "artifact" | "linked" | "js") {
-            assert_eq!(stage.status, Status::Skipped);
+        if stage.id == "errors" {
+            assert_eq!(stage.status, Status::Partial);
+            assert!(stage.text.as_deref().is_some_and(|text| !text.is_empty()));
+            assert!(!stage.summary.is_empty());
+            continue;
+        }
+        // The demo contains deliberate syntax mistakes. Tokens and the
+        // recovery AST remain inspectable, but no semantic stage receives that
+        // recovery tree; every stage that depends on lowering reports a skip.
+        if matches!(
+            stage.id,
+            "externs"
+                | "ir"
+                | "constraints"
+                | "solve"
+                | "types"
+                | "presence"
+                | "patterns"
+                | "lir"
+                | "artifact"
+                | "linked"
+                | "js"
+                | "symbols"
+                | "types-ir"
+        ) {
+            assert_eq!(stage.status, Status::Skipped, "{}", stage.id);
             assert!(stage.nodes.is_empty(), "a skipped stage rendered rows");
             assert!(!stage.summary.is_empty(), "{} counted nothing", stage.id);
             continue;
@@ -788,6 +816,7 @@ fn every_stage_reports_on_the_demo() {
     assert_eq!(
         titles,
         [
+            "Errors",
             "Tokens",
             "Dependencies",
             "AST",
@@ -870,7 +899,8 @@ fn every_span_lies_inside_the_source() {
 /// without the span has `Node::owner` for it.
 #[test]
 fn a_node_naming_a_symbol_is_spanned_at_the_name() {
-    let snapshot = bundle(&[(ROOT, DEMO)]);
+    let source = clean_demo();
+    let snapshot = bundle(&[(ROOT, source)]);
     let symbols = snapshot
         .stages
         .iter()
@@ -904,7 +934,7 @@ fn a_node_naming_a_symbol_is_spanned_at_the_name() {
             // name it heads: a type parameter is written `'a` and named `a`,
             // the way a tag's `#` and an effect's `!` are no part of theirs.
             assert_eq!(
-                DEMO[start..end].trim_start_matches(['\'', '#', '!']),
+                source[start..end].trim_start_matches(['\'', '#', '!']),
                 *name,
                 "{}: {} claims to name {name} at {start}..{end}",
                 stage.id,
@@ -942,8 +972,17 @@ fn diagnostics_are_reported_in_source_order() {
         .iter()
         .map(|diagnostic| diagnostic.code)
         .collect();
-    assert!(codes.contains(&"undefined-term"), "{codes:?}");
-    assert!(codes.contains(&"unrecognized-character"), "{codes:?}");
+    assert_eq!(
+        codes,
+        [
+            "character-not-used",
+            "number-joined-to-name",
+            "expected-name"
+        ]
+    );
+    // The demo also contains semantic mistakes, but frontend gating keeps
+    // those recovery trees out of lowering and therefore out of this list.
+    assert!(!codes.contains(&"undefined-term"), "{codes:?}");
 
     // Where the reader would look for them: the file first, then the offset
     // inside it, since a bundle's diagnostics come from more than one file.
@@ -992,7 +1031,13 @@ fn a_natural_reaches_every_stage() {
         assert_eq!(node.symbol, None, "{id}");
     }
 
-    let tokens = nodes(&snapshot.stages[0]);
+    let tokens = nodes(
+        snapshot
+            .stages
+            .iter()
+            .find(|stage| stage.id == "tokens")
+            .expect("the tokens stage"),
+    );
     let literal = tokens
         .iter()
         .find(|node| node.label == "Natural" && node.text == "42n")
@@ -1012,10 +1057,16 @@ fn a_numeric_field_is_coloured_as_a_number() {
     let snapshot = snapshot("let first = fn p => p.0\n");
     assert!(snapshot.diagnostics.is_empty());
 
-    let field = nodes(&snapshot.stages[0])
-        .into_iter()
-        .find(|node| node.label == "NumericField" && node.text == "0")
-        .expect("the tokens tab renders the numeric field");
+    let field = nodes(
+        snapshot
+            .stages
+            .iter()
+            .find(|stage| stage.id == "tokens")
+            .expect("the tokens stage"),
+    )
+    .into_iter()
+    .find(|node| node.label == "NumericField" && node.text == "0")
+    .expect("the tokens tab renders the numeric field");
     let class = field
         .fields
         .iter()
@@ -1202,18 +1253,80 @@ fn a_bad_literal_is_a_diagnostic_of_its_own() {
             .map(|diagnostic| diagnostic.code)
             .collect::<Vec<_>>()
     };
-    // The lexer emits no token for a literal it rejected, so the `let` is left
-    // with no body — which the parser reports where the body would have gone,
-    // just before the characters the lexer is complaining about, rather than
-    // standing a `()` in for it.
-    assert_eq!(
-        codes("let n = 1x\n"),
-        ["unexpected-token", "malformed-natural"]
-    );
+    // An invalid lexeme is retained as one invalid token. The parser consumes
+    // that placeholder without inventing a second complaint about the same
+    // bytes, and semantic phases never inspect its recovery tree.
+    assert_eq!(codes("let n = 1x\n"), ["number-joined-to-name"]);
     assert_eq!(
         codes(&format!("let n = {}0n\n", u64::MAX)),
-        ["unexpected-token", "natural-too-large"]
+        ["whole-number-too-large"]
     );
+}
+
+#[test]
+fn a_missing_match_end_points_to_the_match_without_repeating_the_fix() {
+    let source = "let _ = match 1 with | f => ()\n\nlet a = 1";
+    let snapshot = snapshot(source);
+    let [diagnostic] = snapshot.diagnostics.as_slice() else {
+        panic!("expected one diagnostic: {:#?}", snapshot.diagnostics);
+    };
+    assert_eq!(diagnostic.code, "expected-end");
+    assert_eq!(diagnostic.message, "this match needs a closing `end`");
+    assert_eq!(diagnostic.label, "write `end` before this");
+    assert_eq!(
+        diagnostic.span.unwrap().range[0],
+        source.rfind("let").unwrap()
+    );
+    let [start] = diagnostic.related.as_slice() else {
+        panic!("expected only the match location: {diagnostic:#?}");
+    };
+    let match_at = source.find("match").unwrap();
+    assert_eq!(start.span.unwrap().range, [match_at, match_at + 5]);
+    assert_eq!(start.message, "this match starts here");
+}
+
+#[test]
+fn frontend_errors_keep_reader_advice_and_skip_semantic_debugger_stages() {
+    let snapshot = snapshot("let n = 1x\n");
+    let [diagnostic] = snapshot.diagnostics.as_slice() else {
+        panic!("expected one diagnostic: {:#?}", snapshot.diagnostics);
+    };
+    assert_eq!(diagnostic.stage, "lex");
+    assert_eq!(diagnostic.code, "number-joined-to-name");
+    assert!(
+        diagnostic
+            .message
+            .starts_with("a number cannot run directly into a name"),
+        "{}",
+        diagnostic.message
+    );
+    assert_eq!(diagnostic.label, "the number and name are joined");
+    assert_eq!(
+        diagnostic.help,
+        ["add a space, or start the whole name with a letter"]
+    );
+
+    for id in [
+        "ir",
+        "constraints",
+        "solve",
+        "types",
+        "presence",
+        "patterns",
+        "lir",
+        "artifact",
+        "linked",
+        "js",
+        "symbols",
+        "types-ir",
+    ] {
+        let stage = snapshot
+            .stages
+            .iter()
+            .find(|stage| stage.id == id)
+            .unwrap_or_else(|| panic!("{id} is registered"));
+        assert_eq!(stage.status, Status::Skipped, "{id}: {stage:#?}");
+    }
 }
 
 /// A repeat is only legible next to what it repeats, so it has to arrive as
@@ -1681,7 +1794,8 @@ fn a_panic_becomes_a_result() {
 
 #[test]
 fn a_snapshot_survives_the_wire() {
-    let snapshot = bundle(&[(ROOT, DEMO)]);
+    let source = clean_demo();
+    let snapshot = bundle(&[(ROOT, source)]);
     let json = serde_json::to_string(&snapshot).expect("serializes");
     let back: serde_json::Value = serde_json::from_str(&json).expect("parses");
 
@@ -1692,8 +1806,9 @@ fn a_snapshot_survives_the_wire() {
         back["stages"].as_array().expect("stages").len(),
         REGISTRY.len()
     );
-    assert_eq!(back["stages"][0]["view"], "list");
-    assert_eq!(back["stages"][1]["view"], "tree");
+    assert_eq!(back["stages"][0]["view"], "terminal");
+    assert_eq!(back["stages"][1]["view"], "list");
+    assert_eq!(back["stages"][2]["view"], "tree");
     let artifact = back["stages"]
         .as_array()
         .expect("stages")
@@ -1715,7 +1830,7 @@ fn a_snapshot_survives_the_wire() {
     let files = back["files"].as_array().expect("files");
     assert_eq!(files.len(), 1);
     assert_eq!(files[0]["path"], ROOT);
-    assert_eq!(files[0]["len"], DEMO.len());
+    assert_eq!(files[0]["len"], source.len());
     assert!(
         files[0]["line_starts"]
             .as_array()
@@ -1898,10 +2013,14 @@ fn a_missing_module_file_reaches_the_strip() {
         })
     );
 
-    // And the rest of the bundle is still compiled: one missing file may not
-    // hide every other complaint, or every other answer.
+    // The loader's recovery AST remains inspectable, but a missing module is
+    // a frontend error and its incomplete tree never reaches semantic phases.
+    let ast = stage_named(&snapshot, "ast");
+    assert!(!ast.nodes.is_empty(), "{ast:#?}");
     let ir = stage_named(&snapshot, "ir");
-    assert!(!ir.nodes.is_empty(), "{ir:#?}");
+    assert_eq!(ir.status, Status::Skipped, "{ir:#?}");
+    let types = stage_named(&snapshot, "types");
+    assert_eq!(types.status, Status::Skipped, "{types:#?}");
 }
 
 /// A document is a bundle, and a bundle starts somewhere. Only the debugger
@@ -2026,7 +2145,7 @@ fn a_solver_step_declares_what_it_added_to_the_state() {
 #[test]
 fn only_the_stages_that_own_a_phase_report_a_time() {
     let clean = snapshot("let f = fn a => a\n");
-    let snapshot = bundle(&[(ROOT, DEMO)]);
+    let snapshot = snapshot("let bad : Nat = fn x => x\n");
     let ids = |timed: bool| -> Vec<&str> {
         snapshot
             .stages
@@ -2049,11 +2168,12 @@ fn only_the_stages_that_own_a_phase_report_a_time() {
         ]
     );
     // LIR owns a phase too, and reports nothing here for the other reason a
-    // stage can: the demo has errors in it, so lowering never ran and there is
-    // no duration to report rather than no phase to have one.
+    // stage can: inference rejected this source, so lowering never ran and
+    // there is no duration to report rather than no phase to have one.
     assert_eq!(
         ids(false),
         [
+            "errors",
             "externs",
             "constraints",
             "solve",
@@ -2796,16 +2916,17 @@ fn a_misplaced_wildcard_reaches_the_strip() {
     let diagnostic = snapshot
         .diagnostics
         .iter()
-        .find(|diagnostic| diagnostic.code == "misplaced-wildcard")
+        .find(|diagnostic| diagnostic.code == "misplaced-discard")
         .unwrap_or_else(|| panic!("{:#?}", snapshot.diagnostics));
     assert_eq!(diagnostic.stage, "parse");
     assert!(
         diagnostic
             .message
-            .starts_with("`_` stands for a value being thrown away"),
+            .starts_with("`_` throws a value away, so it cannot be read here"),
         "{}",
         diagnostic.message
     );
+    assert_eq!(diagnostic.label, "`_` does not provide a name here");
     let wildcard = source.find('_').expect("the `_`");
     assert_eq!(diagnostic.span, at([wildcard, wildcard + 1]));
 }

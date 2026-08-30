@@ -34,6 +34,7 @@ export function createPanes(root, app) {
     focusFilter: () => panes[app.state.pane]?.focusFilter(),
     selectTab: (n) => panes[app.state.pane]?.selectTab(n),
     step: (to) => panes[app.state.pane]?.step(to),
+    view: () => panes.map((pane) => pane.context()),
   };
 }
 
@@ -104,20 +105,27 @@ function createPane(root, app, index) {
       if (row.depth === 0) collapsed.add(row.key);
     }
     render();
+    app.shareView();
   });
 
   pane.querySelector('[data-act="expand"]').addEventListener("click", () => {
     if (!stage) return;
     app.collapsed(stage.id).clear();
     render();
+    app.shareView();
   });
 
-  filter.addEventListener("input", render);
+  filter.addEventListener("input", () => {
+    render();
+    app.shareView();
+  });
+  rows.addEventListener("scroll", () => app.shareView(), { passive: true });
   filter.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
       filter.value = "";
       filter.blur();
       render();
+      app.shareView();
     }
   });
 
@@ -142,6 +150,7 @@ function createPane(root, app, index) {
       const key = row.dataset.key;
       collapsed.has(key) ? collapsed.delete(key) : collapsed.add(key);
       render();
+      app.shareView();
       return;
     }
     // Read the row before moving the cursor: stepping re-renders, and the
@@ -192,6 +201,7 @@ function createPane(root, app, index) {
       to === "start" ? 0 : to === "end" ? last : absolute ? Number(to) : at + Number(to);
     cursors.set(stage.id, Math.max(0, Math.min(last, wanted)));
     render();
+    app.shareView();
   }
 
   function mark(row) {
@@ -253,7 +263,11 @@ function createPane(root, app, index) {
       visible = [];
       return;
     }
-    if (stage.status === "error" || stage.status === "skipped" || !stage.nodes.length) {
+    if (
+      stage.status === "error" ||
+      stage.status === "skipped" ||
+      (!stage.nodes.length && !stage.text)
+    ) {
       const why = stage.status === "error" || stage.status === "skipped" ? stage.summary : "nothing to show";
       const bad = stage.status === "error" ? " bad" : "";
       setRows(`<div class="pane-note${bad}">${esc(why)}</div>`);
@@ -269,6 +283,12 @@ function createPane(root, app, index) {
 
     if (view === "text") {
       setRows(`<pre class="raw">${esc(stage.text || "(empty)")}</pre>`);
+      visible = [];
+      return;
+    }
+
+    if (view === "terminal") {
+      setRows(`<pre class="raw terminal">${ansiHtml(stage.text || "(empty)")}</pre>`);
       visible = [];
       return;
     }
@@ -589,6 +609,14 @@ function createPane(root, app, index) {
     render,
     mark: markRows,
     step,
+    context: () => ({
+      stage: stage?.id ?? null,
+      view: stage ? viewOf(app, stage) : null,
+      filter: filter.value,
+      step: stage ? (cursors.get(stage.id) ?? null) : null,
+      scroll: rows.scrollTop,
+      visible_nodes: visible.map((row) => row.node.id),
+    }),
     focusFilter: () => filter.focus(),
     selectTab(n) {
       const snapshot = app.state.snapshot;
@@ -678,6 +706,38 @@ function columnsOf(stage) {
     }
   }
   return seen;
+}
+
+/// Convert the small SGR subset emitted by Ariadne into safe, theme-aware
+/// spans. Text is escaped before it enters the page; unknown control sequences
+/// are discarded rather than becoming markup.
+function ansiHtml(text) {
+  const sgr = /\x1b\[([0-9;]*)m/g;
+  let html = "";
+  let start = 0;
+  let color = "";
+  let match;
+  const append = (part) => {
+    if (!part) return;
+    const safe = esc(part);
+    html += color ? `<span class="${color}">${safe}</span>` : safe;
+  };
+  while ((match = sgr.exec(text))) {
+    append(text.slice(start, match.index));
+    const codes = (match[1] || "0").split(";").map(Number);
+    for (let i = 0; i < codes.length; i++) {
+      const code = codes[i];
+      if (code === 0 || code === 39) color = "";
+      else if (code >= 30 && code <= 37) color = `ansi-${code}`;
+      else if (code === 38 && codes[i + 1] === 5) {
+        color = `ansi-256-${codes[i + 2]}`;
+        i += 2;
+      }
+    }
+    start = sgr.lastIndex;
+  }
+  append(text.slice(start));
+  return html;
 }
 
 /// Which supported rendering is showing. `raw` is universal; every other

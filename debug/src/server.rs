@@ -17,9 +17,24 @@ use std::{
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 use crate::{
-    docs, snapshot,
-    wire::{CompileRequest, DocBody, ServerStatus},
+    docs, session, snapshot,
+    wire::{
+        CompileRequest, DocBody, ServerStatus, SessionEdit, SessionView, SessionViewUpdate,
+        SharedSession,
+    },
 };
+
+#[derive(serde::Deserialize)]
+struct CompileBody {
+    #[serde(flatten)]
+    request: CompileRequest,
+    #[serde(default)]
+    session_revision: u64,
+    #[serde(default)]
+    client_id: String,
+    #[serde(default)]
+    view: SessionView,
+}
 
 /// Enough to keep a held-open poll and a compile from queueing behind each
 /// other, with room for a second tab.
@@ -49,6 +64,7 @@ pub struct Config {
 pub struct State {
     pub cfg: Config,
     pub events: Events,
+    pub session: Mutex<session::Store>,
 }
 
 /// Events the page waits on, delivered by long polling.
@@ -114,6 +130,7 @@ pub fn serve(cfg: Config) -> io::Result<()> {
     let state = Arc::new(State {
         cfg,
         events: Events::default(),
+        session: Mutex::new(session::Store::default()),
     });
 
     if state.cfg.watch {
@@ -191,12 +208,51 @@ fn handle(mut request: Request, state: &State) {
             build_error: state.cfg.build_error.clone(),
         }),
         (Method::Post, "/compile") => match body(&mut request) {
-            Ok(body) => match serde_json::from_str::<CompileRequest>(&body) {
-                Ok(req) => json(&snapshot::compile_at(
-                    &req,
-                    state.cfg.build,
-                    &state.cfg.scratch,
-                )),
+            Ok(body) => match serde_json::from_str::<CompileBody>(&body) {
+                Ok(req) => {
+                    let (accepted, session_revision) = {
+                        let mut session = state.session.lock().unwrap();
+                        let accepted = session.observe(
+                            req.request.clone(),
+                            req.session_revision,
+                            req.client_id,
+                            req.view,
+                        );
+                        let revision = session
+                            .current()
+                            .map(|current| current.revision)
+                            .unwrap_or(0);
+                        (accepted, revision)
+                    };
+                    compile_response(
+                        &snapshot::compile_at(&req.request, state.cfg.build, &state.cfg.scratch),
+                        session_revision,
+                        accepted,
+                    )
+                }
+                Err(err) => fail(400, &format!("bad request: {err}")),
+            },
+            Err(err) => fail(413, &err),
+        },
+        (Method::Get, "/session") => shared_session(state),
+        (Method::Put, "/session/view") => match body(&mut request) {
+            Ok(body) => match serde_json::from_str::<SessionViewUpdate>(&body) {
+                Ok(update) => match state
+                    .session
+                    .lock()
+                    .unwrap()
+                    .update_view(update.session_revision, update.view)
+                {
+                    Ok(()) => text(204, ""),
+                    Err(error) => session_error(error),
+                },
+                Err(err) => fail(400, &format!("bad request: {err}")),
+            },
+            Err(err) => fail(413, &err),
+        },
+        (Method::Put, "/session") => match body(&mut request) {
+            Ok(body) => match serde_json::from_str::<SessionEdit>(&body) {
+                Ok(edit) => edit_session(state, edit),
                 Err(err) => fail(400, &format!("bad request: {err}")),
             },
             Err(err) => fail(413, &err),
@@ -269,6 +325,79 @@ fn document(
     }
 }
 
+fn shared_session(state: &State) -> Response<io::Cursor<Vec<u8>>> {
+    let Some(current) = state.session.lock().unwrap().current() else {
+        return fail(404, "no browser has joined the debugging session yet");
+    };
+    json(&shared(state, current))
+}
+
+fn shared(state: &State, current: session::Current) -> SharedSession {
+    let snapshot = snapshot::compile_at(&current.request, state.cfg.build, &state.cfg.scratch);
+    SharedSession {
+        protocol: 1,
+        session_revision: current.revision,
+        request: current.request,
+        view: current.view,
+        snapshot,
+    }
+}
+
+fn edit_session(state: &State, edit: SessionEdit) -> Response<io::Cursor<Vec<u8>>> {
+    if !docs::valid_name(&edit.document) || !docs::valid_file_path(&edit.path) {
+        return fail(400, "invalid document or file path");
+    }
+
+    // Keep the optimistic check and persistence one operation. This local
+    // server has only a few workers, and a scratch write is short; allowing a
+    // browser compile between them would make disk and session disagree.
+    let mut store = state.session.lock().unwrap();
+    let before = store.clone();
+    let current = match store.edit(edit.base_revision, &edit.document, &edit.path, edit.source) {
+        Ok(current) => current,
+        Err(error) => return session_error(error),
+    };
+
+    let run = docs::read(&state.cfg.scratch, &current.request.document)
+        .map(|doc| doc.run)
+        .unwrap_or_default();
+    if let Err(error) = docs::write(
+        &state.cfg.scratch,
+        &current.request.document,
+        &current.request.name,
+        &current.request.version,
+        &current.request.root,
+        &run,
+        &current.request.std,
+        &current.request.dependencies,
+        &current.request.files,
+    ) {
+        *store = before;
+        return fail(500, &error.to_string());
+    }
+    drop(store);
+
+    state.events.send(
+        "session-changed",
+        &format!(r#"{{"revision":{}}}"#, current.revision),
+    );
+    json(&shared(state, current))
+}
+
+fn session_error(error: session::EditError) -> Response<io::Cursor<Vec<u8>>> {
+    match error {
+        session::EditError::NoSession => {
+            fail(404, "no browser has joined the debugging session yet")
+        }
+        session::EditError::Conflict { current } => text(
+            409,
+            &format!("session changed; current revision is {current}"),
+        ),
+        session::EditError::WrongDocument => fail(409, "the browser opened another document"),
+        session::EditError::MissingFile => fail(404, "file is not in the open document"),
+    }
+}
+
 fn body(request: &mut Request) -> Result<String, String> {
     if request
         .body_length()
@@ -304,6 +433,19 @@ fn file(path: &Path) -> Response<io::Cursor<Vec<u8>>> {
             .with_header(header("Cache-Control", "no-store")),
         Err(err) => fail(404, &format!("{}: {err}", path.display())),
     }
+}
+
+fn compile_response<T: serde::Serialize>(
+    value: &T,
+    session_revision: u64,
+    accepted: bool,
+) -> Response<io::Cursor<Vec<u8>>> {
+    json(value)
+        .with_header(header("X-Session-Revision", &session_revision.to_string()))
+        .with_header(header(
+            "X-Session-Accepted",
+            if accepted { "true" } else { "false" },
+        ))
 }
 
 fn json<T: serde::Serialize>(value: &T) -> Response<io::Cursor<Vec<u8>>> {

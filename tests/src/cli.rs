@@ -1933,7 +1933,7 @@ fn dependency_projects_must_exist_compile_and_match_the_table_key() {
     .unwrap();
     let found = error(&directory);
     assert!(found.contains("dependency `base`"));
-    assert!(found.contains("error[types/"));
+    assert!(found.contains("[type-mismatch] Error"), "{found}");
 }
 
 #[test]
@@ -2166,11 +2166,117 @@ fn bundle_and_compiler_failures_are_returned_as_cli_diagnostics() {
     )
     .unwrap();
     let compiler = error(&directory);
-    assert!(compiler.contains("error[types/"), "{compiler}");
+    assert!(compiler.contains("[type-mismatch] Error"), "{compiler}");
     assert!(compiler.contains("main.hc:1:"), "{compiler}");
 
     let diagnostics = compile(directory.path()).expect_err("the program has a type error");
     assert_eq!(diagnostics.messages().len(), 1, "{diagnostics}");
+}
+
+#[test]
+fn frontend_errors_stop_compilation_without_parse_or_semantic_cascades() {
+    let directory = project();
+    write_project(directory.path(), "app", "1.0.0", &[]);
+    fs::write(directory.path().join("main.hc"), "let n = 1x\n").unwrap();
+
+    let diagnostics = compile(directory.path()).expect_err("the joined name is invalid");
+    assert_eq!(diagnostics.messages().len(), 1, "{diagnostics}");
+    let rendered = diagnostics.to_string();
+    assert!(
+        rendered.contains("[number-joined-to-name] Error"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("expected-"), "{rendered}");
+    assert!(!rendered.contains("[ir/"), "{rendered}");
+    assert!(!rendered.contains("[types/"), "{rendered}");
+}
+
+#[test]
+fn rendering_without_color_has_no_ansi_and_omits_the_internal_phase() {
+    let sources = [ruddy_cli::DiagnosticSource {
+        path: "main.hc",
+        source: "let n = 1x\n",
+    }];
+    let primary = ruddy_cli::DiagnosticLabel {
+        source: 0,
+        range: 8..10,
+        message: "the number and name are joined",
+    };
+    let rendered = ruddy_cli::render_diagnostic_with_advice(
+        "lex",
+        "number-joined-to-name",
+        "a number cannot run directly into a name",
+        &sources,
+        Some(&primary),
+        &[],
+        Some("add a space"),
+        &[],
+        false,
+    );
+
+    assert!(!rendered.contains('\x1b'), "{rendered:?}");
+    assert!(
+        rendered.contains("[number-joined-to-name] Error"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("[lex/"), "{rendered}");
+    assert!(
+        rendered.contains("a number cannot run directly into a name"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("the number and name are joined"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("Help: add a space") || rendered.contains("help: add a space"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn no_color_overrides_forced_cli_color() {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "cli::no_color_child"])
+        .env("NO_COLOR", "1")
+        .env("CLICOLOR_FORCE", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "run in isolation with controlled color environment variables"]
+fn no_color_child() {
+    let directory = project();
+    write_project(directory.path(), "app", "1.0.0", &[]);
+    fs::write(directory.path().join("main.hc"), "let n = 1x\n").unwrap();
+    let rendered = error(&directory);
+    assert!(!rendered.contains('\x1b'), "{rendered:?}");
+    assert!(
+        rendered.contains("[number-joined-to-name] Error"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn compiler_diagnostics_treat_spans_as_byte_offsets() {
+    let directory = project();
+    write_project(directory.path(), "app", "1.0.0", &[]);
+    fs::write(
+        directory.path().join("main.hc"),
+        "let café = 1n\nlet bad : Nat = false\n",
+    )
+    .unwrap();
+
+    let compiler = error(&directory);
+    assert!(compiler.contains("main.hc:2:17"), "{compiler}");
+    assert!(compiler.contains("2 │let bad : Nat = false"), "{compiler}");
 }
 
 #[test]
@@ -2932,7 +3038,10 @@ fn check_compiles_without_build_output_and_reports_failures() {
     let error = check_project(&app).unwrap_err();
     assert!(!error.is_usage());
     assert_eq!(error.exit_code(), 1);
-    assert!(error.to_string().contains("error[types/"), "{error}");
+    assert!(
+        error.to_string().contains("[type-mismatch] Error"),
+        "{error}"
+    );
     assert!(!app.join("build").exists());
 }
 

@@ -237,24 +237,35 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     };
     let mut mint = Mint::new(configured.unwrap_or_else(fallback));
 
-    let mut built = loaded.as_ref().and_then(|loaded| {
-        let started = Instant::now();
-        let out = guard("ir", &mut panicked, || {
-            let imports: Vec<_> = dependency_aliases
+    let frontend_clean = loaded.as_ref().is_some_and(|loaded| {
+        loaded.errors.is_empty()
+            && loaded
+                .loaded
                 .iter()
-                .zip(&dependency_interfaces)
-                .map(|(alias, artifact)| ir::DependencyImport { alias, artifact })
-                .collect();
-            ir::build_with_dependency_imports(
-                &mut mint,
-                loaded.stmts.clone(),
-                &imports,
-                &linked_interfaces,
-            )
-        });
-        micros.build = started.elapsed().as_micros() as u64;
-        out
+                .all(|file| file.lex_errors.is_empty() && file.parse_errors.is_empty())
     });
+
+    let mut built = loaded
+        .as_ref()
+        .filter(|_| frontend_clean)
+        .and_then(|loaded| {
+            let started = Instant::now();
+            let out = guard("ir", &mut panicked, || {
+                let imports: Vec<_> = dependency_aliases
+                    .iter()
+                    .zip(&dependency_interfaces)
+                    .map(|(alias, artifact)| ir::DependencyImport { alias, artifact })
+                    .collect();
+                ir::build_with_dependency_imports(
+                    &mut mint,
+                    loaded.stmts.clone(),
+                    &imports,
+                    &linked_interfaces,
+                )
+            });
+            micros.build = started.elapsed().as_micros() as u64;
+            out
+        });
 
     // Inference mutates the program it types, so it borrows `built` mutably
     // and finishes before any stage looks at either.
@@ -294,22 +305,18 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     let source = |span: Span| sources.get(&span.file_id).cloned().unwrap_or_default();
     if let Some(loaded) = &loaded {
         for file in &loaded.loaded {
-            diagnostics.extend(file.lex_errors.iter().map(|error| {
-                raw(
-                    "lex",
-                    error.kind.code(),
-                    format!("{} {}", error.kind, quote(&source(error.span), error.span)),
-                    loc(error.span, &index),
+            let mut source_errors: Vec<_> = file
+                .lex_errors
+                .iter()
+                .map(|error| source_error("lex", error.diagnostic(), &index))
+                .chain(
+                    file.parse_errors
+                        .iter()
+                        .map(|error| source_error("parse", error.diagnostic(), &index)),
                 )
-            }));
-            diagnostics.extend(file.parse_errors.iter().map(|error| {
-                raw(
-                    "parse",
-                    error.code(),
-                    format!("{error} {}", quote(&source(error.span), error.span)),
-                    loc(error.span, &index),
-                )
-            }));
+                .collect();
+            source_errors.sort_by_key(|error| error.span.map_or(usize::MAX, |span| span.range[0]));
+            diagnostics.extend(source_errors);
         }
         diagnostics.extend(loaded.errors.iter().map(|error| {
             raw(
@@ -453,22 +460,27 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     // turn any `Loc` into a line and a column. Built from the loader's own list
     // rather than from the request, so a file no module declares is not in it
     // and a file that could not be read still is.
+    let stage_sources: Vec<String> = loaded
+        .iter()
+        .flat_map(|loaded| loaded.loaded.iter())
+        .map(|file| source(file.id.span(0, 0)))
+        .collect();
     let infos: Vec<FileInfo> = loaded
         .iter()
         .flat_map(|loaded| loaded.loaded.iter())
-        .map(|file| {
-            let content = source(file.id.span(0, 0));
-            FileInfo {
-                path: file.path.clone(),
-                len: content.len(),
-                line_starts: line_starts(&content),
-            }
+        .zip(&stage_sources)
+        .map(|(file, content)| FileInfo {
+            path: file.path.clone(),
+            len: content.len(),
+            line_starts: line_starts(content),
         })
         .collect();
 
     let symbols = stage::symbols::index(&mint);
     let cx = Cx {
         files: &infos,
+        sources: &stage_sources,
+        diagnostics: &diagnostics,
         bundle: loaded.as_ref(),
         program: built.as_ref().map(|built| &built.program),
         inference: inferred.as_ref(),
@@ -660,6 +672,31 @@ fn inference_diagnostic(error: &inference::Error, files: &HashMap<FileID, u32>) 
     diagnostic
 }
 
+fn source_error(
+    stage: &'static str,
+    source_diagnostic: ui::Diagnostic,
+    files: &HashMap<FileID, u32>,
+) -> Diagnostic {
+    let mut diagnostic = raw(
+        stage,
+        source_diagnostic.code,
+        source_diagnostic.title,
+        loc(source_diagnostic.primary.span, files),
+    );
+    diagnostic.label = source_diagnostic.primary.message;
+    diagnostic.help = source_diagnostic.help;
+    diagnostic.notes = source_diagnostic.notes;
+    diagnostic.related = source_diagnostic
+        .related
+        .into_iter()
+        .map(|annotation| Related {
+            span: loc(annotation.span, files),
+            message: annotation.message,
+        })
+        .collect();
+    diagnostic
+}
+
 fn raw(stage: &'static str, code: &'static str, message: String, span: Option<Loc>) -> Diagnostic {
     Diagnostic {
         id: 0,
@@ -667,6 +704,9 @@ fn raw(stage: &'static str, code: &'static str, message: String, span: Option<Lo
         severity: Severity::Error,
         code,
         message,
+        label: String::new(),
+        help: Vec::new(),
+        notes: Vec::new(),
         span,
         related: Vec::new(),
     }

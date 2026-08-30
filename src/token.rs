@@ -150,6 +150,10 @@ pub enum Kind {
     String(String),
     /// One of the two boolean values.
     Boolean(bool),
+    /// A lexeme the lexer diagnosed. Keeping its place in the token stream lets
+    /// the parser recover without inventing a second complaint for the same
+    /// source text.
+    Invalid,
 }
 
 #[derive(Debug, Clone)]
@@ -161,15 +165,31 @@ pub struct Error {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
     /// A character that begins no token at all.
-    Unrecognized,
-    /// A natural literal running into identifier characters, as in `1x`. Read
-    /// as one broken literal rather than as a number beside a name, since the
-    /// latter is never what was meant.
-    MalformedNatural,
+    InvalidCharacter { character: char },
+    /// `#` was not followed by an identifier-shaped (or quoted) tag name.
+    MalformedTag,
+    /// `!` was not followed by an identifier-shaped effect name.
+    MalformedEffectLabel,
+    /// `'` was not followed by an identifier-shaped variable name.
+    MalformedVariable,
+    /// A number ran directly into identifier characters, as in `1thing`.
+    NumberFollowedByName,
+    /// A whole-number suffix was attached to a decimal, as in `1.5n`.
+    DecimalWithWholeSuffix { suffix: char },
+    /// A structural numeric field used something other than decimal digits.
+    MalformedNumericField,
     /// A natural literal too large for [`Kind::Natural`] to hold.
     NaturalTooLarge,
-    /// A quoted string did not close or used an unsupported escape.
-    MalformedString,
+    /// An integer literal too large for [`Kind::Integer`] to hold.
+    IntegerTooLarge,
+    /// A real literal outside the finite range of [`Kind::Real`].
+    RealTooLarge,
+    /// A numeric field too large for [`Kind::NumericField`] to hold.
+    NumericFieldTooLarge,
+    /// A string escape the language does not define.
+    UnknownStringEscape { escape: char },
+    /// A string reached a line boundary or the end of input before its quote.
+    MissingClosingQuote,
 }
 
 pub struct Output {
@@ -254,11 +274,15 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                     chars.next();
                     tokens.push(file_id.span(start, 2).track(Kind::NotEqual));
                 } else {
-                    let (kind, width) = sigilled(&mut chars, Kind::EffectLabel);
+                    let (kind, width) = sigilled(
+                        &mut chars,
+                        Kind::EffectLabel,
+                        ErrorKind::MalformedEffectLabel,
+                    );
                     let span = file_id.span(start, width);
                     match kind {
                         Ok(kind) => tokens.push(span.track(kind)),
-                        Err(kind) => errors.push(Error { span, kind }),
+                        Err(kind) => invalid(span, kind, &mut tokens, &mut errors),
                     }
                 }
             }
@@ -266,11 +290,12 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
             // literals and no lifetimes to tell it from, so what follows it is
             // a name or the lexeme is an error.
             '\'' => {
-                let (kind, width) = sigilled(&mut chars, Kind::Variable);
+                let (kind, width) =
+                    sigilled(&mut chars, Kind::Variable, ErrorKind::MalformedVariable);
                 let span = file_id.span(start, width);
                 match kind {
                     Ok(kind) => tokens.push(span.track(kind)),
-                    Err(kind) => errors.push(Error { span, kind }),
+                    Err(kind) => invalid(span, kind, &mut tokens, &mut errors),
                 }
             }
             '+' => {
@@ -309,32 +334,10 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                 // while keeping the `#` in the token's span.
                 let (kind, width) = if matches!(chars.clone().nth(1), Some((_, '"'))) {
                     chars.next();
-                    let (value, mut string_width) = string(&mut chars);
-                    // On an unsupported escape `string` stops at that escape.
-                    // A quoted tag is nevertheless one sigilled lexeme, so
-                    // consume through its closing quote for one complete error
-                    // span rather than lexing the remainder as another string.
-                    if value.is_err() {
-                        // Recovery still observes escapes: a `\"` after the
-                        // malformed escape is content, not the quote ending
-                        // this tag. The validity of those later escapes no
-                        // longer matters; the one error already owns the
-                        // complete lexeme.
-                        let mut escaped = false;
-                        for (_, c) in chars.by_ref() {
-                            string_width += c.len_utf8();
-                            if escaped {
-                                escaped = false;
-                            } else if c == '\\' {
-                                escaped = true;
-                            } else if c == '"' {
-                                break;
-                            }
-                        }
-                    }
+                    let (value, string_width) = string(&mut chars);
                     (value.map(Kind::Tag), string_width + 1)
                 } else {
-                    sigilled(&mut chars, Kind::Tag)
+                    sigilled(&mut chars, Kind::Tag, ErrorKind::MalformedTag)
                 };
                 let span = file_id.span(start, width);
                 match kind {
@@ -345,7 +348,7 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                     // at a character that is not the mistake and leaves the
                     // rest of it unmarked. The natural literal below spans its
                     // own lexeme for the same reason.
-                    Err(kind) => errors.push(Error { span, kind }),
+                    Err(kind) => invalid(span, kind, &mut tokens, &mut errors),
                 }
             }
             '"' => {
@@ -353,7 +356,7 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                 let span = file_id.span(start, width);
                 match value {
                     Ok(value) => tokens.push(span.track(Kind::String(value))),
-                    Err(kind) => errors.push(Error { span, kind }),
+                    Err(kind) => invalid(span, kind, &mut tokens, &mut errors),
                 }
             }
             '{' => {
@@ -439,7 +442,7 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                 let kind = numeric_field(&literal);
                 match kind {
                     Ok(kind) => tokens.push(span.track(kind)),
-                    Err(kind) => errors.push(Error { span, kind }),
+                    Err(kind) => invalid(span, kind, &mut tokens, &mut errors),
                 }
             }
             // A numeric literal is a real by default. An `i` or `n` suffix
@@ -452,21 +455,29 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                 let kind = numeric(&literal);
                 match kind {
                     Ok(kind) => tokens.push(span.track(kind)),
-                    Err(kind) => errors.push(Error { span, kind }),
+                    Err(kind) => invalid(span, kind, &mut tokens, &mut errors),
                 }
             }
             // Anything else is an unrecognized character.
             _ => {
-                errors.push(Error {
-                    span: file_id.span(start, c.len_utf8()),
-                    kind: ErrorKind::Unrecognized,
-                });
+                let span = file_id.span(start, c.len_utf8());
+                invalid(
+                    span,
+                    ErrorKind::InvalidCharacter { character: c },
+                    &mut tokens,
+                    &mut errors,
+                );
                 chars.next();
             }
         }
     }
 
     Output { tokens, errors }
+}
+
+fn invalid(span: Span, kind: ErrorKind, tokens: &mut Vec<Token>, errors: &mut Vec<Error>) {
+    tokens.push(span.track(Kind::Invalid));
+    errors.push(Error { span, kind });
 }
 
 /// Consume the run of characters an identifier may continue with. Shared by
@@ -483,6 +494,7 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
 fn sigilled(
     chars: &mut Peekable<CharIndices<'_>>,
     kind: impl FnOnce(String) -> Kind,
+    malformed: ErrorKind,
 ) -> (Result<Kind, ErrorKind>, usize) {
     chars.next();
     let name = word(chars);
@@ -491,7 +503,7 @@ fn sigilled(
     let width = name.len() + 1;
     match name.chars().next() {
         Some(c) if identifier_start(c) => (Ok(kind(name)), width),
-        _ => (Err(ErrorKind::Unrecognized), width),
+        _ => (Err(malformed), width),
     }
 }
 
@@ -502,20 +514,39 @@ fn identifier_start(c: char) -> bool {
     }
 }
 
-/// Read a double-quoted string, accepting the standard compact escapes.
+/// Read one line-bounded double-quoted string.
+///
+/// Once an unknown escape has been seen, recovery still follows escape syntax
+/// through the real closing quote. This keeps the entire broken string in one
+/// invalid token and prevents its tail from producing further diagnostics.
 fn string(chars: &mut Peekable<CharIndices<'_>>) -> (Result<String, ErrorKind>, usize) {
     let (_, quote) = chars.next().expect("the caller peeked the opening quote");
     debug_assert_eq!(quote, '"');
     let mut value = String::new();
     let mut width = 1;
-    while let Some((_, c)) = chars.next() {
+    let mut error = None;
+
+    loop {
+        let Some(&(_, c)) = chars.peek() else {
+            return (Err(error.unwrap_or(ErrorKind::MissingClosingQuote)), width);
+        };
+        // A source newline is never string content. Leave it for the main loop
+        // so the declaration on the next line is recovered independently.
+        if matches!(c, '\n' | '\r') {
+            return (Err(error.unwrap_or(ErrorKind::MissingClosingQuote)), width);
+        }
+        chars.next();
         width += c.len_utf8();
         match c {
-            '"' => return (Ok(value), width),
+            '"' => return (error.map_or(Ok(value), Err), width),
             '\\' => {
-                let Some((_, escaped)) = chars.next() else {
-                    return (Err(ErrorKind::MalformedString), width);
+                let Some(&(_, escaped)) = chars.peek() else {
+                    return (Err(error.unwrap_or(ErrorKind::MissingClosingQuote)), width);
                 };
+                if matches!(escaped, '\n' | '\r') {
+                    return (Err(error.unwrap_or(ErrorKind::MissingClosingQuote)), width);
+                }
+                chars.next();
                 width += escaped.len_utf8();
                 match escaped {
                     '"' => value.push('"'),
@@ -523,13 +554,14 @@ fn string(chars: &mut Peekable<CharIndices<'_>>) -> (Result<String, ErrorKind>, 
                     'n' => value.push('\n'),
                     'r' => value.push('\r'),
                     't' => value.push('\t'),
-                    _ => return (Err(ErrorKind::MalformedString), width),
+                    _ => {
+                        error.get_or_insert(ErrorKind::UnknownStringEscape { escape: escaped });
+                    }
                 }
             }
             _ => value.push(c),
         }
     }
-    (Err(ErrorKind::MalformedString), width)
 }
 
 fn word(chars: &mut Peekable<CharIndices<'_>>) -> String {
@@ -608,12 +640,12 @@ fn numeric_field_position(tokens: &[Token], delimiters: &[Delimiter]) -> bool {
 
 fn numeric_field(literal: &str) -> Result<Kind, ErrorKind> {
     if !literal.bytes().all(|c| c.is_ascii_digit()) {
-        return Err(ErrorKind::MalformedNatural);
+        return Err(ErrorKind::MalformedNumericField);
     }
     literal
         .parse()
         .map(Kind::NumericField)
-        .map_err(|_| ErrorKind::NaturalTooLarge)
+        .map_err(|_| ErrorKind::NumericFieldTooLarge)
 }
 
 fn numeric(literal: &str) -> Result<Kind, ErrorKind> {
@@ -623,20 +655,23 @@ fn numeric(literal: &str) -> Result<Kind, ErrorKind> {
         Natural,
     }
 
-    let (digits, suffix) = match literal.strip_suffix('i') {
-        Some(digits) => (digits, Some(Suffix::Integer)),
+    let (digits, suffix, suffix_char) = match literal.strip_suffix('i') {
+        Some(digits) => (digits, Some(Suffix::Integer), Some('i')),
         None => match literal.strip_suffix('n') {
-            Some(digits) => (digits, Some(Suffix::Natural)),
-            None => (literal, None),
+            Some(digits) => (digits, Some(Suffix::Natural), Some('n')),
+            None => (literal, None, None),
         },
     };
-    // `number` is entered on a digit and admits at most one decimal point, so
-    // emptiness and a second point are construction invariants here.
-    if !digits.bytes().all(|c| c.is_ascii_digit() || c == b'.')
-        || suffix.is_some_and(|_| digits.contains('.'))
-    {
-        return Err(ErrorKind::MalformedNatural);
+
+    // If removing a possible suffix does not leave only the numeric spelling,
+    // the suffix-like character was merely the end of an attached name.
+    if !digits.bytes().all(|c| c.is_ascii_digit() || c == b'.') {
+        return Err(ErrorKind::NumberFollowedByName);
     }
+    if let Some(suffix) = suffix_char.filter(|_| digits.contains('.')) {
+        return Err(ErrorKind::DecimalWithWholeSuffix { suffix });
+    }
+
     match suffix {
         Some(Suffix::Natural) => digits
             .parse()
@@ -645,12 +680,12 @@ fn numeric(literal: &str) -> Result<Kind, ErrorKind> {
         Some(Suffix::Integer) => digits
             .parse()
             .map(Kind::Integer)
-            .map_err(|_| ErrorKind::NaturalTooLarge),
+            .map_err(|_| ErrorKind::IntegerTooLarge),
         None => digits
             .parse::<f64>()
             .ok()
             .filter(|value| value.is_finite())
             .map(Kind::Real)
-            .ok_or(ErrorKind::NaturalTooLarge),
+            .ok_or(ErrorKind::RealTooLarge),
     }
 }
