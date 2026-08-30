@@ -5,7 +5,7 @@ use std::{
     rc::Rc,
 };
 
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use ruddy::{
     artifact::{
         self, Artifact, Block, Callee, End, Formula, Global, Instr, Lir, Literal, Op, Param,
@@ -428,6 +428,38 @@ fn existential_presence_ownership_round_trips_and_is_validated() {
 }
 
 #[test]
+fn owned_disjunction_with_nested_conjunction_round_trips() {
+    let mut artifact = model_artifact();
+    let scheme = &mut artifact.header.values[0].scheme;
+    scheme.existentials = vec![0, 1];
+    scheme.body = Type::Package(Box::new(Type::Struct(Row {
+        labels: vec![
+            ("a".into(), field(Presence::Bound(0), Type::Nat)),
+            ("b".into(), field(Presence::Bound(1), Type::Nat)),
+        ],
+        rest: Rest::Closed,
+    })));
+    scheme.formula = Formula::Owned(
+        0,
+        Box::new(Formula::Or(
+            Box::new(Formula::And(
+                Box::new(Formula::Bound(0)),
+                Box::new(Formula::Bound(1)),
+            )),
+            Box::new(Formula::Not(Box::new(Formula::Bound(0)))),
+        )),
+    );
+
+    let printed = assert_round_trip(&artifact);
+    assert!(printed.contains("(owned 0 (or (and"), "{printed}");
+
+    // The same conjunction directly beneath Owned is partitionable and is not
+    // compiler-canonical, unlike the conjunction nested in the disjunction.
+    let malformed = printed.replacen("(or (and", "(and (and", 1);
+    assert_malformed(&malformed);
+}
+
+#[test]
 fn broad_existential_package_validation_scales() {
     const WIDTH: u32 = 4_096;
     let mut artifact = model_artifact();
@@ -469,6 +501,55 @@ fn broad_existential_package_validation_scales() {
         parsed.header.values[0].scheme.existentials.len(),
         WIDTH as usize
     );
+}
+
+#[test]
+fn broad_semantic_scheme_converts_to_artifact_linearly() {
+    const WIDTH: u32 = 4_096;
+    let (mint, program, mut inferred, lowered) = compiled("let target = {}\n");
+    let symbol = inferred
+        .schemes
+        .keys()
+        .copied()
+        .find(|symbol| mint.name(*symbol) == "target")
+        .expect("target scheme exists");
+    let labels = (0..WIDTH)
+        .map(|index| {
+            (
+                format!("slot{index}"),
+                types::RowField {
+                    presence: types::Presence::Bound(index),
+                    ty: Rc::new(types::Ty::Nat),
+                },
+            )
+        })
+        .collect();
+    let body = Rc::new(types::Ty::Package(Rc::new(types::Ty::Struct(types::Row {
+        labels,
+        rest: types::Rest::Closed,
+    }))));
+    let formula = types::Formula::any((0..WIDTH).map(types::Formula::bound));
+    inferred.schemes.insert(
+        symbol,
+        types::Scheme::existential(
+            WIDTH,
+            WIDTH,
+            (0..WIDTH).collect::<IndexSet<_>>(),
+            body,
+            formula,
+        ),
+    );
+
+    let artifact = Artifact::build(&mint, &program, &inferred, &lowered);
+    let value = artifact
+        .header
+        .values
+        .iter()
+        .find(|value| value.name.ends_with("::target"))
+        .expect("target is exported");
+    assert_eq!(value.scheme.existentials.len(), WIDTH as usize);
+    assert!(matches!(value.scheme.formula, Formula::Owned(0, _)));
+    Artifact::try_parse(&artifact.print()).expect("broad semantic scheme round trips");
 }
 
 fn assert_round_trip(value: &Artifact) -> String {

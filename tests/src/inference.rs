@@ -193,6 +193,19 @@ fn mixed_input_to_result_guarantees_activate_at_each_call() {
 }
 
 #[test]
+fn captured_presence_activates_nested_closure_result_guarantee() {
+    inferred(
+        "extern follows: { input when 'u: Nat } -> { output when 'e: Nat }\n\
+         where (not 'u) or 'e = host.follows\n\
+         let needs_output: { output: Nat } -> Nat = fn value => value.output\n\
+         let make = fn captured =>\n\
+           let nested = fn _ => follows captured\n\
+           in nested\n\
+         let good = needs_output ((make { input: 1n }) {})",
+    );
+}
+
+#[test]
 fn package_guarantee_identity_survives_allocator_churn_without_crossing_instances() {
     let mut source = String::from(
         "extern follows: { input when 'u: Nat } -> { output when 'e: Nat }\n\

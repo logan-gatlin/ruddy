@@ -3561,6 +3561,13 @@ pub mod text {
                     }
                     _ => (None, part),
                 };
+                // Only a conjunction immediately inside `Owned` is
+                // partitionable into separate top-level conjuncts. An `And`
+                // below `Or`, `Iff`, `Xor`, or `Not` is part of one indivisible
+                // proposition and must retain the package wrapper.
+                if matches!(inner, Formula::And(..)) {
+                    self.fail("owned conjunction is not canonical");
+                }
                 let mut atoms = Vec::new();
                 let mut formulas = vec![inner];
                 while let Some(formula) = formulas.pop() {
@@ -3571,16 +3578,14 @@ pub mod text {
                             }
                             atoms.push(*index);
                         }
-                        Formula::Var(_) if claimed.is_some() => {
-                            self.fail("formula package owner contains an open atom");
-                        }
+                        // A nested local scheme can retain a captured presence
+                        // as an open atom. It scopes the mixed proposition like
+                        // a universal bound; existential bounds alone infer its
+                        // exact package owner.
                         Formula::Owned(_, _) => {
                             self.fail("nested formula package owners are not canonical");
                         }
                         Formula::Not(inner) => formulas.push(inner),
-                        Formula::And(_, _) if claimed.is_some() => {
-                            self.fail("owned conjunction is not canonical");
-                        }
                         Formula::And(left, right)
                         | Formula::Or(left, right)
                         | Formula::Iff(left, right)
