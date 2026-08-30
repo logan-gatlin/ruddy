@@ -4,9 +4,11 @@ primary: this field access requires a struct
 help: change this value to a struct, or change/remove the field access
 
 ## type-mismatch
-[type-mismatch] type mismatch: expected `Nat`, found `()`
-primary: these two uses require incompatible types
-help: change either use so both require the same type
+[type-mismatch] a natural number and a struct cannot be the same type
+primary: the annotation fixes the type here
+related: this expression supplies its type here
+help: change the first use so it agrees with the other one
+help: or change the other use so it agrees with the first one
 
 ## recursive-type
 [recursive-type] this type would have to contain itself
@@ -113,26 +115,36 @@ primary: host code needs one fixed kind of value at this position
 help: use a fixed type here, or keep the generic value behind a Ruddy wrapper
 
 ## repeated-calls
-[type-mismatch] type mismatch: expected `Nat`, found `Boolean`
-primary: these two uses require incompatible types
-help: change either use so both require the same type
+[type-mismatch] a natural number and a boolean cannot be the same type
+primary: this call fixes what type the argument must have
+related: this argument supplies a type to the call
+related: this expression is called as a function
+help: change the first use so it agrees with the other one
+help: or change the other use so it agrees with the first one
 
 ## branches
-[type-mismatch] type mismatch: expected `Nat`, found `()`
-primary: these two uses require incompatible types
-help: change either use so both require the same type
+[type-mismatch] a natural number and a struct cannot be the same type
+primary: all branches must contribute one result type
+related: this branch contributes its type to the match result
+help: change the first use so it agrees with the other one
+help: or change the other use so it agrees with the first one
 
 ## non-function
-[type-mismatch] type mismatch: expected `? -> ?`, found `Nat`
-primary: these two uses require incompatible types
-help: change either use so both require the same type
+[type-mismatch] a natural number cannot be called as a function
+primary: this expression is called as a function
+help: change the first use so it agrees with the other one
+help: or change the other use so it agrees with the first one
 
 ## cross-definition
-[type-mismatch] type mismatch: expected `Nat`, found `()`
-primary: these two uses require incompatible types
-help: change either use so both require the same type
+[type-mismatch] a natural number and a struct cannot be the same type
+primary: this call fixes what type the argument must have
+related: this argument supplies a type to the call
+help: change the first use so it agrees with the other one
+help: or change the other use so it agrees with the first one
 
 ## long-alias
-[type-mismatch] type mismatch: expected `Nat`, found `()`
-primary: these two uses require incompatible types
-help: change either use so both require the same type
+[type-mismatch] a natural number and a struct cannot be the same type
+primary: the annotation fixes the type here
+related: this expression supplies its type here
+help: change the first use so it agrees with the other one
+help: or change the other use so it agrees with the first one

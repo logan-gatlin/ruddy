@@ -453,6 +453,7 @@ impl Solve<'_> {
                     cause: ErrorCause::Direct,
                     span: base_span,
                     kind: ErrorKind::NotAStruct { base: exposed },
+                    explanation: None,
                 };
                 self.fail(
                     base_span,
@@ -473,6 +474,7 @@ impl Solve<'_> {
                         name: name.clone(),
                         declared: self.table.declared(*id),
                     },
+                    explanation: None,
                 };
                 let goal = Goal::Type {
                     expected: Rc::new(Ty::unit()),
@@ -1283,6 +1285,7 @@ impl Solve<'_> {
                     cause: ErrorCause::Direct,
                     span,
                     kind,
+                    explanation: None,
                 },
                 &abandoned,
             );
@@ -2047,6 +2050,7 @@ impl Solve<'_> {
                 sense,
                 declared: self.table.declared(id),
             },
+            explanation: None,
         };
         let abandoned = [Assigned::Ty(found.clone())];
         self.fail(span, Rule::Mismatch, goal, error, &abandoned);
@@ -2062,6 +2066,7 @@ impl Solve<'_> {
                 expected: lhs.clone(),
                 actual: rhs.clone(),
             },
+            explanation: None,
         };
         let abandoned = [Assigned::Ty(lhs.clone()), Assigned::Ty(rhs.clone())];
         self.fail(span, Rule::Mismatch, goal, error, &abandoned);
@@ -2128,6 +2133,7 @@ impl Solve<'_> {
                     cause: ErrorCause::Direct,
                     span,
                     kind: ErrorKind::Recursive,
+                    explanation: None,
                 };
                 let abandoned = [
                     expected.tail.value(expected.labels.clone()),
@@ -2382,6 +2388,7 @@ impl Solve<'_> {
                         cause: ErrorCause::Direct,
                         span,
                         kind,
+                        explanation: None,
                     },
                     &abandoned,
                 );
@@ -2646,6 +2653,7 @@ impl Solve<'_> {
                         name: rigid.clone(),
                         declared: self.table.declared(*id),
                     },
+                    explanation: None,
                 };
                 let goal = Goal::Presence {
                     expected: Presence::Absent,
@@ -2676,6 +2684,7 @@ impl Solve<'_> {
                         cause: ErrorCause::Direct,
                         span,
                         kind,
+                        explanation: None,
                     };
                     let abandoned = [Assigned::Ty(field.ty.clone())];
                     self.fail(span, Rule::Presence { shape }, goal, error, &abandoned);
@@ -2695,6 +2704,7 @@ impl Solve<'_> {
                         cause: ErrorCause::Direct,
                         span,
                         kind,
+                        explanation: None,
                     };
                     let abandoned = [Assigned::Ty(field.ty.clone())];
                     self.fail(span, Rule::Presence { shape }, goal, error, &abandoned);
@@ -2754,6 +2764,7 @@ impl Solve<'_> {
                 cause: ErrorCause::Direct,
                 span,
                 kind: ErrorKind::Recursive,
+                explanation: None,
             };
             let abandoned = [value.variable(var), value];
             self.fail(span, Rule::Occurs, goal, error, &abandoned);
@@ -2789,6 +2800,7 @@ impl Solve<'_> {
                         shape,
                         field: field.clone(),
                     },
+                    explanation: None,
                 };
                 let abandoned = [value.variable(var), value];
                 self.fail(span, Rule::Overlap { shape }, goal, error, &abandoned);

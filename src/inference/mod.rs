@@ -931,6 +931,84 @@ pub struct Error {
     pub cause: ErrorCause,
     pub span: Span,
     pub kind: ErrorKind,
+    /// Source-level account extracted from the immutable reason graph. Families
+    /// not migrated yet deliberately leave this empty and use their established
+    /// diagnostic wording.
+    pub explanation: Option<InferenceExplanation>,
+}
+
+/// A reporter-independent explanation of an inference contradiction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InferenceExplanation {
+    /// Complete source facts in deterministic causal order.
+    pub full_facts: Vec<ExplanationFact>,
+    /// Indices into `full_facts` selected for the ordinary 2–4 fact view.
+    pub abridged: Vec<usize>,
+    pub contradiction: Contradiction,
+    /// Both the source constraint slice and the unabridged raw reason slice.
+    pub cause: ExplanationCause,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplanationFact {
+    pub span: Span,
+    pub constraint: ConstraintId,
+    pub origin: ConstraintOrigin,
+    pub subject: Subject,
+    pub payload: ExplanationFactPayload,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExplanationFactPayload {
+    RequiresType,
+    UsedAsFunction,
+    SuppliesArgument,
+    BranchResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Contradiction {
+    pub kind: ContradictionKind,
+    pub left: TypeDescription,
+    pub right: TypeDescription,
+    /// Neutral equality failures always retain both possible repair directions.
+    pub repairs: [RepairDirection; 2],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContradictionKind {
+    IncompatibleTypes,
+    ValueUsedAsFunction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepairDirection {
+    ChangeFirstUse,
+    ChangeSecondUse,
+}
+
+/// Deliberately source-facing and finite: no solver variable, row-tail, or
+/// compiler-synthesized arrow can enter migrated diagnostic prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeDescription {
+    NaturalNumber,
+    Integer,
+    RealNumber,
+    Text,
+    Boolean,
+    Function,
+    Struct,
+    TaggedValue,
+    DeclaredType,
+    Undecided,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplanationCause {
+    pub error: ErrorId,
+    pub seed: Option<ReasonId>,
+    pub constraints: Vec<ConstraintId>,
+    pub reasons: Vec<ReasonId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -949,6 +1027,7 @@ impl Error {
             cause: ErrorCause::Direct,
             span,
             kind,
+            explanation: None,
         }
     }
 }
@@ -1757,6 +1836,219 @@ fn callback_coverage_constraints(
     (out, conditional)
 }
 
+fn describe_type(ty: &Rc<Ty>) -> TypeDescription {
+    let mut ty = ty;
+    while let Ty::Package(inner) = &**ty {
+        ty = inner;
+    }
+    match &**ty {
+        Ty::Nat => TypeDescription::NaturalNumber,
+        Ty::Int => TypeDescription::Integer,
+        Ty::Real => TypeDescription::RealNumber,
+        Ty::String => TypeDescription::Text,
+        Ty::Boolean => TypeDescription::Boolean,
+        Ty::Arrow(..) => TypeDescription::Function,
+        Ty::Struct(..) => TypeDescription::Struct,
+        Ty::Sum(..) => TypeDescription::TaggedValue,
+        Ty::Named { .. } => TypeDescription::DeclaredType,
+        Ty::Bound(_) | Ty::Var(_) | Ty::Rigid { .. } | Ty::Undecided => TypeDescription::Undecided,
+        Ty::Package(_) => unreachable!("packages were removed iteratively"),
+    }
+}
+
+/// Pick the first incompatible structural leaf without recursive descent. In
+/// practice the solver's mismatch step is already at that leaf; retaining this
+/// walk makes explanations robust to direct/boundary mismatch producers too.
+fn smallest_incompatible(left: &Rc<Ty>, right: &Rc<Ty>) -> (TypeDescription, TypeDescription) {
+    let mut work = vec![(left.clone(), right.clone())];
+    while let Some((left, right)) = work.pop() {
+        let mut left = left;
+        let mut right = right;
+        while let Ty::Package(inner) = &*left {
+            left = inner.clone();
+        }
+        while let Ty::Package(inner) = &*right {
+            right = inner.clone();
+        }
+        if let (Ty::Arrow(l_from, l_to, _), Ty::Arrow(r_from, r_to, _)) = (&*left, &*right) {
+            // Argument is source-first; push result first for LIFO ordering.
+            work.push((l_to.clone(), r_to.clone()));
+            work.push((l_from.clone(), r_from.clone()));
+            continue;
+        }
+        let descriptions = (describe_type(&left), describe_type(&right));
+        if descriptions.0 != descriptions.1 || !same_finite_syntax(&left, &right) {
+            return descriptions;
+        }
+    }
+    (describe_type(left), describe_type(right))
+}
+
+fn all_constraints(
+    constraints: &IndexMap<Symbol, Vec<Constraint>>,
+) -> HashMap<ConstraintId, &Constraint> {
+    let mut out = HashMap::new();
+    let mut work: Vec<&Constraint> = constraints.values().flatten().collect();
+    while let Some(constraint) = work.pop() {
+        if out.insert(constraint.id, constraint).is_some() {
+            continue;
+        }
+        match &constraint.kind {
+            ConstraintKind::Let { value, body, .. } => {
+                work.extend(value);
+                work.extend(body);
+            }
+            ConstraintKind::Match { arms, .. } => {
+                for arm in arms {
+                    work.extend(&arm.constraints);
+                    work.push(&arm.result);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn attach_mismatch_explanations(
+    errors: &mut [Error],
+    constraints: &IndexMap<Symbol, Vec<Constraint>>,
+    steps: &[Step],
+    reasons: &[Reason],
+) {
+    let constraints = all_constraints(constraints);
+    let steps: HashMap<_, _> = steps.iter().map(|step| (step.id, step)).collect();
+    let reasons_by_id: HashMap<_, _> = reasons.iter().map(|reason| (reason.id, reason)).collect();
+
+    for error in errors {
+        let ErrorKind::Mismatch { expected, actual } = &error.kind else {
+            continue;
+        };
+        let seed = match error.cause {
+            ErrorCause::Step(id) => steps.get(&id).map(|step| step.reason),
+            ErrorCause::Batch(_) | ErrorCause::Direct => None,
+        };
+
+        // Iterative, parent-order DFS. IDs are immutable and parents precede
+        // children, so this is deterministic even when bindings share causes.
+        let mut reason_slice = Vec::new();
+        let mut constraint_slice = Vec::new();
+        let mut seen_reasons = HashSet::new();
+        let mut seen_constraints = HashSet::new();
+        let mut work: Vec<ReasonId> = seed.into_iter().collect();
+        while let Some(id) = work.pop() {
+            if !seen_reasons.insert(id) {
+                continue;
+            }
+            let Some(reason) = reasons_by_id.get(&id).filter(|reason| reason.reachable) else {
+                continue;
+            };
+            reason_slice.push(id);
+            if let ReasonOrigin::Constraint(id) = reason.origin
+                && seen_constraints.insert(id)
+            {
+                constraint_slice.push(id);
+            }
+            work.extend(reason.parents.iter().rev().copied());
+        }
+
+        let mut full_facts = Vec::new();
+        for id in &constraint_slice {
+            let Some(constraint) = constraints.get(id) else {
+                continue;
+            };
+            let payload = match constraint.origin {
+                ConstraintOrigin::ApplicationCallee => ExplanationFactPayload::UsedAsFunction,
+                ConstraintOrigin::ApplicationArgument => ExplanationFactPayload::SuppliesArgument,
+                ConstraintOrigin::MatchArm | ConstraintOrigin::Match => {
+                    ExplanationFactPayload::BranchResult
+                }
+                _ => ExplanationFactPayload::RequiresType,
+            };
+            full_facts.push(ExplanationFact {
+                span: constraint.span,
+                constraint: *id,
+                origin: constraint.origin,
+                subject: constraint.subjects.primary,
+                payload,
+            });
+            if let Some(subject) = constraint.subjects.secondary {
+                full_facts.push(ExplanationFact {
+                    span: constraint.span,
+                    constraint: *id,
+                    origin: constraint.origin,
+                    subject,
+                    payload,
+                });
+            }
+        }
+        // A direct mismatch still has a useful structured account. This is
+        // mainly for focused semantic tests; production solve failures carry a
+        // generated constraint reason.
+        if full_facts.is_empty() {
+            full_facts.push(ExplanationFact {
+                span: error.span,
+                constraint: ConstraintId::pending(),
+                origin: ConstraintOrigin::ContextualCheck,
+                subject: Subject::Context,
+                payload: ExplanationFactPayload::RequiresType,
+            });
+            full_facts.push(ExplanationFact {
+                span: error.span,
+                constraint: ConstraintId::pending(),
+                origin: ConstraintOrigin::ContextualCheck,
+                subject: Subject::Term,
+                payload: ExplanationFactPayload::RequiresType,
+            });
+        }
+        let mut abridged = Vec::new();
+        let mut included = HashSet::new();
+        for (at, fact) in full_facts.iter().enumerate() {
+            // The full path retains repeated requirements. The default view
+            // says each source role once instead of repeating identical prose.
+            let key = match fact.payload {
+                ExplanationFactPayload::UsedAsFunction => (fact.payload, Subject::Callee),
+                _ => (fact.payload, fact.subject),
+            };
+            if !included.insert(key) {
+                continue;
+            }
+            abridged.push(at);
+            if abridged.len() == 4 {
+                break;
+            }
+        }
+        let leaf = smallest_incompatible(expected, actual);
+        let value_used_as_function = full_facts.iter().any(|fact| {
+            fact.payload == ExplanationFactPayload::UsedAsFunction
+                && (leaf.0 == TypeDescription::Function || leaf.1 == TypeDescription::Function)
+        });
+        error.explanation = Some(InferenceExplanation {
+            full_facts,
+            abridged,
+            contradiction: Contradiction {
+                kind: if value_used_as_function {
+                    ContradictionKind::ValueUsedAsFunction
+                } else {
+                    ContradictionKind::IncompatibleTypes
+                },
+                left: leaf.0,
+                right: leaf.1,
+                repairs: [
+                    RepairDirection::ChangeFirstUse,
+                    RepairDirection::ChangeSecondUse,
+                ],
+            },
+            cause: ExplanationCause {
+                error: error.id,
+                seed,
+                constraints: constraint_slice,
+                reasons: reason_slice,
+            },
+        });
+    }
+}
+
 /// Assign a type to every term in the program, in place, and return the
 /// schemes of its top-level definitions.
 pub fn infer(mint: &Mint, program: &mut Program) -> Output {
@@ -1863,6 +2155,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 kind: ErrorKind::ClauseImpossible {
                     formula: crate::ui::in_labels(&lowered.formula, &lowered.names),
                 },
+                explanation: None,
             });
         }
         if let Some(span) =
@@ -1873,6 +2166,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 cause: ErrorCause::Direct,
                 span,
                 kind: ErrorKind::PolymorphicExternBoundary,
+                explanation: None,
             });
         } else {
             let (mut coverage, conditional) =
@@ -1889,6 +2183,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                     cause: ErrorCause::Direct,
                     span: decl.value.abi.span,
                     kind: ErrorKind::CallbackEffectsNotCovered,
+                    explanation: None,
                 });
             }
         }
@@ -2192,6 +2487,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                     cause: ErrorCause::Direct,
                     span: annotation.ty.span,
                     kind: ErrorKind::AnnotationAllows { allowed, required },
+                    explanation: None,
                 });
             }
             // An annotation on a nested binding is the same promise about a
@@ -2221,6 +2517,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                         cause: ErrorCause::Direct,
                         span: annotated.span,
                         kind: ErrorKind::AnnotationAllows { allowed, required },
+                        explanation: None,
                     });
                 }
             }
@@ -2295,6 +2592,8 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     schemes.sort_by(|one, _, other, _| position[one].cmp(&position[other]));
     constraints.sort_by(|one, _, other, _| position[one].cmp(&position[other]));
     promises.sort_by(|one, _, other, _| position[one].cmp(&position[other]));
+
+    attach_mismatch_explanations(&mut errors, &constraints, &steps, &table.reasons);
 
     // Constraints are solved in the order the walk emitted them, which is not
     // quite the order anyone reads a file in — a body's demands come before
@@ -2412,6 +2711,7 @@ fn report_flip(table: &mut Table, errors: &mut Vec<Error>) {
         cause: ErrorCause::Batch(batch.id),
         span: batch.span,
         kind,
+        explanation: None,
     });
 }
 
@@ -4126,6 +4426,7 @@ impl Table {
                 cause: ErrorCause::Direct,
                 span,
                 kind: ErrorKind::RigidEscapes { name },
+                explanation: None,
             });
         }
     }

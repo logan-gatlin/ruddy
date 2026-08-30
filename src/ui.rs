@@ -2565,6 +2565,74 @@ impl fmt::Display for Goal {
     }
 }
 
+fn type_description(description: inference::TypeDescription) -> &'static str {
+    use inference::TypeDescription as T;
+    match description {
+        T::NaturalNumber => "a natural number",
+        T::Integer => "an integer",
+        T::RealNumber => "a real number",
+        T::Text => "text",
+        T::Boolean => "a boolean",
+        T::Function => "a function",
+        T::Struct => "a struct",
+        T::TaggedValue => "a tagged value",
+        T::DeclaredType => "a declared type",
+        T::Undecided => "another type",
+    }
+}
+
+fn explanation_fact(fact: &inference::ExplanationFact) -> String {
+    use inference::ExplanationFactPayload as P;
+    match fact.payload {
+        P::UsedAsFunction => "this expression is called as a function".into(),
+        P::SuppliesArgument => match fact.subject {
+            inference::Subject::Parameter => {
+                "this call fixes what type the argument must have".into()
+            }
+            inference::Subject::Argument => "this argument supplies a type to the call".into(),
+            _ => "this call relates the argument and parameter types".into(),
+        },
+        P::BranchResult => match fact.subject {
+            inference::Subject::MatchArm => {
+                "this branch contributes its type to the match result".into()
+            }
+            inference::Subject::MatchResult => {
+                "all branches must contribute one result type".into()
+            }
+            _ => "this match requires its branches to agree".into(),
+        },
+        P::RequiresType => match fact.subject {
+            inference::Subject::Binding
+            | inference::Subject::TopLevelBinding
+            | inference::Subject::LocalBinding => {
+                "this binding keeps one type across all of its uses".into()
+            }
+            inference::Subject::Annotation => "the annotation fixes the type here".into(),
+            inference::Subject::Argument => "this argument has to fit the call".into(),
+            inference::Subject::Parameter => "the function requires one parameter type".into(),
+            inference::Subject::Term => "this expression supplies its type here".into(),
+            _ => "this use contributes one of the conflicting type requirements".into(),
+        },
+    }
+}
+
+fn mismatch_title(contradiction: &inference::Contradiction) -> String {
+    use inference::ContradictionKind as K;
+    let left = type_description(contradiction.left);
+    let right = type_description(contradiction.right);
+    match contradiction.kind {
+        K::ValueUsedAsFunction => {
+            let value = if contradiction.left == inference::TypeDescription::Function {
+                right
+            } else {
+                left
+            };
+            format!("{value} cannot be called as a function")
+        }
+        K::IncompatibleTypes => format!("{left} and {right} cannot be the same type"),
+    }
+}
+
 impl inference::Error {
     /// Turn an inference failure into reporter-independent words and source
     /// annotations. This is deliberately the only presentation boundary for
@@ -2581,9 +2649,30 @@ impl inference::Error {
                     .help("change this value to a struct, or change/remove the field access")
             }
             E::Mismatch { .. } => {
-                diagnostic = diagnostic
-                    .label("these two uses require incompatible types")
-                    .help("change either use so both require the same type")
+                if let Some(explanation) = &self.explanation {
+                    diagnostic.title = mismatch_title(&explanation.contradiction);
+                    let mut selected = explanation
+                        .abridged
+                        .iter()
+                        .filter_map(|at| explanation.full_facts.get(*at));
+                    if let Some(primary) = selected.next() {
+                        diagnostic.primary.span = primary.span;
+                        diagnostic.primary.message = explanation_fact(primary);
+                    } else {
+                        diagnostic.primary.message =
+                            "these uses contribute incompatible type requirements".into();
+                    }
+                    for fact in selected {
+                        diagnostic = diagnostic.related(fact.span, explanation_fact(fact));
+                    }
+                    diagnostic = diagnostic
+                        .help("change the first use so it agrees with the other one")
+                        .help("or change the other use so it agrees with the first one");
+                } else {
+                    diagnostic = diagnostic
+                        .label("these uses contribute incompatible type requirements")
+                        .help("change either use so both require the same type");
+                }
             }
             E::Recursive => {
                 diagnostic = diagnostic
@@ -2737,8 +2826,8 @@ impl fmt::Display for inference::ErrorKind {
             inference::ErrorKind::NotAStruct { base } => {
                 write!(f, "`{base}` is not a struct, so it has no fields to read")
             }
-            inference::ErrorKind::Mismatch { expected, actual } => {
-                write!(f, "type mismatch: expected `{expected}`, found `{actual}`")
+            inference::ErrorKind::Mismatch { .. } => {
+                f.write_str("these uses require incompatible types")
             }
             inference::ErrorKind::Recursive => {
                 f.write_str("this type would have to contain itself")

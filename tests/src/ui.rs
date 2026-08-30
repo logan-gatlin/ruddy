@@ -793,7 +793,7 @@ fn guarded_origins_keep_their_source_and_premise_readable() {
 /// rather than a string the test would have to re-derive the grouping rules to
 /// predict — which would be the rules under test standing in as their own
 /// expectation.
-fn inference_fixture_diagnostics(source: &str) -> Vec<ui::Diagnostic> {
+fn inference_fixture_errors(source: &str) -> Vec<inference::Error> {
     let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
     assert!(
         parsed.errors.is_empty(),
@@ -804,11 +804,53 @@ fn inference_fixture_diagnostics(source: &str) -> Vec<ui::Diagnostic> {
     let mut mint = Mint::new(bundle);
     let mut built = ir::build(&mut mint, parsed.stmts);
     assert!(built.errors.is_empty(), "IR errors: {:#?}", built.errors);
-    inference::infer(&mint, &mut built.program)
-        .errors
+    inference::infer(&mint, &mut built.program).errors
+}
+
+fn inference_fixture_diagnostics(source: &str) -> Vec<ui::Diagnostic> {
+    inference_fixture_errors(source)
         .into_iter()
         .map(|error| error.diagnostic())
         .collect()
+}
+
+#[test]
+fn ordinary_mismatch_explanations_keep_full_and_abridged_causal_evidence() {
+    let source = include_str!("../diagnostics/inference/repeated-calls.hc");
+    let first = inference_fixture_errors(source);
+    let second = inference_fixture_errors(source);
+    let [first] = first.as_slice() else {
+        panic!("the repeated calls fixture must have one error: {first:#?}");
+    };
+    let [second] = second.as_slice() else {
+        panic!("the repeated calls fixture must be deterministic: {second:#?}");
+    };
+    let explanation = first.explanation.as_ref().expect("mismatch explanation");
+    let repeated = second.explanation.as_ref().expect("second explanation");
+    assert_eq!(explanation, repeated);
+    assert!((2..=4).contains(&explanation.abridged.len()));
+    assert!(explanation.full_facts.len() >= explanation.abridged.len());
+    assert!(!explanation.cause.reasons.is_empty());
+    assert!(!explanation.cause.constraints.is_empty());
+    assert_eq!(
+        explanation.contradiction.repairs,
+        [
+            inference::RepairDirection::ChangeFirstUse,
+            inference::RepairDirection::ChangeSecondUse,
+        ]
+    );
+    let rendered = first.diagnostic();
+    for forbidden in ["expected", "found", "?", "~", "->"] {
+        assert!(
+            !rendered.title.contains(forbidden)
+                && !rendered.primary.message.contains(forbidden)
+                && rendered
+                    .related
+                    .iter()
+                    .all(|note| !note.message.contains(forbidden)),
+            "migrated mismatch leaked `{forbidden}`: {rendered:#?}"
+        );
+    }
 }
 
 /// Source-owned examples pin the diagnostic a reader is meant to see, rather
@@ -943,11 +985,11 @@ fn inference_source_corpus_matches_abridged_structured_goldens() {
             assert_eq!(diagnostic.code, "type-mismatch");
             assert_eq!(
                 diagnostic.title,
-                "type mismatch: expected `Nat`, found `Boolean`"
+                "a natural number and a boolean cannot be the same type"
             );
             assert_eq!(
                 diagnostic.primary.message,
-                "these two uses require incompatible types"
+                "this call fixes what type the argument must have"
             );
         }
         for diagnostic in diagnostics {
