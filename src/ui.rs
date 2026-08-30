@@ -2608,11 +2608,31 @@ impl inference::Error {
                         "remove {noun} `{field}`, or allow it in the other type"
                     ));
             }
-            E::RigidBroken { declared, .. } | E::RigidField { declared, .. } => {
+            E::RigidBroken { declared, .. } => {
                 diagnostic = diagnostic
                     .label("this use narrows a choice that belongs to the caller")
                     .related(*declared, DECLARED_HERE)
                     .help("change the body so it works for every choice allowed by the annotation");
+            }
+            E::RigidField {
+                shape, declared, ..
+            } => {
+                let choices = match shape {
+                    Shape::Struct => "struct fields",
+                    Shape::Sum => "cases",
+                    Shape::Effect => "effects",
+                };
+                diagnostic = diagnostic
+                    .label(format!(
+                        "this assumes one of the {choices} chosen by the caller"
+                    ))
+                    .related(
+                        *declared,
+                        format!("the caller's choice of {choices} starts here"),
+                    )
+                    .help(format!(
+                        "change the body so it does not assume which {choices} the caller chooses"
+                    ));
             }
             E::RigidEscapes { .. } => {
                 diagnostic = diagnostic
@@ -2767,14 +2787,14 @@ impl fmt::Display for inference::ErrorKind {
                 shape, field, name, ..
             } => {
                 let field = label(*shape, field);
-                let action = match shape {
-                    Shape::Struct => "reads field",
-                    Shape::Sum => "matches case",
-                    Shape::Effect => "requires effect",
+                let (action, choices) = match shape {
+                    Shape::Struct => ("reads field", "other struct fields"),
+                    Shape::Sum => ("matches case", "other cases"),
+                    Shape::Effect => ("requires effect", "other effects"),
                 };
                 write!(
                     f,
-                    "this {action} `{field}`, but `'{name}` stands for whatever type the caller picks, so that choice cannot be assumed",
+                    "this {action} `{field}`, but `'{name}` stands for whatever {choices} the caller chooses, so `{field}` cannot be assumed",
                 )
             }
             // Said at the declaration, because that is the line that has to

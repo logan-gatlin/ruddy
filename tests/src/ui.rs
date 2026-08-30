@@ -27,13 +27,75 @@ use ruddy::{
 };
 use ruddy_debug::print;
 
+/// One value of every inference error variant. Shared by the inventory and the
+/// structured-diagnostic audit so those two hand-maintained checks cannot
+/// silently drift apart.
+fn inference_error_kinds(span: Span) -> Vec<TypeError> {
+    let nat = Rc::new(Ty::plain(Ty::Nat));
+    vec![
+        TypeError::NotAStruct { base: nat.clone() },
+        TypeError::Mismatch {
+            expected: nat.clone(),
+            actual: Rc::new(Ty::default()),
+        },
+        TypeError::Recursive,
+        TypeError::MissingField {
+            shape: Shape::Struct,
+            base: nat.clone(),
+            field: "x".to_string(),
+        },
+        TypeError::ExtraField {
+            shape: Shape::Struct,
+            base: nat.clone(),
+            field: "x".to_string(),
+        },
+        TypeError::RigidBroken {
+            found: nat.clone(),
+            name: "a".into(),
+            sense: Sense::Type,
+            declared: span,
+        },
+        TypeError::RigidField {
+            shape: Shape::Struct,
+            field: "x".to_string(),
+            name: "a".into(),
+            declared: span,
+        },
+        TypeError::RigidEscapes { name: "a".into() },
+        TypeError::RepeatedField {
+            shape: Shape::Struct,
+            field: "x".to_string(),
+        },
+        TypeError::PresenceRequired {
+            formula: "x != y".to_string(),
+        },
+        TypeError::PresenceImpossible {
+            formula: "x and y".to_string(),
+        },
+        TypeError::ClauseImpossible {
+            formula: "a and not a".to_string(),
+        },
+        TypeError::AnnotationAllows {
+            allowed: "a or b".to_string(),
+            required: "a".to_string(),
+        },
+        TypeError::Unhandled {
+            effect: "Log".to_string(),
+        },
+        TypeError::NotAllowed {
+            effect: "Log".to_string(),
+        },
+        TypeError::CallbackEffectsNotCovered,
+        TypeError::PolymorphicExternBoundary,
+    ]
+}
+
 /// Every error kind in the compiler, with the phase that raises it. Listed by
 /// hand because nothing can force it: a new variant added without a line here
 /// is the exact thing this module exists to catch, so it is worth the reminder
 /// that adding one means coming back.
 fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
     let span = Span::generated(0, 1);
-    let nat = Rc::new(Ty::plain(Ty::Nat));
 
     let mut all: Vec<(&str, &str, String)> = Vec::new();
     for kind in [
@@ -251,62 +313,7 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         all.push(("patterns", kind.code(), kind.to_string()));
     }
 
-    for kind in [
-        TypeError::NotAStruct { base: nat.clone() },
-        TypeError::Mismatch {
-            expected: nat.clone(),
-            actual: Rc::new(Ty::default()),
-        },
-        TypeError::Recursive,
-        TypeError::MissingField {
-            shape: Shape::Struct,
-            base: nat.clone(),
-            field: "x".to_string(),
-        },
-        TypeError::ExtraField {
-            shape: Shape::Struct,
-            base: nat.clone(),
-            field: "x".to_string(),
-        },
-        TypeError::RigidBroken {
-            found: nat.clone(),
-            name: "a".into(),
-            sense: Sense::Type,
-            declared: Span::generated(0, 1),
-        },
-        TypeError::RigidField {
-            shape: Shape::Struct,
-            field: "x".to_string(),
-            name: "a".into(),
-            declared: Span::generated(0, 1),
-        },
-        TypeError::RigidEscapes { name: "a".into() },
-        TypeError::RepeatedField {
-            shape: Shape::Struct,
-            field: "x".to_string(),
-        },
-        TypeError::PresenceRequired {
-            formula: "x != y".to_string(),
-        },
-        TypeError::PresenceImpossible {
-            formula: "x and y".to_string(),
-        },
-        TypeError::ClauseImpossible {
-            formula: "a and not a".to_string(),
-        },
-        TypeError::AnnotationAllows {
-            allowed: "a or b".to_string(),
-            required: "a".to_string(),
-        },
-        TypeError::Unhandled {
-            effect: "Log".to_string(),
-        },
-        TypeError::NotAllowed {
-            effect: "Log".to_string(),
-        },
-        TypeError::CallbackEffectsNotCovered,
-        TypeError::PolymorphicExternBoundary,
-    ] {
+    for kind in inference_error_kinds(span) {
         all.push(("types", kind.code(), kind.to_string()));
     }
     all
@@ -611,27 +618,124 @@ fn an_effect_reads_as_the_one_thing_that_changed() {
 }
 
 #[test]
-fn inference_errors_expose_one_structured_reporter_boundary() {
+fn every_inference_error_exposes_a_complete_structured_diagnostic() {
     let use_span = Span::generated(4, 5);
     let declared = Span::generated(1, 2);
-    let diagnostic = inference::Error {
-        span: use_span,
-        kind: TypeError::RigidField {
-            shape: Shape::Effect,
-            field: "Log".to_string(),
-            name: "e".into(),
-            declared,
-        },
-    }
-    .diagnostic();
+    let kinds = inference_error_kinds(declared);
+    assert_eq!(kinds.len(), 17);
 
-    assert_eq!(diagnostic.code, "rigid-field");
-    assert_eq!(diagnostic.primary.span, use_span);
-    assert_eq!(diagnostic.related[0].span, declared);
-    assert_eq!(diagnostic.related[0].message, ui::DECLARED_HERE);
-    assert!(!diagnostic.primary.message.is_empty());
-    assert!(!diagnostic.help.is_empty());
-    assert!(diagnostic.title.starts_with("this requires effect `!Log`"));
+    for kind in kinds {
+        let diagnostic = inference::Error {
+            span: use_span,
+            kind,
+        }
+        .diagnostic();
+        assert_eq!(diagnostic.primary.span, use_span, "{}", diagnostic.code);
+        assert!(!diagnostic.code.is_empty());
+        assert!(!diagnostic.title.is_empty(), "{}", diagnostic.code);
+        assert!(
+            !diagnostic.primary.message.is_empty(),
+            "{} has no primary label",
+            diagnostic.code
+        );
+        assert!(
+            !diagnostic.help.is_empty() && diagnostic.help.iter().all(|line| !line.is_empty()),
+            "{} has no repair help",
+            diagnostic.code
+        );
+    }
+}
+
+/// Phase 1 owns user-facing inference prose even though it does not yet own the
+/// provenance needed to replace every expected/found or unknown-type fallback.
+/// Keep solver implementation terms out of the structured fields it did migrate.
+#[test]
+fn inference_diagnostic_prose_avoids_solver_jargon() {
+    let span = Span::generated(0, 1);
+    for kind in inference_error_kinds(span) {
+        let diagnostic = inference::Error { span, kind }.diagnostic();
+        let prose = std::iter::once(diagnostic.title.as_str())
+            .chain(std::iter::once(diagnostic.primary.message.as_str()))
+            .chain(diagnostic.related.iter().map(|note| note.message.as_str()))
+            .chain(diagnostic.help.iter().map(String::as_str))
+            .chain(diagnostic.notes.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
+        let words: HashSet<_> = prose
+            .split(|character: char| !character.is_ascii_alphabetic())
+            .filter(|word| !word.is_empty())
+            .collect();
+        for forbidden in [
+            "unify",
+            "unification",
+            "rigid",
+            "row",
+            "presence",
+            "sat",
+            "cnf",
+            "covered",
+        ] {
+            assert!(
+                !words.contains(forbidden),
+                "{} exposes `{forbidden}`: {prose}",
+                diagnostic.code
+            );
+        }
+        for forbidden in ["occurs check", "runtime representation", "boundary leaf"] {
+            assert!(
+                !prose.contains(forbidden),
+                "{} exposes `{forbidden}`: {prose}",
+                diagnostic.code
+            );
+        }
+        assert!(
+            !prose.contains('~'),
+            "{} exposes `~`: {prose}",
+            diagnostic.code
+        );
+        assert!(
+            !prose
+                .as_bytes()
+                .windows(2)
+                .any(|pair| pair[0] == b'?' && pair[1].is_ascii_digit()),
+            "{} exposes a solver variable: {prose}",
+            diagnostic.code
+        );
+    }
+}
+
+#[test]
+fn rigid_field_diagnostics_name_the_caller_chosen_set_by_shape() {
+    let use_span = Span::generated(4, 5);
+    let declared = Span::generated(1, 2);
+    for (shape, field, action, choices) in [
+        (Shape::Struct, "item", "reads field", "struct fields"),
+        (Shape::Sum, "Some", "matches case", "cases"),
+        (Shape::Effect, "Log", "requires effect", "effects"),
+    ] {
+        let diagnostic = inference::Error {
+            span: use_span,
+            kind: TypeError::RigidField {
+                shape,
+                field: field.to_string(),
+                name: "r".into(),
+                declared,
+            },
+        }
+        .diagnostic();
+
+        assert_eq!(diagnostic.code, "rigid-field");
+        assert_eq!(diagnostic.related[0].span, declared);
+        assert_eq!(
+            diagnostic.related[0].message,
+            format!("the caller's choice of {choices} starts here")
+        );
+        assert!(diagnostic.title.starts_with(&format!("this {action} `")));
+        assert!(diagnostic.primary.message.contains(choices));
+        assert!(diagnostic.help[0].contains(choices));
+        assert!(!diagnostic.title.contains("whatever type"));
+    }
 }
 
 #[test]
@@ -2004,8 +2108,8 @@ fn the_variable_complaints_read_as_what_went_wrong() {
             declared: span,
         }
         .to_string(),
-        "this reads field `x`, but `'r` stands for whatever type the caller picks, \
-         so that choice cannot be assumed"
+        "this reads field `x`, but `'r` stands for whatever other struct fields the caller chooses, \
+         so `x` cannot be assumed"
     );
     // In the reader's own nouns: someone who wrote `#`s is told about a
     // case, and the label is quoted with the `#` that makes it one.
@@ -2017,8 +2121,8 @@ fn the_variable_complaints_read_as_what_went_wrong() {
             declared: span,
         }
         .to_string(),
-        "this matches case `#B`, but `'r` stands for whatever type the caller picks, \
-         so that choice cannot be assumed"
+        "this matches case `#B`, but `'r` stands for whatever other cases the caller chooses, \
+         so `#B` cannot be assumed"
     );
     assert_eq!(
         TypeError::RigidEscapes { name: "a".into() }.to_string(),

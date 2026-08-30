@@ -992,8 +992,8 @@ fn a_declared_variable_is_the_definitions_to_leave_alone() {
     assert_eq!(error.kind.code(), "rigid-field");
     assert_eq!(
         error.kind.to_string(),
-        "this reads field `x`, but `'a` stands for whatever type the caller picks, \
-         so that choice cannot be assumed"
+        "this reads field `x`, but `'a` stands for whatever other struct fields the caller chooses, \
+         so `x` cannot be assumed"
     );
     assert_eq!(error.span.start, src.rfind('x').expect("the field"));
     // And it points back at the declaration, which is the promise it broke.
@@ -4539,8 +4539,8 @@ fn a_sums_open_tail_is_the_definitions_to_leave_alone() {
     assert_eq!(output.errors[0].kind.code(), "rigid-field");
     assert_eq!(
         output.errors[0].kind.to_string(),
-        "this matches case `#B`, but `'r` stands for whatever type the caller picks, \
-         so that choice cannot be assumed"
+        "this matches case `#B`, but `'r` stands for whatever other cases the caller chooses, \
+         so `#B` cannot be assumed"
     );
 
     // And the other way: a declared rest handed to something that allows
@@ -7618,8 +7618,8 @@ fn the_written_examples_are_refused_where_they_go_wrong() {
         .unwrap_or_else(|| panic!("{:#?}", output.errors));
     assert_eq!(
         read.kind.to_string(),
-        "this reads field `x`, but `'r` stands for whatever type the caller picks, \
-         so that choice cannot be assumed"
+        "this reads field `x`, but `'r` stands for whatever other struct fields the caller chooses, \
+         so `x` cannot be assumed"
     );
     assert!(
         read.span.start == src.find("{ x").unwrap() || read.span.start == src.rfind('x').unwrap()
