@@ -900,15 +900,24 @@ enum Slot {
 /// [`Table::lacks`].
 type Lacks = (Shape, IndexSet<String>);
 
-/// Everything a solve can change about a [`Table`]: what the variables are
-/// known to be, which level each belongs to, and what they may not stand for.
-/// Taken and put back by [`Rule::Congruent`], which is the one rule that asks a
-/// question before it is sure the question is the right one to have asked.
+/// Everything speculative solving can change about a [`Table`]. Taken and put
+/// back by [`Rule::Congruent`], which is the one rule that asks a question
+/// before it is sure the question is the right one to have asked.
 ///
 /// The levels travel with the slots rather than beside them: the two lists are
 /// indexed by the same variable, so putting one back without the other would
-/// leave a variable minted since the snapshot with a level and no slot.
-type Known = (Vec<Slot>, Vec<u32>, HashMap<TyVar, Lacks>);
+/// leave a variable minted since the snapshot with a level and no slot. The
+/// existential sets travel with them too: presence aliasing propagates sealed
+/// identity, and opening a fresh package records its new variable as both a
+/// witness and abstract. The remaining semantic side tables are either read
+/// only during unification or have their own congruence rollback in [`Solve`].
+struct Known {
+    vars: Vec<Slot>,
+    levels: Vec<u32>,
+    lacks: HashMap<TyVar, Lacks>,
+    existential_witnesses: HashSet<TyVar>,
+    abstract_existentials: HashSet<TyVar>,
+}
 
 /// What one name in scope means. Private for the same reason as [`Slot`]: a
 /// binding exists only while a definition is being walked, and what survives
@@ -2154,7 +2163,13 @@ impl Table {
     /// honest; this is one line, and the one caller takes it once for the
     /// outermost open congruence rather than per binding or nominal depth.
     fn snapshot(&self) -> Known {
-        (self.vars.clone(), self.levels.clone(), self.lacks.clone())
+        Known {
+            vars: self.vars.clone(),
+            levels: self.levels.clone(),
+            lacks: self.lacks.clone(),
+            existential_witnesses: self.existential_witnesses.clone(),
+            abstract_existentials: self.abstract_existentials.clone(),
+        }
     }
 
     /// Put back what [`snapshot`](Self::snapshot) took.
@@ -2162,10 +2177,12 @@ impl Table {
     /// The variables minted since go with it. Nothing can still be pointing at
     /// one: a fresh variable reaches the rest of the solve only by being bound
     /// into something, and every binding made since is being undone here too.
-    fn restore(&mut self, (vars, levels, lacks): Known) {
-        self.vars = vars;
-        self.levels = levels;
-        self.lacks = lacks;
+    fn restore(&mut self, known: Known) {
+        self.vars = known.vars;
+        self.levels = known.levels;
+        self.lacks = known.lacks;
+        self.existential_witnesses = known.existential_witnesses;
+        self.abstract_existentials = known.abstract_existentials;
     }
 
     /// One more variable, of no sort yet, at the level being walked. A
@@ -6015,6 +6032,105 @@ mod existential_regressions {
         table.register_package_guarantees(&package, Formula::owned(0, Formula::var(hidden).not()));
         let guarantee = table.package_guarantees.values().next().unwrap();
         assert_eq!(guarantee.clauses.len(), 2);
+    }
+
+    #[test]
+    fn failed_nominal_congruence_restores_abstract_presence_aliasing() {
+        use crate::symbol::{Bundle, Mint, Namespace, Version};
+
+        let bundle = Bundle::new("rollback-test", Version::new(1, 0, 0)).unwrap();
+        let mut mint = Mint::new(bundle);
+        let wrapper = mint.global(None, Namespace::Types, "Wrapper").unwrap();
+        let definition = mint.global(None, Namespace::Terms, "definition").unwrap();
+
+        let mut table = Table::default();
+        let Presence::Var(hidden) = table.fresh_presence() else {
+            unreachable!()
+        };
+        let Presence::Var(alias) = table.fresh_presence() else {
+            unreachable!()
+        };
+        // This is the state after a package has been opened: its witness is a
+        // sealed identity, while the ordinary variable beside it is flexible.
+        table.existential_witnesses.insert(hidden);
+        table.abstract_existentials.insert(hidden);
+
+        let presence_arg = |presence| {
+            Rc::new(Ty::Struct(Row {
+                labels: [(
+                    "hidden".into(),
+                    RowField {
+                        presence,
+                        ty: Rc::new(Ty::Nat),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                rest: Rest::Closed,
+            }))
+        };
+        let named = |args: Vec<Rc<Ty>>| {
+            Rc::new(Ty::Named {
+                symbol: wrapper,
+                name: Rc::from("Wrapper"),
+                args: args.into(),
+            })
+        };
+        // The first argument speculatively aliases `alias` to the abstract
+        // identity. The second fails, forcing congruence to discard that work.
+        let expected = named(vec![presence_arg(Presence::Var(hidden)), Rc::new(Ty::Nat)]);
+        let actual = named(vec![
+            presence_arg(Presence::Var(alias)),
+            Rc::new(Ty::String),
+        ]);
+        let aliases = IndexMap::new();
+        let nominal = [wrapper].into_iter().collect();
+        let constraint = table.constraint_id();
+        let mut errors = Vec::new();
+        let mut steps = Vec::new();
+        let mut locals = IndexMap::new();
+        let mut refinements = Vec::new();
+        {
+            let mut solve = Solve {
+                table: &mut table,
+                errors: &mut errors,
+                steps: &mut steps,
+                aliases: &aliases,
+                nominal: &nominal,
+                definition,
+                depth: 0,
+                constraint: None,
+                assumed: Vec::new(),
+                schemes: HashMap::new(),
+                locals: &mut locals,
+                guard: None,
+                active_refinement: None,
+                refinements: &mut refinements,
+                generated_end: 0,
+            };
+            solve.run(&[Constraint {
+                id: constraint,
+                span: Span::default(),
+                kind: ConstraintKind::Equal { expected, actual },
+            }]);
+        }
+
+        assert!(table.abstract_existentials.contains(&hidden));
+        assert!(!table.abstract_existentials.contains(&alias));
+        assert!(table.existential_witnesses.contains(&hidden));
+        assert!(!table.existential_witnesses.contains(&alias));
+
+        assert_eq!(errors.len(), 1);
+        let ErrorCause::Step(cause) = errors[0].cause else {
+            panic!("failed congruence must retain its direct solve cause")
+        };
+        let failed = steps.iter().find(|step| step.id == cause).unwrap();
+        assert_eq!(failed.error, Some(errors[0].id));
+        assert_eq!(failed.constraint, Some(constraint));
+        // The discarded congruence, binding, and inner failure consumed their
+        // identities. The surviving failure must not reuse any of them.
+        assert!(failed.id.get() > 0);
+        assert!(errors[0].id.get() > 0);
     }
 
     #[test]
