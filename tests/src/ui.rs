@@ -929,6 +929,22 @@ fn inference_source_corpus_matches_abridged_structured_goldens() {
         writeln!(found, "## {name}").unwrap();
         let diagnostics = inference_fixture_diagnostics(source);
         assert!(!diagnostics.is_empty(), "{name} produced no diagnostic");
+        if name == "repeated-calls" {
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!(
+                    "repeated monomorphic calls should produce one diagnostic: {diagnostics:#?}"
+                );
+            };
+            assert_eq!(diagnostic.code, "type-mismatch");
+            assert_eq!(
+                diagnostic.title,
+                "type mismatch: expected `Nat`, found `Boolean`"
+            );
+            assert_eq!(
+                diagnostic.primary.message,
+                "these two uses require incompatible types"
+            );
+        }
         for diagnostic in diagnostics {
             seen.insert(diagnostic.code);
             writeln!(found, "[{}] {}", diagnostic.code, diagnostic.title).unwrap();

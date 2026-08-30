@@ -11,6 +11,10 @@ use ruddy_cli::{
     Lockfile, Outcome, build_project, check_project, clean_project, compile,
     execute_javascript_module, new_project, run, run_project,
 };
+use ruddy_debug::{
+    snapshot::{ROOT as DEBUG_ROOT, compile as debug_compile},
+    wire::{CompileRequest, FileSpec, StdConfig},
+};
 use tempfile::TempDir;
 
 fn project() -> TempDir {
@@ -48,36 +52,52 @@ fn error(directory: &TempDir) -> String {
 }
 
 #[test]
-fn inference_diagnostics_keep_the_shared_structured_fields_at_the_cli_boundary() {
+fn inference_diagnostics_keep_structured_parity_across_real_consumers() {
+    let source = include_str!("../diagnostics/inference/rigid-field-struct.hc");
     let directory = tempfile::tempdir().unwrap();
     write_project(directory.path(), "diagnostics", "0.1.0", &[]);
-    fs::write(
-        directory.path().join("main.hc"),
-        include_str!("../diagnostics/inference/rigid-field-struct.hc"),
-    )
-    .unwrap();
+    fs::write(directory.path().join("main.hc"), source).unwrap();
+
     let failure = compile(directory.path()).expect_err("the fixture does not type-check");
-    let [diagnostic] = failure.diagnostics() else {
-        panic!("expected one diagnostic: {failure}");
+    let [cli] = failure.diagnostics() else {
+        panic!("expected one CLI diagnostic: {failure}");
     };
-    assert_eq!(diagnostic.code(), "rigid-field");
-    assert_eq!(
-        diagnostic.message(),
-        "this reads field `x`, but `'a` stands for whatever other struct fields the caller chooses, so `x` cannot be assumed"
+    let snapshot = debug_compile(
+        &CompileRequest {
+            name: "diagnostics".into(),
+            version: "0.1.0".into(),
+            root: DEBUG_ROOT.into(),
+            document: "diagnostics".into(),
+            files: vec![FileSpec {
+                path: DEBUG_ROOT.into(),
+                source: source.into(),
+            }],
+            std: StdConfig::Disabled,
+            dependencies: indexmap::IndexMap::new(),
+            revision: 0,
+        },
+        1,
     );
-    assert_eq!(
-        diagnostic.help(),
-        ["change the body so it does not assume which struct fields the caller chooses"]
-    );
-    let rendered = diagnostic.render(false);
-    assert!(
-        rendered.contains("this assumes one of the struct fields chosen by the caller"),
-        "{rendered}"
-    );
-    assert!(
-        rendered.contains("the caller's choice of struct fields starts here"),
-        "{rendered}"
-    );
+    let [debugger] = snapshot.diagnostics.as_slice() else {
+        panic!(
+            "expected one debugger diagnostic: {:#?}",
+            snapshot.diagnostics
+        );
+    };
+
+    assert_eq!(cli.stage(), debugger.stage);
+    assert_eq!(cli.code(), debugger.code);
+    assert_eq!(cli.message(), debugger.message);
+    assert_eq!(cli.help(), debugger.help);
+    assert_eq!(cli.notes(), debugger.notes);
+
+    // The CLI's public adapter renders labels while the debugger keeps them as
+    // wire fields. Ensure those fields came through both real consumers too.
+    let rendered = cli.render(false);
+    assert!(rendered.contains(&debugger.label), "{rendered}");
+    for related in &debugger.related {
+        assert!(rendered.contains(&related.message), "{rendered}");
+    }
 }
 
 #[test]

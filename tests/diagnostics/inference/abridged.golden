@@ -113,7 +113,7 @@ primary: host code needs one fixed kind of value at this position
 help: use a fixed type here, or keep the generic value behind a Ruddy wrapper
 
 ## repeated-calls
-[type-mismatch] type mismatch: expected `Nat`, found `()`
+[type-mismatch] type mismatch: expected `Nat`, found `Boolean`
 primary: these two uses require incompatible types
 help: change either use so both require the same type
 

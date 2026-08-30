@@ -1,4 +1,4 @@
-let identity = fn value => value
-let first = identity 1n
-let second = identity {}
-let bad : Nat = second
+let repeated = fn use => {
+  first: use 1n,
+  second: use false
+}
