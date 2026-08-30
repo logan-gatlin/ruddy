@@ -372,16 +372,28 @@ fn generation_rejects_unlinked_and_internally_inconsistent_artifacts() {
 }
 
 #[test]
-fn generated_extern_functions_keep_their_javascript_receiver() {
+fn generated_extern_expressions_execute_once_and_require_explicit_receiver_binding() {
     if Command::new("node").arg("--version").output().is_err() {
         return;
     }
-    let artifact = compiled("extern next : Nat -> Nat = host.next\nlet exported = next");
+    let artifact = compiled(
+        "extern next : Nat -> Nat = \"(++globalThis.initializations, globalThis.host.next.bind(globalThis.host))\"\n\
+         extern base : Nat = \"globalThis.host.base\"\n\
+         extern add_base : Nat -> Nat = \"n => n + globalThis.host.base\"\n",
+    );
+    let module = js::generate(&artifact).unwrap();
+    assert!(
+        module
+            .contains("(++globalThis.initializations, globalThis.host.next.bind(globalThis.host))"),
+        "extern contents were not emitted as JavaScript code: {module}"
+    );
+    assert!(!module.contains("const $extern"), "{module}");
+
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("extern.mjs");
-    fs::write(&path, js::generate(&artifact).unwrap()).unwrap();
+    fs::write(&path, module).unwrap();
     let probe = format!(
-        "globalThis.host = {{ base: 40, next(n) {{ return this.base + n; }} }}; const app = await import({}); console.log(app.next(2));",
+        "globalThis.initializations = 0; globalThis.host = {{ base: 40, next(n) {{ return this.base + n; }} }}; const app = await import({}); console.log(JSON.stringify([app.next(2), app.base, app.add_base(2), globalThis.initializations]));",
         serde_json::to_string(path.to_str().unwrap()).unwrap()
     );
     let output = Command::new("node")
@@ -393,17 +405,26 @@ fn generated_extern_functions_keep_their_javascript_receiver() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "42");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        "[42,40,42,1]"
+    );
 }
 
 #[test]
-fn extern_target_validation_happens_before_emission() {
-    let mut artifact = compiled("extern host : Nat = runtime.value\nlet value = host");
-    artifact.lir.externs[0].target.push(String::new());
-    let error = js::generate(&artifact).unwrap_err();
-    assert!(
-        matches!(error, Error::TargetLimitation(ref message) if message.contains("empty target")),
-        "{error}"
-    );
-    let _: &dyn std::error::Error = &error;
+fn boa_rejects_invalid_and_empty_extern_expressions() {
+    for source in ["extern host : Nat = \"(\"\n", "extern host : Nat = \"\"\n"] {
+        let error = js::generate(&compiled(source)).unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidJavaScript(ref diagnostic) if !diagnostic.is_empty()),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .starts_with("generated JavaScript is invalid: "),
+            "{error}"
+        );
+        let _: &dyn std::error::Error = &error;
+    }
 }

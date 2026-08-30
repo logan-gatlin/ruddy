@@ -6,6 +6,9 @@
 use crate::artifact::{
     Artifact, Block, Callee, End, FieldKey, Instr, Literal, Op, PrimCase, Rep, TagCase,
 };
+use boa_ast::scope::Scope;
+use boa_interner::Interner;
+use boa_parser::{Parser, Source};
 use std::{
     collections::{BTreeMap, HashSet},
     error, fmt,
@@ -24,8 +27,8 @@ pub enum Error {
     InvalidFunctionReference(u64),
     /// An operation refers to an unknown qualified global.
     InvalidGlobalReference(String),
-    /// Compiler-produced input uses a construct this target cannot represent.
-    TargetLimitation(String),
+    /// The complete generated ECMAScript module failed validation.
+    InvalidJavaScript(String),
 }
 
 impl fmt::Display for Error {
@@ -42,7 +45,9 @@ impl fmt::Display for Error {
                 write!(f, "invalid function reference {index}")
             }
             Self::InvalidGlobalReference(name) => write!(f, "invalid global reference `{name}`"),
-            Self::TargetLimitation(message) => write!(f, "JavaScript target limitation: {message}"),
+            Self::InvalidJavaScript(diagnostic) => {
+                write!(f, "generated JavaScript is invalid: {diagnostic}")
+            }
         }
     }
 }
@@ -74,12 +79,6 @@ impl<'a> Generator<'a> {
         }
         let mut runtime_names = HashSet::new();
         for external in &artifact.lir.externs {
-            if external.target.is_empty() || external.target.iter().any(String::is_empty) {
-                return Err(Error::TargetLimitation(format!(
-                    "extern `{}` has an empty target path or segment",
-                    external.name
-                )));
-            }
             runtime_names.insert(external.name.as_str());
         }
         let extern_names = artifact
@@ -212,14 +211,9 @@ impl<'a> Generator<'a> {
         for external in &self.artifact.lir.externs {
             out.push_str("$h[");
             string(&external.name, &mut out);
-            out.push_str("] = $extern([");
-            for (i, segment) in external.target.iter().enumerate() {
-                if i != 0 {
-                    out.push_str(", ");
-                }
-                string(segment, &mut out);
-            }
-            out.push_str("]);\n$g[");
+            out.push_str("] = (");
+            out.push_str(&external.target);
+            out.push_str(");\n$g[");
             string(&external.name, &mut out);
             out.push_str("] = $h[");
             string(&external.name, &mut out);
@@ -253,6 +247,7 @@ impl<'a> Generator<'a> {
             }
             out.push_str(" };\n");
         }
+        validate_module(&out)?;
         Ok(out)
     }
 
@@ -611,9 +606,16 @@ const $hasRest = ($o, $known) => Reflect.ownKeys($o).some($k => typeof $k !== "s
 const $same = Object.is;
 const $effectValue = ($identity, $value) => ({ [$effect]: true, identity: $identity, value: $value });
 const $catch = ($identity, $body) => { try { return $body(); } catch ($e) { if ($e !== null && typeof $e === "object" && $e[$effect] === true && $e.identity === $identity) return $e.value; throw $e; } };
-const $extern = $path => { let $owner = globalThis; let $value = globalThis; for (const $part of $path) { $owner = $value; if ($value == null || !($part in Object($value))) throw new Error("missing Ruddy extern: " + $path.join(".")); $value = $value[$part]; } return typeof $value === "function" ? $value.bind($owner) : $value; };
 const $unreachable = () => { throw new Error("unreachable Ruddy LIR branch"); };
 "#;
+
+fn validate_module(source: &str) -> Result<(), Error> {
+    let mut interner = Interner::default();
+    Parser::new(Source::from_bytes(source))
+        .parse_module(&Scope::new_global(), &mut interner)
+        .map(|_| ())
+        .map_err(|error| Error::InvalidJavaScript(error.to_string()))
+}
 
 fn temp(value: u32) -> String {
     format!("$v{value}")
@@ -694,5 +696,28 @@ fn export_name(name: &str, out: &mut String) {
         out.push_str(name);
     } else {
         string(name, out);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Error, validate_module};
+
+    #[test]
+    fn validates_complete_ecmascript_modules() {
+        validate_module("const value = (() => 42)(); export { value };").unwrap();
+    }
+
+    #[test]
+    fn reports_boa_diagnostics_for_invalid_modules() {
+        let error = validate_module("const value = (); export { value };").unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidJavaScript(ref diagnostic) if !diagnostic.is_empty())
+        );
+        assert!(
+            error
+                .to_string()
+                .starts_with("generated JavaScript is invalid: ")
+        );
     }
 }
