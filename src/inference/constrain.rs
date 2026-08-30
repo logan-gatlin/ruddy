@@ -553,7 +553,7 @@ impl Constrain<'_> {
             // function rather than of wherever it was written.
             TermKind::Fn { arg, body } => {
                 let param = self.table.fresh_type_for(Subject::Parameter);
-                let does = Row::of(self.table.fresh_row_for(Subject::PerformedEffects));
+                let does = Row::of(self.table.fresh_row_for(Subject::AmbientEffects));
                 self.env.insert(arg.tracked, Binding::Mono(param.clone()));
                 let outer = self.enter(Ambient {
                     row: does.clone(),

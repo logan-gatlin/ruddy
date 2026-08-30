@@ -17,12 +17,50 @@
 //! row already says which question was taken as answered, and a field for it
 //! would print the goal column twice.
 
-use ruddy::inference::Effect;
+use ruddy::inference::{DefaultBinding, Effect, ReasonOrigin, VarSort};
 
 use crate::{
     stage::{Cx, Ids, Spec, plural},
     wire::{Node, Stage},
 };
+
+fn sort_code(sort: VarSort) -> &'static str {
+    match sort {
+        VarSort::Type => "type",
+        VarSort::Row => "row",
+        VarSort::Presence => "presence",
+    }
+}
+
+fn reason_fields(
+    origin: ReasonOrigin,
+) -> (
+    &'static str,
+    Option<u64>,
+    Option<&'static str>,
+    Option<&'static str>,
+) {
+    match origin {
+        ReasonOrigin::Variable { sort, subject } => (
+            "variable",
+            None,
+            Some(subject.code()),
+            Some(sort_code(sort)),
+        ),
+        ReasonOrigin::Constraint(id) => ("constraint", Some(id.get()), None, None),
+        ReasonOrigin::Step(id) => ("step", Some(id.get()), None, None),
+        ReasonOrigin::Recovery => ("recovery", None, None, None),
+        ReasonOrigin::DefaultBinding { var, kind } => (
+            match kind {
+                DefaultBinding::Sat => "sat-binding",
+                DefaultBinding::CloseEffects => "close-effects-binding",
+            },
+            Some(var as u64),
+            None,
+            None,
+        ),
+    }
+}
 
 pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     // A step names its definition by symbol and carries its own types, so the
@@ -35,7 +73,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     };
 
     let mut ids = Ids::default();
-    let nodes: Vec<Node> = output
+    let mut nodes: Vec<Node> = output
         .steps
         .iter()
         .map(|step| {
@@ -93,6 +131,72 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             node
         })
         .collect();
+
+    // Provenance is debugger wire data, not an opaque Rust Debug appendix.
+    // Per-step scalar fields make the common query cheap; complete JSON arenas
+    // ride on the first row so adding them does not alter solve replay or the
+    // reader-visible step count.
+    for (step, node) in output.steps.iter().zip(&mut nodes) {
+        let reason = output
+            .reasons
+            .iter()
+            .find(|reason| reason.id == step.reason)
+            .expect("every published step has a reason");
+        let mut decorated = std::mem::take(node)
+            .field(
+                "_reason_parents",
+                reason
+                    .parents
+                    .iter()
+                    .map(|id| id.get().to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )
+            .field("_reason_origin", "step");
+        if let Effect::Bound { var, .. } = step.effect {
+            let meta = &output.variables[var as usize];
+            decorated = decorated
+                .field("_var_id", var.to_string())
+                .field("_var_sort", sort_code(meta.sort))
+                .field("_var_subject", meta.subject.code())
+                .field("_var_minted_by", meta.minted_by.get().to_string());
+        }
+        *node = decorated;
+    }
+    if let Some(first) = nodes.first_mut() {
+        let variables: Vec<_> = output
+            .variables
+            .iter()
+            .enumerate()
+            .map(|(var, meta)| {
+                serde_json::json!({
+                    "id": var,
+                    "sort": sort_code(meta.sort),
+                    "subject": meta.subject.code(),
+                    "minted_by": meta.minted_by.get(),
+                })
+            })
+            .collect();
+        let reasons: Vec<_> = output
+            .reasons
+            .iter()
+            .map(|reason| {
+                let (origin, origin_id, subject, sort) = reason_fields(reason.origin);
+                serde_json::json!({
+                    "id": reason.id.get(),
+                    "parents": reason.parents.iter().map(|id| id.get()).collect::<Vec<_>>(),
+                    "origin": origin,
+                    "origin_id": origin_id,
+                    "sort": sort,
+                    "subject": subject,
+                    "reachable": reason.reachable,
+                })
+            })
+            .collect();
+        *first = std::mem::take(first)
+            .field("_variables", serde_json::to_string(&variables).unwrap())
+            .field("_reasons", serde_json::to_string(&reasons).unwrap());
+    }
 
     // No time of its own: the inference phase is timed once, on `Types`, which
     // is what leaving `micros` unset says.

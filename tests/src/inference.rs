@@ -8883,3 +8883,140 @@ fn equality_constraints_preserve_expected_then_actual_side_ordering() {
     assert!(matches!(&**expected, Ty::Nat));
     assert!(matches!(&**actual, Ty::Boolean));
 }
+
+#[test]
+fn sat_and_effect_defaults_are_first_class_binding_reasons() {
+    let (_, _, output) = infer_src(
+        "let pure = fn x => x\n\
+         let folded = fn v =>\n\
+         \x20 let {x, ..} = v in\n\
+         \x20 match v with | {x} => {} | {y} => {} end",
+    );
+    assert!(output.reasons.iter().any(|reason| matches!(
+        reason.origin,
+        inference::ReasonOrigin::DefaultBinding {
+            kind: inference::DefaultBinding::CloseEffects,
+            ..
+        }
+    )));
+    assert!(output.reasons.iter().any(|reason| matches!(
+        reason.origin,
+        inference::ReasonOrigin::DefaultBinding {
+            kind: inference::DefaultBinding::Sat,
+            ..
+        }
+    )));
+    for reason in output.reasons.iter().filter(|reason| {
+        matches!(
+            reason.origin,
+            inference::ReasonOrigin::DefaultBinding { .. }
+        )
+    }) {
+        assert!(!reason.parents.is_empty(), "default omitted its mint cause");
+    }
+}
+
+#[test]
+fn a_failure_slice_crosses_the_constraints_whose_bindings_it_resolved() {
+    let (_, _, output) = infer_src("let id = fn x => x\nlet bad : Nat = id true");
+    let failure = output
+        .steps
+        .iter()
+        .find(|step| matches!(step.effect, inference::Effect::Failed(_)))
+        .expect("a failed annotation step");
+    let slice = output.reason_ancestors(failure.reason);
+    let roots: std::collections::HashSet<_> = output
+        .reasons
+        .iter()
+        .filter(|reason| slice.contains(&reason.id))
+        .filter_map(|reason| match reason.origin {
+            inference::ReasonOrigin::Constraint(id) => Some(id),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        roots.len() >= 2,
+        "slice stopped at one constraint: {roots:?}"
+    );
+}
+
+#[test]
+fn published_reason_links_never_reach_rolled_back_origins() {
+    let (_, _, output) = infer_src(
+        "type Box 'a = { value: 'a, next: Box 'a }\n\
+         let bad : Box Nat -> Nat = fn x =>\n\
+         \x20 let wrong : Box Boolean = x in 1n",
+    );
+    assert!(output.reasons.iter().any(|reason| !reason.reachable));
+    let reasons: std::collections::HashMap<_, _> = output
+        .reasons
+        .iter()
+        .map(|reason| (reason.id, reason))
+        .collect();
+    for reason in output.reasons.iter().filter(|reason| reason.reachable) {
+        assert!(
+            reason
+                .parents
+                .iter()
+                .all(|parent| reasons[parent].reachable)
+        );
+        if let inference::ReasonOrigin::Step(step) = reason.origin {
+            assert!(output.steps.iter().any(|candidate| candidate.id == step));
+        }
+    }
+}
+
+#[test]
+fn variable_metadata_uses_semantic_subjects_for_narrow_mint_sites() {
+    let programs = [
+        "let annotated : _ -> { x when _: Nat, .. } = fn p => { x: 1n }",
+        "let id = fn x => x\nlet instance = id 1n",
+        "let projected = fn p => p.x",
+        "let matched = fn v => match v with | {x} => {y: x} | {y} => {y: y} end",
+    ];
+    let mut subjects = std::collections::HashSet::new();
+    for program in programs {
+        let (_, _, output) = infer_src(program);
+        subjects.extend(
+            output
+                .variables
+                .iter()
+                .map(|meta| (meta.sort, meta.subject)),
+        );
+    }
+    use inference::{Subject as S, VarSort as V};
+    for expected in [
+        (V::Type, S::Annotation),
+        (V::Row, S::Annotation),
+        (V::Presence, S::Annotation),
+        (V::Type, S::Instance),
+        (V::Row, S::ProjectionBase),
+        (V::Type, S::MatchResult),
+        (V::Row, S::AmbientEffects),
+    ] {
+        assert!(
+            subjects.contains(&expected),
+            "missing metadata {expected:?}: {subjects:?}"
+        );
+    }
+}
+
+#[test]
+fn deep_reason_slices_are_iterative() {
+    let (_, _, mut output) = infer_src("let x = 1n");
+    let base = output.reasons.len() as u64 + 100;
+    let depth = 30_000u64;
+    for at in 0..depth {
+        output.reasons.push(inference::Reason {
+            id: inference::ReasonId::synthetic(base + at),
+            parents: (at > 0)
+                .then(|| inference::ReasonId::synthetic(base + at - 1))
+                .into_iter()
+                .collect(),
+            origin: inference::ReasonOrigin::Recovery,
+            reachable: true,
+        });
+    }
+    let slice = output.reason_ancestors(inference::ReasonId::synthetic(base + depth - 1));
+    assert_eq!(slice.len(), depth as usize);
+}

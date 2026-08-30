@@ -346,6 +346,9 @@ impl Solve<'_> {
     /// nothing has to wait for a later round to know what its base is.
     pub fn run(&mut self, constraints: &[Constraint]) {
         for constraint in constraints {
+            // Resolution performed while publishing the previous constraint is
+            // not an input to this one. Every step below drains its own reads.
+            self.table.take_binding_reads();
             let previous = self.constraint.replace(constraint.id);
             let previous_reason = self.constraint_reason.replace(constraint.reason);
             let span = constraint.span;
@@ -483,7 +486,7 @@ impl Solve<'_> {
                     labels: [(field.to_string(), RowField::present(result.clone()))]
                         .into_iter()
                         .collect(),
-                    rest: self.table.fresh_row(),
+                    rest: self.table.fresh_row_for(super::Subject::ProjectionBase),
                 }));
                 self.table.note_lacks(&want);
                 self.unify(field_span, &want, &base);
@@ -938,7 +941,7 @@ impl Solve<'_> {
                         .iter()
                         .find(|ty| !matches!(&***ty, Ty::Var(_) | Ty::Undecided))
                     else {
-                        type_values.push(self.table.fresh_type());
+                        type_values.push(self.table.fresh_match_family_type());
                         continue;
                     };
                     match &**chosen {
@@ -1067,7 +1070,7 @@ impl Solve<'_> {
                             .iter()
                             .any(|row| matches!(row.rest, Rest::Var(_)))
                         {
-                            self.table.fresh_row()
+                            self.table.fresh_match_family_row()
                         } else {
                             state.flat[0].rest.clone()
                         };
@@ -1091,7 +1094,7 @@ impl Solve<'_> {
                         state.labels.insert(
                             name,
                             RowField {
-                                presence: self.table.fresh_presence(),
+                                presence: self.table.fresh_match_family_presence(),
                                 ty: Rc::new(Ty::default()),
                             },
                         );
@@ -1107,7 +1110,7 @@ impl Solve<'_> {
                     state.labels.insert(
                         name,
                         RowField {
-                            presence: self.table.fresh_presence(),
+                            presence: self.table.fresh_match_family_presence(),
                             ty,
                         },
                     );
@@ -2774,7 +2777,6 @@ impl Solve<'_> {
         // variable stands for is as old as this variable is, so everything
         // inside it belongs no deeper. See [`Table::demote`](super::Table).
         self.table.demote(var, &value);
-        self.table.vars[var as usize] = Slot::Bound(value.clone());
         self.bound_step(span, Rule::Bind, goal, var, value, None);
     }
 
@@ -2970,9 +2972,11 @@ impl Solve<'_> {
         error.id = error_id;
         error.cause = ErrorCause::Step(step_id);
         self.errors.push(error);
-        let mut parents = Vec::new();
-        if let Some(parent) = self.constraint_reason {
-            parents.push(parent);
+        let mut parents = self.table.take_binding_reads();
+        if let Some(parent) = self.constraint_reason
+            && !parents.contains(&parent)
+        {
+            parents.insert(0, parent);
         }
         let reason = self.table.reason(ReasonOrigin::Step(step_id), parents);
         self.steps.push(Step {
@@ -3102,7 +3106,6 @@ impl Solve<'_> {
     /// would otherwise see a variable acquire a value that no rule they were
     /// shown gave it.
     fn settle(&mut self, span: Span, var: TyVar, value: Assigned) {
-        self.table.vars[var as usize] = Slot::Bound(value.clone());
         let goal = match &value {
             Assigned::Ty(ty) => Goal::Type {
                 expected: Rc::new(Ty::plain(Ty::Var(var))),
@@ -3142,11 +3145,14 @@ impl Solve<'_> {
         }
         let recovery = (rule == Rule::Recover)
             .then(|| self.table.reason(ReasonOrigin::Recovery, recovery_parents));
-        let mut parents = Vec::new();
-        if let Some(parent) = recovery.or(self.constraint_reason) {
-            parents.push(parent);
-        }
+        let parents = self
+            .table
+            .binding_parents(var, recovery.or(self.constraint_reason));
         let reason = self.table.reason(ReasonOrigin::Step(id), parents);
+        self.table.vars[var as usize] = Slot::Bound {
+            value: value.clone(),
+            by: reason,
+        };
         self.steps.push(Step {
             id,
             constraint: self.constraint,
@@ -3168,7 +3174,12 @@ impl Solve<'_> {
 
     fn step(&mut self, span: Span, rule: Rule, goal: Goal, effect: Effect) {
         let id = self.table.step_id();
-        let parents = self.constraint_reason.into_iter().collect();
+        let mut parents = self.table.take_binding_reads();
+        if let Some(parent) = self.constraint_reason
+            && !parents.contains(&parent)
+        {
+            parents.insert(0, parent);
+        }
         let reason = self.table.reason(ReasonOrigin::Step(id), parents);
         self.steps.push(Step {
             id,

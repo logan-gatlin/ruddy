@@ -2461,6 +2461,23 @@ fn inference_stage_rows_serialize_compiler_identities() {
             |node| field(node, "_constraint_id").is_some_and(|id| constraint_ids.contains(&id))
         )
     );
+    let variables: serde_json::Value = serde_json::from_str(
+        &field(solve[0], "_variables").expect("machine-readable variable arena"),
+    )
+    .unwrap();
+    assert!(variables.as_array().unwrap().iter().all(|variable| {
+        variable.get("sort").is_some()
+            && variable.get("subject").is_some()
+            && variable.get("minted_by").is_some()
+    }));
+    let reasons: serde_json::Value =
+        serde_json::from_str(&field(solve[0], "_reasons").expect("machine-readable reason arena"))
+            .unwrap();
+    assert!(reasons.as_array().unwrap().iter().all(|reason| {
+        reason.get("parents").is_some()
+            && reason.get("origin").is_some()
+            && reason.get("reachable").is_some()
+    }));
     let guarded_results: Vec<_> = constraint_rows
         .iter()
         .filter(|node| field(node, "_origin").as_deref() == Some("match-arm"))

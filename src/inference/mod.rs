@@ -75,6 +75,7 @@ pub mod sat;
 mod solve;
 
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     ops::Range,
     rc::Rc,
@@ -226,7 +227,7 @@ inference_id!(ReasonId);
 
 /// The semantic sort of a solver variable. Kept outside [`Ty`] so provenance
 /// never changes type equality or user-facing type notation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VarSort {
     Type,
     Row,
@@ -249,6 +250,9 @@ pub struct Reason {
     pub id: ReasonId,
     pub parents: Vec<ReasonId>,
     pub origin: ReasonOrigin,
+    /// False when the causal act belonged to speculative work that was rolled
+    /// back. IDs remain retired and are never reused.
+    pub reachable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,6 +261,39 @@ pub enum ReasonOrigin {
     Constraint(ConstraintId),
     Step(StepId),
     Recovery,
+    DefaultBinding { var: TyVar, kind: DefaultBinding },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultBinding {
+    Sat,
+    CloseEffects,
+}
+
+impl Output {
+    /// Reachable causal slice rooted at `seed`, walked iteratively so debugger
+    /// queries remain safe for arbitrarily deep chains of solved aliases.
+    pub fn reason_ancestors(&self, seed: ReasonId) -> Vec<ReasonId> {
+        let arena: HashMap<_, _> = self
+            .reasons
+            .iter()
+            .map(|reason| (reason.id, reason))
+            .collect();
+        let mut seen = HashSet::new();
+        let mut work = vec![seed];
+        let mut out = Vec::new();
+        while let Some(id) = work.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(reason) = arena.get(&id).filter(|reason| reason.reachable) else {
+                continue;
+            };
+            out.push(id);
+            work.extend(reason.parents.iter().rev().copied());
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -701,7 +738,7 @@ impl ConstraintSubjects {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Subject {
     Binding,
     Annotation,
@@ -1082,7 +1119,7 @@ pub enum ErrorKind {
 #[derive(Debug, Clone)]
 enum Slot {
     Unbound,
-    Bound(Assigned),
+    Bound { value: Assigned, by: ReasonId },
 }
 
 /// What one variable may not stand for: the labels, and the kind of row the
@@ -1112,6 +1149,7 @@ struct Known {
     lacks: HashMap<TyVar, Lacks>,
     existential_witnesses: HashSet<TyVar>,
     abstract_existentials: HashSet<TyVar>,
+    reason_len: usize,
 }
 
 /// What one name in scope means. Private for the same reason as [`Slot`]: a
@@ -1366,6 +1404,10 @@ struct Table {
     /// deliberately not restored after speculative congruence.
     reasons: Vec<Reason>,
     next_reason_id: u64,
+    /// Binding reasons observed while resolving the next solver act. Interior
+    /// mutability keeps the read-only resolution API while making causality
+    /// explicit at the step boundary.
+    causal_reads: RefCell<IndexSet<ReasonId>>,
 }
 
 /// Which quantified position each thing a scheme closes over was given, in the
@@ -2362,6 +2404,7 @@ impl Table {
             id,
             parents,
             origin,
+            reachable: true,
         });
         id
     }
@@ -2403,6 +2446,7 @@ impl Table {
             lacks: self.lacks.clone(),
             existential_witnesses: self.existential_witnesses.clone(),
             abstract_existentials: self.abstract_existentials.clone(),
+            reason_len: self.reasons.len(),
         }
     }
 
@@ -2418,6 +2462,39 @@ impl Table {
         self.lacks = known.lacks;
         self.existential_witnesses = known.existential_witnesses;
         self.abstract_existentials = known.abstract_existentials;
+        for reason in &mut self.reasons[known.reason_len..] {
+            reason.reachable = false;
+        }
+        self.causal_reads.borrow_mut().clear();
+    }
+
+    fn note_binding_read(&self, reason: ReasonId) {
+        self.causal_reads.borrow_mut().insert(reason);
+    }
+
+    fn take_binding_reads(&self) -> Vec<ReasonId> {
+        self.causal_reads.borrow_mut().drain(..).collect()
+    }
+
+    fn binding_parents(&self, var: TyVar, root: Option<ReasonId>) -> Vec<ReasonId> {
+        let mut parents = Vec::new();
+        if let Some(root) = root {
+            parents.push(root);
+        }
+        parents.push(self.var_meta[var as usize].minted_by);
+        for reason in self.take_binding_reads() {
+            if !parents.contains(&reason) {
+                parents.push(reason);
+            }
+        }
+        parents
+    }
+
+    fn default_bind(&mut self, var: TyVar, value: Assigned, kind: DefaultBinding) -> ReasonId {
+        let parents = self.binding_parents(var, None);
+        let reason = self.reason(ReasonOrigin::DefaultBinding { var, kind }, parents);
+        self.vars[var as usize] = Slot::Bound { value, by: reason };
+        reason
     }
 
     /// One more variable, of no sort yet, at the level being walked. A
@@ -2438,10 +2515,6 @@ impl Table {
 
     /// A variable standing for a whole type: an unconstrained type
     /// of its own, so that binding it takes whatever it is against entire.
-    fn fresh_type(&mut self) -> Rc<Ty> {
-        self.fresh_type_for(Subject::Term)
-    }
-
     fn fresh_type_for(&mut self, subject: Subject) -> Rc<Ty> {
         let var = self.mint(VarSort::Type, subject);
         Rc::new(Ty::plain(Ty::Var(var)))
@@ -2463,6 +2536,26 @@ impl Table {
 
     fn fresh_presence_for(&mut self, subject: Subject) -> Presence {
         Presence::Var(self.mint(VarSort::Presence, subject))
+    }
+
+    fn fresh_instance_type(&mut self) -> Rc<Ty> {
+        self.fresh_type_for(Subject::Instance)
+    }
+
+    fn fresh_instance_presence(&mut self) -> Presence {
+        self.fresh_presence_for(Subject::Instance)
+    }
+
+    fn fresh_match_family_type(&mut self) -> Rc<Ty> {
+        self.fresh_type_for(Subject::MatchResult)
+    }
+
+    fn fresh_match_family_row(&mut self) -> Rest {
+        self.fresh_row_for(Subject::MatchResult)
+    }
+
+    fn fresh_match_family_presence(&mut self) -> Presence {
+        self.fresh_presence_for(Subject::MatchResult)
     }
 
     /// Follow bound variables until reaching something that is not one. Only
@@ -2487,9 +2580,14 @@ impl Table {
         let mut ty = ty.clone();
         let mut budget = self.vars.len();
         while let Ty::Var(v) = &*ty {
-            let Slot::Bound(Assigned::Ty(inner)) = &self.vars[*v as usize] else {
+            let Slot::Bound {
+                value: Assigned::Ty(inner),
+                by,
+            } = &self.vars[*v as usize]
+            else {
                 break;
             };
+            self.note_binding_read(*by);
             budget = budget.checked_sub(1).expect("bound type cycle");
             ty = inner.clone();
         }
@@ -2533,7 +2631,11 @@ impl Table {
             let deeper = match &row.rest {
                 Rest::More(more) => (**more).clone(),
                 Rest::Var(var) => match &self.vars[*var as usize] {
-                    Slot::Bound(Assigned::Row(bound)) => {
+                    Slot::Bound {
+                        value: Assigned::Row(bound),
+                        by,
+                    } => {
+                        self.note_binding_read(*by);
                         budget = budget.checked_sub(1).expect(
                             "a chain of bound row variables closed a cycle the occurs check should refuse",
                         );
@@ -2575,9 +2677,14 @@ impl Table {
         let mut presence = presence.clone();
         let mut budget = self.vars.len();
         while let Presence::Var(var) = presence {
-            let Slot::Bound(Assigned::Presence(inner)) = &self.vars[var as usize] else {
+            let Slot::Bound {
+                value: Assigned::Presence(inner),
+                by,
+            } = &self.vars[var as usize]
+            else {
                 break;
             };
+            self.note_binding_read(*by);
             budget = budget.checked_sub(1).expect(
                 "a chain of bound presence variables closed a cycle the occurs check should refuse",
             );
@@ -3351,7 +3458,7 @@ impl Table {
             } else {
                 continue;
             };
-            self.vars[var as usize] = Slot::Bound(Assigned::Presence(settled));
+            self.default_bind(var, Assigned::Presence(settled), DefaultBinding::Sat);
         }
     }
 
@@ -3494,7 +3601,7 @@ impl Table {
                     let presence = key
                         .and_then(|key| self.local_package_instances.get(&key).cloned())
                         .unwrap_or_else(|| {
-                            let fresh = self.fresh_presence();
+                            let fresh = self.fresh_instance_presence();
                             if let Some(key) = key {
                                 self.local_package_instances.insert(key, fresh.clone());
                             }
@@ -3508,7 +3615,7 @@ impl Table {
                     }
                     Assigned::Presence(presence)
                 }
-                false => Assigned::Ty(self.fresh_type()),
+                false => Assigned::Ty(self.fresh_instance_type()),
             })
             .collect();
         let ty = scheme.body().open(&fresh);
@@ -3631,7 +3738,7 @@ impl Table {
         let mut renames = HashMap::new();
         if guarantee.as_ref().is_some_and(|guarantee| guarantee.fresh) {
             for var in collect_owned_existentials(body, &self.abstract_existentials) {
-                let fresh = self.fresh_presence();
+                let fresh = self.fresh_instance_presence();
                 if let Presence::Var(fresh_var) = fresh {
                     // The alpha-renamed identity is just as sealed as the
                     // scheme witness it replaces. Otherwise a consumer could
@@ -4023,7 +4130,11 @@ impl Table {
             if count != 1 || self.levels[var as usize] < level {
                 continue;
             }
-            self.vars[var as usize] = Slot::Bound(Assigned::Row(Rc::new(Row::closed())));
+            self.default_bind(
+                var,
+                Assigned::Row(Rc::new(Row::closed())),
+                DefaultBinding::CloseEffects,
+            );
         }
     }
 
@@ -5450,7 +5561,7 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
             // clause beside it and the SAT store are what govern it, and
             // nothing here is skolemized.
             Sense::Presence => {
-                let presence = table.fresh_presence();
+                let presence = table.fresh_presence_for(Subject::Annotation);
                 if matches!(
                     variable.ownership,
                     crate::ir::PresenceOwnership::Existential { .. }
@@ -5740,7 +5851,7 @@ fn presence(table: &mut Table, tails: &mut Tails, when: &Option<Box<ir::When>>) 
         return tails
             .anonymous
             .entry(when.id)
-            .or_insert_with(|| table.fresh_presence())
+            .or_insert_with(|| table.fresh_presence_for(Subject::Annotation))
             .clone();
     };
     tails.presences[name].clone()
@@ -5758,7 +5869,7 @@ fn row(
 ) -> Row {
     let rest = match tail.as_ref().map(|tail| &tail.of) {
         None => Rest::Closed,
-        Some(ir::Row::Anything) => table.fresh_row(),
+        Some(ir::Row::Anything) => table.fresh_row_for(Subject::Annotation),
         // The rigid its declaration minted, shared by every `..'r` in this one
         // annotation. Indexed for the reason [`presence`] is.
         Some(ir::Row::Named(name)) => tails.rows[name].clone(),
@@ -6459,7 +6570,9 @@ mod identity_tests {
         assert_ne!(table.batch_id(), abandoned_batch);
         assert!(table.var_meta.is_empty());
         assert!(table.reasons.iter().any(|reason| {
-            reason.id == abandoned_reason && matches!(reason.origin, ReasonOrigin::Variable { .. })
+            reason.id == abandoned_reason
+                && !reason.reachable
+                && matches!(reason.origin, ReasonOrigin::Variable { .. })
         }));
         let surviving = table.mint(VarSort::Type, Subject::Term);
         assert_eq!(surviving, abandoned_var);
