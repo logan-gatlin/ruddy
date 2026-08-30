@@ -54,6 +54,12 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                         .map(|id| id.get().to_string())
                         .unwrap_or_default(),
                 )
+                .field(
+                    "_error_id",
+                    step.error
+                        .map(|id| id.get().to_string())
+                        .unwrap_or_default(),
+                )
                 .field("_def", mint.name(step.definition).to_string());
 
             // The two fields the page accumulates, present only on the steps

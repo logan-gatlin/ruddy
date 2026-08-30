@@ -28,8 +28,8 @@ use ruddy::{
 use crate::{
     stage::{self, Build, Cx, Phases, Trace},
     wire::{
-        CompileRequest, Diagnostic, FileInfo, FileSpec, Loc, Panic, Related, Severity, Snapshot,
-        line_starts, loc, locate,
+        CompileRequest, Diagnostic, FileInfo, FileSpec, InferenceCause, Loc, Panic, Related,
+        Severity, Snapshot, line_starts, loc, locate,
     },
 };
 
@@ -373,12 +373,16 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
         );
     }
     if let Some(inferred) = &inferred {
-        diagnostics.extend(
-            inferred
-                .errors
-                .iter()
-                .map(|error| source_error("types", error.diagnostic(), &index)),
-        );
+        diagnostics.extend(inferred.errors.iter().map(|error| {
+            let mut diagnostic = source_error("types", error.diagnostic(), &index);
+            diagnostic.inference_error_id = Some(error.id.get());
+            diagnostic.inference_cause = Some(match error.cause {
+                inference::ErrorCause::Step(id) => InferenceCause::Step { step_id: id.get() },
+                inference::ErrorCause::Batch(id) => InferenceCause::Batch { batch_id: id.get() },
+                inference::ErrorCause::Direct => InferenceCause::Direct,
+            });
+            diagnostic
+        }));
     }
     if let Some(checked) = &checked {
         diagnostics.extend(checked.errors.iter().map(|error| {
@@ -685,6 +689,8 @@ fn dependency_diagnostic(report: ruddy_cli::CompileDiagnostic) -> Diagnostic {
     };
     Diagnostic {
         id: 0,
+        inference_error_id: None,
+        inference_cause: None,
         stage: "dependencies",
         severity: Severity::Error,
         code,
@@ -701,6 +707,8 @@ fn dependency_diagnostic(report: ruddy_cli::CompileDiagnostic) -> Diagnostic {
 fn raw(stage: &'static str, code: &'static str, message: String, span: Option<Loc>) -> Diagnostic {
     Diagnostic {
         id: 0,
+        inference_error_id: None,
+        inference_cause: None,
         stage,
         severity: Severity::Error,
         code,

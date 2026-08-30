@@ -8,8 +8,8 @@ use ruddy_debug::{
     snapshot::{ROOT, compile, compile_at, guard, install_hook},
     stage::REGISTRY,
     wire::{
-        CompileRequest, DependencyDetail, DependencySpec, FileSpec, Loc, Node, Snapshot, Stage,
-        Status, StdConfig, View,
+        CompileRequest, DependencyDetail, DependencySpec, FileSpec, InferenceCause, Loc, Node,
+        Snapshot, Stage, Status, StdConfig, View,
     },
 };
 
@@ -2446,6 +2446,39 @@ fn inference_stage_rows_serialize_compiler_identities() {
         .collect::<std::collections::HashSet<_>>();
     assert!(!deferred.is_empty());
     assert!(deferred.is_subset(&batches));
+
+    let diagnostic = snapshot
+        .diagnostics
+        .iter()
+        .find(|diagnostic| {
+            matches!(
+                &diagnostic.inference_cause,
+                Some(InferenceCause::Step { .. })
+            )
+        })
+        .expect("a solve-caused inference diagnostic");
+    let error_id = diagnostic
+        .inference_error_id
+        .expect("stable inference error identity");
+    let Some(InferenceCause::Step { step_id }) = diagnostic.inference_cause.as_ref() else {
+        panic!("ordinary inference error should carry its step cause");
+    };
+    let linked = solve
+        .iter()
+        .find(|node| field(node, "_step_id").as_deref() == Some(&step_id.to_string()))
+        .expect("diagnostic cause resolves to a solve row");
+    assert_eq!(field(linked, "_error_id"), Some(error_id.to_string()));
+
+    let wire = serde_json::to_value(&snapshot).expect("snapshot serializes");
+    let serialized = wire["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["inference_error_id"] == error_id)
+        .expect("stable inference metadata reaches the wire");
+    assert!(serialized.get("id").is_some(), "display id remains present");
+    assert_eq!(serialized["inference_cause"]["kind"], "step");
+    assert_eq!(serialized["inference_cause"]["step_id"], *step_id);
 }
 
 #[test]

@@ -8425,6 +8425,79 @@ fn callback_steps_resolve_to_published_callback_constraints() {
 }
 
 #[test]
+fn ordinary_solve_errors_link_directly_to_their_failed_steps() {
+    let (_, _, output) = infer_src("let bad = (1n).missing");
+    let [error] = output.errors.as_slice() else {
+        panic!("expected one error: {:#?}", output.errors);
+    };
+    let inference::ErrorCause::Step(step_id) = error.cause else {
+        panic!("ordinary solve error did not link a step: {error:#?}");
+    };
+    let step = output.steps.iter().find(|step| step.id == step_id).unwrap();
+    assert_eq!(step.error, Some(error.id));
+    let inference::Effect::Failed(step_kind) = &step.effect else {
+        panic!("linked step was not failed: {step:#?}");
+    };
+    assert_eq!(step_kind.code(), error.kind.code());
+}
+
+#[test]
+fn callback_rewrite_updates_the_linked_failed_step_effect() {
+    let (_, _, output) = infer_src(
+        "type Callback 'e = () -> () + ..'e\n\
+         extern install : fn(Callback (..'e)) -> () + ..'f = host.install",
+    );
+    let [error] = output.errors.as_slice() else {
+        panic!("expected one callback error: {:#?}", output.errors);
+    };
+    assert_eq!(error.kind.code(), "callback-effects-not-covered");
+    let inference::ErrorCause::Step(step_id) = error.cause else {
+        panic!("callback solve error did not link a step: {error:#?}");
+    };
+    let step = output.steps.iter().find(|step| step.id == step_id).unwrap();
+    assert_eq!(step.error, Some(error.id));
+    let inference::Effect::Failed(step_kind) = &step.effect else {
+        panic!("linked callback step was not failed: {step:#?}");
+    };
+    assert_eq!(step_kind.code(), error.kind.code());
+}
+
+#[test]
+fn sat_errors_link_directly_to_their_flipped_batches() {
+    let (_, _, output) = infer_src(
+        "let one : { x when 'x: Nat, y when 'y: Nat } -> Nat where 'x != 'y =\n\
+           fn value => match value with | { x } => x | { y } => y end\n\
+         let bad = one {}",
+    );
+    let error = output
+        .errors
+        .iter()
+        .find(|error| matches!(error.cause, inference::ErrorCause::Batch(_)))
+        .expect("a SAT error");
+    let inference::ErrorCause::Batch(batch_id) = error.cause else {
+        unreachable!()
+    };
+    let batch = output
+        .store
+        .batches
+        .iter()
+        .find(|batch| batch.id == batch_id)
+        .expect("the linked batch is published");
+    assert!(batch.flipped);
+}
+
+#[test]
+fn direct_boundary_errors_have_stable_ids_without_solve_steps() {
+    let (_, _, output) = infer_src("extern echo : fn('a) -> 'a = host.echo");
+    let [error] = output.errors.as_slice() else {
+        panic!("expected one boundary error: {:#?}", output.errors);
+    };
+    assert!(matches!(error.cause, inference::ErrorCause::Direct));
+    assert_ne!(error.id.get(), u64::MAX);
+    assert!(output.steps.iter().all(|step| step.error != Some(error.id)));
+}
+
+#[test]
 fn source_sorting_moves_errors_without_renumbering_their_identities() {
     let (_, _, output) = infer_src("let a = { dep: b, bad: (true).missing }\nlet b = (1n).missing");
     assert_eq!(output.errors.len(), 2, "{:#?}", output.errors);

@@ -240,7 +240,14 @@ pub struct Field {
 
 #[derive(Debug, Serialize)]
 pub struct Diagnostic {
+    /// Display identity in the source-sorted diagnostic strip.
     pub id: u32,
+    /// Stable inference identity, when this came from inference. Unlike `id`,
+    /// this survives debugger-wide sorting and never changes with other phases.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inference_error_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inference_cause: Option<InferenceCause>,
     /// Which stage produced it: `lex`, `parse`, `ir`, …
     pub stage: &'static str,
     pub severity: Severity,
@@ -263,6 +270,14 @@ pub struct Diagnostic {
     /// Secondary spans, e.g. the first definition a duplicate repeats.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub related: Vec<Related>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum InferenceCause {
+    Step { step_id: u64 },
+    Batch { batch_id: u64 },
+    Direct,
 }
 
 /// The compiler reports nothing but errors so far; `Warning` is here so that

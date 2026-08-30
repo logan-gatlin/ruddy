@@ -399,6 +399,9 @@ pub struct Step {
     pub id: StepId,
     /// The constraint whose solve produced this step.
     pub constraint: Option<ConstraintId>,
+    /// The error this step emitted, if it failed. Kept separately from the
+    /// rendered effect so correlation never depends on error wording.
+    pub error: Option<ErrorId>,
     /// The definition being solved. Solving runs per definition, so this is
     /// what divides one solve from the next in the flat list.
     pub definition: Symbol,
@@ -667,10 +670,22 @@ pub enum ConstraintKind {
 
 #[derive(Debug, Clone)]
 pub struct Error {
-    /// Stable identity in report order. Source sorting moves but never renumbers it.
+    /// Stable identity allocated when the error is emitted. Source sorting moves
+    /// but never renumbers it, and speculative identities are never reused.
     pub id: ErrorId,
+    /// The compiler record that directly emitted this error. A direct error is
+    /// produced by a boundary/final check rather than by a solve step or SAT
+    /// batch.
+    pub cause: ErrorCause,
     pub span: Span,
     pub kind: ErrorKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorCause {
+    Step(StepId),
+    Batch(BatchId),
+    Direct,
 }
 
 impl Error {
@@ -679,6 +694,7 @@ impl Error {
     pub fn new(span: Span, kind: ErrorKind) -> Self {
         Self {
             id: ErrorId::pending(),
+            cause: ErrorCause::Direct,
             span,
             kind,
         }
@@ -1559,7 +1575,8 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
         // assumptions into later declarations.
         if !sat::satisfiable(&lowered.formula) {
             errors.push(Error {
-                id: ErrorId::pending(),
+                id: table.error_id(),
+                cause: ErrorCause::Direct,
                 span: annotation.ty.span,
                 kind: ErrorKind::ClauseImpossible {
                     formula: crate::ui::in_labels(&lowered.formula, &lowered.names),
@@ -1570,7 +1587,8 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             polymorphic_extern_boundary(&aliases, &decl.value.abi, lowered.scheme.body())
         {
             errors.push(Error {
-                id: ErrorId::pending(),
+                id: table.error_id(),
+                cause: ErrorCause::Direct,
                 span,
                 kind: ErrorKind::PolymorphicExternBoundary,
             });
@@ -1584,7 +1602,8 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 extern_coverage.push((*symbol, coverage));
             } else {
                 errors.push(Error {
-                    id: ErrorId::pending(),
+                    id: table.error_id(),
+                    cause: ErrorCause::Direct,
                     span: decl.value.abi.span,
                     kind: ErrorKind::CallbackEffectsNotCovered,
                 });
@@ -1877,7 +1896,8 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 )
             {
                 errors.push(Error {
-                    id: ErrorId::pending(),
+                    id: table.error_id(),
+                    cause: ErrorCause::Direct,
                     span: annotation.ty.span,
                     kind: ErrorKind::AnnotationAllows { allowed, required },
                 });
@@ -1905,7 +1925,8 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                     )
                 {
                     errors.push(Error {
-                        id: ErrorId::pending(),
+                        id: table.error_id(),
+                        cause: ErrorCause::Direct,
                         span: annotated.span,
                         kind: ErrorKind::AnnotationAllows { allowed, required },
                     });
@@ -1982,13 +2003,6 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     schemes.sort_by(|one, _, other, _| position[one].cmp(&position[other]));
     constraints.sort_by(|one, _, other, _| position[one].cmp(&position[other]));
     promises.sort_by(|one, _, other, _| position[one].cmp(&position[other]));
-
-    // Error identity follows report order before the stable source sort. A
-    // speculative error has already been truncated at this point, so its
-    // pending value is never published or reused.
-    for error in &mut errors {
-        error.id = table.error_id();
-    }
 
     // Constraints are solved in the order the walk emitted them, which is not
     // quite the order anyone reads a file in — a body's demands come before
@@ -2100,7 +2114,8 @@ fn report_flip(table: &mut Table, errors: &mut Vec<Error>) {
         }
     };
     errors.push(Error {
-        id: ErrorId::pending(),
+        id: table.error_id(),
+        cause: ErrorCause::Batch(batch.id),
         span: batch.span,
         kind,
     });
@@ -3573,7 +3588,8 @@ impl Table {
             }
             let span = self.rigids[&id];
             errors.push(Error {
-                id: ErrorId::pending(),
+                id: self.error_id(),
+                cause: ErrorCause::Direct,
                 span,
                 kind: ErrorKind::RigidEscapes { name },
             });

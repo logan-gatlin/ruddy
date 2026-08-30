@@ -15,9 +15,9 @@ use crate::{
 };
 
 use super::{
-    Batch, Constraint, ConstraintKind, DeferredRequirement, Effect, Error, ErrorId, ErrorKind,
-    Goal, GuardedArm, GuardedObligation, GuardedOrigin, Known, Named, Origin, Refinement,
-    RefinementFact, Rule, Side, Slot, Step, Table,
+    Batch, Constraint, ConstraintKind, DeferredRequirement, Effect, Error, ErrorCause, ErrorId,
+    ErrorKind, Goal, GuardedArm, GuardedObligation, GuardedOrigin, Known, Named, Origin,
+    Refinement, RefinementFact, Rule, Side, Slot, Step, Table,
 };
 
 /// What a set of labels says about the ones it does not name.
@@ -397,6 +397,15 @@ impl Solve<'_> {
                     self.performs(span, required, available, true);
                     for error in &mut self.errors[reported..] {
                         error.kind = ErrorKind::CallbackEffectsNotCovered;
+                        let ErrorCause::Step(step_id) = error.cause else {
+                            continue;
+                        };
+                        let step = self
+                            .steps
+                            .iter_mut()
+                            .find(|step| step.id == step_id)
+                            .expect("a solve-caused error links its failed step");
+                        step.effect = Effect::Failed(ErrorKind::CallbackEffectsNotCovered);
                     }
                 }
             }
@@ -429,6 +438,7 @@ impl Solve<'_> {
                 };
                 let error = Error {
                     id: ErrorId::pending(),
+                    cause: ErrorCause::Direct,
                     span: base_span,
                     kind: ErrorKind::NotAStruct { base: exposed },
                 };
@@ -443,6 +453,7 @@ impl Solve<'_> {
             Ty::Rigid { id, name } => {
                 let error = Error {
                     id: ErrorId::pending(),
+                    cause: ErrorCause::Direct,
                     span: field_span,
                     kind: ErrorKind::RigidField {
                         shape: Shape::Struct,
@@ -1225,6 +1236,7 @@ impl Solve<'_> {
                 goal,
                 Error {
                     id: ErrorId::pending(),
+                    cause: ErrorCause::Direct,
                     span,
                     kind,
                 },
@@ -1973,6 +1985,7 @@ impl Solve<'_> {
     ) -> bool {
         let error = Error {
             id: ErrorId::pending(),
+            cause: ErrorCause::Direct,
             span,
             kind: ErrorKind::RigidBroken {
                 found: found.clone(),
@@ -1989,6 +2002,7 @@ impl Solve<'_> {
     fn mismatch(&mut self, span: Span, goal: Goal, lhs: &Rc<Ty>, rhs: &Rc<Ty>) -> bool {
         let error = Error {
             id: ErrorId::pending(),
+            cause: ErrorCause::Direct,
             span,
             kind: ErrorKind::Mismatch {
                 expected: lhs.clone(),
@@ -2057,6 +2071,7 @@ impl Solve<'_> {
             } else {
                 let error = Error {
                     id: ErrorId::pending(),
+                    cause: ErrorCause::Direct,
                     span,
                     kind: ErrorKind::Recursive,
                 };
@@ -2308,6 +2323,7 @@ impl Solve<'_> {
                     goal,
                     Error {
                         id: ErrorId::pending(),
+                        cause: ErrorCause::Direct,
                         span,
                         kind,
                     },
@@ -2561,6 +2577,7 @@ impl Solve<'_> {
             if let (Presence::Present, Some((rigid, id))) = (&presence, &rigid) {
                 let error = Error {
                     id: ErrorId::pending(),
+                    cause: ErrorCause::Direct,
                     span,
                     kind: ErrorKind::RigidField {
                         shape,
@@ -2595,6 +2612,7 @@ impl Solve<'_> {
                     };
                     let error = Error {
                         id: ErrorId::pending(),
+                        cause: ErrorCause::Direct,
                         span,
                         kind,
                     };
@@ -2613,6 +2631,7 @@ impl Solve<'_> {
                     };
                     let error = Error {
                         id: ErrorId::pending(),
+                        cause: ErrorCause::Direct,
                         span,
                         kind,
                     };
@@ -2671,6 +2690,7 @@ impl Solve<'_> {
         if self.table.occurs(var, &value) {
             let error = Error {
                 id: ErrorId::pending(),
+                cause: ErrorCause::Direct,
                 span,
                 kind: ErrorKind::Recursive,
             };
@@ -2702,6 +2722,7 @@ impl Solve<'_> {
             {
                 let error = Error {
                     id: ErrorId::pending(),
+                    cause: ErrorCause::Direct,
                     span,
                     kind: ErrorKind::RepeatedField {
                         shape,
@@ -2919,10 +2940,31 @@ impl Solve<'_> {
     ///
     /// The error carries its own span rather than taking `span`, because the
     /// two need not be the same.
-    fn fail(&mut self, span: Span, rule: Rule, goal: Goal, error: Error, abandoned: &[Assigned]) {
+    fn fail(
+        &mut self,
+        span: Span,
+        rule: Rule,
+        goal: Goal,
+        mut error: Error,
+        abandoned: &[Assigned],
+    ) {
         let kind = error.kind.clone();
+        let error_id = self.table.error_id();
+        let step_id = self.table.step_id();
+        error.id = error_id;
+        error.cause = ErrorCause::Step(step_id);
         self.errors.push(error);
-        self.step(span, rule, goal, Effect::Failed(kind));
+        self.steps.push(Step {
+            id: step_id,
+            constraint: self.constraint,
+            error: Some(error_id),
+            definition: self.definition,
+            span,
+            depth: self.depth,
+            rule,
+            goal,
+            effect: Effect::Failed(kind),
+        });
         for value in abandoned {
             self.recover(span, value);
         }
@@ -3061,6 +3103,7 @@ impl Solve<'_> {
         self.steps.push(Step {
             id,
             constraint: self.constraint,
+            error: None,
             definition: self.definition,
             span,
             depth: self.depth,
