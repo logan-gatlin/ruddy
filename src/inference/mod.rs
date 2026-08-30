@@ -90,7 +90,7 @@ use crate::{
     tracking::Span,
     types::{
         Assigned, Atom, EffectId, Formula, ParamKind, Presence, Rest, Row, RowField, Scheme, Sense,
-        Shape, Ty, TyVar, same_finite_syntax,
+        Shape, Ty, TyVar, same_finite_syntax, same_finite_syntax_metered,
     },
 };
 use constrain::Constrain;
@@ -1904,11 +1904,20 @@ struct AliasGoal {
 }
 
 /// Memoized, stack-safe hashes used only to reject unequal alias goals cheaply.
-/// Hash matches are still checked with `same_finite_syntax`, so collisions can
-/// cost work but cannot alter a diagnostic.
-#[derive(Default)]
+/// Hash matches are still checked with metered exact finite-syntax equality, so
+/// collisions can cost bounded work but cannot alter a diagnostic.
 struct MismatchFingerprints {
     types: HashMap<*const Ty, (Rc<Ty>, u64)>,
+    argument_hash_mask: u64,
+}
+
+impl Default for MismatchFingerprints {
+    fn default() -> Self {
+        Self {
+            types: HashMap::new(),
+            argument_hash_mask: u64::MAX,
+        }
+    }
 }
 
 enum MismatchFingerprintWork {
@@ -2106,7 +2115,7 @@ impl MismatchFingerprints {
             }
         }
         let parts = values.split_off(values.len() - args.len());
-        Some(tagged(14, parts))
+        Some(tagged(14, parts) & self.argument_hash_mask)
     }
 }
 
@@ -2129,6 +2138,16 @@ fn smallest_incompatible_counted(
     right: &Rc<Ty>,
     operations: &mut usize,
 ) -> (TypeDescription, TypeDescription) {
+    smallest_incompatible_counted_with_mask(aliases, left, right, operations, u64::MAX)
+}
+
+fn smallest_incompatible_counted_with_mask(
+    aliases: &IndexMap<Symbol, Scheme>,
+    left: &Rc<Ty>,
+    right: &Rc<Ty>,
+    operations: &mut usize,
+    argument_hash_mask: u64,
+) -> (TypeDescription, TypeDescription) {
     const MAX_ALIAS_WORK: usize = 1_048_576;
     let mut work = vec![MismatchWork {
         left: left.clone(),
@@ -2145,7 +2164,10 @@ fn smallest_incompatible_counted(
     // indices make paths persistent without recursive destruction or cloning.
     let mut alias_goals: Vec<AliasGoal> = Vec::new();
     let mut forwarding = Forwarding::default();
-    let mut fingerprints = MismatchFingerprints::default();
+    let mut fingerprints = MismatchFingerprints {
+        argument_hash_mask,
+        ..MismatchFingerprints::default()
+    };
     // Malformed imported declarations can manufacture fresh, ever larger
     // substitutions. Charge fingerprint nodes and ancestor probes to a strict
     // branch-local budget; queued siblings retain the budget at their fork.
@@ -2220,23 +2242,27 @@ fn smallest_incompatible_counted(
                 if alias_work == 0 {
                     break;
                 }
+                // The ancestor probe itself and every exact collision-check
+                // node share one allowance. A hostile hash collision therefore
+                // cannot smuggle an unbounded structural walk past the meter.
                 alias_work -= 1;
                 let goal = &alias_goals[index];
+                let mut same_arguments = |known: &[Rc<Ty>], current: &[Rc<Ty>]| {
+                    if known.len() != current.len() {
+                        return Some(false);
+                    }
+                    for (known, current) in known.iter().zip(current) {
+                        if !same_finite_syntax_metered(known, current, &mut alias_work)? {
+                            return Some(false);
+                        }
+                    }
+                    Some(true)
+                };
                 if goal.fingerprint == fingerprint
                     && goal.left_symbol == *left_symbol
                     && goal.right_symbol == *right_symbol
-                    && goal.left_args.len() == left_args.len()
-                    && goal.right_args.len() == right_args.len()
-                    && goal
-                        .left_args
-                        .iter()
-                        .zip(left_args.iter())
-                        .all(|(seen, current)| same_finite_syntax(seen, current))
-                    && goal
-                        .right_args
-                        .iter()
-                        .zip(right_args.iter())
-                        .all(|(seen, current)| same_finite_syntax(seen, current))
+                    && same_arguments(&goal.left_args, &left_args) == Some(true)
+                    && same_arguments(&goal.right_args, &right_args) == Some(true)
                 {
                     seen = true;
                     break;
@@ -2276,6 +2302,9 @@ fn smallest_incompatible_counted(
         }
         match (&*left, &*right) {
             (Ty::Arrow(l_from, l_to, l_effects), Ty::Arrow(r_from, r_to, r_effects)) => {
+                // An incompatible effect row contributes no payload jobs. Keep
+                // walking parameter and result first; if neither has a leaf,
+                // the enclosing function fallback remains the honest answer.
                 push_row_payloads(&mut work, l_effects, r_effects, alias_path, alias_work);
                 // Source order: parameter, result, then effects.
                 work.push(MismatchWork {
@@ -2292,8 +2321,7 @@ fn smallest_incompatible_counted(
                 });
             }
             (Ty::Struct(left), Ty::Struct(right)) | (Ty::Sum(left), Ty::Sum(right)) => {
-                push_row_payloads(&mut work, left, right, alias_path, alias_work);
-                if left.labels.keys().ne(right.labels.keys()) {
+                if !push_row_payloads(&mut work, left, right, alias_path, alias_work) {
                     return descriptions;
                 }
             }
@@ -2342,27 +2370,63 @@ fn canonical_alias_argument(
 
 fn push_row_payloads(
     work: &mut Vec<MismatchWork>,
-    left: &Row,
-    right: &Row,
+    mut left: &Row,
+    mut right: &Row,
     alias_path: Option<usize>,
     alias_work: usize,
-) {
-    // Reverse insertion order so the first written common label is visited
-    // first by the LIFO work list. Presence/rest incompatibilities have no type
-    // leaf; their dedicated row diagnostics remain the truthful fallback.
-    let common: Vec<_> = left
-        .labels
-        .iter()
-        .filter_map(|(name, field)| right.labels.get(name).map(|other| (&field.ty, &other.ty)))
-        .collect();
-    for (left, right) in common.into_iter().rev() {
+) -> bool {
+    // Validate the complete composed row before exposing any payload. Label
+    // maps are order-insensitive, and absent/recovery slots have no honest
+    // payload semantics. Collect present payloads in written left-row order,
+    // including every `Rest::More` segment, then reverse once for the LIFO DFS.
+    let mut payloads = Vec::new();
+    loop {
+        if left.labels.len() != right.labels.len()
+            || left
+                .labels
+                .keys()
+                .any(|name| !right.labels.contains_key(name))
+        {
+            return false;
+        }
+        for (name, left_field) in &left.labels {
+            let right_field = &right.labels[name];
+            if left_field.presence != right_field.presence {
+                return false;
+            }
+            if matches!(
+                (&left_field.presence, &right_field.presence),
+                (Presence::Present, Presence::Present)
+            ) {
+                payloads.push((left_field.ty.clone(), right_field.ty.clone()));
+            }
+        }
+        match (&left.rest, &right.rest) {
+            (Rest::More(left_more), Rest::More(right_more)) => {
+                left = left_more;
+                right = right_more;
+            }
+            (Rest::Closed, Rest::Closed) | (Rest::Undecided, Rest::Undecided) => break,
+            (Rest::Var(left), Rest::Var(right)) | (Rest::Bound(left), Rest::Bound(right))
+                if left == right =>
+            {
+                break;
+            }
+            (Rest::Rigid { id: left, .. }, Rest::Rigid { id: right, .. }) if left == right => {
+                break;
+            }
+            _ => return false,
+        }
+    }
+    for (left, right) in payloads.into_iter().rev() {
         work.push(MismatchWork {
-            left: left.clone(),
-            right: right.clone(),
+            left,
+            right,
             alias_path,
             alias_work,
         });
     }
+    true
 }
 
 fn all_constraints(
@@ -7543,6 +7607,73 @@ mod existential_regressions {
     }
 
     #[test]
+    fn mismatch_rows_ignore_label_order_and_walk_composed_tail_payloads() {
+        let field = |ty| RowField::present(Rc::new(ty));
+        let left = Rc::new(Ty::Struct(Row {
+            labels: [
+                ("first".into(), field(Ty::unit())),
+                ("second".into(), field(Ty::unit())),
+            ]
+            .into_iter()
+            .collect(),
+            rest: Rest::More(Rc::new(Row {
+                labels: [("tail".into(), field(Ty::Nat))].into_iter().collect(),
+                rest: Rest::Closed,
+            })),
+        }));
+        let right = Rc::new(Ty::Struct(Row {
+            labels: [
+                ("second".into(), field(Ty::unit())),
+                ("first".into(), field(Ty::unit())),
+            ]
+            .into_iter()
+            .collect(),
+            rest: Rest::More(Rc::new(Row {
+                labels: [("tail".into(), field(Ty::Boolean))].into_iter().collect(),
+                rest: Rest::Closed,
+            })),
+        }));
+        assert_eq!(
+            smallest_incompatible(&IndexMap::new(), &left, &right),
+            (TypeDescription::NaturalNumber, TypeDescription::Boolean),
+            "reordered map keys must not hide a mismatch in a composed tail"
+        );
+    }
+
+    #[test]
+    fn mismatch_rows_do_not_read_semantically_unavailable_payloads() {
+        let row = |presence, ty| {
+            Rc::new(Ty::Struct(Row {
+                labels: [(
+                    "x".into(),
+                    RowField {
+                        presence,
+                        ty: Rc::new(ty),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                rest: Rest::Closed,
+            }))
+        };
+        for (left_presence, right_presence) in [
+            (Presence::Absent, Presence::Absent),
+            (Presence::Recovered(7), Presence::Recovered(7)),
+            (Presence::Present, Presence::Absent),
+        ] {
+            assert_eq!(
+                smallest_incompatible(
+                    &IndexMap::new(),
+                    &row(left_presence, Ty::Nat),
+                    &row(right_presence, Ty::Boolean),
+                ),
+                (TypeDescription::Struct, TypeDescription::Struct),
+                "absent, recovery, and incompatible presences require the honest row fallback"
+            );
+        }
+    }
+
+    #[test]
     fn recursive_alias_mismatch_skips_cycle_and_finds_sibling_leaf() {
         use crate::symbol::{Bundle, Mint, Namespace, Version};
 
@@ -7698,7 +7829,7 @@ mod existential_regressions {
     }
 
     #[test]
-    fn self_growing_alias_mismatch_has_a_strict_operation_bound() {
+    fn fingerprint_collisions_in_self_growth_have_a_strict_operation_bound() {
         use crate::symbol::{Bundle, Mint, Namespace, Version};
 
         let bundle = Bundle::new("self-growing-leaf", Version::new(1, 0, 0)).unwrap();
@@ -7732,7 +7863,10 @@ mod existential_regressions {
         });
         let mut operations = 0;
         assert_eq!(
-            smallest_incompatible_counted(&aliases, &named, &named, &mut operations),
+            // Mask every argument fingerprint to zero. Every ancestor is now
+            // an intentional collision and exact verification must still be
+            // charged to the same bounded node-work allowance.
+            smallest_incompatible_counted_with_mask(&aliases, &named, &named, &mut operations, 0,),
             (TypeDescription::DeclaredType, TypeDescription::DeclaredType)
         );
         assert_eq!(
