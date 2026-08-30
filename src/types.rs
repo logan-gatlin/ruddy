@@ -835,6 +835,29 @@ pub(crate) fn same_finite_syntax_metered(
         Row(&'a Row, &'a Row),
     }
 
+    fn charge(work_left: &mut usize) -> Option<()> {
+        *work_left = work_left.checked_sub(1)?;
+        Some(())
+    }
+
+    fn flatten<'a>(
+        mut row: &'a Row,
+        work_left: &mut usize,
+    ) -> Option<(IndexMap<&'a str, &'a RowField>, &'a Rest)> {
+        let mut labels = IndexMap::new();
+        loop {
+            for (name, field) in &row.labels {
+                charge(work_left)?;
+                // This is the same outer-label precedence as solver canon.
+                labels.entry(name.as_str()).or_insert(field);
+            }
+            match &row.rest {
+                Rest::More(more) => row = more,
+                rest => return Some((labels, rest)),
+            }
+        }
+    }
+
     fn same_presence(left: &Presence, right: &Presence) -> bool {
         match (left, right) {
             (Presence::Present, Presence::Present)
@@ -922,23 +945,27 @@ pub(crate) fn same_finite_syntax_metered(
                 {
                     continue;
                 }
-                if left.labels.len() != right.labels.len() {
+                let (left_labels, left_rest) = flatten(left, work_left)?;
+                let (right_labels, right_rest) = flatten(right, work_left)?;
+                if left_labels.len() != right_labels.len() {
                     return Some(false);
                 }
-                for (name, left_field) in &left.labels {
-                    let Some(right_field) = right.labels.get(name) else {
+                for (name, left_field) in left_labels {
+                    charge(work_left)?;
+                    let Some(right_field) = right_labels.get(name) else {
                         return Some(false);
                     };
                     if !same_presence(&left_field.presence, &right_field.presence) {
                         return Some(false);
                     }
-                    // An absent label has no payload; recovery is free to leave
-                    // any finite type in that semantically unreachable slot.
-                    if !matches!(left_field.presence, Presence::Absent) {
+                    // Only definitely-present labels have an available payload.
+                    // Absent, undecided, variable, and recovered slots may retain
+                    // arbitrary recovery types which are not semantic syntax.
+                    if matches!(left_field.presence, Presence::Present) {
                         pending.push(Pair::Ty(&left_field.ty, &right_field.ty));
                     }
                 }
-                match (&left.rest, &right.rest) {
+                match (left_rest, right_rest) {
                     (Rest::Closed, Rest::Closed) | (Rest::Undecided, Rest::Undecided) => {}
                     (Rest::Var(left), Rest::Var(right))
                     | (Rest::Bound(left), Rest::Bound(right)) => {
@@ -950,9 +977,6 @@ pub(crate) fn same_finite_syntax_metered(
                         if left != right {
                             return Some(false);
                         }
-                    }
-                    (Rest::More(left), Rest::More(right)) => {
-                        pending.push(Pair::Row(left, right));
                     }
                     _ => return Some(false),
                 }

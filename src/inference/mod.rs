@@ -2057,32 +2057,54 @@ impl MismatchFingerprints {
                     values.push(hash);
                 }
                 MismatchFingerprintWork::Row(row) => {
-                    let mut fields = Vec::with_capacity(row.labels.len());
-                    for (name, field) in &row.labels {
-                        let payload = !matches!(field.presence, Presence::Absent);
-                        fields.push((
-                            name.clone(),
-                            field.presence.clone(),
-                            payload,
-                            field.ty.clone(),
-                        ));
+                    // Flatten composed rows exactly as solver canon does: an
+                    // outer spelling wins over a duplicate in its tail.
+                    let mut flattened = IndexMap::new();
+                    let mut segment = &row;
+                    let rest = loop {
+                        for (name, field) in &segment.labels {
+                            if *work_left == 0 {
+                                return None;
+                            }
+                            *work_left -= 1;
+                            flattened
+                                .entry(name.clone())
+                                .or_insert_with(|| field.clone());
+                        }
+                        match &segment.rest {
+                            Rest::More(more) => segment = more,
+                            rest => break rest.clone(),
+                        }
+                    };
+                    let mut fields: Vec<_> = flattened
+                        .into_iter()
+                        .map(|(name, field)| {
+                            let payload = matches!(field.presence, Presence::Present);
+                            (name, field.presence, payload, field.ty)
+                        })
+                        .collect();
+                    // Charge each comparison performed by the sort, not merely
+                    // the eventual label hashes.
+                    let mut exhausted = false;
+                    fields.sort_unstable_by(|left, right| {
+                        if let Some(next) = work_left.checked_sub(1) {
+                            *work_left = next;
+                        } else {
+                            exhausted = true;
+                        }
+                        left.0.cmp(&right.0)
+                    });
+                    if exhausted {
+                        return None;
                     }
-                    // Finite syntax treats labels as a map, independently of
-                    // the source insertion order.
-                    fields.sort_unstable_by(|left, right| left.0.cmp(&right.0));
                     let payloads = fields.iter().filter(|field| field.2).count();
                     let completion = fields
                         .iter()
                         .map(|(n, p, has, _)| (n.clone(), p.clone(), *has))
                         .collect();
                     pending.push(MismatchFingerprintWork::FinishRow(
-                        completion,
-                        row.rest.clone(),
-                        payloads,
+                        completion, rest, payloads,
                     ));
-                    if let Rest::More(more) = &row.rest {
-                        pending.push(MismatchFingerprintWork::Row((**more).clone()));
-                    }
                     pending.extend(
                         fields
                             .into_iter()
@@ -2092,24 +2114,21 @@ impl MismatchFingerprints {
                     );
                 }
                 MismatchFingerprintWork::FinishRow(fields, rest, payloads) => {
-                    let rest_more = matches!(rest, Rest::More(_));
-                    let count = payloads + usize::from(rest_more);
-                    let parts = values.split_off(values.len() - count);
-                    let mut parts = parts.into_iter();
+                    let mut parts = values.split_off(values.len() - payloads).into_iter();
                     let mut hash = DefaultHasher::new();
                     fields.len().hash(&mut hash);
                     for (name, presence, payload) in fields {
+                        if *work_left == 0 {
+                            return None;
+                        }
+                        *work_left -= 1;
                         name.hash(&mut hash);
                         presence_hash(&presence).hash(&mut hash);
                         if payload {
                             parts.next().unwrap().hash(&mut hash);
                         }
                     }
-                    if rest_more {
-                        parts.next().unwrap().hash(&mut hash);
-                    } else {
-                        rest_leaf_hash(&rest).unwrap().hash(&mut hash);
-                    }
+                    rest_leaf_hash(&rest).unwrap().hash(&mut hash);
                     values.push(hash.finish());
                 }
             }
@@ -2305,8 +2324,16 @@ fn smallest_incompatible_counted_with_mask(
                 // An incompatible effect row contributes no payload jobs. Keep
                 // walking parameter and result first; if neither has a leaf,
                 // the enclosing function fallback remains the honest answer.
-                push_row_payloads(&mut work, l_effects, r_effects, alias_path, alias_work);
-                // Source order: parameter, result, then effects.
+                let mut effect_alias_work = alias_work;
+                push_row_payloads(
+                    &mut work,
+                    l_effects,
+                    r_effects,
+                    alias_path,
+                    &mut effect_alias_work,
+                );
+                // Source order: parameter, result, then effects. Effect-row
+                // work is its own queued branch and cannot starve these siblings.
                 work.push(MismatchWork {
                     left: l_to.clone(),
                     right: r_to.clone(),
@@ -2321,7 +2348,7 @@ fn smallest_incompatible_counted_with_mask(
                 });
             }
             (Ty::Struct(left), Ty::Struct(right)) | (Ty::Sum(left), Ty::Sum(right)) => {
-                if !push_row_payloads(&mut work, left, right, alias_path, alias_work) {
+                if !push_row_payloads(&mut work, left, right, alias_path, &mut alias_work) {
                     return descriptions;
                 }
             }
@@ -2370,60 +2397,73 @@ fn canonical_alias_argument(
 
 fn push_row_payloads(
     work: &mut Vec<MismatchWork>,
-    mut left: &Row,
-    mut right: &Row,
+    left: &Row,
+    right: &Row,
     alias_path: Option<usize>,
-    alias_work: usize,
+    alias_work: &mut usize,
 ) -> bool {
-    // Validate the complete composed row before exposing any payload. Label
-    // maps are order-insensitive, and absent/recovery slots have no honest
-    // payload semantics. Collect present payloads in written left-row order,
-    // including every `Rest::More` segment, then reverse once for the LIFO DFS.
+    fn flatten<'a>(
+        mut row: &'a Row,
+        work_left: &mut usize,
+    ) -> Option<(IndexMap<&'a str, &'a RowField>, &'a Rest)> {
+        let mut labels = IndexMap::new();
+        loop {
+            for (name, field) in &row.labels {
+                *work_left = work_left.checked_sub(1)?;
+                labels.entry(name.as_str()).or_insert(field);
+            }
+            match &row.rest {
+                Rest::More(more) => row = more,
+                rest => return Some((labels, rest)),
+            }
+        }
+    }
+
+    // Compare canonical flattened maps rather than segment boundaries. This is
+    // solver canon's outer-label precedence and makes a segmented row equal to
+    // the same finite row represented in one segment.
+    let Some((left_labels, left_rest)) = flatten(left, alias_work) else {
+        return false;
+    };
+    let Some((right_labels, right_rest)) = flatten(right, alias_work) else {
+        return false;
+    };
+    if left_labels.len() != right_labels.len() {
+        return false;
+    }
     let mut payloads = Vec::new();
-    loop {
-        if left.labels.len() != right.labels.len()
-            || left
-                .labels
-                .keys()
-                .any(|name| !right.labels.contains_key(name))
-        {
+    for (name, left_field) in left_labels {
+        let Some(next) = alias_work.checked_sub(1) else {
+            return false;
+        };
+        *alias_work = next;
+        let Some(right_field) = right_labels.get(name) else {
+            return false;
+        };
+        if left_field.presence != right_field.presence {
             return false;
         }
-        for (name, left_field) in &left.labels {
-            let right_field = &right.labels[name];
-            if left_field.presence != right_field.presence {
-                return false;
-            }
-            if matches!(
-                (&left_field.presence, &right_field.presence),
-                (Presence::Present, Presence::Present)
-            ) {
-                payloads.push((left_field.ty.clone(), right_field.ty.clone()));
-            }
+        if matches!(left_field.presence, Presence::Present) {
+            payloads.push((left_field.ty.clone(), right_field.ty.clone()));
         }
-        match (&left.rest, &right.rest) {
-            (Rest::More(left_more), Rest::More(right_more)) => {
-                left = left_more;
-                right = right_more;
-            }
-            (Rest::Closed, Rest::Closed) | (Rest::Undecided, Rest::Undecided) => break,
-            (Rest::Var(left), Rest::Var(right)) | (Rest::Bound(left), Rest::Bound(right))
-                if left == right =>
-            {
-                break;
-            }
-            (Rest::Rigid { id: left, .. }, Rest::Rigid { id: right, .. }) if left == right => {
-                break;
-            }
-            _ => return false,
+    }
+    let same_rest = match (left_rest, right_rest) {
+        (Rest::Closed, Rest::Closed) | (Rest::Undecided, Rest::Undecided) => true,
+        (Rest::Var(left), Rest::Var(right)) | (Rest::Bound(left), Rest::Bound(right)) => {
+            left == right
         }
+        (Rest::Rigid { id: left, .. }, Rest::Rigid { id: right, .. }) => left == right,
+        _ => false,
+    };
+    if !same_rest {
+        return false;
     }
     for (left, right) in payloads.into_iter().rev() {
         work.push(MismatchWork {
             left,
             right,
             alias_path,
-            alias_work,
+            alias_work: *alias_work,
         });
     }
     true
@@ -7638,6 +7678,114 @@ mod existential_regressions {
             (TypeDescription::NaturalNumber, TypeDescription::Boolean),
             "reordered map keys must not hide a mismatch in a composed tail"
         );
+    }
+
+    #[test]
+    fn mismatch_rows_compare_segmented_and_flat_canonical_shapes() {
+        let field = |ty| RowField::present(Rc::new(ty));
+        let left = Rc::new(Ty::Struct(Row {
+            labels: [("outer".into(), field(Ty::unit()))].into_iter().collect(),
+            rest: Rest::More(Rc::new(Row {
+                labels: [("leaf".into(), field(Ty::Nat))].into_iter().collect(),
+                rest: Rest::Closed,
+            })),
+        }));
+        let right = Rc::new(Ty::Struct(Row {
+            labels: [
+                ("leaf".into(), field(Ty::Boolean)),
+                ("outer".into(), field(Ty::unit())),
+            ]
+            .into_iter()
+            .collect(),
+            rest: Rest::Closed,
+        }));
+        assert_eq!(
+            smallest_incompatible(&IndexMap::new(), &left, &right),
+            (TypeDescription::NaturalNumber, TypeDescription::Boolean)
+        );
+    }
+
+    #[test]
+    fn mismatch_rows_give_duplicate_outer_labels_precedence() {
+        let field = |ty| RowField::present(Rc::new(ty));
+        let segmented = |outer, hidden, leaf| {
+            Rc::new(Ty::Struct(Row {
+                labels: [("duplicate".into(), field(outer))].into_iter().collect(),
+                rest: Rest::More(Rc::new(Row {
+                    labels: [
+                        ("duplicate".into(), field(hidden)),
+                        ("leaf".into(), field(leaf)),
+                    ]
+                    .into_iter()
+                    .collect(),
+                    rest: Rest::Closed,
+                })),
+            }))
+        };
+        assert_eq!(
+            smallest_incompatible(
+                &IndexMap::new(),
+                &segmented(Ty::unit(), Ty::Nat, Ty::Nat),
+                &segmented(Ty::unit(), Ty::Boolean, Ty::Boolean),
+            ),
+            (TypeDescription::NaturalNumber, TypeDescription::Boolean),
+            "the hidden duplicate payload must not become the first mismatch"
+        );
+    }
+
+    #[test]
+    fn mismatch_row_fingerprints_meter_unavailable_labels_and_ignore_their_payloads() {
+        let unavailable = |presence: Presence, payload: Ty| {
+            let labels = (0..10_000)
+                .map(|at| {
+                    (
+                        format!("f{at}"),
+                        RowField {
+                            presence: presence.clone(),
+                            ty: Rc::new(payload.clone()),
+                        },
+                    )
+                })
+                .collect();
+            Rc::new(Ty::Struct(Row {
+                labels,
+                rest: Rest::Closed,
+            }))
+        };
+        for presence in [Presence::Absent, Presence::Recovered(7)] {
+            let left = unavailable(presence.clone(), Ty::Nat);
+            let right = unavailable(presence, Ty::Boolean);
+            let mut compare_budget = 128;
+            assert_eq!(
+                same_finite_syntax_metered(&left, &right, &mut compare_budget),
+                None
+            );
+            assert_eq!(
+                compare_budget, 0,
+                "each canonical row-label comparison must be metered"
+            );
+
+            let mut fingerprint_budget = 128;
+            assert!(
+                MismatchFingerprints::default()
+                    .arguments(std::slice::from_ref(&left), &mut fingerprint_budget)
+                    .is_none()
+            );
+            assert_eq!(
+                fingerprint_budget, 0,
+                "each row-label fingerprint operation must be metered"
+            );
+
+            let mut left_fingerprints = MismatchFingerprints::default();
+            let mut right_fingerprints = MismatchFingerprints::default();
+            let mut left_budget = usize::MAX;
+            let mut right_budget = usize::MAX;
+            assert_eq!(
+                left_fingerprints.arguments(&[left], &mut left_budget),
+                right_fingerprints.arguments(&[right], &mut right_budget),
+                "unavailable recovery payloads must not enter fingerprints"
+            );
+        }
     }
 
     #[test]
