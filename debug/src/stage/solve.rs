@@ -75,6 +75,11 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         return crate::stage::skipped(spec, "inference did not run");
     };
 
+    let error_messages: HashMap<_, _> = output
+        .errors
+        .iter()
+        .map(|error| (error.id, error.diagnostic().title))
+        .collect();
     let mut ids = Ids::default();
     let mut nodes: Vec<Node> = output
         .steps
@@ -120,7 +125,13 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                         node = node.field("_recovery_because", because.get().to_string());
                     }
                 }
-                Effect::Failed(kind) => node = node.field("_error", kind.to_string()).error(),
+                Effect::Failed(kind) => {
+                    let message = step
+                        .error
+                        .and_then(|id| error_messages.get(&id).cloned())
+                        .unwrap_or_else(|| kind.to_string());
+                    node = node.field("_error", message).error();
+                }
                 Effect::None | Effect::Decomposed | Effect::Guarded { .. } => {}
             }
 

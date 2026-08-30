@@ -1,7 +1,9 @@
 ## not-a-struct
-[not-a-struct] `Nat` is not a struct, so it has no fields to read
-primary: this field access requires a struct
-help: change this value to a struct, or change/remove the field access
+[not-a-struct] a natural number cannot provide struct fields
+primary: this value supplies a non-struct type here
+related: this field access requires a struct
+help: change the value to a struct
+help: or change/remove the field access
 
 ## type-mismatch
 [type-mismatch] a natural number and a struct cannot be the same type
@@ -16,19 +18,25 @@ primary: this use makes the type refer back to itself
 help: remove the self-reference or introduce a finite wrapper type
 
 ## missing-field
-[missing-field] no field `y` on `{ x: Nat }`
-primary: this requires field `y`
-help: add field `y`, or change the use that requires it
+[missing-field] field `y` is required by one use but excluded by another
+primary: this use requires field `y`
+related: this use limits the type so field `y` is unavailable
+help: allow field `y` in the limiting use
+help: or change the use that requires field `y`
 
 ## extra-field-struct
-[extra-field] extra field `y`: the type `{ x: Nat }` lists every field it allows
-primary: this introduces field `y` where it is not allowed
-help: remove field `y`, or allow it in the other type
+[extra-field] field `y` is required by one use but excluded by another
+primary: this use requires field `y`
+related: this use limits the type so field `y` is unavailable
+help: allow field `y` in the limiting use
+help: or change the use that requires field `y`
 
 ## extra-field-sum
-[extra-field] extra case `#None`: the type `#Some Nat` lists every case it allows
-primary: this introduces case `#None` where it is not allowed
-help: remove case `#None`, or allow it in the other type
+[extra-field] case `#None` is required by one use but excluded by another
+primary: this use requires case `#None`
+related: this use limits the type so case `#None` is unavailable
+help: allow case `#None` in the limiting use
+help: or change the use that requires case `#None`
 
 ## rigid-broken
 [rigid-broken] this is `{ value: Nat }`, but `'a` stands for whatever type the caller picks
@@ -60,19 +68,25 @@ primary: this type carries a caller choice outside its annotation
 help: keep the value inside the annotation that introduces this choice
 
 ## repeated-field-struct
-[repeated-field] `..` covers only the fields a type does not already name, and here it would have to cover `x`
-primary: field `x` is already named outside `..`
-help: remove the repeated field, or remove it from the remainder
+[repeated-field] field `x` cannot be both named and included by `..`
+primary: this use contributes one side of the overlap for field `x`
+related: this use contributes one side of the overlap for field `x`
+help: remove field `x` from the named side
+help: or keep it out of the `..` remainder
 
 ## repeated-field-sum
-[repeated-field] `..` covers only the cases a type does not already name, and here it would have to cover `#A`
-primary: case `#A` is already named outside `..`
-help: remove the repeated case, or remove it from the remainder
+[repeated-field] case `#A` cannot be both named and included by `..`
+primary: this use contributes one side of the overlap for case `#A`
+related: this use contributes one side of the overlap for case `#A`
+help: remove case `#A` from the named side
+help: or keep it out of the `..` remainder
 
 ## repeated-field-effect
-[repeated-field] `..` covers only the effects a type does not already name, and here it would have to cover `!Log`
-primary: effect `!Log` is already named outside `..`
-help: remove the repeated effect, or remove it from the remainder
+[repeated-field] effect `!Log` cannot be both named and included by `..`
+primary: this use contributes one side of the overlap for effect `!Log`
+related: this use contributes one side of the overlap for effect `!Log`
+help: remove effect `!Log` from the named side
+help: or keep it out of the `..` remainder
 
 ## presence-required
 [presence-required] this value needs `x != y` among its fields, and it does not have that

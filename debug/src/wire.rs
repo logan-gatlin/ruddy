@@ -304,7 +304,15 @@ pub struct ExplanationContradiction {
     pub kind: &'static str,
     pub left: &'static str,
     pub right: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub row: Option<ExplanationRow>,
     pub repairs: [&'static str; 2],
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExplanationRow {
+    pub shape: &'static str,
+    pub label: String,
 }
 
 #[derive(Debug, Serialize)]

@@ -1704,7 +1704,10 @@ fn a_type_error_is_a_diagnostic() {
         panic!("expected one error: {:#?}", missing.diagnostics);
     };
     assert_eq!(diagnostic.code, "missing-field");
-    assert_eq!(diagnostic.message, "no field `y` on `{ x: Nat }`");
+    assert_eq!(
+        diagnostic.message,
+        "field `y` is required by one use but excluded by another"
+    );
 }
 
 /// Projection failures keep their shape-specific diagnostics and spans in the

@@ -687,6 +687,9 @@ fn wire_explanation(
             inference::ExplanationFactPayload::UsedAsFunction => "used-as-function",
             inference::ExplanationFactPayload::SuppliesArgument => "supplies-argument",
             inference::ExplanationFactPayload::BranchResult => "branch-result",
+            inference::ExplanationFactPayload::LabelDemand => "label-demand",
+            inference::ExplanationFactPayload::ClosedRow => "closed-row",
+            inference::ExplanationFactPayload::RemainderOverlap => "remainder-overlap",
         };
         crate::wire::ExplanationFact {
             span: loc(fact.span, files),
@@ -714,9 +717,23 @@ fn wire_explanation(
             kind: match contradiction.kind {
                 inference::ContradictionKind::IncompatibleTypes => "incompatible-types",
                 inference::ContradictionKind::ValueUsedAsFunction => "value-used-as-function",
+                inference::ContradictionKind::ProjectionOnNonStruct => "projection-on-non-struct",
+                inference::ContradictionKind::LabelUnavailable => "label-unavailable",
+                inference::ContradictionKind::RepeatedLabel => "repeated-label",
             },
             left: description(contradiction.left),
             right: description(contradiction.right),
+            row: contradiction
+                .row
+                .as_ref()
+                .map(|row| crate::wire::ExplanationRow {
+                    shape: match row.shape {
+                        ruddy::types::Shape::Struct => "struct",
+                        ruddy::types::Shape::Sum => "sum",
+                        ruddy::types::Shape::Effect => "effect",
+                    },
+                    label: row.label.clone(),
+                }),
             repairs: ["change-first-use", "change-second-use"],
         },
         cause: crate::wire::ExplanationCause {

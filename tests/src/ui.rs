@@ -870,6 +870,67 @@ fn ordinary_mismatch_explanations_keep_full_and_abridged_causal_evidence() {
 }
 
 #[test]
+fn row_explanations_keep_both_source_sides_and_normalize_solver_direction() {
+    let projection = include_str!("../diagnostics/inference/projection-closed-later.hc");
+    let errors = inference_fixture_errors(projection);
+    let [error] = errors.as_slice() else {
+        panic!("projection closed by a later use must have one error");
+    };
+    assert!(matches!(
+        error.kind,
+        inference::ErrorKind::MissingField { .. } | inference::ErrorKind::ExtraField { .. }
+    ));
+    let explanation = error.explanation.as_ref().expect("causal row explanation");
+    assert_eq!(
+        explanation.contradiction.kind,
+        inference::ContradictionKind::LabelUnavailable
+    );
+    assert!((2..=4).contains(&explanation.abridged.len()));
+    assert!(
+        explanation
+            .full_facts
+            .iter()
+            .any(|fact| { fact.payload == inference::ExplanationFactPayload::LabelDemand })
+    );
+    assert!(
+        explanation
+            .full_facts
+            .iter()
+            .any(|fact| { fact.payload == inference::ExplanationFactPayload::ClosedRow })
+    );
+
+    for source in [
+        include_str!("../diagnostics/inference/repeated-field-struct.hc"),
+        include_str!("../diagnostics/inference/repeated-field-sum.hc"),
+        include_str!("../diagnostics/inference/repeated-field-effect.hc"),
+    ] {
+        let errors = inference_fixture_errors(source);
+        let [error] = errors.as_slice() else {
+            panic!("each repeated-label shape must have one error");
+        };
+        let explanation = error
+            .explanation
+            .as_ref()
+            .unwrap_or_else(|| panic!("repeated-label explanation for {source}"));
+        assert_eq!(
+            explanation.contradiction.kind,
+            inference::ContradictionKind::RepeatedLabel
+        );
+        assert!((2..=4).contains(&explanation.abridged.len()));
+        assert!(explanation.cause.reasons.len() >= explanation.abridged.len());
+    }
+
+    let mut deep = String::from("let read = fn value => value.target\nlet close : { ");
+    for at in 0..256 {
+        deep.push_str(&format!("f{at}: Nat, "));
+    }
+    deep.push_str("} -> Nat = read\n");
+    let errors = inference_fixture_errors(&deep);
+    assert_eq!(errors.len(), 1, "deep closed rows retain one complaint");
+    assert!(errors[0].explanation.is_some());
+}
+
+#[test]
 fn a_function_argument_mismatch_is_not_called_a_non_function_callee() {
     let source = include_str!("../diagnostics/inference/function-argument.hc");
     let errors = inference_fixture_errors(source);
@@ -2654,6 +2715,7 @@ fn no_two_kinds_of_constraint_are_coded_the_same() {
         ConstraintKind::Performs {
             performed: Row::closed(),
             ambient: Row::closed(),
+            ambient_label_spans: IndexMap::new(),
             inside: true,
         },
     ];
@@ -3468,6 +3530,7 @@ fn the_performs_constraint_reads_as_a_widening() {
     let kind = ConstraintKind::Performs {
         performed: row(&["Log"], Rest::Closed),
         ambient: row(&["Log", "IO"], Rest::Var(3)),
+        ambient_label_spans: IndexMap::new(),
         inside: true,
     };
     assert_eq!(kind.code(), "performs");
@@ -3480,6 +3543,7 @@ fn the_performs_constraint_reads_as_a_widening() {
     let empty = ConstraintKind::Performs {
         performed: row(&[], Rest::Closed),
         ambient: row(&[], Rest::Closed),
+        ambient_label_spans: IndexMap::new(),
         inside: false,
     };
     assert_eq!(empty.to_string(), "| performed where | is allowed");

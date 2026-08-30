@@ -397,6 +397,7 @@ impl Solve<'_> {
                     performed,
                     ambient,
                     inside,
+                    ..
                 } => self.performs(span, performed, ambient, *inside),
                 ConstraintKind::CallbackCoverage {
                     required,

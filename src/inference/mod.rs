@@ -938,6 +938,8 @@ pub enum ConstraintKind {
     Performs {
         performed: Row,
         ambient: Row,
+        /// Source labels of handlers which extend `ambient`.
+        ambient_label_spans: IndexMap<String, Span>,
         /// Whether a `fn` encloses the application. What tells the two readings
         /// of a failure apart: outside every function the ambient is a
         /// definition's own, so nothing could ever have handled the effect,
@@ -994,6 +996,12 @@ pub enum ExplanationFactPayload {
     UsedAsFunction,
     SuppliesArgument,
     BranchResult,
+    /// The written `.name` / pattern operation that demands a label.
+    LabelDemand,
+    /// A source use that fixes or closes the other side of a row.
+    ClosedRow,
+    /// One of the two written uses which makes a label overlap a row remainder.
+    RemainderOverlap,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1001,14 +1009,26 @@ pub struct Contradiction {
     pub kind: ContradictionKind,
     pub left: TypeDescription,
     pub right: TypeDescription,
-    /// Neutral equality failures always retain both possible repair directions.
+    /// Present for row-shaped contradictions. The label is retained as source
+    /// syntax rather than reconstructed from a rendered solver row.
+    pub row: Option<RowContradiction>,
+    /// Neutral failures always retain both possible repair directions.
     pub repairs: [RepairDirection; 2],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowContradiction {
+    pub shape: Shape,
+    pub label: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContradictionKind {
     IncompatibleTypes,
     ValueUsedAsFunction,
+    ProjectionOnNonStruct,
+    LabelUnavailable,
+    RepeatedLabel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2540,7 +2560,7 @@ fn all_constraints(
     out
 }
 
-fn attach_mismatch_explanations(
+fn attach_ordinary_explanations(
     errors: &mut [Error],
     constraints: &IndexMap<Symbol, Vec<Constraint>>,
     steps: &[Step],
@@ -2552,8 +2572,44 @@ fn attach_mismatch_explanations(
     let reasons_by_id: HashMap<_, _> = reasons.iter().map(|reason| (reason.id, reason)).collect();
 
     for error in errors {
-        let ErrorKind::Mismatch { expected, actual } = &error.kind else {
-            continue;
+        let (left, right, kind, row) = match &error.kind {
+            ErrorKind::Mismatch { expected, actual } => {
+                (describe_type(expected), describe_type(actual), None, None)
+            }
+            ErrorKind::NotAStruct { base } => (
+                describe_type(base),
+                TypeDescription::Struct,
+                Some(ContradictionKind::ProjectionOnNonStruct),
+                None,
+            ),
+            ErrorKind::MissingField { shape, field, .. }
+            | ErrorKind::ExtraField { shape, field, .. } => (
+                match shape {
+                    Shape::Struct => TypeDescription::Struct,
+                    Shape::Sum => TypeDescription::TaggedValue,
+                    Shape::Effect => TypeDescription::Function,
+                },
+                TypeDescription::Undecided,
+                Some(ContradictionKind::LabelUnavailable),
+                Some(RowContradiction {
+                    shape: *shape,
+                    label: field.clone(),
+                }),
+            ),
+            ErrorKind::RepeatedField { shape, field } => (
+                match shape {
+                    Shape::Struct => TypeDescription::Struct,
+                    Shape::Sum => TypeDescription::TaggedValue,
+                    Shape::Effect => TypeDescription::Function,
+                },
+                TypeDescription::Undecided,
+                Some(ContradictionKind::RepeatedLabel),
+                Some(RowContradiction {
+                    shape: *shape,
+                    label: field.clone(),
+                }),
+            ),
+            _ => continue,
         };
         let seed = match error.cause {
             ErrorCause::Step(id) => steps.get(&id).map(|step| step.reason),
@@ -2588,7 +2644,7 @@ fn attach_mismatch_explanations(
             let Some(constraint) = constraints.get(id) else {
                 continue;
             };
-            let endpoints = [
+            let mut endpoints = vec![
                 (
                     constraint.subjects.primary,
                     constraint.subjects.primary_span,
@@ -2601,19 +2657,67 @@ fn attach_mismatch_explanations(
                     constraint.subjects.secondary_span,
                 ),
             ];
+            // A projection's two source ranges live in its structured payload:
+            // the field token is the demand and `base_span` is the value which
+            // supplies the other side. Do not invent spans for its fresh result.
+            if let ConstraintKind::Project { base_span, .. } = &constraint.kind {
+                endpoints = vec![
+                    (Subject::ProjectionBase, Some(*base_span)),
+                    (Subject::PatternDemand, Some(constraint.span)),
+                ];
+            } else if let ConstraintKind::Performs {
+                ambient_label_spans,
+                ..
+            } = &constraint.kind
+                && kind == Some(ContradictionKind::RepeatedLabel)
+                && let Some(row) = &row
+                && let Some(ambient_span) = ambient_label_spans.get(&row.label)
+            {
+                endpoints = vec![
+                    (Subject::PerformedEffects, Some(constraint.span)),
+                    (Subject::AmbientEffects, Some(*ambient_span)),
+                ];
+            } else if kind.is_some() && endpoints.iter().all(|(_, span)| span.is_none()) {
+                // Unary/scoping constraints still own their written operation's
+                // range even when no independently written second operand exists.
+                endpoints[0].1 = Some(constraint.span);
+            }
             for (subject, span) in endpoints {
                 let Some(span) = span else { continue };
-                let payload = match (constraint.origin, subject) {
-                    (ConstraintOrigin::ApplicationCallee, Subject::Callee) => {
-                        ExplanationFactPayload::UsedAsFunction
+                let payload = if kind == Some(ContradictionKind::RepeatedLabel) {
+                    ExplanationFactPayload::RemainderOverlap
+                } else {
+                    match (constraint.origin, subject) {
+                        (ConstraintOrigin::Projection, Subject::PatternDemand)
+                        | (ConstraintOrigin::Pattern, Subject::PatternDemand)
+                            if kind.is_some() =>
+                        {
+                            ExplanationFactPayload::LabelDemand
+                        }
+                        (ConstraintOrigin::Projection, Subject::ProjectionBase)
+                            if kind.is_some() =>
+                        {
+                            ExplanationFactPayload::ClosedRow
+                        }
+                        (_, Subject::Argument | Subject::Term)
+                            if matches!(kind, Some(ContradictionKind::LabelUnavailable)) =>
+                        {
+                            ExplanationFactPayload::LabelDemand
+                        }
+                        _ if matches!(kind, Some(ContradictionKind::LabelUnavailable)) => {
+                            ExplanationFactPayload::ClosedRow
+                        }
+                        (ConstraintOrigin::ApplicationCallee, Subject::Callee) => {
+                            ExplanationFactPayload::UsedAsFunction
+                        }
+                        (ConstraintOrigin::ApplicationArgument, _) => {
+                            ExplanationFactPayload::SuppliesArgument
+                        }
+                        (ConstraintOrigin::MatchArm | ConstraintOrigin::Match, _) => {
+                            ExplanationFactPayload::BranchResult
+                        }
+                        _ => ExplanationFactPayload::RequiresType,
                     }
-                    (ConstraintOrigin::ApplicationArgument, _) => {
-                        ExplanationFactPayload::SuppliesArgument
-                    }
-                    (ConstraintOrigin::MatchArm | ConstraintOrigin::Match, _) => {
-                        ExplanationFactPayload::BranchResult
-                    }
-                    _ => ExplanationFactPayload::RequiresType,
                 };
                 full_facts.push(ExplanationFact {
                     span,
@@ -2624,9 +2728,21 @@ fn attach_mismatch_explanations(
                 });
             }
         }
+        // Overlap is discovered while combining two independently written row
+        // uses. Some unary effect constraints name only their own operation;
+        // the failed step's source span is the other grounded endpoint.
+        if kind == Some(ContradictionKind::RepeatedLabel)
+            && full_facts.len() == 1
+            && full_facts[0].span != error.span
+        {
+            let first = full_facts[0].clone();
+            full_facts.push(ExplanationFact {
+                span: error.span,
+                ..first
+            });
+        }
         // A reason without a written endpoint cannot support source labels.
-        // Keep the established mismatch diagnostic rather than inventing
-        // pending contextual facts and claiming they came from the program.
+        // Keep the established diagnostic rather than inventing context.
         if full_facts.is_empty() {
             continue;
         }
@@ -2649,28 +2765,41 @@ fn attach_mismatch_explanations(
         // Keep the failed source endpoint primary; the other genuinely written
         // causes remain related labels even when their reasons precede it.
         abridged.sort_by_key(|at| full_facts[*at].span != error.span);
-        let leaf = smallest_incompatible(aliases, expected, actual);
+        // These row families promise labels on both causal sides. If recovery
+        // retained only one written endpoint, keep the honest family fallback.
+        if kind.is_some() && candidates.len() < 2 {
+            continue;
+        }
+        let leaf = match &error.kind {
+            ErrorKind::Mismatch { expected, actual } => {
+                smallest_incompatible(aliases, expected, actual)
+            }
+            _ => (left, right),
+        };
         let failing_constraint = match error.cause {
             ErrorCause::Step(id) => steps.get(&id).and_then(|step| step.constraint),
             ErrorCause::Batch(_) | ErrorCause::Direct => None,
         };
-        let value_used_as_function = failing_constraint
-            .and_then(|id| constraints.get(&id))
-            .is_some_and(|constraint| {
-                constraint.origin == ConstraintOrigin::ApplicationCallee
-                    && (leaf.0 == TypeDescription::Function || leaf.1 == TypeDescription::Function)
-            });
+        let value_used_as_function = kind.is_none()
+            && failing_constraint
+                .and_then(|id| constraints.get(&id))
+                .is_some_and(|constraint| {
+                    constraint.origin == ConstraintOrigin::ApplicationCallee
+                        && (leaf.0 == TypeDescription::Function
+                            || leaf.1 == TypeDescription::Function)
+                });
         error.explanation = Some(InferenceExplanation {
             full_facts,
             abridged,
             contradiction: Contradiction {
-                kind: if value_used_as_function {
+                kind: kind.unwrap_or(if value_used_as_function {
                     ContradictionKind::ValueUsedAsFunction
                 } else {
                     ContradictionKind::IncompatibleTypes
-                },
+                }),
                 left: leaf.0,
                 right: leaf.1,
+                row,
                 repairs: [
                     RepairDirection::ChangeFirstUse,
                     RepairDirection::ChangeSecondUse,
@@ -2996,6 +3125,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 ambient: constrain::Ambient {
                     row: Row::closed(),
                     inside: false,
+                    label_spans: IndexMap::new(),
                 },
                 answer: None,
                 presence_guard: Formula::True,
@@ -3239,7 +3369,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     constraints.sort_by(|one, _, other, _| position[one].cmp(&position[other]));
     promises.sort_by(|one, _, other, _| position[one].cmp(&position[other]));
 
-    attach_mismatch_explanations(&mut errors, &constraints, &steps, &table.reasons, &aliases);
+    attach_ordinary_explanations(&mut errors, &constraints, &steps, &table.reasons, &aliases);
 
     // Constraints are solved in the order the walk emitted them, which is not
     // quite the order anyone reads a file in — a body's demands come before

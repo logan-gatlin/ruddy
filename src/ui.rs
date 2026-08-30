@@ -2581,7 +2581,10 @@ fn type_description(description: inference::TypeDescription) -> &'static str {
     }
 }
 
-fn explanation_fact(fact: &inference::ExplanationFact) -> String {
+fn explanation_fact(
+    fact: &inference::ExplanationFact,
+    contradiction: &inference::Contradiction,
+) -> String {
     use inference::ExplanationFactPayload as P;
     match fact.payload {
         P::UsedAsFunction => "this expression is called as a function".into(),
@@ -2601,6 +2604,30 @@ fn explanation_fact(fact: &inference::ExplanationFact) -> String {
             }
             _ => "this match requires its branches to agree".into(),
         },
+        P::LabelDemand => {
+            if let Some(row) = &contradiction.row {
+                let (noun, label) = about(row.shape, &row.label);
+                format!("this use requires {noun} `{label}`")
+            } else {
+                "this field access requires a struct".into()
+            }
+        }
+        P::ClosedRow => {
+            if let Some(row) = &contradiction.row {
+                let (noun, label) = about(row.shape, &row.label);
+                format!("this use limits the type so {noun} `{label}` is unavailable")
+            } else {
+                "this value supplies a non-struct type here".into()
+            }
+        }
+        P::RemainderOverlap => {
+            let row = contradiction
+                .row
+                .as_ref()
+                .expect("overlap fact has row metadata");
+            let (noun, label) = about(row.shape, &row.label);
+            format!("this use contributes one side of the overlap for {noun} `{label}`")
+        }
         P::RequiresType => match fact.subject {
             inference::Subject::Binding
             | inference::Subject::TopLevelBinding
@@ -2630,7 +2657,48 @@ fn mismatch_title(contradiction: &inference::Contradiction) -> String {
             format!("{value} cannot be called as a function")
         }
         K::IncompatibleTypes => format!("{left} and {right} cannot be the same type"),
+        K::ProjectionOnNonStruct => format!("{left} cannot provide struct fields"),
+        K::LabelUnavailable => {
+            let row = contradiction
+                .row
+                .as_ref()
+                .expect("row contradiction metadata");
+            let (noun, label) = about(row.shape, &row.label);
+            format!("{noun} `{label}` is required by one use but excluded by another")
+        }
+        K::RepeatedLabel => {
+            let row = contradiction
+                .row
+                .as_ref()
+                .expect("row contradiction metadata");
+            let (noun, label) = about(row.shape, &row.label);
+            format!("{noun} `{label}` cannot be both named and included by `..`")
+        }
     }
+}
+
+fn causal_diagnostic(
+    mut diagnostic: Diagnostic,
+    explanation: &inference::InferenceExplanation,
+) -> Diagnostic {
+    diagnostic.title = mismatch_title(&explanation.contradiction);
+    let mut selected = explanation
+        .abridged
+        .iter()
+        .filter_map(|at| explanation.full_facts.get(*at));
+    if let Some(primary) = selected.next() {
+        diagnostic.primary.span = primary.span;
+        diagnostic.primary.message = explanation_fact(primary, &explanation.contradiction);
+    } else {
+        diagnostic.primary.message = "these uses contribute conflicting requirements".into();
+    }
+    for fact in selected {
+        diagnostic = diagnostic.related(
+            fact.span,
+            explanation_fact(fact, &explanation.contradiction),
+        );
+    }
+    diagnostic
 }
 
 impl inference::Error {
@@ -2644,9 +2712,15 @@ impl inference::Error {
         let mut diagnostic = Diagnostic::new(self.kind.code(), self.kind.to_string(), self.span);
         match &self.kind {
             E::NotAStruct { .. } => {
-                diagnostic = diagnostic
-                    .label("this field access requires a struct")
-                    .help("change this value to a struct, or change/remove the field access")
+                if let Some(explanation) = &self.explanation {
+                    diagnostic = causal_diagnostic(diagnostic, explanation)
+                        .help("change the value to a struct")
+                        .help("or change/remove the field access");
+                } else {
+                    diagnostic = diagnostic
+                        .label("this field access requires a struct")
+                        .help("change this value to a struct, or change/remove the field access");
+                }
             }
             E::Mismatch { .. } => {
                 if let Some(explanation) = &self.explanation {
@@ -2657,13 +2731,17 @@ impl inference::Error {
                         .filter_map(|at| explanation.full_facts.get(*at));
                     if let Some(primary) = selected.next() {
                         diagnostic.primary.span = primary.span;
-                        diagnostic.primary.message = explanation_fact(primary);
+                        diagnostic.primary.message =
+                            explanation_fact(primary, &explanation.contradiction);
                     } else {
                         diagnostic.primary.message =
                             "these uses contribute incompatible type requirements".into();
                     }
                     for fact in selected {
-                        diagnostic = diagnostic.related(fact.span, explanation_fact(fact));
+                        diagnostic = diagnostic.related(
+                            fact.span,
+                            explanation_fact(fact, &explanation.contradiction),
+                        );
                     }
                     diagnostic = diagnostic
                         .help("change the first use so it agrees with the other one")
@@ -2679,23 +2757,19 @@ impl inference::Error {
                     .label("this use makes the type refer back to itself")
                     .help("remove the self-reference or introduce a finite wrapper type")
             }
-            E::MissingField { shape, field, .. } => {
+            E::MissingField { shape, field, .. } | E::ExtraField { shape, field, .. } => {
                 let (noun, field) = about(*shape, field);
-                diagnostic = diagnostic
-                    .label(format!("this requires {noun} `{field}`"))
-                    .help(format!(
-                        "add {noun} `{field}`, or change the use that requires it"
-                    ));
-            }
-            E::ExtraField { shape, field, .. } => {
-                let (noun, field) = about(*shape, field);
-                diagnostic = diagnostic
-                    .label(format!(
-                        "this introduces {noun} `{field}` where it is not allowed"
-                    ))
-                    .help(format!(
-                        "remove {noun} `{field}`, or allow it in the other type"
-                    ));
+                if let Some(explanation) = &self.explanation {
+                    diagnostic = causal_diagnostic(diagnostic, explanation)
+                        .help(format!("allow {noun} `{field}` in the limiting use"))
+                        .help(format!("or change the use that requires {noun} `{field}`"));
+                } else {
+                    diagnostic = diagnostic
+                        .label(format!("this use conflicts over {noun} `{field}`"))
+                        .help(format!(
+                            "allow {noun} `{field}`, or change the use that requires it"
+                        ));
+                }
             }
             E::RigidBroken { declared, .. } => {
                 diagnostic = diagnostic
@@ -2730,11 +2804,17 @@ impl inference::Error {
             }
             E::RepeatedField { shape, field } => {
                 let (noun, field) = about(*shape, field);
-                diagnostic = diagnostic
-                    .label(format!("{noun} `{field}` is already named outside `..`"))
-                    .help(format!(
-                        "remove the repeated {noun}, or remove it from the remainder"
-                    ));
+                if let Some(explanation) = &self.explanation {
+                    diagnostic = causal_diagnostic(diagnostic, explanation)
+                        .help(format!("remove {noun} `{field}` from the named side"))
+                        .help(format!("or keep it out of the `..` remainder"));
+                } else {
+                    diagnostic = diagnostic
+                        .label(format!("{noun} `{field}` is already named outside `..`"))
+                        .help(format!(
+                            "remove the repeated {noun}, or remove it from the remainder"
+                        ));
+                }
             }
             E::PresenceRequired { .. } => {
                 diagnostic = diagnostic

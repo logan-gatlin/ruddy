@@ -101,6 +101,8 @@ pub type Operations = IndexMap<(Symbol, ir::OperationSelector), (Rc<Ty>, Rc<Ty>)
 pub struct Ambient {
     pub row: Row,
     pub inside: bool,
+    /// Written handler labels currently extending this ambient row.
+    pub label_spans: IndexMap<String, Span>,
 }
 
 /// One entry of a match's column at one position: the sub-pattern an arm wrote
@@ -553,6 +555,7 @@ impl Constrain<'_> {
                     ConstraintKind::Performs {
                         performed,
                         ambient: self.ambient.row.clone(),
+                        ambient_label_spans: self.ambient.label_spans.clone(),
                         inside: self.ambient.inside,
                     },
                 );
@@ -568,6 +571,7 @@ impl Constrain<'_> {
                 let outer = self.enter(Ambient {
                     row: does.clone(),
                     inside: true,
+                    label_spans: IndexMap::new(),
                 });
                 // And a closure answers no arm, whichever one it was written
                 // in: it can outlive the `handle` and be called with nothing on
@@ -877,12 +881,31 @@ impl Constrain<'_> {
         // discharges. A row that acquired one would name it twice, which is
         // exactly the masking R16 leaves refused.
         self.table.note_lacks_row(&extended, Shape::Effect);
+        let mut label_spans = self.ambient.label_spans.clone();
+        label_spans.extend(
+            handler
+                .discharges
+                .iter()
+                .map(|effect| (self.effect_ids[&effect.tracked].row_key(), effect.span)),
+        );
         let outer = self.enter(Ambient {
             row: extended,
             inside: self.ambient.inside,
+            label_spans,
         });
         self.infer_term(body);
         self.leave(outer);
+
+        // The arms run in the outer row, but that row now has a lacks fact for
+        // every discharged effect. Retain the written labels as provenance
+        // while walking those arms so an overlap can point to both operations.
+        let previous_label_spans = self.ambient.label_spans.clone();
+        self.ambient.label_spans.extend(
+            handler
+                .discharges
+                .iter()
+                .map(|effect| (self.effect_ids[&effect.tracked].row_key(), effect.span)),
+        );
 
         // An arm answers the handler around it, whichever arm a `raise` inside
         // it is written in.
@@ -941,6 +964,7 @@ impl Constrain<'_> {
             }
         }
         self.answer = held;
+        self.ambient.label_spans = previous_label_spans;
         answer
     }
 
@@ -1262,6 +1286,7 @@ impl Constrain<'_> {
                 let outer = self.enter(Ambient {
                     row: does,
                     inside: true,
+                    label_spans: IndexMap::new(),
                 });
                 let held = self.answer.take();
                 self.check_term(body, &to, expected_subject, expected_span);
