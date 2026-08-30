@@ -5,7 +5,7 @@ use std::{
     rc::Rc,
 };
 
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use ruddy::{
     artifact::{
         self, Artifact, Block, Callee, End, Formula, Global, Instr, Lir, Literal, Op, Param,
@@ -141,6 +141,7 @@ fn model_artifact() -> Artifact {
             scheme: Scheme {
                 count: 15,
                 presences: 7,
+                existentials: Vec::new(),
                 formula: formulas[index % formulas.len()].clone(),
                 body,
             },
@@ -277,6 +278,7 @@ fn model_artifact() -> Artifact {
                     scheme: Scheme {
                         count: 1,
                         presences: 0,
+                        existentials: Vec::new(),
                         formula: Formula::True,
                         body: plain(unit()),
                     },
@@ -291,6 +293,7 @@ fn model_artifact() -> Artifact {
                     scheme: Scheme {
                         count: 1,
                         presences: 0,
+                        existentials: Vec::new(),
                         formula: Formula::True,
                         body: rich(unit()),
                     },
@@ -305,6 +308,7 @@ fn model_artifact() -> Artifact {
                     scheme: Scheme {
                         count: 2,
                         presences: 1,
+                        existentials: Vec::new(),
                         formula: Formula::Var(0),
                         body: plain(Type::Sum(row(Rest::Closed))),
                     },
@@ -319,6 +323,7 @@ fn model_artifact() -> Artifact {
                     scheme: Scheme {
                         count: 3,
                         presences: 2,
+                        existentials: Vec::new(),
                         formula: Formula::Bound(1),
                         body: plain(Type::Arrow(
                             Box::new(plain(Type::Nat)),
@@ -383,6 +388,168 @@ fn model_artifact() -> Artifact {
             }],
         },
     }
+}
+
+#[test]
+fn existential_presence_ownership_round_trips_and_is_validated() {
+    let mut artifact = model_artifact();
+    let scheme = &mut artifact.header.values[0].scheme;
+    scheme.existentials = vec![0, 3];
+    scheme.body = Type::Package(Box::new(Type::Struct(Row {
+        labels: vec![("a".into(), field(Presence::Bound(0), Type::Nat))],
+        rest: Rest::More(Box::new(Row {
+            labels: vec![("b".into(), field(Presence::Bound(3), Type::Nat))],
+            rest: Rest::Closed,
+        })),
+    })));
+    scheme.formula = Formula::Owned(
+        0,
+        Box::new(Formula::Iff(
+            Box::new(Formula::Bound(1)), // a universal in this scheme
+            Box::new(Formula::Or(
+                Box::new(Formula::Bound(0)),
+                Box::new(Formula::Bound(3)),
+            )),
+        )),
+    );
+    let printed = assert_round_trip(&artifact);
+    assert!(printed.contains("(existentials 0 3)"), "{printed}");
+
+    assert_malformed(&printed.replacen("(existentials 0 3)", "(existentials 3 0)", 1));
+    assert_malformed(&printed.replacen("(existentials 0 3)", "(existentials 0 0)", 1));
+    assert_malformed(&printed.replacen("(existentials 0 3)", "(existentials 0 7)", 1));
+    assert_malformed(&printed.replacen("(owned 0", "(owned 1", 1));
+    assert_malformed(&printed.replacen("(bound 1)", "(bound 7)", 1));
+    assert_malformed(&printed.replacen("(owned 0", "", 1).replacen(")", "", 1));
+    // Presence positions share the scheme's quantifier space; accepting more
+    // presence slots than total slots would let malformed bounds pass all
+    // subsequent per-presence checks.
+    assert_malformed(&printed.replacen("(scheme 15 7", "(scheme 6 7", 1));
+}
+
+#[test]
+fn owned_disjunction_with_nested_conjunction_round_trips() {
+    let mut artifact = model_artifact();
+    let scheme = &mut artifact.header.values[0].scheme;
+    scheme.existentials = vec![0, 1];
+    scheme.body = Type::Package(Box::new(Type::Struct(Row {
+        labels: vec![
+            ("a".into(), field(Presence::Bound(0), Type::Nat)),
+            ("b".into(), field(Presence::Bound(1), Type::Nat)),
+        ],
+        rest: Rest::Closed,
+    })));
+    scheme.formula = Formula::Owned(
+        0,
+        Box::new(Formula::Or(
+            Box::new(Formula::And(
+                Box::new(Formula::Bound(0)),
+                Box::new(Formula::Bound(1)),
+            )),
+            Box::new(Formula::Not(Box::new(Formula::Bound(0)))),
+        )),
+    );
+
+    let printed = assert_round_trip(&artifact);
+    assert!(printed.contains("(owned 0 (or (and"), "{printed}");
+
+    // The same conjunction directly beneath Owned is partitionable and is not
+    // compiler-canonical, unlike the conjunction nested in the disjunction.
+    let malformed = printed.replacen("(or (and", "(and (and", 1);
+    assert_malformed(&malformed);
+}
+
+#[test]
+fn broad_existential_package_validation_scales() {
+    const WIDTH: u32 = 4_096;
+    let mut artifact = model_artifact();
+    let scheme = &mut artifact.header.values[0].scheme;
+    scheme.count = WIDTH + 1;
+    scheme.presences = WIDTH + 1;
+    scheme.existentials = (0..WIDTH).collect();
+    scheme.body = Type::Package(Box::new(Type::Struct(Row {
+        labels: (0..WIDTH)
+            .map(|index| {
+                (
+                    format!("slot{index}"),
+                    field(Presence::Bound(index), Type::Nat),
+                )
+            })
+            .collect(),
+        rest: Rest::Closed,
+    })));
+
+    // Include every existential and one universal in an indivisible owned
+    // proposition. This exercises both broad body-owner membership checks and
+    // the mixed formula scan without creating a recursively deep formula.
+    let mut formulas: Vec<_> = (0..=WIDTH).map(Formula::Bound).collect();
+    while formulas.len() > 1 {
+        formulas = formulas
+            .chunks(2)
+            .map(|pair| match pair {
+                [left, right] => Formula::Or(Box::new(left.clone()), Box::new(right.clone())),
+                [only] => only.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+    }
+    scheme.formula = Formula::Owned(0, Box::new(formulas.pop().unwrap()));
+
+    let printed = artifact.print();
+    let parsed = Artifact::try_parse(&printed).expect("broad package remains valid");
+    assert_eq!(
+        parsed.header.values[0].scheme.existentials.len(),
+        WIDTH as usize
+    );
+}
+
+#[test]
+fn broad_semantic_scheme_converts_to_artifact_linearly() {
+    const WIDTH: u32 = 4_096;
+    let (mint, program, mut inferred, lowered) = compiled("let target = {}\n");
+    let symbol = inferred
+        .schemes
+        .keys()
+        .copied()
+        .find(|symbol| mint.name(*symbol) == "target")
+        .expect("target scheme exists");
+    let labels = (0..WIDTH)
+        .map(|index| {
+            (
+                format!("slot{index}"),
+                types::RowField {
+                    presence: types::Presence::Bound(index),
+                    ty: Rc::new(types::Ty::Nat),
+                },
+            )
+        })
+        .collect();
+    let body = Rc::new(types::Ty::Package(Rc::new(types::Ty::Struct(types::Row {
+        labels,
+        rest: types::Rest::Closed,
+    }))));
+    let formula = types::Formula::any((0..WIDTH).map(types::Formula::bound));
+    inferred.schemes.insert(
+        symbol,
+        types::Scheme::existential(
+            WIDTH,
+            WIDTH,
+            (0..WIDTH).collect::<IndexSet<_>>(),
+            body,
+            formula,
+        ),
+    );
+
+    let artifact = Artifact::build(&mint, &program, &inferred, &lowered);
+    let value = artifact
+        .header
+        .values
+        .iter()
+        .find(|value| value.name.ends_with("::target"))
+        .expect("target is exported");
+    assert_eq!(value.scheme.existentials.len(), WIDTH as usize);
+    assert!(matches!(value.scheme.formula, Formula::Owned(0, _)));
+    Artifact::try_parse(&artifact.print()).expect("broad semantic scheme round trips");
 }
 
 fn assert_round_trip(value: &Artifact) -> String {
@@ -498,6 +665,87 @@ fn compact(text: &str) -> String {
         }
     }
     out
+}
+
+#[test]
+fn nested_existential_result_boundaries_survive_artifact_text() {
+    let artifact = built(
+        "extern nested: ((Nat ->\n\
+         { left when 'p: Nat, right when 'q: Nat }) -> Nat) -> Nat\n\
+         where 'p != 'q = host.nested\n",
+    );
+    let value = artifact
+        .header
+        .values
+        .iter()
+        .find(|value| value.name.ends_with("::nested"))
+        .expect("the nested extern is published");
+    let Type::Arrow(outer_from, _, _) = &value.scheme.body else {
+        panic!(
+            "expected the outer callback arrow: {:#?}",
+            value.scheme.body
+        );
+    };
+    let Type::Arrow(callback_from, _, _) = &**outer_from else {
+        panic!("expected the nested callback arrow: {outer_from:#?}");
+    };
+    let Type::Arrow(_, callback_result, _) = &**callback_from else {
+        panic!("expected the callback-producing arrow: {callback_from:#?}");
+    };
+    assert!(
+        matches!(&**callback_result, Type::Package(body) if matches!(&**body, Type::Struct(_))),
+        "the package must stay at the innermost result: {callback_result:#?}"
+    );
+
+    let printed = assert_round_trip(&artifact);
+    let reparsed = Artifact::parse(&printed);
+    let reparsed = reparsed
+        .header
+        .values
+        .iter()
+        .find(|value| value.name.ends_with("::nested"))
+        .expect("the nested extern survives decoding");
+    assert_eq!(reparsed.scheme.existentials, value.scheme.existentials);
+    assert!(
+        matches!(reparsed.scheme.formula, Formula::Owned(0, _)),
+        "the guarantee belongs to the exact nested result package: {:#?}",
+        reparsed.scheme.formula
+    );
+    assert!(printed.contains("(existentials"), "{printed}");
+    assert!(printed.contains("(owned 0 (xor"), "{printed}");
+
+    let invalid = printed.replacen("(owned 0", "(owned 1", 1);
+    let error = Artifact::try_parse(&invalid).expect_err("owner 1 names no package");
+    assert_eq!(
+        error.message(),
+        "formula package owner is outside scheme body"
+    );
+}
+
+#[test]
+fn mixed_universal_input_to_existential_result_guarantee_round_trips() {
+    let artifact = built(
+        "extern relate: { input when 'u: Nat } ->\n\
+         { result when 'e: Nat } where 'u = 'e = host.relate\n",
+    );
+    let value = artifact
+        .header
+        .values
+        .iter()
+        .find(|value| value.name.ends_with("::relate"))
+        .expect("the extern is published");
+    assert_eq!(value.scheme.existentials.len(), 1);
+    assert!(
+        matches!(
+            value.scheme.formula,
+            Formula::Owned(0, ref inner) if matches!(&**inner, Formula::Iff(..))
+        ),
+        "the indivisible mixed guarantee belongs to its result package: {:#?}",
+        value.scheme.formula
+    );
+
+    let printed = assert_round_trip(&artifact);
+    assert!(printed.contains("(owned 0 (iff"), "{printed}");
 }
 
 #[test]
@@ -775,7 +1023,7 @@ fn building_translates_every_compiler_semantic_and_lir_variant() {
     );
     inferred
         .schemes
-        .insert(symbol, types::Scheme::constrained(7, 1, body, formula));
+        .insert(symbol, types::Scheme::constrained(7, 3, body, formula));
 
     let span = Span::default();
     let nested = |kind| lir::Block {
@@ -1152,8 +1400,16 @@ fn malformed_text_exercises_every_parser_and_reader_error_shape() {
     assert_malformed(&replace_balanced(&valid, "(named \"other@", "(named)"));
     assert_bad_replacement(&valid, "(ty nat)", "(ty \"wrong\")");
     assert_bad_replacement(&valid, "field present", "field (wrong)");
-    assert_bad_replacement(&valid, " 7 true ", " 7 \"wrong\" ");
-    assert_bad_replacement(&valid, " 7 true ", " 7 wrong ");
+    assert_bad_replacement(
+        &valid,
+        " 7 (existentials) true ",
+        " 7 (existentials) \"wrong\" ",
+    );
+    assert_bad_replacement(
+        &valid,
+        " 7 (existentials) true ",
+        " 7 (existentials) wrong ",
+    );
 
     // Recursive LIR collections distinguish malformed entries, both optional
     // block cardinalities, and a non-list call target.
@@ -1339,6 +1595,7 @@ fn deeply_nested_artifact_semantics_decode_on_a_small_stack() {
                 scheme: Scheme {
                     count: 0,
                     presences: 0,
+                    existentials: Vec::new(),
                     formula: Formula::True,
                     body: plain(unit()),
                 },
@@ -1633,6 +1890,7 @@ fn recursive_artifact_ownership_clones_and_drops_on_a_small_stack() {
                         scheme: Scheme {
                             count: 0,
                             presences: 0,
+                            existentials: Vec::new(),
                             formula: deep_formula(),
                             body: deep_type(),
                         },
@@ -1643,6 +1901,7 @@ fn recursive_artifact_ownership_clones_and_drops_on_a_small_stack() {
                         scheme: Scheme {
                             count: 0,
                             presences: 0,
+                            existentials: Vec::new(),
                             formula: Formula::True,
                             body: deep_row_type(),
                         },
@@ -1671,6 +1930,7 @@ fn recursive_artifact_ownership_clones_and_drops_on_a_small_stack() {
                 scheme: Scheme {
                     count: 0,
                     presences: 0,
+                    existentials: Vec::new(),
                     formula: deep_formula(),
                     body: deep_type(),
                 },
@@ -1681,6 +1941,7 @@ fn recursive_artifact_ownership_clones_and_drops_on_a_small_stack() {
                 scheme: Scheme {
                     count: 0,
                     presences: 0,
+                    existentials: Vec::new(),
                     formula: Formula::True,
                     body: deep_row_type(),
                 },
@@ -1736,7 +1997,7 @@ fn valid_deep_artifact_parses_and_drops_on_a_small_stack() {
     let formula = format!("{}true{}", "(not ".repeat(DEPTH), ")".repeat(DEPTH));
     let valid = format!(
         "(artifact (header (identity \"deep\" \"1\") (dependencies) \
-         (values (value \"deep@1::value\" (scheme 0 0 {formula} (ty nat)))) \
+         (values (value \"deep@1::value\" (scheme 0 0 (existentials) {formula} (ty nat)))) \
          (types) (effects)) (lir (externs) (functions) (globals)))"
     );
 
@@ -1798,7 +2059,7 @@ fn rejected_deep_semantic_model_is_destroyed_on_a_small_stack() {
     let formula = format!("{}true{}", "(not ".repeat(DEPTH), ")".repeat(DEPTH));
     let malformed = format!(
         "(artifact (header (identity \"deep\" \"1\") (dependencies) \
-         (values (value \"deep@1::value\" (scheme 0 0 {formula} (ty (struct (row (labels) closed)))))) \
+         (values (value \"deep@1::value\" (scheme 0 0 (existentials) {formula} (ty (struct (row (labels) closed)))))) \
          (types) (effects)) (lir (externs) (functions) wrong))"
     );
 

@@ -704,6 +704,9 @@ pub enum TypeField {
 pub struct When {
     pub span: Span,
     pub name: Option<String>,
+    /// Program-unique even for `when _`; anonymous occurrences must never
+    /// accidentally share an inferred package slot.
+    pub id: u32,
 }
 
 /// A `where` clause, lowered: a formula over the names the written type's
@@ -746,12 +749,21 @@ pub struct Annotation {
     /// pass already settled. Empty for an annotation that declares nothing,
     /// which is every annotation the language had before this.
     pub variables: Vec<Variable>,
+    /// Anonymous positive-only occurrences and their exact producer boundary.
+    /// Each `when _` has its own id even when several share a boundary.
+    pub anonymous_existentials: Vec<(u32, Span)>,
     pub clause: Option<Clause>,
 }
 
 /// One variable a variable statement declared.
 #[derive(Debug, Clone)]
 pub struct Variable {
+    /// Whether this presence is selected by callers or hidden by the value
+    /// which produces it. Non-presence variables are always `Universal`.
+    ///
+    /// This is computed from the complete lowered annotation rather than at a
+    /// `when` occurrence, because arrows can reverse polarity more than once.
+    pub ownership: PresenceOwnership,
     /// Where the name was written, so a complaint about what the body did with
     /// it can point back at the promise it broke.
     pub span: Span,
@@ -765,6 +777,334 @@ pub struct Variable {
     /// each write `a` declare two variables, and this is what keeps them apart
     /// wherever both are in hand at once.
     pub id: u32,
+}
+
+/// Ownership inferred for an annotation variable from its type polarity.
+///
+/// Existential ownership is semantic metadata only: it adds no source syntax
+/// and has no runtime representation. `boundary` identifies the result/value
+/// node which owns the hidden choice, allowing later lowering to preserve
+/// nested result scopes instead of prenexing every presence into the scheme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresenceOwnership {
+    Universal,
+    Existential { boundary: Span },
+}
+
+#[derive(Debug, Clone, Default)]
+struct PresenceOccurrences {
+    positive: u32,
+    negative: u32,
+    owners: Vec<Span>,
+}
+
+impl PresenceOccurrences {
+    /// The exact written production boundary shared by every positive
+    /// occurrence. Containing boundaries are deliberately not unified: an
+    /// invocation result makes a fresh choice, so its witness cannot also be
+    /// the witness of the enclosing value (or of a sibling invocation).
+    fn owner(&self) -> Result<Span, (Span, Span)> {
+        let owner = self
+            .owners
+            .first()
+            .copied()
+            .expect("a positive presence occurrence has an owner");
+        self.owners
+            .iter()
+            .copied()
+            .find(|candidate| *candidate != owner)
+            .map_or(Ok(owner), |second| Err((owner, second)))
+    }
+}
+
+/// Compute presence polarity and every positive production boundary used by a
+/// name. Formula uses are deliberately absent: a formula relates
+/// presences established by labels but does not decide their ownership.
+fn presence_polarities(
+    ty: &Type,
+    variances: &HashMap<Slot, u8>,
+) -> HashMap<u32, PresenceOccurrences> {
+    fn note(
+        out: &mut HashMap<u32, PresenceOccurrences>,
+        when: &Option<Box<When>>,
+        positive: bool,
+        owner: Span,
+    ) {
+        let Some(when) = when.as_ref() else { return };
+        let occurrence = out.entry(when.id).or_default();
+        if positive {
+            occurrence.positive += 1;
+            occurrence.owners.push(owner);
+        } else {
+            occurrence.negative += 1;
+        }
+    }
+
+    enum Work<'a> {
+        Ty(&'a Type, bool, Span),
+        Effects(&'a EffectRow, bool, Span),
+    }
+
+    // An explicit worklist is important here: annotations and imported alias
+    // applications are recovery input and may be far deeper than Rust's call
+    // stack. Push in reverse source order so first-occurrence diagnostics stay
+    // deterministic.
+    let mut out = HashMap::new();
+    let mut seen: HashMap<(usize, Span), u8> = HashMap::new();
+    let mut work = vec![Work::Ty(ty, true, ty.span)];
+    while let Some(part) = work.pop() {
+        match part {
+            Work::Effects(row, positive, owner) => {
+                for effect in row.effects.values() {
+                    if let EffectLabel::Written { when, .. } = effect {
+                        note(&mut out, when, positive, owner);
+                    }
+                }
+            }
+            Work::Ty(ty, positive, owner) => {
+                let bit = if positive { COVARIANT } else { CONTRAVARIANT };
+                let visited = seen.entry((ty as *const Type as usize, owner)).or_default();
+                if *visited & bit != 0 {
+                    continue;
+                }
+                *visited |= bit;
+                match &ty.tracked {
+                    TypeKind::Arrow { from, to, effects } => {
+                        work.push(Work::Effects(effects, positive, owner));
+                        let result_owner = if positive { to.span } else { owner };
+                        work.push(Work::Ty(to, positive, result_owner));
+                        work.push(Work::Ty(from, !positive, owner));
+                    }
+                    TypeKind::Struct { fields, .. } => {
+                        for field in fields.values().rev() {
+                            if let TypeField::Written { when, value, .. } = field {
+                                note(&mut out, when, positive, owner);
+                                work.push(Work::Ty(value, positive, owner));
+                            }
+                        }
+                    }
+                    TypeKind::Sum { cases, .. } => {
+                        for case in cases.values().rev() {
+                            if let SumCase::Written { when, payload, .. } = case {
+                                note(&mut out, when, positive, owner);
+                                if let Some(payload) = payload {
+                                    work.push(Work::Ty(payload, positive, owner));
+                                }
+                            }
+                        }
+                    }
+                    TypeKind::Effects(effects) => {
+                        work.push(Work::Effects(effects, positive, owner))
+                    }
+                    TypeKind::Apply { head, args, .. } => {
+                        for (at, arg) in args.iter().enumerate().rev() {
+                            let variance = variances.get(&(*head, at as u32)).copied().unwrap_or(3);
+                            if variance & 2 != 0 {
+                                work.push(Work::Ty(arg, !positive, owner));
+                            }
+                            if variance & 1 != 0 {
+                                work.push(Work::Ty(arg, positive, owner));
+                            }
+                        }
+                    }
+                    TypeKind::Ident(_)
+                    | TypeKind::Param { .. }
+                    | TypeKind::Prim(_)
+                    | TypeKind::Var(_)
+                    | TypeKind::Hole
+                    | TypeKind::Error => {}
+                }
+            }
+        }
+    }
+    out
+}
+
+const COVARIANT: u8 = 1;
+const CONTRAVARIANT: u8 = 2;
+
+/// Declared aliases are representation-transparent, so their parameter
+/// variance is the least solution of the uses in every local and imported body.
+/// The finite two-bit lattice makes recursive and mutually-recursive forwarding
+/// terminate without a depth cap; a parameter may be covariant,
+/// contravariant, invariant (both bits), or erased (no bits).
+fn declaration_variances(
+    local: &IndexMap<Symbol, Decl<Type>>,
+    imported: &IndexMap<Symbol, ExternalType>,
+) -> HashMap<Slot, u8> {
+    let mut out = HashMap::new();
+    for (symbol, decl) in local {
+        for at in 0..decl.params.len() {
+            out.insert((*symbol, at as u32), 0);
+        }
+    }
+    for (symbol, decl) in imported {
+        for at in 0..decl.params.len() {
+            out.insert((*symbol, at as u32), 0);
+        }
+    }
+
+    loop {
+        let before = out.clone();
+        for (owner, decl) in local {
+            let mut seen: HashMap<usize, u8> = HashMap::new();
+            let mut work = vec![(&decl.value, true)];
+            while let Some((ty, positive)) = work.pop() {
+                let bit = if positive { COVARIANT } else { CONTRAVARIANT };
+                let visited = seen.entry(ty as *const Type as usize).or_default();
+                if *visited & bit != 0 {
+                    continue;
+                }
+                *visited |= bit;
+                match &ty.tracked {
+                    TypeKind::Param { index, .. } => {
+                        *out.entry((*owner, *index)).or_default() |= bit;
+                    }
+                    TypeKind::Arrow { from, to, effects } => {
+                        work.push((from, !positive));
+                        work.push((to, positive));
+                        if let Some(Tail {
+                            of: Row::Param { index, .. },
+                            ..
+                        }) = &effects.tail
+                        {
+                            *out.entry((*owner, *index)).or_default() |= bit;
+                        }
+                    }
+                    TypeKind::Struct { fields, tail } => {
+                        work.extend(fields.values().filter_map(|field| match field {
+                            TypeField::Written { value, .. } => Some((value, positive)),
+                            TypeField::Absent { .. } => None,
+                        }));
+                        if let Some(Tail {
+                            of: Row::Param { index, .. },
+                            ..
+                        }) = tail
+                        {
+                            *out.entry((*owner, *index)).or_default() |= bit;
+                        }
+                    }
+                    TypeKind::Sum { cases, tail } => {
+                        work.extend(cases.values().filter_map(|case| match case {
+                            SumCase::Written {
+                                payload: Some(value),
+                                ..
+                            } => Some((value, positive)),
+                            _ => None,
+                        }));
+                        if let Some(Tail {
+                            of: Row::Param { index, .. },
+                            ..
+                        }) = tail
+                        {
+                            *out.entry((*owner, *index)).or_default() |= bit;
+                        }
+                    }
+                    TypeKind::Effects(effects) => {
+                        if let Some(Tail {
+                            of: Row::Param { index, .. },
+                            ..
+                        }) = &effects.tail
+                        {
+                            *out.entry((*owner, *index)).or_default() |= bit;
+                        }
+                    }
+                    TypeKind::Apply { head, args, .. } => {
+                        for (at, arg) in args.iter().enumerate() {
+                            let variance = before.get(&(*head, at as u32)).copied().unwrap_or(3);
+                            if variance & COVARIANT != 0 {
+                                work.push((arg, positive));
+                            }
+                            if variance & CONTRAVARIANT != 0 {
+                                work.push((arg, !positive));
+                            }
+                        }
+                    }
+                    TypeKind::Ident(_)
+                    | TypeKind::Prim(_)
+                    | TypeKind::Var(_)
+                    | TypeKind::Hole
+                    | TypeKind::Error => {}
+                }
+            }
+        }
+
+        enum Semantic<'a> {
+            Ty(&'a Ty, bool),
+            Row(&'a crate::types::Row, bool),
+        }
+        for (owner, decl) in imported {
+            let mut seen: HashMap<usize, u8> = HashMap::new();
+            let mut work = vec![Semantic::Ty(decl.scheme.body(), true)];
+            while let Some(item) = work.pop() {
+                match item {
+                    Semantic::Ty(ty, positive) => {
+                        let bit = if positive { COVARIANT } else { CONTRAVARIANT };
+                        let visited = seen.entry(ty as *const Ty as usize).or_default();
+                        if *visited & bit != 0 {
+                            continue;
+                        }
+                        *visited |= bit;
+                        match ty {
+                            Ty::Bound(index) if (*index as usize) < decl.params.len() => {
+                                *out.entry((*owner, *index)).or_default() |= bit;
+                            }
+                            Ty::Arrow(from, to, effects) => {
+                                work.push(Semantic::Ty(from, !positive));
+                                work.push(Semantic::Ty(to, positive));
+                                work.push(Semantic::Row(effects, positive));
+                            }
+                            Ty::Package(body) => work.push(Semantic::Ty(body, positive)),
+                            Ty::Struct(row) | Ty::Sum(row) => {
+                                work.push(Semantic::Row(row, positive))
+                            }
+                            Ty::Named { symbol, args, .. } => {
+                                for (at, arg) in args.iter().enumerate() {
+                                    let variance =
+                                        before.get(&(*symbol, at as u32)).copied().unwrap_or(3);
+                                    if variance & COVARIANT != 0 {
+                                        work.push(Semantic::Ty(arg, positive));
+                                    }
+                                    if variance & CONTRAVARIANT != 0 {
+                                        work.push(Semantic::Ty(arg, !positive));
+                                    }
+                                }
+                            }
+                            Ty::Var(_)
+                            | Ty::Rigid { .. }
+                            | Ty::Bound(_)
+                            | Ty::Undecided
+                            | Ty::Nat
+                            | Ty::Int
+                            | Ty::Real
+                            | Ty::String
+                            | Ty::Boolean => {}
+                        }
+                    }
+                    Semantic::Row(row, positive) => {
+                        let bit = if positive { COVARIANT } else { CONTRAVARIANT };
+                        work.extend(
+                            row.labels
+                                .values()
+                                .map(|field| Semantic::Ty(&field.ty, positive)),
+                        );
+                        if let Rest::Bound(index) = row.rest
+                            && (index as usize) < decl.params.len()
+                        {
+                            *out.entry((*owner, index)).or_default() |= bit;
+                        }
+                        if let Rest::More(more) = &row.rest {
+                            work.push(Semantic::Row(more, positive));
+                        }
+                    }
+                }
+            }
+        }
+        if out == before {
+            break;
+        }
+    }
+    out
 }
 
 /// One case of a sum type: the [`Field`] split of spans, the `when` clause it
@@ -1024,6 +1364,14 @@ pub enum ErrorKind {
     /// same either way — put the name on a label — so the complaint is too.
     UnboundPresence {
         name: String,
+    },
+    /// One producer-chosen presence was written at more than one production
+    /// boundary. Each result invocation and enclosing value owns a distinct
+    /// hidden choice, so one source variable cannot identify their witnesses.
+    IncompatiblePresenceOwnership {
+        name: String,
+        /// The other actionable production boundary.
+        previous: Span,
     },
     /// A type given a different number of arguments than it takes, including a
     /// name written bare that takes some.
@@ -1483,6 +1831,10 @@ struct Builder<'a> {
     /// that each write `a` never collide however alike they look — see
     /// [`Variable::id`].
     rigids: u32,
+    /// Positive/negative uses of every declared-type parameter after the
+    /// transparent alias graph reaches its least fixpoint. Bit 0 is covariant,
+    /// bit 1 contravariant; both is invariant and neither is erased.
+    variances: HashMap<Slot, u8>,
 }
 
 /// Every declaration in the bundle, split by what it declares and paired with
@@ -2066,6 +2418,7 @@ fn build_with_dependency_imports_inner(
         params: HashMap::new(),
         vars: IndexMap::new(),
         rigids: 0,
+        variances: HashMap::new(),
     };
     let mut program = Program {
         externs: IndexMap::new(),
@@ -2230,6 +2583,11 @@ fn build_with_dependency_imports_inner(
     // by normalized operation interfaces before parameter-kind analysis reads
     // their lacks sets. Terms are re-keyed after they are lowered below.
     structuralize_effects(&mut program, b.mint, &b.expanded, &mut b.errors);
+    // Alias applications are transparent for annotation polarity. Compute the
+    // least variance fixpoint only after every local/imported body is available;
+    // this terminates for recursive and mutually-recursive aliases because each
+    // slot can gain only the positive and negative bits.
+    b.variances = declaration_variances(&program.types, &program.external_types);
     // What each parameter stands for, which only the finished bodies can say: a
     // parameter handed straight on to another declaration takes its kind from
     // there, so no one body decides its own.
@@ -2594,7 +2952,13 @@ fn import_scheme(
             crate::types::Formula::True
         }
     };
-    Scheme::constrained(count, presences, body, formula)
+    let existentials = scheme
+        .existentials
+        .iter()
+        .copied()
+        .filter(|index| *index < presences)
+        .collect();
+    Scheme::existential(count, presences, existentials, body, formula)
 }
 
 /// Replace bound positions a malformed imported interface did not declare with
@@ -2607,6 +2971,7 @@ fn clamp_bounds(ty: Rc<Ty>, count: usize, presences: usize) -> Rc<Ty> {
         Ty(&'a Ty),
         Row(&'a crate::types::Row),
         Arrow,
+        Package,
         Struct,
         Sum,
         Named {
@@ -2643,6 +3008,10 @@ fn clamp_bounds(ty: Rc<Ty>, count: usize, presences: usize) -> Rc<Ty> {
                     work.push(Work::Row(effects));
                     work.push(Work::Ty(to));
                     work.push(Work::Ty(from));
+                }
+                Ty::Package(body) => {
+                    work.push(Work::Package);
+                    work.push(Work::Ty(body));
                 }
                 Ty::Struct(fields) => {
                     work.push(Work::Struct);
@@ -2699,6 +3068,10 @@ fn clamp_bounds(ty: Rc<Ty>, count: usize, presences: usize) -> Rc<Ty> {
                 let to = types.pop().expect("type postorder stays balanced");
                 let from = types.pop().expect("type postorder stays balanced");
                 types.push(Rc::new(Ty::Arrow(from, to, effects)));
+            }
+            Work::Package => {
+                let body = types.pop().expect("package postorder stays balanced");
+                types.push(Rc::new(Ty::Package(body)));
             }
             Work::Struct => {
                 let fields = rows.pop().expect("row postorder stays balanced");
@@ -2786,6 +3159,7 @@ fn drop_type_iterative(root: Rc<Ty>) {
                         work.push(Work::Ty(to.clone()));
                         row(effects, &mut work);
                     }
+                    Ty::Package(body) => work.push(Work::Ty(body.clone())),
                     Ty::Struct(fields) | Ty::Sum(fields) => row(fields, &mut work),
                     Ty::Named { args, .. } => {
                         work.extend(args.iter().cloned().map(Work::Ty));
@@ -2815,7 +3189,7 @@ fn drop_formula_iterative(root: crate::types::Formula) {
 
     fn children(formula: &Formula, work: &mut Vec<Rc<Formula>>) {
         match formula {
-            Formula::Not(inner) => work.push(inner.clone()),
+            Formula::Owned(_, inner) | Formula::Not(inner) => work.push(inner.clone()),
             Formula::And(left, right)
             | Formula::Or(left, right)
             | Formula::Iff(left, right)
@@ -2844,7 +3218,7 @@ fn formula_bounds_valid(formula: &crate::types::Formula, presences: u32) -> bool
             Formula::True | Formula::False => {}
             Formula::Atom(Atom::Bound(index)) if *index < presences => {}
             Formula::Atom(_) => return false,
-            Formula::Not(inner) => work.push(inner),
+            Formula::Owned(_, inner) | Formula::Not(inner) => work.push(inner),
             Formula::And(left, right)
             | Formula::Or(left, right)
             | Formula::Iff(left, right)
@@ -2930,6 +3304,7 @@ fn import_type(
         Ty(&'a artifact::Type, bool),
         Row(&'a artifact::Row, bool),
         Arrow,
+        Package,
         Struct,
         Sum,
         Named {
@@ -2960,6 +3335,10 @@ fn import_type(
                     work.push(Work::Row(effects, true));
                     work.push(Work::Ty(to, false));
                     work.push(Work::Ty(from, false));
+                }
+                artifact::Type::Package(body) => {
+                    work.push(Work::Package);
+                    work.push(Work::Ty(body, is_effect_row));
                 }
                 artifact::Type::Struct(fields) => {
                     work.push(Work::Struct);
@@ -2996,6 +3375,10 @@ fn import_type(
                 let to = types.pop().expect("type postorder stays balanced");
                 let from = types.pop().expect("type postorder stays balanced");
                 types.push(Rc::new(Ty::Arrow(from, to, effects)));
+            }
+            Work::Package => {
+                let body = types.pop().expect("package postorder stays balanced");
+                types.push(Rc::new(Ty::Package(body)));
             }
             Work::Struct => {
                 let fields = rows.pop().expect("row postorder stays balanced");
@@ -3077,6 +3460,7 @@ fn import_formula(value: &artifact::Formula) -> (crate::types::Formula, bool) {
     }
     enum Work<'a> {
         Formula(&'a artifact::Formula),
+        Owned(u32),
         Not,
         Binary(Binary),
     }
@@ -3093,6 +3477,10 @@ fn import_formula(value: &artifact::Formula) -> (crate::types::Formula, bool) {
                 artifact::Formula::Var(_) => {
                     valid = false;
                     values.push(Formula::True);
+                }
+                artifact::Formula::Owned(owner, inner) => {
+                    work.push(Work::Owned(*owner));
+                    work.push(Work::Formula(inner));
                 }
                 artifact::Formula::Not(inner) => {
                     work.push(Work::Not);
@@ -3119,6 +3507,10 @@ fn import_formula(value: &artifact::Formula) -> (crate::types::Formula, bool) {
                     work.push(Work::Formula(left));
                 }
             },
+            Work::Owned(owner) => {
+                let inner = values.pop().expect("owned visits one operand");
+                values.push(Formula::owned(owner, inner));
+            }
             Work::Not => {
                 let inner = values.pop().expect("not visits one operand");
                 values.push(Formula::Not(Rc::new(inner)));
@@ -3830,6 +4222,9 @@ impl RegularType<'_> {
                     Ty::Boolean => values.push(self.atom("Boolean")),
                     Ty::Bound(index) => values.push(self.argument(&args, *index)),
                     Ty::Var(_) | Ty::Rigid { .. } | Ty::Undecided => values.push(self.atom("?")),
+                    Ty::Package(body) => {
+                        work.push(Work::Type(body, args, supplied_as_effects, instantiation));
+                    }
                     Ty::Arrow(from, to, effects) => {
                         work.push(Work::Make(
                             "arrow".into(),
@@ -5022,6 +5417,7 @@ impl<'a> Follow<'a> {
                     }
                 },
                 FollowWork::Semantic(ty) => match &**ty {
+                    Ty::Package(body) => work.push(FollowWork::Semantic(body)),
                     Ty::Bound(index) => {
                         answer = Some(Stands::Param {
                             index: *index,
@@ -5513,6 +5909,7 @@ fn demand(ty: Type) -> Annotation {
     Annotation {
         ty,
         variables: Vec::new(),
+        anonymous_existentials: Vec::new(),
         clause: None,
     }
 }
@@ -6818,6 +7215,7 @@ fn row_summaries(
                     values.push((summary, crossed_cycle));
                 }
                 Work::Semantic(ty) => match ty {
+                    Ty::Package(body) => work.push(Work::Semantic(body)),
                     Ty::Bound(index) => work.push(Work::Value(RowSummary {
                         shaped: false,
                         labels: IndexSet::new(),
@@ -8414,22 +8812,60 @@ impl Builder<'_> {
                 }
             });
         }
+        let polarity = presence_polarities(&ty, &self.variances);
+        let named_ids: HashSet<u32> = self.vars.values().map(|declared| declared.id).collect();
+        let anonymous_existentials = polarity
+            .iter()
+            .filter(|(id, occurrences)| {
+                !named_ids.contains(id) && occurrences.negative == 0 && occurrences.positive > 0
+            })
+            .filter_map(|(id, occurrences)| occurrences.owner().ok().map(|owner| (*id, owner)))
+            .collect();
+        let mut ownership_errors = Vec::new();
         let variables = self
             .vars
             .iter()
-            .map(|(name, declared)| Variable {
-                span: declared.span,
-                name: name.clone(),
-                sense: declared
+            .map(|(name, declared)| {
+                let sense = declared
                     .sense
                     .expect("an annotation variable was minted by a typed use")
-                    .0,
-                id: declared.id,
+                    .0;
+                let ownership = match (sense, polarity.get(&declared.id)) {
+                    (Sense::Presence, Some(occurrences))
+                        if occurrences.negative == 0 && occurrences.positive > 0 =>
+                    {
+                        match occurrences.owner() {
+                            Ok(boundary) => PresenceOwnership::Existential { boundary },
+                            Err((previous, second)) => {
+                                ownership_errors.push(Error {
+                                    span: second,
+                                    kind: ErrorKind::IncompatiblePresenceOwnership {
+                                        name: name.clone(),
+                                        previous,
+                                    },
+                                });
+                                // Lowering continues only to accumulate independent errors;
+                                // this annotation is rejected and never reaches inference.
+                                PresenceOwnership::Universal
+                            }
+                        }
+                    }
+                    _ => PresenceOwnership::Universal,
+                };
+                Variable {
+                    ownership,
+                    span: declared.span,
+                    name: name.clone(),
+                    sense,
+                    id: declared.id,
+                }
             })
             .collect();
+        self.errors.extend(ownership_errors);
         Annotation {
             ty,
             variables,
+            anonymous_existentials,
             // The clause absorbs whole rather than keeping the statements that
             // resolved, for the reason one bad name absorbs a formula: a
             // contract missing one of its conjuncts is a contract nobody wrote.
@@ -8508,26 +8944,38 @@ impl Builder<'_> {
     fn when(&mut self, when: Option<Box<parse::When>>, place: Place) -> Option<Box<When>> {
         let when = when?;
         if place != Place::Annotation {
+            let id = self.rigids;
+            self.rigids += 1;
             return Some(Box::new(When {
                 span: when.span,
                 name: when.name.map(|name| name.tracked),
+                id,
             }));
         }
+        let mut id = None;
         let name = when.name.and_then(|name| {
             if !self.variable(&name, Sense::Presence) {
                 return None;
             }
             // Worn by a label, which is what a formula needs of a name before
             // it can say anything about it.
-            self.vars
+            let declared = self
+                .vars
                 .get_mut(&name.tracked)
-                .expect("the variable was just minted")
-                .labelled = true;
+                .expect("the variable was just minted");
+            declared.labelled = true;
+            id = Some(declared.id);
             Some(name.tracked)
+        });
+        let id = id.unwrap_or_else(|| {
+            let id = self.rigids;
+            self.rigids += 1;
+            id
         });
         Some(Box::new(When {
             span: when.span,
             name,
+            id,
         }))
     }
 

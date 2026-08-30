@@ -676,6 +676,48 @@ fn deep_semantic_type_and_scheme_display_are_stack_safe() {
 }
 
 #[test]
+fn deep_package_formatting_and_structural_accessors_are_stack_safe() {
+    std::thread::Builder::new()
+        .name("deep-package-reads".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            const DEPTH: usize = 30_000;
+
+            let mut record = Rc::new(Ty::Struct(Row {
+                labels: [("marker".into(), RowField::present(Rc::new(Ty::Nat)))]
+                    .into_iter()
+                    .collect(),
+                rest: Rest::Closed,
+            }));
+            for _ in 0..DEPTH {
+                record = Rc::new(Ty::Package(record));
+            }
+
+            // Formatting an arrow asks its input for its precedence before the
+            // explicit formatter consumes it. Both that query and the package
+            // jobs themselves must remain on the heap work list.
+            let arrow = Ty::pure(record.clone(), Rc::new(Ty::Nat));
+            assert_eq!(arrow.to_string(), "{ marker: Nat } -> Nat");
+            assert!(record.fields().unwrap().labels.contains_key("marker"));
+
+            let mut sum = Rc::new(Ty::Sum(Row {
+                labels: [("Only".into(), RowField::present(Rc::new(Ty::unit())))]
+                    .into_iter()
+                    .collect(),
+                rest: Rest::Closed,
+            }));
+            for _ in 0..DEPTH {
+                sum = Rc::new(Ty::Package(sum));
+            }
+            assert!(sum.cases().labels.contains_key("Only"));
+            assert_eq!(sum.to_string(), "#Only");
+        })
+        .expect("the bounded-stack package regression thread starts")
+        .join()
+        .expect("package formatting and accessors use bounded stack");
+}
+
+#[test]
 fn deep_formula_display_and_simplifying_destruction_are_stack_safe() {
     std::thread::Builder::new()
         .name("deep-formula-display-drop".into())

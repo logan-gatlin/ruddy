@@ -57,6 +57,218 @@ fn inferred(src: &str) -> (Mint, ir::Output, inference::Output) {
 }
 
 #[test]
+fn positive_result_presences_can_forget_input_correlations() {
+    let (mint, _, output) = inferred(
+        "let forget:\n\
+         { left when 'a: 't, right when 'b: 't } ->\n\
+         { left when 'c: 't, right when 'd: 't }\n\
+         where ('a != 'b) and ('c != 'd)\n\
+         = fn value => value",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "forget"),
+        "{ left when 'a: 'e, right when 'b: 'e } -> { left when 'c: 'e, right when 'd: 'e } where ('a != 'b) and ('c != 'd)"
+    );
+    let symbol = symbol_named(&mint, output.schemes.keys().copied(), "forget");
+    let Formula::And(input, output_formula) = output.schemes[&symbol].formula() else {
+        panic!("independent input/output guarantees must remain partitionable");
+    };
+    assert!(matches!(&**input, Formula::Xor(..)));
+    assert!(
+        matches!(&**output_formula, Formula::Owned(0, inner) if matches!(&**inner, Formula::Xor(..)))
+    );
+}
+
+#[test]
+fn anonymous_positive_annotation_presences_publish_distinct_existential_slots() {
+    let (mint, _, output) =
+        inferred("extern choice: { left when _: Nat, right when _: Nat } = host.choice");
+    let (_, scheme) = output
+        .externs
+        .iter()
+        .find(|(symbol, _)| mint.name(**symbol) == "choice")
+        .expect("the extern scheme is published");
+    assert_eq!(scheme.presences(), 2);
+    assert!(scheme.is_existential(0) && scheme.is_existential(1));
+    assert!(matches!(&**scheme.body(), Ty::Package(_)));
+}
+
+#[test]
+fn a_consumer_cannot_choose_an_existential_field_presence() {
+    let (_, _, output) = infer_src(
+        "extern choice: { left when 'a: Nat, right when 'b: Nat } where 'a != 'b = host.choice\n\
+         let needs_left: { left: Nat, \\right } -> Nat = fn value => value.left\n\
+         let bad = needs_left choice",
+    );
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+}
+
+#[test]
+fn one_existential_package_keeps_shared_label_identity() {
+    inferred(
+        "extern make: Nat -> Boolean ->\n\
+         { x when 'p: Nat, also when 'p: Nat, y when 'q: Nat }\n\
+         where 'p != 'q = host.make\n\
+         let value = make 1n true\n\
+         let good = match value with\n\
+         | { x, .. } => value.also\n\
+         | { y, .. } => 0n\n\
+         end",
+    );
+}
+
+/// R16 deliberately gives aliases fresh views of a hidden package. Learning a
+/// field through one alias must not correlate a separately bound alias, even
+/// when both came from the same source expression.
+#[test]
+fn separate_alias_views_do_not_share_existential_witnesses() {
+    let (_, _, output) = infer_src(
+        "extern choose: Nat ->\n\
+         { left when 'p: Nat, also when 'p: Nat, right when 'q: Nat }\n\
+         where 'p != 'q = host.choose\n\
+         let source = choose 1n\n\
+         let first = source\n\
+         let second = source\n\
+         let bad = match first with\n\
+         | { left, .. } => second.also\n\
+         | { right, .. } => 0n\n\
+         end",
+    );
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+}
+
+#[test]
+fn separate_partial_application_calls_do_not_share_existential_witnesses() {
+    let (_, _, output) = infer_src(
+        "extern make: Nat -> Boolean ->\n\
+         { x when 'p: Nat, also when 'p: Nat, y when 'q: Nat }\n\
+         where 'p != 'q = host.make\n\
+         let partial = make 1n\n\
+         let bad = match partial true with\n\
+         | { x, .. } => (partial false).also\n\
+         | { y, .. } => 0n\n\
+         end",
+    );
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+}
+
+/// Fully saturated calls open fresh packages too. In particular, learning the
+/// left side of one XOR result says nothing about a separately called result,
+/// even when both calls name the same generalized producer.
+#[test]
+fn independently_called_xor_results_do_not_share_existential_witnesses() {
+    let (_, _, output) = infer_src(
+        "extern choose: Nat ->\n\
+         { left when 'p: Nat, also when 'p: Nat, right when 'q: Nat }\n\
+         where 'p != 'q = host.choose\n\
+         let first = choose 1n\n\
+         let second = choose 2n\n\
+         let bad = match first with\n\
+         | { left, .. } => second.also\n\
+         | { right, .. } => 0n\n\
+         end",
+    );
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+}
+
+#[test]
+fn unconstrained_result_packages_still_open_independent_sealed_witnesses() {
+    inferred(
+        "extern choose: Nat -> { left when _: Nat } = host.choose\n\
+         let needs_left: { left: Nat } -> Nat = fn value => value.left\n\
+         let needs_no_left: { \\left, .. } -> Nat = fn _ => 0n\n\
+         let first = needs_left (choose 1n)\n\
+         let second = needs_no_left (choose 2n)",
+    );
+}
+
+#[test]
+fn mixed_input_to_result_guarantees_activate_at_each_call() {
+    inferred(
+        "extern follows: { input when 'u: Nat } -> { output when 'e: Nat }\n\
+         where (not 'u) or 'e = host.follows\n\
+         let needs_output: { output: Nat } -> Nat = fn value => value.output\n\
+         let good = needs_output (follows { input: 1n })",
+    );
+}
+
+#[test]
+fn captured_presence_activates_nested_closure_result_guarantee() {
+    inferred(
+        "extern follows: { input when 'u: Nat } -> { output when 'e: Nat }\n\
+         where (not 'u) or 'e = host.follows\n\
+         let needs_output: { output: Nat } -> Nat = fn value => value.output\n\
+         let make = fn captured =>\n\
+           let nested = fn _ => follows captured\n\
+           in nested\n\
+         let good = needs_output ((make { input: 1n }) {})",
+    );
+}
+
+#[test]
+fn package_guarantee_identity_survives_allocator_churn_without_crossing_instances() {
+    let mut source = String::from(
+        "extern follows: { input when 'u: Nat } -> { output when 'e: Nat }\n\
+         where (not 'u) or 'e = host.follows\n\
+         extern excludes: { input when 'u: Nat } -> { output when 'e: Nat }\n\
+         where 'u or (not 'e) = host.excludes\n\
+         let needs_output: { output: Nat } -> Nat = fn value => value.output\n\
+         let needs_no_output: { \\output, .. } -> Nat = fn _ => 0n\n",
+    );
+    // Each application creates and promptly destroys an instantiated package
+    // allocation. Address-keyed side metadata could retain and later attach a
+    // stale guarantee when the allocator reused that address.
+    for index in 0..64 {
+        if index % 2 == 0 {
+            source.push_str(&format!(
+                "let good{index} = needs_output (follows {{ input: {index}n }})\n"
+            ));
+        } else {
+            source.push_str(&format!(
+                "let good{index} = needs_no_output (excludes {{}})\n"
+            ));
+        }
+    }
+    inferred(&source);
+}
+
+#[test]
+fn negative_and_erased_alias_arguments_do_not_publish_anonymous_existentials() {
+    let (mint, _, output) = inferred(
+        "type Contra 'a = 'a -> Nat\n\
+         type Erased 'a = Nat\n\
+         let negative: Contra { x when _: Nat } = fn value => 0n\n\
+         let erased: Erased { x when _: Nat } = 0n",
+    );
+    for name in ["negative", "erased"] {
+        let symbol = symbol_named(&mint, output.schemes.keys().copied(), name);
+        let scheme = &output.schemes[&symbol];
+        assert!(scheme.existentials().is_empty(), "{name}: {scheme:#?}");
+        assert!(
+            !matches!(&**scheme.body(), Ty::Package(_)),
+            "{name}: {scheme:#?}"
+        );
+    }
+}
+
+#[test]
+fn producer_guarantees_hold_for_every_admitted_universal_input() {
+    inferred(
+        "let follows: { input when 'u: Nat } -> { output when 'e: Nat }\n\
+         where (not 'u) or 'e = fn value => match value with\n\
+         | { input, .. } => { output: input }\n\
+         | { .. } => {}\n\
+         end",
+    );
+
+    let (_, _, output) = infer_src(
+        "let bad: { input when 'u: Nat } -> { output when 'e: Nat }\n\
+         where (not 'u) or 'e = fn input => {}",
+    );
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+}
+
+#[test]
 fn integer_and_natural_literals_are_function_arguments() {
     let (mint, _, output) = inferred(
         "let nat : Nat -> Nat = fn x => x\n\
@@ -3550,9 +3762,10 @@ fn an_abandoned_presence_and_an_abandoned_tail_absorb_what_meets_them() {
 /// is the presence sort's version of what a tail and a type each get.
 #[test]
 fn a_presence_against_itself_is_already_the_same_presence() {
-    // A recursive call is monomorphic, so the parameter's row meets itself:
-    // one `when` on both sides, and one tail on both sides.
-    let (mint, _, output) = inferred("let f : { x when 'a: Nat, .. } -> Nat = fn p => f p");
+    // An anonymous annotation hole is monomorphic, so the parameter's row
+    // meets itself: one `when` on both sides, and one tail on both sides.
+    // Named presences are declared interface variables and instantiate freshly.
+    let (mint, _, output) = inferred("let f : { x when _: Nat, .. } -> Nat = fn p => f p");
     assert_eq!(
         scheme(&mint, &output, "f"),
         "{ x when 'a: Nat, ..'b } -> Nat"
@@ -4272,7 +4485,7 @@ fn a_sums_tail_is_decided_as_a_row() {
 fn an_abandoned_presence_absorbs_from_either_side() {
     let (mint, out, output) = infer_src(
         "let mk : Nat -> (#A Nat) = fn n => #A n\n\
-         let f : (#A (when 'a) Nat | ..'r) -> Nat = fn p => f (mk (nope p))",
+         let f : (#A (when _) Nat | ..'r) -> Nat = fn p => f (mk (nope p))",
     );
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     let taken = steps(&mint, &output, "f");
@@ -4285,7 +4498,7 @@ fn an_abandoned_presence_absorbs_from_either_side() {
 
     let (mint, out, output) = infer_src(
         "let g : Nat -> (#A Nat) -> Nat = fn a => fn b => 1n\n\
-         let f : (#A (when 'a) Nat | ..'r) -> Nat = fn p => g (nope p) p",
+         let f : (#A (when _) Nat | ..'r) -> Nat = fn p => g (nope p) p",
     );
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     let taken = steps(&mint, &output, "f");
@@ -5836,6 +6049,61 @@ fn structural_result_families_cover_arrows_sums_names_and_absence() {
 }
 
 #[test]
+fn package_rebuilding_places_result_packages_inside_composed_row_tails() {
+    let result = Rc::new(Ty::Struct(Row {
+        labels: [(
+            "hidden".to_string(),
+            RowField {
+                presence: Presence::Bound(0),
+                ty: Rc::new(Ty::Nat),
+            },
+        )]
+        .into_iter()
+        .collect(),
+        rest: Rest::Closed,
+    }));
+    let body = Rc::new(Ty::Struct(Row {
+        labels: IndexMap::new(),
+        rest: Rest::More(Rc::new(Row {
+            labels: [(
+                "producer".to_string(),
+                RowField::present(Rc::new(Ty::Arrow(Rc::new(Ty::Nat), result, Row::closed()))),
+            )]
+            .into_iter()
+            .collect(),
+            rest: Rest::Closed,
+        })),
+    }));
+
+    let (packaged, inferred) =
+        inference::package_positive_presences_for_tests(&body, 1, &Default::default());
+    assert_eq!(inferred.len(), 1);
+    assert!(inferred.contains(&0));
+    let Ty::Struct(row) = &*packaged else {
+        panic!("composed-row root remains a struct")
+    };
+    let Rest::More(more) = &row.rest else {
+        panic!("composed row tail is retained")
+    };
+    let Ty::Arrow(_, result, _) = &*more.labels["producer"].ty else {
+        panic!("composed-row field remains an arrow")
+    };
+    assert!(matches!(&**result, Ty::Package(_)));
+}
+
+#[test]
+fn deeply_nested_invariant_aliases_classify_in_polynomial_time() {
+    const DEPTH: usize = 24;
+    let mut nested = "{ hidden when _: Nat }".to_string();
+    for _ in 0..DEPTH {
+        nested = format!("Invariant ({nested})");
+    }
+    inferred(&format!(
+        "type Invariant 'a = 'a -> 'a\nextern deep: {nested} = host.deep"
+    ));
+}
+
+#[test]
 fn structural_families_are_stack_safe_at_thirty_thousand_layers() {
     std::thread::Builder::new()
         .name("deep-structural-family".into())
@@ -7098,12 +7366,10 @@ fn a_use_site_quotes_an_effect_presence_by_its_label() {
         .filter(|error| error.kind.code() == "presence-required")
         .map(|error| error.kind.to_string())
         .collect();
-    assert_eq!(
-        quoted,
-        ["this value needs `Log != IO` among its fields, and it does not have that"],
-        "{:#?}",
-        output.errors
-    );
+    // The conditional labels are producer-owned: the consumer may not force
+    // both abstract choices present. The exact relation is deliberately no
+    // longer reported as a caller-selected scheme failure.
+    assert_eq!(quoted.len(), 1, "{:#?}", output.errors);
 }
 
 /// A performed row whose label is not *certainly* there asks nothing of the
@@ -7542,6 +7808,16 @@ fn a_recursive_use_instantiates_what_was_declared() {
         "{ kids: Nest, ..'a } -> Nat"
     );
 
+    // A declared presence is part of the recursive interface too. Each call
+    // chooses its own universal instance, so calling recursively with a
+    // definitely-present field does not settle the caller's conditional one.
+    let (mint, _, output) =
+        inferred("let inspect : { x when 'p: Nat } -> Nat = fn value => inspect { x: 1n }");
+    assert_eq!(
+        scheme(&mint, &output, "inspect"),
+        "{ x when 'a: Nat } -> Nat"
+    );
+
     // Monomorphic in what was left to inference: one hole, shared across every
     // recursive use, so two uses that disagree are a mismatch.
     let (mint, _, output) = inferred("let f : _ -> Nat = fn x => f 1n");
@@ -7811,13 +8087,17 @@ fn extern_callback_coverage_uses_where_implications() {
 
     let (_, lowered, invalid) = infer_src(&source(""));
     assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
-    assert!(matches!(
-        invalid.errors.as_slice(),
-        [ruddy::inference::Error {
-            kind: ruddy::inference::ErrorKind::CallbackEffectsNotCovered,
-            ..
-        }]
-    ));
+    assert!(
+        matches!(
+            invalid.errors.as_slice(),
+            [ruddy::inference::Error {
+                kind: ruddy::inference::ErrorKind::CallbackEffectsNotCovered,
+                ..
+            }]
+        ),
+        "{:#?}",
+        invalid.errors
+    );
 }
 
 #[test]

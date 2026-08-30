@@ -620,6 +620,9 @@ fn ir_diagnostic(source: &str, error: &ir::Error, files: &HashMap<FileID, u32>) 
         ir::ErrorKind::Duplicate { previous, .. }
         | ir::ErrorKind::DuplicateParameter { previous } => Some((*previous, ui::FIRST_DEFINITION)),
         ir::ErrorKind::MixedTail { previous, .. } => Some((*previous, ui::FIRST_USE)),
+        ir::ErrorKind::IncompatiblePresenceOwnership { previous, .. } => {
+            Some((*previous, ui::FIRST_PRODUCTION_LIFETIME))
+        }
         _ => None,
     };
     if let Some((previous, note)) = elsewhere {

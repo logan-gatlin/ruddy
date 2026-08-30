@@ -66,6 +66,8 @@ pub const FIRST_DEFINITION: &str = "first defined here";
 /// counterpart for the complaints about a name that was used rather than
 /// defined twice — see [`ir::ErrorKind::MixedTail`].
 pub const FIRST_USE: &str = "first used here";
+/// The other result boundary participating in an existential lifetime clash.
+pub const FIRST_PRODUCTION_LIFETIME: &str = "the conflicting production lifetime begins here";
 
 /// The note a repeated variable points back with, printed against the
 /// span of the declaration that stands.
@@ -698,6 +700,9 @@ impl ir::ErrorKind {
             // which name it was is the span's to show. The two below say the
             // same about theirs.
             ir::ErrorKind::UnboundPresence { .. } => "unbound-presence",
+            ir::ErrorKind::IncompatiblePresenceOwnership { .. } => {
+                "incompatible-presence-ownership"
+            }
             ir::ErrorKind::Arity { .. } => "wrong-argument-count",
             ir::ErrorKind::NotAConstructor => "not-a-type-constructor",
             ir::ErrorKind::ParameterApplied => "applied-parameter",
@@ -811,6 +816,10 @@ impl fmt::Display for ir::ErrorKind {
             ir::ErrorKind::UnboundPresence { name } => write!(
                 f,
                 "this clause names `'{name}`, but no `when` in the type beside it gives it a label",
+            ),
+            ir::ErrorKind::IncompatiblePresenceOwnership { name, .. } => write!(
+                f,
+                "presence `'{name}` is produced at more than one lifetime; use a different name at each result boundary",
             ),
             // Counted in words, and said as what the type takes rather than as
             // what the reader failed to supply — the count is the fact, and
@@ -1225,9 +1234,16 @@ impl fmt::Display for Prim {
 /// comparing against the position a type is being written into, and that
 /// comparison is the surface grammar's whether or not this particular tree can
 /// reach every level of it.
+fn unpackaged(mut ty: &Ty) -> &Ty {
+    while let Ty::Package(body) = ty {
+        ty = body;
+    }
+    ty
+}
+
 impl Grouped for Ty {
     fn prec(&self) -> Prec {
-        match self {
+        match unpackaged(self) {
             Ty::Arrow(..) => Prec::Arrow,
             Ty::Sum(_) => Prec::Sum,
             Ty::Named { args, .. } if !args.is_empty() => Prec::Apply,
@@ -1286,6 +1302,7 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                     work.push(SemanticJob::Text(")"));
                 }
                 match ty {
+                    Ty::Package(body) => work.push(SemanticJob::Ty(body, false)),
                     Ty::Nat => f.write_str(Prim::Nat.name())?,
                     Ty::Int => f.write_str(Prim::Int.name())?,
                     Ty::Real => f.write_str(Prim::Real.name())?,
@@ -1297,7 +1314,10 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                             work.push(SemanticJob::Effects(effects));
                             work.push(SemanticJob::Text(" + "));
                         }
-                        work.push(SemanticJob::Ty(to, shown && matches!(&**to, Ty::Arrow(..))));
+                        work.push(SemanticJob::Ty(
+                            to,
+                            shown && matches!(unpackaged(to), Ty::Arrow(..)),
+                        ));
                         work.push(SemanticJob::Text(" -> "));
                         work.push(SemanticJob::Ty(from, from.prec() < Prec::Sum));
                     }
@@ -1322,7 +1342,7 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                     f.write_str("(")?;
                     work.push(SemanticJob::Text(")"));
                 }
-                match ty {
+                match unpackaged(ty) {
                     Ty::Sum(row)
                         if flattened_row(row)
                             .0
@@ -1641,6 +1661,7 @@ fn name_at(index: u32) -> String {
 /// call sites do not already say.
 fn prec(formula: &Formula) -> u8 {
     match formula {
+        Formula::Owned(_, inner) => prec(inner),
         Formula::Iff(..) | Formula::Xor(..) => 0,
         Formula::Or(..) => 1,
         Formula::And(..) => 2,
@@ -1676,6 +1697,9 @@ impl Named<'_> {
             match part {
                 Work::Text(text) => f.write_str(text)?,
                 Work::Close => f.write_str(")")?,
+                Work::Formula(Formula::Owned(_, inner), level) => {
+                    work.push(Work::Formula(inner, level));
+                }
                 Work::Formula(formula, level) => {
                     let parens = prec(formula) < level;
                     if parens {
@@ -1688,6 +1712,7 @@ impl Named<'_> {
                         Formula::True => f.write_str("always")?,
                         Formula::False => f.write_str("never")?,
                         Formula::Atom(atom) => f.write_str(&self.spell(*atom))?,
+                        Formula::Owned(..) => unreachable!("handled before precedence"),
                         Formula::Not(inner) => {
                             f.write_str("not ")?;
                             work.push(Work::Formula(inner, 3));

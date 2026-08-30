@@ -1234,7 +1234,14 @@ impl Lower<'_> {
                 }
                 seen.push(cursor.clone());
             }
-            let exposed = unfold(&self.inference.aliases, &cursor);
+            // Package erasure and alias unfolding alternate: an alias may
+            // reveal a package whose body is another alias (including an
+            // imported or recursive one), and either operation alone would
+            // stop before the callback arrow.
+            let mut exposed = unfold(&self.inference.aliases, &cursor);
+            while let Ty::Package(body) = &*exposed {
+                exposed = unfold(&self.inference.aliases, body);
+            }
             let Ty::Arrow(_, to, row) = &*exposed else {
                 break;
             };
@@ -1713,7 +1720,7 @@ impl Lower<'_> {
     /// nothing decided is [`Rep::Any`] — monomorphization is deferred, so there
     /// is no narrower answer to give.
     fn rep(&self, ty: &Rc<Ty>) -> Rep {
-        let ty = unfold(&self.inference.aliases, ty);
+        let ty = self.erased(ty);
         match &*ty {
             Ty::Nat => Rep::Nat,
             Ty::Int => Rep::Int,
@@ -1739,8 +1746,21 @@ impl Lower<'_> {
         }
     }
 
-    /// The three halves of an arrow, with a declared name looked through and the
-    /// effect row flattened.
+    /// Look through every type-level wrapper that has no runtime
+    /// representation. Existential packages delimit witness ownership for
+    /// inference, but the value inside a package is stored exactly as its body.
+    /// Opening aliases again after each package also handles a package whose
+    /// body starts with a declared name.
+    fn erased(&self, ty: &Rc<Ty>) -> Rc<Ty> {
+        let mut ty = unfold(&self.inference.aliases, ty);
+        while let Ty::Package(body) = &*ty {
+            ty = unfold(&self.inference.aliases, body);
+        }
+        ty
+    }
+
+    /// The three halves of an arrow, with a declared name and transparent
+    /// existential packages looked through and the effect row flattened.
     ///
     /// Every position that asks holds a term inference gave an arrow to: a `fn`
     /// is built as one, an operation's type is one, a value handed to a
@@ -1748,7 +1768,7 @@ impl Lower<'_> {
     /// that is none of those is a program inference refused — which R2 says
     /// this pass is never handed.
     fn arrow(&self, ty: &Rc<Ty>) -> (Rc<Ty>, Rc<Ty>, Row) {
-        let ty = unfold(&self.inference.aliases, ty);
+        let ty = self.erased(ty);
         let Ty::Arrow(from, to, row) = &*ty else {
             panic!("LIR runs only on programs with no errors");
         };
@@ -1772,7 +1792,7 @@ impl Lower<'_> {
     /// never listed — or does not pin its shape down, in which case the use
     /// site's own reading is all there is to go on.
     fn member_of(&self, ty: &Rc<Ty>, name: &str) -> Option<Rc<Ty>> {
-        let ty = unfold(&self.inference.aliases, ty);
+        let ty = self.erased(ty);
         let member = match &*ty {
             Ty::Sum(row) | Ty::Struct(row) => {
                 flat(row).labels.get(name).map(|field| field.ty.clone())
@@ -3391,7 +3411,7 @@ impl Lower<'_> {
     /// whatever fields lie beyond — so everything below only ever sees a flat
     /// cell.
     fn column(&mut self, col: &Value, matrix: Matrix, tree: &Tree, body: &mut Body) -> Temp {
-        let ty = unfold(&self.inference.aliases, &col.ty);
+        let ty = self.erased(&col.ty);
         if matrix
             .lines
             .iter()
@@ -3599,7 +3619,7 @@ impl Lower<'_> {
         tree: &Tree,
         body: &mut Body,
     ) -> Temp {
-        let exposed = unfold(&self.inference.aliases, ty);
+        let exposed = self.erased(ty);
         let row = match &*exposed {
             Ty::Struct(row) => flat(row),
             // Imported recovery types can disagree with the already-recovered

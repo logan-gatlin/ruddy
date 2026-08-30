@@ -5,8 +5,8 @@ use ruddy::{
     artifact as a, inference,
     ir::{
         Annotation, ClauseKind, DependencyImport, Effect, ErrorKind, ExternTypeKind, Field,
-        OperationSelector, Output, PatternKind, SumCase, Term, TermKind, TypeField, TypeKind,
-        build, build_with_dependencies, build_with_dependency_imports,
+        OperationSelector, Output, PatternKind, PresenceOwnership, SumCase, Term, TermKind,
+        TypeField, TypeKind, build, build_with_dependencies, build_with_dependency_imports,
     },
     parse,
     symbol::{Bundle, Mint, Namespace, Symbol, Version},
@@ -5059,6 +5059,201 @@ fn a_variable_is_minted_by_its_first_use() {
     assert_ne!(one.id, other.id);
 }
 
+/// Presence ownership follows the complete annotation's polarity. Results are
+/// producer-chosen, inputs remain caller-chosen, and two arrow reversals make a
+/// presence positive again. A curried result is owned at its final result
+/// boundary rather than at the whole function.
+#[test]
+fn presence_ownership_is_inferred_from_polarity_and_result_boundaries() {
+    for (source, expected) in [
+        ("let value : { x when 'p: Nat } = { x: 0n }", "existential"),
+        (
+            "let take : { x when 'p: Nat } -> Nat = fn x => 0n",
+            "universal",
+        ),
+        (
+            "let keep : { x when 'p: Nat } -> { x when 'p: Nat } = fn x => x",
+            "universal",
+        ),
+        (
+            "let twice : ({ x when 'p: Nat } -> Nat) -> Nat = fn f => 0n",
+            "existential",
+        ),
+    ] {
+        let (mint, out) = built(source);
+        let variable = &annotation_of(&mint, &out, source[4..].split_whitespace().next().unwrap())
+            .variables[0];
+        match (expected, variable.ownership) {
+            ("existential", PresenceOwnership::Existential { .. })
+            | ("universal", PresenceOwnership::Universal) => {}
+            _ => panic!(
+                "{source}: expected {expected}, got {:?}",
+                variable.ownership
+            ),
+        }
+    }
+
+    let source = "let choose : Nat -> Boolean -> { x when 'p: Nat } = fn n => fn b => { x: n }";
+    let (mint, out) = built(source);
+    let annotation = annotation_of(&mint, &out, "choose");
+    let PresenceOwnership::Existential { boundary } = annotation.variables[0].ownership else {
+        panic!("the final result presence should be producer-chosen");
+    };
+    // The package starts at the final struct result, not at either arrow.
+    assert_eq!(
+        &source[boundary.start..boundary.end()],
+        "{ x when 'p: Nat }"
+    );
+}
+
+#[test]
+fn anonymous_presences_have_distinct_positive_package_owners() {
+    let source = "let choose : { x when _: Nat, y when _: Nat } = { x: 0n, y: 0n }";
+    let (mint, out) = built(source);
+    let annotation = annotation_of(&mint, &out, "choose");
+    assert_eq!(annotation.anonymous_existentials.len(), 2);
+    assert_ne!(
+        annotation.anonymous_existentials[0].0,
+        annotation.anonymous_existentials[1].0
+    );
+    assert_eq!(
+        annotation.anonymous_existentials[0].1,
+        annotation.anonymous_existentials[1].1
+    );
+
+    let source = "let take : { x when _: Nat } -> Nat = fn x => 0n";
+    let (mint, out) = built(source);
+    assert!(
+        annotation_of(&mint, &out, "take")
+            .anonymous_existentials
+            .is_empty()
+    );
+}
+
+#[test]
+fn alias_parameter_variance_reaches_annotation_ownership_fixpoint() {
+    for (declarations, use_ty, existential) in [
+        (
+            "type Cov 'a = { value: 'a }",
+            "Cov { x when 'p: Nat }",
+            true,
+        ),
+        (
+            "type Contra 'a = 'a -> Nat",
+            "Contra { x when 'p: Nat }",
+            false,
+        ),
+        (
+            "type Inv 'a = { value: 'a -> 'a }",
+            "Inv { x when 'p: Nat }",
+            false,
+        ),
+        ("type Erased 'a = Nat", "Erased { x when 'p: Nat }", false),
+        (
+            "type A 'a = { next: B 'a }\ntype B 'b = { next: A 'b, value: 'b }",
+            "A { x when 'p: Nat }",
+            true,
+        ),
+    ] {
+        let source = format!("{declarations}\nlet value : {use_ty} = 0n");
+        let (mint, out) = build_src(&source);
+        assert!(out.errors.is_empty(), "{source}: {:#?}", out.errors);
+        let variable = &annotation_of(&mint, &out, "value").variables[0];
+        assert_eq!(
+            matches!(variable.ownership, PresenceOwnership::Existential { .. }),
+            existential,
+            "{source}: {:?}",
+            variable.ownership
+        );
+    }
+}
+
+/// A source name denotes one witness, while each positive result boundary is
+/// a distinct package lifetime. Neither sibling results nor a containing value
+/// and its nested result can silently widen that witness to scheme scope. The
+/// refusal is independent of field traversal order.
+#[test]
+fn presence_ownership_rejects_incompatible_production_lifetimes_deterministically() {
+    for source in [
+        "let bad : { one: Nat -> { x when 'p: Nat }, two: Nat -> { y when 'p: Nat } } = {}",
+        "let bad : { two: Nat -> { y when 'p: Nat }, one: Nat -> { x when 'p: Nat } } = {}",
+        "let bad : { root when 'p: Nat, nested: Nat -> { x when 'p: Nat } } = {}",
+        "let bad : { nested: Nat -> { x when 'p: Nat }, root when 'p: Nat } = {}",
+    ] {
+        let (_, out) = build_src(source);
+        assert_eq!(out.errors.len(), 1, "{source}: {:#?}", out.errors);
+        assert!(
+            matches!(
+                &out.errors[0].kind,
+                ErrorKind::IncompatiblePresenceOwnership { name, .. } if name == "p"
+            ),
+            "{source}: {:#?}",
+            out.errors
+        );
+        let ErrorKind::IncompatiblePresenceOwnership { previous, .. } = out.errors[0].kind else {
+            unreachable!()
+        };
+        assert_ne!(previous, out.errors[0].span);
+        assert!(source[out.errors[0].span.start..out.errors[0].span.end()].contains('{'));
+        assert!(source[previous.start..previous.end()].contains('{'));
+    }
+
+    // Repetition within one exact package remains one producer-owned witness.
+    let source = "let good : { x when 'p: Nat, y when 'p: Nat } = { x: 0n, y: 0n }";
+    let (mint, out) = built(source);
+    assert!(matches!(
+        annotation_of(&mint, &out, "good").variables[0].ownership,
+        PresenceOwnership::Existential { .. }
+    ));
+}
+
+/// Conditional effect labels have the polarity of the arrow carrying them;
+/// entering an outer parameter has already reversed that polarity.
+#[test]
+fn conditional_effect_presence_uses_the_carrying_arrows_polarity() {
+    let source =
+        "effect Log = { op: () -> () }\nlet run : (() -> () + !Log (when 'p)) -> Nat = fn f => 0n";
+    let (mint, out) = built(source);
+    assert_eq!(
+        annotation_of(&mint, &out, "run").variables[0].ownership,
+        PresenceOwnership::Universal
+    );
+}
+
+/// Callback polarity is not approximated from the nearest arrow. The result of
+/// a callback supplied to a callback is positive after two reversals, and its
+/// hidden choice belongs to that innermost result rather than either wrapper.
+#[test]
+fn nested_callback_results_keep_their_own_existential_boundary() {
+    let source = "let nested : ((Nat -> { x when 'p: Nat }) -> Nat) -> Nat = fn use => 0n";
+    let (mint, out) = built(source);
+    let PresenceOwnership::Existential { boundary } =
+        annotation_of(&mint, &out, "nested").variables[0].ownership
+    else {
+        panic!("a twice-reversed callback result should be producer-owned");
+    };
+    assert_eq!(
+        &source[boundary.start..boundary.end()],
+        "{ x when 'p: Nat }"
+    );
+}
+
+/// An arrow's conditional effect is produced at the invocation boundary while
+/// its return field is produced inside that boundary. One source presence may
+/// not be widened to the invocation boundary: doing so would erase the exact
+/// package lifetime of the returned value.
+#[test]
+fn result_and_effect_occurrences_do_not_merge_package_boundaries() {
+    let source = "effect Log = { op: () -> () }\n\
+                  let mixed : Nat -> { x when 'p: Nat } + !Log (when 'p) = fn n => { x: n }";
+    let (_, out) = build_src(source);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert!(matches!(
+        out.errors[0].kind,
+        ErrorKind::IncompatiblePresenceOwnership { ref name, .. } if name == "p"
+    ));
+}
+
 /// A formula is written about presences, and a presence is what a `when` puts
 /// on a label — so a name no `when` wears is a name the formula has nothing to
 /// say about, whether or not anything declared it.
@@ -5530,9 +5725,102 @@ fn artifact_scheme(body: a::Type) -> a::Scheme {
     a::Scheme {
         count: 0,
         presences: 0,
+        existentials: Vec::new(),
         formula: a::Formula::True,
         body,
     }
+}
+
+#[test]
+fn imported_schemes_preserve_and_sanitize_existential_ownership() {
+    let mut dependency = prelude_artifact("dep");
+    dependency.header.values[0].scheme = a::Scheme {
+        count: 1,
+        presences: 1,
+        existentials: vec![0],
+        formula: a::Formula::True,
+        body: a::Type::Package(Box::new(artifact_struct(vec![(
+            "choice".into(),
+            a::RowField {
+                presence: a::Presence::Bound(0),
+                ty: a::Type::Nat,
+            },
+        )]))),
+    };
+    dependency.header.values[1].scheme.existentials = vec![9];
+
+    let parsed = parse::parse(lex("let value = dep::prelude::shared", FileID::GENERATED).tokens);
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let mut schemes = out.program.external_schemes.values();
+    assert!(
+        schemes
+            .next()
+            .is_some_and(|scheme| scheme.is_existential(0))
+    );
+    assert!(
+        schemes
+            .next()
+            .is_some_and(|scheme| scheme.existentials().is_empty())
+    );
+}
+
+#[test]
+fn canonical_bundle_import_preserves_mixed_input_result_guarantee() {
+    let mut dependency = prelude_artifact("dep");
+    dependency.header.values[0].scheme = a::Scheme {
+        count: 2,
+        presences: 2,
+        existentials: vec![1],
+        formula: a::Formula::Owned(
+            0,
+            Box::new(a::Formula::Iff(
+                Box::new(a::Formula::Bound(0)),
+                Box::new(a::Formula::Bound(1)),
+            )),
+        ),
+        body: a::Type::Arrow(
+            Box::new(artifact_struct(vec![(
+                "input".into(),
+                a::RowField {
+                    presence: a::Presence::Bound(0),
+                    ty: a::Type::Nat,
+                },
+            )])),
+            Box::new(a::Type::Package(Box::new(artifact_struct(vec![(
+                "result".into(),
+                a::RowField {
+                    presence: a::Presence::Bound(1),
+                    ty: a::Type::Nat,
+                },
+            )])))),
+            a::Row {
+                labels: Vec::new(),
+                rest: a::Rest::Closed,
+            },
+        ),
+    };
+
+    // Exercise the complete bundle disk boundary before importing it. The
+    // universal atom remains in scope even though existential atoms determine
+    // which result package owns the indivisible proposition.
+    let text = dependency.print();
+    dependency = a::Artifact::try_parse(&text).expect("canonical dependency parses");
+    let parsed = parse::parse(lex("let value = dep::prelude::shared", FileID::GENERATED).tokens);
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let scheme = out
+        .program
+        .external_schemes
+        .values()
+        .next()
+        .expect("the imported value scheme exists");
+    assert!(scheme.is_existential(1));
+    assert!(
+        matches!(scheme.formula(), ruddy::types::Formula::Owned(0, inner) if matches!(&**inner, ruddy::types::Formula::Iff(..)))
+    );
 }
 
 fn prelude_artifact(bundle: &str) -> a::Artifact {
@@ -5988,6 +6276,7 @@ fn imported_effect_row_keys_follow_canonical_identities_by_shape() {
             scheme: a::Scheme {
                 count: 1,
                 presences: 0,
+                existentials: Vec::new(),
                 formula: a::Formula::True,
                 body: artifact_type(a::Type::Bound(0)),
             },
@@ -6122,6 +6411,7 @@ fn legacy_operation_effects_get_fallback_identity_before_row_normalization() {
         scheme: a::Scheme {
             count: 1,
             presences: 0,
+            existentials: Vec::new(),
             formula: a::Formula::True,
             body: a::Type::Bound(0),
         },
@@ -6881,6 +7171,7 @@ fn imported_bound_presences_are_local_to_each_scheme_instantiation() {
         scheme: a::Scheme {
             count: 1,
             presences: 1,
+            existentials: Vec::new(),
             formula: a::Formula::True,
             body: artifact_struct(vec![
                 (
@@ -6935,6 +7226,7 @@ fn imported_presence_vars_use_a_disjoint_recovery_variant() {
         scheme: a::Scheme {
             count: 1,
             presences: 1,
+            existentials: Vec::new(),
             formula: a::Formula::True,
             body: artifact_struct(vec![
                 (
@@ -7219,6 +7511,7 @@ fn imported_structural_identity_respects_effect_and_case_parameter_senses() {
         scheme: a::Scheme {
             count,
             presences: 0,
+            existentials: Vec::new(),
             formula: a::Formula::True,
             body,
         },
@@ -7432,6 +7725,7 @@ fn structural_rows_mask_inner_duplicates_and_preserve_ordinary_separator_labels(
         scheme: a::Scheme {
             count,
             presences: 0,
+            existentials: Vec::new(),
             formula: a::Formula::True,
             body,
         },
@@ -7596,6 +7890,7 @@ fn absent_imported_payloads_do_not_create_visible_quantifiers_or_effect_counts()
         scheme: a::Scheme {
             count: 1,
             presences: 0,
+            existentials: Vec::new(),
             formula: a::Formula::True,
             body: a::Type::Struct(a::Row {
                 labels: vec![(
@@ -7621,6 +7916,7 @@ fn absent_imported_payloads_do_not_create_visible_quantifiers_or_effect_counts()
         scheme: a::Scheme {
             count: 1,
             presences: 1,
+            existentials: Vec::new(),
             formula: a::Formula::Bound(0),
             body: a::Type::Struct(a::Row {
                 labels: vec![
@@ -7783,6 +8079,7 @@ fn imported_interfaces_keep_applied_types_effects_and_alias_overlap_structural()
                 scheme: a::Scheme {
                     count: 1,
                     presences: 0,
+                    existentials: Vec::new(),
                     formula: a::Formula::True,
                     body: artifact_type(a::Type::Bound(0)),
                 },
@@ -8195,6 +8492,7 @@ fn dependency_interfaces_import_every_semantic_form() {
         scheme: a::Scheme {
             count: 3,
             presences: 1,
+            existentials: Vec::new(),
             formula,
             body: rich,
         },
@@ -8393,6 +8691,7 @@ fn dependency_interfaces_import_every_semantic_form() {
                     scheme: a::Scheme {
                         count: 1,
                         presences: 0,
+                        existentials: Vec::new(),
                         formula: a::Formula::True,
                         body: artifact_type(a::Type::Struct(a::Row {
                             labels: Vec::new(),
@@ -8437,6 +8736,7 @@ fn dependency_interfaces_import_every_semantic_form() {
                     scheme: a::Scheme {
                         count: 1,
                         presences: 0,
+                        existentials: Vec::new(),
                         formula: a::Formula::True,
                         body: artifact_type(a::Type::Struct(a::Row {
                             labels: Vec::new(),
@@ -8883,6 +9183,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::Artifact {
             scheme: a::Scheme {
                 count: 1,
                 presences: 0,
+                existentials: Vec::new(),
                 formula: a::Formula::True,
                 body: a::Type::Struct(a::Row {
                     labels: Vec::new(),
@@ -8900,6 +9201,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::Artifact {
             scheme: a::Scheme {
                 count: 1,
                 presences: 0,
+                existentials: Vec::new(),
                 formula: a::Formula::True,
                 body: artifact_type(a::Type::Bound(0)),
             },
@@ -8921,6 +9223,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::Artifact {
             scheme: a::Scheme {
                 count: 2,
                 presences: 0,
+                existentials: Vec::new(),
                 formula: a::Formula::True,
                 body: artifact_type(a::Type::Bound(0)),
             },
@@ -8943,6 +9246,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::Artifact {
             scheme: a::Scheme {
                 count: 1,
                 presences: 0,
+                existentials: Vec::new(),
                 formula: a::Formula::True,
                 body: artifact_type(a::Type::Undecided),
             },
@@ -8957,6 +9261,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::Artifact {
             scheme: a::Scheme {
                 count: 1,
                 presences: 0,
+                existentials: Vec::new(),
                 formula: a::Formula::True,
                 body: artifact_type(a::Type::Named {
                     name: "dep@1.0.0::Identity".into(),
@@ -8977,6 +9282,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::Artifact {
             scheme: a::Scheme {
                 count: 1,
                 presences: 0,
+                existentials: Vec::new(),
                 formula: a::Formula::True,
                 body: artifact_type(a::Type::Named {
                     name: "dep@1.0.0::Id".into(),
@@ -9001,6 +9307,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::Artifact {
             scheme: a::Scheme {
                 count: 2,
                 presences: 0,
+                existentials: Vec::new(),
                 formula: a::Formula::True,
                 body: artifact_type(a::Type::Named {
                     name: "dep@1.0.0::Chain".into(),
@@ -9018,6 +9325,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::Artifact {
             scheme: a::Scheme {
                 count: 1,
                 presences: 0,
+                existentials: Vec::new(),
                 formula: a::Formula::True,
                 body: artifact_type(a::Type::Struct(a::Row {
                     labels: vec![(
@@ -9041,6 +9349,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::Artifact {
             scheme: a::Scheme {
                 count: 1,
                 presences: 0,
+                existentials: Vec::new(),
                 formula: a::Formula::True,
                 body: artifact_type(a::Type::Struct(a::Row {
                     labels: vec![(
@@ -9064,6 +9373,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::Artifact {
             scheme: a::Scheme {
                 count: 1,
                 presences: 0,
+                existentials: Vec::new(),
                 formula: a::Formula::True,
                 body: artifact_type(a::Type::Struct(a::Row {
                     labels: vec![(
@@ -9098,6 +9408,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::Artifact {
                 scheme: a::Scheme {
                     count: 1,
                     presences: 0,
+                    existentials: Vec::new(),
                     formula: a::Formula::True,
                     body: a::Type::Struct(a::Row {
                         labels: Vec::new(),
@@ -9150,6 +9461,7 @@ fn case_rows_artifact() -> a::Artifact {
             scheme: a::Scheme {
                 count: 1,
                 presences: 0,
+                existentials: Vec::new(),
                 formula: a::Formula::True,
                 body: artifact_type(a::Type::Sum(a::Row {
                     labels: vec![(
@@ -9180,6 +9492,7 @@ fn case_rows_artifact() -> a::Artifact {
             scheme: a::Scheme {
                 count: 2,
                 presences: 0,
+                existentials: Vec::new(),
                 formula: a::Formula::True,
                 body: artifact_type(a::Type::Named {
                     name: "dep@1.0.0::AddB".into(),
@@ -9195,6 +9508,7 @@ fn case_rows_artifact() -> a::Artifact {
             scheme: a::Scheme {
                 count: 1,
                 presences: 0,
+                existentials: Vec::new(),
                 formula: a::Formula::True,
                 body: artifact_type(a::Type::Sum(a::Row {
                     labels: Vec::new(),
@@ -9301,6 +9615,7 @@ fn malformed_named_applications_of_unequal_arity_are_not_congruent() {
         scheme: a::Scheme {
             count: 1,
             presences: 0,
+            existentials: Vec::new(),
             formula: a::Formula::True,
             body: artifact_struct(vec![(
                 "value".into(),
@@ -9355,6 +9670,7 @@ fn malformed_nested_imported_applications_recover_during_effect_identity() {
             scheme: a::Scheme {
                 count: 1,
                 presences: 0,
+                existentials: Vec::new(),
                 formula: a::Formula::True,
                 body: a::Type::Bound(0),
             },
@@ -9496,6 +9812,7 @@ fn imported_effect_identity_graph_is_stack_safe_and_absorbs_growing_types() {
                     scheme: a::Scheme {
                         count: 1,
                         presences: 0,
+                        existentials: Vec::new(),
                         formula: a::Formula::True,
                         body: a::Type::Named {
                             name: "dep@1.0.0::Grow".into(),
@@ -9562,6 +9879,7 @@ fn imported_recursive_instantiations_close_through_forwarding_aliases() {
             scheme: a::Scheme {
                 count: 1,
                 presences: 0,
+                existentials: Vec::new(),
                 formula: a::Formula::True,
                 body: a::Type::Bound(0),
             },
@@ -9572,6 +9890,7 @@ fn imported_recursive_instantiations_close_through_forwarding_aliases() {
             scheme: a::Scheme {
                 count: 1,
                 presences: 0,
+                existentials: Vec::new(),
                 formula: a::Formula::True,
                 body: a::Type::Named {
                     name: "dep@1.0.0::Loop".into(),
@@ -9629,6 +9948,7 @@ fn a_finite_imported_rotation_longer_than_256_states_remains_exact() {
         scheme: a::Scheme {
             count: PARAMETERS as u32,
             presences: 0,
+            existentials: Vec::new(),
             formula: a::Formula::True,
             body: a::Type::Arrow(
                 Box::new(a::Type::Bound(0)),
@@ -9751,6 +10071,7 @@ fn structurally_growing_imported_rotation_recovers_without_a_depth_cap() {
             scheme: a::Scheme {
                 count: 2,
                 presences: 0,
+                existentials: Vec::new(),
                 formula: a::Formula::True,
                 body: a::Type::Named {
                     name: "dep@1.0.0::Grow".into(),
@@ -9794,6 +10115,7 @@ fn structurally_growing_imported_rotation_recovers_without_a_depth_cap() {
             scheme: a::Scheme {
                 count: 1,
                 presences: 0,
+                existentials: Vec::new(),
                 formula: a::Formula::True,
                 body: a::Type::Named {
                     name: "dep@1.0.0::Odd".into(),
@@ -9865,6 +10187,7 @@ fn sequential_imported_instantiations_do_not_exhaust_the_active_recursion_limit(
             scheme: a::Scheme {
                 count: 1,
                 presences: 0,
+                existentials: Vec::new(),
                 formula: a::Formula::True,
                 body: a::Type::Bound(0),
             },
@@ -10102,6 +10425,7 @@ fn forwarded_field_addition_respects_outer_absent_shadowing() {
         scheme: a::Scheme {
             count: 1,
             presences: 0,
+            existentials: Vec::new(),
             formula: a::Formula::True,
             body: a::Type::Struct(a::Row {
                 labels: vec![(
@@ -10213,6 +10537,7 @@ fn deep_field_summary_artifact(depth: usize, cycle: bool) -> a::Artifact {
                 scheme: a::Scheme {
                     count: u32::from(!cycle),
                     presences: 0,
+                    existentials: Vec::new(),
                     formula: a::Formula::True,
                     body: artifact_type(body),
                 },
@@ -10368,6 +10693,7 @@ fn deeply_nested_imported_semantics_are_preserved_on_a_small_stack() {
                 scheme: a::Scheme {
                     count: 1,
                     presences: 1,
+                    existentials: Vec::new(),
                     formula,
                     body: a::Type::Nat,
                 },
@@ -10377,6 +10703,7 @@ fn deeply_nested_imported_semantics_are_preserved_on_a_small_stack() {
                 scheme: a::Scheme {
                     count: 0,
                     presences: 0,
+                    existentials: Vec::new(),
                     formula: malformed_formula,
                     body: a::Type::Nat,
                 },
@@ -10474,6 +10801,7 @@ fn malformed_imported_scheme_bounds_recover_for_types_and_values() {
     let malformed = a::Scheme {
         count: 1,
         presences: 2,
+        existentials: Vec::new(),
         formula: a::Formula::And(Box::new(a::Formula::Bound(9)), Box::new(a::Formula::True)),
         body: a::Type::Struct(a::Row {
             labels: vec![(
@@ -10531,6 +10859,7 @@ fn malformed_imported_scheme_bounds_recover_for_types_and_values() {
             scheme: a::Scheme {
                 count: 2,
                 presences: 1,
+                existentials: Vec::new(),
                 formula,
                 body: valid_body.clone(),
             },
@@ -10541,6 +10870,7 @@ fn malformed_imported_scheme_bounds_recover_for_types_and_values() {
         scheme: a::Scheme {
             count: 2,
             presences: 1,
+            existentials: Vec::new(),
             formula: a::Formula::True,
             body: a::Type::Struct(a::Row {
                 labels: Vec::new(),
@@ -10633,6 +10963,7 @@ fn imported_interfaces_discard_foreign_solver_local_ids_before_inference() {
             scheme: a::Scheme {
                 count: 0,
                 presences: 0,
+                existentials: Vec::new(),
                 formula,
                 body: a::Type::Nat,
             },
@@ -10741,6 +11072,7 @@ fn arrow_effect_more_rows_use_one_canonical_form_in_both_directions() {
             scheme: a::Scheme {
                 count: 1,
                 presences: 0,
+                existentials: Vec::new(),
                 formula: a::Formula::True,
                 body: arrow(vec![effect("A"), plain()], a::Rest::Bound(0)),
             },
@@ -10874,6 +11206,7 @@ fn deep_equal_imported_types_unify_on_a_bounded_stack() {
                     scheme: a::Scheme {
                         count: 1,
                         presences: 0,
+                        existentials: Vec::new(),
                         formula: a::Formula::True,
                         body: a::Type::Bound(0),
                     },
@@ -10931,6 +11264,7 @@ fn deep_equal_imported_types_unify_on_a_bounded_stack() {
                     scheme: a::Scheme {
                         count: 5_000,
                         presences: 0,
+                        existentials: Vec::new(),
                         formula: a::Formula::True,
                         body: a::Type::Nat,
                     },
@@ -10995,6 +11329,7 @@ fn deep_alias_reentry_shares_one_congruence_transaction() {
                 scheme: a::Scheme {
                     count: 1,
                     presences: 0,
+                    existentials: Vec::new(),
                     formula: a::Formula::True,
                     body: a::Type::Bound(0),
                 },
@@ -11034,6 +11369,7 @@ fn deep_alias_reentry_shares_one_congruence_transaction() {
                     scheme: a::Scheme {
                         count: 5_000,
                         presences: 0,
+                        existentials: Vec::new(),
                         formula: a::Formula::True,
                         body: a::Type::Nat,
                     },
@@ -11101,6 +11437,7 @@ fn recursive_imported_alias_reentry_compares_malformed_arities() {
             scheme: a::Scheme {
                 count: 1,
                 presences: 0,
+                existentials: Vec::new(),
                 formula: a::Formula::True,
                 body: recursive("dep@1.0.0::A", true),
             },
@@ -11111,6 +11448,7 @@ fn recursive_imported_alias_reentry_compares_malformed_arities() {
             scheme: a::Scheme {
                 count: 1,
                 presences: 0,
+                existentials: Vec::new(),
                 formula: a::Formula::True,
                 body: recursive("dep@1.0.0::B", false),
             },
@@ -11425,6 +11763,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
             scheme: a::Scheme {
                 count: 1,
                 presences: 0,
+                existentials: Vec::new(),
                 formula: a::Formula::True,
                 body: a::Type::Struct(a::Row {
                     labels: Vec::new(),
@@ -11442,6 +11781,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
             scheme: a::Scheme {
                 count: 1,
                 presences: 0,
+                existentials: Vec::new(),
                 formula: a::Formula::True,
                 body: artifact_type(a::Type::Bound(0)),
             },
@@ -11456,6 +11796,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
             scheme: a::Scheme {
                 count: 1,
                 presences: 0,
+                existentials: Vec::new(),
                 formula: a::Formula::True,
                 body: artifact_type(a::Type::Named {
                     name: "dep@1.0.0::IdentityRow".into(),
@@ -11524,6 +11865,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
             scheme: a::Scheme {
                 count: 1,
                 presences: 0,
+                existentials: Vec::new(),
                 formula: a::Formula::True,
                 body: artifact_type(a::Type::Named {
                     name: "dep@1.0.0::Fields".into(),
@@ -11541,6 +11883,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
             scheme: a::Scheme {
                 count: 1,
                 presences: 0,
+                existentials: Vec::new(),
                 formula: a::Formula::True,
                 body: artifact_struct(vec![(
                     "value".into(),
@@ -11575,6 +11918,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
             scheme: a::Scheme {
                 count: 1,
                 presences: 0,
+                existentials: Vec::new(),
                 formula: a::Formula::True,
                 body: artifact_struct(vec![(
                     "phantom".into(),

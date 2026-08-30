@@ -20,7 +20,7 @@ use ruddy::{
     ir::{Program, Term, TermKind},
     symbol::{Mint, Symbol},
     tracking::Tracked,
-    types::{Rest, Row, Scheme, Ty},
+    types::{Formula, Rest, Row, Scheme, Ty},
 };
 
 use crate::{
@@ -181,11 +181,72 @@ fn raw_types(output: &ruddy::inference::Output) -> String {
     ] {
         let _ = writeln!(out, "{title}:");
         for (symbol, scheme) in schemes {
-            let _ = writeln!(out, "  {symbol:?}: {scheme}");
+            let (packages, owners) = ownership_metadata(scheme);
+            let _ = writeln!(
+                out,
+                "  {symbol:?}: {scheme}  # packages={packages}, owned={owners:?}"
+            );
         }
         out.push('\n');
     }
     out
+}
+
+/// Internal package boundaries and formula ownership are intentionally absent
+/// from the source-like semantic formatter. Keep them explicit in the raw
+/// debugger view so existential lifetime bugs can be diagnosed without
+/// inspecting an artifact by hand.
+fn ownership_metadata(scheme: &Scheme) -> (u32, Vec<u32>) {
+    enum Part<'a> {
+        Ty(&'a Ty),
+        Row(&'a Row),
+    }
+    let mut packages = 0;
+    let mut parts = vec![Part::Ty(scheme.body())];
+    while let Some(part) = parts.pop() {
+        match part {
+            Part::Ty(ty) => match ty {
+                Ty::Package(body) => {
+                    packages += 1;
+                    parts.push(Part::Ty(body));
+                }
+                Ty::Arrow(from, to, effects) => {
+                    parts.push(Part::Row(effects));
+                    parts.push(Part::Ty(to));
+                    parts.push(Part::Ty(from));
+                }
+                Ty::Struct(row) | Ty::Sum(row) => parts.push(Part::Row(row)),
+                Ty::Named { args, .. } => parts.extend(args.iter().rev().map(|ty| Part::Ty(ty))),
+                _ => {}
+            },
+            Part::Row(row) => {
+                if let Rest::More(more) = &row.rest {
+                    parts.push(Part::Row(more));
+                }
+                parts.extend(row.labels.values().rev().map(|field| Part::Ty(&field.ty)));
+            }
+        }
+    }
+    let mut owners = Vec::new();
+    let mut formulas = vec![scheme.formula()];
+    while let Some(formula) = formulas.pop() {
+        match formula {
+            Formula::Owned(owner, inner) => {
+                owners.push(*owner);
+                formulas.push(inner);
+            }
+            Formula::Not(inner) => formulas.push(inner),
+            Formula::And(left, right)
+            | Formula::Or(left, right)
+            | Formula::Iff(left, right)
+            | Formula::Xor(left, right) => {
+                formulas.push(right);
+                formulas.push(left);
+            }
+            Formula::True | Formula::False | Formula::Atom(_) => {}
+        }
+    }
+    (packages, owners)
 }
 
 /// Every name a nested `let` binds inside one definition's value, in the order
@@ -399,6 +460,7 @@ fn relevant_parameters(aliases: &IndexMap<Symbol, Scheme>) -> HashMap<Symbol, Ha
                         work.push(Work::Ty(to));
                         work.push(Work::Ty(from));
                     }
+                    Ty::Package(body) => work.push(Work::Ty(body)),
                     Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(row)),
                     Ty::Nat
                     | Ty::Int
@@ -473,6 +535,7 @@ fn names_in(ty: &Ty, relevant: &HashMap<Symbol, HashSet<usize>>, out: &mut Vec<S
                     work.push(Work::Ty(to));
                     work.push(Work::Ty(from));
                 }
+                Ty::Package(body) => work.push(Work::Ty(body)),
                 Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(row)),
                 Ty::Nat
                 | Ty::Int

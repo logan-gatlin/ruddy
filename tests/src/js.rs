@@ -171,6 +171,46 @@ fn generated_module_executes_values_functions_records_and_sums_in_node() {
 }
 
 #[test]
+fn generated_module_erases_existential_packages_around_structs() {
+    if Command::new("node").arg("--version").output().is_err() {
+        return;
+    }
+    let artifact = compiled(
+        "let build: Nat ->\n\
+         { left when 'p: Nat, also when 'p: Nat, right when 'q: Nat }\n\
+         where 'p != 'q = fn n => { left: n, also: n }\n\
+         extern choose: Nat ->\n\
+         { left when 'p: Nat, also when 'p: Nat, right when 'q: Nat }\n\
+         where 'p != 'q = host.choose\n\
+         let built = build 7n\n\
+         let projected = (choose 8n).also\n\
+         let matched = match choose 9n with\n\
+         | { left, .. } => left\n\
+         | { right, .. } => right\n\
+         end\n",
+    );
+    let module = js::generate(&artifact).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("app.mjs");
+    fs::write(&path, module).unwrap();
+
+    let probe = format!(
+        "globalThis.host = {{ choose: n => n === 9 ? {{ right: n }} : {{ left: n, also: n }} }}; const app = await import({}); console.log(JSON.stringify([app.built.left, app.projected, app.matched]));",
+        serde_json::to_string(path.to_str().unwrap()).unwrap()
+    );
+    let output = Command::new("node")
+        .args(["--input-type=module", "--eval", &probe])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "[7,8,9]");
+}
+
+#[test]
 fn generated_module_executes_tuple_values_projections_and_patterns() {
     if Command::new("node").arg("--version").output().is_err() {
         return;

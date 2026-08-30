@@ -7,7 +7,7 @@
 //! malformed input. Use [`try_parse`] at trust boundaries. This is an internal
 //! v1 format, not a compatibility promise.
 
-use std::{error::Error, fmt};
+use std::{collections::HashMap, error::Error, fmt};
 
 use crate::{
     inference, ir, lir,
@@ -182,6 +182,10 @@ pub enum OperationSelector {
 pub struct Scheme {
     pub count: u32,
     pub presences: u32,
+    /// Producer-owned presence positions. Each index is in `0..presences`.
+    /// The sorted canonical representation survives import and linking so an
+    /// imported consumer cannot accidentally reopen a witness as universal.
+    pub existentials: Vec<u32>,
     pub formula: Formula,
     pub body: Type,
 }
@@ -196,6 +200,7 @@ pub enum Type {
     String,
     Boolean,
     Arrow(Box<Type>, Box<Type>, Row),
+    Package(Box<Type>),
     Struct(Row),
     Sum(Row),
     Var(u32),
@@ -253,6 +258,8 @@ pub enum Formula {
     False,
     Var(u32),
     Bound(u32),
+    /// Constraint owned by the package at this preorder in the scheme body.
+    Owned(u32, Box<Formula>),
     Not(Box<Formula>),
     And(Box<Formula>, Box<Formula>),
     Or(Box<Formula>, Box<Formula>),
@@ -305,6 +312,9 @@ fn semantic_eq(root: SemanticPair<'_>) -> bool {
                     pending.push(SemanticPair::Row(left_effects, right_effects));
                     pending.push(SemanticPair::Type(left_to, right_to));
                     pending.push(SemanticPair::Type(left_from, right_from));
+                }
+                (Type::Package(left), Type::Package(right)) => {
+                    pending.push(SemanticPair::Type(left, right));
                 }
                 (Type::Struct(left), Type::Struct(right)) | (Type::Sum(left), Type::Sum(right)) => {
                     pending.push(SemanticPair::Row(left, right));
@@ -400,6 +410,11 @@ impl PartialEq for Formula {
                 (Formula::Var(left), Formula::Var(right))
                 | (Formula::Bound(left), Formula::Bound(right))
                     if left == right => {}
+                (Formula::Owned(left_owner, left), Formula::Owned(right_owner, right))
+                    if left_owner == right_owner =>
+                {
+                    pending.push((left, right))
+                }
                 (Formula::Not(left), Formula::Not(right)) => pending.push((left, right)),
                 (Formula::And(left_a, left_b), Formula::And(right_a, right_b))
                 | (Formula::Or(left_a, left_b), Formula::Or(right_a, right_b))
@@ -420,6 +435,7 @@ impl Eq for Formula {}
 enum CloneWork<'a> {
     Semantic(SemanticRef<'a>),
     Arrow,
+    Package,
     Struct,
     Sum,
     Named {
@@ -449,6 +465,10 @@ fn clone_semantic(root: SemanticRef<'_>) -> (Vec<Type>, Vec<Row>) {
                     work.push(CloneWork::Semantic(SemanticRef::Row(effects)));
                     work.push(CloneWork::Semantic(SemanticRef::Type(to)));
                     work.push(CloneWork::Semantic(SemanticRef::Type(from)));
+                }
+                Type::Package(body) => {
+                    work.push(CloneWork::Package);
+                    work.push(CloneWork::Semantic(SemanticRef::Type(body)));
                 }
                 Type::Struct(row) => {
                     work.push(CloneWork::Struct);
@@ -511,6 +531,10 @@ fn clone_semantic(root: SemanticRef<'_>) -> (Vec<Type>, Vec<Row>) {
                 let to = types.pop().expect("cloned arrow result");
                 let from = types.pop().expect("cloned arrow parameter");
                 types.push(Type::Arrow(Box::new(from), Box::new(to), effects));
+            }
+            CloneWork::Package => {
+                let body = types.pop().expect("cloned package body");
+                types.push(Type::Package(Box::new(body)));
             }
             CloneWork::Struct => {
                 types.push(Type::Struct(rows.pop().expect("cloned struct row")));
@@ -579,6 +603,10 @@ fn empty_row() -> Row {
 
 fn drain_type(value: &mut Type, pending: &mut Vec<SemanticOwned>) {
     match value {
+        Type::Package(body) => pending.push(SemanticOwned::Type(std::mem::replace(
+            body.as_mut(),
+            Type::Undecided,
+        ))),
         Type::Arrow(from, to, effects) => {
             pending.push(SemanticOwned::Type(std::mem::replace(
                 from.as_mut(),
@@ -657,6 +685,7 @@ impl Clone for Formula {
     fn clone(&self) -> Self {
         enum Work<'a> {
             Formula(&'a Formula),
+            Owned(u32),
             Not,
             Pair(u8),
         }
@@ -669,6 +698,10 @@ impl Clone for Formula {
                 Work::Formula(Formula::False) => out.push(Formula::False),
                 Work::Formula(Formula::Var(value)) => out.push(Formula::Var(*value)),
                 Work::Formula(Formula::Bound(value)) => out.push(Formula::Bound(*value)),
+                Work::Formula(Formula::Owned(owner, inner)) => {
+                    work.push(Work::Owned(*owner));
+                    work.push(Work::Formula(inner));
+                }
                 Work::Formula(Formula::Not(inner)) => {
                     work.push(Work::Not);
                     work.push(Work::Formula(inner));
@@ -692,6 +725,10 @@ impl Clone for Formula {
                     work.push(Work::Pair(3));
                     work.push(Work::Formula(right));
                     work.push(Work::Formula(left));
+                }
+                Work::Owned(owner) => {
+                    let inner = out.pop().expect("cloned owned formula operand");
+                    out.push(Formula::Owned(owner, Box::new(inner)));
                 }
                 Work::Not => {
                     let inner = out.pop().expect("cloned formula operand");
@@ -725,7 +762,9 @@ impl Drop for Formula {
 
 fn drain_formula(value: &mut Formula, pending: &mut Vec<Formula>) {
     match value {
-        Formula::Not(inner) => pending.push(std::mem::replace(inner.as_mut(), Formula::True)),
+        Formula::Owned(_, inner) | Formula::Not(inner) => {
+            pending.push(std::mem::replace(inner.as_mut(), Formula::True))
+        }
         Formula::And(left, right)
         | Formula::Or(left, right)
         | Formula::Iff(left, right)
@@ -1739,9 +1778,12 @@ fn effect_id(id: &types::EffectId) -> EffectIdentity {
 }
 
 fn scheme(mint: &Mint, value: &types::Scheme) -> Scheme {
+    let mut existentials: Vec<_> = value.existentials().iter().copied().collect();
+    existentials.sort_unstable();
     Scheme {
         count: value.count(),
         presences: value.presences(),
+        existentials,
         formula: formula(value.formula()),
         body: ty(mint, value.body()),
     }
@@ -1752,6 +1794,7 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
         Ty(&'a types::Ty),
         Row(&'a types::Row),
         Arrow,
+        Package,
         Struct,
         Sum,
         Named {
@@ -1800,6 +1843,10 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
                     work.push(Work::Ty(to));
                     work.push(Work::Ty(from));
                 }
+                types::Ty::Package(body) => {
+                    work.push(Work::Package);
+                    work.push(Work::Ty(body));
+                }
                 types::Ty::Struct(row) => {
                     work.push(Work::Struct);
                     work.push(Work::Row(row));
@@ -1847,6 +1894,10 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
                 let from = tys.pop().expect("artifact arrow parameter");
                 tys.push(Type::Arrow(Box::new(from), Box::new(to), effects));
             }
+            Work::Package => {
+                let body = tys.pop().expect("artifact package body");
+                tys.push(Type::Package(Box::new(body)));
+            }
             Work::Struct => {
                 let row = rows.pop().expect("artifact struct row");
                 tys.push(Type::Struct(row));
@@ -1885,6 +1936,7 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
 fn formula(value: &types::Formula) -> Formula {
     enum Work<'a> {
         Formula(&'a types::Formula),
+        Owned(u32),
         Not,
         Pair(u8),
     }
@@ -1900,6 +1952,10 @@ fn formula(value: &types::Formula) -> Formula {
             }
             Work::Formula(types::Formula::Atom(types::Atom::Bound(value))) => {
                 out.push(Formula::Bound(*value))
+            }
+            Work::Formula(types::Formula::Owned(owner, inner)) => {
+                work.push(Work::Owned(*owner));
+                work.push(Work::Formula(inner));
             }
             Work::Formula(types::Formula::Not(inner)) => {
                 work.push(Work::Not);
@@ -1924,6 +1980,10 @@ fn formula(value: &types::Formula) -> Formula {
                 work.push(Work::Pair(3));
                 work.push(Work::Formula(right));
                 work.push(Work::Formula(left));
+            }
+            Work::Owned(owner) => {
+                let inner = out.pop().expect("owned formula conversion postorder");
+                out.push(Formula::Owned(owner, Box::new(inner)));
             }
             Work::Not => {
                 let inner = out.pop().expect("formula conversion postorder");
@@ -2356,6 +2416,9 @@ pub mod text {
             A("scheme".into()),
             A(value.count.to_string()),
             A(value.presences.to_string()),
+            L(std::iter::once(A("existentials".into()))
+                .chain(value.existentials.iter().map(|index| A(index.to_string())))
+                .collect()),
             formula(&value.formula),
             ty(&value.body),
         ])
@@ -2396,6 +2459,11 @@ pub mod text {
                             work.push(Work::Ty(to));
                             work.push(Work::Text(" "));
                             work.push(Work::Ty(from));
+                        }
+                        Type::Package(body) => {
+                            out.push_str("(package ");
+                            work.push(Work::Text(")"));
+                            work.push(Work::Ty(body));
                         }
                         Type::Struct(row) | Type::Sum(row) => {
                             out.push('(');
@@ -2482,7 +2550,7 @@ pub mod text {
                 return Raw(compact_formula(value));
             }
             match formula {
-                Formula::Not(inner) => depth.push((inner, at + 1)),
+                Formula::Owned(_, inner) | Formula::Not(inner) => depth.push((inner, at + 1)),
                 Formula::And(left, right)
                 | Formula::Or(left, right)
                 | Formula::Iff(left, right)
@@ -2496,6 +2564,7 @@ pub mod text {
 
         enum Work<'a> {
             Formula(&'a Formula),
+            Owned(u32),
             Not,
             Pair(&'static str),
         }
@@ -2510,6 +2579,10 @@ pub mod text {
                 }
                 Work::Formula(Formula::Bound(value)) => {
                     out.push(L(vec![A("bound".into()), A(value.to_string())]))
+                }
+                Work::Formula(Formula::Owned(owner, inner)) => {
+                    work.push(Work::Owned(*owner));
+                    work.push(Work::Formula(inner));
                 }
                 Work::Formula(Formula::Not(inner)) => {
                     work.push(Work::Not);
@@ -2534,6 +2607,10 @@ pub mod text {
                     work.push(Work::Pair("xor"));
                     work.push(Work::Formula(right));
                     work.push(Work::Formula(left));
+                }
+                Work::Owned(owner) => {
+                    let inner = out.pop().expect("owned formula text postorder");
+                    out.push(L(vec![A("owned".into()), A(owner.to_string()), inner]));
                 }
                 Work::Not => {
                     let inner = out.pop().expect("formula text postorder");
@@ -2570,6 +2647,13 @@ pub mod text {
                     out.push_str("(bound ");
                     out.push_str(&value.to_string());
                     out.push(')');
+                }
+                Work::Formula(Formula::Owned(owner, inner)) => {
+                    out.push_str("(owned ");
+                    out.push_str(&owner.to_string());
+                    out.push(' ');
+                    work.push(Work::Text(")"));
+                    work.push(Work::Formula(inner));
                 }
                 Work::Formula(Formula::Not(inner)) => {
                     out.push_str("(not ");
@@ -3360,12 +3444,185 @@ pub mod text {
             }
         }
         fn read_scheme(&self, value: S) -> Scheme {
-            let mut value = self.exact(self.list(value, "scheme"), 4, "scheme");
+            let mut value = self.exact(self.list(value, "scheme"), 5, "scheme");
+            let count = self.number(self.take(&mut value));
+            let presences = self.number(self.take(&mut value));
+            let mut encoded = self.list(self.take(&mut value), "existentials");
+            let mut existentials = Vec::new();
+            while !encoded.is_empty() {
+                existentials.push(self.number(self.take(&mut encoded)));
+            }
+            if presences > count {
+                self.fail("scheme presence count exceeds quantifier count");
+            }
+            if existentials.iter().any(|index| *index >= presences)
+                || existentials.windows(2).any(|pair| pair[0] >= pair[1])
+            {
+                self.fail("invalid existential presence positions");
+            }
+            let formula = self.read_formula(self.take(&mut value));
+            let body = self.read_ty(self.take(&mut value));
+            // Package owners are exact structural preorder positions. Validate
+            // them against the decoded body rather than guessing from arrow
+            // shape or from which existential slots happen to occur nearby.
+            let mut package_count = 0u32;
+            let mut slot_owners = HashMap::new();
+            enum Part<'a> {
+                Ty(&'a Type, Option<u32>),
+                Row(&'a Row, Option<u32>),
+            }
+            let mut parts = vec![Part::Ty(&body, None)];
+            while let Some(part) = parts.pop() {
+                match part {
+                    Part::Ty(ty, owner) => match ty {
+                        Type::Bound(index) => {
+                            if *index < presences || *index >= count {
+                                self.fail("type bound is outside the type quantifier space");
+                            }
+                        }
+                        Type::Package(inner) => {
+                            let here = package_count;
+                            package_count += 1;
+                            parts.push(Part::Ty(inner, Some(here)));
+                        }
+                        Type::Arrow(from, to, row) => {
+                            parts.push(Part::Row(row, owner));
+                            parts.push(Part::Ty(to, owner));
+                            parts.push(Part::Ty(from, owner));
+                        }
+                        Type::Struct(row) | Type::Sum(row) => {
+                            parts.push(Part::Row(row, owner));
+                        }
+                        Type::Named { args, .. } => {
+                            parts.extend(args.iter().rev().map(|ty| Part::Ty(ty, owner)))
+                        }
+                        _ => {}
+                    },
+                    Part::Row(row, owner) => {
+                        if let Rest::Bound(index) = row.rest
+                            && (index < presences || index >= count)
+                        {
+                            self.fail("row bound is outside the row quantifier space");
+                        }
+                        if let Rest::More(more) = &row.rest {
+                            parts.push(Part::Row(more, owner));
+                        }
+                        for (_, field) in row.labels.iter().rev() {
+                            if let Presence::Bound(index) = field.presence {
+                                if index >= presences {
+                                    self.fail(
+                                        "presence bound is outside the presence quantifier space",
+                                    );
+                                }
+                                if existentials.binary_search(&index).is_ok() {
+                                    let Some(owner) = owner else {
+                                        self.fail("existential presence occurs outside a package");
+                                        continue;
+                                    };
+                                    if slot_owners
+                                        .insert(index, owner)
+                                        .is_some_and(|before| before != owner)
+                                    {
+                                        self.fail("existential presence crosses package owners");
+                                    }
+                                }
+                            }
+                            parts.push(Part::Ty(&field.ty, owner));
+                        }
+                    }
+                }
+            }
+            if existentials
+                .iter()
+                .any(|index| !slot_owners.contains_key(index))
+            {
+                self.fail("existential presence has no package-owned occurrence");
+            }
+
+            // `Owned` is a canonical wrapper around one top-level conjunct.
+            // Its owner is determined by the existential atoms it mentions;
+            // universal atoms may occur in the same indivisible proposition and
+            // remain scoped by this scheme. This rejects incomplete metadata
+            // without rejecting an input-to-result guarantee that necessarily
+            // relates a universal input to a package-owned result.
+            let mut conjuncts = vec![&formula];
+            while let Some(part) = conjuncts.pop() {
+                if let Formula::And(left, right) = part {
+                    conjuncts.push(right);
+                    conjuncts.push(left);
+                    continue;
+                }
+                let (claimed, inner) = match part {
+                    Formula::Owned(owner, inner) => {
+                        if *owner >= package_count {
+                            self.fail("formula package owner is outside scheme body");
+                        }
+                        (Some(*owner), &**inner)
+                    }
+                    _ => (None, part),
+                };
+                // Only a conjunction immediately inside `Owned` is
+                // partitionable into separate top-level conjuncts. An `And`
+                // below `Or`, `Iff`, `Xor`, or `Not` is part of one indivisible
+                // proposition and must retain the package wrapper.
+                if matches!(inner, Formula::And(..)) {
+                    self.fail("owned conjunction is not canonical");
+                }
+                let mut atoms = Vec::new();
+                let mut formulas = vec![inner];
+                while let Some(formula) = formulas.pop() {
+                    match formula {
+                        Formula::Bound(index) => {
+                            if *index >= presences {
+                                self.fail("formula bound is outside the presence quantifier space");
+                            }
+                            atoms.push(*index);
+                        }
+                        // A nested local scheme can retain a captured presence
+                        // as an open atom. It scopes the mixed proposition like
+                        // a universal bound; existential bounds alone infer its
+                        // exact package owner.
+                        Formula::Owned(_, _) => {
+                            self.fail("nested formula package owners are not canonical");
+                        }
+                        Formula::Not(inner) => formulas.push(inner),
+                        Formula::And(left, right)
+                        | Formula::Or(left, right)
+                        | Formula::Iff(left, right)
+                        | Formula::Xor(left, right) => {
+                            formulas.push(right);
+                            formulas.push(left);
+                        }
+                        Formula::True | Formula::False | Formula::Var(_) => {}
+                    }
+                }
+                let mut inferred = None;
+                for index in atoms
+                    .iter()
+                    .copied()
+                    .filter(|index| existentials.binary_search(index).is_ok())
+                {
+                    let owner = slot_owners.get(&index).copied();
+                    match (inferred, owner) {
+                        (None, owner) => inferred = owner,
+                        (Some(before), Some(owner)) if before == owner => {}
+                        _ => {
+                            self.fail("formula existential atoms cross package owners");
+                            inferred = None;
+                            break;
+                        }
+                    }
+                }
+                if claimed != inferred {
+                    self.fail("formula package ownership is incomplete or non-canonical");
+                }
+            }
             Scheme {
-                count: self.number(self.take(&mut value)),
-                presences: self.number(self.take(&mut value)),
-                formula: self.read_formula(self.take(&mut value)),
-                body: self.read_ty(self.take(&mut value)),
+                count,
+                presences,
+                existentials,
+                formula,
+                body,
             }
         }
         fn read_ty(&self, value: S) -> Type {
@@ -3375,6 +3632,7 @@ pub mod text {
                 Rest(S),
                 Field(S),
                 BuildArrow,
+                BuildPackage,
                 BuildStruct,
                 BuildSum,
                 BuildNamed { name: String, count: usize },
@@ -3412,6 +3670,11 @@ pub mod text {
                                         tasks.push(Task::Row(effects));
                                         tasks.push(Task::Ty(to));
                                         tasks.push(Task::Ty(from));
+                                    }
+                                    "package" => {
+                                        let body = self.exact(values, 1, "package").remove(0);
+                                        tasks.push(Task::BuildPackage);
+                                        tasks.push(Task::Ty(body));
                                     }
                                     "struct" => {
                                         let row = self.exact(values, 1, "struct").remove(0);
@@ -3516,6 +3779,10 @@ pub mod text {
                         let from = tys.pop().expect("from");
                         tys.push(Type::Arrow(Box::new(from), Box::new(to), effects));
                     }
+                    Task::BuildPackage => {
+                        let body = tys.pop().expect("package body");
+                        tys.push(Type::Package(Box::new(body)));
+                    }
                     Task::BuildStruct => {
                         let row = rows.pop().expect("struct row");
                         tys.push(Type::Struct(row));
@@ -3569,6 +3836,7 @@ pub mod text {
         fn read_formula(&self, value: S) -> Formula {
             enum Task {
                 Read(S),
+                Owned(u32),
                 Not,
                 Pair(fn(Box<Formula>, Box<Formula>) -> Formula),
             }
@@ -3576,6 +3844,10 @@ pub mod text {
             let mut out = Vec::new();
             while let Some(task) = tasks.pop() {
                 match task {
+                    Task::Owned(owner) => {
+                        let value = out.pop().unwrap_or(Formula::False);
+                        out.push(Formula::Owned(owner, Box::new(value)));
+                    }
                     Task::Not => {
                         let value = out.pop().unwrap_or(Formula::False);
                         out.push(Formula::Not(Box::new(value)));
@@ -3598,6 +3870,13 @@ pub mod text {
                                 "bound" => out.push(Formula::Bound(
                                     self.number(self.exact(values, 1, "formula bound").remove(0)),
                                 )),
+                                "owned" => {
+                                    let mut values = self.exact(values, 2, "owned");
+                                    let owner = self.number(self.take(&mut values));
+                                    let value = self.take(&mut values);
+                                    tasks.push(Task::Owned(owner));
+                                    tasks.push(Task::Read(value));
+                                }
                                 "not" => {
                                     let value = self.exact(values, 1, "not").remove(0);
                                     tasks.push(Task::Not);

@@ -1,4 +1,7 @@
-use std::rc::Rc;
+use std::{
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 
 use indexmap::{IndexMap, IndexSet};
 
@@ -254,7 +257,7 @@ pub enum Atom {
 /// The constructors below simplify as they build — `and` with [`Formula::True`]
 /// is the other side — so the common case of a formula that says nothing is the
 /// value `True` rather than a tree of trues to be recognized later.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum Formula {
     /// The constraint that says nothing. A scheme carrying this prints with no
     /// `where` clause at all.
@@ -263,6 +266,9 @@ pub enum Formula {
     /// batches that contradict each other comes to.
     False,
     Atom(Atom),
+    /// Logically transparent constraint owned by the package at this zero-based
+    /// preorder in the enclosing scheme body.
+    Owned(u32, Rc<Formula>),
     Not(Rc<Formula>),
     And(Rc<Formula>, Rc<Formula>),
     Or(Rc<Formula>, Rc<Formula>),
@@ -270,6 +276,72 @@ pub enum Formula {
     Iff(Rc<Formula>, Rc<Formula>),
     /// `a != b` — exactly one of them there.
     Xor(Rc<Formula>, Rc<Formula>),
+}
+
+impl PartialEq for Formula {
+    fn eq(&self, other: &Self) -> bool {
+        let mut work = vec![(self, other)];
+        while let Some((left, right)) = work.pop() {
+            match (left, right) {
+                (Formula::True, Formula::True) | (Formula::False, Formula::False) => {}
+                (Formula::Atom(left), Formula::Atom(right)) if left == right => {}
+                (Formula::Owned(lo, left), Formula::Owned(ro, right)) if lo == ro => {
+                    work.push((left, right));
+                }
+                (Formula::Not(left), Formula::Not(right)) => work.push((left, right)),
+                (Formula::And(ll, lr), Formula::And(rl, rr))
+                | (Formula::Or(ll, lr), Formula::Or(rl, rr))
+                | (Formula::Iff(ll, lr), Formula::Iff(rl, rr))
+                | (Formula::Xor(ll, lr), Formula::Xor(rl, rr)) => {
+                    work.push((lr, rr));
+                    work.push((ll, rl));
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+}
+
+impl Eq for Formula {}
+
+impl std::hash::Hash for Formula {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let mut work = vec![self];
+        while let Some(formula) = work.pop() {
+            match formula {
+                Formula::True => 0u8.hash(state),
+                Formula::False => 1u8.hash(state),
+                Formula::Atom(atom) => {
+                    2u8.hash(state);
+                    atom.hash(state);
+                }
+                Formula::Owned(owner, inner) => {
+                    3u8.hash(state);
+                    owner.hash(state);
+                    work.push(inner);
+                }
+                Formula::Not(inner) => {
+                    4u8.hash(state);
+                    work.push(inner);
+                }
+                Formula::And(left, right)
+                | Formula::Or(left, right)
+                | Formula::Iff(left, right)
+                | Formula::Xor(left, right) => {
+                    let tag = match formula {
+                        Formula::And(_, _) => 5u8,
+                        Formula::Or(_, _) => 6,
+                        Formula::Iff(_, _) => 7,
+                        _ => 8,
+                    };
+                    tag.hash(state);
+                    work.push(right);
+                    work.push(left);
+                }
+            }
+        }
+    }
 }
 
 /// A type closed over the variables it binds, and what it requires of the
@@ -285,6 +357,9 @@ pub enum Formula {
 pub struct Scheme {
     count: u32,
     presences: u32,
+    /// Presence positions opened as abstract producer-owned identities rather
+    /// than flexible caller-chosen variables.
+    existentials: IndexSet<u32>,
     body: Rc<Ty>,
     /// What has to hold of the presences this scheme quantifies. A constrained
     /// scheme in the HM(X) sense: instantiating one conjoins this, with fresh
@@ -313,6 +388,10 @@ pub enum Ty {
     /// [`Ty::Sum`] is [`Shape::Sum`]'s: "may perform these effects" is not a
     /// property of every type, so there is nowhere else for the row to live.
     Arrow(Rc<Ty>, Rc<Ty>, Row),
+    /// A producer-owned existential value. The wrapper marks the exact
+    /// annotation result boundary at which hidden presence identities are
+    /// opened; it is otherwise representation-transparent.
+    Package(Rc<Ty>),
     /// A structural record and its true field-row tail.
     Struct(Row),
     /// The cases a value may be: a row of labels, each with a presence, and a
@@ -676,6 +755,9 @@ fn take_ty_children(ty: &mut Ty, types: &mut Vec<Rc<Ty>>, rows: &mut Vec<Rc<Row>
             types.push(std::mem::replace(to, Rc::new(Ty::Undecided)));
             take_row_children(effects, types, rows);
         }
+        Ty::Package(body) => {
+            types.push(std::mem::replace(body, Rc::new(Ty::Undecided)));
+        }
         Ty::Struct(row) | Ty::Sum(row) => take_row_children(row, types, rows),
         Ty::Named { args, .. } => {
             types.extend(std::mem::replace(args, Rc::from([])).iter().cloned());
@@ -789,6 +871,7 @@ pub fn same_finite_syntax(left: &Rc<Ty>, right: &Rc<Ty>) -> bool {
                         pending.push(Pair::Ty(left_to, right_to));
                         pending.push(Pair::Ty(left_from, right_from));
                     }
+                    (Ty::Package(left), Ty::Package(right)) => pending.push(Pair::Ty(left, right)),
                     (Ty::Struct(left), Ty::Struct(right)) | (Ty::Sum(left), Ty::Sum(right)) => {
                         pending.push(Pair::Row(left, right))
                     }
@@ -899,7 +982,11 @@ impl Ty {
 
     /// The field row inside a struct, if this is one.
     pub fn fields(&self) -> Option<&Row> {
-        match self {
+        let mut ty = self;
+        while let Ty::Package(body) = ty {
+            ty = body;
+        }
+        match ty {
             Ty::Struct(row) => Some(row),
             _ => None,
         }
@@ -913,7 +1000,11 @@ impl Ty {
     /// only way to reach it — so the tail it leaves behind is undecided rather
     /// than closed, which is what an erased argument has always been.
     pub fn cases(&self) -> Row {
-        match self {
+        let mut ty = self;
+        while let Ty::Package(body) = ty {
+            ty = body;
+        }
+        match ty {
             Ty::Sum(cases) => cases.clone(),
             _ => Row::of(Rest::Undecided),
         }
@@ -985,6 +1076,7 @@ impl Scheme {
         Self {
             count,
             presences: 0,
+            existentials: IndexSet::new(),
             body,
             formula: Formula::True,
         }
@@ -993,12 +1085,50 @@ impl Scheme {
     /// [`new`](Self::new) with the presences a definition's generalization
     /// quantified, and what it requires of them.
     pub fn constrained(count: u32, presences: u32, body: Rc<Ty>, formula: Formula) -> Self {
+        debug_assert!(presences <= count);
         Self {
             count,
             presences,
+            existentials: IndexSet::new(),
             body,
             formula,
         }
+    }
+
+    /// Construct a constrained scheme with producer-owned presence positions.
+    pub fn existential(
+        count: u32,
+        presences: u32,
+        existentials: IndexSet<u32>,
+        body: Rc<Ty>,
+        formula: Formula,
+    ) -> Self {
+        debug_assert!(presences <= count);
+        debug_assert!(existentials.iter().all(|index| *index < presences));
+        // Opening a package for a lexical alias deliberately gives that alias
+        // a fresh, unrelated view (R16). Generalizing the opened view can leave
+        // its existential slots structurally bare; reseal those slots at the
+        // alias boundary rather than retaining the source package's identity.
+        let body = match existential_outside_package(&body, &existentials) {
+            true => Rc::new(Ty::Package(body)),
+            false => body,
+        };
+        let formula = partition_package_formula(&body, &existentials, formula);
+        Self {
+            count,
+            presences,
+            existentials,
+            body,
+            formula,
+        }
+    }
+
+    pub fn is_existential(&self, index: u32) -> bool {
+        self.existentials.contains(&index)
+    }
+
+    pub fn existentials(&self) -> &IndexSet<u32> {
+        &self.existentials
     }
 
     /// How many variables the scheme quantifies, of every sort together. Zero
@@ -1024,7 +1154,166 @@ impl Scheme {
     }
 }
 
+/// Whether an existential bound occurrence has not yet been resealed by a
+/// package. The walk includes composed row tails because imported and inferred
+/// rows may retain their finite shape in `Rest::More`.
+fn existential_outside_package(body: &Rc<Ty>, existentials: &IndexSet<u32>) -> bool {
+    enum Work {
+        Ty(Rc<Ty>, bool),
+        Row(Row, bool),
+    }
+    let mut work = vec![Work::Ty(body.clone(), false)];
+    while let Some(part) = work.pop() {
+        match part {
+            Work::Ty(ty, packaged) => match &*ty {
+                Ty::Package(inner) => work.push(Work::Ty(inner.clone(), true)),
+                Ty::Arrow(from, to, effects) => {
+                    work.push(Work::Row(effects.clone(), packaged));
+                    work.push(Work::Ty(to.clone(), packaged));
+                    work.push(Work::Ty(from.clone(), packaged));
+                }
+                Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(row.clone(), packaged)),
+                Ty::Named { args, .. } => {
+                    work.extend(args.iter().rev().cloned().map(|ty| Work::Ty(ty, packaged)))
+                }
+                _ => {}
+            },
+            Work::Row(row, packaged) => {
+                if let Rest::More(more) = &row.rest {
+                    work.push(Work::Row((**more).clone(), packaged));
+                }
+                for field in row.labels.values().rev() {
+                    if !packaged
+                        && matches!(field.presence, Presence::Bound(index) if existentials.contains(&index))
+                    {
+                        return true;
+                    }
+                    work.push(Work::Ty(field.ty.clone(), packaged));
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Partition independent conjuncts by the exact package which owns all their
+/// existential atoms. Package numbers are stable structural preorder; a
+/// conjunct involving a universal or multiple owners stays scheme-wide.
+fn partition_package_formula(
+    body: &Rc<Ty>,
+    existentials: &IndexSet<u32>,
+    formula: Formula,
+) -> Formula {
+    enum Work {
+        Ty(Rc<Ty>, Option<u32>),
+        Row(Row, Option<u32>),
+    }
+    let mut slot_owners = HashMap::new();
+    let mut package_count = 0u32;
+    let mut work = vec![Work::Ty(body.clone(), None)];
+    while let Some(part) = work.pop() {
+        match part {
+            Work::Ty(ty, owner) => match &*ty {
+                Ty::Package(inner) => {
+                    let here = package_count;
+                    package_count += 1;
+                    work.push(Work::Ty(inner.clone(), Some(here)));
+                }
+                Ty::Arrow(from, to, effects) => {
+                    work.push(Work::Row(effects.clone(), owner));
+                    work.push(Work::Ty(to.clone(), owner));
+                    work.push(Work::Ty(from.clone(), owner));
+                }
+                Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(row.clone(), owner)),
+                Ty::Named { args, .. } => {
+                    work.extend(args.iter().rev().cloned().map(|ty| Work::Ty(ty, owner)))
+                }
+                _ => {}
+            },
+            Work::Row(row, owner) => {
+                if let Rest::More(more) = &row.rest {
+                    work.push(Work::Row((**more).clone(), owner));
+                }
+                for field in row.labels.values().rev() {
+                    if let Presence::Bound(index) = field.presence
+                        && existentials.contains(&index)
+                    {
+                        let owner = owner.expect("an existential slot has a package owner");
+                        if let Some(before) = slot_owners.insert(index, owner) {
+                            debug_assert_eq!(
+                                before, owner,
+                                "existential slot crossed package owners"
+                            );
+                        }
+                    }
+                    work.push(Work::Ty(field.ty.clone(), owner));
+                }
+            }
+        }
+    }
+
+    debug_assert!(
+        existentials
+            .iter()
+            .all(|index| slot_owners.contains_key(index)),
+        "every existential slot occurs in its package"
+    );
+
+    fn owned(part: Formula, owners: &HashMap<u32, u32>, existentials: &IndexSet<u32>) -> Formula {
+        let mut atoms = Vec::new();
+        part.atoms(&mut atoms);
+        let mut selected = None;
+        for atom in atoms {
+            let Atom::Bound(index) = atom else {
+                // A nested generalized scheme can retain a presence from its
+                // enclosing closure as a free solver variable. Like a bound
+                // universal input, it scopes the proposition but does not
+                // choose which result package owns the fresh witness.
+                continue;
+            };
+            // A conjunct that relates a caller-owned input to a hidden result
+            // is still a guarantee of that result package. Keep the universal
+            // atom in the clause, but select ownership from its existential
+            // atoms so opening the package can rename only the fresh witness.
+            if !existentials.contains(&index) {
+                continue;
+            }
+            let Some(owner) = owners.get(&index).copied() else {
+                return part;
+            };
+            if selected.is_some_and(|before| before != owner) {
+                return part;
+            }
+            selected = Some(owner);
+        }
+        match selected {
+            Some(owner) => Formula::owned(owner, part),
+            None => part,
+        }
+    }
+
+    let mut pending = vec![formula];
+    let mut parts = Vec::new();
+    while let Some(part) = pending.pop() {
+        match &part {
+            Formula::Owned(_, inner) => pending.push((**inner).clone()),
+            Formula::And(left, right) => {
+                pending.push((**right).clone());
+                pending.push((**left).clone());
+            }
+            _ => parts.push(owned(part, &slot_owners, existentials)),
+        }
+    }
+    Formula::all(parts)
+}
+
 impl Formula {
+    /// Mark a constraint with its exact package owner. Ownership is metadata;
+    /// propositional operations deliberately treat this wrapper transparently.
+    pub fn owned(owner: u32, formula: Formula) -> Self {
+        Formula::Owned(owner, Rc::new(formula))
+    }
+
     /// The formula naming one solver variable.
     pub fn var(var: TyVar) -> Self {
         Formula::Atom(Atom::Var(var))
@@ -1120,16 +1409,17 @@ impl Formula {
     /// First-appearance order is what decides the printed alphabet, so it is
     /// what the walk preserves.
     pub fn atoms(&self, out: &mut Vec<Atom>) {
+        let mut seen: HashSet<_> = out.iter().copied().collect();
         let mut work = vec![self];
         while let Some(formula) = work.pop() {
             match formula {
                 Formula::True | Formula::False => {}
                 Formula::Atom(atom) => {
-                    if !out.contains(atom) {
+                    if seen.insert(*atom) {
                         out.push(*atom);
                     }
                 }
-                Formula::Not(inner) => work.push(inner),
+                Formula::Owned(_, inner) | Formula::Not(inner) => work.push(inner),
                 Formula::And(left, right)
                 | Formula::Or(left, right)
                 | Formula::Iff(left, right)
@@ -1156,6 +1446,7 @@ impl Formula {
                 Work::Formula(Formula::True) => values.push(true),
                 Work::Formula(Formula::False) => values.push(false),
                 Work::Formula(Formula::Atom(atom)) => values.push(assign(*atom)),
+                Work::Formula(Formula::Owned(_, inner)) => work.push(Work::Formula(inner)),
                 Work::Formula(Formula::Not(inner)) => {
                     work.push(Work::Not);
                     work.push(Work::Formula(inner));
@@ -1209,6 +1500,7 @@ impl Formula {
     pub fn substitute(&self, of: &dyn Fn(Atom) -> Formula) -> Self {
         enum Work<'a> {
             Formula(&'a Formula),
+            Owned(u32),
             Not,
             Binary(u8),
         }
@@ -1220,6 +1512,10 @@ impl Formula {
                 Work::Formula(Formula::True) => values.push(Formula::True),
                 Work::Formula(Formula::False) => values.push(Formula::False),
                 Work::Formula(Formula::Atom(atom)) => values.push(of(*atom)),
+                Work::Formula(Formula::Owned(owner, inner)) => {
+                    work.push(Work::Owned(*owner));
+                    work.push(Work::Formula(inner));
+                }
                 Work::Formula(Formula::Not(inner)) => {
                     work.push(Work::Not);
                     work.push(Work::Formula(inner));
@@ -1243,6 +1539,10 @@ impl Formula {
                     work.push(Work::Binary(3));
                     work.push(Work::Formula(right));
                     work.push(Work::Formula(left));
+                }
+                Work::Owned(owner) => {
+                    let inner = values.pop().expect("a visited owned formula value");
+                    values.push(Formula::owned(owner, inner));
                 }
                 Work::Not => {
                     let inner = values.pop().expect("a visited formula value");
@@ -1300,7 +1600,7 @@ impl Drop for Formula {
     fn drop(&mut self) {
         fn take_children(formula: &mut Formula, pending: &mut Vec<Rc<Formula>>) {
             match formula {
-                Formula::Not(inner) => {
+                Formula::Owned(_, inner) | Formula::Not(inner) => {
                     pending.push(std::mem::replace(inner, Rc::new(Formula::True)));
                 }
                 Formula::And(left, right)

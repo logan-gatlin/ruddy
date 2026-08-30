@@ -603,6 +603,7 @@ impl Solve<'_> {
         enum FingerprintWork {
             Type(Rc<Ty>),
             Arrow(*const Ty, Rc<Ty>),
+            Package(*const Ty, Rc<Ty>),
             Struct(*const Ty, Rc<Ty>),
             Sum(*const Ty, Rc<Ty>),
             Named(*const Ty, Rc<Ty>, Symbol, usize),
@@ -685,6 +686,11 @@ impl Solve<'_> {
                                     work.push(FingerprintWork::Type(from.clone()));
                                     continue;
                                 }
+                                Ty::Package(body) => {
+                                    work.push(FingerprintWork::Package(key, ty.clone()));
+                                    work.push(FingerprintWork::Type(body.clone()));
+                                    continue;
+                                }
                                 Ty::Struct(row) => {
                                     work.push(FingerprintWork::Struct(key, ty.clone()));
                                     work.push(FingerprintWork::Row(row.clone()));
@@ -716,6 +722,12 @@ impl Solve<'_> {
                         FingerprintWork::Arrow(key, ty) => {
                             let parts = values.split_off(values.len() - 3);
                             let hash = tagged(9, parts);
+                            self.types.insert(key, (ty, hash));
+                            values.push(hash);
+                        }
+                        FingerprintWork::Package(key, ty) => {
+                            let body = values.pop().expect("family package fingerprint body");
+                            let hash = tagged(12, [body]);
                             self.types.insert(key, (ty, hash));
                             values.push(hash);
                         }
@@ -1334,7 +1346,7 @@ impl Solve<'_> {
         // as new as the place it was made, whatever the scheme was generalized
         // at.
         let required = self.table.store.batches.len();
-        let copy = self.table.instantiate(span, &scheme);
+        let copy = self.table.instantiate_local(span, symbol, &scheme);
         let mut batches: Vec<Batch> = self.table.store.batches.drain(required..).collect();
         match batches.pop() {
             Some(mut batch) => {
@@ -1410,6 +1422,27 @@ impl Solve<'_> {
                         actual: rhs.clone(),
                     };
                     match (&*lhs, &*rhs) {
+                        (Ty::Package(_), Ty::Package(_)) => {
+                            self.step(span, Rule::Same, goal, Effect::Decomposed);
+                            if Rc::ptr_eq(&lhs, &rhs) {
+                                let opened = self.table.open_package(span, &lhs);
+                                work.push(SolveWork::Ty(opened.clone(), opened, depth + 1));
+                            } else {
+                                let left = self.table.open_package(span, &lhs);
+                                let right = self.table.open_package(span, &rhs);
+                                work.push(SolveWork::Ty(left, right, depth + 1));
+                            }
+                        }
+                        (Ty::Package(_), _) => {
+                            self.step(span, Rule::Same, goal, Effect::Decomposed);
+                            let body = self.table.open_package(span, &lhs);
+                            work.push(SolveWork::Ty(body, rhs.clone(), depth + 1));
+                        }
+                        (_, Ty::Package(_)) => {
+                            self.step(span, Rule::Same, goal, Effect::Decomposed);
+                            let body = self.table.open_package(span, &rhs);
+                            work.push(SolveWork::Ty(lhs.clone(), body, depth + 1));
+                        }
                         (Ty::Undecided, _) => {
                             self.step(span, Rule::Absorb, goal, Effect::None);
                             self.recover_ty(span, &rhs);
@@ -1789,6 +1822,7 @@ impl Solve<'_> {
                             work.push(Work::Ty(to.clone()));
                             work.push(Work::Ty(from.clone()));
                         }
+                        Ty::Package(body) => work.push(Work::Ty(body.clone())),
                         Ty::Struct(row) | Ty::Sum(row) => {
                             work.push(Work::Row(row.clone()));
                         }
@@ -2297,6 +2331,36 @@ impl Solve<'_> {
             (Presence::Var(a), Presence::Var(b)) if a == b => {
                 self.step(span, Rule::Same, goal, Effect::None)
             }
+            (Presence::Var(var), Presence::Var(other))
+                if self.table.abstract_existentials.contains(var)
+                    && !self.table.abstract_existentials.contains(other) =>
+            {
+                self.assign(span, goal, *other, Assigned::Presence(Presence::Var(*var)));
+            }
+            (Presence::Var(other), Presence::Var(var))
+                if self.table.abstract_existentials.contains(var)
+                    && !self.table.abstract_existentials.contains(other) =>
+            {
+                self.assign(span, goal, *other, Assigned::Presence(Presence::Var(*var)));
+            }
+            (Presence::Var(var), other) if self.table.existential_witnesses.contains(var) => {
+                let formula = lhs.formula().iff(other.formula());
+                self.step(span, Rule::Refine, goal, Effect::None);
+                self.table.require(
+                    span,
+                    Origin::Instance(Named { labels: Vec::new() }),
+                    formula,
+                );
+            }
+            (other, Presence::Var(var)) if self.table.existential_witnesses.contains(var) => {
+                let formula = other.formula().iff(rhs.formula());
+                self.step(span, Rule::Refine, goal, Effect::None);
+                self.table.require(
+                    span,
+                    Origin::Instance(Named { labels: Vec::new() }),
+                    formula,
+                );
+            }
             (Presence::Var(var), other) => {
                 let (var, other) = (*var, other.clone());
                 self.assign(span, goal, var, Assigned::Presence(other));
@@ -2330,7 +2394,27 @@ impl Solve<'_> {
             (Presence::Absent, other) | (other, Presence::Absent) => other.formula().not(),
             _ => lhs.formula().iff(rhs.formula()),
         };
-        let formula = premise.clone().not().or(obligation.clone());
+        let mut formula = premise.clone().not().or(obligation.clone());
+        let lhs_sealed =
+            matches!(&lhs, Presence::Var(var) if self.table.abstract_existentials.contains(var));
+        let rhs_sealed =
+            matches!(&rhs, Presence::Var(var) if self.table.abstract_existentials.contains(var));
+        // Relating a sealed identity to an ordinary fresh variable opens an
+        // alias which follows the package; it does not choose the witness.
+        // Constants (and a distinct sealed identity) are observations which
+        // must already follow from the package and arm premise.
+        let sealed = (lhs_sealed
+            && !matches!(&rhs, Presence::Var(var) if !self.table.abstract_existentials.contains(var)))
+            || (rhs_sealed
+                && !matches!(&lhs, Presence::Var(var) if !self.table.abstract_existentials.contains(var)));
+        if sealed {
+            let known = self.table.known().and(premise.clone());
+            if !crate::inference::sat::entails(&known, &obligation) {
+                // The arm may refine an opened package only with facts its own
+                // match premise and the package guarantee already establish.
+                formula = Formula::False;
+            }
+        }
         let labels = self
             .active_refinement
             .map(|at| {
@@ -2594,6 +2678,13 @@ impl Solve<'_> {
                 }
             }
         }
+        if let Assigned::Presence(Presence::Var(other)) = &value
+            && (self.table.abstract_existentials.contains(&var)
+                || self.table.abstract_existentials.contains(other))
+        {
+            self.table.abstract_existentials.insert(var);
+            self.table.abstract_existentials.insert(*other);
+        }
         self.table.inherit_lacks(var, &value);
         // And the levels travel the same way the conditions do: what this
         // variable stands for is as old as this variable is, so everything
@@ -2853,6 +2944,7 @@ impl Solve<'_> {
                             work.push(Work::Type(to.clone()));
                             work.push(Work::Type(from.clone()));
                         }
+                        Ty::Package(body) => work.push(Work::Type(body.clone())),
                         Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(row.clone())),
                         Ty::Named { args, .. } => {
                             work.extend(args.iter().rev().cloned().map(Work::Type));
