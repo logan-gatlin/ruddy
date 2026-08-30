@@ -1895,7 +1895,13 @@ fn smallest_incompatible(
     right: &Rc<Ty>,
 ) -> (TypeDescription, TypeDescription) {
     let mut work = vec![(left.clone(), right.clone())];
-    let mut fallback = (describe_type(left), describe_type(right));
+    let fallback = (describe_type(left), describe_type(right));
+    // Recursive declarations return to the same applications. Arguments are
+    // part of the goal: the same pair of names can occur at independent
+    // substitutions in sibling fields, and suppressing one must not suppress
+    // the other. Keep the finite syntax itself because opening can rebuild a
+    // semantically identical substitution at a different allocation.
+    let mut visited_names = Vec::new();
     while let Some((mut left, mut right)) = work.pop() {
         while let Ty::Package(inner) = &*left {
             left = inner.clone();
@@ -1906,7 +1912,55 @@ fn smallest_incompatible(
 
         // Names are source spelling, not semantic leaves. Only unfold when the
         // published declaration is actually available; imported recovery holes
-        // retain the honest `DeclaredType` fallback.
+        // retain the honest `DeclaredType` fallback. Record a pair before
+        // unfolding it so a recursive field is skipped without abandoning the
+        // other fields already on the explicit DFS stack.
+        if let (
+            Ty::Named {
+                symbol: left_symbol,
+                args: left_args,
+                ..
+            },
+            Ty::Named {
+                symbol: right_symbol,
+                args: right_args,
+                ..
+            },
+        ) = (&*left, &*right)
+            && aliases.contains_key(left_symbol)
+            && aliases.contains_key(right_symbol)
+        {
+            let seen = visited_names.iter().any(
+                |(seen_left_symbol, seen_left_args, seen_right_symbol, seen_right_args): &(
+                    Symbol,
+                    Rc<[Rc<Ty>]>,
+                    Symbol,
+                    Rc<[Rc<Ty>]>,
+                )| {
+                    seen_left_symbol == left_symbol
+                        && seen_right_symbol == right_symbol
+                        && seen_left_args.len() == left_args.len()
+                        && seen_right_args.len() == right_args.len()
+                        && seen_left_args
+                            .iter()
+                            .zip(left_args.iter())
+                            .all(|(seen, current)| same_finite_syntax(seen, current))
+                        && seen_right_args
+                            .iter()
+                            .zip(right_args.iter())
+                            .all(|(seen, current)| same_finite_syntax(seen, current))
+                },
+            );
+            if seen {
+                continue;
+            }
+            visited_names.push((
+                *left_symbol,
+                left_args.clone(),
+                *right_symbol,
+                right_args.clone(),
+            ));
+        }
         if matches!(&*left, Ty::Named { symbol, .. } if aliases.contains_key(symbol)) {
             left = unfold(aliases, &left);
         }
@@ -1915,7 +1969,6 @@ fn smallest_incompatible(
         }
 
         let descriptions = (describe_type(&left), describe_type(&right));
-        fallback = descriptions;
         // A name left here has no declaration we can honestly inspect. Even
         // when both sides spell the same name, its arguments are not known to
         // be the declaration's semantic parameters, so they cannot supply a
@@ -7140,6 +7193,140 @@ mod existential_regressions {
             (TypeDescription::DeclaredType, TypeDescription::Boolean),
             "one unavailable alias must remain declared without hiding the other side"
         );
+    }
+
+    #[test]
+    fn recursive_alias_mismatch_skips_cycle_and_finds_sibling_leaf() {
+        use crate::symbol::{Bundle, Mint, Namespace, Version};
+
+        let bundle = Bundle::new("recursive-leaf", Version::new(1, 0, 0)).unwrap();
+        let mut mint = Mint::new(bundle);
+        let stream = mint.global(None, Namespace::Types, "Stream").unwrap();
+        // Put the recursive field first: the DFS must encounter and suppress
+        // that cycle, then continue to the value field rather than returning a
+        // container fallback or looping forever.
+        let recursive = Rc::new(Ty::Named {
+            symbol: stream,
+            name: "Stream".into(),
+            args: Rc::from([Rc::new(Ty::Bound(0))]),
+        });
+        let body = Rc::new(Ty::Struct(Row {
+            labels: [
+                ("tail".into(), RowField::present(recursive)),
+                ("value".into(), RowField::present(Rc::new(Ty::Bound(0)))),
+            ]
+            .into_iter()
+            .collect(),
+            rest: Rest::Closed,
+        }));
+        let aliases = [(stream, Scheme::new(1, body))].into_iter().collect();
+        let named = |argument| {
+            Rc::new(Ty::Named {
+                symbol: stream,
+                name: "Stream".into(),
+                args: Rc::from([argument]),
+            })
+        };
+        let left = named(Rc::new(Ty::Nat));
+        let right = named(Rc::new(Ty::Boolean));
+        for _ in 0..32 {
+            assert_eq!(
+                smallest_incompatible(&aliases, &left, &right),
+                (TypeDescription::NaturalNumber, TypeDescription::Boolean),
+                "the recursive walk must be deterministic"
+            );
+        }
+    }
+
+    #[test]
+    fn recursive_alias_pure_cycle_keeps_declared_fallback() {
+        use crate::symbol::{Bundle, Mint, Namespace, Version};
+
+        let bundle = Bundle::new("recursive-fallback", Version::new(1, 0, 0)).unwrap();
+        let mut mint = Mint::new(bundle);
+        let cycle = mint.global(None, Namespace::Types, "Cycle").unwrap();
+        let named = || {
+            Rc::new(Ty::Named {
+                symbol: cycle,
+                name: "Cycle".into(),
+                args: Rc::from([]),
+            })
+        };
+        let body = Rc::new(Ty::Struct(Row {
+            labels: [("next".into(), RowField::present(named()))]
+                .into_iter()
+                .collect(),
+            rest: Rest::Closed,
+        }));
+        let aliases = [(cycle, Scheme::new(0, body))].into_iter().collect();
+        assert_eq!(
+            smallest_incompatible(&aliases, &named(), &named()),
+            (TypeDescription::DeclaredType, TypeDescription::DeclaredType)
+        );
+    }
+
+    #[test]
+    fn recursive_alias_mismatch_is_deep_stack_safe() {
+        use crate::symbol::{Bundle, Mint, Namespace, Version};
+
+        std::thread::Builder::new()
+            .name("deep-recursive-mismatch-leaf".into())
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                let bundle = Bundle::new("deep-recursive-leaf", Version::new(1, 0, 0)).unwrap();
+                let mut mint = Mint::new(bundle);
+                let stream = mint.global(None, Namespace::Types, "Stream").unwrap();
+                let recursive = Rc::new(Ty::Named {
+                    symbol: stream,
+                    name: "Stream".into(),
+                    args: Rc::from([Rc::new(Ty::Bound(0))]),
+                });
+                let body = Rc::new(Ty::Struct(Row {
+                    labels: [
+                        ("tail".into(), RowField::present(recursive)),
+                        ("value".into(), RowField::present(Rc::new(Ty::Bound(0)))),
+                    ]
+                    .into_iter()
+                    .collect(),
+                    rest: Rest::Closed,
+                }));
+                let aliases: IndexMap<_, _> =
+                    [(stream, Scheme::new(1, body))].into_iter().collect();
+                let mut left_argument = Rc::new(Ty::Nat);
+                let mut right_argument = Rc::new(Ty::Boolean);
+                for _ in 0..30_000 {
+                    left_argument = Rc::new(Ty::Struct(Row {
+                        labels: [("x".into(), RowField::present(left_argument))]
+                            .into_iter()
+                            .collect(),
+                        rest: Rest::Closed,
+                    }));
+                    right_argument = Rc::new(Ty::Struct(Row {
+                        labels: [("x".into(), RowField::present(right_argument))]
+                            .into_iter()
+                            .collect(),
+                        rest: Rest::Closed,
+                    }));
+                }
+                let named = |argument| {
+                    Rc::new(Ty::Named {
+                        symbol: stream,
+                        name: "Stream".into(),
+                        args: Rc::from([argument]),
+                    })
+                };
+                let left = named(left_argument);
+                let right = named(right_argument);
+                assert_eq!(
+                    smallest_incompatible(&aliases, &left, &right),
+                    (TypeDescription::NaturalNumber, TypeDescription::Boolean)
+                );
+                std::mem::forget(left);
+                std::mem::forget(right);
+            })
+            .unwrap()
+            .join()
+            .expect("recursive mismatch leaves stay on the explicit stack");
     }
 
     #[test]
