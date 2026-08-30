@@ -2348,7 +2348,10 @@ impl Solve<'_> {
                 self.step(span, Rule::Refine, goal, Effect::None);
                 self.table.require(
                     span,
-                    Origin::Instance(Named { labels: Vec::new() }),
+                    Origin::Instance(Named {
+                        labels: Vec::new(),
+                        shape: None,
+                    }),
                     formula,
                 );
             }
@@ -2357,7 +2360,10 @@ impl Solve<'_> {
                 self.step(span, Rule::Refine, goal, Effect::None);
                 self.table.require(
                     span,
-                    Origin::Instance(Named { labels: Vec::new() }),
+                    Origin::Instance(Named {
+                        labels: Vec::new(),
+                        shape: None,
+                    }),
                     formula,
                 );
             }
@@ -2428,7 +2434,10 @@ impl Solve<'_> {
         let origin = Origin::Guarded(GuardedOrigin {
             premise: premise.clone(),
             obligation: obligation.clone(),
-            origin: Box::new(Origin::Refinement(Named { labels })),
+            origin: Box::new(Origin::Refinement(Named {
+                labels,
+                shape: Some(Shape::Struct),
+            })),
         });
         if !obligation.is_true() {
             self.table.require(span, origin, formula.clone());

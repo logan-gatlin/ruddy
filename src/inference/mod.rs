@@ -349,6 +349,10 @@ pub struct GuardedObligation {
 #[derive(Debug, Clone)]
 pub struct Named {
     pub labels: Vec<(String, Presence)>,
+    /// The row shape whose labels the formula names. Annotation-only origins
+    /// do not need one; required-use diagnostics do, so they can call the
+    /// labels fields, cases, or effects without guessing from their spelling.
+    pub shape: Option<Shape>,
 }
 
 /// One act of the solver: the rule it applied, what it applied it to, and what
@@ -757,7 +761,10 @@ pub enum ErrorKind {
     /// The formula is carried already worded in the reader's own nouns: the
     /// labels their type names, rather than the presence variables the compiler
     /// gave them.
-    PresenceRequired { formula: String },
+    PresenceRequired {
+        formula: String,
+        shape: Option<Shape>,
+    },
     /// An annotation whose `where` clause nothing can satisfy once the
     /// definition under it has had its say.
     ///
@@ -1607,6 +1614,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                     if !lowered.formula.is_true() {
                         let origin = Origin::Annotation(Named {
                             labels: lowered.names.clone(),
+                            shape: None,
                         });
                         // A true placeholder preserves source/debug ordering
                         // for a wholly package-owned clause without making its
@@ -2004,7 +2012,10 @@ fn report_flip(table: &mut Table, errors: &mut Vec<Error>) {
         }
         UnguardedOrigin::Required(named) => {
             let formula = crate::ui::in_labels(&batch.formula, &named.labels);
-            ErrorKind::PresenceRequired { formula }
+            ErrorKind::PresenceRequired {
+                formula,
+                shape: named.shape,
+            }
         }
     };
     errors.push(Error {
@@ -2732,6 +2743,7 @@ impl Table {
                 .iter()
                 .map(|(name, presence)| (name.clone(), self.presence_of(presence)))
                 .collect(),
+            shape: named.shape,
         }
     }
 
@@ -2909,6 +2921,7 @@ impl Table {
         // asked for the other would find nothing and print the number.
         let named = self.settled_names(&Named {
             labels: names.to_vec(),
+            shape: None,
         });
         Some((
             crate::ui::in_labels(&sat::project(&promised, &promised_atoms), &named.labels),
@@ -3117,9 +3130,10 @@ impl Table {
         let immediate = self.register_package_guarantees(&ty, formula);
         if !immediate.is_true() {
             let mut labels = IndexMap::new();
-            self.labels_in(&ty, &mut labels);
+            let mut shape = None;
+            self.labels_in(&ty, &mut labels, &mut shape, &immediate);
             let labels = labels.into_values().collect();
-            self.require(span, Origin::Instance(Named { labels }), immediate);
+            self.require(span, Origin::Instance(Named { labels, shape }), immediate);
         }
         ty
     }
@@ -3249,11 +3263,13 @@ impl Table {
             });
             if !formula.is_true() {
                 let mut labels = IndexMap::new();
-                self.labels_in(&opened, &mut labels);
+                let mut shape = None;
+                self.labels_in(&opened, &mut labels, &mut shape, &formula);
                 self.require(
                     span,
                     Origin::Instance(Named {
                         labels: labels.into_values().collect(),
+                        shape,
                     }),
                     formula,
                 );
@@ -3291,13 +3307,26 @@ impl Table {
     /// order the type names them — what a use-site complaint quotes its formula
     /// in. The first spelling of a label wins, which is the one a reader
     /// reading the type left to right meets.
-    fn labels_in(&self, ty: &Rc<Ty>, found: &mut IndexMap<String, (String, Presence)>) {
+    fn labels_in(
+        &self,
+        ty: &Rc<Ty>,
+        found: &mut IndexMap<String, (String, Presence)>,
+        formula_shape: &mut Option<Shape>,
+        formula: &Formula,
+    ) {
         enum Work {
             Ty(Rc<Ty>),
-            Field(String, RowField),
+            Field(Shape, String, RowField),
             Effects(Row),
         }
 
+        let mut atoms = Vec::new();
+        formula.atoms(&mut atoms);
+        let names_atom = |presence: &Presence| match presence {
+            Presence::Var(var) => atoms.contains(&Atom::Var(*var)),
+            Presence::Bound(index) => atoms.contains(&Atom::Bound(*index)),
+            _ => false,
+        };
         let mut work = vec![Work::Ty(ty.clone())];
         while let Some(part) = work.pop() {
             match part {
@@ -3311,12 +3340,17 @@ impl Table {
                             work.push(Work::Ty(a.clone()));
                         }
                         Ty::Struct(row) | Ty::Sum(row) => {
+                            let shape = match &*ty {
+                                Ty::Struct(_) => Shape::Struct,
+                                Ty::Sum(_) => Shape::Sum,
+                                _ => unreachable!(),
+                            };
                             let (labels, _) = self.canon(row).into_parts();
                             work.extend(
                                 labels
                                     .into_iter()
                                     .rev()
-                                    .map(|(name, field)| Work::Field(name, field)),
+                                    .map(|(name, field)| Work::Field(shape, name, field)),
                             );
                         }
                         Ty::Named { args, .. } => {
@@ -3325,8 +3359,11 @@ impl Table {
                         _ => {}
                     }
                 }
-                Work::Field(name, field) => {
+                Work::Field(shape, name, field) => {
                     let presence = self.presence_of(&field.presence);
+                    if formula_shape.is_none() && names_atom(&presence) {
+                        *formula_shape = Some(shape);
+                    }
                     found
                         .entry(name.clone())
                         .or_insert_with(|| (name, presence.clone()));
@@ -3338,10 +3375,14 @@ impl Table {
                 Work::Effects(row) => {
                     let (labels, _) = self.canon(&row).into_parts();
                     for (name, field) in labels {
+                        let presence = self.presence_of(&field.presence);
+                        if formula_shape.is_none() && names_atom(&presence) {
+                            *formula_shape = Some(Shape::Effect);
+                        }
                         found.entry(name.clone()).or_insert_with(|| {
                             let shown =
                                 EffectId::parse_row_key(&name).map_or(name.as_str(), |x| x.0);
-                            (shown.to_string(), self.presence_of(&field.presence))
+                            (shown.to_string(), presence)
                         });
                     }
                 }
@@ -4185,8 +4226,9 @@ impl Table {
             // their formulas were already worded, at the moment the variables
             // in them still had labels to be named by. There is nothing here
             // for a later substitution to improve.
-            ErrorKind::PresenceRequired { formula } => ErrorKind::PresenceRequired {
+            ErrorKind::PresenceRequired { formula, shape } => ErrorKind::PresenceRequired {
                 formula: formula.clone(),
+                shape: *shape,
             },
             ErrorKind::PresenceImpossible { formula } => ErrorKind::PresenceImpossible {
                 formula: formula.clone(),

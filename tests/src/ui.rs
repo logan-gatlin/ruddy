@@ -68,6 +68,7 @@ fn inference_error_kinds(span: Span) -> Vec<TypeError> {
         },
         TypeError::PresenceRequired {
             formula: "x != y".to_string(),
+            shape: Some(Shape::Struct),
         },
         TypeError::PresenceImpossible {
             formula: "x and y".to_string(),
@@ -739,9 +740,28 @@ fn rigid_field_diagnostics_name_the_caller_chosen_set_by_shape() {
 }
 
 #[test]
+fn required_presence_diagnostics_name_labels_by_shape() {
+    for (shape, labels) in [
+        (Shape::Struct, "fields"),
+        (Shape::Sum, "cases"),
+        (Shape::Effect, "effects"),
+    ] {
+        let kind = TypeError::PresenceRequired {
+            formula: "x and y".to_string(),
+            shape: Some(shape),
+        };
+        assert_eq!(
+            kind.to_string(),
+            format!("this value needs `x and y` among its {labels}, and it does not have that")
+        );
+    }
+}
+
+#[test]
 fn guarded_origins_keep_their_source_and_premise_readable() {
     let source = inference::Origin::Refinement(inference::Named {
         labels: vec![("x".to_string(), Presence::Var(1))],
+        shape: Some(Shape::Struct),
     });
     assert_eq!(source.code(), "branch-refinement");
     assert!(source.to_string().contains("structural presence relation"));

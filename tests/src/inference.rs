@@ -6512,6 +6512,24 @@ fn a_use_site_that_cannot_satisfy_the_scheme_is_refused() {
     assert_eq!(flipped, ["use-site"]);
 }
 
+/// A required presence formula keeps the shape of the labels it constrains;
+/// sum cases must never be described as struct fields.
+#[test]
+fn a_required_case_combination_uses_sum_vocabulary() {
+    let src = "let p : (#X (when 'a) | #Y (when 'b)) -> () where 'a != 'b = fn _ => ()\n\
+               let both : #X () | #Y () = #X ()\n\
+               let bad = p both";
+    let (_, _, output) = infer_src(src);
+    let [error] = output.errors.as_slice() else {
+        panic!("expected one error: {:#?}", output.errors);
+    };
+    assert_eq!(error.kind.code(), "presence-required");
+    assert_eq!(
+        error.kind.to_string(),
+        "this value needs `X != Y` among its cases, and it does not have that"
+    );
+}
+
 /// Constraints are per instance, never per scheme: two uses with different
 /// field sets are both legal when each instantiation is separately
 /// satisfiable.
@@ -7771,6 +7789,18 @@ fn a_label_demanded_of_a_rigid_is_refused() {
         "this is `()`, but `'r` stands for whatever the caller picks for the rest of a struct's fields"
     );
 
+    // The same closed-row conflict on a sum describes the caller-chosen
+    // remaining cases, not an arbitrary caller-chosen type.
+    let (_, _, output) = infer_src("let f : (#A Nat | ..'r) -> #A Nat = fn value => value");
+    let [error] = output.errors.as_slice() else {
+        panic!("expected one error: {:#?}", output.errors);
+    };
+    assert_eq!(error.kind.code(), "rigid-broken");
+    assert_eq!(
+        error.kind.to_string(),
+        "this is `|`, but `'r` stands for whatever the caller picks for the remaining cases"
+    );
+
     // A field the row *does* name is no demand on the rest at all.
     let (mint, _, output) = inferred("let f : { x: Nat, ..'r } -> Nat = fn p => p.x");
     assert_eq!(scheme(&mint, &output, "f"), "{ x: Nat, ..'a } -> Nat");
@@ -7889,7 +7919,7 @@ fn a_declared_sum_rest_is_equal_to_itself_and_to_nothing_else() {
     assert_eq!(error.kind.code(), "rigid-broken");
     assert_eq!(
         error.kind.to_string(),
-        "this is `|`, but `'r` stands for whatever type the caller picks"
+        "this is `|`, but `'r` stands for whatever the caller picks for the remaining cases"
     );
 }
 

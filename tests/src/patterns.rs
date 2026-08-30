@@ -163,7 +163,10 @@ fn unrelated_same_span_batches_do_not_hide_match_coverage() {
         .expect("the qualifying match has a coverage batch");
     let (definition, span) = (coverage.definition, coverage.span);
 
-    let named = || inference::Named { labels: Vec::new() };
+    let named = || inference::Named {
+        labels: Vec::new(),
+        shape: None,
+    };
     for origin in [
         inference::Origin::Instance(named()),
         inference::Origin::Annotation(named()),

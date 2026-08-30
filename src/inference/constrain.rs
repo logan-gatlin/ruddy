@@ -327,6 +327,7 @@ impl Constrain<'_> {
                         if !lowered.formula.is_true() {
                             let origin = Origin::Annotation(Named {
                                 labels: lowered.names.clone(),
+                                shape: None,
                             });
                             self.table.require(
                                 annotation.ty.span,
@@ -1203,7 +1204,10 @@ impl Constrain<'_> {
                 let requirement = self.table.store.batches.len();
                 self.table.require(
                     span,
-                    Origin::Instance(Named { labels: Vec::new() }),
+                    Origin::Instance(Named {
+                        labels: Vec::new(),
+                        shape: None,
+                    }),
                     Formula::True,
                 );
                 self.table.deferred.insert(requirement);

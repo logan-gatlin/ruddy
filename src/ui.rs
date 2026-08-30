@@ -2779,6 +2779,15 @@ impl fmt::Display for inference::ErrorKind {
                 f,
                 "this is `{found}`, but `'{name}` stands for whatever the caller picks for the rest of a struct's fields",
             ),
+            inference::ErrorKind::RigidBroken {
+                found,
+                name,
+                sense: Sense::Cases,
+                ..
+            } => write!(
+                f,
+                "this is `{found}`, but `'{name}` stands for whatever the caller picks for the remaining cases",
+            ),
             inference::ErrorKind::RigidBroken { found, name, .. } => write!(
                 f,
                 "this is `{found}`, but `'{name}` stands for whatever type the caller picks",
@@ -2815,12 +2824,19 @@ impl fmt::Display for inference::ErrorKind {
             ),
             // Said in the labels the reader wrote rather than in the presence
             // variables the compiler gave them: what has to change is the value
-            // on this line, and its fields are the whole of what they can
-            // change about it.
-            inference::ErrorKind::PresenceRequired { formula } => write!(
-                f,
-                "this value needs `{formula}` among its fields, and it does not have that",
-            ),
+            // on this line, and the labels of this shape are the whole of what
+            // they can change about it.
+            inference::ErrorKind::PresenceRequired { formula, shape } => match shape {
+                Some(shape) => write!(
+                    f,
+                    "this value needs `{formula}` among its {}s, and it does not have that",
+                    noun(*shape),
+                ),
+                None => write!(
+                    f,
+                    "this value needs `{formula}` among its labels, and it does not have that",
+                ),
+            },
             inference::ErrorKind::PresenceImpossible { formula } => write!(
                 f,
                 "nothing can satisfy `{formula}`: what this definition does with the type has already ruled it out",
