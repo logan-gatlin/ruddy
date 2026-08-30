@@ -332,6 +332,8 @@ pub struct Solve<'a> {
     pub guard: Option<Formula>,
     /// The arm report guarded obligations are appended to.
     pub active_refinement: Option<usize>,
+    /// Coverage batches establishing the active (possibly nested) premise.
+    pub guard_reasons: Vec<ReasonId>,
     pub refinements: &'a mut Vec<Refinement>,
     /// End of generation-time store slots for this definition. Guarded
     /// structural relations appended while solving participate in later arm
@@ -418,6 +420,7 @@ impl Solve<'_> {
             }
             self.constraint = previous;
             self.constraint_reason = previous_reason;
+            self.table.end_solver_act();
         }
         self.table.leave_solver_scope();
     }
@@ -510,6 +513,7 @@ impl Solve<'_> {
     ) {
         let enclosing_guard = self.guard.clone();
         let enclosing_refinement = self.active_refinement;
+        let enclosing_guard_reasons = self.guard_reasons.clone();
         let mut guards = Vec::with_capacity(arms.len());
         let mut reports = Vec::with_capacity(arms.len());
 
@@ -575,6 +579,10 @@ impl Solve<'_> {
             let guard = (reachable && !effective.is_true()).then_some(effective);
             guards.push(guard.clone());
             self.guard = guard;
+            self.guard_reasons = enclosing_guard_reasons.clone();
+            if self.guard.is_some() {
+                self.guard_reasons.push(arm.premise_reason);
+            }
             self.active_refinement = Some(report);
             for requirement in &arm.requirements {
                 self.commit_deferred(requirement.clone());
@@ -587,6 +595,7 @@ impl Solve<'_> {
         // relating those to each arm under that arm's premise is where the
         // input/output relationship is published.
         self.guard = None;
+        self.guard_reasons.clear();
         self.active_refinement = enclosing_refinement;
         let body_types: Vec<Rc<Ty>> = arms
             .iter()
@@ -601,6 +610,10 @@ impl Solve<'_> {
             arms.iter().zip(body_types).zip(guards).zip(reports)
         {
             self.guard = guard;
+            self.guard_reasons = enclosing_guard_reasons.clone();
+            if self.guard.is_some() {
+                self.guard_reasons.push(arm.premise_reason);
+            }
             self.active_refinement = Some(report);
             let previous = self.constraint.replace(arm.result.id);
             let previous_reason = self.constraint_reason.replace(arm.result.reason);
@@ -609,10 +622,12 @@ impl Solve<'_> {
             self.constraint_reason = previous_reason;
         }
         self.guard = None;
+        self.guard_reasons.clear();
         self.active_refinement = enclosing_refinement;
         self.alias_result_presences(span, &family, scrutinee);
 
         self.guard = enclosing_guard;
+        self.guard_reasons = enclosing_guard_reasons;
         self.active_refinement = enclosing_refinement;
     }
 
@@ -1183,12 +1198,19 @@ impl Solve<'_> {
             obligation.clone(),
             formula.clone(),
         );
+        let mut parents = vec![batch.reason];
+        for cause in &self.guard_reasons {
+            if !parents.contains(cause) {
+                parents.push(*cause);
+            }
+        }
+        let reason = self.table.reason(ReasonOrigin::Batch(batch.id), parents);
         Batch {
             id: batch.id,
             definition: batch.definition,
             span: batch.span,
             origin,
-            reason: batch.reason,
+            reason,
             formula,
             flipped: false,
         }
@@ -1404,9 +1426,14 @@ impl Solve<'_> {
             Some(mut batch) => {
                 // Application generation may have aimed the reserved slot at
                 // the argument; retain that source attribution.
-                let reserved = &self.table.store.batches[requirement];
-                batch.id = reserved.id;
-                batch.span = reserved.span;
+                let reserved_id = self.table.store.batches[requirement].id;
+                let reserved_span = self.table.store.batches[requirement].span;
+                batch.id = reserved_id;
+                batch.span = reserved_span;
+                batch.reason = self.table.reason(
+                    ReasonOrigin::Batch(reserved_id),
+                    self.constraint_reason.into_iter().collect(),
+                );
                 let replacement = self.guarded_batch(batch);
                 self.table.store.batches[requirement] = replacement;
             }
@@ -1467,6 +1494,10 @@ impl Solve<'_> {
         let mut assumption_arguments: HashMap<usize, Arguments> = HashMap::new();
         let mut work = vec![SolveWork::Ty(lhs, rhs, original_depth)];
         while let Some(part) = work.pop() {
+            // Each trampoline item is one solver rule candidate. Preserve the
+            // reads used to expose its goal, but discard them if the candidate
+            // is a zero-step equality rather than lending them to its sibling.
+            self.table.begin_solver_rule();
             match part {
                 SolveWork::Ty(lhs, rhs, depth) => {
                     self.depth = depth;
@@ -1822,6 +1853,7 @@ impl Solve<'_> {
                     }
                 }
             }
+            self.table.end_solver_act();
         }
         self.depth = original_depth;
     }
@@ -3063,6 +3095,10 @@ impl Solve<'_> {
             work.push(Work::Type(ty));
         }
         while let Some(part) = work.pop() {
+            // Recovery is a traversal of independent settling rules. A bound
+            // component which needs no settling must not lend its read to the
+            // next component that does.
+            self.table.begin_solver_rule();
             match part {
                 Work::Type(ty) => {
                     let ty = self.table.resolve(&ty);
@@ -3113,6 +3149,7 @@ impl Solve<'_> {
                     }
                 }
             }
+            self.table.end_solver_act();
         }
     }
 

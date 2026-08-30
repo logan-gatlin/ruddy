@@ -422,6 +422,8 @@ pub struct GuardedArm {
     pub span: Span,
     pub raw: Formula,
     pub effective: Formula,
+    /// Coverage batch whose arm condition supplies this premise.
+    pub premise_reason: ReasonId,
     pub constraints: Vec<Constraint>,
     pub requirements: Vec<DeferredRequirement>,
     /// The guarded equality between this body's type and the match result
@@ -1426,7 +1428,7 @@ struct Table {
     /// Binding reasons observed during one solver act. `None` outside a solve
     /// makes publication, generalization, and zonking incapable of leaking
     /// incidental reads into a later step.
-    causal_reads: RefCell<Option<IndexSet<ReasonId>>>,
+    causal_reads: RefCell<Option<Vec<IndexSet<ReasonId>>>>,
     causal_scope_depth: usize,
 }
 
@@ -1489,6 +1491,7 @@ pub fn structural_family_for_tests(
         locals: &mut locals,
         guard: None,
         active_refinement: None,
+        guard_reasons: Vec::new(),
         refinements: &mut refinements,
         generated_end: 0,
     }
@@ -1925,6 +1928,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             locals: &mut locals,
             guard: None,
             active_refinement: None,
+            guard_reasons: Vec::new(),
             refinements: &mut refinements,
             generated_end: 0,
         }
@@ -2101,6 +2105,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 locals: &mut locals,
                 guard: None,
                 active_refinement: None,
+                guard_reasons: Vec::new(),
                 refinements: &mut refinements,
                 generated_end,
             }
@@ -2485,14 +2490,16 @@ impl Table {
         for reason in &mut self.reasons[known.reason_len..] {
             reason.reachable = false;
         }
-        if let Some(reads) = self.causal_reads.borrow_mut().as_mut() {
+        if let Some(captures) = self.causal_reads.borrow_mut().as_mut()
+            && let Some(reads) = captures.last_mut()
+        {
             reads.clear();
         }
     }
 
     fn enter_solver_scope(&mut self) {
         if self.causal_scope_depth == 0 {
-            let previous = self.causal_reads.replace(Some(IndexSet::new()));
+            let previous = self.causal_reads.replace(Some(Vec::new()));
             assert!(
                 previous.is_none(),
                 "causal reads active outside a solver scope"
@@ -2515,14 +2522,41 @@ impl Table {
         }
     }
 
+    /// Start an independent boundary such as one generated constraint. Any
+    /// unfinished reads in the enclosing act are discarded: crossing a nested
+    /// solve cannot make them causes of work performed after that solve.
     fn begin_solver_act(&self) {
-        let mut reads = self.causal_reads.borrow_mut();
-        let reads = reads.as_mut().expect("solver act outside solver scope");
-        reads.clear();
+        let mut captures = self.causal_reads.borrow_mut();
+        let captures = captures.as_mut().expect("solver act outside solver scope");
+        if let Some(enclosing) = captures.last_mut() {
+            enclosing.clear();
+        }
+        captures.push(IndexSet::new());
+    }
+
+    /// Start one rule, handing it reads made while exposing its goal. A rule
+    /// which records no step discards those reads at completion rather than
+    /// allowing the next rule to claim them.
+    fn begin_solver_rule(&self) {
+        let mut captures = self.causal_reads.borrow_mut();
+        let captures = captures.as_mut().expect("solver rule outside solver scope");
+        let inherited = captures.last_mut().map(std::mem::take).unwrap_or_default();
+        captures.push(inherited);
+    }
+
+    fn end_solver_act(&self) {
+        self.causal_reads
+            .borrow_mut()
+            .as_mut()
+            .expect("solver act outside solver scope")
+            .pop()
+            .expect("solver act capture");
     }
 
     fn note_binding_read(&self, reason: ReasonId) {
-        if let Some(reads) = self.causal_reads.borrow_mut().as_mut() {
+        if let Some(captures) = self.causal_reads.borrow_mut().as_mut()
+            && let Some(reads) = captures.last_mut()
+        {
             reads.insert(reason);
         }
     }
@@ -2532,6 +2566,8 @@ impl Table {
             .borrow_mut()
             .as_mut()
             .expect("causal reads consumed outside a solver act")
+            .last_mut()
+            .expect("causal reads consumed without an active act")
             .drain(..)
             .collect()
     }
@@ -3193,8 +3229,8 @@ impl Table {
     /// origin the readers downstream need — a match's coverage is what the
     /// patterns phase asks its reachability questions of, whether or not the
     /// arms happened to relate anything.
-    fn require(&mut self, span: Span, origin: Origin, formula: Formula) {
-        self.require_because(span, origin, formula, None);
+    fn require(&mut self, span: Span, origin: Origin, formula: Formula) -> ReasonId {
+        self.require_because(span, origin, formula, None)
     }
 
     fn require_because(
@@ -3203,7 +3239,7 @@ impl Table {
         origin: Origin,
         formula: Formula,
         because: Option<ReasonId>,
-    ) {
+    ) -> ReasonId {
         let id = self.batch_id();
         let reason = self.reason(ReasonOrigin::Batch(id), because.into_iter().collect());
         self.store.batches.push(Batch {
@@ -3215,6 +3251,7 @@ impl Table {
             formula,
             flipped: false,
         });
+        reason
     }
 
     /// Point the use-site batches emitted since `from`, and still carrying
@@ -6593,6 +6630,7 @@ mod existential_regressions {
                 locals: &mut locals,
                 guard: None,
                 active_refinement: None,
+                guard_reasons: Vec::new(),
                 refinements: &mut refinements,
                 generated_end: 0,
             };

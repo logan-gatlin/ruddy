@@ -8939,6 +8939,117 @@ fn sat_and_effect_defaults_are_first_class_binding_reasons() {
 }
 
 #[test]
+fn replaced_and_guarded_batches_keep_referentially_integral_reason_roots() {
+    let (_, _, local) = infer_src(
+        "let outer =\n\
+         \x20 let choice : { x when 'a: Nat, y when 'b: Nat } where 'a != 'b = { x: 1n } in\n\
+         \x20 choice",
+    );
+    let reasons: std::collections::HashMap<_, _> = local
+        .reasons
+        .iter()
+        .map(|reason| (reason.id, reason))
+        .collect();
+    let mut constraints = Vec::new();
+    for generated in local.constraints.values() {
+        all_constraints(generated, &mut constraints);
+    }
+    let instance = constraints
+        .iter()
+        .find(|constraint| constraint.origin == inference::ConstraintOrigin::Instance)
+        .expect("the local instance constraint");
+    let batch = local
+        .store
+        .batches
+        .iter()
+        .find(|batch| matches!(batch.origin, inference::Origin::Instance(_)))
+        .expect("the local instance requirement");
+    let reason = reasons[&batch.reason];
+    assert!(matches!(reason.origin, inference::ReasonOrigin::Batch(id) if id == batch.id));
+    assert!(reason.parents.contains(&instance.reason));
+
+    let (_, _, guarded) = infer_src(
+        "let choose : { x when 'a: Nat, y when 'b: Nat } -> Nat where 'a != 'b = fn r => 1n\n\
+         let use = fn value => match value with\n\
+         \x20 | { x } => choose value\n\
+         \x20 | { y } => 0n end",
+    );
+    let reasons: std::collections::HashMap<_, _> = guarded
+        .reasons
+        .iter()
+        .map(|reason| (reason.id, reason))
+        .collect();
+    let transformed = guarded
+        .store
+        .batches
+        .iter()
+        .find(|batch| matches!(batch.origin, inference::Origin::Guarded(_)))
+        .expect("a requirement transformed by the active arm premise");
+    let reason = reasons[&transformed.reason];
+    assert!(matches!(reason.origin, inference::ReasonOrigin::Batch(id) if id == transformed.id));
+    assert!(reason.parents.iter().any(|parent| matches!(
+        reasons[parent].origin,
+        inference::ReasonOrigin::Batch(id) if id == transformed.id
+    )));
+    assert!(reason.parents.iter().any(|parent| matches!(
+        reasons[parent].origin,
+        inference::ReasonOrigin::Batch(id)
+            if guarded.store.batches.iter().any(|batch| {
+                batch.id == id && matches!(batch.origin, inference::Origin::Coverage(_))
+            })
+    )));
+}
+
+#[test]
+fn zero_step_rules_and_recovery_components_do_not_contaminate_later_steps() {
+    let (_, _, output) = infer_src("let bad : {} -> Boolean = fn x => let {} = x in 1n");
+    let failure = output
+        .steps
+        .iter()
+        .find(|step| matches!(step.effect, inference::Effect::Failed(_)))
+        .expect("the result mismatch");
+    let ancestors: std::collections::HashSet<_> = output
+        .reason_ancestors(failure.reason)
+        .into_iter()
+        .collect();
+    let mut constraints = Vec::new();
+    for generated in output.constraints.values() {
+        all_constraints(generated, &mut constraints);
+    }
+    assert!(!constraints.iter().any(|constraint| {
+        constraint.origin == inference::ConstraintOrigin::Pattern
+            && ancestors.contains(&constraint.reason)
+    }));
+
+    let (_, _, output) = infer_src("let bad : Nat = (fn x => { first: x, second: fn y => y }) 1n");
+    let reasons: std::collections::HashMap<_, _> = output
+        .reasons
+        .iter()
+        .map(|reason| (reason.id, reason))
+        .collect();
+    let recovered = output
+        .steps
+        .iter()
+        .find(|step| {
+            step.rule == inference::Rule::Recover
+                && matches!(
+                    step.effect,
+                    inference::Effect::Bound {
+                        var,
+                        ..
+                    } if output.variables[var as usize].subject == inference::Subject::Parameter
+                )
+        })
+        .expect("the abandoned inner parameter");
+    assert!(
+        reasons[&recovered.reason]
+            .parents
+            .iter()
+            .all(|parent| !matches!(reasons[parent].origin, inference::ReasonOrigin::Step(_)))
+    );
+}
+
+#[test]
 fn causal_reads_do_not_leak_across_solver_and_publication_boundaries() {
     let (mint, _, output) = infer_src("let first = fn x => x\nlet second = fn y => y");
     let first = output

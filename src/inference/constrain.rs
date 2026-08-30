@@ -730,7 +730,7 @@ impl Constrain<'_> {
                             };
                             let paths = structural_presence_paths(&demand);
                             let formula = Formula::any(raw.clone());
-                            self.table.require(
+                            let premise_reason = self.table.require(
                                 span,
                                 Origin::Coverage(Coverage {
                                     arms: raw.clone(),
@@ -739,7 +739,7 @@ impl Constrain<'_> {
                                 }),
                                 formula,
                             );
-                            qualifying = Some(raw);
+                            qualifying = Some((raw, premise_reason));
                         }
                         demand
                     }
@@ -755,7 +755,7 @@ impl Constrain<'_> {
                 );
 
                 match qualifying {
-                    Some(raw) => {
+                    Some((raw, premise_reason)) => {
                         let effective = effective_conditions(&raw);
                         let mut guarded = Vec::with_capacity(arms.len());
                         for (((pattern, body), raw), effective) in
@@ -786,6 +786,7 @@ impl Constrain<'_> {
                                 span: pattern.span.merge(body.span),
                                 raw,
                                 effective,
+                                premise_reason,
                                 constraints,
                                 requirements,
                                 result: arm_result,
