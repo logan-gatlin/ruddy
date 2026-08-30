@@ -6530,6 +6530,23 @@ fn a_required_case_combination_uses_sum_vocabulary() {
     );
 }
 
+/// A formula can relate labels from nested rows of different shapes. There is
+/// then no single truthful noun for every label in it, so use the neutral one.
+#[test]
+fn a_required_mixed_nested_combination_uses_neutral_vocabulary() {
+    let src = "let p : { outer when 'a: (#X (when 'b) | #Y ()) } -> () where 'a != 'b = fn _ => ()\n\
+               let bad = p { outer: #X () }";
+    let (_, _, output) = infer_src(src);
+    let [error] = output.errors.as_slice() else {
+        panic!("expected one error: {:#?}", output.errors);
+    };
+    assert_eq!(error.kind.code(), "presence-required");
+    assert_eq!(
+        error.kind.to_string(),
+        "this value needs `outer != X` among its labels, and it does not have that"
+    );
+}
+
 /// Constraints are per instance, never per scheme: two uses with different
 /// field sets are both legal when each instantiation is separately
 /// satisfiable.

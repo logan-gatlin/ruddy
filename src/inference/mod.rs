@@ -3306,7 +3306,9 @@ impl Table {
     /// Every label a type names and what decides whether it is there, in the
     /// order the type names them — what a use-site complaint quotes its formula
     /// in. The first spelling of a label wins, which is the one a reader
-    /// reading the type left to right meets.
+    /// reading the type left to right meets. A formula gets a shape only when
+    /// all of its named presences belong to that shape; a relation spanning
+    /// nested shapes must use the neutral diagnostic vocabulary.
     fn labels_in(
         &self,
         ty: &Rc<Ty>,
@@ -3327,6 +3329,8 @@ impl Table {
             Presence::Bound(index) => atoms.contains(&Atom::Bound(*index)),
             _ => false,
         };
+        let mut matched_shape = None;
+        let mut mixed_shapes = false;
         let mut work = vec![Work::Ty(ty.clone())];
         while let Some(part) = work.pop() {
             match part {
@@ -3361,8 +3365,12 @@ impl Table {
                 }
                 Work::Field(shape, name, field) => {
                     let presence = self.presence_of(&field.presence);
-                    if formula_shape.is_none() && names_atom(&presence) {
-                        *formula_shape = Some(shape);
+                    if names_atom(&presence) {
+                        match matched_shape {
+                            Some(found) if found != shape => mixed_shapes = true,
+                            None => matched_shape = Some(shape),
+                            _ => {}
+                        }
                     }
                     found
                         .entry(name.clone())
@@ -3376,8 +3384,12 @@ impl Table {
                     let (labels, _) = self.canon(&row).into_parts();
                     for (name, field) in labels {
                         let presence = self.presence_of(&field.presence);
-                        if formula_shape.is_none() && names_atom(&presence) {
-                            *formula_shape = Some(Shape::Effect);
+                        if names_atom(&presence) {
+                            match matched_shape {
+                                Some(Shape::Effect) => {}
+                                Some(_) => mixed_shapes = true,
+                                None => matched_shape = Some(Shape::Effect),
+                            }
                         }
                         found.entry(name.clone()).or_insert_with(|| {
                             let shown =
@@ -3388,6 +3400,7 @@ impl Table {
                 }
             }
         }
+        *formula_shape = (!mixed_shapes).then_some(matched_shape).flatten();
     }
 
     /// [`unfold`] with the row conditions its result implies recorded against
