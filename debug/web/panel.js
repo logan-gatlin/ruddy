@@ -195,7 +195,7 @@ function createPane(root, app, index) {
   /// last step, which is the state the solve actually ended in.
   function step(to, absolute = false) {
     if (!stage || viewOf(app, stage) !== "steps") return;
-    const last = stage.nodes.length;
+    const last = stepNodes(stage).length;
     const at = cursors.get(stage.id) ?? 0;
     const wanted =
       to === "start" ? 0 : to === "end" ? last : absolute ? Number(to) : at + Number(to);
@@ -327,7 +327,7 @@ function createPane(root, app, index) {
   /// move crossed. Rebuilding the list and replaying its prefix for a one-step
   /// delta made each press of `.` cost the whole solve, twice over.
   function renderSteps() {
-    const steps = stage.nodes;
+    const steps = stepNodes(stage);
     const at = Math.min(cursors.get(stage.id) ?? 0, steps.length);
     cursors.set(stage.id, at);
 
@@ -696,6 +696,10 @@ function allKeys(nodes, prefix, depth = 0, out = []) {
     if (node.children?.length) allKeys(node.children, key, depth + 1, out);
   });
   return out;
+}
+
+function stepNodes(stage) {
+  return stage.nodes.filter((node) => field(node, "_record") !== "metadata");
 }
 
 function columnsOf(stage) {

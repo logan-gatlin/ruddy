@@ -185,6 +185,7 @@ fn unrelated_same_span_batches_do_not_hide_match_coverage() {
                 definition,
                 span,
                 origin,
+                reason: inference::ReasonId::synthetic(0),
                 formula: Formula::True,
                 flipped: false,
             },

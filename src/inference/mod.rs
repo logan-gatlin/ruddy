@@ -257,17 +257,32 @@ pub struct Reason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasonOrigin {
-    Variable { sort: VarSort, subject: Subject },
+    Variable {
+        sort: VarSort,
+        subject: Subject,
+    },
     Constraint(ConstraintId),
+    Batch(BatchId),
     Step(StepId),
     Recovery,
-    DefaultBinding { var: TyVar, kind: DefaultBinding },
+    DefaultBinding {
+        var: TyVar,
+        kind: DefaultBinding,
+        assigned: DefaultAssignment,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DefaultBinding {
     Sat,
     CloseEffects,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultAssignment {
+    Present,
+    Absent,
+    EmptyRow,
 }
 
 impl Output {
@@ -312,6 +327,8 @@ pub struct Batch {
     /// Where the program said it: the match, the use site, or the annotation.
     pub span: Span,
     pub origin: Origin,
+    /// Root of this batch's causal explanation.
+    pub reason: ReasonId,
     /// What it requires, over the presence variables that existed when it was
     /// emitted. Kept as it was emitted, not as the solve later resolved it —
     /// the debugger shows the pass being read rather than its result, exactly
@@ -753,6 +770,7 @@ pub enum Subject {
     PerformedEffects,
     AmbientEffects,
     RaisedValue,
+    RaiseResult,
     HandlerAnswer,
     ProjectionBase,
     ProjectionResult,
@@ -785,6 +803,7 @@ impl Subject {
             Self::PerformedEffects => "performed-effects",
             Self::AmbientEffects => "ambient-effects",
             Self::RaisedValue => "raised-value",
+            Self::RaiseResult => "raise-result",
             Self::HandlerAnswer => "handler-answer",
             Self::ProjectionBase => "projection-base",
             Self::ProjectionResult => "projection-result",
@@ -1404,10 +1423,11 @@ struct Table {
     /// deliberately not restored after speculative congruence.
     reasons: Vec<Reason>,
     next_reason_id: u64,
-    /// Binding reasons observed while resolving the next solver act. Interior
-    /// mutability keeps the read-only resolution API while making causality
-    /// explicit at the step boundary.
-    causal_reads: RefCell<IndexSet<ReasonId>>,
+    /// Binding reasons observed during one solver act. `None` outside a solve
+    /// makes publication, generalization, and zonking incapable of leaking
+    /// incidental reads into a later step.
+    causal_reads: RefCell<Option<IndexSet<ReasonId>>>,
+    causal_scope_depth: usize,
 }
 
 /// Which quantified position each thing a scheme closes over was given, in the
@@ -2465,15 +2485,55 @@ impl Table {
         for reason in &mut self.reasons[known.reason_len..] {
             reason.reachable = false;
         }
-        self.causal_reads.borrow_mut().clear();
+        if let Some(reads) = self.causal_reads.borrow_mut().as_mut() {
+            reads.clear();
+        }
+    }
+
+    fn enter_solver_scope(&mut self) {
+        if self.causal_scope_depth == 0 {
+            let previous = self.causal_reads.replace(Some(IndexSet::new()));
+            assert!(
+                previous.is_none(),
+                "causal reads active outside a solver scope"
+            );
+        }
+        self.causal_scope_depth += 1;
+    }
+
+    fn leave_solver_scope(&mut self) {
+        self.causal_scope_depth = self
+            .causal_scope_depth
+            .checked_sub(1)
+            .expect("solver scope");
+        if self.causal_scope_depth == 0 {
+            let _discarded = self
+                .causal_reads
+                .replace(None)
+                .expect("solver reads active");
+            assert!(self.causal_reads.borrow().is_none());
+        }
+    }
+
+    fn begin_solver_act(&self) {
+        let mut reads = self.causal_reads.borrow_mut();
+        let reads = reads.as_mut().expect("solver act outside solver scope");
+        reads.clear();
     }
 
     fn note_binding_read(&self, reason: ReasonId) {
-        self.causal_reads.borrow_mut().insert(reason);
+        if let Some(reads) = self.causal_reads.borrow_mut().as_mut() {
+            reads.insert(reason);
+        }
     }
 
     fn take_binding_reads(&self) -> Vec<ReasonId> {
-        self.causal_reads.borrow_mut().drain(..).collect()
+        self.causal_reads
+            .borrow_mut()
+            .as_mut()
+            .expect("causal reads consumed outside a solver act")
+            .drain(..)
+            .collect()
     }
 
     fn binding_parents(&self, var: TyVar, root: Option<ReasonId>) -> Vec<ReasonId> {
@@ -2490,9 +2550,24 @@ impl Table {
         parents
     }
 
-    fn default_bind(&mut self, var: TyVar, value: Assigned, kind: DefaultBinding) -> ReasonId {
-        let parents = self.binding_parents(var, None);
-        let reason = self.reason(ReasonOrigin::DefaultBinding { var, kind }, parents);
+    fn default_bind(
+        &mut self,
+        var: TyVar,
+        value: Assigned,
+        kind: DefaultBinding,
+        assigned: DefaultAssignment,
+        mut causes: Vec<ReasonId>,
+    ) -> ReasonId {
+        causes.insert(0, self.var_meta[var as usize].minted_by);
+        causes.dedup();
+        let reason = self.reason(
+            ReasonOrigin::DefaultBinding {
+                var,
+                kind,
+                assigned,
+            },
+            causes,
+        );
         self.vars[var as usize] = Slot::Bound { value, by: reason };
         reason
     }
@@ -3119,12 +3194,24 @@ impl Table {
     /// patterns phase asks its reachability questions of, whether or not the
     /// arms happened to relate anything.
     fn require(&mut self, span: Span, origin: Origin, formula: Formula) {
+        self.require_because(span, origin, formula, None);
+    }
+
+    fn require_because(
+        &mut self,
+        span: Span,
+        origin: Origin,
+        formula: Formula,
+        because: Option<ReasonId>,
+    ) {
         let id = self.batch_id();
+        let reason = self.reason(ReasonOrigin::Batch(id), because.into_iter().collect());
         self.store.batches.push(Batch {
             id,
             definition: self.definition,
             span,
             origin,
+            reason,
             formula,
             flipped: false,
         });
@@ -3173,6 +3260,7 @@ impl Table {
                 definition: batch.definition,
                 span: batch.span,
                 origin: self.settled_origin(&batch.origin),
+                reason: batch.reason,
                 formula: self.resolved(&batch.formula),
                 flipped: batch.flipped,
             })
@@ -3458,7 +3546,39 @@ impl Table {
             } else {
                 continue;
             };
-            self.default_bind(var, Assigned::Presence(settled), DefaultBinding::Sat);
+            let assigned = match settled {
+                Presence::Present => DefaultAssignment::Present,
+                Presence::Absent => DefaultAssignment::Absent,
+                _ => unreachable!("SAT only settles literals"),
+            };
+            let mut causes = Vec::new();
+            let mut wanted = IndexSet::from([Atom::Var(var)]);
+            let mut taken = vec![false; self.store.batches.len()];
+            let mut grew = true;
+            while grew {
+                grew = false;
+                for (at, batch) in self.store.batches.iter().enumerate() {
+                    if taken[at] {
+                        continue;
+                    }
+                    let formula = self.resolved(&batch.formula);
+                    let mut atoms = Vec::new();
+                    formula.atoms(&mut atoms);
+                    if atoms.iter().any(|atom| wanted.contains(atom)) {
+                        taken[at] = true;
+                        grew = true;
+                        wanted.extend(atoms);
+                        causes.push(batch.reason);
+                    }
+                }
+            }
+            self.default_bind(
+                var,
+                Assigned::Presence(settled),
+                DefaultBinding::Sat,
+                assigned,
+                causes,
+            );
         }
     }
 
@@ -4134,6 +4254,8 @@ impl Table {
                 var,
                 Assigned::Row(Rc::new(Row::closed())),
                 DefaultBinding::CloseEffects,
+                DefaultAssignment::EmptyRow,
+                Vec::new(),
             );
         }
     }

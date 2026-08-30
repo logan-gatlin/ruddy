@@ -8906,6 +8906,11 @@ fn sat_and_effect_defaults_are_first_class_binding_reasons() {
             ..
         }
     )));
+    let arena: std::collections::HashMap<_, _> = output
+        .reasons
+        .iter()
+        .map(|reason| (reason.id, reason))
+        .collect();
     for reason in output.reasons.iter().filter(|reason| {
         matches!(
             reason.origin,
@@ -8913,7 +8918,94 @@ fn sat_and_effect_defaults_are_first_class_binding_reasons() {
         )
     }) {
         assert!(!reason.parents.is_empty(), "default omitted its mint cause");
+        if let inference::ReasonOrigin::DefaultBinding {
+            kind: inference::DefaultBinding::Sat,
+            assigned,
+            ..
+        } = reason.origin
+        {
+            assert!(matches!(
+                assigned,
+                inference::DefaultAssignment::Present | inference::DefaultAssignment::Absent
+            ));
+            assert!(
+                reason.parents.iter().any(|parent| matches!(
+                    arena[parent].origin,
+                    inference::ReasonOrigin::Batch(_)
+                ))
+            );
+        }
     }
+}
+
+#[test]
+fn causal_reads_do_not_leak_across_solver_and_publication_boundaries() {
+    let (mint, _, output) = infer_src("let first = fn x => x\nlet second = fn y => y");
+    let first = output
+        .steps
+        .iter()
+        .find(|step| mint.name(step.definition) == "first")
+        .unwrap()
+        .definition;
+    let second = output
+        .steps
+        .iter()
+        .find(|step| mint.name(step.definition) == "second")
+        .unwrap()
+        .definition;
+    let first_steps: std::collections::HashSet<_> = output
+        .steps
+        .iter()
+        .filter(|step| step.definition == first)
+        .map(|step| step.reason)
+        .collect();
+    let second_seed = output
+        .steps
+        .iter()
+        .find(|step| step.definition == second)
+        .expect("second definition step")
+        .reason;
+    let ancestors: std::collections::HashSet<_> =
+        output.reason_ancestors(second_seed).into_iter().collect();
+    assert!(first_steps.is_disjoint(&ancestors));
+}
+
+#[test]
+fn recovery_names_the_failure_or_absorption_that_requested_it() {
+    let (_, _, output) = infer_src("let bad : Nat = true\nlet absorbed = fn x => bad x");
+    let steps: std::collections::HashMap<_, _> = output
+        .steps
+        .iter()
+        .map(|step| (step.reason, step))
+        .collect();
+    for step in output
+        .steps
+        .iter()
+        .filter(|step| step.rule == inference::Rule::Recover)
+    {
+        let inference::Effect::Bound {
+            because: Some(because),
+            ..
+        } = step.effect
+        else {
+            panic!("recovery omitted its explicit cause")
+        };
+        let cause = steps[&because];
+        assert!(
+            matches!(cause.effect, inference::Effect::Failed(_))
+                || cause.rule == inference::Rule::Absorb
+        );
+    }
+}
+
+#[test]
+fn raise_result_has_its_own_semantic_subject() {
+    let (_, _, output) = infer_src(
+        "effect Fail = { abort: Nat -> Boolean }\nlet f = fn unit => raise Fail.abort 1n",
+    );
+    assert!(output.variables.iter().any(|meta| {
+        meta.sort == inference::VarSort::Type && meta.subject == inference::Subject::RaiseResult
+    }));
 }
 
 #[test]

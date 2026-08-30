@@ -2222,6 +2222,9 @@ fn a_solver_step_declares_what_it_added_to_the_state() {
     let mut bound = Vec::new();
     let mut failed = Vec::new();
     for node in &stage.nodes {
+        if field(node, "_record").as_deref() == Some("metadata") {
+            continue;
+        }
         // Everything the page reads off every step, on every step.
         for name in ["_rule", "_effect", "_depth", "_def"] {
             assert!(field(node, name).is_some(), "{} has no {name}", node.label);
@@ -2400,6 +2403,31 @@ fn a_raw_dump_carries_only_its_own_tab() {
 }
 
 #[test]
+fn zero_step_solves_still_publish_machine_readable_arenas() {
+    let snapshot = snapshot("");
+    let solve = snapshot
+        .stages
+        .iter()
+        .find(|stage| stage.id == "solve")
+        .expect("solve stage");
+    assert_eq!(solve.summary, "0 steps");
+    assert_eq!(solve.nodes.len(), 1);
+    let metadata = &solve.nodes[0];
+    let field = |name| {
+        metadata
+            .fields
+            .iter()
+            .find(|field| field.name == name)
+            .map(|field| field.value.as_str())
+    };
+    assert_eq!(field("_record"), Some("metadata"));
+    for arena in ["_variables", "_reasons"] {
+        let value: serde_json::Value = serde_json::from_str(field(arena).unwrap()).unwrap();
+        assert!(value.is_array());
+    }
+}
+
+#[test]
 fn inference_stage_rows_serialize_compiler_identities() {
     let source = "effect Fail = { abort: () -> () }\n\
                   type Callback = () -> () + !Fail\n\
@@ -2435,34 +2463,43 @@ fn inference_stage_rows_serialize_compiler_identities() {
     }));
 
     let solve = nodes(stage("solve"));
-    let step_ids: std::collections::HashSet<_> = solve
+    let metadata = solve
+        .iter()
+        .find(|node| field(node, "_record").as_deref() == Some("metadata"))
+        .expect("always-present inference metadata record");
+    let steps: Vec<_> = solve
+        .iter()
+        .copied()
+        .filter(|node| field(node, "_record").is_none())
+        .collect();
+    let step_ids: std::collections::HashSet<_> = steps
         .iter()
         .filter_map(|node| field(node, "_step_id"))
         .collect();
-    assert_eq!(step_ids.len(), solve.len());
-    let reason_ids: std::collections::HashSet<_> = solve
+    assert_eq!(step_ids.len(), steps.len());
+    let reason_ids: std::collections::HashSet<_> = steps
         .iter()
         .filter_map(|node| field(node, "_reason_id"))
         .collect();
-    assert_eq!(reason_ids.len(), solve.len());
+    assert_eq!(reason_ids.len(), steps.len());
     assert!(
-        solve
+        steps
             .iter()
             .filter(|node| field(node, "_bind").is_some())
             .all(|node| field(node, "_bind_by") == field(node, "_reason_id"))
     );
     assert!(
-        solve
+        steps
             .iter()
             .any(|node| field(node, "_recovery_because").is_some())
     );
     assert!(
-        solve.iter().all(
+        steps.iter().all(
             |node| field(node, "_constraint_id").is_some_and(|id| constraint_ids.contains(&id))
         )
     );
     let variables: serde_json::Value = serde_json::from_str(
-        &field(solve[0], "_variables").expect("machine-readable variable arena"),
+        &field(metadata, "_variables").expect("machine-readable variable arena"),
     )
     .unwrap();
     assert!(variables.as_array().unwrap().iter().all(|variable| {
@@ -2471,7 +2508,7 @@ fn inference_stage_rows_serialize_compiler_identities() {
             && variable.get("minted_by").is_some()
     }));
     let reasons: serde_json::Value =
-        serde_json::from_str(&field(solve[0], "_reasons").expect("machine-readable reason arena"))
+        serde_json::from_str(&field(metadata, "_reasons").expect("machine-readable reason arena"))
             .unwrap();
     assert!(reasons.as_array().unwrap().iter().all(|reason| {
         reason.get("parents").is_some()

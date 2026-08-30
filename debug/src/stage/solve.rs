@@ -17,7 +17,9 @@
 //! row already says which question was taken as answered, and a field for it
 //! would print the goal column twice.
 
-use ruddy::inference::{DefaultBinding, Effect, ReasonOrigin, VarSort};
+use std::collections::HashMap;
+
+use ruddy::inference::{DefaultAssignment, DefaultBinding, Effect, ReasonOrigin, VarSort};
 
 use crate::{
     stage::{Cx, Ids, Spec, plural},
@@ -48,9 +50,10 @@ fn reason_fields(
             Some(sort_code(sort)),
         ),
         ReasonOrigin::Constraint(id) => ("constraint", Some(id.get()), None, None),
+        ReasonOrigin::Batch(id) => ("batch", Some(id.get()), None, None),
         ReasonOrigin::Step(id) => ("step", Some(id.get()), None, None),
         ReasonOrigin::Recovery => ("recovery", None, None, None),
-        ReasonOrigin::DefaultBinding { var, kind } => (
+        ReasonOrigin::DefaultBinding { var, kind, .. } => (
             match kind {
                 DefaultBinding::Sat => "sat-binding",
                 DefaultBinding::CloseEffects => "close-effects-binding",
@@ -134,13 +137,16 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
 
     // Provenance is debugger wire data, not an opaque Rust Debug appendix.
     // Per-step scalar fields make the common query cheap; complete JSON arenas
-    // ride on the first row so adding them does not alter solve replay or the
-    // reader-visible step count.
+    // ride on one explicitly tagged metadata record, present even when there
+    // are no steps and excluded from solve replay by wire consumers.
+    let reason_by_id: HashMap<_, _> = output
+        .reasons
+        .iter()
+        .map(|reason| (reason.id, reason))
+        .collect();
     for (step, node) in output.steps.iter().zip(&mut nodes) {
-        let reason = output
-            .reasons
-            .iter()
-            .find(|reason| reason.id == step.reason)
+        let reason = reason_by_id
+            .get(&step.reason)
             .expect("every published step has a reason");
         let mut decorated = std::mem::take(node)
             .field(
@@ -163,7 +169,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         }
         *node = decorated;
     }
-    if let Some(first) = nodes.first_mut() {
+    {
         let variables: Vec<_> = output
             .variables
             .iter()
@@ -182,6 +188,14 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             .iter()
             .map(|reason| {
                 let (origin, origin_id, subject, sort) = reason_fields(reason.origin);
+                let assigned = match reason.origin {
+                    ReasonOrigin::DefaultBinding { assigned, .. } => Some(match assigned {
+                        DefaultAssignment::Present => "present",
+                        DefaultAssignment::Absent => "absent",
+                        DefaultAssignment::EmptyRow => "empty-row",
+                    }),
+                    _ => None,
+                };
                 serde_json::json!({
                     "id": reason.id.get(),
                     "parents": reason.parents.iter().map(|id| id.get()).collect::<Vec<_>>(),
@@ -189,18 +203,21 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                     "origin_id": origin_id,
                     "sort": sort,
                     "subject": subject,
+                    "assigned": assigned,
                     "reachable": reason.reachable,
                 })
             })
             .collect();
-        *first = std::mem::take(first)
+        let metadata = Node::new(ids.next(), "metadata", "")
+            .field("_record", "metadata")
             .field("_variables", serde_json::to_string(&variables).unwrap())
             .field("_reasons", serde_json::to_string(&reasons).unwrap());
+        nodes.insert(0, metadata);
     }
 
     // No time of its own: the inference phase is timed once, on `Types`, which
     // is what leaving `micros` unset says.
-    let summary = plural(nodes.len(), "step");
+    let summary = plural(output.steps.len(), "step");
     Stage {
         nodes,
         debug: format!(

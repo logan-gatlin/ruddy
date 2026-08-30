@@ -345,10 +345,11 @@ impl Solve<'_> {
     /// projection's demand is an ordinary type with an open field row, so
     /// nothing has to wait for a later round to know what its base is.
     pub fn run(&mut self, constraints: &[Constraint]) {
+        self.table.enter_solver_scope();
         for constraint in constraints {
-            // Resolution performed while publishing the previous constraint is
-            // not an input to this one. Every step below drains its own reads.
-            self.table.take_binding_reads();
+            // Resolution performed while publishing/generalizing the previous
+            // constraint is not an input to this one.
+            self.table.begin_solver_act();
             let previous = self.constraint.replace(constraint.id);
             let previous_reason = self.constraint_reason.replace(constraint.reason);
             let span = constraint.span;
@@ -418,6 +419,7 @@ impl Solve<'_> {
             self.constraint = previous;
             self.constraint_reason = previous_reason;
         }
+        self.table.leave_solver_scope();
     }
 
     /// Solve a field projection after exposing only the base's outer constructor.
@@ -1186,6 +1188,7 @@ impl Solve<'_> {
             definition: batch.definition,
             span: batch.span,
             origin,
+            reason: batch.reason,
             formula,
             flipped: false,
         }
@@ -1495,18 +1498,18 @@ impl Solve<'_> {
                             work.push(SolveWork::Ty(lhs.clone(), body, depth + 1));
                         }
                         (Ty::Undecided, _) => {
-                            self.step(span, Rule::Absorb, goal, Effect::None);
-                            self.recover_ty(span, &rhs);
+                            let absorbing = self.step(span, Rule::Absorb, goal, Effect::None);
+                            self.recover_ty(span, &rhs, absorbing);
                         }
                         (_, Ty::Undecided) => {
-                            self.step(span, Rule::Absorb, goal, Effect::None);
-                            self.recover_ty(span, &lhs);
+                            let absorbing = self.step(span, Rule::Absorb, goal, Effect::None);
+                            self.recover_ty(span, &lhs, absorbing);
                         }
                         (Ty::Var(a), Ty::Var(b)) if a == b => {
-                            self.step(span, Rule::Same, goal, Effect::None)
+                            self.step(span, Rule::Same, goal, Effect::None);
                         }
                         (Ty::Rigid { id: a, .. }, Ty::Rigid { id: b, .. }) if a == b => {
-                            self.step(span, Rule::Same, goal, Effect::None)
+                            self.step(span, Rule::Same, goal, Effect::None);
                         }
                         (Ty::Var(_), _)
                         | (_, Ty::Var(_))
@@ -1727,9 +1730,9 @@ impl Solve<'_> {
                             if already {
                                 self.step(span, Rule::Assume, goal, Effect::None);
                             } else if growing {
-                                self.step(span, Rule::Absorb, goal, Effect::None);
-                                self.recover_ty(span, &lhs);
-                                self.recover_ty(span, &rhs);
+                                let absorbing = self.step(span, Rule::Absorb, goal, Effect::None);
+                                self.recover_ty(span, &lhs, absorbing);
+                                self.recover_ty(span, &rhs, absorbing);
                             } else {
                                 let exposed_left = self.table.unfolded(self.aliases, &lhs);
                                 let exposed_right = self.table.unfolded(self.aliases, &rhs);
@@ -2196,21 +2199,21 @@ impl Solve<'_> {
         };
         match (&want.rest, &have.rest) {
             (Rest::Undecided, _) => {
-                self.step(span, Rule::Absorb, goal, Effect::None);
-                self.recover_row(span, &have);
+                let absorbing = self.step(span, Rule::Absorb, goal, Effect::None);
+                self.recover_row(span, &have, absorbing);
             }
             (_, Rest::Undecided) => {
-                self.step(span, Rule::Absorb, goal, Effect::None);
-                self.recover_row(span, &want);
+                let absorbing = self.step(span, Rule::Absorb, goal, Effect::None);
+                self.recover_row(span, &want, absorbing);
             }
             (Rest::Var(a), Rest::Var(b)) if a == b => {
-                self.step(span, Rule::Same, goal, Effect::None)
+                self.step(span, Rule::Same, goal, Effect::None);
             }
             // The row-tail rule's arms about a sum's rest, and the same rule: a
             // declared rest is equal to itself, takes an unbound variable as
             // any row would, and breaks its promise against anything else.
             (Rest::Rigid { id: a, .. }, Rest::Rigid { id: b, .. }) if a == b => {
-                self.step(span, Rule::Same, goal, Effect::None)
+                self.step(span, Rule::Same, goal, Effect::None);
             }
             (Rest::Rigid { name, id }, other) if !matches!(other, Rest::Var(_)) => {
                 let (name, id) = (name.clone(), *id);
@@ -2232,7 +2235,9 @@ impl Solve<'_> {
             }
             // Two tails that are already the same thing: two closed ones, which
             // is what a row closed from both sides comes to.
-            _ => self.step(span, Rule::Same, goal, Effect::None),
+            _ => {
+                self.step(span, Rule::Same, goal, Effect::None);
+            }
         }
     }
 
@@ -2383,15 +2388,15 @@ impl Solve<'_> {
         };
         match (lhs, rhs) {
             (Presence::Undecided, _) => {
-                self.step(span, Rule::Absorb, goal, Effect::None);
-                self.recover(span, &Assigned::Presence(rhs.clone()));
+                let absorbing = self.step(span, Rule::Absorb, goal, Effect::None);
+                self.recover(span, &Assigned::Presence(rhs.clone()), absorbing);
             }
             (_, Presence::Undecided) => {
-                self.step(span, Rule::Absorb, goal, Effect::None);
-                self.recover(span, &Assigned::Presence(lhs.clone()));
+                let absorbing = self.step(span, Rule::Absorb, goal, Effect::None);
+                self.recover(span, &Assigned::Presence(lhs.clone()), absorbing);
             }
             (Presence::Var(a), Presence::Var(b)) if a == b => {
-                self.step(span, Rule::Same, goal, Effect::None)
+                self.step(span, Rule::Same, goal, Effect::None);
             }
             (Presence::Var(var), Presence::Var(other))
                 if self.table.abstract_existentials.contains(var)
@@ -2408,25 +2413,27 @@ impl Solve<'_> {
             (Presence::Var(var), other) if self.table.existential_witnesses.contains(var) => {
                 let formula = lhs.formula().iff(other.formula());
                 self.step(span, Rule::Refine, goal, Effect::None);
-                self.table.require(
+                self.table.require_because(
                     span,
                     Origin::Instance(Named {
                         labels: Vec::new(),
                         shape: None,
                     }),
                     formula,
+                    self.constraint_reason,
                 );
             }
             (other, Presence::Var(var)) if self.table.existential_witnesses.contains(var) => {
                 let formula = other.formula().iff(rhs.formula());
                 self.step(span, Rule::Refine, goal, Effect::None);
-                self.table.require(
+                self.table.require_because(
                     span,
                     Origin::Instance(Named {
                         labels: Vec::new(),
                         shape: None,
                     }),
                     formula,
+                    self.constraint_reason,
                 );
             }
             (Presence::Var(var), other) => {
@@ -2437,7 +2444,9 @@ impl Solve<'_> {
                 let (var, other) = (*var, other.clone());
                 self.assign(span, goal, var, Assigned::Presence(other));
             }
-            _ => self.step(span, Rule::Same, goal, Effect::None),
+            _ => {
+                self.step(span, Rule::Same, goal, Effect::None);
+            }
         }
     }
 
@@ -2502,7 +2511,8 @@ impl Solve<'_> {
             })),
         });
         if !obligation.is_true() {
-            self.table.require(span, origin, formula.clone());
+            self.table
+                .require_because(span, origin, formula.clone(), self.constraint_reason);
         }
         let goal = Goal::Presence {
             expected: lhs,
@@ -2574,8 +2584,8 @@ impl Solve<'_> {
             match tail.var() {
                 Some(var) => self.assign(span, goal, var, value),
                 None => {
-                    self.step(span, Rule::Absorb, goal, Effect::None);
-                    self.recover(span, &value);
+                    let absorbing = self.step(span, Rule::Absorb, goal, Effect::None);
+                    self.recover(span, &value, absorbing);
                 }
             }
             return;
@@ -2992,7 +3002,7 @@ impl Solve<'_> {
             effect: Effect::Failed(kind),
         });
         for value in abandoned {
-            self.recover(span, value);
+            self.recover(span, value, reason);
         }
     }
 
@@ -3006,32 +3016,38 @@ impl Solve<'_> {
     /// arms that meet something already undecided — an undecided presence or an
     /// undecided tail absorbs whatever it was put against, and everything that
     /// would have decided it is abandoned with it.
-    fn recover(&mut self, span: Span, value: &Assigned) {
+    fn recover(&mut self, span: Span, value: &Assigned, because: ReasonId) {
         match value {
-            Assigned::Ty(ty) => self.recover_ty(span, ty),
-            Assigned::Row(row) => self.recover_row(span, row),
-            Assigned::Presence(presence) => self.recover_presence(span, presence),
+            Assigned::Ty(ty) => self.recover_ty(span, ty, because),
+            Assigned::Row(row) => self.recover_row(span, row, because),
+            Assigned::Presence(presence) => self.recover_presence(span, presence, because),
         }
     }
 
     /// [`recover`](Self::recover) over a type: its constructor, and then the fields it
     /// carries. A composite is abandoned by abandoning what it is made of —
     /// the goal that would have decided `?1 -> ?2` decided neither half.
-    fn recover_ty(&mut self, span: Span, ty: &Rc<Ty>) {
-        self.recover_parts(span, Some(ty.clone()), None);
+    fn recover_ty(&mut self, span: Span, ty: &Rc<Ty>, because: ReasonId) {
+        self.recover_parts(span, Some(ty.clone()), None, because);
     }
 
     /// [`recover`](Self::recover) over a sum's cases: every label, and then the
     /// tail saying what else the row might have had.
-    fn recover_row(&mut self, span: Span, row: &Row) {
-        self.recover_parts(span, None, Some(row.clone()));
+    fn recover_row(&mut self, span: Span, row: &Row, because: ReasonId) {
+        self.recover_parts(span, None, Some(row.clone()), because);
     }
 
     /// Iterative recovery for imported semantic trees. A failure can abandon a
     /// value whose artifact contains 30,000 arrows, names, rows, or field
     /// payloads; recovery still has to settle every variable and presence in
     /// it without borrowing the native call stack from the malformed input.
-    fn recover_parts(&mut self, span: Span, ty: Option<Rc<Ty>>, row: Option<Row>) {
+    fn recover_parts(
+        &mut self,
+        span: Span,
+        ty: Option<Rc<Ty>>,
+        row: Option<Row>,
+        because: ReasonId,
+    ) {
         enum Work {
             Type(Rc<Ty>),
             Row(Row),
@@ -3052,7 +3068,7 @@ impl Solve<'_> {
                     let ty = self.table.resolve(&ty);
                     match &*ty {
                         Ty::Var(var) => {
-                            self.settle(span, *var, Assigned::Ty(Rc::new(Ty::Undecided)))
+                            self.settle(span, *var, Assigned::Ty(Rc::new(Ty::Undecided)), because)
                         }
                         Ty::Arrow(from, to, effects) => {
                             work.push(Work::Row(effects.clone()));
@@ -3085,10 +3101,15 @@ impl Solve<'_> {
                         work.push(Work::Presence(presence));
                     }
                 }
-                Work::Presence(presence) => self.recover_presence(span, &presence),
+                Work::Presence(presence) => self.recover_presence(span, &presence, because),
                 Work::Rest(rest) => {
                     if let Rest::Var(var) = self.table.canon(&Row::of(rest)).rest {
-                        self.settle(span, var, Assigned::Row(Rc::new(Row::of(Rest::Undecided))));
+                        self.settle(
+                            span,
+                            var,
+                            Assigned::Row(Rc::new(Row::of(Rest::Undecided))),
+                            because,
+                        );
                     }
                 }
             }
@@ -3096,16 +3117,16 @@ impl Solve<'_> {
     }
 
     /// [`recover`](Self::recover) over a presence.
-    fn recover_presence(&mut self, span: Span, presence: &Presence) {
+    fn recover_presence(&mut self, span: Span, presence: &Presence, because: ReasonId) {
         if let Presence::Var(var) = self.table.presence_of(presence) {
-            self.settle(span, var, Assigned::Presence(Presence::Undecided));
+            self.settle(span, var, Assigned::Presence(Presence::Undecided), because);
         }
     }
 
     /// Bind one abandoned variable, and say so: a reader following the state
     /// would otherwise see a variable acquire a value that no rule they were
     /// shown gave it.
-    fn settle(&mut self, span: Span, var: TyVar, value: Assigned) {
+    fn settle(&mut self, span: Span, var: TyVar, value: Assigned, because: ReasonId) {
         let goal = match &value {
             Assigned::Ty(ty) => Goal::Type {
                 expected: Rc::new(Ty::plain(Ty::Var(var))),
@@ -3120,13 +3141,7 @@ impl Solve<'_> {
                 actual: presence.clone(),
             },
         };
-        let because = self
-            .steps
-            .iter()
-            .rev()
-            .find(|step| step.rule != Rule::Recover)
-            .map(|step| step.reason);
-        self.bound_step(span, Rule::Recover, goal, var, value, because);
+        self.bound_step(span, Rule::Recover, goal, var, value, Some(because));
     }
 
     fn bound_step(
@@ -3172,7 +3187,7 @@ impl Solve<'_> {
         });
     }
 
-    fn step(&mut self, span: Span, rule: Rule, goal: Goal, effect: Effect) {
+    fn step(&mut self, span: Span, rule: Rule, goal: Goal, effect: Effect) -> ReasonId {
         let id = self.table.step_id();
         let mut parents = self.table.take_binding_reads();
         if let Some(parent) = self.constraint_reason
@@ -3193,6 +3208,7 @@ impl Solve<'_> {
             goal,
             effect,
         });
+        reason
     }
 }
 

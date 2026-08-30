@@ -609,7 +609,7 @@ impl Constrain<'_> {
                         Subject::RaisedValue,
                     );
                 }
-                self.table.fresh_type_for(Subject::RaisedValue)
+                self.table.fresh_type_for(Subject::RaiseResult)
             }
             TermKind::Struct(fields) => {
                 let mut tys = IndexMap::new();
