@@ -1000,8 +1000,10 @@ pub enum ExplanationFactPayload {
     LabelDemand,
     /// A source use that fixes or closes the other side of a row.
     ClosedRow,
-    /// One of the two written uses which makes a label overlap a row remainder.
-    RemainderOverlap,
+    /// The source use which actually introduces the repeated label.
+    LabelIntroduction,
+    /// The source row remainder whose adjacent label forbids that introduction.
+    LabelForbidden,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1195,7 +1197,12 @@ pub enum ErrorKind {
     /// and what kind of row it was found in are carried: those are the two
     /// things both halves of the contradiction have in common, and the rows
     /// themselves are each half a type the reader never wrote down.
-    RepeatedField { shape: Shape, field: String },
+    RepeatedField {
+        shape: Shape,
+        field: String,
+        introduction: Option<RowFactOrigin>,
+        forbidden: Option<RowFactOrigin>,
+    },
     /// A use of a definition whose type requires a combination of labels the
     /// value written there cannot have: `p {}` where `p` accepts exactly one of
     /// `x` and `y`.
@@ -1279,7 +1286,23 @@ enum Slot {
 /// because there is no longer anywhere to read it from — a row-tail variable stands
 /// for a whole type, and the labels forbidden of it are that type's fields. See
 /// [`Table::lacks`].
-type Lacks = (Shape, IndexSet<String>);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowFactOrigin {
+    pub constraint: ConstraintId,
+    pub reason: ReasonId,
+    pub origin: ConstraintOrigin,
+    pub subject: Subject,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+struct LacksEntry {
+    shape: Shape,
+    label: String,
+    origin: Option<RowFactOrigin>,
+}
+
+type Lacks = IndexMap<String, LacksEntry>;
 
 /// Everything speculative solving can change about a [`Table`]. Taken and put
 /// back by [`Rule::Congruent`], which is the one rule that asks a question
@@ -1297,6 +1320,7 @@ struct Known {
     var_meta: Vec<VarMeta>,
     levels: Vec<u32>,
     lacks: HashMap<TyVar, Lacks>,
+    active_lacks_origin: Option<RowFactOrigin>,
     existential_witnesses: HashSet<TyVar>,
     abstract_existentials: HashSet<TyVar>,
     reason_len: usize,
@@ -1559,6 +1583,9 @@ struct Table {
     /// incidental reads into a later step.
     causal_reads: RefCell<Option<Vec<IndexSet<ReasonId>>>>,
     causal_scope_depth: usize,
+    /// Source cause currently introducing row syntax. Lacks facts copy this
+    /// value when they are created and retain it across every tail binding.
+    active_lacks_origin: Option<RowFactOrigin>,
 }
 
 /// Which quantified position each thing a scheme closes over was given, in the
@@ -2596,7 +2623,7 @@ fn attach_ordinary_explanations(
                     label: field.clone(),
                 }),
             ),
-            ErrorKind::RepeatedField { shape, field } => (
+            ErrorKind::RepeatedField { shape, field, .. } => (
                 match shape {
                     Shape::Struct => TypeDescription::Struct,
                     Shape::Sum => TypeDescription::TaggedValue,
@@ -2685,7 +2712,10 @@ fn attach_ordinary_explanations(
             for (subject, span) in endpoints {
                 let Some(span) = span else { continue };
                 let payload = if kind == Some(ContradictionKind::RepeatedLabel) {
-                    ExplanationFactPayload::RemainderOverlap
+                    match subject {
+                        Subject::AmbientEffects => ExplanationFactPayload::LabelForbidden,
+                        _ => ExplanationFactPayload::LabelIntroduction,
+                    }
                 } else {
                     match (constraint.origin, subject) {
                         (ConstraintOrigin::Projection, Subject::PatternDemand)
@@ -2699,10 +2729,24 @@ fn attach_ordinary_explanations(
                         {
                             ExplanationFactPayload::ClosedRow
                         }
-                        (_, Subject::Argument | Subject::Term)
+                        (ConstraintOrigin::Pattern, Subject::PatternDemand)
                             if matches!(kind, Some(ContradictionKind::LabelUnavailable)) =>
                         {
                             ExplanationFactPayload::LabelDemand
+                        }
+                        (ConstraintOrigin::ApplicationArgument, Subject::Argument)
+                        | (ConstraintOrigin::MatchScrutinee, Subject::MatchScrutinee)
+                        | (ConstraintOrigin::ContextualCheck, Subject::Term)
+                            if matches!(kind, Some(ContradictionKind::LabelUnavailable)) =>
+                        {
+                            ExplanationFactPayload::LabelDemand
+                        }
+                        (ConstraintOrigin::ApplicationArgument, Subject::Parameter)
+                        | (ConstraintOrigin::ContextualCheck, Subject::Annotation)
+                        | (ConstraintOrigin::Binding, Subject::Annotation)
+                            if matches!(kind, Some(ContradictionKind::LabelUnavailable)) =>
+                        {
+                            ExplanationFactPayload::ClosedRow
                         }
                         _ if matches!(kind, Some(ContradictionKind::LabelUnavailable)) => {
                             ExplanationFactPayload::ClosedRow
@@ -2728,18 +2772,29 @@ fn attach_ordinary_explanations(
                 });
             }
         }
-        // Overlap is discovered while combining two independently written row
-        // uses. Some unary effect constraints name only their own operation;
-        // the failed step's source span is the other grounded endpoint.
-        if kind == Some(ContradictionKind::RepeatedLabel)
-            && full_facts.len() == 1
-            && full_facts[0].span != error.span
+        if let ErrorKind::RepeatedField {
+            introduction: Some(introduction),
+            forbidden: Some(forbidden),
+            ..
+        } = &error.kind
+            && introduction.span != forbidden.span
         {
-            let first = full_facts[0].clone();
-            full_facts.push(ExplanationFact {
-                span: error.span,
-                ..first
-            });
+            full_facts = vec![
+                ExplanationFact {
+                    span: introduction.span,
+                    constraint: introduction.constraint,
+                    origin: introduction.origin,
+                    subject: introduction.subject,
+                    payload: ExplanationFactPayload::LabelIntroduction,
+                },
+                ExplanationFact {
+                    span: forbidden.span,
+                    constraint: forbidden.constraint,
+                    origin: forbidden.origin,
+                    subject: forbidden.subject,
+                    payload: ExplanationFactPayload::LabelForbidden,
+                },
+            ];
         }
         // A reason without a written endpoint cannot support source labels.
         // Keep the established diagnostic rather than inventing context.
@@ -2767,8 +2822,32 @@ fn attach_ordinary_explanations(
         abridged.sort_by_key(|at| full_facts[*at].span != error.span);
         // These row families promise labels on both causal sides. If recovery
         // retained only one written endpoint, keep the honest family fallback.
-        if kind.is_some() && candidates.len() < 2 {
-            continue;
+        if kind.is_some() {
+            let distinct: HashSet<_> = candidates.iter().map(|at| full_facts[*at].span).collect();
+            let opposing = match kind {
+                Some(ContradictionKind::RepeatedLabel) => {
+                    full_facts
+                        .iter()
+                        .any(|fact| fact.payload == ExplanationFactPayload::LabelIntroduction)
+                        && full_facts
+                            .iter()
+                            .any(|fact| fact.payload == ExplanationFactPayload::LabelForbidden)
+                }
+                Some(
+                    ContradictionKind::LabelUnavailable | ContradictionKind::ProjectionOnNonStruct,
+                ) => {
+                    full_facts
+                        .iter()
+                        .any(|fact| fact.payload == ExplanationFactPayload::LabelDemand)
+                        && full_facts
+                            .iter()
+                            .any(|fact| fact.payload == ExplanationFactPayload::ClosedRow)
+                }
+                _ => true,
+            };
+            if distinct.len() < 2 || !opposing {
+                continue;
+            }
         }
         let leaf = match &error.kind {
             ErrorKind::Mismatch { expected, actual } => {
@@ -3545,6 +3624,7 @@ impl Table {
             var_meta: self.var_meta.clone(),
             levels: self.levels.clone(),
             lacks: self.lacks.clone(),
+            active_lacks_origin: self.active_lacks_origin.clone(),
             existential_witnesses: self.existential_witnesses.clone(),
             abstract_existentials: self.abstract_existentials.clone(),
             reason_len: self.reasons.len(),
@@ -3561,6 +3641,7 @@ impl Table {
         self.var_meta = known.var_meta;
         self.levels = known.levels;
         self.lacks = known.lacks;
+        self.active_lacks_origin = known.active_lacks_origin;
         self.existential_witnesses = known.existential_witnesses;
         self.abstract_existentials = known.abstract_existentials;
         for reason in &mut self.reasons[known.reason_len..] {
@@ -4239,9 +4320,7 @@ impl Table {
                             })
                             .map(|field| Work::Ty(field.ty.clone())),
                     );
-                    if let Rest::Var(var) = flat.rest {
-                        self.forbidden(var, shape, labels);
-                    }
+                    self.forbid(&flat, shape, &labels);
                 }
             }
         }
@@ -4258,9 +4337,7 @@ impl Table {
                 self.note_lacks(&field.ty);
             }
         }
-        if let Rest::Var(var) = flat.rest {
-            self.forbidden(var, shape, labels);
-        }
+        self.forbid(&flat, shape, &labels);
     }
 
     /// Record that whatever is still open past a sum's cases may not stand for
@@ -4273,30 +4350,72 @@ impl Table {
     /// [`ir::kinds`](crate::ir) already worked out and this table never sees a
     /// variable for.
     fn forbid(&mut self, row: &Row, shape: Shape, labels: &IndexSet<String>) {
+        let origin = self.active_lacks_origin.clone();
+        let entries = labels.iter().cloned().map(|label| LacksEntry {
+            shape,
+            label,
+            origin: origin.clone(),
+        });
+        self.forbid_entries(row, entries);
+    }
+
+    fn forbid_entries(&mut self, row: &Row, entries: impl IntoIterator<Item = LacksEntry>) {
         if let Rest::Var(var) = self.canon(row).rest {
-            self.forbidden(var, shape, labels.iter().cloned());
+            self.forbidden(var, entries);
         }
     }
 
-    /// Put one condition on one variable. The shape is the row the condition
-    /// came from, and the first one recorded stands: a variable sits at the
-    /// open end of one row, so every condition on it is about the same shape.
-    ///
-    /// A condition forbidding nothing is not recorded at all. It would say
-    /// nothing about what the variable may stand for and would fix the shape
-    /// every later condition on it is read in — so a tail carried across a
-    /// binding by a row that happened to name no labels would leave a sum's
-    /// tail being complained about in fields.
-    fn forbidden(&mut self, var: TyVar, shape: Shape, labels: impl IntoIterator<Item = String>) {
-        let mut labels = labels.into_iter().peekable();
-        if labels.peek().is_none() {
+    /// Put conditions on one variable without losing where each label was
+    /// introduced. Existing entries win: they are the earliest grounded
+    /// introduction and remain the causal parent through arbitrarily many
+    /// tail bindings.
+    fn forbidden_labels(
+        &mut self,
+        var: TyVar,
+        shape: Shape,
+        labels: impl IntoIterator<Item = String>,
+    ) {
+        let origin = self.active_lacks_origin.clone();
+        self.forbidden(
+            var,
+            labels.into_iter().map(|label| LacksEntry {
+                shape,
+                label,
+                origin: origin.clone(),
+            }),
+        );
+    }
+
+    fn forbidden(&mut self, var: TyVar, entries: impl IntoIterator<Item = LacksEntry>) {
+        let mut entries = entries.into_iter().peekable();
+        if entries.peek().is_none() {
             return;
         }
-        let (_, recorded) = self
-            .lacks
-            .entry(var)
-            .or_insert_with(|| (shape, IndexSet::new()));
-        recorded.extend(labels);
+        let recorded = self.lacks.entry(var).or_default();
+        for entry in entries {
+            match recorded.entry(entry.label.clone()) {
+                indexmap::map::Entry::Vacant(slot) => {
+                    slot.insert(entry);
+                }
+                indexmap::map::Entry::Occupied(mut slot)
+                    if slot.get().origin.is_none() && entry.origin.is_some() =>
+                {
+                    slot.insert(entry);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn with_lacks_origin<T>(
+        &mut self,
+        origin: Option<RowFactOrigin>,
+        f: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let previous = std::mem::replace(&mut self.active_lacks_origin, origin);
+        let result = f(self);
+        self.active_lacks_origin = previous;
+        result
     }
 
     /// Record one more thing the program requires of its presences.
@@ -5273,24 +5392,30 @@ impl Table {
     /// first reading the type left to right. The shape comes off the recorded
     /// condition, since a row-tail variable's labels are the fields of whatever it
     /// is being bound to and there is no row here to read a shape from.
-    fn lacked(&self, var: TyVar, value: &Assigned) -> Option<(Shape, Vec<(String, Presence)>)> {
-        let (shape, lacks) = self.lacks.get(&var)?;
-        // Whatever labels the value would bring with it, read at the shape the
-        // condition was recorded in: the fields of a whole type, or the cases a
-        // sum's rest stands for. A presence brings neither, which
-        // [`Assigned::as_row`] says by answering with a row that names nothing
-        // and [`Assigned::as_ty`] by answering with a type that carries none.
-        let labels: IndexMap<String, RowField> = match shape {
-            Shape::Struct | Shape::Sum | Shape::Effect => {
-                self.canon(&value.as_row()).into_parts().0
-            }
+    fn lacked(
+        &self,
+        var: TyVar,
+        value: &Assigned,
+    ) -> Option<Vec<(LacksEntry, Presence, Option<RowFactOrigin>)>> {
+        let lacks = self.lacks.get(&var)?;
+        let row = self.canon(&value.as_row());
+        let introduction = match row.rest {
+            Rest::Var(tail) => self.lacks.get(&tail),
+            _ => None,
         };
-        let named = labels
+        let named = row
+            .labels
             .iter()
-            .filter(|(name, _)| lacks.contains(*name))
-            .map(|(name, field)| (name.clone(), self.presence_of(&field.presence)))
+            .filter_map(|(name, field)| {
+                let lacked = lacks.get(name)?.clone();
+                let introduced = introduction
+                    .and_then(|entries| entries.get(name))
+                    .and_then(|entry| entry.origin.clone())
+                    .or_else(|| self.active_lacks_origin.clone());
+                Some((lacked, self.presence_of(&field.presence), introduced))
+            })
             .collect();
-        Some((*shape, named))
+        Some(named)
     }
 
     /// Carry the lacks condition across a binding. What `var` may not stand
@@ -5303,11 +5428,11 @@ impl Table {
     /// next field to conflict would arrive.
     fn inherit_lacks(&mut self, var: TyVar, value: &Assigned) {
         self.note_lacks_value(value, self.lacks_shape(var));
-        let Some((shape, labels)) = self.lacks.get(&var).cloned() else {
+        let Some(entries) = self.lacks.get(&var).cloned() else {
             return;
         };
         let row = value.as_row();
-        self.forbid(&row, shape, &labels);
+        self.forbid_entries(&row, entries.into_values());
     }
 
     /// [`note_lacks`](Self::note_lacks) about a value of any sort. `shape` is
@@ -5334,10 +5459,10 @@ impl Table {
     /// complaint would be worded in depends on it, and a tail with no condition
     /// recorded has nothing to complain about.
     fn lacks_shape(&self, var: TyVar) -> Shape {
-        match self.lacks.get(&var) {
-            Some((shape, _)) => *shape,
-            None => Shape::Struct,
-        }
+        self.lacks
+            .get(&var)
+            .and_then(|entries| entries.first().map(|(_, entry)| entry.shape))
+            .unwrap_or(Shape::Struct)
     }
 
     /// Close every effect row variable this type mentions exactly once.
@@ -5996,9 +6121,16 @@ impl Table {
                 allowed: allowed.clone(),
                 required: required.clone(),
             },
-            ErrorKind::RepeatedField { shape, field } => ErrorKind::RepeatedField {
+            ErrorKind::RepeatedField {
+                shape,
+                field,
+                introduction,
+                forbidden,
+            } => ErrorKind::RepeatedField {
                 shape: *shape,
                 field: field.clone(),
+                introduction: introduction.clone(),
+                forbidden: forbidden.clone(),
             },
             // The two effect complaints carry a label rather than a type, for
             // the reason the presence ones carry prose: what the reader can

@@ -1708,6 +1708,30 @@ fn a_type_error_is_a_diagnostic() {
         diagnostic.message,
         "field `y` is required by one use but excluded by another"
     );
+
+    let repeated_source = concat!(
+        "let split : { x: Nat, ..'r } -> { ..'r } -> Nat = fn whole => fn rest => 0n\n",
+        "let bad = fn value => split value { x: 1n }\n",
+    );
+    let repeated = snapshot(repeated_source);
+    let explanation = repeated.diagnostics[0]
+        .inference_explanation
+        .as_ref()
+        .expect("repeated row explanation crosses the full debugger path");
+    assert_eq!(explanation.contradiction.kind, "repeated-label");
+    assert_eq!(
+        explanation.contradiction.repairs,
+        ["change-first-use", "change-second-use"]
+    );
+    assert_eq!(
+        explanation
+            .abridged
+            .iter()
+            .map(|fact| fact.payload)
+            .collect::<std::collections::HashSet<_>>(),
+        std::collections::HashSet::from(["label-introduction", "label-forbidden"]),
+    );
+    assert!(explanation.abridged.iter().all(|fact| fact.span.is_some()));
 }
 
 /// Projection failures keep their shape-specific diagnostics and spans in the

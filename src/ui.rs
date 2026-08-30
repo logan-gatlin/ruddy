@@ -2620,13 +2620,15 @@ fn explanation_fact(
                 "this value supplies a non-struct type here".into()
             }
         }
-        P::RemainderOverlap => {
-            let row = contradiction
-                .row
-                .as_ref()
-                .expect("overlap fact has row metadata");
+        P::LabelIntroduction => {
+            let row = contradiction.row.as_ref().expect("overlap row metadata");
             let (noun, label) = about(row.shape, &row.label);
-            format!("this use contributes one side of the overlap for {noun} `{label}`")
+            format!("this use introduces {noun} `{label}`")
+        }
+        P::LabelForbidden => {
+            let row = contradiction.row.as_ref().expect("overlap row metadata");
+            let (noun, label) = about(row.shape, &row.label);
+            format!("this `..` remainder already follows named {noun} `{label}`")
         }
         P::RequiresType => match fact.subject {
             inference::Subject::Binding
@@ -2802,7 +2804,7 @@ impl inference::Error {
                     .label("this type carries a caller choice outside its annotation")
                     .help("keep the value inside the annotation that introduces this choice")
             }
-            E::RepeatedField { shape, field } => {
+            E::RepeatedField { shape, field, .. } => {
                 let (noun, field) = about(*shape, field);
                 if let Some(explanation) = &self.explanation {
                     diagnostic = causal_diagnostic(diagnostic, explanation)
@@ -2985,7 +2987,7 @@ impl fmt::Display for inference::ErrorKind {
             // Said as what `..` means rather than as the two rows that
             // disagreed: neither of those is a type the reader wrote, and the
             // field is the whole of what they can change.
-            inference::ErrorKind::RepeatedField { shape, field } => write!(
+            inference::ErrorKind::RepeatedField { shape, field, .. } => write!(
                 f,
                 "`..` covers only the {}s a type does not already name, and here it would have to cover `{}`",
                 noun(*shape),

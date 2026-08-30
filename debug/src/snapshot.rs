@@ -689,7 +689,8 @@ fn wire_explanation(
             inference::ExplanationFactPayload::BranchResult => "branch-result",
             inference::ExplanationFactPayload::LabelDemand => "label-demand",
             inference::ExplanationFactPayload::ClosedRow => "closed-row",
-            inference::ExplanationFactPayload::RemainderOverlap => "remainder-overlap",
+            inference::ExplanationFactPayload::LabelIntroduction => "label-introduction",
+            inference::ExplanationFactPayload::LabelForbidden => "label-forbidden",
         };
         crate::wire::ExplanationFact {
             span: loc(fact.span, files),
@@ -734,7 +735,10 @@ fn wire_explanation(
                     },
                     label: row.label.clone(),
                 }),
-            repairs: ["change-first-use", "change-second-use"],
+            repairs: contradiction.repairs.map(|repair| match repair {
+                inference::RepairDirection::ChangeFirstUse => "change-first-use",
+                inference::RepairDirection::ChangeSecondUse => "change-second-use",
+            }),
         },
         cause: crate::wire::ExplanationCause {
             error_id: explanation.cause.error.get(),

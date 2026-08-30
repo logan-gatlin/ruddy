@@ -65,6 +65,8 @@ fn inference_error_kinds(span: Span) -> Vec<TypeError> {
         TypeError::RepeatedField {
             shape: Shape::Struct,
             field: "x".to_string(),
+            introduction: None,
+            forbidden: None,
         },
         TypeError::PresenceRequired {
             formula: "x != y".to_string(),
@@ -899,10 +901,22 @@ fn row_explanations_keep_both_source_sides_and_normalize_solver_direction() {
             .any(|fact| { fact.payload == inference::ExplanationFactPayload::ClosedRow })
     );
 
-    for source in [
-        include_str!("../diagnostics/inference/repeated-field-struct.hc"),
-        include_str!("../diagnostics/inference/repeated-field-sum.hc"),
-        include_str!("../diagnostics/inference/repeated-field-effect.hc"),
+    for (source, introduction, forbidden) in [
+        (
+            include_str!("../diagnostics/inference/repeated-field-struct.hc"),
+            110..119,
+            104..109,
+        ),
+        (
+            include_str!("../diagnostics/inference/repeated-field-sum.hc"),
+            109..116,
+            103..108,
+        ),
+        (
+            include_str!("../diagnostics/inference/repeated-field-effect.hc"),
+            96..108,
+            80..84,
+        ),
     ] {
         let errors = inference_fixture_errors(source);
         let [error] = errors.as_slice() else {
@@ -917,17 +931,71 @@ fn row_explanations_keep_both_source_sides_and_normalize_solver_direction() {
             inference::ContradictionKind::RepeatedLabel
         );
         assert!((2..=4).contains(&explanation.abridged.len()));
+        let introduced = explanation
+            .full_facts
+            .iter()
+            .find(|fact| fact.payload == inference::ExplanationFactPayload::LabelIntroduction)
+            .expect("actual label introduction");
+        let lacked = explanation
+            .full_facts
+            .iter()
+            .find(|fact| fact.payload == inference::ExplanationFactPayload::LabelForbidden)
+            .expect("remainder/lacks origin");
+        assert_eq!(introduced.span.start..introduced.span.end(), introduction);
+        assert_eq!(lacked.span.start..lacked.span.end(), forbidden);
+        assert_ne!(introduced.span, lacked.span);
         assert!(explanation.cause.reasons.len() >= explanation.abridged.len());
     }
 
-    let mut deep = String::from("let read = fn value => value.target\nlet close : { ");
+    // A genuinely deep tail-binding chain, rather than one wide row, keeps
+    // provenance iterative and parents the original lack through every hop.
+    let mut deep = String::from("let read = fn value => value.target\n");
+    let mut previous = "read".to_string();
     for at in 0..256 {
-        deep.push_str(&format!("f{at}: Nat, "));
+        deep.push_str(&format!("let pass{at} = fn value => value\n"));
+        deep.push_str(&format!("let link{at} = pass{at} {previous}\n"));
+        previous = format!("link{at}");
     }
-    deep.push_str("} -> Nat = read\n");
+    deep.push_str(&format!("let close : {{}} -> Nat = {previous}\n"));
     let errors = inference_fixture_errors(&deep);
     assert_eq!(errors.len(), 1, "deep closed rows retain one complaint");
     assert!(errors[0].explanation.is_some());
+}
+
+#[test]
+fn required_and_forbidden_row_roles_do_not_follow_solver_direction() {
+    for source in [
+        "let direct : {} -> Nat = fn p => p.x\n",
+        "let projected = fn p => p.x\nlet indirect : {} -> Nat = projected\n",
+    ] {
+        let errors = inference_fixture_errors(source);
+        let [error] = errors.as_slice() else {
+            panic!("direction-neutral fixture must have one error: {errors:#?}");
+        };
+        let explanation = error.explanation.as_ref().expect("row cause");
+        let roles: HashSet<_> = explanation
+            .abridged
+            .iter()
+            .map(|at| explanation.full_facts[*at].payload)
+            .collect();
+        assert!(
+            roles.contains(&inference::ExplanationFactPayload::LabelDemand),
+            "{explanation:#?}"
+        );
+        assert!(
+            roles.contains(&inference::ExplanationFactPayload::ClosedRow),
+            "{explanation:#?}"
+        );
+        let spans: HashSet<_> = explanation
+            .abridged
+            .iter()
+            .map(|at| explanation.full_facts[*at].span)
+            .collect();
+        assert!(
+            spans.len() >= 2,
+            "roles need independently written endpoints"
+        );
+    }
 }
 
 #[test]
@@ -1447,6 +1515,8 @@ fn a_complaint_about_a_sum_says_case_and_writes_the_sigil() {
     let repeated = TypeError::RepeatedField {
         shape: Shape::Sum,
         field: "A".to_string(),
+        introduction: None,
+        forbidden: None,
     };
     assert!(repeated.to_string().contains("cases"), "{repeated}");
     assert!(repeated.to_string().contains("`#A`"), "{repeated}");
@@ -3472,6 +3542,8 @@ fn the_effect_complaints_are_read_in_effects() {
             TypeError::RepeatedField {
                 shape: Shape::Effect,
                 field: "Log".to_string(),
+                introduction: None,
+                forbidden: None,
             },
             "`..` covers only the effects a type does not already name, and here it would have to cover `!Log`",
         ),

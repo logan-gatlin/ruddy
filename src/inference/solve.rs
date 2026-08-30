@@ -355,6 +355,36 @@ impl Solve<'_> {
             let previous = self.constraint.replace(constraint.id);
             let previous_reason = self.constraint_reason.replace(constraint.reason);
             let span = constraint.span;
+            let source = matches!(
+                constraint.origin,
+                super::ConstraintOrigin::ApplicationArgument
+                    | super::ConstraintOrigin::ContextualCheck
+                    | super::ConstraintOrigin::MatchScrutinee
+                    | super::ConstraintOrigin::HandlerArm
+                    | super::ConstraintOrigin::HandlerReturn
+                    | super::ConstraintOrigin::HandlerFallback
+            )
+            .then(|| {
+                constraint
+                    .subjects
+                    .secondary
+                    .zip(constraint.subjects.secondary_span)
+            })
+            .flatten()
+            .unwrap_or((
+                constraint.subjects.primary,
+                constraint.subjects.primary_span.unwrap_or(span),
+            ));
+            let previous_lacks_origin =
+                self.table
+                    .active_lacks_origin
+                    .replace(super::RowFactOrigin {
+                        constraint: constraint.id,
+                        reason: constraint.reason,
+                        origin: constraint.origin,
+                        subject: source.0,
+                        span: source.1,
+                    });
             match &constraint.kind {
                 ConstraintKind::Project {
                     base,
@@ -421,6 +451,7 @@ impl Solve<'_> {
             }
             self.constraint = previous;
             self.constraint_reason = previous_reason;
+            self.table.active_lacks_origin = previous_lacks_origin;
             self.table.end_solver_act();
         }
         self.table.leave_solver_scope();
@@ -496,7 +527,13 @@ impl Solve<'_> {
                         .collect(),
                     rest: self.table.fresh_row_for(super::Subject::ProjectionBase),
                 }));
-                self.table.note_lacks(&want);
+                let origin = self.table.active_lacks_origin.clone().map(|mut origin| {
+                    origin.subject = super::Subject::PatternDemand;
+                    origin.span = field_span;
+                    origin
+                });
+                self.table
+                    .with_lacks_origin(origin, |table| table.note_lacks(&want));
                 self.unify(field_span, &want, &base);
             }
         }
@@ -2119,7 +2156,7 @@ impl Solve<'_> {
             if guarded || only_want.values().all(&absent) && only_have.values().all(&absent) {
                 let labels: Vec<String> =
                     only_want.keys().chain(only_have.keys()).cloned().collect();
-                self.table.forbidden(a, expected.shape(), labels);
+                self.table.forbidden_labels(a, expected.shape(), labels);
                 if guarded {
                     for field in only_want.values().chain(only_have.values()) {
                         let presence = self.table.presence_of(&field.presence);
@@ -2783,28 +2820,44 @@ impl Solve<'_> {
             // fallback is also the ordinary, unguarded assignment path.
             (_, value) => value,
         };
-        if let Some((shape, named)) = self.table.lacked(var, &value) {
+        if let Some(named) = self.table.lacked(var, &value) {
             // One complaint per binding, not per label: a tail that would have
             // to repeat two fields is one thing gone wrong with one row, and
             // naming the first of them is what the reader has to look at
             // either way. Ruled on before anything is settled, so a refusal
             // leaves no binding behind that only this goal wanted.
-            if let Some((field, _)) = named
+            if let Some((lacked, _, introduction)) = named
                 .iter()
-                .find(|(_, presence)| matches!(presence, Presence::Present))
+                .find(|(_, presence, _)| matches!(presence, Presence::Present))
             {
                 let error = Error {
                     id: ErrorId::pending(),
                     cause: ErrorCause::Direct,
                     span,
                     kind: ErrorKind::RepeatedField {
-                        shape,
-                        field: field.clone(),
+                        shape: lacked.shape,
+                        field: lacked.label.clone(),
+                        introduction: introduction.clone(),
+                        forbidden: lacked.origin.clone(),
                     },
                     explanation: None,
                 };
+                if let Some(origin) = &lacked.origin {
+                    self.table.note_binding_read(origin.reason);
+                }
+                if let Some(origin) = introduction {
+                    self.table.note_binding_read(origin.reason);
+                }
                 let abandoned = [value.variable(var), value];
-                self.fail(span, Rule::Overlap { shape }, goal, error, &abandoned);
+                self.fail(
+                    span,
+                    Rule::Overlap {
+                        shape: lacked.shape,
+                    },
+                    goal,
+                    error,
+                    &abandoned,
+                );
                 return;
             }
             // No label is certainly there, so the ones still being decided are
@@ -2814,7 +2867,7 @@ impl Solve<'_> {
             // abandoned by a failure that was reported where it happened —
             // and two labels never share a presence variable, so no entry
             // here is a stale reading of another.
-            for (_, presence) in &named {
+            for (_, presence, _) in &named {
                 if matches!(presence, Presence::Var(_)) {
                     self.presences(span, &Presence::Absent, presence);
                 }

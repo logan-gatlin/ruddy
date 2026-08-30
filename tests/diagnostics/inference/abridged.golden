@@ -69,22 +69,22 @@ help: keep the value inside the annotation that introduces this choice
 
 ## repeated-field-struct
 [repeated-field] field `x` cannot be both named and included by `..`
-primary: this use contributes one side of the overlap for field `x`
-related: this use contributes one side of the overlap for field `x`
+primary: this use introduces field `x`
+related: this `..` remainder already follows named field `x`
 help: remove field `x` from the named side
 help: or keep it out of the `..` remainder
 
 ## repeated-field-sum
 [repeated-field] case `#A` cannot be both named and included by `..`
-primary: this use contributes one side of the overlap for case `#A`
-related: this use contributes one side of the overlap for case `#A`
+primary: this use introduces case `#A`
+related: this `..` remainder already follows named case `#A`
 help: remove case `#A` from the named side
 help: or keep it out of the `..` remainder
 
 ## repeated-field-effect
 [repeated-field] effect `!Log` cannot be both named and included by `..`
-primary: this use contributes one side of the overlap for effect `!Log`
-related: this use contributes one side of the overlap for effect `!Log`
+primary: this use introduces effect `!Log`
+related: this `..` remainder already follows named effect `!Log`
 help: remove effect `!Log` from the named side
 help: or keep it out of the `..` remainder
 
