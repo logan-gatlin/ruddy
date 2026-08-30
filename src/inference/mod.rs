@@ -1902,6 +1902,12 @@ fn smallest_incompatible(
     // the other. Keep the finite syntax itself because opening can rebuild a
     // semantically identical substitution at a different allocation.
     let mut visited_names = Vec::new();
+    let mut forwarding = Forwarding::default();
+    // Malformed imported declarations can manufacture a fresh substitution on
+    // every turn. A finite diagnostic walk must not retain that unbounded
+    // history: once the budget is exhausted, suppress the cyclic-looking
+    // branch and continue with siblings already on the deterministic DFS.
+    const MAX_ALIAS_GOALS: usize = 4096;
     while let Some((mut left, mut right)) = work.pop() {
         while let Ty::Package(inner) = &*left {
             left = inner.clone();
@@ -1930,6 +1936,22 @@ fn smallest_incompatible(
             && aliases.contains_key(left_symbol)
             && aliases.contains_key(right_symbol)
         {
+            // Forwarding spellings do not change a substitution. Without
+            // removing them, `Stream (Id 'a)` appears successively as
+            // `Stream (Id 'a)`, `Stream (Id (Id 'a))`, ... and defeats the
+            // coinductive key. The forwarding classifier is the same semantic
+            // machinery used by alias opening; it is iterative and also marks
+            // mutually-forwarding recovery cycles.
+            let left_args: Rc<[Rc<Ty>]> = left_args
+                .iter()
+                .map(|arg| canonical_alias_argument(aliases, &mut forwarding, arg))
+                .collect::<Vec<_>>()
+                .into();
+            let right_args: Rc<[Rc<Ty>]> = right_args
+                .iter()
+                .map(|arg| canonical_alias_argument(aliases, &mut forwarding, arg))
+                .collect::<Vec<_>>()
+                .into();
             let seen = visited_names.iter().any(
                 |(seen_left_symbol, seen_left_args, seen_right_symbol, seen_right_args): &(
                     Symbol,
@@ -1951,15 +1973,10 @@ fn smallest_incompatible(
                             .all(|(seen, current)| same_finite_syntax(seen, current))
                 },
             );
-            if seen {
+            if seen || visited_names.len() == MAX_ALIAS_GOALS {
                 continue;
             }
-            visited_names.push((
-                *left_symbol,
-                left_args.clone(),
-                *right_symbol,
-                right_args.clone(),
-            ));
+            visited_names.push((*left_symbol, left_args, *right_symbol, right_args));
         }
         if matches!(&*left, Ty::Named { symbol, .. } if aliases.contains_key(symbol)) {
             left = unfold(aliases, &left);
@@ -2002,6 +2019,34 @@ fn smallest_incompatible(
         }
     }
     fallback
+}
+
+/// Remove head aliases that only select one of their arguments. This consumes
+/// the finite argument syntax rather than rebuilding it. A forwarding cycle
+/// has no observable body in recovery input, so all its applications share the
+/// same undecided canonical form regardless of the ignored arguments.
+fn canonical_alias_argument(
+    aliases: &IndexMap<Symbol, Scheme>,
+    forwarding: &mut Forwarding,
+    argument: &Rc<Ty>,
+) -> Rc<Ty> {
+    let mut argument = argument.clone();
+    loop {
+        let Ty::Named { symbol, args, .. } = &*argument else {
+            return argument;
+        };
+        let Some(scheme) = aliases.get(symbol) else {
+            return argument;
+        };
+        match forwarding.projection(aliases, scheme.body()) {
+            Some(index) => match args.get(index as usize) {
+                Some(selected) => argument = selected.clone(),
+                None => return Rc::new(Ty::Undecided),
+            },
+            None if forwarding.cycles.contains(symbol) => return Rc::new(Ty::Undecided),
+            None => return argument,
+        }
+    }
 }
 
 fn push_row_payloads(work: &mut Vec<(Rc<Ty>, Rc<Ty>)>, left: &Row, right: &Row) {
@@ -7236,6 +7281,158 @@ mod existential_regressions {
                 "the recursive walk must be deterministic"
             );
         }
+    }
+
+    #[test]
+    fn recursive_alias_mismatch_canonicalizes_forwarding_arguments() {
+        use crate::symbol::{Bundle, Mint, Namespace, Version};
+
+        let bundle = Bundle::new("forwarding-recursive-leaf", Version::new(1, 0, 0)).unwrap();
+        let mut mint = Mint::new(bundle);
+        let stream = mint.global(None, Namespace::Types, "Stream").unwrap();
+        let id = mint.global(None, Namespace::Types, "Id").unwrap();
+        let forward = mint.global(None, Namespace::Types, "Forward").unwrap();
+        let pass = mint.global(None, Namespace::Types, "Pass").unwrap();
+        let id_body = Rc::new(Ty::Bound(0));
+        // Malformed imported interfaces can also contain a mutually-forwarding
+        // cycle. It has no observable body and canonicalizes deterministically
+        // to recovery instead of retaining an ever-growing argument spelling.
+        let forward_body = Rc::new(Ty::Named {
+            symbol: pass,
+            name: "Pass".into(),
+            args: Rc::from([Rc::new(Ty::Bound(0))]),
+        });
+        let pass_body = Rc::new(Ty::Named {
+            symbol: forward,
+            name: "Forward".into(),
+            args: Rc::from([Rc::new(Ty::Bound(0))]),
+        });
+        let recursive = Rc::new(Ty::Named {
+            symbol: stream,
+            name: "Stream".into(),
+            args: Rc::from([Rc::new(Ty::Named {
+                symbol: id,
+                name: "Id".into(),
+                args: Rc::from([Rc::new(Ty::Bound(0))]),
+            })]),
+        });
+        let stream_body = Rc::new(Ty::Struct(Row {
+            labels: [
+                ("tail".into(), RowField::present(recursive)),
+                ("value".into(), RowField::present(Rc::new(Ty::Bound(0)))),
+            ]
+            .into_iter()
+            .collect(),
+            rest: Rest::Closed,
+        }));
+        let aliases = [
+            (stream, Scheme::new(1, stream_body)),
+            (id, Scheme::new(1, id_body)),
+            (forward, Scheme::new(1, forward_body)),
+            (pass, Scheme::new(1, pass_body)),
+        ]
+        .into_iter()
+        .collect();
+        let named = |argument| {
+            Rc::new(Ty::Named {
+                symbol: stream,
+                name: "Stream".into(),
+                args: Rc::from([argument]),
+            })
+        };
+        assert_eq!(
+            smallest_incompatible(
+                &aliases,
+                &named(Rc::new(Ty::Nat)),
+                &named(Rc::new(Ty::Boolean)),
+            ),
+            (TypeDescription::NaturalNumber, TypeDescription::Boolean)
+        );
+        let cyclic = Rc::new(Ty::Named {
+            symbol: forward,
+            name: "Forward".into(),
+            args: Rc::from([Rc::new(Ty::Nat)]),
+        });
+        for _ in 0..32 {
+            assert!(matches!(
+                &*canonical_alias_argument(&aliases, &mut Forwarding::default(), &cyclic),
+                Ty::Undecided
+            ));
+        }
+    }
+
+    #[test]
+    fn recursive_alias_forwarding_argument_is_deep_stack_safe() {
+        use crate::symbol::{Bundle, Mint, Namespace, Version};
+
+        std::thread::Builder::new()
+            .name("deep-forwarding-recursive-leaf".into())
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                let bundle = Bundle::new("deep-forwarding-leaf", Version::new(1, 0, 0)).unwrap();
+                let mut mint = Mint::new(bundle);
+                let stream = mint.global(None, Namespace::Types, "Stream").unwrap();
+                let forwards: Vec<_> = (0..30_000)
+                    .map(|at| {
+                        mint.global(None, Namespace::Types, &format!("Forward{at}"))
+                            .unwrap()
+                    })
+                    .collect();
+                let mut aliases = IndexMap::new();
+                for (at, symbol) in forwards.iter().copied().enumerate() {
+                    let body = match forwards.get(at + 1) {
+                        Some(next) => Rc::new(Ty::Named {
+                            symbol: *next,
+                            name: format!("Forward{}", at + 1).into(),
+                            args: Rc::from([Rc::new(Ty::Bound(0))]),
+                        }),
+                        None => Rc::new(Ty::Bound(0)),
+                    };
+                    aliases.insert(symbol, Scheme::new(1, body));
+                }
+                let recursive = Rc::new(Ty::Named {
+                    symbol: stream,
+                    name: "Stream".into(),
+                    args: Rc::from([Rc::new(Ty::Named {
+                        symbol: forwards[0],
+                        name: "Forward0".into(),
+                        args: Rc::from([Rc::new(Ty::Bound(0))]),
+                    })]),
+                });
+                aliases.insert(
+                    stream,
+                    Scheme::new(
+                        1,
+                        Rc::new(Ty::Struct(Row {
+                            labels: [
+                                ("tail".into(), RowField::present(recursive)),
+                                ("value".into(), RowField::present(Rc::new(Ty::Bound(0)))),
+                            ]
+                            .into_iter()
+                            .collect(),
+                            rest: Rest::Closed,
+                        })),
+                    ),
+                );
+                let named = |argument| {
+                    Rc::new(Ty::Named {
+                        symbol: stream,
+                        name: "Stream".into(),
+                        args: Rc::from([argument]),
+                    })
+                };
+                assert_eq!(
+                    smallest_incompatible(
+                        &aliases,
+                        &named(Rc::new(Ty::Nat)),
+                        &named(Rc::new(Ty::Boolean)),
+                    ),
+                    (TypeDescription::NaturalNumber, TypeDescription::Boolean)
+                );
+            })
+            .unwrap()
+            .join()
+            .expect("forwarding normalization stays on the explicit stack");
     }
 
     #[test]
