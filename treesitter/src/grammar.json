@@ -116,7 +116,7 @@
           "name": "target",
           "content": {
             "type": "SYMBOL",
-            "name": "foreign_path"
+            "name": "string"
           }
         }
       ]
@@ -296,39 +296,6 @@
         {
           "type": "STRING",
           "value": ")"
-        }
-      ]
-    },
-    "foreign_path": {
-      "type": "SEQ",
-      "members": [
-        {
-          "type": "FIELD",
-          "name": "segment",
-          "content": {
-            "type": "SYMBOL",
-            "name": "identifier"
-          }
-        },
-        {
-          "type": "REPEAT",
-          "content": {
-            "type": "SEQ",
-            "members": [
-              {
-                "type": "STRING",
-                "value": "."
-              },
-              {
-                "type": "FIELD",
-                "name": "segment",
-                "content": {
-                  "type": "SYMBOL",
-                  "name": "identifier"
-                }
-              }
-            ]
-          }
         }
       ]
     },

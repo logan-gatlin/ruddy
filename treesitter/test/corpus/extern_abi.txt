@@ -2,9 +2,9 @@
 Marked extern ABIs retain arity, nesting, grouping, effects, and where clauses
 ================================================================================
 
-extern add : fn(Nat, Nat,) -> Nat + !IO = host.add
-extern zero : fn() -> Nat = host.zero
-extern nested : fn(fn(Nat) -> Nat, (fn(String, Nat) -> String)) -> (fn() -> Nat) + !Outer where 'a = 'a = host.nested
+extern add : fn(Nat, Nat,) -> Nat + !IO = "(a, b) => a + b"
+extern zero : fn() -> Nat = "() => 0"
+extern nested : fn(fn(Nat) -> Nat, (fn(String, Nat) -> String)) -> (fn() -> Nat) + !Outer where 'a = 'a = "host[\"nested\"]"
 
 --------------------------------------------------------------------------------
 
@@ -19,17 +19,13 @@ extern nested : fn(fn(Nat) -> Nat, (fn(String, Nat) -> String)) -> (fn() -> Nat)
         effects: (effect_row
           (effect_case
             name: (effect_label)))))
-    target: (foreign_path
-      segment: (identifier)
-      segment: (identifier)))
+    target: (string))
   (extern_definition
     name: (identifier)
     type: (extern_annotation
       type: (extern_function_type
         result: (identifier)))
-    target: (foreign_path
-      segment: (identifier)
-      segment: (identifier)))
+    target: (string))
   (extern_definition
     name: (identifier)
     type: (extern_annotation
@@ -52,16 +48,14 @@ extern nested : fn(fn(Nat) -> Nat, (fn(String, Nat) -> String)) -> (fn() -> Nat)
         (clause_comparison
           left: (type_variable)
           right: (type_variable))))
-    target: (foreign_path
-      segment: (identifier)
-      segment: (identifier))))
+    target: (string)))
 
 ================================================================================
 The fn ABI marker is rejected outside direct extern positions
 ================================================================================
 
 let bad : fn(Nat) -> Nat = value
-extern record : { callback: fn(Nat) -> Nat } = host.record
+extern record : { callback: fn(Nat) -> Nat } = "host.record"
 
 --------------------------------------------------------------------------------
 
@@ -86,6 +80,4 @@ extern record : { callback: fn(Nat) -> Nat } = host.record
             from: (parenthesized_type
               (identifier))
             to: (identifier)))))
-    target: (foreign_path
-      segment: (identifier)
-      segment: (identifier))))
+    target: (string)))
