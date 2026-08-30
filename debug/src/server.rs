@@ -124,7 +124,9 @@ impl Events {
 }
 
 pub fn serve(cfg: Config) -> io::Result<()> {
-    let address = format!("127.0.0.1:{}", cfg.port);
+    // Listen on every interface so the debugger is reachable from other devices
+    // on the local network, not only from this machine.
+    let address = format!("0.0.0.0:{}", cfg.port);
     let server = Server::http(&address).map_err(|err| io::Error::other(err.to_string()))?;
     let server = Arc::new(server);
     let state = Arc::new(State {
