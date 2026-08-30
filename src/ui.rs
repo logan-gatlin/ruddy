@@ -2778,13 +2778,22 @@ impl inference::Error {
             }
             E::Recursive => {
                 if let Some(explanation) = &self.explanation {
-                    diagnostic = causal_diagnostic(diagnostic, explanation)
-                        .help("change the call so a value is not passed to itself")
-                        .help("or change the value or field so it no longer contains itself");
+                    diagnostic = causal_diagnostic(diagnostic, explanation);
+                    diagnostic = match explanation.contradiction.recursive {
+                        Some(inference::RecursiveCycleShape::CallInput) => diagnostic
+                            .help("change the call so a value is not passed to itself")
+                            .help("or change the called value so it accepts a different input"),
+                        Some(inference::RecursiveCycleShape::Containment) => diagnostic
+                            .help("change the value so it does not contain itself")
+                            .help("or change the field or row that creates the containment"),
+                        Some(inference::RecursiveCycleShape::Neutral) | None => diagnostic
+                            .help("change one of these uses so the type is finite")
+                            .help("or separate the uses so they no longer require the same type"),
+                    };
                 } else {
                     diagnostic = diagnostic
                         .label("this use requires the value to contain or accept itself")
-                        .help("change the call, value, or field to remove the self-reference");
+                        .help("change one of these uses so the type is finite");
                 }
             }
             E::MissingField { shape, field, .. } | E::ExtraField { shape, field, .. } => {

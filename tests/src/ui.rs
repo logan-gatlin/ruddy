@@ -875,18 +875,38 @@ fn ordinary_mismatch_explanations_keep_full_and_abridged_causal_evidence() {
 fn recursive_types_have_grounded_structured_cycle_explanations() {
     let cases = [
         // Direct self-application.
-        "let bad = fn f => f f",
+        (
+            "let bad = fn f => f f",
+            inference::RecursiveCycleShape::CallInput,
+        ),
         // The cycle closes below another function application.
-        "let id = fn x => x  let bad = fn f => id (f f)",
+        (
+            "let id = fn x => x  let bad = fn f => id (f f)",
+            inference::RecursiveCycleShape::CallInput,
+        ),
         // A value nested through a field contains itself.
-        "let bad = { outer: { inner: bad } }",
+        (
+            "let bad = { outer: { inner: bad } }",
+            inference::RecursiveCycleShape::Containment,
+        ),
         // Two independently written uses close the cycle across a binding.
-        "let bad = fn f => let keep = f in { call: keep f, value: f }",
+        (
+            "let bad = fn f => let keep = f in { call: keep f, value: f }",
+            inference::RecursiveCycleShape::CallInput,
+        ),
         // One shared row tail cannot absorb the extra field on one side.
-        "let use : { x: Nat, ..'r } -> { x: Nat, y: Nat, ..'r } -> Nat = fn a => fn b => 1n  let bad = fn p => use p p",
+        (
+            "let use : { x: Nat, ..'r } -> { x: Nat, y: Nat, ..'r } -> Nat = fn a => fn b => 1n  let bad = fn p => use p p",
+            inference::RecursiveCycleShape::CallInput,
+        ),
+        // A recursive result with neither a call-input nor row containment.
+        (
+            "let bad = fn x => bad",
+            inference::RecursiveCycleShape::Neutral,
+        ),
     ];
 
-    for source in cases {
+    for (source, expected_shape) in cases {
         let errors = inference_fixture_errors(source);
         let [error] = errors.as_slice() else {
             panic!("expected one recursive error for {source}: {errors:#?}");
@@ -899,6 +919,11 @@ fn recursive_types_have_grounded_structured_cycle_explanations() {
         assert_eq!(
             explanation.contradiction.kind,
             inference::ContradictionKind::RecursiveValue
+        );
+        assert_eq!(
+            explanation.contradiction.recursive,
+            Some(expected_shape),
+            "{source}: {explanation:#?}"
         );
         assert!(
             (2..=4).contains(&explanation.abridged.len()),
@@ -936,7 +961,71 @@ fn recursive_types_have_grounded_structured_cycle_explanations() {
             2,
             "repairs must name both editable sides"
         );
+        match expected_shape {
+            inference::RecursiveCycleShape::CallInput => {
+                assert!(rendered.help.iter().all(|help| !help.contains("field")));
+                assert!(rendered.help.iter().any(|help| help.contains("call")));
+            }
+            inference::RecursiveCycleShape::Containment => {
+                assert!(rendered.help.iter().all(|help| !help.contains("call")));
+                assert!(rendered.help.iter().any(|help| help.contains("field")));
+            }
+            inference::RecursiveCycleShape::Neutral => {
+                assert!(
+                    rendered
+                        .help
+                        .iter()
+                        .all(|help| !help.contains("call") && !help.contains("field"))
+                );
+                assert!(rendered.help.iter().any(|help| help.contains("finite")));
+            }
+        }
     }
+}
+
+#[test]
+fn recursive_failure_path_excludes_siblings_and_recovers_for_the_next_error() {
+    let source = "let bad = fn f => { cycle: f f, innocent: 1n }  let later : Nat = false";
+    let errors = inference_fixture_errors(source);
+    assert_eq!(errors.len(), 2, "{errors:#?}");
+    let recursive = errors
+        .iter()
+        .find(|error| matches!(error.kind, inference::ErrorKind::Recursive))
+        .expect("recursive failure");
+    let later = errors
+        .iter()
+        .find(|error| matches!(error.kind, inference::ErrorKind::Mismatch { .. }))
+        .expect("independent post-recovery mismatch");
+    let explanation = recursive.explanation.as_ref().expect("recursive path");
+    let innocent = source.find("1n").unwrap();
+    let later_at = source.rfind("false").unwrap();
+    assert!(
+        explanation
+            .full_facts
+            .iter()
+            .all(|fact| fact.span.start != innocent && fact.span.start != later_at),
+        "unrelated siblings must not enter the exact cycle: {explanation:#?}"
+    );
+    assert!(
+        explanation
+            .full_facts
+            .iter()
+            .any(|fact| fact.span.start == source.find("f f").unwrap()),
+        "the closing call stays in the cycle path: {explanation:#?}"
+    );
+    let later_explanation = later.explanation.as_ref().expect("later path");
+    assert!(
+        later_explanation
+            .full_facts
+            .iter()
+            .any(|fact| fact.span.start == later_at)
+    );
+    assert!(
+        later_explanation
+            .full_facts
+            .iter()
+            .all(|fact| fact.span.start >= source.find("let later").unwrap())
+    );
 }
 
 #[test]

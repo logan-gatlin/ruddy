@@ -17,7 +17,7 @@ related: this call requires the input to accept itself
 related: this call requires the value to accept an input
 related: this call requires the value to accept an input
 help: change the call so a value is not passed to itself
-help: or change the value or field so it no longer contains itself
+help: or change the called value so it accepts a different input
 
 ## missing-field
 [missing-field] no field `y` on `{ x: Nat }`

@@ -1014,6 +1014,8 @@ pub struct Contradiction {
     /// Present for row-shaped contradictions. The label is retained as source
     /// syntax rather than reconstructed from a rendered solver row.
     pub row: Option<RowContradiction>,
+    /// Source shape of a recursive cycle, used to keep repair advice specific.
+    pub recursive: Option<RecursiveCycleShape>,
     /// Neutral failures always retain both possible repair directions.
     pub repairs: [RepairDirection; 2],
 }
@@ -1040,6 +1042,13 @@ pub enum ContradictionKind {
 pub enum RepairDirection {
     ChangeFirstUse,
     ChangeSecondUse,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecursiveCycleShape {
+    CallInput,
+    Containment,
+    Neutral,
 }
 
 /// Deliberately source-facing and finite: no solver variable, row-tail, or
@@ -2940,6 +2949,38 @@ fn attach_ordinary_explanations(
                         && (leaf.0 == TypeDescription::Function
                             || leaf.1 == TypeDescription::Function)
                 });
+        let recursive = (kind == Some(ContradictionKind::RecursiveValue)).then(|| {
+            let has_call_input = constraint_slice.iter().any(|id| {
+                constraints.get(id).is_some_and(|constraint| {
+                    constraint.origin == ConstraintOrigin::ApplicationArgument
+                        && (matches!(
+                            constraint.subjects.primary,
+                            Subject::Argument | Subject::Parameter
+                        ) || matches!(
+                            constraint.subjects.secondary,
+                            Some(Subject::Argument | Subject::Parameter)
+                        ))
+                })
+            });
+            let has_containment = constraint_slice.iter().any(|id| {
+                constraints.get(id).is_some_and(|constraint| {
+                    matches!(constraint.kind, ConstraintKind::Project { .. })
+                        || matches!(
+                            &constraint.kind,
+                            ConstraintKind::Equal { expected, actual }
+                                if matches!(&**expected, Ty::Struct(_) | Ty::Sum(_))
+                                    || matches!(&**actual, Ty::Struct(_) | Ty::Sum(_))
+                        )
+                })
+            });
+            if has_call_input {
+                RecursiveCycleShape::CallInput
+            } else if has_containment {
+                RecursiveCycleShape::Containment
+            } else {
+                RecursiveCycleShape::Neutral
+            }
+        });
         error.explanation = Some(InferenceExplanation {
             full_facts,
             abridged,
@@ -2952,6 +2993,7 @@ fn attach_ordinary_explanations(
                 left: leaf.0,
                 right: leaf.1,
                 row,
+                recursive,
                 repairs: [
                     RepairDirection::ChangeFirstUse,
                     RepairDirection::ChangeSecondUse,
@@ -4175,7 +4217,7 @@ impl Table {
         #[derive(Clone)]
         enum Part {
             Ty(Rc<Ty>),
-            Row(Row),
+            Row(Rc<Row>),
             Presence(Presence),
             Field(Rc<Ty>, Presence),
         }
@@ -4184,120 +4226,158 @@ impl Table {
             parent: Option<usize>,
         }
 
-        let first = match value {
-            Assigned::Ty(ty) => Part::Ty(ty.clone()),
-            Assigned::Row(row) => Part::Row((**row).clone()),
-            Assigned::Presence(presence) => Part::Presence(presence.clone()),
-        };
-        let mut work: Vec<(Part, Option<usize>)> = vec![(first, None)];
+        fn assigned_part(value: &Assigned) -> Part {
+            match value {
+                Assigned::Ty(ty) => Part::Ty(ty.clone()),
+                Assigned::Row(row) => Part::Row(row.clone()),
+                Assigned::Presence(presence) => Part::Presence(presence.clone()),
+            }
+        }
+
+        let mut work = vec![(assigned_part(value), None)];
         let mut traces: Vec<Trace> = Vec::new();
+        let mut seen_tys = HashSet::new();
+        let mut seen_rows = HashSet::new();
+        // Keep visited allocations alive: inline rows are wrapped for this
+        // walk, and otherwise an allocator could reuse a recorded address.
+        let mut visited_tys = Vec::new();
+        let mut visited_rows = Vec::new();
+        let mut seen_vars = HashSet::new();
+        // Presence resolution in a field has a continuation: two fields may
+        // share one presence variable but carry different payloads.
+        let mut seen_field_presences = HashSet::new();
         while let Some((part, trace)) = work.pop() {
-            match part {
-                Part::Ty(ty) => match &*ty {
-                    Ty::Var(found) if *found == var => {
-                        let mut path = Vec::new();
-                        let mut at = trace;
-                        while let Some(index) = at {
-                            path.push(traces[index].reason);
-                            at = traces[index].parent;
-                        }
-                        path.reverse();
-                        for reason in path {
-                            self.note_binding_read(reason);
-                        }
-                        return true;
-                    }
-                    Ty::Var(found) => {
-                        if let Slot::Bound { value, by } = &self.vars[*found as usize] {
+            let found_target = match part {
+                Part::Ty(ty) => {
+                    if let Ty::Var(found) = &*ty {
+                        if *found == var {
+                            true
+                        } else if !seen_vars.insert(*found) {
+                            false
+                        } else if let Slot::Bound { value, by } = &self.vars[*found as usize] {
                             let next = traces.len();
                             traces.push(Trace {
                                 reason: *by,
                                 parent: trace,
                             });
-                            let part = match value {
-                                Assigned::Ty(ty) => Part::Ty(ty.clone()),
-                                Assigned::Row(row) => Part::Row((**row).clone()),
-                                Assigned::Presence(presence) => Part::Presence(presence.clone()),
-                            };
-                            work.push((part, Some(next)));
+                            work.push((assigned_part(value), Some(next)));
+                            false
+                        } else {
+                            false
                         }
+                    } else if !seen_tys.insert(Rc::as_ptr(&ty) as usize) {
+                        false
+                    } else {
+                        visited_tys.push(ty.clone());
+                        match &*ty {
+                            Ty::Package(body) => work.push((Part::Ty(body.clone()), trace)),
+                            Ty::Arrow(from, to, effects) => {
+                                // Reverse pushes preserve written order: input,
+                                // output, then effects.
+                                work.push((Part::Row(Rc::new(effects.clone())), trace));
+                                work.push((Part::Ty(to.clone()), trace));
+                                work.push((Part::Ty(from.clone()), trace));
+                            }
+                            Ty::Struct(row) | Ty::Sum(row) => {
+                                work.push((Part::Row(Rc::new(row.clone())), trace));
+                            }
+                            Ty::Named { args, .. } => work
+                                .extend(args.iter().rev().cloned().map(|ty| (Part::Ty(ty), trace))),
+                            Ty::Var(_)
+                            | Ty::Nat
+                            | Ty::Int
+                            | Ty::Real
+                            | Ty::String
+                            | Ty::Boolean
+                            | Ty::Bound(_)
+                            | Ty::Rigid { .. }
+                            | Ty::Undecided => {}
+                        }
+                        false
                     }
-                    Ty::Package(body) => work.push((Part::Ty(body.clone()), trace)),
-                    Ty::Arrow(from, to, effects) => {
-                        work.push((Part::Row(effects.clone()), trace));
-                        work.push((Part::Ty(to.clone()), trace));
-                        work.push((Part::Ty(from.clone()), trace));
-                    }
-                    Ty::Struct(row) | Ty::Sum(row) => {
-                        work.push((Part::Row(row.clone()), trace));
-                    }
-                    Ty::Named { args, .. } => {
-                        work.extend(args.iter().rev().cloned().map(|ty| (Part::Ty(ty), trace)));
-                    }
-                    Ty::Nat
-                    | Ty::Int
-                    | Ty::Real
-                    | Ty::String
-                    | Ty::Boolean
-                    | Ty::Bound(_)
-                    | Ty::Rigid { .. }
-                    | Ty::Undecided => {}
-                },
+                }
                 Part::Row(row) => {
-                    // Push payloads first so the row tail, the direct route for
-                    // shared-row cycles, is examined before them.
-                    for field in row.labels.values().rev() {
-                        work.push((Part::Field(field.ty.clone(), field.presence.clone()), trace));
-                    }
-                    match &row.rest {
-                        Rest::More(more) => work.push((Part::Row((**more).clone()), trace)),
-                        Rest::Var(found) if *found == var => {
-                            let mut path = Vec::new();
-                            let mut at = trace;
-                            while let Some(index) = at {
-                                path.push(traces[index].reason);
-                                at = traces[index].parent;
-                            }
-                            path.reverse();
-                            for reason in path {
-                                self.note_binding_read(reason);
-                            }
-                            return true;
+                    if !seen_rows.insert(Rc::as_ptr(&row) as usize) {
+                        false
+                    } else {
+                        visited_rows.push(row.clone());
+                        // Push payloads first so the tail is visited first. A
+                        // later sibling therefore cannot pollute the retained
+                        // binding route.
+                        for field in row.labels.values().rev() {
+                            work.push((
+                                Part::Field(field.ty.clone(), field.presence.clone()),
+                                trace,
+                            ));
                         }
-                        Rest::Var(found) => {
-                            if let Slot::Bound {
-                                value: Assigned::Row(row),
-                                by,
-                            } = &self.vars[*found as usize]
-                            {
-                                let next = traces.len();
-                                traces.push(Trace {
-                                    reason: *by,
-                                    parent: trace,
-                                });
-                                work.push((Part::Row((**row).clone()), Some(next)));
+                        if matches!(&row.rest, Rest::Var(found) if *found == var) {
+                            true
+                        } else {
+                            match &row.rest {
+                                Rest::More(more) => work.push((Part::Row(more.clone()), trace)),
+                                Rest::Var(found) if seen_vars.insert(*found) => {
+                                    if let Slot::Bound {
+                                        value: Assigned::Row(row),
+                                        by,
+                                    } = &self.vars[*found as usize]
+                                    {
+                                        let next = traces.len();
+                                        traces.push(Trace {
+                                            reason: *by,
+                                            parent: trace,
+                                        });
+                                        work.push((Part::Row(row.clone()), Some(next)));
+                                    }
+                                }
+                                Rest::Var(_)
+                                | Rest::Closed
+                                | Rest::Undecided
+                                | Rest::Bound(_)
+                                | Rest::Rigid { .. } => {}
                             }
+                            false
                         }
-                        Rest::Closed | Rest::Undecided | Rest::Bound(_) | Rest::Rigid { .. } => {}
                     }
                 }
                 Part::Presence(presence) => {
                     if let Presence::Var(found) = presence {
                         if found == var {
-                            let mut path = Vec::new();
-                            let mut at = trace;
-                            while let Some(index) = at {
-                                path.push(traces[index].reason);
-                                at = traces[index].parent;
-                            }
-                            path.reverse();
-                            for reason in path {
-                                self.note_binding_read(reason);
-                            }
-                            return true;
+                            true
+                        } else if seen_vars.insert(found)
+                            && let Slot::Bound {
+                                value: Assigned::Presence(presence),
+                                by,
+                            } = &self.vars[found as usize]
+                        {
+                            let next = traces.len();
+                            traces.push(Trace {
+                                reason: *by,
+                                parent: trace,
+                            });
+                            work.push((Part::Presence(presence.clone()), Some(next)));
+                            false
+                        } else {
+                            false
                         }
+                    } else {
+                        false
+                    }
+                }
+                Part::Field(ty, presence) => match presence {
+                    Presence::Absent => false,
+                    Presence::Present
+                    | Presence::Undecided
+                    | Presence::Recovered(_)
+                    | Presence::Bound(_) => {
+                        work.push((Part::Ty(ty), trace));
+                        false
+                    }
+                    Presence::Var(found) if found == var => true,
+                    Presence::Var(found)
+                        if seen_field_presences.insert((Rc::as_ptr(&ty) as usize, found)) =>
+                    {
                         if let Slot::Bound {
-                            value: Assigned::Presence(presence),
+                            value: Assigned::Presence(next_presence),
                             by,
                         } = &self.vars[found as usize]
                         {
@@ -4306,33 +4386,26 @@ impl Table {
                                 reason: *by,
                                 parent: trace,
                             });
-                            work.push((Part::Presence(presence.clone()), Some(next)));
-                        }
-                    }
-                }
-                Part::Field(ty, presence) => match presence {
-                    Presence::Absent => {}
-                    Presence::Present
-                    | Presence::Undecided
-                    | Presence::Recovered(_)
-                    | Presence::Bound(_) => {
-                        work.push((Part::Ty(ty), trace));
-                    }
-                    Presence::Var(found) => match &self.vars[found as usize] {
-                        Slot::Bound {
-                            value: Assigned::Presence(next_presence),
-                            by,
-                        } => {
-                            let next = traces.len();
-                            traces.push(Trace {
-                                reason: *by,
-                                parent: trace,
-                            });
                             work.push((Part::Field(ty, next_presence.clone()), Some(next)));
+                        } else {
+                            work.push((Part::Ty(ty), trace));
                         }
-                        _ => work.push((Part::Ty(ty), trace)),
-                    },
+                        false
+                    }
+                    Presence::Var(_) => false,
                 },
+            };
+            if found_target {
+                let mut path = Vec::new();
+                let mut at = trace;
+                while let Some(index) = at {
+                    path.push(traces[index].reason);
+                    at = traces[index].parent;
+                }
+                for reason in path.into_iter().rev() {
+                    self.note_binding_read(reason);
+                }
+                return true;
             }
         }
         false
@@ -8990,6 +9063,140 @@ mod existential_regressions {
         table.begin_solver_act();
         assert!(table.occurs(target, &candidate));
         assert_eq!(table.take_binding_reads(), [first_reason, second_reason]);
+        table.end_solver_act();
+        table.leave_solver_scope();
+    }
+
+    #[test]
+    fn recursive_cycle_walk_is_linear_over_a_compact_exponential_dag() {
+        let mut table = Table::default();
+        let target = table.mint(VarSort::Type, Subject::Term);
+        let mut shared = Rc::new(Ty::Nat);
+        for _ in 0..28 {
+            shared = Rc::new(Ty::Arrow(shared.clone(), shared.clone(), Row::closed()));
+        }
+
+        table.enter_solver_scope();
+        table.begin_solver_act();
+        assert!(!table.occurs(target, &Assigned::Ty(shared)));
+        assert!(table.take_binding_reads().is_empty());
+        table.end_solver_act();
+        table.leave_solver_scope();
+    }
+
+    #[test]
+    fn unrelated_bound_variable_cycle_is_bounded_and_does_not_leak_reads() {
+        let mut table = Table::default();
+        let target = table.mint(VarSort::Type, Subject::Term);
+        let first = table.mint(VarSort::Type, Subject::Term);
+        let second = table.mint(VarSort::Type, Subject::Term);
+        let first_reason = table.reason(ReasonOrigin::Recovery, Vec::new());
+        let second_reason = table.reason(ReasonOrigin::Recovery, Vec::new());
+        table.vars[first as usize] = Slot::Bound {
+            value: Assigned::Ty(Rc::new(Ty::Var(second))),
+            by: first_reason,
+        };
+        table.vars[second as usize] = Slot::Bound {
+            value: Assigned::Ty(Rc::new(Ty::Var(first))),
+            by: second_reason,
+        };
+
+        table.enter_solver_scope();
+        table.begin_solver_act();
+        assert!(!table.occurs(target, &Assigned::Ty(Rc::new(Ty::Var(first)))));
+        assert!(table.take_binding_reads().is_empty());
+        // A failed search must not suppress or pollute the next independent
+        // search in the same solver act.
+        let direct = Assigned::Ty(Rc::new(Ty::Var(target)));
+        assert!(table.occurs(target, &direct));
+        assert!(table.take_binding_reads().is_empty());
+        table.end_solver_act();
+        table.leave_solver_scope();
+    }
+
+    #[test]
+    fn recursive_cycle_paths_cover_row_tails_presences_and_first_shared_sibling() {
+        let mut table = Table::default();
+        let row_target = table.mint(VarSort::Row, Subject::Term);
+        let row_first = table.mint(VarSort::Row, Subject::Term);
+        let row_reason = table.reason(ReasonOrigin::Recovery, Vec::new());
+        table.vars[row_first as usize] = Slot::Bound {
+            value: Assigned::Row(Rc::new(Row::of(Rest::Var(row_target)))),
+            by: row_reason,
+        };
+
+        let presence_target = table.mint(VarSort::Presence, Subject::Term);
+        let presence_first = table.mint(VarSort::Presence, Subject::Term);
+        let presence_reason = table.reason(ReasonOrigin::Recovery, Vec::new());
+        table.vars[presence_first as usize] = Slot::Bound {
+            value: Assigned::Presence(Presence::Var(presence_target)),
+            by: presence_reason,
+        };
+
+        let ty_target = table.mint(VarSort::Type, Subject::Term);
+        let left = table.mint(VarSort::Type, Subject::Term);
+        let right = table.mint(VarSort::Type, Subject::Term);
+        let left_reason = table.reason(ReasonOrigin::Recovery, Vec::new());
+        let right_reason = table.reason(ReasonOrigin::Recovery, Vec::new());
+        let shared_target = Rc::new(Ty::Var(ty_target));
+        table.vars[left as usize] = Slot::Bound {
+            value: Assigned::Ty(shared_target.clone()),
+            by: left_reason,
+        };
+        table.vars[right as usize] = Slot::Bound {
+            value: Assigned::Ty(shared_target),
+            by: right_reason,
+        };
+        let siblings = Assigned::Ty(Rc::new(Ty::Arrow(
+            Rc::new(Ty::Var(left)),
+            Rc::new(Ty::Var(right)),
+            Row::closed(),
+        )));
+
+        table.enter_solver_scope();
+        table.begin_solver_act();
+        assert!(table.occurs(
+            row_target,
+            &Assigned::Row(Rc::new(Row::of(Rest::Var(row_first))))
+        ));
+        assert_eq!(table.take_binding_reads(), [row_reason]);
+        assert!(table.occurs(
+            presence_target,
+            &Assigned::Presence(Presence::Var(presence_first))
+        ));
+        assert_eq!(table.take_binding_reads(), [presence_reason]);
+        assert!(table.occurs(ty_target, &siblings));
+        assert_eq!(table.take_binding_reads(), [left_reason]);
+
+        let shared_presence = table.mint(VarSort::Presence, Subject::Term);
+        let shared_presence_reason = table.reason(ReasonOrigin::Recovery, Vec::new());
+        table.vars[shared_presence as usize] = Slot::Bound {
+            value: Assigned::Presence(Presence::Present),
+            by: shared_presence_reason,
+        };
+        let shared_fields = Assigned::Row(Rc::new(Row {
+            labels: [
+                (
+                    "first".into(),
+                    RowField {
+                        ty: Rc::new(Ty::Nat),
+                        presence: Presence::Var(shared_presence),
+                    },
+                ),
+                (
+                    "second".into(),
+                    RowField {
+                        ty: Rc::new(Ty::Var(ty_target)),
+                        presence: Presence::Var(shared_presence),
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            rest: Rest::Closed,
+        }));
+        assert!(table.occurs(ty_target, &shared_fields));
+        assert_eq!(table.take_binding_reads(), [shared_presence_reason]);
         table.end_solver_act();
         table.leave_solver_scope();
     }
