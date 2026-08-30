@@ -6,7 +6,7 @@
 use crate::artifact::{
     Artifact, Block, Callee, End, FieldKey, Instr, Literal, Op, PrimCase, Rep, TagCase,
 };
-use boa_ast::scope::Scope;
+use boa_ast::{ModuleItem, scope::Scope};
 use boa_interner::Interner;
 use boa_parser::{Parser, Source};
 use std::{
@@ -136,6 +136,10 @@ impl<'a> Generator<'a> {
     }
 
     fn validate(&self) -> Result<(), Error> {
+        for external in &self.artifact.lir.externs {
+            validate_extern_target(&external.target)?;
+        }
+
         let mut pending: Vec<&Block> = self
             .artifact
             .lir
@@ -211,9 +215,9 @@ impl<'a> Generator<'a> {
         for external in &self.artifact.lir.externs {
             out.push_str("$h[");
             string(&external.name, &mut out);
-            out.push_str("] = (");
+            out.push_str("] = (\n");
             out.push_str(&external.target);
-            out.push_str(");\n$g[");
+            out.push_str("\n);\n$g[");
             string(&external.name, &mut out);
             out.push_str("] = $h[");
             string(&external.name, &mut out);
@@ -609,6 +613,23 @@ const $catch = ($identity, $body) => { try { return $body(); } catch ($e) { if (
 const $unreachable = () => { throw new Error("unreachable Ruddy LIR branch"); };
 "#;
 
+fn validate_extern_target(target: &str) -> Result<(), Error> {
+    // Parsing the target in its own module prevents it from closing the generated
+    // initializer and introducing statements or module declarations. The newlines
+    // keep a trailing line comment from consuming either closing delimiter.
+    let source = format!("export default (\n{target}\n);\n");
+    let mut interner = Interner::default();
+    let module = Parser::new(Source::from_bytes(&source))
+        .parse_module(&Scope::new_global(), &mut interner)
+        .map_err(|error| Error::InvalidJavaScript(error.to_string()))?;
+    if !matches!(module.items().items(), [ModuleItem::ExportDeclaration(_)]) {
+        return Err(Error::InvalidJavaScript(
+            "an extern target must be exactly one expression".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_module(source: &str) -> Result<(), Error> {
     let mut interner = Interner::default();
     Parser::new(Source::from_bytes(source))
@@ -701,7 +722,27 @@ fn export_name(name: &str, out: &mut String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, validate_module};
+    use super::{Error, validate_extern_target, validate_module};
+
+    #[test]
+    fn validates_exactly_one_extern_expression() {
+        for target in ["host.value", "({ value: 1 })", "host.value // trailing"] {
+            validate_extern_target(target).unwrap();
+        }
+        for target in [
+            "0); export const injected = 1; (2",
+            "0); import 'injected'; (2",
+            "0); sideEffect(); (2",
+        ] {
+            assert!(
+                matches!(
+                    validate_extern_target(target),
+                    Err(Error::InvalidJavaScript(_))
+                ),
+                "accepted structural breakout: {target}"
+            );
+        }
+    }
 
     #[test]
     fn validates_complete_ecmascript_modules() {

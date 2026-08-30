@@ -108,7 +108,7 @@ fn one_existential_package_keeps_shared_label_identity() {
     inferred(
         "extern make: Nat -> Boolean ->\n\
          { x when 'p: Nat, also when 'p: Nat, y when 'q: Nat }\n\
-         where 'p != 'q = host.make\n\
+         where 'p != 'q = \"host.make\"\n\
          let value = make 1n true\n\
          let good = match value with\n\
          | { x, .. } => value.also\n\
@@ -125,7 +125,7 @@ fn separate_alias_views_do_not_share_existential_witnesses() {
     let (_, _, output) = infer_src(
         "extern choose: Nat ->\n\
          { left when 'p: Nat, also when 'p: Nat, right when 'q: Nat }\n\
-         where 'p != 'q = host.choose\n\
+         where 'p != 'q = \"host.choose\"\n\
          let source = choose 1n\n\
          let first = source\n\
          let second = source\n\
@@ -142,7 +142,7 @@ fn separate_partial_application_calls_do_not_share_existential_witnesses() {
     let (_, _, output) = infer_src(
         "extern make: Nat -> Boolean ->\n\
          { x when 'p: Nat, also when 'p: Nat, y when 'q: Nat }\n\
-         where 'p != 'q = host.make\n\
+         where 'p != 'q = \"host.make\"\n\
          let partial = make 1n\n\
          let bad = match partial true with\n\
          | { x, .. } => (partial false).also\n\
@@ -160,7 +160,7 @@ fn independently_called_xor_results_do_not_share_existential_witnesses() {
     let (_, _, output) = infer_src(
         "extern choose: Nat ->\n\
          { left when 'p: Nat, also when 'p: Nat, right when 'q: Nat }\n\
-         where 'p != 'q = host.choose\n\
+         where 'p != 'q = \"host.choose\"\n\
          let first = choose 1n\n\
          let second = choose 2n\n\
          let bad = match first with\n\
@@ -186,7 +186,7 @@ fn unconstrained_result_packages_still_open_independent_sealed_witnesses() {
 fn mixed_input_to_result_guarantees_activate_at_each_call() {
     inferred(
         "extern follows: { input when 'u: Nat } -> { output when 'e: Nat }\n\
-         where (not 'u) or 'e = host.follows\n\
+         where (not 'u) or 'e = \"host.follows\"\n\
          let needs_output: { output: Nat } -> Nat = fn value => value.output\n\
          let good = needs_output (follows { input: 1n })",
     );
@@ -196,7 +196,7 @@ fn mixed_input_to_result_guarantees_activate_at_each_call() {
 fn captured_presence_activates_nested_closure_result_guarantee() {
     inferred(
         "extern follows: { input when 'u: Nat } -> { output when 'e: Nat }\n\
-         where (not 'u) or 'e = host.follows\n\
+         where (not 'u) or 'e = \"host.follows\"\n\
          let needs_output: { output: Nat } -> Nat = fn value => value.output\n\
          let make = fn captured =>\n\
            let nested = fn _ => follows captured\n\
@@ -209,9 +209,9 @@ fn captured_presence_activates_nested_closure_result_guarantee() {
 fn package_guarantee_identity_survives_allocator_churn_without_crossing_instances() {
     let mut source = String::from(
         "extern follows: { input when 'u: Nat } -> { output when 'e: Nat }\n\
-         where (not 'u) or 'e = host.follows\n\
+         where (not 'u) or 'e = \"host.follows\"\n\
          extern excludes: { input when 'u: Nat } -> { output when 'e: Nat }\n\
-         where 'u or (not 'e) = host.excludes\n\
+         where 'u or (not 'e) = \"host.excludes\"\n\
          let needs_output: { output: Nat } -> Nat = fn value => value.output\n\
          let needs_no_output: { \\output, .. } -> Nat = fn _ => 0n\n",
     );

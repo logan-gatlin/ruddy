@@ -51,6 +51,23 @@ extern nested : fn(fn(Nat) -> Nat, (fn(String, Nat) -> String)) -> (fn() -> Nat)
     target: (string)))
 
 ================================================================================
+Extern targets may contain raw newlines
+================================================================================
+
+extern multiline : Nat = "(() => {
+  return 42
+})()"
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (extern_definition
+    name: (identifier)
+    type: (extern_annotation
+      type: (identifier))
+    target: (string)))
+
+================================================================================
 The fn ABI marker is rejected outside direct extern positions
 ================================================================================
 

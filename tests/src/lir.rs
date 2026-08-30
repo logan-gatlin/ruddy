@@ -238,7 +238,7 @@ fn existential_packages_are_transparent_to_container_lowering() {
                   where 'p != 'q = fn n => { left: n, also: n }\n\
                   extern choose: Nat ->\n\
                   { left when 'p: Nat, also when 'p: Nat, right when 'q: Nat }\n\
-                  where 'p != 'q = host.choose\n\
+                  where 'p != 'q = \"host.choose\"\n\
                   let value = choose 7n\n\
                   let projected = (choose 8n).also\n\
                   let matched = match value with\n\

@@ -875,7 +875,7 @@ module.exports = grammar({
     ),
 
     /** A double-quoted UTF-8 string with the escapes token::lex accepts. */
-    string: _ => token(seq('"', repeat(choice(/[^"\\\n]/, /\\["\\nrt]/)), '"')),
+    string: _ => token(seq('"', repeat(choice(/[^"\\]/, /\\["\\nrt]/)), '"')),
 
     /** The two boolean literals, reserved by token::lex. */
     boolean: _ => choice('true', 'false'),

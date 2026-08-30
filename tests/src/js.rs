@@ -181,7 +181,7 @@ fn generated_module_erases_existential_packages_around_structs() {
          where 'p != 'q = fn n => { left: n, also: n }\n\
          extern choose: Nat ->\n\
          { left when 'p: Nat, also when 'p: Nat, right when 'q: Nat }\n\
-         where 'p != 'q = host.choose\n\
+         where 'p != 'q = \"host.choose\"\n\
          let built = build 7n\n\
          let projected = (choose 8n).also\n\
          let matched = match choose 9n with\n\
@@ -412,12 +412,20 @@ fn generated_extern_expressions_execute_once_and_require_explicit_receiver_bindi
 }
 
 #[test]
-fn boa_rejects_invalid_and_empty_extern_expressions() {
-    for source in ["extern host : Nat = \"(\"\n", "extern host : Nat = \"\"\n"] {
-        let error = js::generate(&compiled(source)).unwrap_err();
+fn boa_rejects_invalid_empty_and_structurally_breaking_extern_expressions() {
+    let mut artifact = compiled("extern host : Nat = \"0\"\n");
+    for target in [
+        "(",
+        "",
+        "0); export const injected = 1; (2",
+        "0); import 'injected'; (2",
+        "0); globalThis.injected = true; (2",
+    ] {
+        artifact.lir.externs[0].target = target.to_string();
+        let error = js::generate(&artifact).unwrap_err();
         assert!(
             matches!(error, Error::InvalidJavaScript(ref diagnostic) if !diagnostic.is_empty()),
-            "{error}"
+            "accepted `{target}`: {error}"
         );
         assert!(
             error
@@ -427,4 +435,14 @@ fn boa_rejects_invalid_and_empty_extern_expressions() {
         );
         let _: &dyn std::error::Error = &error;
     }
+}
+
+#[test]
+fn trailing_line_comments_in_extern_expressions_do_not_consume_the_initializer() {
+    let artifact = compiled("extern host : Nat = \"globalThis.host // trailing comment\"\n");
+    let module = js::generate(&artifact).unwrap();
+    assert!(
+        module.contains("globalThis.host // trailing comment\n);"),
+        "{module}"
+    );
 }
