@@ -50,6 +50,7 @@ fn reason_fields(
             Some(sort_code(sort)),
         ),
         ReasonOrigin::Constraint(id) => ("constraint", Some(id.get()), None, None),
+        ReasonOrigin::Contract(id) => ("contract", Some(id.get()), None, None),
         ReasonOrigin::Batch(id) => ("batch", Some(id.get()), None, None),
         ReasonOrigin::Step(id) => ("step", Some(id.get()), None, None),
         ReasonOrigin::Recovery => ("recovery", None, None, None),

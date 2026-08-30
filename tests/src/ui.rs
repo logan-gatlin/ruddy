@@ -841,6 +841,40 @@ fn generalized_accessor_explains_its_original_projection() {
 }
 
 #[test]
+fn wide_definition_keeps_a_late_semantically_relevant_fact() {
+    let mut source = String::from("let field = fn value => { ");
+    for at in 0..300 {
+        source.push_str(&format!("noise{at}: {at}n, "));
+    }
+    source.push_str("target: value.target }\nlet bad = field 1n");
+    let facts = explained_facts(&source);
+    let target = source.find(".target").unwrap() + 1;
+    assert!(
+        facts.iter().any(|fact| fact.span.start == target),
+        "{facts:#?}"
+    );
+    let first_noise = source.find("noise0").unwrap();
+    assert!(
+        facts.iter().all(|fact| fact.span.start != first_noise),
+        "{facts:#?}"
+    );
+}
+
+#[test]
+fn annotated_definition_publishes_contract_not_unrelated_body_facts() {
+    let source = "let fixed : Nat -> Nat = fn value => value\nlet bad = fixed false";
+    let facts = explained_facts(source);
+    let annotation = source.find("Nat -> Nat").unwrap();
+    let body = source.find("fn value => value").unwrap();
+    assert!(facts.iter().any(|fact| fact.span.start == annotation));
+    assert!(
+        facts
+            .iter()
+            .all(|fact| fact.span.start < body || fact.span.start >= body + 17)
+    );
+}
+
+#[test]
 fn scheme_provenance_survives_a_long_definition_chain_iteratively() {
     let mut source = String::from("let root = fn value => value.x\n");
     let mut previous = "root".to_string();
@@ -1352,27 +1386,9 @@ fn repeated_effects_keep_full_facts_and_exact_abridged_endpoints() {
         facts,
         [
             (
-                150..162,
-                inference::ConstraintOrigin::ApplicationArgument,
-                inference::Subject::Parameter,
-                inference::ExplanationFactPayload::RequiresType,
-            ),
-            (
-                167..185,
-                inference::ConstraintOrigin::ApplicationArgument,
-                inference::Subject::Argument,
-                inference::ExplanationFactPayload::RequiresType,
-            ),
-            (
                 46..98,
                 inference::ConstraintOrigin::ContextualCheck,
                 inference::Subject::Annotation,
-                inference::ExplanationFactPayload::RequiresType,
-            ),
-            (
-                124..126,
-                inference::ConstraintOrigin::ContextualCheck,
-                inference::Subject::Term,
                 inference::ExplanationFactPayload::RequiresType,
             ),
             (
@@ -1388,6 +1404,18 @@ fn repeated_effects_keep_full_facts_and_exact_abridged_endpoints() {
                 inference::ExplanationFactPayload::LabelForbidden,
             ),
             (
+                150..162,
+                inference::ConstraintOrigin::ApplicationArgument,
+                inference::Subject::Parameter,
+                inference::ExplanationFactPayload::RequiresType,
+            ),
+            (
+                167..185,
+                inference::ConstraintOrigin::ApplicationArgument,
+                inference::Subject::Argument,
+                inference::ExplanationFactPayload::RequiresType,
+            ),
+            (
                 172..185,
                 inference::ConstraintOrigin::ApplicationEffects,
                 inference::Subject::PerformedEffects,
@@ -1395,7 +1423,7 @@ fn repeated_effects_keep_full_facts_and_exact_abridged_endpoints() {
             ),
         ]
     );
-    assert_eq!(explanation.abridged, [5, 6]);
+    assert_eq!(explanation.abridged, [2, 5]);
 }
 
 #[test]

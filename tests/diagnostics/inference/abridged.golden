@@ -13,9 +13,9 @@ help: or change the other use so it agrees with the first one
 ## recursive-type
 [recursive-type] this value would have to contain or accept itself
 primary: this input is required to be the value itself
+related: this call requires the value to accept an input
+related: this call requires the value to accept an input
 related: this call requires the input to accept itself
-related: this call requires the value to accept an input
-related: this call requires the value to accept an input
 help: change the call so a value is not passed to itself
 help: or change the called value so it accepts a different input
 
@@ -130,8 +130,8 @@ help: use a fixed type here, or keep the generic value behind a Ruddy wrapper
 [type-mismatch] a natural number and a boolean cannot be the same type
 primary: this argument supplies a type to the call
 related: this call fixes what type the argument must have
-related: this expression is called as a function
 related: this argument supplies a type to the call
+related: this expression is called as a function
 help: change the first use so it agrees with the other one
 help: or change the other use so it agrees with the first one
 
@@ -151,9 +151,8 @@ help: or change the other use so it agrees with the first one
 ## cross-definition
 [type-mismatch] a natural number and a struct cannot be the same type
 primary: this argument supplies a type to the call
-related: this call fixes what type the argument must have
 related: the annotation fixes the type here
-related: this expression supplies its type here
+related: this call fixes what type the argument must have
 help: change the first use so it agrees with the other one
 help: or change the other use so it agrees with the first one
 

@@ -756,6 +756,7 @@ fn wire_explanation(
                 .iter()
                 .map(|id| id.get())
                 .collect(),
+            omitted_reasons: explanation.cause.omitted_reasons,
         },
     }
 }

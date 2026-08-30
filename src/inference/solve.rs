@@ -17,8 +17,8 @@ use crate::{
 use super::{
     Batch, Constraint, ConstraintKind, DeferredRequirement, Effect, Error, ErrorCause, ErrorId,
     ErrorKind, ExplainedScheme, Goal, GuardedArm, GuardedObligation, GuardedOrigin, Known, Named,
-    Origin, ReasonId, ReasonOrigin, RecursiveCycleShape, Refinement, RefinementFact, Rule, Side,
-    Slot, Step, Table, constraint_provenance,
+    Origin, ReasonId, ReasonOrigin, RecursiveCycleShape, Refinement, RefinementFact, Rule,
+    SchemeProvenance, Side, Slot, Step, Table,
 };
 
 /// What a set of labels says about the ones it does not name.
@@ -1417,6 +1417,7 @@ impl Solve<'_> {
             body,
         } = scoping;
         self.table.level = level;
+        let error_start = self.errors.len();
         self.run(value);
         // R23's closing rule, said about a nested binding on the same terms: a
         // `let` in the middle of a body is generalized exactly as one at the
@@ -1441,13 +1442,19 @@ impl Solve<'_> {
         // the scheme it is about to publish, exactly as it means nothing in a
         // definition's. See [`Table::escapes`](super::Table).
         self.table.escapes(bound, rigids, self.errors);
-        let (scheme, _) = self.table.generalize(bound, level, required);
+        let (scheme, subst) = self.table.generalize(bound, level, required);
         self.table.level = level - 1;
         self.locals.insert(symbol, scheme.clone());
-        self.schemes.insert(
-            symbol,
-            ExplainedScheme::local(scheme, constraint_provenance(value)),
-        );
+        let provenance = if self.errors.len() != error_start {
+            SchemeProvenance::default()
+        } else if self.table.authoritative_bindings.contains(&symbol) {
+            self.table
+                .authoritative_provenance(bound, &subst, scheme.count(), value)
+        } else {
+            self.table.scheme_provenance(bound, &subst, scheme.count())
+        };
+        self.schemes
+            .insert(symbol, ExplainedScheme::local(scheme, provenance));
         self.run(body);
         self.schemes.remove(&symbol);
     }
@@ -1466,6 +1473,10 @@ impl Solve<'_> {
         // at.
         let required = self.table.store.batches.len();
         let copy = self.table.instantiate_local(span, symbol, &scheme);
+        // Local schemes open during solving, after their Instance constraint's
+        // reason was minted. Seed the next rule with the opened root just as
+        // generation-time opening parents a top-level constraint directly.
+        self.table.note_opened_type(&copy);
         let mut batches: Vec<Batch> = self.table.store.batches.drain(required..).collect();
         match batches.pop() {
             Some(mut batch) => {

@@ -263,6 +263,8 @@ pub enum ReasonOrigin {
         subject: Subject,
     },
     Constraint(ConstraintId),
+    /// A written annotation reopened as an authoritative scheme contract.
+    Contract(ConstraintId),
     Batch(BatchId),
     Step(StepId),
     Recovery,
@@ -1076,6 +1078,9 @@ pub struct ExplanationCause {
     pub seed: Option<ReasonId>,
     pub constraints: Vec<ConstraintId>,
     pub reasons: Vec<ReasonId>,
+    /// Reachable reason nodes not visited because the source-facing full view
+    /// hit its work budget. Nonzero means the slice is explicitly abridged.
+    pub omitted_reasons: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1368,7 +1373,30 @@ enum Binding {
 #[derive(Debug, Clone)]
 struct ExplainedScheme {
     scheme: Scheme,
-    provenance: Vec<ReasonId>,
+    provenance: SchemeProvenance,
+}
+
+/// A compact causal skeleton in the same semantic preorder as a scheme body.
+/// Each entry belongs to exactly one type, row, or presence position; shared
+/// reason tails remain shared in the arena instead of being copied as a flat
+/// list of every constraint in the defining body.
+#[derive(Debug, Clone, Default)]
+struct SchemeProvenance {
+    parts: Vec<ProvenancePart>,
+    quantified: Vec<Vec<ReasonId>>,
+}
+
+#[derive(Debug, Clone)]
+struct ProvenancePart {
+    kind: ProvenanceKind,
+    roots: Vec<ReasonId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProvenanceKind {
+    Ty,
+    Row,
+    Presence,
 }
 
 impl ExplainedScheme {
@@ -1377,11 +1405,11 @@ impl ExplainedScheme {
     fn imported(scheme: Scheme) -> Self {
         Self {
             scheme,
-            provenance: Vec::new(),
+            provenance: SchemeProvenance::default(),
         }
     }
 
-    fn local(scheme: Scheme, provenance: Vec<ReasonId>) -> Self {
+    fn local(scheme: Scheme, provenance: SchemeProvenance) -> Self {
         Self { scheme, provenance }
     }
 }
@@ -1620,6 +1648,9 @@ struct Table {
     /// Immutable append-only causal records. Unlike variable metadata this is
     /// deliberately not restored after speculative congruence.
     reasons: Vec<Reason>,
+    /// Reasons descended from recovery, retained for debugging but excluded
+    /// from publishable scheme evidence in O(1).
+    unpublishable_reasons: HashSet<ReasonId>,
     next_reason_id: u64,
     /// Binding reasons observed during one solver act. `None` outside a solve
     /// makes publication, generalization, and zonking incapable of leaking
@@ -1633,6 +1664,9 @@ struct Table {
     /// closed schemes, which mint no variable on which to hang provenance.
     /// Entries live only for this inference run and never affect semantics.
     opened_provenance: HashMap<usize, (Weak<Ty>, ReasonId)>,
+    /// Nested bindings whose written contracts, rather than implementation
+    /// evidence, are authoritative when their schemes are published.
+    authoritative_bindings: HashSet<Symbol>,
 }
 
 /// Which quantified position each thing a scheme closes over was given, in the
@@ -2661,37 +2695,6 @@ fn push_row_payloads(
     true
 }
 
-/// Every generated source root a scheme carries into later definitions.
-/// Iterative and capped: the reason graph retains shared tails, while an
-/// enormous definition cannot make every later instantiation linear in its
-/// entire body. Source order is retained so unrelated definitions cannot alter
-/// which roots survive the cap.
-fn constraint_provenance(constraints: &[Constraint]) -> Vec<ReasonId> {
-    const MAX_SCHEME_ROOTS: usize = 256;
-    let mut out = Vec::new();
-    let mut work: Vec<&Constraint> = constraints.iter().rev().collect();
-    while let Some(constraint) = work.pop() {
-        if out.len() == MAX_SCHEME_ROOTS {
-            break;
-        }
-        out.push(constraint.reason);
-        match &constraint.kind {
-            ConstraintKind::Let { value, body, .. } => {
-                work.extend(body.iter().rev());
-                work.extend(value.iter().rev());
-            }
-            ConstraintKind::Match { arms, .. } => {
-                for arm in arms.iter().rev() {
-                    work.push(&arm.result);
-                    work.extend(arm.constraints.iter().rev());
-                }
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
 fn all_constraints(
     constraints: &IndexMap<Symbol, Vec<Constraint>>,
 ) -> HashMap<ConstraintId, &Constraint> {
@@ -2716,6 +2719,22 @@ fn all_constraints(
         }
     }
     out
+}
+
+fn budget_reason_slice(mut reasons: Vec<ReasonId>) -> (Vec<ReasonId>, usize) {
+    const MAX_EXPLANATION_REASONS: usize = 16_384;
+    reasons.sort_unstable();
+    let omitted = reasons.len().saturating_sub(MAX_EXPLANATION_REASONS);
+    if omitted == 0 {
+        return (reasons, 0);
+    }
+    let half = MAX_EXPLANATION_REASONS / 2;
+    let kept = reasons[..half]
+        .iter()
+        .chain(&reasons[reasons.len() - half..])
+        .copied()
+        .collect();
+    (kept, omitted)
 }
 
 fn attach_ordinary_explanations(
@@ -2798,30 +2817,44 @@ fn attach_ordinary_explanations(
 
         // Iterative, parent-order DFS. IDs are immutable and parents precede
         // children, so this is deterministic even when bindings share causes.
-        let mut reason_slice = Vec::new();
-        let mut constraint_slice = Vec::new();
+        let mut walked_reasons = Vec::new();
         let mut seen_reasons = HashSet::new();
-        let mut seen_constraints = HashSet::new();
         let mut work: Vec<ReasonId> = seed.into_iter().collect();
-        const MAX_EXPLANATION_REASONS: usize = 16_384;
         while let Some(id) = work.pop() {
-            if reason_slice.len() == MAX_EXPLANATION_REASONS {
-                break;
-            }
             if !seen_reasons.insert(id) {
                 continue;
             }
             let Some(reason) = reasons_by_id.get(&id).filter(|reason| reason.reachable) else {
                 continue;
             };
-            reason_slice.push(id);
-            if let ReasonOrigin::Constraint(id) = reason.origin
-                && seen_constraints.insert(id)
-            {
-                constraint_slice.push(id);
-            }
+            walked_reasons.push(id);
             work.extend(reason.parents.iter().rev().copied());
         }
+        // Preserve both semantic endpoints: the newest nodes contain the
+        // failing act, while the oldest tail contains the defining fact. A
+        // bounded full view says exactly how much middle was omitted.
+        let (reason_slice, omitted_reasons) = budget_reason_slice(walked_reasons);
+        let mut seen_constraints = HashSet::new();
+        let mut authoritative_constraints = HashSet::new();
+        let mut constraint_slice: Vec<_> = reason_slice
+            .iter()
+            .filter_map(|id| reasons_by_id.get(id))
+            .filter_map(|reason| match reason.origin {
+                ReasonOrigin::Constraint(id) if seen_constraints.insert(id) => Some(id),
+                ReasonOrigin::Contract(id) => {
+                    authoritative_constraints.insert(id);
+                    seen_constraints.insert(id).then_some(id)
+                }
+                _ => None,
+            })
+            .collect();
+        constraint_slice.sort_by_key(|id| {
+            constraints
+                .get(id)
+                .map_or((usize::MAX, id.get()), |constraint| {
+                    (constraint.span.start, id.get())
+                })
+        });
 
         let mut full_facts = Vec::new();
         for id in &constraint_slice {
@@ -2885,6 +2918,9 @@ fn attach_ordinary_explanations(
             }
             for &(subject, span, side) in &endpoints {
                 let Some(span) = span else { continue };
+                if authoritative_constraints.contains(id) && subject != Subject::Annotation {
+                    continue;
+                }
                 let payload = if kind == Some(ContradictionKind::RepeatedLabel) {
                     // A same-label effects application can be an intermediate in
                     // another repeated-effect path. Assign endpoint roles only
@@ -3022,9 +3058,10 @@ fn attach_ordinary_explanations(
             opposing_roles.and_then(|(first, second)| {
                 let first = candidates
                     .iter()
+                    .rev()
                     .copied()
                     .find(|at| full_facts[*at].payload == first)?;
-                let second = candidates.iter().copied().find(|at| {
+                let second = candidates.iter().rev().copied().find(|at| {
                     full_facts[*at].payload == second
                         && full_facts[*at].span != full_facts[first].span
                 })?;
@@ -3103,6 +3140,7 @@ fn attach_ordinary_explanations(
                 seed,
                 constraints: constraint_slice,
                 reasons: reason_slice,
+                omitted_reasons,
             },
         });
     }
@@ -3647,7 +3685,22 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 let zonked = table.zonk_error(&errors[at].kind, &mut subst);
                 errors[at].kind = zonked;
             }
-            let provenance = constraint_provenance(&member.generated);
+            // Written contracts are authoritative: their implementation and
+            // any recovery used to finish it must not leak into consumers.
+            // Likewise a failed definition publishes no causal evidence.
+            let failed = from != to || told != errors.len();
+            let provenance = if failed {
+                SchemeProvenance::default()
+            } else if decl.annotation.is_some() {
+                table.authoritative_provenance(
+                    &member.ty,
+                    &subst,
+                    scheme.count(),
+                    &member.generated,
+                )
+            } else {
+                table.scheme_provenance(&member.ty, &subst, scheme.count())
+            };
             env.insert(
                 symbol,
                 Binding::Poly(ExplainedScheme::local(scheme.clone(), provenance)),
@@ -3804,6 +3857,13 @@ impl Table {
     fn reason(&mut self, origin: ReasonOrigin, parents: Vec<ReasonId>) -> ReasonId {
         let id = ReasonId(self.next_reason_id);
         self.next_reason_id += 1;
+        if origin == ReasonOrigin::Recovery
+            || parents
+                .iter()
+                .any(|parent| self.unpublishable_reasons.contains(parent))
+        {
+            self.unpublishable_reasons.insert(id);
+        }
         self.reasons.push(Reason {
             id,
             parents,
@@ -3815,6 +3875,16 @@ impl Table {
 
     fn constraint_reason(&mut self, id: ConstraintId) -> ReasonId {
         self.reason(ReasonOrigin::Constraint(id), Vec::new())
+    }
+
+    fn note_opened_type(&self, ty: &Rc<Ty>) {
+        if let Some((opened, reason)) = self.opened_provenance.get(&(Rc::as_ptr(ty) as usize))
+            && opened
+                .upgrade()
+                .is_some_and(|opened| Rc::ptr_eq(&opened, ty))
+        {
+            self.note_binding_read(*reason);
+        }
     }
 
     fn constraint_reason_for(&mut self, id: ConstraintId, kind: &ConstraintKind) -> ReasonId {
@@ -5409,63 +5479,65 @@ impl Table {
             Ty::Package(_) => self.open_package(span, &instantiated),
             _ => instantiated,
         };
-        if !explained.provenance.is_empty() {
-            let marker = self.reason(
-                ReasonOrigin::Variable {
-                    sort: VarSort::Type,
-                    subject: Subject::Scheme,
-                },
-                explained.provenance.clone(),
-            );
-            self.mark_opened_type(&opened, marker);
-        }
+        self.mark_opened_type(&opened, &explained.provenance);
         opened
     }
 
-    /// Mark every semantic type node exposed by opening a scheme. Generation
-    /// often takes an arrow apart before emitting its argument constraint, so
-    /// recording only the root would lose the provenance precisely at that
-    /// accessor/call boundary. Rows are walked iteratively as well.
-    fn mark_opened_type(&mut self, root: &Rc<Ty>, marker: ReasonId) {
+    /// Replay a scheme's semantic skeleton over the exact opened structure.
+    /// A marker is minted only for a node with contributors of its own; sibling
+    /// fields and branches therefore cannot inherit one another's body facts.
+    fn mark_opened_type(&mut self, root: &Rc<Ty>, provenance: &SchemeProvenance) {
         enum Work {
             Ty(Rc<Ty>),
             Row(Row),
+            Presence(Presence),
         }
-        let mut seen = HashSet::new();
+        let mut at = 0;
         let mut work = vec![Work::Ty(root.clone())];
         while let Some(part) = work.pop() {
-            match part {
-                Work::Ty(ty) => {
-                    let key = Rc::as_ptr(&ty) as usize;
-                    if !seen.insert(key) {
-                        continue;
-                    }
-                    self.opened_provenance
-                        .insert(key, (Rc::downgrade(&ty), marker));
-                    match &*ty {
-                        Ty::Arrow(from, to, effects) => {
-                            work.push(Work::Row(effects.clone()));
-                            work.push(Work::Ty(to.clone()));
-                            work.push(Work::Ty(from.clone()));
-                        }
-                        Ty::Package(body) => work.push(Work::Ty(body.clone())),
-                        Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(row.clone())),
-                        Ty::Named { args, .. } => {
-                            work.extend(args.iter().rev().cloned().map(Work::Ty));
-                        }
-                        _ => {}
-                    }
-                }
+            let (kind, ty) = match part {
+                Work::Ty(ty) => (ProvenanceKind::Ty, Some(ty)),
                 Work::Row(row) => {
                     if let Rest::More(more) = &row.rest {
                         work.push(Work::Row((**more).clone()));
                     }
-                    work.extend(
-                        row.labels
-                            .values()
-                            .rev()
-                            .map(|field| Work::Ty(field.ty.clone())),
+                    for field in row.labels.values().rev() {
+                        work.push(Work::Ty(field.ty.clone()));
+                        work.push(Work::Presence(field.presence.clone()));
+                    }
+                    (ProvenanceKind::Row, None)
+                }
+                Work::Presence(_presence) => (ProvenanceKind::Presence, None),
+            };
+            let Some(part) = provenance.parts.get(at) else {
+                break;
+            };
+            if part.kind != kind {
+                break;
+            }
+            at += 1;
+            if let Some(ty) = ty {
+                if !part.roots.is_empty() {
+                    let marker = self.reason(
+                        ReasonOrigin::Variable {
+                            sort: VarSort::Type,
+                            subject: Subject::Scheme,
+                        },
+                        part.roots.clone(),
                     );
+                    self.opened_provenance
+                        .insert(Rc::as_ptr(&ty) as usize, (Rc::downgrade(&ty), marker));
+                }
+                match &*ty {
+                    Ty::Arrow(from, to, effects) => {
+                        work.push(Work::Row(effects.clone()));
+                        work.push(Work::Ty(to.clone()));
+                        work.push(Work::Ty(from.clone()));
+                    }
+                    Ty::Package(body) => work.push(Work::Ty(body.clone())),
+                    Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(row.clone())),
+                    Ty::Named { args, .. } => work.extend(args.iter().rev().cloned().map(Work::Ty)),
+                    _ => {}
                 }
             }
         }
@@ -5492,11 +5564,18 @@ impl Table {
                     let presence = key
                         .and_then(|key| self.local_package_instances.get(&key).cloned())
                         .unwrap_or_else(|| {
-                            let fresh = Presence::Var(self.mint_from(
-                                VarSort::Presence,
-                                Subject::Instance,
-                                explained.provenance.clone(),
-                            ));
+                            let fresh = Presence::Var(
+                                self.mint_from(
+                                    VarSort::Presence,
+                                    Subject::Instance,
+                                    explained
+                                        .provenance
+                                        .quantified
+                                        .get(at as usize)
+                                        .cloned()
+                                        .unwrap_or_default(),
+                                ),
+                            );
                             if let Some(key) = key {
                                 self.local_package_instances.insert(key, fresh.clone());
                             }
@@ -5510,11 +5589,18 @@ impl Table {
                     }
                     Assigned::Presence(presence)
                 }
-                false => Assigned::Ty(Rc::new(Ty::plain(Ty::Var(self.mint_from(
-                    VarSort::Type,
-                    Subject::Instance,
-                    explained.provenance.clone(),
-                ))))),
+                false => Assigned::Ty(Rc::new(Ty::plain(Ty::Var(
+                    self.mint_from(
+                        VarSort::Type,
+                        Subject::Instance,
+                        explained
+                            .provenance
+                            .quantified
+                            .get(at as usize)
+                            .cloned()
+                            .unwrap_or_default(),
+                    ),
+                )))),
             })
             .collect();
         let ty = scheme.body().open(&fresh);
@@ -6136,6 +6222,191 @@ impl Table {
             ),
             subst,
         )
+    }
+
+    /// Capture only causal bindings which survive in the published semantic
+    /// shape. This preorder is replayed over the opened scheme, bounding work
+    /// by semantic nodes rather than by the size of the defining body.
+    fn scheme_provenance(&self, ty: &Rc<Ty>, subst: &Subst, count: u32) -> SchemeProvenance {
+        enum Work {
+            Ty(Rc<Ty>),
+            Row(Row),
+            Presence(Presence),
+        }
+        let mut quantified = vec![Vec::new(); count as usize];
+        for (var, at) in subst.types.iter().chain(&subst.presences) {
+            if let Some(roots) = quantified.get_mut(*at as usize) {
+                roots.push(self.var_meta[*var as usize].minted_by);
+            }
+        }
+        let mut parts = Vec::new();
+        let mut work = vec![Work::Ty(ty.clone())];
+        while let Some(part) = work.pop() {
+            match part {
+                Work::Ty(mut ty) => {
+                    let mut roots = Vec::new();
+                    if let Some((opened, reason)) =
+                        self.opened_provenance.get(&(Rc::as_ptr(&ty) as usize))
+                        && opened
+                            .upgrade()
+                            .is_some_and(|opened| Rc::ptr_eq(&opened, &ty))
+                    {
+                        roots.push(*reason);
+                    }
+                    let mut seen = HashSet::new();
+                    while let Ty::Var(var) = &*ty {
+                        if !seen.insert(*var) {
+                            break;
+                        }
+                        match &self.vars[*var as usize] {
+                            Slot::Bound {
+                                value: Assigned::Ty(next),
+                                by,
+                            } => {
+                                roots.push(*by);
+                                ty = next.clone();
+                            }
+                            _ => break,
+                        }
+                    }
+                    roots.retain(|root| self.publishable_reason(*root));
+                    parts.push(ProvenancePart {
+                        kind: ProvenanceKind::Ty,
+                        roots,
+                    });
+                    match &*ty {
+                        Ty::Arrow(from, to, effects) => {
+                            work.push(Work::Row(effects.clone()));
+                            work.push(Work::Ty(to.clone()));
+                            work.push(Work::Ty(from.clone()));
+                        }
+                        Ty::Package(body) => work.push(Work::Ty(body.clone())),
+                        Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(row.clone())),
+                        Ty::Named { args, .. } => {
+                            work.extend(args.iter().rev().cloned().map(Work::Ty))
+                        }
+                        _ => {}
+                    }
+                }
+                Work::Row(row) => {
+                    let canonical = self.canon(&row);
+                    let mut roots = Vec::new();
+                    let mut rest = row.rest.clone();
+                    let mut seen = HashSet::new();
+                    while let Rest::Var(var) = rest {
+                        if !seen.insert(var) {
+                            break;
+                        }
+                        match &self.vars[var as usize] {
+                            Slot::Bound {
+                                value: Assigned::Row(next),
+                                by,
+                            } => {
+                                roots.push(*by);
+                                rest = next.rest.clone();
+                            }
+                            _ => break,
+                        }
+                    }
+                    roots.retain(|root| self.publishable_reason(*root));
+                    parts.push(ProvenancePart {
+                        kind: ProvenanceKind::Row,
+                        roots,
+                    });
+                    for field in canonical.labels.values().rev() {
+                        work.push(Work::Ty(field.ty.clone()));
+                        work.push(Work::Presence(field.presence.clone()));
+                    }
+                }
+                Work::Presence(mut presence) => {
+                    let mut roots = Vec::new();
+                    let mut seen = HashSet::new();
+                    while let Presence::Var(var) = presence {
+                        if !seen.insert(var) {
+                            break;
+                        }
+                        match &self.vars[var as usize] {
+                            Slot::Bound {
+                                value: Assigned::Presence(next),
+                                by,
+                            } => {
+                                roots.push(*by);
+                                presence = next.clone();
+                            }
+                            _ => break,
+                        }
+                    }
+                    roots.retain(|root| self.publishable_reason(*root));
+                    parts.push(ProvenancePart {
+                        kind: ProvenanceKind::Presence,
+                        roots,
+                    });
+                }
+            }
+        }
+        for roots in &mut quantified {
+            roots.sort_unstable();
+            roots.dedup();
+            roots.retain(|root| self.publishable_reason(*root));
+        }
+        SchemeProvenance { parts, quantified }
+    }
+
+    /// Preserve a written contract as the sole defining contributor. Its body
+    /// is walked only to reproduce the compact semantic skeleton; recovered or
+    /// incidental implementation facts are never published through it.
+    fn authoritative_provenance(
+        &mut self,
+        ty: &Rc<Ty>,
+        subst: &Subst,
+        count: u32,
+        constraints: &[Constraint],
+    ) -> SchemeProvenance {
+        let mut provenance = self.scheme_provenance(ty, subst, count);
+        for part in &mut provenance.parts {
+            part.roots.clear();
+        }
+        for roots in &mut provenance.quantified {
+            roots.clear();
+        }
+        let mut work: Vec<_> = constraints.iter().rev().collect();
+        while let Some(constraint) = work.pop() {
+            if constraint.origin == ConstraintOrigin::ContextualCheck
+                && (constraint.subjects.primary == Subject::Annotation
+                    || constraint.subjects.secondary == Some(Subject::Annotation))
+            {
+                let contract = self.reason(ReasonOrigin::Contract(constraint.id), Vec::new());
+                for part in &mut provenance.parts {
+                    if part.kind == ProvenanceKind::Ty {
+                        part.roots.push(contract);
+                    }
+                }
+                break;
+            }
+            match &constraint.kind {
+                ConstraintKind::Let { value, body, .. } => {
+                    work.extend(body.iter().rev());
+                    work.extend(value.iter().rev());
+                }
+                ConstraintKind::Match { arms, .. } => {
+                    for arm in arms.iter().rev() {
+                        work.push(&arm.result);
+                        work.extend(arm.constraints.iter().rev());
+                    }
+                }
+                _ => {}
+            }
+        }
+        provenance
+    }
+
+    /// Recovery nodes and rolled-back work can settle the compiler enough to
+    /// continue, but are not facts a later consumer may attribute to a scheme.
+    fn publishable_reason(&self, seed: ReasonId) -> bool {
+        self.reasons
+            .get(seed.get() as usize)
+            .is_some_and(|reason| reason.reachable)
+            && !self.unpublishable_reasons.contains(&seed)
     }
 
     /// What the scheme of a type generalized here should require of its
@@ -9626,7 +9897,17 @@ mod existential_regressions {
 
 #[cfg(test)]
 mod identity_tests {
-    use super::{ReasonOrigin, Subject, Table, VarSort};
+    use super::{ReasonId, ReasonOrigin, Subject, Table, VarSort, budget_reason_slice};
+
+    #[test]
+    fn full_reason_budget_preserves_oldest_and_failure_endpoints_and_counts_omissions() {
+        let chain: Vec<_> = (0..17_000).rev().map(ReasonId::synthetic).collect();
+        let (kept, omitted) = budget_reason_slice(chain);
+        assert_eq!(kept.len(), 16_384);
+        assert_eq!(omitted, 616);
+        assert_eq!(kept.first().copied(), Some(ReasonId::synthetic(0)));
+        assert_eq!(kept.last().copied(), Some(ReasonId::synthetic(16_999)));
+    }
 
     #[test]
     fn rollback_retires_allocated_identities_instead_of_reusing_them() {

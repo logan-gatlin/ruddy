@@ -401,6 +401,7 @@ impl Constrain<'_> {
                         // annotation declared, sharing what it left to
                         // inference: the same rule a top-level annotated
                         // definition follows, about a smaller scope.
+                        self.table.authoritative_bindings.insert(name.tracked);
                         self.env.insert(
                             name.tracked,
                             Binding::Poly(ExplainedScheme::imported(lowered.scheme)),

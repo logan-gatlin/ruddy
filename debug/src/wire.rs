@@ -321,6 +321,12 @@ pub struct ExplanationCause {
     pub seed_reason_id: Option<u64>,
     pub constraint_ids: Vec<u64>,
     pub reason_ids: Vec<u64>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub omitted_reasons: usize,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 /// The compiler reports nothing but errors so far; `Warning` is here so that
