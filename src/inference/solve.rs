@@ -16,8 +16,8 @@ use crate::{
 
 use super::{
     Batch, Constraint, ConstraintKind, DeferredRequirement, Effect, Error, ErrorCause, ErrorId,
-    ErrorKind, Goal, GuardedArm, GuardedObligation, GuardedOrigin, Known, Named, Origin,
-    Refinement, RefinementFact, Rule, Side, Slot, Step, Table,
+    ErrorKind, Goal, GuardedArm, GuardedObligation, GuardedOrigin, Known, Named, Origin, ReasonId,
+    ReasonOrigin, Refinement, RefinementFact, Rule, Side, Slot, Step, Table,
 };
 
 /// What a set of labels says about the ones it does not name.
@@ -304,6 +304,8 @@ pub struct Solve<'a> {
     /// Constraint currently being expanded; absent for work started directly
     /// at a non-constraint boundary.
     pub constraint: Option<super::ConstraintId>,
+    /// Root reason of the constraint currently being expanded.
+    pub constraint_reason: Option<ReasonId>,
     /// The goals about two declared types that the goals currently open were
     /// reached by unfolding, innermost last.
     ///
@@ -345,6 +347,7 @@ impl Solve<'_> {
     pub fn run(&mut self, constraints: &[Constraint]) {
         for constraint in constraints {
             let previous = self.constraint.replace(constraint.id);
+            let previous_reason = self.constraint_reason.replace(constraint.reason);
             let span = constraint.span;
             match &constraint.kind {
                 ConstraintKind::Project {
@@ -410,6 +413,7 @@ impl Solve<'_> {
                 }
             }
             self.constraint = previous;
+            self.constraint_reason = previous_reason;
         }
     }
 
@@ -594,8 +598,10 @@ impl Solve<'_> {
             self.guard = guard;
             self.active_refinement = Some(report);
             let previous = self.constraint.replace(arm.result.id);
+            let previous_reason = self.constraint_reason.replace(arm.result.reason);
             self.unify(arm.result.span, &family, &body_ty);
             self.constraint = previous;
+            self.constraint_reason = previous_reason;
         }
         self.guard = None;
         self.active_refinement = enclosing_refinement;
@@ -2769,7 +2775,7 @@ impl Solve<'_> {
         // inside it belongs no deeper. See [`Table::demote`](super::Table).
         self.table.demote(var, &value);
         self.table.vars[var as usize] = Slot::Bound(value.clone());
-        self.step(span, Rule::Bind, goal, Effect::Bound { var, value });
+        self.bound_step(span, Rule::Bind, goal, var, value, None);
     }
 
     fn guarded_type(&mut self, span: Span, ty: &Rc<Ty>) -> Rc<Ty> {
@@ -2964,9 +2970,15 @@ impl Solve<'_> {
         error.id = error_id;
         error.cause = ErrorCause::Step(step_id);
         self.errors.push(error);
+        let mut parents = Vec::new();
+        if let Some(parent) = self.constraint_reason {
+            parents.push(parent);
+        }
+        let reason = self.table.reason(ReasonOrigin::Step(step_id), parents);
         self.steps.push(Step {
             id: step_id,
             constraint: self.constraint,
+            reason,
             error: Some(error_id),
             definition: self.definition,
             span,
@@ -3105,14 +3117,63 @@ impl Solve<'_> {
                 actual: presence.clone(),
             },
         };
-        self.step(span, Rule::Recover, goal, Effect::Bound { var, value });
+        let because = self
+            .steps
+            .iter()
+            .rev()
+            .find(|step| step.rule != Rule::Recover)
+            .map(|step| step.reason);
+        self.bound_step(span, Rule::Recover, goal, var, value, because);
+    }
+
+    fn bound_step(
+        &mut self,
+        span: Span,
+        rule: Rule,
+        goal: Goal,
+        var: TyVar,
+        value: Assigned,
+        because: Option<ReasonId>,
+    ) {
+        let id = self.table.step_id();
+        let mut recovery_parents = Vec::new();
+        if let Some(parent) = because {
+            recovery_parents.push(parent);
+        }
+        let recovery = (rule == Rule::Recover)
+            .then(|| self.table.reason(ReasonOrigin::Recovery, recovery_parents));
+        let mut parents = Vec::new();
+        if let Some(parent) = recovery.or(self.constraint_reason) {
+            parents.push(parent);
+        }
+        let reason = self.table.reason(ReasonOrigin::Step(id), parents);
+        self.steps.push(Step {
+            id,
+            constraint: self.constraint,
+            reason,
+            error: None,
+            definition: self.definition,
+            span,
+            depth: self.depth,
+            rule,
+            goal,
+            effect: Effect::Bound {
+                var,
+                value,
+                by: reason,
+                because,
+            },
+        });
     }
 
     fn step(&mut self, span: Span, rule: Rule, goal: Goal, effect: Effect) {
         let id = self.table.step_id();
+        let parents = self.constraint_reason.into_iter().collect();
+        let reason = self.table.reason(ReasonOrigin::Step(id), parents);
         self.steps.push(Step {
             id,
             constraint: self.constraint,
+            reason,
             error: None,
             definition: self.definition,
             span,

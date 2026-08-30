@@ -8550,6 +8550,14 @@ fn match_result_checks_are_ordered_children_at_each_written_body() {
             Subjects::pair(Subject::MatchResult, Subject::MatchArm)
         );
         assert!(matches!(arm.result.kind, ConstraintKind::Equal { .. }));
+        assert!(
+            output
+                .steps
+                .iter()
+                .any(|step| step.constraint == Some(arm.result.id)),
+            "guarded child {:?} had no directly linked solve step",
+            arm.result.id
+        );
     }
 
     let mut constraints = Vec::new();
@@ -8610,6 +8618,20 @@ fn handler_checks_distinguish_arms_explicit_returns_and_body_fallbacks() {
         Origin::HandlerFallback,
         Subjects::pair(Subject::HandlerAnswer, Subject::HandlerBody)
     ));
+    assert_eq!(
+        constraints
+            .iter()
+            .filter(|constraint| constraint.origin == Origin::HandlerReturn)
+            .count(),
+        1
+    );
+    assert_eq!(
+        constraints
+            .iter()
+            .filter(|constraint| constraint.origin == Origin::HandlerFallback)
+            .count(),
+        1
+    );
     let arm_checks = constraints
         .iter()
         .filter(|constraint| constraint.origin == Origin::HandlerArm)
@@ -8745,4 +8767,119 @@ fn source_sorting_moves_errors_without_renumbering_their_identities() {
     assert_eq!(output.errors.len(), 2, "{:#?}", output.errors);
     assert!(output.errors[0].span.start < output.errors[1].span.start);
     assert!(output.errors[0].id.get() > output.errors[1].id.get());
+    for error in &output.errors {
+        let inference::ErrorCause::Step(step_id) = error.cause else {
+            panic!("sorted solve error lost its step cause: {error:#?}");
+        };
+        let step = output.steps.iter().find(|step| step.id == step_id).unwrap();
+        let reason = output
+            .reasons
+            .iter()
+            .find(|reason| reason.id == step.reason)
+            .unwrap();
+        assert!(matches!(
+            reason.origin,
+            inference::ReasonOrigin::Step(id) if id == step_id
+        ));
+    }
+}
+
+#[test]
+fn variables_and_solver_changes_link_into_the_immutable_reason_arena() {
+    use std::collections::HashSet;
+
+    let (_, _, output) = infer_src(
+        "let id = fn x => x\n\
+         let good = id 1n\n\
+         let bad = (true).missing",
+    );
+    assert!(!output.variables.is_empty());
+    let ids: HashSet<_> = output.reasons.iter().map(|reason| reason.id).collect();
+    assert_eq!(ids.len(), output.reasons.len());
+    assert!(
+        output
+            .reasons
+            .iter()
+            .all(|reason| reason.parents.iter().all(|parent| ids.contains(parent)))
+    );
+    for meta in &output.variables {
+        let reason = output
+            .reasons
+            .iter()
+            .find(|reason| reason.id == meta.minted_by)
+            .expect("a variable's mint reason remains in the arena");
+        assert!(matches!(
+            reason.origin,
+            inference::ReasonOrigin::Variable { sort, subject }
+                if sort == meta.sort && subject == meta.subject
+        ));
+    }
+    for step in &output.steps {
+        assert!(ids.contains(&step.reason));
+        if let inference::Effect::Bound { by, because, .. } = &step.effect {
+            assert_eq!(*by, step.reason);
+            assert_eq!(because.is_some(), step.rule == inference::Rule::Recover);
+            if let Some(cause) = because {
+                assert!(ids.contains(cause));
+            }
+        }
+    }
+}
+
+#[test]
+fn constraints_keep_reason_roots_for_raise_pattern_and_instance_origins() {
+    use inference::ConstraintOrigin as Origin;
+
+    let (_, _, output) = infer_src(
+        "effect Fail = { oops: () -> () }\n\
+         let run = fn v => handle !Fail.oops () with\n\
+           | !Fail.oops _ => match v with\n\
+             | {x} => let local = fn y => y in local (raise 0n)\n\
+             | 0n => 1n end\n\
+           end",
+    );
+    let mut constraints = Vec::new();
+    for generated in output.constraints.values() {
+        all_constraints(generated, &mut constraints);
+    }
+    for origin in [Origin::Raise, Origin::Pattern, Origin::Instance] {
+        let constraint = constraints
+            .iter()
+            .find(|constraint| constraint.origin == origin)
+            .unwrap_or_else(|| panic!("missing {origin:?}: {constraints:#?}"));
+        let reason = output
+            .reasons
+            .iter()
+            .find(|reason| reason.id == constraint.reason)
+            .expect("constraint reason is published");
+        assert!(matches!(
+            reason.origin,
+            inference::ReasonOrigin::Constraint(id) if id == constraint.id
+        ));
+    }
+}
+
+#[test]
+fn equality_constraints_preserve_expected_then_actual_side_ordering() {
+    let (_, _, output) = infer_src("let bad : Nat = true");
+    let mut constraints = Vec::new();
+    for generated in output.constraints.values() {
+        all_constraints(generated, &mut constraints);
+    }
+    let constraint = constraints
+        .iter()
+        .find(|constraint| {
+            constraint.origin == inference::ConstraintOrigin::ContextualCheck
+                && constraint.subjects
+                    == inference::ConstraintSubjects::pair(
+                        inference::Subject::Annotation,
+                        inference::Subject::Term,
+                    )
+        })
+        .expect("the annotation check");
+    let inference::ConstraintKind::Equal { expected, actual } = &constraint.kind else {
+        unreachable!()
+    };
+    assert!(matches!(&**expected, Ty::Nat));
+    assert!(matches!(&**actual, Ty::Boolean));
 }

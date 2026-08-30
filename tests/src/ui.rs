@@ -579,6 +579,7 @@ fn a_constraint_reads_as_what_it_demands() {
 
     let equal = Constraint {
         id: inference::ConstraintId::synthetic(0),
+        reason: inference::ReasonId::synthetic(0),
         span,
         origin: inference::ConstraintOrigin::ContextualCheck,
         subjects: inference::ConstraintSubjects::pair(
@@ -604,7 +605,9 @@ fn an_effect_reads_as_the_one_thing_that_changed() {
     assert_eq!(
         Effect::Bound {
             var: 3,
-            value: Assigned::Ty(Rc::new(Ty::plain(Ty::Nat)))
+            value: Assigned::Ty(Rc::new(Ty::plain(Ty::Nat))),
+            by: inference::ReasonId::synthetic(0),
+            because: None,
         }
         .to_string(),
         "?3 := Nat"
@@ -2098,7 +2101,13 @@ fn the_three_sorts_each_print_on_their_own() {
         (Assigned::Presence(Presence::Absent), "?2 := absent"),
     ] {
         assert_eq!(
-            Effect::Bound { var: 2, value }.to_string(),
+            Effect::Bound {
+                var: 2,
+                value,
+                by: inference::ReasonId::synthetic(0),
+                because: None,
+            }
+            .to_string(),
             printed.to_string()
         );
     }
@@ -2584,6 +2593,7 @@ fn the_scoping_constraints_read_as_what_they_do() {
 
     let bound = Constraint {
         id: inference::ConstraintId::synthetic(0),
+        reason: inference::ReasonId::synthetic(0),
         span: Span::generated(0, 1),
         origin: inference::ConstraintOrigin::Binding,
         subjects: inference::ConstraintSubjects::one(inference::Subject::Binding),

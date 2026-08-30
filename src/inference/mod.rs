@@ -175,6 +175,11 @@ pub struct Output {
     /// The branch-local presence assumptions inference used, one report per
     /// arm of every qualifying match, in solve order.
     pub refinements: Vec<Refinement>,
+    /// Metadata indexed by `TyVar`, parallel to the solver's private slots.
+    pub variables: Vec<VarMeta>,
+    /// Append-only reason arena. Speculative nodes remain retired but readable
+    /// after rollback; no surviving link can be retargeted by identity reuse.
+    pub reasons: Vec<Reason>,
     pub errors: Vec<Error>,
 }
 
@@ -217,6 +222,42 @@ inference_id!(ConstraintId);
 inference_id!(StepId);
 inference_id!(ErrorId);
 inference_id!(BatchId);
+inference_id!(ReasonId);
+
+/// The semantic sort of a solver variable. Kept outside [`Ty`] so provenance
+/// never changes type equality or user-facing type notation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VarSort {
+    Type,
+    Row,
+    Presence,
+}
+
+/// Immutable information recorded when a solver variable is minted.
+#[derive(Debug, Clone)]
+pub struct VarMeta {
+    pub sort: VarSort,
+    pub subject: Subject,
+    pub minted_by: ReasonId,
+}
+
+/// One immutable node in the inference reason arena. Parents always name
+/// earlier nodes, so consumers can walk the graph iteratively without needing
+/// the solver table or risking recursion on deeply nested imported types.
+#[derive(Debug, Clone)]
+pub struct Reason {
+    pub id: ReasonId,
+    pub parents: Vec<ReasonId>,
+    pub origin: ReasonOrigin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasonOrigin {
+    Variable { sort: VarSort, subject: Subject },
+    Constraint(ConstraintId),
+    Step(StepId),
+    Recovery,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct Store {
@@ -402,6 +443,8 @@ pub struct Step {
     pub id: StepId,
     /// The constraint whose solve produced this step.
     pub constraint: Option<ConstraintId>,
+    /// Immutable reason node for this act of the solver.
+    pub reason: ReasonId,
     /// The error this step emitted, if it failed. Kept separately from the
     /// rendered effect so correlation never depends on error wording.
     pub error: Option<ErrorId>,
@@ -551,7 +594,15 @@ pub enum Effect {
     /// The goal already held, or was put back for later.
     None,
     /// A variable now points at a value of its own sort.
-    Bound { var: TyVar, value: Assigned },
+    Bound {
+        var: TyVar,
+        value: Assigned,
+        /// The solver-step reason that made this binding.
+        by: ReasonId,
+        /// For recovery bindings, the failed/absorbing step that caused the
+        /// value to be abandoned. Ordinary bindings have no `because` link.
+        because: Option<ReasonId>,
+    },
     /// The goal was replaced by the goals that follow it one level deeper —
     /// the halves of an arrow, the fields of a struct, or the same goal asked
     /// again about what a name stands for.
@@ -571,6 +622,8 @@ pub enum Effect {
 pub struct Constraint {
     /// Stable identity in generation order, including nested constraints.
     pub id: ConstraintId,
+    /// Immutable root reason for this generated requirement.
+    pub reason: ReasonId,
     pub span: Span,
     /// The source operation that required this constraint.
     pub origin: ConstraintOrigin,
@@ -1054,6 +1107,7 @@ type Lacks = (Shape, IndexSet<String>);
 /// only during unification or have their own congruence rollback in [`Solve`].
 struct Known {
     vars: Vec<Slot>,
+    var_meta: Vec<VarMeta>,
     levels: Vec<u32>,
     lacks: HashMap<TyVar, Lacks>,
     existential_witnesses: HashSet<TyVar>,
@@ -1187,6 +1241,8 @@ struct Table {
     /// walked. It is still nobody's but the group's, because the group is
     /// finished before anything outside it is looked at.
     vars: Vec<Slot>,
+    /// Source-semantic metadata parallel to `vars`.
+    var_meta: Vec<VarMeta>,
     /// The generalization level each variable was minted at, parallel to
     /// `vars`. A binding group is level 0, a nested `let`'s value is one deeper
     /// than whatever it was written in, and everything still unbound at or
@@ -1306,6 +1362,10 @@ struct Table {
     next_step_id: u64,
     next_error_id: u64,
     next_batch_id: u64,
+    /// Immutable append-only causal records. Unlike variable metadata this is
+    /// deliberately not restored after speculative congruence.
+    reasons: Vec<Reason>,
+    next_reason_id: u64,
 }
 
 /// Which quantified position each thing a scheme closes over was given, in the
@@ -1361,6 +1421,7 @@ pub fn structural_family_for_tests(
         definition,
         depth: 0,
         constraint: None,
+        constraint_reason: None,
         assumed: Vec::new(),
         schemes: HashMap::new(),
         locals: &mut locals,
@@ -1532,6 +1593,7 @@ fn callback_coverage_constraints(
                 .into_iter()
                 .map(|required| Constraint {
                     id: ConstraintId::pending(),
+                    reason: ReasonId::pending(),
                     span,
                     origin: ConstraintOrigin::CallbackBoundary,
                     subjects: ConstraintSubjects::pair(
@@ -1752,6 +1814,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 callback_coverage_constraints(&aliases, &decl.value.abi, &lowered.ty);
             for constraint in &mut coverage {
                 constraint.id = table.constraint_id();
+                constraint.reason = table.constraint_reason(constraint.id);
             }
             if sat::entails(&lowered.formula, &conditional) {
                 extern_coverage.push((*symbol, coverage));
@@ -1794,6 +1857,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             definition: symbol,
             depth: 0,
             constraint: None,
+            constraint_reason: None,
             assumed: Vec::new(),
             schemes: HashMap::new(),
             locals: &mut locals,
@@ -1882,7 +1946,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                         lowered.ty.clone()
                     }
                     None => {
-                        let bound = table.fresh_type();
+                        let bound = table.fresh_type_for(Subject::TopLevelBinding);
                         env.insert(*symbol, Binding::Mono(bound.clone()));
                         bound
                     }
@@ -1969,6 +2033,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 definition: scoped.symbol,
                 depth: 0,
                 constraint: None,
+                constraint_reason: None,
                 assumed: Vec::new(),
                 schemes: HashMap::new(),
                 locals: &mut locals,
@@ -2201,6 +2266,8 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
         store,
         promises,
         refinements,
+        variables: table.var_meta.clone(),
+        reasons: table.reasons.clone(),
         errors,
     }
 }
@@ -2288,6 +2355,21 @@ impl Table {
         id
     }
 
+    fn reason(&mut self, origin: ReasonOrigin, parents: Vec<ReasonId>) -> ReasonId {
+        let id = ReasonId(self.next_reason_id);
+        self.next_reason_id += 1;
+        self.reasons.push(Reason {
+            id,
+            parents,
+            origin,
+        });
+        id
+    }
+
+    fn constraint_reason(&mut self, id: ConstraintId) -> ReasonId {
+        self.reason(ReasonOrigin::Constraint(id), Vec::new())
+    }
+
     fn step_id(&mut self) -> StepId {
         let id = StepId(self.next_step_id);
         self.next_step_id += 1;
@@ -2316,6 +2398,7 @@ impl Table {
     fn snapshot(&self) -> Known {
         Known {
             vars: self.vars.clone(),
+            var_meta: self.var_meta.clone(),
             levels: self.levels.clone(),
             lacks: self.lacks.clone(),
             existential_witnesses: self.existential_witnesses.clone(),
@@ -2330,6 +2413,7 @@ impl Table {
     /// into something, and every binding made since is being undone here too.
     fn restore(&mut self, known: Known) {
         self.vars = known.vars;
+        self.var_meta = known.var_meta;
         self.levels = known.levels;
         self.lacks = known.lacks;
         self.existential_witnesses = known.existential_witnesses;
@@ -2339,9 +2423,15 @@ impl Table {
     /// One more variable, of no sort yet, at the level being walked. A
     /// variable's sort is fixed by the position it was minted for, and the four
     /// functions below are those positions; nothing else may call this.
-    fn mint(&mut self) -> TyVar {
+    fn mint(&mut self, sort: VarSort, subject: Subject) -> TyVar {
         let var = self.vars.len() as TyVar;
+        let minted_by = self.reason(ReasonOrigin::Variable { sort, subject }, Vec::new());
         self.vars.push(Slot::Unbound);
+        self.var_meta.push(VarMeta {
+            sort,
+            subject,
+            minted_by,
+        });
         self.levels.push(self.level);
         var
     }
@@ -2349,18 +2439,30 @@ impl Table {
     /// A variable standing for a whole type: an unconstrained type
     /// of its own, so that binding it takes whatever it is against entire.
     fn fresh_type(&mut self) -> Rc<Ty> {
-        let var = self.mint();
+        self.fresh_type_for(Subject::Term)
+    }
+
+    fn fresh_type_for(&mut self, subject: Subject) -> Rc<Ty> {
+        let var = self.mint(VarSort::Type, subject);
         Rc::new(Ty::plain(Ty::Var(var)))
     }
 
     /// A variable standing for the rest of a row.
     fn fresh_row(&mut self) -> Rest {
-        Rest::Var(self.mint())
+        self.fresh_row_for(Subject::Term)
+    }
+
+    fn fresh_row_for(&mut self, subject: Subject) -> Rest {
+        Rest::Var(self.mint(VarSort::Row, subject))
     }
 
     /// A variable standing for whether one label is there.
     fn fresh_presence(&mut self) -> Presence {
-        Presence::Var(self.mint())
+        self.fresh_presence_for(Subject::Term)
+    }
+
+    fn fresh_presence_for(&mut self, subject: Subject) -> Presence {
+        Presence::Var(self.mint(VarSort::Presence, subject))
     }
 
     /// Follow bound variables until reaching something that is not one. Only
@@ -5605,7 +5707,7 @@ fn lower_scoped(
         // pattern desugar's exact demand are the same thing — a position left
         // to be decided, whoever left it — and the variable is what lets a
         // projection of a field and the demand for it share one answer.
-        TypeKind::Hole => Ty::Var(table.mint()),
+        TypeKind::Hole => Ty::Var(table.mint(VarSort::Type, Subject::Annotation)),
         // A variable in a type position: the rigid its declaration
         // minted, shared by every mention of the name in this one annotation.
         //
@@ -6237,6 +6339,7 @@ mod existential_regressions {
         let aliases = IndexMap::new();
         let nominal = [wrapper].into_iter().collect();
         let constraint = table.constraint_id();
+        let reason = table.constraint_reason(constraint);
         let mut errors = Vec::new();
         let mut steps = Vec::new();
         let mut locals = IndexMap::new();
@@ -6251,6 +6354,7 @@ mod existential_regressions {
                 definition,
                 depth: 0,
                 constraint: None,
+                constraint_reason: None,
                 assumed: Vec::new(),
                 schemes: HashMap::new(),
                 locals: &mut locals,
@@ -6261,6 +6365,7 @@ mod existential_regressions {
             };
             solve.run(&[Constraint {
                 id: constraint,
+                reason,
                 span: Span::default(),
                 origin: ConstraintOrigin::ContextualCheck,
                 subjects: ConstraintSubjects::pair(Subject::Context, Subject::Term),
@@ -6337,7 +6442,7 @@ mod existential_regressions {
 
 #[cfg(test)]
 mod identity_tests {
-    use super::Table;
+    use super::{ReasonOrigin, Subject, Table, VarSort};
 
     #[test]
     fn rollback_retires_allocated_identities_instead_of_reusing_them() {
@@ -6345,10 +6450,22 @@ mod identity_tests {
         let known = table.snapshot();
         let abandoned_step = table.step_id();
         let abandoned_batch = table.batch_id();
+        let abandoned_var = table.mint(VarSort::Type, Subject::Term);
+        let abandoned_reason = table.var_meta[abandoned_var as usize].minted_by;
 
         table.restore(known);
 
         assert_ne!(table.step_id(), abandoned_step);
         assert_ne!(table.batch_id(), abandoned_batch);
+        assert!(table.var_meta.is_empty());
+        assert!(table.reasons.iter().any(|reason| {
+            reason.id == abandoned_reason && matches!(reason.origin, ReasonOrigin::Variable { .. })
+        }));
+        let surviving = table.mint(VarSort::Type, Subject::Term);
+        assert_eq!(surviving, abandoned_var);
+        assert_ne!(
+            table.var_meta[surviving as usize].minted_by,
+            abandoned_reason
+        );
     }
 }

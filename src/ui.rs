@@ -2426,7 +2426,7 @@ impl fmt::Display for Effect {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Effect::None => f.write_str("no change"),
-            Effect::Bound { var, value } => write!(f, "?{var} := {value}"),
+            Effect::Bound { var, value, .. } => write!(f, "?{var} := {value}"),
             // Not "smaller goals": an unfolding replaces a goal with the same
             // question asked about a shape, which is a step towards an answer
             // without being any smaller.

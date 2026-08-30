@@ -74,6 +74,7 @@ fn rows(ids: &mut Ids, constraints: &[Constraint]) -> Vec<Node> {
             let mut node = Node::new(ids.next(), constraint.kind.code(), constraint.to_string())
                 .at(constraint.span)
                 .field("_constraint_id", constraint.id.get().to_string())
+                .field("_reason_id", constraint.reason.get().to_string())
                 .field("_origin", constraint.origin.code())
                 .field("_primary_subject", constraint.subjects.primary.code());
             if let Some(subject) = constraint.subjects.secondary {

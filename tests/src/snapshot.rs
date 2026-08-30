@@ -2424,7 +2424,9 @@ fn inference_stage_rows_serialize_compiler_identities() {
     assert!(!constraint_ids.is_empty());
     assert!(constraint_rows.iter().all(|node| {
         field(node, "_constraint_id").is_none()
-            || (field(node, "_origin").is_some() && field(node, "_primary_subject").is_some())
+            || (field(node, "_reason_id").is_some()
+                && field(node, "_origin").is_some()
+                && field(node, "_primary_subject").is_some())
     }));
     assert!(constraint_rows.iter().any(|node| {
         field(node, "_origin").as_deref() == Some("callback-boundary")
@@ -2438,6 +2440,22 @@ fn inference_stage_rows_serialize_compiler_identities() {
         .filter_map(|node| field(node, "_step_id"))
         .collect();
     assert_eq!(step_ids.len(), solve.len());
+    let reason_ids: std::collections::HashSet<_> = solve
+        .iter()
+        .filter_map(|node| field(node, "_reason_id"))
+        .collect();
+    assert_eq!(reason_ids.len(), solve.len());
+    assert!(
+        solve
+            .iter()
+            .filter(|node| field(node, "_bind").is_some())
+            .all(|node| field(node, "_bind_by") == field(node, "_reason_id"))
+    );
+    assert!(
+        solve
+            .iter()
+            .any(|node| field(node, "_recovery_because").is_some())
+    );
     assert!(
         solve.iter().all(
             |node| field(node, "_constraint_id").is_some_and(|id| constraint_ids.contains(&id))

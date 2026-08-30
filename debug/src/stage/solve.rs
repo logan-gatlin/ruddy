@@ -48,6 +48,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                 .field("_effect", effect.clone())
                 .field("_depth", step.depth.to_string())
                 .field("_step_id", step.id.get().to_string())
+                .field("_reason_id", step.reason.get().to_string())
                 .field(
                     "_constraint_id",
                     step.constraint
@@ -70,7 +71,14 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                 // own `Display for Effect` — rather than spelling `?4 := Nat`
                 // a second time here. It had been spelled twice, identically,
                 // which is two places for one notation to change in.
-                Effect::Bound { .. } => node = node.field("_bind", effect),
+                Effect::Bound { by, because, .. } => {
+                    node = node
+                        .field("_bind", effect)
+                        .field("_bind_by", by.get().to_string());
+                    if let Some(because) = because {
+                        node = node.field("_recovery_because", because.get().to_string());
+                    }
+                }
                 Effect::Failed(kind) => node = node.field("_error", kind.to_string()).error(),
                 Effect::None | Effect::Decomposed | Effect::Guarded { .. } => {}
             }
@@ -91,7 +99,10 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     let summary = plural(nodes.len(), "step");
     Stage {
         nodes,
-        debug: format!("{:#?}", output.steps),
+        debug: format!(
+            "steps = {:#?}\nvariables = {:#?}\nreasons = {:#?}",
+            output.steps, output.variables, output.reasons
+        ),
         ..spec.stage(cx.status(), summary)
     }
 }

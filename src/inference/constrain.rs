@@ -225,8 +225,10 @@ impl Constrain<'_> {
         subjects: ConstraintSubjects,
         kind: ConstraintKind,
     ) -> Constraint {
+        let id = self.table.constraint_id();
         Constraint {
-            id: self.table.constraint_id(),
+            id,
+            reason: self.table.constraint_reason(id),
             span,
             origin,
             subjects,
@@ -396,7 +398,7 @@ impl Constrain<'_> {
                         // follows: a use of the name inside its own value is
                         // the one type being decided rather than a copy of a
                         // scheme that does not exist yet.
-                        let bound = self.table.fresh_type();
+                        let bound = self.table.fresh_type_for(Subject::LocalBinding);
                         self.env.insert(name.tracked, Binding::Mono(bound.clone()));
                         (bound, Formula::True, Vec::new())
                     }
@@ -506,9 +508,9 @@ impl Constrain<'_> {
                     // written into, since [`Solve::fail`] cannot tell which
                     // half of a demand the failure was about.
                     _ => {
-                        let param = self.table.fresh_type();
-                        let result = self.table.fresh_type();
-                        let does = Row::of(self.table.fresh_row());
+                        let param = self.table.fresh_type_for(Subject::Parameter);
+                        let result = self.table.fresh_type_for(Subject::Context);
+                        let does = Row::of(self.table.fresh_row_for(Subject::PerformedEffects));
                         let wanted = Rc::new(Ty::plain(Ty::Arrow(
                             param.clone(),
                             result.clone(),
@@ -550,8 +552,8 @@ impl Constrain<'_> {
             // it, which is what makes "what this may do" a property of the
             // function rather than of wherever it was written.
             TermKind::Fn { arg, body } => {
-                let param = self.table.fresh_type();
-                let does = Row::of(self.table.fresh_row());
+                let param = self.table.fresh_type_for(Subject::Parameter);
+                let does = Row::of(self.table.fresh_row_for(Subject::PerformedEffects));
                 self.env.insert(arg.tracked, Binding::Mono(param.clone()));
                 let outer = self.enter(Ambient {
                     row: does.clone(),
@@ -607,7 +609,7 @@ impl Constrain<'_> {
                         Subject::RaisedValue,
                     );
                 }
-                self.table.fresh_type()
+                self.table.fresh_type_for(Subject::RaisedValue)
             }
             TermKind::Struct(fields) => {
                 let mut tys = IndexMap::new();
@@ -642,7 +644,7 @@ impl Constrain<'_> {
                     }
                     None => Rc::new(Ty::unit()),
                 };
-                let rest = self.table.fresh_row();
+                let rest = self.table.fresh_row_for(Subject::Term);
                 let ty = Rc::new(Ty::plain(Ty::Sum(Row {
                     labels: [(name.tracked.clone(), RowField::present(carried))]
                         .into_iter()
@@ -663,7 +665,7 @@ impl Constrain<'_> {
             // definition polymorphic in everything but the field it reads.
             TermKind::Project { base, field } => {
                 self.infer_term(base);
-                let result = self.table.fresh_type();
+                let result = self.table.fresh_type_for(Subject::ProjectionResult);
                 self.emit(
                     field.span,
                     ConstraintOrigin::Projection,
@@ -690,7 +692,7 @@ impl Constrain<'_> {
             // column rule.
             TermKind::Match { scrutinee, arms } => {
                 self.infer_term(scrutinee);
-                let result = self.table.fresh_type();
+                let result = self.table.fresh_type_for(Subject::MatchResult);
                 let mut qualifying = None;
                 let expected = match arms.is_empty() {
                     true => Rc::new(Ty::plain(Ty::Sum(Row {
@@ -842,7 +844,7 @@ impl Constrain<'_> {
     /// what the `return` arm gives, or the handled expression's own type where
     /// none was written, and it is what the whole expression comes to.
     fn handle(&mut self, body: &mut Term, handler: &mut ir::Handler) -> Rc<Ty> {
-        let answer = self.table.fresh_type();
+        let answer = self.table.fresh_type_for(Subject::HandlerAnswer);
         let discharged: IndexMap<String, RowField> = handler
             .discharges
             .iter()
@@ -1087,7 +1089,7 @@ impl Constrain<'_> {
                 labels.insert(name.to_string(), RowField::present(payload));
             }
             let rest = match open {
-                true => self.table.fresh_row(),
+                true => self.table.fresh_row_for(Subject::PatternDemand),
                 false => Rest::Closed,
             };
             let ty = Rc::new(Ty::plain(Ty::Sum(Row {
@@ -1132,7 +1134,7 @@ impl Constrain<'_> {
                 }
                 let presence = match subs.len() == total {
                     true => Presence::Present,
-                    false => self.table.fresh_presence(),
+                    false => self.table.fresh_presence_for(Subject::PatternDemand),
                 };
                 named.insert(
                     name.to_string(),
@@ -1144,7 +1146,7 @@ impl Constrain<'_> {
             }
             let rest = match exact {
                 true => Rest::Closed,
-                false => self.table.fresh_row(),
+                false => self.table.fresh_row_for(Subject::PatternDemand),
             };
             let ty = Rc::new(Ty::Struct(Row {
                 labels: named.clone(),
@@ -1156,7 +1158,9 @@ impl Constrain<'_> {
         let mut demands = demands.into_iter();
         // A column that only binds demands nothing: the position is a fresh
         // type the scrutinee decides — the `c` of the column-union example.
-        let ty = demands.next().unwrap_or_else(|| self.table.fresh_type());
+        let ty = demands
+            .next()
+            .unwrap_or_else(|| self.table.fresh_type_for(Subject::PatternDemand));
         for also in demands {
             self.checks(
                 columns.at,
@@ -1344,7 +1348,7 @@ impl Constrain<'_> {
             // pass is built on — nothing here reads the table — over the one
             // construct that would otherwise have to wait for a solve.
             Binding::Local => {
-                let ty = self.table.fresh_type();
+                let ty = self.table.fresh_type_for(Subject::Instance);
                 // The scheme does not exist yet, but its possible store batch
                 // still has a source position. Reserve an inert slot now; the
                 // solver fills it (under any active arm premise) once the local
