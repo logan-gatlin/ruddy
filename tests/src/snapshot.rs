@@ -158,7 +158,11 @@ fn dependency_paths_without_a_scratch_root_are_recoverable() {
         1,
     );
     assert_eq!(snapshot.diagnostics[0].stage, "dependencies");
-    assert_eq!(snapshot.diagnostics[0].code, "missing-scratch-root");
+    assert_eq!(snapshot.diagnostics[0].code, "dependency-workspace-missing");
+    assert_eq!(
+        snapshot.diagnostics[0].help,
+        ["open the debugger with a scratch directory before adding dependencies"]
+    );
     assert_eq!(
         snapshot
             .stages
@@ -166,7 +170,7 @@ fn dependency_paths_without_a_scratch_root_are_recoverable() {
             .find(|stage| stage.id == "ir")
             .unwrap()
             .status,
-        Status::Partial
+        Status::Skipped
     );
     assert_eq!(
         snapshot
@@ -230,7 +234,7 @@ fn custom_standard_library_is_source_visible_rendered_and_sandboxed() {
     };
     let failed = compile_at(&escaped, 2, &scratch);
     assert!(failed.diagnostics.iter().any(|diagnostic| {
-        diagnostic.stage == "dependencies" && diagnostic.message.contains("escapes sandbox")
+        diagnostic.stage == "dependencies" && diagnostic.code == "project-outside-workspace"
     }));
 }
 
@@ -306,9 +310,7 @@ fn installed_standard_library_child() {
     };
     let rejected = compile_at(&custom, 2, &scratch);
     assert!(rejected.diagnostics.iter().any(|diagnostic| {
-        diagnostic.stage == "dependencies"
-            && (diagnostic.message.contains("absolute dependency paths")
-                || diagnostic.message.contains("escapes sandbox"))
+        diagnostic.stage == "dependencies" && diagnostic.code == "project-outside-workspace"
     }));
 }
 
@@ -385,6 +387,24 @@ fn saved_dependency_projects_supply_artifact_identity_and_gate_lir() {
     fs::write(base.join("main.hc"), "let bad : Nat = fn x => x\n").unwrap();
     let failed = compile_at(&request, 1, scratch.path());
     assert_eq!(failed.diagnostics[0].stage, "dependencies");
+    assert_eq!(failed.diagnostics[0].code, "type-mismatch");
+    assert!(
+        failed.diagnostics[0]
+            .notes
+            .iter()
+            .any(|note| note.contains("dependency `base`")),
+        "{:#?}",
+        failed.diagnostics[0]
+    );
+    let errors = &failed
+        .stages
+        .iter()
+        .find(|stage| stage.id == "errors")
+        .expect("the Errors tab renders the dependency report")
+        .debug;
+    assert!(errors.contains("[type-mismatch]"), "{errors}");
+    assert!(errors.contains("let bad : Nat = fn x => x"), "{errors}");
+    assert!(errors.contains("dependency `base`"), "{errors}");
     assert_eq!(
         failed
             .stages
@@ -402,6 +422,21 @@ fn saved_dependency_projects_supply_artifact_identity_and_gate_lir() {
             .unwrap()
             .status,
         Status::Skipped
+    );
+
+    fs::write(
+        base.join("main.hc"),
+        "let one : Nat = false\nlet two : String = 2n\n",
+    )
+    .unwrap();
+    let multiple = compile_at(&request, 2, scratch.path());
+    assert_eq!(multiple.diagnostics.len(), 2, "{:#?}", multiple.diagnostics);
+    assert!(
+        multiple
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.stage == "dependencies"
+                && diagnostic.code == "type-mismatch")
     );
 }
 
@@ -546,13 +581,17 @@ fn failed_graph_validation_is_reported_for_the_dependency_build() {
     ]));
 
     let snapshot = compile_at(&request, 1, scratch.path());
-    assert_eq!(
-        snapshot
-            .diagnostics
+    let unavailable: Vec<_> = snapshot
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "project-unavailable")
+        .collect();
+    assert_eq!(unavailable.len(), 1);
+    assert!(
+        unavailable[0]
+            .notes
             .iter()
-            .filter(|diagnostic| diagnostic.code == "dependency-build")
-            .count(),
-        1
+            .any(|note| note.contains("dependency `missing`"))
     );
 }
 
@@ -580,10 +619,12 @@ fn dependency_roots_cannot_be_absolute_or_escape_the_scratch_folder() {
             &scratch,
         );
         assert!(
-            snapshot
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "dependency-build"),
+            snapshot.diagnostics.iter().any(|diagnostic| {
+                matches!(
+                    diagnostic.code,
+                    "project-root-outside-workspace" | "project-outside-workspace"
+                )
+            }),
             "{:#?}",
             snapshot.diagnostics
         );
@@ -611,13 +652,16 @@ fn symlinked_dependency_manifests_are_confined_to_the_scratch_folder() {
         snapshot
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.code == "dependency-build"),
+            .any(|diagnostic| diagnostic.code == "manifest-outside-workspace"),
         "{:#?}",
         snapshot.diagnostics
     );
     let error =
         ruddy_cli::compile_sandboxed_dependency_graph([("base", &base)], &scratch).unwrap_err();
-    assert!(error.to_string().contains("escapes sandbox"), "{error}");
+    assert!(
+        error.to_string().contains("outside the debugger workspace"),
+        "{error}"
+    );
 
     fs::remove_file(base.join("Ruddy.toml")).unwrap();
     let shared = scratch.join("base-manifest.toml");
@@ -662,7 +706,7 @@ fn symlinked_dependency_modules_cannot_escape_the_scratch_folder() {
         snapshot
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.code == "dependency-build"),
+            .any(|diagnostic| diagnostic.code == "module-file-missing"),
         "{:#?}",
         snapshot.diagnostics
     );
@@ -1363,7 +1407,10 @@ fn a_mixed_tail_carries_the_use_it_clashes_with() {
     assert_eq!(mixed.related[0].span, at([first, first + 2]));
     // Worded as a use rather than as a definition: nothing here was defined
     // twice.
-    assert_eq!(mixed.related[0].message, "first used here");
+    assert_eq!(
+        mixed.related[0].message,
+        "first used as the rest of a struct's fields here"
+    );
 }
 
 /// The types stage reports what inference concluded, and the annotating
@@ -1887,10 +1934,10 @@ fn an_empty_buffer_is_not_an_error() {
 /// it is reported, the mint falls back, and every later phase still runs.
 #[test]
 fn a_bad_bundle_is_reported_rather_than_fatal() {
-    for (name, version) in [
-        ("_x", "0.1.0"),
-        ("demo", "not-a-version"),
-        ("demo", "1.2.3+unsupported"),
+    for (name, version, code) in [
+        ("_x", "0.1.0", "project-name-invalid"),
+        ("demo", "not-a-version", "project-version-invalid"),
+        ("demo", "1.2.3+unsupported", "project-version-build-suffix"),
     ] {
         let snapshot = compile(
             &CompileRequest {
@@ -1908,7 +1955,8 @@ fn a_bad_bundle_is_reported_rather_than_fatal() {
             },
             1,
         );
-        assert_eq!(snapshot.diagnostics[0].code, "bad-bundle-identity");
+        assert_eq!(snapshot.diagnostics[0].code, code);
+        assert!(!snapshot.diagnostics[0].help.is_empty());
         // And the chip has nothing to show because the supplied identity was
         // invalid.
         assert_eq!(snapshot.bundle, None);
@@ -1920,6 +1968,47 @@ fn a_bad_bundle_is_reported_rather_than_fatal() {
             .expect("ir stage");
         assert_eq!(ir.nodes.len(), 1);
     }
+}
+
+/// Module file candidates are relative to the configured root's directory,
+/// including when the in-memory debugger filesystem names that directory.
+#[test]
+fn a_nested_debugger_root_resolves_module_files_beside_its_root() {
+    let snapshot = compile(
+        &CompileRequest {
+            name: "demo".into(),
+            version: "0.1.0".into(),
+            root: "src/main.hc".into(),
+            document: "demo".into(),
+            files: vec![
+                FileSpec {
+                    path: "src/main.hc".into(),
+                    source: "module Math\n".into(),
+                },
+                FileSpec {
+                    path: "src/Math.hc".into(),
+                    source: "let four = 4n\n".into(),
+                },
+            ],
+            std: StdConfig::Disabled,
+            dependencies: IndexMap::new(),
+            revision: 1,
+        },
+        1,
+    );
+    assert!(
+        snapshot.diagnostics.is_empty(),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+    assert_eq!(
+        snapshot
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>(),
+        ["src/main.hc", "src/Math.hc"]
+    );
 }
 
 /// The file list is the index every `Loc` on the wire points into, so it has to
@@ -2003,6 +2092,10 @@ fn a_missing_module_file_reaches_the_strip() {
     };
     assert_eq!(diagnostic.stage, "bundle");
     assert_eq!(diagnostic.code, "module-file-missing");
+    assert_eq!(diagnostic.message, "this module needs a file");
+    assert_eq!(diagnostic.label, "no file was found for this module");
+    assert_eq!(diagnostic.help, ["create `Math.hc` or `Math/module.hc`"]);
+    assert_eq!(diagnostic.notes.len(), 1);
     // At the name, which is what the file's path was spelled from.
     let at = root.find("Math").expect("the declaration");
     assert_eq!(
@@ -2023,6 +2116,29 @@ fn a_missing_module_file_reaches_the_strip() {
     assert_eq!(types.status, Status::Skipped, "{types:#?}");
 }
 
+#[test]
+fn two_module_files_explain_how_to_choose_one() {
+    let root = "module Math\n";
+    let snapshot = bundle(&[
+        (ROOT, root),
+        ("Math.hc", "let beside = 1n\n"),
+        ("Math/module.hc", "let inside = 2n\n"),
+    ]);
+    let [diagnostic] = snapshot.diagnostics.as_slice() else {
+        panic!("expected one error: {:#?}", snapshot.diagnostics);
+    };
+    assert_eq!(diagnostic.code, "module-file-ambiguous");
+    assert_eq!(diagnostic.message, "this module has two possible files");
+    assert_eq!(
+        diagnostic.label,
+        "Ruddy cannot choose which file defines this module"
+    );
+    assert_eq!(
+        diagnostic.help,
+        ["keep one of `Math.hc` or `Math/module.hc` and delete the other"]
+    );
+}
+
 /// A document is a bundle, and a bundle starts somewhere. Only the debugger
 /// knows the page was meant to have put a root file in the request — the loader
 /// reads a file that is not there as an empty one — so the debugger is what says
@@ -2035,16 +2151,20 @@ fn a_request_without_a_root_file_is_told_so() {
         .iter()
         .map(|diagnostic| diagnostic.code)
         .collect();
-    assert!(codes.contains(&"missing-root-file"), "{codes:?}");
+    assert!(codes.contains(&"project-root-missing"), "{codes:?}");
     let missing = snapshot
         .diagnostics
         .iter()
-        .find(|diagnostic| diagnostic.code == "missing-root-file")
+        .find(|diagnostic| diagnostic.code == "project-root-missing")
         .expect("the complaint is there");
     assert_eq!(missing.stage, "bundle");
     assert_eq!(
         missing.message,
-        "a document needs a `main.hc`; it is the bundle's root file"
+        "this document needs its root file `main.hc`"
+    );
+    assert_eq!(
+        missing.help,
+        ["create `main.hc` or choose another root file"]
     );
     // Nowhere to point at: there is no file for the missing one to be missing
     // from.

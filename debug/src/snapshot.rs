@@ -21,7 +21,7 @@ use ruddy::{
     bundle::{self, Files},
     inference, ir, lir, patterns,
     symbol::{Bundle, Mint, Version},
-    tracking::{FileID, FileManager, Span},
+    tracking::{FileID, FileManager},
     ui,
 };
 
@@ -122,41 +122,73 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     // loader, which reads an absent file as an empty one: only the debugger
     // knows that the page is meant to have put one there.
     if fs.read(&req.root).is_none() {
-        diagnostics.push(raw(
+        let mut diagnostic = raw(
             "bundle",
-            "missing-root-file",
-            if req.root == ROOT {
-                format!("a document needs a `{ROOT}`; it is the bundle's root file")
-            } else {
-                format!("a document needs its configured root `{}`", req.root)
-            },
+            "project-root-missing",
+            format!("this document needs its root file `{}`", req.root),
             None,
-        ));
+        );
+        diagnostic
+            .help
+            .push(format!("create `{}` or choose another root file", req.root));
+        diagnostics.push(diagnostic);
     }
 
     // Identity is project configuration, not source syntax. Keep malformed
     // wire input recoverable like every compiler error: report it, mint under
     // a stable fallback, and still show all later phases that can run.
-    let configured = Version::parse(&req.version)
-        .ok()
+    let parsed_version = Version::parse(&req.version).ok();
+    let configured = parsed_version
+        .clone()
         .filter(|version| version.build.is_empty())
         .and_then(|version| Bundle::new(&req.name, version));
     if configured.is_none() {
-        diagnostics.push(raw(
-            "bundle",
-            "bad-bundle-identity",
-            format!(
-                "`{}@{}` is not a valid Ruddy bundle identity",
-                req.name, req.version
-            ),
-            None,
-        ));
+        let mut diagnostic = if parsed_version.is_none() {
+            raw(
+                "bundle",
+                "project-version-invalid",
+                format!("`{}` is not a valid project version", req.version),
+                None,
+            )
+        } else if parsed_version
+            .as_ref()
+            .is_some_and(|version| !version.build.is_empty())
+        {
+            raw(
+                "bundle",
+                "project-version-build-suffix",
+                format!(
+                    "project version `{}` has an unsupported `+` suffix",
+                    req.version
+                ),
+                None,
+            )
+        } else {
+            raw(
+                "bundle",
+                "project-name-invalid",
+                format!("`{}` is not a valid project name", req.name),
+                None,
+            )
+        };
+        diagnostic.help.push(if parsed_version.is_none() {
+            "use three numbers such as `1.2.3`".to_string()
+        } else if parsed_version
+            .as_ref()
+            .is_some_and(|version| !version.build.is_empty())
+        {
+            "remove the `+...` suffix from the version".to_string()
+        } else {
+            "start with an ASCII letter and use only ASCII letters, digits, `-`, or `_`".to_string()
+        });
+        diagnostics.push(diagnostic);
     }
     let identity = configured.as_ref().map(ToString::to_string);
 
     // Resolve and compile saved dependency projects, including the standard
     // library synthesized ahead of explicit declarations. Configuration
-    // failures are recoverable so active source phases remain inspectable.
+    // failures are recoverable so source, token, and AST views remain
+    // inspectable, but semantic phases wait for the requested imports.
     let dependency_started = Instant::now();
     let mut dependency_artifacts = Vec::new();
     let mut dependency_aliases = Vec::new();
@@ -164,22 +196,33 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     let mut linked_interfaces = Vec::new();
     if !req.std.is_disabled() || !req.dependencies.is_empty() {
         match scratch {
-            None => diagnostics.push(raw(
-                "dependencies",
-                "missing-scratch-root",
-                "dependency projects require a debugger scratch root".to_string(),
-                None,
-            )),
+            None => {
+                let mut diagnostic = raw(
+                    "dependencies",
+                    "dependency-workspace-missing",
+                    "saved dependencies need a document workspace".to_string(),
+                    None,
+                );
+                diagnostic.help.push(
+                    "open the debugger with a scratch directory before adding dependencies"
+                        .to_string(),
+                );
+                diagnostics.push(diagnostic);
+            }
             Some(scratch) => {
                 let project = match crate::docs::path(scratch, &req.document) {
                     Some(project) => project,
                     None => {
-                        diagnostics.push(raw(
+                        let mut diagnostic = raw(
                             "dependencies",
-                            "bad-document",
-                            "the active document name is invalid".to_string(),
+                            "document-name-invalid",
+                            "this document name cannot be used for saved dependencies".to_string(),
                             None,
-                        ));
+                        );
+                        diagnostic.help.push(
+                            "rename the document using letters, digits, `-`, or `_`".to_string(),
+                        );
+                        diagnostics.push(diagnostic);
                         PathBuf::from("invalid-document")
                     }
                 };
@@ -219,12 +262,12 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
                             .collect();
                         dependency_artifacts = direct;
                     }
-                    Err(error) => diagnostics.push(raw(
-                        "dependencies",
-                        "dependency-build",
-                        error.to_string(),
-                        None,
-                    )),
+                    Err(error) => diagnostics.extend(
+                        error
+                            .into_diagnostics()
+                            .into_iter()
+                            .map(dependency_diagnostic),
+                    ),
                 }
             }
         }
@@ -237,6 +280,9 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     };
     let mut mint = Mint::new(configured.unwrap_or_else(fallback));
 
+    let dependencies_valid = !diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.stage == "dependencies");
     let frontend_clean = loaded.as_ref().is_some_and(|loaded| {
         loaded.errors.is_empty()
             && loaded
@@ -247,7 +293,7 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
 
     let mut built = loaded
         .as_ref()
-        .filter(|_| frontend_clean)
+        .filter(|_| frontend_clean && dependencies_valid)
         .and_then(|loaded| {
             let started = Instant::now();
             let out = guard("ir", &mut panicked, || {
@@ -294,15 +340,8 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
 
     // Every phase words and codes its own errors in `ruddy::ui`, so the strip
     // and the CLI driver cannot describe the same program differently, and a
-    // new error kind reaches both the moment it exists. What is added here is
-    // what only the strip has: the quoted snippet, and the second span a
-    // duplicate points back at.
-    //
-    // The source a span is quoted out of is the file it was written in, which
-    // the loader registered and the file manager still holds — so a complaint
-    // about a module file quotes that file rather than whatever the editor has
-    // in front of it.
-    let source = |span: Span| sources.get(&span.file_id).cloned().unwrap_or_default();
+    // new error kind reaches both the moment it exists. This layer only maps
+    // the shared diagnostic's spans into debugger file locations.
     if let Some(loaded) = &loaded {
         for file in &loaded.loaded {
             let mut source_errors: Vec<_> = file
@@ -318,21 +357,19 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
             source_errors.sort_by_key(|error| error.span.map_or(usize::MAX, |span| span.range[0]));
             diagnostics.extend(source_errors);
         }
-        diagnostics.extend(loaded.errors.iter().map(|error| {
-            raw(
-                "bundle",
-                error.kind.code(),
-                error.kind.to_string(),
-                loc(error.span, &index),
-            )
-        }));
+        diagnostics.extend(
+            loaded
+                .errors
+                .iter()
+                .map(|error| source_error("bundle", error.diagnostic(), &index)),
+        );
     }
     if let Some(built) = &built {
         diagnostics.extend(
             built
                 .errors
                 .iter()
-                .map(|error| ir_diagnostic(&source(error.span), error, &index)),
+                .map(|error| source_error("ir", error.diagnostic(), &index)),
         );
     }
     if let Some(inferred) = &inferred {
@@ -463,7 +500,7 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     let stage_sources: Vec<String> = loaded
         .iter()
         .flat_map(|loaded| loaded.loaded.iter())
-        .map(|file| source(file.id.span(0, 0)))
+        .map(|file| sources.get(&file.id).cloned().unwrap_or_default())
         .collect();
     let infos: Vec<FileInfo> = loaded
         .iter()
@@ -614,42 +651,9 @@ pub fn install_hook() {
     });
 }
 
-/// Lowering's errors, which are the only ones with a second place to point at.
-fn ir_diagnostic(source: &str, error: &ir::Error, files: &HashMap<FileID, u32>) -> Diagnostic {
-    let mut diagnostic = raw(
-        "ir",
-        error.kind.code(),
-        format!("{} {}", error.kind, quote(source, error.span)),
-        loc(error.span, files),
-    );
-    // One diagnostic with two highlights, rather than the two loose lines the
-    // CLI prints: the repeat is only legible next to what it repeats. Both of
-    // lowering's repeats carry the span, a name given two rests carries where
-    // the first one was written, and a panel that cross-highlighted one pair
-    // and not the others would be showing the reader less than the compiler had
-    // already worked out.
-    let elsewhere = match &error.kind {
-        ir::ErrorKind::Duplicate { previous, .. }
-        | ir::ErrorKind::DuplicateParameter { previous } => Some((*previous, ui::FIRST_DEFINITION)),
-        ir::ErrorKind::MixedTail { previous, .. } => Some((*previous, ui::FIRST_USE)),
-        ir::ErrorKind::IncompatiblePresenceOwnership { previous, .. } => {
-            Some((*previous, ui::FIRST_PRODUCTION_LIFETIME))
-        }
-        _ => None,
-    };
-    if let Some((previous, note)) = elsewhere {
-        diagnostic.related.push(Related {
-            span: loc(previous, files),
-            message: note.to_string(),
-        });
-    }
-    diagnostic
-}
-
 /// Inference's errors, two of which have a second place to point at: the
-/// a variable that declared the variable a body broke its promise about. The
-/// same pairing [`ir_diagnostic`] makes one phase earlier, and shown the same
-/// way — one diagnostic with two highlights, because a broken promise is only
+/// variable declaration that a body broke its promise about. They are shown as
+/// one diagnostic with two highlights, because a broken promise is only
 /// legible next to the promise.
 fn inference_diagnostic(error: &inference::Error, files: &HashMap<FileID, u32>) -> Diagnostic {
     let mut diagnostic = raw(
@@ -689,12 +693,34 @@ fn source_error(
     diagnostic.related = source_diagnostic
         .related
         .into_iter()
+        .filter(|annotation| !annotation.span.is_generated())
         .map(|annotation| Related {
             span: loc(annotation.span, files),
             message: annotation.message,
         })
         .collect();
     diagnostic
+}
+
+fn dependency_diagnostic(report: ruddy_cli::CompileDiagnostic) -> Diagnostic {
+    let code = if report.code() == "project-error" {
+        "dependency-build"
+    } else {
+        report.code()
+    };
+    Diagnostic {
+        id: 0,
+        stage: "dependencies",
+        severity: Severity::Error,
+        code,
+        message: report.message().to_string(),
+        label: String::new(),
+        help: report.help().to_vec(),
+        notes: report.notes().to_vec(),
+        report: Some(report),
+        span: None,
+        related: Vec::new(),
+    }
 }
 
 fn raw(stage: &'static str, code: &'static str, message: String, span: Option<Loc>) -> Diagnostic {
@@ -707,15 +733,8 @@ fn raw(stage: &'static str, code: &'static str, message: String, span: Option<Lo
         label: String::new(),
         help: Vec::new(),
         notes: Vec::new(),
+        report: None,
         span,
         related: Vec::new(),
-    }
-}
-
-/// The source text a span covers, quoted for a message.
-fn quote(source: &str, span: Span) -> String {
-    match source.get(span.start..span.end()) {
-        Some("") | None => "at end of input".to_string(),
-        Some(text) => format!("`{text}`"),
     }
 }

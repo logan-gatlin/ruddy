@@ -907,24 +907,176 @@ fn replace_existing_windows(
     }
 }
 
-/// A user-facing failure while loading a manifest or compiling its bundle.
+/// One compiler or project diagnostic, retained until its reporter chooses a
+/// terminal, browser, or editor presentation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompileDiagnostic {
+    stage: &'static str,
+    code: &'static str,
+    message: String,
+    sources: Vec<OwnedDiagnosticSource>,
+    primary: Option<OwnedDiagnosticLabel>,
+    related: Vec<OwnedDiagnosticLabel>,
+    help: Vec<String>,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnedDiagnosticSource {
+    path: String,
+    source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnedDiagnosticLabel {
+    source: usize,
+    range: Range<usize>,
+    message: String,
+}
+
+impl CompileDiagnostic {
+    fn plain(stage: &'static str, code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            stage,
+            code,
+            message: message.into(),
+            sources: Vec::new(),
+            primary: None,
+            related: Vec::new(),
+            help: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    /// The phase which produced this diagnostic.
+    pub const fn stage(&self) -> &'static str {
+        self.stage
+    }
+
+    /// Its stable, greppable identifier.
+    pub const fn code(&self) -> &'static str {
+        self.code
+    }
+
+    /// The reader-facing headline, without severity or layout.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    pub fn help(&self) -> &[String] {
+        &self.help
+    }
+
+    pub fn notes(&self) -> &[String] {
+        &self.notes
+    }
+
+    /// Render this diagnostic through the same Ariadne boundary as source
+    /// diagnostics from the active bundle.
+    pub fn render(&self, color: bool) -> String {
+        let available: Vec<_> = self
+            .sources
+            .iter()
+            .map(|source| DiagnosticSource {
+                path: &source.path,
+                source: &source.source,
+            })
+            .collect();
+        let primary = self.primary.as_ref().map(|label| DiagnosticLabel {
+            source: label.source,
+            range: label.range.clone(),
+            message: &label.message,
+        });
+        let related: Vec<_> = self
+            .related
+            .iter()
+            .map(|label| DiagnosticLabel {
+                source: label.source,
+                range: label.range.clone(),
+                message: &label.message,
+            })
+            .collect();
+        let help = (!self.help.is_empty()).then(|| self.help.join("; "));
+        let notes: Vec<_> = self.notes.iter().map(String::as_str).collect();
+        render_diagnostic_with_advice(
+            self.stage,
+            self.code,
+            &self.message,
+            &available,
+            primary.as_ref(),
+            &related,
+            help.as_deref(),
+            &notes,
+            color,
+        )
+    }
+
+    fn with_help(mut self, message: impl Into<String>) -> Self {
+        let message = message.into();
+        if !self.help.contains(&message) {
+            self.help.push(message);
+        }
+        self
+    }
+
+    fn with_note(mut self, message: impl Into<String>) -> Self {
+        let message = message.into();
+        if !self.notes.contains(&message) {
+            self.notes.push(message);
+        }
+        self
+    }
+}
+
+/// User-facing failures while loading projects and compiling their bundles.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompileError {
+    diagnostics: Vec<CompileDiagnostic>,
+    // A plain rendered cache preserves the existing `messages()` API. Display
+    // renders afresh so terminal colour is chosen only at the final boundary.
     messages: Vec<String>,
 }
 
 impl CompileError {
-    fn one(message: impl Into<String>) -> Self {
+    fn report(code: &'static str, message: impl Into<String>) -> Self {
+        Self::from_diagnostics(vec![CompileDiagnostic::plain("project", code, message)])
+    }
+
+    fn from_diagnostics(diagnostics: Vec<CompileDiagnostic>) -> Self {
+        let messages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.render(false))
+            .collect();
         Self {
-            messages: vec![format!("error: {}", message.into())],
+            diagnostics,
+            messages,
         }
     }
 
-    fn diagnostics(messages: Vec<String>) -> Self {
-        Self { messages }
+    fn map_diagnostics(self, mut map: impl FnMut(CompileDiagnostic) -> CompileDiagnostic) -> Self {
+        Self::from_diagnostics(self.diagnostics.into_iter().map(&mut map).collect())
     }
 
-    /// The individual diagnostics in display order.
+    fn with_help(self, message: impl Into<String>) -> Self {
+        let message = message.into();
+        self.map_diagnostics(|diagnostic| diagnostic.with_help(message.clone()))
+    }
+
+    fn with_note(self, message: impl Into<String>) -> Self {
+        let message = message.into();
+        self.map_diagnostics(|diagnostic| diagnostic.with_note(message.clone()))
+    }
+
+    /// The structured diagnostics in display order.
+    pub fn diagnostics(&self) -> &[CompileDiagnostic] {
+        &self.diagnostics
+    }
+
+    pub fn into_diagnostics(self) -> Vec<CompileDiagnostic> {
+        self.diagnostics
+    }
+
+    /// The individual plain-text diagnostics in display order.
     pub fn messages(&self) -> &[String] {
         &self.messages
     }
@@ -932,11 +1084,11 @@ impl CompileError {
 
 impl fmt::Display for CompileError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (index, message) in self.messages.iter().enumerate() {
+        for (index, diagnostic) in self.diagnostics.iter().enumerate() {
             if index != 0 {
                 formatter.write_str("\n")?;
             }
-            formatter.write_str(message)?;
+            formatter.write_str(&diagnostic.render(stderr_color()))?;
         }
         Ok(())
     }
@@ -1141,15 +1293,19 @@ impl DependencySpec {
             detail.rev.as_deref(),
         ];
         if selectors.iter().flatten().count() > 1 {
-            return Err(CompileError::one(
-                "Git dependency has conflicting `branch`, `tag`, and `rev` selectors",
-            ));
+            return Err(CompileError::report(
+                "dependency-selectors-conflict",
+                "a Git dependency can select only one branch, tag, or revision",
+            )
+            .with_help("remove all but one of `branch`, `tag`, and `rev`"));
         }
         for value in selectors.iter().flatten() {
             if value.is_empty() {
-                return Err(CompileError::one(
-                    "Git dependency selectors must not be empty",
-                ));
+                return Err(CompileError::report(
+                    "dependency-selector-empty",
+                    "a Git branch, tag, or revision cannot be empty",
+                )
+                .with_help("provide a value or remove the empty setting"));
             }
         }
         Ok(if let Some(v) = selectors[0] {
@@ -1169,28 +1325,36 @@ impl DependencySpec {
         };
         match (detail.path.is_some(), detail.git.as_deref()) {
             (true, Some(_)) => {
-                return Err(CompileError::one(
-                    "dependency cannot specify both `path` and `git`",
-                ));
+                return Err(CompileError::report(
+                    "dependency-source-conflict",
+                    "a dependency cannot use both `path` and `git`",
+                )
+                .with_help("remove either `path` or `git`"));
             }
             (false, None) => {
-                return Err(CompileError::one(
-                    "dependency must specify either `path` or `git`",
-                ));
+                return Err(CompileError::report(
+                    "dependency-source-missing",
+                    "a dependency needs either a local `path` or a `git` URL",
+                )
+                .with_help("add `path = \"...\"` or `git = \"https://...\"`"));
             }
             (_, Some(url)) if !url.starts_with("https://") => {
-                return Err(CompileError::one(format!(
-                    "Git dependency URL `{url}` must use HTTPS"
-                )));
+                return Err(CompileError::report(
+                    "dependency-git-not-https",
+                    "this Git dependency URL must use HTTPS",
+                )
+                .with_help("use a URL beginning with `https://`"));
             }
             _ => {}
         }
         if detail.git.is_none()
             && (detail.branch.is_some() || detail.tag.is_some() || detail.rev.is_some())
         {
-            return Err(CompileError::one(
-                "dependency selectors require a `git` source",
-            ));
+            return Err(CompileError::report(
+                "dependency-selector-without-git",
+                "`branch`, `tag`, and `rev` can be used only with a Git dependency",
+            )
+            .with_help("add a `git` URL or remove the selector"));
         }
         self.selector()?;
         Ok(())
@@ -1318,7 +1482,8 @@ fn link_rooted(graph: &CompiledGraph) -> Result<Artifact, CompileError> {
         .iter()
         .map(|project| project.artifact.clone())
         .collect();
-    ruddy::link::link(&artifacts).map_err(|error| CompileError::one(error.to_string()))
+    ruddy::link::link(&artifacts)
+        .map_err(|error| CompileError::report("link-failed", error.to_string()))
 }
 
 /// Compile and statically link the project in `directory`.
@@ -1440,9 +1605,11 @@ where
     for (alias, specification) in dependencies {
         let alias = alias.into();
         if alias == "std" {
-            return Err(CompileError::one(
-                "dependency alias `std` is reserved for the standard-library setting under `[dependencies]`",
-            ));
+            return Err(CompileError::report(
+                "dependency-alias-reserved",
+                "`std` is reserved for the standard-library dependency",
+            )
+            .with_help("configure it as `[dependencies].std`, not as a separate dependency"));
         }
         specifications.push((alias, specification, false));
     }
@@ -1458,10 +1625,11 @@ where
     I: IntoIterator<Item = (String, DependencySpec, bool)>,
 {
     let sandbox = fs::canonicalize(sandbox).map_err(|error| {
-        CompileError::one(format!(
-            "could not resolve sandbox folder {}: {error}",
-            sandbox.display()
-        ))
+        CompileError::report(
+            "workspace-unavailable",
+            format!("could not open debugger workspace `{}`", sandbox.display()),
+        )
+        .with_note(error.to_string())
     })?;
     let project = canonical_project_in(project, Some(&sandbox))?;
     let resolver = git::Resolver::new(&project)?;
@@ -1473,29 +1641,48 @@ where
     let mut direct = Vec::new();
     let mut paths = Vec::new();
     for (alias, specification, installed_default) in dependencies {
-        specification.validate()?;
+        specification.validate().map_err(|error| {
+            dependency_error(
+                &alias,
+                specification.bundle(&alias),
+                Path::new("<source>"),
+                &project,
+                error,
+            )
+        })?;
         if !source_identifier(&alias) {
-            return Err(CompileError::one(format!(
-                "dependency alias `{alias}` is not a valid Ruddy source identifier"
-            )));
+            return Err(invalid_dependency_alias(&alias));
         }
         let expected = specification.bundle(&alias).to_string();
+        let declared = specification
+            .path()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(specification.git().unwrap_or("<source>")));
+        let contextualize = |error| {
+            let error = dependency_error(&alias, &expected, &declared, &project, error);
+            if installed_default {
+                default_std_error(error)
+            } else {
+                error
+            }
+        };
         let directory = if let Some(path) = specification.path() {
             if installed_default {
-                let directory =
-                    canonical_project(&project.join(path)).map_err(default_std_error)?;
+                let directory = canonical_project(&project.join(path)).map_err(&contextualize)?;
                 compiler.installed_std_roots.push(directory.clone());
                 directory
             } else {
-                canonical_project_in(&project.join(path), compiler.sandbox.as_deref())?
+                canonical_project_in(&project.join(path), compiler.sandbox.as_deref())
+                    .map_err(&contextualize)?
             }
         } else {
             let path = compiler
                 .resolver
                 .as_mut()
                 .expect("resolver")
-                .resolve(&specification)?;
-            let path = canonical_project(&path)?;
+                .resolve(&specification)
+                .map_err(&contextualize)?;
+            let path = canonical_project(&path).map_err(&contextualize)?;
             compiler.git_roots.push(path.clone());
             path
         };
@@ -1509,18 +1696,14 @@ where
                 .map(PathBuf::as_path)
                 .or(compiler.sandbox.as_deref()),
         )
-        .map_err(|error| {
-            if installed_default {
-                default_std_error(error)
-            } else {
-                error
-            }
-        })?;
+        .map_err(&contextualize)?;
         if manifest.name != expected {
-            let error = CompileError::one(format!(
-                "dependency key `{expected}` resolves to project `{}` instead",
-                manifest.name
-            ));
+            let error = dependency_name_mismatch(
+                &alias,
+                &expected,
+                &manifest.name,
+                &directory.join(MANIFEST),
+            );
             return Err(if installed_default {
                 default_std_error(error)
             } else {
@@ -1528,14 +1711,8 @@ where
             });
         }
         let index = compiler
-            .visit(directory.clone(), Some((expected, PathBuf::new())))
-            .map_err(|error| {
-                if installed_default {
-                    default_std_error(error)
-                } else {
-                    error
-                }
-            })?;
+            .visit(directory.clone(), Some((alias.clone(), declared.clone())))
+            .map_err(&contextualize)?;
         let artifact = &compiler.projects[index].artifact;
         direct.push(Dependency {
             name: artifact.header.identity.name.clone(),
@@ -1567,10 +1744,14 @@ where
     P: AsRef<Path>,
 {
     let sandbox = fs::canonicalize(sandbox.as_ref()).map_err(|error| {
-        CompileError::one(format!(
-            "could not resolve sandbox folder {}: {error}",
-            sandbox.as_ref().display()
-        ))
+        CompileError::report(
+            "workspace-unavailable",
+            format!(
+                "could not open debugger workspace `{}`",
+                sandbox.as_ref().display()
+            ),
+        )
+        .with_note(error.to_string())
     })?;
     compile_aliased_dependency_graph_inner(
         dependencies.into_iter().map(|(alias, bundle, path)| {
@@ -1594,19 +1775,28 @@ where
     let mut direct = Vec::new();
     for (alias, expected, directory) in dependencies {
         if !source_identifier(&alias) {
-            return Err(CompileError::one(format!(
-                "dependency alias `{alias}` is not a valid Ruddy source identifier"
-            )));
+            return Err(invalid_dependency_alias(&alias));
         }
-        let directory = canonical_project_in(&directory, compiler.sandbox.as_deref())?;
-        let manifest = load_manifest(&directory, compiler.sandbox.as_deref())?;
+        let context = format!(
+            "while loading dependency `{alias}` as project `{expected}` from `{}`",
+            directory.display()
+        );
+        let contextualize = |error: CompileError| error.with_note(context.clone());
+        let directory = canonical_project_in(&directory, compiler.sandbox.as_deref())
+            .map_err(&contextualize)?;
+        let manifest =
+            load_manifest(&directory, compiler.sandbox.as_deref()).map_err(&contextualize)?;
         if manifest.name != expected {
-            return Err(CompileError::one(format!(
-                "dependency key `{expected}` resolves to project `{}` instead",
-                manifest.name
-            )));
+            return Err(dependency_name_mismatch(
+                &alias,
+                &expected,
+                &manifest.name,
+                &directory.join(MANIFEST),
+            ));
         }
-        let index = compiler.visit(directory, Some((expected, PathBuf::new())))?;
+        let index = compiler
+            .visit(directory, Some((alias, PathBuf::new())))
+            .map_err(&contextualize)?;
         let artifact = &compiler.projects[index].artifact;
         direct.push(Dependency {
             name: artifact.header.identity.name.clone(),
@@ -1663,15 +1853,16 @@ impl GraphCompiler {
         if let Some(at) = self.active.iter().position(|(path, _)| path == &directory) {
             let mut chain: Vec<String> = self.active[at..]
                 .iter()
-                .map(|(path, name)| format!("{name} ({})", path.display()))
+                .map(|(_, name)| format!("`{name}`"))
                 .collect();
-            if let Some((name, declared)) = edge {
-                chain.push(format!("{name} ({})", declared.display()));
+            if let Some((name, _)) = edge {
+                chain.push(format!("`{name}`"));
             }
-            return Err(CompileError::one(format!(
-                "dependency cycle: {}",
-                chain.join(" -> ")
-            )));
+            return Err(CompileError::report(
+                "dependency-cycle",
+                format!("dependency cycle: {}", chain.join(" → ")),
+            )
+            .with_help("remove or replace one dependency in this cycle"));
         }
 
         let boundary = self
@@ -1691,13 +1882,16 @@ impl GraphCompiler {
         if let Some(previous) = self.identities.get(&identity_key)
             && previous != &directory
         {
-            return Err(CompileError::one(format!(
-                "projects {} and {} both declare bundle {}@{}",
-                previous.display(),
-                directory.display(),
-                manifest.name,
-                manifest.version
-            )));
+            return Err(CompileError::report(
+                "project-identity-conflict",
+                format!(
+                    "two projects declare the same name and version `{}@{}`",
+                    manifest.name, manifest.version
+                ),
+            )
+            .with_note(format!("first project: `{}`", previous.display()))
+            .with_note(format!("second project: `{}`", directory.display()))
+            .with_help("change one project's `name` or `version` in `Ruddy.toml`"));
         }
         self.identities.insert(identity_key, directory.clone());
         let active_name = edge
@@ -1735,7 +1929,8 @@ impl GraphCompiler {
             let expected = specification.bundle(alias).to_string();
             if let Err(error) = specification.validate() {
                 self.active.pop();
-                let error = dependency_error(&expected, Path::new("<source>"), &directory, error);
+                let error =
+                    dependency_error(alias, &expected, Path::new("<source>"), &directory, error);
                 return Err(if *installed_default {
                     default_std_error(error)
                 } else {
@@ -1744,9 +1939,7 @@ impl GraphCompiler {
             }
             if !source_identifier(alias) {
                 self.active.pop();
-                return Err(CompileError::one(format!(
-                    "dependency alias `{alias}` is not a valid Ruddy source identifier"
-                )));
+                return Err(invalid_dependency_alias(alias));
             }
             let declared = specification
                 .path()
@@ -1778,8 +1971,9 @@ impl GraphCompiler {
                 self.resolver
                     .as_mut()
                     .ok_or_else(|| {
-                        CompileError::one(
-                            "Git dependencies are unavailable in this compilation mode",
+                        CompileError::report(
+                            "git-dependency-unavailable",
+                            "Git dependencies are not available in this compilation mode",
                         )
                     })
                     .and_then(|resolver| resolver.resolve(specification))
@@ -1791,7 +1985,7 @@ impl GraphCompiler {
                     })
             }
             .map_err(|error: CompileError| {
-                let error = dependency_error(&expected, &declared, &directory, error);
+                let error = dependency_error(alias, &expected, &declared, &directory, error);
                 if *installed_default {
                     default_std_error(error)
                 } else {
@@ -1810,7 +2004,7 @@ impl GraphCompiler {
                 .map(PathBuf::as_path)
                 .or(self.sandbox.as_deref());
             let child_manifest = load_manifest(&child, child_boundary).map_err(|error| {
-                let error = dependency_error(&expected, &declared, &directory, error);
+                let error = dependency_error(alias, &expected, &declared, &directory, error);
                 if *installed_default {
                     default_std_error(error)
                 } else {
@@ -1819,11 +2013,16 @@ impl GraphCompiler {
             })?;
             if child_manifest.name != expected {
                 self.active.pop();
-                let error = CompileError::one(format!(
-                    "dependency `{expected}` declared as `{}` by {} contains project `{}` instead",
+                let error = dependency_name_mismatch(
+                    alias,
+                    &expected,
+                    &child_manifest.name,
+                    &child.join(MANIFEST),
+                )
+                .with_note(format!(
+                    "declared at `{}` in `{}`",
                     declared.display(),
-                    directory.join(MANIFEST).display(),
-                    child_manifest.name
+                    directory.join(MANIFEST).display()
                 ));
                 return Err(if *installed_default {
                     default_std_error(error)
@@ -1832,9 +2031,9 @@ impl GraphCompiler {
                 });
             }
             let index = self
-                .visit(child, Some((expected.clone(), declared.clone())))
+                .visit(child, Some((alias.clone(), declared.clone())))
                 .map_err(|error| {
-                    let error = dependency_error(&expected, &declared, &directory, error);
+                    let error = dependency_error(alias, &expected, &declared, &directory, error);
                     if *installed_default {
                         default_std_error(error)
                     } else {
@@ -1900,63 +2099,63 @@ fn canonical_project(directory: &Path) -> Result<PathBuf, CompileError> {
 
 fn canonical_project_in(directory: &Path, sandbox: Option<&Path>) -> Result<PathBuf, CompileError> {
     let canonical = fs::canonicalize(directory).map_err(|error| {
-        CompileError::one(format!(
-            "could not resolve project folder {}: {error}",
-            directory.display()
-        ))
+        CompileError::report(
+            "project-unavailable",
+            format!("could not open project folder `{}`", directory.display()),
+        )
+        .with_note(error.to_string())
+        .with_help("check that the dependency path exists and is readable")
     })?;
     if !canonical.is_dir() {
-        return Err(CompileError::one(format!(
-            "project path {} is not a folder",
-            directory.display()
-        )));
+        return Err(CompileError::report(
+            "project-not-a-folder",
+            format!("project path `{}` is not a folder", directory.display()),
+        )
+        .with_help("point the dependency at the folder containing `Ruddy.toml`"));
     }
     if let Some(sandbox) = sandbox
         && !canonical.starts_with(sandbox)
     {
-        return Err(CompileError::one(format!(
-            "project folder {} escapes sandbox {}",
-            canonical.display(),
-            sandbox.display()
-        )));
+        return Err(CompileError::report(
+            "project-outside-workspace",
+            format!(
+                "project `{}` is outside the debugger workspace `{}`",
+                canonical.display(),
+                sandbox.display()
+            ),
+        )
+        .with_help("move the project under the workspace or use an HTTPS Git dependency"));
     }
     Ok(canonical)
 }
 
 fn default_std_error(error: CompileError) -> CompileError {
-    CompileError::diagnostics(
-        error
-            .messages
-            .into_iter()
-            .map(|message| {
-                format!(
-                    "{message}\nhelp: install the Ruddy standard library in $RUDDY_HOME/std, configure `[dependencies].std` to another dependency, or set it to `false`"
-                )
-            })
-            .collect(),
-    )
+    error.map_diagnostics(|diagnostic| {
+        diagnostic.with_help("install the Ruddy standard library in `$RUDDY_HOME/std`, configure `[dependencies].std` to use another project, or set it to `false`")
+    })
 }
 
 fn dependency_error(
-    name: &str,
+    alias: &str,
+    expected: &str,
     declared: &Path,
     parent: &Path,
     error: CompileError,
 ) -> CompileError {
-    CompileError::diagnostics(
-        error
-            .messages
-            .into_iter()
-            .map(|message| {
-                format!(
-                    "error: dependency `{name}` at `{}` from {}:\n{}",
-                    declared.display(),
-                    parent.join(MANIFEST).display(),
-                    message
-                )
-            })
-            .collect(),
-    )
+    let manifest = parent.join(MANIFEST);
+    let context = if declared == Path::new("<source>") {
+        format!(
+            "dependency `{alias}` expects project `{expected}` in `{}`",
+            manifest.display()
+        )
+    } else {
+        format!(
+            "dependency `{alias}` expects project `{expected}` at `{}`, declared in `{}`",
+            redact_git_url(&declared.to_string_lossy()),
+            manifest.display()
+        )
+    };
+    error.map_diagnostics(|diagnostic| diagnostic.with_note(context.clone()))
 }
 
 fn compile_one(
@@ -1968,12 +2167,18 @@ fn compile_one(
     sandbox: Option<&Path>,
 ) -> Result<Artifact, CompileError> {
     if sandbox.is_some() && manifest.root.is_absolute() {
-        return Err(CompileError::one(
-            "manifest field `root` must be relative in a sandboxed build",
-        ));
+        return Err(CompileError::report(
+            "project-root-outside-workspace",
+            "a dependency project's `root` must be a relative path",
+        )
+        .with_help("write a path relative to the project's `Ruddy.toml`"));
     }
     let Some(name) = configured_file_name(&manifest.root) else {
-        return Err(CompileError::one("manifest field `root` must name a file"));
+        return Err(CompileError::report(
+            "project-root-invalid",
+            "`root` must name a Ruddy source file",
+        )
+        .with_help("set `root` to a file such as `main.hc`"));
     };
     let source_directory = manifest.root.parent().unwrap_or(Path::new(""));
     let root = directory.join(&manifest.root);
@@ -1982,16 +2187,35 @@ fn compile_one(
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
 
+    if let Some(workspace) = sandbox
+        && let Ok(canonical_root) = fs::canonicalize(&root)
+        && !canonical_root.starts_with(workspace)
+    {
+        return Err(CompileError::report(
+            "project-root-outside-workspace",
+            format!(
+                "project root file `{}` is outside the debugger workspace `{}`",
+                canonical_root.display(),
+                workspace.display()
+            ),
+        )
+        .with_help("move the source file under the project folder or choose another `root`"));
+    }
+
     let disk = sandbox.map_or_else(
         || Disk::new(parent),
         |sandbox| Disk::sandboxed(parent, sandbox),
     );
     if disk.read(name).is_none() {
-        return Err(CompileError::one(format!(
-            "could not read bundle root {} configured by {}",
-            root.display(),
+        return Err(CompileError::report(
+            "project-root-missing",
+            format!("project root file `{}` could not be read", root.display()),
+        )
+        .with_note(format!(
+            "configured by `root` in `{}`",
             directory.join(MANIFEST).display()
-        )));
+        ))
+        .with_help("create the file or update `root` in `Ruddy.toml`"));
     }
 
     let mut files = FileManager::new();
@@ -2010,33 +2234,29 @@ fn compile_one(
     if frontend_errors != 0 {
         let mut diagnostics = Vec::with_capacity(frontend_errors);
         for file in &loaded.loaded {
-            let mut source_errors: Vec<_> = file
+            let mut source_errors: Vec<(&'static str, ui::Diagnostic)> = file
                 .lex_errors
                 .iter()
-                .map(|error| error.diagnostic())
-                .chain(file.parse_errors.iter().map(|error| error.diagnostic()))
+                .map(|error| ("lex", error.diagnostic()))
+                .chain(
+                    file.parse_errors
+                        .iter()
+                        .map(|error| ("parse", error.diagnostic())),
+                )
+                .chain(
+                    loaded
+                        .errors
+                        .iter()
+                        .filter(|error| error.span.file_id == file.id)
+                        .map(|error| ("bundle", error.diagnostic_in(source_directory))),
+                )
                 .collect();
-            source_errors.sort_by_key(|error| error.primary.span.start);
-            diagnostics.extend(
-                source_errors
-                    .iter()
-                    .map(|error| source_diagnostic(&mut files, error, source_directory)),
-            );
+            source_errors.sort_by_key(|(_, error)| error.primary.span.start);
+            diagnostics.extend(source_errors.iter().map(|(stage, error)| {
+                source_diagnostic(&mut files, stage, error, source_directory)
+            }));
         }
-        for error in &loaded.errors {
-            diagnostics.push(diagnostic(
-                &mut files,
-                "bundle",
-                error.kind.code(),
-                error.span,
-                &BundleMessage {
-                    kind: &error.kind,
-                    source_directory,
-                },
-                source_directory,
-            ));
-        }
-        return Err(CompileError::diagnostics(diagnostics));
+        return Err(CompileError::from_diagnostics(diagnostics));
     }
 
     let mut mint = Mint::new(identity);
@@ -2052,12 +2272,10 @@ fn compile_one(
     if errors != 0 {
         let mut diagnostics = Vec::with_capacity(errors);
         for error in &built.errors {
-            diagnostics.push(diagnostic(
+            diagnostics.push(source_diagnostic(
                 &mut files,
                 "ir",
-                error.kind.code(),
-                error.span,
-                &error.kind,
+                &error.diagnostic(),
                 source_directory,
             ));
         }
@@ -2081,7 +2299,7 @@ fn compile_one(
                 source_directory,
             ));
         }
-        return Err(CompileError::diagnostics(diagnostics));
+        return Err(CompileError::from_diagnostics(diagnostics));
     }
 
     let lowered = lir::lower(&mint, &built.program, &inferred);
@@ -2098,6 +2316,74 @@ fn compile_one(
         &inferred,
         &lowered,
         identities,
+    ))
+}
+
+fn toml_error_note(source: &str, error: &toml::de::Error) -> String {
+    let Some(start) = error.span().map(|span| span.start) else {
+        return error.message().to_string();
+    };
+    let before = &source[..start.min(source.len())];
+    let line = before.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let column = before
+        .rsplit_once('\n')
+        .map_or(before, |(_, line)| line)
+        .chars()
+        .count()
+        + 1;
+    format!("{} at line {line}, column {column}", error.message())
+}
+
+fn redact_git_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return if url.contains(['@', '?', '#']) {
+            "<redacted dependency source>".to_string()
+        } else {
+            url.to_string()
+        };
+    };
+    let without_fragment = rest.split_once('#').map_or(rest, |(before, _)| before);
+    let without_query = without_fragment
+        .split_once('?')
+        .map_or(without_fragment, |(before, _)| before);
+    let (authority, path) = without_query
+        .split_once('/')
+        .map_or((without_query, ""), |(authority, path)| (authority, path));
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    if path.is_empty() {
+        format!("{scheme}://{host}")
+    } else {
+        format!("{scheme}://{host}/{path}")
+    }
+}
+
+fn invalid_dependency_alias(alias: &str) -> CompileError {
+    CompileError::report(
+        "dependency-alias-invalid",
+        format!("dependency alias `{alias}` cannot be used as a module name"),
+    )
+    .with_help(
+        "use letters, digits, and `_`, beginning with a letter or `_`, and avoid Ruddy keywords",
+    )
+}
+
+fn dependency_name_mismatch(
+    alias: &str,
+    expected: &str,
+    found: &str,
+    manifest: &Path,
+) -> CompileError {
+    CompileError::report(
+        "dependency-name-mismatch",
+        format!(
+            "dependency `{alias}` expects project `{expected}`, but `{}` declares `{found}`",
+            manifest.display()
+        ),
+    )
+    .with_help(format!(
+        "set this dependency's `bundle` to `{found}`, or change the dependency project's `name` to `{expected}`"
     ))
 }
 
@@ -2129,19 +2415,26 @@ fn source_identifier(name: &str) -> bool {
 
 fn configured_identity(name: &str, configured_version: &str) -> Result<Bundle, CompileError> {
     let version = Version::parse(configured_version).map_err(|error| {
-        CompileError::one(format!(
-            "manifest field `version` has invalid semantic version `{configured_version}`: {error}"
-        ))
+        CompileError::report(
+            "project-version-invalid",
+            format!("`{configured_version}` is not a valid project version"),
+        )
+        .with_help("use three numbers such as `1.2.3`")
+        .with_note(error.to_string())
     })?;
     if !version.build.is_empty() {
-        return Err(CompileError::one(format!(
-            "manifest field `version` value `{version}` uses unsupported build metadata"
-        )));
+        return Err(CompileError::report(
+            "project-version-build-suffix",
+            format!("project version `{version}` has an unsupported `+` suffix"),
+        )
+        .with_help("remove the `+...` suffix from `version`"));
     }
     Bundle::new(name, version).ok_or_else(|| {
-        CompileError::one(format!(
-            "manifest field `name` value `{name}` is not a valid Ruddy bundle name"
-        ))
+        CompileError::report(
+            "project-name-invalid",
+            format!("`{name}` is not a valid project name"),
+        )
+        .with_help("start with an ASCII letter and use only ASCII letters, digits, `-`, or `_`")
     })
 }
 
@@ -2159,17 +2452,23 @@ fn load_manifest(directory: &Path, sandbox: Option<&Path>) -> Result<Manifest, C
     let path = match sandbox {
         Some(sandbox) => {
             let canonical = fs::canonicalize(&configured).map_err(|error| {
-                CompileError::one(format!(
-                    "could not resolve manifest {}: {error}",
-                    configured.display()
-                ))
+                CompileError::report(
+                    "manifest-unavailable",
+                    format!("could not open `{}`", configured.display()),
+                )
+                .with_note(error.to_string())
+                .with_help("check that the project contains a readable `Ruddy.toml`")
             })?;
             if !canonical.starts_with(sandbox) {
-                return Err(CompileError::one(format!(
-                    "manifest {} escapes sandbox {}",
-                    canonical.display(),
-                    sandbox.display()
-                )));
+                return Err(CompileError::report(
+                    "manifest-outside-workspace",
+                    format!(
+                        "project settings `{}` are outside the debugger workspace `{}`",
+                        canonical.display(),
+                        sandbox.display()
+                    ),
+                )
+                .with_help("keep `Ruddy.toml` inside the dependency project folder"));
             }
             canonical
         }
@@ -2178,46 +2477,21 @@ fn load_manifest(directory: &Path, sandbox: Option<&Path>) -> Result<Manifest, C
         None => configured,
     };
     let source = fs::read_to_string(&path).map_err(|error| {
-        CompileError::one(format!(
-            "could not read manifest {}: {error}",
-            path.display()
-        ))
+        CompileError::report(
+            "manifest-unreadable",
+            format!("could not read `{}`", path.display()),
+        )
+        .with_note(error.to_string())
     })?;
     let manifest: Manifest = toml::from_str(&source).map_err(|error| {
-        CompileError::one(format!(
-            "could not parse manifest {}: {error}",
-            path.display()
-        ))
+        CompileError::report(
+            "manifest-invalid",
+            format!("`{}` contains invalid project settings", path.display()),
+        )
+        .with_note(toml_error_note(&source, &error))
+        .with_help("fix the named field in `Ruddy.toml` and try again")
     })?;
     Ok(manifest)
-}
-
-/// A bundle complaint rendered from the project boundary. The loader keeps
-/// candidate paths relative to the bundle root for debugger and in-memory
-/// consumers; at the CLI those instructions need the configured source
-/// directory prefix to name files the user can actually create or delete.
-struct BundleMessage<'a> {
-    kind: &'a bundle::ErrorKind,
-    source_directory: &'a Path,
-}
-
-impl fmt::Display for BundleMessage<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.kind {
-            bundle::ErrorKind::ModuleFileMissing { beside, inside } => write!(
-                formatter,
-                "this module has no file; create `{}` or `{}`",
-                self.source_directory.join(beside).display(),
-                self.source_directory.join(inside).display(),
-            ),
-            bundle::ErrorKind::ModuleFileAmbiguous { beside, inside } => write!(
-                formatter,
-                "this module has two files; delete one of `{}` or `{}`",
-                self.source_directory.join(beside).display(),
-                self.source_directory.join(inside).display(),
-            ),
-        }
-    }
 }
 
 /// One source file available while rendering a compiler diagnostic.
@@ -2267,6 +2541,7 @@ pub fn render_diagnostic(
 ///
 /// The shorter [`render_diagnostic`] entry point remains for callers whose
 /// diagnostic model does not yet carry advice.
+#[allow(clippy::too_many_arguments)] // Public rendering boundary keeps each presentation channel explicit.
 pub fn render_diagnostic_with_advice(
     phase: &str,
     code: &str,
@@ -2279,12 +2554,12 @@ pub fn render_diagnostic_with_advice(
     color: bool,
 ) -> String {
     let _ = phase;
-    let kind = format!("error[{code}]");
     let Some(primary) = primary else {
+        let heading = format!("[{code}] Error");
         let mut rendered = if color {
-            format!("\x1b[31m{kind}:\x1b[0m {message}")
+            format!("\x1b[31m{heading}:\x1b[0m {message}")
         } else {
-            format!("{kind}: {message}")
+            format!("{heading}: {message}")
         };
         if let Some(help) = help {
             rendered.push_str(&format!("\nhelp: {help}"));
@@ -2356,76 +2631,95 @@ pub fn render_diagnostic_with_advice(
 
 fn source_diagnostic(
     files: &mut FileManager,
+    stage: &'static str,
     diagnostic: &ui::Diagnostic,
     source_directory: &Path,
-) -> String {
-    let file = files.get_file(diagnostic.primary.span.file_id);
-    let path = source_directory.join(&file.path);
-    let path = path.to_string_lossy();
-    let available = [DiagnosticSource {
-        path: path.as_ref(),
-        source: &file.content,
+) -> CompileDiagnostic {
+    let primary_file_id = diagnostic.primary.span.file_id;
+    let file = files.get_file(primary_file_id);
+    let mut sources = vec![OwnedDiagnosticSource {
+        path: source_directory
+            .join(&file.path)
+            .to_string_lossy()
+            .into_owned(),
+        source: file.content.clone(),
     }];
-    let primary = DiagnosticLabel {
+    let mut source_indexes = HashMap::from([(primary_file_id, 0)]);
+    let primary = OwnedDiagnosticLabel {
         source: 0,
         range: diagnostic.primary.span.start..diagnostic.primary.span.end(),
-        message: &diagnostic.primary.message,
+        message: diagnostic.primary.message.clone(),
     };
-    let related: Vec<_> = diagnostic
-        .related
-        .iter()
-        .filter(|label| label.span.file_id == diagnostic.primary.span.file_id)
-        .map(|label| DiagnosticLabel {
-            source: 0,
+    let mut related = Vec::with_capacity(diagnostic.related.len());
+    for label in &diagnostic.related {
+        // A generated recovery declaration has no source location to show.
+        if label.span.is_generated() {
+            continue;
+        }
+        let source = match source_indexes.get(&label.span.file_id) {
+            Some(source) => *source,
+            None => {
+                let file = files.get_file(label.span.file_id);
+                let source = sources.len();
+                sources.push(OwnedDiagnosticSource {
+                    path: source_directory
+                        .join(&file.path)
+                        .to_string_lossy()
+                        .into_owned(),
+                    source: file.content.clone(),
+                });
+                source_indexes.insert(label.span.file_id, source);
+                source
+            }
+        };
+        related.push(OwnedDiagnosticLabel {
+            source,
             range: label.span.start..label.span.end(),
-            message: &label.message,
-        })
-        .collect();
-    let help = diagnostic.help.first().map(String::as_str);
-    let notes: Vec<_> = diagnostic.notes.iter().map(String::as_str).collect();
-    render_diagnostic_with_advice(
-        "",
-        diagnostic.code,
-        &diagnostic.title,
-        &available,
-        Some(&primary),
-        &related,
-        help,
-        &notes,
-        stderr_color(),
-    )
+            message: label.message.clone(),
+        });
+    }
+    CompileDiagnostic {
+        stage,
+        code: diagnostic.code,
+        message: diagnostic.title.clone(),
+        sources,
+        primary: Some(primary),
+        related,
+        help: diagnostic.help.clone(),
+        notes: diagnostic.notes.clone(),
+    }
 }
 
 fn diagnostic(
     files: &mut FileManager,
-    phase: &str,
-    code: &str,
+    stage: &'static str,
+    code: &'static str,
     span: Span,
     message: &impl fmt::Display,
     source_directory: &Path,
-) -> String {
+) -> CompileDiagnostic {
     let file = files.get_file(span.file_id);
-    let path = source_directory.join(&file.path);
-    let path = path.to_string_lossy();
     let message = message.to_string();
-    let available = [DiagnosticSource {
-        path: path.as_ref(),
-        source: &file.content,
-    }];
-    let primary = DiagnosticLabel {
-        source: 0,
-        range: span.start..span.end(),
-        message: &message,
-    };
-    render_diagnostic(
-        phase,
+    CompileDiagnostic {
+        stage,
         code,
-        &message,
-        &available,
-        Some(&primary),
-        &[],
-        stderr_color(),
-    )
+        message: message.clone(),
+        sources: vec![OwnedDiagnosticSource {
+            path: source_directory
+                .join(&file.path)
+                .to_string_lossy()
+                .into_owned(),
+            source: file.content.clone(),
+        }],
+        primary: Some(OwnedDiagnosticLabel {
+            source: 0,
+            range: span.start..span.end(),
+            message,
+        }),
+        related: Vec::new(),
+        help: Vec::new(),
+        notes: Vec::new(),
+    }
 }
 
 /// Keep redirected output plain while respecting the conventional overrides.

@@ -95,8 +95,12 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         Namespace::Modules,
     ] {
         for kind in [
-            IrError::Undefined { namespace },
+            IrError::Undefined {
+                name: "x".to_string(),
+                namespace,
+            },
             IrError::Duplicate {
+                name: "x".to_string(),
                 namespace,
                 previous: span,
             },
@@ -122,7 +126,10 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
             name: "math".to_string(),
             version: "1.2.3".to_string(),
         },
-        IrError::DuplicateField,
+        IrError::DuplicateField {
+            name: "x".to_string(),
+            previous: span,
+        },
         IrError::AbsentInClosed {
             shape: Shape::Struct,
             label: "x".to_string(),
@@ -131,14 +138,24 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
             shape: Shape::Struct,
         },
         IrError::Arity {
+            name: "Pair".to_string(),
             expected: 2,
             found: 1,
         },
         IrError::NotAConstructor,
-        IrError::ParameterApplied,
-        IrError::DuplicateParameter { previous: span },
+        IrError::ParameterApplied {
+            name: "f".to_string(),
+        },
+        IrError::DuplicateParameter {
+            name: "a".to_string(),
+            previous: span,
+        },
         IrError::GrowingRecursion,
-        IrError::DuplicateCase,
+        IrError::DuplicateCase {
+            shape: Shape::Sum,
+            name: "A".to_string(),
+            previous: span,
+        },
         IrError::MixedTail {
             first: Sense::Type,
             second: Sense::Cases,
@@ -161,18 +178,32 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         },
         IrError::DuplicateBinding {
             name: "x".to_string(),
+            previous: span,
         },
         IrError::ClauseInDeclaration,
-        IrError::VariableInDeclaration,
+        IrError::VariableInDeclaration {
+            name: "a".to_string(),
+        },
         IrError::HoleInDeclaration,
+        IrError::HoleInOperation,
         IrError::UnboundPresence {
             name: "c".to_string(),
         },
-        IrError::DuplicateOperation,
+        IrError::IncompatiblePresenceOwnership {
+            name: "c".to_string(),
+            previous: span,
+        },
+        IrError::DuplicateOperation {
+            name: "write".to_string(),
+            previous: span,
+        },
         IrError::NotAnOperation {
             name: "here".to_string(),
         },
-        IrError::ImpureOperation,
+        IrError::ImpureOperation {
+            found: ir::OperationTypeProblem::OpenPart,
+        },
+        IrError::EffectsOutsideRow,
         IrError::BareOperationUnavailable {
             effect: "Log".to_string(),
             suggestion: Some("write".to_string()),
@@ -195,10 +226,11 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         IrError::DuplicateArm {
             effect: "Log".to_string(),
             selector: ir::OperationSelector::Named("write".to_string()),
+            previous: span,
         },
         IrError::DuplicateReturn { previous: span },
         IrError::RaiseOutsideArm,
-        IrError::RaiseInFunction,
+        IrError::RaiseInFunction { function: span },
     ] {
         all.push(("ir", kind.code(), kind.to_string()));
     }
@@ -1014,8 +1046,7 @@ fn a_mixed_parameter_names_both_readings() {
     };
     assert_eq!(
         mixed.to_string(),
-        "this stands for a whole type in one place \
-         and for the rest of a sum's cases in another"
+        "this parameter is used as a whole type and as the rest of a sum's cases"
     );
 }
 
@@ -1136,24 +1167,25 @@ fn literal_patterns_print_as_written() {
 /// problem the sentence is not going to help with.
 #[test]
 fn an_arity_complaint_counts_in_words_as_far_as_words_go() {
-    let said = |expected, found| IrError::Arity { expected, found }.to_string();
+    let said = |expected, found| {
+        IrError::Arity {
+            name: "T".to_string(),
+            expected,
+            found,
+        }
+        .to_string()
+    };
 
-    assert_eq!(
-        said(0, 1),
-        "this type takes no arguments, and one was written"
-    );
-    assert_eq!(
-        said(1, 0),
-        "this type takes one argument, and none was written"
-    );
+    assert_eq!(said(0, 1), "`T` expects no arguments, but one was written");
+    assert_eq!(said(1, 0), "`T` expects one argument, but none was written");
     assert_eq!(
         said(2, 9),
-        "this type takes two arguments, and nine were written"
+        "`T` expects two arguments, but nine were written"
     );
     // Beyond the words, the numeral — on both sides.
     assert_eq!(
         said(10, 13),
-        "this type takes 10 arguments, and 13 were written"
+        "`T` expects 10 arguments, but 13 were written"
     );
 }
 
@@ -1872,24 +1904,45 @@ fn nothing_is_coded_as_annotation_too_open_any_more() {
 #[test]
 fn the_variable_complaints_read_as_what_went_wrong() {
     let span = Span::generated(0, 1);
+    let variable = ir::Error {
+        span,
+        kind: IrError::VariableInDeclaration {
+            name: "a".to_string(),
+        },
+    }
+    .diagnostic();
+    assert_eq!(variable.title, "`'a` is not declared in this type's header");
     assert_eq!(
-        IrError::VariableInDeclaration.to_string(),
-        "a declared type's variables are its parameters, so this one has to be \
-         written in its header; write `type T 'a = ...`"
+        variable.primary.message,
+        "this name is not one of the type's parameters"
     );
+    assert_eq!(
+        variable.help,
+        ["add `'a` to the header, or use an existing parameter"]
+    );
+
     assert_eq!(
         IrError::HoleInDeclaration.to_string(),
-        "a declared type says the same thing wherever it is used, so there is \
-         nothing here for `_` to leave open"
+        "a declared type cannot contain `_`"
     );
-    // Reworded for the new grammar: what a formula needs of a name is that a
-    // label wears it, which is the fix whether or not anything declared it.
-    assert_eq!(
-        IrError::UnboundPresence {
+    // What a formula needs of a name and how to repair it remain structured:
+    // the headline identifies the unused presence, while the label and help
+    // connect it to the `when` spelling the reader can change.
+    let unbound = ir::Error {
+        span,
+        kind: IrError::UnboundPresence {
             name: "b".to_string(),
-        }
-        .to_string(),
-        "this clause names `'b`, but no `when` in the type beside it gives it a label"
+        },
+    }
+    .diagnostic();
+    assert_eq!(unbound.title, "`'b` does not control any field or case");
+    assert_eq!(
+        unbound.primary.message,
+        "used here, but no label has `when 'b`"
+    );
+    assert_eq!(
+        unbound.help,
+        ["add `when 'b` to the intended label, or correct the name"]
     );
 
     // And the three inference raises, each naming what the expression turned
@@ -1953,9 +2006,22 @@ fn the_variable_complaints_read_as_what_went_wrong() {
 #[test]
 fn the_complaints_about_a_declarations_own_labels_are_worded_once() {
     assert_eq!(IrError::EndlessFields.code(), "endless-fields");
+    let endless = ir::Error {
+        span: Span::generated(0, 1),
+        kind: IrError::EndlessFields,
+    }
+    .diagnostic();
     assert_eq!(
-        IrError::EndlessFields.to_string(),
-        "this type adds fields to itself, so it never has all of them"
+        endless.title,
+        "this recursive type adds more fields on every cycle"
+    );
+    assert_eq!(
+        endless.primary.message,
+        "the fields never reach a finite end"
+    );
+    assert_eq!(
+        endless.help,
+        ["place the recursion inside a field, or stop extending the `..` part"]
     );
 
     // The repeat is worded as what the argument does rather than as what goes
@@ -1966,18 +2032,12 @@ fn the_complaints_about_a_declarations_own_labels_are_worded_once() {
         shape: Shape::Struct,
         field: "x".to_string(),
     };
-    assert_eq!(
-        field.to_string(),
-        "this names `x`, which the struct it goes into already has"
-    );
+    assert_eq!(field.to_string(), "`x` would appear twice in this struct");
     let case = IrError::RepeatedRowField {
         shape: Shape::Sum,
         field: "A".to_string(),
     };
-    assert_eq!(
-        case.to_string(),
-        "this names `#A`, which the sum it goes into already has"
-    );
+    assert_eq!(case.to_string(), "`#A` would appear twice in this sum");
     assert_eq!(field.code(), case.code());
 }
 
@@ -1999,25 +2059,21 @@ fn a_mixed_tail_names_the_two_senses_it_was_given() {
     };
     assert_eq!(
         said(Sense::Type, Sense::Cases),
-        "this is used as the rest of a sum's cases here and as a whole type \
-         before it, and a name can only stand for one of them"
+        "one variable cannot stand for both a whole type and the rest of a sum's cases"
     );
     assert_eq!(
         said(Sense::Cases, Sense::Type),
-        "this is used as a whole type here and as the rest of a sum's cases \
-         before it, and a name can only stand for one of them"
+        "one variable cannot stand for both the rest of a sum's cases and a whole type"
     );
     // The third sense, which only a `where 'let` variable can have: a formula is
     // written about presences, so a name in one is read as a presence.
     assert_eq!(
         said(Sense::Type, Sense::Presence),
-        "this is used as a presence here and as a whole type \
-         before it, and a name can only stand for one of them"
+        "one variable cannot stand for both a whole type and a presence"
     );
     assert_eq!(
         said(Sense::Presence, Sense::Cases),
-        "this is used as the rest of a sum's cases here and as a presence \
-         before it, and a name can only stand for one of them"
+        "one variable cannot stand for both a presence and the rest of a sum's cases"
     );
 }
 
@@ -2234,31 +2290,41 @@ fn the_scoping_constraints_read_as_what_they_do() {
 /// error tests in `ir.rs` key on.
 #[test]
 fn the_pattern_complaints_say_what_was_written() {
-    let case = IrError::RefutableBinding {
-        found: ir::Refuter::Case("Some".to_string()),
+    let diagnose = |kind| {
+        ir::Error {
+            span: Span::generated(0, 1),
+            kind,
+        }
+        .diagnostic()
     };
-    assert_eq!(case.code(), "binding-can-fail");
+    let case = diagnose(IrError::RefutableBinding {
+        found: ir::Refuter::Case("Some".to_string()),
+    });
+    assert_eq!(case.code, "binding-can-fail");
     assert_eq!(
-        case.to_string(),
-        "this binding has to accept every value, but a value here might not be `#Some`"
+        case.title,
+        "this pattern can fail, but a binding must accept every value"
     );
+    assert_eq!(case.primary.message, "a value here might not be `#Some`");
+    assert_eq!(
+        case.help,
+        ["use `match` for this case or literal, or bind a name instead"]
+    );
+
     // A number is the same complaint made about the other kind of test, and
     // the same code: what went wrong is the binding either way.
-    let number = IrError::RefutableBinding {
+    let number = diagnose(IrError::RefutableBinding {
         found: ir::Refuter::Literal(ir::Literal::Natural(0)),
-    };
-    assert_eq!(number.code(), "binding-can-fail");
-    assert_eq!(
-        number.to_string(),
-        "this binding has to accept every value, but the number `0` makes it able to fail"
-    );
-    let string = IrError::RefutableBinding {
+    });
+    assert_eq!(number.code, "binding-can-fail");
+    assert_eq!(number.primary.message, "a value here might not equal `0n`");
+    let string = diagnose(IrError::RefutableBinding {
         found: ir::Refuter::Literal(ir::Literal::String("x".to_string())),
-    };
-    assert_eq!(string.code(), number.code());
+    });
+    assert_eq!(string.code, number.code);
     assert_eq!(
-        string.to_string(),
-        "this binding has to accept every value, but `String(\"x\")` makes it able to fail"
+        string.primary.message,
+        "a value here might not equal `\"x\"`"
     );
 
     assert_eq!(PatternError::UnreachableArm.code(), "unreachable-arm");
@@ -2325,9 +2391,10 @@ fn the_pattern_complaints_say_what_was_written() {
 
     let bound = IrError::DuplicateBinding {
         name: "x".to_string(),
+        previous: Span::generated(0, 1),
     };
     assert_eq!(bound.code(), "duplicate-binding");
-    assert_eq!(bound.to_string(), "this binds `x` twice");
+    assert_eq!(bound.to_string(), "this pattern binds `x` more than once");
 }
 
 /// Every shape a witness takes, rendered: numbers as themselves, tags bare
@@ -2749,36 +2816,39 @@ fn the_effect_complaints_are_read_in_effects() {
             IrError::NotAnOperation {
                 name: "here".to_string(),
             },
-            "an operation must be a function: write `here : Nat -> ()`",
+            "`here` is not a function",
         ),
         (
-            IrError::ImpureOperation,
-            "an operation's signature must be plain; `+`, `..` and `when` belong in annotations",
+            IrError::ImpureOperation {
+                found: ir::OperationTypeProblem::OpenPart,
+            },
+            "an operation must have one fixed function type",
         ),
         (
             IrError::OperationOnAlias {
                 effect: "Console".to_string(),
             },
-            "an alias names effects and declares no operations, so `!Console` has none to perform",
+            "effect alias `!Console` declares no operations",
         ),
         (
             IrError::UnknownOperation {
                 effect: "Log".to_string(),
                 op: "writ".to_string(),
             },
-            "no operation `writ` on effect `!Log`",
+            "effect `!Log` has no operation `writ`",
         ),
         (
             IrError::PartialHandler {
                 effect: "Log".to_string(),
                 missing: vec!["flush".to_string()],
             },
-            "handling `!Log` needs an arm for `flush` too",
+            "this handler does not cover effect `!Log`",
         ),
         (
             IrError::DuplicateArm {
                 effect: "Log".to_string(),
                 selector: ir::OperationSelector::Named("write".to_string()),
+                previous: Span::generated(0, 1),
             },
             "duplicate arm for `!Log.write`",
         ),
@@ -2786,6 +2856,7 @@ fn the_effect_complaints_are_read_in_effects() {
             IrError::DuplicateArm {
                 effect: "Log".to_string(),
                 selector: ir::OperationSelector::Unnamed,
+                previous: Span::generated(0, 1),
             },
             "duplicate arm for `!Log`",
         ),
@@ -2793,34 +2864,82 @@ fn the_effect_complaints_are_read_in_effects() {
             IrError::DuplicateReturn {
                 previous: Span::generated(0, 1),
             },
-            "duplicate return arm",
+            "this handler has more than one `return` arm",
         ),
-        (IrError::RaiseOutsideArm, "raise belongs in a handler arm"),
+        (
+            IrError::RaiseOutsideArm,
+            "`raise` can be used only directly inside a handler arm",
+        ),
         (
             IrError::EffectsOutsideRow,
-            "effects belong on an arrow, or at a parameter a type uses as its own",
+            "effects cannot be used as a type by themselves",
         ),
         (
-            IrError::RaiseInFunction,
-            "raise may not be written inside a function: it answers the handler around it, and a function can outlive one",
+            IrError::RaiseInFunction {
+                function: Span::generated(0, 1),
+            },
+            "`raise` cannot cross a function boundary",
         ),
         (
             IrError::OpenDeclaredType {
                 shape: Shape::Effect,
             },
-            "a declared type must list its effects exactly; `..` and `when` belong in annotations",
+            "a declared type must list its effects exactly",
         ),
     ] {
         assert_eq!(kind.to_string(), message, "{}", kind.code());
     }
 
-    assert_eq!(
-        IrError::BareOperationUnavailable {
+    // Each reason an operation signature is rejected keeps the actionable
+    // detail in its label and repair rather than forcing reporters to split a
+    // headline apart.
+    let span = Span::generated(0, 1);
+    for (found, title, label, help) in [
+        (
+            ir::OperationTypeProblem::Effects,
+            "an operation signature cannot declare effects",
+            "operation calls already perform the operation's own effect",
+            "remove this `+` effect list",
+        ),
+        (
+            ir::OperationTypeProblem::OpenPart,
+            "an operation must have one fixed function type",
+            "this leaves part of the operation's type undecided",
+            "write this part explicitly; use `..` and `when` in annotations instead",
+        ),
+        (
+            ir::OperationTypeProblem::Variable("a".to_string()),
+            "`'a` is not declared by this operation",
+            "operation signatures cannot introduce type variables",
+            "replace it with a fixed type or a declared type application",
+        ),
+    ] {
+        let diagnostic = ir::Error {
+            span,
+            kind: IrError::ImpureOperation { found },
+        }
+        .diagnostic();
+        assert_eq!(diagnostic.title, title);
+        assert_eq!(diagnostic.primary.message, label);
+        assert_eq!(diagnostic.help, [help]);
+    }
+
+    let empty = ir::Error {
+        span,
+        kind: IrError::BareOperationUnavailable {
             effect: "Nil".to_string(),
             suggestion: None,
-        }
-        .to_string(),
-        "empty effect `!Nil` has no operation"
+        },
+    }
+    .diagnostic();
+    assert_eq!(empty.title, "effect `!Nil` declares no operations");
+    assert_eq!(
+        empty.primary.message,
+        "there is nothing in this effect to perform"
+    );
+    assert_eq!(
+        empty.help,
+        ["remove this performance, or declare an operation on the effect"]
     );
 
     for (kind, message) in [
@@ -2865,24 +2984,32 @@ fn the_effect_complaints_are_read_in_effects() {
 #[test]
 fn a_partial_handler_names_every_operation_with_no_arm() {
     let named = |missing: &[&str]| {
-        IrError::PartialHandler {
-            effect: "Log".to_string(),
-            missing: missing.iter().map(|name| name.to_string()).collect(),
+        ir::Error {
+            span: Span::generated(0, 1),
+            kind: IrError::PartialHandler {
+                effect: "Log".to_string(),
+                missing: missing.iter().map(|name| name.to_string()).collect(),
+            },
         }
-        .to_string()
+        .diagnostic()
     };
-    assert_eq!(
-        named(&["flush"]),
-        "handling `!Log` needs an arm for `flush` too"
-    );
-    assert_eq!(
-        named(&["flush", "close"]),
-        "handling `!Log` needs an arm for `flush` and `close` too"
-    );
-    assert_eq!(
-        named(&["flush", "close", "sync"]),
-        "handling `!Log` needs an arm for `flush`, `close` and `sync` too"
-    );
+    for (missing, listed) in [
+        (&["flush"][..], "`flush`"),
+        (&["flush", "close"][..], "`flush` and `close`"),
+        (
+            &["flush", "close", "sync"][..],
+            "`flush`, `close` and `sync`",
+        ),
+    ] {
+        let diagnostic = named(missing);
+        let arms = if missing.len() == 1 {
+            format!("an arm for {listed}")
+        } else {
+            format!("{} arms: {listed}", missing.len())
+        };
+        assert_eq!(diagnostic.primary.message, format!("missing {arms}"));
+        assert_eq!(diagnostic.help, [format!("add {arms}")]);
+    }
 }
 
 /// The one rule that widens rather than equates reads as the widening it is,
@@ -2936,6 +3063,150 @@ fn the_effect_tokens_print_as_they_were_written() {
     }
 }
 
+/// Duplicate lowering complaints retain both actionable locations: the repeat
+/// is primary and the occurrence that already stood is secondary. The variants
+/// below cover each source-level duplicate payload, including the return arm
+/// whose previous span predated the other redesigned variants.
+#[test]
+fn ir_duplicate_diagnostics_point_back_to_the_first_occurrence() {
+    let primary = Span::generated(12, 2);
+    let previous = Span::generated(3, 1);
+    let examples = [
+        (
+            IrError::DuplicateField {
+                name: "x".to_string(),
+                previous,
+            },
+            "field `x` is written more than once",
+            "written again here",
+            ui::FIRST_WRITTEN,
+        ),
+        (
+            IrError::DuplicateCase {
+                shape: Shape::Sum,
+                name: "Ready".to_string(),
+                previous,
+            },
+            "case `#Ready` is included more than once",
+            "included again here",
+            ui::FIRST_WRITTEN,
+        ),
+        (
+            IrError::DuplicateBinding {
+                name: "value".to_string(),
+                previous,
+            },
+            "this pattern binds `value` more than once",
+            "bound again here",
+            ui::FIRST_BINDING,
+        ),
+        (
+            IrError::DuplicateOperation {
+                name: "write".to_string(),
+                previous,
+            },
+            "operation `write` is declared more than once",
+            "declared again here",
+            ui::FIRST_DECLARATION,
+        ),
+        (
+            IrError::DuplicateArm {
+                effect: "Log".to_string(),
+                selector: ir::OperationSelector::Named("write".to_string()),
+                previous,
+            },
+            "duplicate arm for `!Log.write`",
+            "this operation is handled again",
+            ui::FIRST_ARM,
+        ),
+        (
+            IrError::DuplicateReturn { previous },
+            "this handler has more than one `return` arm",
+            "second return arm",
+            ui::FIRST_ARM,
+        ),
+    ];
+
+    for (kind, title, label, related_label) in examples {
+        let diagnostic = ir::Error {
+            span: primary,
+            kind,
+        }
+        .diagnostic();
+        assert_eq!(diagnostic.title, title);
+        assert_eq!(diagnostic.primary.span, primary);
+        assert_eq!(diagnostic.primary.message, label);
+        assert_eq!(
+            diagnostic.related,
+            [ui::Annotation {
+                span: previous,
+                message: related_label.to_string(),
+            }]
+        );
+    }
+}
+
+/// Headline, local explanation, and repair are separate parts of an IR
+/// diagnostic. Pin representative declaration, row, and operation failures so
+/// a reporter never has to split prose back apart to present them.
+#[test]
+fn redesigned_ir_diagnostics_expose_labels_and_help() {
+    let span = Span::generated(9, 1);
+    for (kind, title, label, help) in [
+        (
+            IrError::OpenDeclaredType { shape: Shape::Sum },
+            "a declared type must list its cases exactly",
+            "this leaves part of the declared type undecided",
+            "list every label, use one of the declaration's parameters, or move this type to an annotation",
+        ),
+        (
+            IrError::AbsentInClosed {
+                shape: Shape::Sum,
+                label: "Missing".to_string(),
+            },
+            "a type with no `..` already says `#Missing` is not there",
+            "this mark repeats what the closed type already says",
+            "remove this `\\` mark; a closed type already excludes labels it does not list",
+        ),
+        (
+            IrError::EffectsOutsideRow,
+            "effects cannot be used as a type by themselves",
+            "there is no function arrow here to carry these effects",
+            "write them after a function result, as in `Nat -> Nat + !Log`",
+        ),
+        (
+            IrError::NotAnOperation {
+                name: "write".to_string(),
+            },
+            "`write` is not a function",
+            "an operation signature must be a function type",
+            "write a signature such as `write : Nat -> ()`",
+        ),
+    ] {
+        let diagnostic = ir::Error { span, kind }.diagnostic();
+        assert_eq!(diagnostic.title, title);
+        assert_eq!(diagnostic.primary.message, label);
+        assert_eq!(diagnostic.help, [help]);
+    }
+}
+
+/// Operation signatures are declarations of a fixed interface, but a hole in
+/// one has its own identity and headline rather than borrowing the declared-
+/// type complaint.
+#[test]
+fn a_hole_in_an_operation_has_its_own_code_and_title() {
+    let diagnostic = ir::Error {
+        span: Span::generated(5, 1),
+        kind: IrError::HoleInOperation,
+    }
+    .diagnostic();
+    assert_eq!(diagnostic.code, "hole-in-operation");
+    assert_eq!(
+        diagnostic.title,
+        "an operation signature cannot contain `_`"
+    );
+}
+
 /// The two codes `ui::code` used to fold into the term namespace's. A reporter
 /// that wants to treat an undefined module differently from an undefined term
 /// should not have to re-inspect the variant to tell them apart, which is the
@@ -2943,17 +3214,19 @@ fn the_effect_tokens_print_as_they_were_written() {
 #[test]
 fn the_module_namespace_has_codes_of_its_own() {
     let undefined = IrError::Undefined {
+        name: "Math".to_string(),
         namespace: Namespace::Modules,
     };
     assert_eq!(undefined.code(), "undefined-module");
-    assert_eq!(undefined.to_string(), "undefined module");
+    assert_eq!(undefined.to_string(), "cannot find module `Math`");
 
     let duplicate = IrError::Duplicate {
+        name: "Math".to_string(),
         namespace: Namespace::Modules,
         previous: Span::generated(0, 1),
     };
     assert_eq!(duplicate.code(), "duplicate-module");
-    assert_eq!(duplicate.to_string(), "duplicate module");
+    assert_eq!(duplicate.to_string(), "`Math` is defined more than once");
 }
 
 /// The two things reading a bundle's files can refuse, worded and coded like
@@ -2961,25 +3234,45 @@ fn the_module_namespace_has_codes_of_its_own() {
 /// a reader told only "no file" still has to work out where one would have gone.
 #[test]
 fn the_bundle_phase_words_and_codes_its_refusals() {
-    let missing = BundleError::ModuleFileMissing {
-        beside: "Math.hc".to_string(),
-        inside: "Math/module.hc".to_string(),
+    let span = Span::generated(7, 4);
+    let missing = ruddy::bundle::Error {
+        span,
+        kind: BundleError::ModuleFileMissing {
+            beside: "Math.hc".to_string(),
+            inside: "Math/module.hc".to_string(),
+        },
     };
-    assert_eq!(missing.code(), "module-file-missing");
+    let diagnostic = missing.diagnostic();
+    assert_eq!(diagnostic.code, "module-file-missing");
+    assert_eq!(diagnostic.title, "this module needs a file");
+    assert_eq!(diagnostic.primary.span, span);
     assert_eq!(
-        missing.to_string(),
-        "this module has no file; create `Math.hc` or `Math/module.hc`"
+        diagnostic.primary.message,
+        "no file was found for this module"
     );
+    assert_eq!(diagnostic.help, ["create `Math.hc` or `Math/module.hc`"]);
+    assert_eq!(diagnostic.notes.len(), 1);
+    assert!(diagnostic.related.is_empty());
 
-    let ambiguous = BundleError::ModuleFileAmbiguous {
-        beside: "Math.hc".to_string(),
-        inside: "Math/module.hc".to_string(),
+    let ambiguous = ruddy::bundle::Error {
+        span,
+        kind: BundleError::ModuleFileAmbiguous {
+            beside: "Math.hc".to_string(),
+            inside: "Math/module.hc".to_string(),
+        },
     };
-    assert_eq!(ambiguous.code(), "module-file-ambiguous");
+    let diagnostic = ambiguous.diagnostic();
+    assert_eq!(diagnostic.code, "module-file-ambiguous");
+    assert_eq!(diagnostic.title, "this module has two possible files");
     assert_eq!(
-        ambiguous.to_string(),
-        "this module has two files; delete one of `Math.hc` or `Math/module.hc`"
+        diagnostic.primary.message,
+        "Ruddy cannot choose which file defines this module"
     );
+    assert_eq!(
+        diagnostic.help,
+        ["keep one of `Math.hc` or `Math/module.hc` and delete the other"]
+    );
+    assert_eq!(diagnostic.notes.len(), 1);
 }
 
 /// The tokens the module grammar added print as the lexemes they were written

@@ -38,8 +38,10 @@ const DIRECTORY_FILE: &str = "module";
 /// lists a directory — an orphan `.hc` file no module declares is ignored — and
 /// nothing writes.
 pub trait Files {
-    /// The contents of `path`, relative to the bundle root's directory and
-    /// always `/`-separated, or `None` when there is no such file.
+    /// The contents of `path` in the caller's logical source tree, always
+    /// `/`-separated, or `None` when there is no such file. Module files use
+    /// the same coordinate space as the configured root: a root at
+    /// `src/main.hc` looks for `src/Math.hc`.
     fn read(&self, path: &str) -> Option<String>;
 }
 
@@ -57,7 +59,7 @@ pub struct Disk {
 #[derive(Debug, Clone)]
 pub struct Loaded {
     pub id: FileID,
-    /// The path it was read from, relative to the bundle root's directory.
+    /// The path it was read from in the [`Files`] coordinate space.
     pub path: String,
     pub tokens: Vec<Token>,
     pub lex_errors: Vec<token::Error>,
@@ -104,11 +106,15 @@ pub enum ErrorKind {
 struct Loader<'a> {
     files: &'a mut FileManager,
     fs: &'a dyn Files,
+    /// Directory of the configured root, including its trailing `/`. Module
+    /// paths are relative to this point even when the caller names the root as
+    /// `src/main.hc` rather than rooting its [`Files`] there first.
+    directory: String,
     out: Output,
 }
 
 impl Disk {
-    /// Rooted at the directory holding the bundle's root file.
+    /// Rooted at the base directory paths passed to [`Files::read`] use.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
@@ -159,6 +165,9 @@ pub fn load(files: &mut FileManager, fs: &dyn Files, root: &str) -> Output {
     let mut loader = Loader {
         files,
         fs,
+        directory: root
+            .rsplit_once('/')
+            .map_or_else(String::new, |(directory, _)| format!("{directory}/")),
         out: Output {
             stmts: Vec::new(),
             loaded: Vec::new(),
@@ -236,8 +245,12 @@ impl Loader<'_> {
     /// their own, reported at the declaration, and each leaves the module with
     /// an empty body so the rest of the bundle still loads.
     fn body(&mut self, at: Span, path: &[String]) -> Vec<Stmt> {
-        let beside = format!("{}.{EXTENSION}", path.join("/"));
-        let inside = format!("{}/{DIRECTORY_FILE}.{EXTENSION}", path.join("/"));
+        let beside = format!("{}{}.{EXTENSION}", self.directory, path.join("/"));
+        let inside = format!(
+            "{}{}/{DIRECTORY_FILE}.{EXTENSION}",
+            self.directory,
+            path.join("/")
+        );
         // A repeated file-module declaration is already an error in lowering,
         // but its body must not be spliced a second time: the repeated copy
         // would turn every declaration in the file into a spurious duplicate.

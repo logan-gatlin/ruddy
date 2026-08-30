@@ -254,6 +254,11 @@ pub struct Diagnostic {
     pub help: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
+    /// A dependency compiler report may quote files outside the active editor
+    /// bundle. Keep it server-side so the Errors tab can render that source
+    /// without adding external files to the browser's editable file list.
+    #[serde(skip)]
+    pub report: Option<ruddy_cli::CompileDiagnostic>,
     pub span: Option<Loc>,
     /// Secondary spans, e.g. the first definition a duplicate repeats.
     #[serde(skip_serializing_if = "Vec::is_empty")]

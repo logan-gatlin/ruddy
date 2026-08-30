@@ -5,8 +5,9 @@ use ruddy::{
     artifact as a, inference,
     ir::{
         Annotation, ClauseKind, DependencyImport, Effect, ErrorKind, ExternTypeKind, Field,
-        OperationSelector, Output, PatternKind, PresenceOwnership, SumCase, Term, TermKind,
-        TypeField, TypeKind, build, build_with_dependencies, build_with_dependency_imports,
+        OperationSelector, OperationTypeProblem, Output, PatternKind, PresenceOwnership, SumCase,
+        Term, TermKind, TypeField, TypeKind, build, build_with_dependencies,
+        build_with_dependency_imports,
     },
     parse,
     symbol::{Bundle, Mint, Namespace, Symbol, Version},
@@ -389,8 +390,9 @@ fn a_quoted_projection_lowers_to_its_decoded_label() {
     assert!(matches!(
         out.errors[0].kind,
         ErrorKind::Undefined {
-            namespace: Namespace::Terms
-        }
+            ref name,
+            namespace: Namespace::Terms,
+        } if name == "q"
     ));
 }
 
@@ -428,8 +430,9 @@ fn an_ascription_resolves_in_the_type_namespace() {
     assert!(matches!(
         out.errors[0].kind,
         ErrorKind::Undefined {
-            namespace: Namespace::Types
-        }
+            ref name,
+            namespace: Namespace::Types,
+        } if name == "T"
     ));
 
     // A `type` declaration carries no annotation, and a `let` without one
@@ -578,8 +581,9 @@ fn a_name_defined_nowhere_is_still_undefined() {
     assert!(matches!(
         out.errors[0].kind,
         ErrorKind::Undefined {
-            namespace: Namespace::Terms
-        }
+            ref name,
+            namespace: Namespace::Terms,
+        } if name == "nope"
     ));
 }
 
@@ -630,9 +634,10 @@ fn duplicate_definitions_keep_the_first() {
     assert!(matches!(
         out.errors[0].kind,
         ErrorKind::Duplicate {
+            ref name,
             namespace: Namespace::Terms,
             previous,
-        } if previous.start == 4
+        } if name == "x" && previous.start == 4
     ));
 
     // One symbol, and it still holds the first definition's body.
@@ -657,7 +662,8 @@ fn duplicate_definitions_keep_the_first() {
     assert!(matches!(
         out.errors[1].kind,
         ErrorKind::Undefined {
-            namespace: Namespace::Terms
+            namespace: Namespace::Terms,
+            ..
         }
     ));
 }
@@ -669,7 +675,8 @@ fn namespaces_do_not_leak() {
     assert!(matches!(
         out.errors[0].kind,
         ErrorKind::Undefined {
-            namespace: Namespace::Terms
+            namespace: Namespace::Terms,
+            ..
         }
     ));
 
@@ -678,7 +685,8 @@ fn namespaces_do_not_leak() {
     assert!(matches!(
         out.errors[0].kind,
         ErrorKind::Undefined {
-            namespace: Namespace::Types
+            namespace: Namespace::Types,
+            ..
         }
     ));
 }
@@ -758,12 +766,17 @@ fn quoted_fields_lower_to_decoded_keys_and_render_canonically() {
 
 #[test]
 fn duplicate_term_fields_are_rejected() {
-    let (mint, out) = build_src("let p = fn a b => { x: a, x: b }");
+    let src = "let p = fn a b => { x: a, x: b }";
+    let (mint, out) = build_src(src);
 
     // Reported at the offending repeat, not at the first occurrence.
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
     assert_eq!(out.errors[0].span.start, 26);
-    assert!(matches!(out.errors[0].kind, ErrorKind::DuplicateField));
+    assert!(matches!(
+        &out.errors[0].kind,
+        ErrorKind::DuplicateField { name, previous }
+            if name == "x" && previous.start == src.find("x: a").expect("the first")
+    ));
 
     // The first occurrence is the one that survives.
     let fields = term_fields(&mint, &out, "p");
@@ -780,7 +793,11 @@ fn bare_numeric_and_quoted_canonical_labels_are_duplicates() {
     ] {
         let (_, out) = build_src(src);
         assert_eq!(out.errors.len(), 1, "errors for {src:?}: {:#?}", out.errors);
-        assert!(matches!(out.errors[0].kind, ErrorKind::DuplicateField));
+        assert!(matches!(
+            &out.errors[0].kind,
+            ErrorKind::DuplicateField { name, previous }
+                if name == "1" && previous.start == src.find("001").expect("the first")
+        ));
         assert_eq!(
             out.errors[0].span.start,
             src.rfind("\"1\"").expect("the duplicate")
@@ -799,7 +816,11 @@ fn duplicate_type_fields_are_rejected() {
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
 
     // Reported at the offending repeat, not at the first occurrence.
-    assert!(matches!(out.errors[0].kind, ErrorKind::DuplicateField));
+    assert!(matches!(
+        &out.errors[0].kind,
+        ErrorKind::DuplicateField { name, previous }
+            if name == "a" && previous.start == src.find("a: A").expect("the first")
+    ));
     assert_eq!(
         out.errors[0].span.start,
         src.rfind("a: B").expect("the repeat")
@@ -822,7 +843,11 @@ fn duplicate_type_fields_are_rejected() {
     let src = "let f : { a when 'a: Nat, a: Nat } -> Nat = fn p => p.a";
     let (mint, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
-    assert!(matches!(out.errors[0].kind, ErrorKind::DuplicateField));
+    assert!(matches!(
+        &out.errors[0].kind,
+        ErrorKind::DuplicateField { name, previous }
+            if name == "a" && previous.start == src.find("a when").expect("the first")
+    ));
     assert_eq!(
         out.errors[0].span.start,
         src.rfind("a: Nat").expect("the repeat")
@@ -894,8 +919,14 @@ fn a_declared_type_must_be_closed() {
 
 #[test]
 fn duplicate_fields_are_rejected_when_nested() {
-    let (_, out) = build_src("let p = fn a b => { outer: { y: a, y: b } }");
+    let src = "let p = fn a b => { outer: { y: a, y: b } }";
+    let (_, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
+    assert!(matches!(
+        &out.errors[0].kind,
+        ErrorKind::DuplicateField { name, previous }
+            if name == "y" && previous.start == src.find("y: a").expect("the first")
+    ));
 }
 
 #[test]
@@ -938,8 +969,9 @@ fn a_parameter_is_out_of_scope_outside_its_declaration() {
             .filter(|error| matches!(
                 error.kind,
                 ErrorKind::Undefined {
-                    namespace: Namespace::Types
-                }
+                    ref name,
+                    namespace: Namespace::Types,
+                } if name == "A"
             ))
             .count(),
         1,
@@ -991,7 +1023,7 @@ fn a_type_takes_the_arguments_it_declares() {
         assert!(
             out.errors.iter().any(|error| matches!(
                 error.kind,
-                ErrorKind::Arity { expected: e, found: f } if e == expected && f == found
+                ErrorKind::Arity { expected: e, found: f, .. } if e == expected && f == found
             )),
             "{src}: {:#?}",
             out.errors
@@ -1061,7 +1093,8 @@ fn only_a_declared_type_can_be_applied() {
             error.kind,
             ErrorKind::Arity {
                 expected: 0,
-                found: 1
+                found: 1,
+                ..
             }
         )),
         "errors: {:#?}",
@@ -1128,9 +1161,10 @@ fn separate_recursive_groups_do_not_restrict_each_other() {
 fn a_parameter_may_not_be_applied() {
     let (_, out) = build_src("type Flip 'f 'a = 'f 'a");
     assert!(
-        out.errors
-            .iter()
-            .any(|error| matches!(error.kind, ErrorKind::ParameterApplied)),
+        out.errors.iter().any(|error| matches!(
+            error.kind,
+            ErrorKind::ParameterApplied { ref name } if name == "f"
+        )),
         "errors: {:#?}",
         out.errors
     );
@@ -1140,9 +1174,10 @@ fn a_parameter_may_not_be_applied() {
 fn a_declaration_binds_each_parameter_once() {
     let (_, out) = build_src("type Pair 'A 'A = { a: 'A }");
     assert!(
-        out.errors
-            .iter()
-            .any(|error| matches!(error.kind, ErrorKind::DuplicateParameter { .. })),
+        out.errors.iter().any(|error| matches!(
+            error.kind,
+            ErrorKind::DuplicateParameter { ref name, .. } if name == "A"
+        )),
         "errors: {:#?}",
         out.errors
     );
@@ -1157,7 +1192,7 @@ fn a_repeated_parameter_is_not_counted_twice() {
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert!(matches!(
         out.errors[0].kind,
-        ErrorKind::DuplicateParameter { .. }
+        ErrorKind::DuplicateParameter { ref name, .. } if name == "A"
     ));
 
     let decl = &out.program.types[&type_symbol(&mint, &out, "P")];
@@ -1602,9 +1637,10 @@ fn a_declaration_is_open_only_through_a_parameter() {
     for src in ["type T = { x: Nat, ..'r }", "type T 'a = { x: Nat, ..'r }"] {
         let (_, out) = build_src(src);
         assert!(
-            out.errors
-                .iter()
-                .any(|error| matches!(error.kind, ErrorKind::VariableInDeclaration)),
+            out.errors.iter().any(|error| matches!(
+                error.kind,
+                ErrorKind::VariableInDeclaration { ref name } if name == "r"
+            )),
             "{src}: {:#?}",
             out.errors
         );
@@ -1723,9 +1759,14 @@ fn lowers_a_tag() {
 /// same rule a struct's fields keep, worded as the case it is about.
 #[test]
 fn a_repeated_case_is_reported_once() {
-    let (mint, out) = build_src("type T = #A Nat | #A Nat");
+    let src = "type T = #A Nat | #A Nat";
+    let (mint, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
-    assert!(matches!(out.errors[0].kind, ErrorKind::DuplicateCase));
+    assert!(matches!(
+        &out.errors[0].kind,
+        ErrorKind::DuplicateCase { name, previous, .. }
+            if name == "A" && previous.start == src.find("#A").expect("the first")
+    ));
     // The first occurrence is the one that stands.
     let decl = &out.program.types[&type_symbol(&mint, &out, "T")];
     let TypeKind::Sum { cases, .. } = &decl.value.tracked else {
@@ -1786,7 +1827,11 @@ fn bare_and_quoted_labels_are_duplicates() {
     ] {
         let (_, out) = build_src(src);
         assert_eq!(out.errors.len(), 1, "{src:?}: {:#?}", out.errors);
-        assert!(matches!(out.errors[0].kind, ErrorKind::DuplicateField));
+        assert!(matches!(
+            &out.errors[0].kind,
+            ErrorKind::DuplicateField { name, previous }
+                if name == "same" && previous.start == src.find("same").expect("the first")
+        ));
         assert_eq!(
             out.errors[0].span.start,
             src.rfind(r###""same""###).unwrap()
@@ -1796,7 +1841,11 @@ fn bare_and_quoted_labels_are_duplicates() {
     let src = r###"type T = #Same Nat | #"Same" Nat"###;
     let (_, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
-    assert!(matches!(out.errors[0].kind, ErrorKind::DuplicateCase));
+    assert!(matches!(
+        &out.errors[0].kind,
+        ErrorKind::DuplicateCase { name, previous, .. }
+            if name == "Same" && previous.start == src.find("#Same").expect("the first")
+    ));
     assert_eq!(
         out.errors[0].span.start,
         src.rfind(r###"#"Same""###).unwrap()
@@ -2036,9 +2085,10 @@ fn duplicate_type_declarations_keep_the_first() {
         matches!(
             out.errors[0].kind,
             ErrorKind::Duplicate {
+                ref name,
                 namespace: Namespace::Types,
                 previous,
-            } if previous.start == 5
+            } if name == "T" && previous.start == 5
         ),
         "{:#?}",
         out.errors
@@ -2067,8 +2117,9 @@ fn applying_an_undeclared_name_is_an_undefined_type() {
         matches!(
             out.errors[0].kind,
             ErrorKind::Undefined {
-                namespace: Namespace::Types
-            }
+                ref name,
+                namespace: Namespace::Types,
+            } if name == "Missing"
         ),
         "{:#?}",
         out.errors
@@ -2082,7 +2133,8 @@ fn applying_an_undeclared_name_is_an_undefined_type() {
             out.errors[0].kind,
             ErrorKind::Arity {
                 expected: 0,
-                found: 1
+                found: 1,
+                ..
             }
         ),
         "{:#?}",
@@ -2122,8 +2174,9 @@ fn an_erroneous_row_argument_absorbs() {
         matches!(
             out.errors[0].kind,
             ErrorKind::Undefined {
-                namespace: Namespace::Types
-            }
+                ref name,
+                namespace: Namespace::Types,
+            } if name == "Missing"
         ),
         "{:#?}",
         out.errors
@@ -2414,8 +2467,9 @@ fn a_nested_let_releases_its_name_after_the_body() {
     assert!(matches!(
         out.errors[0].kind,
         ErrorKind::Undefined {
-            namespace: Namespace::Terms
-        }
+            ref name,
+            namespace: Namespace::Terms,
+        } if name == "n"
     ));
     assert_eq!(out.errors[0].span.start, src.rfind('n').expect("the use"));
     assert!(matches!(term_value(&mint, &out, "after"), TermKind::Error));
@@ -2451,8 +2505,9 @@ fn two_nested_lets_cannot_name_each_other() {
     assert!(matches!(
         out.errors[0].kind,
         ErrorKind::Undefined {
-            namespace: Namespace::Terms
-        }
+            ref name,
+            namespace: Namespace::Terms,
+        } if name == "b"
     ));
     assert_eq!(out.errors[0].span.start, src.find("b in").expect("the use"));
 }
@@ -2684,7 +2739,7 @@ fn an_absent_label_needs_a_tail() {
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
     assert!(matches!(
         out.errors[0].kind,
-        ErrorKind::VariableInDeclaration
+        ErrorKind::VariableInDeclaration { ref name } if name == "r"
     ));
 
     // And a closed declaration gets the same complaint an annotation does.
@@ -2701,15 +2756,19 @@ fn an_absent_label_needs_a_tail() {
 /// occurrence is the one that survives.
 #[test]
 fn a_label_named_present_and_absent_is_a_duplicate() {
-    for (src, second) in [
-        ("let x : { x: Nat, \\x, .. } = 1n", "\\x"),
-        ("let x : { \\x, x: Nat, .. } = 1n", "x: Nat"),
-        ("let x : { \\x, \\x, .. } = 1n", "\\x"),
+    for (src, first, second) in [
+        ("let x : { x: Nat, \\x, .. } = 1n", "x: Nat", "\\x"),
+        ("let x : { \\x, x: Nat, .. } = 1n", "\\x", "x: Nat"),
+        ("let x : { \\x, \\x, .. } = 1n", "\\x", "\\x"),
     ] {
         let (_, out) = build_src(src);
         assert_eq!(out.errors.len(), 1, "{src}: {:#?}", out.errors);
         assert!(
-            matches!(out.errors[0].kind, ErrorKind::DuplicateField),
+            matches!(
+                &out.errors[0].kind,
+                ErrorKind::DuplicateField { name, previous }
+                    if name == "x" && previous.start == src.find(first).expect("the first mention")
+            ),
             "{src}: {:#?}",
             out.errors
         );
@@ -2723,7 +2782,11 @@ fn a_label_named_present_and_absent_is_a_duplicate() {
     let src = "let x : #A | \\#A | .. = 1n";
     let (_, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
-    assert!(matches!(out.errors[0].kind, ErrorKind::DuplicateCase));
+    assert!(matches!(
+        &out.errors[0].kind,
+        ErrorKind::DuplicateCase { name, previous, .. }
+            if name == "A" && previous.start == src.find("#A").expect("the first mention")
+    ));
     assert_eq!(
         out.errors[0].span.start,
         src.find("\\#A").expect("the second mention")
@@ -3912,19 +3975,58 @@ fn an_effect_declaration_is_held_to_its_form() {
         codes_of("effect Log = { write: Nat -> (), write: () -> () }"),
         ["duplicate-operation"]
     );
-    assert_eq!(
-        codes_of("effect IO = { print: Nat -> () }\neffect Log = { w: Nat -> () + !IO }"),
-        ["impure-operation"]
-    );
-    // The three an operation's signature may not leave open are one complaint,
-    // because one sentence naming all three is what a reader can act on.
+    let source = "effect IO = { print: Nat -> () }\neffect Log = { w: Nat -> () + !IO }";
+    let (_, out) = build_src(source);
+    assert!(matches!(
+        out.errors.as_slice(),
+        [error]
+            if matches!(
+                error.kind,
+                ErrorKind::ImpureOperation {
+                    found: OperationTypeProblem::Effects,
+                }
+            )
+    ));
+
+    // A bare tail or a conditional field leaves part of the signature open.
     for source in [
         "effect Log = { w: { x: Nat, .. } -> () }",
         "effect Log = { w: { x when 'a: Nat } -> () }",
-        "effect Log = { w: Nat -> (#A | ..'r) }",
     ] {
-        assert_eq!(codes_of(source), ["impure-operation"], "{source}");
+        let (_, out) = build_src(source);
+        assert!(
+            matches!(
+                out.errors.as_slice(),
+                [error]
+                    if matches!(
+                        error.kind,
+                        ErrorKind::ImpureOperation {
+                            found: OperationTypeProblem::OpenPart,
+                        }
+                    )
+            ),
+            "{source}: {:#?}",
+            out.errors
+        );
     }
+
+    // A named tail is a variable an operation declaration cannot bind.
+    let source = "effect Log = { w: Nat -> (#A | ..'r) }";
+    let (_, out) = build_src(source);
+    assert!(
+        matches!(
+            out.errors.as_slice(),
+            [error]
+                if matches!(
+                    error.kind,
+                    ErrorKind::ImpureOperation {
+                        found: OperationTypeProblem::Variable(ref name),
+                    } if name == "r"
+                )
+        ),
+        "{source}: {:#?}",
+        out.errors
+    );
     // A repeated effect name is a duplicate like any other, in its own
     // namespace.
     let out = build_src("effect Log\neffect Log").1;
@@ -3932,9 +4034,10 @@ fn an_effect_declaration_is_held_to_its_form() {
     assert!(matches!(
         out.errors[0].kind,
         ErrorKind::Duplicate {
+            ref name,
             namespace: Namespace::Effects,
             ..
-        }
+        } if name == "Log"
     ));
 }
 
@@ -4053,10 +4156,13 @@ fn a_handler_must_cover_every_effect_it_names() {
         panic!("{:#?}", out.errors);
     };
     assert_eq!(error.kind.code(), "partial-handler");
+    let diagnostic = error.diagnostic();
     assert_eq!(
-        error.kind.to_string(),
-        "handling `!Log` needs an arm for `flush` too"
+        diagnostic.title,
+        "this handler does not cover effect `!Log`"
     );
+    assert_eq!(diagnostic.primary.message, "missing an arm for `flush`");
+    assert_eq!(diagnostic.help, ["add an arm for `flush`"]);
     assert!(matches!(
         error.kind,
         ErrorKind::PartialHandler { ref missing, .. } if missing == &["flush".to_string()]
@@ -4270,20 +4376,22 @@ fn a_declared_effect_row_must_be_closed() {
             out.errors[0].kind
         );
     }
+    let out = build_src(&format!("{base}type T = Nat -> Nat + ..")).1;
+    let diagnostic = out.errors[0].diagnostic();
     assert_eq!(
-        out_message(&format!("{base}type T = Nat -> Nat + ..")),
-        "a declared type must list its effects exactly; `..` and `when` belong in annotations"
+        diagnostic.title,
+        "a declared type must list its effects exactly"
     );
-}
-
-/// The first complaint one source made, worded.
-fn out_message(src: &str) -> String {
-    let (_, out) = build_src(src);
-    out.errors
-        .first()
-        .unwrap_or_else(|| panic!("{src}: no complaint"))
-        .kind
-        .to_string()
+    assert_eq!(
+        diagnostic.primary.message,
+        "this leaves part of the declared type undecided"
+    );
+    assert_eq!(
+        diagnostic.help,
+        [
+            "list every label, use one of the declaration's parameters, or move this type to an annotation"
+        ]
+    );
 }
 
 /// One name is one rest, and an arrow's effects are a third thing a rest can
@@ -4305,9 +4413,18 @@ fn a_parameter_read_two_ways_names_both() {
             second: Sense::Effects
         }
     ));
+    let diagnostic = error.diagnostic();
     assert_eq!(
-        error.kind.to_string(),
-        "this stands for a whole type in one place and for the rest of an arrow's effects in another"
+        diagnostic.title,
+        "this parameter is used as a whole type and as the rest of an arrow's effects"
+    );
+    assert_eq!(
+        diagnostic.primary.message,
+        "some uses need a whole type, while others need the rest of an arrow's effects"
+    );
+    assert_eq!(
+        diagnostic.help,
+        ["use a separate parameter name for each purpose"]
     );
 
     // And a name given two rests in one *annotation* is the same mistake.
@@ -4436,7 +4553,7 @@ fn effectful_operation_signatures_compare_their_dependencies_structurally() {
     assert!(
         out.errors
             .iter()
-            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation))
+            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation { .. }))
     );
     let logs: Vec<_> = out
         .program
@@ -4502,8 +4619,9 @@ fn a_row_may_only_name_declared_effects() {
     assert!(matches!(
         out.errors[0].kind,
         ErrorKind::Undefined {
-            namespace: Namespace::Effects
-        }
+            ref name,
+            namespace: Namespace::Effects,
+        } if name == "Lg"
     ));
     assert_eq!(annotation_effects(&mint, &out, "f"), ["Log"]);
 }
@@ -4644,9 +4762,14 @@ fn an_argument_at_an_effect_parameter_has_to_be_a_row() {
             sense: Sense::Effects
         }
     ));
+    let diagnostic = error.diagnostic();
     assert_eq!(
-        error.kind.to_string(),
-        "the rest of an arrow's effects goes here, and this is not that"
+        diagnostic.title,
+        "this argument must provide the rest of an arrow's effects"
+    );
+    assert_eq!(
+        diagnostic.primary.message,
+        "this type cannot provide the rest of an arrow's effects"
     );
 
     // And a row naming what the declaration already names: the `..` covers
@@ -4656,9 +4779,18 @@ fn an_argument_at_an_effect_parameter_has_to_be_a_row() {
         panic!("{:#?}", out.errors);
     };
     assert_eq!(error.kind.code(), "repeated-row-field");
+    let diagnostic = error.diagnostic();
     assert_eq!(
-        error.kind.to_string(),
-        "this names `!Log`, which the function it goes into already has"
+        diagnostic.title,
+        "`!Log` would appear twice in this function"
+    );
+    assert_eq!(
+        diagnostic.primary.message,
+        "the declaration and this argument both provide this name"
+    );
+    assert_eq!(
+        diagnostic.help,
+        ["remove or rename the repeated field or case"]
     );
 }
 
@@ -4868,8 +5000,9 @@ fn an_undeclared_name_is_undefined_wherever_it_is_used() {
             matches!(
                 error.kind,
                 ErrorKind::Undefined {
-                    namespace: Namespace::Types
-                }
+                    ref name,
+                    namespace: Namespace::Types,
+                } if name == "a"
             ),
             "{src}: {:#?}",
             out.errors
@@ -5287,7 +5420,10 @@ fn a_declaration_may_declare_nothing_in_its_where() {
     let [error] = out.errors.as_slice() else {
         panic!("expected one error: {:#?}", out.errors);
     };
-    assert!(matches!(error.kind, ErrorKind::VariableInDeclaration));
+    assert!(matches!(
+        error.kind,
+        ErrorKind::VariableInDeclaration { ref name } if name == "r"
+    ));
     assert_eq!(error.span.start, src.rfind("'r").expect("the variable"));
     // The body absorbs, the way one left open through anything but a parameter
     // does: what the declaration would stand for is exactly what was refused.
@@ -5355,7 +5491,10 @@ fn a_declared_variable_may_not_be_applied() {
     let [error] = out.errors.as_slice() else {
         panic!("expected one error: {:#?}", out.errors);
     };
-    assert!(matches!(error.kind, ErrorKind::ParameterApplied));
+    assert!(matches!(
+        error.kind,
+        ErrorKind::ParameterApplied { ref name } if name == "a"
+    ));
     assert_eq!(error.span.start, src.find("'a").expect("the head"));
 }
 
@@ -5453,8 +5592,9 @@ fn a_sibling_module_is_reached_only_by_a_path() {
     assert!(matches!(
         out.errors[0].kind,
         ErrorKind::Undefined {
-            namespace: Namespace::Terms
-        }
+            ref name,
+            namespace: Namespace::Terms,
+        } if name == "x"
     ));
 }
 
@@ -5499,12 +5639,14 @@ fn a_repeated_module_is_a_duplicate() {
     let (_, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     let ErrorKind::Duplicate {
+        ref name,
         namespace,
         previous,
     } = out.errors[0].kind
     else {
         panic!("expected a duplicate: {:#?}", out.errors);
     };
+    assert_eq!(name, "A");
     assert_eq!(namespace, Namespace::Modules);
     assert_eq!(
         out.errors[0].span.start,
@@ -5529,8 +5671,9 @@ fn an_undefined_first_segment_is_reported_at_the_segment() {
     assert!(matches!(
         out.errors[0].kind,
         ErrorKind::Undefined {
-            namespace: Namespace::Modules
-        }
+            ref name,
+            namespace: Namespace::Modules,
+        } if name == "Nope"
     ));
     assert_eq!(
         out.errors[0].span.start,
@@ -5550,8 +5693,9 @@ fn a_later_segment_does_not_walk_outward() {
     assert!(matches!(
         out.errors[0].kind,
         ErrorKind::Undefined {
-            namespace: Namespace::Modules
-        }
+            ref name,
+            namespace: Namespace::Modules,
+        } if name == "Outer"
     ));
     assert_eq!(
         out.errors[0].span.start,
@@ -5571,8 +5715,9 @@ fn an_undefined_segment_in_a_type_is_reported_once() {
             matches!(
                 out.errors[0].kind,
                 ErrorKind::Undefined {
-                    namespace: Namespace::Modules
-                }
+                    ref name,
+                    namespace: Namespace::Modules,
+                } if name == "Nope"
             ),
             "{src:?}: {:#?}",
             out.errors[0].kind
@@ -5595,20 +5740,23 @@ fn an_undefined_final_name_is_reported_in_its_own_namespace() {
             "module M = end\nlet a = M::missing",
             Namespace::Terms,
             "missing",
+            "missing",
         ),
         (
             "module M = end\ntype T = M::Missing",
             Namespace::Types,
             "Missing",
+            "Missing",
         ),
         (
             "module M = end\nlet f : () -> Nat + M::!Log = fn _ => 0n",
             Namespace::Effects,
+            "Log",
             // A label's span wears its sigil, the way every other label's does.
             "!Log",
         ),
     ];
-    for (src, namespace, at) in cases {
+    for (src, namespace, name, at) in cases {
         let (_, out) = build_src(src);
         let undefined: Vec<_> = out
             .errors
@@ -5617,7 +5765,11 @@ fn an_undefined_final_name_is_reported_in_its_own_namespace() {
             .collect();
         assert_eq!(undefined.len(), 1, "{src:?}: {:#?}", out.errors);
         assert!(
-            matches!(undefined[0].kind, ErrorKind::Undefined { namespace: found } if found == namespace),
+            matches!(
+                undefined[0].kind,
+                ErrorKind::Undefined { name: ref found, namespace: found_namespace }
+                    if found == name && found_namespace == namespace
+            ),
             "{src:?}: {:#?}",
             undefined[0].kind
         );
@@ -5680,8 +5832,9 @@ fn a_path_never_reaches_a_primitive() {
             matches!(
                 out.errors[0].kind,
                 ErrorKind::Undefined {
-                    namespace: Namespace::Types
-                }
+                    ref name,
+                    namespace: Namespace::Types,
+                } if name == "Nat"
             ),
             "{src:?}: {:#?}",
             out.errors[0].kind
@@ -5699,8 +5852,9 @@ fn a_module_with_no_body_is_declared_and_empty() {
     assert!(matches!(
         out.errors[0].kind,
         ErrorKind::Undefined {
-            namespace: Namespace::Terms
-        }
+            ref name,
+            namespace: Namespace::Terms,
+        } if name == "x"
     ));
     assert!(
         mint.symbols()
@@ -5939,7 +6093,8 @@ fn a_bundle_does_not_open_its_own_prelude_without_configured_std() {
         out.errors.as_slice(),
         [ruddy::ir::Error {
             kind: ErrorKind::Undefined {
-                namespace: Namespace::Terms
+                namespace: Namespace::Terms,
+                ..
             },
             ..
         }]
@@ -5954,7 +6109,8 @@ fn std_prelude_does_not_flatten_descendants_and_requires_the_source_alias() {
         out.errors.as_slice(),
         [ruddy::ir::Error {
             kind: ErrorKind::Undefined {
-                namespace: Namespace::Terms
+                namespace: Namespace::Terms,
+                ..
             },
             ..
         }]
@@ -5966,7 +6122,8 @@ fn std_prelude_does_not_flatten_descendants_and_requires_the_source_alias() {
         out.errors.as_slice(),
         [ruddy::ir::Error {
             kind: ErrorKind::Undefined {
-                namespace: Namespace::Terms
+                namespace: Namespace::Terms,
+                ..
             },
             ..
         }]
@@ -5987,7 +6144,8 @@ fn std_prelude_does_not_flatten_descendants_and_requires_the_source_alias() {
         out.errors.as_slice(),
         [ruddy::ir::Error {
             kind: ErrorKind::Undefined {
-                namespace: Namespace::Terms
+                namespace: Namespace::Terms,
+                ..
             },
             ..
         }]
@@ -6861,7 +7019,7 @@ fn recovery_signatures_keep_every_normalized_source_form_structural() {
         out.errors.iter().all(|error| {
             matches!(
                 error.kind,
-                ErrorKind::ImpureOperation
+                ErrorKind::ImpureOperation { .. }
                     | ErrorKind::RepeatedRowField {
                         shape: Shape::Effect,
                         ..
@@ -7090,7 +7248,7 @@ fn imported_presence_variables_keep_alpha_correlation_in_effect_identity() {
     assert!(
         out.errors
             .iter()
-            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation)),
+            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation { .. })),
         "{:#?}",
         out.errors
     );
@@ -7122,7 +7280,7 @@ fn effect_identity_alpha_normalizes_presence_variables_and_keeps_correlation() {
     assert!(
         out.errors
             .iter()
-            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation)),
+            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation { .. })),
         "{:#?}",
         out.errors
     );
@@ -7293,7 +7451,7 @@ fn effect_identity_uses_compact_exact_backreferences_for_branching_and_recursion
     assert!(
         out.errors
             .iter()
-            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation)),
+            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation { .. })),
         "{:#?}",
         out.errors
     );
@@ -7365,7 +7523,7 @@ fn source_and_imported_absent_effect_payloads_have_one_identity() {
     assert!(
         out.errors
             .iter()
-            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation)),
+            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation { .. })),
         "{:#?}",
         out.errors
     );
@@ -7596,7 +7754,7 @@ fn imported_structural_identity_respects_effect_and_case_parameter_senses() {
     assert!(
         out.errors
             .iter()
-            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation)),
+            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation { .. })),
         "{:#?}",
         out.errors
     );
@@ -8179,7 +8337,7 @@ fn imported_effects_in_recovery_signatures_compare_structurally() {
     assert!(
         out.errors
             .iter()
-            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation)),
+            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation { .. })),
         "{:#?}",
         out.errors
     );
@@ -8312,7 +8470,7 @@ fn imported_declared_types_exercise_every_semantic_identity_form() {
     assert!(
         out.errors
             .iter()
-            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation)),
+            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation { .. })),
         "{:#?}",
         out.errors
     );
@@ -9723,7 +9881,7 @@ fn deep_acyclic_operation_effect_dependencies_use_a_bounded_stack() {
             assert!(
                 out.errors
                     .iter()
-                    .all(|error| matches!(error.kind, ErrorKind::ImpureOperation)),
+                    .all(|error| matches!(error.kind, ErrorKind::ImpureOperation { .. })),
                 "{:#?}",
                 out.errors
             );
@@ -9845,7 +10003,7 @@ fn imported_effect_identity_graph_is_stack_safe_and_absorbs_growing_types() {
             assert!(
                 out.errors
                     .iter()
-                    .all(|error| matches!(error.kind, ErrorKind::ImpureOperation)),
+                    .all(|error| matches!(error.kind, ErrorKind::ImpureOperation { .. })),
                 "{:#?}",
                 out.errors
             );
@@ -10260,7 +10418,7 @@ fn malformed_interfaces_cannot_collide_with_encoded_ordinary_atoms() {
     assert!(
         out.errors
             .iter()
-            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation)),
+            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation { .. })),
         "{:#?}",
         out.errors
     );
@@ -10392,7 +10550,7 @@ fn malformed_effect_keys_cannot_collide_with_encoded_unknown_atoms() {
     assert!(
         out.errors
             .iter()
-            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation)),
+            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation { .. })),
         "{:#?}",
         out.errors
     );

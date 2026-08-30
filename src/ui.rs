@@ -41,7 +41,7 @@
 //! sharing can only run in this direction: `ruddy-debug` depends on `ruddy`,
 //! and nothing may make the dependency run back.
 
-use std::{collections::HashSet, fmt};
+use std::{collections::HashSet, fmt, path::Path as FsPath};
 
 use crate::{
     bundle,
@@ -61,6 +61,12 @@ use crate::{
 /// wording because it is a second line about a second place, and only a
 /// reporter knows how to attach one.
 pub const FIRST_DEFINITION: &str = "first defined here";
+/// The earlier source item in a repeated list.
+pub const FIRST_WRITTEN: &str = "first written here";
+/// The earlier binder in a pattern.
+pub const FIRST_BINDING: &str = "first bound here";
+/// The earlier arm in a handler.
+pub const FIRST_ARM: &str = "first arm here";
 
 /// The note a clash of tails points back with, printed against the span of the
 /// `..` that decided what the name stands for. [`FIRST_DEFINITION`]'s
@@ -68,7 +74,7 @@ pub const FIRST_DEFINITION: &str = "first defined here";
 /// defined twice — see [`ir::ErrorKind::MixedTail`].
 pub const FIRST_USE: &str = "first used here";
 /// The other result boundary participating in an existential lifetime clash.
-pub const FIRST_PRODUCTION_LIFETIME: &str = "the conflicting production lifetime begins here";
+pub const FIRST_PRODUCTION_LIFETIME: &str = "another result makes a separate choice here";
 
 /// The note a repeated variable points back with, printed against the
 /// span of the declaration that stands.
@@ -285,8 +291,21 @@ impl Diagnostic {
         self
     }
 
+    fn related(mut self, span: Span, message: impl Into<String>) -> Self {
+        self.related.push(Annotation {
+            span,
+            message: message.into(),
+        });
+        self
+    }
+
     fn help(mut self, message: impl Into<String>) -> Self {
         self.help.push(message.into());
+        self
+    }
+
+    fn note(mut self, message: impl Into<String>) -> Self {
+        self.notes.push(message.into());
         self
     }
 }
@@ -913,25 +932,47 @@ impl bundle::ErrorKind {
     }
 }
 
-/// What loading could not do, in a phrase.
-///
-/// The two about a module's file name the exact paths that were looked for,
-/// because that is the whole of the fix: a reader who is told "no file" still
-/// has to work out where one would have gone, and the loader already knows.
+impl bundle::Error {
+    /// Describe a module-file failure using paths relative to the bundle root.
+    pub fn diagnostic(&self) -> Diagnostic {
+        self.diagnostic_in(FsPath::new(""))
+    }
+
+    /// Describe a module-file failure using paths relative to `directory`.
+    /// Filesystem reporters use this to name paths from the project root while
+    /// in-memory reporters keep the loader's bundle-relative spellings.
+    pub fn diagnostic_in(&self, directory: &FsPath) -> Diagnostic {
+        let path = |candidate: &str| directory.join(candidate).display().to_string();
+        let convention = "a module written without a body uses either `Name.hc` or `Name/module.hc`, and exactly one of them must exist";
+        match &self.kind {
+            bundle::ErrorKind::ModuleFileMissing { beside, inside } => {
+                Diagnostic::new(self.kind.code(), "this module needs a file", self.span)
+                    .label("no file was found for this module")
+                    .help(format!("create `{}` or `{}`", path(beside), path(inside)))
+                    .note(convention)
+            }
+            bundle::ErrorKind::ModuleFileAmbiguous { beside, inside } => Diagnostic::new(
+                self.kind.code(),
+                "this module has two possible files",
+                self.span,
+            )
+            .label("Ruddy cannot choose which file defines this module")
+            .help(format!(
+                "keep one of `{}` or `{}` and delete the other",
+                path(beside),
+                path(inside)
+            ))
+            .note(convention),
+        }
+    }
+}
+
 impl fmt::Display for bundle::ErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            bundle::ErrorKind::ModuleFileMissing { beside, inside } => write!(
-                f,
-                "this module has no file; create `{beside}` or `{inside}`",
-            ),
-            // Which of the two was meant is not the compiler's to guess, so it
-            // says what to delete rather than which one it took.
-            bundle::ErrorKind::ModuleFileAmbiguous { beside, inside } => write!(
-                f,
-                "this module has two files; delete one of `{beside}` or `{inside}`",
-            ),
-        }
+        f.write_str(match self {
+            bundle::ErrorKind::ModuleFileMissing { .. } => "this module needs a file",
+            bundle::ErrorKind::ModuleFileAmbiguous { .. } => "this module has two possible files",
+        })
     }
 }
 
@@ -945,7 +986,7 @@ impl ir::ErrorKind {
             ir::ErrorKind::InvalidDependencyAlias { .. } => "invalid-dependency-alias",
             ir::ErrorKind::DuplicateDependencyAlias { .. } => "duplicate-dependency-alias",
             ir::ErrorKind::DuplicateDependency { .. } => "duplicate-dependency",
-            ir::ErrorKind::Undefined { namespace } => match namespace {
+            ir::ErrorKind::Undefined { namespace, .. } => match namespace {
                 Namespace::Types => "undefined-type",
                 Namespace::Effects => "undefined-effect",
                 Namespace::Modules => "undefined-module",
@@ -957,7 +998,7 @@ impl ir::ErrorKind {
                 Namespace::Modules => "duplicate-module",
                 Namespace::Terms => "duplicate-term",
             },
-            ir::ErrorKind::DuplicateField => "duplicate-field",
+            ir::ErrorKind::DuplicateField { .. } => "duplicate-field",
             // The shape is not part of the code, for the reason a repeated row
             // field's is not: the wording quotes the label the way it was
             // written, and that already says which kind of row it sits in.
@@ -971,8 +1012,9 @@ impl ir::ErrorKind {
             },
             ir::ErrorKind::OpenDeclaredType { .. } => "open-declared-type",
             ir::ErrorKind::ClauseInDeclaration => "declared-where-clause",
-            ir::ErrorKind::VariableInDeclaration => "variable-in-declaration",
+            ir::ErrorKind::VariableInDeclaration { .. } => "variable-in-declaration",
             ir::ErrorKind::HoleInDeclaration => "hole-in-declaration",
+            ir::ErrorKind::HoleInOperation => "hole-in-operation",
             // The name is not part of the code, only of the wording: what went
             // wrong is that the clause names something no label wears, and
             // which name it was is the span's to show. The two below say the
@@ -983,10 +1025,10 @@ impl ir::ErrorKind {
             }
             ir::ErrorKind::Arity { .. } => "wrong-argument-count",
             ir::ErrorKind::NotAConstructor => "not-a-type-constructor",
-            ir::ErrorKind::ParameterApplied => "applied-parameter",
+            ir::ErrorKind::ParameterApplied { .. } => "applied-parameter",
             ir::ErrorKind::DuplicateParameter { .. } => "duplicate-parameter",
             ir::ErrorKind::GrowingRecursion => "growing-recursion",
-            ir::ErrorKind::DuplicateCase => "duplicate-case",
+            ir::ErrorKind::DuplicateCase { .. } => "duplicate-case",
             // The shape is not part of these codes, only of their wording: a
             // reporter that treats a struct's row differently from a sum's is
             // reading the type, not the complaint. The namespace on
@@ -1001,9 +1043,9 @@ impl ir::ErrorKind {
             // number only points at where.
             ir::ErrorKind::RefutableBinding { .. } => "binding-can-fail",
             ir::ErrorKind::DuplicateBinding { .. } => "duplicate-binding",
-            ir::ErrorKind::DuplicateOperation => "duplicate-operation",
+            ir::ErrorKind::DuplicateOperation { .. } => "duplicate-operation",
             ir::ErrorKind::NotAnOperation { .. } => "not-an-operation",
-            ir::ErrorKind::ImpureOperation => "impure-operation",
+            ir::ErrorKind::ImpureOperation { .. } => "impure-operation",
             ir::ErrorKind::EffectsOutsideRow => "effects-outside-row",
             ir::ErrorKind::OperationOnAlias { .. } => "operation-on-alias",
             ir::ErrorKind::UnknownOperation { .. } => "unknown-operation",
@@ -1013,241 +1055,432 @@ impl ir::ErrorKind {
             ir::ErrorKind::DuplicateArm { .. } => "duplicate-arm",
             ir::ErrorKind::DuplicateReturn { .. } => "duplicate-return-arm",
             ir::ErrorKind::RaiseOutsideArm => "raise-outside-arm",
-            ir::ErrorKind::RaiseInFunction => "raise-in-function",
+            ir::ErrorKind::RaiseInFunction { .. } => "raise-in-function",
         }
     }
 }
 
-/// What lowering could not resolve, in a phrase. [`ir::ErrorKind::Duplicate`]
-/// says nothing here about the definition it repeats, and
-/// [`ir::ErrorKind::MixedTail`] nothing about the first `..` it clashes with:
-/// each is a second span in another place, and pointing at one is layout — see
-/// [`FIRST_DEFINITION`] and [`FIRST_USE`].
+impl ir::Error {
+    /// Turn a lowering failure into reporter-independent words and annotations.
+    pub fn diagnostic(&self) -> Diagnostic {
+        use ir::ErrorKind as E;
+
+        let code = self.kind.code();
+        let span = self.span;
+        match &self.kind {
+            E::InvalidDependencyAlias { alias } => Diagnostic::new(
+                code,
+                format!("`{alias}` cannot be used as a module name"),
+                span,
+            )
+            .label("this name is not valid in Ruddy source")
+            .help("start with a letter or `_`, use only letters, digits, and `_`, and do not use a reserved word"),
+            E::DuplicateDependencyAlias { alias } => Diagnostic::new(
+                code,
+                format!("dependency alias `{alias}` was imported more than once"),
+                span,
+            )
+            .label("this alias is already in use")
+            .help("remove one import or give it a different alias"),
+            E::DuplicateDependency { name, version } => Diagnostic::new(
+                code,
+                format!("dependency `{name}@{version}` was imported more than once"),
+                span,
+            )
+            .label("this exact dependency is already imported")
+            .help("remove one of the duplicate dependencies"),
+            E::Undefined { namespace, name } => {
+                let kind = namespace_name(*namespace);
+                Diagnostic::new(code, format!("cannot find {kind} `{name}`"), span)
+                    .label(format!("no {kind} of this name is in scope"))
+            }
+            E::Duplicate {
+                namespace,
+                name,
+                previous,
+            } => {
+                let kind = namespace_name(*namespace);
+                Diagnostic::new(code, format!("`{name}` is defined more than once"), span)
+                    .label(format!("this {kind} is defined again"))
+                    .related(*previous, FIRST_DEFINITION)
+            }
+            E::DuplicateField { name, previous } => {
+                Diagnostic::new(code, format!("field `{name}` is written more than once"), span)
+                    .label("written again here")
+                    .related(*previous, FIRST_WRITTEN)
+            }
+            E::DuplicateCase {
+                shape,
+                name,
+                previous,
+            } => {
+                let name = label(*shape, name);
+                Diagnostic::new(
+                    code,
+                    format!("{} `{name}` is included more than once", noun(*shape)),
+                    span,
+                )
+                .label("included again here")
+                .related(*previous, FIRST_WRITTEN)
+            }
+            E::AbsentInClosed { shape, label: name } => Diagnostic::new(
+                code,
+                format!(
+                    "a type with no `..` already says `{}` is not there",
+                    label(*shape, name)
+                ),
+                span,
+            )
+            .label("this mark repeats what the closed type already says")
+            .help("remove this `\\` mark; a closed type already excludes labels it does not list"),
+            E::Circular { namespace } => match namespace {
+                Namespace::Types => {
+                    Diagnostic::new(code, "type defined only as another name", span)
+                        .label("following these names never reaches an actual type")
+                        .help("put a struct, sum, or arrow between the type and itself")
+                }
+                Namespace::Terms | Namespace::Effects | Namespace::Modules => Diagnostic::new(
+                    code,
+                    "this definition is never given a value of its own",
+                    span,
+                )
+                .label("following these names leads back here")
+                .help("give the definition a value instead of only another name"),
+            },
+            E::OpenDeclaredType { shape } => Diagnostic::new(
+                code,
+                format!("a declared type must list its {}s exactly", noun(*shape)),
+                span,
+            )
+            .label("this leaves part of the declared type undecided")
+            .help("list every label, use one of the declaration's parameters, or move this type to an annotation"),
+            E::ClauseInDeclaration => {
+                Diagnostic::new(code, "a declared type cannot have a `where` clause", span)
+                    .label("there is nothing in a declaration for this clause to decide")
+                    .help("move the `where` clause to an annotation")
+            }
+            E::VariableInDeclaration { name } => Diagnostic::new(
+                code,
+                format!("`'{name}` is not declared in this type's header"),
+                span,
+            )
+            .label("this name is not one of the type's parameters")
+            .help(format!("add `'{name}` to the header, or use an existing parameter")),
+            E::HoleInDeclaration => {
+                Diagnostic::new(code, "a declared type cannot contain `_`", span)
+                    .label("a declaration cannot leave its type open")
+                    .help("write the type that every use of this declaration should have")
+            }
+            E::HoleInOperation => {
+                Diagnostic::new(code, "an operation signature cannot contain `_`", span)
+                    .label("an operation must have one fixed type")
+                    .help("write the type that every call to this operation should have")
+            }
+            E::UnboundPresence { name } => Diagnostic::new(
+                code,
+                format!("`'{name}` does not control any field or case"),
+                span,
+            )
+            .label(format!("used here, but no label has `when '{name}`"))
+            .help(format!("add `when '{name}` to the intended label, or correct the name")),
+            E::IncompatiblePresenceOwnership { name, previous } => Diagnostic::new(
+                code,
+                format!("`'{name}` cannot describe choices made by two separate results"),
+                span,
+            )
+            .label("this result makes its own choice")
+            .related(*previous, FIRST_PRODUCTION_LIFETIME)
+            .help("use a different name for each result's choice"),
+            E::Arity {
+                name,
+                expected,
+                found,
+            } => Diagnostic::new(
+                code,
+                format!(
+                    "`{name}` expects {}, but {} written",
+                    arguments(*expected),
+                    supplied(*found)
+                ),
+                span,
+            )
+            .label(if found < expected {
+                "not enough arguments are supplied"
+            } else {
+                "too many arguments are supplied"
+            })
+            .help(if found < expected {
+                "add the missing type arguments"
+            } else {
+                "remove the extra type arguments"
+            }),
+            E::NotAConstructor => Diagnostic::new(
+                code,
+                "this type cannot take arguments",
+                span,
+            )
+            .label("arguments are applied here")
+            .help("apply a named type declaration that has parameters"),
+            E::ParameterApplied { name } => Diagnostic::new(
+                code,
+                format!("type parameter `'{name}` cannot take arguments"),
+                span,
+            )
+            .label("this parameter already represents one complete type")
+            .help("apply a declared type with parameters instead"),
+            E::DuplicateParameter { name, previous } => {
+                Diagnostic::new(code, format!("parameter `'{name}` is declared more than once"), span)
+                    .label("declared again here")
+                    .related(*previous, FIRST_DECLARATION)
+            }
+            E::GrowingRecursion => {
+                Diagnostic::new(code, "recursive type arguments grow without bound", span)
+                    .label("each trip around this recursion builds a larger type")
+                    .help("pass recursive parameters through unchanged, use a fixed type, or break the recursion")
+            }
+            E::MixedTail {
+                first,
+                second,
+                previous,
+            } => Diagnostic::new(
+                code,
+                format!("one variable cannot stand for both {first} and {second}"),
+                span,
+            )
+            .label(format!("used as {second} here"))
+            .related(*previous, format!("first used as {first} here"))
+            .help("use a different name for each purpose"),
+            E::MixedParameter { first, second } => Diagnostic::new(
+                code,
+                format!("this parameter is used as {first} and as {second}"),
+                span,
+            )
+            .label(format!("some uses need {first}, while others need {second}"))
+            .help("use a separate parameter name for each purpose"),
+            E::NotARow { sense } => Diagnostic::new(
+                code,
+                format!("this argument must provide {sense}"),
+                span,
+            )
+            .label(format!("this type cannot provide {sense}")),
+            E::RepeatedRowField { shape, field } => Diagnostic::new(
+                code,
+                format!(
+                    "`{}` would appear twice in this {shape}",
+                    label(*shape, field)
+                ),
+                span,
+            )
+            .label("the declaration and this argument both provide this name")
+            .help("remove or rename the repeated field or case"),
+            E::EndlessFields => {
+                Diagnostic::new(code, "this recursive type adds more fields on every cycle", span)
+                    .label("the fields never reach a finite end")
+                    .help("place the recursion inside a field, or stop extending the `..` part")
+            }
+            E::RefutableBinding { found } => {
+                let message = match found {
+                    ir::Refuter::Case(name) => {
+                        format!("a value here might not be `{}`", label(Shape::Sum, name))
+                    }
+                    ir::Refuter::Literal(value) => {
+                        format!("a value here might not equal `{}`", SourceLiteral(value))
+                    }
+                };
+                Diagnostic::new(code, "this pattern can fail, but a binding must accept every value", span)
+                    .label(message)
+                    .help("use `match` for this case or literal, or bind a name instead")
+            }
+            E::DuplicateBinding { name, previous } => {
+                Diagnostic::new(code, format!("this pattern binds `{name}` more than once"), span)
+                    .label("bound again here")
+                    .related(*previous, FIRST_BINDING)
+                    .help("rename one binding or replace it with `_`")
+            }
+            E::DuplicateOperation { name, previous } => {
+                Diagnostic::new(code, format!("operation `{name}` is declared more than once"), span)
+                    .label("declared again here")
+                    .related(*previous, FIRST_DECLARATION)
+            }
+            E::NotAnOperation { name } => {
+                Diagnostic::new(code, format!("`{name}` is not a function"), span)
+                    .label("an operation signature must be a function type")
+                    .help(format!("write a signature such as `{name} : Nat -> ()`"))
+            }
+            E::ImpureOperation { found } => match found {
+                ir::OperationTypeProblem::Effects => Diagnostic::new(
+                    code,
+                    "an operation signature cannot declare effects",
+                    span,
+                )
+                .label("operation calls already perform the operation's own effect")
+                .help("remove this `+` effect list"),
+                ir::OperationTypeProblem::OpenPart => Diagnostic::new(
+                    code,
+                    "an operation must have one fixed function type",
+                    span,
+                )
+                .label("this leaves part of the operation's type undecided")
+                .help("write this part explicitly; use `..` and `when` in annotations instead"),
+                ir::OperationTypeProblem::Variable(name) => Diagnostic::new(
+                    code,
+                    format!("`'{name}` is not declared by this operation"),
+                    span,
+                )
+                .label("operation signatures cannot introduce type variables")
+                .help("replace it with a fixed type or a declared type application"),
+            },
+            E::EffectsOutsideRow => Diagnostic::new(
+                code,
+                "effects cannot be used as a type by themselves",
+                span,
+            )
+            .label("there is no function arrow here to carry these effects")
+            .help("write them after a function result, as in `Nat -> Nat + !Log`"),
+            E::OperationOnAlias { effect } => Diagnostic::new(
+                code,
+                format!(
+                    "effect alias `{}` declares no operations",
+                    label(Shape::Effect, effect)
+                ),
+                span,
+            )
+            .label("an alias groups effects but declares no operation of its own")
+            .help("perform an operation from one of the concrete effects named by the alias"),
+            E::UnknownOperation { effect, op } => Diagnostic::new(
+                code,
+                format!(
+                    "effect `{}` has no operation `{op}`",
+                    label(Shape::Effect, effect)
+                ),
+                span,
+            )
+            .label("this operation is not declared by the effect")
+            .help("use one of the effect's declared operations, or add this operation to its declaration"),
+            E::BareOperationUnavailable { effect, suggestion } => {
+                let effect = label(Shape::Effect, effect);
+                match suggestion {
+                    Some(op) => Diagnostic::new(
+                        code,
+                        format!("effect `{effect}` requires an operation name"),
+                        span,
+                    )
+                    .label("this effect has only named operations")
+                    .help(format!("write `{effect}.{op}`")),
+                    None => Diagnostic::new(
+                        code,
+                        format!("effect `{effect}` declares no operations"),
+                        span,
+                    )
+                    .label("there is nothing in this effect to perform")
+                    .help("remove this performance, or declare an operation on the effect"),
+                }
+            }
+            E::NamedOperationOnUnnamed { effect, op } => {
+                let effect = label(Shape::Effect, effect);
+                Diagnostic::new(
+                    code,
+                    format!("effect `{effect}` has one unnamed operation"),
+                    span,
+                )
+                .label(format!("`{op}` is not the name of an operation here"))
+                .help(format!("write `{effect}` instead"))
+            }
+            E::PartialHandler { effect, missing } => Diagnostic::new(
+                code,
+                format!(
+                    "this handler does not cover effect `{}`",
+                    label(Shape::Effect, effect)
+                ),
+                span,
+            )
+            .label(format!("missing {}", operation_arms(missing)))
+            .help(format!("add {}", operation_arms(missing))),
+            E::DuplicateArm {
+                effect,
+                selector,
+                previous,
+            } => Diagnostic::new(
+                code,
+                format!(
+                    "duplicate arm for `{}{selector}`",
+                    label(Shape::Effect, effect)
+                ),
+                span,
+            )
+            .label("this operation is handled again")
+            .related(*previous, FIRST_ARM),
+            E::DuplicateReturn { previous } => Diagnostic::new(
+                code,
+                "this handler has more than one `return` arm",
+                span,
+            )
+            .label("second return arm")
+            .related(*previous, FIRST_ARM),
+            E::RaiseOutsideArm => Diagnostic::new(
+                code,
+                "`raise` can be used only directly inside a handler arm",
+                span,
+            )
+            .label("there is no enclosing arm for this `raise`")
+            .help("move it into a handler arm, or remove it"),
+            E::RaiseInFunction { function } => Diagnostic::new(
+                code,
+                "`raise` cannot cross a function boundary",
+                span,
+            )
+            .label("this `raise` is separated from its handler arm")
+            .related(*function, "the intervening function starts here")
+            .help("move `raise` directly into the handler arm, or return a value from the function"),
+        }
+    }
+}
+
+/// The diagnostic headline, retained for callers that only need a phrase.
 impl fmt::Display for ir::ErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ir::ErrorKind::InvalidDependencyAlias { alias } => write!(
-                f,
-                "dependency alias `{alias}` is not a valid source identifier"
-            ),
-            ir::ErrorKind::DuplicateDependencyAlias { alias } => {
-                write!(f, "dependency alias `{alias}` was imported more than once")
-            }
-            ir::ErrorKind::DuplicateDependency { name, version } => {
-                write!(f, "dependency `{name}@{version}` was imported more than once")
-            }
-            ir::ErrorKind::Undefined { namespace } => write!(f, "undefined {namespace}"),
-            ir::ErrorKind::Duplicate { namespace, .. } => write!(f, "duplicate {namespace}"),
-            ir::ErrorKind::DuplicateField => f.write_str("duplicate field"),
-            ir::ErrorKind::DuplicateCase => f.write_str("duplicate case"),
-            // Said as what the type already does rather than as the mark that
-            // repeats it: a `\` rules a label out of the `..` beside it, and a
-            // type with no `..` has already ruled out everything it does not
-            // name. The label is quoted the way it was written — `#` and all
-            // for a case — like every label a complaint quotes.
-            ir::ErrorKind::AbsentInClosed { shape, label } => write!(
-                f,
-                "a type with no `..` already says `{}` is not there",
-                self::label(*shape, label),
-            ),
-            // Not "recursive": a definition is welcome to lead back to itself,
-            // and what is wrong here is that there is nothing in the way when
-            // it does. Said as what the reader can change — give it a shape —
-            // rather than as the loop the compiler noticed. Two wordings for
-            // the one rule, because a reader who wrote `let` is being told
-            // about a value rather than about a type.
-            ir::ErrorKind::Circular { namespace } => match namespace {
-                Namespace::Types => f.write_str("type defined only as another name"),
-                Namespace::Terms | Namespace::Effects | Namespace::Modules => {
-                    f.write_str("this definition is never given a value of its own")
-                }
-            },
-            // The noun follows the shape that was written: someone who wrote
-            // `#`s is told about cases, and the `when` and the `..` are the
-            // same two marks either way.
-            ir::ErrorKind::OpenDeclaredType { shape } => write!(
-                f,
-                "a declared type must list its {}s exactly; `..` and `when` belong in annotations",
-                noun(*shape),
-            ),
-            // The same refusal about the clause beside the type rather than
-            // about a label inside it, so it has no noun to be worded in.
-            ir::ErrorKind::ClauseInDeclaration => f.write_str(
-                "a declared type says the same thing wherever it is used, so there is nothing here for a `where` clause to decide; it belongs in an annotation",
-            ),
-            // The same refusal about a variable rather than a comparison, and
-            // said as what a declaration's variables already are: writing one
-            // in the header is the fix, and naming it is shorter than
-            // describing it.
-            ir::ErrorKind::VariableInDeclaration => f.write_str(
-                "a declared type's variables are its parameters, so this one has to be written in its header; write `type T 'a = ...`",
-            ),
-            // And the same about a `_`, which leaves open the one thing a
-            // declaration has no way to leave open.
-            ir::ErrorKind::HoleInDeclaration => f.write_str(
-                "a declared type says the same thing wherever it is used, so there is nothing here for `_` to leave open",
-            ),
-            // Said as what the type would have to do rather than as what the
-            // clause failed to find: a formula is about presences, a presence
-            // is what a `when` puts on a label, and putting the name on one is
-            // the fix whether it was declared or not.
-            ir::ErrorKind::UnboundPresence { name } => write!(
-                f,
-                "this clause names `'{name}`, but no `when` in the type beside it gives it a label",
-            ),
-            ir::ErrorKind::IncompatiblePresenceOwnership { name, .. } => write!(
-                f,
-                "presence `'{name}` is produced at more than one lifetime; use a different name at each result boundary",
-            ),
-            // Counted in words, and said as what the type takes rather than as
-            // what the reader failed to supply — the count is the fact, and
-            // which side is short of it follows from the two numbers.
-            ir::ErrorKind::Arity { expected, found } => write!(
-                f,
-                "this type takes {}, and {} written",
-                arguments(*expected),
-                supplied(*found),
-            ),
-            ir::ErrorKind::NotAConstructor => {
-                f.write_str("only a declared type can be given arguments")
-            }
-            ir::ErrorKind::ParameterApplied => {
-                f.write_str("this stands for one type, so there is nothing to give arguments to")
-            }
-            ir::ErrorKind::DuplicateParameter { .. } => {
-                f.write_str("this type already takes something of this name")
-            }
-            // Said as the rule rather than as the loop: what the reader can
-            // change is the arguments at this one mention, and naming the whole
-            // cycle would point at declarations they got right.
-            ir::ErrorKind::GrowingRecursion => f.write_str(
-                "types that lead back to each other may hand on the names they take, but not types built out of them, which get bigger every time round",
-            ),
-            // Said as the readings rather than as "kind", which names a thing
-            // this language does not otherwise have and the reader has never
-            // been shown. One sentence for the two, because it is one thing
-            // gone wrong: a name that has to stand for one thing was given two.
-            // Which name it is, the span already says; where the other reading
-            // was is a second place, and pointing at one is layout — see
-            // [`FIRST_USE`].
-            ir::ErrorKind::MixedTail { first, second, .. } => write!(
-                f,
-                "this is used as {second} here and as {first} before it, and a name can only stand for one of them",
-            ),
-            ir::ErrorKind::MixedParameter { first, second } => write!(
-                f,
-                "this stands for {first} in one place and for {second} in another",
-            ),
-            ir::ErrorKind::NotARow { sense } => {
-                write!(f, "{sense} goes here, and this is not that")
-            }
-            // Said as what the argument does rather than as what goes here: a
-            // struct's `..` takes any type at all, so there is no reading to
-            // open with, and what is wrong is that the label would be named
-            // twice. The reader can change the field they wrote, and the type
-            // the declaration would end up with is not one anybody put on the
-            // page.
-            ir::ErrorKind::RepeatedRowField { shape, field } => write!(
-                f,
-                "this names `{}`, which the {} it goes into already has",
-                label(*shape, field),
-                shape,
-            ),
-            // Said as what the type does rather than as the loop the compiler
-            // noticed, the way [`ir::ErrorKind::Circular`] is: a type that adds
-            // fields to itself has more of them every time round, so there is no
-            // finite set of fields for it to have.
-            ir::ErrorKind::EndlessFields => {
-                f.write_str("this type adds fields to itself, so it never has all of them")
-            }
-            // Said as what a binding has to do — take whatever arrives — with
-            // the tag or number that breaks the promise quoted the way it was
-            // written. Two sentences for the two, because a case is something
-            // a value might not be and a number is something it might not
-            // equal.
-            ir::ErrorKind::RefutableBinding { found } => match found {
-                ir::Refuter::Case(name) => write!(
-                    f,
-                    "this binding has to accept every value, but a value here might not be `{}`",
-                    label(Shape::Sum, name),
-                ),
-                ir::Refuter::Literal(ir::Literal::Natural(value)) => write!(
-                    f,
-                    "this binding has to accept every value, but the number `{value}` makes it able to fail",
-                ),
-                ir::Refuter::Literal(value) => write!(
-                    f,
-                    "this binding has to accept every value, but `{value:?}` makes it able to fail",
-                ),
-            },
-            ir::ErrorKind::DuplicateBinding { name } => {
-                write!(f, "this binds `{name}` twice")
-            }
-            ir::ErrorKind::DuplicateOperation => f.write_str("duplicate operation"),
-            // Said as what to write instead, since the shape of the fix is the
-            // whole of what a reader needs: performing an operation is applying
-            // it, so an operation has to be something that can be applied.
-            ir::ErrorKind::NotAnOperation { name } => write!(
-                f,
-                "an operation must be a function: write `{name} : Nat -> ()`",
-            ),
-            ir::ErrorKind::ImpureOperation => f.write_str(
-                "an operation's signature must be plain; `+`, `..` and `when` belong in annotations",
-            ),
-            // Said as where effects do go, since the reader has written
-            // something that means one thing and put it where nothing means
-            // it: what is missing is an arrow to carry them.
-            ir::ErrorKind::EffectsOutsideRow => f.write_str(
-                "effects belong on an arrow, or at a parameter a type uses as its own",
-            ),
-            ir::ErrorKind::OperationOnAlias { effect } => write!(
-                f,
-                "an alias names effects and declares no operations, so `{}` has none to perform",
-                label(Shape::Effect, effect),
-            ),
-            ir::ErrorKind::UnknownOperation { effect, op } => write!(
-                f,
-                "no operation `{op}` on effect `{}`",
-                label(Shape::Effect, effect),
-            ),
-            ir::ErrorKind::BareOperationUnavailable { effect, suggestion } => match suggestion {
-                Some(op) => write!(
-                    f,
-                    "effect `{}` has only named operations; write `!{effect}.{op}`",
-                    label(Shape::Effect, effect),
-                ),
-                None => write!(f, "empty effect `{}` has no operation", label(Shape::Effect, effect)),
-            },
-            ir::ErrorKind::NamedOperationOnUnnamed { effect, op } => write!(
-                f,
-                "effect `{}` has one unnamed operation; write `!{effect}` instead of `!{effect}.{op}`",
-                label(Shape::Effect, effect),
-            ),
-            // Named rather than counted: the reader has to write an arm for
-            // each of them, and the list is the whole of what they have to do.
-            ir::ErrorKind::PartialHandler { effect, missing } => write!(
-                f,
-                "handling `{}` needs an arm for {} too",
-                label(Shape::Effect, effect),
-                listed(missing),
-            ),
-            ir::ErrorKind::DuplicateArm { effect, selector } => write!(
-                f,
-                "duplicate arm for `{}{selector}`",
-                label(Shape::Effect, effect),
-            ),
-            ir::ErrorKind::DuplicateReturn { .. } => f.write_str("duplicate return arm"),
-            ir::ErrorKind::RaiseOutsideArm => f.write_str("raise belongs in a handler arm"),
-            ir::ErrorKind::RaiseInFunction => f.write_str(
-                "raise may not be written inside a function: it answers the handler around it, and a function can outlive one",
-            ),
-        }
+        let error = ir::Error {
+            span: Span::default(),
+            kind: self.clone(),
+        };
+        f.write_str(&error.diagnostic().title)
     }
 }
 
 /// A list of operations as a sentence reads them: `a`, `a and b`, `a, b and
 /// c`. Every one is named, because every one is an arm the reader has to
 /// write.
+fn namespace_name(namespace: Namespace) -> &'static str {
+    match namespace {
+        Namespace::Terms => "value",
+        Namespace::Types => "type",
+        Namespace::Effects => "effect",
+        Namespace::Modules => "module",
+    }
+}
+
+/// A scalar literal written with Ruddy's own suffixes and escaping.
+struct SourceLiteral<'a>(&'a ir::Literal);
+
+impl fmt::Display for SourceLiteral<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            ir::Literal::Natural(value) => write!(f, "{value}n"),
+            ir::Literal::Integer(value) => write!(f, "{value}i"),
+            ir::Literal::Real(value) => write!(f, "{value:?}"),
+            ir::Literal::String(value) => write_string(f, value),
+            ir::Literal::Boolean(value) => write!(f, "{value}"),
+        }
+    }
+}
+
+fn operation_arms(names: &[String]) -> String {
+    match names.len() {
+        1 => format!("an arm for {}", listed(names)),
+        count => format!("{count} arms: {}", listed(names)),
+    }
+}
+
 fn listed(names: &[String]) -> String {
     let quoted: Vec<String> = names.iter().map(|name| format!("`{name}`")).collect();
     // Indexed rather than matched for emptiness: a handler that covers every

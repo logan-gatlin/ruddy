@@ -71,46 +71,63 @@ impl Resolver {
         let lock_path = root.join(LOCKFILE);
         let lock = match fs::read_to_string(&lock_path) {
             Ok(source) => Some(toml::from_str::<Lockfile>(&source).map_err(|error| {
-                CompileError::one(format!(
-                    "could not parse lockfile {}: {error}",
-                    lock_path.display()
-                ))
+                CompileError::report(
+                    "lockfile-invalid",
+                    format!("`{}` contains invalid lock settings", lock_path.display()),
+                )
+                .with_note(crate::toml_error_note(&source, &error))
+                .with_help("remove `Ruddy.lock` to regenerate it, or fix the named field")
             })?),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => {
-                return Err(CompileError::one(format!(
-                    "could not read lockfile {}: {error}",
-                    lock_path.display()
-                )));
+                return Err(CompileError::report(
+                    "lockfile-unreadable",
+                    format!("could not read `{}`", lock_path.display()),
+                )
+                .with_note(error.to_string()));
             }
         };
-        if lock.as_ref().is_some_and(|lock| lock.version != 1) {
-            return Err(CompileError::one(format!(
-                "lockfile {} has unsupported version",
-                lock_path.display()
-            )));
+        if let Some(lock) = &lock
+            && lock.version != 1
+        {
+            return Err(CompileError::report(
+                "lockfile-version-unsupported",
+                format!(
+                    "`{}` uses lock format version {}, but this Ruddy supports version 1",
+                    lock_path.display(),
+                    lock.version
+                ),
+            )
+            .with_help("update Ruddy or remove `Ruddy.lock` to regenerate it"));
         }
         let had_lockfile = lock.is_some();
         let mut locked = BTreeMap::new();
         for entry in lock.into_iter().flat_map(|lock| lock.entries) {
             if !entry.url.starts_with("https://") {
-                return Err(CompileError::one(format!(
-                    "invalid lockfile entry URL `{}`: Git sources must use HTTPS",
-                    entry.url
-                )));
+                return Err(CompileError::report(
+                    "lockfile-insecure-git-url",
+                    "a Git URL in `Ruddy.lock` must use HTTPS",
+                )
+                .with_note(format!("in `{}`", lock_path.display()))
+                .with_help("remove `Ruddy.lock` to regenerate it from `Ruddy.toml`"));
             }
             validate_full_commit(&entry.commit).map_err(|message| {
-                CompileError::one(format!(
-                    "invalid lockfile entry for {}: {message}",
-                    entry.url
-                ))
+                CompileError::report(
+                    "lockfile-invalid-commit",
+                    "a Git commit in `Ruddy.lock` is invalid",
+                )
+                .with_note(message)
+                .with_note(format!("in `{}`", lock_path.display()))
             })?;
-            let selector = selector_from_locked(&entry.selector)?;
+            let selector = selector_from_locked(&entry.selector)
+                .map_err(|error| error.with_note(format!("in `{}`", lock_path.display())))?;
             validate_selector(selector).map_err(|message| {
-                CompileError::one(format!(
-                    "invalid lockfile entry for {}: {message}",
-                    entry.url
-                ))
+                CompileError::report(
+                    "lockfile-invalid-selector",
+                    "a Git branch, tag, or revision in `Ruddy.lock` is invalid",
+                )
+                .with_note(message)
+                .with_note(format!("in `{}`", lock_path.display()))
             })?;
             if let GitSelector::Rev(revision) = selector
                 && !entry
@@ -118,19 +135,27 @@ impl Resolver {
                     .to_ascii_lowercase()
                     .starts_with(&revision.to_ascii_lowercase())
             {
-                return Err(CompileError::one(format!(
-                    "invalid lockfile entry for {}: exact revision `{revision}` is not a prefix of commit `{}`",
-                    entry.url, entry.commit
-                )));
+                return Err(CompileError::report(
+                    "lockfile-revision-mismatch",
+                    format!(
+                        "revision `{revision}` does not match locked commit `{}`",
+                        entry.commit
+                    ),
+                )
+                .with_note(format!("in `{}`", lock_path.display()))
+                .with_help("remove `Ruddy.lock` to resolve and lock the revision again"));
             }
             let key = (entry.url, LockedSelectorKey::new(selector));
             if locked
                 .insert(key, entry.commit.to_ascii_lowercase())
                 .is_some()
             {
-                return Err(CompileError::one(
-                    "lockfile contains a duplicate Git source selector",
-                ));
+                return Err(CompileError::report(
+                    "lockfile-duplicate-git-source",
+                    "`Ruddy.lock` contains the same Git source more than once",
+                )
+                .with_note(format!("in `{}`", lock_path.display()))
+                .with_help("remove `Ruddy.lock` to regenerate it"));
             }
         }
         Ok(Self {
@@ -146,7 +171,10 @@ impl Resolver {
     pub(crate) fn resolve(&mut self, spec: &DependencySpec) -> Result<PathBuf, CompileError> {
         let url = spec.git().expect("called for a Git dependency");
         let selector = spec.selector()?;
-        validate_selector(selector).map_err(CompileError::one)?;
+        validate_selector(selector).map_err(|message| {
+            CompileError::report("dependency-selector-invalid", message)
+                .with_help("choose a valid Git branch, tag, or 7–40 character hexadecimal revision")
+        })?;
         if self.home.is_none() {
             self.home = Some(ruddy_home()?);
         }
@@ -167,10 +195,13 @@ impl Resolver {
             } else {
                 if checkout.exists() {
                     fs::remove_dir_all(&checkout).map_err(|error| {
-                        CompileError::one(format!(
-                            "could not replace invalid Git cache checkout {}: {error}",
-                            checkout.display()
-                        ))
+                        cache_error(
+                            format!(
+                                "could not replace cached Git dependency `{}`",
+                                checkout.display()
+                            ),
+                            error,
+                        )
                     })?;
                 }
                 (clone_locked(home, url, selector, &commit)?, commit)
@@ -199,15 +230,19 @@ impl Resolver {
             version: 1,
             entries,
         })
-        .map_err(|error| CompileError::one(format!("could not serialize lockfile: {error}")))?;
+        .map_err(|error| {
+            CompileError::report("lockfile-write-failed", "could not prepare `Ruddy.lock`")
+                .with_note(error.to_string())
+        })?;
         if fs::read_to_string(&self.lock_path).ok().as_deref() == Some(&source) {
             return Ok(());
         }
         crate::replace_file(&self.lock_path, source.as_bytes()).map_err(|error| {
-            CompileError::one(format!(
-                "could not write lockfile {}: {error}",
-                self.lock_path.display()
-            ))
+            CompileError::report(
+                "lockfile-write-failed",
+                format!("could not write `{}`", self.lock_path.display()),
+            )
+            .with_note(error.to_string())
         })
     }
 }
@@ -219,9 +254,11 @@ fn selector_from_locked(selector: &LockedSelector) -> Result<GitSelector<'_>, Co
         selector.rev.as_deref(),
     ];
     if values.iter().flatten().count() > 1 {
-        return Err(CompileError::one(
-            "lockfile Git entry has conflicting selectors",
-        ));
+        return Err(CompileError::report(
+            "lockfile-selectors-conflict",
+            "a Git entry in `Ruddy.lock` selects more than one branch, tag, or revision",
+        )
+        .with_help("remove `Ruddy.lock` to regenerate it"));
     }
     Ok(if let Some(v) = values[0] {
         GitSelector::Branch(v)
@@ -267,7 +304,13 @@ pub fn ruddy_home() -> Result<PathBuf, CompileError> {
         env::var_os("HOME")
             .filter(|value| !value.is_empty())
             .map(|home| PathBuf::from(home).join(".ruddy"))
-            .ok_or_else(|| CompileError::one("could not determine Ruddy home; set RUDDY_HOME"))?
+            .ok_or_else(|| {
+                CompileError::report(
+                    "ruddy-home-unavailable",
+                    "Ruddy does not know where to store downloaded dependencies",
+                )
+                .with_help("set `RUDDY_HOME` to a writable folder")
+            })?
     };
     if configured.is_absolute() {
         Ok(configured)
@@ -275,7 +318,12 @@ pub fn ruddy_home() -> Result<PathBuf, CompileError> {
         env::current_dir()
             .map(|current| current.join(configured))
             .map_err(|error| {
-                CompileError::one(format!("could not resolve relative Ruddy home: {error}"))
+                CompileError::report(
+                    "ruddy-home-unavailable",
+                    "could not resolve the relative `RUDDY_HOME` folder",
+                )
+                .with_note(error.to_string())
+                .with_help("set `RUDDY_HOME` to an absolute writable folder")
             })
     }
 }
@@ -284,13 +332,30 @@ fn git_cache(home: &Path) -> PathBuf {
     home.join("cache/git")
 }
 
+fn cache_error(message: impl Into<String>, error: impl ToString) -> CompileError {
+    CompileError::report("git-cache-unavailable", message)
+        .with_note(error.to_string())
+        .with_help("check that the Git dependency cache is writable, then try again")
+}
+
+fn invalid_cache(path: &Path, detail: impl Into<String>) -> CompileError {
+    CompileError::report(
+        "git-cache-invalid",
+        format!("cached Git dependency `{}` is not usable", path.display()),
+    )
+    .with_note(detail)
+    .with_help("remove this cached folder and try again")
+}
+
 fn acquire_cache_lock(home: &Path) -> Result<File, CompileError> {
     let git = git_cache(home);
     fs::create_dir_all(&git).map_err(|error| {
-        CompileError::one(format!(
-            "could not create Git cache directory {}: {error}",
-            git.display()
-        ))
+        CompileError::report(
+            "git-cache-unavailable",
+            format!("could not create Git dependency cache `{}`", git.display()),
+        )
+        .with_note(error.to_string())
+        .with_help("check that the cache folder is writable")
     })?;
     let path = git.join("cache.lock");
     let file = OpenOptions::new()
@@ -300,16 +365,26 @@ fn acquire_cache_lock(home: &Path) -> Result<File, CompileError> {
         .truncate(false)
         .open(&path)
         .map_err(|error| {
-            CompileError::one(format!(
-                "could not open Git cache lock {}: {error}",
-                path.display()
-            ))
+            CompileError::report(
+                "git-cache-unavailable",
+                format!(
+                    "could not open Git dependency cache lock `{}`",
+                    path.display()
+                ),
+            )
+            .with_note(error.to_string())
+            .with_help("check that the cache folder is writable")
         })?;
     fs2::FileExt::lock_exclusive(&file).map_err(|error| {
-        CompileError::one(format!(
-            "could not acquire Git cache lock {}: {error}",
-            path.display()
-        ))
+        CompileError::report(
+            "git-cache-unavailable",
+            format!(
+                "could not lock the Git dependency cache `{}`",
+                path.display()
+            ),
+        )
+        .with_note(error.to_string())
+        .with_help("wait for another Ruddy process to finish, then try again")
     })?;
     Ok(file)
 }
@@ -321,42 +396,75 @@ fn clone_unlocked(
 ) -> Result<(PathBuf, String), CompileError> {
     let temp = temporary_checkout(home, url, selector)?;
     clone_to(url, selector, None, temp.path())?;
-    let repo = gix::open(temp.path()).map_err(|e| {
-        CompileError::one(format!(
-            "could not open fetched Git dependency `{url}`: {e}"
-        ))
+    let repo = gix::open(temp.path()).map_err(|error| {
+        CompileError::report(
+            "git-fetch-failed",
+            format!(
+                "could not open downloaded Git dependency `{}`",
+                crate::redact_git_url(url)
+            ),
+        )
+        .with_note(redact_git_cause(error.to_string(), url))
     })?;
     let id = match selector {
         GitSelector::Rev(revision) => repo.rev_parse_single(revision).map_err(|error| {
-            CompileError::one(format!(
-                "could not resolve Git revision `{revision}` from `{url}`: {error}"
-            ))
+            CompileError::report(
+                "git-revision-not-found",
+                format!(
+                    "Git dependency `{}` has no revision `{revision}`",
+                    crate::redact_git_url(url)
+                ),
+            )
+            .with_note(redact_git_cause(error.to_string(), url))
+            .with_help("check the `rev` value in `Ruddy.toml`")
         })?,
-        _ => repo.head_id().map_err(|e| {
-            CompileError::one(format!(
-                "Git dependency `{url}` has no resolved commit: {e}"
-            ))
+        _ => repo.head_id().map_err(|error| {
+            CompileError::report(
+                "git-revision-not-found",
+                format!(
+                    "Git dependency `{}` has no default revision",
+                    crate::redact_git_url(url)
+                ),
+            )
+            .with_note(redact_git_cause(error.to_string(), url))
+            .with_help("select an existing `branch`, `tag`, or `rev`")
         })?,
     };
     let object = id.object().map_err(|error| {
-        CompileError::one(format!(
-            "could not read resolved Git object for `{url}`: {error}"
-        ))
+        CompileError::report(
+            "git-revision-unreadable",
+            format!(
+                "could not read the selected revision from `{}`",
+                crate::redact_git_url(url)
+            ),
+        )
+        .with_note(redact_git_cause(error.to_string(), url))
     })?;
     let commit = object
         .peel_to_commit()
         .map_err(|error| {
-            CompileError::one(format!(
-                "Git dependency `{url}` did not resolve to a commit: {error}"
-            ))
+            CompileError::report(
+                "git-revision-not-commit",
+                format!(
+                    "the selected revision from `{}` is not a commit",
+                    crate::redact_git_url(url)
+                ),
+            )
+            .with_note(redact_git_cause(error.to_string(), url))
+            .with_help("select a branch, tag, or revision that points to a commit")
         })?
         .id
         .to_hex()
         .to_string();
     checkout_commit(&repo, &commit).map_err(|error| {
-        CompileError::one(format!(
-            "could not check out Git dependency `{url}` at `{commit}`: {error}"
-        ))
+        CompileError::report(
+            "git-checkout-failed",
+            format!(
+                "could not prepare Git dependency `{}` at `{commit}`",
+                crate::redact_git_url(url)
+            ),
+        )
+        .with_note(redact_git_cause(error.to_string(), url))
     })?;
     drop(repo);
     let final_path = checkout_path(home, url, selector, &commit);
@@ -384,23 +492,48 @@ fn clone_to(
     destination: &Path,
 ) -> Result<(), CompileError> {
     if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent).map_err(|e| {
-            CompileError::one(format!(
-                "could not create Git cache {}: {e}",
-                parent.display()
-            ))
+        fs::create_dir_all(parent).map_err(|error| {
+            CompileError::report(
+                "git-cache-unavailable",
+                format!(
+                    "could not create Git dependency cache `{}`",
+                    parent.display()
+                ),
+            )
+            .with_note(error.to_string())
+            .with_help("check that the cache folder is writable")
         })?;
     }
-    let mut prepare = gix::prepare_clone(url, destination)
-        .map_err(|e| CompileError::one(format!("could not prepare Git dependency `{url}`: {e}")))?;
+    let mut prepare = gix::prepare_clone(url, destination).map_err(|error| {
+        CompileError::report(
+            "git-fetch-failed",
+            format!(
+                "could not prepare Git dependency `{}` for download",
+                crate::redact_git_url(url)
+            ),
+        )
+        .with_note(redact_git_cause(error.to_string(), url))
+    })?;
     if locked.is_none() {
         prepare = match selector {
             GitSelector::Branch(value) => prepare
                 .with_ref_name(Some(format!("refs/heads/{value}").as_str()))
-                .map_err(|e| CompileError::one(format!("invalid branch `{value}`: {e}")))?,
+                .map_err(|error| {
+                    CompileError::report(
+                        "dependency-selector-invalid",
+                        format!("`{value}` is not a valid Git branch name"),
+                    )
+                    .with_note(error.to_string())
+                })?,
             GitSelector::Tag(value) => prepare
                 .with_ref_name(Some(format!("refs/tags/{value}").as_str()))
-                .map_err(|e| CompileError::one(format!("invalid tag `{value}`: {e}")))?,
+                .map_err(|error| {
+                    CompileError::report(
+                        "dependency-selector-invalid",
+                        format!("`{value}` is not a valid Git tag name"),
+                    )
+                    .with_note(error.to_string())
+                })?,
             GitSelector::Default | GitSelector::Rev(_) => prepare,
         };
     }
@@ -409,10 +542,9 @@ fn clone_to(
             .url(gix::remote::Direction::Fetch)
             .ok_or("Git remote has no fetch URL")?;
         if effective.scheme != gix::url::Scheme::Https {
-            return Err(format!(
-                "effective Git remote URL must use HTTPS after configuration rewriting, found `{effective}`"
-            )
-            .into());
+            return Err(
+                "Git configuration rewrote the dependency URL to a non-HTTPS address".into(),
+            );
         }
         // Fetch only normally advertised branch and tag refs. In particular,
         // never request a lock's raw object ID: many servers reject wants for
@@ -430,12 +562,49 @@ fn clone_to(
     })();
     if let Err(error) = result {
         let _ = fs::remove_dir_all(destination);
-        return Err(CompileError::one(format!(
-            "could not fetch or check out Git dependency `{url}`: {}",
-            error_chain(error.as_ref())
-        )));
+        return Err(CompileError::report(
+            "git-fetch-failed",
+            format!(
+                "could not fetch or check out Git dependency `{}`",
+                crate::redact_git_url(url)
+            ),
+        )
+        .with_note(redact_git_cause(error_chain(error.as_ref()), url))
+        .with_help("check the URL, selected branch or tag, network access, and credentials"));
     }
     Ok(())
+}
+
+fn redact_git_cause(message: String, url: &str) -> String {
+    message
+        .replace(url, &crate::redact_git_url(url))
+        .split_whitespace()
+        .map(redact_url_word)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn redact_url_word(word: &str) -> String {
+    let Some(scheme_end) = word.find("://") else {
+        return word.to_string();
+    };
+    let start = word[..scheme_end]
+        .rfind(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.'))
+        })
+        .map_or(0, |at| at + 1);
+    let end = word
+        .trim_end_matches(['`', '\'', '"', ',', ';', ':', ')', ']', '}'])
+        .len();
+    if end <= start {
+        return word.to_string();
+    }
+    format!(
+        "{}{}{}",
+        &word[..start],
+        crate::redact_git_url(&word[start..end]),
+        &word[end..]
+    )
 }
 
 fn error_chain(error: &dyn std::error::Error) -> String {
@@ -450,17 +619,17 @@ fn error_chain(error: &dyn std::error::Error) -> String {
 }
 
 fn install_checkout(temp: &Path, destination: &Path, commit: &str) -> Result<(), CompileError> {
-    let parent = destination.parent().ok_or_else(|| {
-        CompileError::one(format!(
-            "Git cache checkout {} has no parent directory",
-            destination.display()
-        ))
-    })?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| invalid_cache(destination, "the cache path has no parent folder"))?;
     fs::create_dir_all(parent).map_err(|error| {
-        CompileError::one(format!(
-            "could not create Git checkout directory {}: {error}",
-            parent.display()
-        ))
+        cache_error(
+            format!(
+                "could not create Git dependency cache `{}`",
+                parent.display()
+            ),
+            error,
+        )
     })?;
     if destination.exists() {
         if restore_checkout(destination, commit).is_ok() {
@@ -468,17 +637,23 @@ fn install_checkout(temp: &Path, destination: &Path, commit: &str) -> Result<(),
             return Ok(());
         }
         fs::remove_dir_all(destination).map_err(|error| {
-            CompileError::one(format!(
-                "could not replace invalid Git cache checkout {}: {error}",
-                destination.display()
-            ))
+            cache_error(
+                format!(
+                    "could not replace cached Git dependency `{}`",
+                    destination.display()
+                ),
+                error,
+            )
         })?;
     }
-    fs::rename(temp, destination).map_err(|e| {
-        CompileError::one(format!(
-            "could not install Git checkout {}: {e}",
-            destination.display()
-        ))
+    fs::rename(temp, destination).map_err(|error| {
+        cache_error(
+            format!(
+                "could not install Git dependency in cache `{}`",
+                destination.display()
+            ),
+            error,
+        )
     })?;
     if let Err(error) = restore_checkout(destination, commit) {
         let _ = fs::remove_dir_all(destination);
@@ -490,55 +665,50 @@ fn install_checkout(temp: &Path, destination: &Path, commit: &str) -> Result<(),
 fn restore_checkout(path: &Path, commit: &str) -> Result<(), CompileError> {
     let git_dir = path.join(".git");
     let metadata = fs::symlink_metadata(&git_dir).map_err(|error| {
-        CompileError::one(format!(
-            "cached Git checkout {} has no safe repository directory: {error}",
-            path.display()
-        ))
+        invalid_cache(
+            path,
+            format!("its `.git` folder could not be read: {error}"),
+        )
     })?;
     if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-        return Err(CompileError::one(format!(
-            "cached Git checkout {} has an unsafe repository directory",
-            path.display()
-        )));
+        return Err(invalid_cache(path, "its `.git` path is not a safe folder"));
     }
-    let repo = gix::open(path).map_err(|error| {
-        CompileError::one(format!(
-            "could not open cached Git checkout {}: {error}",
-            path.display()
-        ))
-    })?;
+    let repo = gix::open(path)
+        .map_err(|error| invalid_cache(path, format!("Git could not open it: {error}")))?;
     let canonical_path = fs::canonicalize(path).map_err(|error| {
-        CompileError::one(format!(
-            "could not resolve cached Git checkout {}: {error}",
-            path.display()
-        ))
+        cache_error(
+            format!("could not open cached Git dependency `{}`", path.display()),
+            error,
+        )
     })?;
     let canonical_git = fs::canonicalize(&git_dir).map_err(|error| {
-        CompileError::one(format!(
-            "could not resolve cached Git repository {}: {error}",
-            git_dir.display()
-        ))
+        cache_error(
+            format!("could not open cached Git data `{}`", git_dir.display()),
+            error,
+        )
     })?;
     if repo.workdir() != Some(canonical_path.as_path())
         || repo.git_dir() != canonical_git.as_path()
         || !canonical_git.starts_with(&canonical_path)
     {
-        return Err(CompileError::one(format!(
-            "cached Git checkout {} points outside its cache directory",
-            path.display()
-        )));
+        return Err(invalid_cache(
+            path,
+            "its Git data points outside the cached dependency folder",
+        ));
     }
     checkout_commit(&repo, commit).map_err(|error| {
-        CompileError::one(format!(
-            "could not restore cached Git checkout {} at `{commit}`: {error}",
-            path.display()
-        ))
+        invalid_cache(
+            path,
+            format!("commit `{commit}` could not be restored: {error}"),
+        )
     })?;
     if !path.join("Ruddy.toml").is_file() {
-        return Err(CompileError::one(format!(
-            "cached Git checkout {} contains no Ruddy.toml at `{commit}`",
-            path.display()
-        )));
+        return Err(CompileError::report(
+            "git-project-missing-manifest",
+            format!("Git dependency at commit `{commit}` is not a Ruddy project"),
+        )
+        .with_note(format!("`{}` contains no `Ruddy.toml`", path.display()))
+        .with_help("choose a revision containing a Ruddy project, or add `Ruddy.toml` there"));
     }
     Ok(())
 }
@@ -548,7 +718,9 @@ fn checkout_commit(repo: &gix::Repository, commit: &str) -> Result<(), Box<dyn s
     let id = gix::hash::ObjectId::from_hex(commit.as_bytes())?;
     let commit = repo.find_object(id)?.peel_to_commit()?;
     let tree = commit.tree_id()?;
-    let workdir = repo.workdir().ok_or("Git dependency has no worktree")?;
+    let workdir = repo
+        .workdir()
+        .ok_or("downloaded Git dependency has no working folder")?;
     clear_worktree(workdir)?;
     let state = gix::index::State::from_tree(&tree, &repo.objects, Default::default())?;
     let mut index = gix::index::File::from_state(state, repo.index_path());
@@ -599,21 +771,23 @@ fn validate_selector(selector: GitSelector<'_>) -> Result<(), &'static str> {
             && value.len() <= 40
             && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
         .then_some(())
-        .ok_or("revision must contain 7 to 40 hexadecimal digits"),
-        GitSelector::Branch("") | GitSelector::Tag("") => Err("selector must not be empty"),
+        .ok_or("a revision must contain 7 to 40 hexadecimal characters"),
+        GitSelector::Branch("") | GitSelector::Tag("") => {
+            Err("a Git branch or tag cannot be empty")
+        }
         GitSelector::Branch(value) => gix::refs::FullName::try_from(format!("refs/heads/{value}"))
             .map(|_| ())
-            .map_err(|_| "branch and tag selectors must be valid Git reference names"),
+            .map_err(|_| "the selected branch is not a valid Git name"),
         GitSelector::Tag(value) => gix::refs::FullName::try_from(format!("refs/tags/{value}"))
             .map(|_| ())
-            .map_err(|_| "branch and tag selectors must be valid Git reference names"),
+            .map_err(|_| "the selected tag is not a valid Git name"),
     }
 }
 
 fn validate_full_commit(commit: &str) -> Result<(), &'static str> {
     (commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit()))
         .then_some(())
-        .ok_or("commit must be a full 40-digit object ID")
+        .ok_or("a locked commit must contain exactly 40 hexadecimal characters")
 }
 
 fn cache_key(url: &str, selector: GitSelector<'_>) -> String {
@@ -665,10 +839,14 @@ fn temporary_checkout(
             return Ok(TemporaryCheckout(path));
         }
     }
-    Err(CompileError::one(format!(
-        "could not allocate a temporary Git checkout in {}",
-        directory.display()
-    )))
+    Err(CompileError::report(
+        "git-cache-unavailable",
+        format!(
+            "could not reserve temporary space in Git dependency cache `{}`",
+            directory.display()
+        ),
+    )
+    .with_help("remove stale files from the cache or choose another `RUDDY_HOME`"))
 }
 
 fn clean_stale_temporary_checkouts(
@@ -678,24 +856,33 @@ fn clean_stale_temporary_checkouts(
 ) -> Result<(), CompileError> {
     let directory = git_cache(home).join("tmp");
     fs::create_dir_all(&directory).map_err(|error| {
-        CompileError::one(format!(
-            "could not create Git temporary directory {}: {error}",
-            directory.display()
-        ))
+        cache_error(
+            format!(
+                "could not create temporary Git cache folder `{}`",
+                directory.display()
+            ),
+            error,
+        )
     })?;
     let prefix = format!("{}-", cache_key(url, selector));
     for entry in fs::read_dir(&directory).map_err(|error| {
-        CompileError::one(format!(
-            "could not inspect Git temporary directory {}: {error}",
-            directory.display()
-        ))
+        cache_error(
+            format!(
+                "could not inspect temporary Git cache folder `{}`",
+                directory.display()
+            ),
+            error,
+        )
     })? {
         let path = entry
             .map_err(|error| {
-                CompileError::one(format!(
-                    "could not inspect Git temporary directory {}: {error}",
-                    directory.display()
-                ))
+                cache_error(
+                    format!(
+                        "could not inspect temporary Git cache folder `{}`",
+                        directory.display()
+                    ),
+                    error,
+                )
             })?
             .path();
         if path
@@ -704,10 +891,13 @@ fn clean_stale_temporary_checkouts(
             .is_some_and(|name| name.starts_with(&prefix))
         {
             remove_cache_entry(&path).map_err(|error| {
-                CompileError::one(format!(
-                    "could not clean stale Git temporary checkout {}: {error}",
-                    path.display()
-                ))
+                cache_error(
+                    format!(
+                        "could not remove stale Git cache entry `{}`",
+                        path.display()
+                    ),
+                    error,
+                )
             })?;
         }
     }

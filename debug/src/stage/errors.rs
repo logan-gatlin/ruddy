@@ -32,6 +32,9 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         cx.diagnostics
             .iter()
             .map(|diagnostic| {
+                if let Some(report) = &diagnostic.report {
+                    return report.render(color);
+                }
                 let primary = diagnostic.span.map(|span| DiagnosticLabel {
                     source: span.file as usize,
                     range: span.range[0]..span.range[1],

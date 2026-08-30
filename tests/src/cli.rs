@@ -71,7 +71,7 @@ fn std_manifest_forms_are_strict_and_contextual() {
     for (setting, expected) in [
         ("1", "invalid type"),
         ("[]", "invalid type"),
-        ("{}", "either `path` or `git`"),
+        ("{}", "[dependency-source-missing] Error"),
         (
             "{ path = \"std\", git = \"https://example.test/std\" }",
             "both `path` and `git`",
@@ -1037,7 +1037,10 @@ fn automatic_std_graph_child() {
     )
     .unwrap();
     let found = compile(&versions).unwrap_err().to_string();
-    assert!(found.contains("both declare bundle std@1.0.0"), "{found}");
+    assert!(
+        found.contains("[project-identity-conflict] Error") && found.contains("`std@1.0.0`"),
+        "{found}"
+    );
 
     let cycle = root.join("cycle");
     fs::create_dir_all(&cycle).unwrap();
@@ -1111,7 +1114,8 @@ fn disabled_std_does_not_open_an_implicit_prelude() {
     )
     .unwrap();
     let found = error(&directory);
-    assert!(found.contains("undefined term"), "{found}");
+    assert!(found.contains("[undefined-term] Error"), "{found}");
+    assert!(found.contains("cannot find value `answer`"), "{found}");
 }
 
 #[test]
@@ -1242,7 +1246,7 @@ fn detailed_dependencies_alias_hyphenated_bundle_identities() {
     .unwrap();
     let error = error(&directory);
     assert!(
-        error.contains("not a valid Ruddy source identifier"),
+        error.contains("[dependency-alias-invalid] Error"),
         "{error}"
     );
 }
@@ -1282,7 +1286,8 @@ fn transitive_dependencies_are_linkable_but_not_source_visible() {
 
     fs::write(directory.path().join("main.hc"), "let main = base::foo\n").unwrap();
     let error = error(&directory);
-    assert!(error.contains("undefined module"), "{error}");
+    assert!(error.contains("[undefined-module] Error"), "{error}");
+    assert!(error.contains("cannot find module `base`"), "{error}");
 }
 
 #[test]
@@ -1300,10 +1305,22 @@ fn missing_dependency_paths_report_the_requested_namespace() {
     )
     .unwrap();
     let error = error(&directory);
-    assert!(error.contains("undefined term"), "{error}");
-    assert!(error.contains("undefined type"), "{error}");
-    assert!(error.contains("undefined effect"), "{error}");
-    assert!(error.contains("undefined module"), "{error}");
+    assert!(
+        error.contains("[undefined-term] Error: cannot find value `missing`"),
+        "{error}"
+    );
+    assert!(
+        error.contains("[undefined-type] Error: cannot find type `Missing`"),
+        "{error}"
+    );
+    assert!(
+        error.contains("[undefined-effect] Error: cannot find effect `MissingEffect`"),
+        "{error}"
+    );
+    assert!(
+        error.contains("[undefined-module] Error: cannot find module `NoModule`"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -1321,7 +1338,8 @@ fn a_local_module_cannot_shadow_a_direct_dependency_root() {
     )
     .unwrap();
     let error = error(&directory);
-    assert!(error.contains("duplicate module"), "{error}");
+    assert!(error.contains("[duplicate-module] Error"), "{error}");
+    assert!(error.contains("`std` is defined more than once"), "{error}");
 }
 
 #[test]
@@ -1374,6 +1392,12 @@ fn nested_root_diagnostics_preserve_root_and_module_paths() {
 
     fs::remove_file(directory.path().join("src/Child.hc")).expect("remove the module file");
     let missing = error(&directory).replace('\\', "/");
+    assert!(missing.contains("[module-file-missing] Error"), "{missing}");
+    assert!(missing.contains("this module needs a file"), "{missing}");
+    assert!(
+        missing.contains("no file was found for this module"),
+        "{missing}"
+    );
     assert!(
         missing.contains("create `src/Child.hc` or `src/Child/module.hc`"),
         "{missing}",
@@ -1389,7 +1413,13 @@ fn nested_root_diagnostics_preserve_root_and_module_paths() {
     .expect("write the inside candidate");
     let ambiguous = error(&directory).replace('\\', "/");
     assert!(
-        ambiguous.contains("delete one of `src/Child.hc` or `src/Child/module.hc`"),
+        ambiguous.contains("[module-file-ambiguous] Error")
+            && ambiguous.contains("this module has two possible files"),
+        "{ambiguous}"
+    );
+    assert!(
+        ambiguous
+            .contains("keep one of `src/Child.hc` or `src/Child/module.hc` and delete the other"),
         "{ambiguous}",
     );
 }
@@ -1398,7 +1428,7 @@ fn nested_root_diagnostics_preserve_root_and_module_paths() {
 fn the_manifest_is_required_and_must_be_valid_and_supported() {
     let directory = project();
     let missing = error(&directory);
-    assert!(missing.contains("could not read manifest"), "{missing}");
+    assert!(missing.contains("[manifest-unreadable] Error"), "{missing}");
     assert!(missing.contains("Ruddy.toml"), "{missing}");
 
     for (manifest, expected) in [
@@ -1421,7 +1451,7 @@ fn the_manifest_is_required_and_must_be_valid_and_supported() {
             "name = \"app\"\nversion = \"1.0.0\"\nroot = 1\n[dependencies]\n",
             "invalid type",
         ),
-        ("[dependencies", "could not parse manifest"),
+        ("[dependencies", "[manifest-invalid] Error"),
         (
             "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\ntitle = \"app\"\n[dependencies]\nstd = false\n",
             "unknown field `title`",
@@ -1460,34 +1490,49 @@ fn the_manifest_is_required_and_must_be_valid_and_supported() {
         let found = error(&directory);
         assert!(found.contains(expected), "`{expected}` in:\n{found}");
     }
+
+    fs::write(
+        directory.path().join("Ruddy.toml"),
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nbase = { git = [\"https://user:secret@example.test/repo\"] }\n",
+    )
+    .unwrap();
+    let redacted = error(&directory);
+    assert!(redacted.contains("[manifest-invalid] Error"), "{redacted}");
+    assert!(!redacted.contains("user:secret"), "{redacted}");
 }
 
 #[test]
 fn git_dependency_manifest_validation_is_strict_and_contextual() {
     let directory = project();
     for (specification, expected) in [
-        ("{ git = \"http://example.test/repo\" }", "must use HTTPS"),
-        ("{ git = \"ssh://example.test/repo\" }", "must use HTTPS"),
+        (
+            "{ git = \"http://example.test/repo\" }",
+            "[dependency-git-not-https] Error",
+        ),
+        (
+            "{ git = \"ssh://example.test/repo\" }",
+            "[dependency-git-not-https] Error",
+        ),
         (
             "{ path = \"dep\", git = \"https://example.test/repo\" }",
-            "both `path` and `git`",
+            "[dependency-source-conflict] Error",
         ),
-        ("{ bundle = \"base\" }", "either `path` or `git`"),
+        ("{ bundle = \"base\" }", "[dependency-source-missing] Error"),
         (
             "{ path = \"dep\", branch = \"main\" }",
-            "selectors require a `git`",
+            "[dependency-selector-without-git] Error",
         ),
         (
             "{ git = \"https://example.test/repo\", branch = \"\" }",
-            "must not be empty",
+            "[dependency-selector-empty] Error",
         ),
         (
             "{ git = \"https://example.test/repo\", branch = \"main\", tag = \"v1\" }",
-            "conflicting",
+            "[dependency-selectors-conflict] Error",
         ),
         (
             "{ git = \"https://example.test/repo\", branch = \"bad..name\" }",
-            "valid Git reference names",
+            "[dependency-selector-invalid] Error",
         ),
         (
             "{ git = \"https://example.test/repo\", unknown = true }",
@@ -1502,6 +1547,31 @@ fn git_dependency_manifest_validation_is_strict_and_contextual() {
         }
         assert!(!directory.path().join("Ruddy.lock").exists());
     }
+
+    fs::write(
+        directory.path().join("Ruddy.toml"),
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nbase = { git = \"http://user:secret@example.test/repo?token=hidden\" }\n",
+    )
+    .unwrap();
+    let redacted = error(&directory);
+    assert!(!redacted.contains("user:secret"), "{redacted}");
+    assert!(!redacted.contains("token=hidden"), "{redacted}");
+    assert!(
+        redacted.contains("this Git dependency URL must use HTTPS"),
+        "{redacted}"
+    );
+
+    fs::write(
+        directory.path().join("Ruddy.toml"),
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nbase = { git = \"user:secret@example.test/repo\" }\n",
+    )
+    .unwrap();
+    let malformed = error(&directory);
+    assert!(!malformed.contains("user:secret"), "{malformed}");
+    assert!(
+        malformed.contains("[dependency-git-not-https] Error"),
+        "{malformed}"
+    );
 }
 
 #[test]
@@ -1545,7 +1615,7 @@ fn hostile_git_configuration_child() {
     let app = PathBuf::from(std::env::var_os("RUDDY_TEST_GIT_APP").unwrap());
     let found = compile(app).unwrap_err().to_string();
     assert!(
-        found.contains("effective Git remote URL must use HTTPS"),
+        found.contains("rewrote the dependency URL to a non-HTTPS address"),
         "{found}"
     );
 }
@@ -1609,7 +1679,7 @@ fn ruddy_home_layout_child() {
             ruddy_cli::ruddy_home()
                 .unwrap_err()
                 .to_string()
-                .contains("set RUDDY_HOME")
+                .contains("[ruddy-home-unavailable] Error")
         ),
     }
 }
@@ -1821,7 +1891,7 @@ fn exact_revisions_require_unambiguous_hex_prefixes_before_network_access() {
     let directory = project();
     fs::write(directory.path().join("Ruddy.toml"), "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nbase = { git = \"https://127.0.0.1:9/repository\", rev = \"abc123\" }\n").unwrap();
     let found = error(&directory);
-    assert!(found.contains("7 to 40 hexadecimal digits"), "{found}");
+    assert!(found.contains("7 to 40 hexadecimal characters"), "{found}");
     assert!(!directory.path().join("Ruddy.lock").exists());
 }
 
@@ -1869,15 +1939,21 @@ fn malformed_and_unsupported_lockfiles_are_diagnosed_without_replacement() {
         "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
-    for source in [
-        "not toml =",
-        "version = 2\n",
-        "version = 1\n[[git]]\nurl = \"https://example.test/repo\"\ncommit = \"short\"\n",
-        "version = 1\n[[git]]\nurl = \"https://example.test/repo\"\nbranch = \"main\"\ntag = \"v1\"\ncommit = \"0000000000000000000000000000000000000000\"\n",
+    for (source, code) in [
+        ("not toml =", "lockfile-invalid"),
+        ("version = 2\n", "lockfile-version-unsupported"),
+        (
+            "version = 1\n[[git]]\nurl = \"https://example.test/repo\"\ncommit = \"short\"\n",
+            "lockfile-invalid-commit",
+        ),
+        (
+            "version = 1\n[[git]]\nurl = \"https://example.test/repo\"\nbranch = \"main\"\ntag = \"v1\"\ncommit = \"0000000000000000000000000000000000000000\"\n",
+            "lockfile-selectors-conflict",
+        ),
     ] {
         fs::write(directory.path().join("Ruddy.lock"), source).unwrap();
         let found = error(&directory);
-        assert!(found.contains("lockfile"), "{found}");
+        assert!(found.contains(&format!("[{code}] Error")), "{found}");
         assert_eq!(
             fs::read_to_string(directory.path().join("Ruddy.lock")).unwrap(),
             source
@@ -1901,9 +1977,9 @@ fn public_lockfile_format_round_trips_deterministically() {
 fn manifest_bundle_identity_must_be_valid() {
     let directory = project();
     for (name, version, expected) in [
-        ("app", "not-semver", "invalid semantic version"),
-        ("not.a.name", "1.0.0", "not a valid Ruddy bundle name"),
-        ("app", "1.0.0+local", "unsupported build metadata"),
+        ("app", "not-semver", "[project-version-invalid] Error"),
+        ("not.a.name", "1.0.0", "[project-name-invalid] Error"),
+        ("app", "1.0.0+local", "[project-version-build-suffix] Error"),
     ] {
         fs::write(
             directory.path().join("Ruddy.toml"),
@@ -1923,7 +1999,12 @@ fn dependency_projects_must_exist_compile_and_match_the_table_key() {
 
     write_project(&directory.path().join("child"), "other", "1.0.0", &[]);
     fs::write(directory.path().join("Ruddy.toml"), "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nbase = \"child\"\n").unwrap();
-    assert!(error(&directory).contains("contains project `other` instead"));
+    let mismatch = error(&directory);
+    assert!(
+        mismatch.contains("[dependency-name-mismatch] Error")
+            && mismatch.contains("declares `other`"),
+        "{mismatch}"
+    );
 
     write_project(&directory.path().join("child"), "base", "1.0.0", &[]);
     fs::write(
@@ -1931,9 +2012,19 @@ fn dependency_projects_must_exist_compile_and_match_the_table_key() {
         "let bad : Nat = fn x => x\n",
     )
     .unwrap();
-    let found = error(&directory);
+    let diagnostics = compile(directory.path()).expect_err("the dependency does not type-check");
+    assert_eq!(diagnostics.diagnostics().len(), 1, "{diagnostics}");
+    assert_eq!(diagnostics.diagnostics()[0].code(), "type-mismatch");
+    assert!(
+        diagnostics.diagnostics()[0]
+            .notes()
+            .iter()
+            .any(|note| note.contains("dependency `base`"))
+    );
+    let found = diagnostics.to_string();
     assert!(found.contains("dependency `base`"));
     assert!(found.contains("[type-mismatch] Error"), "{found}");
+    assert!(!found.contains("error: dependency"), "{found}");
 }
 
 #[test]
@@ -2088,7 +2179,10 @@ fn distinct_projects_cannot_claim_one_bundle_identity() {
     let error = ruddy_cli::compile_dependency_graph([("same", &left), ("same", &right)])
         .unwrap_err()
         .to_string();
-    assert!(error.contains("both declare bundle same@1.0.0"), "{error}");
+    assert!(
+        error.contains("[project-identity-conflict] Error") && error.contains("`same@1.0.0`"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -2150,7 +2244,7 @@ fn bundle_and_compiler_failures_are_returned_as_cli_diagnostics() {
         .expect_err("the configured root is missing")
         .to_string();
     assert!(
-        root_error.contains("could not read bundle root"),
+        root_error.contains("[project-root-missing] Error") && root_error.contains("missing.hc"),
         "{root_error}"
     );
 
@@ -2232,6 +2326,25 @@ fn rendering_without_color_has_no_ansi_and_omits_the_internal_phase() {
         rendered.contains("Help: add a space") || rendered.contains("help: add a space"),
         "{rendered}"
     );
+
+    let plain = ruddy_cli::render_diagnostic_with_advice(
+        "dependencies",
+        "dependency-source-missing",
+        "a dependency needs either a local `path` or a `git` URL",
+        &[],
+        None,
+        &[],
+        Some("add one source"),
+        &["declared in `Ruddy.toml`"],
+        false,
+    );
+    assert!(
+        plain.starts_with("[dependency-source-missing] Error:"),
+        "{plain}"
+    );
+    assert!(!plain.contains("error["), "{plain}");
+    assert!(plain.contains("help: add one source"), "{plain}");
+    assert!(plain.contains("note: declared in `Ruddy.toml`"), "{plain}");
 }
 
 #[test]
@@ -2292,7 +2405,7 @@ fn the_configured_root_must_name_a_file() {
             .expect_err("the root does not name a file")
             .to_string();
         assert!(
-            error.contains("field `root` must name a file"),
+            error.contains("[project-root-invalid] Error"),
             "root `{root}`: {error}"
         );
     }
@@ -2538,7 +2651,7 @@ fn unsupported_manifest_targets_use_manifest_parse_diagnostics() {
         )
         .unwrap();
         let error = compile(directory.path()).unwrap_err().to_string();
-        assert!(error.contains("could not parse manifest"), "{error}");
+        assert!(error.contains("[manifest-invalid] Error"), "{error}");
     }
 }
 
@@ -2549,7 +2662,7 @@ fn build_surfaces_compile_directory_and_artifact_write_failures() {
     assert!(
         compile_error
             .to_string()
-            .contains("could not read manifest")
+            .contains("[manifest-unreadable] Error")
     );
     assert!(!compile_error.is_usage());
 
