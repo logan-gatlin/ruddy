@@ -26,47 +26,29 @@ pub struct Path {
     pub name: TrackedString,
 }
 
-/// A dotted target supplied by the compilation target rather than by Ruddy.
-///
-/// `console.log` is deliberately not an expression or a module path: dots in
-/// terms are record projections and `::` names Ruddy modules, while an extern
-/// target belongs to neither namespace. Its segments stay spelled and spanned
-/// so a backend can map the declaration without re-reading source.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ForeignPath {
-    pub segments: Vec<TrackedString>,
-}
-
-impl ForeignPath {
-    pub fn span(&self) -> Span {
-        self.segments
-            .first()
-            .expect("a foreign path has its required first name")
-            .span
-            .merge(
-                self.segments
-                    .last()
-                    .expect("a foreign path is nonempty")
-                    .span,
-            )
-    }
-}
-
-impl fmt::Display for ForeignPath {
+/// A tracked string formats as a Ruddy string literal. Names are normally
+/// formatted through their decoded `.tracked` value; the extern target is the
+/// one parse-tree position that formats the tracked string itself.
+impl fmt::Display for TrackedString {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (at, segment) in self.segments.iter().enumerate() {
-            if at > 0 {
-                f.write_str(".")?;
+        f.write_str("\"")?;
+        for character in self.tracked.chars() {
+            match character {
+                '"' => f.write_str("\\\"")?,
+                '\\' => f.write_str("\\\\")?,
+                '\n' => f.write_str("\\n")?,
+                '\r' => f.write_str("\\r")?,
+                '\t' => f.write_str("\\t")?,
+                character => write!(f, "{character}")?,
             }
-            f.write_str(&segment.tracked)?;
         }
-        Ok(())
+        f.write_str("\"")
     }
 }
 
 #[derive(Debug, Clone)]
 pub enum StmtKind {
-    /// `extern answer : Nat = host.answer` — a target-supplied value.
+    /// `extern answer : Nat = "host.answer"` — a target-supplied value.
     ///
     /// Its annotation is required because there is no Ruddy body to infer from,
     /// and it binds one ordinary term name for the module just as `let` does.
@@ -77,7 +59,9 @@ pub enum StmtKind {
         ty: Annotation,
         /// The extern-only ABI spelling, retaining every marked `fn` boundary.
         abi: ExternType,
-        target: ForeignPath,
+        /// Decoded target source, with the span of its complete quoted literal.
+        /// Target-independent phases carry this unchanged and do not interpret it.
+        target: TrackedString,
     },
     Let {
         /// What the definition binds: a bare name, which is every definition
@@ -1256,8 +1240,8 @@ impl Parser {
         self.eat(&Kind::Colon)?;
         let (ty, abi) = self.extern_annotation()?;
         self.eat(&Kind::Equal)?;
-        let target = self.foreign_path()?;
-        let span = kw.span.merge(target.span());
+        let target = self.foreign_target()?;
+        let span = kw.span.merge(target.span);
         Some(span.track(StmtKind::Extern {
             name,
             ty,
@@ -1374,16 +1358,23 @@ impl Parser {
         Some((ty, abi))
     }
 
-    /// `<name> ('.' <name>)*` — the target side of an extern declaration.
-    /// Dots are required between segments and at least one name is required,
-    /// which makes a malformed target stop exactly where the next component
-    /// should have started rather than being treated as an expression.
-    fn foreign_path(&mut self) -> Option<ForeignPath> {
-        let mut segments = vec![self.ident()?];
-        while self.eat_if(&Kind::Dot).is_some() {
-            segments.push(self.ident()?);
+    /// A quoted target expression. The lexer has already decoded its contents;
+    /// retain that value unchanged while preserving the complete literal span.
+    fn foreign_target(&mut self) -> Option<TrackedString> {
+        let target = match self.peek() {
+            Some(token) => match &token.tracked {
+                Kind::String(value) => Some(token.span.track(value.clone())),
+                _ => None,
+            },
+            None => None,
+        };
+        match target {
+            Some(target) => {
+                self.advance();
+                Some(target)
+            }
+            None => self.unexpected(),
         }
-        Some(ForeignPath { segments })
     }
 
     /// `let <pattern> [: <type>] = <expr>`. The ascription is optional: without
@@ -2942,5 +2933,46 @@ impl Parser {
             }
             self.advance();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{token, tracking::FileID};
+
+    fn parse_source(source: &str) -> Output {
+        let lexed = token::lex(source, FileID::GENERATED);
+        assert!(lexed.errors.is_empty(), "lexer errors: {:?}", lexed.errors);
+        parse(lexed.tokens)
+    }
+
+    #[test]
+    fn extern_target_is_a_decoded_string_with_the_literal_span() {
+        let source = r#"extern log : String = "(s) => \"ok\"""#;
+        let output = parse_source(source);
+        assert!(
+            output.errors.is_empty(),
+            "parse errors: {:?}",
+            output.errors
+        );
+        let StmtKind::Extern { target, .. } = &output.stmts[0].tracked else {
+            panic!("expected an extern declaration");
+        };
+        assert_eq!(target.tracked, r#"(s) => "ok""#);
+        assert_eq!(target.to_string(), r#""(s) => \"ok\"""#);
+        let start = source.find('"').expect("source contains the target quote");
+        assert_eq!(target.span.start, start);
+        assert_eq!(target.span.width, source.len() - start);
+    }
+
+    #[test]
+    fn extern_target_rejects_the_old_dotted_form() {
+        let source = "extern log : String = console.log";
+        let output = parse_source(source);
+        assert!(output.stmts.is_empty());
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(output.errors[0].kind, ErrorKind::Unexpected);
+        assert_eq!(output.errors[0].span.start, source.find("console").unwrap());
     }
 }
