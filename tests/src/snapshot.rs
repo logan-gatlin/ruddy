@@ -2402,8 +2402,11 @@ fn a_raw_dump_carries_only_its_own_tab() {
 #[test]
 fn inference_stage_rows_serialize_compiler_identities() {
     let snapshot = snapshot(
-        "extern choose: { left when 'a: Nat, right when 'b: Nat } where 'a != 'b = host.choose\n\
-         let picked = choose\n\
+        "effect Fail = { abort: () -> () }\n\
+         type Callback = () -> () + !Fail\n\
+         extern install : fn(Callback) -> () + !Fail = host.install\n\
+         let choose : { x when 'a: Nat, y when 'b: Nat } -> Nat where 'a != 'b = fn v => match v with | {x} => x | {y} => y end\n\
+         let local = fn tag => match tag with | {a} => let g = fn w => choose w in g {} | {b} => 0n end\n\
          let bad = (1n).missing\n",
     );
     let stage = |id| snapshot.stages.iter().find(|stage| stage.id == id).unwrap();
@@ -2437,6 +2440,12 @@ fn inference_stage_rows_serialize_compiler_identities() {
         .filter_map(|node| field(node, "_batch_id"))
         .collect::<std::collections::HashSet<_>>();
     assert!(!batches.is_empty());
+    let deferred = nodes(stage("constraints"))
+        .into_iter()
+        .filter_map(|node| field(node, "_batch_id"))
+        .collect::<std::collections::HashSet<_>>();
+    assert!(!deferred.is_empty());
+    assert!(deferred.is_subset(&batches));
 }
 
 #[test]

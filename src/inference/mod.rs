@@ -1607,6 +1607,10 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     let mut steps = Vec::new();
     let mut refinements = Vec::new();
     for (symbol, coverage) in extern_coverage {
+        // Callback coverage is solver input just like generated definition
+        // constraints. Keep it in the published arena so every step's direct
+        // constraint identity remains resolvable by debugger consumers.
+        constraints.insert(symbol, coverage.clone());
         Solve {
             table: &mut table,
             errors: &mut errors,
@@ -1969,8 +1973,9 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     // had to be solved first is the solver's business rather than theirs.
     // [`Output::steps`] is that business exactly, and stays in solve order.
     let position: HashMap<Symbol, usize> = program
-        .terms
+        .externs
         .keys()
+        .chain(program.terms.keys())
         .enumerate()
         .map(|(at, symbol)| (*symbol, at))
         .collect();

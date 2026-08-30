@@ -96,7 +96,8 @@ fn rows(ids: &mut Ids, constraints: &[Constraint]) -> Vec<Node> {
                                             requirement.batch.origin.code(),
                                             requirement.batch.formula.to_string(),
                                         )
-                                        .at(requirement.batch.span),
+                                        .at(requirement.batch.span)
+                                        .field("_batch_id", requirement.batch.id.get().to_string()),
                                     )
                                 });
                             arm_node.children(rows(ids, &arm.constraints))

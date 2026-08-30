@@ -6375,6 +6375,19 @@ fn local_instance_requirements_keep_their_reserved_source_slot() {
     let first_empty = src.find("g {}").expect("the local call") + "g ".len();
     assert_eq!(flipped.span.start, first_empty, "{:#?}", output.store);
     assert_eq!(output.errors[0].span.start, first_empty);
+    // Generation reserved IDs 2 and 3 for the two use-site slots. Solving
+    // instantiates `g` through a temporary batch allocated after those slots;
+    // replacement must retain 2 rather than publishing that temporary ID.
+    assert_eq!(flipped.id.get(), 2, "{:#?}", output.store);
+    assert_eq!(
+        output
+            .store
+            .batches
+            .iter()
+            .map(|batch| batch.id.get())
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2, 3]
+    );
 }
 
 #[test]
@@ -8325,17 +8338,41 @@ fn explicit_variant_edges_are_solved_in_both_directions() {
     }
 }
 
+fn all_constraints<'a>(
+    constraints: &'a [inference::Constraint],
+    out: &mut Vec<&'a inference::Constraint>,
+) {
+    for constraint in constraints {
+        out.push(constraint);
+        match &constraint.kind {
+            inference::ConstraintKind::Let { value, body, .. } => {
+                all_constraints(value, out);
+                all_constraints(body, out);
+            }
+            inference::ConstraintKind::Match { arms, .. } => {
+                for arm in arms {
+                    all_constraints(&arm.constraints, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 #[test]
-fn inference_records_have_stable_direct_identities() {
+fn inference_records_have_unique_direct_identities_across_nested_constraints() {
     use std::collections::HashSet;
 
-    let (_, _, output) = infer_src("let bad = (1n).missing");
-    let constraint_ids: HashSet<_> = output
-        .constraints
-        .values()
-        .flatten()
-        .map(|constraint| constraint.id)
-        .collect();
+    let (_, _, output) = infer_src(
+        "let f = fn v => let read = fn x => x.field in match v with\n\
+         | {a} => read { field: 1n } | {b} => read { field: true } end",
+    );
+    let mut constraints = Vec::new();
+    for generated in output.constraints.values() {
+        all_constraints(generated, &mut constraints);
+    }
+    let constraint_ids: HashSet<_> = constraints.iter().map(|constraint| constraint.id).collect();
+    assert_eq!(constraint_ids.len(), constraints.len());
     assert!(!constraint_ids.is_empty());
 
     let step_ids: HashSet<_> = output.steps.iter().map(|step| step.id).collect();
@@ -8351,6 +8388,40 @@ fn inference_records_have_stable_direct_identities() {
     let error_ids: HashSet<_> = output.errors.iter().map(|error| error.id).collect();
     assert_eq!(error_ids.len(), output.errors.len());
     assert!(output.errors.iter().all(|error| error.id.get() != u64::MAX));
+}
+
+#[test]
+fn callback_steps_resolve_to_published_callback_constraints() {
+    use std::collections::HashSet;
+
+    let (_, _, output) = infer_src(
+        "effect Fail = { abort: () -> () }\n\
+         type Callback = () -> () + !Fail\n\
+         extern install : fn(Callback) -> () + !Fail = host.install",
+    );
+    let mut constraints = Vec::new();
+    for generated in output.constraints.values() {
+        all_constraints(generated, &mut constraints);
+    }
+    let callback_ids: HashSet<_> = constraints
+        .iter()
+        .filter(|constraint| {
+            matches!(
+                &constraint.kind,
+                inference::ConstraintKind::CallbackCoverage { .. }
+            )
+        })
+        .map(|constraint| constraint.id)
+        .collect();
+    assert!(!callback_ids.is_empty(), "{:#?}", output.constraints);
+    assert!(
+        output
+            .steps
+            .iter()
+            .any(|step| step.constraint.is_some_and(|id| callback_ids.contains(&id))),
+        "{:#?}",
+        output.steps
+    );
 }
 
 #[test]
