@@ -36,7 +36,7 @@ Git repositories are fetched and checked out with pure-Rust `gix` and Rustls—R
 
 ### Standard library
 
-Every project implicitly receives a dependency under the source alias `std`, resolved from `$RUDDY_HOME/std`. The dependency is injected before declared dependencies and is available through qualified `std::…` names. Direct terms, types, effects, and child modules of its `prelude` module are also available unqualified in every application module. Prelude child modules retain their structure—their own declarations are reached through the child module rather than flattened—and `std::prelude::…` always remains available. Lexical and user-module declarations shadow same-named prelude members; namespaces remain independent. The bundled `std@0.1.0` is initially empty; its source project lives in [`std/`](std/).
+Every project implicitly receives a dependency under the source alias `std`, resolved from `$RUDDY_HOME/std`. The dependency is injected before declared dependencies and is available through qualified `std::…` names. Direct terms, types, effects, and child modules of its `prelude` module are also available unqualified in every application module. Prelude child modules retain their structure—their own declarations are reached through the child module rather than flattened—and `std::prelude::…` always remains available. Lexical and user-module declarations shadow same-named prelude members; namespaces remain independent. The bundled `std@0.1.0` source project lives in [`std/`](std/). Its primitive utility modules are `std::str`, `std::nat`, `std::int`, `std::real`, and `std::boolean`. They provide conversions, arithmetic, comparisons, numeric bounds and rounding, Boolean logic, and string inspection and manipulation. Operations are written in Ruddy when the language has an equivalent primitive operation and otherwise use portable JavaScript externs. Numeric utilities follow JavaScript `Number` semantics; natural subtraction saturates at zero and natural and integer division truncate toward zero. String lengths and offsets are measured in UTF-16 code units.
 
 A project can disable this dependency or replace it with any normal path or Git dependency using the `std` option under `[dependencies]`:
 
@@ -74,9 +74,9 @@ target = "js"
 [dependencies]
 ```
 
-`ruddy build` then writes both `build/app.artifact` and `build/app.js`. Generation uses the fully linked in-memory root artifact, so the JavaScript module is self-contained with respect to Ruddy dependencies. A dependency's own `target` never causes JavaScript output while building a parent, and Ruddy never writes into an immutable Git checkout. The default `target = "lib"` writes only the canonical artifact. `ruddy check` generates neither file.
+`ruddy build` then writes `build/app.artifact`, `build/app.js`, and a `build/package.json` that marks the generated `.js` as ESM regardless of any ancestor package scope. Generation uses the fully linked in-memory root artifact, so the JavaScript module is self-contained with respect to Ruddy dependencies. A dependency's own `target` never causes JavaScript output while building a parent, and Ruddy never writes into an immutable Git checkout. The default `target = "lib"` writes only the canonical artifact. `ruddy check` generates neither file.
 
-The generated file is deterministic, portable JavaScript ESM. Root values are named exports, while nested Ruddy modules become frozen, prototype-free namespace objects:
+The generated file is deterministic, portable JavaScript ESM. The JavaScript target must work, at a minimum, in current Node.js and modern browsers; generated runtime code must not rely on environment-specific globals or APIs. Extern expressions may deliberately depend on capabilities supplied by their intended host. Root values are named exports, while nested Ruddy modules become frozen, prototype-free namespace objects:
 
 ```js
 import { main, util } from "./build/app.js";
@@ -119,7 +119,7 @@ Switching a project back to `"lib"` leaves an existing JavaScript file in place 
 
 `ruddy run` accepts no path or program arguments and is available only when the root manifest sets `target = "js"`. It first performs the same complete, dependency-first build and atomic installation as `ruddy build`, then loads and evaluates the newly installed `build/<name>.js` as an ECMAScript module. Loading the module is the entire entry point: Ruddy does not require, inspect, call, or print a `main` export. A library target is rejected and stale JavaScript is never executed. Since installation finishes before execution starts, completed build files remain available when module initialization later fails.
 
-Boa is the default runtime. A root project can instead configure a shell command in `Ruddy.toml`:
+Node.js is the default runtime and must be available as `node` on `PATH`. Ruddy checks for it before execution and reports a clear error when it is unavailable. A root project can instead configure a shell command in `Ruddy.toml`:
 
 ```toml
 [run]
@@ -128,4 +128,4 @@ js = "node"
 
 Ruddy runs this command from the project directory with the generated JavaScript file path appended as its final argument. The command may include shell syntax and arguments, for example `js = "node --enable-source-maps"`. A failure to start the shell or a nonzero runner exit status fails `ruddy run`; installed build files remain available. Run settings in dependency manifests have no effect.
 
-The embedded Boa runtime provides `console`, timers, `queueMicrotask`, text encoding, `URL`, base64, `structuredClone`, abort APIs, `process.cwd()` and `process.env`, and blocking network-enabled `fetch`. It intentionally provides no filesystem or standard-input API and Ruddy adds no custom host API. Boa's queued promises, microtasks, and timers are driven through completion; code that continually schedules more work can therefore keep `ruddy run` alive. Parse, linking, evaluation, rejected-promise, and queued-job errors exit with status 1 and include Boa's available JavaScript stack frames. A successful run is silent except for output produced by the module or runtime.
+By default Ruddy invokes `node build/<name>.js` from the project directory. The module therefore has Node.js's standard globals and host APIs. A nonzero Node.js exit status fails `ruddy run`; installed build files remain available. A successful run is silent except for output produced by the module or Node.js.

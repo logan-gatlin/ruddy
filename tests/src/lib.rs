@@ -25,6 +25,7 @@ mod runtime;
 mod sat;
 mod snapshot;
 mod stage;
+mod stdlib;
 mod symbol;
 mod token;
 mod tracking;
