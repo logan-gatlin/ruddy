@@ -580,6 +580,11 @@ fn a_constraint_reads_as_what_it_demands() {
     let equal = Constraint {
         id: inference::ConstraintId::synthetic(0),
         span,
+        origin: inference::ConstraintOrigin::ContextualCheck,
+        subjects: inference::ConstraintSubjects::pair(
+            inference::Subject::Context,
+            inference::Subject::Term,
+        ),
         kind: ConstraintKind::Equal {
             expected: nat.clone(),
             actual: Rc::new(Ty::plain(Ty::Var(0))),
@@ -2580,6 +2585,8 @@ fn the_scoping_constraints_read_as_what_they_do() {
     let bound = Constraint {
         id: inference::ConstraintId::synthetic(0),
         span: Span::generated(0, 1),
+        origin: inference::ConstraintOrigin::Binding,
+        subjects: inference::ConstraintSubjects::one(inference::Subject::Binding),
         kind: ConstraintKind::Let {
             symbol,
             bound: nat.clone(),

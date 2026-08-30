@@ -569,7 +569,137 @@ pub struct Constraint {
     /// Stable identity in generation order, including nested constraints.
     pub id: ConstraintId,
     pub span: Span,
+    /// The source operation that required this constraint.
+    pub origin: ConstraintOrigin,
+    /// Source-facing names for the ordered operands carried by `kind`.
+    pub subjects: ConstraintSubjects,
     pub kind: ConstraintKind,
+}
+
+/// Why generation emitted a constraint. This describes generation rather than
+/// the solver rule that eventually handles it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstraintOrigin {
+    Binding,
+    ContextualCheck,
+    ApplicationCallee,
+    ApplicationArgument,
+    ApplicationEffects,
+    Raise,
+    Projection,
+    Match,
+    MatchScrutinee,
+    MatchArm,
+    HandlerArm,
+    HandlerReturn,
+    Pattern,
+    Instance,
+    CallbackBoundary,
+}
+
+impl ConstraintOrigin {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Binding => "binding",
+            Self::ContextualCheck => "contextual-check",
+            Self::ApplicationCallee => "application-callee",
+            Self::ApplicationArgument => "application-argument",
+            Self::ApplicationEffects => "application-effects",
+            Self::Raise => "raise",
+            Self::Projection => "projection",
+            Self::Match => "match",
+            Self::MatchScrutinee => "match-scrutinee",
+            Self::MatchArm => "match-arm",
+            Self::HandlerArm => "handler-arm",
+            Self::HandlerReturn => "handler-return",
+            Self::Pattern => "pattern",
+            Self::Instance => "instance",
+            Self::CallbackBoundary => "callback-boundary",
+        }
+    }
+}
+
+/// Source roles of a constraint's ordered operands. Unary and scoping
+/// constraints use only `primary`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConstraintSubjects {
+    pub primary: Subject,
+    pub secondary: Option<Subject>,
+}
+
+impl ConstraintSubjects {
+    pub const fn one(primary: Subject) -> Self {
+        Self {
+            primary,
+            secondary: None,
+        }
+    }
+
+    pub const fn pair(primary: Subject, secondary: Subject) -> Self {
+        Self {
+            primary,
+            secondary: Some(secondary),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Subject {
+    Binding,
+    Annotation,
+    Context,
+    Term,
+    Callee,
+    CallShape,
+    Argument,
+    Parameter,
+    PerformedEffects,
+    AmbientEffects,
+    RaisedValue,
+    HandlerAnswer,
+    ProjectionBase,
+    ProjectionResult,
+    MatchScrutinee,
+    PatternDemand,
+    MatchResult,
+    MatchArm,
+    HandlerArm,
+    HandlerReturn,
+    Scheme,
+    Instance,
+    CallbackRequired,
+    CallbackAvailable,
+}
+
+impl Subject {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Binding => "binding",
+            Self::Annotation => "annotation",
+            Self::Context => "context",
+            Self::Term => "term",
+            Self::Callee => "callee",
+            Self::CallShape => "call-shape",
+            Self::Argument => "argument",
+            Self::Parameter => "parameter",
+            Self::PerformedEffects => "performed-effects",
+            Self::AmbientEffects => "ambient-effects",
+            Self::RaisedValue => "raised-value",
+            Self::HandlerAnswer => "handler-answer",
+            Self::ProjectionBase => "projection-base",
+            Self::ProjectionResult => "projection-result",
+            Self::MatchScrutinee => "match-scrutinee",
+            Self::PatternDemand => "pattern-demand",
+            Self::MatchResult => "match-result",
+            Self::MatchArm => "match-arm",
+            Self::HandlerArm => "handler-arm",
+            Self::HandlerReturn => "handler-return",
+            Self::Scheme => "scheme",
+            Self::Instance => "instance",
+            Self::CallbackRequired => "callback-required",
+            Self::CallbackAvailable => "callback-available",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1392,6 +1522,11 @@ fn callback_coverage_constraints(
                 .map(|required| Constraint {
                     id: ConstraintId::pending(),
                     span,
+                    origin: ConstraintOrigin::CallbackBoundary,
+                    subjects: ConstraintSubjects::pair(
+                        Subject::CallbackRequired,
+                        Subject::CallbackAvailable,
+                    ),
                     kind: ConstraintKind::CallbackCoverage {
                         required,
                         available: available.clone(),
@@ -6111,6 +6246,8 @@ mod existential_regressions {
             solve.run(&[Constraint {
                 id: constraint,
                 span: Span::default(),
+                origin: ConstraintOrigin::ContextualCheck,
+                subjects: ConstraintSubjects::pair(Subject::Context, Subject::Term),
                 kind: ConstraintKind::Equal { expected, actual },
             }]);
         }

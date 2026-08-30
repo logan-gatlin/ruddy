@@ -8391,6 +8391,38 @@ fn inference_records_have_unique_direct_identities_across_nested_constraints() {
 }
 
 #[test]
+fn generated_constraints_retain_source_origins_and_ordered_subjects() {
+    let (_, _, output) = infer_src(
+        "let get = fn value => value.answer\n\
+         let found = get { answer: 1n }",
+    );
+    let mut constraints = Vec::new();
+    for generated in output.constraints.values() {
+        all_constraints(generated, &mut constraints);
+    }
+    assert!(constraints.iter().any(|constraint| {
+        constraint.origin == inference::ConstraintOrigin::Projection
+            && constraint.subjects
+                == inference::ConstraintSubjects::pair(
+                    inference::Subject::ProjectionBase,
+                    inference::Subject::ProjectionResult,
+                )
+    }));
+    assert!(constraints.iter().any(|constraint| {
+        constraint.origin == inference::ConstraintOrigin::ApplicationArgument
+            && constraint.subjects.secondary == Some(inference::Subject::Argument)
+    }));
+    assert!(constraints.iter().any(|constraint| {
+        constraint.origin == inference::ConstraintOrigin::ApplicationEffects
+            && constraint.subjects
+                == inference::ConstraintSubjects::pair(
+                    inference::Subject::PerformedEffects,
+                    inference::Subject::AmbientEffects,
+                )
+    }));
+}
+
+#[test]
 fn callback_steps_resolve_to_published_callback_constraints() {
     use std::collections::HashSet;
 
@@ -8403,7 +8435,7 @@ fn callback_steps_resolve_to_published_callback_constraints() {
     for generated in output.constraints.values() {
         all_constraints(generated, &mut constraints);
     }
-    let callback_ids: HashSet<_> = constraints
+    let callbacks: Vec<_> = constraints
         .iter()
         .filter(|constraint| {
             matches!(
@@ -8411,6 +8443,17 @@ fn callback_steps_resolve_to_published_callback_constraints() {
                 inference::ConstraintKind::CallbackCoverage { .. }
             )
         })
+        .collect();
+    assert!(callbacks.iter().all(|constraint| {
+        constraint.origin == inference::ConstraintOrigin::CallbackBoundary
+            && constraint.subjects
+                == inference::ConstraintSubjects::pair(
+                    inference::Subject::CallbackRequired,
+                    inference::Subject::CallbackAvailable,
+                )
+    }));
+    let callback_ids: HashSet<_> = callbacks
+        .into_iter()
         .map(|constraint| constraint.id)
         .collect();
     assert!(!callback_ids.is_empty(), "{:#?}", output.constraints);

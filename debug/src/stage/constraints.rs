@@ -71,9 +71,14 @@ fn rows(ids: &mut Ids, constraints: &[Constraint]) -> Vec<Node> {
         .map(|constraint| {
             // Each constraint wears the span the program said it at, which is
             // what lets clicking one highlight the term that demanded it.
-            let node = Node::new(ids.next(), constraint.kind.code(), constraint.to_string())
+            let mut node = Node::new(ids.next(), constraint.kind.code(), constraint.to_string())
                 .at(constraint.span)
-                .field("_constraint_id", constraint.id.get().to_string());
+                .field("_constraint_id", constraint.id.get().to_string())
+                .field("_origin", constraint.origin.code())
+                .field("_primary_subject", constraint.subjects.primary.code());
+            if let Some(subject) = constraint.subjects.secondary {
+                node = node.field("_secondary_subject", subject.code());
+            }
             match &constraint.kind {
                 ConstraintKind::Let { value, body, .. } => {
                     node.children(rows(ids, value)).children(rows(ids, body))

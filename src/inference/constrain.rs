@@ -12,8 +12,9 @@ use crate::{
 };
 
 use super::{
-    Annotated, Binding, Constraint, ConstraintKind, Coverage, DeferredRequirement, GuardedArm,
-    Named, Origin, Table, effective_conditions, lower_annotation, same_field_set,
+    Annotated, Binding, Constraint, ConstraintKind, ConstraintOrigin, ConstraintSubjects, Coverage,
+    DeferredRequirement, GuardedArm, Named, Origin, Subject, Table, effective_conditions,
+    lower_annotation, same_field_set,
 };
 
 /// Pass one: the walk that says what has to hold, and solves nothing.
@@ -217,9 +218,21 @@ fn covered(
 }
 
 impl Constrain<'_> {
-    fn emit(&mut self, span: Span, kind: ConstraintKind) {
+    fn emit(
+        &mut self,
+        span: Span,
+        origin: ConstraintOrigin,
+        subjects: ConstraintSubjects,
+        kind: ConstraintKind,
+    ) {
         let id = self.table.constraint_id();
-        self.out.push(Constraint { id, span, kind });
+        self.out.push(Constraint {
+            id,
+            span,
+            origin,
+            subjects,
+            kind,
+        });
     }
 
     /// Record that `actual` — the type a term turned out to have — has to be
@@ -232,9 +245,19 @@ impl Constrain<'_> {
     /// whatever order this was called in. An arm that had to remember an
     /// `expected, actual` pair got applications backwards and told the reader
     /// their annotation was the mistake.
-    fn checks(&mut self, span: Span, actual: &Rc<Ty>, expected: &Rc<Ty>) {
+    fn checks(
+        &mut self,
+        span: Span,
+        actual: &Rc<Ty>,
+        expected: &Rc<Ty>,
+        origin: ConstraintOrigin,
+        expected_subject: Subject,
+        actual_subject: Subject,
+    ) {
         self.emit(
             span,
+            origin,
+            ConstraintSubjects::pair(expected_subject, actual_subject),
             ConstraintKind::Equal {
                 expected: expected.clone(),
                 actual: actual.clone(),
@@ -380,6 +403,8 @@ impl Constrain<'_> {
 
                 self.emit(
                     span,
+                    ConstraintOrigin::Binding,
+                    ConstraintSubjects::one(Subject::Binding),
                     ConstraintKind::Let {
                         symbol: name.tracked,
                         bound,
@@ -427,7 +452,14 @@ impl Constrain<'_> {
                     Ty::Arrow(from, to, does) => {
                         let (from, mut to, does) = (from.clone(), to.clone(), does.clone());
                         let actual = arg.ty.clone();
-                        self.checks(arg.span, &actual, &from);
+                        self.checks(
+                            arg.span,
+                            &actual,
+                            &from,
+                            ConstraintOrigin::ApplicationArgument,
+                            Subject::Parameter,
+                            Subject::Argument,
+                        );
                         // Application is the semantic destruction point of a
                         // packaged result. Open it during generation so its
                         // invocation-fresh guarantee occupies the call's
@@ -467,14 +499,30 @@ impl Constrain<'_> {
                             result.clone(),
                             does.clone(),
                         )));
-                        self.checks(span, &applied, &wanted);
+                        self.checks(
+                            span,
+                            &applied,
+                            &wanted,
+                            ConstraintOrigin::ApplicationCallee,
+                            Subject::CallShape,
+                            Subject::Callee,
+                        );
                         let actual = arg.ty.clone();
-                        self.checks(arg.span, &actual, &param);
+                        self.checks(
+                            arg.span,
+                            &actual,
+                            &param,
+                            ConstraintOrigin::ApplicationArgument,
+                            Subject::Parameter,
+                            Subject::Argument,
+                        );
                         (result, does)
                     }
                 };
                 self.emit(
                     span,
+                    ConstraintOrigin::ApplicationEffects,
+                    ConstraintSubjects::pair(Subject::PerformedEffects, Subject::AmbientEffects),
                     ConstraintKind::Performs {
                         performed,
                         ambient: self.ambient.row.clone(),
@@ -535,7 +583,14 @@ impl Constrain<'_> {
                 self.infer_term(value);
                 if let Some(answer) = self.answer.clone() {
                     let actual = value.ty.clone();
-                    self.checks(value.span, &actual, &answer);
+                    self.checks(
+                        value.span,
+                        &actual,
+                        &answer,
+                        ConstraintOrigin::Raise,
+                        Subject::HandlerAnswer,
+                        Subject::RaisedValue,
+                    );
                 }
                 self.table.fresh_type()
             }
@@ -596,6 +651,8 @@ impl Constrain<'_> {
                 let result = self.table.fresh_type();
                 self.emit(
                     field.span,
+                    ConstraintOrigin::Projection,
+                    ConstraintSubjects::pair(Subject::ProjectionBase, Subject::ProjectionResult),
                     ConstraintKind::Project {
                         base: base.ty.clone(),
                         field: field.tracked.clone(),
@@ -671,7 +728,14 @@ impl Constrain<'_> {
                     }
                 };
                 let actual = scrutinee.ty.clone();
-                self.checks(scrutinee.span, &actual, &expected);
+                self.checks(
+                    scrutinee.span,
+                    &actual,
+                    &expected,
+                    ConstraintOrigin::MatchScrutinee,
+                    Subject::PatternDemand,
+                    Subject::MatchScrutinee,
+                );
 
                 match qualifying {
                     Some(raw) => {
@@ -703,6 +767,8 @@ impl Constrain<'_> {
                         }
                         self.emit(
                             span,
+                            ConstraintOrigin::Match,
+                            ConstraintSubjects::pair(Subject::MatchScrutinee, Subject::MatchResult),
                             ConstraintKind::Match {
                                 scrutinee: expected,
                                 result: result.clone(),
@@ -717,7 +783,14 @@ impl Constrain<'_> {
                         for (_, body) in arms.iter_mut() {
                             self.infer_term(body);
                             let actual = body.ty.clone();
-                            self.checks(body.span, &actual, &result);
+                            self.checks(
+                                body.span,
+                                &actual,
+                                &result,
+                                ConstraintOrigin::MatchArm,
+                                Subject::MatchResult,
+                                Subject::MatchArm,
+                            );
                         }
                     }
                 }
@@ -783,7 +856,14 @@ impl Constrain<'_> {
             self.env.insert(arm.binder.tracked, Binding::Mono(from));
             self.infer_term(&mut arm.body);
             let actual = arm.body.ty.clone();
-            self.checks(arm.body.span, &actual, &to);
+            self.checks(
+                arm.body.span,
+                &actual,
+                &to,
+                ConstraintOrigin::HandlerArm,
+                Subject::Context,
+                Subject::HandlerArm,
+            );
         }
         match &mut handler.ret {
             // `| return p => e` binds `p` at the type of the handled
@@ -794,13 +874,27 @@ impl Constrain<'_> {
                     .insert(ret.binder.tracked, Binding::Mono(body.ty.clone()));
                 self.infer_term(&mut ret.body);
                 let actual = ret.body.ty.clone();
-                self.checks(ret.body.span, &actual, &answer);
+                self.checks(
+                    ret.body.span,
+                    &actual,
+                    &answer,
+                    ConstraintOrigin::HandlerReturn,
+                    Subject::HandlerAnswer,
+                    Subject::HandlerReturn,
+                );
             }
             // With none, the answer is what the body came to — said as one
             // equation rather than as a rule of its own.
             None => {
                 let actual = body.ty.clone();
-                self.checks(body.span, &actual, &answer);
+                self.checks(
+                    body.span,
+                    &actual,
+                    &answer,
+                    ConstraintOrigin::HandlerReturn,
+                    Subject::HandlerAnswer,
+                    Subject::Term,
+                );
             }
         }
         self.answer = held;
@@ -1040,7 +1134,14 @@ impl Constrain<'_> {
         // type the scrutinee decides — the `c` of the column-union example.
         let ty = demands.next().unwrap_or_else(|| self.table.fresh_type());
         for also in demands {
-            self.checks(columns.at, &also, &ty);
+            self.checks(
+                columns.at,
+                &also,
+                &ty,
+                ConstraintOrigin::Pattern,
+                Subject::PatternDemand,
+                Subject::PatternDemand,
+            );
         }
         let cover = match qualifies {
             false => None,
@@ -1164,7 +1265,14 @@ impl Constrain<'_> {
                     // span, which is the whole of what the reader wrote.
                     None => {
                         let carried = Rc::new(Ty::unit());
-                        self.checks(name.span, &carried, &want);
+                        self.checks(
+                            name.span,
+                            &carried,
+                            &want,
+                            ConstraintOrigin::ContextualCheck,
+                            Subject::Context,
+                            Subject::Term,
+                        );
                     }
                 }
                 term.ty = expected.clone();
@@ -1172,7 +1280,14 @@ impl Constrain<'_> {
             _ => {
                 self.infer_term(term);
                 let actual = term.ty.clone();
-                self.checks(term.span, &actual, expected);
+                self.checks(
+                    term.span,
+                    &actual,
+                    expected,
+                    ConstraintOrigin::ContextualCheck,
+                    Subject::Context,
+                    Subject::Term,
+                );
             }
         }
     }
@@ -1218,6 +1333,8 @@ impl Constrain<'_> {
                 self.table.deferred.insert(requirement);
                 self.emit(
                     span,
+                    ConstraintOrigin::Instance,
+                    ConstraintSubjects::pair(Subject::Scheme, Subject::Instance),
                     ConstraintKind::Instance {
                         symbol,
                         ty: ty.clone(),
