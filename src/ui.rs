@@ -2826,8 +2826,8 @@ impl fmt::Display for inference::ErrorKind {
             inference::ErrorKind::NotAStruct { base } => {
                 write!(f, "`{base}` is not a struct, so it has no fields to read")
             }
-            inference::ErrorKind::Mismatch { .. } => {
-                f.write_str("these uses require incompatible types")
+            inference::ErrorKind::Mismatch { expected, actual } => {
+                write!(f, "type mismatch: expected `{expected}`, found `{actual}`")
             }
             inference::ErrorKind::Recursive => {
                 f.write_str("this type would have to contain itself")

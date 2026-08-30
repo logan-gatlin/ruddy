@@ -5,8 +5,8 @@ help: change this value to a struct, or change/remove the field access
 
 ## type-mismatch
 [type-mismatch] a natural number and a struct cannot be the same type
-primary: the annotation fixes the type here
-related: this expression supplies its type here
+primary: this expression supplies its type here
+related: the annotation fixes the type here
 help: change the first use so it agrees with the other one
 help: or change the other use so it agrees with the first one
 
@@ -116,15 +116,16 @@ help: use a fixed type here, or keep the generic value behind a Ruddy wrapper
 
 ## repeated-calls
 [type-mismatch] a natural number and a boolean cannot be the same type
-primary: this call fixes what type the argument must have
-related: this argument supplies a type to the call
+primary: this argument supplies a type to the call
+related: this call fixes what type the argument must have
 related: this expression is called as a function
+related: this argument supplies a type to the call
 help: change the first use so it agrees with the other one
 help: or change the other use so it agrees with the first one
 
 ## branches
 [type-mismatch] a natural number and a struct cannot be the same type
-primary: all branches must contribute one result type
+primary: this branch contributes its type to the match result
 related: this branch contributes its type to the match result
 help: change the first use so it agrees with the other one
 help: or change the other use so it agrees with the first one
@@ -137,14 +138,14 @@ help: or change the other use so it agrees with the first one
 
 ## cross-definition
 [type-mismatch] a natural number and a struct cannot be the same type
-primary: this call fixes what type the argument must have
-related: this argument supplies a type to the call
+primary: this argument supplies a type to the call
+related: this call fixes what type the argument must have
 help: change the first use so it agrees with the other one
 help: or change the other use so it agrees with the first one
 
 ## long-alias
 [type-mismatch] a natural number and a struct cannot be the same type
-primary: the annotation fixes the type here
-related: this expression supplies its type here
+primary: this expression supplies its type here
+related: the annotation fixes the type here
 help: change the first use so it agrees with the other one
 help: or change the other use so it agrees with the first one

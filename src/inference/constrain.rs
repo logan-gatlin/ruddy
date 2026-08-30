@@ -264,12 +264,18 @@ impl Constrain<'_> {
         expected: &Rc<Ty>,
         origin: ConstraintOrigin,
         expected_subject: Subject,
+        expected_span: Option<Span>,
         actual_subject: Subject,
     ) {
         self.emit(
             span,
             origin,
-            ConstraintSubjects::pair(expected_subject, actual_subject),
+            ConstraintSubjects::pair_at(
+                expected_subject,
+                expected_span,
+                actual_subject,
+                Some(span),
+            ),
             ConstraintKind::Equal {
                 expected: expected.clone(),
                 actual: actual.clone(),
@@ -309,12 +315,12 @@ impl Constrain<'_> {
             TermKind::Unary { op, value } => match op {
                 crate::ir::UnaryOp::Neg => {
                     let real = Rc::new(Ty::plain(Ty::Real));
-                    self.check_term(value, &real, Subject::Context);
+                    self.check_term(value, &real, Subject::Context, None);
                     real
                 }
                 crate::ir::UnaryOp::Not => {
                     let boolean = Rc::new(Ty::plain(Ty::Boolean));
-                    self.check_term(value, &boolean, Subject::Context);
+                    self.check_term(value, &boolean, Subject::Context, None);
                     boolean
                 }
             },
@@ -329,8 +335,8 @@ impl Constrain<'_> {
                     | crate::ir::BinaryOp::Xor => Ty::Boolean,
                 };
                 let ty = Rc::new(Ty::plain(core));
-                self.check_term(left, &ty, Subject::Context);
-                self.check_term(right, &ty, Subject::Context);
+                self.check_term(left, &ty, Subject::Context, None);
+                self.check_term(right, &ty, Subject::Context, None);
                 ty
             }
             TermKind::Ident(symbol) => {
@@ -363,6 +369,7 @@ impl Constrain<'_> {
                 } else {
                     Subject::LocalBinding
                 };
+                let expected_span = annotation.as_ref().map(|annotation| annotation.ty.span);
                 let (bound, promised, rigids) = match annotation {
                     Some(annotation) => {
                         let lowered = lower_annotation(self.mint, self.table, annotation);
@@ -404,7 +411,7 @@ impl Constrain<'_> {
                     }
                 };
                 let outer = std::mem::take(&mut self.out);
-                self.check_term(value, &bound, expected_subject);
+                self.check_term(value, &bound, expected_subject, expected_span);
                 let required = std::mem::replace(&mut self.out, outer);
 
                 self.table.level -= 1;
@@ -475,6 +482,7 @@ impl Constrain<'_> {
                             &from,
                             ConstraintOrigin::ApplicationArgument,
                             Subject::Parameter,
+                            Some(func.span),
                             Subject::Argument,
                         );
                         // Application is the semantic destruction point of a
@@ -522,6 +530,7 @@ impl Constrain<'_> {
                             &wanted,
                             ConstraintOrigin::ApplicationCallee,
                             Subject::CallShape,
+                            None,
                             Subject::Callee,
                         );
                         let actual = arg.ty.clone();
@@ -531,6 +540,7 @@ impl Constrain<'_> {
                             &param,
                             ConstraintOrigin::ApplicationArgument,
                             Subject::Parameter,
+                            Some(func.span),
                             Subject::Argument,
                         );
                         (result, does)
@@ -606,6 +616,7 @@ impl Constrain<'_> {
                         &answer,
                         ConstraintOrigin::Raise,
                         Subject::HandlerAnswer,
+                        None,
                         Subject::RaisedValue,
                     );
                 }
@@ -751,6 +762,7 @@ impl Constrain<'_> {
                     &expected,
                     ConstraintOrigin::MatchScrutinee,
                     Subject::PatternDemand,
+                    None,
                     Subject::MatchScrutinee,
                 );
 
@@ -816,6 +828,7 @@ impl Constrain<'_> {
                                 &result,
                                 ConstraintOrigin::MatchArm,
                                 Subject::MatchResult,
+                                None,
                                 Subject::MatchArm,
                             );
                         }
@@ -889,6 +902,7 @@ impl Constrain<'_> {
                 &to,
                 ConstraintOrigin::HandlerArm,
                 Subject::Context,
+                None,
                 Subject::HandlerArm,
             );
         }
@@ -907,6 +921,7 @@ impl Constrain<'_> {
                     &answer,
                     ConstraintOrigin::HandlerReturn,
                     Subject::HandlerAnswer,
+                    None,
                     Subject::HandlerReturn,
                 );
             }
@@ -920,6 +935,7 @@ impl Constrain<'_> {
                     &answer,
                     ConstraintOrigin::HandlerFallback,
                     Subject::HandlerAnswer,
+                    None,
                     Subject::HandlerBody,
                 );
             }
@@ -1169,6 +1185,7 @@ impl Constrain<'_> {
                 &ty,
                 ConstraintOrigin::Pattern,
                 Subject::PatternDemand,
+                None,
                 Subject::PatternDemand,
             );
         }
@@ -1227,6 +1244,7 @@ impl Constrain<'_> {
         term: &mut Term,
         expected: &Rc<Ty>,
         expected_subject: Subject,
+        expected_span: Option<Span>,
     ) {
         // Checking looks through a name — an annotation of `list` still pushes
         // into a struct literal — but `term.ty` is set from `expected` rather
@@ -1246,7 +1264,7 @@ impl Constrain<'_> {
                     inside: true,
                 });
                 let held = self.answer.take();
-                self.check_term(body, &to, expected_subject);
+                self.check_term(body, &to, expected_subject, expected_span);
                 self.answer = held;
                 self.leave(outer);
                 term.ty = expected.clone();
@@ -1269,7 +1287,7 @@ impl Constrain<'_> {
             {
                 for (name, field) in fields.iter_mut() {
                     let want = row.labels[name].ty.clone();
-                    self.check_term(&mut field.value, &want, expected_subject);
+                    self.check_term(&mut field.value, &want, expected_subject, expected_span);
                 }
                 term.ty = expected.clone();
             }
@@ -1292,7 +1310,9 @@ impl Constrain<'_> {
             {
                 let want = cases.labels[&name.tracked].ty.clone();
                 match payload {
-                    Some(payload) => self.check_term(payload, &want, expected_subject),
+                    Some(payload) => {
+                        self.check_term(payload, &want, expected_subject, expected_span)
+                    }
                     // Nothing written is unit, and the case has to carry one.
                     // Said as a constraint rather than pushed, since there is
                     // no term here to push into — and worded with the tag's own
@@ -1305,6 +1325,7 @@ impl Constrain<'_> {
                             &want,
                             ConstraintOrigin::ContextualCheck,
                             expected_subject,
+                            expected_span,
                             Subject::Term,
                         );
                     }
@@ -1320,6 +1341,7 @@ impl Constrain<'_> {
                     expected,
                     ConstraintOrigin::ContextualCheck,
                     expected_subject,
+                    expected_span,
                     Subject::Term,
                 );
             }

@@ -381,6 +381,10 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
                 inference::ErrorCause::Batch(id) => InferenceCause::Batch { batch_id: id.get() },
                 inference::ErrorCause::Direct => InferenceCause::Direct,
             });
+            diagnostic.inference_explanation = error
+                .explanation
+                .as_ref()
+                .map(|explanation| wire_explanation(explanation, &index));
             diagnostic
         }));
     }
@@ -655,6 +659,85 @@ pub fn install_hook() {
     });
 }
 
+fn wire_explanation(
+    explanation: &inference::InferenceExplanation,
+    files: &HashMap<FileID, u32>,
+) -> crate::wire::InferenceExplanation {
+    fn description(value: inference::TypeDescription) -> &'static str {
+        use inference::TypeDescription as T;
+        match value {
+            T::NaturalNumber => "natural-number",
+            T::Integer => "integer",
+            T::RealNumber => "real-number",
+            T::Text => "text",
+            T::Boolean => "boolean",
+            T::Function => "function",
+            T::Struct => "struct",
+            T::TaggedValue => "tagged-value",
+            T::DeclaredType => "declared-type",
+            T::Undecided => "undecided",
+        }
+    }
+    fn fact(
+        fact: &inference::ExplanationFact,
+        files: &HashMap<FileID, u32>,
+    ) -> crate::wire::ExplanationFact {
+        let payload = match fact.payload {
+            inference::ExplanationFactPayload::RequiresType => "requires-type",
+            inference::ExplanationFactPayload::UsedAsFunction => "used-as-function",
+            inference::ExplanationFactPayload::SuppliesArgument => "supplies-argument",
+            inference::ExplanationFactPayload::BranchResult => "branch-result",
+        };
+        crate::wire::ExplanationFact {
+            span: loc(fact.span, files),
+            constraint_id: fact.constraint.get(),
+            origin: fact.origin.code(),
+            subject: fact.subject.code(),
+            payload,
+        }
+    }
+    let full: Vec<_> = explanation
+        .full_facts
+        .iter()
+        .map(|item| fact(item, files))
+        .collect();
+    let abridged = explanation
+        .abridged
+        .iter()
+        .filter_map(|at| full.get(*at).cloned())
+        .collect();
+    let contradiction = &explanation.contradiction;
+    crate::wire::InferenceExplanation {
+        abridged,
+        full,
+        contradiction: crate::wire::ExplanationContradiction {
+            kind: match contradiction.kind {
+                inference::ContradictionKind::IncompatibleTypes => "incompatible-types",
+                inference::ContradictionKind::ValueUsedAsFunction => "value-used-as-function",
+            },
+            left: description(contradiction.left),
+            right: description(contradiction.right),
+            repairs: ["change-first-use", "change-second-use"],
+        },
+        cause: crate::wire::ExplanationCause {
+            error_id: explanation.cause.error.get(),
+            seed_reason_id: explanation.cause.seed.map(|id| id.get()),
+            constraint_ids: explanation
+                .cause
+                .constraints
+                .iter()
+                .map(|id| id.get())
+                .collect(),
+            reason_ids: explanation
+                .cause
+                .reasons
+                .iter()
+                .map(|id| id.get())
+                .collect(),
+        },
+    }
+}
+
 fn source_error(
     stage: &'static str,
     source_diagnostic: ui::Diagnostic,
@@ -691,6 +774,7 @@ fn dependency_diagnostic(report: ruddy_cli::CompileDiagnostic) -> Diagnostic {
         id: 0,
         inference_error_id: None,
         inference_cause: None,
+        inference_explanation: None,
         stage: "dependencies",
         severity: Severity::Error,
         code,
@@ -709,6 +793,7 @@ fn raw(stage: &'static str, code: &'static str, message: String, span: Option<Lo
         id: 0,
         inference_error_id: None,
         inference_cause: None,
+        inference_explanation: None,
         stage,
         severity: Severity::Error,
         code,

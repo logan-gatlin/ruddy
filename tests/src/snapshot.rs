@@ -1685,6 +1685,19 @@ fn a_type_error_is_a_diagnostic() {
         .map(|diagnostic| diagnostic.code)
         .collect();
     assert_eq!(codes, ["type-mismatch"]);
+    let explanation = mismatch.diagnostics[0]
+        .inference_explanation
+        .as_ref()
+        .expect("debugger mismatch explanation");
+    assert!(!explanation.full.is_empty());
+    assert!(!explanation.abridged.is_empty());
+    assert_eq!(explanation.contradiction.kind, "incompatible-types");
+    assert!(
+        explanation
+            .abridged
+            .iter()
+            .all(|fact| fact.span.is_some() && !fact.origin.is_empty())
+    );
 
     let missing = snapshot("let f : { x: Nat } -> Nat = fn p => p.y\n");
     let [diagnostic] = missing.diagnostics.as_slice() else {

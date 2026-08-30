@@ -830,6 +830,22 @@ fn ordinary_mismatch_explanations_keep_full_and_abridged_causal_evidence() {
     assert_eq!(explanation, repeated);
     assert!((2..=4).contains(&explanation.abridged.len()));
     assert!(explanation.full_facts.len() >= explanation.abridged.len());
+    let selected_spans: HashSet<_> = explanation
+        .abridged
+        .iter()
+        .map(|at| explanation.full_facts[*at].span)
+        .collect();
+    for endpoint in [source.find("1n").unwrap(), source.find("false").unwrap()] {
+        assert!(
+            selected_spans.iter().any(|span| span.start == endpoint),
+            "both conflicting call arguments need their own label: {explanation:#?}"
+        );
+    }
+    assert_eq!(
+        explanation.contradiction.kind,
+        inference::ContradictionKind::IncompatibleTypes,
+        "an argument mismatch is not a non-function callee failure"
+    );
     assert!(!explanation.cause.reasons.is_empty());
     assert!(!explanation.cause.constraints.is_empty());
     assert_eq!(
@@ -851,6 +867,31 @@ fn ordinary_mismatch_explanations_keep_full_and_abridged_causal_evidence() {
             "migrated mismatch leaked `{forbidden}`: {rendered:#?}"
         );
     }
+}
+
+#[test]
+fn a_function_argument_mismatch_is_not_called_a_non_function_callee() {
+    let source = include_str!("../diagnostics/inference/function-argument.hc");
+    let errors = inference_fixture_errors(source);
+    let [error] = errors.as_slice() else {
+        panic!("function argument fixture must produce one mismatch: {errors:#?}");
+    };
+    let explanation = error.explanation.as_ref().expect("grounded explanation");
+    assert_eq!(
+        explanation.contradiction.kind,
+        inference::ContradictionKind::IncompatibleTypes
+    );
+    assert_eq!(
+        (
+            explanation.contradiction.left,
+            explanation.contradiction.right
+        ),
+        (
+            inference::TypeDescription::NaturalNumber,
+            inference::TypeDescription::Boolean,
+        )
+    );
+    assert!(!error.diagnostic().title.contains("called as a function"));
 }
 
 /// Source-owned examples pin the diagnostic a reader is meant to see, rather
@@ -987,9 +1028,13 @@ fn inference_source_corpus_matches_abridged_structured_goldens() {
                 diagnostic.title,
                 "a natural number and a boolean cannot be the same type"
             );
-            assert_eq!(
-                diagnostic.primary.message,
-                "this call fixes what type the argument must have"
+            assert!(
+                diagnostic.primary.message.contains("argument")
+                    && diagnostic
+                        .related
+                        .iter()
+                        .any(|related| related.message.contains("argument")),
+                "both repeated call arguments must be displayed: {diagnostic:#?}"
             );
         }
         for diagnostic in diagnostics {

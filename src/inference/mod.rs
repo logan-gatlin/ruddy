@@ -735,24 +735,53 @@ impl ConstraintOrigin {
 
 /// Source roles of a constraint's ordered operands. Unary and scoping
 /// constraints use only `primary`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Eq)]
 pub struct ConstraintSubjects {
     pub primary: Subject,
+    pub primary_span: Option<Span>,
     pub secondary: Option<Subject>,
+    pub secondary_span: Option<Span>,
+}
+
+impl PartialEq for ConstraintSubjects {
+    fn eq(&self, other: &Self) -> bool {
+        self.primary == other.primary && self.secondary == other.secondary
+    }
 }
 
 impl ConstraintSubjects {
     pub const fn one(primary: Subject) -> Self {
         Self {
             primary,
+            primary_span: None,
             secondary: None,
+            secondary_span: None,
         }
     }
 
     pub const fn pair(primary: Subject, secondary: Subject) -> Self {
         Self {
             primary,
+            primary_span: None,
             secondary: Some(secondary),
+            secondary_span: None,
+        }
+    }
+
+    /// Two source roles with the independent ranges that actually wrote them.
+    /// `None` means the role is semantic context rather than source syntax and
+    /// must not be turned into a diagnostic annotation.
+    pub const fn pair_at(
+        primary: Subject,
+        primary_span: Option<Span>,
+        secondary: Subject,
+        secondary_span: Option<Span>,
+    ) -> Self {
+        Self {
+            primary,
+            primary_span,
+            secondary: Some(secondary),
+            secondary_span,
         }
     }
 }
@@ -1856,32 +1885,93 @@ fn describe_type(ty: &Rc<Ty>) -> TypeDescription {
     }
 }
 
-/// Pick the first incompatible structural leaf without recursive descent. In
-/// practice the solver's mismatch step is already at that leaf; retaining this
-/// walk makes explanations robust to direct/boundary mismatch producers too.
-fn smallest_incompatible(left: &Rc<Ty>, right: &Rc<Ty>) -> (TypeDescription, TypeDescription) {
+/// Pick the first incompatible semantic leaf on an explicit stack. The walk
+/// follows every payload-bearing type position and unfolds declarations one
+/// layer at a time; malformed/missing alias provenance is reported honestly as
+/// a declared or undecided type rather than guessed from solver variables.
+fn smallest_incompatible(
+    aliases: &IndexMap<Symbol, Scheme>,
+    left: &Rc<Ty>,
+    right: &Rc<Ty>,
+) -> (TypeDescription, TypeDescription) {
     let mut work = vec![(left.clone(), right.clone())];
-    while let Some((left, right)) = work.pop() {
-        let mut left = left;
-        let mut right = right;
+    let mut fallback = (describe_type(left), describe_type(right));
+    while let Some((mut left, mut right)) = work.pop() {
         while let Ty::Package(inner) = &*left {
             left = inner.clone();
         }
         while let Ty::Package(inner) = &*right {
             right = inner.clone();
         }
-        if let (Ty::Arrow(l_from, l_to, _), Ty::Arrow(r_from, r_to, _)) = (&*left, &*right) {
-            // Argument is source-first; push result first for LIFO ordering.
-            work.push((l_to.clone(), r_to.clone()));
-            work.push((l_from.clone(), r_from.clone()));
-            continue;
+
+        // Names are source spelling, not semantic leaves. Only unfold when the
+        // published declaration is actually available; imported recovery holes
+        // retain the honest `DeclaredType` fallback.
+        if matches!(&*left, Ty::Named { symbol, .. } if aliases.contains_key(symbol)) {
+            left = unfold(aliases, &left);
         }
+        if matches!(&*right, Ty::Named { symbol, .. } if aliases.contains_key(symbol)) {
+            right = unfold(aliases, &right);
+        }
+
         let descriptions = (describe_type(&left), describe_type(&right));
-        if descriptions.0 != descriptions.1 || !same_finite_syntax(&left, &right) {
-            return descriptions;
+        fallback = descriptions;
+        match (&*left, &*right) {
+            (Ty::Arrow(l_from, l_to, l_effects), Ty::Arrow(r_from, r_to, r_effects)) => {
+                push_row_payloads(&mut work, l_effects, r_effects);
+                // Source order: parameter, result, then effects.
+                work.push((l_to.clone(), r_to.clone()));
+                work.push((l_from.clone(), r_from.clone()));
+            }
+            (Ty::Struct(left), Ty::Struct(right)) | (Ty::Sum(left), Ty::Sum(right)) => {
+                push_row_payloads(&mut work, left, right);
+                if left.labels.keys().ne(right.labels.keys()) {
+                    return descriptions;
+                }
+            }
+            (
+                Ty::Named {
+                    symbol: l_symbol,
+                    args: l_args,
+                    ..
+                },
+                Ty::Named {
+                    symbol: r_symbol,
+                    args: r_args,
+                    ..
+                },
+            ) if l_symbol == r_symbol && l_args.len() == r_args.len() => {
+                for (left, right) in l_args.iter().zip(r_args.iter()).rev() {
+                    work.push((left.clone(), right.clone()));
+                }
+            }
+            (Ty::Nat, Ty::Nat)
+            | (Ty::Int, Ty::Int)
+            | (Ty::Real, Ty::Real)
+            | (Ty::String, Ty::String)
+            | (Ty::Boolean, Ty::Boolean)
+            | (Ty::Bound(_), Ty::Bound(_))
+            | (Ty::Var(_), Ty::Var(_))
+            | (Ty::Rigid { .. }, Ty::Rigid { .. })
+            | (Ty::Undecided, Ty::Undecided) => {}
+            _ => return descriptions,
         }
     }
-    (describe_type(left), describe_type(right))
+    fallback
+}
+
+fn push_row_payloads(work: &mut Vec<(Rc<Ty>, Rc<Ty>)>, left: &Row, right: &Row) {
+    // Reverse insertion order so the first written common label is visited
+    // first by the LIFO work list. Presence/rest incompatibilities have no type
+    // leaf; their dedicated row diagnostics remain the truthful fallback.
+    let common: Vec<_> = left
+        .labels
+        .iter()
+        .filter_map(|(name, field)| right.labels.get(name).map(|other| (&field.ty, &other.ty)))
+        .collect();
+    for (left, right) in common.into_iter().rev() {
+        work.push((left.clone(), right.clone()));
+    }
 }
 
 fn all_constraints(
@@ -1915,6 +2005,7 @@ fn attach_mismatch_explanations(
     constraints: &IndexMap<Symbol, Vec<Constraint>>,
     steps: &[Step],
     reasons: &[Reason],
+    aliases: &IndexMap<Symbol, Scheme>,
 ) {
     let constraints = all_constraints(constraints);
     let steps: HashMap<_, _> = steps.iter().map(|step| (step.id, step)).collect();
@@ -1957,24 +2048,35 @@ fn attach_mismatch_explanations(
             let Some(constraint) = constraints.get(id) else {
                 continue;
             };
-            let payload = match constraint.origin {
-                ConstraintOrigin::ApplicationCallee => ExplanationFactPayload::UsedAsFunction,
-                ConstraintOrigin::ApplicationArgument => ExplanationFactPayload::SuppliesArgument,
-                ConstraintOrigin::MatchArm | ConstraintOrigin::Match => {
-                    ExplanationFactPayload::BranchResult
-                }
-                _ => ExplanationFactPayload::RequiresType,
-            };
-            full_facts.push(ExplanationFact {
-                span: constraint.span,
-                constraint: *id,
-                origin: constraint.origin,
-                subject: constraint.subjects.primary,
-                payload,
-            });
-            if let Some(subject) = constraint.subjects.secondary {
+            let endpoints = [
+                (
+                    constraint.subjects.primary,
+                    constraint.subjects.primary_span,
+                ),
+                (
+                    constraint
+                        .subjects
+                        .secondary
+                        .unwrap_or(constraint.subjects.primary),
+                    constraint.subjects.secondary_span,
+                ),
+            ];
+            for (subject, span) in endpoints {
+                let Some(span) = span else { continue };
+                let payload = match (constraint.origin, subject) {
+                    (ConstraintOrigin::ApplicationCallee, Subject::Callee) => {
+                        ExplanationFactPayload::UsedAsFunction
+                    }
+                    (ConstraintOrigin::ApplicationArgument, _) => {
+                        ExplanationFactPayload::SuppliesArgument
+                    }
+                    (ConstraintOrigin::MatchArm | ConstraintOrigin::Match, _) => {
+                        ExplanationFactPayload::BranchResult
+                    }
+                    _ => ExplanationFactPayload::RequiresType,
+                };
                 full_facts.push(ExplanationFact {
-                    span: constraint.span,
+                    span,
                     constraint: *id,
                     origin: constraint.origin,
                     subject,
@@ -1982,47 +2084,42 @@ fn attach_mismatch_explanations(
                 });
             }
         }
-        // A direct mismatch still has a useful structured account. This is
-        // mainly for focused semantic tests; production solve failures carry a
-        // generated constraint reason.
+        // A reason without a written endpoint cannot support source labels.
+        // Keep the established mismatch diagnostic rather than inventing
+        // pending contextual facts and claiming they came from the program.
         if full_facts.is_empty() {
-            full_facts.push(ExplanationFact {
-                span: error.span,
-                constraint: ConstraintId::pending(),
-                origin: ConstraintOrigin::ContextualCheck,
-                subject: Subject::Context,
-                payload: ExplanationFactPayload::RequiresType,
-            });
-            full_facts.push(ExplanationFact {
-                span: error.span,
-                constraint: ConstraintId::pending(),
-                origin: ConstraintOrigin::ContextualCheck,
-                subject: Subject::Term,
-                payload: ExplanationFactPayload::RequiresType,
-            });
+            continue;
         }
-        let mut abridged = Vec::new();
+        let mut candidates = Vec::new();
         let mut included = HashSet::new();
         for (at, fact) in full_facts.iter().enumerate() {
-            // The full path retains repeated requirements. The default view
-            // says each source role once instead of repeating identical prose.
-            let key = match fact.payload {
-                ExplanationFactPayload::UsedAsFunction => (fact.payload, Subject::Callee),
-                _ => (fact.payload, fact.subject),
-            };
-            if !included.insert(key) {
-                continue;
-            }
-            abridged.push(at);
-            if abridged.len() == 4 {
-                break;
+            // Repeated roles at different source ranges are different uses.
+            // Suppress only literal duplicate annotations from shared paths.
+            if included.insert((fact.span, fact.constraint, fact.subject)) {
+                candidates.push(at);
             }
         }
-        let leaf = smallest_incompatible(expected, actual);
-        let value_used_as_function = full_facts.iter().any(|fact| {
-            fact.payload == ExplanationFactPayload::UsedAsFunction
-                && (leaf.0 == TypeDescription::Function || leaf.1 == TypeDescription::Function)
-        });
+        // The failed requirement is first in the reason walk and its oldest
+        // conflicting source requirement is last. Keep both even on long paths,
+        // filling the bounded ordinary view with nearby causal context.
+        let mut abridged: Vec<_> = candidates.iter().take(4).copied().collect();
+        if candidates.len() > 4 {
+            abridged[3] = *candidates.last().unwrap();
+        }
+        // Keep the failed source endpoint primary; the other genuinely written
+        // causes remain related labels even when their reasons precede it.
+        abridged.sort_by_key(|at| full_facts[*at].span != error.span);
+        let leaf = smallest_incompatible(aliases, expected, actual);
+        let failing_constraint = match error.cause {
+            ErrorCause::Step(id) => steps.get(&id).and_then(|step| step.constraint),
+            ErrorCause::Batch(_) | ErrorCause::Direct => None,
+        };
+        let value_used_as_function = failing_constraint
+            .and_then(|id| constraints.get(&id))
+            .is_some_and(|constraint| {
+                constraint.origin == ConstraintOrigin::ApplicationCallee
+                    && (leaf.0 == TypeDescription::Function || leaf.1 == TypeDescription::Function)
+            });
         error.explanation = Some(InferenceExplanation {
             full_facts,
             abridged,
@@ -2374,7 +2471,16 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             } else {
                 Subject::TopLevelBinding
             };
-            constrain.check_term(&mut decl.value, &scoped.bound, expected_subject);
+            let expected_span = decl
+                .annotation
+                .as_ref()
+                .map(|annotation| annotation.ty.span);
+            constrain.check_term(
+                &mut decl.value,
+                &scoped.bound,
+                expected_subject,
+                expected_span,
+            );
             let generated = constrain.out;
             let annotated = constrain.annotated;
             let ty = match &decl.annotation {
@@ -2593,7 +2699,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     constraints.sort_by(|one, _, other, _| position[one].cmp(&position[other]));
     promises.sort_by(|one, _, other, _| position[one].cmp(&position[other]));
 
-    attach_mismatch_explanations(&mut errors, &constraints, &steps, &table.reasons);
+    attach_mismatch_explanations(&mut errors, &constraints, &steps, &table.reasons, &aliases);
 
     // Constraints are solved in the order the walk emitted them, which is not
     // quite the order anyone reads a file in — a body's demands come before
@@ -6961,6 +7067,101 @@ mod existential_regressions {
         // identities. The surviving failure must not reuse any of them.
         assert!(failed.id.get() > 0);
         assert!(errors[0].id.get() > 0);
+    }
+
+    #[test]
+    fn mismatch_leaf_walks_nested_rows_effect_payloads_and_alias_arguments() {
+        use crate::symbol::{Bundle, Mint, Namespace, Version};
+
+        let bundle = Bundle::new("leaf-test", Version::new(1, 0, 0)).unwrap();
+        let mut mint = Mint::new(bundle);
+        let wrapper = mint.global(None, Namespace::Types, "Wrapper").unwrap();
+        let unit = Rc::new(Ty::unit());
+        let effect = Row {
+            labels: [("effect".into(), RowField::present(Rc::new(Ty::Bound(0))))]
+                .into_iter()
+                .collect(),
+            rest: Rest::Closed,
+        };
+        let arrow = Rc::new(Ty::Arrow(unit.clone(), unit, effect));
+        let sum = Rc::new(Ty::Sum(Row {
+            labels: [("Case".into(), RowField::present(arrow))]
+                .into_iter()
+                .collect(),
+            rest: Rest::Closed,
+        }));
+        let body = Rc::new(Ty::Struct(Row {
+            labels: [("field".into(), RowField::present(sum))]
+                .into_iter()
+                .collect(),
+            rest: Rest::Closed,
+        }));
+        let aliases = [(wrapper, Scheme::new(1, body))].into_iter().collect();
+        let named = |argument| {
+            Rc::new(Ty::Named {
+                symbol: wrapper,
+                name: "Wrapper".into(),
+                args: Rc::from([Rc::new(argument)]),
+            })
+        };
+        assert_eq!(
+            smallest_incompatible(&aliases, &named(Ty::Nat), &named(Ty::Boolean)),
+            (TypeDescription::NaturalNumber, TypeDescription::Boolean)
+        );
+
+        let missing_left = mint.global(None, Namespace::Types, "MissingLeft").unwrap();
+        let missing_right = mint.global(None, Namespace::Types, "MissingRight").unwrap();
+        let missing = |symbol, name: &'static str| {
+            Rc::new(Ty::Named {
+                symbol,
+                name: name.into(),
+                args: Rc::from([]),
+            })
+        };
+        assert_eq!(
+            smallest_incompatible(
+                &aliases,
+                &missing(missing_left, "MissingLeft"),
+                &missing(missing_right, "MissingRight"),
+            ),
+            (TypeDescription::DeclaredType, TypeDescription::DeclaredType),
+            "missing semantic definitions must keep the declared-type fallback"
+        );
+    }
+
+    #[test]
+    fn smallest_mismatch_leaf_is_deep_stack_safe() {
+        std::thread::Builder::new()
+            .name("deep-mismatch-leaf".into())
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                let mut left = Rc::new(Ty::Nat);
+                let mut right = Rc::new(Ty::Boolean);
+                for _ in 0..30_000 {
+                    left = Rc::new(Ty::Struct(Row {
+                        labels: [("x".into(), RowField::present(left))]
+                            .into_iter()
+                            .collect(),
+                        rest: Rest::Closed,
+                    }));
+                    right = Rc::new(Ty::Struct(Row {
+                        labels: [("x".into(), RowField::present(right))]
+                            .into_iter()
+                            .collect(),
+                        rest: Rest::Closed,
+                    }));
+                }
+                assert_eq!(
+                    smallest_incompatible(&IndexMap::new(), &left, &right),
+                    (TypeDescription::NaturalNumber, TypeDescription::Boolean)
+                );
+                // Deep Rc destruction is unrelated to the iterative reader.
+                std::mem::forget(left);
+                std::mem::forget(right);
+            })
+            .unwrap()
+            .join()
+            .expect("smallest mismatch leaf stays on its explicit stack");
     }
 
     #[test]

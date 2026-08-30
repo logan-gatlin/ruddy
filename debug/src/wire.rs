@@ -248,6 +248,8 @@ pub struct Diagnostic {
     pub inference_error_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inference_cause: Option<InferenceCause>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inference_explanation: Option<InferenceExplanation>,
     /// Which stage produced it: `lex`, `parse`, `ir`, …
     pub stage: &'static str,
     pub severity: Severity,
@@ -278,6 +280,39 @@ pub enum InferenceCause {
     Step { step_id: u64 },
     Batch { batch_id: u64 },
     Direct,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InferenceExplanation {
+    pub abridged: Vec<ExplanationFact>,
+    pub full: Vec<ExplanationFact>,
+    pub contradiction: ExplanationContradiction,
+    pub cause: ExplanationCause,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExplanationFact {
+    pub span: Option<Loc>,
+    pub constraint_id: u64,
+    pub origin: &'static str,
+    pub subject: &'static str,
+    pub payload: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExplanationContradiction {
+    pub kind: &'static str,
+    pub left: &'static str,
+    pub right: &'static str,
+    pub repairs: [&'static str; 2],
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExplanationCause {
+    pub error_id: u64,
+    pub seed_reason_id: Option<u64>,
+    pub constraint_ids: Vec<u64>,
+    pub reason_ids: Vec<u64>,
 }
 
 /// The compiler reports nothing but errors so far; `Warning` is here so that
