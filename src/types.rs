@@ -1,4 +1,7 @@
-use std::{collections::HashMap, rc::Rc};
+use std::{
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 
 use indexmap::{IndexMap, IndexSet};
 
@@ -1262,7 +1265,11 @@ fn partition_package_formula(
         let mut selected = None;
         for atom in atoms {
             let Atom::Bound(index) = atom else {
-                return part;
+                // A nested generalized scheme can retain a presence from its
+                // enclosing closure as a free solver variable. Like a bound
+                // universal input, it scopes the proposition but does not
+                // choose which result package owns the fresh witness.
+                continue;
             };
             // A conjunct that relates a caller-owned input to a hidden result
             // is still a guarantee of that result package. Keep the universal
@@ -1402,12 +1409,13 @@ impl Formula {
     /// First-appearance order is what decides the printed alphabet, so it is
     /// what the walk preserves.
     pub fn atoms(&self, out: &mut Vec<Atom>) {
+        let mut seen: HashSet<_> = out.iter().copied().collect();
         let mut work = vec![self];
         while let Some(formula) = work.pop() {
             match formula {
                 Formula::True | Formula::False => {}
                 Formula::Atom(atom) => {
-                    if !out.contains(atom) {
+                    if seen.insert(*atom) {
                         out.push(*atom);
                     }
                 }
