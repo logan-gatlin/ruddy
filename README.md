@@ -86,13 +86,15 @@ util.map;
 
 ### Extern function ABI
 
-Ruddy `extern` declarations are resolved by walking their dotted target from `globalThis` during module initialization; the embedding environment must provide those values. Function externs are bound to the object owning the final path segment, so host methods retain their `this` receiver.
+An `extern` target must be a Ruddy string whose decoded contents are a raw JavaScript expression. During generated module initialization, each expression is parenthesized, evaluated once in extern/source order, and assigned to its extern. Expressions run in the generated module's lexical scope. They are trusted code, not a security boundary. The complete generated ECMAScript module is validated with Boa before generation succeeds, so an invalid or empty expression is rejected.
+
+There is no implicit `globalThis` path lookup or receiver binding. A global expression such as `"host.now"` works when the embedding environment provides `host`, but a method that uses `this` must bind its receiver explicitly, for example `"host.counter.add.bind(host.counter)"`, or use an arrow wrapper such as `"(left, right) => host.counter.add(left, right)"`.
 
 Ruddy functions are curried, but JavaScript APIs commonly accept several arguments in one call. In an extern annotation, `fn(...) -> ...` records that foreign calling convention without changing the Ruddy type:
 
 ```ruddy
-extern add : fn(Nat, Nat) -> Nat = host.add
-extern now : fn() -> Nat = host.now
+extern add : fn(Nat, Nat) -> Nat = "host.add"
+extern now : fn() -> Nat = "host.now"
 
 let add_two = add 2n
 let answer = add_two 40n
@@ -101,7 +103,7 @@ let timestamp = now ()
 
 `fn(A, B) -> R` is visible to Ruddy as the curried type `A -> B -> R`. A trailing comma is permitted. `fn() -> R` is called by applying Ruddy unit and invokes the host with no arguments. An effect on a marked function belongs to its final curried arrow, so partial application remains pure: `fn(A, B) -> R + !E` means `A -> B -> R + !E`.
 
-The existing arrow syntax deliberately retains the existing host-curried ABI. For example, `extern add : Nat -> Nat -> Nat = host.add` expects `host.add(a)(b)`, including when an ordinary type alias reveals the arrow. Use `fn(Nat, Nat) -> Nat` to call `host.add(a, b)`. The `fn(...)` ABI notation is available only in extern annotations and in direct, possibly parenthesized parameter or result positions of another marked function; it is not a general Ruddy type constructor.
+The existing arrow syntax deliberately retains the existing host-curried ABI. For example, `extern add : Nat -> Nat -> Nat = "host.add"` expects `host.add(a)(b)`, including when an ordinary type alias reveals the arrow. Use `fn(Nat, Nat) -> Nat` to call `host.add(a, b)`. The `fn(...)` ABI notation is available only in extern annotations and in direct, possibly parenthesized parameter or result positions of another marked function; it is not a general Ruddy type constructor.
 
 Function conversion is recursive at that boundary. Marked function parameters expose a Ruddy callback to the host as an n-ary function, marked results adapt an n-ary host function back into a curried Ruddy value, and ordinary-arrow function parameters and results use the host-curried convention. This also applies to nested direct function parameters and results.
 
@@ -109,7 +111,7 @@ Effect rows on externs still constrain Ruddy calls, but raw host functions recei
 
 Ruddy `Nat`, `Int`, and `Real` values use JavaScript `Number`; integers beyond 2^53 can therefore lose precision. Natural subtraction saturates at zero, integer division truncates toward zero, and real division uses ordinary JavaScript division.
 
-Compiler integrations can invoke the backend directly with `ruddy::backend::js::generate(&artifact)`. The argument must be the final linked [`ruddy::artifact::Artifact`]; generation returns the module source or a validation error and performs no filesystem I/O. The debugger always shows this same output in its **JavaScript** phase, regardless of the manifest target.
+Compiler integrations can invoke the backend directly with `ruddy::backend::js::generate(&artifact)`. The argument must be the final linked [`ruddy::artifact::Artifact`]; generation validates the complete resulting module with Boa, returns the module source or a JavaScript-generation error, and performs no filesystem I/O. The debugger always shows this same output in its **JavaScript** phase, regardless of the manifest target.
 
 Switching a project back to `"lib"` leaves an existing JavaScript file in place until `ruddy clean` removes the build directory.
 

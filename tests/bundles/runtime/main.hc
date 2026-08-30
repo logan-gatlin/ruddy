@@ -1,26 +1,26 @@
 module Math
 
-extern next : Nat -> Nat = host.counter.next
-extern add : fn(Nat, Nat) -> Nat = host.counter.add
-extern nullary : fn() -> Nat = host.counter.nullary
-extern curried_add : Nat -> Nat -> Nat = host.curriedAdd
-extern apply_pair : fn(fn(Nat, Nat) -> Nat, Nat, Nat) -> Nat = host.applyPair
-extern make_adder : fn(Nat) -> fn(Nat, Nat) -> Nat = host.makeAdder
+extern next : Nat -> Nat = "host.counter.next.bind(host.counter)"
+extern add : fn(Nat, Nat) -> Nat = "host.counter.add.bind(host.counter)"
+extern nullary : fn() -> Nat = "host.counter.nullary.bind(host.counter)"
+extern curried_add : Nat -> Nat -> Nat = "host.curriedAdd"
+extern apply_pair : fn(fn(Nat, Nat) -> Nat, Nat, Nat) -> Nat = "host.applyPair"
+extern make_adder : fn(Nat) -> fn(Nat, Nat) -> Nat = "host.makeAdder"
 
 effect Tick = Nat -> Nat
-extern tick : fn(Nat) -> Nat + !Tick = host.tick
-extern run_tick : fn(fn(Nat) -> Nat + !Tick, Nat) -> Nat + !Tick = host.runTick
-extern run_returned_tick : fn(fn(Nat) -> (Nat -> Nat + !Tick), Nat, Nat) -> Nat + !Tick = host.runReturnedTick
+extern tick : fn(Nat) -> Nat + !Tick = "host.tick"
+extern run_tick : fn(fn(Nat) -> Nat + !Tick, Nat) -> Nat + !Tick = "host.runTick"
+extern run_returned_tick : fn(fn(Nat) -> (Nat -> Nat + !Tick), Nat, Nat) -> Nat + !Tick = "host.runReturnedTick"
 
 effect Needed = () -> Nat
 effect Spare = Nat -> Nat
-extern invoke_conditional_shared : fn(fn(()) -> Nat + !Needed (when 'needed) + ..'effects) -> Nat + !Needed + ..'effects = host.invokeConditionalShared
+extern invoke_conditional_shared : fn(fn(()) -> Nat + !Needed (when 'needed) + ..'effects) -> Nat + !Needed + ..'effects = "host.invokeConditionalShared"
 let run_conditional_shared : () -> Nat + !Needed + ..'effects =
   fn _ => let needed = !Needed () in invoke_conditional_shared (fn _ => needed)
 
 type Loop = () -> Loop
-extern host_loop : Loop = host.loop
-extern run_loop : fn(Loop) -> Nat = host.runLoop
+extern host_loop : Loop = "host.loop.bind(host)"
+extern run_loop : fn(Loop) -> Nat = "host.runLoop"
 
 let answer = Math::answer
 let identity = Math::identity
