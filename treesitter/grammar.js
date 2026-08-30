@@ -153,7 +153,7 @@ module.exports = grammar({
       ':',
       field('type', $.extern_annotation),
       '=',
-      field('target', $.foreign_path),
+      field('target', $.string),
     ),
 
     /** The extern-only ABI type plus its ordinary outer `where` clause. */
@@ -192,9 +192,6 @@ module.exports = grammar({
       )),
       ')',
     ),
-
-    /** `console.log` — a dotted target, not a Ruddy path or projection. */
-    foreign_path: $ => sepBy1('.', field('segment', $.identifier)),
 
     /** `let <pattern> [: <annotation>] = <expr>` */
     let_definition: $ => seq(
@@ -878,7 +875,7 @@ module.exports = grammar({
     ),
 
     /** A double-quoted UTF-8 string with the escapes token::lex accepts. */
-    string: _ => token(seq('"', repeat(choice(/[^"\\\n]/, /\\["\\nrt]/)), '"')),
+    string: _ => token(seq('"', repeat(choice(/[^"\\]/, /\\["\\nrt]/)), '"')),
 
     /** The two boolean literals, reserved by token::lex. */
     boolean: _ => choice('true', 'false'),

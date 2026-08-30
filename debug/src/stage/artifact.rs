@@ -96,7 +96,7 @@ pub fn render(spec: &Spec, cx: &Cx, artifact: &Artifact, micros: u64) -> Stage {
             format!(
                 "{} = {} · {:?}",
                 external.name,
-                external.target.join("."),
+                crate::print::string(&external.target),
                 external.rep
             ),
         ));

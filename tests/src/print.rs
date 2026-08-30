@@ -56,6 +56,20 @@ fn an_if_prints_as_surface_syntax_and_ir_match() {
     assert_eq!(ast_of(&ast), ast, "conditional printing is a fixed point");
 }
 
+/// A raw NUL is valid inside a Ruddy string. Rust's debug formatter spells it
+/// as `\\0`, which the Ruddy lexer rejects, so extern targets must use the
+/// language's literal formatter and remain stable when re-lowered.
+#[test]
+fn ir_extern_target_with_raw_control_character_prints_to_a_fixed_point() {
+    let source = "extern host : Nat = \"raw\0target\"";
+    let (_, ir) = printed(source);
+
+    assert_eq!(ir, source);
+    assert!(!ir.contains("\\0"));
+    let (_, again) = printed(&ir);
+    assert_eq!(again, ir, "IR extern target printing is a fixed point");
+}
+
 /// Rendering `{ name: value }` is one rule, in `print`, that both printers
 /// read. It used to be a copy each, so the AST tab and the IR tab could come to
 /// disagree about the same braces without anything noticing.

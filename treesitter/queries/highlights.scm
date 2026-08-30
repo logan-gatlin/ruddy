@@ -77,7 +77,6 @@
 (effect_operation_field name: (identifier) @function)
 (operation name: (identifier) @function)
 (extern_definition name: (identifier) @function)
-(foreign_path segment: (identifier) @module @namespace)
 
 ; ── modules ──────────────────────────────────────────────────────────────────
 

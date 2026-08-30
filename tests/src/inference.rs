@@ -82,7 +82,7 @@ fn positive_result_presences_can_forget_input_correlations() {
 #[test]
 fn anonymous_positive_annotation_presences_publish_distinct_existential_slots() {
     let (mint, _, output) =
-        inferred("extern choice: { left when _: Nat, right when _: Nat } = host.choice");
+        inferred("extern choice: { left when _: Nat, right when _: Nat } = \"host.choice\"");
     let (_, scheme) = output
         .externs
         .iter()
@@ -96,7 +96,7 @@ fn anonymous_positive_annotation_presences_publish_distinct_existential_slots() 
 #[test]
 fn a_consumer_cannot_choose_an_existential_field_presence() {
     let (_, _, output) = infer_src(
-        "extern choice: { left when 'a: Nat, right when 'b: Nat } where 'a != 'b = host.choice\n\
+        "extern choice: { left when 'a: Nat, right when 'b: Nat } where 'a != 'b = \"host.choice\"\n\
          let needs_left: { left: Nat, \\right } -> Nat = fn value => value.left\n\
          let bad = needs_left choice",
     );
@@ -108,7 +108,7 @@ fn one_existential_package_keeps_shared_label_identity() {
     inferred(
         "extern make: Nat -> Boolean ->\n\
          { x when 'p: Nat, also when 'p: Nat, y when 'q: Nat }\n\
-         where 'p != 'q = host.make\n\
+         where 'p != 'q = \"host.make\"\n\
          let value = make 1n true\n\
          let good = match value with\n\
          | { x, .. } => value.also\n\
@@ -125,7 +125,7 @@ fn separate_alias_views_do_not_share_existential_witnesses() {
     let (_, _, output) = infer_src(
         "extern choose: Nat ->\n\
          { left when 'p: Nat, also when 'p: Nat, right when 'q: Nat }\n\
-         where 'p != 'q = host.choose\n\
+         where 'p != 'q = \"host.choose\"\n\
          let source = choose 1n\n\
          let first = source\n\
          let second = source\n\
@@ -142,7 +142,7 @@ fn separate_partial_application_calls_do_not_share_existential_witnesses() {
     let (_, _, output) = infer_src(
         "extern make: Nat -> Boolean ->\n\
          { x when 'p: Nat, also when 'p: Nat, y when 'q: Nat }\n\
-         where 'p != 'q = host.make\n\
+         where 'p != 'q = \"host.make\"\n\
          let partial = make 1n\n\
          let bad = match partial true with\n\
          | { x, .. } => (partial false).also\n\
@@ -160,7 +160,7 @@ fn independently_called_xor_results_do_not_share_existential_witnesses() {
     let (_, _, output) = infer_src(
         "extern choose: Nat ->\n\
          { left when 'p: Nat, also when 'p: Nat, right when 'q: Nat }\n\
-         where 'p != 'q = host.choose\n\
+         where 'p != 'q = \"host.choose\"\n\
          let first = choose 1n\n\
          let second = choose 2n\n\
          let bad = match first with\n\
@@ -174,7 +174,7 @@ fn independently_called_xor_results_do_not_share_existential_witnesses() {
 #[test]
 fn unconstrained_result_packages_still_open_independent_sealed_witnesses() {
     inferred(
-        "extern choose: Nat -> { left when _: Nat } = host.choose\n\
+        "extern choose: Nat -> { left when _: Nat } = \"host.choose\"\n\
          let needs_left: { left: Nat } -> Nat = fn value => value.left\n\
          let needs_no_left: { \\left, .. } -> Nat = fn _ => 0n\n\
          let first = needs_left (choose 1n)\n\
@@ -186,7 +186,7 @@ fn unconstrained_result_packages_still_open_independent_sealed_witnesses() {
 fn mixed_input_to_result_guarantees_activate_at_each_call() {
     inferred(
         "extern follows: { input when 'u: Nat } -> { output when 'e: Nat }\n\
-         where (not 'u) or 'e = host.follows\n\
+         where (not 'u) or 'e = \"host.follows\"\n\
          let needs_output: { output: Nat } -> Nat = fn value => value.output\n\
          let good = needs_output (follows { input: 1n })",
     );
@@ -196,7 +196,7 @@ fn mixed_input_to_result_guarantees_activate_at_each_call() {
 fn captured_presence_activates_nested_closure_result_guarantee() {
     inferred(
         "extern follows: { input when 'u: Nat } -> { output when 'e: Nat }\n\
-         where (not 'u) or 'e = host.follows\n\
+         where (not 'u) or 'e = \"host.follows\"\n\
          let needs_output: { output: Nat } -> Nat = fn value => value.output\n\
          let make = fn captured =>\n\
            let nested = fn _ => follows captured\n\
@@ -209,9 +209,9 @@ fn captured_presence_activates_nested_closure_result_guarantee() {
 fn package_guarantee_identity_survives_allocator_churn_without_crossing_instances() {
     let mut source = String::from(
         "extern follows: { input when 'u: Nat } -> { output when 'e: Nat }\n\
-         where (not 'u) or 'e = host.follows\n\
+         where (not 'u) or 'e = \"host.follows\"\n\
          extern excludes: { input when 'u: Nat } -> { output when 'e: Nat }\n\
-         where 'u or (not 'e) = host.excludes\n\
+         where 'u or (not 'e) = \"host.excludes\"\n\
          let needs_output: { output: Nat } -> Nat = fn value => value.output\n\
          let needs_no_output: { \\output, .. } -> Nat = fn _ => 0n\n",
     );
@@ -6099,7 +6099,7 @@ fn deeply_nested_invariant_aliases_classify_in_polynomial_time() {
         nested = format!("Invariant ({nested})");
     }
     inferred(&format!(
-        "type Invariant 'a = 'a -> 'a\nextern deep: {nested} = host.deep"
+        "type Invariant 'a = 'a -> 'a\nextern deep: {nested} = \"host.deep\""
     ));
 }
 
@@ -7945,7 +7945,7 @@ fn a_type_declared_in_one_module_unifies_with_a_use_in_another() {
 #[test]
 fn an_extern_publishes_its_declared_scheme_and_instantiates_at_uses() {
     let (mint, _, output) = inferred(
-        "extern log : String -> () = console.log\n\
+        "extern log : String -> () = \"console.log\"\n\
          let written = log \"hello\"",
     );
     let (_, declared) = output
@@ -7963,7 +7963,7 @@ fn an_extern_publishes_its_declared_scheme_and_instantiates_at_uses() {
     );
 
     let (_, _, output) = infer_src(
-        "extern log : String -> () = console.log\n\
+        "extern log : String -> () = \"console.log\"\n\
          let wrong = log 1n",
     );
     assert_eq!(output.errors.len(), 1);
@@ -7973,7 +7973,7 @@ fn an_extern_publishes_its_declared_scheme_and_instantiates_at_uses() {
 #[test]
 fn polymorphic_extern_boundary_leaves_are_rejected_before_callback_instantiation() {
     let source = "effect Tick = Nat -> Nat\n\
-                  extern run : fn('a) -> Nat = host.run\n\
+                  extern run : fn('a) -> Nat = \"host.run\"\n\
                   let called = handle run (fn n => !Tick n) with\n\
                     | !Tick n => n\n\
                   end";
@@ -7998,7 +7998,7 @@ fn polymorphic_extern_boundary_leaves_are_rejected_before_callback_instantiation
     // polymorphic, including when the unsafe leaf is a host result.
     let (_, lowered, output) = infer_src(
         "type Identity 'a = 'a\n\
-         extern make : fn(Nat) -> Identity 'a = host.make",
+         extern make : fn(Nat) -> Identity 'a = \"host.make\"",
     );
     assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
     assert!(matches!(
@@ -8013,7 +8013,7 @@ fn polymorphic_extern_boundary_leaves_are_rejected_before_callback_instantiation
 #[test]
 fn fixed_representation_polymorphism_remains_valid_at_extern_boundaries() {
     let (_, lowered, output) = infer_src(
-        "extern echo : fn({ value: 'a }) -> { value: 'a } = host.echo\n\
+        "extern echo : fn({ value: 'a }) -> { value: 'a } = \"host.echo\"\n\
          let answer = (echo { value: 42n }).value",
     );
     assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
@@ -8025,7 +8025,7 @@ fn extern_callback_coverage_uses_semantic_rows_and_aliases() {
     let (_, lowered, invalid) = infer_src(
         "effect Fail = { abort: () -> () }\n\
          type Callback = () -> () + !Fail\n\
-         extern install : fn(Callback) -> () = host.install",
+         extern install : fn(Callback) -> () = \"host.install\"",
     );
     assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
     assert!(matches!(
@@ -8039,7 +8039,7 @@ fn extern_callback_coverage_uses_semantic_rows_and_aliases() {
     let (_, lowered, valid) = infer_src(
         "effect Fail = { abort: () -> () }\n\
          type Callback = () -> () + !Fail\n\
-         extern install : fn(Callback) -> () + !Fail = host.install",
+         extern install : fn(Callback) -> () + !Fail = \"host.install\"",
     );
     assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
     assert!(valid.errors.is_empty(), "{:#?}", valid.errors);
@@ -8049,7 +8049,7 @@ fn extern_callback_coverage_uses_semantic_rows_and_aliases() {
 fn extern_callback_coverage_terminates_on_recursive_ordinary_aliases() {
     let (_, lowered, output) = infer_src(
         "type Loop = () -> Loop\n\
-         extern loop : Loop = host.loop",
+         extern loop : Loop = \"host.loop\"",
     );
     assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
     assert!(output.errors.is_empty(), "{:#?}", output.errors);
@@ -8059,7 +8059,7 @@ fn extern_callback_coverage_terminates_on_recursive_ordinary_aliases() {
 fn extern_callback_coverage_preserves_conditional_presence() {
     let (mint, lowered, output) = inferred(
         "effect Fail = { abort: () -> () }\n\
-         extern install : fn(fn(()) -> () + !Fail (when 'needed)) -> () + !Fail = host.install",
+         extern install : fn(fn(()) -> () + !Fail (when 'needed)) -> () + !Fail = \"host.install\"",
     );
     assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
     let (_, declared) = output
@@ -8078,7 +8078,7 @@ fn extern_callback_coverage_uses_where_implications() {
     let source = |clause: &str| {
         format!(
             "effect Fail = {{ abort: () -> () }}\n\
-             extern install : fn(fn(()) -> () + !Fail (when 'needed)) -> () + !Fail (when 'carried){clause} = host.install"
+             extern install : fn(fn(()) -> () + !Fail (when 'needed)) -> () + !Fail (when 'carried){clause} = \"host.install\""
         )
     };
     let (_, lowered, valid) = infer_src(&source(" where not 'needed or 'carried"));
@@ -8104,14 +8104,14 @@ fn extern_callback_coverage_uses_where_implications() {
 fn extern_callback_coverage_respects_shared_open_effect_tails() {
     let (_, lowered, valid) = infer_src(
         "type Callback 'e = () -> () + ..'e\n\
-         extern install : fn(Callback (..'e)) -> () + ..'e = host.install",
+         extern install : fn(Callback (..'e)) -> () + ..'e = \"host.install\"",
     );
     assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
     assert!(valid.errors.is_empty(), "{:#?}", valid.errors);
 
     let (_, lowered, invalid) = infer_src(
         "type Callback 'e = () -> () + ..'e\n\
-         extern install : fn(Callback (..'e)) -> () + ..'f = host.install",
+         extern install : fn(Callback (..'e)) -> () + ..'f = \"host.install\"",
     );
     assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
     assert!(matches!(
@@ -8128,7 +8128,7 @@ fn legacy_outer_extern_arrows_check_callback_coverage() {
     let (_, lowered, output) = infer_src(
         "effect Fail = { abort: () -> () }\n\
          type Callback = () -> () + !Fail\n\
-         extern install : Callback -> () = host.install",
+         extern install : Callback -> () = \"host.install\"",
     );
     assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
     assert!(matches!(
@@ -8144,7 +8144,7 @@ fn legacy_outer_extern_arrows_check_callback_coverage() {
 fn a_marked_extern_callback_keeps_its_effect_type_during_inference() {
     let (mint, _, output) = inferred(
         "effect Fail = { abort: () -> () }\n\
-         extern install : fn(fn(()) -> () + !Fail) -> () + !Fail = host.install\n\
+         extern install : fn(fn(()) -> () + !Fail) -> () + !Fail = \"host.install\"\n\
          let callback = fn unit => !Fail.abort unit\n\
          let installed = handle install callback with\n\
            | !Fail.abort unit => ()\n\
@@ -8162,7 +8162,7 @@ fn a_marked_extern_callback_keeps_its_effect_type_during_inference() {
 
 #[test]
 fn an_impossible_extern_clause_is_refused_at_the_declaration() {
-    let src = "extern impossible : { x when 'x: Nat } where 'x and not 'x = host.impossible";
+    let src = "extern impossible : { x when 'x: Nat } where 'x and not 'x = \"host.impossible\"";
     let (_, out, output) = infer_src(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
 
@@ -8179,7 +8179,7 @@ fn an_impossible_extern_clause_is_refused_at_the_declaration() {
 #[test]
 fn an_extern_can_publish_a_non_function_scheme() {
     let (mint, _, output) = inferred(
-        "extern answer : Nat = host.answer\n\
+        "extern answer : Nat = \"host.answer\"\n\
          let next = answer",
     );
     let (_, declared) = output

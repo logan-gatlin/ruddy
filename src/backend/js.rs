@@ -6,9 +6,14 @@
 use crate::artifact::{
     Artifact, Block, Callee, End, FieldKey, Instr, Literal, Op, PrimCase, Rep, TagCase,
 };
+use boa_ast::{ModuleItem, scope::Scope};
+use boa_interner::Interner;
+use boa_parser::{Parser, Source};
 use std::{
     collections::{BTreeMap, HashSet},
     error, fmt,
+    panic::resume_unwind,
+    thread,
 };
 
 /// A JavaScript generation failure.
@@ -24,8 +29,8 @@ pub enum Error {
     InvalidFunctionReference(u64),
     /// An operation refers to an unknown qualified global.
     InvalidGlobalReference(String),
-    /// Compiler-produced input uses a construct this target cannot represent.
-    TargetLimitation(String),
+    /// The complete generated ECMAScript module failed validation.
+    InvalidJavaScript(String),
 }
 
 impl fmt::Display for Error {
@@ -42,7 +47,9 @@ impl fmt::Display for Error {
                 write!(f, "invalid function reference {index}")
             }
             Self::InvalidGlobalReference(name) => write!(f, "invalid global reference `{name}`"),
-            Self::TargetLimitation(message) => write!(f, "JavaScript target limitation: {message}"),
+            Self::InvalidJavaScript(diagnostic) => {
+                write!(f, "generated JavaScript is invalid: {diagnostic}")
+            }
         }
     }
 }
@@ -74,12 +81,6 @@ impl<'a> Generator<'a> {
         }
         let mut runtime_names = HashSet::new();
         for external in &artifact.lir.externs {
-            if external.target.is_empty() || external.target.iter().any(String::is_empty) {
-                return Err(Error::TargetLimitation(format!(
-                    "extern `{}` has an empty target path or segment",
-                    external.name
-                )));
-            }
             runtime_names.insert(external.name.as_str());
         }
         let extern_names = artifact
@@ -137,6 +138,10 @@ impl<'a> Generator<'a> {
     }
 
     fn validate(&self) -> Result<(), Error> {
+        for external in &self.artifact.lir.externs {
+            validate_extern_target(&external.target)?;
+        }
+
         let mut pending: Vec<&Block> = self
             .artifact
             .lir
@@ -212,14 +217,9 @@ impl<'a> Generator<'a> {
         for external in &self.artifact.lir.externs {
             out.push_str("$h[");
             string(&external.name, &mut out);
-            out.push_str("] = $extern([");
-            for (i, segment) in external.target.iter().enumerate() {
-                if i != 0 {
-                    out.push_str(", ");
-                }
-                string(segment, &mut out);
-            }
-            out.push_str("]);\n$g[");
+            out.push_str("] = (\n");
+            out.push_str(&external.target);
+            out.push_str("\n);\n$g[");
             string(&external.name, &mut out);
             out.push_str("] = $h[");
             string(&external.name, &mut out);
@@ -253,6 +253,7 @@ impl<'a> Generator<'a> {
             }
             out.push_str(" };\n");
         }
+        validate_module(&out)?;
         Ok(out)
     }
 
@@ -611,9 +612,62 @@ const $hasRest = ($o, $known) => Reflect.ownKeys($o).some($k => typeof $k !== "s
 const $same = Object.is;
 const $effectValue = ($identity, $value) => ({ [$effect]: true, identity: $identity, value: $value });
 const $catch = ($identity, $body) => { try { return $body(); } catch ($e) { if ($e !== null && typeof $e === "object" && $e[$effect] === true && $e.identity === $identity) return $e.value; throw $e; } };
-const $extern = $path => { let $owner = globalThis; let $value = globalThis; for (const $part of $path) { $owner = $value; if ($value == null || !($part in Object($value))) throw new Error("missing Ruddy extern: " + $path.join(".")); $value = $value[$part]; } return typeof $value === "function" ? $value.bind($owner) : $value; };
 const $unreachable = () => { throw new Error("unreachable Ruddy LIR branch"); };
 "#;
+
+const JAVASCRIPT_PARSER_STACK: usize = 8 * 1024 * 1024;
+
+fn with_javascript_parser_stack(
+    parse: impl FnOnce() -> Result<(), Error> + Send,
+) -> Result<(), Error> {
+    // Boa's parser uses the native stack in proportion to expression nesting.
+    // Rust test and worker threads commonly have only a 2 MiB stack, while the
+    // generated runtime suite needs more than that. Give validation the same
+    // stack budget as a typical main thread instead of making success depend on
+    // which thread called the backend.
+    thread::scope(|scope| {
+        let parser = thread::Builder::new()
+            .name("ruddy-javascript-validator".to_string())
+            .stack_size(JAVASCRIPT_PARSER_STACK)
+            .spawn_scoped(scope, parse)
+            .map_err(|error| {
+                Error::InvalidJavaScript(format!("could not start validator: {error}"))
+            })?;
+        match parser.join() {
+            Ok(result) => result,
+            Err(panic) => resume_unwind(panic),
+        }
+    })
+}
+
+fn validate_extern_target(target: &str) -> Result<(), Error> {
+    // Parsing the target in its own module prevents it from closing the generated
+    // initializer and introducing statements or module declarations. The newlines
+    // keep a trailing line comment from consuming either closing delimiter.
+    let source = format!("export default (\n{target}\n);\n");
+    with_javascript_parser_stack(move || {
+        let mut interner = Interner::default();
+        let module = Parser::new(Source::from_bytes(&source))
+            .parse_module(&Scope::new_global(), &mut interner)
+            .map_err(|error| Error::InvalidJavaScript(error.to_string()))?;
+        if !matches!(module.items().items(), [ModuleItem::ExportDeclaration(_)]) {
+            return Err(Error::InvalidJavaScript(
+                "an extern target must be exactly one expression".to_string(),
+            ));
+        }
+        Ok(())
+    })
+}
+
+fn validate_module(source: &str) -> Result<(), Error> {
+    with_javascript_parser_stack(|| {
+        let mut interner = Interner::default();
+        Parser::new(Source::from_bytes(source))
+            .parse_module(&Scope::new_global(), &mut interner)
+            .map(|_| ())
+            .map_err(|error| Error::InvalidJavaScript(error.to_string()))
+    })
+}
 
 fn temp(value: u32) -> String {
     format!("$v{value}")
@@ -694,5 +748,48 @@ fn export_name(name: &str, out: &mut String) {
         out.push_str(name);
     } else {
         string(name, out);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Error, validate_extern_target, validate_module};
+
+    #[test]
+    fn validates_exactly_one_extern_expression() {
+        for target in ["host.value", "({ value: 1 })", "host.value // trailing"] {
+            validate_extern_target(target).unwrap();
+        }
+        for target in [
+            "0); export const injected = 1; (2",
+            "0); import 'injected'; (2",
+            "0); sideEffect(); (2",
+        ] {
+            assert!(
+                matches!(
+                    validate_extern_target(target),
+                    Err(Error::InvalidJavaScript(_))
+                ),
+                "accepted structural breakout: {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn validates_complete_ecmascript_modules() {
+        validate_module("const value = (() => 42)(); export { value };").unwrap();
+    }
+
+    #[test]
+    fn reports_boa_diagnostics_for_invalid_modules() {
+        let error = validate_module("const value = (); export { value };").unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidJavaScript(ref diagnostic) if !diagnostic.is_empty())
+        );
+        assert!(
+            error
+                .to_string()
+                .starts_with("generated JavaScript is invalid: ")
+        );
     }
 }

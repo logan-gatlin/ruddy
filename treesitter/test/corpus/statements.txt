@@ -205,7 +205,7 @@ let bundle = bundle
 extern declaration
 ================================================================================
 
-extern log : String -> () = console.log
+extern log : String -> () = "console.log"
 
 --------------------------------------------------------------------------------
 
@@ -216,9 +216,25 @@ extern log : String -> () = console.log
       type: (function_type
         from: (identifier)
         to: (unit)))
-    target: (foreign_path
-      segment: (identifier)
-      segment: (identifier))))
+    target: (string)))
+
+================================================================================
+Dotted extern targets are rejected
+================================================================================
+
+extern log : String -> () = console.log
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (ERROR
+    (identifier)
+    (extern_annotation
+      type: (function_type
+        from: (identifier)
+        to: (unit)))
+    (identifier)
+    (identifier)))
 
 ================================================================================
 Unnamed and struct-input singleton effects

@@ -1,32 +1,16 @@
 //! Filesystem-facing Ruddy compiler entry point used by the command-line tool.
 
 use std::{
-    cell::RefCell,
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::HashMap,
     ffi::{OsStr, OsString},
     fmt, fs,
     fs::OpenOptions,
-    io::Write as _,
+    io::{self, Write as _},
     path::{Path, PathBuf},
-    process::Command as ProcessCommand,
-    rc::Rc,
+    process::{Command as ProcessCommand, Stdio},
 };
 
-use boa_engine::{
-    Context, JsError, JsValue, Module, Source,
-    builtins::promise::{OperationType, Promise, PromiseState},
-    context::{HostHooks, time::JsInstant},
-    job::{GenericJob, IntervalJob, Job, JobExecutor, NativeAsyncJob, PromiseJob, TimeoutJob},
-    module::SimpleModuleLoader,
-    object::{JsObject, builtins::JsPromise},
-};
-use boa_runtime::{
-    extensions::{ConsoleExtension, FetchExtension},
-    fetch::BlockingReqwestFetcher,
-};
 use clap::{Parser, Subcommand};
-use futures_concurrency::future::FutureGroup;
-use futures_lite::{StreamExt, future};
 use indexmap::IndexMap;
 use ruddy::{
     artifact::{Artifact, Dependency},
@@ -44,6 +28,7 @@ const MANIFEST: &str = "Ruddy.toml";
 const ROOT: &str = "main.hc";
 const GITIGNORE: &str = ".gitignore";
 const BUILD_DIRECTORY: &str = "build";
+const NODE_PACKAGE: &[u8] = b"{\"type\":\"module\"}\n";
 const INITIAL_VERSION: &str = "0.1.0";
 
 #[derive(Debug, Parser)]
@@ -388,6 +373,9 @@ fn install_project(directory: &Path) -> Result<InstalledBuild, CliError> {
         replace_file(&artifact_path, artifact.print().as_bytes())?;
         if Some(index) == last {
             if let Some(javascript) = &javascript {
+                // The generated `.js` is always ESM, independent of any
+                // ancestor package scope in which the project happens to live.
+                replace_file(&build.join("package.json"), NODE_PACKAGE)?;
                 let path = build.join(format!("{}.js", project.artifact.header.identity.name));
                 replace_file(&path, javascript.as_bytes())?;
                 root_javascript = Some(path);
@@ -405,7 +393,7 @@ fn install_project(directory: &Path) -> Result<InstalledBuild, CliError> {
 }
 
 /// Build and execute the installed root JavaScript module. By default this uses
-/// Boa's standard runtime extensions; `[run].js` may select a shell runner.
+/// Node.js; `[run].js` may select a different shell runner.
 pub fn run_project(directory: impl AsRef<Path>) -> Result<PathBuf, CliError> {
     let installed = install_project(directory.as_ref())?;
     if installed.target != Target::Js {
@@ -418,7 +406,7 @@ pub fn run_project(directory: impl AsRef<Path>) -> Result<PathBuf, CliError> {
         .ok_or_else(|| CliError::one("the JavaScript build output was not installed"))?;
     match installed.run.js.as_deref() {
         Some(runner) => execute_javascript_runner(runner, &javascript, &installed.directory)?,
-        None => execute_javascript_module(&javascript)?,
+        None => execute_node_module(OsStr::new("node"), &javascript, &installed.directory)?,
     }
     Ok(javascript)
 }
@@ -461,342 +449,88 @@ fn execute_javascript_runner(runner: &str, path: &Path, directory: &Path) -> Res
     }
 }
 
-type RejectedPromises = Rc<RefCell<Vec<(JsObject<Promise>, JsValue)>>>;
-
-#[derive(Default)]
-struct RuntimeHooks {
-    unhandled: RejectedPromises,
-}
-
-impl RuntimeHooks {
-    fn first_unhandled(&self) -> Option<JsValue> {
-        self.unhandled
-            .borrow()
-            .first()
-            .map(|(_, reason)| reason.clone())
-    }
-}
-
-impl HostHooks for RuntimeHooks {
-    fn promise_rejection_tracker(
-        &self,
-        promise: &JsObject<Promise>,
-        operation: OperationType,
-        _context: &mut Context,
-    ) {
-        match operation {
-            OperationType::Reject => {
-                let PromiseState::Rejected(reason) = JsPromise::from(promise.clone()).state()
-                else {
-                    return;
-                };
-                self.unhandled.borrow_mut().push((promise.clone(), reason));
-            }
-            OperationType::Handle => self
-                .unhandled
-                .borrow_mut()
-                .retain(|(unhandled, _)| unhandled != promise),
-        }
-    }
-}
-
-#[derive(Debug)]
-enum ClockJob {
-    Timeout(TimeoutJob),
-    Interval(IntervalJob),
-}
-
-impl ClockJob {
-    fn cancelled(&self) -> bool {
-        match self {
-            Self::Timeout(job) => job.cancelled(),
-            Self::Interval(job) => job.cancelled(),
-        }
-    }
-}
-
-/// Boa's simple executor with an observable ECMAScript microtask checkpoint.
-///
-/// Promise jobs always reach quiescence before a timer is dispatched. This is
-/// the boundary at which the host reports rejected promises; a timer therefore
-/// cannot retroactively handle a rejection from the preceding task. The other
-/// queues deliberately mirror `SimpleJobExecutor`.
-#[derive(Default)]
-struct RuntimeJobExecutor {
-    promise_jobs: RefCell<VecDeque<PromiseJob>>,
-    async_jobs: RefCell<VecDeque<NativeAsyncJob>>,
-    finalization_registry_jobs: RefCell<VecDeque<NativeAsyncJob>>,
-    clock_jobs: RefCell<BTreeMap<JsInstant, VecDeque<ClockJob>>>,
-    generic_jobs: RefCell<VecDeque<GenericJob>>,
-    unhandled: RejectedPromises,
-}
-
-impl RuntimeJobExecutor {
-    fn new(unhandled: RejectedPromises) -> Self {
-        Self {
-            unhandled,
-            ..Self::default()
-        }
-    }
-
-    fn clear(&self) {
-        self.promise_jobs.borrow_mut().clear();
-        self.async_jobs.borrow_mut().clear();
-        self.clock_jobs.borrow_mut().clear();
-        self.generic_jobs.borrow_mut().clear();
-        self.finalization_registry_jobs.borrow_mut().clear();
-    }
-
-    fn has_immediate_jobs(&self) -> bool {
-        !self.promise_jobs.borrow().is_empty()
-            || !self.async_jobs.borrow().is_empty()
-            || !self.generic_jobs.borrow().is_empty()
-    }
-
-    fn run_microtask_checkpoint(
-        &self,
-        context: &RefCell<&mut Context>,
-    ) -> boa_engine::JsResult<()> {
-        loop {
-            let jobs = std::mem::take(&mut *self.promise_jobs.borrow_mut());
-            if jobs.is_empty() {
-                return Ok(());
-            }
-            for job in jobs {
-                job.call(&mut context.borrow_mut())?;
-            }
-        }
-    }
-
-    fn prune_cancelled_clock_jobs(&self) {
-        self.clock_jobs.borrow_mut().retain(|_, jobs| {
-            jobs.retain(|job| !job.cancelled());
-            !jobs.is_empty()
-        });
-    }
-
-    fn pop_due_clock_job(&self, now: JsInstant) -> Option<ClockJob> {
-        let mut clock_jobs = self.clock_jobs.borrow_mut();
-        loop {
-            let at = *clock_jobs.first_key_value()?.0;
-            if at > now {
-                return None;
-            }
-            let (job, empty) = {
-                let jobs = clock_jobs.get_mut(&at).expect("deadline came from map");
-                let job = jobs.pop_front();
-                (job, jobs.is_empty())
-            };
-            if empty {
-                clock_jobs.remove(&at);
-            }
-            if job.as_ref().is_some_and(|job| !job.cancelled()) {
-                return job;
-            }
-        }
-    }
-}
-
-impl JobExecutor for RuntimeJobExecutor {
-    fn enqueue_job(self: Rc<Self>, job: Job, context: &mut Context) {
-        match job {
-            Job::PromiseJob(job) => self.promise_jobs.borrow_mut().push_back(job),
-            Job::AsyncJob(job) => self.async_jobs.borrow_mut().push_back(job),
-            Job::TimeoutJob(job) => {
-                self.clock_jobs
-                    .borrow_mut()
-                    .entry(context.clock().now() + job.timeout())
-                    .or_default()
-                    .push_back(ClockJob::Timeout(job));
-            }
-            Job::IntervalJob(job) => {
-                self.clock_jobs
-                    .borrow_mut()
-                    .entry(context.clock().now() + job.interval())
-                    .or_default()
-                    .push_back(ClockJob::Interval(job));
-            }
-            Job::GenericJob(job) => self.generic_jobs.borrow_mut().push_back(job),
-            Job::FinalizationRegistryCleanupJob(job) => {
-                self.finalization_registry_jobs.borrow_mut().push_back(job)
-            }
-            _ => unreachable!("Boa 0.22 job category"),
-        }
-    }
-
-    fn run_jobs(self: Rc<Self>, context: &mut Context) -> boa_engine::JsResult<()> {
-        future::block_on(self.run_jobs_async(&RefCell::new(context)))
-    }
-
-    async fn run_jobs_async(
-        self: Rc<Self>,
-        context: &RefCell<&mut Context>,
-    ) -> boa_engine::JsResult<()> {
-        let mut async_jobs = FutureGroup::new();
-        let mut finalization_jobs = FutureGroup::new();
-        loop {
-            for job in std::mem::take(&mut *self.async_jobs.borrow_mut()) {
-                async_jobs.insert(job.call(context));
-            }
-            for job in std::mem::take(&mut *self.finalization_registry_jobs.borrow_mut()) {
-                finalization_jobs.insert(job.call(context));
-            }
-
-            if let Err(error) = self.run_microtask_checkpoint(context) {
-                self.clear();
-                return Err(error);
-            }
-            if !self.unhandled.borrow().is_empty() {
-                self.clear();
-                return Ok(());
-            }
-
-            let jobs = std::mem::take(&mut *self.generic_jobs.borrow_mut());
-            for job in jobs {
-                if let Err(error) = job.call(&mut context.borrow_mut()) {
-                    self.clear();
-                    return Err(error);
-                }
-            }
-            if !self.promise_jobs.borrow().is_empty() {
-                context.borrow_mut().clear_kept_objects();
-                continue;
-            }
-
-            let now = context.borrow().clock().now();
-            if let Some(job) = self.pop_due_clock_job(now) {
-                let result = match job {
-                    ClockJob::Timeout(job) => job.call(&mut context.borrow_mut()),
-                    ClockJob::Interval(job) => {
-                        let interval = job.interval();
-                        let result = job.call(&mut context.borrow_mut());
-                        if result.is_ok() && !job.cancelled() {
-                            self.clock_jobs
-                                .borrow_mut()
-                                .entry(now + interval)
-                                .or_default()
-                                .push_back(ClockJob::Interval(job));
-                        }
-                        result
-                    }
-                };
-                if let Err(error) = result {
-                    self.clear();
-                    return Err(error);
-                }
-                // A timer callback is one host task. Its microtasks and promise
-                // rejections become observable before any other work proceeds.
-                if let Err(error) = self.run_microtask_checkpoint(context) {
-                    self.clear();
-                    return Err(error);
-                }
-                if !self.unhandled.borrow().is_empty() {
-                    self.clear();
-                    return Ok(());
-                }
-            }
-
-            if let Some(Err(error)) = future::poll_once(async_jobs.next()).await.flatten() {
-                self.clear();
-                return Err(error);
-            }
-            context.borrow_mut().clear_kept_objects();
-
-            if self.has_immediate_jobs() {
-                continue;
-            }
-            if async_jobs.is_empty() {
-                match future::poll_once(finalization_jobs.next()).await.flatten() {
-                    Some(Err(error)) => {
-                        self.clear();
-                        return Err(error);
-                    }
-                    _ if self.has_immediate_jobs() => continue,
-                    _ => {}
-                }
-                // A task can cancel a later timer after the due job was selected.
-                // Remove it before choosing a deadline so cancellation never sleeps.
-                self.prune_cancelled_clock_jobs();
-                let deadline = self
-                    .clock_jobs
-                    .borrow()
-                    .first_key_value()
-                    .map(|(at, _)| *at);
-                let Some(deadline) = deadline else {
-                    break;
-                };
-                let now = context.borrow().clock().now();
-                if deadline > now {
-                    std::thread::sleep((deadline - now).into());
-                }
-            } else {
-                future::yield_now().await;
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Execute one JavaScript module with the same Boa runtime used by [`run_project`].
-///
-/// Module initialization and queued jobs run to completion. A rejected module
-/// or a promise that remains unhandled after its microtask checkpoint is
-/// returned as a runtime error.
+/// Execute one JavaScript module with Node.js, as [`run_project`] does by
+/// default. Node must be available as `node` on `PATH`.
 pub fn execute_javascript_module(path: impl AsRef<Path>) -> Result<(), CliError> {
     let path = path.as_ref();
-    let parent = path.parent().ok_or_else(|| {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| {
+                CliError::one(format!("could not determine current directory: {error}"))
+            })?
+            .join(path)
+    };
+    let directory = absolute.parent().ok_or_else(|| {
         CliError::one(format!("JavaScript path {} has no parent", path.display()))
     })?;
-    let loader = Rc::new(SimpleModuleLoader::new(parent).map_err(boa_error)?);
-    let hooks = Rc::new(RuntimeHooks::default());
-    let executor = Rc::new(RuntimeJobExecutor::new(hooks.unhandled.clone()));
-    let mut context = Context::builder()
-        .module_loader(loader)
-        .job_executor(executor.clone())
-        .host_hooks(hooks.clone())
-        .build()
-        .map_err(boa_error)?;
-    boa_runtime::register(
-        (
-            ConsoleExtension::default(),
-            FetchExtension(BlockingReqwestFetcher::default()),
-        ),
-        None,
-        &mut context,
-    )
-    .map_err(boa_error)?;
-    let source = Source::from_filepath(path).map_err(|error| {
-        CliError::one(format!(
-            "could not read JavaScript module {}: {error}",
-            path.display()
-        ))
-    })?;
-    let module = Module::parse(source, None, &mut context).map_err(boa_error)?;
-    let evaluation = module.load_link_evaluate(&mut context);
-    if matches!(evaluation.state(), PromiseState::Pending) {
-        context.run_jobs().map_err(boa_error)?;
-    }
-    let state = evaluation.state();
-    if let PromiseState::Rejected(value) = state {
-        return Err(boa_error(JsError::from_opaque(value)));
-    }
-    if let Some(reason) = hooks.first_unhandled() {
-        return Err(CliError::one(format!(
-            "JavaScript runtime: unhandled promise rejection: {}",
-            JsError::from_opaque(reason)
-        )));
-    }
-    match state {
-        PromiseState::Fulfilled(_) => Ok(()),
-        PromiseState::Pending => Err(CliError::one(
-            "JavaScript module evaluation remained pending after the job queue completed",
-        )),
-        PromiseState::Rejected(_) => unreachable!("handled above"),
-    }
+    execute_node_module(OsStr::new("node"), &absolute, directory)
 }
 
-fn boa_error(error: JsError) -> CliError {
-    CliError::one(format!("JavaScript runtime: {error}"))
+fn execute_node_module(program: &OsStr, path: &Path, directory: &Path) -> Result<(), CliError> {
+    let available = ProcessCommand::new(program)
+        .arg("--version")
+        .current_dir(directory)
+        .output()
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                CliError::one(
+                    "Node.js is required to run JavaScript, but `node` was not found on PATH",
+                )
+            } else {
+                CliError::one(format!(
+                    "could not check whether Node.js is available: {error}"
+                ))
+            }
+        })?;
+    if !available.status.success() {
+        return Err(CliError::one(format!(
+            "Node.js is required to run JavaScript, but `node --version` exited with {}",
+            available.status
+        )));
+    }
+
+    let output = ProcessCommand::new(program)
+        .arg(path)
+        .current_dir(directory)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .output()
+        .map_err(|error| CliError::one(format!("could not start Node.js: {error}")))?;
+    if output.status.success() {
+        io::stderr().write_all(&output.stderr).map_err(|error| {
+            CliError::one(format!("could not write Node.js diagnostics: {error}"))
+        })?;
+        return Ok(());
+    }
+
+    let diagnostics = String::from_utf8_lossy(&output.stderr);
+    let diagnostics = diagnostics.trim_end();
+    let detail = if diagnostics.is_empty() {
+        String::new()
+    } else {
+        format!("\n{diagnostics}")
+    };
+    Err(CliError::one(format!(
+        "Node.js exited with {}{detail}",
+        output.status
+    )))
+}
+
+#[cfg(test)]
+mod node_tests {
+    use super::*;
+
+    #[test]
+    fn missing_node_has_a_focused_error() {
+        let directory = std::env::current_dir().unwrap();
+        let missing = directory.join("ruddy-test-node-executable-that-does-not-exist");
+        let error = execute_node_module(missing.as_os_str(), Path::new("module.js"), &directory)
+            .unwrap_err();
+        assert!(error.to_string().contains("Node.js is required"), "{error}");
+        assert!(error.to_string().contains("not found on PATH"), "{error}");
+    }
 }
 
 /// Write beside the destination first, so a failed write cannot truncate the

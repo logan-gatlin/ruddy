@@ -11,13 +11,9 @@ name = "ruddy"
 path = "src/main.rs"
 
 [dependencies]
-boa_engine = "0.22"
-boa_runtime = { version = "0.22", features = ["all", "process"] }
 clap = { version = "4", features = ["derive"] }
 gix = { version = "0.85.0", default-features = false, features = ["sha1", "blocking-http-transport-reqwest-rust-tls", "worktree-mutation", "revision"] }
 fs2 = "0.4.3"
-futures-concurrency = "7"
-futures-lite = "2"
 indexmap = { version = "2", features = ["serde"] }
 ruddy = { path = ".." }
 serde = { version = "1", features = ["derive"] }

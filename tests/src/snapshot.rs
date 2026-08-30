@@ -2146,7 +2146,7 @@ fn a_raw_dump_carries_only_its_own_tab() {
 #[test]
 fn the_types_raw_dump_asserts_package_and_owned_metadata() {
     let snapshot = snapshot(
-        "extern choose: { left when 'a: Nat, right when 'b: Nat } where 'a != 'b = host.choose\n",
+        "extern choose: { left when 'a: Nat, right when 'b: Nat } where 'a != 'b = \"host.choose\"\n",
     );
     let types = snapshot
         .stages
@@ -2911,7 +2911,7 @@ fn stage_named<'a>(snapshot: &'a Snapshot, id: &str) -> &'a Stage {
 
 #[test]
 fn extern_values_reach_every_import_and_artifact_view() {
-    let source = "extern answer : Nat = host.answer\nlet next = answer";
+    let source = "extern answer : Nat = \"host.answer\"\nlet next = answer";
     let snapshot = snapshot(source);
     assert!(
         snapshot.diagnostics.is_empty(),
@@ -2927,7 +2927,11 @@ fn extern_values_reach_every_import_and_artifact_view() {
     };
     let externs = stage("externs");
     assert_eq!(externs.summary, "1 extern");
-    assert!(nodes(externs).iter().any(|node| node.text == "host.answer"));
+    assert!(
+        nodes(externs)
+            .iter()
+            .any(|node| node.text == "\"host.answer\"")
+    );
     assert!(
         nodes(stage("types"))
             .iter()
@@ -2961,7 +2965,7 @@ fn extern_values_reach_every_import_and_artifact_view() {
             artifact
                 .text
                 .as_deref()
-                .is_some_and(|text| text.contains("(target \"host\" \"answer\")")),
+                .is_some_and(|text| text.contains("(target \"host.answer\")")),
             "{id}: {:?}",
             artifact.text
         );
