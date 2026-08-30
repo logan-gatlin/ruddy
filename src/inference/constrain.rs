@@ -218,6 +218,22 @@ fn covered(
 }
 
 impl Constrain<'_> {
+    fn constraint(
+        &mut self,
+        span: Span,
+        origin: ConstraintOrigin,
+        subjects: ConstraintSubjects,
+        kind: ConstraintKind,
+    ) -> Constraint {
+        Constraint {
+            id: self.table.constraint_id(),
+            span,
+            origin,
+            subjects,
+            kind,
+        }
+    }
+
     fn emit(
         &mut self,
         span: Span,
@@ -225,14 +241,8 @@ impl Constrain<'_> {
         subjects: ConstraintSubjects,
         kind: ConstraintKind,
     ) {
-        let id = self.table.constraint_id();
-        self.out.push(Constraint {
-            id,
-            span,
-            origin,
-            subjects,
-            kind,
-        });
+        let constraint = self.constraint(span, origin, subjects, kind);
+        self.out.push(constraint);
     }
 
     /// Record that `actual` — the type a term turned out to have — has to be
@@ -297,12 +307,12 @@ impl Constrain<'_> {
             TermKind::Unary { op, value } => match op {
                 crate::ir::UnaryOp::Neg => {
                     let real = Rc::new(Ty::plain(Ty::Real));
-                    self.check_term(value, &real);
+                    self.check_term(value, &real, Subject::Context);
                     real
                 }
                 crate::ir::UnaryOp::Not => {
                     let boolean = Rc::new(Ty::plain(Ty::Boolean));
-                    self.check_term(value, &boolean);
+                    self.check_term(value, &boolean, Subject::Context);
                     boolean
                 }
             },
@@ -317,8 +327,8 @@ impl Constrain<'_> {
                     | crate::ir::BinaryOp::Xor => Ty::Boolean,
                 };
                 let ty = Rc::new(Ty::plain(core));
-                self.check_term(left, &ty);
-                self.check_term(right, &ty);
+                self.check_term(left, &ty, Subject::Context);
+                self.check_term(right, &ty, Subject::Context);
                 ty
             }
             TermKind::Ident(symbol) => {
@@ -346,6 +356,11 @@ impl Constrain<'_> {
                 // is the contract, so the value is checked against it and the
                 // recursive uses the annotation exists for are checked against
                 // it too; without one it is a variable the value decides.
+                let expected_subject = if annotation.is_some() {
+                    Subject::Annotation
+                } else {
+                    Subject::LocalBinding
+                };
                 let (bound, promised, rigids) = match annotation {
                     Some(annotation) => {
                         let lowered = lower_annotation(self.mint, self.table, annotation);
@@ -387,7 +402,7 @@ impl Constrain<'_> {
                     }
                 };
                 let outer = std::mem::take(&mut self.out);
-                self.check_term(value, &bound);
+                self.check_term(value, &bound, expected_subject);
                 let required = std::mem::replace(&mut self.out, outer);
 
                 self.table.level -= 1;
@@ -402,7 +417,7 @@ impl Constrain<'_> {
                 let rest = std::mem::replace(&mut self.out, outer);
 
                 self.emit(
-                    span,
+                    name.span,
                     ConstraintOrigin::Binding,
                     ConstraintSubjects::one(Subject::Binding),
                     ConstraintKind::Let {
@@ -500,7 +515,7 @@ impl Constrain<'_> {
                             does.clone(),
                         )));
                         self.checks(
-                            span,
+                            func.span,
                             &applied,
                             &wanted,
                             ConstraintOrigin::ApplicationCallee,
@@ -756,13 +771,22 @@ impl Constrain<'_> {
                             self.presence_guard = enclosing;
                             let constraints = std::mem::replace(&mut self.out, outer);
                             let requirements = self.defer_requirements(required);
+                            let arm_result = self.constraint(
+                                body.span,
+                                ConstraintOrigin::MatchArm,
+                                ConstraintSubjects::pair(Subject::MatchResult, Subject::MatchArm),
+                                ConstraintKind::Equal {
+                                    expected: result.clone(),
+                                    actual: body.ty.clone(),
+                                },
+                            );
                             guarded.push(GuardedArm {
                                 span: pattern.span.merge(body.span),
                                 raw,
                                 effective,
                                 constraints,
                                 requirements,
-                                ty: body.ty.clone(),
+                                result: arm_result,
                             });
                         }
                         self.emit(
@@ -891,9 +915,9 @@ impl Constrain<'_> {
                     body.span,
                     &actual,
                     &answer,
-                    ConstraintOrigin::HandlerReturn,
+                    ConstraintOrigin::HandlerFallback,
                     Subject::HandlerAnswer,
-                    Subject::Term,
+                    Subject::HandlerBody,
                 );
             }
         }
@@ -1193,7 +1217,12 @@ impl Constrain<'_> {
     /// [`lower_type`] and unbound, so checking matches on what was literally
     /// written and, like the rest of generation, never has to ask the table
     /// anything.
-    pub(super) fn check_term(&mut self, term: &mut Term, expected: &Rc<Ty>) {
+    pub(super) fn check_term(
+        &mut self,
+        term: &mut Term,
+        expected: &Rc<Ty>,
+        expected_subject: Subject,
+    ) {
         // Checking looks through a name — an annotation of `list` still pushes
         // into a struct literal — but `term.ty` is set from `expected` rather
         // than from this, so the term keeps the name the user wrote and prints
@@ -1212,7 +1241,7 @@ impl Constrain<'_> {
                     inside: true,
                 });
                 let held = self.answer.take();
-                self.check_term(body, &to);
+                self.check_term(body, &to, expected_subject);
                 self.answer = held;
                 self.leave(outer);
                 term.ty = expected.clone();
@@ -1235,7 +1264,7 @@ impl Constrain<'_> {
             {
                 for (name, field) in fields.iter_mut() {
                     let want = row.labels[name].ty.clone();
-                    self.check_term(&mut field.value, &want);
+                    self.check_term(&mut field.value, &want, expected_subject);
                 }
                 term.ty = expected.clone();
             }
@@ -1258,7 +1287,7 @@ impl Constrain<'_> {
             {
                 let want = cases.labels[&name.tracked].ty.clone();
                 match payload {
-                    Some(payload) => self.check_term(payload, &want),
+                    Some(payload) => self.check_term(payload, &want, expected_subject),
                     // Nothing written is unit, and the case has to carry one.
                     // Said as a constraint rather than pushed, since there is
                     // no term here to push into — and worded with the tag's own
@@ -1270,7 +1299,7 @@ impl Constrain<'_> {
                             &carried,
                             &want,
                             ConstraintOrigin::ContextualCheck,
-                            Subject::Context,
+                            expected_subject,
                             Subject::Term,
                         );
                     }
@@ -1285,7 +1314,7 @@ impl Constrain<'_> {
                     &actual,
                     expected,
                     ConstraintOrigin::ContextualCheck,
-                    Subject::Context,
+                    expected_subject,
                     Subject::Term,
                 );
             }

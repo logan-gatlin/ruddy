@@ -2401,14 +2401,13 @@ fn a_raw_dump_carries_only_its_own_tab() {
 
 #[test]
 fn inference_stage_rows_serialize_compiler_identities() {
-    let snapshot = snapshot(
-        "effect Fail = { abort: () -> () }\n\
-         type Callback = () -> () + !Fail\n\
-         extern install : fn(Callback) -> () + !Fail = host.install\n\
-         let choose : { x when 'a: Nat, y when 'b: Nat } -> Nat where 'a != 'b = fn v => match v with | {x} => x | {y} => y end\n\
-         let local = fn tag => match tag with | {a} => let g = fn w => choose w in g {} | {b} => 0n end\n\
-         let bad = (1n).missing\n",
-    );
+    let source = "effect Fail = { abort: () -> () }\n\
+                  type Callback = () -> () + !Fail\n\
+                  extern install : fn(Callback) -> () + !Fail = host.install\n\
+                  let choose : { x when 'a: Nat, y when 'b: Nat } -> Nat where 'a != 'b = fn v => match v with | {x} => x | {y} => y end\n\
+                  let local = fn tag => match tag with | {a} => let g = fn w => choose w in g {} | {b} => 0n end\n\
+                  let bad = (1n).missing\n";
+    let snapshot = snapshot(source);
     let stage = |id| snapshot.stages.iter().find(|stage| stage.id == id).unwrap();
     let field = |node: &Node, name| {
         node.fields
@@ -2444,6 +2443,36 @@ fn inference_stage_rows_serialize_compiler_identities() {
             |node| field(node, "_constraint_id").is_some_and(|id| constraint_ids.contains(&id))
         )
     );
+    let guarded_results: Vec<_> = constraint_rows
+        .iter()
+        .filter(|node| field(node, "_origin").as_deref() == Some("match-arm"))
+        .collect();
+    assert!(!guarded_results.is_empty());
+    assert!(guarded_results.iter().any(|result| {
+        result
+            .span
+            .is_some_and(|span| matches!(&source[span.range[0]..span.range[1]], "x" | "y"))
+    }));
+    for result in guarded_results {
+        assert_eq!(
+            field(result, "_primary_subject").as_deref(),
+            Some("match-result")
+        );
+        assert_eq!(
+            field(result, "_secondary_subject").as_deref(),
+            Some("match-arm")
+        );
+        let span = result
+            .span
+            .expect("a guarded result points at its arm body");
+        assert!(!source[span.range[0]..span.range[1]].is_empty());
+        let id = field(result, "_constraint_id").expect("guarded result identity");
+        assert!(
+            solve
+                .iter()
+                .any(|step| field(step, "_constraint_id").as_deref() == Some(id.as_str()))
+        );
+    }
 
     let batches = nodes(stage("presence"))
         .into_iter()

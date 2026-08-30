@@ -579,13 +579,23 @@ impl Solve<'_> {
         // input/output relationship is published.
         self.guard = None;
         self.active_refinement = enclosing_refinement;
-        let body_types: Vec<Rc<Ty>> = arms.iter().map(|arm| arm.ty.clone()).collect();
+        let body_types: Vec<Rc<Ty>> = arms
+            .iter()
+            .map(|arm| match &arm.result.kind {
+                ConstraintKind::Equal { actual, .. } => actual.clone(),
+                _ => unreachable!("a guarded arm result is an equality"),
+            })
+            .collect();
         let family = self.family_type(&body_types);
         self.unify(span, result, &family);
-        for ((arm, guard), report) in arms.iter().zip(guards).zip(reports) {
+        for (((arm, body_ty), guard), report) in
+            arms.iter().zip(body_types).zip(guards).zip(reports)
+        {
             self.guard = guard;
             self.active_refinement = Some(report);
-            self.unify(arm.span, &family, &arm.ty);
+            let previous = self.constraint.replace(arm.result.id);
+            self.unify(arm.result.span, &family, &body_ty);
+            self.constraint = previous;
         }
         self.guard = None;
         self.active_refinement = enclosing_refinement;

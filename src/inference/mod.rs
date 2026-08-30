@@ -329,7 +329,10 @@ pub struct GuardedArm {
     pub effective: Formula,
     pub constraints: Vec<Constraint>,
     pub requirements: Vec<DeferredRequirement>,
-    pub ty: Rc<Ty>,
+    /// The guarded equality between this body's type and the match result
+    /// family. It is a child constraint because it is solved under this arm's
+    /// premise, not as undifferentiated work owned by the enclosing match.
+    pub result: Constraint,
 }
 
 /// A generation-time store batch held inert in its original source-order slot
@@ -592,6 +595,7 @@ pub enum ConstraintOrigin {
     MatchArm,
     HandlerArm,
     HandlerReturn,
+    HandlerFallback,
     Pattern,
     Instance,
     CallbackBoundary,
@@ -612,6 +616,7 @@ impl ConstraintOrigin {
             Self::MatchArm => "match-arm",
             Self::HandlerArm => "handler-arm",
             Self::HandlerReturn => "handler-return",
+            Self::HandlerFallback => "handler-fallback",
             Self::Pattern => "pattern",
             Self::Instance => "instance",
             Self::CallbackBoundary => "callback-boundary",
@@ -647,6 +652,8 @@ impl ConstraintSubjects {
 pub enum Subject {
     Binding,
     Annotation,
+    TopLevelBinding,
+    LocalBinding,
     Context,
     Term,
     Callee,
@@ -665,6 +672,7 @@ pub enum Subject {
     MatchArm,
     HandlerArm,
     HandlerReturn,
+    HandlerBody,
     Scheme,
     Instance,
     CallbackRequired,
@@ -676,6 +684,8 @@ impl Subject {
         match self {
             Self::Binding => "binding",
             Self::Annotation => "annotation",
+            Self::TopLevelBinding => "top-level-binding",
+            Self::LocalBinding => "local-binding",
             Self::Context => "context",
             Self::Term => "term",
             Self::Callee => "callee",
@@ -694,6 +704,7 @@ impl Subject {
             Self::MatchArm => "match-arm",
             Self::HandlerArm => "handler-arm",
             Self::HandlerReturn => "handler-return",
+            Self::HandlerBody => "handler-body",
             Self::Scheme => "scheme",
             Self::Instance => "instance",
             Self::CallbackRequired => "callback-required",
@@ -1933,7 +1944,12 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             // the definition, and checking against a bare variable is inferring
             // and equating — see [`Constrain::check_term`]. The equation is what
             // ties the name the body used to the type the body has.
-            constrain.check_term(&mut decl.value, &scoped.bound);
+            let expected_subject = if decl.annotation.is_some() {
+                Subject::Annotation
+            } else {
+                Subject::TopLevelBinding
+            };
+            constrain.check_term(&mut decl.value, &scoped.bound, expected_subject);
             let generated = constrain.out;
             let annotated = constrain.annotated;
             let ty = match &decl.annotation {

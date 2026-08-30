@@ -105,7 +105,9 @@ fn rows(ids: &mut Ids, constraints: &[Constraint]) -> Vec<Node> {
                                         .field("_batch_id", requirement.batch.id.get().to_string()),
                                     )
                                 });
-                            arm_node.children(rows(ids, &arm.constraints))
+                            arm_node
+                                .children(rows(ids, &arm.constraints))
+                                .children(rows(ids, std::slice::from_ref(&arm.result)))
                         })
                         .collect::<Vec<_>>(),
                 ),
@@ -130,7 +132,7 @@ fn counted(constraints: &[Constraint]) -> usize {
             ConstraintKind::Match { arms, .. } => {
                 1 + arms
                     .iter()
-                    .map(|arm| arm.requirements.len() + counted(&arm.constraints))
+                    .map(|arm| arm.requirements.len() + counted(&arm.constraints) + 1)
                     .sum::<usize>()
             }
             ConstraintKind::Project { .. }

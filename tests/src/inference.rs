@@ -8352,6 +8352,7 @@ fn all_constraints<'a>(
             inference::ConstraintKind::Match { arms, .. } => {
                 for arm in arms {
                     all_constraints(&arm.constraints, out);
+                    out.push(&arm.result);
                 }
             }
             _ => {}
@@ -8419,6 +8420,204 @@ fn generated_constraints_retain_source_origins_and_ordered_subjects() {
                     inference::Subject::PerformedEffects,
                     inference::Subject::AmbientEffects,
                 )
+    }));
+}
+
+#[test]
+fn contextual_checks_retain_exact_spans_and_expected_side_provenance() {
+    use inference::{ConstraintOrigin as Origin, ConstraintSubjects as Subjects, Subject};
+
+    let src = "let unary = not 1n\n\
+               let binary = true and 2n\n\
+               let call = 3n {}\n\
+               let inferred = 4n\n\
+               let annotated : Nat = 5n\n\
+               let nested = let local = 6n in let noted : Nat = 7n in noted";
+    let (_, _, output) = infer_src(src);
+    let mut constraints = Vec::new();
+    for generated in output.constraints.values() {
+        all_constraints(generated, &mut constraints);
+    }
+    let exact = |needle: &str, occurrence: usize, origin, subjects| {
+        let start = src
+            .match_indices(needle)
+            .nth(occurrence)
+            .unwrap_or_else(|| panic!("missing occurrence {occurrence} of {needle:?}"))
+            .0;
+        let found: Vec<_> = constraints
+            .iter()
+            .filter(|constraint| {
+                constraint.span.start == start
+                    && constraint.span.end() == start + needle.len()
+                    && constraint.origin == origin
+                    && constraint.subjects == subjects
+            })
+            .collect();
+        assert_eq!(found.len(), 1, "{needle:?}: {constraints:#?}");
+    };
+
+    exact(
+        "1n",
+        0,
+        Origin::ContextualCheck,
+        Subjects::pair(Subject::Context, Subject::Term),
+    );
+    exact(
+        "true",
+        0,
+        Origin::ContextualCheck,
+        Subjects::pair(Subject::Context, Subject::Term),
+    );
+    exact(
+        "2n",
+        0,
+        Origin::ContextualCheck,
+        Subjects::pair(Subject::Context, Subject::Term),
+    );
+    exact(
+        "3n",
+        0,
+        Origin::ApplicationCallee,
+        Subjects::pair(Subject::CallShape, Subject::Callee),
+    );
+    exact(
+        "4n",
+        0,
+        Origin::ContextualCheck,
+        Subjects::pair(Subject::TopLevelBinding, Subject::Term),
+    );
+    exact(
+        "5n",
+        0,
+        Origin::ContextualCheck,
+        Subjects::pair(Subject::Annotation, Subject::Term),
+    );
+    exact(
+        "6n",
+        0,
+        Origin::ContextualCheck,
+        Subjects::pair(Subject::LocalBinding, Subject::Term),
+    );
+    exact(
+        "7n",
+        0,
+        Origin::ContextualCheck,
+        Subjects::pair(Subject::Annotation, Subject::Term),
+    );
+    exact("local", 0, Origin::Binding, Subjects::one(Subject::Binding));
+    exact("noted", 0, Origin::Binding, Subjects::one(Subject::Binding));
+}
+
+#[test]
+fn match_result_checks_are_ordered_children_at_each_written_body() {
+    use inference::{
+        ConstraintKind, ConstraintOrigin as Origin, ConstraintSubjects as Subjects, Subject,
+    };
+
+    let src = "let guarded = fn v => match v with | {x} => 1n | {} => 2n end\n\
+               let ordinary = match true with | true => 3n | false => 4n end";
+    let (_, _, output) = infer_src(src);
+    let matches: Vec<_> = output
+        .constraints
+        .values()
+        .flatten()
+        .filter_map(|constraint| match &constraint.kind {
+            ConstraintKind::Match { arms, .. } => Some((constraint, arms)),
+            _ => None,
+        })
+        .collect();
+    let (guarded_match, arms) = matches
+        .iter()
+        .find(|(_, arms)| !arms.is_empty())
+        .expect("the qualifying match");
+    let match_start = src.find("match v").unwrap();
+    let match_end = src[match_start..].find(" end").unwrap() + match_start + " end".len();
+    assert_eq!(guarded_match.span.start, match_start);
+    assert_eq!(guarded_match.span.end(), match_end);
+    assert_eq!(guarded_match.origin, Origin::Match);
+    assert_eq!(
+        guarded_match.subjects,
+        Subjects::pair(Subject::MatchScrutinee, Subject::MatchResult)
+    );
+    assert_eq!(arms.len(), 2);
+    for (arm, body) in arms.iter().zip(["1n", "2n"]) {
+        let at = src.find(body).unwrap();
+        assert_eq!(arm.result.span.start, at);
+        assert_eq!(arm.result.span.end(), at + body.len());
+        assert_eq!(arm.result.origin, Origin::MatchArm);
+        assert_eq!(
+            arm.result.subjects,
+            Subjects::pair(Subject::MatchResult, Subject::MatchArm)
+        );
+        assert!(matches!(arm.result.kind, ConstraintKind::Equal { .. }));
+    }
+
+    let mut constraints = Vec::new();
+    for generated in output.constraints.values() {
+        all_constraints(generated, &mut constraints);
+    }
+    for (scrutinee, occurrence) in [("v", 1), ("true", 0)] {
+        let at = src.match_indices(scrutinee).nth(occurrence).unwrap().0;
+        assert!(constraints.iter().any(|constraint| {
+            constraint.span.start == at
+                && constraint.span.end() == at + scrutinee.len()
+                && constraint.origin == Origin::MatchScrutinee
+                && constraint.subjects
+                    == Subjects::pair(Subject::PatternDemand, Subject::MatchScrutinee)
+        }));
+    }
+    for body in ["3n", "4n"] {
+        let at = src.find(body).unwrap();
+        assert!(constraints.iter().any(|constraint| {
+            constraint.span.start == at
+                && constraint.span.end() == at + body.len()
+                && constraint.origin == Origin::MatchArm
+                && constraint.subjects == Subjects::pair(Subject::MatchResult, Subject::MatchArm)
+        }));
+    }
+}
+
+#[test]
+fn handler_checks_distinguish_arms_explicit_returns_and_body_fallbacks() {
+    use inference::{ConstraintOrigin as Origin, ConstraintSubjects as Subjects, Subject};
+
+    let src = "effect Log = { write: Nat -> () }\n\
+               let explicit = handle 1n with | !Log.write n => {} | return value => value end\n\
+               let implicit = handle 2n with | !Log.write n => {} end";
+    let (_, _, output) = infer_src(src);
+    let mut constraints = Vec::new();
+    for generated in output.constraints.values() {
+        all_constraints(generated, &mut constraints);
+    }
+    let has = |needle: &str, origin, subjects| {
+        let at = src.find(needle).unwrap();
+        constraints.iter().any(|constraint| {
+            constraint.span.start == at
+                && constraint.span.end() == at + needle.len()
+                && constraint.origin == origin
+                && constraint.subjects == subjects
+        })
+    };
+    let returned = src.rfind("value").unwrap();
+    assert!(constraints.iter().any(|constraint| {
+        constraint.span.start == returned
+            && constraint.span.end() == returned + "value".len()
+            && constraint.origin == Origin::HandlerReturn
+            && constraint.subjects == Subjects::pair(Subject::HandlerAnswer, Subject::HandlerReturn)
+    }));
+    assert!(has(
+        "2n",
+        Origin::HandlerFallback,
+        Subjects::pair(Subject::HandlerAnswer, Subject::HandlerBody)
+    ));
+    let arm_checks = constraints
+        .iter()
+        .filter(|constraint| constraint.origin == Origin::HandlerArm)
+        .collect::<Vec<_>>();
+    assert_eq!(arm_checks.len(), 2, "{arm_checks:#?}");
+    assert!(arm_checks.iter().all(|constraint| {
+        constraint.subjects == Subjects::pair(Subject::Context, Subject::HandlerArm)
+            && &src[constraint.span.start..constraint.span.end()] == "{}"
     }));
 }
 
