@@ -1885,6 +1885,21 @@ fn describe_type(ty: &Rc<Ty>) -> TypeDescription {
     }
 }
 
+struct MismatchWork {
+    left: Rc<Ty>,
+    right: Rc<Ty>,
+    alias_path: Option<usize>,
+}
+
+struct AliasGoal {
+    left_symbol: Symbol,
+    left_args: Rc<[Rc<Ty>]>,
+    right_symbol: Symbol,
+    right_args: Rc<[Rc<Ty>]>,
+    parent: Option<usize>,
+    depth: usize,
+}
+
 /// Pick the first incompatible semantic leaf on an explicit stack. The walk
 /// follows every payload-bearing type position and unfolds declarations one
 /// layer at a time; malformed/missing alias provenance is reported honestly as
@@ -1894,21 +1909,30 @@ fn smallest_incompatible(
     left: &Rc<Ty>,
     right: &Rc<Ty>,
 ) -> (TypeDescription, TypeDescription) {
-    let mut work = vec![(left.clone(), right.clone())];
+    let mut work = vec![MismatchWork {
+        left: left.clone(),
+        right: right.clone(),
+        alias_path: None,
+    }];
     let fallback = (describe_type(left), describe_type(right));
     // Recursive declarations return to the same applications. Arguments are
     // part of the goal: the same pair of names can occur at independent
     // substitutions in sibling fields, and suppressing one must not suppress
     // the other. Keep the finite syntax itself because opening can rebuild a
-    // semantically identical substitution at a different allocation.
-    let mut visited_names = Vec::new();
+    // semantically identical substitution at a different allocation. Arena
+    // indices make paths persistent without recursive destruction or cloning.
+    let mut alias_goals: Vec<AliasGoal> = Vec::new();
     let mut forwarding = Forwarding::default();
     // Malformed imported declarations can manufacture a fresh substitution on
-    // every turn. A finite diagnostic walk must not retain that unbounded
-    // history: once the budget is exhausted, suppress the cyclic-looking
-    // branch and continue with siblings already on the deterministic DFS.
+    // every turn. Bound each DFS branch independently: exhausting one growing
+    // branch must still leave queued siblings their full diagnostic walk.
     const MAX_ALIAS_GOALS: usize = 4096;
-    while let Some((mut left, mut right)) = work.pop() {
+    while let Some(MismatchWork {
+        mut left,
+        mut right,
+        mut alias_path,
+    }) = work.pop()
+    {
         while let Ty::Package(inner) = &*left {
             left = inner.clone();
         }
@@ -1952,31 +1976,43 @@ fn smallest_incompatible(
                 .map(|arg| canonical_alias_argument(aliases, &mut forwarding, arg))
                 .collect::<Vec<_>>()
                 .into();
-            let seen = visited_names.iter().any(
-                |(seen_left_symbol, seen_left_args, seen_right_symbol, seen_right_args): &(
-                    Symbol,
-                    Rc<[Rc<Ty>]>,
-                    Symbol,
-                    Rc<[Rc<Ty>]>,
-                )| {
-                    seen_left_symbol == left_symbol
-                        && seen_right_symbol == right_symbol
-                        && seen_left_args.len() == left_args.len()
-                        && seen_right_args.len() == right_args.len()
-                        && seen_left_args
-                            .iter()
-                            .zip(left_args.iter())
-                            .all(|(seen, current)| same_finite_syntax(seen, current))
-                        && seen_right_args
-                            .iter()
-                            .zip(right_args.iter())
-                            .all(|(seen, current)| same_finite_syntax(seen, current))
-                },
-            );
-            if seen || visited_names.len() == MAX_ALIAS_GOALS {
+            let mut ancestor = alias_path;
+            let mut seen = false;
+            while let Some(index) = ancestor {
+                let goal = &alias_goals[index];
+                if goal.left_symbol == *left_symbol
+                    && goal.right_symbol == *right_symbol
+                    && goal.left_args.len() == left_args.len()
+                    && goal.right_args.len() == right_args.len()
+                    && goal
+                        .left_args
+                        .iter()
+                        .zip(left_args.iter())
+                        .all(|(seen, current)| same_finite_syntax(seen, current))
+                    && goal
+                        .right_args
+                        .iter()
+                        .zip(right_args.iter())
+                        .all(|(seen, current)| same_finite_syntax(seen, current))
+                {
+                    seen = true;
+                    break;
+                }
+                ancestor = goal.parent;
+            }
+            let depth = alias_path.map_or(0, |index| alias_goals[index].depth);
+            if seen || depth == MAX_ALIAS_GOALS {
                 continue;
             }
-            visited_names.push((*left_symbol, left_args, *right_symbol, right_args));
+            alias_goals.push(AliasGoal {
+                left_symbol: *left_symbol,
+                left_args,
+                right_symbol: *right_symbol,
+                right_args,
+                parent: alias_path,
+                depth: depth + 1,
+            });
+            alias_path = Some(alias_goals.len() - 1);
         }
         if matches!(&*left, Ty::Named { symbol, .. } if aliases.contains_key(symbol)) {
             left = unfold(aliases, &left);
@@ -1995,13 +2031,21 @@ fn smallest_incompatible(
         }
         match (&*left, &*right) {
             (Ty::Arrow(l_from, l_to, l_effects), Ty::Arrow(r_from, r_to, r_effects)) => {
-                push_row_payloads(&mut work, l_effects, r_effects);
+                push_row_payloads(&mut work, l_effects, r_effects, alias_path);
                 // Source order: parameter, result, then effects.
-                work.push((l_to.clone(), r_to.clone()));
-                work.push((l_from.clone(), r_from.clone()));
+                work.push(MismatchWork {
+                    left: l_to.clone(),
+                    right: r_to.clone(),
+                    alias_path,
+                });
+                work.push(MismatchWork {
+                    left: l_from.clone(),
+                    right: r_from.clone(),
+                    alias_path,
+                });
             }
             (Ty::Struct(left), Ty::Struct(right)) | (Ty::Sum(left), Ty::Sum(right)) => {
-                push_row_payloads(&mut work, left, right);
+                push_row_payloads(&mut work, left, right, alias_path);
                 if left.labels.keys().ne(right.labels.keys()) {
                     return descriptions;
                 }
@@ -2049,7 +2093,12 @@ fn canonical_alias_argument(
     }
 }
 
-fn push_row_payloads(work: &mut Vec<(Rc<Ty>, Rc<Ty>)>, left: &Row, right: &Row) {
+fn push_row_payloads(
+    work: &mut Vec<MismatchWork>,
+    left: &Row,
+    right: &Row,
+    alias_path: Option<usize>,
+) {
     // Reverse insertion order so the first written common label is visited
     // first by the LIFO work list. Presence/rest incompatibilities have no type
     // leaf; their dedicated row diagnostics remain the truthful fallback.
@@ -2059,7 +2108,11 @@ fn push_row_payloads(work: &mut Vec<(Rc<Ty>, Rc<Ty>)>, left: &Row, right: &Row) 
         .filter_map(|(name, field)| right.labels.get(name).map(|other| (&field.ty, &other.ty)))
         .collect();
     for (left, right) in common.into_iter().rev() {
-        work.push((left.clone(), right.clone()));
+        work.push(MismatchWork {
+            left: left.clone(),
+            right: right.clone(),
+            alias_path,
+        });
     }
 }
 
@@ -7281,6 +7334,118 @@ mod existential_regressions {
                 "the recursive walk must be deterministic"
             );
         }
+    }
+
+    #[test]
+    fn growing_alias_branch_does_not_starve_later_sibling() {
+        use crate::symbol::{Bundle, Mint, Namespace, Version};
+
+        let bundle = Bundle::new("growing-branch-leaf", Version::new(1, 0, 0)).unwrap();
+        let mut mint = Mint::new(bundle);
+        let growth: Vec<_> = (0..4_200)
+            .map(|at| {
+                mint.global(None, Namespace::Types, &format!("Growth{at}"))
+                    .unwrap()
+            })
+            .collect();
+        let wrapper = mint.global(None, Namespace::Types, "Wrapper").unwrap();
+        let mut aliases = IndexMap::new();
+        for (at, symbols) in growth.windows(2).enumerate() {
+            let argument = Rc::new(Ty::Struct(Row {
+                labels: [("x".into(), RowField::present(Rc::new(Ty::Bound(0))))]
+                    .into_iter()
+                    .collect(),
+                rest: Rest::Closed,
+            }));
+            aliases.insert(
+                symbols[0],
+                Scheme::new(
+                    1,
+                    Rc::new(Ty::Named {
+                        symbol: symbols[1],
+                        name: format!("Growth{}", at + 1).into(),
+                        args: Rc::from([argument]),
+                    }),
+                ),
+            );
+        }
+        aliases.insert(wrapper, Scheme::new(1, Rc::new(Ty::Bound(0))));
+        let named = |symbol, name: String, argument| {
+            Rc::new(Ty::Named {
+                symbol,
+                name: name.into(),
+                args: Rc::from([argument]),
+            })
+        };
+        let row = |bad, good| {
+            Rc::new(Ty::Struct(Row {
+                labels: [
+                    ("bad".into(), RowField::present(bad)),
+                    ("good".into(), RowField::present(good)),
+                ]
+                .into_iter()
+                .collect(),
+                rest: Rest::Closed,
+            }))
+        };
+        let left = row(
+            named(growth[0], "Growth0".into(), Rc::new(Ty::Nat)),
+            named(wrapper, "Wrapper".into(), Rc::new(Ty::Nat)),
+        );
+        let right = row(
+            named(growth[0], "Growth0".into(), Rc::new(Ty::Nat)),
+            named(wrapper, "Wrapper".into(), Rc::new(Ty::Boolean)),
+        );
+
+        assert_eq!(
+            smallest_incompatible(&aliases, &left, &right),
+            (TypeDescription::NaturalNumber, TypeDescription::Boolean),
+            "a growing first branch must not spend its sibling's alias depth"
+        );
+    }
+
+    #[test]
+    fn pure_alias_growth_has_a_bounded_declared_fallback() {
+        use crate::symbol::{Bundle, Mint, Namespace, Version};
+
+        let bundle = Bundle::new("pure-growth-leaf", Version::new(1, 0, 0)).unwrap();
+        let mut mint = Mint::new(bundle);
+        let growth: Vec<_> = (0..30_000)
+            .map(|at| {
+                mint.global(None, Namespace::Types, &format!("Growth{at}"))
+                    .unwrap()
+            })
+            .collect();
+        let mut aliases = IndexMap::new();
+        for (at, symbols) in growth.windows(2).enumerate() {
+            let argument = Rc::new(Ty::Struct(Row {
+                labels: [("x".into(), RowField::present(Rc::new(Ty::Bound(0))))]
+                    .into_iter()
+                    .collect(),
+                rest: Rest::Closed,
+            }));
+            aliases.insert(
+                symbols[0],
+                Scheme::new(
+                    1,
+                    Rc::new(Ty::Named {
+                        symbol: symbols[1],
+                        name: format!("Growth{}", at + 1).into(),
+                        args: Rc::from([argument]),
+                    }),
+                ),
+            );
+        }
+        let named = Rc::new(Ty::Named {
+            symbol: growth[0],
+            name: "Growth0".into(),
+            args: Rc::from([Rc::new(Ty::Nat)]),
+        });
+        assert_eq!(
+            smallest_incompatible(&aliases, &named, &named),
+            (TypeDescription::DeclaredType, TypeDescription::DeclaredType),
+            "pure growth must stop at the per-branch bound"
+        );
     }
 
     #[test]
