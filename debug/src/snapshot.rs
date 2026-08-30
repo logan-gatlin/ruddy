@@ -377,7 +377,7 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
             inferred
                 .errors
                 .iter()
-                .map(|error| inference_diagnostic(error, &index)),
+                .map(|error| source_error("types", error.diagnostic(), &index)),
         );
     }
     if let Some(checked) = &checked {
@@ -649,31 +649,6 @@ pub fn install_hook() {
             LAST_PANIC.with(|last| *last.borrow_mut() = Some(panicked));
         }));
     });
-}
-
-/// Inference's errors, two of which have a second place to point at: the
-/// variable declaration that a body broke its promise about. They are shown as
-/// one diagnostic with two highlights, because a broken promise is only
-/// legible next to the promise.
-fn inference_diagnostic(error: &inference::Error, files: &HashMap<FileID, u32>) -> Diagnostic {
-    let mut diagnostic = raw(
-        "types",
-        error.kind.code(),
-        error.kind.to_string(),
-        loc(error.span, files),
-    );
-    let declared = match &error.kind {
-        inference::ErrorKind::RigidBroken { declared, .. }
-        | inference::ErrorKind::RigidField { declared, .. } => Some(*declared),
-        _ => None,
-    };
-    if let Some(declared) = declared {
-        diagnostic.related.push(Related {
-            span: loc(declared, files),
-            message: ui::DECLARED_HERE.to_string(),
-        });
-    }
-    diagnostic
 }
 
 fn source_error(

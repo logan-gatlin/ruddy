@@ -992,8 +992,8 @@ fn a_declared_variable_is_the_definitions_to_leave_alone() {
     assert_eq!(error.kind.code(), "rigid-field");
     assert_eq!(
         error.kind.to_string(),
-        "this reads a field `x`, but `'a` stands for whatever type the caller picks, \
-         so it may not have one"
+        "this reads field `x`, but `'a` stands for whatever type the caller picks, \
+         so that choice cannot be assumed"
     );
     assert_eq!(error.span.start, src.rfind('x').expect("the field"));
     // And it points back at the declaration, which is the promise it broke.
@@ -4539,8 +4539,8 @@ fn a_sums_open_tail_is_the_definitions_to_leave_alone() {
     assert_eq!(output.errors[0].kind.code(), "rigid-field");
     assert_eq!(
         output.errors[0].kind.to_string(),
-        "this reads a case `#B`, but `'r` stands for whatever type the caller picks, \
-         so it may not have one"
+        "this matches case `#B`, but `'r` stands for whatever type the caller picks, \
+         so that choice cannot be assumed"
     );
 
     // And the other way: a declared rest handed to something that allows
@@ -7618,8 +7618,8 @@ fn the_written_examples_are_refused_where_they_go_wrong() {
         .unwrap_or_else(|| panic!("{:#?}", output.errors));
     assert_eq!(
         read.kind.to_string(),
-        "this reads a field `x`, but `'r` stands for whatever type the caller picks, \
-         so it may not have one"
+        "this reads field `x`, but `'r` stands for whatever type the caller picks, \
+         so that choice cannot be assumed"
     );
     assert!(
         read.span.start == src.find("{ x").unwrap() || read.span.start == src.rfind('x').unwrap()
@@ -7747,7 +7747,7 @@ fn a_label_demanded_of_a_rigid_is_refused() {
     };
     assert_eq!(error.kind.code(), "rigid-field");
     assert!(
-        error.kind.to_string().starts_with("this reads a field `y`"),
+        error.kind.to_string().starts_with("this reads field `y`"),
         "{}",
         error.kind
     );
@@ -7785,7 +7785,7 @@ fn a_label_demanded_of_a_rigid_is_refused() {
     };
     assert_eq!(error.kind.code(), "rigid-field");
     assert!(
-        error.kind.to_string().starts_with("this reads a case `#B`"),
+        error.kind.to_string().starts_with("this matches case `#B`"),
         "{}",
         error.kind
     );
@@ -7991,7 +7991,7 @@ fn polymorphic_extern_boundary_leaves_are_rejected_before_callback_instantiation
         output.errors[0]
             .kind
             .to_string()
-            .contains("fixed runtime representation")
+            .contains("one fixed kind of value")
     );
 
     // A forwarding alias does not make the representation any less

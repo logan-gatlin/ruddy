@@ -304,6 +304,8 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         TypeError::NotAllowed {
             effect: "Log".to_string(),
         },
+        TypeError::CallbackEffectsNotCovered,
+        TypeError::PolymorphicExternBoundary,
     ] {
         all.push(("types", kind.code(), kind.to_string()));
     }
@@ -606,6 +608,30 @@ fn an_effect_reads_as_the_one_thing_that_changed() {
         .to_string(),
         "requires not ?2 when ?1"
     );
+}
+
+#[test]
+fn inference_errors_expose_one_structured_reporter_boundary() {
+    let use_span = Span::generated(4, 5);
+    let declared = Span::generated(1, 2);
+    let diagnostic = inference::Error {
+        span: use_span,
+        kind: TypeError::RigidField {
+            shape: Shape::Effect,
+            field: "Log".to_string(),
+            name: "e".into(),
+            declared,
+        },
+    }
+    .diagnostic();
+
+    assert_eq!(diagnostic.code, "rigid-field");
+    assert_eq!(diagnostic.primary.span, use_span);
+    assert_eq!(diagnostic.related[0].span, declared);
+    assert_eq!(diagnostic.related[0].message, ui::DECLARED_HERE);
+    assert!(!diagnostic.primary.message.is_empty());
+    assert!(!diagnostic.help.is_empty());
+    assert!(diagnostic.title.starts_with("this requires effect `!Log`"));
 }
 
 #[test]
@@ -1978,8 +2004,8 @@ fn the_variable_complaints_read_as_what_went_wrong() {
             declared: span,
         }
         .to_string(),
-        "this reads a field `x`, but `'r` stands for whatever type the caller picks, \
-         so it may not have one"
+        "this reads field `x`, but `'r` stands for whatever type the caller picks, \
+         so that choice cannot be assumed"
     );
     // In the reader's own nouns: someone who wrote `#`s is told about a
     // case, and the label is quoted with the `#` that makes it one.
@@ -1991,8 +2017,8 @@ fn the_variable_complaints_read_as_what_went_wrong() {
             declared: span,
         }
         .to_string(),
-        "this reads a case `#B`, but `'r` stands for whatever type the caller picks, \
-         so it may not have one"
+        "this matches case `#B`, but `'r` stands for whatever type the caller picks, \
+         so that choice cannot be assumed"
     );
     assert_eq!(
         TypeError::RigidEscapes { name: "a".into() }.to_string(),

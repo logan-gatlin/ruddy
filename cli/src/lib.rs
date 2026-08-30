@@ -2280,12 +2280,10 @@ fn compile_one(
             ));
         }
         for error in &inferred.errors {
-            diagnostics.push(diagnostic(
+            diagnostics.push(source_diagnostic(
                 &mut files,
                 "types",
-                error.kind.code(),
-                error.span,
-                &error.kind,
+                &error.diagnostic(),
                 source_directory,
             ));
         }

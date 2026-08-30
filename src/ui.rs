@@ -2565,6 +2565,117 @@ impl fmt::Display for Goal {
     }
 }
 
+impl inference::Error {
+    /// Turn an inference failure into reporter-independent words and source
+    /// annotations. This is deliberately the only presentation boundary for
+    /// type errors: terminals and the debugger must not reconstruct evidence
+    /// from the error kind themselves.
+    pub fn diagnostic(&self) -> Diagnostic {
+        use inference::ErrorKind as E;
+
+        let mut diagnostic = Diagnostic::new(self.kind.code(), self.kind.to_string(), self.span);
+        match &self.kind {
+            E::NotAStruct { .. } => {
+                diagnostic = diagnostic
+                    .label("this field access requires a struct")
+                    .help("change this value to a struct, or change/remove the field access")
+            }
+            E::Mismatch { .. } => {
+                diagnostic = diagnostic
+                    .label("these two uses require incompatible types")
+                    .help("change either use so both require the same type")
+            }
+            E::Recursive => {
+                diagnostic = diagnostic
+                    .label("this use makes the type refer back to itself")
+                    .help("remove the self-reference or introduce a finite wrapper type")
+            }
+            E::MissingField { shape, field, .. } => {
+                let (noun, field) = about(*shape, field);
+                diagnostic = diagnostic
+                    .label(format!("this requires {noun} `{field}`"))
+                    .help(format!(
+                        "add {noun} `{field}`, or change the use that requires it"
+                    ));
+            }
+            E::ExtraField { shape, field, .. } => {
+                let (noun, field) = about(*shape, field);
+                diagnostic = diagnostic
+                    .label(format!(
+                        "this introduces {noun} `{field}` where it is not allowed"
+                    ))
+                    .help(format!(
+                        "remove {noun} `{field}`, or allow it in the other type"
+                    ));
+            }
+            E::RigidBroken { declared, .. } | E::RigidField { declared, .. } => {
+                diagnostic = diagnostic
+                    .label("this use narrows a choice that belongs to the caller")
+                    .related(*declared, DECLARED_HERE)
+                    .help("change the body so it works for every choice allowed by the annotation");
+            }
+            E::RigidEscapes { .. } => {
+                diagnostic = diagnostic
+                    .label("this type carries a caller choice outside its annotation")
+                    .help("keep the value inside the annotation that introduces this choice")
+            }
+            E::RepeatedField { shape, field } => {
+                let (noun, field) = about(*shape, field);
+                diagnostic = diagnostic
+                    .label(format!("{noun} `{field}` is already named outside `..`"))
+                    .help(format!(
+                        "remove the repeated {noun}, or remove it from the remainder"
+                    ));
+            }
+            E::PresenceRequired { .. } => {
+                diagnostic = diagnostic
+                    .label("this value does not meet the required combination")
+                    .help("change the value or loosen the required combination")
+            }
+            E::PresenceImpossible { .. } => {
+                diagnostic = diagnostic
+                    .label("the annotation and definition rule out every combination")
+                    .help("change the annotation or change how the definition uses the value")
+            }
+            E::ClauseImpossible { .. } => {
+                diagnostic = diagnostic
+                    .label("this clause rules out every combination")
+                    .help("remove one of the conflicting requirements in this clause")
+            }
+            E::AnnotationAllows { .. } => {
+                diagnostic = diagnostic
+                    .label("this annotation promises more combinations than the body accepts")
+                    .help("strengthen the annotation or loosen the body")
+            }
+            E::Unhandled { effect } => {
+                diagnostic = diagnostic
+                    .label(format!(
+                        "effect `{}` has no enclosing handler",
+                        label(Shape::Effect, effect)
+                    ))
+                    .help("handle this effect, or perform it inside a function")
+            }
+            E::NotAllowed { effect } => {
+                diagnostic = diagnostic
+                    .label(format!(
+                        "effect `{}` is not listed by this function",
+                        label(Shape::Effect, effect)
+                    ))
+                    .help("add the effect to the function type, or handle it here")
+            }
+            E::CallbackEffectsNotCovered => diagnostic = diagnostic
+                .label("this callback may perform effects the extern call does not allow")
+                .help("allow those effects on the extern call, or handle them inside the callback"),
+            E::PolymorphicExternBoundary => {
+                diagnostic = diagnostic
+                    .label("host code needs one fixed kind of value at this position")
+                    .help("use a fixed type here, or keep the generic value behind a Ruddy wrapper")
+            }
+        }
+        diagnostic
+    }
+}
+
 impl inference::ErrorKind {
     /// A stable, greppable name for this kind of error. Reporters key on it
     /// rather than on the message, which is prose and may be reworded.
@@ -2655,10 +2766,15 @@ impl fmt::Display for inference::ErrorKind {
             inference::ErrorKind::RigidField {
                 shape, field, name, ..
             } => {
-                let (noun, field) = about(*shape, field);
+                let field = label(*shape, field);
+                let action = match shape {
+                    Shape::Struct => "reads field",
+                    Shape::Sum => "matches case",
+                    Shape::Effect => "requires effect",
+                };
                 write!(
                     f,
-                    "this reads a {noun} `{field}`, but `'{name}` stands for whatever type the caller picks, so it may not have one",
+                    "this {action} `{field}`, but `'{name}` stands for whatever type the caller picks, so that choice cannot be assumed",
                 )
             }
             // Said at the declaration, because that is the line that has to
@@ -2714,14 +2830,12 @@ impl fmt::Display for inference::ErrorKind {
                 "this function performs `{}`, which its type does not allow",
                 label(Shape::Effect, effect),
             ),
-            inference::ErrorKind::CallbackEffectsNotCovered => write!(
-                f,
-                "callback effects are not covered by the containing extern call",
+            inference::ErrorKind::CallbackEffectsNotCovered => f.write_str(
+                "this callback may perform effects the containing extern call does not allow",
             ),
-            inference::ErrorKind::PolymorphicExternBoundary => write!(
-                f,
-                "an extern boundary leaf must have a fixed runtime representation",
-            ),
+            inference::ErrorKind::PolymorphicExternBoundary => {
+                f.write_str("host code needs one fixed kind of value at this extern position")
+            }
         }
     }
 }

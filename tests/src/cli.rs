@@ -3097,10 +3097,7 @@ fn run_rejects_an_effectful_callback_through_a_polymorphic_extern_boundary() {
         rendered.contains("polymorphic-extern-boundary"),
         "{rendered}"
     );
-    assert!(
-        rendered.contains("fixed runtime representation"),
-        "{rendered}"
-    );
+    assert!(rendered.contains("one fixed kind of value"), "{rendered}");
     assert!(
         !app.join("build/polymorphic-callback.js").exists(),
         "an unsound module reached execution"
