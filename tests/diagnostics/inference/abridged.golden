@@ -152,6 +152,8 @@ help: or change the other use so it agrees with the first one
 [type-mismatch] a natural number and a struct cannot be the same type
 primary: this argument supplies a type to the call
 related: this call fixes what type the argument must have
+related: the annotation fixes the type here
+related: this expression supplies its type here
 help: change the first use so it agrees with the other one
 help: or change the other use so it agrees with the first one
 

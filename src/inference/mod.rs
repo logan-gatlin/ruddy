@@ -79,7 +79,7 @@ use std::{
     collections::{HashMap, HashSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     ops::Range,
-    rc::Rc,
+    rc::{Rc, Weak},
 };
 
 use indexmap::{IndexMap, IndexSet};
@@ -1347,7 +1347,7 @@ struct Known {
 #[derive(Debug, Clone)]
 enum Binding {
     Mono(Rc<Ty>),
-    Poly(Scheme),
+    Poly(ExplainedScheme),
     /// A name a nested `let` bound, whose scheme only the solver will know.
     ///
     /// Generation cannot name what a use of one is a copy of: the scheme is
@@ -1356,6 +1356,34 @@ enum Binding {
     /// [`ConstraintKind::Instance`] — and the solver, which by then has the
     /// scheme, makes it.
     Local,
+}
+
+/// A semantic scheme paired with the causal roots that produced its shape.
+///
+/// This deliberately stays outside [`Scheme`]: spans and inference identity are
+/// compilation-local evidence, not part of type equality or an exported type.
+/// Opening the scheme opens this compact skeleton at the same time, attaching
+/// its shared roots to the freshly instantiated variables (and to the opened
+/// root for closed contracts).
+#[derive(Debug, Clone)]
+struct ExplainedScheme {
+    scheme: Scheme,
+    provenance: Vec<ReasonId>,
+}
+
+impl ExplainedScheme {
+    /// An imported contract is authoritative but has no definition span in
+    /// this compilation, so only its local use can become a displayed fact.
+    fn imported(scheme: Scheme) -> Self {
+        Self {
+            scheme,
+            provenance: Vec::new(),
+        }
+    }
+
+    fn local(scheme: Scheme, provenance: Vec<ReasonId>) -> Self {
+        Self { scheme, provenance }
+    }
 }
 
 /// Which side of a goal a row's tail sits on. [`Solve::unify`] decomposes
@@ -1601,6 +1629,10 @@ struct Table {
     /// Source cause currently introducing row syntax. Lacks facts copy this
     /// value when they are created and retain it across every tail binding.
     active_lacks_origin: Option<RowFactOrigin>,
+    /// Opened scheme roots keyed by the root `Rc<Ty>` identity. This covers
+    /// closed schemes, which mint no variable on which to hang provenance.
+    /// Entries live only for this inference run and never affect semantics.
+    opened_provenance: HashMap<usize, (Weak<Ty>, ReasonId)>,
 }
 
 /// Which quantified position each thing a scheme closes over was given, in the
@@ -2629,6 +2661,37 @@ fn push_row_payloads(
     true
 }
 
+/// Every generated source root a scheme carries into later definitions.
+/// Iterative and capped: the reason graph retains shared tails, while an
+/// enormous definition cannot make every later instantiation linear in its
+/// entire body. Source order is retained so unrelated definitions cannot alter
+/// which roots survive the cap.
+fn constraint_provenance(constraints: &[Constraint]) -> Vec<ReasonId> {
+    const MAX_SCHEME_ROOTS: usize = 256;
+    let mut out = Vec::new();
+    let mut work: Vec<&Constraint> = constraints.iter().rev().collect();
+    while let Some(constraint) = work.pop() {
+        if out.len() == MAX_SCHEME_ROOTS {
+            break;
+        }
+        out.push(constraint.reason);
+        match &constraint.kind {
+            ConstraintKind::Let { value, body, .. } => {
+                work.extend(body.iter().rev());
+                work.extend(value.iter().rev());
+            }
+            ConstraintKind::Match { arms, .. } => {
+                for arm in arms.iter().rev() {
+                    work.push(&arm.result);
+                    work.extend(arm.constraints.iter().rev());
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 fn all_constraints(
     constraints: &IndexMap<Symbol, Vec<Constraint>>,
 ) -> HashMap<ConstraintId, &Constraint> {
@@ -2740,7 +2803,11 @@ fn attach_ordinary_explanations(
         let mut seen_reasons = HashSet::new();
         let mut seen_constraints = HashSet::new();
         let mut work: Vec<ReasonId> = seed.into_iter().collect();
+        const MAX_EXPLANATION_REASONS: usize = 16_384;
         while let Some(id) = work.pop() {
+            if reason_slice.len() == MAX_EXPLANATION_REASONS {
+                break;
+            }
             if !seen_reasons.insert(id) {
                 continue;
             }
@@ -3179,17 +3246,20 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 });
             }
         }
-        env.insert(*symbol, Binding::Poly(lowered.scheme.clone()));
+        env.insert(
+            *symbol,
+            Binding::Poly(ExplainedScheme::imported(lowered.scheme.clone())),
+        );
         externs.insert(*symbol, lowered.scheme);
     }
 
     let mut schemes = IndexMap::new();
-    env.extend(
-        program
-            .external_schemes
-            .iter()
-            .map(|(symbol, scheme)| (*symbol, Binding::Poly(scheme.clone()))),
-    );
+    env.extend(program.external_schemes.iter().map(|(symbol, scheme)| {
+        (
+            *symbol,
+            Binding::Poly(ExplainedScheme::imported(scheme.clone())),
+        )
+    }));
     let mut locals = IndexMap::new();
     let mut constraints = IndexMap::new();
     let mut promises = IndexMap::new();
@@ -3295,7 +3365,10 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                     .map_or_else(Vec::new, |lowered| lowered.rigids.clone());
                 let bound = match &lowered {
                     Some(lowered) => {
-                        env.insert(*symbol, Binding::Poly(lowered.scheme.clone()));
+                        env.insert(
+                            *symbol,
+                            Binding::Poly(ExplainedScheme::imported(lowered.scheme.clone())),
+                        );
                         lowered.ty.clone()
                     }
                     None => {
@@ -3574,7 +3647,11 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 let zonked = table.zonk_error(&errors[at].kind, &mut subst);
                 errors[at].kind = zonked;
             }
-            env.insert(symbol, Binding::Poly(scheme.clone()));
+            let provenance = constraint_provenance(&member.generated);
+            env.insert(
+                symbol,
+                Binding::Poly(ExplainedScheme::local(scheme.clone(), provenance)),
+            );
             schemes.insert(symbol, scheme);
             constraints.insert(symbol, member.generated);
         }
@@ -3738,6 +3815,31 @@ impl Table {
 
     fn constraint_reason(&mut self, id: ConstraintId) -> ReasonId {
         self.reason(ReasonOrigin::Constraint(id), Vec::new())
+    }
+
+    fn constraint_reason_for(&mut self, id: ConstraintId, kind: &ConstraintKind) -> ReasonId {
+        let roots: Vec<&Rc<Ty>> = match kind {
+            ConstraintKind::Project { base, result, .. } => vec![base, result],
+            ConstraintKind::Equal { expected, actual } => vec![expected, actual],
+            ConstraintKind::Let { bound, .. } => vec![bound],
+            ConstraintKind::Instance { ty, .. } => vec![ty],
+            ConstraintKind::Match {
+                scrutinee, result, ..
+            } => vec![scrutinee, result],
+            ConstraintKind::Performs { .. } | ConstraintKind::CallbackCoverage { .. } => Vec::new(),
+        };
+        let mut parents = Vec::new();
+        for ty in roots {
+            if let Some((opened, parent)) = self.opened_provenance.get(&(Rc::as_ptr(ty) as usize))
+                && opened
+                    .upgrade()
+                    .is_some_and(|opened| Rc::ptr_eq(&opened, ty))
+                && !parents.contains(parent)
+            {
+                parents.push(*parent);
+            }
+        }
+        self.reason(ReasonOrigin::Constraint(id), parents)
     }
 
     fn step_id(&mut self) -> StepId {
@@ -3916,8 +4018,12 @@ impl Table {
     /// variable's sort is fixed by the position it was minted for, and the four
     /// functions below are those positions; nothing else may call this.
     fn mint(&mut self, sort: VarSort, subject: Subject) -> TyVar {
+        self.mint_from(sort, subject, Vec::new())
+    }
+
+    fn mint_from(&mut self, sort: VarSort, subject: Subject, parents: Vec<ReasonId>) -> TyVar {
         let var = self.vars.len() as TyVar;
-        let minted_by = self.reason(ReasonOrigin::Variable { sort, subject }, Vec::new());
+        let minted_by = self.reason(ReasonOrigin::Variable { sort, subject }, parents);
         self.vars.push(Slot::Unbound);
         self.var_meta.push(VarMeta {
             sort,
@@ -3951,10 +4057,6 @@ impl Table {
 
     fn fresh_presence_for(&mut self, subject: Subject) -> Presence {
         Presence::Var(self.mint(VarSort::Presence, subject))
-    }
-
-    fn fresh_instance_type(&mut self) -> Rc<Ty> {
-        self.fresh_type_for(Subject::Instance)
     }
 
     fn fresh_instance_presence(&mut self) -> Presence {
@@ -5253,7 +5355,13 @@ impl Table {
     /// Open a nested value binding. Only an explicit producer package is
     /// coherent for the binding; arrow shape is no longer used as a proxy.
     /// Packages nested in an arrow remain wrapped until result destruction.
-    fn instantiate_local(&mut self, span: Span, symbol: Symbol, scheme: &Scheme) -> Rc<Ty> {
+    fn instantiate_local(
+        &mut self,
+        span: Span,
+        symbol: Symbol,
+        explained: &ExplainedScheme,
+    ) -> Rc<Ty> {
+        let scheme = &explained.scheme;
         // Only slots occurring directly in the root package are coherent for a
         // lexical value. Nested package nodes are separate production
         // boundaries and must remain fresh even when the same scheme also owns
@@ -5296,19 +5404,80 @@ impl Table {
             }
         }
         let coherent = (!root_slots.is_empty()).then_some((symbol, root_slots));
-        let instantiated = self.instantiate_scoped(span, scheme, coherent);
-        match &*instantiated {
+        let instantiated = self.instantiate_scoped(span, explained, coherent);
+        let opened = match &*instantiated {
             Ty::Package(_) => self.open_package(span, &instantiated),
             _ => instantiated,
+        };
+        if !explained.provenance.is_empty() {
+            let marker = self.reason(
+                ReasonOrigin::Variable {
+                    sort: VarSort::Type,
+                    subject: Subject::Scheme,
+                },
+                explained.provenance.clone(),
+            );
+            self.mark_opened_type(&opened, marker);
+        }
+        opened
+    }
+
+    /// Mark every semantic type node exposed by opening a scheme. Generation
+    /// often takes an arrow apart before emitting its argument constraint, so
+    /// recording only the root would lose the provenance precisely at that
+    /// accessor/call boundary. Rows are walked iteratively as well.
+    fn mark_opened_type(&mut self, root: &Rc<Ty>, marker: ReasonId) {
+        enum Work {
+            Ty(Rc<Ty>),
+            Row(Row),
+        }
+        let mut seen = HashSet::new();
+        let mut work = vec![Work::Ty(root.clone())];
+        while let Some(part) = work.pop() {
+            match part {
+                Work::Ty(ty) => {
+                    let key = Rc::as_ptr(&ty) as usize;
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    self.opened_provenance
+                        .insert(key, (Rc::downgrade(&ty), marker));
+                    match &*ty {
+                        Ty::Arrow(from, to, effects) => {
+                            work.push(Work::Row(effects.clone()));
+                            work.push(Work::Ty(to.clone()));
+                            work.push(Work::Ty(from.clone()));
+                        }
+                        Ty::Package(body) => work.push(Work::Ty(body.clone())),
+                        Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(row.clone())),
+                        Ty::Named { args, .. } => {
+                            work.extend(args.iter().rev().cloned().map(Work::Ty));
+                        }
+                        _ => {}
+                    }
+                }
+                Work::Row(row) => {
+                    if let Rest::More(more) = &row.rest {
+                        work.push(Work::Row((**more).clone()));
+                    }
+                    work.extend(
+                        row.labels
+                            .values()
+                            .rev()
+                            .map(|field| Work::Ty(field.ty.clone())),
+                    );
+                }
+            }
         }
     }
 
     fn instantiate_scoped(
         &mut self,
         span: Span,
-        scheme: &Scheme,
+        explained: &ExplainedScheme,
         coherent: Option<(Symbol, IndexSet<u32>)>,
     ) -> Rc<Ty> {
+        let scheme = &explained.scheme;
         // One fresh variable per position the scheme bound, handed over as a
         // bare type: which sort each one is, is decided where it lands, since
         // that is what a scheme records. See [`Assigned::as_row`]. A presence
@@ -5323,7 +5492,11 @@ impl Table {
                     let presence = key
                         .and_then(|key| self.local_package_instances.get(&key).cloned())
                         .unwrap_or_else(|| {
-                            let fresh = self.fresh_instance_presence();
+                            let fresh = Presence::Var(self.mint_from(
+                                VarSort::Presence,
+                                Subject::Instance,
+                                explained.provenance.clone(),
+                            ));
                             if let Some(key) = key {
                                 self.local_package_instances.insert(key, fresh.clone());
                             }
@@ -5337,7 +5510,11 @@ impl Table {
                     }
                     Assigned::Presence(presence)
                 }
-                false => Assigned::Ty(self.fresh_instance_type()),
+                false => Assigned::Ty(Rc::new(Ty::plain(Ty::Var(self.mint_from(
+                    VarSort::Type,
+                    Subject::Instance,
+                    explained.provenance.clone(),
+                ))))),
             })
             .collect();
         let ty = scheme.body().open(&fresh);

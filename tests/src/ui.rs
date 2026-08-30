@@ -816,6 +816,110 @@ fn inference_fixture_diagnostics(source: &str) -> Vec<ui::Diagnostic> {
         .collect()
 }
 
+fn explained_facts(source: &str) -> Vec<inference::ExplanationFact> {
+    let errors = inference_fixture_errors(source);
+    let error = errors.last().expect("fixture error");
+    error
+        .explanation
+        .as_ref()
+        .expect("structured explanation")
+        .full_facts
+        .clone()
+}
+
+#[test]
+fn generalized_accessor_explains_its_original_projection() {
+    let source = "let field = fn value => value.x\nlet bad = field 1n";
+    let facts = explained_facts(source);
+    let projection = source.find(".x").unwrap() + 1;
+    assert!(
+        facts.iter().any(|fact| {
+            fact.span.start == projection && fact.origin == inference::ConstraintOrigin::Projection
+        }),
+        "the scheme must reopen the accessor's source demand: {facts:#?}"
+    );
+}
+
+#[test]
+fn scheme_provenance_survives_a_long_definition_chain_iteratively() {
+    let mut source = String::from("let root = fn value => value.x\n");
+    let mut previous = "root".to_string();
+    for at in 0..2_000 {
+        let next = format!("link{at}");
+        source.push_str(&format!("let {next} = {previous}\n"));
+        previous = next;
+    }
+    source.push_str(&format!("let bad = {previous} 1n"));
+    let errors = inference_fixture_errors(&source);
+    let explanation = errors.last().unwrap().explanation.as_ref().unwrap();
+    let projection = source.find(".x").unwrap() + 1;
+    assert!(
+        explanation
+            .full_facts
+            .iter()
+            .any(|fact| fact.span.start == projection)
+    );
+    assert!((2..=4).contains(&explanation.abridged.len()));
+    assert!(explanation.cause.reasons.len() <= 16_384);
+}
+
+#[test]
+fn repeated_accessor_uses_each_reach_the_shared_definition_fact() {
+    let source = "let field = fn value => value.x\nlet first = field 1n\nlet second = field false";
+    let errors = inference_fixture_errors(source);
+    assert_eq!(errors.len(), 2);
+    let projection = source.find(".x").unwrap() + 1;
+    for error in errors {
+        assert!(error.explanation.unwrap().full_facts.iter().any(|fact| {
+            fact.span.start == projection && fact.origin == inference::ConstraintOrigin::Projection
+        }));
+    }
+}
+
+#[test]
+fn unrelated_definitions_do_not_change_cross_definition_abridgement() {
+    fn selected(
+        source: &str,
+    ) -> Vec<(
+        inference::ConstraintOrigin,
+        inference::Subject,
+        inference::ExplanationFactPayload,
+        String,
+    )> {
+        let errors = inference_fixture_errors(source);
+        let explanation = errors.last().unwrap().explanation.as_ref().unwrap();
+        explanation
+            .abridged
+            .iter()
+            .map(|at| {
+                let fact = &explanation.full_facts[*at];
+                (
+                    fact.origin,
+                    fact.subject,
+                    fact.payload,
+                    source[fact.span.start..fact.span.end()].to_string(),
+                )
+            })
+            .collect()
+    }
+    let base = "let field = fn value => value.x\nlet bad = field 1n";
+    let unrelated = "let field = fn value => value.x\nlet noise = fn x => x\nlet bad = field 1n";
+    assert_eq!(selected(base), selected(unrelated));
+}
+
+#[test]
+fn imported_contracts_fall_back_to_local_authoritative_uses() {
+    let source = "extern consume : Nat -> Nat = host.consume\nlet bad = consume false";
+    let facts = explained_facts(source);
+    let argument = source.rfind("false").unwrap();
+    assert!(facts.iter().any(|fact| fact.span.start == argument));
+    assert!(
+        facts
+            .iter()
+            .all(|fact| fact.span.start >= source.find("let bad").unwrap())
+    );
+}
+
 #[test]
 fn ordinary_mismatch_explanations_keep_full_and_abridged_causal_evidence() {
     let source = include_str!("../diagnostics/inference/repeated-calls.hc");
@@ -1260,6 +1364,18 @@ fn repeated_effects_keep_full_facts_and_exact_abridged_endpoints() {
                 inference::ExplanationFactPayload::RequiresType,
             ),
             (
+                46..98,
+                inference::ConstraintOrigin::ContextualCheck,
+                inference::Subject::Annotation,
+                inference::ExplanationFactPayload::RequiresType,
+            ),
+            (
+                124..126,
+                inference::ConstraintOrigin::ContextualCheck,
+                inference::Subject::Term,
+                inference::ExplanationFactPayload::RequiresType,
+            ),
+            (
                 150..155,
                 inference::ConstraintOrigin::ApplicationArgument,
                 inference::Subject::Parameter,
@@ -1279,7 +1395,7 @@ fn repeated_effects_keep_full_facts_and_exact_abridged_endpoints() {
             ),
         ]
     );
-    assert_eq!(explanation.abridged, [3, 4]);
+    assert_eq!(explanation.abridged, [5, 6]);
 }
 
 #[test]

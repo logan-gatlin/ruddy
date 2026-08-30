@@ -16,8 +16,9 @@ use crate::{
 
 use super::{
     Batch, Constraint, ConstraintKind, DeferredRequirement, Effect, Error, ErrorCause, ErrorId,
-    ErrorKind, Goal, GuardedArm, GuardedObligation, GuardedOrigin, Known, Named, Origin, ReasonId,
-    ReasonOrigin, RecursiveCycleShape, Refinement, RefinementFact, Rule, Side, Slot, Step, Table,
+    ErrorKind, ExplainedScheme, Goal, GuardedArm, GuardedObligation, GuardedOrigin, Known, Named,
+    Origin, ReasonId, ReasonOrigin, RecursiveCycleShape, Refinement, RefinementFact, Rule, Side,
+    Slot, Step, Table, constraint_provenance,
 };
 
 /// What a set of labels says about the ones it does not name.
@@ -324,7 +325,7 @@ pub struct Solve<'a> {
     /// The scheme each nested `let` currently in scope published, for as long
     /// as its body is being solved. [`Constrain`](super::Constrain)'s
     /// environment, about the one kind of name generation could not decide.
-    pub schemes: HashMap<Symbol, Scheme>,
+    pub schemes: HashMap<Symbol, ExplainedScheme>,
     /// Every scheme published, kept. [`Output::locals`](super::Output::locals).
     pub locals: &'a mut IndexMap<Symbol, Scheme>,
     /// The reachable ordered arm premise currently in force. `None` is the
@@ -1443,7 +1444,10 @@ impl Solve<'_> {
         let (scheme, _) = self.table.generalize(bound, level, required);
         self.table.level = level - 1;
         self.locals.insert(symbol, scheme.clone());
-        self.schemes.insert(symbol, scheme);
+        self.schemes.insert(
+            symbol,
+            ExplainedScheme::local(scheme, constraint_provenance(value)),
+        );
         self.run(body);
         self.schemes.remove(&symbol);
     }
@@ -3225,7 +3229,7 @@ impl Solve<'_> {
                             self.table.note_binding_read(*by);
                             work.push(Work::Type(inner.clone()));
                         }
-                        Slot::Unbound { .. } => {
+                        Slot::Unbound => {
                             self.settle(span, *var, Assigned::Ty(Rc::new(Ty::Undecided)), because)
                         }
                         Slot::Bound { .. } => {}
@@ -3279,7 +3283,7 @@ impl Solve<'_> {
                                         self.table.note_binding_read(*by);
                                         presence = inner.clone();
                                     }
-                                    Slot::Unbound { .. } => {
+                                    Slot::Unbound => {
                                         self.settle(
                                             span,
                                             var,
@@ -3313,7 +3317,7 @@ impl Solve<'_> {
                                 self.table.note_binding_read(*by);
                                 work.push(Work::Row(inner.clone()));
                             }
-                            Slot::Unbound { .. } => self.settle(
+                            Slot::Unbound => self.settle(
                                 span,
                                 var,
                                 Assigned::Row(Rc::new(Row::of(Rest::Undecided))),
@@ -3349,7 +3353,7 @@ impl Solve<'_> {
                     self.table.note_binding_read(*by);
                     presence = inner.clone();
                 }
-                Slot::Unbound { .. } => {
+                Slot::Unbound => {
                     self.settle(span, var, Assigned::Presence(Presence::Undecided), because);
                     return;
                 }

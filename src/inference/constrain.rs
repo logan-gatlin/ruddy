@@ -13,8 +13,8 @@ use crate::{
 
 use super::{
     Annotated, Binding, Constraint, ConstraintKind, ConstraintOrigin, ConstraintSubjects, Coverage,
-    DeferredRequirement, GuardedArm, Named, Origin, Subject, Table, effective_conditions,
-    lower_annotation, same_field_set,
+    DeferredRequirement, ExplainedScheme, GuardedArm, Named, Origin, Subject, Table,
+    effective_conditions, lower_annotation, same_field_set,
 };
 
 /// Pass one: the walk that says what has to hold, and solves nothing.
@@ -228,9 +228,10 @@ impl Constrain<'_> {
         kind: ConstraintKind,
     ) -> Constraint {
         let id = self.table.constraint_id();
+        let reason = self.table.constraint_reason_for(id, &kind);
         Constraint {
             id,
-            reason: self.table.constraint_reason(id),
+            reason,
             span,
             origin,
             subjects,
@@ -259,6 +260,7 @@ impl Constrain<'_> {
     /// whatever order this was called in. An arm that had to remember an
     /// `expected, actual` pair got applications backwards and told the reader
     /// their annotation was the mistake.
+    #[allow(clippy::too_many_arguments)]
     fn checks(
         &mut self,
         span: Span,
@@ -399,7 +401,10 @@ impl Constrain<'_> {
                         // annotation declared, sharing what it left to
                         // inference: the same rule a top-level annotated
                         // definition follows, about a smaller scope.
-                        self.env.insert(name.tracked, Binding::Poly(lowered.scheme));
+                        self.env.insert(
+                            name.tracked,
+                            Binding::Poly(ExplainedScheme::imported(lowered.scheme)),
+                        );
                         (lowered.ty, lowered.formula, lowered.rigids)
                     }
                     None => {

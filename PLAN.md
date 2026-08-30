@@ -8,3 +8,14 @@
 - [x] Add self-application, nested function/row, row-tail/presence/shared-tail exact paths, sibling exclusion, post-failure recovery, exponential-DAG, cyclic-binding, and 30,000-depth regressions.
 - [x] Run formatting, focused tests, full workspace tests/checks, and Clippy.
 - [x] Commit without disturbing unrelated workspace changes.
+
+# Phase 3: cross-definition inference explanations
+
+- [x] Keep semantic `Scheme` span/prose-free and pair it internally with a compact causal skeleton.
+- [x] Close provenance at generalization and reopen it with the same scheme instantiation, including closed contracts and nested lets.
+- [x] Carry original call/projection/body facts through later definitions; treat imported contracts as authoritative local-use fallbacks.
+- [x] Keep causal walks iterative and cap scheme roots/full reason slices without changing inference semantics.
+- [x] Make the 2–4 fact selection source-ordered and independent of unrelated definition identities; never introduce more than one shared causal pivot.
+- [x] Cover accessors, repeated uses, long definition chains, imported fallback, and unrelated-definition determinism.
+- [x] Run formatting, focused regressions, full workspace tests/checks, and Clippy.
+- [x] Commit without disturbing unrelated workspace changes.
