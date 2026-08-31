@@ -1471,8 +1471,12 @@ impl Solve<'_> {
             self.table
                 .scheme_provenance(bound, scheme.body(), &subst, scheme.count())
         };
-        self.schemes
-            .insert(symbol, ExplainedScheme::local(scheme, provenance));
+        let mut effect_origins = Vec::new();
+        super::collect_effect_origins(value, &mut effect_origins);
+        self.schemes.insert(
+            symbol,
+            ExplainedScheme::local(scheme, provenance, effect_origins),
+        );
         self.run(body);
         self.schemes.remove(&symbol);
     }

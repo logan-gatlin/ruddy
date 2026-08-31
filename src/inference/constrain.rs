@@ -51,6 +51,18 @@ pub struct Constrain<'a> {
     /// Structural row identity for each source-resolved effect declaration.
     /// Symbols remain the operation-table keys; rows use this map instead.
     pub effect_ids: &'a IndexMap<Symbol, crate::types::EffectId>,
+    /// Declaration spans keyed by the source-resolved identity. Kept apart
+    /// from structural row keys because equivalent same-named interfaces are
+    /// allowed to coalesce semantically.
+    pub effect_declaration_spans: &'a IndexMap<Symbol, Span>,
+    /// Exact declarations contributing effects to inferred name/application
+    /// types. This compilation-local channel follows aliases without changing
+    /// structural type equality.
+    pub term_effect_origins: HashMap<Span, Vec<super::EffectOrigin>>,
+    /// Origins published by a nested alias before its body is generated. The
+    /// semantic scheme is deferred to solving, but declaration provenance is
+    /// already exact in the generated value constraints.
+    pub local_effect_origins: HashMap<Symbol, Vec<super::EffectOrigin>>,
     /// The effects the place being walked allows, and whether a `fn` encloses
     /// it.
     ///
@@ -443,6 +455,10 @@ impl Constrain<'_> {
                 let required = std::mem::replace(&mut self.out, outer);
 
                 self.table.level -= 1;
+                let mut local_effect_origins = Vec::new();
+                super::collect_effect_origins(&required, &mut local_effect_origins);
+                self.local_effect_origins
+                    .insert(name.tracked, local_effect_origins);
                 // And polymorphically in the body, where the scheme exists.
                 // Nothing is put back afterwards: a symbol is unique, so the
                 // name a nested `let` binds can never be one anything outside
@@ -475,6 +491,18 @@ impl Constrain<'_> {
                 body.ty.clone()
             }
             TermKind::Apply { func, arg } => {
+                let direct_effect_origin = match &func.kind {
+                    TermKind::Operation { effect, .. } => self
+                        .effect_ids
+                        .get(&effect.tracked)
+                        .zip(self.effect_declaration_spans.get(&effect.tracked))
+                        .map(|(interface, declaration_span)| super::EffectOrigin {
+                            symbol: effect.tracked,
+                            interface: interface.clone(),
+                            declaration_span: *declaration_span,
+                        }),
+                    _ => None,
+                };
                 let opened = self.table.store.batches.len();
                 self.infer_term(func);
                 let at = func.span;
@@ -488,6 +516,20 @@ impl Constrain<'_> {
                 // belong.
                 self.table.aim(opened, at, arg.span);
                 let applied = func.ty.clone();
+                let mut effect_origins = self
+                    .term_effect_origins
+                    .get(&func.span)
+                    .cloned()
+                    .unwrap_or_default();
+                if let Some(origin) = direct_effect_origin
+                    && !effect_origins.contains(&origin)
+                {
+                    effect_origins.push(origin);
+                }
+                if !effect_origins.is_empty() {
+                    self.term_effect_origins
+                        .insert(span, effect_origins.clone());
+                }
                 // Through a name, so that something annotated `Endo` is
                 // applied as the arrow it stands for. The arrow the arm then
                 // works with is the unfolded one, which is the only shape a
@@ -591,6 +633,7 @@ impl Constrain<'_> {
                     ConstraintKind::Performs {
                         performed,
                         ambient: self.ambient.row.clone(),
+                        effect_origins,
                         ambient_label_spans: self.ambient.label_spans.clone(),
                         inside: self.ambient.inside,
                     },
@@ -1433,13 +1476,24 @@ impl Constrain<'_> {
         // fresh variable would hide the day one of those stops holding.
         match self.env[&symbol].clone() {
             Binding::Mono(ty) => ty,
-            Binding::Poly(scheme) => self.table.instantiate_local(span, symbol, &scheme),
+            Binding::Poly(scheme) => {
+                if !scheme.effect_origins.is_empty() {
+                    self.term_effect_origins
+                        .insert(span, scheme.effect_origins.clone());
+                }
+                self.table.instantiate_local(span, symbol, &scheme)
+            }
             // The scheme is not written yet, so the walk says what this use is
             // rather than what it has: a fresh copy of whatever the enclosing
             // [`ConstraintKind::Let`] publishes. Which keeps the invariant this
             // pass is built on — nothing here reads the table — over the one
             // construct that would otherwise have to wait for a solve.
             Binding::Local => {
+                if let Some(origins) = self.local_effect_origins.get(&symbol)
+                    && !origins.is_empty()
+                {
+                    self.term_effect_origins.insert(span, origins.clone());
+                }
                 let ty = self.table.fresh_type_for(Subject::Instance);
                 // The scheme does not exist yet, but its possible store batch
                 // still has a source position. Reserve an inert slot now; the

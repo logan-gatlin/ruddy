@@ -1690,6 +1690,51 @@ fn effect_boundaries_keep_source_causal_paths_and_repairs() {
 }
 
 #[test]
+fn effect_declarations_keep_qualified_identity_through_aliases_and_primary_roles() {
+    use inference::{ContradictionKind as K, ExplanationFactPayload as P};
+
+    let source = concat!(
+        "module A = effect Log = { write: Nat -> () } end\n",
+        "module B = effect Log = { write: () -> () } end\n",
+        "module C = effect Log = { write: Nat -> () } end\n",
+        "let action : () -> () + C::!Log = fn _ => C::!Log.write 0n\n",
+        "let bad = action ()\n",
+    );
+    let errors = inference_fixture_errors(source);
+    let error = errors
+        .iter()
+        .find(|error| matches!(error.kind, inference::ErrorKind::Unhandled { .. }))
+        .expect("aliased operation must escape at the top level");
+    let explanation = error.explanation.as_ref().expect("effect explanation");
+    assert_eq!(explanation.contradiction.kind, K::UnhandledEffect);
+    let declaration = explanation
+        .abridged
+        .iter()
+        .map(|at| &explanation.full_facts[*at])
+        .find(|fact| fact.payload == P::EffectDeclaration)
+        .expect("resolved declaration evidence");
+    assert_eq!(
+        &source[declaration.span.start..declaration.span.end()],
+        "Log"
+    );
+    assert!(
+        declaration.span.start > source.find("module C").unwrap(),
+        "the coalesced A::!Log declaration must not overwrite C::!Log evidence, while distinct B::!Log remains separate"
+    );
+    let primary = &explanation.full_facts[explanation.abridged[0]];
+    assert_eq!(primary.payload, P::EffectUse);
+    assert_eq!(&source[primary.span.start..primary.span.end()], "action ()");
+    let diagnostic = error.diagnostic();
+    assert_eq!(diagnostic.primary.span, primary.span);
+    assert!(
+        diagnostic
+            .related
+            .iter()
+            .any(|related| related.span == declaration.span)
+    );
+}
+
+#[test]
 fn deep_and_multiple_effect_boundaries_remain_bounded_and_counted() {
     use inference::ExplanationFactPayload as P;
 
@@ -3664,6 +3709,7 @@ fn no_two_kinds_of_constraint_are_coded_the_same() {
         ConstraintKind::Performs {
             performed: Row::closed(),
             ambient: Row::closed(),
+            effect_origins: Vec::new(),
             ambient_label_spans: IndexMap::new(),
             inside: true,
         },
@@ -4481,6 +4527,7 @@ fn the_performs_constraint_reads_as_a_widening() {
     let kind = ConstraintKind::Performs {
         performed: row(&["Log"], Rest::Closed),
         ambient: row(&["Log", "IO"], Rest::Var(3)),
+        effect_origins: Vec::new(),
         ambient_label_spans: IndexMap::new(),
         inside: true,
     };
@@ -4494,6 +4541,7 @@ fn the_performs_constraint_reads_as_a_widening() {
     let empty = ConstraintKind::Performs {
         performed: row(&[], Rest::Closed),
         ambient: row(&[], Rest::Closed),
+        effect_origins: Vec::new(),
         ambient_label_spans: IndexMap::new(),
         inside: false,
     };

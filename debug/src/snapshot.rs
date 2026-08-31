@@ -860,3 +860,53 @@ fn raw(stage: &'static str, code: &'static str, message: String, span: Option<Lo
         related: Vec::new(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use indexmap::IndexMap;
+
+    use super::*;
+    use crate::wire::StdConfig;
+
+    #[test]
+    fn effect_primary_and_related_roles_match_the_shared_cli_diagnostic() {
+        let source = concat!(
+            "effect Log = { write: Nat -> () }\n",
+            "let action : () -> () + !Log = fn _ => !Log.write 0n\n",
+            "let bad = action ()\n",
+        );
+        let request = CompileRequest {
+            name: "test".into(),
+            version: "0.1.0".into(),
+            root: ROOT.into(),
+            files: vec![FileSpec {
+                path: ROOT.into(),
+                source: source.into(),
+            }],
+            std: StdConfig::Disabled,
+            dependencies: IndexMap::new(),
+            document: "test".into(),
+            revision: 0,
+        };
+        let snapshot = compile(&request, 0);
+        let diagnostic = snapshot
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "unhandled-effect")
+            .expect("effect diagnostic");
+        assert_eq!(
+            diagnostic.label,
+            "this operation or call may perform effect `!Log`"
+        );
+        assert_eq!(
+            diagnostic.span.expect("primary location").range,
+            [source.rfind("action ()").unwrap(), source.len() - 1]
+        );
+        assert!(
+            diagnostic
+                .related
+                .iter()
+                .any(|related| related.message == "effect `!Log` is declared here")
+        );
+    }
+}

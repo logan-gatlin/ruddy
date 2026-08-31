@@ -955,6 +955,11 @@ pub enum ConstraintKind {
     Performs {
         performed: Row,
         ambient: Row,
+        /// The exact declaration selected by a directly written operation.
+        /// This is diagnostic provenance, not row identity: structurally equal
+        /// declarations may coalesce in `performed` while retaining distinct
+        /// source origins through calls and generalized aliases.
+        effect_origins: Vec<EffectOrigin>,
         /// Source labels of handlers which extend `ambient`.
         ambient_label_spans: IndexMap<String, Span>,
         /// Whether a `fn` encloses the application. What tells the two readings
@@ -967,6 +972,39 @@ pub enum ConstraintKind {
     /// An effectful callback crossing a foreign boundary must be callable with
     /// the evidence carried by that boundary.
     CallbackCoverage { required: Row, available: Row },
+}
+
+/// Source identity of an effect use, kept separate from structural row
+/// equality so equivalent interfaces cannot overwrite one another's evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectOrigin {
+    pub symbol: Symbol,
+    pub interface: crate::types::EffectId,
+    pub declaration_span: Span,
+}
+
+fn collect_effect_origins(constraints: &[Constraint], origins: &mut Vec<EffectOrigin>) {
+    for constraint in constraints {
+        match &constraint.kind {
+            ConstraintKind::Performs { effect_origins, .. } => {
+                for origin in effect_origins {
+                    if !origins.contains(origin) {
+                        origins.push(origin.clone());
+                    }
+                }
+            }
+            ConstraintKind::Let { value, body, .. } => {
+                collect_effect_origins(value, origins);
+                collect_effect_origins(body, origins);
+            }
+            ConstraintKind::Match { arms, .. } => {
+                for arm in arms {
+                    collect_effect_origins(&arm.constraints, origins);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1439,6 +1477,7 @@ enum Binding {
 struct ExplainedScheme {
     scheme: Scheme,
     provenance: SchemeProvenance,
+    effect_origins: Vec<EffectOrigin>,
 }
 
 /// A compact causal skeleton keyed like the zonked scheme body. Child edges,
@@ -1490,11 +1529,20 @@ impl ExplainedScheme {
         Self {
             scheme,
             provenance: SchemeProvenance::default(),
+            effect_origins: Vec::new(),
         }
     }
 
-    fn local(scheme: Scheme, provenance: SchemeProvenance) -> Self {
-        Self { scheme, provenance }
+    fn local(
+        scheme: Scheme,
+        provenance: SchemeProvenance,
+        effect_origins: Vec<EffectOrigin>,
+    ) -> Self {
+        Self {
+            scheme,
+            provenance,
+            effect_origins,
+        }
     }
 }
 
@@ -2989,7 +3037,6 @@ fn budget_reason_slice(mut reasons: Vec<ReasonId>) -> (Vec<ReasonId>, usize) {
 
 struct ExplanationSources<'a> {
     aliases: &'a IndexMap<Symbol, Scheme>,
-    effect_declarations: &'a HashMap<String, Span>,
 }
 
 fn attach_ordinary_explanations(
@@ -3001,10 +3048,7 @@ fn attach_ordinary_explanations(
     omitted_reason_parents: &HashMap<ReasonId, usize>,
     sources: ExplanationSources<'_>,
 ) {
-    let ExplanationSources {
-        aliases,
-        effect_declarations,
-    } = sources;
+    let ExplanationSources { aliases } = sources;
     let pivot_contexts = pivot_contexts(constraints);
     let all = all_constraints(constraints);
     let instance_binders: HashMap<Span, Symbol> = all
@@ -3390,29 +3434,28 @@ fn attach_ordinary_explanations(
         if matches!(
             kind,
             Some(ContradictionKind::UnhandledEffect | ContradictionKind::EffectNotAllowed)
-        ) && let Some(failing) = match error.cause {
-            ErrorCause::Step(id) => steps.get(&id).and_then(|step| step.constraint),
-            ErrorCause::Batch(_) | ErrorCause::Direct => None,
-        } && let Some(
-            constraint @ Constraint {
-                kind: ConstraintKind::Performs { .. },
-                ..
-            },
-        ) = constraints.get(&failing)
-            && let Some(boundary_span) = constraint.subjects.secondary_span
+        ) && let Some(row) = &row
+            && let Some((constraint, origin)) = constraint_slice.iter().rev().find_map(|id| {
+                let ConstraintKind::Performs { effect_origins, .. } = &constraints.get(id)?.kind
+                else {
+                    return None;
+                };
+                effect_origins
+                    .iter()
+                    .find(|origin| origin.interface.row_key() == row.label)
+                    .map(|origin| (*id, origin))
+            })
         {
-            let _ = boundary_span;
-            if let Some(row) = &row
-                && let Some(span) = effect_declarations.get(&row.label)
-            {
-                full_facts.push(ExplanationFact {
-                    span: *span,
-                    constraint: failing,
-                    origin: ConstraintOrigin::ContextualCheck,
-                    subject: Subject::EffectDeclaration,
-                    payload: ExplanationFactPayload::EffectDeclaration,
-                });
-            }
+            // Declaration evidence follows the resolved operation identity, not
+            // a structural row-key lookup. Same-named equivalent interfaces may
+            // share a row while still naming different declarations here.
+            full_facts.push(ExplanationFact {
+                span: origin.declaration_span,
+                constraint,
+                origin: ConstraintOrigin::ContextualCheck,
+                subject: Subject::EffectDeclaration,
+                payload: ExplanationFactPayload::EffectDeclaration,
+            });
         }
         if let ErrorKind::RepeatedField {
             introduction: Some(introduction),
@@ -3570,7 +3613,11 @@ fn attach_ordinary_explanations(
                 .iter()
                 .copied()
                 .find(|at| full_facts[*at].payload == ExplanationFactPayload::EffectBoundary)?;
-            Some([use_at, boundary])
+            Some(match kind {
+                Some(ContradictionKind::UnhandledEffect) => [use_at, boundary],
+                Some(ContradictionKind::EffectNotAllowed) => [boundary, use_at],
+                _ => unreachable!("effect endpoints require an effect contradiction"),
+            })
         })
         .flatten();
         let endpoints = caller_endpoints
@@ -3617,8 +3664,16 @@ fn attach_ordinary_explanations(
         {
             abridged.push(handoff);
         }
-        abridged.sort_unstable();
-        abridged.dedup();
+        if effect_endpoints.is_some() {
+            // Effect diagnostics have a semantic primary: the call which makes
+            // a top-level escape unavoidable, or the function boundary which
+            // refuses it. Source sorting must not promote a declaration fact.
+            let mut seen = HashSet::new();
+            abridged.retain(|at| seen.insert(*at));
+        } else {
+            abridged.sort_unstable();
+            abridged.dedup();
+        }
 
         let pivot_candidate = shared_keys.iter().find_map(|(key, all_references)| {
             if matches!(
@@ -3788,6 +3843,11 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     // the reason the aliases above are: a signature is a plain closed arrow, so
     // it mentions no variable and lowering one twice would only mint two copies
     // of nothing.
+    let effect_declaration_spans: IndexMap<_, _> = program
+        .effects
+        .iter()
+        .map(|(symbol, declaration)| (*symbol, declaration.name_span))
+        .collect();
     let mut operations = program.external_operations.clone();
     for (symbol, decl) in &program.effects {
         let ir::Effect::Operations(declared) = &decl.value else {
@@ -4028,6 +4088,9 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 annotated: Vec::new(),
                 operations: &operations,
                 effect_ids: &program.effect_ids,
+                effect_declaration_spans: &effect_declaration_spans,
+                term_effect_origins: HashMap::new(),
+                local_effect_origins: HashMap::new(),
                 // A definition's value is computed where no handler can reach
                 // it, so it is walked at the empty closed row and outside every
                 // function — which is what makes performing an effect at the
@@ -4283,9 +4346,15 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             } else {
                 table.scheme_provenance(&member.ty, scheme.body(), &subst, scheme.count())
             };
+            let mut effect_origins = Vec::new();
+            collect_effect_origins(&member.generated, &mut effect_origins);
             env.insert(
                 symbol,
-                Binding::Poly(ExplainedScheme::local(scheme.clone(), provenance)),
+                Binding::Poly(ExplainedScheme::local(
+                    scheme.clone(),
+                    provenance,
+                    effect_origins,
+                )),
             );
             schemes.insert(symbol, scheme);
             constraints.insert(symbol, member.generated);
@@ -4307,16 +4376,6 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     constraints.sort_by(|one, _, other, _| position[one].cmp(&position[other]));
     promises.sort_by(|one, _, other, _| position[one].cmp(&position[other]));
 
-    let effect_declarations: HashMap<_, _> = program
-        .effects
-        .iter()
-        .filter_map(|(symbol, declaration)| {
-            program
-                .effect_ids
-                .get(symbol)
-                .map(|id| (id.row_key(), declaration.name_span))
-        })
-        .collect();
     attach_ordinary_explanations(
         mint,
         &mut errors,
@@ -4324,10 +4383,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
         &steps,
         &table.reasons,
         &table.omitted_reason_parents,
-        ExplanationSources {
-            aliases: &aliases,
-            effect_declarations: &effect_declarations,
-        },
+        ExplanationSources { aliases: &aliases },
     );
 
     // Constraints are solved in the order the walk emitted them, which is not
@@ -11179,6 +11235,7 @@ mod identity_tests {
                     omitted: 0,
                 }],
             },
+            effect_origins: Vec::new(),
         };
         table.instantiate_scoped(Span::default(), &explained, None);
         assert_eq!(table.var_meta.last().unwrap().sort, VarSort::Row);
