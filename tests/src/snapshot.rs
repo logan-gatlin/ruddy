@@ -1837,24 +1837,33 @@ fn a_row_error_reaches_the_strip_and_the_solve_tab() {
     assert_eq!(diagnostic.code, "rigid-field");
     assert_eq!(
         diagnostic.message,
-        "this reads field `x`, but `'a` stands for whatever other struct fields the caller chooses, so `x` cannot be assumed"
+        "the body cannot assume caller-chosen field `x`"
     );
     assert_eq!(
         diagnostic.label,
-        "this assumes one of the struct fields chosen by the caller"
+        "this annotation leaves the choice to each caller"
     );
     assert_eq!(
         diagnostic.help,
-        ["change the body so it does not assume which struct fields the caller chooses"]
+        [
+            "read caller-chosen struct fields only when named explicitly before the annotation's `..` remainder",
+            "or add this field explicitly to the annotation"
+        ]
     );
     assert_eq!(
         diagnostic.related[0].message,
-        "the caller's choice of struct fields starts here"
+        "this reads field `x` from the caller's choice"
     );
-    let field = rigid_source.rfind('x').unwrap();
-    assert_eq!(diagnostic.span, at([field, field + 1]));
     let declared = rigid_source.find("'a").unwrap();
-    assert_eq!(diagnostic.related[0].span, at([declared, declared + 2]));
+    assert_eq!(diagnostic.span, at([declared, declared + 2]));
+    let field = rigid_source.rfind('x').unwrap();
+    assert_eq!(diagnostic.related[0].span, at([field, field + 1]));
+    let explanation = diagnostic
+        .inference_explanation
+        .as_ref()
+        .expect("structured caller-choice explanation");
+    assert_eq!(explanation.contradiction.kind, "caller-choice");
+    assert_eq!(explanation.abridged.len(), 2);
 
     for snapshot in [&not_struct, &missing, &rigid] {
         let constraints = stage_named(snapshot, "constraints");

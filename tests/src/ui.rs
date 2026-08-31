@@ -61,7 +61,13 @@ fn inference_error_kinds(span: Span) -> Vec<TypeError> {
             name: "a".into(),
             declared: span,
         },
-        TypeError::RigidEscapes { name: "a".into() },
+        TypeError::RigidEscapes {
+            name: "a".into(),
+            declared: span,
+            destination: nat.clone(),
+            destination_name: "outside".into(),
+            destination_span: span,
+        },
         TypeError::RepeatedField {
             shape: Shape::Struct,
             field: "x".to_string(),
@@ -3198,9 +3204,16 @@ fn the_variable_complaints_read_as_what_went_wrong() {
          so `#B` cannot be assumed"
     );
     assert_eq!(
-        TypeError::RigidEscapes { name: "a".into() }.to_string(),
-        "`\'a` stands for whatever the caller picks, so it can't be part of a type \
-         outside the annotation that declared it"
+        TypeError::RigidEscapes {
+            name: "a".into(),
+            declared: span,
+            destination: Rc::new(Ty::Nat),
+            destination_name: "outside".into(),
+            destination_span: span,
+        }
+        .to_string(),
+        "`\'a` stands for whatever that annotation's caller picks, but binding `outside` \
+         would publish it as `Nat` outside that annotation"
     );
 }
 

@@ -728,7 +728,7 @@ fn the_type_tabs_show_the_new_spelling() {
         .expect("a failed step carries what it said");
     assert_eq!(
         error.value,
-        "this is `Nat`, but `'a` stands for whatever type the caller picks"
+        "the body cannot fix a choice that belongs to each caller"
     );
 }
 

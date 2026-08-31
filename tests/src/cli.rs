@@ -90,6 +90,36 @@ fn inference_diagnostics_keep_structured_parity_across_real_consumers() {
     assert_eq!(cli.message(), debugger.message);
     assert_eq!(cli.help(), debugger.help);
     assert_eq!(cli.notes(), debugger.notes);
+    for prose in std::iter::once(debugger.message.as_str())
+        .chain(std::iter::once(debugger.label.as_str()))
+        .chain(debugger.help.iter().map(String::as_str))
+        .chain(
+            debugger
+                .related
+                .iter()
+                .map(|related| related.message.as_str()),
+        )
+    {
+        assert!(!prose.to_lowercase().contains("rigid"), "{prose}");
+    }
+    let explanation = debugger
+        .inference_explanation
+        .as_ref()
+        .expect("caller-choice diagnostics are structured");
+    assert_eq!(explanation.contradiction.kind, "caller-choice");
+    assert!((2..=4).contains(&explanation.abridged.len()));
+    assert!(
+        explanation
+            .full
+            .iter()
+            .any(|fact| fact.payload == "caller-choice-declaration")
+    );
+    assert!(
+        explanation
+            .full
+            .iter()
+            .any(|fact| fact.payload == "caller-choice-use")
+    );
 
     // The CLI's public adapter renders labels while the debugger keeps them as
     // wire fields. Ensure those fields came through both real consumers too.

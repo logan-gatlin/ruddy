@@ -2651,6 +2651,23 @@ fn explanation_fact(
             let (noun, label) = about(row.shape, &row.label);
             format!("this `..` remainder already follows named {noun} `{label}`")
         }
+        P::CallerChoiceDeclaration => "this annotation leaves the choice to each caller".into(),
+        P::CallerChoiceUse => match contradiction.row.as_ref() {
+            Some(row) => {
+                let label = label(row.shape, &row.label);
+                match row.shape {
+                    Shape::Struct => format!("this reads field `{label}` from the caller's choice"),
+                    Shape::Sum => format!("this matches case `{label}` from the caller's choice"),
+                    Shape::Effect => {
+                        format!("this requires effect `{label}` from the caller's choice")
+                    }
+                }
+            }
+            None => "this use fixes a type that the caller must be free to choose".into(),
+        },
+        P::CallerChoiceDestination => {
+            "this binding's type would carry that choice outside its annotation".into()
+        }
         P::RequiresType => match fact.subject {
             inference::Subject::Binding
             | inference::Subject::TopLevelBinding
@@ -2739,6 +2756,14 @@ fn mismatch_title(contradiction: &inference::Contradiction) -> String {
             let (noun, label) = about(row.shape, &row.label);
             format!("{noun} `{label}` cannot be both named and included by `..`")
         }
+        K::CallerChoice => match &contradiction.row {
+            Some(row) => {
+                let (noun, label) = about(row.shape, &row.label);
+                format!("the body cannot assume caller-chosen {noun} `{label}`")
+            }
+            None => "the body cannot fix a choice that belongs to each caller".into(),
+        },
+        K::CallerChoiceEscape => "a caller choice cannot cross into another binding's type".into(),
     }
 }
 
@@ -2849,11 +2874,33 @@ impl inference::Error {
                         ));
                 }
             }
-            E::RigidBroken { declared, .. } => {
-                diagnostic = diagnostic
-                    .label("this use narrows a choice that belongs to the caller")
-                    .related(*declared, DECLARED_HERE)
-                    .help("change the body so it works for every choice allowed by the annotation");
+            E::RigidBroken {
+                declared, sense, ..
+            } => {
+                if let Some(explanation) = &self.explanation {
+                    diagnostic = causal_diagnostic(diagnostic, explanation);
+                } else {
+                    diagnostic = diagnostic
+                        .label("this use narrows a choice that belongs to the caller")
+                        .related(*declared, DECLARED_HERE);
+                }
+                diagnostic = match sense {
+                    Sense::Type => diagnostic
+                        .help("return or pass through the annotated value instead of replacing its type")
+                        .help("or change the annotation to name the concrete type the body uses"),
+                    Sense::Fields => diagnostic
+                        .help("preserve the caller-chosen struct remainder instead of closing it")
+                        .help("or remove the open remainder from the annotation"),
+                    Sense::Cases => diagnostic
+                        .help("preserve the caller-chosen remaining cases instead of closing them")
+                        .help("or remove the open remainder from the annotation"),
+                    Sense::Effects => diagnostic
+                        .help("handle the performed effect inside the body")
+                        .help("or list that effect explicitly in the annotation"),
+                    Sense::Presence => diagnostic
+                        .help("preserve the annotation's label condition in the body")
+                        .help("or change the annotation's `where` condition"),
+                };
             }
             E::RigidField {
                 shape, declared, ..
@@ -2863,22 +2910,50 @@ impl inference::Error {
                     Shape::Sum => "cases",
                     Shape::Effect => "effects",
                 };
+                if let Some(explanation) = &self.explanation {
+                    diagnostic = causal_diagnostic(diagnostic, explanation);
+                } else {
+                    diagnostic = diagnostic
+                        .label(format!(
+                            "this assumes one of the {choices} chosen by the caller"
+                        ))
+                        .related(
+                            *declared,
+                            format!("the caller's choice of {choices} starts here"),
+                        );
+                }
+                diagnostic = match shape {
+                    Shape::Struct => diagnostic
+                        .help("read caller-chosen struct fields only when named explicitly before the annotation's `..` remainder")
+                        .help("or add this field explicitly to the annotation"),
+                    Shape::Sum => diagnostic
+                        .help("match caller-chosen cases only when named explicitly before the annotation's `..` remainder")
+                        .help("or add this case explicitly to the annotation"),
+                    Shape::Effect => diagnostic
+                        .help("handle this effect instead of requiring it from the caller-chosen effects")
+                        .help("or list this effect explicitly before the annotation's effect remainder"),
+                };
+            }
+            E::RigidEscapes {
+                destination_name,
+                destination_span,
+                ..
+            } => {
+                if let Some(explanation) = &self.explanation {
+                    diagnostic = causal_diagnostic(diagnostic, explanation);
+                } else {
+                    diagnostic = diagnostic
+                        .label("this type carries a caller choice outside its annotation");
+                }
                 diagnostic = diagnostic
-                    .label(format!(
-                        "this assumes one of the {choices} chosen by the caller"
-                    ))
                     .related(
-                        *declared,
-                        format!("the caller's choice of {choices} starts here"),
+                        *destination_span,
+                        format!("binding `{destination_name}` would publish the choice here"),
                     )
                     .help(format!(
-                        "change the body so it does not assume which {choices} the caller chooses"
-                    ));
-            }
-            E::RigidEscapes { .. } => {
-                diagnostic = diagnostic
-                    .label("this type carries a caller choice outside its annotation")
-                    .help("keep the value inside the annotation that introduces this choice")
+                        "give `{destination_name}` an annotation that owns its own caller choices"
+                    ))
+                    .help("or keep the value from crossing into this binding");
             }
             E::RepeatedField { shape, field, .. } => {
                 let (noun, field) = about(*shape, field);
@@ -3056,9 +3131,14 @@ impl fmt::Display for inference::ErrorKind {
             // Said at the declaration, because that is the line that has to
             // change: the type the variable leaked into is somewhere the reader
             // never wrote it down.
-            inference::ErrorKind::RigidEscapes { name } => write!(
+            inference::ErrorKind::RigidEscapes {
+                name,
+                destination,
+                destination_name,
+                ..
+            } => write!(
                 f,
-                "`'{name}` stands for whatever the caller picks, so it can't be part of a type outside the annotation that declared it",
+                "`'{name}` stands for whatever that annotation's caller picks, but binding `{destination_name}` would publish it as `{destination}` outside that annotation",
             ),
             // Said as what `..` means rather than as the two rows that
             // disagreed: neither of those is a type the reader wrote, and the

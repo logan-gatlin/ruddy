@@ -691,6 +691,13 @@ fn wire_explanation(
             inference::ExplanationFactPayload::ClosedRow => "closed-row",
             inference::ExplanationFactPayload::LabelIntroduction => "label-introduction",
             inference::ExplanationFactPayload::LabelForbidden => "label-forbidden",
+            inference::ExplanationFactPayload::CallerChoiceDeclaration => {
+                "caller-choice-declaration"
+            }
+            inference::ExplanationFactPayload::CallerChoiceUse => "caller-choice-use",
+            inference::ExplanationFactPayload::CallerChoiceDestination => {
+                "caller-choice-destination"
+            }
         };
         crate::wire::ExplanationFact {
             span: loc(fact.span, files),
@@ -739,6 +746,8 @@ fn wire_explanation(
                 inference::ContradictionKind::ProjectionOnNonStruct => "projection-on-non-struct",
                 inference::ContradictionKind::LabelUnavailable => "label-unavailable",
                 inference::ContradictionKind::RepeatedLabel => "repeated-label",
+                inference::ContradictionKind::CallerChoice => "caller-choice",
+                inference::ContradictionKind::CallerChoiceEscape => "caller-choice-escape",
             },
             left: description(contradiction.left),
             right: description(contradiction.right),

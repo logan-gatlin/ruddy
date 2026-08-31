@@ -7760,8 +7760,8 @@ fn the_written_examples_are_refused_where_they_go_wrong() {
     assert_eq!(error.kind.code(), "rigid-escapes");
     assert_eq!(
         error.kind.to_string(),
-        "`\'a` stands for whatever the caller picks, so it can't be part of a type \
-         outside the annotation that declared it"
+        "`\'a` stands for whatever that annotation's caller picks, but binding `bad` would \
+         publish it as `('a -> 'a) -> Nat` outside that annotation"
     );
     assert_eq!(error.span.start, src.find("'a").expect("the first use"));
 
@@ -7776,6 +7776,82 @@ fn the_written_examples_are_refused_where_they_go_wrong() {
     );
     assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
     assert_eq!(output.errors[0].kind.code(), "rigid-escapes");
+}
+
+/// Caller-owned type, remainder, case, and effect choices retain a short
+/// structured route from the exact annotation declaration to the body use.
+#[test]
+fn caller_choices_have_shape_specific_causal_paths() {
+    let sources = [
+        "let f : 'a -> 'a = fn x => 0n".to_string(),
+        "let f : { x: Nat, ..'r } -> Nat = fn p => p.y".to_string(),
+        "let f : (#A Nat | ..'r) -> Nat = fn p => match p with | #A x => 1n | #B y => 0n end"
+            .to_string(),
+        format!(
+            "{EFFECTS}let greet : () -> Nat + !Log = fn _ => let _ = !Log.write 1n in 0n\n\
+             let f : () -> Nat + ..'e = fn _ => greet ()"
+        ),
+    ];
+    for source in sources {
+        let (_, _, output) = infer_src(&source);
+        let [error] = output.errors.as_slice() else {
+            panic!("{source}: {:#?}", output.errors);
+        };
+        let explanation = error
+            .explanation
+            .as_ref()
+            .unwrap_or_else(|| panic!("{source}: no caller-choice explanation"));
+        assert_eq!(
+            explanation.contradiction.kind,
+            inference::ContradictionKind::CallerChoice,
+            "{source}"
+        );
+        assert!((2..=4).contains(&explanation.abridged.len()), "{source}");
+        assert!(explanation.full_facts.iter().any(|fact| {
+            fact.payload == inference::ExplanationFactPayload::CallerChoiceDeclaration
+        }));
+        assert!(
+            explanation
+                .full_facts
+                .iter()
+                .any(|fact| { fact.payload == inference::ExplanationFactPayload::CallerChoiceUse })
+        );
+    }
+}
+
+/// Escape explanations preserve both bindings and the complete destination
+/// type, even when the choice crosses a deeply nested type path.
+#[test]
+fn caller_choice_escape_names_its_destination_and_deep_type_path() {
+    let source = "let bad = fn outer =>\n\
+                  \x20 let source : 'a -> 'a = outer in\n\
+                  \x20 { nested: { value: outer } }";
+    let (_, _, output) = infer_src(source);
+    let escape = output
+        .errors
+        .iter()
+        .find(|error| error.kind.code() == "rigid-escapes")
+        .unwrap_or_else(|| panic!("{:#?}", output.errors));
+    let ErrorKind::RigidEscapes {
+        destination,
+        destination_name,
+        destination_span,
+        declared,
+        ..
+    } = &escape.kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(&**destination_name, "bad");
+    assert_eq!(destination_span.start, source.find("bad").unwrap());
+    assert_eq!(declared.start, source.find("'a").unwrap());
+    assert!(destination.to_string().contains("nested"), "{destination}");
+    let explanation = escape.explanation.as_ref().expect("escape explanation");
+    assert_eq!(explanation.abridged.len(), 2);
+    assert_eq!(
+        explanation.full_facts[1].payload,
+        inference::ExplanationFactPayload::CallerChoiceDestination
+    );
 }
 
 /// A rigid is equal to a rigid with the same id and to nothing else. Every

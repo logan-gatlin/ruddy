@@ -1045,6 +1045,12 @@ pub enum ExplanationFactPayload {
     LabelIntroduction,
     /// The source row remainder whose adjacent label forbids that introduction.
     LabelForbidden,
+    /// The annotation spelling which leaves this choice to each caller.
+    CallerChoiceDeclaration,
+    /// The body operation which fixes or assumes part of the caller's choice.
+    CallerChoiceUse,
+    /// The binding whose published type would carry another annotation's choice.
+    CallerChoiceDestination,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1077,6 +1083,10 @@ pub enum ContradictionKind {
     ProjectionOnNonStruct,
     LabelUnavailable,
     RepeatedLabel,
+    /// A body fixed or inspected a choice its annotation leaves to callers.
+    CallerChoice,
+    /// A binding would export a choice owned by another annotation.
+    CallerChoiceEscape,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1242,7 +1252,13 @@ pub enum ErrorKind {
     /// means nothing anywhere else: a scheme quantifying one would be promising
     /// its own callers something only somebody else's caller decides. Reported
     /// at the declaring name, which is the line that has to change.
-    RigidEscapes { name: Rc<str> },
+    RigidEscapes {
+        name: Rc<str>,
+        declared: Span,
+        destination: Rc<Ty>,
+        destination_name: Rc<str>,
+        destination_span: Span,
+    },
     /// A `..` was decided to stand for a label the row it tails already names.
     /// `{ x: Nat, ..'r }` says "an `x`, plus whatever else `'r` is", so `'r`
     /// standing for anything that certainly has an `x` of its own would name
@@ -1571,6 +1587,8 @@ struct PackageGuarantee {
 
 #[derive(Default)]
 struct Table {
+    /// Source spellings for bindings whose nested generalization may report an escape.
+    binding_names: HashMap<Symbol, Rc<str>>,
     /// One slot per variable; [`Ty::Var`] indexes into it.
     ///
     /// A group rather than a definition, and the difference is only where the
@@ -3036,6 +3054,26 @@ fn attach_ordinary_explanations(
                 Some(ContradictionKind::RecursiveValue),
                 None,
             ),
+            ErrorKind::RigidBroken { found, .. } => (
+                describe_type(found),
+                TypeDescription::Undecided,
+                Some(ContradictionKind::CallerChoice),
+                None,
+            ),
+            ErrorKind::RigidField { shape, field, .. } => (
+                match shape {
+                    Shape::Struct => TypeDescription::Struct,
+                    Shape::Sum => TypeDescription::TaggedValue,
+                    Shape::Effect => TypeDescription::Function,
+                },
+                TypeDescription::Undecided,
+                Some(ContradictionKind::CallerChoice),
+                Some(RowContradiction {
+                    shape: *shape,
+                    label: field.clone(),
+                }),
+            ),
+            ErrorKind::RigidEscapes { .. } => continue,
             _ => continue,
         };
         // Presence failures retain which side supplied the required label after
@@ -3242,6 +3280,32 @@ fn attach_ordinary_explanations(
                 });
             }
         }
+        if let Some(declared) = match &error.kind {
+            ErrorKind::RigidBroken { declared, .. } | ErrorKind::RigidField { declared, .. } => {
+                Some(*declared)
+            }
+            _ => None,
+        } {
+            for fact in &mut full_facts {
+                if fact.span == error.span {
+                    fact.payload = ExplanationFactPayload::CallerChoiceUse;
+                }
+                if fact.span == declared {
+                    fact.payload = ExplanationFactPayload::CallerChoiceDeclaration;
+                }
+            }
+            if !full_facts.iter().any(|fact| fact.span == declared)
+                && let Some(constraint) = constraint_slice.first().copied()
+            {
+                full_facts.push(ExplanationFact {
+                    span: declared,
+                    constraint,
+                    origin: ConstraintOrigin::ContextualCheck,
+                    subject: Subject::Annotation,
+                    payload: ExplanationFactPayload::CallerChoiceDeclaration,
+                });
+            }
+        }
         if let ErrorKind::RepeatedField {
             introduction: Some(introduction),
             forbidden: Some(forbidden),
@@ -3312,6 +3376,17 @@ fn attach_ordinary_explanations(
             )),
             _ => None,
         };
+        let caller_endpoints = (kind == Some(ContradictionKind::CallerChoice))
+            .then(|| {
+                let declared = candidates.iter().copied().find(|at| {
+                    full_facts[*at].payload == ExplanationFactPayload::CallerChoiceDeclaration
+                })?;
+                let used = candidates.iter().rev().copied().find(|at| {
+                    full_facts[*at].payload == ExplanationFactPayload::CallerChoiceUse
+                })?;
+                Some([declared, used])
+            })
+            .flatten();
         let opposing_endpoints = opposing_roles.and_then(|(first, second)| {
             let first = candidates
                 .iter()
@@ -3373,16 +3448,20 @@ fn attach_ordinary_explanations(
             };
             [matching[0], *matching.last().expect("shared pivot key")]
         });
-        let endpoints = opposing_endpoints.or(endpoint_family).unwrap_or_else(|| {
-            [
-                candidates[0],
-                *candidates.last().expect("nonempty candidates"),
-            ]
-        });
+        let endpoints = caller_endpoints
+            .or(opposing_endpoints)
+            .or(endpoint_family)
+            .unwrap_or_else(|| {
+                [
+                    candidates[0],
+                    *candidates.last().expect("nonempty candidates"),
+                ]
+            });
         let mut abridged = vec![endpoints[0], endpoints[1]];
         let lo = endpoints[0].min(endpoints[1]);
         let hi = endpoints[0].max(endpoints[1]);
         if opposing_endpoints.is_none()
+            && caller_endpoints.is_none()
             && let Some(handoff) = candidates.iter().copied().find(|at| {
                 lo < *at
                     && *at < hi
@@ -3401,7 +3480,9 @@ fn attach_ordinary_explanations(
         abridged.dedup();
 
         let pivot_candidate = shared_keys.iter().find_map(|(key, all_references)| {
-            if opposing_endpoints.is_some() && matches!(key, PivotKey::Anonymous { .. }) {
+            if kind == Some(ContradictionKind::CallerChoice)
+                || opposing_endpoints.is_some() && matches!(key, PivotKey::Anonymous { .. })
+            {
                 return None;
             }
             let references: Vec<_> = all_references
@@ -3488,6 +3569,13 @@ fn attach_ordinary_explanations(
 /// schemes of its top-level definitions.
 pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     let mut table = Table::default();
+    table.binding_names.extend(
+        program
+            .terms
+            .keys()
+            .copied()
+            .map(|symbol| (symbol, Rc::from(mint.name(symbol)))),
+    );
     let mut env = HashMap::new();
     let mut aliases = IndexMap::new();
     let mut errors = Vec::new();
@@ -3909,7 +3997,13 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             // caller picks, so it means nothing in anybody else's type. A
             // scheme that would quantify one it did not declare is refused at
             // the declaration, which is the line the reader has to change.
-            table.escapes(&member.ty, &member.scoped.rigids, &mut errors);
+            table.escapes(
+                &member.ty,
+                &member.scoped.rigids,
+                Rc::from(mint.name(symbol)),
+                decl.name_span,
+                &mut errors,
+            );
             // An annotation's `where` clause is the contract, so the body may
             // not need more of its presences than the clause allows: a use of
             // the name sees the clause and nothing of the body, and one that
@@ -6441,20 +6535,74 @@ impl Table {
     /// Said once per variable across the whole program. A rigid that reaches
     /// two schemes it does not belong to is still one annotation to rewrite,
     /// and a reader sent to the same line twice learns nothing the second time.
-    fn escapes(&mut self, ty: &Rc<Ty>, owned: &[u32], errors: &mut Vec<Error>) {
+    fn escapes(
+        &mut self,
+        ty: &Rc<Ty>,
+        owned: &[u32],
+        destination_name: Rc<str>,
+        destination_span: Span,
+        errors: &mut Vec<Error>,
+    ) {
         let mut found = IndexMap::new();
         self.rigids_in(ty, &mut found);
         for (id, name) in found {
             if owned.contains(&id) || !self.escaped.insert(id) {
                 continue;
             }
-            let span = self.rigids[&id];
+            let declared = self.rigids[&id];
+            let error_id = self.error_id();
+            let constraint = ConstraintId::synthetic(error_id.get());
+            let full_facts = vec![
+                ExplanationFact {
+                    span: declared,
+                    constraint,
+                    origin: ConstraintOrigin::ContextualCheck,
+                    subject: Subject::Annotation,
+                    payload: ExplanationFactPayload::CallerChoiceDeclaration,
+                },
+                ExplanationFact {
+                    span: destination_span,
+                    constraint,
+                    origin: ConstraintOrigin::Binding,
+                    subject: Subject::Binding,
+                    payload: ExplanationFactPayload::CallerChoiceDestination,
+                },
+            ];
             errors.push(Error {
-                id: self.error_id(),
+                id: error_id,
                 cause: ErrorCause::Direct,
-                span,
-                kind: ErrorKind::RigidEscapes { name },
-                explanation: None,
+                span: declared,
+                kind: ErrorKind::RigidEscapes {
+                    name,
+                    declared,
+                    destination: ty.clone(),
+                    destination_name: destination_name.clone(),
+                    destination_span,
+                },
+                explanation: Some(InferenceExplanation {
+                    full_facts,
+                    abridged: vec![0, 1],
+                    pivot: None,
+                    omitted_facts: 0,
+                    contradiction: Contradiction {
+                        kind: ContradictionKind::CallerChoiceEscape,
+                        left: TypeDescription::Undecided,
+                        right: describe_type(ty),
+                        row: None,
+                        recursive: None,
+                        repairs: [
+                            RepairDirection::ChangeFirstUse,
+                            RepairDirection::ChangeSecondUse,
+                        ],
+                    },
+                    cause: ExplanationCause {
+                        error: error_id,
+                        seed: None,
+                        constraints: vec![constraint],
+                        reasons: Vec::new(),
+                        omitted_reasons: 0,
+                    },
+                }),
             });
         }
     }
@@ -7668,7 +7816,19 @@ impl Table {
                 name: name.clone(),
                 declared: *declared,
             },
-            ErrorKind::RigidEscapes { name } => ErrorKind::RigidEscapes { name: name.clone() },
+            ErrorKind::RigidEscapes {
+                name,
+                declared,
+                destination,
+                destination_name,
+                destination_span,
+            } => ErrorKind::RigidEscapes {
+                name: name.clone(),
+                declared: *declared,
+                destination: self.close(destination, subst),
+                destination_name: destination_name.clone(),
+                destination_span: *destination_span,
+            },
             // The presence complaints carry prose rather than types:
             // their formulas were already worded, at the moment the variables
             // in them still had labels to be named by. There is nothing here

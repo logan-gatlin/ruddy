@@ -404,6 +404,7 @@ impl Solve<'_> {
                     body,
                 } => self.bind_local(
                     *symbol,
+                    span,
                     &Scoping {
                         bound,
                         level: *level,
@@ -1407,7 +1408,7 @@ impl Solve<'_> {
     /// The scheme is released when the body ends, the way lowering released the
     /// name. Nothing could reach it afterwards — a symbol is unique — but a
     /// scope that is not closed is a scope that is not a scope.
-    fn bind_local(&mut self, symbol: Symbol, scoping: &Scoping<'_>) {
+    fn bind_local(&mut self, symbol: Symbol, binding_span: Span, scoping: &Scoping<'_>) {
         let &Scoping {
             bound,
             level,
@@ -1441,7 +1442,17 @@ impl Solve<'_> {
         // A variable this binding did not declare means nothing in
         // the scheme it is about to publish, exactly as it means nothing in a
         // definition's. See [`Table::escapes`](super::Table).
-        self.table.escapes(bound, rigids, self.errors);
+        self.table.escapes(
+            bound,
+            rigids,
+            self.table
+                .binding_names
+                .get(&symbol)
+                .cloned()
+                .unwrap_or_else(|| Rc::from("local binding")),
+            binding_span,
+            self.errors,
+        );
         let (scheme, subst) = self.table.generalize(bound, level, required);
         self.table.level = level - 1;
         self.locals.insert(symbol, scheme.clone());

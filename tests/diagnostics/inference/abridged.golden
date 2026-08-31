@@ -40,33 +40,41 @@ help: or change the use that requires case `#None`
 note: 1 intermediate use is omitted from this short explanation
 
 ## rigid-broken
-[rigid-broken] this is `{ value: Nat }`, but `'a` stands for whatever type the caller picks
-primary: this use narrows a choice that belongs to the caller
-related: declared here
-help: change the body so it works for every choice allowed by the annotation
+[rigid-broken] the body cannot fix a choice that belongs to each caller
+primary: this annotation leaves the choice to each caller
+related: this use fixes a type that the caller must be free to choose
+help: return or pass through the annotated value instead of replacing its type
+help: or change the annotation to name the concrete type the body uses
 
 ## rigid-field-struct
-[rigid-field] this reads field `x`, but `'a` stands for whatever other struct fields the caller chooses, so `x` cannot be assumed
-primary: this assumes one of the struct fields chosen by the caller
-related: the caller's choice of struct fields starts here
-help: change the body so it does not assume which struct fields the caller chooses
+[rigid-field] the body cannot assume caller-chosen field `x`
+primary: this annotation leaves the choice to each caller
+related: this reads field `x` from the caller's choice
+help: read caller-chosen struct fields only when named explicitly before the annotation's `..` remainder
+help: or add this field explicitly to the annotation
+note: 1 intermediate use is omitted from this short explanation
 
 ## rigid-field-sum
-[rigid-field] this matches case `#B`, but `'r` stands for whatever other cases the caller chooses, so `#B` cannot be assumed
-primary: this assumes one of the cases chosen by the caller
-related: the caller's choice of cases starts here
-help: change the body so it does not assume which cases the caller chooses
+[rigid-field] the body cannot assume caller-chosen case `#B`
+primary: this annotation leaves the choice to each caller
+related: this matches case `#B` from the caller's choice
+help: match caller-chosen cases only when named explicitly before the annotation's `..` remainder
+help: or add this case explicitly to the annotation
 
 ## rigid-field-effect
-[rigid-field] this requires effect `!Log`, but `'effects` stands for whatever other effects the caller chooses, so `!Log` cannot be assumed
-primary: this assumes one of the effects chosen by the caller
-related: the caller's choice of effects starts here
-help: change the body so it does not assume which effects the caller chooses
+[rigid-field] the body cannot assume caller-chosen effect `!Log`
+primary: this annotation leaves the choice to each caller
+related: this requires effect `!Log` from the caller's choice
+help: handle this effect instead of requiring it from the caller-chosen effects
+help: or list this effect explicitly before the annotation's effect remainder
 
 ## rigid-escapes
-[rigid-escapes] `'a` stands for whatever the caller picks, so it can't be part of a type outside the annotation that declared it
-primary: this type carries a caller choice outside its annotation
-help: keep the value inside the annotation that introduces this choice
+[rigid-escapes] a caller choice cannot cross into another binding's type
+primary: this annotation leaves the choice to each caller
+related: this binding's type would carry that choice outside its annotation
+related: binding `bad` would publish the choice here
+help: give `bad` an annotation that owns its own caller choices
+help: or keep the value from crossing into this binding
 
 ## repeated-field-struct
 [repeated-field] field `x` cannot be both named and included by `..`

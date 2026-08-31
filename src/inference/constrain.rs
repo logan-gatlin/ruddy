@@ -450,6 +450,9 @@ impl Constrain<'_> {
                 self.infer_term(body);
                 let rest = std::mem::replace(&mut self.out, outer);
 
+                self.table
+                    .binding_names
+                    .insert(name.tracked, Rc::from(self.mint.name(name.tracked)));
                 self.emit(
                     name.span,
                     ConstraintOrigin::Binding,
