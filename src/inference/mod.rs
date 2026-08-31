@@ -694,9 +694,15 @@ pub struct Constraint {
     pub kind: ConstraintKind,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticPivot {
+    FunctionInput(Symbol),
+    BranchResult(Span),
+}
+
 /// Why generation emitted a constraint. This describes generation rather than
 /// the solver rule that eventually handles it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConstraintOrigin {
     Binding,
     ContextualCheck,
@@ -743,6 +749,7 @@ impl ConstraintOrigin {
 /// constraints use only `primary`.
 #[derive(Debug, Clone, Copy, Eq)]
 pub struct ConstraintSubjects {
+    pub semantic_pivot: Option<SemanticPivot>,
     pub primary: Subject,
     pub primary_span: Option<Span>,
     pub secondary: Option<Subject>,
@@ -758,6 +765,7 @@ impl PartialEq for ConstraintSubjects {
 impl ConstraintSubjects {
     pub const fn one(primary: Subject) -> Self {
         Self {
+            semantic_pivot: None,
             primary,
             primary_span: None,
             secondary: None,
@@ -767,6 +775,7 @@ impl ConstraintSubjects {
 
     pub const fn pair(primary: Subject, secondary: Subject) -> Self {
         Self {
+            semantic_pivot: None,
             primary,
             primary_span: None,
             secondary: Some(secondary),
@@ -784,6 +793,7 @@ impl ConstraintSubjects {
         secondary_span: Option<Span>,
     ) -> Self {
         Self {
+            semantic_pivot: None,
             primary,
             primary_span,
             secondary: Some(secondary),
@@ -2777,6 +2787,159 @@ fn all_constraints(
     out
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum PivotKey {
+    FunctionInput(PivotAnchor),
+    BranchResult(Span),
+    ProjectedField { base: Span, field: String },
+    FunctionEffects(Span),
+    WrittenBinder(Span),
+    Anonymous { span: Span, origin: &'static str },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum PivotAnchor {
+    Binder(Symbol),
+    Span(Span),
+}
+
+impl PivotKey {
+    fn kind(&self) -> ExplanationPivotKind {
+        match self {
+            Self::FunctionInput(_) => ExplanationPivotKind::FunctionInput,
+            Self::BranchResult(_) => ExplanationPivotKind::BranchResult,
+            Self::ProjectedField { .. } => ExplanationPivotKind::ProjectedField,
+            Self::FunctionEffects(_) => ExplanationPivotKind::FunctionEffects,
+            Self::WrittenBinder(_) => ExplanationPivotKind::WrittenValue,
+            Self::Anonymous { .. } => ExplanationPivotKind::Value,
+        }
+    }
+
+    fn priority(&self) -> u8 {
+        match self {
+            Self::FunctionInput(_) => 0,
+            Self::BranchResult(_) => 1,
+            Self::ProjectedField { .. } => 2,
+            Self::FunctionEffects(_) => 3,
+            Self::WrittenBinder(_) => 4,
+            Self::Anonymous { .. } => 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PivotContext {
+    branch: Option<Span>,
+    binder: Option<Span>,
+}
+
+fn pivot_contexts(
+    constraints: &IndexMap<Symbol, Vec<Constraint>>,
+) -> HashMap<ConstraintId, PivotContext> {
+    let mut contexts = HashMap::new();
+    let mut work: Vec<_> = constraints
+        .values()
+        .flatten()
+        .map(|constraint| (constraint, PivotContext::default()))
+        .collect();
+    while let Some((constraint, inherited)) = work.pop() {
+        if contexts.insert(constraint.id, inherited).is_some() {
+            continue;
+        }
+        match &constraint.kind {
+            ConstraintKind::Let { value, body, .. } => {
+                let nested = PivotContext {
+                    binder: Some(constraint.span),
+                    ..inherited
+                };
+                work.extend(value.iter().map(|child| (child, nested)));
+                work.extend(body.iter().map(|child| (child, inherited)));
+            }
+            ConstraintKind::Match { arms, .. } => {
+                let nested = PivotContext {
+                    branch: Some(constraint.span),
+                    ..inherited
+                };
+                for arm in arms {
+                    work.extend(arm.constraints.iter().map(|child| (child, nested)));
+                    work.push((&arm.result, nested));
+                }
+            }
+            _ => {}
+        }
+    }
+    contexts
+}
+
+fn pivot_key(
+    fact: &ExplanationFact,
+    constraint: &Constraint,
+    context: PivotContext,
+    instance_binders: &HashMap<Span, Symbol>,
+) -> PivotKey {
+    if constraint.origin == ConstraintOrigin::ApplicationArgument {
+        let call = constraint.subjects.primary_span.unwrap_or(constraint.span);
+        return PivotKey::FunctionInput(match constraint.subjects.semantic_pivot {
+            Some(SemanticPivot::FunctionInput(symbol)) => PivotAnchor::Binder(symbol),
+            _ => instance_binders
+                .get(&call)
+                .copied()
+                .map_or(PivotAnchor::Span(call), PivotAnchor::Binder),
+        });
+    }
+    if matches!(
+        constraint.origin,
+        ConstraintOrigin::Match | ConstraintOrigin::MatchArm
+    ) {
+        return PivotKey::BranchResult(match constraint.subjects.semantic_pivot {
+            Some(SemanticPivot::BranchResult(span)) => span,
+            _ => context.branch.unwrap_or(constraint.span),
+        });
+    }
+    if let ConstraintKind::Project {
+        field, base_span, ..
+    } = &constraint.kind
+    {
+        return PivotKey::ProjectedField {
+            base: *base_span,
+            field: field.clone(),
+        };
+    }
+    if matches!(constraint.kind, ConstraintKind::Performs { .. }) {
+        return PivotKey::FunctionEffects(constraint.span);
+    }
+    if matches!(
+        fact.subject,
+        Subject::Binding | Subject::TopLevelBinding | Subject::LocalBinding
+    ) {
+        return PivotKey::WrittenBinder(context.binder.unwrap_or(fact.span));
+    }
+    PivotKey::Anonymous {
+        span: constraint.span,
+        origin: constraint.origin.code(),
+    }
+}
+
+fn explanatory_name(base: &str, visible_names: &HashSet<String>) -> String {
+    if !visible_names.contains(base) {
+        return base.into();
+    }
+    for suffix in 'A'..='Z' {
+        let candidate = format!("{base} {suffix}");
+        if !visible_names.contains(&candidate) {
+            return candidate;
+        }
+    }
+    let mut suffix = 2usize;
+    loop {
+        let candidate = format!("{base} {suffix}");
+        if !visible_names.contains(&candidate) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
 fn budget_reason_slice(mut reasons: Vec<ReasonId>) -> (Vec<ReasonId>, usize) {
     const MAX_EXPLANATION_REASONS: usize = 16_384;
     reasons.sort_unstable();
@@ -2794,6 +2957,7 @@ fn budget_reason_slice(mut reasons: Vec<ReasonId>) -> (Vec<ReasonId>, usize) {
 }
 
 fn attach_ordinary_explanations(
+    mint: &Mint,
     errors: &mut [Error],
     constraints: &IndexMap<Symbol, Vec<Constraint>>,
     steps: &[Step],
@@ -2801,7 +2965,30 @@ fn attach_ordinary_explanations(
     omitted_reason_parents: &HashMap<ReasonId, usize>,
     aliases: &IndexMap<Symbol, Scheme>,
 ) {
-    let constraints = all_constraints(constraints);
+    let pivot_contexts = pivot_contexts(constraints);
+    let all = all_constraints(constraints);
+    let instance_binders: HashMap<Span, Symbol> = all
+        .values()
+        .filter_map(|constraint| match constraint.kind {
+            ConstraintKind::Instance { symbol, .. } => Some((constraint.span, symbol)),
+            _ => None,
+        })
+        .collect();
+    let visible_names: HashSet<String> = constraints
+        .keys()
+        .copied()
+        .chain(all.values().filter_map(|constraint| match constraint.kind {
+            ConstraintKind::Let { symbol, .. } | ConstraintKind::Instance { symbol, .. } => {
+                Some(symbol)
+            }
+            _ => match constraint.subjects.semantic_pivot {
+                Some(SemanticPivot::FunctionInput(symbol)) => Some(symbol),
+                _ => None,
+            },
+        }))
+        .map(|symbol| mint.name(symbol).to_owned())
+        .collect();
+    let constraints = all;
     let steps: HashMap<_, _> = steps.iter().map(|step| (step.id, step)).collect();
     let reasons_by_id: HashMap<_, _> = reasons.iter().map(|reason| (reason.id, reason)).collect();
 
@@ -2912,8 +3099,14 @@ fn attach_ordinary_explanations(
         constraint_slice.sort_by_key(|id| {
             constraints
                 .get(id)
-                .map_or((usize::MAX, id.get()), |constraint| {
-                    (constraint.span.start, id.get())
+                .map_or((true, Span::default(), "", "", ""), |constraint| {
+                    (
+                        constraint.span.is_generated(),
+                        constraint.span,
+                        constraint.origin.code(),
+                        constraint.subjects.primary.code(),
+                        constraint.subjects.secondary.map_or("", Subject::code),
+                    )
                 })
         });
 
@@ -3049,7 +3242,6 @@ fn attach_ordinary_explanations(
                 });
             }
         }
-        let mut exact_row_endpoints = None;
         if let ErrorKind::RepeatedField {
             introduction: Some(introduction),
             forbidden: Some(forbidden),
@@ -3060,21 +3252,18 @@ fn attach_ordinary_explanations(
             // Keep the complete causal slice. Exact row-fact provenance either
             // corrects the corresponding sliced fact in place or adds a missing
             // endpoint; it must never replace the intermediate path.
-            let mut endpoints = Vec::with_capacity(2);
             for (origin, payload) in [
                 (introduction, ExplanationFactPayload::LabelIntroduction),
                 (forbidden, ExplanationFactPayload::LabelForbidden),
             ] {
-                let at = if let Some(at) = full_facts.iter().position(|fact| {
+                if let Some(at) = full_facts.iter().position(|fact| {
                     fact.span == origin.span
                         && fact.constraint == origin.constraint
                         && fact.origin == origin.origin
                         && fact.subject == origin.subject
                 }) {
                     full_facts[at].payload = payload;
-                    at
                 } else {
-                    let at = full_facts.len();
                     full_facts.push(ExplanationFact {
                         span: origin.span,
                         constraint: origin.constraint,
@@ -3082,12 +3271,20 @@ fn attach_ordinary_explanations(
                         subject: origin.subject,
                         payload,
                     });
-                    at
-                };
-                endpoints.push(at);
+                }
             }
-            exact_row_endpoints = Some([endpoints[0], endpoints[1]]);
         }
+        // Overlays can append or change roles. Restore source order afterwards;
+        // no diagnostic order is allowed to inherit a solver identity.
+        full_facts.sort_by_key(|fact| {
+            (
+                fact.span.is_generated(),
+                fact.span,
+                fact.origin.code(),
+                fact.subject.code(),
+                fact.payload as u8,
+            )
+        });
         // A reason without a written endpoint cannot support source labels.
         // Keep the established diagnostic rather than inventing context.
         if full_facts.is_empty() {
@@ -3096,9 +3293,9 @@ fn attach_ordinary_explanations(
         let mut candidates = Vec::new();
         let mut included = HashSet::new();
         for (at, fact) in full_facts.iter().enumerate() {
-            // Repeated roles at different source ranges are different uses.
-            // Suppress only literal duplicate annotations from shared paths.
-            if included.insert((fact.span, fact.constraint, fact.subject)) {
+            // Constraint IDs distinguish solver records, not source facts.
+            // Shared paths may repeat one written fact through several records.
+            if included.insert((fact.span, fact.origin, fact.subject, fact.payload)) {
                 candidates.push(at);
             }
         }
@@ -3115,19 +3312,16 @@ fn attach_ordinary_explanations(
             )),
             _ => None,
         };
-        let opposing_endpoints = exact_row_endpoints.or_else(|| {
-            opposing_roles.and_then(|(first, second)| {
-                let first = candidates
-                    .iter()
-                    .rev()
-                    .copied()
-                    .find(|at| full_facts[*at].payload == first)?;
-                let second = candidates.iter().rev().copied().find(|at| {
-                    full_facts[*at].payload == second
-                        && full_facts[*at].span != full_facts[first].span
-                })?;
-                Some([first, second])
-            })
+        let opposing_endpoints = opposing_roles.and_then(|(first, second)| {
+            let first = candidates
+                .iter()
+                .rev()
+                .copied()
+                .find(|at| full_facts[*at].payload == first)?;
+            let second = candidates.iter().rev().copied().find(|at| {
+                full_facts[*at].payload == second && full_facts[*at].span != full_facts[first].span
+            })?;
+            Some([first, second])
         });
         // Row prose is causal only when independently grounded evidence names
         // both the demand/introduction and the use which limits/forbids it.
@@ -3138,20 +3332,46 @@ fn attach_ordinary_explanations(
         // Keep the two contradiction endpoints and, at most, one useful
         // semantic handoff between them. The complete path above is untouched;
         // this only chooses the ordinary reading of it.
-        let endpoint_family = [
-            (ExplanationFactPayload::SuppliesArgument, Subject::Argument),
-            (ExplanationFactPayload::BranchResult, Subject::MatchArm),
-        ]
-        .into_iter()
-        .find_map(|(payload, subject)| {
-            let matching: Vec<_> = candidates
+        let mut shared_keys: Vec<(PivotKey, Vec<usize>)> = Vec::new();
+        let mut keyed: HashMap<PivotKey, Vec<usize>> = HashMap::new();
+        for at in candidates.iter().copied() {
+            let fact = &full_facts[at];
+            let Some(constraint) = constraints.get(&fact.constraint) else {
+                continue;
+            };
+            let key = pivot_key(
+                fact,
+                constraint,
+                pivot_contexts
+                    .get(&fact.constraint)
+                    .copied()
+                    .unwrap_or_default(),
+                &instance_binders,
+            );
+            keyed.entry(key).or_default().push(at);
+        }
+        shared_keys.extend(
+            keyed
+                .into_iter()
+                .filter(|(_, references)| references.len() >= 2),
+        );
+        shared_keys.sort_by_key(|(key, references)| (key.priority(), key.clone(), references[0]));
+        let endpoint_family = shared_keys.first().map(|(key, matching)| {
+            let preferred: Vec<_> = matching
                 .iter()
                 .copied()
-                .filter(|at| {
-                    full_facts[*at].payload == payload && full_facts[*at].subject == subject
+                .filter(|at| match key {
+                    PivotKey::FunctionInput(_) => full_facts[*at].subject == Subject::Argument,
+                    PivotKey::BranchResult(_) => full_facts[*at].subject == Subject::MatchArm,
+                    _ => true,
                 })
                 .collect();
-            (matching.len() >= 2).then(|| [matching[0], *matching.last().unwrap()])
+            let matching = if preferred.len() >= 2 {
+                &preferred
+            } else {
+                matching
+            };
+            [matching[0], *matching.last().expect("shared pivot key")]
         });
         let endpoints = opposing_endpoints.or(endpoint_family).unwrap_or_else(|| {
             [
@@ -3180,74 +3400,33 @@ fn attach_ordinary_explanations(
         abridged.sort_unstable();
         abridged.dedup();
 
-        let pivot_candidate = [
-            ExplanationPivotKind::WrittenValue,
-            ExplanationPivotKind::FunctionInput,
-            ExplanationPivotKind::BranchResult,
-            ExplanationPivotKind::ProjectedField,
-            ExplanationPivotKind::FunctionEffects,
-            ExplanationPivotKind::Value,
-        ]
-        .into_iter()
-        // A row's already-written label is enough when no more specific shared
-        // concept exists; do not rename the whole contradiction `Value`.
-        .filter(|pivot_kind| {
-            opposing_endpoints.is_none() || *pivot_kind != ExplanationPivotKind::Value
-        })
-        .find_map(|pivot_kind| {
-            let describes_whole_path = abridged.iter().any(|at| {
-                let fact = &full_facts[*at];
-                match pivot_kind {
-                    ExplanationPivotKind::WrittenValue => matches!(
-                        fact.subject,
-                        Subject::Binding | Subject::TopLevelBinding | Subject::LocalBinding
-                    ),
-                    ExplanationPivotKind::ProjectedField => {
-                        fact.origin == ConstraintOrigin::Projection
-                            || matches!(fact.subject, Subject::ProjectionResult)
-                    }
-                    ExplanationPivotKind::FunctionEffects => matches!(
-                        fact.subject,
-                        Subject::PerformedEffects | Subject::AmbientEffects
-                    ),
-                    _ => false,
-                }
-            });
-            let references: Vec<_> = abridged
+        let pivot_candidate = shared_keys.iter().find_map(|(key, all_references)| {
+            if opposing_endpoints.is_some() && matches!(key, PivotKey::Anonymous { .. }) {
+                return None;
+            }
+            let references: Vec<_> = all_references
                 .iter()
                 .copied()
-                .filter(|at| {
-                    let fact = &full_facts[*at];
-                    match pivot_kind {
-                        ExplanationPivotKind::WrittenValue
-                        | ExplanationPivotKind::ProjectedField
-                        | ExplanationPivotKind::FunctionEffects => describes_whole_path,
-                        ExplanationPivotKind::FunctionInput => {
-                            fact.payload == ExplanationFactPayload::SuppliesArgument
-                        }
-                        ExplanationPivotKind::BranchResult => {
-                            fact.payload == ExplanationFactPayload::BranchResult
-                        }
-                        ExplanationPivotKind::Value => true,
-                    }
-                })
+                .filter(|at| abridged.contains(at))
                 .collect();
-            (references.len() >= 2).then_some((pivot_kind, references))
+            (references.len() >= 2).then_some((key.kind(), references))
         });
-        let pivot = pivot_candidate.map(|(kind, references)| ExplanationPivot {
-            name: match kind {
+        let pivot = pivot_candidate.map(|(kind, references)| {
+            let base = match kind {
                 ExplanationPivotKind::FunctionInput => "Input",
                 ExplanationPivotKind::BranchResult => "Result",
                 ExplanationPivotKind::ProjectedField => "Field",
                 ExplanationPivotKind::FunctionEffects => "Effects",
                 ExplanationPivotKind::WrittenValue | ExplanationPivotKind::Value => "Value",
+            };
+            ExplanationPivot {
+                name: explanatory_name(base, &visible_names),
+                kind,
+                introduced_at: references[0],
+                references,
             }
-            .into(),
-            kind,
-            introduced_at: references[0],
-            references,
         });
-        let omitted_facts = full_facts.len().saturating_sub(abridged.len());
+        let omitted_facts = candidates.len().saturating_sub(abridged.len());
         let leaf = match &error.kind {
             ErrorKind::Mismatch { expected, actual } => {
                 smallest_incompatible(aliases, expected, actual)
@@ -3887,6 +4066,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     promises.sort_by(|one, _, other, _| position[one].cmp(&position[other]));
 
     attach_ordinary_explanations(
+        mint,
         &mut errors,
         &constraints,
         &steps,

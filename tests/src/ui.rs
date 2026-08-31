@@ -1063,7 +1063,10 @@ fn pivots_name_repeated_inputs_branches_and_anonymous_shared_values_once() {
     for (source, kind, spelling) in cases {
         let errors = inference_fixture_errors(source);
         let explanation = errors.last().unwrap().explanation.as_ref().unwrap();
-        let pivot = explanation.pivot.as_ref().expect("shared semantic pivot");
+        let pivot = explanation
+            .pivot
+            .as_ref()
+            .unwrap_or_else(|| panic!("shared semantic pivot: {source}\n{explanation:#?}"));
         assert_eq!(pivot.kind, kind);
         assert!(pivot.references.len() >= 2);
         assert!(
@@ -1080,6 +1083,27 @@ fn pivots_name_repeated_inputs_branches_and_anonymous_shared_values_once() {
         assert_eq!(prose.matches("Let’s call").count(), 1, "{prose}");
         assert!(prose.matches(spelling).count() >= 2, "{prose}");
     }
+}
+
+#[test]
+fn pivot_labels_avoid_visible_source_names_without_solver_spelling() {
+    let source = "let Input = fn use => { first: use 1n, second: use false }";
+    let errors = inference_fixture_errors(source);
+    let pivot = errors[0]
+        .explanation
+        .as_ref()
+        .and_then(|explanation| explanation.pivot.as_ref())
+        .expect("the repeated function input is shared");
+    assert_eq!(pivot.kind, inference::ExplanationPivotKind::FunctionInput);
+    assert_eq!(pivot.name, "Input A");
+}
+
+#[test]
+fn unrelated_whole_path_facts_do_not_create_a_false_pivot() {
+    let errors = inference_fixture_errors(include_str!("../diagnostics/inference/non-function.hc"));
+    let explanation = errors[0].explanation.as_ref().unwrap();
+    assert!(explanation.full_facts.len() >= explanation.abridged.len());
+    assert!(explanation.pivot.is_none());
 }
 
 #[test]
@@ -1520,16 +1544,16 @@ fn repeated_effects_keep_full_facts_and_exact_abridged_endpoints() {
                 inference::ExplanationFactPayload::RequiresType,
             ),
             (
-                156..162,
-                inference::ConstraintOrigin::ApplicationArgument,
-                inference::Subject::Argument,
-                inference::ExplanationFactPayload::LabelForbidden,
-            ),
-            (
                 150..162,
                 inference::ConstraintOrigin::ApplicationArgument,
                 inference::Subject::Parameter,
                 inference::ExplanationFactPayload::RequiresType,
+            ),
+            (
+                156..162,
+                inference::ConstraintOrigin::ApplicationArgument,
+                inference::Subject::Argument,
+                inference::ExplanationFactPayload::LabelForbidden,
             ),
             (
                 167..185,
@@ -1545,14 +1569,11 @@ fn repeated_effects_keep_full_facts_and_exact_abridged_endpoints() {
             ),
         ]
     );
-    assert_eq!(explanation.abridged, [2, 5]);
-    let pivot = explanation
-        .pivot
-        .as_ref()
-        .expect("the displayed effect endpoints share function effects");
-    assert_eq!(pivot.kind, inference::ExplanationPivotKind::FunctionEffects);
-    assert_eq!(pivot.name, "Effects");
-    assert_eq!(pivot.references, explanation.abridged);
+    assert_eq!(explanation.abridged, [3, 5]);
+    assert!(
+        explanation.pivot.is_none(),
+        "effect facts from different source families must not share a name"
+    );
 }
 
 #[test]

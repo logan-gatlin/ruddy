@@ -13,7 +13,7 @@ use crate::{
 
 use super::{
     Annotated, Binding, Constraint, ConstraintKind, ConstraintOrigin, ConstraintSubjects, Coverage,
-    DeferredRequirement, ExplainedScheme, GuardedArm, Named, Origin, Subject, Table,
+    DeferredRequirement, ExplainedScheme, GuardedArm, Named, Origin, SemanticPivot, Subject, Table,
     effective_conditions, lower_annotation, same_field_set,
 };
 
@@ -237,6 +237,20 @@ impl Constrain<'_> {
             subjects,
             kind,
         }
+    }
+
+    fn mark_function_input(&mut self, func: &Term) {
+        if let TermKind::Ident(symbol) = &func.kind {
+            self.out
+                .last_mut()
+                .expect("just emitted argument check")
+                .subjects
+                .semantic_pivot = Some(SemanticPivot::FunctionInput(*symbol));
+        }
+    }
+
+    fn mark_branch_result(constraint: &mut Constraint, family: Span) {
+        constraint.subjects.semantic_pivot = Some(SemanticPivot::BranchResult(family));
     }
 
     fn emit(
@@ -496,6 +510,7 @@ impl Constrain<'_> {
                             Some(func.span),
                             Subject::Argument,
                         );
+                        self.mark_function_input(func);
                         // Application is the semantic destruction point of a
                         // packaged result. Open it during generation so its
                         // invocation-fresh guarantee occupies the call's
@@ -554,6 +569,7 @@ impl Constrain<'_> {
                             Some(func.span),
                             Subject::Argument,
                         );
+                        self.mark_function_input(func);
                         (result, does)
                     }
                 };
@@ -798,7 +814,7 @@ impl Constrain<'_> {
                             self.presence_guard = enclosing;
                             let constraints = std::mem::replace(&mut self.out, outer);
                             let requirements = self.defer_requirements(required);
-                            let arm_result = self.constraint(
+                            let mut arm_result = self.constraint(
                                 body.span,
                                 ConstraintOrigin::MatchArm,
                                 ConstraintSubjects::pair(Subject::MatchResult, Subject::MatchArm),
@@ -807,6 +823,7 @@ impl Constrain<'_> {
                                     actual: body.ty.clone(),
                                 },
                             );
+                            Self::mark_branch_result(&mut arm_result, span);
                             guarded.push(GuardedArm {
                                 span: pattern.span.merge(body.span),
                                 raw,
@@ -843,6 +860,10 @@ impl Constrain<'_> {
                                 Subject::MatchResult,
                                 None,
                                 Subject::MatchArm,
+                            );
+                            Self::mark_branch_result(
+                                self.out.last_mut().expect("just emitted branch result"),
+                                span,
                             );
                         }
                     }

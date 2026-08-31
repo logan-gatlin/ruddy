@@ -12,12 +12,11 @@ help: or change the other use so it agrees with the first one
 
 ## recursive-type
 [recursive-type] this value would have to contain or accept itself
-primary: this call requires the value to accept an input
-related: Let’s call this function input `Input` — this call requires the input to accept itself
+primary: Let’s call this function input `Input` — this call requires the input to accept itself
 related: this input is required to be the value itself; this is another requirement on `Input`
 help: change the call so a value is not passed to itself
 help: or change the called value so it accepts a different input
-note: 1 intermediate use is omitted from this short explanation
+note: 2 intermediate uses are omitted from this short explanation
 
 ## missing-field
 [missing-field] no field `y` on `{ x: Nat }`
@@ -26,16 +25,16 @@ help: allow field `y`, or change the use that requires it
 
 ## extra-field-struct
 [extra-field] field `y` is required by one use but excluded by another
-primary: this use limits the type so field `y` is unavailable
-related: this use requires field `y`
+primary: Let’s call this function input `Input` — this use limits the type so field `y` is unavailable
+related: this use requires field `y`; this is another requirement on `Input`
 help: allow field `y` in the limiting use
 help: or change the use that requires field `y`
 note: 1 intermediate use is omitted from this short explanation
 
 ## extra-field-sum
 [extra-field] case `#None` is required by one use but excluded by another
-primary: this use limits the type so case `#None` is unavailable
-related: this use requires case `#None`
+primary: Let’s call this function input `Input` — this use limits the type so case `#None` is unavailable
+related: this use requires case `#None`; this is another requirement on `Input`
 help: allow case `#None` in the limiting use
 help: or change the use that requires case `#None`
 note: 1 intermediate use is omitted from this short explanation
@@ -154,11 +153,11 @@ help: or change the other use so it agrees with the first one
 
 ## cross-definition
 [type-mismatch] a natural number and a struct cannot be the same type
-primary: the annotation fixes the type here
-related: Let’s call this function input `Input` — this call fixes what type the argument must have
+primary: Let’s call this function input `Input` — this call fixes what type the argument must have
 related: this argument supplies a type to the call; this is another requirement on `Input`
 help: change the first use so it agrees with the other one
 help: or change the other use so it agrees with the first one
+note: 1 intermediate use is omitted from this short explanation
 
 ## long-alias
 [type-mismatch] a natural number and a struct cannot be the same type

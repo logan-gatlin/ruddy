@@ -1758,6 +1758,38 @@ fn a_type_error_is_a_diagnostic() {
         "the shared diagnostic prose and debugger account must agree"
     );
 
+    let projection = snapshot("let value = { x: 1n }\nlet bad : Boolean = value.x\n");
+    let projection = projection.diagnostics[0]
+        .inference_explanation
+        .as_ref()
+        .expect("projection keeps its debugger explanation");
+    assert_eq!(
+        projection.pivot.as_ref().map(|pivot| pivot.kind),
+        Some("projected-field")
+    );
+    assert!(
+        projection
+            .pivot
+            .as_ref()
+            .is_some_and(|pivot| pivot.references.len() >= 2)
+    );
+
+    let effects = snapshot(concat!(
+        "effect Log = { write: Nat -> () }\n",
+        "let split : (() -> () + !Log + ..'r) -> (() -> () + ..'r) -> Nat = fn whole => fn rest => 0n\n",
+        "let bad = fn action => split action (fn _ => !Log.write 0n)\n",
+    ));
+    let effects = effects.diagnostics[0]
+        .inference_explanation
+        .as_ref()
+        .expect("effect contradiction keeps its debugger explanation");
+    assert!(effects.pivot.is_none());
+    assert!(effects.full.windows(2).all(|facts| {
+        let [one, two] = facts else { return true };
+        one.span.as_ref().map(|span| (span.file, span.range))
+            <= two.span.as_ref().map(|span| (span.file, span.range))
+    }));
+
     let recursive = snapshot("let bad = fn f => f f\n");
     let explanation = recursive.diagnostics[0]
         .inference_explanation
