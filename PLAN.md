@@ -1,9 +1,8 @@
-# Semantic inference pivot repair plan
+# Caller-choice diagnostic repair plan
 
-- [x] Give generated function-input and branch-result constraints source-semantic identities, and derive field/effect/binder/fallback pivot keys for every displayed fact.
-- [x] Select only keys shared by at least two deduplicated source facts, in input/branch/field/effects/binder/fallback priority order.
-- [x] Sort constraints, facts, endpoints, and post-overlay facts by source visibility, file, span, semantic role, and stable content rather than solver IDs.
-- [x] Count abridgement omissions from deduplicated source candidates.
-- [x] Choose deterministic collision-free explanatory labels from visible symbols without consulting solver identities.
-- [x] Cover false pivots, priority selection, overlay order, omission accounting, label collisions, projection/effect serialization, and stable source ordering regressions.
+- [x] Distinguish closing a caller-chosen effect remainder from restricting it with a specific performed operation.
+- [x] Offer only repairs applicable to the effect-row failure: preserve/remove the remainder for closure, handle/list the operation for restriction.
+- [x] Replace invalid destination-ownership advice for escaping rigids with source-annotation or value-flow repairs.
+- [x] Collapse duplicate escape destination labels into one grounded fact naming the destination binding and source-level inferred type.
+- [x] Add exact closure/restriction, escape-repair validity, and one-label/deep-type regressions and update structured goldens.
 - [x] Run formatting, the full workspace suite, checks, and Clippy; commit without disturbing unrelated changes.

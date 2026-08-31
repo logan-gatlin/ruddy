@@ -46,6 +46,14 @@ related: this use fixes a type that the caller must be free to choose
 help: return or pass through the annotated value instead of replacing its type
 help: or change the annotation to name the concrete type the body uses
 
+## rigid-broken-effect-closure
+[rigid-broken] the body cannot fix a choice that belongs to each caller
+primary: this annotation leaves the choice to each caller
+related: this use fixes a type that the caller must be free to choose
+help: preserve the caller-chosen effect remainder instead of closing it
+help: or remove or change the open effect remainder in the annotation
+note: 1 intermediate use is omitted from this short explanation
+
 ## rigid-field-struct
 [rigid-field] the body cannot assume caller-chosen field `x`
 primary: this annotation leaves the choice to each caller
@@ -71,10 +79,9 @@ help: or list this effect explicitly before the annotation's effect remainder
 ## rigid-escapes
 [rigid-escapes] a caller choice cannot cross into another binding's type
 primary: this annotation leaves the choice to each caller
-related: this binding's type would carry that choice outside its annotation
-related: binding `bad` would publish the choice here
-help: give `bad` an annotation that owns its own caller choices
-help: or keep the value from crossing into this binding
+related: binding `bad` has inferred type `('a -> 'a) -> Nat`, which would carry this choice outside its annotation
+help: change or remove the source annotation so its caller choice does not enter this value
+help: or keep this value from flowing into binding `bad`
 
 ## repeated-field-struct
 [repeated-field] field `x` cannot be both named and included by `..`

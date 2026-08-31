@@ -2767,6 +2767,16 @@ fn mismatch_title(contradiction: &inference::Contradiction) -> String {
     }
 }
 
+fn effect_row_has_specific_operation(ty: &Ty) -> bool {
+    let Ty::Arrow(_, _, effects) = ty else {
+        return false;
+    };
+    effects
+        .labels
+        .values()
+        .any(|field| matches!(field.presence, Presence::Present))
+}
+
 fn causal_diagnostic(
     mut diagnostic: Diagnostic,
     explanation: &inference::InferenceExplanation,
@@ -2875,7 +2885,10 @@ impl inference::Error {
                 }
             }
             E::RigidBroken {
-                declared, sense, ..
+                declared,
+                sense,
+                found,
+                ..
             } => {
                 if let Some(explanation) = &self.explanation {
                     diagnostic = causal_diagnostic(diagnostic, explanation);
@@ -2894,9 +2907,12 @@ impl inference::Error {
                     Sense::Cases => diagnostic
                         .help("preserve the caller-chosen remaining cases instead of closing them")
                         .help("or remove the open remainder from the annotation"),
-                    Sense::Effects => diagnostic
+                    Sense::Effects if effect_row_has_specific_operation(found) => diagnostic
                         .help("handle the performed effect inside the body")
                         .help("or list that effect explicitly in the annotation"),
+                    Sense::Effects => diagnostic
+                        .help("preserve the caller-chosen effect remainder instead of closing it")
+                        .help("or remove or change the open effect remainder in the annotation"),
                     Sense::Presence => diagnostic
                         .help("preserve the annotation's label condition in the body")
                         .help("or change the annotation's `where` condition"),
@@ -2935,12 +2951,19 @@ impl inference::Error {
                 };
             }
             E::RigidEscapes {
+                destination,
                 destination_name,
                 destination_span,
                 ..
             } => {
                 if let Some(explanation) = &self.explanation {
                     diagnostic = causal_diagnostic(diagnostic, explanation);
+                    // The synthetic escape explanation already contributes a
+                    // destination fact. Replace it rather than appending a
+                    // second label for the same binding and span.
+                    diagnostic
+                        .related
+                        .retain(|annotation| annotation.span != *destination_span);
                 } else {
                     diagnostic = diagnostic
                         .label("this type carries a caller choice outside its annotation");
@@ -2948,12 +2971,14 @@ impl inference::Error {
                 diagnostic = diagnostic
                     .related(
                         *destination_span,
-                        format!("binding `{destination_name}` would publish the choice here"),
+                        format!(
+                            "binding `{destination_name}` has inferred type `{destination}`, which would carry this choice outside its annotation"
+                        ),
                     )
+                    .help("change or remove the source annotation so its caller choice does not enter this value")
                     .help(format!(
-                        "give `{destination_name}` an annotation that owns its own caller choices"
-                    ))
-                    .help("or keep the value from crossing into this binding");
+                        "or keep this value from flowing into binding `{destination_name}`"
+                    ));
             }
             E::RepeatedField { shape, field, .. } => {
                 let (noun, field) = about(*shape, field);
@@ -3086,11 +3111,20 @@ impl fmt::Display for inference::ErrorKind {
             // at an arrow nobody wrote.
             inference::ErrorKind::RigidBroken {
                 sense: Sense::Effects,
+                found,
+                name,
+                ..
+            } if effect_row_has_specific_operation(found) => write!(
+                f,
+                "this restricts which effect it may perform, but `'{name}` stands for whatever effects the caller allows",
+            ),
+            inference::ErrorKind::RigidBroken {
+                sense: Sense::Effects,
                 name,
                 ..
             } => write!(
                 f,
-                "this decides what it may perform, but `'{name}` stands for whatever effects the caller allows",
+                "this closes the effects it may perform, but `'{name}` stands for whatever effects the caller allows",
             ),
             inference::ErrorKind::RigidBroken {
                 found,

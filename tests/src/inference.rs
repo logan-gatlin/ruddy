@@ -7384,7 +7384,14 @@ fn a_body_that_closes_a_declared_effect_tail_breaks_it() {
     assert_eq!(error.kind.code(), "rigid-broken");
     assert_eq!(
         error.kind.to_string(),
-        "this decides what it may perform, but `'e` stands for whatever effects the caller allows"
+        "this closes the effects it may perform, but `'e` stands for whatever effects the caller allows"
+    );
+    assert_eq!(
+        error.diagnostic().help,
+        [
+            "preserve the caller-chosen effect remainder instead of closing it",
+            "or remove or change the open effect remainder in the annotation",
+        ]
     );
 }
 
@@ -7851,6 +7858,35 @@ fn caller_choice_escape_names_its_destination_and_deep_type_path() {
     assert_eq!(
         explanation.full_facts[1].payload,
         inference::ExplanationFactPayload::CallerChoiceDestination
+    );
+
+    let diagnostic = escape.diagnostic();
+    assert_eq!(diagnostic.related.len(), 1, "{diagnostic:#?}");
+    assert_eq!(diagnostic.related[0].span, *destination_span);
+    assert!(
+        diagnostic.related[0].message.contains("binding `bad`")
+            && diagnostic.related[0].message.contains("nested")
+            && !diagnostic.related[0].message.contains("TyVar"),
+        "destination fact must name the source binding and surface type: {diagnostic:#?}"
+    );
+    assert!(
+        diagnostic
+            .help
+            .iter()
+            .all(|repair| !repair.contains("give `bad` an annotation")),
+        "an annotation on the destination cannot own the source annotation's choice: {diagnostic:#?}"
+    );
+    assert!(
+        diagnostic
+            .help
+            .iter()
+            .any(|repair| { repair.contains("change or remove the source annotation") })
+    );
+    assert!(
+        diagnostic
+            .help
+            .iter()
+            .any(|repair| repair.contains("flowing into binding `bad`"))
     );
 }
 

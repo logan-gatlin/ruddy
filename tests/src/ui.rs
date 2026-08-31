@@ -1701,6 +1701,10 @@ fn inference_source_corpus_matches_abridged_structured_goldens() {
             include_str!("../diagnostics/inference/rigid-broken.hc"),
         ),
         (
+            "rigid-broken-effect-closure",
+            include_str!("../diagnostics/inference/rigid-broken-effect-closure.hc"),
+        ),
+        (
             "rigid-field-struct",
             include_str!("../diagnostics/inference/rigid-field-struct.hc"),
         ),
@@ -3166,18 +3170,71 @@ fn the_variable_complaints_read_as_what_went_wrong() {
         .to_string(),
         "this is `Nat`, but `'a` stands for whatever type the caller picks"
     );
-    // The effect reading quotes no arrow: the rows differ only in their
-    // tails, and the reader's fix is at the expression, not a type nobody
-    // wrote.
-    assert_eq!(
-        TypeError::RigidBroken {
-            found: Rc::new(Ty::plain(Ty::Nat)),
+    // Closing an open effect remainder is distinct from restricting it with a
+    // performed operation, because the two mistakes have different repairs.
+    let closed_effects = Rc::new(Ty::plain(Ty::Arrow(
+        Rc::new(Ty::unit()),
+        Rc::new(Ty::unit()),
+        Row::closed(),
+    )));
+    let closure = inference::Error {
+        id: inference::ErrorId::synthetic(0),
+        cause: inference::ErrorCause::Direct,
+        span,
+        kind: TypeError::RigidBroken {
+            found: closed_effects,
             name: "e".into(),
             sense: Sense::Effects,
             declared: span,
-        }
-        .to_string(),
-        "this decides what it may perform, but `'e` stands for whatever effects the caller allows"
+        },
+        explanation: None,
+    };
+    assert_eq!(
+        closure.kind.to_string(),
+        "this closes the effects it may perform, but `'e` stands for whatever effects the caller allows"
+    );
+    assert_eq!(
+        closure.diagnostic().help,
+        [
+            "preserve the caller-chosen effect remainder instead of closing it",
+            "or remove or change the open effect remainder in the annotation",
+        ]
+    );
+
+    let mut performed_row = Row::closed();
+    performed_row.labels.insert(
+        "Log".into(),
+        RowField {
+            presence: Presence::Present,
+            ty: Rc::new(Ty::unit()),
+        },
+    );
+    let restriction = inference::Error {
+        id: inference::ErrorId::synthetic(1),
+        cause: inference::ErrorCause::Direct,
+        span,
+        kind: TypeError::RigidBroken {
+            found: Rc::new(Ty::plain(Ty::Arrow(
+                Rc::new(Ty::unit()),
+                Rc::new(Ty::unit()),
+                performed_row,
+            ))),
+            name: "e".into(),
+            sense: Sense::Effects,
+            declared: span,
+        },
+        explanation: None,
+    };
+    assert_eq!(
+        restriction.kind.to_string(),
+        "this restricts which effect it may perform, but `'e` stands for whatever effects the caller allows"
+    );
+    assert_eq!(
+        restriction.diagnostic().help,
+        [
+            "handle the performed effect inside the body",
+            "or list that effect explicitly in the annotation",
+        ]
     );
     assert_eq!(
         TypeError::RigidField {
