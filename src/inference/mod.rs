@@ -1169,16 +1169,19 @@ impl EffectProvenance {
         &self,
         path: &[EffectPathStep],
         meter: &mut ProvenanceMeter,
-    ) -> Result<Option<Self>, ()> {
+    ) -> Result<Option<Self>, Self> {
+        // Missing structure and a bounded traversal cutoff have different
+        // meanings. A genuinely missing route contributes nothing; a cutoff
+        // conservatively contributes this node's cached declaration summary.
         if path.len() > Self::PATH_BUDGET || !meter.spend(1) {
-            return Err(());
+            return Err(self.exact_summary());
         }
         let mut work: Vec<_> = path.iter().enumerate().rev().collect();
         let mut selected = self;
         while let Some((at, step)) = work.pop() {
             // One path step and one traversed edge (including a missing edge).
             if !meter.spend(2) {
-                return Err(());
+                return Err(selected.exact_summary());
             }
             let known = match step {
                 EffectPathStep::CallResult => selected.result.as_ref(),
@@ -1187,7 +1190,7 @@ impl EffectProvenance {
             if let Some(known) = known {
                 selected = known;
                 if !meter.spend(1) {
-                    return Err(());
+                    return Err(selected.exact_summary());
                 } // selected node
                 continue;
             }
@@ -1196,7 +1199,7 @@ impl EffectProvenance {
             };
             let tail = &path[at..];
             if parameter.path.len() + tail.len() > Self::PATH_BUDGET || !meter.spend(tail.len()) {
-                return Err(());
+                return Err(selected.exact_summary());
             }
             parameter.path.extend_from_slice(tail);
             return Ok(Some(Self::node(EffectProvenanceNode {
@@ -1211,7 +1214,10 @@ impl EffectProvenance {
         let mut meter = ProvenanceMeter {
             left: Self::NODE_BUDGET,
         };
-        self.select_metered(path, &mut meter).ok().flatten()
+        match self.select_metered(path, &mut meter) {
+            Ok(selected) => selected,
+            Err(summary) => Some(summary),
+        }
     }
 
     fn projected(&self, field: String) -> Option<Self> {
@@ -1228,9 +1234,30 @@ impl EffectProvenance {
         self.substitute_bounded(symbol, value, &mut memo, &mut budget)
     }
 
-    fn exhausted(&self, symbol: Symbol) -> Self {
-        let callable = self
-            .exact_origins
+    fn exact_summary(&self) -> Self {
+        Self::node_summarized(EffectProvenanceNode {
+            callable: self
+                .exact_origins
+                .iter()
+                .cloned()
+                .map(EffectSource::Origin)
+                .collect(),
+            exact_origins: self.exact_origins.clone(),
+            ..Default::default()
+        })
+    }
+
+    fn exhausted_with(&self, symbol: Symbol, extra: &[EffectOrigin]) -> Self {
+        let mut exact_origins = self.exact_origins.clone();
+        for origin in extra {
+            if exact_origins.len() == Self::SUMMARY_BUDGET {
+                break;
+            }
+            if !exact_origins.contains(origin) {
+                exact_origins.push(origin.clone());
+            }
+        }
+        let callable = exact_origins
             .iter()
             .cloned()
             .map(EffectSource::Origin)
@@ -1241,9 +1268,13 @@ impl EffectProvenance {
             // substitute. An unresolved projection is omission, not stale data.
             value_parameter: self.value_parameter.clone().filter(|p| p.symbol != symbol),
             argument: self.argument,
-            exact_origins: self.exact_origins.clone(),
+            exact_origins,
             ..Default::default()
         })
+    }
+
+    fn exhausted(&self, symbol: Symbol) -> Self {
+        self.exhausted_with(symbol, &[])
     }
 
     fn substitute_bounded(
@@ -1323,11 +1354,11 @@ impl EffectProvenance {
                     if let Some(parameter) = &original.value_parameter
                         && parameter.symbol == symbol
                     {
-                        let selected = original
-                            .value_parameter
-                            .as_ref()
-                            .and_then(|p| value.select_metered(&p.path, &mut meter).ok().flatten())
-                            .unwrap_or_default();
+                        let selected = match value.select_metered(&parameter.path, &mut meter) {
+                            Ok(Some(selected)) => selected,
+                            Ok(None) => Self::default(),
+                            Err(summary) => summary,
+                        };
                         memo.insert(key, selected);
                         continue;
                     }
@@ -1417,45 +1448,108 @@ impl EffectProvenance {
                             }
                         }
                         Stage::Callable(at) => {
-                            if let Some(source) = frame.original.callable.get(at).cloned() {
+                            if let Some(source) = frame.original.callable.get(at) {
                                 if !meter.spend(1) {
                                     true
                                 } else {
-                                    let mut replacements = Vec::new();
+                                    let mut ok = true;
                                     match source {
                                         EffectSource::Parameter { symbol: p, path }
-                                            if p == symbol =>
+                                            if *p == symbol =>
                                         {
-                                            if let Ok(Some(replacement)) =
-                                                value.select_metered(&path, &mut meter)
-                                            {
-                                                replacements
-                                                    .extend(replacement.callable.iter().cloned());
-                                                if let Some(p) = &replacement.value_parameter {
-                                                    replacements.push(EffectSource::Parameter {
-                                                        symbol: p.symbol,
-                                                        path: p.path.clone(),
-                                                    });
+                                            let replacement =
+                                                match value.select_metered(path, &mut meter) {
+                                                    Ok(Some(replacement)) => Some(replacement),
+                                                    Ok(None) => None,
+                                                    Err(summary) => Some(summary),
+                                                };
+                                            if let Some(replacement) = replacement {
+                                                // Preserve the bounded endpoint cache before
+                                                // walking entries. If admission exhausts midway,
+                                                // the fallback still names declarations introduced
+                                                // by this substitution.
+                                                ok = add_exact(
+                                                    &mut frame,
+                                                    &replacement.exact_origins,
+                                                    &mut meter,
+                                                );
+                                                if ok {
+                                                    // Do not collect or clone the replacement list:
+                                                    // every entry is metered before it is admitted.
+                                                    for replacement_source in &replacement.callable
+                                                    {
+                                                        let entry_work = match replacement_source {
+                                                            EffectSource::Origin(_) => 1,
+                                                            EffectSource::Parameter {
+                                                                path,
+                                                                ..
+                                                            } => path.len() + 1,
+                                                        };
+                                                        if entry_work > Self::PATH_BUDGET + 1
+                                                            || !meter.spend(entry_work)
+                                                            || !add_unique(
+                                                                &mut frame.callable,
+                                                                replacement_source.clone(),
+                                                                &mut meter,
+                                                            )
+                                                        {
+                                                            ok = false;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                if ok
+                                                    && let Some(parameter) =
+                                                        &replacement.value_parameter
+                                                    && (parameter.path.len() > Self::PATH_BUDGET
+                                                        || !meter.spend(parameter.path.len() + 1)
+                                                        || !add_unique(
+                                                            &mut frame.callable,
+                                                            EffectSource::Parameter {
+                                                                symbol: parameter.symbol,
+                                                                path: parameter.path.clone(),
+                                                            },
+                                                            &mut meter,
+                                                        ))
+                                                {
+                                                    ok = false;
                                                 }
                                             }
                                         }
-                                        source => replacements.push(source),
-                                    }
-                                    let mut ok = true;
-                                    for source in replacements {
-                                        if !add_unique(
-                                            &mut frame.callable,
-                                            source.clone(),
-                                            &mut meter,
-                                        ) {
-                                            ok = false;
-                                            break;
-                                        }
-                                        if let EffectSource::Origin(origin) = source
-                                            && !add_exact(&mut frame, &[origin], &mut meter)
-                                        {
-                                            ok = false;
-                                            break;
+                                        source => {
+                                            let path_work = match source {
+                                                EffectSource::Origin(_) => 1,
+                                                EffectSource::Parameter { path, .. } => {
+                                                    path.len() + 1
+                                                }
+                                            };
+                                            if path_work > Self::PATH_BUDGET + 1
+                                                || !meter.spend(path_work)
+                                            {
+                                                ok = false;
+                                            } else {
+                                                // Clone only this admitted entry, after charging
+                                                // for its path-sized allocation.
+                                                let source = source.clone();
+                                                if let EffectSource::Origin(origin) = &source
+                                                    && !add_exact(
+                                                        &mut frame,
+                                                        std::slice::from_ref(origin),
+                                                        &mut meter,
+                                                    )
+                                                {
+                                                    ok = false;
+                                                }
+                                                if ok
+                                                    && !add_unique(
+                                                        &mut frame.callable,
+                                                        source,
+                                                        &mut meter,
+                                                    )
+                                                {
+                                                    ok = false;
+                                                }
+                                            }
                                         }
                                     }
                                     if !ok {
@@ -1486,7 +1580,7 @@ impl EffectProvenance {
                         }
                     };
                     if failed {
-                        memo.insert(key, frame.original.exhausted(symbol));
+                        memo.insert(key, frame.original.exhausted_with(symbol, &frame.exact));
                     }
                 }
             }
@@ -1642,6 +1736,79 @@ mod effect_provenance_tests {
             wide.substitute_bounded(target, &EffectProvenance::default(), &mut memo, &mut budget);
         assert_eq!(budget, 0);
         assert!(unique_nodes(&rewritten) <= EffectProvenance::NODE_BUDGET);
+    }
+
+    #[test]
+    fn huge_callable_replacement_is_admitted_with_bounded_work_and_allocation() {
+        let bundle = Bundle::new("huge-callable", Version::new(0, 0, 0)).unwrap();
+        let mut mint = Mint::new(bundle);
+        let target = symbol(&mut mint, "target");
+        let effect = symbol(&mut mint, "Log");
+        let origin = EffectOrigin {
+            symbol: effect,
+            interface: crate::types::EffectId::structural("Log".into(), "test".into()),
+            declaration_span: Span::generated(7, 9),
+        };
+        // Construct directly: function() deliberately deduplicates its normal,
+        // source-sized input, while this test models an adversarial replacement.
+        let replacement = EffectProvenance::node(EffectProvenanceNode {
+            callable: vec![EffectSource::Origin(origin.clone()); 100_000],
+            ..Default::default()
+        });
+        let source = EffectProvenance::function(
+            vec![EffectSource::Parameter {
+                symbol: target,
+                path: Vec::new(),
+            }],
+            target,
+            EffectProvenance::default(),
+        );
+        let mut memo = HashMap::new();
+        let mut budget = EffectProvenance::NODE_BUDGET;
+        let rewritten = source.substitute_bounded(target, &replacement, &mut memo, &mut budget);
+        assert_eq!(budget, 0, "the traversal must stop at its work budget");
+        assert_eq!(rewritten.callable, [EffectSource::Origin(origin)]);
+        assert!(
+            rewritten.callable.capacity() <= EffectProvenance::SUMMARY_BUDGET,
+            "fallback allocation is bounded rather than sized to the replacement"
+        );
+    }
+
+    #[test]
+    fn selection_exhaustion_retains_exact_origin_but_missing_path_does_not() {
+        let bundle = Bundle::new("selection-exhaustion", Version::new(0, 0, 0)).unwrap();
+        let mut mint = Mint::new(bundle);
+        let target = symbol(&mut mint, "target");
+        let effect = symbol(&mut mint, "Log");
+        let origin = EffectOrigin {
+            symbol: effect,
+            interface: crate::types::EffectId::structural("Log".into(), "test".into()),
+            declaration_span: Span::generated(11, 13),
+        };
+        let replacement = EffectProvenance::origin(origin.clone());
+        let too_long = vec![EffectPathStep::CallResult; EffectProvenance::PATH_BUDGET + 1];
+
+        let mut meter = ProvenanceMeter { left: usize::MAX };
+        let Err(summary) = replacement.select_metered(&too_long, &mut meter) else {
+            panic!("PATH_BUDGET exhaustion must be distinct from a missing path");
+        };
+        assert_eq!(summary.callable, [EffectSource::Origin(origin.clone())]);
+        let mut meter = ProvenanceMeter { left: usize::MAX };
+        assert!(matches!(
+            replacement.select_metered(&[EffectPathStep::CallResult], &mut meter),
+            Ok(None)
+        ));
+
+        let source = EffectProvenance::function(
+            vec![EffectSource::Parameter {
+                symbol: target,
+                path: too_long,
+            }],
+            target,
+            EffectProvenance::default(),
+        );
+        let rewritten = source.substitute(target, &replacement);
+        assert_eq!(rewritten.callable, [EffectSource::Origin(origin)]);
     }
 
     #[test]

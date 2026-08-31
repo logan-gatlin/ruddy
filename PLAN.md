@@ -50,3 +50,10 @@
 - [x] Cache bounded exact-origin summaries for deterministic exhaustion fallback and remove unresolved sources naming the substituted parameter.
 - [x] Destroy unique provenance chains iteratively and cover >4096-depth small-stack, wide/edge-heavy exhaustion, retained deep origins, and stale-parameter removal.
 - [x] Run formatting, the full workspace suite, workspace checks, and Clippy.
+
+## Effect-provenance callable-admission hardening
+
+- [x] Stream replacement callable entries through work and path budgets instead of cloning an unmetered intermediate list.
+- [x] Distinguish a genuinely missing selection from bounded traversal exhaustion and retain cached exact declaration endpoints on cutoff.
+- [x] Cover a 100,000-entry callable replacement and PATH_BUDGET selection exhaustion with bounded allocation and exact-origin retention.
+- [x] Run formatting, the full workspace suite, workspace checks, and Clippy.
