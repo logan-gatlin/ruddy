@@ -2666,6 +2666,47 @@ fn explanation_fact(
     }
 }
 
+fn displayed_explanation_fact(
+    fact: &inference::ExplanationFact,
+    at: usize,
+    explanation: &inference::InferenceExplanation,
+) -> String {
+    let message = explanation_fact(fact, &explanation.contradiction);
+    let Some(pivot) = explanation
+        .pivot
+        .as_ref()
+        .filter(|pivot| pivot.references.contains(&at))
+    else {
+        return message;
+    };
+    if at == pivot.introduced_at {
+        let description = match pivot.kind {
+            inference::ExplanationPivotKind::WrittenValue => "written value",
+            inference::ExplanationPivotKind::FunctionInput => "function input",
+            inference::ExplanationPivotKind::BranchResult => "branch result",
+            inference::ExplanationPivotKind::ProjectedField => "projected field",
+            inference::ExplanationPivotKind::FunctionEffects => "function effects",
+            inference::ExplanationPivotKind::Value => "shared value",
+        };
+        format!("Let’s call this {description} `{}` — {message}", pivot.name)
+    } else {
+        format!("{message}; this is another requirement on `{}`", pivot.name)
+    }
+}
+
+fn add_abridgement_note(
+    diagnostic: Diagnostic,
+    explanation: &inference::InferenceExplanation,
+) -> Diagnostic {
+    match explanation.omitted_facts {
+        0 => diagnostic,
+        1 => diagnostic.note("1 intermediate use is omitted from this short explanation"),
+        count => diagnostic.note(format!(
+            "{count} intermediate uses are omitted from this short explanation"
+        )),
+    }
+}
+
 fn mismatch_title(contradiction: &inference::Contradiction) -> String {
     use inference::ContradictionKind as K;
     let left = type_description(contradiction.left);
@@ -2709,20 +2750,19 @@ fn causal_diagnostic(
     let mut selected = explanation
         .abridged
         .iter()
-        .filter_map(|at| explanation.full_facts.get(*at));
-    if let Some(primary) = selected.next() {
+        .copied()
+        .filter_map(|at| explanation.full_facts.get(at).map(|fact| (at, fact)));
+    if let Some((at, primary)) = selected.next() {
         diagnostic.primary.span = primary.span;
-        diagnostic.primary.message = explanation_fact(primary, &explanation.contradiction);
+        diagnostic.primary.message = displayed_explanation_fact(primary, at, explanation);
     } else {
         diagnostic.primary.message = "these uses contribute conflicting requirements".into();
     }
-    for fact in selected {
-        diagnostic = diagnostic.related(
-            fact.span,
-            explanation_fact(fact, &explanation.contradiction),
-        );
+    for (at, fact) in selected {
+        diagnostic =
+            diagnostic.related(fact.span, displayed_explanation_fact(fact, at, explanation));
     }
-    diagnostic
+    add_abridgement_note(diagnostic, explanation)
 }
 
 impl inference::Error {
@@ -2752,22 +2792,21 @@ impl inference::Error {
                     let mut selected = explanation
                         .abridged
                         .iter()
-                        .filter_map(|at| explanation.full_facts.get(*at));
-                    if let Some(primary) = selected.next() {
+                        .copied()
+                        .filter_map(|at| explanation.full_facts.get(at).map(|fact| (at, fact)));
+                    if let Some((at, primary)) = selected.next() {
                         diagnostic.primary.span = primary.span;
                         diagnostic.primary.message =
-                            explanation_fact(primary, &explanation.contradiction);
+                            displayed_explanation_fact(primary, at, explanation);
                     } else {
                         diagnostic.primary.message =
                             "these uses contribute incompatible type requirements".into();
                     }
-                    for fact in selected {
-                        diagnostic = diagnostic.related(
-                            fact.span,
-                            explanation_fact(fact, &explanation.contradiction),
-                        );
+                    for (at, fact) in selected {
+                        diagnostic = diagnostic
+                            .related(fact.span, displayed_explanation_fact(fact, at, explanation));
                     }
-                    diagnostic = diagnostic
+                    diagnostic = add_abridgement_note(diagnostic, explanation)
                         .help("change the first use so it agrees with the other one")
                         .help("or change the other use so it agrees with the first one");
                 } else {

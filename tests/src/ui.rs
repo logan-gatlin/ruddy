@@ -1037,6 +1037,101 @@ fn ordinary_mismatch_explanations_keep_full_and_abridged_causal_evidence() {
 }
 
 #[test]
+fn pivots_name_repeated_inputs_branches_and_anonymous_shared_values_once() {
+    let cases = [
+        (
+            include_str!("../diagnostics/inference/repeated-calls.hc"),
+            inference::ExplanationPivotKind::FunctionInput,
+            "`Input`",
+        ),
+        (
+            include_str!("../diagnostics/inference/branches.hc"),
+            inference::ExplanationPivotKind::BranchResult,
+            "`Result`",
+        ),
+        (
+            "let value = { x: 1n }\nlet bad : Boolean = value.x",
+            inference::ExplanationPivotKind::ProjectedField,
+            "`Field`",
+        ),
+        (
+            "let bad : Nat = false",
+            inference::ExplanationPivotKind::Value,
+            "`Value`",
+        ),
+    ];
+    for (source, kind, spelling) in cases {
+        let errors = inference_fixture_errors(source);
+        let explanation = errors.last().unwrap().explanation.as_ref().unwrap();
+        let pivot = explanation.pivot.as_ref().expect("shared semantic pivot");
+        assert_eq!(pivot.kind, kind);
+        assert!(pivot.references.len() >= 2);
+        assert!(
+            pivot
+                .references
+                .iter()
+                .all(|at| explanation.abridged.contains(at))
+        );
+        let diagnostic = errors.last().unwrap().diagnostic();
+        let prose = std::iter::once(diagnostic.primary.message.as_str())
+            .chain(diagnostic.related.iter().map(|note| note.message.as_str()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(prose.matches("Let’s call").count(), 1, "{prose}");
+        assert!(prose.matches(spelling).count() >= 2, "{prose}");
+    }
+}
+
+#[test]
+fn a_failure_without_two_grounded_facts_has_no_pivot() {
+    let errors = inference_fixture_errors(include_str!("../diagnostics/inference/non-function.hc"));
+    let explanation = errors[0].explanation.as_ref().unwrap();
+    assert_eq!(explanation.abridged.len(), 1);
+    assert!(explanation.pivot.is_none());
+    assert!(
+        !errors[0]
+            .diagnostic()
+            .primary
+            .message
+            .contains("Let’s call")
+    );
+}
+
+#[test]
+fn abridgement_is_source_ordered_counts_omissions_and_ignores_noise() {
+    fn account(source: &str) -> (Vec<String>, usize, Option<String>) {
+        let errors = inference_fixture_errors(source);
+        let explanation = errors.last().unwrap().explanation.as_ref().unwrap();
+        assert!(
+            explanation
+                .abridged
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+        );
+        assert_eq!(
+            explanation.omitted_facts,
+            explanation.full_facts.len() - explanation.abridged.len()
+        );
+        (
+            explanation
+                .abridged
+                .iter()
+                .map(|at| {
+                    let span = explanation.full_facts[*at].span;
+                    source[span.start..span.end()].to_string()
+                })
+                .collect(),
+            explanation.omitted_facts,
+            explanation.pivot.as_ref().map(|pivot| pivot.name.clone()),
+        )
+    }
+    let base = "let repeated = fn use => { first: use 1n, second: use false }";
+    let noisy = "let noise = fn unrelated => unrelated\nlet repeated = fn use => { first: use 1n, second: use false }";
+    assert_eq!(account(base), account(noisy));
+    assert!(account(base).1 > 0);
+}
+
+#[test]
 fn recursive_types_have_grounded_structured_cycle_explanations() {
     let cases = [
         // Direct self-application.
@@ -1353,7 +1448,7 @@ fn repeated_labels_keep_the_full_intermediate_path_and_exact_endpoints() {
                 && fact.payload == inference::ExplanationFactPayload::LabelForbidden
         })
         .expect("exact forbidden endpoint");
-    assert_eq!(explanation.abridged, [introduced, forbidden]);
+    assert_eq!(explanation.abridged, [forbidden, introduced]);
 }
 
 #[test]
@@ -1451,6 +1546,13 @@ fn repeated_effects_keep_full_facts_and_exact_abridged_endpoints() {
         ]
     );
     assert_eq!(explanation.abridged, [2, 5]);
+    let pivot = explanation
+        .pivot
+        .as_ref()
+        .expect("the displayed effect endpoints share function effects");
+    assert_eq!(pivot.kind, inference::ExplanationPivotKind::FunctionEffects);
+    assert_eq!(pivot.name, "Effects");
+    assert_eq!(pivot.references, explanation.abridged);
 }
 
 #[test]

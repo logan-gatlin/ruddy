@@ -5,19 +5,19 @@ help: change this value to a struct, or change/remove the field access
 
 ## type-mismatch
 [type-mismatch] a natural number and a struct cannot be the same type
-primary: this expression supplies its type here
-related: the annotation fixes the type here
+primary: Let’s call this shared value `Value` — the annotation fixes the type here
+related: this expression supplies its type here; this is another requirement on `Value`
 help: change the first use so it agrees with the other one
 help: or change the other use so it agrees with the first one
 
 ## recursive-type
 [recursive-type] this value would have to contain or accept itself
-primary: this input is required to be the value itself
-related: this call requires the value to accept an input
-related: this call requires the value to accept an input
-related: this call requires the input to accept itself
+primary: this call requires the value to accept an input
+related: Let’s call this function input `Input` — this call requires the input to accept itself
+related: this input is required to be the value itself; this is another requirement on `Input`
 help: change the call so a value is not passed to itself
 help: or change the called value so it accepts a different input
+note: 1 intermediate use is omitted from this short explanation
 
 ## missing-field
 [missing-field] no field `y` on `{ x: Nat }`
@@ -26,17 +26,19 @@ help: allow field `y`, or change the use that requires it
 
 ## extra-field-struct
 [extra-field] field `y` is required by one use but excluded by another
-primary: this use requires field `y`
-related: this use limits the type so field `y` is unavailable
+primary: this use limits the type so field `y` is unavailable
+related: this use requires field `y`
 help: allow field `y` in the limiting use
 help: or change the use that requires field `y`
+note: 1 intermediate use is omitted from this short explanation
 
 ## extra-field-sum
 [extra-field] case `#None` is required by one use but excluded by another
-primary: this use requires case `#None`
-related: this use limits the type so case `#None` is unavailable
+primary: this use limits the type so case `#None` is unavailable
+related: this use requires case `#None`
 help: allow case `#None` in the limiting use
 help: or change the use that requires case `#None`
+note: 1 intermediate use is omitted from this short explanation
 
 ## rigid-broken
 [rigid-broken] this is `{ value: Nat }`, but `'a` stands for whatever type the caller picks
@@ -69,17 +71,19 @@ help: keep the value inside the annotation that introduces this choice
 
 ## repeated-field-struct
 [repeated-field] field `x` cannot be both named and included by `..`
-primary: this use introduces field `x`
-related: this `..` remainder already follows named field `x`
+primary: this `..` remainder already follows named field `x`
+related: this use introduces field `x`
 help: remove field `x` from the named side
 help: or keep it out of the `..` remainder
+note: 3 intermediate uses are omitted from this short explanation
 
 ## repeated-field-sum
 [repeated-field] case `#A` cannot be both named and included by `..`
-primary: this use introduces case `#A`
-related: this `..` remainder already follows named case `#A`
+primary: this `..` remainder already follows named case `#A`
+related: this use introduces case `#A`
 help: remove case `#A` from the named side
 help: or keep it out of the `..` remainder
+note: 3 intermediate uses are omitted from this short explanation
 
 ## repeated-field-effect
 [repeated-field] `..` covers only the effects a type does not already name, and here it would have to cover `!Log`
@@ -128,17 +132,17 @@ help: use a fixed type here, or keep the generic value behind a Ruddy wrapper
 
 ## repeated-calls
 [type-mismatch] a natural number and a boolean cannot be the same type
-primary: this argument supplies a type to the call
-related: this call fixes what type the argument must have
-related: this argument supplies a type to the call
-related: this expression is called as a function
+primary: Let’s call this function input `Input` — this argument supplies a type to the call
+related: this call fixes what type the argument must have; this is another requirement on `Input`
+related: this argument supplies a type to the call; this is another requirement on `Input`
 help: change the first use so it agrees with the other one
 help: or change the other use so it agrees with the first one
+note: 2 intermediate uses are omitted from this short explanation
 
 ## branches
 [type-mismatch] a natural number and a struct cannot be the same type
-primary: this branch contributes its type to the match result
-related: this branch contributes its type to the match result
+primary: Let’s call this branch result `Result` — this branch contributes its type to the match result
+related: this branch contributes its type to the match result; this is another requirement on `Result`
 help: change the first use so it agrees with the other one
 help: or change the other use so it agrees with the first one
 
@@ -150,15 +154,15 @@ help: or change the other use so it agrees with the first one
 
 ## cross-definition
 [type-mismatch] a natural number and a struct cannot be the same type
-primary: this argument supplies a type to the call
-related: the annotation fixes the type here
-related: this call fixes what type the argument must have
+primary: the annotation fixes the type here
+related: Let’s call this function input `Input` — this call fixes what type the argument must have
+related: this argument supplies a type to the call; this is another requirement on `Input`
 help: change the first use so it agrees with the other one
 help: or change the other use so it agrees with the first one
 
 ## long-alias
 [type-mismatch] a natural number and a struct cannot be the same type
-primary: this expression supplies its type here
-related: the annotation fixes the type here
+primary: Let’s call this shared value `Value` — the annotation fixes the type here
+related: this expression supplies its type here; this is another requirement on `Value`
 help: change the first use so it agrees with the other one
 help: or change the other use so it agrees with the first one

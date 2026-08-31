@@ -714,6 +714,23 @@ fn wire_explanation(
     crate::wire::InferenceExplanation {
         abridged,
         full,
+        pivot: explanation
+            .pivot
+            .as_ref()
+            .map(|pivot| crate::wire::ExplanationPivot {
+                name: pivot.name.clone(),
+                kind: match pivot.kind {
+                    inference::ExplanationPivotKind::WrittenValue => "written-value",
+                    inference::ExplanationPivotKind::FunctionInput => "function-input",
+                    inference::ExplanationPivotKind::BranchResult => "branch-result",
+                    inference::ExplanationPivotKind::ProjectedField => "projected-field",
+                    inference::ExplanationPivotKind::FunctionEffects => "function-effects",
+                    inference::ExplanationPivotKind::Value => "value",
+                },
+                references: pivot.references.clone(),
+                introduced_at: pivot.introduced_at,
+            }),
+        omitted_facts: explanation.omitted_facts,
         contradiction: crate::wire::ExplanationContradiction {
             kind: match contradiction.kind {
                 inference::ContradictionKind::IncompatibleTypes => "incompatible-types",

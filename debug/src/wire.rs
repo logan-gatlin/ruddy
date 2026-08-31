@@ -286,8 +286,19 @@ pub enum InferenceCause {
 pub struct InferenceExplanation {
     pub abridged: Vec<ExplanationFact>,
     pub full: Vec<ExplanationFact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pivot: Option<ExplanationPivot>,
+    pub omitted_facts: usize,
     pub contradiction: ExplanationContradiction,
     pub cause: ExplanationCause,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExplanationPivot {
+    pub name: String,
+    pub kind: &'static str,
+    pub references: Vec<usize>,
+    pub introduced_at: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]

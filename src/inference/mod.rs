@@ -979,8 +979,13 @@ pub struct Error {
 pub struct InferenceExplanation {
     /// Complete source facts in deterministic causal order.
     pub full_facts: Vec<ExplanationFact>,
-    /// Indices into `full_facts` selected for the ordinary 2–4 fact view.
+    /// Indices into `full_facts` selected for the ordinary source-ordered view.
     pub abridged: Vec<usize>,
+    /// The one source-facing name, if any, which ties displayed facts together.
+    /// It is presentation metadata, never a solver-variable name.
+    pub pivot: Option<ExplanationPivot>,
+    /// Grounded facts retained by the full path but left out of `abridged`.
+    pub omitted_facts: usize,
     pub contradiction: Contradiction,
     /// Both the source constraint slice and the unabridged raw reason slice.
     pub cause: ExplanationCause,
@@ -993,6 +998,27 @@ pub struct ExplanationFact {
     pub origin: ConstraintOrigin,
     pub subject: Subject,
     pub payload: ExplanationFactPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplanationPivot {
+    /// Explanatory spelling chosen without exposing or consulting solver IDs.
+    pub name: String,
+    pub kind: ExplanationPivotKind,
+    /// Displayed facts which refer to this pivot, as indices into `full_facts`.
+    pub references: Vec<usize>,
+    /// The one fact whose label introduces the spelling.
+    pub introduced_at: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExplanationPivotKind {
+    WrittenValue,
+    FunctionInput,
+    BranchResult,
+    ProjectedField,
+    FunctionEffects,
+    Value,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -3109,23 +3135,119 @@ fn attach_ordinary_explanations(
             continue;
         }
 
-        // Row contradictions have two complete source-facing facts. Keep those
-        // exact endpoints in the ordinary view regardless of how many neutral
-        // intermediate facts the full slice retains.
-        let mut abridged: Vec<_> = if let Some(endpoints) = opposing_endpoints {
-            endpoints.into()
-        } else {
-            let mut nearby: Vec<_> = candidates.iter().take(4).copied().collect();
-            if candidates.len() > 4 {
-                nearby[3] = *candidates.last().unwrap();
-            }
-            nearby
-        };
+        // Keep the two contradiction endpoints and, at most, one useful
+        // semantic handoff between them. The complete path above is untouched;
+        // this only chooses the ordinary reading of it.
+        let endpoint_family = [
+            (ExplanationFactPayload::SuppliesArgument, Subject::Argument),
+            (ExplanationFactPayload::BranchResult, Subject::MatchArm),
+        ]
+        .into_iter()
+        .find_map(|(payload, subject)| {
+            let matching: Vec<_> = candidates
+                .iter()
+                .copied()
+                .filter(|at| {
+                    full_facts[*at].payload == payload && full_facts[*at].subject == subject
+                })
+                .collect();
+            (matching.len() >= 2).then(|| [matching[0], *matching.last().unwrap()])
+        });
+        let endpoints = opposing_endpoints.or(endpoint_family).unwrap_or_else(|| {
+            [
+                candidates[0],
+                *candidates.last().expect("nonempty candidates"),
+            ]
+        });
+        let mut abridged = vec![endpoints[0], endpoints[1]];
+        let lo = endpoints[0].min(endpoints[1]);
+        let hi = endpoints[0].max(endpoints[1]);
+        if opposing_endpoints.is_none()
+            && let Some(handoff) = candidates.iter().copied().find(|at| {
+                lo < *at
+                    && *at < hi
+                    && matches!(
+                        full_facts[*at].subject,
+                        Subject::Parameter
+                            | Subject::MatchResult
+                            | Subject::ProjectionResult
+                            | Subject::AmbientEffects
+                    )
+            })
+        {
+            abridged.push(handoff);
+        }
         abridged.sort_unstable();
         abridged.dedup();
-        // Keep the failed source endpoint primary; the other genuinely written
-        // causes remain related labels even when their reasons precede it.
-        abridged.sort_by_key(|at| full_facts[*at].span != error.span);
+
+        let pivot_candidate = [
+            ExplanationPivotKind::WrittenValue,
+            ExplanationPivotKind::FunctionInput,
+            ExplanationPivotKind::BranchResult,
+            ExplanationPivotKind::ProjectedField,
+            ExplanationPivotKind::FunctionEffects,
+            ExplanationPivotKind::Value,
+        ]
+        .into_iter()
+        // A row's already-written label is enough when no more specific shared
+        // concept exists; do not rename the whole contradiction `Value`.
+        .filter(|pivot_kind| {
+            opposing_endpoints.is_none() || *pivot_kind != ExplanationPivotKind::Value
+        })
+        .find_map(|pivot_kind| {
+            let describes_whole_path = abridged.iter().any(|at| {
+                let fact = &full_facts[*at];
+                match pivot_kind {
+                    ExplanationPivotKind::WrittenValue => matches!(
+                        fact.subject,
+                        Subject::Binding | Subject::TopLevelBinding | Subject::LocalBinding
+                    ),
+                    ExplanationPivotKind::ProjectedField => {
+                        fact.origin == ConstraintOrigin::Projection
+                            || matches!(fact.subject, Subject::ProjectionResult)
+                    }
+                    ExplanationPivotKind::FunctionEffects => matches!(
+                        fact.subject,
+                        Subject::PerformedEffects | Subject::AmbientEffects
+                    ),
+                    _ => false,
+                }
+            });
+            let references: Vec<_> = abridged
+                .iter()
+                .copied()
+                .filter(|at| {
+                    let fact = &full_facts[*at];
+                    match pivot_kind {
+                        ExplanationPivotKind::WrittenValue
+                        | ExplanationPivotKind::ProjectedField
+                        | ExplanationPivotKind::FunctionEffects => describes_whole_path,
+                        ExplanationPivotKind::FunctionInput => {
+                            fact.payload == ExplanationFactPayload::SuppliesArgument
+                        }
+                        ExplanationPivotKind::BranchResult => {
+                            fact.payload == ExplanationFactPayload::BranchResult
+                        }
+                        ExplanationPivotKind::Value => true,
+                    }
+                })
+                .collect();
+            (references.len() >= 2).then_some((pivot_kind, references))
+        });
+        let pivot = pivot_candidate.map(|(kind, references)| ExplanationPivot {
+            name: match kind {
+                ExplanationPivotKind::FunctionInput => "Input",
+                ExplanationPivotKind::BranchResult => "Result",
+                ExplanationPivotKind::ProjectedField => "Field",
+                ExplanationPivotKind::FunctionEffects => "Effects",
+                ExplanationPivotKind::WrittenValue | ExplanationPivotKind::Value => "Value",
+            }
+            .into(),
+            kind,
+            introduced_at: references[0],
+            references,
+        });
+        let omitted_facts = full_facts.len().saturating_sub(abridged.len());
         let leaf = match &error.kind {
             ErrorKind::Mismatch { expected, actual } => {
                 smallest_incompatible(aliases, expected, actual)
@@ -3155,6 +3277,8 @@ fn attach_ordinary_explanations(
         error.explanation = Some(InferenceExplanation {
             full_facts,
             abridged,
+            pivot,
+            omitted_facts,
             contradiction: Contradiction {
                 kind: kind.unwrap_or(if value_used_as_function {
                     ContradictionKind::ValueUsedAsFunction

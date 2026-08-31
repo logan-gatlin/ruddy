@@ -1734,6 +1734,30 @@ fn a_type_error_is_a_diagnostic() {
     );
     assert!(explanation.abridged.iter().all(|fact| fact.span.is_some()));
 
+    let calls = snapshot("let repeated = fn use => { first: use 1n, second: use false }\n");
+    let diagnostic = &calls.diagnostics[0];
+    let explanation = diagnostic
+        .inference_explanation
+        .as_ref()
+        .expect("repeated calls keep the shared debugger explanation");
+    let pivot = explanation.pivot.as_ref().expect("named shared input");
+    assert_eq!(pivot.kind, "function-input");
+    assert_eq!(pivot.name, "Input");
+    assert_eq!(
+        explanation.omitted_facts,
+        explanation.full.len() - explanation.abridged.len()
+    );
+    assert_eq!(diagnostic.label.matches("Let’s call").count(), 1);
+    assert_eq!(
+        diagnostic
+            .notes
+            .iter()
+            .filter(|note| note.contains("omitted"))
+            .count(),
+        usize::from(explanation.omitted_facts > 0),
+        "the shared diagnostic prose and debugger account must agree"
+    );
+
     let recursive = snapshot("let bad = fn f => f f\n");
     let explanation = recursive.diagnostics[0]
         .inference_explanation

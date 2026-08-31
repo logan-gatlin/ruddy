@@ -2441,7 +2441,7 @@ fn compiler_diagnostics_treat_spans_as_byte_offsets() {
     .unwrap();
 
     let compiler = error(&directory);
-    assert!(compiler.contains("main.hc:2:17"), "{compiler}");
+    assert!(compiler.contains("main.hc:2:11"), "{compiler}");
     assert!(compiler.contains("2 │let bad : Nat = false"), "{compiler}");
 }
 
