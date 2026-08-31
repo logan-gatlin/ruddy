@@ -992,13 +992,19 @@ pub struct EffectOrigin {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EffectSource {
     Origin(EffectOrigin),
-    Parameter(Symbol),
+    Parameter { symbol: Symbol, fields: Vec<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EffectParameter {
+    symbol: Symbol,
+    fields: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EffectProvenance {
     callable: Vec<EffectSource>,
-    value_parameter: Option<Symbol>,
+    value_parameter: Option<EffectParameter>,
     argument: Option<Symbol>,
     result: Option<Box<EffectProvenance>>,
     fields: IndexMap<String, EffectProvenance>,
@@ -1007,22 +1013,64 @@ pub struct EffectProvenance {
 impl EffectProvenance {
     fn parameter(symbol: Symbol) -> Self {
         Self {
-            value_parameter: Some(symbol),
+            value_parameter: Some(EffectParameter {
+                symbol,
+                fields: Vec::new(),
+            }),
             ..Self::default()
         }
     }
 
+    fn select(&self, fields: &[String]) -> Option<Self> {
+        let mut selected = self;
+        for (at, field) in fields.iter().enumerate() {
+            if let Some(known) = selected.fields.get(field) {
+                selected = known;
+                continue;
+            }
+            let mut parameter = selected.value_parameter.clone()?;
+            parameter.fields.extend_from_slice(&fields[at..]);
+            return Some(Self {
+                value_parameter: Some(parameter),
+                ..Self::default()
+            });
+        }
+        Some(selected.clone())
+    }
+
+    fn projected(&self, field: String) -> Option<Self> {
+        self.select(&[field])
+    }
+
     fn substitute(&self, symbol: Symbol, value: &Self) -> Self {
-        if self.value_parameter == Some(symbol) {
-            return value.clone();
+        if let Some(parameter) = &self.value_parameter
+            && parameter.symbol == symbol
+        {
+            return value.select(&parameter.fields).unwrap_or_default();
         }
         let mut out = self.clone();
         let mut callable = Vec::new();
         for source in &out.callable {
-            if *source == EffectSource::Parameter(symbol) {
-                for replacement in &value.callable {
-                    if !callable.contains(replacement) {
-                        callable.push(replacement.clone());
+            if let EffectSource::Parameter {
+                symbol: parameter,
+                fields,
+            } = source
+                && *parameter == symbol
+            {
+                if let Some(replacement) = value.select(fields) {
+                    for replacement in &replacement.callable {
+                        if !callable.contains(replacement) {
+                            callable.push(replacement.clone());
+                        }
+                    }
+                    if let Some(parameter) = &replacement.value_parameter {
+                        let replacement = EffectSource::Parameter {
+                            symbol: parameter.symbol,
+                            fields: parameter.fields.clone(),
+                        };
+                        if !callable.contains(&replacement) {
+                            callable.push(replacement);
+                        }
                     }
                 }
             } else if !callable.contains(source) {
@@ -1038,30 +1086,6 @@ impl EffectProvenance {
             *field = field.substitute(symbol, value);
         }
         out
-    }
-}
-
-fn collect_effect_sources(constraints: &[Constraint], sources: &mut Vec<EffectSource>) {
-    for constraint in constraints {
-        match &constraint.kind {
-            ConstraintKind::Performs { effect_origins, .. } => {
-                for source in effect_origins {
-                    if !sources.contains(source) {
-                        sources.push(source.clone());
-                    }
-                }
-            }
-            ConstraintKind::Let { value, body, .. } => {
-                collect_effect_sources(value, sources);
-                collect_effect_sources(body, sources);
-            }
-            ConstraintKind::Match { arms, .. } => {
-                for arm in arms {
-                    collect_effect_sources(&arm.constraints, sources);
-                }
-            }
-            _ => {}
-        }
     }
 }
 
@@ -4154,6 +4178,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 term_effect_provenance: HashMap::new(),
                 local_effect_provenance: HashMap::new(),
                 binding_effect_provenance: HashMap::new(),
+                callable_effect_scopes: Vec::new(),
                 // A definition's value is computed where no handler can reach
                 // it, so it is walked at the empty closed row and outside every
                 // function — which is what makes performing an effect at the

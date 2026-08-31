@@ -22,3 +22,10 @@
 - [x] Substitute higher-order parameter flow and preserve callback origins through call results, storage, and projection.
 - [x] Cover bare aliases, projected/stored callbacks, forwarding, and coalesced qualified same-leaf declarations.
 - [x] Run formatting, the full workspace suite, workspace checks, and Clippy.
+
+## Scope- and path-aware effect provenance follow-up
+
+- [x] Represent projected parameter provenance as a symbolic field path and resolve it against the exact argument value during application.
+- [x] Collect performed sources per callable walk so nested closure bodies do not leak into an enclosing callable unless invoked there.
+- [x] Cover projected higher-order parameters, returned versus invoked callbacks, coalesced declarations, annotations, and local/generalized flow.
+- [x] Run formatting, the full workspace suite, workspace checks, and Clippy.

@@ -63,6 +63,10 @@ pub struct Constrain<'a> {
     pub local_effect_provenance: HashMap<Symbol, super::EffectProvenance>,
     /// Parameter placeholders used to preserve higher-order value flow.
     pub binding_effect_provenance: HashMap<Symbol, super::EffectProvenance>,
+    /// Exact sources performed by each callable body currently being walked.
+    /// A nested closure gets its own entry, so merely constructing or returning
+    /// that closure cannot make the enclosing callable appear to invoke it.
+    pub callable_effect_scopes: Vec<Vec<super::EffectSource>>,
     /// The effects the place being walked allows, and whether a `fn` encloses
     /// it.
     ///
@@ -529,10 +533,20 @@ impl Constrain<'_> {
                     Some(symbol) => func_provenance.substitute(symbol, &arg_provenance),
                     None => func_provenance,
                 };
-                let effect_origins = match resolved_func.value_parameter {
-                    Some(symbol) => vec![super::EffectSource::Parameter(symbol)],
+                let effect_origins = match &resolved_func.value_parameter {
+                    Some(parameter) => vec![super::EffectSource::Parameter {
+                        symbol: parameter.symbol,
+                        fields: parameter.fields.clone(),
+                    }],
                     None => resolved_func.callable.clone(),
                 };
+                if let Some(scope) = self.callable_effect_scopes.last_mut() {
+                    for source in &effect_origins {
+                        if !scope.contains(source) {
+                            scope.push(source.clone());
+                        }
+                    }
+                }
                 if let Some(result) = resolved_func.result {
                     self.term_effect_provenance.insert(span, *result);
                 }
@@ -655,7 +669,7 @@ impl Constrain<'_> {
                 self.env.insert(arg.tracked, Binding::Mono(param.clone()));
                 self.binding_effect_provenance
                     .insert(arg.tracked, super::EffectProvenance::parameter(arg.tracked));
-                let constraints_start = self.out.len();
+                self.callable_effect_scopes.push(Vec::new());
                 let outer = self.enter(Ambient {
                     row: does.clone(),
                     inside: true,
@@ -671,8 +685,10 @@ impl Constrain<'_> {
                 self.infer_term(body);
                 self.answer = held;
                 self.leave(outer);
-                let mut callable = Vec::new();
-                super::collect_effect_sources(&self.out[constraints_start..], &mut callable);
+                let callable = self
+                    .callable_effect_scopes
+                    .pop()
+                    .expect("function effect scope");
                 let result = self
                     .term_effect_provenance
                     .get(&body.span)
@@ -814,8 +830,7 @@ impl Constrain<'_> {
                 if let Some(provenance) = self
                     .term_effect_provenance
                     .get(&base.span)
-                    .and_then(|provenance| provenance.fields.get(&field.tracked))
-                    .cloned()
+                    .and_then(|provenance| provenance.projected(field.tracked.clone()))
                 {
                     self.term_effect_provenance.insert(span, provenance);
                 }
@@ -1430,7 +1445,7 @@ impl Constrain<'_> {
                 self.env.insert(arg.tracked, Binding::Mono(from));
                 self.binding_effect_provenance
                     .insert(arg.tracked, super::EffectProvenance::parameter(arg.tracked));
-                let constraints_start = self.out.len();
+                self.callable_effect_scopes.push(Vec::new());
                 let outer = self.enter(Ambient {
                     row: does,
                     inside: true,
@@ -1441,8 +1456,10 @@ impl Constrain<'_> {
                 self.check_term(body, &to, expected_subject, expected_span);
                 self.answer = held;
                 self.leave(outer);
-                let mut callable = Vec::new();
-                super::collect_effect_sources(&self.out[constraints_start..], &mut callable);
+                let callable = self
+                    .callable_effect_scopes
+                    .pop()
+                    .expect("checked function effect scope");
                 let result = self
                     .term_effect_provenance
                     .get(&body.span)

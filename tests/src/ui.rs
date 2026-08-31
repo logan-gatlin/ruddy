@@ -1744,6 +1744,12 @@ fn bare_operation_values_keep_exact_origins_through_value_flow() {
         "let forward = fn callback => callback\nlet write = forward C::!Log.write\nlet bad = write 0n\n",
         "let invoke = fn callback => callback 0n\nlet bad = invoke C::!Log.write\n",
         "let store = fn callback => { run: callback }\nlet bad = (store C::!Log.write).run 0n\n",
+        "let invoke = fn holder => holder.run 0n\nlet bad = invoke { run: C::!Log.write }\n",
+        "let invoke = fn holder => holder.run 0n\nlet forward = fn holder => invoke holder\nlet bad = forward { run: C::!Log.write }\n",
+        "let invoke : { run: Nat -> () + C::!Log } -> () + C::!Log = fn holder => holder.run 0n\nlet bad = invoke { run: C::!Log.write }\n",
+        "let bad = let invoke = fn holder => holder.run 0n in invoke { run: C::!Log.write }\n",
+        "let bad = let invoke : { run: Nat -> () + C::!Log } -> () + C::!Log = fn holder => holder.run 0n in invoke { run: C::!Log.write }\n",
+        "let return = fn holder => fn _ => holder.run 0n\nlet callback = return { run: C::!Log.write }\nlet bad = callback ()\n",
     ] {
         let source = format!(
             "module A = effect Log = {{ write: Nat -> () }} end\nmodule C = effect Log = {{ write: Nat -> () }} end\n{tail}"
@@ -1766,6 +1772,18 @@ fn bare_operation_values_keep_exact_origins_through_value_flow() {
             "value flow must retain C::!Log rather than coalesced A::!Log: {tail}"
         );
     }
+}
+
+#[test]
+fn returning_an_effectful_callback_does_not_perform_its_body() {
+    let source = "module A = effect Log = { write: Nat -> () } end\nmodule C = effect Log = { write: Nat -> () } end\nlet return = fn holder => fn _ => holder.run 0n\nlet callback = return { run: C::!Log.write }\n";
+    let errors = inference_fixture_errors(source);
+    assert!(
+        !errors
+            .iter()
+            .any(|error| matches!(error.kind, inference::ErrorKind::Unhandled { .. })),
+        "constructing and returning the callback must not invoke it: {errors:#?}"
+    );
 }
 
 #[test]
