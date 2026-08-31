@@ -449,8 +449,16 @@ impl Solve<'_> {
                             callback_path: boundary.callback_path.clone(),
                             callback_type: boundary.callback_type.clone(),
                             extern_name: boundary.extern_name.clone(),
+                            issues: vec![super::ExternCallbackIssue {
+                                callback_span: boundary.callback_span,
+                                callback_path: boundary.callback_path.clone(),
+                                callback_type: boundary.callback_type.clone(),
+                                missing_effects: missing_effects.clone(),
+                                extern_effects: super::listed_effects(available),
+                                condition: boundary.condition.to_string(),
+                            }],
                         };
-                        error.explanation = Some(super::direct_extern_explanation(
+                        let mut explanation = super::direct_extern_explanation(
                             error.id,
                             vec![
                                 (
@@ -479,7 +487,19 @@ impl Solve<'_> {
                                     shape: Shape::Effect,
                                     label: effect.clone(),
                                 }),
-                        ));
+                        );
+                        if let Some(constraint) = self.constraint {
+                            for fact in &mut explanation.full_facts {
+                                fact.direct = false;
+                                fact.constraint = constraint;
+                            }
+                            explanation.cause.constraints = vec![constraint];
+                            explanation.cause.seed = self.constraint_reason;
+                            if let Some(reason) = self.constraint_reason {
+                                explanation.cause.reasons = vec![reason];
+                            }
+                        }
+                        error.explanation = Some(explanation);
                         let ErrorCause::Step(step_id) = error.cause else {
                             continue;
                         };

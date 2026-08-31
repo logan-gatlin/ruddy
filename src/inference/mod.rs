@@ -989,6 +989,9 @@ pub struct CallbackBoundary {
     pub callback_span: Span,
     pub callback_path: String,
     pub callback_type: String,
+    /// Exact implication required by this callback row, retained even when a
+    /// label's presence remains symbolic.
+    pub condition: Formula,
     pub extern_name: String,
     pub extern_span: Span,
     pub capability_span: Span,
@@ -1905,6 +1908,8 @@ pub struct InferenceExplanation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExplanationFact {
     pub span: Span,
+    /// True for source facts established by a direct boundary check.
+    pub direct: bool,
     pub constraint: ConstraintId,
     pub origin: ConstraintOrigin,
     pub subject: Subject,
@@ -2265,6 +2270,9 @@ pub enum ErrorKind {
         callback_path: String,
         callback_type: String,
         extern_name: String,
+        /// Every offending callback path in this declaration. The scalar
+        /// fields above retain the first issue for compatibility and prose.
+        issues: Vec<ExternCallbackIssue>,
     },
     /// An ordinary foreign boundary leaf has no fixed runtime representation:
     /// an annotation variable there could instantiate to a Ruddy closure.
@@ -2273,6 +2281,11 @@ pub enum ErrorKind {
         variable_kind: ExternVariableKind,
         position: String,
         extern_name: String,
+        /// All representation-varying leaves in source/path order.
+        leaves: Vec<PolymorphicExternLeaf>,
+        /// Callback evidence is retained even when a polymorphic leaf is the
+        /// declaration's primary existing diagnostic kind.
+        callback_issues: Vec<ExternCallbackIssue>,
     },
 }
 
@@ -2858,11 +2871,72 @@ fn expose_packages(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Rc<Ty> {
 /// in particular, an instantiation to an arrow would otherwise send a Ruddy
 /// evidence-taking closure directly to the host.
 #[derive(Debug, Clone)]
-struct PolymorphicExternLeaf {
-    span: Span,
-    variable: String,
-    kind: ExternVariableKind,
-    position: String,
+pub struct PolymorphicExternLeaf {
+    pub span: Span,
+    pub variable: String,
+    pub kind: ExternVariableKind,
+    pub position: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExternCallbackIssue {
+    pub callback_span: Span,
+    pub callback_path: String,
+    pub callback_type: String,
+    pub missing_effects: Vec<String>,
+    pub extern_effects: Vec<String>,
+    /// Source-level symbolic implication which the extern declaration fails
+    /// to guarantee for this exact callback/path.
+    pub condition: String,
+}
+
+#[derive(Clone, Copy)]
+struct ExternPath(usize);
+
+struct ExternPathNode {
+    parent: Option<usize>,
+    segment: String,
+}
+
+fn root_path(paths: &mut Vec<ExternPathNode>) -> ExternPath {
+    paths.push(ExternPathNode {
+        parent: None,
+        segment: "extern".into(),
+    });
+    ExternPath(0)
+}
+
+fn child_path(
+    paths: &mut Vec<ExternPathNode>,
+    parent: ExternPath,
+    segment: impl Into<String>,
+) -> ExternPath {
+    let at = paths.len();
+    paths.push(ExternPathNode {
+        parent: Some(parent.0),
+        segment: segment.into(),
+    });
+    ExternPath(at)
+}
+
+fn render_path(paths: &[ExternPathNode], path: ExternPath) -> String {
+    let mut parts = Vec::new();
+    let mut cursor = Some(path.0);
+    while let Some(at) = cursor {
+        parts.push(paths[at].segment.as_str());
+        cursor = paths[at].parent;
+    }
+    parts.reverse();
+    parts.join(" ")
+}
+
+fn render_child_path(
+    paths: &mut Vec<ExternPathNode>,
+    parent: ExternPath,
+    segment: impl Into<String>,
+) -> String {
+    let child = child_path(paths, parent, segment);
+    render_path(paths, child)
 }
 
 fn first_written_variable(ty: &ir::Type) -> Option<(Span, String)> {
@@ -2897,88 +2971,190 @@ fn polymorphic_extern_boundary(
     aliases: &IndexMap<Symbol, Scheme>,
     abi: &ir::ExternType,
     ty: &Rc<Ty>,
-) -> Option<PolymorphicExternLeaf> {
-    fn boundary(
-        aliases: &IndexMap<Symbol, Scheme>,
-        abi: &ir::ExternType,
-        ty: &Rc<Ty>,
-        path: &str,
-        seen: &mut Vec<(*const ir::ExternType, Rc<Ty>)>,
-    ) -> Option<PolymorphicExternLeaf> {
-        let state = abi as *const ir::ExternType;
-        if seen.iter().any(|(prior_state, prior_ty)| {
-            *prior_state == state && same_finite_syntax(prior_ty, ty)
-        }) {
-            return None;
+) -> Vec<PolymorphicExternLeaf> {
+    // This is intentionally an explicit work list. Extern annotations are user
+    // input and generated annotations can contain tens of thousands of nested
+    // arrows; diagnostics must not consume the Rust call stack.
+    let mut found = Vec::new();
+    let mut paths = Vec::new();
+    let root = root_path(&mut paths);
+    let mut work = vec![(abi, ty.clone(), root)];
+    let mut seen: HashSet<(*const ir::ExternType, *const Ty)> = HashSet::new();
+    while let Some((abi, ty, path)) = work.pop() {
+        if !seen.insert((abi as *const ir::ExternType, Rc::as_ptr(&ty))) {
+            continue;
         }
-        seen.push((state, ty.clone()));
         match &abi.tracked {
-            ir::ExternTypeKind::Group(inner) => boundary(aliases, inner, ty, path, seen),
+            ir::ExternTypeKind::Group(inner) => work.push((inner, ty, path)),
             ir::ExternTypeKind::Function {
                 parameters, result, ..
             } => {
-                let mut cursor = ty.clone();
+                let mut cursor = ty;
+                let mut children = Vec::new();
                 for (at, parameter) in parameters.iter().enumerate() {
                     let exposed = expose_packages(aliases, &cursor);
                     let Ty::Arrow(from, to, _) = &*exposed else {
-                        return None;
+                        break;
                     };
-                    let child = format!("{path} parameter {}", at + 1);
-                    if let Some(found) = boundary(aliases, parameter, from, &child, seen) {
-                        return Some(found);
-                    }
+                    children.push((
+                        parameter,
+                        from.clone(),
+                        child_path(&mut paths, path, format!("parameter {}", at + 1)),
+                    ));
                     cursor = to.clone();
                 }
                 if parameters.is_empty() {
                     let exposed = expose_packages(aliases, &cursor);
-                    let Ty::Arrow(_, to, _) = &*exposed else {
-                        return None;
-                    };
-                    cursor = to.clone();
+                    if let Ty::Arrow(_, to, _) = &*exposed {
+                        cursor = to.clone();
+                    }
                 }
-                boundary(aliases, result, &cursor, &format!("{path} result"), seen)
+                work.push((result, cursor, child_path(&mut paths, path, "result")));
+                work.extend(children.into_iter().rev());
             }
-            ir::ExternTypeKind::Ordinary(written) => match &*expose_packages(aliases, ty) {
-                Ty::Package(_) => unreachable!("package exposure reaches a fixed point"),
-                Ty::Bound(_) | Ty::Var(_) | Ty::Rigid { .. } => {
-                    let (span, variable) = first_written_variable(written)
-                        .unwrap_or((abi.span, "generic type".into()));
-                    Some(PolymorphicExternLeaf {
-                        span,
-                        variable,
-                        kind: ExternVariableKind::Type,
-                        position: path.into(),
-                    })
+            ir::ExternTypeKind::Ordinary(written) => {
+                let unfolded = unfold(aliases, &ty);
+                // Existential packages fix the host-facing container shape;
+                // their sealed presence choices are intentionally not ordinary
+                // polymorphic boundary leaves.
+                if matches!(&*unfolded, Ty::Package(_)) {
+                    continue;
                 }
-                Ty::Arrow(from, to, row) => {
-                    if matches!(row.rest, Rest::Bound(_) | Rest::Var(_) | Rest::Rigid { .. }) {
+                let exposed = expose_packages(aliases, &unfolded);
+                match &*exposed {
+                    Ty::Bound(_) | Ty::Var(_) | Ty::Rigid { .. } => {
                         let (span, variable) = first_written_variable(written)
-                            .unwrap_or((abi.span, "generic row".into()));
-                        return Some(PolymorphicExternLeaf {
+                            .unwrap_or((abi.span, "generic type".into()));
+                        found.push(PolymorphicExternLeaf {
                             span,
                             variable,
-                            kind: ExternVariableKind::Row,
-                            position: format!("{path} callback effects"),
+                            kind: ExternVariableKind::Type,
+                            position: render_path(&paths, path),
                         });
                     }
-                    boundary(aliases, abi, from, &format!("{path} callback input"), seen).or_else(
-                        || boundary(aliases, abi, to, &format!("{path} callback result"), seen),
-                    )
+                    Ty::Arrow(from, to, row) => {
+                        if matches!(row.rest, Rest::Bound(_) | Rest::Var(_) | Rest::Rigid { .. })
+                            && let Some((span, variable)) = written_arrow_tail(written)
+                        {
+                            found.push(PolymorphicExternLeaf {
+                                span,
+                                variable,
+                                kind: ExternVariableKind::Row,
+                                position: render_child_path(&mut paths, path, "callback effects"),
+                            });
+                        }
+                        work.push((
+                            abi,
+                            to.clone(),
+                            child_path(&mut paths, path, "callback result"),
+                        ));
+                        work.push((
+                            abi,
+                            from.clone(),
+                            child_path(&mut paths, path, "callback input"),
+                        ));
+                    }
+                    Ty::Struct(row) | Ty::Sum(row) => {
+                        if matches!(row.rest, Rest::Bound(_) | Rest::Var(_) | Rest::Rigid { .. })
+                            && let Some((span, variable)) = written_row_tail(written)
+                        {
+                            found.push(PolymorphicExternLeaf {
+                                span,
+                                variable,
+                                kind: ExternVariableKind::Row,
+                                position: render_child_path(&mut paths, path, "row tail"),
+                            });
+                        }
+                        for (label, field) in &row.labels {
+                            if matches!(field.presence, Presence::Bound(_) | Presence::Var(_))
+                                && let Some((span, variable)) = written_presence(written, label)
+                            {
+                                found.push(PolymorphicExternLeaf {
+                                    span,
+                                    variable,
+                                    kind: ExternVariableKind::Presence,
+                                    position: render_child_path(
+                                        &mut paths,
+                                        path,
+                                        format!("`{label}` presence"),
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                    _ => {}
                 }
-                Ty::Nat
-                | Ty::Int
-                | Ty::Real
-                | Ty::String
-                | Ty::Boolean
-                | Ty::Struct(_)
-                | Ty::Sum(_)
-                | Ty::Undecided
-                | Ty::Named { .. } => None,
-            },
+            }
         }
     }
+    found
+}
 
-    boundary(aliases, abi, ty, "extern", &mut Vec::new())
+fn written_arrow_tail(ty: &ir::Type) -> Option<(Span, String)> {
+    let mut work = vec![ty];
+    while let Some(ty) = work.pop() {
+        match &ty.tracked {
+            ir::TypeKind::Arrow { from, to, effects } => {
+                if let Some(tail) = &effects.tail {
+                    let name = match &tail.of {
+                        ir::Row::Named(name) => format!("'{name}"),
+                        _ => "generic row".into(),
+                    };
+                    return Some((tail.span, name));
+                }
+                work.push(to);
+                work.push(from);
+            }
+            ir::TypeKind::Apply { args, .. } => work.extend(args.iter().rev()),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn written_row_tail(ty: &ir::Type) -> Option<(Span, String)> {
+    let tail = match &ty.tracked {
+        ir::TypeKind::Struct { tail, .. } | ir::TypeKind::Sum { tail, .. } => tail.as_ref()?,
+        _ => return None,
+    };
+    let name = match &tail.of {
+        ir::Row::Named(name) => format!("'{name}"),
+        _ => "generic row".into(),
+    };
+    Some((tail.span, name))
+}
+
+fn written_presence(ty: &ir::Type, label: &str) -> Option<(Span, String)> {
+    let when = match &ty.tracked {
+        ir::TypeKind::Arrow { effects, .. } => {
+            effects.effects.values().find_map(|effect| match effect {
+                ir::EffectLabel::Written {
+                    when: Some(when), ..
+                } => Some(when.as_ref()),
+                _ => None,
+            })
+        }
+        ir::TypeKind::Struct { fields, .. } => fields.get(label).and_then(|field| match field {
+            ir::TypeField::Written {
+                when: Some(when), ..
+            } => Some(when.as_ref()),
+            _ => None,
+        }),
+        ir::TypeKind::Sum { cases, .. } => cases.get(label).and_then(|case| match case {
+            ir::SumCase::Written {
+                when: Some(when), ..
+            } => Some(when.as_ref()),
+            _ => None,
+        }),
+        _ => None,
+    }?;
+    Some((
+        when.span,
+        when.name
+            .as_ref()
+            .map(|name| format!("'{name}"))
+            .unwrap_or_else(|| "conditional presence".into()),
+    ))
 }
 
 /// Build callback evidence obligations from the resolved semantic type. The
@@ -3040,127 +3216,136 @@ fn callback_coverage_constraints(
         aliases: &IndexMap<Symbol, Scheme>,
         callback: &Rc<Ty>,
         available: &Row,
-        boundary: CallbackBoundary,
+        mut boundary: CallbackBoundary,
         out: &mut Vec<Constraint>,
     ) {
-        out.extend(
-            callback_rows(aliases, callback)
-                .into_iter()
-                .map(|required| Constraint {
-                    id: ConstraintId::pending(),
-                    reason: ReasonId::pending(),
-                    span: boundary.callback_span,
-                    origin: ConstraintOrigin::CallbackBoundary,
-                    subjects: ConstraintSubjects::pair(
-                        Subject::CallbackRequired,
-                        Subject::CallbackAvailable,
-                    ),
-                    kind: ConstraintKind::CallbackCoverage {
-                        required,
-                        available: available.clone(),
-                        boundary: boundary.clone(),
-                    },
-                }),
-        );
+        for required in callback_rows(aliases, callback) {
+            boundary.condition = callback_condition(&required, available);
+            out.push(Constraint {
+                id: ConstraintId::pending(),
+                reason: ReasonId::pending(),
+                span: boundary.callback_span,
+                origin: ConstraintOrigin::CallbackBoundary,
+                subjects: ConstraintSubjects::pair(
+                    Subject::CallbackRequired,
+                    Subject::CallbackAvailable,
+                ),
+                kind: ConstraintKind::CallbackCoverage {
+                    required,
+                    available: available.clone(),
+                    boundary: boundary.clone(),
+                },
+            });
+        }
+    }
+
+    fn callback_condition(required: &Row, available: &Row) -> Formula {
+        Formula::all(required.labels.iter().filter_map(|(name, required)| {
+            let required = presence_formula(&required.presence)?;
+            let available = match available.labels.get(name) {
+                Some(field) => presence_formula(&field.presence)?,
+                None if matches!(
+                    available.rest,
+                    Rest::Closed | Rest::Bound(_) | Rest::Rigid { .. }
+                ) =>
+                {
+                    Formula::False
+                }
+                None => return None,
+            };
+            Some(required.not().or(available))
+        }))
     }
 
     fn boundary(
         aliases: &IndexMap<Symbol, Scheme>,
-        abi: &ir::ExternType,
-        ty: &Rc<Ty>,
-        path: &str,
+        root_abi: &ir::ExternType,
+        root_ty: &Rc<Ty>,
+        _root_path: &str,
         context: ExternContext<'_>,
         out: &mut Vec<Constraint>,
-        seen: &mut Vec<(*const ir::ExternType, Rc<Ty>)>,
     ) {
-        let state = abi as *const ir::ExternType;
-        if seen.iter().any(|(prior_state, prior_ty)| {
-            *prior_state == state && same_finite_syntax(prior_ty, ty)
-        }) {
-            return;
-        }
-        seen.push((state, ty.clone()));
-        match &abi.tracked {
-            ir::ExternTypeKind::Group(inner) => {
-                boundary(aliases, inner, ty, path, context, out, seen)
+        let mut paths = Vec::new();
+        let root = root_path(&mut paths);
+        let mut work = vec![(root_abi, root_ty.clone(), root)];
+        let mut seen: HashSet<(*const ir::ExternType, *const Ty)> = HashSet::new();
+        while let Some((abi, ty, path)) = work.pop() {
+            if !seen.insert((abi as *const ir::ExternType, Rc::as_ptr(&ty))) {
+                continue;
             }
-            ir::ExternTypeKind::Function {
-                parameters, result, ..
-            } => {
-                let mut cursor = ty.clone();
-                let mut inputs = Vec::new();
-                let mut available = Row::closed();
-                for _ in 0..parameters.len().max(1) {
-                    let exposed = expose(aliases, &cursor);
-                    let Ty::Arrow(from, to, row) = &*exposed else {
-                        return;
-                    };
-                    if !parameters.is_empty() {
-                        inputs.push(from.clone());
+            match &abi.tracked {
+                ir::ExternTypeKind::Group(inner) => work.push((inner, ty, path)),
+                ir::ExternTypeKind::Function {
+                    parameters, result, ..
+                } => {
+                    let mut cursor = ty;
+                    let mut inputs = Vec::new();
+                    let mut available = Row::closed();
+                    for _ in 0..parameters.len().max(1) {
+                        let exposed = expose(aliases, &cursor);
+                        let Ty::Arrow(from, to, row) = &*exposed else {
+                            break;
+                        };
+                        if !parameters.is_empty() {
+                            inputs.push(from.clone());
+                        }
+                        available = row.clone();
+                        cursor = to.clone();
                     }
-                    available = row.clone();
-                    cursor = to.clone();
+                    work.push((result, cursor, child_path(&mut paths, path, "result")));
+                    for (at, (parameter, input)) in parameters.iter().zip(inputs).enumerate().rev()
+                    {
+                        let child = child_path(&mut paths, path, format!("parameter {}", at + 1));
+                        if matches!(&*expose(aliases, &input), Ty::Arrow(..)) {
+                            cover(
+                                aliases,
+                                &input,
+                                &available,
+                                CallbackBoundary {
+                                    callback_span: parameter.span,
+                                    callback_path: render_path(&paths, child),
+                                    callback_type: input.to_string(),
+                                    condition: Formula::True,
+                                    extern_name: context.name.into(),
+                                    extern_span: context.span,
+                                    capability_span: abi.span,
+                                },
+                                out,
+                            );
+                        }
+                        work.push((parameter, input, child));
+                    }
                 }
-                for (at, (parameter, input)) in parameters.iter().zip(inputs).enumerate() {
-                    let child = format!("{path} parameter {}", at + 1);
-                    cover(
-                        aliases,
-                        &input,
-                        &available,
-                        CallbackBoundary {
-                            callback_span: parameter.span,
-                            callback_path: child.clone(),
-                            callback_type: input.to_string(),
-                            extern_name: context.name.into(),
-                            extern_span: context.span,
-                            capability_span: abi.span,
-                        },
-                        out,
-                    );
-                    boundary(aliases, parameter, &input, &child, context, out, seen);
+                ir::ExternTypeKind::Ordinary(_) => {
+                    let exposed = expose(aliases, &ty);
+                    let Ty::Arrow(from, to, available) = &*exposed else {
+                        continue;
+                    };
+                    let callback_path = child_path(&mut paths, path, "callback input");
+                    if matches!(&*expose(aliases, from), Ty::Arrow(..)) {
+                        cover(
+                            aliases,
+                            from,
+                            available,
+                            CallbackBoundary {
+                                callback_span: abi.span,
+                                callback_path: render_path(&paths, callback_path),
+                                callback_type: from.to_string(),
+                                condition: Formula::True,
+                                extern_name: context.name.into(),
+                                extern_span: context.span,
+                                capability_span: abi.span,
+                            },
+                            out,
+                        );
+                    }
+                    work.push((
+                        abi,
+                        to.clone(),
+                        child_path(&mut paths, path, "callback result"),
+                    ));
+                    work.push((abi, from.clone(), callback_path));
                 }
-                boundary(
-                    aliases,
-                    result,
-                    &cursor,
-                    &format!("{path} result"),
-                    context,
-                    out,
-                    seen,
-                );
-            }
-            ir::ExternTypeKind::Ordinary(_) => {
-                let exposed = expose(aliases, ty);
-                let Ty::Arrow(from, to, available) = &*exposed else {
-                    return;
-                };
-                let callback_path = format!("{path} callback input");
-                cover(
-                    aliases,
-                    from,
-                    available,
-                    CallbackBoundary {
-                        callback_span: abi.span,
-                        callback_path: callback_path.clone(),
-                        callback_type: from.to_string(),
-                        extern_name: context.name.into(),
-                        extern_span: context.span,
-                        capability_span: abi.span,
-                    },
-                    out,
-                );
-                // An ordinary leaf may conceal arbitrarily much foreign shape
-                // behind aliases. Every arrow remains a unary host boundary.
-                boundary(aliases, abi, from, &callback_path, context, out, seen);
-                boundary(
-                    aliases,
-                    abi,
-                    to,
-                    &format!("{path} callback result"),
-                    context,
-                    out,
-                    seen,
-                );
             }
         }
     }
@@ -3176,7 +3361,6 @@ fn callback_coverage_constraints(
             span: extern_span,
         },
         &mut out,
-        &mut Vec::new(),
     );
     let conditional = Formula::all(out.iter().flat_map(|constraint| {
         let ConstraintKind::CallbackCoverage {
@@ -3206,6 +3390,37 @@ fn callback_coverage_constraints(
         )))
     }));
     (out, conditional)
+}
+
+#[cfg(test)]
+mod extern_boundary_depth_tests {
+    use super::*;
+    use crate::{tracking::Tracked, types::Prim};
+
+    #[test]
+    fn thirty_thousand_arrow_boundary_walk_is_stack_safe() {
+        let span = Span::generated(0, 1);
+        let written = Tracked {
+            tracked: ir::TypeKind::Prim(Prim::Nat),
+            span,
+        };
+        let abi = Tracked {
+            tracked: ir::ExternTypeKind::Ordinary(written),
+            span,
+        };
+        let mut ty = Rc::new(Ty::Nat);
+        for _ in 0..30_000 {
+            ty = Rc::new(Ty::Arrow(Rc::new(Ty::Nat), ty, Row::closed()));
+        }
+        let aliases = IndexMap::new();
+        assert!(polymorphic_extern_boundary(&aliases, &abi, &ty).is_empty());
+        let (coverage, _) = callback_coverage_constraints(&aliases, &abi, &ty, "deep", span);
+        assert!(coverage.is_empty());
+        // A 30k recursively represented test value also needs iterative
+        // destruction; leaking this one synthetic value keeps the test focused
+        // on the boundary walkers rather than `Rc<Ty>`'s destructor.
+        std::mem::forget(ty);
+    }
 }
 
 fn describe_type(ty: &Rc<Ty>) -> TypeDescription {
@@ -4414,6 +4629,7 @@ fn attach_ordinary_explanations(
                 };
                 full_facts.push(ExplanationFact {
                     span,
+                    direct: false,
                     constraint: *id,
                     origin: constraint.origin,
                     subject,
@@ -4439,6 +4655,7 @@ fn attach_ordinary_explanations(
                 && let Some(constraint) = constraint_slice.first().copied()
             {
                 full_facts.push(ExplanationFact {
+                    direct: false,
                     span: declared,
                     constraint,
                     origin: ConstraintOrigin::ContextualCheck,
@@ -4468,6 +4685,7 @@ fn attach_ordinary_explanations(
             // a structural row-key lookup. Same-named equivalent interfaces may
             // share a row while still naming different declarations here.
             full_facts.push(ExplanationFact {
+                direct: false,
                 span: origin.declaration_span,
                 constraint,
                 origin: ConstraintOrigin::ContextualCheck,
@@ -4498,6 +4716,7 @@ fn attach_ordinary_explanations(
                     full_facts[at].payload = payload;
                 } else {
                     full_facts.push(ExplanationFact {
+                        direct: false,
                         span: origin.span,
                         constraint: origin.constraint,
                         origin: origin.origin,
@@ -4793,11 +5012,14 @@ fn direct_extern_explanation(
     kind: ContradictionKind,
     row: Option<RowContradiction>,
 ) -> InferenceExplanation {
-    let constraint = ConstraintId::synthetic(error.get());
+    // Direct source facts deliberately do not claim a forgeable arena
+    // identity. `pending` is never published in the cause's constraint slice.
+    let constraint = ConstraintId::pending();
     let full_facts = facts
         .into_iter()
         .map(|(span, origin, subject, payload)| ExplanationFact {
             span,
+            direct: true,
             constraint,
             origin,
             subject,
@@ -4823,7 +5045,7 @@ fn direct_extern_explanation(
         cause: ExplanationCause {
             error,
             seed: None,
-            constraints: vec![constraint],
+            constraints: Vec::new(),
             reasons: Vec::new(),
             omitted_reasons: 0,
         },
@@ -4961,7 +5183,8 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
         // global store. `lowered.scheme` carries its closed copy; validate an
         // intrinsically impossible contract here without leaking its
         // assumptions into later declarations.
-        if !sat::satisfiable(&lowered.formula) {
+        let clause_valid = sat::satisfiable(&lowered.formula);
+        if !clause_valid {
             errors.push(Error {
                 id: table.error_id(),
                 cause: ErrorCause::Direct,
@@ -4973,138 +5196,152 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             });
         }
         let extern_name = mint.name(*symbol).to_string();
-        if let Some(leaf) =
+        let leaves = if clause_valid {
             polymorphic_extern_boundary(&aliases, &decl.value.abi, lowered.scheme.body())
-        {
+        } else {
+            Vec::new()
+        };
+        let (mut coverage, _) = callback_coverage_constraints(
+            &aliases,
+            &decl.value.abi,
+            &lowered.ty,
+            &extern_name,
+            decl.name_span,
+        );
+        if !clause_valid {
+            coverage.clear();
+        }
+        for constraint in &mut coverage {
+            constraint.id = table.constraint_id();
+            constraint.reason = table.constraint_reason(constraint.id);
+        }
+        let callback_issues: Vec<_> = coverage
+            .iter()
+            .filter_map(|constraint| {
+                let ConstraintKind::CallbackCoverage {
+                    required,
+                    available,
+                    boundary,
+                } = &constraint.kind
+                else {
+                    return None;
+                };
+                if sat::entails(&lowered.formula, &boundary.condition) {
+                    return None;
+                }
+                Some(ExternCallbackIssue {
+                    callback_span: boundary.callback_span,
+                    callback_path: boundary.callback_path.clone(),
+                    callback_type: boundary.callback_type.clone(),
+                    missing_effects: missing_callback_effects(required, available),
+                    extern_effects: listed_effects(available),
+                    condition: crate::ui::in_labels(&boundary.condition, &lowered.names),
+                })
+            })
+            .collect();
+
+        if let Some(first) = leaves.first().cloned() {
             let id = table.error_id();
-            let kind = ErrorKind::PolymorphicExternBoundary {
-                variable: leaf.variable,
-                variable_kind: leaf.kind,
-                position: leaf.position,
-                extern_name,
-            };
+            let mut facts = Vec::new();
+            for leaf in &leaves {
+                facts.push((
+                    leaf.span,
+                    ConstraintOrigin::ContextualCheck,
+                    Subject::Annotation,
+                    ExplanationFactPayload::PolymorphicExternLeaf,
+                ));
+            }
+            for issue in &callback_issues {
+                facts.push((
+                    issue.callback_span,
+                    ConstraintOrigin::CallbackBoundary,
+                    Subject::CallbackRequired,
+                    ExplanationFactPayload::CallbackRequirement,
+                ));
+            }
+            facts.push((
+                decl.name_span,
+                ConstraintOrigin::Binding,
+                Subject::Binding,
+                ExplanationFactPayload::ExternPosition,
+            ));
+            facts.push((
+                decl.name_span,
+                ConstraintOrigin::Binding,
+                Subject::Binding,
+                ExplanationFactPayload::ExternDeclaration,
+            ));
             let explanation = direct_extern_explanation(
                 id,
-                vec![
-                    (
-                        leaf.span,
-                        ConstraintOrigin::ContextualCheck,
-                        Subject::Annotation,
-                        ExplanationFactPayload::PolymorphicExternLeaf,
-                    ),
-                    (
-                        decl.name_span,
-                        ConstraintOrigin::Binding,
-                        Subject::Binding,
-                        ExplanationFactPayload::ExternPosition,
-                    ),
-                    (
-                        decl.name_span,
-                        ConstraintOrigin::Binding,
-                        Subject::Binding,
-                        ExplanationFactPayload::ExternDeclaration,
-                    ),
-                ],
+                facts,
                 ContradictionKind::PolymorphicExternBoundary,
                 None,
             );
             errors.push(Error {
                 id,
                 cause: ErrorCause::Direct,
-                span: leaf.span,
-                kind,
+                span: first.span,
+                kind: ErrorKind::PolymorphicExternBoundary {
+                    variable: first.variable.clone(),
+                    variable_kind: first.kind,
+                    position: first.position.clone(),
+                    extern_name,
+                    leaves,
+                    callback_issues,
+                },
+                explanation: Some(explanation),
+            });
+        } else if let Some(first) = callback_issues.first().cloned() {
+            let id = table.error_id();
+            let mut facts = Vec::new();
+            for issue in &callback_issues {
+                facts.push((
+                    issue.callback_span,
+                    ConstraintOrigin::CallbackBoundary,
+                    Subject::CallbackRequired,
+                    ExplanationFactPayload::CallbackRequirement,
+                ));
+            }
+            facts.push((
+                decl.value.abi.span,
+                ConstraintOrigin::CallbackBoundary,
+                Subject::CallbackAvailable,
+                ExplanationFactPayload::ExternCapability,
+            ));
+            facts.push((
+                decl.name_span,
+                ConstraintOrigin::Binding,
+                Subject::Binding,
+                ExplanationFactPayload::ExternDeclaration,
+            ));
+            let explanation = direct_extern_explanation(
+                id,
+                facts,
+                ContradictionKind::CallbackEffectsNotCovered,
+                first
+                    .missing_effects
+                    .first()
+                    .map(|effect| RowContradiction {
+                        shape: Shape::Effect,
+                        label: effect.clone(),
+                    }),
+            );
+            errors.push(Error {
+                id,
+                cause: ErrorCause::Direct,
+                span: first.callback_span,
+                kind: ErrorKind::CallbackEffectsNotCovered {
+                    missing_effects: first.missing_effects.clone(),
+                    extern_effects: first.extern_effects.clone(),
+                    callback_path: first.callback_path.clone(),
+                    callback_type: first.callback_type.clone(),
+                    extern_name,
+                    issues: callback_issues,
+                },
                 explanation: Some(explanation),
             });
         } else {
-            let (mut coverage, conditional) = callback_coverage_constraints(
-                &aliases,
-                &decl.value.abi,
-                &lowered.ty,
-                &extern_name,
-                decl.name_span,
-            );
-            for constraint in &mut coverage {
-                constraint.id = table.constraint_id();
-                constraint.reason = table.constraint_reason(constraint.id);
-            }
-            if sat::entails(&lowered.formula, &conditional) {
-                extern_coverage.push((*symbol, coverage));
-            } else {
-                let failing = coverage.iter().find_map(|constraint| {
-                    let ConstraintKind::CallbackCoverage {
-                        required,
-                        available,
-                        boundary,
-                    } = &constraint.kind
-                    else {
-                        return None;
-                    };
-                    let missing = missing_callback_effects(required, available);
-                    (!missing.is_empty()).then_some((missing, boundary))
-                });
-                let (missing_effects, boundary) = failing.unwrap_or_else(|| {
-                    let ConstraintKind::CallbackCoverage { boundary, .. } = &coverage[0].kind
-                    else {
-                        unreachable!()
-                    };
-                    (Vec::new(), boundary)
-                });
-                let id = table.error_id();
-                let row = missing_effects.first().map(|effect| RowContradiction {
-                    shape: Shape::Effect,
-                    label: effect.clone(),
-                });
-                let explanation = direct_extern_explanation(
-                    id,
-                    vec![
-                        (
-                            boundary.callback_span,
-                            ConstraintOrigin::CallbackBoundary,
-                            Subject::CallbackRequired,
-                            ExplanationFactPayload::CallbackRequirement,
-                        ),
-                        (
-                            boundary.capability_span,
-                            ConstraintOrigin::CallbackBoundary,
-                            Subject::CallbackAvailable,
-                            ExplanationFactPayload::ExternCapability,
-                        ),
-                        (
-                            boundary.extern_span,
-                            ConstraintOrigin::Binding,
-                            Subject::Binding,
-                            ExplanationFactPayload::ExternDeclaration,
-                        ),
-                    ],
-                    ContradictionKind::CallbackEffectsNotCovered,
-                    row,
-                );
-                errors.push(Error {
-                    id,
-                    cause: ErrorCause::Direct,
-                    span: boundary.callback_span,
-                    kind: ErrorKind::CallbackEffectsNotCovered {
-                        missing_effects,
-                        extern_effects: coverage
-                            .iter()
-                            .find_map(|constraint| match &constraint.kind {
-                                ConstraintKind::CallbackCoverage {
-                                    boundary: candidate,
-                                    available,
-                                    ..
-                                } if candidate.callback_span == boundary.callback_span => {
-                                    Some(listed_effects(available))
-                                }
-                                _ => None,
-                            })
-                            .unwrap_or_default(),
-                        callback_path: boundary.callback_path.clone(),
-                        callback_type: boundary.callback_type.clone(),
-                        extern_name: boundary.extern_name.clone(),
-                    },
-                    explanation: Some(explanation),
-                });
-            }
+            extern_coverage.push((*symbol, coverage));
         }
         env.insert(
             *symbol,
@@ -5126,6 +5363,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     let mut steps = Vec::new();
     let mut refinements = Vec::new();
     for (symbol, coverage) in extern_coverage {
+        let error_start = errors.len();
         // Callback coverage is solver input just like generated definition
         // constraints. Keep it in the published arena so every step's direct
         // constraint identity remains resolvable by debugger consumers.
@@ -5151,6 +5389,43 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
         }
         .run(&coverage);
         report_flip(&mut table, &mut errors);
+        // One extern declaration remains one diagnostic even when several
+        // callback paths fail. Preserve every path and every real causal ID in
+        // the first payload/explanation rather than multiplying diagnostics.
+        if errors.len() > error_start + 1 {
+            let primary_id = errors[error_start].id;
+            let mut merged_issues = Vec::new();
+            let mut merged_facts = Vec::new();
+            let mut merged_constraints = Vec::new();
+            let mut merged_reasons = Vec::new();
+            for error in &errors[error_start..] {
+                if let ErrorKind::CallbackEffectsNotCovered { issues, .. } = &error.kind {
+                    merged_issues.extend(issues.iter().cloned());
+                }
+                if let Some(explanation) = &error.explanation {
+                    merged_facts.extend(explanation.full_facts.iter().cloned());
+                    merged_constraints.extend(explanation.cause.constraints.iter().copied());
+                    merged_reasons.extend(explanation.cause.reasons.iter().copied());
+                }
+            }
+            if let ErrorKind::CallbackEffectsNotCovered { issues, .. } =
+                &mut errors[error_start].kind
+            {
+                *issues = merged_issues;
+            }
+            if let Some(explanation) = &mut errors[error_start].explanation {
+                explanation.full_facts = merged_facts;
+                explanation.abridged = (0..explanation.full_facts.len()).collect();
+                explanation.cause.constraints = deduplicate(merged_constraints);
+                explanation.cause.reasons = deduplicate(merged_reasons);
+            }
+            for step in &mut steps {
+                if step.definition == symbol && step.error.is_some() {
+                    step.error = Some(primary_id);
+                }
+            }
+            errors.truncate(error_start + 1);
+        }
     }
     // The groups are read out before anything is solved: solving mutates the
     // definitions they name, and which definitions have to be typed together is
@@ -7966,6 +8241,7 @@ impl Table {
             let constraint = ConstraintId::synthetic(error_id.get());
             let full_facts = vec![
                 ExplanationFact {
+                    direct: false,
                     span: declared,
                     constraint,
                     origin: ConstraintOrigin::ContextualCheck,
@@ -7973,6 +8249,7 @@ impl Table {
                     payload: ExplanationFactPayload::CallerChoiceDeclaration,
                 },
                 ExplanationFact {
+                    direct: false,
                     span: destination_span,
                     constraint,
                     origin: ConstraintOrigin::Binding,
@@ -9286,23 +9563,29 @@ impl Table {
                 callback_path,
                 callback_type,
                 extern_name,
+                issues,
             } => ErrorKind::CallbackEffectsNotCovered {
                 missing_effects: missing_effects.clone(),
                 extern_effects: extern_effects.clone(),
                 callback_path: callback_path.clone(),
                 callback_type: callback_type.clone(),
                 extern_name: extern_name.clone(),
+                issues: issues.clone(),
             },
             ErrorKind::PolymorphicExternBoundary {
                 variable,
                 variable_kind,
                 position,
                 extern_name,
+                leaves,
+                callback_issues,
             } => ErrorKind::PolymorphicExternBoundary {
                 variable: variable.clone(),
                 variable_kind: *variable_kind,
                 position: position.clone(),
                 extern_name: extern_name.clone(),
+                leaves: leaves.clone(),
+                callback_issues: callback_issues.clone(),
             },
         }
     }

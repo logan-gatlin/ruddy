@@ -709,7 +709,8 @@ fn wire_explanation(
         };
         crate::wire::ExplanationFact {
             span: loc(fact.span, files),
-            constraint_id: fact.constraint.get(),
+            constraint_id: (!fact.direct).then(|| fact.constraint.get()),
+            direct: fact.direct,
             origin: fact.origin.code(),
             subject: fact.subject.code(),
             payload,

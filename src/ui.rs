@@ -2697,11 +2697,11 @@ fn explanation_fact(
             "this callback can perform effects when host code invokes it".into()
         }
         P::ExternCapability => {
-            "the containing extern call does not permit those callback effects".into()
+            "this extern declaration does not list those callback effects".into()
         }
         P::ExternDeclaration => "this extern declaration owns the host boundary".into(),
         P::PolymorphicExternLeaf => {
-            "this generic leaf can have different runtime representations".into()
+            "this variable can produce differently shaped host values".into()
         }
         P::ExternPosition => "host code needs one fixed kind of value at this position".into(),
         P::RequiresType => match fact.subject {
@@ -2815,7 +2815,7 @@ fn mismatch_title(contradiction: &inference::Contradiction) -> String {
             )
         }
         K::CallbackEffectsNotCovered => {
-            "callback effects exceed the containing extern capability".into()
+            "a callback can perform effects not listed by the extern declaration".into()
         }
         K::PolymorphicExternBoundary => {
             "host code needs one fixed kind of value at this extern position".into()
@@ -3097,7 +3097,7 @@ impl inference::Error {
                 missing_effects, ..
             } => {
                 let effects = if missing_effects.is_empty() {
-                    "the effects chosen for its generic callback".into()
+                    "effects selected by a conditional callback type".into()
                 } else {
                     missing_effects
                         .iter()
@@ -3116,8 +3116,8 @@ impl inference::Error {
                     .note(format!(
                         "the callback can perform {effects}, which the extern does not permit"
                     ))
-                    .help(format!("add {effects} to the extern effects"))
-                    .help("or handle those effects inside the callback");
+                    .help(format!("list {effects} on this extern declaration whenever the callback condition holds"))
+                    .help("or handle those effects before the callback returns to host code");
             }
             E::PolymorphicExternBoundary { .. } => {
                 if let Some(explanation) = &self.explanation {
@@ -3128,7 +3128,7 @@ impl inference::Error {
                 }
                 diagnostic = diagnostic
                     .help("use a fixed type at this position")
-                    .help("or keep the generic value behind a Ruddy wrapper")
+                    .help("or expose a concrete host-facing type and convert the value in Ruddy")
             }
         }
         diagnostic
@@ -3329,7 +3329,7 @@ impl fmt::Display for inference::ErrorKind {
                 ..
             } => {
                 let effects = if missing_effects.is_empty() {
-                    "the effects chosen for its generic callback".into()
+                    "effects selected by a conditional callback type".into()
                 } else {
                     missing_effects
                         .iter()
@@ -3347,6 +3347,7 @@ impl fmt::Display for inference::ErrorKind {
                 variable_kind,
                 position,
                 extern_name,
+                ..
             } => {
                 let kind = match variable_kind {
                     inference::ExternVariableKind::Type => "type",

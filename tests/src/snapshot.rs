@@ -1687,7 +1687,7 @@ fn extern_boundary_explanations_reach_the_debugger_with_cli_vocabulary() {
         .iter()
         .find(|diagnostic| diagnostic.code == "callback-effects-not-covered")
         .expect("callback diagnostic");
-    assert!(diagnostic.message.contains("extern capability"));
+    assert!(diagnostic.message.contains("extern declaration"));
     let explanation = diagnostic
         .inference_explanation
         .as_ref()

@@ -60,8 +60,11 @@
 
 ## Structured extern-boundary explanations
 
-- [x] Carry exact callback effects, callback type/path/span, extern capability, and declaration context through direct and solved coverage failures.
-- [x] Describe polymorphic leaves by source variable, variable kind, host position, and owning extern without exposing solver terms.
-- [x] Publish causal facts and stable vocabulary identically through CLI diagnostics and debugger snapshots.
-- [x] Cover multiple/coalesced effects, nested callbacks, aliases, fallback coverage, and structured fact counts.
+- [x] Carry exact callback effects, callback type/path/span, extern declaration facts, and declaration context through direct and solved coverage failures.
+- [x] Aggregate every failing callback path and polymorphic leaf without changing the declaration-level diagnostic count.
+- [x] Preserve each symbolic conditional coverage implication and remove first-constraint fallback selection.
+- [x] Walk callback arrows, effect rows, row tails, and conditional presences iteratively with exact leaf kind/span/path.
+- [x] Publish direct facts explicitly and retain real solver constraint/reason provenance for solved callback failures.
+- [x] Use plain host/extern vocabulary and conditional, source-applicable repair advice in CLI and debugger output.
+- [x] Cover later conditional callbacks, multiple issues, row/presence kinds, 30,000 arrows, and cause resolution.
 - [x] Run formatting, the full workspace suite, workspace checks, and Clippy.

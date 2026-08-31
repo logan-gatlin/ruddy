@@ -100,12 +100,15 @@ fn inference_error_kinds(span: Span) -> Vec<TypeError> {
             callback_path: "extern parameter 1".into(),
             callback_type: "() -> () + !Log".into(),
             extern_name: "install".into(),
+            issues: Vec::new(),
         },
         TypeError::PolymorphicExternBoundary {
             variable: "'a".into(),
             variable_kind: ruddy::inference::ExternVariableKind::Type,
             position: "extern parameter 1".into(),
             extern_name: "run".into(),
+            leaves: Vec::new(),
+            callback_issues: Vec::new(),
         },
     ]
 }

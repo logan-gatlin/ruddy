@@ -304,7 +304,10 @@ pub struct ExplanationPivot {
 #[derive(Debug, Clone, Serialize)]
 pub struct ExplanationFact {
     pub span: Option<Loc>,
-    pub constraint_id: u64,
+    /// Absent for an explicit direct source fact, rather than a solver fact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub constraint_id: Option<u64>,
+    pub direct: bool,
     pub origin: &'static str,
     pub subject: &'static str,
     pub payload: &'static str,

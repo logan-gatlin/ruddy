@@ -8289,6 +8289,7 @@ fn extern_boundary_errors_publish_exact_source_payloads_and_paths() {
         callback_path,
         callback_type,
         extern_name,
+        issues,
     } = &error.kind
     else {
         panic!("wrong boundary error: {error:#?}");
@@ -8298,6 +8299,7 @@ fn extern_boundary_errors_publish_exact_source_payloads_and_paths() {
     assert!(callback_path.contains("parameter 1"), "{callback_path}");
     assert!(callback_type.contains("!Read") && callback_type.contains("!Write"));
     assert_eq!(extern_name, "install");
+    assert_eq!(issues.len(), 1);
     let explanation = error
         .explanation
         .as_ref()
@@ -8347,6 +8349,8 @@ fn extern_boundary_errors_publish_exact_source_payloads_and_paths() {
         variable_kind,
         position,
         extern_name,
+        leaves,
+        callback_issues,
     } = &error.kind
     else {
         panic!("{error:#?}")
@@ -8355,6 +8359,8 @@ fn extern_boundary_errors_publish_exact_source_payloads_and_paths() {
     assert_eq!(*variable_kind, ExternVariableKind::Type);
     assert!(position.contains("result"), "{position}");
     assert_eq!(extern_name, "make");
+    assert_eq!(leaves.len(), 1);
+    assert!(callback_issues.is_empty());
     let explanation = error
         .explanation
         .as_ref()
@@ -8364,6 +8370,138 @@ fn extern_boundary_errors_publish_exact_source_payloads_and_paths() {
         ContradictionKind::PolymorphicExternBoundary
     );
     assert_eq!(explanation.full_facts.len(), 3);
+}
+
+#[test]
+fn extern_boundary_aggregates_paths_and_retains_callback_evidence() {
+    use ruddy::inference::ErrorKind;
+
+    let (_, _, output) = infer_src(
+        "effect Read = () -> ()\n\
+         effect Write = () -> ()\n\
+         extern install : fn(fn(()) -> () + !Read, fn(()) -> () + !Write) -> () = host.install",
+    );
+    let [error] = output.errors.as_slice() else {
+        panic!("{:#?}", output.errors)
+    };
+    let ErrorKind::CallbackEffectsNotCovered { issues, .. } = &error.kind else {
+        panic!("{error:#?}")
+    };
+    assert_eq!(issues.len(), 2);
+    assert!(
+        issues
+            .iter()
+            .any(|issue| issue.callback_path.contains("parameter 1"))
+    );
+    assert!(
+        issues
+            .iter()
+            .any(|issue| issue.callback_path.contains("parameter 2"))
+    );
+
+    let (_, _, output) = infer_src(
+        "effect Fail = () -> ()\n\
+         extern install : fn(fn('a) -> () + !Fail) -> () = host.install",
+    );
+    let [error] = output.errors.as_slice() else {
+        panic!("{:#?}", output.errors)
+    };
+    let ErrorKind::PolymorphicExternBoundary {
+        leaves,
+        callback_issues,
+        ..
+    } = &error.kind
+    else {
+        panic!("{error:#?}")
+    };
+    assert!(!leaves.is_empty());
+    assert_eq!(callback_issues.len(), 1);
+}
+
+#[test]
+fn conditional_callback_failure_keeps_its_later_path_and_formula() {
+    use ruddy::inference::ErrorKind;
+    let (_, lowered, output) = infer_src(
+        "effect Fail = () -> ()\n\
+         extern install : fn(fn(()) -> () + !Fail (when 'first), fn(()) -> () + !Fail (when 'second)) -> () + !Fail (when 'carried) where not 'first or 'carried = host.install",
+    );
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    let [error] = output.errors.as_slice() else {
+        panic!("{:#?}", output.errors)
+    };
+    let ErrorKind::CallbackEffectsNotCovered { issues, .. } = &error.kind else {
+        panic!("{error:#?}")
+    };
+    assert_eq!(issues.len(), 1, "{issues:#?}");
+    assert!(issues[0].callback_path.contains("parameter 2"));
+    assert!(
+        issues[0].condition.contains("second"),
+        "{}",
+        issues[0].condition
+    );
+    assert!(
+        issues[0].condition.contains("carried"),
+        "{}",
+        issues[0].condition
+    );
+}
+
+#[test]
+fn extern_boundary_reports_arrow_effect_row_and_presence_kinds() {
+    use ruddy::inference::{ErrorKind, ExternVariableKind};
+    for (source, expected) in [
+        (
+            "extern x : (() -> () + ..'effects) -> () = host.x",
+            ExternVariableKind::Row,
+        ),
+        (
+            "extern x : fn({ value when 'present: Nat }) -> () = host.x",
+            ExternVariableKind::Presence,
+        ),
+    ] {
+        let (_, lowered, output) = infer_src(source);
+        assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+        let [error] = output.errors.as_slice() else {
+            panic!("{:#?}", output.errors)
+        };
+        let ErrorKind::PolymorphicExternBoundary { leaves, .. } = &error.kind else {
+            panic!("{error:#?}")
+        };
+        assert!(
+            leaves.iter().any(|leaf| leaf.kind == expected),
+            "{leaves:#?}"
+        );
+        assert!(leaves.iter().all(|leaf| !leaf.position.is_empty()));
+    }
+}
+
+#[test]
+fn extern_callback_solver_causes_resolve_to_published_constraints() {
+    use ruddy::inference::ErrorKind;
+    let (_, _, output) = infer_src(
+        "type Callback 'e = () -> () + ..'e\n\
+         extern install : fn(Callback (..'e)) -> () + ..'f = host.install",
+    );
+    let error = output
+        .errors
+        .iter()
+        .find(|error| matches!(error.kind, ErrorKind::CallbackEffectsNotCovered { .. }))
+        .unwrap();
+    let explanation = error.explanation.as_ref().unwrap();
+    assert!(!explanation.cause.constraints.is_empty());
+    let published: Vec<_> = output
+        .constraints
+        .values()
+        .flatten()
+        .map(|constraint| constraint.id)
+        .collect();
+    assert!(
+        explanation
+            .cause
+            .constraints
+            .iter()
+            .all(|id| published.contains(id))
+    );
 }
 
 #[test]
