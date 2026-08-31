@@ -875,6 +875,22 @@ fn annotated_definition_publishes_contract_not_unrelated_body_facts() {
 }
 
 #[test]
+fn authoritative_provenance_uses_the_owning_annotation() {
+    let source = "let outer : Nat -> Nat = fn value => let inner : Boolean -> Boolean = fn flag => flag in value\nlet bad = outer false";
+    let facts = explained_facts(source);
+    let outer = source.find("Nat -> Nat").unwrap();
+    let inner = source.find("Boolean -> Boolean").unwrap();
+    assert!(
+        facts.iter().any(|fact| fact.span.start == outer),
+        "{facts:#?}"
+    );
+    assert!(
+        facts.iter().all(|fact| fact.span.start != inner),
+        "{facts:#?}"
+    );
+}
+
+#[test]
 fn scheme_provenance_survives_a_long_definition_chain_iteratively() {
     let mut source = String::from("let root = fn value => value.x\n");
     let mut previous = "root".to_string();

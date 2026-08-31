@@ -1376,27 +1376,46 @@ struct ExplainedScheme {
     provenance: SchemeProvenance,
 }
 
-/// A compact causal skeleton in the same semantic preorder as a scheme body.
-/// Each entry belongs to exactly one type, row, or presence position; shared
-/// reason tails remain shared in the arena instead of being copied as a flat
-/// list of every constraint in the defining body.
+/// A compact causal skeleton keyed like the zonked scheme body. Child edges,
+/// rather than incidental traversal order, align evidence when a scheme is
+/// opened; this matters when packages disappear and absent payloads are
+/// pruned.
 #[derive(Debug, Clone, Default)]
 struct SchemeProvenance {
-    parts: Vec<ProvenancePart>,
-    quantified: Vec<Vec<ReasonId>>,
+    nodes: Vec<ProvenanceNode>,
+    quantified: Vec<QuantifiedProvenance>,
 }
 
 #[derive(Debug, Clone)]
-struct ProvenancePart {
-    kind: ProvenanceKind,
+struct QuantifiedProvenance {
+    sort: VarSort,
     roots: Vec<ReasonId>,
+    omitted: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ProvenanceNode {
+    shape: ProvenanceShape,
+    roots: Vec<ReasonId>,
+    omitted: usize,
+    children: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProvenanceShape {
+    Ty(ProvenanceTy),
+    Row(Vec<(String, bool)>),
+    Presence,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProvenanceKind {
-    Ty,
-    Row,
-    Presence,
+enum ProvenanceTy {
+    Leaf,
+    Arrow,
+    Package,
+    Struct,
+    Sum,
+    Named(usize),
 }
 
 impl ExplainedScheme {
@@ -1648,6 +1667,8 @@ struct Table {
     /// Immutable append-only causal records. Unlike variable metadata this is
     /// deliberately not restored after speculative congruence.
     reasons: Vec<Reason>,
+    /// Publication roots omitted before a marker entered the public arena.
+    omitted_reason_parents: HashMap<ReasonId, usize>,
     /// Reasons descended from recovery, retained for debugging but excluded
     /// from publishable scheme evidence in O(1).
     unpublishable_reasons: HashSet<ReasonId>,
@@ -1663,10 +1684,12 @@ struct Table {
     /// Opened scheme roots keyed by the root `Rc<Ty>` identity. This covers
     /// closed schemes, which mint no variable on which to hang provenance.
     /// Entries live only for this inference run and never affect semantics.
-    opened_provenance: HashMap<usize, (Weak<Ty>, ReasonId)>,
+    opened_provenance: HashMap<usize, (Weak<Ty>, Vec<ReasonId>)>,
     /// Nested bindings whose written contracts, rather than implementation
     /// evidence, are authoritative when their schemes are published.
     authoritative_bindings: HashSet<Symbol>,
+    /// Binding-specific annotation identity used when publishing local schemes.
+    authoritative_spans: HashMap<Symbol, Span>,
 }
 
 /// Which quantified position each thing a scheme closes over was given, in the
@@ -2742,6 +2765,7 @@ fn attach_ordinary_explanations(
     constraints: &IndexMap<Symbol, Vec<Constraint>>,
     steps: &[Step],
     reasons: &[Reason],
+    omitted_reason_parents: &HashMap<ReasonId, usize>,
     aliases: &IndexMap<Symbol, Scheme>,
 ) {
     let constraints = all_constraints(constraints);
@@ -2818,6 +2842,7 @@ fn attach_ordinary_explanations(
         // Iterative, parent-order DFS. IDs are immutable and parents precede
         // children, so this is deterministic even when bindings share causes.
         let mut walked_reasons = Vec::new();
+        let mut omitted_by_roots = 0usize;
         let mut seen_reasons = HashSet::new();
         let mut work: Vec<ReasonId> = seed.into_iter().collect();
         while let Some(id) = work.pop() {
@@ -2828,12 +2853,15 @@ fn attach_ordinary_explanations(
                 continue;
             };
             walked_reasons.push(id);
+            omitted_by_roots = omitted_by_roots
+                .saturating_add(omitted_reason_parents.get(&id).copied().unwrap_or(0));
             work.extend(reason.parents.iter().rev().copied());
         }
         // Preserve both semantic endpoints: the newest nodes contain the
         // failing act, while the oldest tail contains the defining fact. A
         // bounded full view says exactly how much middle was omitted.
         let (reason_slice, omitted_reasons) = budget_reason_slice(walked_reasons);
+        let omitted_reasons = omitted_reasons.saturating_add(omitted_by_roots);
         let mut seen_constraints = HashSet::new();
         let mut authoritative_constraints = HashSet::new();
         let mut constraint_slice: Vec<_> = reason_slice
@@ -3697,6 +3725,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                     &subst,
                     scheme.count(),
                     &member.generated,
+                    decl.annotation.as_ref().expect("annotated").ty.span,
                 )
             } else {
                 table.scheme_provenance(&member.ty, &subst, scheme.count())
@@ -3725,7 +3754,14 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     constraints.sort_by(|one, _, other, _| position[one].cmp(&position[other]));
     promises.sort_by(|one, _, other, _| position[one].cmp(&position[other]));
 
-    attach_ordinary_explanations(&mut errors, &constraints, &steps, &table.reasons, &aliases);
+    attach_ordinary_explanations(
+        &mut errors,
+        &constraints,
+        &steps,
+        &table.reasons,
+        &table.omitted_reason_parents,
+        &aliases,
+    );
 
     // Constraints are solved in the order the walk emitted them, which is not
     // quite the order anyone reads a file in — a body's demands come before
@@ -3855,6 +3891,15 @@ impl Table {
     }
 
     fn reason(&mut self, origin: ReasonOrigin, parents: Vec<ReasonId>) -> ReasonId {
+        self.reason_with_omissions(origin, parents, 0)
+    }
+
+    fn reason_with_omissions(
+        &mut self,
+        origin: ReasonOrigin,
+        parents: Vec<ReasonId>,
+        omitted_parents: usize,
+    ) -> ReasonId {
         let id = ReasonId(self.next_reason_id);
         self.next_reason_id += 1;
         if origin == ReasonOrigin::Recovery
@@ -3863,6 +3908,9 @@ impl Table {
                 .any(|parent| self.unpublishable_reasons.contains(parent))
         {
             self.unpublishable_reasons.insert(id);
+        }
+        if omitted_parents != 0 {
+            self.omitted_reason_parents.insert(id, omitted_parents);
         }
         self.reasons.push(Reason {
             id,
@@ -3878,12 +3926,14 @@ impl Table {
     }
 
     fn note_opened_type(&self, ty: &Rc<Ty>) {
-        if let Some((opened, reason)) = self.opened_provenance.get(&(Rc::as_ptr(ty) as usize))
+        if let Some((opened, reasons)) = self.opened_provenance.get(&(Rc::as_ptr(ty) as usize))
             && opened
                 .upgrade()
                 .is_some_and(|opened| Rc::ptr_eq(&opened, ty))
         {
-            self.note_binding_read(*reason);
+            for reason in reasons {
+                self.note_binding_read(*reason);
+            }
         }
     }
 
@@ -3900,13 +3950,17 @@ impl Table {
         };
         let mut parents = Vec::new();
         for ty in roots {
-            if let Some((opened, parent)) = self.opened_provenance.get(&(Rc::as_ptr(ty) as usize))
+            if let Some((opened, opened_parents)) =
+                self.opened_provenance.get(&(Rc::as_ptr(ty) as usize))
                 && opened
                     .upgrade()
                     .is_some_and(|opened| Rc::ptr_eq(&opened, ty))
-                && !parents.contains(parent)
             {
-                parents.push(*parent);
+                for parent in opened_parents {
+                    if !parents.contains(parent) {
+                        parents.push(*parent);
+                    }
+                }
             }
         }
         self.reason(ReasonOrigin::Constraint(id), parents)
@@ -4092,8 +4146,19 @@ impl Table {
     }
 
     fn mint_from(&mut self, sort: VarSort, subject: Subject, parents: Vec<ReasonId>) -> TyVar {
+        self.mint_from_budgeted(sort, subject, parents, 0)
+    }
+
+    fn mint_from_budgeted(
+        &mut self,
+        sort: VarSort,
+        subject: Subject,
+        parents: Vec<ReasonId>,
+        omitted: usize,
+    ) -> TyVar {
         let var = self.vars.len() as TyVar;
-        let minted_by = self.reason(ReasonOrigin::Variable { sort, subject }, parents);
+        let minted_by =
+            self.reason_with_omissions(ReasonOrigin::Variable { sort, subject }, parents, omitted);
         self.vars.push(Slot::Unbound);
         self.var_meta.push(VarMeta {
             sort,
@@ -5487,57 +5552,137 @@ impl Table {
     /// A marker is minted only for a node with contributors of its own; sibling
     /// fields and branches therefore cannot inherit one another's body facts.
     fn mark_opened_type(&mut self, root: &Rc<Ty>, provenance: &SchemeProvenance) {
-        enum Work {
+        enum Opened {
             Ty(Rc<Ty>),
-            Row(Row),
-            Presence(Presence),
+            Row(Row, Rc<Ty>),
+            Presence(Rc<Ty>),
         }
-        let mut at = 0;
-        let mut work = vec![Work::Ty(root.clone())];
-        while let Some(part) = work.pop() {
-            let (kind, ty) = match part {
-                Work::Ty(ty) => (ProvenanceKind::Ty, Some(ty)),
-                Work::Row(row) => {
-                    if let Rest::More(more) = &row.rest {
-                        work.push(Work::Row((**more).clone()));
-                    }
-                    for field in row.labels.values().rev() {
-                        work.push(Work::Ty(field.ty.clone()));
-                        work.push(Work::Presence(field.presence.clone()));
-                    }
-                    (ProvenanceKind::Row, None)
+        let Some(mut root_node) = (!provenance.nodes.is_empty()).then_some(0) else {
+            return;
+        };
+        // A lexical package is destructed before it is returned. Follow the
+        // explicit body edge rather than shifting an unlabelled preorder.
+        if matches!(
+            provenance.nodes[root_node].shape,
+            ProvenanceShape::Ty(ProvenanceTy::Package)
+        ) && !matches!(&**root, Ty::Package(_))
+        {
+            let Some(body) = provenance.nodes[root_node].children.first() else {
+                return;
+            };
+            root_node = *body;
+        }
+        let mut work = vec![(Opened::Ty(root.clone()), root_node)];
+        while let Some((opened, at)) = work.pop() {
+            let Some(node) = provenance.nodes.get(at) else {
+                continue;
+            };
+            let attach = |table: &mut Self, owner: &Rc<Ty>| {
+                if node.roots.is_empty() && node.omitted == 0 {
+                    return;
                 }
-                Work::Presence(_presence) => (ProvenanceKind::Presence, None),
-            };
-            let Some(part) = provenance.parts.get(at) else {
-                break;
-            };
-            if part.kind != kind {
-                break;
-            }
-            at += 1;
-            if let Some(ty) = ty {
-                if !part.roots.is_empty() {
-                    let marker = self.reason(
-                        ReasonOrigin::Variable {
-                            sort: VarSort::Type,
-                            subject: Subject::Scheme,
+                let marker = table.reason_with_omissions(
+                    ReasonOrigin::Variable {
+                        sort: match node.shape {
+                            ProvenanceShape::Ty(_) => VarSort::Type,
+                            ProvenanceShape::Row(_) => VarSort::Row,
+                            ProvenanceShape::Presence => VarSort::Presence,
                         },
-                        part.roots.clone(),
-                    );
-                    self.opened_provenance
-                        .insert(Rc::as_ptr(&ty) as usize, (Rc::downgrade(&ty), marker));
+                        subject: Subject::Scheme,
+                    },
+                    node.roots.clone(),
+                    node.omitted,
+                );
+                let entry = table
+                    .opened_provenance
+                    .entry(Rc::as_ptr(owner) as usize)
+                    .or_insert_with(|| (Rc::downgrade(owner), Vec::new()));
+                if entry
+                    .0
+                    .upgrade()
+                    .is_some_and(|opened| Rc::ptr_eq(&opened, owner))
+                {
+                    entry.1.push(marker);
+                } else {
+                    *entry = (Rc::downgrade(owner), vec![marker]);
                 }
-                match &*ty {
-                    Ty::Arrow(from, to, effects) => {
-                        work.push(Work::Row(effects.clone()));
-                        work.push(Work::Ty(to.clone()));
-                        work.push(Work::Ty(from.clone()));
+            };
+            match opened {
+                Opened::Ty(ty) => {
+                    let shape = match &*ty {
+                        Ty::Arrow(..) => ProvenanceTy::Arrow,
+                        Ty::Package(..) => ProvenanceTy::Package,
+                        Ty::Struct(..) => ProvenanceTy::Struct,
+                        Ty::Sum(..) => ProvenanceTy::Sum,
+                        Ty::Named { args, .. } => ProvenanceTy::Named(args.len()),
+                        _ => ProvenanceTy::Leaf,
+                    };
+                    if node.shape != ProvenanceShape::Ty(shape) {
+                        continue;
                     }
-                    Ty::Package(body) => work.push(Work::Ty(body.clone())),
-                    Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(row.clone())),
-                    Ty::Named { args, .. } => work.extend(args.iter().rev().cloned().map(Work::Ty)),
-                    _ => {}
+                    attach(self, &ty);
+                    let children: Vec<Opened> = match &*ty {
+                        Ty::Arrow(from, to, effects) => vec![
+                            Opened::Ty(from.clone()),
+                            Opened::Ty(to.clone()),
+                            Opened::Row(effects.clone(), ty.clone()),
+                        ],
+                        Ty::Package(body) => vec![Opened::Ty(body.clone())],
+                        Ty::Struct(row) | Ty::Sum(row) => {
+                            vec![Opened::Row(self.canon(row), ty.clone())]
+                        }
+                        Ty::Named { args, .. } => args.iter().cloned().map(Opened::Ty).collect(),
+                        _ => Vec::new(),
+                    };
+                    if children.len() != node.children.len() {
+                        continue;
+                    }
+                    work.extend(
+                        children
+                            .into_iter()
+                            .zip(node.children.iter().copied())
+                            .rev(),
+                    );
+                }
+                Opened::Row(row, owner) => {
+                    let row = self.canon(&row);
+                    let layout: Vec<_> = row
+                        .labels
+                        .iter()
+                        .map(|(name, field)| {
+                            (
+                                name.clone(),
+                                !matches!(self.presence_of(&field.presence), Presence::Absent),
+                            )
+                        })
+                        .collect();
+                    if node.shape != ProvenanceShape::Row(layout) {
+                        continue;
+                    }
+                    attach(self, &owner);
+                    let mut children = Vec::new();
+                    for field in row.labels.values() {
+                        let presence = self.presence_of(&field.presence);
+                        children.push(Opened::Presence(field.ty.clone()));
+                        if !matches!(presence, Presence::Absent) {
+                            children.push(Opened::Ty(field.ty.clone()));
+                        }
+                    }
+                    if children.len() != node.children.len() {
+                        continue;
+                    }
+                    work.extend(
+                        children
+                            .into_iter()
+                            .zip(node.children.iter().copied())
+                            .rev(),
+                    );
+                }
+                Opened::Presence(owner) => {
+                    if node.shape != ProvenanceShape::Presence {
+                        continue;
+                    }
+                    attach(self, &owner);
                 }
             }
         }
@@ -5565,15 +5710,20 @@ impl Table {
                         .and_then(|key| self.local_package_instances.get(&key).cloned())
                         .unwrap_or_else(|| {
                             let fresh = Presence::Var(
-                                self.mint_from(
+                                self.mint_from_budgeted(
                                     VarSort::Presence,
                                     Subject::Instance,
                                     explained
                                         .provenance
                                         .quantified
                                         .get(at as usize)
-                                        .cloned()
+                                        .map(|slot| slot.roots.clone())
                                         .unwrap_or_default(),
+                                    explained
+                                        .provenance
+                                        .quantified
+                                        .get(at as usize)
+                                        .map_or(0, |slot| slot.omitted),
                                 ),
                             );
                             if let Some(key) = key {
@@ -5590,15 +5740,24 @@ impl Table {
                     Assigned::Presence(presence)
                 }
                 false => Assigned::Ty(Rc::new(Ty::plain(Ty::Var(
-                    self.mint_from(
-                        VarSort::Type,
+                    self.mint_from_budgeted(
+                        explained
+                            .provenance
+                            .quantified
+                            .get(at as usize)
+                            .map_or(VarSort::Type, |slot| slot.sort),
                         Subject::Instance,
                         explained
                             .provenance
                             .quantified
                             .get(at as usize)
-                            .cloned()
+                            .map(|slot| slot.roots.clone())
                             .unwrap_or_default(),
+                        explained
+                            .provenance
+                            .quantified
+                            .get(at as usize)
+                            .map_or(0, |slot| slot.omitted),
                     ),
                 )))),
             })
@@ -6229,127 +6388,217 @@ impl Table {
     /// by semantic nodes rather than by the size of the defining body.
     fn scheme_provenance(&self, ty: &Rc<Ty>, subst: &Subst, count: u32) -> SchemeProvenance {
         enum Work {
-            Ty(Rc<Ty>),
-            Row(Row),
-            Presence(Presence),
+            Ty(Rc<Ty>, Option<usize>),
+            Row(Row, Option<usize>),
+            Presence(Presence, Option<usize>),
         }
-        let mut quantified = vec![Vec::new(); count as usize];
-        for (var, at) in subst.types.iter().chain(&subst.presences) {
-            if let Some(roots) = quantified.get_mut(*at as usize) {
-                roots.push(self.var_meta[*var as usize].minted_by);
+        let mut quantified = (0..count)
+            .map(|_| QuantifiedProvenance {
+                sort: VarSort::Type,
+                roots: Vec::new(),
+                omitted: 0,
+            })
+            .collect::<Vec<_>>();
+        for (var, at) in &subst.types {
+            if let Some(slot) = quantified.get_mut(*at as usize) {
+                slot.sort = self.var_meta[*var as usize].sort;
+                slot.roots.push(self.var_meta[*var as usize].minted_by);
             }
         }
-        let mut parts = Vec::new();
-        let mut work = vec![Work::Ty(ty.clone())];
-        while let Some(part) = work.pop() {
-            match part {
-                Work::Ty(mut ty) => {
-                    let mut roots = Vec::new();
-                    if let Some((opened, reason)) =
-                        self.opened_provenance.get(&(Rc::as_ptr(&ty) as usize))
-                        && opened
-                            .upgrade()
-                            .is_some_and(|opened| Rc::ptr_eq(&opened, &ty))
-                    {
-                        roots.push(*reason);
-                    }
-                    let mut seen = HashSet::new();
-                    while let Ty::Var(var) = &*ty {
-                        if !seen.insert(*var) {
-                            break;
-                        }
-                        match &self.vars[*var as usize] {
-                            Slot::Bound {
-                                value: Assigned::Ty(next),
-                                by,
-                            } => {
-                                roots.push(*by);
-                                ty = next.clone();
-                            }
-                            _ => break,
-                        }
-                    }
-                    roots.retain(|root| self.publishable_reason(*root));
-                    parts.push(ProvenancePart {
-                        kind: ProvenanceKind::Ty,
-                        roots,
-                    });
-                    match &*ty {
-                        Ty::Arrow(from, to, effects) => {
-                            work.push(Work::Row(effects.clone()));
-                            work.push(Work::Ty(to.clone()));
-                            work.push(Work::Ty(from.clone()));
-                        }
-                        Ty::Package(body) => work.push(Work::Ty(body.clone())),
-                        Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(row.clone())),
-                        Ty::Named { args, .. } => {
-                            work.extend(args.iter().rev().cloned().map(Work::Ty))
-                        }
-                        _ => {}
-                    }
-                }
-                Work::Row(row) => {
-                    let canonical = self.canon(&row);
-                    let mut roots = Vec::new();
-                    let mut rest = row.rest.clone();
-                    let mut seen = HashSet::new();
-                    while let Rest::Var(var) = rest {
-                        if !seen.insert(var) {
-                            break;
-                        }
-                        match &self.vars[var as usize] {
-                            Slot::Bound {
-                                value: Assigned::Row(next),
-                                by,
-                            } => {
-                                roots.push(*by);
-                                rest = next.rest.clone();
-                            }
-                            _ => break,
-                        }
-                    }
-                    roots.retain(|root| self.publishable_reason(*root));
-                    parts.push(ProvenancePart {
-                        kind: ProvenanceKind::Row,
-                        roots,
-                    });
-                    for field in canonical.labels.values().rev() {
-                        work.push(Work::Ty(field.ty.clone()));
-                        work.push(Work::Presence(field.presence.clone()));
-                    }
-                }
-                Work::Presence(mut presence) => {
-                    let mut roots = Vec::new();
-                    let mut seen = HashSet::new();
-                    while let Presence::Var(var) = presence {
-                        if !seen.insert(var) {
-                            break;
-                        }
-                        match &self.vars[var as usize] {
-                            Slot::Bound {
-                                value: Assigned::Presence(next),
-                                by,
-                            } => {
-                                roots.push(*by);
-                                presence = next.clone();
-                            }
-                            _ => break,
-                        }
-                    }
-                    roots.retain(|root| self.publishable_reason(*root));
-                    parts.push(ProvenancePart {
-                        kind: ProvenanceKind::Presence,
-                        roots,
-                    });
-                }
+        for (var, at) in &subst.presences {
+            if let Some(slot) = quantified.get_mut(*at as usize) {
+                slot.sort = VarSort::Presence;
+                slot.roots.push(self.var_meta[*var as usize].minted_by);
             }
         }
-        for roots in &mut quantified {
+        let mut nodes = Vec::<ProvenanceNode>::new();
+        let mut work = vec![Work::Ty(ty.clone(), None)];
+        while let Some(item) = work.pop() {
+            let parent = match &item {
+                Work::Ty(_, p) | Work::Row(_, p) | Work::Presence(_, p) => *p,
+            };
+            let (shape, mut roots, children): (ProvenanceShape, Vec<ReasonId>, Vec<Work>) =
+                match item {
+                    Work::Ty(mut ty, _) => {
+                        let mut roots = Vec::new();
+                        if let Some((opened, reasons)) =
+                            self.opened_provenance.get(&(Rc::as_ptr(&ty) as usize))
+                            && opened
+                                .upgrade()
+                                .is_some_and(|opened| Rc::ptr_eq(&opened, &ty))
+                        {
+                            roots.extend(reasons);
+                        }
+                        let mut seen = HashSet::new();
+                        while let Ty::Var(var) = &*ty {
+                            if !seen.insert(*var) {
+                                break;
+                            }
+                            match &self.vars[*var as usize] {
+                                Slot::Bound {
+                                    value: Assigned::Ty(next),
+                                    by,
+                                } => {
+                                    roots.push(*by);
+                                    ty = next.clone();
+                                }
+                                _ => break,
+                            }
+                        }
+                        let (tag, children) = match &*ty {
+                            Ty::Arrow(from, to, effects) => (
+                                ProvenanceTy::Arrow,
+                                vec![
+                                    Work::Ty(from.clone(), None),
+                                    Work::Ty(to.clone(), None),
+                                    Work::Row(effects.clone(), None),
+                                ],
+                            ),
+                            Ty::Package(body) => {
+                                (ProvenanceTy::Package, vec![Work::Ty(body.clone(), None)])
+                            }
+                            Ty::Struct(row) => {
+                                (ProvenanceTy::Struct, vec![Work::Row(row.clone(), None)])
+                            }
+                            Ty::Sum(row) => (ProvenanceTy::Sum, vec![Work::Row(row.clone(), None)]),
+                            Ty::Named { args, .. } => (
+                                ProvenanceTy::Named(args.len()),
+                                args.iter().cloned().map(|ty| Work::Ty(ty, None)).collect(),
+                            ),
+                            _ => (ProvenanceTy::Leaf, Vec::new()),
+                        };
+                        (ProvenanceShape::Ty(tag), roots, children)
+                    }
+                    Work::Row(row, _) => {
+                        let canonical = self.canon(&row);
+                        let mut roots = Vec::new();
+                        let mut rest = row.rest.clone();
+                        let mut seen = HashSet::new();
+                        while let Rest::Var(var) = rest {
+                            if !seen.insert(var) {
+                                break;
+                            }
+                            match &self.vars[var as usize] {
+                                Slot::Bound {
+                                    value: Assigned::Row(next),
+                                    by,
+                                } => {
+                                    roots.push(*by);
+                                    rest = next.rest.clone();
+                                }
+                                _ => break,
+                            }
+                        }
+                        let mut layout = Vec::new();
+                        let mut children = Vec::new();
+                        for (name, field) in &canonical.labels {
+                            let presence = self.presence_of(&field.presence);
+                            let payload = !matches!(presence, Presence::Absent);
+                            layout.push((name.clone(), payload));
+                            children.push(Work::Presence(presence, None));
+                            if payload {
+                                children.push(Work::Ty(field.ty.clone(), None));
+                            }
+                        }
+                        (ProvenanceShape::Row(layout), roots, children)
+                    }
+                    Work::Presence(mut presence, _) => {
+                        let mut roots = Vec::new();
+                        let mut seen = HashSet::new();
+                        while let Presence::Var(var) = presence {
+                            if !seen.insert(var) {
+                                break;
+                            }
+                            match &self.vars[var as usize] {
+                                Slot::Bound {
+                                    value: Assigned::Presence(next),
+                                    by,
+                                } => {
+                                    roots.push(*by);
+                                    presence = next.clone();
+                                }
+                                _ => break,
+                            }
+                        }
+                        (ProvenanceShape::Presence, roots, Vec::new())
+                    }
+                };
+            roots.retain(|root| self.publishable_reason(*root));
             roots.sort_unstable();
             roots.dedup();
-            roots.retain(|root| self.publishable_reason(*root));
+            let id = nodes.len();
+            nodes.push(ProvenanceNode {
+                shape,
+                roots,
+                omitted: 0,
+                children: Vec::new(),
+            });
+            if let Some(parent) = parent {
+                nodes[parent].children.push(id);
+            }
+            for child in children.into_iter().rev() {
+                let child = match child {
+                    Work::Ty(x, _) => Work::Ty(x, Some(id)),
+                    Work::Row(x, _) => Work::Row(x, Some(id)),
+                    Work::Presence(x, _) => Work::Presence(x, Some(id)),
+                };
+                work.push(child);
+            }
         }
-        SchemeProvenance { parts, quantified }
+        for slot in &mut quantified {
+            slot.roots.sort_unstable();
+            slot.roots.dedup();
+            slot.roots.retain(|root| self.publishable_reason(*root));
+        }
+        // Bound each position and then the whole publication, preserving the
+        // earliest defining and latest relevant endpoints at both levels.
+        const PER_POSITION: usize = 64;
+        const TOTAL: usize = 256;
+        fn trim(roots: &mut Vec<ReasonId>, omitted: &mut usize, limit: usize) {
+            if roots.len() <= limit {
+                return;
+            }
+            let old = roots.len();
+            let low = limit / 2;
+            let high = limit - low;
+            let mut kept = roots[..low].to_vec();
+            kept.extend_from_slice(&roots[old - high..]);
+            *roots = kept;
+            *omitted += old - limit;
+        }
+        for node in &mut nodes {
+            trim(&mut node.roots, &mut node.omitted, PER_POSITION);
+        }
+        for slot in &mut quantified {
+            trim(&mut slot.roots, &mut slot.omitted, PER_POSITION);
+        }
+        let mut all = nodes
+            .iter()
+            .flat_map(|n| n.roots.iter().copied())
+            .chain(quantified.iter().flat_map(|q| q.roots.iter().copied()))
+            .collect::<Vec<_>>();
+        all.sort_unstable();
+        all.dedup();
+        if all.len() > TOTAL {
+            let low = TOTAL / 2;
+            let high = TOTAL - low;
+            let keep: HashSet<_> = all[..low]
+                .iter()
+                .chain(&all[all.len() - high..])
+                .copied()
+                .collect();
+            for node in &mut nodes {
+                let old = node.roots.len();
+                node.roots.retain(|root| keep.contains(root));
+                node.omitted += old - node.roots.len();
+            }
+            for slot in &mut quantified {
+                let old = slot.roots.len();
+                slot.roots.retain(|root| keep.contains(root));
+                slot.omitted += old - slot.roots.len();
+            }
+        }
+        SchemeProvenance { nodes, quantified }
     }
 
     /// Preserve a written contract as the sole defining contributor. Its body
@@ -6361,26 +6610,26 @@ impl Table {
         subst: &Subst,
         count: u32,
         constraints: &[Constraint],
+        annotation_span: Span,
     ) -> SchemeProvenance {
         let mut provenance = self.scheme_provenance(ty, subst, count);
-        for part in &mut provenance.parts {
-            part.roots.clear();
+        for node in &mut provenance.nodes {
+            node.roots.clear();
+            node.omitted = 0;
         }
-        for roots in &mut provenance.quantified {
-            roots.clear();
+        for slot in &mut provenance.quantified {
+            slot.roots.clear();
+            slot.omitted = 0;
         }
         let mut work: Vec<_> = constraints.iter().rev().collect();
+        let mut contract = None;
         while let Some(constraint) = work.pop() {
-            if constraint.origin == ConstraintOrigin::ContextualCheck
-                && (constraint.subjects.primary == Subject::Annotation
-                    || constraint.subjects.secondary == Some(Subject::Annotation))
-            {
-                let contract = self.reason(ReasonOrigin::Contract(constraint.id), Vec::new());
-                for part in &mut provenance.parts {
-                    if part.kind == ProvenanceKind::Ty {
-                        part.roots.push(contract);
-                    }
-                }
+            let exact = (constraint.subjects.primary == Subject::Annotation
+                && constraint.subjects.primary_span == Some(annotation_span))
+                || (constraint.subjects.secondary == Some(Subject::Annotation)
+                    && constraint.subjects.secondary_span == Some(annotation_span));
+            if constraint.origin == ConstraintOrigin::ContextualCheck && exact {
+                contract = Some(self.reason(ReasonOrigin::Contract(constraint.id), Vec::new()));
                 break;
             }
             match &constraint.kind {
@@ -6395,6 +6644,13 @@ impl Table {
                     }
                 }
                 _ => {}
+            }
+        }
+        if let Some(contract) = contract {
+            // Structural decomposition of a written contract remains the same
+            // contract at each corresponding semantic position.
+            for node in &mut provenance.nodes {
+                node.roots.push(contract);
             }
         }
         provenance
@@ -9897,7 +10153,14 @@ mod existential_regressions {
 
 #[cfg(test)]
 mod identity_tests {
-    use super::{ReasonId, ReasonOrigin, Subject, Table, VarSort, budget_reason_slice};
+    use super::{
+        ExplainedScheme, QuantifiedProvenance, ReasonId, ReasonOrigin, SchemeProvenance, Subject,
+        Table, VarSort, budget_reason_slice,
+    };
+    use crate::tracking::Span;
+    use crate::types::{Presence, Rest, Row, RowField, Scheme, Ty};
+    use indexmap::IndexMap;
+    use std::rc::Rc;
 
     #[test]
     fn full_reason_budget_preserves_oldest_and_failure_endpoints_and_counts_omissions() {
@@ -9907,6 +10170,66 @@ mod identity_tests {
         assert_eq!(omitted, 616);
         assert_eq!(kept.first().copied(), Some(ReasonId::synthetic(0)));
         assert_eq!(kept.last().copied(), Some(ReasonId::synthetic(16_999)));
+    }
+
+    #[test]
+    fn package_and_absent_payload_provenance_follow_zonked_structure() {
+        let table = Table::default();
+        let absent_payload = Rc::new(Ty::Arrow(
+            Rc::new(Ty::Nat),
+            Rc::new(Ty::Boolean),
+            Row::closed(),
+        ));
+        let mut labels = IndexMap::new();
+        labels.insert(
+            "hidden".into(),
+            RowField {
+                presence: Presence::Absent,
+                ty: absent_payload,
+            },
+        );
+        labels.insert("shown".into(), RowField::present(Rc::new(Ty::Nat)));
+        let root = Rc::new(Ty::Package(Rc::new(Ty::Struct(Row {
+            labels,
+            rest: Rest::Closed,
+        }))));
+        let provenance = table.scheme_provenance(&root, &Default::default(), 0);
+        assert_eq!(provenance.nodes.len(), 6);
+        assert!(matches!(
+            provenance.nodes[0].shape,
+            super::ProvenanceShape::Ty(super::ProvenanceTy::Package)
+        ));
+        assert_eq!(provenance.nodes[0].children, [1]);
+        let super::ProvenanceShape::Row(layout) = &provenance.nodes[2].shape else {
+            panic!()
+        };
+        assert_eq!(layout, &[("hidden".into(), false), ("shown".into(), true)]);
+        assert_eq!(provenance.nodes[2].children.len(), 3);
+    }
+
+    #[test]
+    fn quantified_row_positions_keep_their_sort_when_opened() {
+        let mut table = Table::default();
+        let explained = ExplainedScheme {
+            scheme: Scheme::new(1, Rc::new(Ty::Struct(Row::of(Rest::Bound(0))))),
+            provenance: SchemeProvenance {
+                nodes: Vec::new(),
+                quantified: vec![QuantifiedProvenance {
+                    sort: VarSort::Row,
+                    roots: Vec::new(),
+                    omitted: 0,
+                }],
+            },
+        };
+        table.instantiate_scoped(Span::default(), &explained, None);
+        assert_eq!(table.var_meta.last().unwrap().sort, VarSort::Row);
+        assert!(matches!(
+            table.reasons[table.var_meta.last().unwrap().minted_by.get() as usize].origin,
+            ReasonOrigin::Variable {
+                sort: VarSort::Row,
+                ..
+            }
+        ));
     }
 
     #[test]

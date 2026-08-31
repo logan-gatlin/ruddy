@@ -1,21 +1,9 @@
-# Structured recursive-cycle explanation plan
+# Scheme provenance structural alignment plan
 
-- [x] Replace flattening occurs detection with a graph-safe iterative raw walk that retains only the exact binding-reason route back to the assigned variable.
-- [x] Bound shared `Rc` DAGs and malformed unrelated binding cycles with visited node/continuation state while preserving deterministic sibling order.
-- [x] Attach `Recursive` failures to the ordinary structured causal explanation path, including direct and shared-row cycle-closing constraints.
-- [x] Derive call-input, containment, and neutral recursive repair advice from the causal source shape, with no solver terminology.
-- [x] Expose the 2–4 fact abridged view and complete causal path through debugger snapshots.
-- [x] Add self-application, nested function/row, row-tail/presence/shared-tail exact paths, sibling exclusion, post-failure recovery, exponential-DAG, cyclic-binding, and 30,000-depth regressions.
-- [x] Run formatting, focused tests, full workspace tests/checks, and Clippy.
-- [x] Commit without disturbing unrelated workspace changes.
-
-# Phase 3: cross-definition inference explanations
-
-- [x] Keep semantic `Scheme` span/prose-free and pair it internally with a compact causal skeleton.
-- [x] Close provenance at generalization and reopen it with the same scheme instantiation, including closed contracts and nested lets.
-- [x] Carry original call/projection/body facts through later definitions; treat imported contracts as authoritative local-use fallbacks.
-- [x] Keep causal walks iterative and cap scheme roots/full reason slices without changing inference semantics.
-- [x] Make the 2–4 fact selection source-ordered and independent of unrelated definition identities; never introduce more than one shared causal pivot.
-- [x] Cover accessors, repeated uses, long definition chains, imported fallback, and unrelated-definition determinism.
-- [x] Run formatting, focused regressions, full workspace tests/checks, and Clippy.
-- [x] Commit without disturbing unrelated workspace changes.
+- [x] Replace flat semantic preorder provenance with an explicit arena whose child edges mirror zonked type/row/presence structure.
+- [x] Replay package bodies, absent payload pruning, rows, and presences against their exact semantic children and attach roots to opened nodes/variables.
+- [x] Preserve quantified Type/Row/Presence sorts when instantiating schemes.
+- [x] Pass each binding's exact annotation evidence into authoritative provenance instead of searching unrelated nested contextual checks.
+- [x] Bound roots per semantic position and globally, retaining earliest/latest endpoints and accounting for omitted parents/reasons.
+- [x] Add package/absent sibling structure, competing annotation, row-sort, long-chain, and >16k reason-budget regressions.
+- [x] Run formatting, full workspace tests/checks, and Clippy; commit without disturbing unrelated changes.

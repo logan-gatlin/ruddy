@@ -1447,9 +1447,14 @@ impl Solve<'_> {
         self.locals.insert(symbol, scheme.clone());
         let provenance = if self.errors.len() != error_start {
             SchemeProvenance::default()
-        } else if self.table.authoritative_bindings.contains(&symbol) {
-            self.table
-                .authoritative_provenance(bound, &subst, scheme.count(), value)
+        } else if let Some(annotation_span) = self.table.authoritative_spans.get(&symbol).copied() {
+            self.table.authoritative_provenance(
+                bound,
+                &subst,
+                scheme.count(),
+                value,
+                annotation_span,
+            )
         } else {
             self.table.scheme_provenance(bound, &subst, scheme.count())
         };
