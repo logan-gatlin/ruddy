@@ -875,6 +875,17 @@ fn annotated_definition_publishes_contract_not_unrelated_body_facts() {
 }
 
 #[test]
+fn annotated_row_rigid_reopens_as_a_row_and_keeps_contract_provenance() {
+    let source = "let field : { x: Nat, ..'r } -> Nat = fn value => value.x\nlet bad = field 1n";
+    let facts = explained_facts(source);
+    let annotation = source.find("{ x: Nat, ..'r }").unwrap();
+    assert!(
+        facts.iter().any(|fact| fact.span.start == annotation),
+        "{facts:#?}"
+    );
+}
+
+#[test]
 fn authoritative_provenance_uses_the_owning_annotation() {
     let source = "let outer : Nat -> Nat = fn value => let inner : Boolean -> Boolean = fn flag => flag in value\nlet bad = outer false";
     let facts = explained_facts(source);

@@ -1685,6 +1685,10 @@ struct Table {
     /// closed schemes, which mint no variable on which to hang provenance.
     /// Entries live only for this inference run and never affect semantics.
     opened_provenance: HashMap<usize, (Weak<Ty>, Vec<ReasonId>)>,
+    /// Presence-position evidence follows the opened presence variable itself.
+    /// It must not ride on the field payload's `Rc`: distinct sibling fields
+    /// may deliberately share a payload node without sharing presence causes.
+    opened_presence_provenance: HashMap<TyVar, (ReasonId, Vec<ReasonId>)>,
     /// Nested bindings whose written contracts, rather than implementation
     /// evidence, are authoritative when their schemes are published.
     authoritative_bindings: HashSet<Symbol>,
@@ -1710,6 +1714,9 @@ struct Subst {
     /// quantified position once it has been. See [`ErrorKind::RigidEscapes`]
     /// for the one that may not be.
     rigids: HashMap<u32, u32>,
+    /// A rigid may occur as a whole type or as a row tail. Keep that semantic
+    /// sort when the annotation's rigid is reopened as an ordinary variable.
+    rigid_sorts: HashMap<u32, VarSort>,
 }
 
 impl Subst {
@@ -3722,13 +3729,14 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             } else if decl.annotation.is_some() {
                 table.authoritative_provenance(
                     &member.ty,
+                    scheme.body(),
                     &subst,
                     scheme.count(),
                     &member.generated,
                     decl.annotation.as_ref().expect("annotated").ty.span,
                 )
             } else {
-                table.scheme_provenance(&member.ty, &subst, scheme.count())
+                table.scheme_provenance(&member.ty, scheme.body(), &subst, scheme.count())
             };
             env.insert(
                 symbol,
@@ -4329,6 +4337,13 @@ impl Table {
         let mut presence = presence.clone();
         let mut budget = self.vars.len();
         while let Presence::Var(var) = presence {
+            if let Some((identity, reasons)) = self.opened_presence_provenance.get(&var)
+                && self.var_meta[var as usize].minted_by == *identity
+            {
+                for reason in reasons {
+                    self.note_binding_read(*reason);
+                }
+            }
             let Slot::Bound {
                 value: Assigned::Presence(inner),
                 by,
@@ -5555,7 +5570,7 @@ impl Table {
         enum Opened {
             Ty(Rc<Ty>),
             Row(Row, Rc<Ty>),
-            Presence(Rc<Ty>),
+            Presence(Presence),
         }
         let Some(mut root_node) = (!provenance.nodes.is_empty()).then_some(0) else {
             return;
@@ -5663,7 +5678,7 @@ impl Table {
                     let mut children = Vec::new();
                     for field in row.labels.values() {
                         let presence = self.presence_of(&field.presence);
-                        children.push(Opened::Presence(field.ty.clone()));
+                        children.push(Opened::Presence(presence.clone()));
                         if !matches!(presence, Presence::Absent) {
                             children.push(Opened::Ty(field.ty.clone()));
                         }
@@ -5678,11 +5693,33 @@ impl Table {
                             .rev(),
                     );
                 }
-                Opened::Presence(owner) => {
+                Opened::Presence(presence) => {
                     if node.shape != ProvenanceShape::Presence {
                         continue;
                     }
-                    attach(self, &owner);
+                    if let Presence::Var(var) = presence
+                        && (!node.roots.is_empty() || node.omitted != 0)
+                    {
+                        let marker = self.reason_with_omissions(
+                            ReasonOrigin::Variable {
+                                sort: VarSort::Presence,
+                                subject: Subject::Scheme,
+                            },
+                            node.roots.clone(),
+                            node.omitted,
+                        );
+                        let identity = self.var_meta[var as usize].minted_by;
+                        self.opened_presence_provenance
+                            .entry(var)
+                            .and_modify(|entry| {
+                                if entry.0 == identity {
+                                    entry.1.push(marker);
+                                } else {
+                                    *entry = (identity, vec![marker]);
+                                }
+                            })
+                            .or_insert_with(|| (identity, vec![marker]));
+                    }
                 }
             }
         }
@@ -6386,7 +6423,13 @@ impl Table {
     /// Capture only causal bindings which survive in the published semantic
     /// shape. This preorder is replayed over the opened scheme, bounding work
     /// by semantic nodes rather than by the size of the defining body.
-    fn scheme_provenance(&self, ty: &Rc<Ty>, subst: &Subst, count: u32) -> SchemeProvenance {
+    fn scheme_provenance(
+        &self,
+        ty: &Rc<Ty>,
+        published: &Rc<Ty>,
+        subst: &Subst,
+        count: u32,
+    ) -> SchemeProvenance {
         enum Work {
             Ty(Rc<Ty>, Option<usize>),
             Row(Row, Option<usize>),
@@ -6409,6 +6452,11 @@ impl Table {
             if let Some(slot) = quantified.get_mut(*at as usize) {
                 slot.sort = VarSort::Presence;
                 slot.roots.push(self.var_meta[*var as usize].minted_by);
+            }
+        }
+        for (id, at) in &subst.rigids {
+            if let Some(slot) = quantified.get_mut(*at as usize) {
+                slot.sort = subst.rigid_sorts.get(id).copied().unwrap_or(VarSort::Type);
             }
         }
         let mut nodes = Vec::<ProvenanceNode>::new();
@@ -6545,6 +6593,142 @@ impl Table {
                 work.push(child);
             }
         }
+        // Positive-presence packaging runs after zonking and may synthesize a
+        // package at any covariant structural position. Rebuild the skeleton
+        // from the exact body that is actually published, carrying evidence
+        // through matching nodes and inserting evidence-free package wrappers
+        // in lockstep. Opening can therefore replay nested synthesized packages
+        // without guessing from the pre-packaging body.
+        enum Published {
+            Ty(Rc<Ty>, Option<usize>, Option<usize>),
+            Row(Row, Option<usize>, Option<usize>),
+            Presence(Option<usize>, Option<usize>),
+        }
+        let before = nodes;
+        let mut exact = Vec::<ProvenanceNode>::new();
+        let mut work = vec![Published::Ty(published.clone(), None, Some(0))];
+        while let Some(item) = work.pop() {
+            let (shape, parent, old, children): (_, _, _, Vec<Published>) = match item {
+                Published::Ty(ty, parent, old) => {
+                    let (tag, child_types): (ProvenanceTy, Vec<Published>) = match &*ty {
+                        Ty::Arrow(from, to, effects) => (
+                            ProvenanceTy::Arrow,
+                            vec![
+                                Published::Ty(from.clone(), None, None),
+                                Published::Ty(to.clone(), None, None),
+                                Published::Row(effects.clone(), None, None),
+                            ],
+                        ),
+                        Ty::Package(body) => (
+                            ProvenanceTy::Package,
+                            vec![Published::Ty(body.clone(), None, None)],
+                        ),
+                        Ty::Struct(row) => (
+                            ProvenanceTy::Struct,
+                            vec![Published::Row(row.clone(), None, None)],
+                        ),
+                        Ty::Sum(row) => (
+                            ProvenanceTy::Sum,
+                            vec![Published::Row(row.clone(), None, None)],
+                        ),
+                        Ty::Named { args, .. } => (
+                            ProvenanceTy::Named(args.len()),
+                            args.iter()
+                                .cloned()
+                                .map(|arg| Published::Ty(arg, None, None))
+                                .collect(),
+                        ),
+                        _ => (ProvenanceTy::Leaf, Vec::new()),
+                    };
+                    let shape = ProvenanceShape::Ty(tag);
+                    let synthesized = matches!(shape, ProvenanceShape::Ty(ProvenanceTy::Package))
+                        && old.is_some_and(|at| before.get(at).is_some_and(|n| n.shape != shape));
+                    let old_children = if synthesized {
+                        vec![old]
+                    } else {
+                        old.and_then(|at| before.get(at))
+                            .filter(|node| node.shape == shape)
+                            .map(|node| node.children.iter().copied().map(Some).collect())
+                            .unwrap_or_default()
+                    };
+                    let children = child_types
+                        .into_iter()
+                        .enumerate()
+                        .map(|(at, child)| match child {
+                            Published::Ty(ty, _, _) => {
+                                Published::Ty(ty, None, old_children.get(at).copied().flatten())
+                            }
+                            Published::Row(row, _, _) => {
+                                Published::Row(row, None, old_children.get(at).copied().flatten())
+                            }
+                            Published::Presence(_, _) => unreachable!(),
+                        })
+                        .collect();
+                    (
+                        shape,
+                        parent,
+                        (!synthesized).then_some(old).flatten(),
+                        children,
+                    )
+                }
+                Published::Row(row, parent, old) => {
+                    let layout: Vec<_> = row
+                        .labels
+                        .iter()
+                        .map(|(name, field)| {
+                            (name.clone(), !matches!(field.presence, Presence::Absent))
+                        })
+                        .collect();
+                    let shape = ProvenanceShape::Row(layout);
+                    let old_children = old
+                        .and_then(|at| before.get(at))
+                        .filter(|node| node.shape == shape)
+                        .map(|node| node.children.clone())
+                        .unwrap_or_default();
+                    let mut children = Vec::new();
+                    let mut at = 0;
+                    for field in row.labels.values() {
+                        children.push(Published::Presence(None, old_children.get(at).copied()));
+                        at += 1;
+                        if !matches!(field.presence, Presence::Absent) {
+                            children.push(Published::Ty(
+                                field.ty.clone(),
+                                None,
+                                old_children.get(at).copied(),
+                            ));
+                            at += 1;
+                        }
+                    }
+                    (shape, parent, old, children)
+                }
+                Published::Presence(parent, old) => {
+                    (ProvenanceShape::Presence, parent, old, Vec::new())
+                }
+            };
+            let id = exact.len();
+            let (roots, omitted) = old
+                .and_then(|at| before.get(at))
+                .filter(|node| node.shape == shape)
+                .map(|node| (node.roots.clone(), node.omitted))
+                .unwrap_or_default();
+            exact.push(ProvenanceNode {
+                shape,
+                roots,
+                omitted,
+                children: Vec::new(),
+            });
+            if let Some(parent) = parent {
+                exact[parent].children.push(id);
+            }
+            for child in children.into_iter().rev() {
+                work.push(match child {
+                    Published::Ty(ty, _, old) => Published::Ty(ty, Some(id), old),
+                    Published::Row(row, _, old) => Published::Row(row, Some(id), old),
+                    Published::Presence(_, old) => Published::Presence(Some(id), old),
+                });
+            }
+        }
+        let mut nodes = exact;
         for slot in &mut quantified {
             slot.roots.sort_unstable();
             slot.roots.dedup();
@@ -6607,12 +6791,13 @@ impl Table {
     fn authoritative_provenance(
         &mut self,
         ty: &Rc<Ty>,
+        published: &Rc<Ty>,
         subst: &Subst,
         count: u32,
         constraints: &[Constraint],
         annotation_span: Span,
     ) -> SchemeProvenance {
-        let mut provenance = self.scheme_provenance(ty, subst, count);
+        let mut provenance = self.scheme_provenance(ty, published, subst, count);
         for node in &mut provenance.nodes {
             node.roots.clear();
             node.omitted = 0;
@@ -6761,6 +6946,7 @@ impl Table {
             // one into a [`Ty::Bound`] before it published anything, so
             // there is nothing here left to shift.
             rigids: HashMap::new(),
+            rigid_sorts: HashMap::new(),
         };
         let mut existentials = scheme.existentials().clone();
         existentials.extend(
@@ -6824,6 +7010,7 @@ impl Table {
                         Ty::Rigid { id, .. } if !presences => {
                             let next = subst.next();
                             subst.rigids.entry(*id).or_insert(next);
+                            subst.rigid_sorts.entry(*id).or_insert(VarSort::Type);
                         }
                         Ty::Arrow(from, to, effects) => {
                             work.push(Work::Row(effects.clone()));
@@ -6861,6 +7048,7 @@ impl Table {
                 Work::Tail(Rest::Rigid { id, .. }) => {
                     let next = subst.next();
                     subst.rigids.entry(id).or_insert(next);
+                    subst.rigid_sorts.entry(id).or_insert(VarSort::Row);
                 }
                 Work::Tail(Rest::Closed | Rest::Bound(_) | Rest::Undecided | Rest::More(_)) => {}
             }
@@ -8085,6 +8273,18 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
         rigids: at
             .iter()
             .map(|(id, index)| (*id, presences + index))
+            .collect(),
+        rigid_sorts: annotation
+            .variables
+            .iter()
+            .filter_map(|variable| {
+                let sort = match variable.sense {
+                    Sense::Type => VarSort::Type,
+                    Sense::Fields | Sense::Cases | Sense::Effects => VarSort::Row,
+                    Sense::Presence => return None,
+                };
+                Some((variable.id, sort))
+            })
             .collect(),
     };
     let scheme = Scheme::existential(
@@ -10154,8 +10354,9 @@ mod existential_regressions {
 #[cfg(test)]
 mod identity_tests {
     use super::{
-        ExplainedScheme, QuantifiedProvenance, ReasonId, ReasonOrigin, SchemeProvenance, Subject,
-        Table, VarSort, budget_reason_slice,
+        ConstraintId, ExplainedScheme, ProvenanceNode, ProvenanceShape, ProvenanceTy,
+        QuantifiedProvenance, ReasonId, ReasonOrigin, SchemeProvenance, Subject, Table, VarSort,
+        budget_reason_slice,
     };
     use crate::tracking::Span;
     use crate::types::{Presence, Rest, Row, RowField, Scheme, Ty};
@@ -10193,7 +10394,7 @@ mod identity_tests {
             labels,
             rest: Rest::Closed,
         }))));
-        let provenance = table.scheme_provenance(&root, &Default::default(), 0);
+        let provenance = table.scheme_provenance(&root, &root, &Default::default(), 0);
         assert_eq!(provenance.nodes.len(), 6);
         assert!(matches!(
             provenance.nodes[0].shape,
@@ -10205,6 +10406,139 @@ mod identity_tests {
         };
         assert_eq!(layout, &[("hidden".into(), false), ("shown".into(), true)]);
         assert_eq!(provenance.nodes[2].children.len(), 3);
+    }
+
+    #[test]
+    fn synthesized_nested_packages_rebuild_the_published_provenance_body() {
+        let table = Table::default();
+        let result = Rc::new(Ty::Struct(Row {
+            labels: [(
+                "hidden".into(),
+                RowField {
+                    presence: Presence::Bound(0),
+                    ty: Rc::new(Ty::Nat),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            rest: Rest::Closed,
+        }));
+        let source = Rc::new(Ty::Arrow(Rc::new(Ty::Nat), result.clone(), Row::closed()));
+        let published = Rc::new(Ty::Arrow(
+            Rc::new(Ty::Nat),
+            Rc::new(Ty::Package(result)),
+            Row::closed(),
+        ));
+
+        let provenance = table.scheme_provenance(&source, &published, &Default::default(), 1);
+        assert_eq!(
+            provenance.nodes[provenance.nodes[0].children[1]].shape,
+            ProvenanceShape::Ty(ProvenanceTy::Package)
+        );
+        assert_eq!(
+            provenance.nodes[provenance.nodes[0].children[1]]
+                .children
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn shared_payload_rc_does_not_share_sibling_presence_provenance() {
+        let mut table = Table::default();
+        let left_root = table.constraint_reason(ConstraintId::synthetic(10));
+        let right_root = table.constraint_reason(ConstraintId::synthetic(20));
+        let left = table.fresh_instance_presence();
+        let right = table.fresh_instance_presence();
+        let shared = Rc::new(Ty::Nat);
+        let root = Rc::new(Ty::Struct(Row {
+            labels: [
+                (
+                    "left".into(),
+                    RowField {
+                        presence: left.clone(),
+                        ty: shared.clone(),
+                    },
+                ),
+                (
+                    "right".into(),
+                    RowField {
+                        presence: right.clone(),
+                        ty: shared,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            rest: Rest::Closed,
+        }));
+        let provenance = SchemeProvenance {
+            nodes: vec![
+                ProvenanceNode {
+                    shape: ProvenanceShape::Ty(ProvenanceTy::Struct),
+                    roots: vec![],
+                    omitted: 0,
+                    children: vec![1],
+                },
+                ProvenanceNode {
+                    shape: ProvenanceShape::Row(vec![
+                        ("left".into(), true),
+                        ("right".into(), true),
+                    ]),
+                    roots: vec![],
+                    omitted: 0,
+                    children: vec![2, 3, 4, 5],
+                },
+                ProvenanceNode {
+                    shape: ProvenanceShape::Presence,
+                    roots: vec![left_root],
+                    omitted: 0,
+                    children: vec![],
+                },
+                ProvenanceNode {
+                    shape: ProvenanceShape::Ty(ProvenanceTy::Leaf),
+                    roots: vec![],
+                    omitted: 0,
+                    children: vec![],
+                },
+                ProvenanceNode {
+                    shape: ProvenanceShape::Presence,
+                    roots: vec![right_root],
+                    omitted: 0,
+                    children: vec![],
+                },
+                ProvenanceNode {
+                    shape: ProvenanceShape::Ty(ProvenanceTy::Leaf),
+                    roots: vec![],
+                    omitted: 0,
+                    children: vec![],
+                },
+            ],
+            quantified: vec![],
+        };
+        table.mark_opened_type(&root, &provenance);
+        table.enter_solver_scope();
+
+        table.begin_solver_act();
+        table.presence_of(&left);
+        let left_reads = table.take_binding_reads();
+        table.end_solver_act();
+        table.begin_solver_act();
+        table.presence_of(&right);
+        let right_reads = table.take_binding_reads();
+        table.end_solver_act();
+        table.leave_solver_scope();
+
+        assert_eq!(left_reads.len(), 1);
+        assert_eq!(right_reads.len(), 1);
+        assert_eq!(
+            table.reasons[left_reads[0].get() as usize].parents,
+            [left_root]
+        );
+        assert_eq!(
+            table.reasons[right_reads[0].get() as usize].parents,
+            [right_root]
+        );
     }
 
     #[test]

@@ -1450,13 +1450,15 @@ impl Solve<'_> {
         } else if let Some(annotation_span) = self.table.authoritative_spans.get(&symbol).copied() {
             self.table.authoritative_provenance(
                 bound,
+                scheme.body(),
                 &subst,
                 scheme.count(),
                 value,
                 annotation_span,
             )
         } else {
-            self.table.scheme_provenance(bound, &subst, scheme.count())
+            self.table
+                .scheme_provenance(bound, scheme.body(), &subst, scheme.count())
         };
         self.schemes
             .insert(symbol, ExplainedScheme::local(scheme, provenance));
