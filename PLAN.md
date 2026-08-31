@@ -29,3 +29,10 @@
 - [x] Collect performed sources per callable walk so nested closure bodies do not leak into an enclosing callable unless invoked there.
 - [x] Cover projected higher-order parameters, returned versus invoked callbacks, coalesced declarations, annotations, and local/generalized flow.
 - [x] Run formatting, the full workspace suite, workspace checks, and Clippy.
+
+## Call-result effect provenance follow-up
+
+- [x] Extend symbolic value paths with call-result and field steps, without placing provenance in inferred types.
+- [x] Resolve arbitrary call-result/projection chains during argument substitution while counting only invoked values as performed effects.
+- [x] Cover producer/invoker flow, nested bounded chains, coalesced declaration identity, and obtaining effectful results without invoking them.
+- [x] Run formatting, the full workspace suite, workspace checks, and Clippy.

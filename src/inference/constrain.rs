@@ -536,7 +536,7 @@ impl Constrain<'_> {
                 let effect_origins = match &resolved_func.value_parameter {
                     Some(parameter) => vec![super::EffectSource::Parameter {
                         symbol: parameter.symbol,
-                        fields: parameter.fields.clone(),
+                        path: parameter.path.clone(),
                     }],
                     None => resolved_func.callable.clone(),
                 };
@@ -547,8 +547,12 @@ impl Constrain<'_> {
                         }
                     }
                 }
-                if let Some(result) = resolved_func.result {
-                    self.term_effect_provenance.insert(span, *result);
+                // A symbolic callable's returned value remains symbolic too:
+                // subsequent projections and invocations resolve this path
+                // against the exact argument. Merely obtaining the result does
+                // not add that result's callable origin to `effect_origins`.
+                if let Some(result) = resolved_func.call_result() {
+                    self.term_effect_provenance.insert(span, result);
                 }
                 // Through a name, so that something annotated `Endo` is
                 // applied as the arrow it stands for. The arrow the arm then

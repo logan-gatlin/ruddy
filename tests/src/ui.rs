@@ -1750,6 +1750,8 @@ fn bare_operation_values_keep_exact_origins_through_value_flow() {
         "let bad = let invoke = fn holder => holder.run 0n in invoke { run: C::!Log.write }\n",
         "let bad = let invoke : { run: Nat -> () + C::!Log } -> () + C::!Log = fn holder => holder.run 0n in invoke { run: C::!Log.write }\n",
         "let return = fn holder => fn _ => holder.run 0n\nlet callback = return { run: C::!Log.write }\nlet bad = callback ()\n",
+        "let produce = fn _ => { run: C::!Log.write }\nlet invoke = fn maker => (maker ()).run 0n\nlet bad = invoke produce\n",
+        "let produce = fn _ => { next: fn _ => { run: C::!Log.write } }\nlet invoke = fn maker => ((maker ()).next ()).run 0n\nlet bad = invoke produce\n",
     ] {
         let source = format!(
             "module A = effect Log = {{ write: Nat -> () }} end\nmodule C = effect Log = {{ write: Nat -> () }} end\n{tail}"
@@ -1776,14 +1778,48 @@ fn bare_operation_values_keep_exact_origins_through_value_flow() {
 
 #[test]
 fn returning_an_effectful_callback_does_not_perform_its_body() {
-    let source = "module A = effect Log = { write: Nat -> () } end\nmodule C = effect Log = { write: Nat -> () } end\nlet return = fn holder => fn _ => holder.run 0n\nlet callback = return { run: C::!Log.write }\n";
-    let errors = inference_fixture_errors(source);
-    assert!(
-        !errors
-            .iter()
-            .any(|error| matches!(error.kind, inference::ErrorKind::Unhandled { .. })),
-        "constructing and returning the callback must not invoke it: {errors:#?}"
+    for source in [
+        "module A = effect Log = { write: Nat -> () } end\nmodule C = effect Log = { write: Nat -> () } end\nlet return = fn holder => fn _ => holder.run 0n\nlet callback = return { run: C::!Log.write }\n",
+        "module A = effect Log = { write: Nat -> () } end\nmodule C = effect Log = { write: Nat -> () } end\nlet produce = fn _ => { run: C::!Log.write }\nlet saved = produce ()\n",
+    ] {
+        let errors = inference_fixture_errors(source);
+        assert!(
+            !errors
+                .iter()
+                .any(|error| matches!(error.kind, inference::ErrorKind::Unhandled { .. })),
+            "obtaining an effectful invocation result must not invoke it: {errors:#?}"
+        );
+    }
+}
+
+#[test]
+fn call_result_and_field_provenance_paths_remain_bounded() {
+    const DEPTH: usize = 24;
+    let mut producer = String::from("C::!Log.write");
+    for _ in 0..DEPTH {
+        producer = format!("fn _ => {{ next: {producer} }}");
+    }
+    let mut selected = String::from("maker");
+    for _ in 0..DEPTH {
+        selected = format!("({selected} ()).next");
+    }
+    let source = format!(
+        "module A = effect Log = {{ write: Nat -> () }} end\nmodule C = effect Log = {{ write: Nat -> () }} end\nlet produce = {producer}\nlet invoke = fn maker => {selected} 0n\nlet bad = invoke produce\n"
     );
+    let errors = inference_fixture_errors(&source);
+    let error = errors
+        .iter()
+        .find(|error| matches!(error.kind, inference::ErrorKind::Unhandled { .. }))
+        .unwrap_or_else(|| panic!("deep call-result path must retain the operation: {errors:#?}"));
+    let declaration = error
+        .explanation
+        .as_ref()
+        .expect("effect explanation")
+        .full_facts
+        .iter()
+        .find(|fact| fact.payload == inference::ExplanationFactPayload::EffectDeclaration)
+        .expect("resolved operation declaration");
+    assert!(declaration.span.start > source.find("module C").unwrap());
 }
 
 #[test]

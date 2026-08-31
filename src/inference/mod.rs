@@ -992,13 +992,24 @@ pub struct EffectOrigin {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EffectSource {
     Origin(EffectOrigin),
-    Parameter { symbol: Symbol, fields: Vec<String> },
+    Parameter {
+        symbol: Symbol,
+        path: Vec<EffectPathStep>,
+    },
+}
+
+/// One value-flow step from a symbolic higher-order parameter. Kept beside
+/// provenance rather than in [`Ty`] so paths do not affect type identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EffectPathStep {
+    CallResult,
+    Field(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EffectParameter {
     symbol: Symbol,
-    fields: Vec<String>,
+    path: Vec<EffectPathStep>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1015,21 +1026,25 @@ impl EffectProvenance {
         Self {
             value_parameter: Some(EffectParameter {
                 symbol,
-                fields: Vec::new(),
+                path: Vec::new(),
             }),
             ..Self::default()
         }
     }
 
-    fn select(&self, fields: &[String]) -> Option<Self> {
+    fn select(&self, path: &[EffectPathStep]) -> Option<Self> {
         let mut selected = self;
-        for (at, field) in fields.iter().enumerate() {
-            if let Some(known) = selected.fields.get(field) {
+        for (at, step) in path.iter().enumerate() {
+            let known = match step {
+                EffectPathStep::CallResult => selected.result.as_deref(),
+                EffectPathStep::Field(field) => selected.fields.get(field),
+            };
+            if let Some(known) = known {
                 selected = known;
                 continue;
             }
             let mut parameter = selected.value_parameter.clone()?;
-            parameter.fields.extend_from_slice(&fields[at..]);
+            parameter.path.extend_from_slice(&path[at..]);
             return Some(Self {
                 value_parameter: Some(parameter),
                 ..Self::default()
@@ -1039,25 +1054,32 @@ impl EffectProvenance {
     }
 
     fn projected(&self, field: String) -> Option<Self> {
-        self.select(&[field])
+        self.select(&[EffectPathStep::Field(field)])
+    }
+
+    fn call_result(&self) -> Option<Self> {
+        self.result
+            .as_deref()
+            .cloned()
+            .or_else(|| self.select(&[EffectPathStep::CallResult]))
     }
 
     fn substitute(&self, symbol: Symbol, value: &Self) -> Self {
         if let Some(parameter) = &self.value_parameter
             && parameter.symbol == symbol
         {
-            return value.select(&parameter.fields).unwrap_or_default();
+            return value.select(&parameter.path).unwrap_or_default();
         }
         let mut out = self.clone();
         let mut callable = Vec::new();
         for source in &out.callable {
             if let EffectSource::Parameter {
                 symbol: parameter,
-                fields,
+                path,
             } = source
                 && *parameter == symbol
             {
-                if let Some(replacement) = value.select(fields) {
+                if let Some(replacement) = value.select(path) {
                     for replacement in &replacement.callable {
                         if !callable.contains(replacement) {
                             callable.push(replacement.clone());
@@ -1066,7 +1088,7 @@ impl EffectProvenance {
                     if let Some(parameter) = &replacement.value_parameter {
                         let replacement = EffectSource::Parameter {
                             symbol: parameter.symbol,
-                            fields: parameter.fields.clone(),
+                            path: parameter.path.clone(),
                         };
                         if !callable.contains(&replacement) {
                             callable.push(replacement);
