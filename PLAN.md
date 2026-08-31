@@ -58,6 +58,14 @@
 - [x] Cover a 100,000-entry callable replacement and PATH_BUDGET selection exhaustion with bounded allocation and exact-origin retention.
 - [x] Run formatting, the full workspace suite, workspace checks, and Clippy.
 
+## Extern-boundary structural review follow-up
+
+- [x] Build one semantic/source boundary walk with variable provenance keyed by exact lowered identities across alias and composed-row expansion.
+- [x] Preserve exact callback label formulas and open-tail relations, and evaluate coverage alongside polymorphic boundary failures.
+- [x] Aggregate failures by callback path and render every missing effect, tail, and condition with shared declaration facts only once.
+- [x] Cover alias presence/tails, exact multi-variable spans, simultaneous failures, complete repairs, conditional prose, and result-spine deduplication.
+- [x] Run formatting, the full workspace suite, workspace checks, and Clippy; commit without disturbing unrelated changes.
+
 ## Structured extern-boundary explanations
 
 - [x] Carry exact callback effects, callback type/path/span, extern declaration facts, and declaration context through direct and solved coverage failures.

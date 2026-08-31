@@ -8374,7 +8374,7 @@ fn extern_boundary_errors_publish_exact_source_payloads_and_paths() {
 
 #[test]
 fn extern_boundary_aggregates_paths_and_retains_callback_evidence() {
-    use ruddy::inference::ErrorKind;
+    use ruddy::inference::{ErrorKind, ExplanationFactPayload};
 
     let (_, _, output) = infer_src(
         "effect Read = () -> ()\n\
@@ -8397,6 +8397,23 @@ fn extern_boundary_aggregates_paths_and_retains_callback_evidence() {
         issues
             .iter()
             .any(|issue| issue.callback_path.contains("parameter 2"))
+    );
+    let facts = &error.explanation.as_ref().unwrap().full_facts;
+    assert_eq!(
+        facts
+            .iter()
+            .filter(|fact| fact.payload == ExplanationFactPayload::ExternCapability)
+            .count(),
+        1,
+        "{facts:#?}"
+    );
+    assert_eq!(
+        facts
+            .iter()
+            .filter(|fact| fact.payload == ExplanationFactPayload::ExternDeclaration)
+            .count(),
+        1,
+        "{facts:#?}"
     );
 
     let (_, _, output) = infer_src(
@@ -8447,11 +8464,11 @@ fn conditional_callback_failure_keeps_its_later_path_and_formula() {
 }
 
 #[test]
-fn extern_boundary_reports_arrow_effect_row_and_presence_kinds() {
+fn extern_boundary_reports_row_and_presence_kinds() {
     use ruddy::inference::{ErrorKind, ExternVariableKind};
     for (source, expected) in [
         (
-            "extern x : (() -> () + ..'effects) -> () = host.x",
+            "extern x : fn({ value: Nat, ..'fields }) -> () = host.x",
             ExternVariableKind::Row,
         ),
         (
@@ -8473,6 +8490,332 @@ fn extern_boundary_reports_arrow_effect_row_and_presence_kinds() {
         );
         assert!(leaves.iter().all(|leaf| !leaf.position.is_empty()));
     }
+}
+
+#[test]
+fn extern_boundary_alias_presence_and_multiple_variables_keep_exact_sources() {
+    use ruddy::inference::{ErrorKind, ExternVariableKind};
+
+    let maybe_source = "type Maybe 'r = #Nil | ..'r\n\
+         extern consume : fn(Maybe (#Some (when 'some) Nat)) -> () = host.consume";
+    let (_, lowered, output) = infer_src(maybe_source);
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    let [error] = output.errors.as_slice() else {
+        panic!("{:#?}", output.errors)
+    };
+    let ErrorKind::PolymorphicExternBoundary { leaves, .. } = &error.kind else {
+        panic!("{error:#?}")
+    };
+    let presence = leaves
+        .iter()
+        .find(|leaf| leaf.kind == ExternVariableKind::Presence)
+        .expect("presence from the row spliced through Maybe");
+    assert_eq!(presence.variable, "'some");
+    assert_eq!(
+        &maybe_source[presence.span.start..presence.span.start + presence.span.width],
+        "'some"
+    );
+    assert!(presence.position.contains("`Some` presence"));
+
+    let variables_source = "extern choose : fn('first, 'second) -> () = host.choose";
+    let (_, lowered, output) = infer_src(variables_source);
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    let [error] = output.errors.as_slice() else {
+        panic!("{:#?}", output.errors)
+    };
+    let ErrorKind::PolymorphicExternBoundary { leaves, .. } = &error.kind else {
+        panic!("{error:#?}")
+    };
+    for (name, path) in [("'first", "parameter 1"), ("'second", "parameter 2")] {
+        let leaf = leaves
+            .iter()
+            .find(|leaf| leaf.variable == name)
+            .unwrap_or_else(|| panic!("missing {name}: {leaves:#?}"));
+        assert!(leaf.position.contains(path), "{}", leaf.position);
+        assert_eq!(
+            &variables_source[leaf.span.start..leaf.span.start + leaf.span.width],
+            name
+        );
+    }
+}
+
+#[test]
+fn local_and_imported_alias_callback_tails_keep_exact_relations() {
+    use ruddy::inference::ErrorKind;
+
+    let source = "type Callback 'e = () -> () + ..'e\n\
+         extern install : fn(Callback (..'needed)) -> () + ..'carried = host.install";
+    let (_, lowered, output) = infer_src(source);
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    let [error] = output.errors.as_slice() else {
+        panic!("{:#?}", output.errors)
+    };
+    let ErrorKind::CallbackEffectsNotCovered { issues, .. } = &error.kind else {
+        panic!("{error:#?}")
+    };
+    assert_eq!(issues.len(), 1);
+    assert!(
+        issues[0]
+            .missing_tails
+            .iter()
+            .any(|tail| { tail.contains("..'needed") && tail.contains("..'carried") })
+    );
+
+    let parsed = parse::parse(lex(source, FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    let mut mint = dummy_mint();
+    let mut lowered = ir::build(&mut mint, parsed.stmts);
+    let callback = lowered
+        .program
+        .types
+        .keys()
+        .copied()
+        .find(|symbol| mint.name(*symbol) == "Callback")
+        .expect("local callback declaration");
+    lowered.program.types.shift_remove(&callback);
+    lowered.program.external_types.insert(
+        callback,
+        ir::ExternalType {
+            params: vec![ParamKind::Effects {
+                lacks: Default::default(),
+            }],
+            relevant: vec![true],
+            scheme: Scheme::new(
+                1,
+                Rc::new(Ty::Arrow(
+                    Rc::new(Ty::unit()),
+                    Rc::new(Ty::unit()),
+                    Row::of(Rest::Bound(0)),
+                )),
+            ),
+            unresolved: None,
+        },
+    );
+    let output = inference::infer(&mint, &mut lowered.program);
+    let [error] = output.errors.as_slice() else {
+        panic!("{:#?}", output.errors)
+    };
+    let ErrorKind::CallbackEffectsNotCovered { issues, .. } = &error.kind else {
+        panic!("{error:#?}")
+    };
+    assert!(
+        issues[0]
+            .missing_tails
+            .iter()
+            .any(|tail| { tail.contains("..'needed") && tail.contains("..'carried") })
+    );
+}
+
+#[test]
+fn polymorphic_leaf_and_callback_effect_tail_failures_share_one_error() {
+    use ruddy::inference::{ErrorKind, ExplanationFactPayload};
+    let (_, lowered, output) = infer_src(
+        "effect Fail = () -> ()\n\
+         type Callback 'a 'e = 'a -> () + !Fail + ..'e\n\
+         extern install : fn(Callback 'value (..'needed)) -> () + ..'carried = host.install",
+    );
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    let [error] = output.errors.as_slice() else {
+        panic!("{:#?}", output.errors)
+    };
+    let ErrorKind::PolymorphicExternBoundary {
+        leaves,
+        callback_issues,
+        ..
+    } = &error.kind
+    else {
+        panic!("{error:#?}")
+    };
+    assert!(leaves.iter().any(|leaf| leaf.variable == "'value"));
+    assert_eq!(callback_issues.len(), 1);
+    assert_eq!(callback_issues[0].missing_effects.len(), 1);
+    assert!(!callback_issues[0].missing_tails.is_empty());
+    let diagnostic = error.diagnostic();
+    assert!(
+        diagnostic
+            .notes
+            .iter()
+            .any(|note| note.contains("needed") && note.contains("carried")),
+        "{diagnostic:#?}"
+    );
+    assert!(
+        diagnostic
+            .help
+            .iter()
+            .any(|help| help.contains("callback remainder")),
+        "{diagnostic:#?}"
+    );
+    assert!(error.explanation.as_ref().is_some_and(|explanation| {
+        explanation.cause.constraints.iter().all(|id| {
+            output
+                .constraints
+                .values()
+                .flatten()
+                .any(|constraint| constraint.id == *id)
+        }) && explanation
+            .full_facts
+            .iter()
+            .filter(|fact| fact.payload == ExplanationFactPayload::ExternCapability)
+            .count()
+            == 1
+            && explanation
+                .full_facts
+                .iter()
+                .filter(|fact| fact.payload == ExplanationFactPayload::ExternDeclaration)
+                .count()
+                == 1
+    }));
+}
+
+#[test]
+fn callback_diagnostic_renders_all_effects_tails_and_conditions() {
+    use ruddy::inference::ErrorKind;
+    let (_, _, output) = infer_src(
+        "effect Read = () -> ()\n\
+         effect Write = () -> ()\n\
+         extern install : fn(fn(()) -> () + !Read + !Write) -> () = host.install",
+    );
+    let [error] = output.errors.as_slice() else {
+        panic!("{:#?}", output.errors)
+    };
+    let diagnostic = error.diagnostic();
+    assert!(
+        diagnostic
+            .help
+            .iter()
+            .any(|help| { help.contains("Read") && help.contains("Write") }),
+        "{diagnostic:#?}"
+    );
+
+    let (_, _, output) = infer_src(
+        "effect Fail = () -> ()\n\
+         extern install : fn(fn(()) -> () + !Fail (when 'needed), fn(()) -> () + !Fail (when 'needed)) -> () + !Fail (when 'carried) = host.install",
+    );
+    let [error] = output.errors.as_slice() else {
+        panic!("{:#?}", output.errors)
+    };
+    let ErrorKind::CallbackEffectsNotCovered { issues, .. } = &error.kind else {
+        panic!("{error:#?}")
+    };
+    assert_eq!(issues.len(), 2);
+    assert!(issues.iter().all(|issue| issue.conditions.len() == 1));
+    let diagnostic = error.diagnostic();
+    assert_eq!(
+        diagnostic
+            .notes
+            .iter()
+            .filter(|note| note.contains("coverage requires")
+                && note.contains("needed")
+                && note.contains("carried"))
+            .count(),
+        2,
+        "{diagnostic:#?}"
+    );
+    assert!(
+        diagnostic
+            .help
+            .iter()
+            .any(|help| { help.contains("needed") && help.contains("carried") }),
+        "{diagnostic:#?}"
+    );
+}
+
+#[test]
+fn aggregated_callback_requirements_keep_each_effects_condition() {
+    use ruddy::inference::ErrorKind;
+    let (_, lowered, output) = infer_src(
+        "effect Read = () -> ()\n\
+         effect Write = () -> ()\n\
+         extern install : fn(fn(()) -> (() -> () + !Write (when 'needed)) + !Read) -> () = host.install",
+    );
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    let [error] = output.errors.as_slice() else {
+        panic!("{:#?}", output.errors)
+    };
+    let ErrorKind::CallbackEffectsNotCovered { issues, .. } = &error.kind else {
+        panic!("{error:#?}")
+    };
+    assert_eq!(issues.len(), 1, "{issues:#?}");
+    assert!(
+        issues[0]
+            .requirements
+            .iter()
+            .any(|item| item.effect.contains("Read") && item.condition.is_none())
+    );
+    assert!(issues[0].requirements.iter().any(|item| {
+        item.effect.contains("Write")
+            && item
+                .condition
+                .as_ref()
+                .is_some_and(|condition| condition.contains("needed"))
+    }));
+    let diagnostic = error.diagnostic();
+    assert!(diagnostic.help.iter().any(|help| help.contains("Read")));
+    assert!(
+        diagnostic
+            .help
+            .iter()
+            .any(|help| help.contains("Write") && help.contains("needed"))
+    );
+}
+
+#[test]
+fn tail_only_callback_issue_does_not_claim_a_satisfied_label_condition() {
+    use ruddy::inference::ErrorKind;
+    let (_, lowered, output) = infer_src(
+        "effect Fail = () -> ()\n\
+         extern install : fn(fn(()) -> () + !Fail (when 'needed) + ..'tail) -> () + !Fail (when 'carried) + ..'other where not 'needed or 'carried = host.install",
+    );
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    let [error] = output.errors.as_slice() else {
+        panic!("{:#?}", output.errors)
+    };
+    let ErrorKind::CallbackEffectsNotCovered { issues, .. } = &error.kind else {
+        panic!("{error:#?}")
+    };
+    assert_eq!(issues.len(), 1, "{issues:#?}");
+    assert!(issues[0].requirements.is_empty(), "{issues:#?}");
+    assert!(issues[0].conditions.is_empty(), "{issues:#?}");
+    assert_eq!(issues[0].condition, "true");
+    assert!(!issues[0].missing_tails.is_empty());
+}
+
+#[test]
+fn complete_extern_callback_repairs_cover_labels_and_remainders() {
+    let (_, lowered, output) = infer_src(
+        "effect Fail = () -> ()\n\
+         type Callback 'a 'e = 'a -> () + !Fail + ..'e\n\
+         extern install : fn(Callback Nat (..'shared)) -> () + !Fail + ..'shared = host.install",
+    );
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+
+    // An anonymous capability remainder is an inference site, not a
+    // caller-chosen fixed relation. It can acquire the callback's exact label.
+    let (_, lowered, output) = infer_src(
+        "effect Fail = () -> ()\n\
+         extern install : fn(fn(()) -> () + !Fail) -> () + .. = host.install",
+    );
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+}
+
+#[test]
+fn callback_result_spine_issues_deduplicate_by_path() {
+    use ruddy::inference::ErrorKind;
+    let (_, lowered, output) = infer_src(
+        "effect Read = () -> ()\n\
+         extern install : fn(fn(()) -> (() -> () + !Read) + !Read) -> () = host.install",
+    );
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    let [error] = output.errors.as_slice() else {
+        panic!("{:#?}", output.errors)
+    };
+    let ErrorKind::CallbackEffectsNotCovered { issues, .. } = &error.kind else {
+        panic!("{error:#?}")
+    };
+    assert_eq!(issues.len(), 1, "{issues:#?}");
+    assert_eq!(issues[0].missing_effects.len(), 1, "{issues:#?}");
 }
 
 #[test]

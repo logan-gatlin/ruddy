@@ -440,12 +440,66 @@ impl Solve<'_> {
                     boundary,
                 } => {
                     let reported = self.errors.len();
-                    self.performs(span, required, available, true);
+                    let required = self.table.canon(required);
+                    let mut available = self.table.canon(available);
+                    // Publish one exact, non-mutating review step even when
+                    // static formula validation settled every label and there
+                    // is no tail to solve. Debugger consumers can therefore
+                    // correlate every callback constraint with solver evidence
+                    // without equating caller-chosen presences.
+                    self.step(
+                        span,
+                        Rule::Performs,
+                        Goal::Row {
+                            expected: Rc::new(required.clone()),
+                            actual: Rc::new(available.clone()),
+                        },
+                        Effect::Decomposed,
+                    );
+                    // Presence implications over written labels were validated
+                    // against the annotation's complete formula before solving.
+                    // Equating those presences here would narrow a caller
+                    // choice. An anonymous row hole is different: it is an
+                    // inference site, so retain the exact missing labels in it.
+                    if matches!(available.rest, Rest::Var(_)) {
+                        let inferred = Row {
+                            labels: required
+                                .labels
+                                .iter()
+                                .filter(|(name, _)| !available.labels.contains_key(*name))
+                                .map(|(name, field)| (name.clone(), field.clone()))
+                                .collect(),
+                            rest: Rest::Closed,
+                        };
+                        if !inferred.labels.is_empty() {
+                            self.performs(span, &inferred, &available, true);
+                            available = self.table.canon(&available);
+                        }
+                    }
+                    // Fixed open remainders remain a structural relation of
+                    // their own and are never collapsed to definitely-present
+                    // labels.
+                    if !matches!(required.rest, Rest::Closed | Rest::Undecided)
+                        && !super::same_callback_tail(&required.rest, &available.rest)
+                    {
+                        self.performs(
+                            span,
+                            &Row::of(required.rest.clone()),
+                            &Row::of(available.rest.clone()),
+                            true,
+                        );
+                    }
                     for error in &mut self.errors[reported..] {
-                        let missing_effects = super::missing_callback_effects(required, available);
+                        let missing_effects = Vec::new();
+                        let missing_tails: Vec<_> = boundary
+                            .tail
+                            .as_ref()
+                            .map(super::tail_issue)
+                            .into_iter()
+                            .collect();
                         error.kind = ErrorKind::CallbackEffectsNotCovered {
                             missing_effects: missing_effects.clone(),
-                            extern_effects: super::listed_effects(available),
+                            extern_effects: super::listed_effects(&available),
                             callback_path: boundary.callback_path.clone(),
                             callback_type: boundary.callback_type.clone(),
                             extern_name: boundary.extern_name.clone(),
@@ -454,7 +508,10 @@ impl Solve<'_> {
                                 callback_path: boundary.callback_path.clone(),
                                 callback_type: boundary.callback_type.clone(),
                                 missing_effects: missing_effects.clone(),
-                                extern_effects: super::listed_effects(available),
+                                extern_effects: super::listed_effects(&available),
+                                requirements: Vec::new(),
+                                missing_tails,
+                                conditions: Vec::new(),
                                 condition: boundary.condition.to_string(),
                             }],
                         };

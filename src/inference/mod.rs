@@ -989,12 +989,33 @@ pub struct CallbackBoundary {
     pub callback_span: Span,
     pub callback_path: String,
     pub callback_type: String,
-    /// Exact implication required by this callback row, retained even when a
-    /// label's presence remains symbolic.
+    /// One exact required-presence => available-presence implication per
+    /// semantic effect label. Keeping the labels separate lets declaration
+    /// validation name every failed implication instead of collapsing a row to
+    /// its definitely-present subset.
+    pub effects: Vec<CallbackEffectCondition>,
+    /// Their conjunction, retained for debugger consumers and source rendering.
     pub condition: Formula,
+    /// The exact terminal relation after every `Rest::More` segment is
+    /// flattened. `None` means the callback row is closed.
+    pub tail: Option<CallbackTailRelation>,
     pub extern_name: String,
     pub extern_span: Span,
     pub capability_span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct CallbackEffectCondition {
+    pub effect: String,
+    pub condition: Formula,
+}
+
+#[derive(Debug, Clone)]
+pub struct CallbackTailRelation {
+    /// Source spelling of the callback remainder, including its `..` sigil.
+    pub required: String,
+    /// Source spelling of the extern remainder, or `None` for a closed row.
+    pub available: Option<String>,
 }
 
 /// Source identity of an effect use, kept separate from structural row
@@ -2885,9 +2906,24 @@ pub struct ExternCallbackIssue {
     pub callback_type: String,
     pub missing_effects: Vec<String>,
     pub extern_effects: Vec<String>,
-    /// Source-level symbolic implication which the extern declaration fails
-    /// to guarantee for this exact callback/path.
+    /// Effect/condition pairs retain which symbolic requirement belongs to
+    /// which effect after several callback result arrows share one path.
+    pub requirements: Vec<ExternCallbackRequirement>,
+    /// Every open callback remainder not covered by the extern remainder.
+    pub missing_tails: Vec<String>,
+    /// Every distinct source-level implication the declaration fails to
+    /// guarantee at this callback path.
+    pub conditions: Vec<String>,
+    /// Conjunction of this issue's conditions. Retained as the compatibility
+    /// scalar for structured consumers; new presentation uses `requirements`.
     pub condition: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternCallbackRequirement {
+    pub effect: String,
+    /// `None` means the effect is required unconditionally.
+    pub condition: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -2939,139 +2975,426 @@ fn render_child_path(
     render_path(paths, child)
 }
 
-fn first_written_variable(ty: &ir::Type) -> Option<(Span, String)> {
-    let mut work = vec![ty];
-    while let Some(ty) = work.pop() {
-        match &ty.tracked {
-            ir::TypeKind::Var(name) => return Some((ty.span, format!("'{name}"))),
-            ir::TypeKind::Arrow { from, to, .. } => {
-                work.push(to);
-                work.push(from);
-            }
-            ir::TypeKind::Struct { fields, .. } => {
-                work.extend(fields.values().rev().filter_map(|field| match field {
-                    ir::TypeField::Written { value, .. } => Some(value),
-                    ir::TypeField::Absent { .. } => None,
-                }));
-            }
-            ir::TypeKind::Sum { cases, .. } => {
-                work.extend(cases.values().rev().filter_map(|case| match case {
-                    ir::SumCase::Written { payload, .. } => payload.as_ref(),
-                    ir::SumCase::Absent { .. } => None,
-                }));
-            }
-            ir::TypeKind::Apply { args, .. } => work.extend(args.iter().rev()),
-            _ => {}
-        }
-    }
-    None
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ExternVariableIdentity {
+    TypeVar(TyVar),
+    TypeRigid(u32),
+    TypeBound(u32),
+    RowVar(TyVar),
+    RowRigid(u32),
+    RowBound(u32),
+    PresenceVar(TyVar),
+    PresenceBound(u32),
 }
 
-fn polymorphic_extern_boundary(
+#[derive(Debug, Clone)]
+struct ExternVariableSource {
+    span: Span,
+    name: String,
+    hidden: bool,
+}
+
+/// Identity-indexed source provenance for one annotation boundary. Alias
+/// expansion substitutes the same semantic identities into local and imported
+/// bodies (including `Rest::More` row splices), so this map remains exact where
+/// rescanning an alias application cannot possibly recover the originating
+/// quantifier.
+#[derive(Debug, Clone, Default)]
+struct ExternSourceMap {
+    variables: HashMap<ExternVariableIdentity, ExternVariableSource>,
+}
+
+impl ExternSourceMap {
+    fn insert(&mut self, identity: ExternVariableIdentity, span: Span, name: impl Into<String>) {
+        self.insert_with_ownership(identity, span, name, false);
+    }
+
+    fn insert_with_ownership(
+        &mut self,
+        identity: ExternVariableIdentity,
+        span: Span,
+        name: impl Into<String>,
+        hidden: bool,
+    ) {
+        self.variables
+            .entry(identity)
+            .or_insert(ExternVariableSource {
+                span,
+                name: name.into(),
+                hidden,
+            });
+    }
+
+    fn get(&self, identity: ExternVariableIdentity) -> Option<&ExternVariableSource> {
+        self.variables.get(&identity)
+    }
+}
+
+fn type_variable_identity(ty: &Ty) -> Option<ExternVariableIdentity> {
+    match ty {
+        Ty::Var(var) => Some(ExternVariableIdentity::TypeVar(*var)),
+        Ty::Rigid { id, .. } => Some(ExternVariableIdentity::TypeRigid(*id)),
+        Ty::Bound(index) => Some(ExternVariableIdentity::TypeBound(*index)),
+        _ => None,
+    }
+}
+
+fn row_variable_identity(rest: &Rest) -> Option<ExternVariableIdentity> {
+    match rest {
+        Rest::Var(var) => Some(ExternVariableIdentity::RowVar(*var)),
+        Rest::Rigid { id, .. } => Some(ExternVariableIdentity::RowRigid(*id)),
+        Rest::Bound(index) => Some(ExternVariableIdentity::RowBound(*index)),
+        Rest::Closed | Rest::Undecided | Rest::More(_) => None,
+    }
+}
+
+fn presence_variable_identity(presence: &Presence) -> Option<ExternVariableIdentity> {
+    match presence {
+        Presence::Var(var) => Some(ExternVariableIdentity::PresenceVar(*var)),
+        Presence::Bound(index) => Some(ExternVariableIdentity::PresenceBound(*index)),
+        Presence::Present | Presence::Absent | Presence::Recovered(_) | Presence::Undecided => None,
+    }
+}
+
+fn flatten_row(row: &Row) -> Row {
+    let mut labels = IndexMap::new();
+    let mut segment = row;
+    loop {
+        for (name, field) in &segment.labels {
+            labels.entry(name.clone()).or_insert_with(|| field.clone());
+        }
+        match &segment.rest {
+            Rest::More(more) => segment = more,
+            rest => {
+                return Row {
+                    labels,
+                    rest: rest.clone(),
+                };
+            }
+        }
+    }
+}
+
+fn presence_formula(presence: &Presence) -> Option<Formula> {
+    match presence {
+        Presence::Present => Some(Formula::True),
+        Presence::Absent => Some(Formula::False),
+        Presence::Var(var) => Some(Formula::Atom(Atom::Var(*var))),
+        Presence::Bound(bound) => Some(Formula::Atom(Atom::Bound(*bound))),
+        Presence::Recovered(_) | Presence::Undecided => None,
+    }
+}
+
+fn callback_rows(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Vec<Row> {
+    let mut rows = Vec::new();
+    let mut cursor = ty.clone();
+    let mut seen = Vec::new();
+    loop {
+        if matches!(&*cursor, Ty::Named { .. }) {
+            if seen.iter().any(|prior| same_finite_syntax(prior, &cursor)) {
+                break;
+            }
+            seen.push(cursor.clone());
+        }
+        let exposed = expose_packages(aliases, &cursor);
+        let Ty::Arrow(_, to, row) = &*exposed else {
+            break;
+        };
+        rows.push(row.clone());
+        cursor = to.clone();
+    }
+    rows
+}
+
+fn callback_tail_spelling(rest: &Rest, sources: &ExternSourceMap) -> Option<String> {
+    if matches!(rest, Rest::Closed | Rest::Undecided) {
+        return None;
+    }
+    if let Some(source) = row_variable_identity(rest).and_then(|identity| sources.get(identity)) {
+        return Some(match source.name.as_str() {
+            "generic row" => "`..`".into(),
+            name => format!("`..{name}`"),
+        });
+    }
+    Some(match rest {
+        Rest::Var(var) => format!("open callback tail `?{var}`"),
+        Rest::Bound(index) => format!("open callback tail `bound {index}`"),
+        Rest::Rigid { name, .. } => format!("`..'{name}`"),
+        Rest::More(_) => unreachable!("callback rows are flattened"),
+        Rest::Closed | Rest::Undecided => return None,
+    })
+}
+
+fn callback_effect_conditions(required: &Row, available: &Row) -> Vec<CallbackEffectCondition> {
+    required
+        .labels
+        .iter()
+        .map(|(name, required)| {
+            let required = presence_formula(&required.presence).unwrap_or(Formula::True);
+            let available = match available.labels.get(name) {
+                Some(field) => presence_formula(&field.presence).unwrap_or(Formula::True),
+                // A flexible row hole can acquire this exact conditional
+                // label. Fixed abstract tails cannot: their lacks promise
+                // excludes every label written beside them.
+                None if matches!(available.rest, Rest::Var(_) | Rest::Undecided) => Formula::True,
+                None => Formula::False,
+            };
+            CallbackEffectCondition {
+                effect: name.clone(),
+                condition: required.not().or(available),
+            }
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_callback_coverage(
     aliases: &IndexMap<Symbol, Scheme>,
-    abi: &ir::ExternType,
-    ty: &Rc<Ty>,
-) -> Vec<PolymorphicExternLeaf> {
+    callback: &Rc<Ty>,
+    available: &Row,
+    sources: &ExternSourceMap,
+    callback_span: Span,
+    callback_path: String,
+    extern_name: &str,
+    extern_span: Span,
+    capability_span: Span,
+    out: &mut Vec<Constraint>,
+) {
+    let available = flatten_row(available);
+    for required in callback_rows(aliases, callback) {
+        let required = flatten_row(&required);
+        let effects = callback_effect_conditions(&required, &available);
+        let condition = Formula::all(effects.iter().map(|effect| effect.condition.clone()));
+        let tail =
+            callback_tail_spelling(&required.rest, sources).map(|required| CallbackTailRelation {
+                required,
+                available: callback_tail_spelling(&available.rest, sources),
+            });
+        let boundary = CallbackBoundary {
+            callback_span,
+            callback_path: callback_path.clone(),
+            callback_type: callback.to_string(),
+            effects,
+            condition,
+            tail,
+            extern_name: extern_name.into(),
+            extern_span,
+            capability_span,
+        };
+        out.push(Constraint {
+            id: ConstraintId::pending(),
+            reason: ReasonId::pending(),
+            span: callback_span,
+            origin: ConstraintOrigin::CallbackBoundary,
+            subjects: ConstraintSubjects::pair(
+                Subject::CallbackRequired,
+                Subject::CallbackAvailable,
+            ),
+            kind: ConstraintKind::CallbackCoverage {
+                required,
+                available: available.clone(),
+                boundary,
+            },
+        });
+    }
+}
+
+#[derive(Default)]
+struct ExternBoundaryReview {
+    leaves: Vec<PolymorphicExternLeaf>,
+    coverage: Vec<Constraint>,
+}
+
+/// Review one extern's semantic boundary once. The ABI contributes only host
+/// grouping and source spans; the lowered type supplies representation leaves,
+/// callback formulas, and composed rows. Exact lowered identities recover the
+/// source variable which survived alias substitution and row expansion.
+fn extern_boundary_review(
+    aliases: &IndexMap<Symbol, Scheme>,
+    root_abi: &ir::ExternType,
+    root_ty: &Rc<Ty>,
+    sources: &ExternSourceMap,
+    extern_name: &str,
+    extern_span: Span,
+) -> ExternBoundaryReview {
     // This is intentionally an explicit work list. Extern annotations are user
     // input and generated annotations can contain tens of thousands of nested
     // arrows; diagnostics must not consume the Rust call stack.
-    let mut found = Vec::new();
+    let mut review = ExternBoundaryReview::default();
     let mut paths = Vec::new();
     let root = root_path(&mut paths);
-    let mut work = vec![(abi, ty.clone(), root)];
+    let mut work = vec![(root_abi, root_ty.clone(), root, Vec::<Rc<Ty>>::new(), true)];
     let mut seen: HashSet<(*const ir::ExternType, *const Ty)> = HashSet::new();
-    while let Some((abi, ty, path)) = work.pop() {
-        if !seen.insert((abi as *const ir::ExternType, Rc::as_ptr(&ty))) {
+    while let Some((abi, mut ty, path, mut active_aliases, mut report_row_leaves)) = work.pop() {
+        // A package fixes the representation choices it encloses, but callbacks
+        // inside it still cross the host boundary and need effect coverage.
+        while let Ty::Package(inner) = &*ty {
+            report_row_leaves = false;
+            ty = inner.clone();
+        }
+        let original = ty.clone();
+        // Lowered semantic types are DAGs. An invariant alias reuses the same
+        // argument for both sides of every arrow, so walking occurrences rather
+        // than nodes turns depth N into 2^N work. The ABI node is part of the
+        // key so distinct written parameters still retain distinct paths.
+        if !seen.insert((abi as *const ir::ExternType, Rc::as_ptr(&original))) {
             continue;
         }
+        if matches!(&*original, Ty::Named { .. }) {
+            if active_aliases
+                .iter()
+                .any(|prior| same_finite_syntax(prior, &original))
+            {
+                continue;
+            }
+            active_aliases.push(original.clone());
+        }
+
         match &abi.tracked {
-            ir::ExternTypeKind::Group(inner) => work.push((inner, ty, path)),
+            ir::ExternTypeKind::Group(inner) => {
+                work.push((inner, ty, path, active_aliases, report_row_leaves))
+            }
             ir::ExternTypeKind::Function {
                 parameters, result, ..
             } => {
                 let mut cursor = ty;
                 let mut children = Vec::new();
-                for (at, parameter) in parameters.iter().enumerate() {
+                let mut available = Row::closed();
+                for at in 0..parameters.len().max(1) {
                     let exposed = expose_packages(aliases, &cursor);
-                    let Ty::Arrow(from, to, _) = &*exposed else {
+                    let Ty::Arrow(from, to, row) = &*exposed else {
                         break;
                     };
-                    children.push((
-                        parameter,
-                        from.clone(),
-                        child_path(&mut paths, path, format!("parameter {}", at + 1)),
-                    ));
+                    if let Some(parameter) = parameters.get(at) {
+                        children.push((
+                            parameter,
+                            from.clone(),
+                            child_path(&mut paths, path, format!("parameter {}", at + 1)),
+                            active_aliases.clone(),
+                        ));
+                    }
+                    available = row.clone();
                     cursor = to.clone();
                 }
-                if parameters.is_empty() {
-                    let exposed = expose_packages(aliases, &cursor);
-                    if let Ty::Arrow(_, to, _) = &*exposed {
-                        cursor = to.clone();
+
+                // Preserve source callback order in the boundary evidence. The
+                // traversal stack below is reversed separately so leaves also
+                // remain in source/path order.
+                for (parameter, input, child, _) in &children {
+                    if matches!(&*expose_packages(aliases, input), Ty::Arrow(..)) {
+                        push_callback_coverage(
+                            aliases,
+                            input,
+                            &available,
+                            sources,
+                            parameter.span,
+                            render_path(&paths, *child),
+                            extern_name,
+                            extern_span,
+                            abi.span,
+                            &mut review.coverage,
+                        );
                     }
                 }
-                work.push((result, cursor, child_path(&mut paths, path, "result")));
-                work.extend(children.into_iter().rev());
+
+                work.push((
+                    result,
+                    cursor,
+                    child_path(&mut paths, path, "result"),
+                    active_aliases,
+                    report_row_leaves,
+                ));
+                work.extend(
+                    children.into_iter().rev().map(|(abi, ty, path, aliases)| {
+                        (abi, ty, path, aliases, report_row_leaves)
+                    }),
+                );
             }
             ir::ExternTypeKind::Ordinary(written) => {
-                let unfolded = unfold(aliases, &ty);
-                // Existential packages fix the host-facing container shape;
-                // their sealed presence choices are intentionally not ordinary
-                // polymorphic boundary leaves.
+                // An alias may expose an existential package even when the
+                // work item itself is still nominal. Preserve that boundary
+                // instead of looking through its hidden witness.
+                let unfolded = unfold(aliases, &original);
                 if matches!(&*unfolded, Ty::Package(_)) {
                     continue;
                 }
                 let exposed = expose_packages(aliases, &unfolded);
                 match &*exposed {
                     Ty::Bound(_) | Ty::Var(_) | Ty::Rigid { .. } => {
-                        let (span, variable) = first_written_variable(written)
-                            .unwrap_or((abi.span, "generic type".into()));
-                        found.push(PolymorphicExternLeaf {
-                            span,
-                            variable,
-                            kind: ExternVariableKind::Type,
-                            position: render_path(&paths, path),
-                        });
-                    }
-                    Ty::Arrow(from, to, row) => {
-                        if matches!(row.rest, Rest::Bound(_) | Rest::Var(_) | Rest::Rigid { .. })
-                            && let Some((span, variable)) = written_arrow_tail(written)
-                        {
-                            found.push(PolymorphicExternLeaf {
-                                span,
-                                variable,
-                                kind: ExternVariableKind::Row,
-                                position: render_child_path(&mut paths, path, "callback effects"),
+                        let source = type_variable_identity(&exposed)
+                            .and_then(|identity| sources.get(identity));
+                        if let Some(source) = source.filter(|source| !source.hidden) {
+                            review.leaves.push(PolymorphicExternLeaf {
+                                span: source.span,
+                                variable: source.name.clone(),
+                                kind: ExternVariableKind::Type,
+                                position: render_path(&paths, path),
                             });
                         }
+                    }
+                    Ty::Arrow(from, to, available) => {
+                        let callback_path = child_path(&mut paths, path, "callback input");
+                        if matches!(&*expose_packages(aliases, from), Ty::Arrow(..)) {
+                            push_callback_coverage(
+                                aliases,
+                                from,
+                                available,
+                                sources,
+                                abi.span,
+                                render_path(&paths, callback_path),
+                                extern_name,
+                                extern_span,
+                                abi.span,
+                                &mut review.coverage,
+                            );
+                        }
+                        // Effect-row variables are evidence relations rather
+                        // than runtime representation choices. Coverage above
+                        // retains their exact tails and label formulas.
+                        // With legacy ordinary-arrow spelling, the reused ABI
+                        // node cannot identify a nested row token. Keep its
+                        // established representation behavior instead of
+                        // attributing an unrelated outer presence or tail.
+                        let child_row_leaves = report_row_leaves
+                            && !matches!(written.tracked, ir::TypeKind::Arrow { .. });
                         work.push((
                             abi,
                             to.clone(),
                             child_path(&mut paths, path, "callback result"),
+                            active_aliases.clone(),
+                            child_row_leaves,
                         ));
                         work.push((
                             abi,
                             from.clone(),
-                            child_path(&mut paths, path, "callback input"),
+                            callback_path,
+                            active_aliases,
+                            child_row_leaves,
                         ));
                     }
-                    Ty::Struct(row) | Ty::Sum(row) => {
-                        if matches!(row.rest, Rest::Bound(_) | Rest::Var(_) | Rest::Rigid { .. })
-                            && let Some((span, variable)) = written_row_tail(written)
+                    Ty::Struct(semantic_row) | Ty::Sum(semantic_row) => {
+                        let row = flatten_row(semantic_row);
+                        if report_row_leaves
+                            && let Some(source) = row_variable_identity(&row.rest)
+                                .and_then(|identity| sources.get(identity))
+                                .filter(|source| !source.hidden)
                         {
-                            found.push(PolymorphicExternLeaf {
-                                span,
-                                variable,
+                            review.leaves.push(PolymorphicExternLeaf {
+                                span: source.span,
+                                variable: source.name.clone(),
                                 kind: ExternVariableKind::Row,
                                 position: render_child_path(&mut paths, path, "row tail"),
                             });
                         }
-                        for (label, field) in &row.labels {
-                            if matches!(field.presence, Presence::Bound(_) | Presence::Var(_))
-                                && let Some((span, variable)) = written_presence(written, label)
+                        for (label, field) in row.labels.iter().rev() {
+                            if report_row_leaves
+                                && let Some(source) = presence_variable_identity(&field.presence)
+                                    .and_then(|identity| sources.get(identity))
+                                    .filter(|source| !source.hidden)
                             {
-                                found.push(PolymorphicExternLeaf {
-                                    span,
-                                    variable,
+                                review.leaves.push(PolymorphicExternLeaf {
+                                    span: source.span,
+                                    variable: source.name.clone(),
                                     kind: ExternVariableKind::Presence,
                                     position: render_child_path(
                                         &mut paths,
@@ -3080,6 +3403,9 @@ fn polymorphic_extern_boundary(
                                     ),
                                 });
                             }
+                            // Payload polymorphism has a fixed outer host
+                            // representation supplied by the surrounding row;
+                            // only the row's own tail/presence can vary it.
                         }
                     }
                     _ => {}
@@ -3087,309 +3413,7 @@ fn polymorphic_extern_boundary(
             }
         }
     }
-    found
-}
-
-fn written_arrow_tail(ty: &ir::Type) -> Option<(Span, String)> {
-    let mut work = vec![ty];
-    while let Some(ty) = work.pop() {
-        match &ty.tracked {
-            ir::TypeKind::Arrow { from, to, effects } => {
-                if let Some(tail) = &effects.tail {
-                    let name = match &tail.of {
-                        ir::Row::Named(name) => format!("'{name}"),
-                        _ => "generic row".into(),
-                    };
-                    return Some((tail.span, name));
-                }
-                work.push(to);
-                work.push(from);
-            }
-            ir::TypeKind::Apply { args, .. } => work.extend(args.iter().rev()),
-            _ => {}
-        }
-    }
-    None
-}
-
-fn written_row_tail(ty: &ir::Type) -> Option<(Span, String)> {
-    let tail = match &ty.tracked {
-        ir::TypeKind::Struct { tail, .. } | ir::TypeKind::Sum { tail, .. } => tail.as_ref()?,
-        _ => return None,
-    };
-    let name = match &tail.of {
-        ir::Row::Named(name) => format!("'{name}"),
-        _ => "generic row".into(),
-    };
-    Some((tail.span, name))
-}
-
-fn written_presence(ty: &ir::Type, label: &str) -> Option<(Span, String)> {
-    let when = match &ty.tracked {
-        ir::TypeKind::Arrow { effects, .. } => {
-            effects.effects.values().find_map(|effect| match effect {
-                ir::EffectLabel::Written {
-                    when: Some(when), ..
-                } => Some(when.as_ref()),
-                _ => None,
-            })
-        }
-        ir::TypeKind::Struct { fields, .. } => fields.get(label).and_then(|field| match field {
-            ir::TypeField::Written {
-                when: Some(when), ..
-            } => Some(when.as_ref()),
-            _ => None,
-        }),
-        ir::TypeKind::Sum { cases, .. } => cases.get(label).and_then(|case| match case {
-            ir::SumCase::Written {
-                when: Some(when), ..
-            } => Some(when.as_ref()),
-            _ => None,
-        }),
-        _ => None,
-    }?;
-    Some((
-        when.span,
-        when.name
-            .as_ref()
-            .map(|name| format!("'{name}"))
-            .unwrap_or_else(|| "conditional presence".into()),
-    ))
-}
-
-/// Build callback evidence obligations from the resolved semantic type. The
-/// ABI tree contributes only host grouping; aliases, row tails and conditional
-/// presences all come from the same rows ordinary inference solves.
-fn callback_coverage_constraints(
-    aliases: &IndexMap<Symbol, Scheme>,
-    abi: &ir::ExternType,
-    ty: &Rc<Ty>,
-    extern_name: &str,
-    extern_span: Span,
-) -> (Vec<Constraint>, Formula) {
-    fn presence_formula(presence: &Presence) -> Option<Formula> {
-        match presence {
-            Presence::Present => Some(Formula::True),
-            Presence::Absent => Some(Formula::False),
-            Presence::Var(var) => Some(Formula::Atom(Atom::Var(*var))),
-            Presence::Bound(bound) => Some(Formula::Atom(Atom::Bound(*bound))),
-            Presence::Recovered(_) | Presence::Undecided => None,
-        }
-    }
-
-    fn expose(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Rc<Ty> {
-        let mut ty = unfold(aliases, ty);
-        while let Ty::Package(body) = &*ty {
-            ty = unfold(aliases, body);
-        }
-        ty
-    }
-
-    fn callback_rows(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Vec<Row> {
-        let mut rows = Vec::new();
-        let mut cursor = ty.clone();
-        let mut seen = Vec::new();
-        loop {
-            if matches!(&*cursor, Ty::Named { .. }) {
-                if seen.iter().any(|prior| same_finite_syntax(prior, &cursor)) {
-                    break;
-                }
-                seen.push(cursor.clone());
-            }
-            let exposed = expose(aliases, &cursor);
-            let Ty::Arrow(_, to, row) = &*exposed else {
-                break;
-            };
-            rows.push(row.clone());
-            cursor = to.clone();
-        }
-        rows
-    }
-
-    #[derive(Clone, Copy)]
-    struct ExternContext<'a> {
-        name: &'a str,
-        span: Span,
-    }
-
-    fn cover(
-        aliases: &IndexMap<Symbol, Scheme>,
-        callback: &Rc<Ty>,
-        available: &Row,
-        mut boundary: CallbackBoundary,
-        out: &mut Vec<Constraint>,
-    ) {
-        for required in callback_rows(aliases, callback) {
-            boundary.condition = callback_condition(&required, available);
-            out.push(Constraint {
-                id: ConstraintId::pending(),
-                reason: ReasonId::pending(),
-                span: boundary.callback_span,
-                origin: ConstraintOrigin::CallbackBoundary,
-                subjects: ConstraintSubjects::pair(
-                    Subject::CallbackRequired,
-                    Subject::CallbackAvailable,
-                ),
-                kind: ConstraintKind::CallbackCoverage {
-                    required,
-                    available: available.clone(),
-                    boundary: boundary.clone(),
-                },
-            });
-        }
-    }
-
-    fn callback_condition(required: &Row, available: &Row) -> Formula {
-        Formula::all(required.labels.iter().filter_map(|(name, required)| {
-            let required = presence_formula(&required.presence)?;
-            let available = match available.labels.get(name) {
-                Some(field) => presence_formula(&field.presence)?,
-                None if matches!(
-                    available.rest,
-                    Rest::Closed | Rest::Bound(_) | Rest::Rigid { .. }
-                ) =>
-                {
-                    Formula::False
-                }
-                None => return None,
-            };
-            Some(required.not().or(available))
-        }))
-    }
-
-    fn boundary(
-        aliases: &IndexMap<Symbol, Scheme>,
-        root_abi: &ir::ExternType,
-        root_ty: &Rc<Ty>,
-        _root_path: &str,
-        context: ExternContext<'_>,
-        out: &mut Vec<Constraint>,
-    ) {
-        let mut paths = Vec::new();
-        let root = root_path(&mut paths);
-        let mut work = vec![(root_abi, root_ty.clone(), root)];
-        let mut seen: HashSet<(*const ir::ExternType, *const Ty)> = HashSet::new();
-        while let Some((abi, ty, path)) = work.pop() {
-            if !seen.insert((abi as *const ir::ExternType, Rc::as_ptr(&ty))) {
-                continue;
-            }
-            match &abi.tracked {
-                ir::ExternTypeKind::Group(inner) => work.push((inner, ty, path)),
-                ir::ExternTypeKind::Function {
-                    parameters, result, ..
-                } => {
-                    let mut cursor = ty;
-                    let mut inputs = Vec::new();
-                    let mut available = Row::closed();
-                    for _ in 0..parameters.len().max(1) {
-                        let exposed = expose(aliases, &cursor);
-                        let Ty::Arrow(from, to, row) = &*exposed else {
-                            break;
-                        };
-                        if !parameters.is_empty() {
-                            inputs.push(from.clone());
-                        }
-                        available = row.clone();
-                        cursor = to.clone();
-                    }
-                    work.push((result, cursor, child_path(&mut paths, path, "result")));
-                    for (at, (parameter, input)) in parameters.iter().zip(inputs).enumerate().rev()
-                    {
-                        let child = child_path(&mut paths, path, format!("parameter {}", at + 1));
-                        if matches!(&*expose(aliases, &input), Ty::Arrow(..)) {
-                            cover(
-                                aliases,
-                                &input,
-                                &available,
-                                CallbackBoundary {
-                                    callback_span: parameter.span,
-                                    callback_path: render_path(&paths, child),
-                                    callback_type: input.to_string(),
-                                    condition: Formula::True,
-                                    extern_name: context.name.into(),
-                                    extern_span: context.span,
-                                    capability_span: abi.span,
-                                },
-                                out,
-                            );
-                        }
-                        work.push((parameter, input, child));
-                    }
-                }
-                ir::ExternTypeKind::Ordinary(_) => {
-                    let exposed = expose(aliases, &ty);
-                    let Ty::Arrow(from, to, available) = &*exposed else {
-                        continue;
-                    };
-                    let callback_path = child_path(&mut paths, path, "callback input");
-                    if matches!(&*expose(aliases, from), Ty::Arrow(..)) {
-                        cover(
-                            aliases,
-                            from,
-                            available,
-                            CallbackBoundary {
-                                callback_span: abi.span,
-                                callback_path: render_path(&paths, callback_path),
-                                callback_type: from.to_string(),
-                                condition: Formula::True,
-                                extern_name: context.name.into(),
-                                extern_span: context.span,
-                                capability_span: abi.span,
-                            },
-                            out,
-                        );
-                    }
-                    work.push((
-                        abi,
-                        to.clone(),
-                        child_path(&mut paths, path, "callback result"),
-                    ));
-                    work.push((abi, from.clone(), callback_path));
-                }
-            }
-        }
-    }
-
-    let mut out = Vec::new();
-    boundary(
-        aliases,
-        abi,
-        ty,
-        "extern",
-        ExternContext {
-            name: extern_name,
-            span: extern_span,
-        },
-        &mut out,
-    );
-    let conditional = Formula::all(out.iter().flat_map(|constraint| {
-        let ConstraintKind::CallbackCoverage {
-            required,
-            available,
-            ..
-        } = &constraint.kind
-        else {
-            return None;
-        };
-        Some(Formula::all(required.labels.iter().filter_map(
-            |(name, required)| {
-                let required = presence_formula(&required.presence)?;
-                let available = match available.labels.get(name) {
-                    Some(field) => presence_formula(&field.presence)?,
-                    None if matches!(
-                        available.rest,
-                        Rest::Closed | Rest::Bound(_) | Rest::Rigid { .. }
-                    ) =>
-                    {
-                        Formula::False
-                    }
-                    None => return None,
-                };
-                Some(required.not().or(available))
-            },
-        )))
-    }));
-    (out, conditional)
+    review
 }
 
 #[cfg(test)]
@@ -3413,9 +3437,10 @@ mod extern_boundary_depth_tests {
             ty = Rc::new(Ty::Arrow(Rc::new(Ty::Nat), ty, Row::closed()));
         }
         let aliases = IndexMap::new();
-        assert!(polymorphic_extern_boundary(&aliases, &abi, &ty).is_empty());
-        let (coverage, _) = callback_coverage_constraints(&aliases, &abi, &ty, "deep", span);
-        assert!(coverage.is_empty());
+        let sources = ExternSourceMap::default();
+        let review = extern_boundary_review(&aliases, &abi, &ty, &sources, "deep", span);
+        assert!(review.leaves.is_empty());
+        assert!(review.coverage.is_empty());
         // A 30k recursively represented test value also needs iterative
         // destruction; leaking this one synthetic value keeps the test focused
         // on the boundary walkers rather than `Rc<Ty>`'s destructor.
@@ -5015,17 +5040,25 @@ fn direct_extern_explanation(
     // Direct source facts deliberately do not claim a forgeable arena
     // identity. `pending` is never published in the cause's constraint slice.
     let constraint = ConstraintId::pending();
-    let full_facts = facts
-        .into_iter()
-        .map(|(span, origin, subject, payload)| ExplanationFact {
+    let mut full_facts = Vec::new();
+    for (span, origin, subject, payload) in facts {
+        if full_facts.iter().any(|fact: &ExplanationFact| {
+            fact.span == span
+                && fact.origin == origin
+                && fact.subject == subject
+                && fact.payload == payload
+        }) {
+            continue;
+        }
+        full_facts.push(ExplanationFact {
             span,
             direct: true,
             constraint,
             origin,
             subject,
             payload,
-        })
-        .collect::<Vec<_>>();
+        });
+    }
     InferenceExplanation {
         abridged: (0..full_facts.len()).collect(),
         full_facts,
@@ -5053,26 +5086,219 @@ fn direct_extern_explanation(
 }
 
 fn listed_effects(row: &Row) -> Vec<String> {
-    row.labels
-        .iter()
-        .filter(|(_, field)| matches!(field.presence, Presence::Present))
-        .map(|(name, _)| name.clone())
+    flatten_row(row)
+        .into_parts()
+        .0
+        .into_iter()
+        .filter(|(_, field)| !matches!(field.presence, Presence::Absent))
+        .map(|(name, _)| name)
         .collect()
 }
 
-fn missing_callback_effects(required: &Row, available: &Row) -> Vec<String> {
-    required
-        .labels
+fn same_callback_tail(required: &Rest, available: &Rest) -> bool {
+    match (required, available) {
+        (Rest::Closed, Rest::Closed) | (Rest::Undecided, Rest::Undecided) => true,
+        (Rest::Var(left), Rest::Var(right)) | (Rest::Bound(left), Rest::Bound(right)) => {
+            left == right
+        }
+        (Rest::Rigid { id: left, .. }, Rest::Rigid { id: right, .. }) => left == right,
+        _ => false,
+    }
+}
+
+/// A fixed abstract callback remainder cannot be supplied by a closed or
+/// differently-quantified extern remainder. Flexible holes are intentionally
+/// left for the published solver constraint: constraining such a hole is valid
+/// inference, not a declaration error by itself.
+fn callback_tail_definitely_missing(required: &Row, available: &Row) -> bool {
+    let required = flatten_row(required);
+    let available = flatten_row(available);
+    if matches!(required.rest, Rest::Closed | Rest::Undecided)
+        || same_callback_tail(&required.rest, &available.rest)
+    {
+        return false;
+    }
+    matches!(required.rest, Rest::Bound(_) | Rest::Rigid { .. })
+        && matches!(
+            available.rest,
+            Rest::Closed | Rest::Bound(_) | Rest::Rigid { .. }
+        )
+}
+
+fn tail_issue(relation: &CallbackTailRelation) -> String {
+    match &relation.available {
+        Some(available) => format!(
+            "callback remainder {} is not covered by extern remainder {available}",
+            relation.required
+        ),
+        None => format!(
+            "callback remainder {} is not covered by the closed extern effect row",
+            relation.required
+        ),
+    }
+}
+
+fn push_distinct(values: &mut Vec<String>, value: String) {
+    if !values.contains(&value) {
+        values.push(value);
+    }
+}
+
+fn aggregate_callback_issues(
+    issues: impl IntoIterator<Item = ExternCallbackIssue>,
+) -> Vec<ExternCallbackIssue> {
+    let mut merged: IndexMap<String, ExternCallbackIssue> = IndexMap::new();
+    for issue in issues {
+        let entry = merged
+            .entry(issue.callback_path.clone())
+            .or_insert_with(|| ExternCallbackIssue {
+                callback_span: issue.callback_span,
+                callback_path: issue.callback_path.clone(),
+                callback_type: issue.callback_type.clone(),
+                missing_effects: Vec::new(),
+                extern_effects: Vec::new(),
+                requirements: Vec::new(),
+                missing_tails: Vec::new(),
+                conditions: Vec::new(),
+                condition: String::new(),
+            });
+        for effect in issue.missing_effects {
+            push_distinct(&mut entry.missing_effects, effect);
+        }
+        for effect in issue.extern_effects {
+            push_distinct(&mut entry.extern_effects, effect);
+        }
+        for requirement in issue.requirements {
+            if !entry.requirements.contains(&requirement) {
+                entry.requirements.push(requirement);
+            }
+        }
+        for tail in issue.missing_tails {
+            push_distinct(&mut entry.missing_tails, tail);
+        }
+        for condition in issue.conditions {
+            push_distinct(&mut entry.conditions, condition);
+        }
+        entry.condition = match entry.conditions.as_slice() {
+            [] => "true".into(),
+            [condition] => condition.clone(),
+            conditions => conditions
+                .iter()
+                .map(|condition| format!("({condition})"))
+                .collect::<Vec<_>>()
+                .join(" and "),
+        };
+    }
+    merged.into_values().collect()
+}
+
+fn set_callback_issues(error: &mut Error, additional: Vec<ExternCallbackIssue>) {
+    match &mut error.kind {
+        ErrorKind::CallbackEffectsNotCovered {
+            missing_effects,
+            extern_effects,
+            callback_path,
+            callback_type,
+            issues,
+            ..
+        } => {
+            let merged = aggregate_callback_issues(issues.iter().cloned().chain(additional));
+            if let Some(first) = merged.first() {
+                *missing_effects = first.missing_effects.clone();
+                *extern_effects = first.extern_effects.clone();
+                *callback_path = first.callback_path.clone();
+                *callback_type = first.callback_type.clone();
+            }
+            *issues = merged;
+        }
+        ErrorKind::PolymorphicExternBoundary {
+            callback_issues, ..
+        } => {
+            *callback_issues =
+                aggregate_callback_issues(callback_issues.iter().cloned().chain(additional));
+        }
+        _ => {}
+    }
+}
+
+fn deduplicate_extern_facts(facts: Vec<ExplanationFact>) -> Vec<ExplanationFact> {
+    let mut found = Vec::new();
+    for fact in facts {
+        if let Some(at) = found.iter().position(|prior: &ExplanationFact| {
+            prior.span == fact.span
+                && prior.origin == fact.origin
+                && prior.subject == fact.subject
+                && prior.payload == fact.payload
+        }) {
+            // A solved endpoint carries a published constraint identity. Prefer
+            // it over an otherwise equivalent direct declaration-time fact.
+            if found[at].direct && !fact.direct {
+                found[at] = fact;
+            }
+            continue;
+        }
+        found.push(fact);
+    }
+    found
+}
+
+fn direct_callback_issue(
+    constraint: &Constraint,
+    promised: &Formula,
+    names: &[(String, Presence)],
+) -> Option<ExternCallbackIssue> {
+    let ConstraintKind::CallbackCoverage {
+        required,
+        available,
+        boundary,
+    } = &constraint.kind
+    else {
+        return None;
+    };
+    let failed: Vec<_> = boundary
+        .effects
         .iter()
-        .filter(|(_, field)| matches!(field.presence, Presence::Present))
-        .filter(|(name, _)| {
-            !matches!(
-                available.labels.get(*name).map(|field| &field.presence),
-                Some(Presence::Present)
-            )
+        .filter(|effect| !sat::entails(promised, &effect.condition))
+        .collect();
+    let missing_tail = callback_tail_definitely_missing(required, available);
+    if failed.is_empty() && !missing_tail {
+        return None;
+    }
+    let requirements: Vec<_> = failed
+        .iter()
+        .map(|effect| {
+            let mut atoms = Vec::new();
+            effect.condition.atoms(&mut atoms);
+            ExternCallbackRequirement {
+                effect: effect.effect.clone(),
+                condition: (!atoms.is_empty())
+                    .then(|| crate::ui::in_labels(&effect.condition, names)),
+            }
         })
-        .map(|(name, _)| name.clone())
-        .collect()
+        .collect();
+    let conditions: Vec<_> = requirements
+        .iter()
+        .filter_map(|requirement| requirement.condition.clone())
+        .collect();
+    let condition = crate::ui::in_labels(
+        &Formula::all(failed.iter().map(|effect| effect.condition.clone())),
+        names,
+    );
+    Some(ExternCallbackIssue {
+        callback_span: boundary.callback_span,
+        callback_path: boundary.callback_path.clone(),
+        callback_type: boundary.callback_type.clone(),
+        missing_effects: failed.iter().map(|effect| effect.effect.clone()).collect(),
+        extern_effects: listed_effects(available),
+        requirements,
+        missing_tails: missing_tail
+            .then(|| boundary.tail.as_ref().map(tail_issue))
+            .flatten()
+            .into_iter()
+            .collect(),
+        conditions,
+        condition,
+    })
 }
 
 pub fn infer(mint: &Mint, program: &mut Program) -> Output {
@@ -5196,51 +5422,30 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             });
         }
         let extern_name = mint.name(*symbol).to_string();
-        let leaves = if clause_valid {
-            polymorphic_extern_boundary(&aliases, &decl.value.abi, lowered.scheme.body())
+        let ExternBoundaryReview {
+            leaves,
+            mut coverage,
+        } = if clause_valid {
+            extern_boundary_review(
+                &aliases,
+                &decl.value.abi,
+                &lowered.ty,
+                &lowered.extern_sources,
+                &extern_name,
+                decl.name_span,
+            )
         } else {
-            Vec::new()
+            ExternBoundaryReview::default()
         };
-        let (mut coverage, _) = callback_coverage_constraints(
-            &aliases,
-            &decl.value.abi,
-            &lowered.ty,
-            &extern_name,
-            decl.name_span,
-        );
-        if !clause_valid {
-            coverage.clear();
-        }
         for constraint in &mut coverage {
             constraint.id = table.constraint_id();
             constraint.reason = table.constraint_reason(constraint.id);
         }
-        let callback_issues: Vec<_> = coverage
-            .iter()
-            .filter_map(|constraint| {
-                let ConstraintKind::CallbackCoverage {
-                    required,
-                    available,
-                    boundary,
-                } = &constraint.kind
-                else {
-                    return None;
-                };
-                if sat::entails(&lowered.formula, &boundary.condition) {
-                    return None;
-                }
-                Some(ExternCallbackIssue {
-                    callback_span: boundary.callback_span,
-                    callback_path: boundary.callback_path.clone(),
-                    callback_type: boundary.callback_type.clone(),
-                    missing_effects: missing_callback_effects(required, available),
-                    extern_effects: listed_effects(available),
-                    condition: crate::ui::in_labels(&boundary.condition, &lowered.names),
-                })
-            })
-            .collect();
+        let callback_issues = aggregate_callback_issues(coverage.iter().filter_map(|constraint| {
+            direct_callback_issue(constraint, &lowered.formula, &lowered.names)
+        }));
 
-        if let Some(first) = leaves.first().cloned() {
+        let baseline_error = if let Some(first) = leaves.first().cloned() {
             let id = table.error_id();
             let mut facts = Vec::new();
             for leaf in &leaves {
@@ -5291,7 +5496,16 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 },
                 explanation: Some(explanation),
             });
-        } else if let Some(first) = callback_issues.first().cloned() {
+            Some(id)
+        } else if let Some(first) = callback_issues
+            .iter()
+            .find(|issue| !issue.missing_effects.is_empty())
+            .cloned()
+        {
+            // Label implications are declaration-level SAT failures and do
+            // not bind caller choices in the solver. A tail-only issue is left
+            // to its real solver failure so the diagnostic retains the failed
+            // step which established that structural relation.
             let id = table.error_id();
             let mut facts = Vec::new();
             for issue in &callback_issues {
@@ -5340,9 +5554,16 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 },
                 explanation: Some(explanation),
             });
+            Some(id)
         } else {
-            extern_coverage.push((*symbol, coverage));
-        }
+            None
+        };
+        // Coverage remains real solver evidence even when another boundary
+        // defect already owns this declaration's one diagnostic. Static SAT
+        // checks above decide written symbolic labels; solving retains labels
+        // in anonymous row holes, evaluates exact open-tail relations, and
+        // preserves every published constraint id.
+        extern_coverage.push((*symbol, coverage, baseline_error));
         env.insert(
             *symbol,
             Binding::Poly(ExplainedScheme::imported(lowered.scheme.clone())),
@@ -5362,7 +5583,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     let mut promises = IndexMap::new();
     let mut steps = Vec::new();
     let mut refinements = Vec::new();
-    for (symbol, coverage) in extern_coverage {
+    for (symbol, coverage, baseline_error) in extern_coverage {
         let error_start = errors.len();
         // Callback coverage is solver input just like generated definition
         // constraints. Keep it in the published arena so every step's direct
@@ -5389,42 +5610,78 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
         }
         .run(&coverage);
         report_flip(&mut table, &mut errors);
-        // One extern declaration remains one diagnostic even when several
-        // callback paths fail. Preserve every path and every real causal ID in
-        // the first payload/explanation rather than multiplying diagnostics.
-        if errors.len() > error_start + 1 {
-            let primary_id = errors[error_start].id;
-            let mut merged_issues = Vec::new();
-            let mut merged_facts = Vec::new();
-            let mut merged_constraints = Vec::new();
-            let mut merged_reasons = Vec::new();
-            for error in &errors[error_start..] {
-                if let ErrorKind::CallbackEffectsNotCovered { issues, .. } = &error.kind {
-                    merged_issues.extend(issues.iter().cloned());
-                }
-                if let Some(explanation) = &error.explanation {
-                    merged_facts.extend(explanation.full_facts.iter().cloned());
-                    merged_constraints.extend(explanation.cause.constraints.iter().copied());
-                    merged_reasons.extend(explanation.cause.reasons.iter().copied());
-                }
+        if errors.len() == error_start {
+            continue;
+        }
+
+        let generated_issues = errors[error_start..]
+            .iter()
+            .flat_map(|error| match &error.kind {
+                ErrorKind::CallbackEffectsNotCovered { issues, .. } => issues.clone(),
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let generated_facts = errors[error_start..]
+            .iter()
+            .filter_map(|error| error.explanation.as_ref())
+            .flat_map(|explanation| explanation.full_facts.iter().cloned())
+            .collect::<Vec<_>>();
+        let generated_constraints = errors[error_start..]
+            .iter()
+            .filter_map(|error| error.explanation.as_ref())
+            .flat_map(|explanation| explanation.cause.constraints.iter().copied())
+            .collect::<Vec<_>>();
+        let generated_reasons = errors[error_start..]
+            .iter()
+            .filter_map(|error| error.explanation.as_ref())
+            .flat_map(|explanation| explanation.cause.reasons.iter().copied())
+            .collect::<Vec<_>>();
+
+        // One extern declaration remains one diagnostic. A representation
+        // defect may already own it; otherwise the first solved tail failure
+        // does. In either case merge every callback path and every real causal
+        // id, while emitting shared capability/declaration facts only once.
+        let primary_at = baseline_error
+            .and_then(|id| {
+                errors[..error_start]
+                    .iter()
+                    .position(|error| error.id == id)
+            })
+            .unwrap_or(error_start);
+        let primary_id = errors[primary_at].id;
+        set_callback_issues(&mut errors[primary_at], generated_issues);
+        if let Some(explanation) = &mut errors[primary_at].explanation {
+            let mut facts = explanation.full_facts.clone();
+            facts.extend(generated_facts);
+            explanation.full_facts = deduplicate_extern_facts(facts);
+            explanation.abridged = (0..explanation.full_facts.len()).collect();
+            explanation.cause.constraints = deduplicate(
+                explanation
+                    .cause
+                    .constraints
+                    .iter()
+                    .copied()
+                    .chain(generated_constraints)
+                    .collect(),
+            );
+            explanation.cause.reasons = deduplicate(
+                explanation
+                    .cause
+                    .reasons
+                    .iter()
+                    .copied()
+                    .chain(generated_reasons)
+                    .collect(),
+            );
+        }
+        for step in &mut steps {
+            if step.definition == symbol && step.error.is_some() {
+                step.error = Some(primary_id);
             }
-            if let ErrorKind::CallbackEffectsNotCovered { issues, .. } =
-                &mut errors[error_start].kind
-            {
-                *issues = merged_issues;
-            }
-            if let Some(explanation) = &mut errors[error_start].explanation {
-                explanation.full_facts = merged_facts;
-                explanation.abridged = (0..explanation.full_facts.len()).collect();
-                explanation.cause.constraints = deduplicate(merged_constraints);
-                explanation.cause.reasons = deduplicate(merged_reasons);
-            }
-            for step in &mut steps {
-                if step.definition == symbol && step.error.is_some() {
-                    step.error = Some(primary_id);
-                }
-            }
-            errors.truncate(error_start + 1);
+        }
+        match baseline_error {
+            Some(_) => errors.truncate(error_start),
+            None => errors.truncate(error_start + 1),
         }
     }
     // The groups are read out before anything is solved: solving mutates the
@@ -10296,6 +10553,160 @@ struct Tails {
     anonymous: HashMap<u32, Presence>,
 }
 
+fn extern_annotation_sources(
+    annotation: &Annotation,
+    tails: &Tails,
+    semantic: &Rc<Ty>,
+) -> ExternSourceMap {
+    fn source_when(
+        sources: &mut ExternSourceMap,
+        when: &Option<Box<ir::When>>,
+        presence: &Presence,
+    ) {
+        let Some(when) = when else { return };
+        if when.name.is_none()
+            && let Some(identity) = presence_variable_identity(presence)
+        {
+            // Anonymous presence holes are declaration-local inference sites,
+            // not caller-chosen polymorphism at the host boundary. This is true
+            // whether polarity later packages them existentially or leaves the
+            // one monomorphic hole to inference.
+            sources.insert_with_ownership(identity, when.span, "conditional presence", true);
+        }
+    }
+
+    fn source_tail(sources: &mut ExternSourceMap, tail: &Option<ir::Tail>, rest: &Rest) {
+        let Some(tail) = tail else { return };
+        if matches!(tail.of, ir::Row::Anything)
+            && let Some(identity) = row_variable_identity(rest)
+        {
+            sources.insert(identity, tail.span, "generic row");
+        }
+    }
+
+    let mut sources = ExternSourceMap::default();
+    for variable in &annotation.variables {
+        let name = format!("'{}", variable.name);
+        match variable.sense {
+            Sense::Type => {
+                if let Some(ty) = tails.types.get(&variable.name)
+                    && let Some(identity) = type_variable_identity(ty)
+                {
+                    sources.insert(identity, variable.span, name);
+                }
+            }
+            Sense::Fields | Sense::Cases | Sense::Effects => {
+                if let Some(rest) = tails.rows.get(&variable.name)
+                    && let Some(identity) = row_variable_identity(rest)
+                {
+                    sources.insert(identity, variable.span, name);
+                }
+            }
+            Sense::Presence => {
+                if let Some(presence) = tails.presences.get(&variable.name)
+                    && let Some(identity) = presence_variable_identity(presence)
+                {
+                    sources.insert_with_ownership(
+                        identity,
+                        variable.span,
+                        name,
+                        matches!(
+                            variable.ownership,
+                            crate::ir::PresenceOwnership::Existential { .. }
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    // Walk the still-written annotation and its unexpanded semantic spelling in
+    // lockstep. This records anonymous holes at their exact occurrence while
+    // named variables above deliberately retain their declaration span. Alias
+    // arguments are visited here before unfolding; their semantic identities
+    // are what later survive substitution into local or imported bodies.
+    let mut work = vec![(&annotation.ty, semantic.clone())];
+    while let Some((written, mut semantic)) = work.pop() {
+        while let Ty::Package(inner) = &*semantic {
+            semantic = inner.clone();
+        }
+        match (&written.tracked, &*semantic) {
+            (ir::TypeKind::Hole, Ty::Var(var)) => sources.insert(
+                ExternVariableIdentity::TypeVar(*var),
+                written.span,
+                "generic type",
+            ),
+            (ir::TypeKind::Apply { args, .. }, Ty::Named { args: lowered, .. }) => {
+                work.extend(
+                    args.iter()
+                        .zip(lowered.iter())
+                        .rev()
+                        .map(|(written, semantic)| (written, semantic.clone())),
+                );
+            }
+            (
+                ir::TypeKind::Arrow { from, to, effects },
+                Ty::Arrow(lowered_from, lowered_to, lowered_effects),
+            ) => {
+                let lowered_effects = flatten_row(lowered_effects);
+                source_tail(&mut sources, &effects.tail, &lowered_effects.rest);
+                for (effect, written) in &effects.effects {
+                    let ir::EffectLabel::Written { when, .. } = written else {
+                        continue;
+                    };
+                    if let Some(field) = lowered_effects.labels.get(&effect.row_key()) {
+                        source_when(&mut sources, when, &field.presence);
+                    }
+                }
+                work.push((to, lowered_to.clone()));
+                work.push((from, lowered_from.clone()));
+            }
+            (ir::TypeKind::Struct { fields, tail }, Ty::Struct(row)) => {
+                let row = flatten_row(row);
+                source_tail(&mut sources, tail, &row.rest);
+                for (name, written) in fields.iter().rev() {
+                    let ir::TypeField::Written { when, value, .. } = written else {
+                        continue;
+                    };
+                    if let Some(field) = row.labels.get(name) {
+                        source_when(&mut sources, when, &field.presence);
+                        work.push((value, field.ty.clone()));
+                    }
+                }
+            }
+            (ir::TypeKind::Sum { cases, tail }, Ty::Sum(row)) => {
+                let row = flatten_row(row);
+                source_tail(&mut sources, tail, &row.rest);
+                for (name, written) in cases.iter().rev() {
+                    let ir::SumCase::Written { when, payload, .. } = written else {
+                        continue;
+                    };
+                    if let Some(field) = row.labels.get(name) {
+                        source_when(&mut sources, when, &field.presence);
+                        if let Some(payload) = payload {
+                            work.push((payload, field.ty.clone()));
+                        }
+                    }
+                }
+            }
+            (ir::TypeKind::Effects(effects), Ty::Sum(row)) => {
+                let row = flatten_row(row);
+                source_tail(&mut sources, &effects.tail, &row.rest);
+                for (effect, written) in &effects.effects {
+                    let ir::EffectLabel::Written { when, .. } = written else {
+                        continue;
+                    };
+                    if let Some(field) = row.labels.get(&effect.row_key()) {
+                        source_when(&mut sources, when, &field.presence);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    sources
+}
+
 /// Everything one lowered annotation says: the type its body is checked
 /// against, the scheme a use of its own name inside that body instantiates, and
 /// what it promised about its presences.
@@ -10327,6 +10738,8 @@ struct Lowered {
     /// The ids of the type and row variables it declared, which are the ones
     /// its own scheme may quantify. See [`Table::escapes`].
     rigids: Vec<u32>,
+    /// Exact source provenance for variables which may reach a host boundary.
+    extern_sources: ExternSourceMap,
 }
 
 /// The semantic type a written annotation denotes, with everything else the
@@ -10403,6 +10816,7 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
         )
         .collect();
     let ty = lower_scoped(mint, table, &mut tails, &annotation.ty, Some(&boundaries));
+    let extern_sources = extern_annotation_sources(annotation, &tails, &ty);
     for (id, _) in &annotation.anonymous_existentials {
         if let Some(Presence::Var(var)) = tails.anonymous.get(id) {
             table.existential_witnesses.insert(*var);
@@ -10504,6 +10918,7 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
         assumptions,
         names,
         rigids,
+        extern_sources,
     }
 }
 

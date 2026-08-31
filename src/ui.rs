@@ -2856,6 +2856,84 @@ fn causal_diagnostic(
     add_abridgement_note(diagnostic, explanation)
 }
 
+fn callback_effects(effects: &[String]) -> String {
+    effects
+        .iter()
+        .map(|effect| format!("`{}`", label(Shape::Effect, effect)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn callback_issue_details(
+    mut diagnostic: Diagnostic,
+    issues: &[inference::ExternCallbackIssue],
+) -> Diagnostic {
+    let mut all_effects = Vec::new();
+    let mut tails = Vec::new();
+    let mut conditional_repairs = Vec::new();
+    for issue in issues {
+        let requirements = if issue.requirements.is_empty() {
+            issue
+                .missing_effects
+                .iter()
+                .map(|effect| inference::ExternCallbackRequirement {
+                    effect: effect.clone(),
+                    condition: None,
+                })
+                .collect::<Vec<_>>()
+        } else {
+            issue.requirements.clone()
+        };
+        let mut unconditional = Vec::new();
+        for requirement in requirements {
+            let effect = callback_effects(std::slice::from_ref(&requirement.effect));
+            if let Some(condition) = requirement.condition {
+                diagnostic = diagnostic.note(format!(
+                    "at {}, callback coverage requires {effect} whenever {condition}",
+                    issue.callback_path
+                ));
+                let repair =
+                    format!("list {effect} on this extern declaration whenever {condition} holds");
+                if !conditional_repairs.contains(&repair) {
+                    conditional_repairs.push(repair);
+                }
+            } else {
+                if !all_effects.contains(&requirement.effect) {
+                    all_effects.push(requirement.effect.clone());
+                }
+                unconditional.push(requirement.effect);
+            }
+        }
+        if !unconditional.is_empty() {
+            diagnostic = diagnostic.note(format!(
+                "at {}, the callback can perform {} without matching extern capability",
+                issue.callback_path,
+                callback_effects(&unconditional),
+            ));
+        }
+        for tail in &issue.missing_tails {
+            diagnostic = diagnostic.note(format!("at {}, {tail}", issue.callback_path));
+            if !tails.contains(tail) {
+                tails.push(tail.clone());
+            }
+        }
+    }
+    if !all_effects.is_empty() {
+        diagnostic = diagnostic.help(format!(
+            "list {} on this extern declaration",
+            callback_effects(&all_effects)
+        ));
+    }
+    for repair in conditional_repairs {
+        diagnostic = diagnostic.help(repair);
+    }
+    if !tails.is_empty() {
+        diagnostic = diagnostic
+            .help("make each extern effect row cover the callback remainder noted at that path");
+    }
+    diagnostic.help("or handle those effects before the callback returns to host code")
+}
+
 impl inference::Error {
     /// Turn an inference failure into reporter-independent words and source
     /// annotations. This is deliberately the only presentation boundary for
@@ -3094,32 +3172,43 @@ impl inference::Error {
                     diagnostic.help("add the effect to the function type, or handle it here")
             }
             E::CallbackEffectsNotCovered {
-                missing_effects, ..
+                missing_effects,
+                issues,
+                ..
             } => {
-                let effects = if missing_effects.is_empty() {
-                    "effects selected by a conditional callback type".into()
-                } else {
-                    missing_effects
-                        .iter()
-                        .map(|effect| format!("`{}`", label(Shape::Effect, effect)))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
                 if let Some(explanation) = &self.explanation {
                     diagnostic = causal_diagnostic(diagnostic, explanation);
                 } else {
+                    let effects = if missing_effects.is_empty() {
+                        "callback evidence not carried by this extern".into()
+                    } else {
+                        callback_effects(missing_effects)
+                    };
                     diagnostic = diagnostic.label(format!(
-                        "this callback can perform {effects}, which the extern does not permit"
+                        "this callback requires {effects}, which the extern does not permit"
                     ));
                 }
-                diagnostic = diagnostic
-                    .note(format!(
-                        "the callback can perform {effects}, which the extern does not permit"
-                    ))
-                    .help(format!("list {effects} on this extern declaration whenever the callback condition holds"))
-                    .help("or handle those effects before the callback returns to host code");
+                if issues.is_empty() {
+                    let effects = if missing_effects.is_empty() {
+                        "effects selected by a conditional callback type".into()
+                    } else {
+                        callback_effects(missing_effects)
+                    };
+                    diagnostic = diagnostic
+                        .note(format!(
+                            "the callback can perform {effects}, which the extern does not permit"
+                        ))
+                        .help(format!(
+                            "list {effects} on this extern declaration whenever the callback condition holds"
+                        ))
+                        .help("or handle those effects before the callback returns to host code");
+                } else {
+                    diagnostic = callback_issue_details(diagnostic, issues);
+                }
             }
-            E::PolymorphicExternBoundary { .. } => {
+            E::PolymorphicExternBoundary {
+                callback_issues, ..
+            } => {
                 if let Some(explanation) = &self.explanation {
                     diagnostic = causal_diagnostic(diagnostic, explanation);
                 } else {
@@ -3128,7 +3217,10 @@ impl inference::Error {
                 }
                 diagnostic = diagnostic
                     .help("use a fixed type at this position")
-                    .help("or expose a concrete host-facing type and convert the value in Ruddy")
+                    .help("or expose a concrete host-facing type and convert the value in Ruddy");
+                if !callback_issues.is_empty() {
+                    diagnostic = callback_issue_details(diagnostic, callback_issues);
+                }
             }
         }
         diagnostic

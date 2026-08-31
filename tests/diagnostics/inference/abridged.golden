@@ -143,9 +143,9 @@ help: add the effect to the function type, or handle it here
 primary: this callback can perform effects when host code invokes it
 related: this extern declaration does not list those callback effects
 related: this extern declaration owns the host boundary
-help: list `!Fail` on this extern declaration whenever the callback condition holds
+help: list `!Fail` on this extern declaration
 help: or handle those effects before the callback returns to host code
-note: the callback can perform `!Fail`, which the extern does not permit
+note: at extern parameter 1, the callback can perform `!Fail` without matching extern capability
 
 ## polymorphic-extern-boundary
 [polymorphic-extern-boundary] host code needs one fixed kind of value at this extern position
