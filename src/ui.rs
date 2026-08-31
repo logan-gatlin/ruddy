@@ -2668,6 +2668,30 @@ fn explanation_fact(
         P::CallerChoiceDestination => {
             "this binding's type would carry that choice outside its annotation".into()
         }
+        P::EffectUse => {
+            let row = contradiction.row.as_ref().expect("effect metadata");
+            format!(
+                "this operation or call may perform effect `{}`",
+                label(row.shape, &row.label)
+            )
+        }
+        P::EffectBoundary => {
+            let row = contradiction.row.as_ref().expect("effect metadata");
+            let effect = label(row.shape, &row.label);
+            match contradiction.kind {
+                inference::ContradictionKind::UnhandledEffect => {
+                    format!("this top-level computation has no handler for effect `{effect}`")
+                }
+                inference::ContradictionKind::EffectNotAllowed => {
+                    format!("this enclosing function does not allow effect `{effect}`")
+                }
+                _ => unreachable!("effect boundary payload on non-effect contradiction"),
+            }
+        }
+        P::EffectDeclaration => {
+            let row = contradiction.row.as_ref().expect("effect metadata");
+            format!("effect `{}` is declared here", label(row.shape, &row.label))
+        }
         P::RequiresType => match fact.subject {
             inference::Subject::Binding
             | inference::Subject::TopLevelBinding
@@ -2764,6 +2788,20 @@ fn mismatch_title(contradiction: &inference::Contradiction) -> String {
             None => "the body cannot fix a choice that belongs to each caller".into(),
         },
         K::CallerChoiceEscape => "a caller choice cannot cross into another binding's type".into(),
+        K::UnhandledEffect => {
+            let row = contradiction.row.as_ref().expect("effect metadata");
+            format!(
+                "effect `{}` has no enclosing handler",
+                label(row.shape, &row.label)
+            )
+        }
+        K::EffectNotAllowed => {
+            let row = contradiction.row.as_ref().expect("effect metadata");
+            format!(
+                "effect `{}` is not allowed by the enclosing function",
+                label(row.shape, &row.label)
+            )
+        }
     }
 }
 
@@ -3015,20 +3053,27 @@ impl inference::Error {
                     .help("strengthen the annotation or loosen the body")
             }
             E::Unhandled { effect } => {
-                diagnostic = diagnostic
-                    .label(format!(
+                if let Some(explanation) = &self.explanation {
+                    diagnostic = causal_diagnostic(diagnostic, explanation);
+                } else {
+                    diagnostic = diagnostic.label(format!(
                         "effect `{}` has no enclosing handler",
                         label(Shape::Effect, effect)
-                    ))
-                    .help("handle this effect, or perform it inside a function")
+                    ));
+                }
+                diagnostic = diagnostic.help("handle this effect, or perform it inside a function")
             }
             E::NotAllowed { effect } => {
-                diagnostic = diagnostic
-                    .label(format!(
+                if let Some(explanation) = &self.explanation {
+                    diagnostic = causal_diagnostic(diagnostic, explanation);
+                } else {
+                    diagnostic = diagnostic.label(format!(
                         "effect `{}` is not listed by this function",
                         label(Shape::Effect, effect)
-                    ))
-                    .help("add the effect to the function type, or handle it here")
+                    ));
+                }
+                diagnostic =
+                    diagnostic.help("add the effect to the function type, or handle it here")
             }
             E::CallbackEffectsNotCovered => diagnostic = diagnostic
                 .label("this callback may perform effects the extern call does not allow")

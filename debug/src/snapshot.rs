@@ -698,6 +698,9 @@ fn wire_explanation(
             inference::ExplanationFactPayload::CallerChoiceDestination => {
                 "caller-choice-destination"
             }
+            inference::ExplanationFactPayload::EffectUse => "effect-use",
+            inference::ExplanationFactPayload::EffectBoundary => "effect-boundary",
+            inference::ExplanationFactPayload::EffectDeclaration => "effect-declaration",
         };
         crate::wire::ExplanationFact {
             span: loc(fact.span, files),
@@ -748,6 +751,8 @@ fn wire_explanation(
                 inference::ContradictionKind::RepeatedLabel => "repeated-label",
                 inference::ContradictionKind::CallerChoice => "caller-choice",
                 inference::ContradictionKind::CallerChoiceEscape => "caller-choice-escape",
+                inference::ContradictionKind::UnhandledEffect => "unhandled-effect",
+                inference::ContradictionKind::EffectNotAllowed => "effect-not-allowed",
             },
             left: description(contradiction.left),
             right: description(contradiction.right),

@@ -125,13 +125,17 @@ primary: this annotation promises more combinations than the body accepts
 help: strengthen the annotation or loosen the body
 
 ## unhandled-effect
-[unhandled-effect] nothing can handle `!Log` here: a definition's value is computed outside every handler
-primary: effect `!Log` has no enclosing handler
+[unhandled-effect] effect `!Log` has no enclosing handler
+primary: effect `!Log` is declared here
+related: this top-level computation has no handler for effect `!Log`
+related: this operation or call may perform effect `!Log`
 help: handle this effect, or perform it inside a function
 
 ## effect-not-allowed
-[effect-not-allowed] this function performs `!Log`, which its type does not allow
-primary: effect `!Log` is not listed by this function
+[effect-not-allowed] effect `!Log` is not allowed by the enclosing function
+primary: effect `!Log` is declared here
+related: this enclosing function does not allow effect `!Log`
+related: this operation or call may perform effect `!Log`
 help: add the effect to the function type, or handle it here
 
 ## callback-effects-not-covered

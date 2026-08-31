@@ -101,6 +101,9 @@ pub type Operations = IndexMap<(Symbol, ir::OperationSelector), (Rc<Ty>, Rc<Ty>)
 pub struct Ambient {
     pub row: Row,
     pub inside: bool,
+    /// The written function, or top-level name, whose effect boundary owns this
+    /// ambient. Handlers extend the row but do not replace its owner.
+    pub boundary_span: Span,
     /// Written handler labels currently extending this ambient row.
     pub label_spans: IndexMap<String, Span>,
 }
@@ -579,7 +582,12 @@ impl Constrain<'_> {
                 self.emit(
                     span,
                     ConstraintOrigin::ApplicationEffects,
-                    ConstraintSubjects::pair(Subject::PerformedEffects, Subject::AmbientEffects),
+                    ConstraintSubjects::pair_at(
+                        Subject::PerformedEffects,
+                        Some(span),
+                        Subject::AmbientEffects,
+                        Some(self.ambient.boundary_span),
+                    ),
                     ConstraintKind::Performs {
                         performed,
                         ambient: self.ambient.row.clone(),
@@ -599,6 +607,7 @@ impl Constrain<'_> {
                 let outer = self.enter(Ambient {
                     row: does.clone(),
                     inside: true,
+                    boundary_span: span,
                     label_spans: IndexMap::new(),
                 });
                 // And a closure answers no arm, whichever one it was written
@@ -924,6 +933,7 @@ impl Constrain<'_> {
         let outer = self.enter(Ambient {
             row: extended,
             inside: self.ambient.inside,
+            boundary_span: self.ambient.boundary_span,
             label_spans,
         });
         self.infer_term(body);
@@ -1319,6 +1329,7 @@ impl Constrain<'_> {
                 let outer = self.enter(Ambient {
                     row: does,
                     inside: true,
+                    boundary_span: term.span,
                     label_spans: IndexMap::new(),
                 });
                 let held = self.answer.take();

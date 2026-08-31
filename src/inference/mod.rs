@@ -832,6 +832,7 @@ pub enum Subject {
     Instance,
     CallbackRequired,
     CallbackAvailable,
+    EffectDeclaration,
 }
 
 impl Subject {
@@ -865,6 +866,7 @@ impl Subject {
             Self::Instance => "instance",
             Self::CallbackRequired => "callback-required",
             Self::CallbackAvailable => "callback-available",
+            Self::EffectDeclaration => "effect-declaration",
         }
     }
 }
@@ -1051,6 +1053,13 @@ pub enum ExplanationFactPayload {
     CallerChoiceUse,
     /// The binding whose published type would carry another annotation's choice.
     CallerChoiceDestination,
+    /// A written operation application, including calls which propagate an
+    /// operation performed deeper in their callee.
+    EffectUse,
+    /// The function or top-level computation whose effect boundary refuses it.
+    EffectBoundary,
+    /// The source declaration which gives the effect its name.
+    EffectDeclaration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1087,6 +1096,10 @@ pub enum ContradictionKind {
     CallerChoice,
     /// A binding would export a choice owned by another annotation.
     CallerChoiceEscape,
+    /// An operation reaches a top-level computation with no enclosing handler.
+    UnhandledEffect,
+    /// An operation reaches an enclosing function whose type does not list it.
+    EffectNotAllowed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2974,6 +2987,11 @@ fn budget_reason_slice(mut reasons: Vec<ReasonId>) -> (Vec<ReasonId>, usize) {
     (kept, omitted)
 }
 
+struct ExplanationSources<'a> {
+    aliases: &'a IndexMap<Symbol, Scheme>,
+    effect_declarations: &'a HashMap<String, Span>,
+}
+
 fn attach_ordinary_explanations(
     mint: &Mint,
     errors: &mut [Error],
@@ -2981,8 +2999,12 @@ fn attach_ordinary_explanations(
     steps: &[Step],
     reasons: &[Reason],
     omitted_reason_parents: &HashMap<ReasonId, usize>,
-    aliases: &IndexMap<Symbol, Scheme>,
+    sources: ExplanationSources<'_>,
 ) {
+    let ExplanationSources {
+        aliases,
+        effect_declarations,
+    } = sources;
     let pivot_contexts = pivot_contexts(constraints);
     let all = all_constraints(constraints);
     let instance_binders: HashMap<Span, Symbol> = all
@@ -3074,6 +3096,24 @@ fn attach_ordinary_explanations(
                 }),
             ),
             ErrorKind::RigidEscapes { .. } => continue,
+            ErrorKind::Unhandled { effect } => (
+                TypeDescription::Function,
+                TypeDescription::Undecided,
+                Some(ContradictionKind::UnhandledEffect),
+                Some(RowContradiction {
+                    shape: Shape::Effect,
+                    label: effect.clone(),
+                }),
+            ),
+            ErrorKind::NotAllowed { effect } => (
+                TypeDescription::Function,
+                TypeDescription::Undecided,
+                Some(ContradictionKind::EffectNotAllowed),
+                Some(RowContradiction {
+                    shape: Shape::Effect,
+                    label: effect.clone(),
+                }),
+            ),
             _ => continue,
         };
         // Presence failures retain which side supplied the required label after
@@ -3181,13 +3221,24 @@ fn attach_ordinary_explanations(
                 ..
             } = &constraint.kind
                 && kind == Some(ContradictionKind::RepeatedLabel)
-                && let Some(row) = &row
-                && let Some(ambient_span) = ambient_label_spans.get(&row.label)
             {
-                endpoints = vec![
-                    (Subject::PerformedEffects, Some(constraint.span), None),
-                    (Subject::AmbientEffects, Some(*ambient_span), None),
-                ];
+                endpoints = vec![(Subject::PerformedEffects, Some(constraint.span), None)];
+                if let Some(ambient_span) = row
+                    .as_ref()
+                    .and_then(|row| ambient_label_spans.get(&row.label))
+                {
+                    endpoints.push((Subject::AmbientEffects, Some(*ambient_span), None));
+                }
+            } else if matches!(constraint.kind, ConstraintKind::Performs { .. })
+                && !matches!(
+                    kind,
+                    Some(ContradictionKind::UnhandledEffect | ContradictionKind::EffectNotAllowed)
+                )
+            {
+                // The ambient owner is effect-boundary provenance only. Other
+                // contradiction families retain the operation endpoint they
+                // had before boundaries became structured.
+                endpoints = vec![(Subject::PerformedEffects, Some(constraint.span), None)];
             } else if kind == Some(ContradictionKind::RecursiveValue) {
                 // A recursive cycle needs both source concepts even when one
                 // operand is semantic context (most notably a definition's
@@ -3259,6 +3310,36 @@ fn attach_ordinary_explanations(
                         {
                             ExplanationFactPayload::LabelDemand
                         }
+                        (
+                            ConstraintKind::Performs { .. },
+                            ConstraintOrigin::ApplicationEffects,
+                            Subject::AmbientEffects,
+                            _,
+                        ) if matches!(
+                            kind,
+                            Some(
+                                ContradictionKind::UnhandledEffect
+                                    | ContradictionKind::EffectNotAllowed
+                            )
+                        ) =>
+                        {
+                            ExplanationFactPayload::EffectBoundary
+                        }
+                        (
+                            ConstraintKind::Performs { .. },
+                            ConstraintOrigin::ApplicationEffects,
+                            _,
+                            _,
+                        ) if matches!(
+                            kind,
+                            Some(
+                                ContradictionKind::UnhandledEffect
+                                    | ContradictionKind::EffectNotAllowed
+                            )
+                        ) =>
+                        {
+                            ExplanationFactPayload::EffectUse
+                        }
                         (_, ConstraintOrigin::ApplicationCallee, Subject::Callee, _) => {
                             ExplanationFactPayload::UsedAsFunction
                         }
@@ -3303,6 +3384,33 @@ fn attach_ordinary_explanations(
                     origin: ConstraintOrigin::ContextualCheck,
                     subject: Subject::Annotation,
                     payload: ExplanationFactPayload::CallerChoiceDeclaration,
+                });
+            }
+        }
+        if matches!(
+            kind,
+            Some(ContradictionKind::UnhandledEffect | ContradictionKind::EffectNotAllowed)
+        ) && let Some(failing) = match error.cause {
+            ErrorCause::Step(id) => steps.get(&id).and_then(|step| step.constraint),
+            ErrorCause::Batch(_) | ErrorCause::Direct => None,
+        } && let Some(
+            constraint @ Constraint {
+                kind: ConstraintKind::Performs { .. },
+                ..
+            },
+        ) = constraints.get(&failing)
+            && let Some(boundary_span) = constraint.subjects.secondary_span
+        {
+            let _ = boundary_span;
+            if let Some(row) = &row
+                && let Some(span) = effect_declarations.get(&row.label)
+            {
+                full_facts.push(ExplanationFact {
+                    span: *span,
+                    constraint: failing,
+                    origin: ConstraintOrigin::ContextualCheck,
+                    subject: Subject::EffectDeclaration,
+                    payload: ExplanationFactPayload::EffectDeclaration,
                 });
             }
         }
@@ -3448,8 +3556,26 @@ fn attach_ordinary_explanations(
             };
             [matching[0], *matching.last().expect("shared pivot key")]
         });
+        let effect_endpoints = matches!(
+            kind,
+            Some(ContradictionKind::UnhandledEffect | ContradictionKind::EffectNotAllowed)
+        )
+        .then(|| {
+            let use_at = candidates
+                .iter()
+                .rev()
+                .copied()
+                .find(|at| full_facts[*at].payload == ExplanationFactPayload::EffectUse)?;
+            let boundary = candidates
+                .iter()
+                .copied()
+                .find(|at| full_facts[*at].payload == ExplanationFactPayload::EffectBoundary)?;
+            Some([use_at, boundary])
+        })
+        .flatten();
         let endpoints = caller_endpoints
             .or(opposing_endpoints)
+            .or(effect_endpoints)
             .or(endpoint_family)
             .unwrap_or_else(|| {
                 [
@@ -3458,10 +3584,25 @@ fn attach_ordinary_explanations(
                 ]
             });
         let mut abridged = vec![endpoints[0], endpoints[1]];
+        if effect_endpoints.is_some() {
+            if let Some(declaration) = candidates
+                .iter()
+                .copied()
+                .find(|at| full_facts[*at].payload == ExplanationFactPayload::EffectDeclaration)
+            {
+                abridged.push(declaration);
+            }
+            if let Some(first_use) = candidates.iter().copied().find(|at| {
+                full_facts[*at].payload == ExplanationFactPayload::EffectUse && *at != endpoints[0]
+            }) {
+                abridged.push(first_use);
+            }
+        }
         let lo = endpoints[0].min(endpoints[1]);
         let hi = endpoints[0].max(endpoints[1]);
         if opposing_endpoints.is_none()
             && caller_endpoints.is_none()
+            && effect_endpoints.is_none()
             && let Some(handoff) = candidates.iter().copied().find(|at| {
                 lo < *at
                     && *at < hi
@@ -3480,8 +3621,14 @@ fn attach_ordinary_explanations(
         abridged.dedup();
 
         let pivot_candidate = shared_keys.iter().find_map(|(key, all_references)| {
-            if kind == Some(ContradictionKind::CallerChoice)
-                || opposing_endpoints.is_some() && matches!(key, PivotKey::Anonymous { .. })
+            if matches!(
+                kind,
+                Some(
+                    ContradictionKind::CallerChoice
+                        | ContradictionKind::UnhandledEffect
+                        | ContradictionKind::EffectNotAllowed
+                )
+            ) || opposing_endpoints.is_some() && matches!(key, PivotKey::Anonymous { .. })
             {
                 return None;
             }
@@ -3888,6 +4035,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 ambient: constrain::Ambient {
                     row: Row::closed(),
                     inside: false,
+                    boundary_span: decl.name_span,
                     label_spans: IndexMap::new(),
                 },
                 answer: None,
@@ -4159,6 +4307,16 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     constraints.sort_by(|one, _, other, _| position[one].cmp(&position[other]));
     promises.sort_by(|one, _, other, _| position[one].cmp(&position[other]));
 
+    let effect_declarations: HashMap<_, _> = program
+        .effects
+        .iter()
+        .filter_map(|(symbol, declaration)| {
+            program
+                .effect_ids
+                .get(symbol)
+                .map(|id| (id.row_key(), declaration.name_span))
+        })
+        .collect();
     attach_ordinary_explanations(
         mint,
         &mut errors,
@@ -4166,7 +4324,10 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
         &steps,
         &table.reasons,
         &table.omitted_reason_parents,
-        &aliases,
+        ExplanationSources {
+            aliases: &aliases,
+            effect_declarations: &effect_declarations,
+        },
     );
 
     // Constraints are solved in the order the walk emitted them, which is not

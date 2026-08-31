@@ -1583,6 +1583,179 @@ fn repeated_effects_keep_full_facts_and_exact_abridged_endpoints() {
 }
 
 #[test]
+fn effect_boundaries_keep_source_causal_paths_and_repairs() {
+    use inference::{ContradictionKind as K, ExplanationFactPayload as P};
+
+    for (source, expected) in [
+        (
+            concat!(
+                "effect Log = { write: Nat -> () }\n",
+                "let bad = !Log.write 1n\n",
+            ),
+            K::UnhandledEffect,
+        ),
+        (
+            include_str!("../diagnostics/inference/unhandled-effect.hc"),
+            K::UnhandledEffect,
+        ),
+        (
+            include_str!("../diagnostics/inference/effect-not-allowed.hc"),
+            K::EffectNotAllowed,
+        ),
+        (
+            concat!(
+                "effect Log = { write: Nat -> () }\n",
+                "effect Tick = { tick: () -> () }\n",
+                "let bad : () -> () = fn _ => handle !Log.write 0n with ",
+                "| !Log.write n => !Tick.tick () end\n",
+            ),
+            K::EffectNotAllowed,
+        ),
+        (
+            concat!(
+                "effect Log = { write: Nat -> () }\n",
+                "effect Tick = { tick: () -> () }\n",
+                "let bad : () -> () = fn _ => handle !Log.write 0n with ",
+                "| !Log.write n => () | return value => !Tick.tick () end\n",
+            ),
+            K::EffectNotAllowed,
+        ),
+        (
+            concat!(
+                "effect Log = { write: Nat -> () }\n",
+                "let bad = fn _ => let inner : () -> () = ",
+                "fn _ => !Log.write 0n in inner\n",
+            ),
+            K::EffectNotAllowed,
+        ),
+        (
+            concat!(
+                "effect Log = { write: Nat -> () }\n",
+                "effect Tick = { tick: () -> () }\n",
+                "effect Both = !Log + !Tick\n",
+                "let action : () -> () + !Both = fn _ => ",
+                "let _ = !Log.write 0n in !Tick.tick ()\n",
+                "let bad : () -> () = fn _ => action ()\n",
+            ),
+            K::EffectNotAllowed,
+        ),
+    ] {
+        let errors = inference_fixture_errors(source);
+        let error = errors
+            .iter()
+            .find(|error| {
+                matches!(
+                    error.kind,
+                    inference::ErrorKind::Unhandled { .. }
+                        | inference::ErrorKind::NotAllowed { .. }
+                )
+            })
+            .unwrap_or_else(|| panic!("effect fixture has no boundary error: {errors:#?}"));
+        let explanation = error.explanation.as_ref().expect("structured effect path");
+        assert_eq!(explanation.contradiction.kind, expected);
+        assert!(
+            (2..=4).contains(&explanation.abridged.len()),
+            "{explanation:#?}"
+        );
+        let selected: HashSet<_> = explanation
+            .abridged
+            .iter()
+            .map(|at| explanation.full_facts[*at].payload)
+            .collect();
+        assert!(selected.contains(&P::EffectUse), "{explanation:#?}");
+        assert!(selected.contains(&P::EffectBoundary), "{explanation:#?}");
+        assert!(selected.contains(&P::EffectDeclaration), "{explanation:#?}");
+        assert!(
+            explanation.pivot.is_none(),
+            "effect paths need no invented name"
+        );
+
+        let diagnostic = error.diagnostic();
+        let prose = format!("{diagnostic:?}");
+        for forbidden in ["solver", "constraint", "row tail", "unification"] {
+            assert!(!prose.contains(forbidden), "{prose}");
+        }
+        match expected {
+            K::UnhandledEffect => assert_eq!(
+                diagnostic.help,
+                ["handle this effect, or perform it inside a function"]
+            ),
+            K::EffectNotAllowed => assert_eq!(
+                diagnostic.help,
+                ["add the effect to the function type, or handle it here"]
+            ),
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn deep_and_multiple_effect_boundaries_remain_bounded_and_counted() {
+    use inference::ExplanationFactPayload as P;
+
+    let mut deep =
+        String::from("effect Log = { write: Nat -> () }\nlet id = fn value => value\nlet bad = ");
+    for _ in 0..24 {
+        deep.push_str("id (");
+    }
+    deep.push_str("fn _ => !Log.write 0n");
+    for _ in 0..24 {
+        deep.push(')');
+    }
+    deep.push_str(" ()\n");
+    let errors = inference_fixture_errors(&deep);
+    let [error] = errors.as_slice() else {
+        panic!("a deep propagated effect remains one error: {errors:#?}");
+    };
+    let explanation = error.explanation.as_ref().expect("deep effect cause");
+    assert!((2..=4).contains(&explanation.abridged.len()));
+    assert!(explanation.full_facts.len() > explanation.abridged.len());
+    assert_eq!(
+        explanation.omitted_facts,
+        explanation.full_facts.len() - explanation.abridged.len()
+    );
+    assert!(
+        explanation
+            .full_facts
+            .iter()
+            .any(|fact| fact.payload == P::EffectUse)
+    );
+
+    let multiple = concat!(
+        "effect Log = { write: Nat -> () }\n",
+        "effect Tick = { tick: () -> () }\n",
+        "effect Both = !Log + !Tick\n",
+        "let bad : () -> () = fn _ => let _ = !Log.write 0n in !Tick.tick ()\n",
+    );
+    let errors = inference_fixture_errors(multiple);
+    assert_eq!(errors.len(), 2, "one diagnostic per refused source effect");
+    let declared: HashSet<_> = errors
+        .iter()
+        .map(|error| {
+            let explanation = error.explanation.as_ref().expect("effect explanation");
+            assert!(
+                explanation
+                    .full_facts
+                    .iter()
+                    .any(|fact| fact.payload == P::EffectDeclaration)
+            );
+            explanation
+                .contradiction
+                .row
+                .as_ref()
+                .unwrap()
+                .label
+                .clone()
+        })
+        .collect();
+    assert_eq!(
+        declared.len(),
+        2,
+        "aliases must not merge distinct source effects"
+    );
+}
+
+#[test]
 fn row_roles_follow_the_resolved_rejected_side() {
     for (source, demand_subject, limiter_subject) in [
         (
