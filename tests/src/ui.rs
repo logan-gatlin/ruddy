@@ -1735,6 +1735,40 @@ fn effect_declarations_keep_qualified_identity_through_aliases_and_primary_roles
 }
 
 #[test]
+fn bare_operation_values_keep_exact_origins_through_value_flow() {
+    use inference::ExplanationFactPayload as P;
+
+    for tail in [
+        "let write = C::!Log.write\nlet bad = write 0n\n",
+        "let stored = { write: C::!Log.write }\nlet bad = stored.write 0n\n",
+        "let forward = fn callback => callback\nlet write = forward C::!Log.write\nlet bad = write 0n\n",
+        "let invoke = fn callback => callback 0n\nlet bad = invoke C::!Log.write\n",
+        "let store = fn callback => { run: callback }\nlet bad = (store C::!Log.write).run 0n\n",
+    ] {
+        let source = format!(
+            "module A = effect Log = {{ write: Nat -> () }} end\nmodule C = effect Log = {{ write: Nat -> () }} end\n{tail}"
+        );
+        let errors = inference_fixture_errors(&source);
+        let error = errors
+            .iter()
+            .find(|error| matches!(error.kind, inference::ErrorKind::Unhandled { .. }))
+            .unwrap_or_else(|| panic!("forwarded operation must escape: {errors:#?}"));
+        let declaration = error
+            .explanation
+            .as_ref()
+            .expect("effect explanation")
+            .full_facts
+            .iter()
+            .find(|fact| fact.payload == P::EffectDeclaration)
+            .expect("resolved operation declaration");
+        assert!(
+            declaration.span.start > source.find("module C").unwrap(),
+            "value flow must retain C::!Log rather than coalesced A::!Log: {tail}"
+        );
+    }
+}
+
+#[test]
 fn deep_and_multiple_effect_boundaries_remain_bounded_and_counted() {
     use inference::ExplanationFactPayload as P;
 
@@ -2916,6 +2950,7 @@ fn a_printer_reports_a_writer_that_refuses_it() {
             level: 1,
             promised: Formula::var(0),
             rigids: Vec::new(),
+            effect_provenance: Default::default(),
             value: Vec::new(),
             body: Vec::new(),
         },
@@ -3692,6 +3727,7 @@ fn no_two_kinds_of_constraint_are_coded_the_same() {
             level: 1,
             promised: Formula::True,
             rigids: Vec::new(),
+            effect_provenance: Default::default(),
             value: Vec::new(),
             body: Vec::new(),
         },
@@ -3747,6 +3783,7 @@ fn the_scoping_constraints_read_as_what_they_do() {
             level: 2,
             promised: Formula::True,
             rigids: Vec::new(),
+            effect_provenance: Default::default(),
             value: Vec::new(),
             body: Vec::new(),
         },
@@ -3761,6 +3798,7 @@ fn the_scoping_constraints_read_as_what_they_do() {
         level: 2,
         promised: Formula::var(0).xor(Formula::var(1)),
         rigids: Vec::new(),
+        effect_provenance: Default::default(),
         value: Vec::new(),
         body: Vec::new(),
     };

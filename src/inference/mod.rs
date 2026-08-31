@@ -912,6 +912,9 @@ pub enum ConstraintKind {
         /// ones the scheme this publishes may quantify. Empty where none was
         /// written. See [`ErrorKind::RigidEscapes`].
         rigids: Vec<u32>,
+        /// Operation values produced by the bound expression, kept outside its
+        /// semantic scheme while the solver publishes that scheme.
+        effect_provenance: EffectProvenance,
         /// What the value requires, including that it match the annotation when
         /// one was written. Solved first, at `level`.
         value: Vec<Constraint>,
@@ -959,7 +962,7 @@ pub enum ConstraintKind {
         /// This is diagnostic provenance, not row identity: structurally equal
         /// declarations may coalesce in `performed` while retaining distinct
         /// source origins through calls and generalized aliases.
-        effect_origins: Vec<EffectOrigin>,
+        effect_origins: Vec<EffectSource>,
         /// Source labels of handlers which extend `ambient`.
         ambient_label_spans: IndexMap<String, Span>,
         /// Whether a `fn` encloses the application. What tells the two readings
@@ -983,23 +986,78 @@ pub struct EffectOrigin {
     pub declaration_span: Span,
 }
 
-fn collect_effect_origins(constraints: &[Constraint], origins: &mut Vec<EffectOrigin>) {
+/// Either an exact operation declaration or a callable supplied through a
+/// function parameter. Parameter sources are substituted as values flow; only
+/// exact origins ever reach a diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EffectSource {
+    Origin(EffectOrigin),
+    Parameter(Symbol),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EffectProvenance {
+    callable: Vec<EffectSource>,
+    value_parameter: Option<Symbol>,
+    argument: Option<Symbol>,
+    result: Option<Box<EffectProvenance>>,
+    fields: IndexMap<String, EffectProvenance>,
+}
+
+impl EffectProvenance {
+    fn parameter(symbol: Symbol) -> Self {
+        Self {
+            value_parameter: Some(symbol),
+            ..Self::default()
+        }
+    }
+
+    fn substitute(&self, symbol: Symbol, value: &Self) -> Self {
+        if self.value_parameter == Some(symbol) {
+            return value.clone();
+        }
+        let mut out = self.clone();
+        let mut callable = Vec::new();
+        for source in &out.callable {
+            if *source == EffectSource::Parameter(symbol) {
+                for replacement in &value.callable {
+                    if !callable.contains(replacement) {
+                        callable.push(replacement.clone());
+                    }
+                }
+            } else if !callable.contains(source) {
+                callable.push(source.clone());
+            }
+        }
+        out.callable = callable;
+        out.result = out
+            .result
+            .as_deref()
+            .map(|result| Box::new(result.substitute(symbol, value)));
+        for field in out.fields.values_mut() {
+            *field = field.substitute(symbol, value);
+        }
+        out
+    }
+}
+
+fn collect_effect_sources(constraints: &[Constraint], sources: &mut Vec<EffectSource>) {
     for constraint in constraints {
         match &constraint.kind {
             ConstraintKind::Performs { effect_origins, .. } => {
-                for origin in effect_origins {
-                    if !origins.contains(origin) {
-                        origins.push(origin.clone());
+                for source in effect_origins {
+                    if !sources.contains(source) {
+                        sources.push(source.clone());
                     }
                 }
             }
             ConstraintKind::Let { value, body, .. } => {
-                collect_effect_origins(value, origins);
-                collect_effect_origins(body, origins);
+                collect_effect_sources(value, sources);
+                collect_effect_sources(body, sources);
             }
             ConstraintKind::Match { arms, .. } => {
                 for arm in arms {
-                    collect_effect_origins(&arm.constraints, origins);
+                    collect_effect_sources(&arm.constraints, sources);
                 }
             }
             _ => {}
@@ -1477,7 +1535,7 @@ enum Binding {
 struct ExplainedScheme {
     scheme: Scheme,
     provenance: SchemeProvenance,
-    effect_origins: Vec<EffectOrigin>,
+    effect_provenance: Box<EffectProvenance>,
 }
 
 /// A compact causal skeleton keyed like the zonked scheme body. Child edges,
@@ -1529,19 +1587,19 @@ impl ExplainedScheme {
         Self {
             scheme,
             provenance: SchemeProvenance::default(),
-            effect_origins: Vec::new(),
+            effect_provenance: Box::default(),
         }
     }
 
     fn local(
         scheme: Scheme,
         provenance: SchemeProvenance,
-        effect_origins: Vec<EffectOrigin>,
+        effect_provenance: EffectProvenance,
     ) -> Self {
         Self {
             scheme,
             provenance,
-            effect_origins,
+            effect_provenance: Box::new(effect_provenance),
         }
     }
 }
@@ -1619,6 +1677,8 @@ struct Solved {
     generated: Vec<Constraint>,
     /// Every annotation written on a nested `let` inside it. See [`Annotated`].
     annotated: Vec<Annotated>,
+    /// Exact operation-value provenance inferred for this value.
+    effect_provenance: EffectProvenance,
     /// Where the schemes this definition's nested lets published begin in the
     /// shared list, so that each can be numbered for printing once the group is
     /// solved. See [`Table::published`].
@@ -3440,10 +3500,12 @@ fn attach_ordinary_explanations(
                 else {
                     return None;
                 };
-                effect_origins
-                    .iter()
-                    .find(|origin| origin.interface.row_key() == row.label)
-                    .map(|origin| (*id, origin))
+                effect_origins.iter().find_map(|source| {
+                    let EffectSource::Origin(origin) = source else {
+                        return None;
+                    };
+                    (origin.interface.row_key() == row.label).then_some((*id, origin))
+                })
             })
         {
             // Declaration evidence follows the resolved operation identity, not
@@ -4089,8 +4151,9 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 operations: &operations,
                 effect_ids: &program.effect_ids,
                 effect_declaration_spans: &effect_declaration_spans,
-                term_effect_origins: HashMap::new(),
-                local_effect_origins: HashMap::new(),
+                term_effect_provenance: HashMap::new(),
+                local_effect_provenance: HashMap::new(),
+                binding_effect_provenance: HashMap::new(),
                 // A definition's value is computed where no handler can reach
                 // it, so it is walked at the empty closed row and outside every
                 // function — which is what makes performing an effect at the
@@ -4125,6 +4188,11 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 expected_subject,
                 expected_span,
             );
+            let effect_provenance = constrain
+                .term_effect_provenance
+                .get(&decl.value.span)
+                .cloned()
+                .unwrap_or_default();
             let generated = constrain.out;
             let annotated = constrain.annotated;
             let ty = match &decl.annotation {
@@ -4169,6 +4237,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 ty,
                 generated,
                 annotated,
+                effect_provenance,
                 reported,
                 locals: published,
             });
@@ -4346,14 +4415,12 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             } else {
                 table.scheme_provenance(&member.ty, scheme.body(), &subst, scheme.count())
             };
-            let mut effect_origins = Vec::new();
-            collect_effect_origins(&member.generated, &mut effect_origins);
             env.insert(
                 symbol,
                 Binding::Poly(ExplainedScheme::local(
                     scheme.clone(),
                     provenance,
-                    effect_origins,
+                    member.effect_provenance,
                 )),
             );
             schemes.insert(symbol, scheme);
@@ -11235,7 +11302,7 @@ mod identity_tests {
                     omitted: 0,
                 }],
             },
-            effect_origins: Vec::new(),
+            effect_provenance: Box::default(),
         };
         table.instantiate_scoped(Span::default(), &explained, None);
         assert_eq!(table.var_meta.last().unwrap().sort, VarSort::Row);

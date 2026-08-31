@@ -217,6 +217,7 @@ struct Scoping<'a> {
     level: u32,
     promised: &'a Formula,
     rigids: &'a [u32],
+    effect_provenance: &'a super::EffectProvenance,
     value: &'a [Constraint],
     body: &'a [Constraint],
 }
@@ -400,6 +401,7 @@ impl Solve<'_> {
                     level,
                     promised,
                     rigids,
+                    effect_provenance,
                     value,
                     body,
                 } => self.bind_local(
@@ -410,6 +412,7 @@ impl Solve<'_> {
                         level: *level,
                         promised,
                         rigids,
+                        effect_provenance,
                         value,
                         body,
                     },
@@ -1414,6 +1417,7 @@ impl Solve<'_> {
             level,
             promised,
             rigids,
+            effect_provenance,
             value,
             body,
         } = scoping;
@@ -1471,11 +1475,9 @@ impl Solve<'_> {
             self.table
                 .scheme_provenance(bound, scheme.body(), &subst, scheme.count())
         };
-        let mut effect_origins = Vec::new();
-        super::collect_effect_origins(value, &mut effect_origins);
         self.schemes.insert(
             symbol,
-            ExplainedScheme::local(scheme, provenance, effect_origins),
+            ExplainedScheme::local(scheme, provenance, effect_provenance.clone()),
         );
         self.run(body);
         self.schemes.remove(&symbol);

@@ -14,3 +14,11 @@
 - [x] Make the unavoidable call primary for unhandled effects and the refusing function boundary primary for disallowed effects; keep declarations related-only.
 - [x] Cover coalesced and distinct same-leaf interfaces, alias propagation, CLI goldens, and debugger parity.
 - [x] Run formatting, the full workspace suite, workspace checks, and Clippy.
+
+## Bare operation-value provenance follow-up
+
+- [x] Capture exact operation identity when an operation is resolved as a value, not only when directly applied.
+- [x] Keep structured value provenance beside inferred and local/top explained schemes without changing `Ty` or `Scheme`.
+- [x] Substitute higher-order parameter flow and preserve callback origins through call results, storage, and projection.
+- [x] Cover bare aliases, projected/stored callbacks, forwarding, and coalesced qualified same-leaf declarations.
+- [x] Run formatting, the full workspace suite, workspace checks, and Clippy.

@@ -55,14 +55,14 @@ pub struct Constrain<'a> {
     /// from structural row keys because equivalent same-named interfaces are
     /// allowed to coalesce semantically.
     pub effect_declaration_spans: &'a IndexMap<Symbol, Span>,
-    /// Exact declarations contributing effects to inferred name/application
-    /// types. This compilation-local channel follows aliases without changing
-    /// structural type equality.
-    pub term_effect_origins: HashMap<Span, Vec<super::EffectOrigin>>,
-    /// Origins published by a nested alias before its body is generated. The
-    /// semantic scheme is deferred to solving, but declaration provenance is
-    /// already exact in the generated value constraints.
-    pub local_effect_origins: HashMap<Symbol, Vec<super::EffectOrigin>>,
+    /// Compilation-local operation-value provenance. It mirrors only value
+    /// flow (call results and struct fields), never semantic type identity.
+    pub term_effect_provenance: HashMap<Span, super::EffectProvenance>,
+    /// Provenance published by nested values before solving can publish their
+    /// semantic schemes.
+    pub local_effect_provenance: HashMap<Symbol, super::EffectProvenance>,
+    /// Parameter placeholders used to preserve higher-order value flow.
+    pub binding_effect_provenance: HashMap<Symbol, super::EffectProvenance>,
     /// The effects the place being walked allows, and whether a `fn` encloses
     /// it.
     ///
@@ -455,10 +455,13 @@ impl Constrain<'_> {
                 let required = std::mem::replace(&mut self.out, outer);
 
                 self.table.level -= 1;
-                let mut local_effect_origins = Vec::new();
-                super::collect_effect_origins(&required, &mut local_effect_origins);
-                self.local_effect_origins
-                    .insert(name.tracked, local_effect_origins);
+                let value_effect_provenance = self
+                    .term_effect_provenance
+                    .get(&value.span)
+                    .cloned()
+                    .unwrap_or_default();
+                self.local_effect_provenance
+                    .insert(name.tracked, value_effect_provenance);
                 // And polymorphically in the body, where the scheme exists.
                 // Nothing is put back afterwards: a symbol is unique, so the
                 // name a nested `let` binds can never be one anything outside
@@ -482,27 +485,23 @@ impl Constrain<'_> {
                         level,
                         promised,
                         rigids,
+                        effect_provenance: self
+                            .local_effect_provenance
+                            .get(&name.tracked)
+                            .cloned()
+                            .unwrap_or_default(),
                         value: required,
                         body: rest,
                     },
                 );
                 // What the expression evaluates to is what its body evaluates
                 // to; the value is what the name is, not what the `let` is.
+                if let Some(provenance) = self.term_effect_provenance.get(&body.span).cloned() {
+                    self.term_effect_provenance.insert(span, provenance);
+                }
                 body.ty.clone()
             }
             TermKind::Apply { func, arg } => {
-                let direct_effect_origin = match &func.kind {
-                    TermKind::Operation { effect, .. } => self
-                        .effect_ids
-                        .get(&effect.tracked)
-                        .zip(self.effect_declaration_spans.get(&effect.tracked))
-                        .map(|(interface, declaration_span)| super::EffectOrigin {
-                            symbol: effect.tracked,
-                            interface: interface.clone(),
-                            declaration_span: *declaration_span,
-                        }),
-                    _ => None,
-                };
                 let opened = self.table.store.batches.len();
                 self.infer_term(func);
                 let at = func.span;
@@ -516,19 +515,26 @@ impl Constrain<'_> {
                 // belong.
                 self.table.aim(opened, at, arg.span);
                 let applied = func.ty.clone();
-                let mut effect_origins = self
-                    .term_effect_origins
+                let func_provenance = self
+                    .term_effect_provenance
                     .get(&func.span)
                     .cloned()
                     .unwrap_or_default();
-                if let Some(origin) = direct_effect_origin
-                    && !effect_origins.contains(&origin)
-                {
-                    effect_origins.push(origin);
-                }
-                if !effect_origins.is_empty() {
-                    self.term_effect_origins
-                        .insert(span, effect_origins.clone());
+                let arg_provenance = self
+                    .term_effect_provenance
+                    .get(&arg.span)
+                    .cloned()
+                    .unwrap_or_default();
+                let resolved_func = match func_provenance.argument {
+                    Some(symbol) => func_provenance.substitute(symbol, &arg_provenance),
+                    None => func_provenance,
+                };
+                let effect_origins = match resolved_func.value_parameter {
+                    Some(symbol) => vec![super::EffectSource::Parameter(symbol)],
+                    None => resolved_func.callable.clone(),
+                };
+                if let Some(result) = resolved_func.result {
+                    self.term_effect_provenance.insert(span, *result);
                 }
                 // Through a name, so that something annotated `Endo` is
                 // applied as the arrow it stands for. The arrow the arm then
@@ -647,6 +653,9 @@ impl Constrain<'_> {
                 let param = self.table.fresh_type_for(Subject::Parameter);
                 let does = Row::of(self.table.fresh_row_for(Subject::AmbientEffects));
                 self.env.insert(arg.tracked, Binding::Mono(param.clone()));
+                self.binding_effect_provenance
+                    .insert(arg.tracked, super::EffectProvenance::parameter(arg.tracked));
+                let constraints_start = self.out.len();
                 let outer = self.enter(Ambient {
                     row: does.clone(),
                     inside: true,
@@ -662,6 +671,22 @@ impl Constrain<'_> {
                 self.infer_term(body);
                 self.answer = held;
                 self.leave(outer);
+                let mut callable = Vec::new();
+                super::collect_effect_sources(&self.out[constraints_start..], &mut callable);
+                let result = self
+                    .term_effect_provenance
+                    .get(&body.span)
+                    .cloned()
+                    .unwrap_or_default();
+                self.term_effect_provenance.insert(
+                    span,
+                    super::EffectProvenance {
+                        callable,
+                        argument: Some(arg.tracked),
+                        result: Some(Box::new(result)),
+                        ..Default::default()
+                    },
+                );
                 Rc::new(Ty::plain(Ty::Arrow(param, body.ty.clone(), does)))
             }
             // An operation is an ordinary value of its declared signature, with
@@ -683,6 +708,24 @@ impl Constrain<'_> {
                     .collect(),
                     rest: Rest::Closed,
                 };
+                if let Some((interface, declaration_span)) = self
+                    .effect_ids
+                    .get(&effect.tracked)
+                    .zip(self.effect_declaration_spans.get(&effect.tracked))
+                {
+                    let origin = super::EffectOrigin {
+                        symbol: effect.tracked,
+                        interface: interface.clone(),
+                        declaration_span: *declaration_span,
+                    };
+                    self.term_effect_provenance.insert(
+                        span,
+                        super::EffectProvenance {
+                            callable: vec![super::EffectSource::Origin(origin)],
+                            ..Default::default()
+                        },
+                    );
+                }
                 Rc::new(Ty::plain(Ty::Arrow(from.clone(), to.clone(), does)))
             }
             TermKind::Handle { body, handler } => self.handle(body, handler),
@@ -708,9 +751,17 @@ impl Constrain<'_> {
             }
             TermKind::Struct(fields) => {
                 let mut tys = IndexMap::new();
+                let mut provenance = super::EffectProvenance::default();
                 for (name, field) in fields.iter_mut() {
                     self.infer_term(&mut field.value);
+                    if let Some(value) = self.term_effect_provenance.get(&field.value.span).cloned()
+                    {
+                        provenance.fields.insert(name.clone(), value);
+                    }
                     tys.insert(name.clone(), RowField::present(field.value.ty.clone()));
+                }
+                if !provenance.fields.is_empty() {
+                    self.term_effect_provenance.insert(span, provenance);
                 }
                 // A literal's fields are all there, and are all it has: the
                 // tail is closed. Openness belongs to demands, not to values.
@@ -760,6 +811,14 @@ impl Constrain<'_> {
             // definition polymorphic in everything but the field it reads.
             TermKind::Project { base, field } => {
                 self.infer_term(base);
+                if let Some(provenance) = self
+                    .term_effect_provenance
+                    .get(&base.span)
+                    .and_then(|provenance| provenance.fields.get(&field.tracked))
+                    .cloned()
+                {
+                    self.term_effect_provenance.insert(span, provenance);
+                }
                 let result = self.table.fresh_type_for(Subject::ProjectionResult);
                 self.emit(
                     field.span,
@@ -1369,6 +1428,9 @@ impl Constrain<'_> {
             (TermKind::Fn { arg, body }, Ty::Arrow(from, to, does)) => {
                 let (from, to, does) = (from.clone(), to.clone(), does.clone());
                 self.env.insert(arg.tracked, Binding::Mono(from));
+                self.binding_effect_provenance
+                    .insert(arg.tracked, super::EffectProvenance::parameter(arg.tracked));
+                let constraints_start = self.out.len();
                 let outer = self.enter(Ambient {
                     row: does,
                     inside: true,
@@ -1379,6 +1441,22 @@ impl Constrain<'_> {
                 self.check_term(body, &to, expected_subject, expected_span);
                 self.answer = held;
                 self.leave(outer);
+                let mut callable = Vec::new();
+                super::collect_effect_sources(&self.out[constraints_start..], &mut callable);
+                let result = self
+                    .term_effect_provenance
+                    .get(&body.span)
+                    .cloned()
+                    .unwrap_or_default();
+                self.term_effect_provenance.insert(
+                    term.span,
+                    super::EffectProvenance {
+                        callable,
+                        argument: Some(arg.tracked),
+                        result: Some(Box::new(result)),
+                        ..Default::default()
+                    },
+                );
                 term.ty = expected.clone();
             }
             // Only the exact closed shape a literal already has is pushed
@@ -1397,9 +1475,17 @@ impl Constrain<'_> {
                         .all(|field| matches!(field.presence, Presence::Present))
                     && same_field_set(fields, &row.labels) =>
             {
+                let mut provenance = super::EffectProvenance::default();
                 for (name, field) in fields.iter_mut() {
                     let want = row.labels[name].ty.clone();
                     self.check_term(&mut field.value, &want, expected_subject, expected_span);
+                    if let Some(value) = self.term_effect_provenance.get(&field.value.span).cloned()
+                    {
+                        provenance.fields.insert(name.clone(), value);
+                    }
+                }
+                if !provenance.fields.is_empty() {
+                    self.term_effect_provenance.insert(term.span, provenance);
                 }
                 term.ty = expected.clone();
             }
@@ -1475,11 +1561,16 @@ impl Constrain<'_> {
         // nothing already became `TermKind::Error`. A lookup falling back to a
         // fresh variable would hide the day one of those stops holding.
         match self.env[&symbol].clone() {
-            Binding::Mono(ty) => ty,
+            Binding::Mono(ty) => {
+                if let Some(provenance) = self.binding_effect_provenance.get(&symbol).cloned() {
+                    self.term_effect_provenance.insert(span, provenance);
+                }
+                ty
+            }
             Binding::Poly(scheme) => {
-                if !scheme.effect_origins.is_empty() {
-                    self.term_effect_origins
-                        .insert(span, scheme.effect_origins.clone());
+                if *scheme.effect_provenance != super::EffectProvenance::default() {
+                    self.term_effect_provenance
+                        .insert(span, (*scheme.effect_provenance).clone());
                 }
                 self.table.instantiate_local(span, symbol, &scheme)
             }
@@ -1489,10 +1580,8 @@ impl Constrain<'_> {
             // pass is built on — nothing here reads the table — over the one
             // construct that would otherwise have to wait for a solve.
             Binding::Local => {
-                if let Some(origins) = self.local_effect_origins.get(&symbol)
-                    && !origins.is_empty()
-                {
-                    self.term_effect_origins.insert(span, origins.clone());
+                if let Some(provenance) = self.local_effect_provenance.get(&symbol).cloned() {
+                    self.term_effect_provenance.insert(span, provenance);
                 }
                 let ty = self.table.fresh_type_for(Subject::Instance);
                 // The scheme does not exist yet, but its possible store batch
