@@ -2532,6 +2532,7 @@ impl fmt::Display for ConstraintKind {
             ConstraintKind::CallbackCoverage {
                 required,
                 available,
+                ..
             } => write!(
                 f,
                 "callback {} covered by {}",
@@ -2692,6 +2693,17 @@ fn explanation_fact(
             let row = contradiction.row.as_ref().expect("effect metadata");
             format!("effect `{}` is declared here", label(row.shape, &row.label))
         }
+        P::CallbackRequirement => {
+            "this callback can perform effects when host code invokes it".into()
+        }
+        P::ExternCapability => {
+            "the containing extern call does not permit those callback effects".into()
+        }
+        P::ExternDeclaration => "this extern declaration owns the host boundary".into(),
+        P::PolymorphicExternLeaf => {
+            "this generic leaf can have different runtime representations".into()
+        }
+        P::ExternPosition => "host code needs one fixed kind of value at this position".into(),
         P::RequiresType => match fact.subject {
             inference::Subject::Binding
             | inference::Subject::TopLevelBinding
@@ -2801,6 +2813,12 @@ fn mismatch_title(contradiction: &inference::Contradiction) -> String {
                 "effect `{}` is not allowed by the enclosing function",
                 label(row.shape, &row.label)
             )
+        }
+        K::CallbackEffectsNotCovered => {
+            "callback effects exceed the containing extern capability".into()
+        }
+        K::PolymorphicExternBoundary => {
+            "host code needs one fixed kind of value at this extern position".into()
         }
     }
 }
@@ -3075,13 +3093,42 @@ impl inference::Error {
                 diagnostic =
                     diagnostic.help("add the effect to the function type, or handle it here")
             }
-            E::CallbackEffectsNotCovered => diagnostic = diagnostic
-                .label("this callback may perform effects the extern call does not allow")
-                .help("allow those effects on the extern call, or handle them inside the callback"),
-            E::PolymorphicExternBoundary => {
+            E::CallbackEffectsNotCovered {
+                missing_effects, ..
+            } => {
+                let effects = if missing_effects.is_empty() {
+                    "the effects chosen for its generic callback".into()
+                } else {
+                    missing_effects
+                        .iter()
+                        .map(|effect| format!("`{}`", label(Shape::Effect, effect)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                if let Some(explanation) = &self.explanation {
+                    diagnostic = causal_diagnostic(diagnostic, explanation);
+                } else {
+                    diagnostic = diagnostic.label(format!(
+                        "this callback can perform {effects}, which the extern does not permit"
+                    ));
+                }
                 diagnostic = diagnostic
-                    .label("host code needs one fixed kind of value at this position")
-                    .help("use a fixed type here, or keep the generic value behind a Ruddy wrapper")
+                    .note(format!(
+                        "the callback can perform {effects}, which the extern does not permit"
+                    ))
+                    .help(format!("add {effects} to the extern effects"))
+                    .help("or handle those effects inside the callback");
+            }
+            E::PolymorphicExternBoundary { .. } => {
+                if let Some(explanation) = &self.explanation {
+                    diagnostic = causal_diagnostic(diagnostic, explanation);
+                } else {
+                    diagnostic = diagnostic
+                        .label("host code needs one fixed kind of value at this position");
+                }
+                diagnostic = diagnostic
+                    .help("use a fixed type at this position")
+                    .help("or keep the generic value behind a Ruddy wrapper")
             }
         }
         diagnostic
@@ -3116,8 +3163,10 @@ impl inference::ErrorKind {
             inference::ErrorKind::AnnotationAllows { .. } => "annotation-allows-more",
             inference::ErrorKind::Unhandled { .. } => "unhandled-effect",
             inference::ErrorKind::NotAllowed { .. } => "effect-not-allowed",
-            inference::ErrorKind::CallbackEffectsNotCovered => "callback-effects-not-covered",
-            inference::ErrorKind::PolymorphicExternBoundary => "polymorphic-extern-boundary",
+            inference::ErrorKind::CallbackEffectsNotCovered { .. } => {
+                "callback-effects-not-covered"
+            }
+            inference::ErrorKind::PolymorphicExternBoundary { .. } => "polymorphic-extern-boundary",
         }
     }
 }
@@ -3272,11 +3321,42 @@ impl fmt::Display for inference::ErrorKind {
                 "this function performs `{}`, which its type does not allow",
                 label(Shape::Effect, effect),
             ),
-            inference::ErrorKind::CallbackEffectsNotCovered => f.write_str(
-                "this callback may perform effects the containing extern call does not allow",
-            ),
-            inference::ErrorKind::PolymorphicExternBoundary => {
-                f.write_str("host code needs one fixed kind of value at this extern position")
+            inference::ErrorKind::CallbackEffectsNotCovered {
+                missing_effects,
+                callback_path,
+                callback_type,
+                extern_name,
+                ..
+            } => {
+                let effects = if missing_effects.is_empty() {
+                    "the effects chosen for its generic callback".into()
+                } else {
+                    missing_effects
+                        .iter()
+                        .map(|effect| format!("`{}`", label(Shape::Effect, effect)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                write!(
+                    f,
+                    "callback `{callback_type}` at {callback_path} can perform {effects}, which extern `{extern_name}` does not permit"
+                )
+            }
+            inference::ErrorKind::PolymorphicExternBoundary {
+                variable,
+                variable_kind,
+                position,
+                extern_name,
+            } => {
+                let kind = match variable_kind {
+                    inference::ExternVariableKind::Type => "type",
+                    inference::ExternVariableKind::Row => "row",
+                    inference::ExternVariableKind::Presence => "presence",
+                };
+                write!(
+                    f,
+                    "host code needs one fixed kind of value at {position}, but {kind} variable `{variable}` in extern `{extern_name}` can vary"
+                )
             }
         }
     }

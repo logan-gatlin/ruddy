@@ -57,3 +57,11 @@
 - [x] Distinguish a genuinely missing selection from bounded traversal exhaustion and retain cached exact declaration endpoints on cutoff.
 - [x] Cover a 100,000-entry callable replacement and PATH_BUDGET selection exhaustion with bounded allocation and exact-origin retention.
 - [x] Run formatting, the full workspace suite, workspace checks, and Clippy.
+
+## Structured extern-boundary explanations
+
+- [x] Carry exact callback effects, callback type/path/span, extern capability, and declaration context through direct and solved coverage failures.
+- [x] Describe polymorphic leaves by source variable, variable kind, host position, and owning extern without exposing solver terms.
+- [x] Publish causal facts and stable vocabulary identically through CLI diagnostics and debugger snapshots.
+- [x] Cover multiple/coalesced effects, nested callbacks, aliases, fallback coverage, and structured fact counts.
+- [x] Run formatting, the full workspace suite, workspace checks, and Clippy.

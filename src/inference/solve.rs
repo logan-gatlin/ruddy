@@ -437,11 +437,49 @@ impl Solve<'_> {
                 ConstraintKind::CallbackCoverage {
                     required,
                     available,
+                    boundary,
                 } => {
                     let reported = self.errors.len();
                     self.performs(span, required, available, true);
                     for error in &mut self.errors[reported..] {
-                        error.kind = ErrorKind::CallbackEffectsNotCovered;
+                        let missing_effects = super::missing_callback_effects(required, available);
+                        error.kind = ErrorKind::CallbackEffectsNotCovered {
+                            missing_effects: missing_effects.clone(),
+                            extern_effects: super::listed_effects(available),
+                            callback_path: boundary.callback_path.clone(),
+                            callback_type: boundary.callback_type.clone(),
+                            extern_name: boundary.extern_name.clone(),
+                        };
+                        error.explanation = Some(super::direct_extern_explanation(
+                            error.id,
+                            vec![
+                                (
+                                    boundary.callback_span,
+                                    super::ConstraintOrigin::CallbackBoundary,
+                                    super::Subject::CallbackRequired,
+                                    super::ExplanationFactPayload::CallbackRequirement,
+                                ),
+                                (
+                                    boundary.capability_span,
+                                    super::ConstraintOrigin::CallbackBoundary,
+                                    super::Subject::CallbackAvailable,
+                                    super::ExplanationFactPayload::ExternCapability,
+                                ),
+                                (
+                                    boundary.extern_span,
+                                    super::ConstraintOrigin::Binding,
+                                    super::Subject::Binding,
+                                    super::ExplanationFactPayload::ExternDeclaration,
+                                ),
+                            ],
+                            super::ContradictionKind::CallbackEffectsNotCovered,
+                            missing_effects
+                                .first()
+                                .map(|effect| super::RowContradiction {
+                                    shape: Shape::Effect,
+                                    label: effect.clone(),
+                                }),
+                        ));
                         let ErrorCause::Step(step_id) = error.cause else {
                             continue;
                         };
@@ -450,7 +488,7 @@ impl Solve<'_> {
                             .iter_mut()
                             .find(|step| step.id == step_id)
                             .expect("a solve-caused error links its failed step");
-                        step.effect = Effect::Failed(ErrorKind::CallbackEffectsNotCovered);
+                        step.effect = Effect::Failed(error.kind.clone());
                     }
                 }
             }

@@ -1677,6 +1677,68 @@ fn an_argument_wears_its_type_through_a_declared_type() {
 /// CLI driver's, and the two had already drifted apart on this very sentence —
 /// `tests/src/inference.rs` pins the other end of it.
 #[test]
+fn extern_boundary_explanations_reach_the_debugger_with_cli_vocabulary() {
+    let callback = snapshot(
+        "effect Fail = () -> ()\n\
+         extern install : fn(fn(()) -> () + !Fail) -> () = host.install\n",
+    );
+    let diagnostic = callback
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "callback-effects-not-covered")
+        .expect("callback diagnostic");
+    assert!(diagnostic.message.contains("extern capability"));
+    let explanation = diagnostic
+        .inference_explanation
+        .as_ref()
+        .expect("callback explanation on wire");
+    assert_eq!(
+        explanation.contradiction.kind,
+        "callback-effects-not-covered"
+    );
+    assert_eq!(
+        explanation
+            .full
+            .iter()
+            .map(|fact| fact.payload)
+            .collect::<Vec<_>>(),
+        [
+            "callback-requirement",
+            "extern-capability",
+            "extern-declaration"
+        ]
+    );
+    assert_eq!(explanation.full.len(), explanation.abridged.len());
+
+    let polymorphic = snapshot("extern run : fn('a) -> Nat = host.run\n");
+    let diagnostic = polymorphic
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "polymorphic-extern-boundary")
+        .expect("polymorphic diagnostic");
+    let explanation = diagnostic
+        .inference_explanation
+        .as_ref()
+        .expect("polymorphic explanation on wire");
+    assert_eq!(
+        explanation.contradiction.kind,
+        "polymorphic-extern-boundary"
+    );
+    assert_eq!(
+        explanation
+            .full
+            .iter()
+            .map(|fact| fact.payload)
+            .collect::<Vec<_>>(),
+        [
+            "polymorphic-extern-leaf",
+            "extern-position",
+            "extern-declaration"
+        ]
+    );
+}
+
+#[test]
 fn a_type_error_is_a_diagnostic() {
     let mismatch = snapshot("let n : Nat = fn x => x\n");
     let codes: Vec<_> = mismatch

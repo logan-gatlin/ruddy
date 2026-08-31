@@ -701,6 +701,11 @@ fn wire_explanation(
             inference::ExplanationFactPayload::EffectUse => "effect-use",
             inference::ExplanationFactPayload::EffectBoundary => "effect-boundary",
             inference::ExplanationFactPayload::EffectDeclaration => "effect-declaration",
+            inference::ExplanationFactPayload::CallbackRequirement => "callback-requirement",
+            inference::ExplanationFactPayload::ExternCapability => "extern-capability",
+            inference::ExplanationFactPayload::ExternDeclaration => "extern-declaration",
+            inference::ExplanationFactPayload::PolymorphicExternLeaf => "polymorphic-extern-leaf",
+            inference::ExplanationFactPayload::ExternPosition => "extern-position",
         };
         crate::wire::ExplanationFact {
             span: loc(fact.span, files),
@@ -753,6 +758,12 @@ fn wire_explanation(
                 inference::ContradictionKind::CallerChoiceEscape => "caller-choice-escape",
                 inference::ContradictionKind::UnhandledEffect => "unhandled-effect",
                 inference::ContradictionKind::EffectNotAllowed => "effect-not-allowed",
+                inference::ContradictionKind::CallbackEffectsNotCovered => {
+                    "callback-effects-not-covered"
+                }
+                inference::ContradictionKind::PolymorphicExternBoundary => {
+                    "polymorphic-extern-boundary"
+                }
             },
             left: description(contradiction.left),
             right: description(contradiction.right),

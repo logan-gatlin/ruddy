@@ -94,8 +94,19 @@ fn inference_error_kinds(span: Span) -> Vec<TypeError> {
         TypeError::NotAllowed {
             effect: "Log".to_string(),
         },
-        TypeError::CallbackEffectsNotCovered,
-        TypeError::PolymorphicExternBoundary,
+        TypeError::CallbackEffectsNotCovered {
+            missing_effects: vec!["Log".into()],
+            extern_effects: Vec::new(),
+            callback_path: "extern parameter 1".into(),
+            callback_type: "() -> () + !Log".into(),
+            extern_name: "install".into(),
+        },
+        TypeError::PolymorphicExternBoundary {
+            variable: "'a".into(),
+            variable_kind: ruddy::inference::ExternVariableKind::Type,
+            position: "extern parameter 1".into(),
+            extern_name: "run".into(),
+        },
     ]
 }
 
