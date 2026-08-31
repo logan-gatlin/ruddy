@@ -43,3 +43,10 @@
 - [x] Prune empty branches immediately, deduplicate sources, and bound symbolic paths and substitution work with deterministic endpoint-preserving omission.
 - [x] Cover forty binary duplications for empty and exact operation origins, linear unique-node growth, branch sharing, and later projected invocation.
 - [x] Run formatting, the full workspace suite, workspace checks, and Clippy.
+
+## Effect-provenance budget hardening
+
+- [x] Rewrite substitution and selection iteratively with explicit accounting for nodes, edges, callable entries, path steps, and deduplication.
+- [x] Cache bounded exact-origin summaries for deterministic exhaustion fallback and remove unresolved sources naming the substituted parameter.
+- [x] Destroy unique provenance chains iteratively and cover >4096-depth small-stack, wide/edge-heavy exhaustion, retained deep origins, and stale-parameter removal.
+- [x] Run formatting, the full workspace suite, workspace checks, and Clippy.

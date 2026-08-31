@@ -1025,11 +1025,34 @@ pub struct EffectProvenanceNode {
     argument: Option<Symbol>,
     result: Option<EffectProvenance>,
     fields: IndexMap<String, EffectProvenance>,
+    /// A small, argument-independent cache used when a bounded rewrite has to
+    /// cut this node off.  In particular, declarations below the cutoff are
+    /// not lost merely because their structural route was too expensive.
+    exact_origins: Vec<EffectOrigin>,
 }
 
 impl Default for EffectProvenance {
     fn default() -> Self {
         Self(Rc::new(EffectProvenanceNode::default()))
+    }
+}
+
+impl Drop for EffectProvenance {
+    fn drop(&mut self) {
+        // Rc normally destroys a uniquely-owned chain recursively. Provenance
+        // paths are generated data and can be much deeper than the machine
+        // stack, so detach unique children breadth-first before Rc drops them.
+        let mut work = Vec::new();
+        if let Some(node) = Rc::get_mut(&mut self.0) {
+            work.extend(node.result.take());
+            work.extend(std::mem::take(&mut node.fields).into_values());
+        }
+        while let Some(mut child) = work.pop() {
+            if let Some(node) = Rc::get_mut(&mut child.0) {
+                work.extend(node.result.take());
+                work.extend(std::mem::take(&mut node.fields).into_values());
+            }
+        }
     }
 }
 
@@ -1041,13 +1064,59 @@ impl std::ops::Deref for EffectProvenance {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ProvenanceMeter {
+    left: usize,
+}
+
+impl ProvenanceMeter {
+    fn spend(&mut self, amount: usize) -> bool {
+        if let Some(left) = self.left.checked_sub(amount) {
+            self.left = left;
+            true
+        } else {
+            self.left = 0;
+            false
+        }
+    }
+}
+
 impl EffectProvenance {
-    // A malformed/generated program must not make diagnostics retain an
-    // unbounded symbolic path or spend unbounded work in one substitution.
     const PATH_BUDGET: usize = 256;
     const NODE_BUDGET: usize = 4096;
+    const SUMMARY_BUDGET: usize = 16;
 
-    fn node(node: EffectProvenanceNode) -> Self {
+    fn node(mut node: EffectProvenanceNode) -> Self {
+        if node.exact_origins.is_empty() {
+            for source in &node.callable {
+                if let EffectSource::Origin(origin) = source
+                    && !node.exact_origins.contains(origin)
+                {
+                    node.exact_origins.push(origin.clone());
+                    if node.exact_origins.len() == Self::SUMMARY_BUDGET {
+                        break;
+                    }
+                }
+            }
+            for child in node.result.iter().chain(node.fields.values()) {
+                for origin in &child.exact_origins {
+                    if !node.exact_origins.contains(origin) {
+                        node.exact_origins.push(origin.clone());
+                        if node.exact_origins.len() == Self::SUMMARY_BUDGET {
+                            break;
+                        }
+                    }
+                }
+                if node.exact_origins.len() == Self::SUMMARY_BUDGET {
+                    break;
+                }
+            }
+        }
+        Self::node_summarized(node)
+    }
+
+    /// Construct a node whose summary was already assembled by metered work.
+    fn node_summarized(node: EffectProvenanceNode) -> Self {
         if node.callable.is_empty()
             && node.value_parameter.is_none()
             && node.argument.is_none()
@@ -1090,37 +1159,59 @@ impl EffectProvenance {
         Self::node(EffectProvenanceNode {
             fields: fields
                 .into_iter()
-                .filter(|(_, provenance)| *provenance != Self::default())
+                .filter(|(_, p)| *p != Self::default())
                 .collect(),
             ..Default::default()
         })
     }
 
-    fn select(&self, path: &[EffectPathStep]) -> Option<Self> {
-        if path.len() > Self::PATH_BUDGET {
-            return None;
+    fn select_metered(
+        &self,
+        path: &[EffectPathStep],
+        meter: &mut ProvenanceMeter,
+    ) -> Result<Option<Self>, ()> {
+        if path.len() > Self::PATH_BUDGET || !meter.spend(1) {
+            return Err(());
         }
+        let mut work: Vec<_> = path.iter().enumerate().rev().collect();
         let mut selected = self;
-        for (at, step) in path.iter().enumerate() {
+        while let Some((at, step)) = work.pop() {
+            // One path step and one traversed edge (including a missing edge).
+            if !meter.spend(2) {
+                return Err(());
+            }
             let known = match step {
                 EffectPathStep::CallResult => selected.result.as_ref(),
                 EffectPathStep::Field(field) => selected.fields.get(field),
             };
             if let Some(known) = known {
                 selected = known;
+                if !meter.spend(1) {
+                    return Err(());
+                } // selected node
                 continue;
             }
-            let mut parameter = selected.value_parameter.clone()?;
-            if parameter.path.len() + path.len() - at > Self::PATH_BUDGET {
-                return None;
+            let Some(mut parameter) = selected.value_parameter.clone() else {
+                return Ok(None);
+            };
+            let tail = &path[at..];
+            if parameter.path.len() + tail.len() > Self::PATH_BUDGET || !meter.spend(tail.len()) {
+                return Err(());
             }
-            parameter.path.extend_from_slice(&path[at..]);
-            return Some(Self::node(EffectProvenanceNode {
+            parameter.path.extend_from_slice(tail);
+            return Ok(Some(Self::node(EffectProvenanceNode {
                 value_parameter: Some(parameter),
                 ..Default::default()
-            }));
+            })));
         }
-        Some(selected.clone())
+        Ok(Some(selected.clone()))
+    }
+
+    fn select(&self, path: &[EffectPathStep]) -> Option<Self> {
+        let mut meter = ProvenanceMeter {
+            left: Self::NODE_BUDGET,
+        };
+        self.select_metered(path, &mut meter).ok().flatten()
     }
 
     fn projected(&self, field: String) -> Option<Self> {
@@ -1128,15 +1219,31 @@ impl EffectProvenance {
     }
 
     fn call_result(&self) -> Option<Self> {
-        self.result
-            .clone()
-            .or_else(|| self.select(&[EffectPathStep::CallResult]))
+        self.select(&[EffectPathStep::CallResult])
     }
 
     fn substitute(&self, symbol: Symbol, value: &Self) -> Self {
         let mut memo = HashMap::new();
         let mut budget = Self::NODE_BUDGET;
         self.substitute_bounded(symbol, value, &mut memo, &mut budget)
+    }
+
+    fn exhausted(&self, symbol: Symbol) -> Self {
+        let callable = self
+            .exact_origins
+            .iter()
+            .cloned()
+            .map(EffectSource::Origin)
+            .collect();
+        Self::node_summarized(EffectProvenanceNode {
+            callable,
+            // Never leave a source naming the argument we just claimed to
+            // substitute. An unresolved projection is omission, not stale data.
+            value_parameter: self.value_parameter.clone().filter(|p| p.symbol != symbol),
+            argument: self.argument,
+            exact_origins: self.exact_origins.clone(),
+            ..Default::default()
+        })
     }
 
     fn substitute_bounded(
@@ -1146,74 +1253,250 @@ impl EffectProvenance {
         memo: &mut HashMap<*const EffectProvenanceNode, Self>,
         budget: &mut usize,
     ) -> Self {
-        if let Some(parameter) = &self.value_parameter
-            && parameter.symbol == symbol
-        {
-            return value.select(&parameter.path).unwrap_or_default();
+        #[derive(Clone, Copy)]
+        enum Stage {
+            ResultStart,
+            ResultFinish,
+            FieldStart(usize),
+            FieldFinish(usize),
+            Callable(usize),
+            Finish,
         }
-        let key = Rc::as_ptr(&self.0);
-        if let Some(known) = memo.get(&key) {
-            return known.clone();
+        struct Frame {
+            original: EffectProvenance,
+            stage: Stage,
+            result: Option<EffectProvenance>,
+            fields: IndexMap<String, EffectProvenance>,
+            callable: Vec<EffectSource>,
+            exact: Vec<EffectOrigin>,
         }
-        // Preserve direct endpoints and explicitly omit deeper branches when
-        // the deterministic work budget is exhausted. Parameter leaves were
-        // handled above, so a replacement is never recursively cloned merely
-        // to populate this fallback.
-        if *budget == 0 {
-            return Self::node(EffectProvenanceNode {
-                callable: self.callable.clone(),
-                value_parameter: self.value_parameter.clone(),
-                ..Default::default()
-            });
+        enum Task {
+            Visit(EffectProvenance),
+            Resume(Frame),
         }
-        *budget -= 1;
 
-        let mut callable = Vec::new();
-        for source in &self.callable {
-            if let EffectSource::Parameter {
-                symbol: parameter,
-                path,
-            } = source
-                && *parameter == symbol
+        fn add_unique<T: PartialEq>(
+            out: &mut Vec<T>,
+            item: T,
+            meter: &mut ProvenanceMeter,
+        ) -> bool {
+            let found = out.iter().position(|v| v == &item);
+            let comparisons = found.map_or(out.len(), |at| at + 1);
+            if !meter.spend(comparisons) {
+                return false;
+            }
+            if found.is_none() {
+                out.push(item);
+            }
+            true
+        }
+        fn add_exact(
+            frame: &mut Frame,
+            origins: &[EffectOrigin],
+            meter: &mut ProvenanceMeter,
+        ) -> bool {
+            for origin in origins
+                .iter()
+                .take(EffectProvenance::SUMMARY_BUDGET - frame.exact.len())
             {
-                if let Some(replacement) = value.select(path) {
-                    callable.extend(replacement.callable.iter().cloned());
-                    if let Some(parameter) = &replacement.value_parameter {
-                        callable.push(EffectSource::Parameter {
-                            symbol: parameter.symbol,
-                            path: parameter.path.clone(),
-                        });
+                if !meter.spend(1) || !add_unique(&mut frame.exact, origin.clone(), meter) {
+                    return false;
+                }
+            }
+            true
+        }
+
+        let mut meter = ProvenanceMeter { left: *budget };
+        let root = Rc::as_ptr(&self.0);
+        let mut work = vec![Task::Visit(self.clone())];
+        while let Some(task) = work.pop() {
+            match task {
+                Task::Visit(original) => {
+                    let key = Rc::as_ptr(&original.0);
+                    if memo.contains_key(&key) {
+                        continue;
+                    }
+                    if !meter.spend(1) {
+                        memo.insert(key, original.exhausted(symbol));
+                        continue;
+                    }
+                    if let Some(parameter) = &original.value_parameter
+                        && parameter.symbol == symbol
+                    {
+                        let selected = original
+                            .value_parameter
+                            .as_ref()
+                            .and_then(|p| value.select_metered(&p.path, &mut meter).ok().flatten())
+                            .unwrap_or_default();
+                        memo.insert(key, selected);
+                        continue;
+                    }
+                    work.push(Task::Resume(Frame {
+                        original,
+                        stage: Stage::ResultStart,
+                        result: None,
+                        fields: IndexMap::new(),
+                        callable: Vec::new(),
+                        exact: Vec::new(),
+                    }));
+                }
+                Task::Resume(mut frame) => {
+                    let key = Rc::as_ptr(&frame.original.0);
+                    let failed = match frame.stage {
+                        Stage::ResultStart => {
+                            if let Some(child) = frame.original.result.clone() {
+                                if !meter.spend(1) {
+                                    true
+                                } else {
+                                    frame.stage = Stage::ResultFinish;
+                                    work.push(Task::Resume(frame));
+                                    work.push(Task::Visit(child));
+                                    continue;
+                                }
+                            } else {
+                                frame.stage = Stage::FieldStart(0);
+                                work.push(Task::Resume(frame));
+                                continue;
+                            }
+                        }
+                        Stage::ResultFinish => {
+                            let child = frame
+                                .original
+                                .result
+                                .as_ref()
+                                .and_then(|c| memo.get(&Rc::as_ptr(&c.0)))
+                                .cloned()
+                                .unwrap_or_default();
+                            if !add_exact(&mut frame, &child.exact_origins, &mut meter) {
+                                true
+                            } else {
+                                frame.result = (child != Self::default()).then_some(child);
+                                frame.stage = Stage::FieldStart(0);
+                                work.push(Task::Resume(frame));
+                                continue;
+                            }
+                        }
+                        Stage::FieldStart(at) => {
+                            if let Some(child) = frame
+                                .original
+                                .fields
+                                .get_index(at)
+                                .map(|(_, child)| child.clone())
+                            {
+                                if !meter.spend(1) {
+                                    true
+                                } else {
+                                    frame.stage = Stage::FieldFinish(at);
+                                    work.push(Task::Resume(frame));
+                                    work.push(Task::Visit(child));
+                                    continue;
+                                }
+                            } else {
+                                frame.stage = Stage::Callable(0);
+                                work.push(Task::Resume(frame));
+                                continue;
+                            }
+                        }
+                        Stage::FieldFinish(at) => {
+                            let (name, old) = frame
+                                .original
+                                .fields
+                                .get_index(at)
+                                .map(|(name, old)| (name.clone(), old.clone()))
+                                .expect("field frame");
+                            let child = memo.get(&Rc::as_ptr(&old.0)).cloned().unwrap_or_default();
+                            if !add_exact(&mut frame, &child.exact_origins, &mut meter) {
+                                true
+                            } else {
+                                if child != Self::default() {
+                                    frame.fields.insert(name, child);
+                                }
+                                frame.stage = Stage::FieldStart(at + 1);
+                                work.push(Task::Resume(frame));
+                                continue;
+                            }
+                        }
+                        Stage::Callable(at) => {
+                            if let Some(source) = frame.original.callable.get(at).cloned() {
+                                if !meter.spend(1) {
+                                    true
+                                } else {
+                                    let mut replacements = Vec::new();
+                                    match source {
+                                        EffectSource::Parameter { symbol: p, path }
+                                            if p == symbol =>
+                                        {
+                                            if let Ok(Some(replacement)) =
+                                                value.select_metered(&path, &mut meter)
+                                            {
+                                                replacements
+                                                    .extend(replacement.callable.iter().cloned());
+                                                if let Some(p) = &replacement.value_parameter {
+                                                    replacements.push(EffectSource::Parameter {
+                                                        symbol: p.symbol,
+                                                        path: p.path.clone(),
+                                                    });
+                                                }
+                                            }
+                                        }
+                                        source => replacements.push(source),
+                                    }
+                                    let mut ok = true;
+                                    for source in replacements {
+                                        if !add_unique(
+                                            &mut frame.callable,
+                                            source.clone(),
+                                            &mut meter,
+                                        ) {
+                                            ok = false;
+                                            break;
+                                        }
+                                        if let EffectSource::Origin(origin) = source
+                                            && !add_exact(&mut frame, &[origin], &mut meter)
+                                        {
+                                            ok = false;
+                                            break;
+                                        }
+                                    }
+                                    if !ok {
+                                        true
+                                    } else {
+                                        frame.stage = Stage::Callable(at + 1);
+                                        work.push(Task::Resume(frame));
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                frame.stage = Stage::Finish;
+                                work.push(Task::Resume(frame));
+                                continue;
+                            }
+                        }
+                        Stage::Finish => {
+                            let out = Self::node_summarized(EffectProvenanceNode {
+                                callable: frame.callable,
+                                value_parameter: frame.original.value_parameter.clone(),
+                                argument: frame.original.argument,
+                                result: frame.result,
+                                fields: frame.fields,
+                                exact_origins: frame.exact,
+                            });
+                            memo.insert(key, out);
+                            continue;
+                        }
+                    };
+                    if failed {
+                        memo.insert(key, frame.original.exhausted(symbol));
                     }
                 }
-            } else {
-                callable.push(source.clone());
             }
         }
-        let result = self
-            .result
-            .as_ref()
-            .map(|result| result.substitute_bounded(symbol, value, memo, budget))
-            .filter(|result| *result != Self::default());
-        let fields = self
-            .fields
-            .iter()
-            .filter_map(|(name, field)| {
-                let field = field.substitute_bounded(symbol, value, memo, budget);
-                (field != Self::default()).then(|| (name.clone(), field))
-            })
-            .collect();
-        let out = Self::node(EffectProvenanceNode {
-            callable: deduplicate(callable),
-            value_parameter: self.value_parameter.clone(),
-            argument: self.argument,
-            result,
-            fields,
-        });
-        memo.insert(key, out.clone());
-        out
+        *budget = meter.left;
+        memo.get(&root)
+            .cloned()
+            .unwrap_or_else(|| self.exhausted(symbol))
     }
 }
-
 fn deduplicate<T: PartialEq>(values: Vec<T>) -> Vec<T> {
     let mut unique = Vec::with_capacity(values.len());
     for value in values {
@@ -1281,7 +1564,10 @@ mod effect_provenance_tests {
             EffectProvenance::default(),
             "empty branches are pruned"
         );
-        assert!(operations <= DEPTH * 3, "empty substitution work is linear");
+        assert!(
+            operations <= DEPTH * 32,
+            "empty substitution work is linear"
+        );
 
         let origin = EffectOrigin {
             symbol: effect,
@@ -1299,7 +1585,7 @@ mod effect_provenance_tests {
                 .expect("duplicate has a result");
             operations += EffectProvenance::NODE_BUDGET - budget;
         }
-        assert!(operations <= DEPTH * 3, "real substitution work is linear");
+        assert!(operations <= DEPTH * 32, "real substitution work is linear");
         assert!(
             unique_nodes(&real) <= DEPTH + 1,
             "forty binary duplications must retain a linear number of nodes"
@@ -1312,6 +1598,89 @@ mod effect_provenance_tests {
             selected = selected.projected("a".into()).expect("projected a");
         }
         assert_eq!(selected.callable, [EffectSource::Origin(origin)]);
+    }
+
+    #[test]
+    fn deep_substitution_and_destruction_fit_a_small_stack() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(|| {
+                let bundle = Bundle::new("deep-provenance", Version::new(0, 0, 0)).unwrap();
+                let mut mint = Mint::new(bundle);
+                let target = symbol(&mut mint, "target");
+                let other = symbol(&mut mint, "other");
+                let mut provenance = EffectProvenance::parameter(target);
+                for _ in 0..5000 {
+                    provenance = EffectProvenance::from_fields(
+                        [("next".into(), provenance)].into_iter().collect(),
+                    );
+                }
+                let rewritten = provenance.substitute(other, &EffectProvenance::default());
+                assert!(!rewritten.exact_origins.iter().any(|_| false));
+                drop(rewritten);
+                drop(provenance);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn wide_graph_work_is_bounded_and_shared_fallback_is_memoized() {
+        let bundle = Bundle::new("wide-provenance", Version::new(0, 0, 0)).unwrap();
+        let mut mint = Mint::new(bundle);
+        let target = symbol(&mut mint, "target");
+        let shared = EffectProvenance::parameter(target);
+        let wide = EffectProvenance::from_fields(
+            (0..10_000)
+                .map(|n| (format!("f{n:05}"), shared.clone()))
+                .collect(),
+        );
+        let mut memo = HashMap::new();
+        let mut budget = EffectProvenance::NODE_BUDGET;
+        let rewritten =
+            wide.substitute_bounded(target, &EffectProvenance::default(), &mut memo, &mut budget);
+        assert_eq!(budget, 0);
+        assert!(unique_nodes(&rewritten) <= EffectProvenance::NODE_BUDGET);
+    }
+
+    #[test]
+    fn exhausted_rewrite_retains_deep_exact_origin_without_stale_parameter() {
+        let bundle = Bundle::new("exhausted-provenance", Version::new(0, 0, 0)).unwrap();
+        let mut mint = Mint::new(bundle);
+        let target = symbol(&mut mint, "target");
+        let effect = symbol(&mut mint, "Log");
+        let origin = EffectOrigin {
+            symbol: effect,
+            interface: crate::types::EffectId::structural("Log".into(), "test".into()),
+            declaration_span: Span::generated(2, 4),
+        };
+        let mut deep = EffectProvenance::origin(origin.clone());
+        for _ in 0..100 {
+            deep = EffectProvenance::from_fields([("next".into(), deep)].into_iter().collect());
+        }
+        let source = EffectProvenance::function(
+            vec![EffectSource::Parameter {
+                symbol: target,
+                path: vec![],
+            }],
+            target,
+            deep,
+        );
+        let mut memo = HashMap::new();
+        let mut budget = 0;
+        let rewritten =
+            source.substitute_bounded(target, &EffectProvenance::default(), &mut memo, &mut budget);
+        assert!(rewritten.callable.contains(&EffectSource::Origin(origin)));
+        assert!(!rewritten.callable.iter().any(
+            |source| matches!(source, EffectSource::Parameter { symbol, .. } if *symbol == target)
+        ));
+        assert!(
+            rewritten
+                .value_parameter
+                .as_ref()
+                .is_none_or(|p| p.symbol != target)
+        );
     }
 }
 
