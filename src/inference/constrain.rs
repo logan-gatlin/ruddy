@@ -700,12 +700,7 @@ impl Constrain<'_> {
                     .unwrap_or_default();
                 self.term_effect_provenance.insert(
                     span,
-                    super::EffectProvenance {
-                        callable,
-                        argument: Some(arg.tracked),
-                        result: Some(Box::new(result)),
-                        ..Default::default()
-                    },
+                    super::EffectProvenance::function(callable, arg.tracked, result),
                 );
                 Rc::new(Ty::plain(Ty::Arrow(param, body.ty.clone(), does)))
             }
@@ -738,13 +733,8 @@ impl Constrain<'_> {
                         interface: interface.clone(),
                         declaration_span: *declaration_span,
                     };
-                    self.term_effect_provenance.insert(
-                        span,
-                        super::EffectProvenance {
-                            callable: vec![super::EffectSource::Origin(origin)],
-                            ..Default::default()
-                        },
-                    );
+                    self.term_effect_provenance
+                        .insert(span, super::EffectProvenance::origin(origin));
                 }
                 Rc::new(Ty::plain(Ty::Arrow(from.clone(), to.clone(), does)))
             }
@@ -771,16 +761,17 @@ impl Constrain<'_> {
             }
             TermKind::Struct(fields) => {
                 let mut tys = IndexMap::new();
-                let mut provenance = super::EffectProvenance::default();
+                let mut provenance_fields = IndexMap::new();
                 for (name, field) in fields.iter_mut() {
                     self.infer_term(&mut field.value);
                     if let Some(value) = self.term_effect_provenance.get(&field.value.span).cloned()
                     {
-                        provenance.fields.insert(name.clone(), value);
+                        provenance_fields.insert(name.clone(), value);
                     }
                     tys.insert(name.clone(), RowField::present(field.value.ty.clone()));
                 }
-                if !provenance.fields.is_empty() {
+                let provenance = super::EffectProvenance::from_fields(provenance_fields);
+                if provenance != super::EffectProvenance::default() {
                     self.term_effect_provenance.insert(span, provenance);
                 }
                 // A literal's fields are all there, and are all it has: the
@@ -1471,12 +1462,7 @@ impl Constrain<'_> {
                     .unwrap_or_default();
                 self.term_effect_provenance.insert(
                     term.span,
-                    super::EffectProvenance {
-                        callable,
-                        argument: Some(arg.tracked),
-                        result: Some(Box::new(result)),
-                        ..Default::default()
-                    },
+                    super::EffectProvenance::function(callable, arg.tracked, result),
                 );
                 term.ty = expected.clone();
             }
@@ -1496,16 +1482,17 @@ impl Constrain<'_> {
                         .all(|field| matches!(field.presence, Presence::Present))
                     && same_field_set(fields, &row.labels) =>
             {
-                let mut provenance = super::EffectProvenance::default();
+                let mut provenance_fields = IndexMap::new();
                 for (name, field) in fields.iter_mut() {
                     let want = row.labels[name].ty.clone();
                     self.check_term(&mut field.value, &want, expected_subject, expected_span);
                     if let Some(value) = self.term_effect_provenance.get(&field.value.span).cloned()
                     {
-                        provenance.fields.insert(name.clone(), value);
+                        provenance_fields.insert(name.clone(), value);
                     }
                 }
-                if !provenance.fields.is_empty() {
+                let provenance = super::EffectProvenance::from_fields(provenance_fields);
+                if provenance != super::EffectProvenance::default() {
                     self.term_effect_provenance.insert(term.span, provenance);
                 }
                 term.ty = expected.clone();

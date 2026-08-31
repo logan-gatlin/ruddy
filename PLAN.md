@@ -36,3 +36,10 @@
 - [x] Resolve arbitrary call-result/projection chains during argument substitution while counting only invoked values as performed effects.
 - [x] Cover producer/invoker flow, nested bounded chains, coalesced declaration identity, and obtaining effectful results without invoking them.
 - [x] Run formatting, the full workspace suite, workspace checks, and Clippy.
+
+## Bounded effect-provenance substitution follow-up
+
+- [x] Store provenance as immutable shared DAG nodes so duplicate substitutions reuse replacement nodes instead of recursively cloning them.
+- [x] Prune empty branches immediately, deduplicate sources, and bound symbolic paths and substitution work with deterministic endpoint-preserving omission.
+- [x] Cover forty binary duplications for empty and exact operation origins, linear unique-node growth, branch sharing, and later projected invocation.
+- [x] Run formatting, the full workspace suite, workspace checks, and Clippy.

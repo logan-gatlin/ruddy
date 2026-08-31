@@ -1823,6 +1823,56 @@ fn call_result_and_field_provenance_paths_remain_bounded() {
 }
 
 #[test]
+fn thirty_duplicate_struct_substitutions_remain_bounded_and_project_invocation_origin() {
+    const DEPTH: usize = 32;
+
+    let chain = |seed: &str, prefix: &str| {
+        let mut source = format!("let {prefix}0 = {seed}\n");
+        for at in 0..DEPTH {
+            // Select after every duplication so this source-level correctness
+            // check does not independently construct an exponential type. The
+            // provenance-only regression exercises the retained binary DAG.
+            source.push_str(&format!("let {prefix}{} = (dup {prefix}{at}).a\n", at + 1));
+        }
+        source
+    };
+
+    // The empty seed exercises immediate pruning: no binary provenance tree is
+    // retained merely because the value's structural type is duplicated.
+    let empty = format!(
+        "let dup = fn x => {{ a: x, b: x }}\n{}",
+        chain("0n", "empty")
+    );
+    assert!(
+        inference_fixture_errors(&empty).is_empty(),
+        "duplicating an origin-free value must remain origin-free"
+    );
+
+    let projection = format!("(dup real{DEPTH}).b");
+    let source = format!(
+        "module C = effect Log = {{ write: Nat -> () }} end\nlet dup = fn x => {{ a: x, b: x }}\n{}let bad = {projection} 0n\n",
+        chain("C::!Log.write", "real")
+    );
+    let errors = inference_fixture_errors(&source);
+    let error = errors
+        .iter()
+        .find(|error| matches!(error.kind, inference::ErrorKind::Unhandled { .. }))
+        .unwrap_or_else(|| panic!("later projected invocation retains its origin: {errors:#?}"));
+    let declaration = error
+        .explanation
+        .as_ref()
+        .expect("effect explanation")
+        .full_facts
+        .iter()
+        .find(|fact| fact.payload == inference::ExplanationFactPayload::EffectDeclaration)
+        .expect("operation declaration");
+    assert_eq!(
+        &source[declaration.span.start..declaration.span.end()],
+        "Log"
+    );
+}
+
+#[test]
 fn deep_and_multiple_effect_boundaries_remain_bounded_and_counted() {
     use inference::ExplanationFactPayload as P;
 

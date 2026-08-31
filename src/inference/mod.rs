@@ -1012,31 +1012,98 @@ struct EffectParameter {
     path: Vec<EffectPathStep>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct EffectProvenance {
+/// Shared value-flow provenance. Children are immutable DAG edges: substituting
+/// one argument into several fields therefore installs the same node at every
+/// occurrence instead of recursively cloning its complete replacement tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectProvenance(Rc<EffectProvenanceNode>);
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct EffectProvenanceNode {
     callable: Vec<EffectSource>,
     value_parameter: Option<EffectParameter>,
     argument: Option<Symbol>,
-    result: Option<Box<EffectProvenance>>,
+    result: Option<EffectProvenance>,
     fields: IndexMap<String, EffectProvenance>,
 }
 
+impl Default for EffectProvenance {
+    fn default() -> Self {
+        Self(Rc::new(EffectProvenanceNode::default()))
+    }
+}
+
+impl std::ops::Deref for EffectProvenance {
+    type Target = EffectProvenanceNode;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 impl EffectProvenance {
+    // A malformed/generated program must not make diagnostics retain an
+    // unbounded symbolic path or spend unbounded work in one substitution.
+    const PATH_BUDGET: usize = 256;
+    const NODE_BUDGET: usize = 4096;
+
+    fn node(node: EffectProvenanceNode) -> Self {
+        if node.callable.is_empty()
+            && node.value_parameter.is_none()
+            && node.argument.is_none()
+            && node.result.is_none()
+            && node.fields.is_empty()
+        {
+            Self::default()
+        } else {
+            Self(Rc::new(node))
+        }
+    }
+
     fn parameter(symbol: Symbol) -> Self {
-        Self {
+        Self::node(EffectProvenanceNode {
             value_parameter: Some(EffectParameter {
                 symbol,
                 path: Vec::new(),
             }),
-            ..Self::default()
-        }
+            ..Default::default()
+        })
+    }
+
+    fn function(callable: Vec<EffectSource>, argument: Symbol, result: Self) -> Self {
+        Self::node(EffectProvenanceNode {
+            callable: deduplicate(callable),
+            argument: Some(argument),
+            result: (result != Self::default()).then_some(result),
+            ..Default::default()
+        })
+    }
+
+    fn origin(origin: EffectOrigin) -> Self {
+        Self::node(EffectProvenanceNode {
+            callable: vec![EffectSource::Origin(origin)],
+            ..Default::default()
+        })
+    }
+
+    fn from_fields(fields: IndexMap<String, Self>) -> Self {
+        Self::node(EffectProvenanceNode {
+            fields: fields
+                .into_iter()
+                .filter(|(_, provenance)| *provenance != Self::default())
+                .collect(),
+            ..Default::default()
+        })
     }
 
     fn select(&self, path: &[EffectPathStep]) -> Option<Self> {
+        if path.len() > Self::PATH_BUDGET {
+            return None;
+        }
         let mut selected = self;
         for (at, step) in path.iter().enumerate() {
             let known = match step {
-                EffectPathStep::CallResult => selected.result.as_deref(),
+                EffectPathStep::CallResult => selected.result.as_ref(),
                 EffectPathStep::Field(field) => selected.fields.get(field),
             };
             if let Some(known) = known {
@@ -1044,11 +1111,14 @@ impl EffectProvenance {
                 continue;
             }
             let mut parameter = selected.value_parameter.clone()?;
+            if parameter.path.len() + path.len() - at > Self::PATH_BUDGET {
+                return None;
+            }
             parameter.path.extend_from_slice(&path[at..]);
-            return Some(Self {
+            return Some(Self::node(EffectProvenanceNode {
                 value_parameter: Some(parameter),
-                ..Self::default()
-            });
+                ..Default::default()
+            }));
         }
         Some(selected.clone())
     }
@@ -1059,20 +1129,47 @@ impl EffectProvenance {
 
     fn call_result(&self) -> Option<Self> {
         self.result
-            .as_deref()
-            .cloned()
+            .clone()
             .or_else(|| self.select(&[EffectPathStep::CallResult]))
     }
 
     fn substitute(&self, symbol: Symbol, value: &Self) -> Self {
+        let mut memo = HashMap::new();
+        let mut budget = Self::NODE_BUDGET;
+        self.substitute_bounded(symbol, value, &mut memo, &mut budget)
+    }
+
+    fn substitute_bounded(
+        &self,
+        symbol: Symbol,
+        value: &Self,
+        memo: &mut HashMap<*const EffectProvenanceNode, Self>,
+        budget: &mut usize,
+    ) -> Self {
         if let Some(parameter) = &self.value_parameter
             && parameter.symbol == symbol
         {
             return value.select(&parameter.path).unwrap_or_default();
         }
-        let mut out = self.clone();
+        let key = Rc::as_ptr(&self.0);
+        if let Some(known) = memo.get(&key) {
+            return known.clone();
+        }
+        // Preserve direct endpoints and explicitly omit deeper branches when
+        // the deterministic work budget is exhausted. Parameter leaves were
+        // handled above, so a replacement is never recursively cloned merely
+        // to populate this fallback.
+        if *budget == 0 {
+            return Self::node(EffectProvenanceNode {
+                callable: self.callable.clone(),
+                value_parameter: self.value_parameter.clone(),
+                ..Default::default()
+            });
+        }
+        *budget -= 1;
+
         let mut callable = Vec::new();
-        for source in &out.callable {
+        for source in &self.callable {
             if let EffectSource::Parameter {
                 symbol: parameter,
                 path,
@@ -1080,34 +1177,141 @@ impl EffectProvenance {
                 && *parameter == symbol
             {
                 if let Some(replacement) = value.select(path) {
-                    for replacement in &replacement.callable {
-                        if !callable.contains(replacement) {
-                            callable.push(replacement.clone());
-                        }
-                    }
+                    callable.extend(replacement.callable.iter().cloned());
                     if let Some(parameter) = &replacement.value_parameter {
-                        let replacement = EffectSource::Parameter {
+                        callable.push(EffectSource::Parameter {
                             symbol: parameter.symbol,
                             path: parameter.path.clone(),
-                        };
-                        if !callable.contains(&replacement) {
-                            callable.push(replacement);
-                        }
+                        });
                     }
                 }
-            } else if !callable.contains(source) {
+            } else {
                 callable.push(source.clone());
             }
         }
-        out.callable = callable;
-        out.result = out
+        let result = self
             .result
-            .as_deref()
-            .map(|result| Box::new(result.substitute(symbol, value)));
-        for field in out.fields.values_mut() {
-            *field = field.substitute(symbol, value);
-        }
+            .as_ref()
+            .map(|result| result.substitute_bounded(symbol, value, memo, budget))
+            .filter(|result| *result != Self::default());
+        let fields = self
+            .fields
+            .iter()
+            .filter_map(|(name, field)| {
+                let field = field.substitute_bounded(symbol, value, memo, budget);
+                (field != Self::default()).then(|| (name.clone(), field))
+            })
+            .collect();
+        let out = Self::node(EffectProvenanceNode {
+            callable: deduplicate(callable),
+            value_parameter: self.value_parameter.clone(),
+            argument: self.argument,
+            result,
+            fields,
+        });
+        memo.insert(key, out.clone());
         out
+    }
+}
+
+fn deduplicate<T: PartialEq>(values: Vec<T>) -> Vec<T> {
+    let mut unique = Vec::with_capacity(values.len());
+    for value in values {
+        if !unique.contains(&value) {
+            unique.push(value);
+        }
+    }
+    unique
+}
+
+#[cfg(test)]
+mod effect_provenance_tests {
+    use super::*;
+    use crate::symbol::{Bundle, Mint, Namespace};
+    use semver::Version;
+
+    fn symbol(mint: &mut Mint, name: &str) -> Symbol {
+        mint.local(None, Namespace::Terms, name)
+    }
+
+    fn unique_nodes(root: &EffectProvenance) -> usize {
+        let mut seen = std::collections::HashSet::new();
+        let mut work = vec![root];
+        while let Some(node) = work.pop() {
+            if !seen.insert(Rc::as_ptr(&node.0)) {
+                continue;
+            }
+            work.extend(node.fields.values());
+            work.extend(node.result.iter());
+        }
+        seen.len()
+    }
+
+    #[test]
+    fn duplicate_substitution_is_a_bounded_shared_dag() {
+        const DEPTH: usize = 40;
+        let bundle = Bundle::new("provenance-test", Version::new(0, 0, 0)).unwrap();
+        let mut mint = Mint::new(bundle);
+        let parameter = symbol(&mut mint, "x");
+        let effect = symbol(&mut mint, "Log");
+        let parameter_node = EffectProvenance::parameter(parameter);
+        let duplicated = EffectProvenance::from_fields(
+            [
+                ("a".into(), parameter_node.clone()),
+                ("b".into(), parameter_node),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let duplicate = EffectProvenance::function(Vec::new(), parameter, duplicated);
+
+        let mut operations = 0;
+        let mut empty = EffectProvenance::default();
+        for _ in 0..DEPTH {
+            let mut memo = HashMap::new();
+            let mut budget = EffectProvenance::NODE_BUDGET;
+            empty = duplicate
+                .substitute_bounded(parameter, &empty, &mut memo, &mut budget)
+                .call_result()
+                .unwrap_or_default();
+            operations += EffectProvenance::NODE_BUDGET - budget;
+        }
+        assert_eq!(
+            empty,
+            EffectProvenance::default(),
+            "empty branches are pruned"
+        );
+        assert!(operations <= DEPTH * 3, "empty substitution work is linear");
+
+        let origin = EffectOrigin {
+            symbol: effect,
+            interface: crate::types::EffectId::structural("Log".into(), "test".into()),
+            declaration_span: Span::generated(1, 3),
+        };
+        let mut operations = 0;
+        let mut real = EffectProvenance::origin(origin.clone());
+        for _ in 0..DEPTH {
+            let mut memo = HashMap::new();
+            let mut budget = EffectProvenance::NODE_BUDGET;
+            real = duplicate
+                .substitute_bounded(parameter, &real, &mut memo, &mut budget)
+                .call_result()
+                .expect("duplicate has a result");
+            operations += EffectProvenance::NODE_BUDGET - budget;
+        }
+        assert!(operations <= DEPTH * 3, "real substitution work is linear");
+        assert!(
+            unique_nodes(&real) <= DEPTH + 1,
+            "forty binary duplications must retain a linear number of nodes"
+        );
+        let mut selected = real;
+        for _ in 0..DEPTH {
+            let a = selected.fields.get("a").expect("duplicated a");
+            let b = selected.fields.get("b").expect("duplicated b");
+            assert!(Rc::ptr_eq(&a.0, &b.0), "identical branches share one node");
+            selected = selected.projected("a".into()).expect("projected a");
+        }
+        assert_eq!(selected.callable, [EffectSource::Origin(origin)]);
     }
 }
 
