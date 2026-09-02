@@ -122,7 +122,13 @@ helix:
 check: fmt-check clippy test
 
 test:
-    cargo test --workspace
+    # Keep a runaway test inside its own cgroup so it cannot exhaust the desktop.
+    # Zero swap keeps the aggregate memory bound at 4 GiB rather than 4 GiB plus swap.
+    systemd-run --user --scope --quiet \
+        --property=MemoryMax=4G \
+        --property=MemorySwapMax=0 \
+        --property=OOMPolicy=continue \
+        timeout --signal=TERM --kill-after=30s 30m cargo test --workspace
 
 build:
     cargo build --workspace

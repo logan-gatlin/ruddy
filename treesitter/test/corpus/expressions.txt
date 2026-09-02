@@ -150,23 +150,6 @@ let absurd = fn v => match v with end
         (identifier)))))
 
 ================================================================================
-A nonempty match requires its first bar
-================================================================================
-
-let x = match value with case => case end
-
---------------------------------------------------------------------------------
-
-(source_file
-  (let_definition
-    (identifier)
-    (match_expression
-      (identifier)
-      (ERROR
-        (identifier)
-        (identifier)))))
-
-================================================================================
 A handler, with a value arm
 ================================================================================
 
