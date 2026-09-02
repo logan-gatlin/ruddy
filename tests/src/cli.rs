@@ -2506,7 +2506,7 @@ fn new_scaffolds_a_compilable_project_without_overwriting() {
     let scaffold_manifest = fs::read_to_string(destination.join("Ruddy.toml")).unwrap();
     assert_eq!(
         scaffold_manifest,
-        "name = \"my_app\"\nversion = \"0.1.0\"\nroot = \"main.hc\"\n\n[dependencies]\n"
+        "name = \"my_app\"\nversion = \"0.1.0\"\nroot = \"main.hc\"\ntarget = \"js\"\n\n[dependencies]\n"
     );
     assert!(
         !scaffold_manifest
@@ -2624,6 +2624,12 @@ fn build_writes_and_replaces_the_named_canonical_artifact() {
     let project = directory.path().join("sample");
     new_project(&project).unwrap();
     disable_std(&project);
+    let manifest = fs::read_to_string(project.join("Ruddy.toml")).unwrap();
+    fs::write(
+        project.join("Ruddy.toml"),
+        manifest.replace("target = \"js\"", "target = \"lib\""),
+    )
+    .unwrap();
 
     let path = build_project(&project).expect("build project");
     assert_eq!(path, project.join("build/sample.artifact"));
@@ -2648,6 +2654,12 @@ fn manifest_targets_select_root_javascript_output() {
     disable_std(&app);
 
     // Omission and an explicit library target retain artifact-only behavior.
+    let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
+    fs::write(
+        app.join("Ruddy.toml"),
+        manifest.replace("target = \"js\"\n", ""),
+    )
+    .unwrap();
     let artifact = build_project(&app).unwrap();
     assert!(artifact.is_file());
     assert!(!app.join("build/app.js").exists());

@@ -208,7 +208,7 @@ pub fn new_project(path: impl AsRef<Path>) -> Result<(), CliError> {
     write_new_file(
         &manifest,
         &format!(
-            "name = {name:?}\nversion = {INITIAL_VERSION:?}\nroot = \"main.hc\"\n\n[dependencies]\n"
+            "name = {name:?}\nversion = {INITIAL_VERSION:?}\nroot = \"main.hc\"\ntarget = \"js\"\n\n[dependencies]\n"
         ),
     )?;
     write_new_file(&root, "let main = 0n\n")?;
