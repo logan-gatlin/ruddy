@@ -906,10 +906,7 @@ mod tests {
             .iter()
             .find(|diagnostic| diagnostic.code == "unhandled-effect")
             .expect("effect diagnostic");
-        assert_eq!(
-            diagnostic.label,
-            "this operation or call may perform effect `!Log`"
-        );
+        assert_eq!(diagnostic.label, "this may perform effect `!Log`");
         assert_eq!(
             diagnostic.span.expect("primary location").range,
             [source.rfind("action ()").unwrap(), source.len() - 1]

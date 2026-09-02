@@ -4475,20 +4475,20 @@ fn the_effect_complaints_are_read_in_effects() {
             IrError::ImpureOperation {
                 found: ir::OperationTypeProblem::OpenPart,
             },
-            "an operation must have one fixed function type",
+            "an effect function must have one fixed function type",
         ),
         (
             IrError::OperationOnAlias {
                 effect: "Console".to_string(),
             },
-            "effect alias `!Console` declares no operations",
+            "effect alias `!Console` declares nothing to perform",
         ),
         (
             IrError::UnknownOperation {
                 effect: "Log".to_string(),
                 op: "writ".to_string(),
             },
-            "effect `!Log` has no operation `writ`",
+            "effect `!Log` does not declare `writ`",
         ),
         (
             IrError::PartialHandler {
@@ -4550,20 +4550,20 @@ fn the_effect_complaints_are_read_in_effects() {
     for (found, title, label, help) in [
         (
             ir::OperationTypeProblem::Effects,
-            "an operation signature cannot declare effects",
-            "operation calls already perform the operation's own effect",
+            "an effect function cannot declare effects of its own",
+            "calling it already performs this effect",
             "remove this `+` effect list",
         ),
         (
             ir::OperationTypeProblem::OpenPart,
-            "an operation must have one fixed function type",
-            "this leaves part of the operation's type undecided",
+            "an effect function must have one fixed function type",
+            "this leaves part of the function's type undecided",
             "write this part explicitly; use `..` and `when` in annotations instead",
         ),
         (
             ir::OperationTypeProblem::Variable("a".to_string()),
-            "`'a` is not declared by this operation",
-            "operation signatures cannot introduce type variables",
+            "`'a` is not declared by this effect function",
+            "an effect function cannot introduce type variables",
             "replace it with a fixed type or a declared type application",
         ),
     ] {
@@ -4585,14 +4585,14 @@ fn the_effect_complaints_are_read_in_effects() {
         },
     }
     .diagnostic();
-    assert_eq!(empty.title, "effect `!Nil` declares no operations");
+    assert_eq!(empty.title, "effect `!Nil` declares nothing to perform");
     assert_eq!(
         empty.primary.message,
         "there is nothing in this effect to perform"
     );
     assert_eq!(
         empty.help,
-        ["remove this performance, or declare an operation on the effect"]
+        ["remove this use, or declare a function on the effect"]
     );
 
     for (kind, message) in [
@@ -4764,7 +4764,7 @@ fn ir_duplicate_diagnostics_point_back_to_the_first_occurrence() {
                 name: "write".to_string(),
                 previous,
             },
-            "operation `write` is declared more than once",
+            "effect function `write` is declared more than once",
             "declared again here",
             ui::FIRST_DECLARATION,
         ),
@@ -4775,7 +4775,7 @@ fn ir_duplicate_diagnostics_point_back_to_the_first_occurrence() {
                 previous,
             },
             "duplicate arm for `!Log.write`",
-            "this operation is handled again",
+            "handled again here",
             ui::FIRST_ARM,
         ),
         (
@@ -4838,7 +4838,7 @@ fn redesigned_ir_diagnostics_expose_labels_and_help() {
                 name: "write".to_string(),
             },
             "`write` is not a function",
-            "an operation signature must be a function type",
+            "what an effect declares must be a function type",
             "write a signature such as `write : Nat -> ()`",
         ),
     ] {
@@ -4862,7 +4862,7 @@ fn a_hole_in_an_operation_has_its_own_code_and_title() {
     assert_eq!(diagnostic.code, "hole-in-operation");
     assert_eq!(
         diagnostic.title,
-        "an operation signature cannot contain `_`"
+        "an effect function's type cannot contain `_`"
     );
 }
 

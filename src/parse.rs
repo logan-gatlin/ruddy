@@ -813,6 +813,13 @@ struct Parser {
     toks: Vec<Token>,
     pos: usize,
     errors: Vec<Error>,
+    /// How far [`Parser::mismatched_closer`] has folded the token prefix into
+    /// `scan_open`, so error-dense input scans each token once rather than
+    /// rescanning the whole prefix at every error.
+    scan_pos: usize,
+    /// The still-open delimiters of the scanned prefix: the closer each one
+    /// needs and where it was opened.
+    scan_open: Vec<(&'static str, Span)>,
 }
 
 impl Path {
@@ -865,6 +872,8 @@ impl Parser {
             toks,
             pos: 0,
             errors: Vec::new(),
+            scan_pos: 0,
+            scan_open: Vec::new(),
         }
     }
 
@@ -1282,31 +1291,55 @@ impl Parser {
     /// the opener to point back to. This is lexical on purpose: every parser
     /// production agrees that `(` pairs with `)` and `{` with `}`, so the
     /// useful diagnosis does not depend on which kind of value was inside.
-    fn mismatched_closer(&self) -> Option<(&'static str, Span)> {
+    fn mismatched_closer(&mut self) -> Option<(&'static str, Span)> {
         let found = match self.peek().map(|token| &token.tracked) {
             Some(Kind::RightParen) => ")",
             Some(Kind::RightBrace) => "}",
             _ => return None,
         };
-        let mut open = Vec::new();
-        for token in &self.toks[..self.pos] {
-            match token.tracked {
-                Kind::LeftParen => open.push((")", token.span)),
-                Kind::LeftBrace => open.push(("}", token.span)),
-                Kind::RightParen => {
-                    if matches!(open.last(), Some((")", _))) {
-                        open.pop();
-                    }
+        // Resume the scan where the previous error left it. Recovery can move
+        // the cursor backward past scanned tokens; then the prefix is folded
+        // again from the start.
+        if self.scan_pos > self.pos {
+            self.scan_pos = 0;
+            self.scan_open.clear();
+        }
+        for token in &self.toks[self.scan_pos..self.pos] {
+            let closer = match token.tracked {
+                Kind::LeftParen => {
+                    self.scan_open.push((")", token.span));
+                    continue;
                 }
-                Kind::RightBrace => {
-                    if matches!(open.last(), Some(("}", _))) {
-                        open.pop();
-                    }
+                Kind::LeftBrace => {
+                    self.scan_open.push(("}", token.span));
+                    continue;
                 }
-                _ => {}
+                Kind::RightParen => ")",
+                Kind::RightBrace => "}",
+                _ => continue,
+            };
+            if matches!(self.scan_open.last(), Some((needed, _)) if *needed == closer) {
+                self.scan_open.pop();
+            } else if let Some(matching) = self
+                .scan_open
+                .iter()
+                .rposition(|(needed, _)| *needed == closer)
+            {
+                // The closer pairs with an opener further out; the unclosed
+                // delimiters inside it were diagnosed when the parser stood on
+                // this closer, so they are spent along with the pair.
+                self.scan_open.truncate(matching);
+            } else {
+                // A closer with no opener of its own shape anywhere: it was
+                // diagnosed against the innermost opener when the parser stood
+                // on it. That opener is spent — leaving it here would make it
+                // hijack the diagnosis of every later stray closer.
+                self.scan_open.pop();
             }
         }
-        open.last()
+        self.scan_pos = self.pos;
+        self.scan_open
+            .last()
             .copied()
             .filter(|(expected, _)| *expected != found)
     }

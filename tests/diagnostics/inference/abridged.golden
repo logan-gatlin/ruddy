@@ -126,7 +126,7 @@ help: strengthen the annotation or loosen the body
 
 ## unhandled-effect
 [unhandled-effect] effect `!Log` has no enclosing handler
-primary: this operation or call may perform effect `!Log`
+primary: this may perform effect `!Log`
 related: this top-level computation has no handler for effect `!Log`
 related: effect `!Log` is declared here
 help: handle this effect, or perform it inside a function
@@ -134,7 +134,7 @@ help: handle this effect, or perform it inside a function
 ## effect-not-allowed
 [effect-not-allowed] effect `!Log` is not allowed by the enclosing function
 primary: this enclosing function does not allow effect `!Log`
-related: this operation or call may perform effect `!Log`
+related: this may perform effect `!Log`
 related: effect `!Log` is declared here
 help: add the effect to the function type, or handle it here
 

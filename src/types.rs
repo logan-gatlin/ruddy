@@ -958,10 +958,15 @@ pub(crate) fn same_finite_syntax_metered(
                     if !same_presence(&left_field.presence, &right_field.presence) {
                         return Some(false);
                     }
-                    // Only definitely-present labels have an available payload.
-                    // Absent, undecided, variable, and recovered slots may retain
-                    // arbitrary recovery types which are not semantic syntax.
-                    if matches!(left_field.presence, Presence::Present) {
+                    // Present and variable-presence labels carry payloads the
+                    // program can reach — lowering switches on them — so those
+                    // payloads are part of the syntax. Absent, undecided, and
+                    // recovered slots may retain arbitrary recovery types
+                    // which are not.
+                    if matches!(
+                        left_field.presence,
+                        Presence::Present | Presence::Var(_) | Presence::Bound(_)
+                    ) {
                         pending.push(Pair::Ty(&left_field.ty, &right_field.ty));
                     }
                 }

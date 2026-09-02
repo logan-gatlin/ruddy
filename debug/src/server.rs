@@ -32,8 +32,11 @@ struct CompileBody {
     session_revision: u64,
     #[serde(default)]
     client_id: String,
+    /// Absent when the client does not track a view; the shared session then
+    /// keeps whichever view it already holds rather than resetting every
+    /// collaborator's panels to serialized defaults.
     #[serde(default)]
-    view: SessionView,
+    view: Option<SessionView>,
 }
 
 /// Enough to keep a held-open poll and a compile from queueing behind each

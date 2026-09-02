@@ -4307,13 +4307,23 @@ fn attach_ordinary_explanations(
     let ExplanationSources { aliases } = sources;
     let pivot_contexts = pivot_contexts(constraints);
     let all = all_constraints(constraints);
-    let instance_binders: HashMap<Span, Symbol> = all
+    // `all` iterates in hash order, so when desugaring reuses one span for
+    // several instances the earliest constraint wins explicitly — collecting
+    // directly would print a different binder from run to run.
+    let mut instances: Vec<(ConstraintId, Span, Symbol)> = all
         .values()
         .filter_map(|constraint| match constraint.kind {
-            ConstraintKind::Instance { symbol, .. } => Some((constraint.span, symbol)),
+            ConstraintKind::Instance { symbol, .. } => {
+                Some((constraint.id, constraint.span, symbol))
+            }
             _ => None,
         })
         .collect();
+    instances.sort_unstable_by_key(|(id, ..)| *id);
+    let mut instance_binders: HashMap<Span, Symbol> = HashMap::new();
+    for (_, span, symbol) in instances {
+        instance_binders.entry(span).or_insert(symbol);
+    }
     let visible_names: HashSet<String> = constraints
         .keys()
         .copied()
@@ -5132,7 +5142,7 @@ fn tail_issue(relation: &CallbackTailRelation) -> String {
             relation.required
         ),
         None => format!(
-            "callback remainder {} is not covered by the closed extern effect row",
+            "callback remainder {} is not covered by the extern declaration's fixed effects",
             relation.required
         ),
     }
@@ -5609,8 +5619,17 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             generated_end: 0,
         }
         .run(&coverage);
-        report_flip(&mut table, &mut errors);
+        let flipped_now = report_flip(&mut table, &mut errors);
         if errors.len() == error_start {
+            // A coverage-origin flip reports no error of its own. Leaving the
+            // store marked unsatisfiable with nothing on screen would silently
+            // suppress every later definition's presence diagnostics, so the
+            // mark rolls back; a genuine contradiction resurfaces during the
+            // definition solves, where the flip owns a surviving error.
+            if let Some(at) = flipped_now {
+                table.unsat = false;
+                table.store.batches[at].flipped = false;
+            }
             continue;
         }
 
@@ -5682,6 +5701,18 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
         match baseline_error {
             Some(_) => errors.truncate(error_start),
             None => errors.truncate(error_start + 1),
+        }
+        // The merge keeps one extern diagnostic and discards the rest of the
+        // window, which may include the flip error just reported. The cascade
+        // rule suppresses later presence diagnostics only while the flip's
+        // own error is on screen, so when the merge dropped that error the
+        // store's mark rolls back with it.
+        if let Some(at) = flipped_now {
+            let cause = ErrorCause::Batch(table.store.batches[at].id);
+            if !errors.iter().any(|error| error.cause == cause) {
+                table.unsat = false;
+                table.store.batches[at].flipped = false;
+            }
         }
     }
     // The groups are read out before anything is solved: solving mutates the
@@ -6186,19 +6217,19 @@ fn unguarded_formula<'a>(origin: &'a Origin, formula: &'a Formula) -> &'a Formul
     }
 }
 
-fn report_flip(table: &mut Table, errors: &mut Vec<Error>) {
+/// Returns the index of the batch this call newly marked as the flip, so a
+/// caller which then discards the flip's error can roll the mark back.
+fn report_flip(table: &mut Table, errors: &mut Vec<Error>) -> Option<usize> {
     if table.unsat {
-        return;
+        return None;
     }
-    let Some(at) = table.flip() else {
-        return;
-    };
+    let at = table.flip()?;
     table.unsat = true;
     table.store.batches[at].flipped = true;
     let batch = table.store.batches[at].clone();
     let base = unguarded_origin(&batch.origin);
     let kind = match base {
-        UnguardedOrigin::Coverage => return,
+        UnguardedOrigin::Coverage => return Some(at),
         UnguardedOrigin::Annotation(named) => {
             // Which of the two annotation complaints it is: a clause with no
             // model of its own is wrong by itself, and the body under it —
@@ -6231,6 +6262,7 @@ fn report_flip(table: &mut Table, errors: &mut Vec<Error>) {
         kind,
         explanation: None,
     });
+    Some(at)
 }
 
 impl Table {

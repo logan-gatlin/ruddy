@@ -42,7 +42,7 @@ impl Store {
         request: CompileRequest,
         known_revision: u64,
         client_id: String,
-        view: SessionView,
+        view: Option<SessionView>,
     ) -> bool {
         match &mut self.current {
             // Two compiles from one browser may overlap when dependency work is
@@ -59,7 +59,12 @@ impl Store {
             Some(current) => {
                 current.revision += 1;
                 current.request = request;
-                current.view = view;
+                // A compile without a view is a client that tracks none; the
+                // collaborators watching this session keep the panels they
+                // have rather than being reset to defaults.
+                if let Some(view) = view {
+                    current.view = view;
+                }
                 current.client_id = client_id;
                 current.agent_written = false;
                 true
@@ -68,7 +73,7 @@ impl Store {
                 self.current = Some(Current {
                     revision: 1,
                     request,
-                    view,
+                    view: view.unwrap_or_default(),
                     client_id,
                     agent_written: false,
                 });

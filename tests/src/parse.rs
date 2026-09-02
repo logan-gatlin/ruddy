@@ -673,6 +673,45 @@ fn a_mismatched_closer_points_to_the_innermost_opener() {
     }
 }
 
+/// A closer that matched nothing spends the opener it was diagnosed against.
+/// The spent opener must not hijack the diagnosis of a stray closer in a
+/// later statement, which has no opener of its own.
+#[test]
+fn a_diagnosed_opener_does_not_hijack_a_later_stray_closer() {
+    let source = "let a = (1}\nlet c = 3}";
+    let out = parse(lex(source, FileID::GENERATED).tokens);
+    let opener = source.find('(').unwrap();
+    // The first complaint is the line-1 mismatch, pointing at its own opener.
+    let first = out.errors.first().expect("the mismatch is diagnosed");
+    assert!(
+        matches!(
+            first.kind,
+            ErrorKind::Expected {
+                expected: Expected::Punctuation(")"),
+                related: Some(related),
+                ..
+            } if related.span.start == opener
+        ),
+        "first error: {first:#?}"
+    );
+    assert!(
+        out.errors.len() > 1,
+        "the stray closer on the second line is diagnosed too: {:#?}",
+        out.errors
+    );
+    // Every later complaint is about its own statement, not the spent opener.
+    for error in &out.errors[1..] {
+        let hijacked = matches!(
+            error.kind,
+            ErrorKind::Expected {
+                related: Some(related),
+                ..
+            } if related.span.start == opener
+        );
+        assert!(!hijacked, "spent opener reused: {error:#?}");
+    }
+}
+
 /// Empty `()` and `{}` are complete values, patterns, and types. If the token
 /// after an opener belongs to the surrounding construct, the missing part is
 /// therefore the closer—not imaginary content before that token.

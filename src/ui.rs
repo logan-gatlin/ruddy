@@ -1174,9 +1174,9 @@ impl ir::Error {
                     .help("write the type that every use of this declaration should have")
             }
             E::HoleInOperation => {
-                Diagnostic::new(code, "an operation signature cannot contain `_`", span)
-                    .label("an operation must have one fixed type")
-                    .help("write the type that every call to this operation should have")
+                Diagnostic::new(code, "an effect function's type cannot contain `_`", span)
+                    .label("an effect function must have one fixed type")
+                    .help("write the type that every call to this function should have")
             }
             E::UnboundPresence { name } => Diagnostic::new(
                 code,
@@ -1300,36 +1300,36 @@ impl ir::Error {
                     .help("rename one binding or replace it with `_`")
             }
             E::DuplicateOperation { name, previous } => {
-                Diagnostic::new(code, format!("operation `{name}` is declared more than once"), span)
+                Diagnostic::new(code, format!("effect function `{name}` is declared more than once"), span)
                     .label("declared again here")
                     .related(*previous, FIRST_DECLARATION)
             }
             E::NotAnOperation { name } => {
                 Diagnostic::new(code, format!("`{name}` is not a function"), span)
-                    .label("an operation signature must be a function type")
+                    .label("what an effect declares must be a function type")
                     .help(format!("write a signature such as `{name} : Nat -> ()`"))
             }
             E::ImpureOperation { found } => match found {
                 ir::OperationTypeProblem::Effects => Diagnostic::new(
                     code,
-                    "an operation signature cannot declare effects",
+                    "an effect function cannot declare effects of its own",
                     span,
                 )
-                .label("operation calls already perform the operation's own effect")
+                .label("calling it already performs this effect")
                 .help("remove this `+` effect list"),
                 ir::OperationTypeProblem::OpenPart => Diagnostic::new(
                     code,
-                    "an operation must have one fixed function type",
+                    "an effect function must have one fixed function type",
                     span,
                 )
-                .label("this leaves part of the operation's type undecided")
+                .label("this leaves part of the function's type undecided")
                 .help("write this part explicitly; use `..` and `when` in annotations instead"),
                 ir::OperationTypeProblem::Variable(name) => Diagnostic::new(
                     code,
-                    format!("`'{name}` is not declared by this operation"),
+                    format!("`'{name}` is not declared by this effect function"),
                     span,
                 )
-                .label("operation signatures cannot introduce type variables")
+                .label("an effect function cannot introduce type variables")
                 .help("replace it with a fixed type or a declared type application"),
             },
             E::EffectsOutsideRow => Diagnostic::new(
@@ -1342,50 +1342,50 @@ impl ir::Error {
             E::OperationOnAlias { effect } => Diagnostic::new(
                 code,
                 format!(
-                    "effect alias `{}` declares no operations",
+                    "effect alias `{}` declares nothing to perform",
                     label(Shape::Effect, effect)
                 ),
                 span,
             )
-            .label("an alias groups effects but declares no operation of its own")
-            .help("perform an operation from one of the concrete effects named by the alias"),
+            .label("an alias groups effects but declares nothing of its own")
+            .help("perform one of the functions declared by the concrete effects this alias names"),
             E::UnknownOperation { effect, op } => Diagnostic::new(
                 code,
                 format!(
-                    "effect `{}` has no operation `{op}`",
+                    "effect `{}` does not declare `{op}`",
                     label(Shape::Effect, effect)
                 ),
                 span,
             )
-            .label("this operation is not declared by the effect")
-            .help("use one of the effect's declared operations, or add this operation to its declaration"),
+            .label("the effect does not declare this name")
+            .help("use one of the names the effect declares, or add this one to its declaration"),
             E::BareOperationUnavailable { effect, suggestion } => {
                 let effect = label(Shape::Effect, effect);
                 match suggestion {
                     Some(op) => Diagnostic::new(
                         code,
-                        format!("effect `{effect}` requires an operation name"),
+                        format!("performing `{effect}` requires a function name"),
                         span,
                     )
-                    .label("this effect has only named operations")
+                    .label("this effect declares only named functions")
                     .help(format!("write `{effect}.{op}`")),
                     None => Diagnostic::new(
                         code,
-                        format!("effect `{effect}` declares no operations"),
+                        format!("effect `{effect}` declares nothing to perform"),
                         span,
                     )
                     .label("there is nothing in this effect to perform")
-                    .help("remove this performance, or declare an operation on the effect"),
+                    .help("remove this use, or declare a function on the effect"),
                 }
             }
             E::NamedOperationOnUnnamed { effect, op } => {
                 let effect = label(Shape::Effect, effect);
                 Diagnostic::new(
                     code,
-                    format!("effect `{effect}` has one unnamed operation"),
+                    format!("effect `{effect}` declares one unnamed function"),
                     span,
                 )
-                .label(format!("`{op}` is not the name of an operation here"))
+                .label(format!("`{op}` does not name anything this effect declares"))
                 .help(format!("write `{effect}` instead"))
             }
             E::PartialHandler { effect, missing } => Diagnostic::new(
@@ -1410,7 +1410,7 @@ impl ir::Error {
                 ),
                 span,
             )
-            .label("this operation is handled again")
+            .label("handled again here")
             .related(*previous, FIRST_ARM),
             E::DuplicateReturn { previous } => Diagnostic::new(
                 code,
@@ -2673,10 +2673,7 @@ fn explanation_fact(
         }
         P::EffectUse => {
             let row = contradiction.row.as_ref().expect("effect metadata");
-            format!(
-                "this operation or call may perform effect `{}`",
-                label(row.shape, &row.label)
-            )
+            format!("this may perform effect `{}`", label(row.shape, &row.label))
         }
         P::EffectBoundary => {
             let row = contradiction.row.as_ref().expect("effect metadata");
@@ -2930,8 +2927,9 @@ fn callback_issue_details(
         diagnostic = diagnostic.help(repair);
     }
     if !tails.is_empty() {
-        diagnostic = diagnostic
-            .help("make each extern effect row cover the callback remainder noted at that path");
+        diagnostic = diagnostic.help(
+            "make the extern declaration's effects cover the callback remainder noted at each path",
+        );
     }
     diagnostic.help("or handle those effects before the callback returns to host code")
 }
@@ -2995,7 +2993,7 @@ impl inference::Error {
                             .help("or change the called value so it accepts a different input"),
                         Some(inference::RecursiveCycleShape::Containment) => diagnostic
                             .help("change the value so it does not contain itself")
-                            .help("or change the field or row that creates the containment"),
+                            .help("or change the field that creates the containment"),
                         Some(inference::RecursiveCycleShape::Neutral) | None => diagnostic
                             .help("change one of these uses so the type is finite")
                             .help("or separate the uses so they no longer require the same type"),
@@ -3443,14 +3441,18 @@ impl fmt::Display for inference::ErrorKind {
                 extern_name,
                 ..
             } => {
-                let kind = match variable_kind {
-                    inference::ExternVariableKind::Type => "type",
-                    inference::ExternVariableKind::Row => "row",
-                    inference::ExternVariableKind::Presence => "presence",
+                let varies = match variable_kind {
+                    inference::ExternVariableKind::Type => "can be many different types",
+                    inference::ExternVariableKind::Row => {
+                        "leaves open which fields or effects the value carries"
+                    }
+                    inference::ExternVariableKind::Presence => {
+                        "leaves open whether parts of the value are present"
+                    }
                 };
                 write!(
                     f,
-                    "host code needs one fixed kind of value at {position}, but {kind} variable `{variable}` in extern `{extern_name}` can vary"
+                    "host code needs one fixed kind of value at {position}, but `{variable}` in extern `{extern_name}` {varies}"
                 )
             }
         }
