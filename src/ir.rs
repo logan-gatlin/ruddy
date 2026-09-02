@@ -198,10 +198,11 @@ pub struct Param {
     pub relevant: bool,
 }
 
-/// A target-provided global value, named by a dotted target path.
+/// A target-provided global value. The decoded target source is retained
+/// unchanged; target-independent lowering does not interpret it.
 #[derive(Debug, Clone)]
 pub struct Extern {
-    pub target: ForeignPath,
+    pub target: TrackedString,
     /// The resolved foreign boundary spelling. This is kept separately from
     /// the annotation's ordinary curried type so lowering can distinguish one
     /// n-ary host call from a chain of Ruddy calls without resolving names (or
@@ -285,27 +286,6 @@ fn resolved_extern_type(written: parse::ExternType, resolved: &Type) -> ExternTy
                 effects,
             })
         }
-    }
-}
-
-/// A target path is neither a Ruddy module path nor a projection expression.
-#[derive(Debug, Clone)]
-pub struct ForeignPath {
-    pub segments: Vec<TrackedString>,
-}
-
-impl ForeignPath {
-    pub fn span(&self) -> Span {
-        self.segments
-            .first()
-            .expect("a lowered foreign path has a first segment")
-            .span
-            .merge(
-                self.segments
-                    .last()
-                    .expect("a lowered foreign path is nonempty")
-                    .span,
-            )
     }
 }
 
@@ -1907,7 +1887,7 @@ type External = (
     TrackedString,
     Annotated,
     parse::ExternType,
-    parse::ForeignPath,
+    TrackedString,
 );
 
 enum DeclaredValue {
@@ -2724,12 +2704,7 @@ fn build_with_dependency_imports_inner(
                             name_span: name.span,
                             annotation: Some(annotation),
                             params: Vec::new(),
-                            value: Extern {
-                                target: ForeignPath {
-                                    segments: target.segments,
-                                },
-                                abi,
-                            },
+                            value: Extern { target, abi },
                         },
                     );
                 }
@@ -10610,6 +10585,37 @@ fn sense(shape: Shape) -> Sense {
         Shape::Struct => Sense::Fields,
         Shape::Sum => Sense::Cases,
         Shape::Effect => Sense::Effects,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        parse,
+        symbol::{Bundle, Version},
+        token,
+        tracking::FileID,
+    };
+
+    #[test]
+    fn extern_target_text_and_literal_span_survive_lowering() {
+        let source = r#"extern value : String = "globalThis.answer""#;
+        let lexed = token::lex(source, FileID::GENERATED);
+        assert!(lexed.errors.is_empty());
+        let parsed = parse::parse(lexed.tokens);
+        assert!(parsed.errors.is_empty());
+
+        let bundle = Bundle::new("test", Version::new(0, 0, 0)).unwrap();
+        let mut mint = Mint::new(bundle);
+        let lowered = build(&mut mint, parsed.stmts);
+        assert!(lowered.errors.is_empty(), "IR errors: {:?}", lowered.errors);
+
+        let external = lowered.program.externs.values().next().unwrap();
+        assert_eq!(external.value.target.tracked, "globalThis.answer");
+        let start = source.find('"').unwrap();
+        assert_eq!(external.value.target.span.start, start);
+        assert_eq!(external.value.target.span.width, source.len() - start);
     }
 }
 

@@ -1,0 +1,45 @@
+let reverse : Ordering -> Ordering = fn value => match value with
+  | #Less => #Greater
+  | #Equal => #Equal
+  | #Greater => #Less
+end
+
+let is_less : Ordering -> Boolean = fn value => match value with
+  | #Less => true
+  | _ => false
+end
+
+let is_equal : Ordering -> Boolean = fn value => match value with
+  | #Equal => true
+  | _ => false
+end
+
+let is_greater : Ordering -> Boolean = fn value => match value with
+  | #Greater => true
+  | _ => false
+end
+
+let compare_by : ('b -> 'b -> Ordering + ..'effects) -> ('a -> 'b + ..'effects) -> 'a -> 'a -> Ordering + ..'effects =
+  fn comparator project left right => comparator (project left) (project right)
+
+let reverse_compare : ('a -> 'a -> Ordering + ..'effects) -> 'a -> 'a -> Ordering + ..'effects =
+  fn comparator left right => reverse (comparator left right)
+
+let then_compare : ('a -> 'a -> Ordering + ..'effects) -> ('a -> 'a -> Ordering + ..'effects) -> 'a -> 'a -> Ordering + ..'effects =
+  fn first second left right => match first left right with
+  | #Less => #Less
+  | #Equal => second left right
+  | #Greater => #Greater
+  end
+
+let min_by : ('a -> 'a -> Ordering + ..'effects) -> 'a -> 'a -> 'a + ..'effects =
+  fn comparator left right => match comparator left right with
+  | #Greater => right
+  | _ => left
+  end
+
+let max_by : ('a -> 'a -> Ordering + ..'effects) -> 'a -> 'a -> 'a + ..'effects =
+  fn comparator left right => match comparator left right with
+  | #Less => right
+  | _ => left
+  end

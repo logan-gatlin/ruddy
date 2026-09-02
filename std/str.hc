@@ -1,0 +1,98 @@
+extern concat : fn(String, String) -> String = "(left, right) => left + right"
+extern len : fn(String) -> Nat = "value => value.length"
+let is_empty: String -> Boolean = fn value => match value with | "" => true | _ => false end
+
+extern from_nat : fn(Nat) -> String = "value => String(value)"
+extern from_int : fn(Int) -> String = "value => String(value)"
+extern from_real : fn(Real) -> String = "value => String(value)"
+let from_boolean: Boolean -> String = fn b => match b with | true => "true" | false => "false" end
+
+extern equal : fn(String, String) -> Boolean = "(left, right) => left === right"
+extern not_equal : fn(String, String) -> Boolean = "(left, right) => left !== right"
+extern less_than : fn(String, String) -> Boolean = "(left, right) => left < right"
+extern less_than_or_equal : fn(String, String) -> Boolean = "(left, right) => left <= right"
+extern greater_than : fn(String, String) -> Boolean = "(left, right) => left > right"
+extern greater_than_or_equal : fn(String, String) -> Boolean = "(left, right) => left >= right"
+
+extern contains : fn(String, String) -> Boolean = "(value, search) => value.includes(search)"
+extern starts_with : fn(String, String) -> Boolean = "(value, prefix) => value.startsWith(prefix)"
+extern ends_with : fn(String, String) -> Boolean = "(value, suffix) => value.endsWith(suffix)"
+extern char_at : fn(String, Nat) -> String = "(value, index) => value.charAt(index)"
+extern index_of : fn(String, String) -> Int = "(value, search) => value.indexOf(search)"
+
+extern slice : fn(String, Nat, Nat) -> String = "(value, start, end) => value.slice(start, end)"
+extern trim : fn(String) -> String = "value => value.trim()"
+extern trim_start : fn(String) -> String = "value => value.trimStart()"
+extern trim_end : fn(String) -> String = "value => value.trimEnd()"
+extern to_lowercase : fn(String) -> String = "value => value.toLowerCase()"
+extern to_uppercase : fn(String) -> String = "value => value.toUpperCase()"
+
+extern repeat : fn(String, Nat) -> String = "(value, count) => value.repeat(count)"
+extern replace_first : fn(String, String, String) -> String = "(value, search, replacement) => value.replace(search, replacement)"
+extern replace_all : fn(String, String, String) -> String = "(value, search, replacement) => value.replaceAll(search, replacement)"
+extern pad_start : fn(String, Nat, String) -> String = "(value, length, fill) => value.padStart(length, fill)"
+extern pad_end : fn(String, Nat, String) -> String = "(value, length, fill) => value.padEnd(length, fill)"
+extern reverse : fn(String) -> String = "value => value.split('').reverse().join('')"
+
+let compare : String -> String -> Ordering = fn left right =>
+  if less_than left right then #Less
+  else if greater_than left right then #Greater
+  else #Equal
+  end
+
+let is_blank : String -> Boolean = fn value => is_empty (trim value)
+
+let char_at_option : String -> Nat -> Option String = fn value index =>
+  if nat::less_than index (len value) then #Some (char_at value index) else #None end
+
+let index_of_option : String -> String -> Option Nat = fn value search =>
+  let index = index_of value search in
+  if int::less_than index 0i then #None else #Some (nat::from_int index) end
+
+let take : String -> Nat -> String = fn value count => slice value 0n count
+let drop : String -> Nat -> String = fn value count => slice value count (len value)
+
+let strip_prefix : String -> String -> Option String = fn value prefix =>
+  if starts_with value prefix then #Some (drop value (len prefix)) else #None end
+
+let strip_suffix : String -> String -> Option String = fn value suffix =>
+  if ends_with value suffix
+  then #Some (take value (nat::subtract (len value) (len suffix)))
+  else #None
+  end
+
+let split_once : String -> String -> Option (String, String) = fn value separator =>
+  match index_of_option value separator with
+  | #Some index => #Some (take value index, drop value (nat::add index (len separator)))
+  | #None => #None
+  end
+
+let chars : String -> List String = fn value =>
+  if is_empty value
+  then #None
+  else #Cons (char_at value 0n, chars (drop value 1n))
+  end
+
+let split : String -> String -> List String = fn value separator =>
+  if is_empty separator then chars value else
+    match index_of_option value separator with
+    | #Some index => #Cons (take value index, split (drop value (nat::add index (len separator))) separator)
+    | #None => #Cons (value, #None)
+    end
+  end
+
+let join : String -> List String -> String = fn separator values => match values with
+  | #Cons (head, tail) => match tail with
+    | #Cons _ => concat head (concat separator (join separator tail))
+    | #None => head
+    end
+  | #None => ""
+end
+
+let slice_with : String -> { start when 'start: Nat, stop when 'stop: Nat } -> String =
+  fn value bounds => match bounds with
+  | {} => value
+  | { start } => slice value start (len value)
+  | { stop } => slice value 0n stop
+  | { start, stop } => slice value start stop
+  end

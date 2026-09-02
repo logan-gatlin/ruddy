@@ -40,7 +40,7 @@ fn artifact(
         lir: a::Lir {
             externs: vec![a::Extern {
                 name: format!("{name}@1.0.0::host"),
-                target: vec![name.into(), "host".into()],
+                target: format!("{name}.host"),
                 rep: a::Rep::Any,
             }],
             functions,

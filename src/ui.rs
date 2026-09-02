@@ -596,6 +596,7 @@ impl parse::Expected {
             Self::Case => "another case".into(),
             Self::FunctionType => "a function type such as `Nat -> Nat`".into(),
             Self::EndOfClause => "the end of this condition".into(),
+            Self::ExternTarget => "a quoted JavaScript expression such as `\"host.log\"`".into(),
             Self::Keyword(word) | Self::Punctuation(word) => format!("`{word}`"),
         }
     }
@@ -614,6 +615,7 @@ impl parse::Expected {
             Self::Case => "expected-case",
             Self::FunctionType => "expected-function-type",
             Self::EndOfClause => "expected-condition-end",
+            Self::ExternTarget => "expected-extern-target",
             Self::Keyword("=") | Self::Punctuation("=") => "expected-equals",
             Self::Keyword("=>") | Self::Punctuation("=>") => "expected-function-arrow",
             Self::Keyword("end") => "expected-end",

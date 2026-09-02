@@ -1,0 +1,76 @@
+let add: Real -> Real -> Real = fn left => fn right => left + right
+let subtract: Real -> Real -> Real = fn left => fn right => left - right
+let multiply: Real -> Real -> Real = fn left => fn right => left * right
+let divide: Real -> Real -> Real = fn left => fn right => left / right
+let negate: Real -> Real = fn value => -value
+
+extern remainder : fn(Real, Real) -> Real = "(left, right) => left % right"
+extern abs : fn(Real) -> Real = "Math.abs"
+extern sqrt : fn(Real) -> Real = "Math.sqrt"
+extern power : fn(Real, Real) -> Real = "Math.pow"
+
+extern equal : fn(Real, Real) -> Boolean = "Object.is"
+extern not_equal : fn(Real, Real) -> Boolean = "(left, right) => !Object.is(left, right)"
+extern less_than : fn(Real, Real) -> Boolean = "(left, right) => left < right"
+extern less_than_or_equal : fn(Real, Real) -> Boolean = "(left, right) => left <= right"
+extern greater_than : fn(Real, Real) -> Boolean = "(left, right) => left > right"
+extern greater_than_or_equal : fn(Real, Real) -> Boolean = "(left, right) => left >= right"
+
+extern min : fn(Real, Real) -> Real = "Math.min"
+extern max : fn(Real, Real) -> Real = "Math.max"
+extern clamp : fn(Real, Real, Real) -> Real = "(value, minimum, maximum) => Math.min(Math.max(value, minimum), maximum)"
+extern floor : fn(Real) -> Int = "Math.floor"
+extern ceil : fn(Real) -> Int = "Math.ceil"
+extern round : fn(Real) -> Int = "Math.round"
+extern truncate : fn(Real) -> Int = "Math.trunc"
+extern is_nan : fn(Real) -> Boolean = "Number.isNaN"
+extern is_finite : fn(Real) -> Boolean = "Number.isFinite"
+extern is_integer : fn(Real) -> Boolean = "Number.isInteger"
+
+extern from_nat : fn(Nat) -> Real = "value => value"
+extern from_int : fn(Int) -> Real = "value => value"
+
+extern sin : fn(Real) -> Real = "Math.sin"
+extern cos : fn(Real) -> Real = "Math.cos"
+extern tan : fn(Real) -> Real = "Math.tan"
+extern asin : fn(Real) -> Real = "Math.asin"
+extern acos : fn(Real) -> Real = "Math.acos"
+extern atan : fn(Real) -> Real = "Math.atan"
+extern atan2 : fn(Real, Real) -> Real = "Math.atan2"
+
+extern sinh : fn(Real) -> Real = "Math.sinh"
+extern cosh : fn(Real) -> Real = "Math.cosh"
+extern tanh : fn(Real) -> Real = "Math.tanh"
+extern asinh : fn(Real) -> Real = "Math.asinh"
+extern acosh : fn(Real) -> Real = "Math.acosh"
+extern atanh : fn(Real) -> Real = "Math.atanh"
+
+extern exp : fn(Real) -> Real = "Math.exp"
+extern expm1 : fn(Real) -> Real = "Math.expm1"
+extern log : fn(Real) -> Real = "Math.log"
+extern log1p : fn(Real) -> Real = "Math.log1p"
+extern log2 : fn(Real) -> Real = "Math.log2"
+extern log10 : fn(Real) -> Real = "Math.log10"
+
+let e: Real = 2.718281828459045
+let ln_2: Real = 0.6931471805599453
+let ln_10: Real = 2.302585092994046
+let log2_e: Real = 1.4426950408889634
+let log10_e: Real = 0.4342944819032518
+let pi: Real = 3.141592653589793
+let sqrt_1_2: Real = 0.7071067811865476
+let sqrt_2: Real = 1.4142135623730951
+let tau: Real = 2.0 * pi
+
+let degrees_to_radians: Real -> Real = fn degrees => degrees * (pi / 180.0)
+let radians_to_degrees: Real -> Real = fn radians => radians * (180.0 / pi)
+
+let compare : Real -> Real -> Ordering = fn left right =>
+  if equal left right then #Equal
+  else if is_nan left then #Greater
+  else if is_nan right then #Less
+  else if less_than left right then #Less
+  else if greater_than left right then #Greater
+  else if less_than (divide 1.0 left) (divide 1.0 right) then #Less
+  else #Greater
+  end

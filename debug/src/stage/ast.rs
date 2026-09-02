@@ -144,7 +144,7 @@ fn stmt_node(ids: &mut Ids, stmt: &Stmt) -> Node {
         }
         .child(Node::new(ids.next(), "Name", name.tracked.clone()).at(name.span))
         .child(annotation_node(ids, ty))
-        .child(Node::new(ids.next(), "Target", target.to_string()).at(target.span())),
+        .child(Node::new(ids.next(), "Target", target.to_string()).at(target.span)),
         StmtKind::Let { pattern, ty, body } => {
             let mut let_node = Node {
                 label: "Let".into(),

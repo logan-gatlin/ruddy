@@ -1,0 +1,13 @@
+let logical_not: Boolean -> Boolean = fn value => not value
+let logical_and: Boolean -> Boolean -> Boolean = fn left => fn right => left and right
+let logical_or: Boolean -> Boolean -> Boolean = fn left => fn right => left or right
+let logical_xor: Boolean -> Boolean -> Boolean = fn left => fn right => left xor right
+let equal: Boolean -> Boolean -> Boolean = fn left => fn right => not (left xor right)
+let not_equal: Boolean -> Boolean -> Boolean = fn left => fn right => left xor right
+let implies: Boolean -> Boolean -> Boolean = fn premise => fn conclusion => not premise or conclusion
+
+let compare : Boolean -> Boolean -> Ordering = fn left right =>
+  if equal left right then #Equal
+  else if left then #Greater
+  else #Less
+  end

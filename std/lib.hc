@@ -7,8 +7,22 @@ type Result 'some 'error = #Some 'some | #Error 'error
 type Fallible 'error 'rest = #Error 'error | ..'rest
 
 let map_some = fn f maybe => match maybe with
-| #Some s => #Some (f maybe)
+| #Some s => #Some (f s)
 | _ => maybe
 end
 
 type List 'a = #Cons ('a, List 'a) | #None
+
+type Ordering = #Less | #Equal | #Greater
+
+module str
+module nat
+module int
+module real
+module boolean
+module option
+module result
+module list
+module function
+module tuple
+module ordering

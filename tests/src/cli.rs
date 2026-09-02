@@ -1255,7 +1255,7 @@ fn direct_dependency_exports_resolve_and_keep_their_artifact_owner() {
     write_project(&dependency, "std", "0.1.0", &[]);
     fs::write(
         dependency.join("main.hc"),
-        "module Nested =\n  type Number = Nat\n  effect Read = { get: {} -> Nat }\n  extern runtime : Nat = host.runtime\n  let foo = 1n\nend\n",
+        "module Nested =\n  type Number = Nat\n  effect Read = { get: {} -> Nat }\n  extern runtime : Nat = \"host.runtime\"\n  let foo = 1n\nend\n",
     )
     .unwrap();
     fs::write(
@@ -1275,7 +1275,7 @@ fn direct_dependency_exports_resolve_and_keep_their_artifact_owner() {
     assert!(printed.contains("std@0.1.0::Nested::Number"), "{printed}");
     assert_eq!(built.lir.externs.len(), 1);
     assert_eq!(built.lir.externs[0].name, "std@0.1.0::Nested::runtime");
-    assert_eq!(built.lir.externs[0].target, ["host", "runtime"]);
+    assert_eq!(built.lir.externs[0].target, "host.runtime");
     assert_eq!(built.header.values.len(), 3);
     assert!(built.header.types.is_empty());
     assert!(built.header.effects.is_empty());
@@ -2127,10 +2127,16 @@ fn transitive_diamond_graphs_are_unique_dependency_first_and_direct_only() {
         &[("left", "../left"), ("right", "../right")],
     );
     for (project, declaration) in [
-        (&shared, "extern host : Nat = shared.host\nlet value = 0n\n"),
-        (&left, "extern host : Nat = left.host\nlet value = 0n\n"),
-        (&right, "extern host : Nat = right.host\nlet value = 0n\n"),
-        (&app, "extern host : Nat = app.host\nlet value = 0n\n"),
+        (
+            &shared,
+            "extern host : Nat = \"shared.host\"\nlet value = 0n\n",
+        ),
+        (&left, "extern host : Nat = \"left.host\"\nlet value = 0n\n"),
+        (
+            &right,
+            "extern host : Nat = \"right.host\"\nlet value = 0n\n",
+        ),
+        (&app, "extern host : Nat = \"app.host\"\nlet value = 0n\n"),
     ] {
         fs::write(project.join("main.hc"), declaration).unwrap();
     }
@@ -2184,7 +2190,7 @@ fn transitive_diamond_graphs_are_unique_dependency_first_and_direct_only() {
             .lir
             .externs
             .iter()
-            .map(|external| (external.name.as_str(), external.target.join(".")))
+            .map(|external| (external.name.as_str(), external.target.clone()))
             .collect::<Vec<_>>(),
         [
             ("shared@3.0.0::host", "shared.host".to_string()),
@@ -2829,6 +2835,13 @@ fn clap_commands_support_aliases_help_and_strict_arguments() {
 #[test]
 fn run_builds_and_evaluates_a_javascript_module_without_a_main_entrypoint() {
     let directory = tempfile::tempdir().unwrap();
+    // The generated module remains ESM even inside an explicitly CommonJS
+    // package scope.
+    fs::write(
+        directory.path().join("package.json"),
+        "{\"type\":\"commonjs\"}\n",
+    )
+    .unwrap();
     let app = directory.path().join("app");
     write_project(&app, "app", "1.0.0", &[]);
     fs::write(app.join("main.hc"), "let initialized = 1n\n").unwrap();
@@ -2847,6 +2860,10 @@ fn run_builds_and_evaluates_a_javascript_module_without_a_main_entrypoint() {
     assert_eq!(run(["run"], &app).unwrap(), Outcome::Ran(expected.clone()));
     assert!(expected.is_file());
     assert!(app.join("build/app.artifact").is_file());
+    assert_eq!(
+        fs::read_to_string(app.join("build/package.json")).unwrap(),
+        "{\"type\":\"module\"}\n"
+    );
 
     let built_javascript = fs::read_to_string(&expected).unwrap();
     let built_artifact = fs::read_to_string(app.join("build/app.artifact")).unwrap();
@@ -2939,24 +2956,24 @@ fn run_rejects_library_targets_without_executing_stale_javascript() {
 }
 
 #[test]
-fn run_registers_the_standard_runtime_bundle() {
+fn run_uses_node_standard_globals() {
     let directory = tempfile::tempdir().unwrap();
     let app = directory.path().join("runtime");
     write_project(&app, "runtime", "1.0.0", &[]);
     fs::write(
         app.join("main.hc"),
-        "extern cwd : {} -> String = process.cwd\n\
-         extern environment : {} = process.env\n\
-         extern console_object : {} = console\n\
-         extern url : {} = URL\n\
-         extern encoder : {} = TextEncoder\n\
-         extern decoder : {} = TextDecoder\n\
-         extern base64 : String -> String = btoa\n\
-         extern clone : {} -> {} = structuredClone\n\
-         extern microtask : ({} -> {}) -> {} = queueMicrotask\n\
-         extern timeout : ({} -> {}) -> Nat = setTimeout\n\
-         extern abort_controller : {} = AbortController\n\
-         extern fetch_value : String -> {} = fetch\n\
+        "extern cwd : {} -> String = \"process.cwd\"\n\
+         extern environment : {} = \"process.env\"\n\
+         extern console_object : {} = \"console\"\n\
+         extern url : {} = \"URL\"\n\
+         extern encoder : {} = \"TextEncoder\"\n\
+         extern decoder : {} = \"TextDecoder\"\n\
+         extern base64 : String -> String = \"btoa\"\n\
+         extern clone : {} -> {} = \"structuredClone\"\n\
+         extern microtask : ({} -> {}) -> {} = \"queueMicrotask\"\n\
+         extern timeout : ({} -> {}) -> Nat = \"setTimeout\"\n\
+         extern abort_controller : {} = \"AbortController\"\n\
+         extern fetch_value : String -> {} = \"fetch\"\n\
          let initialized = 0n\n",
     )
     .unwrap();
@@ -2970,7 +2987,7 @@ fn run_registers_the_standard_runtime_bundle() {
     )
     .unwrap();
 
-    run_project(&app).expect("all documented Boa runtime globals are registered");
+    run_project(&app).expect("the documented Node.js globals are available");
 }
 
 #[test]
@@ -2980,8 +2997,8 @@ fn run_drains_queued_jobs_and_preserves_installed_files_on_runtime_failure() {
     write_project(&app, "queued", "1.0.0", &[]);
     fs::write(
         app.join("main.hc"),
-        "extern queue : ({} -> {}) -> {} = queueMicrotask\n\
-         extern parse : String -> {} = JSON.parse\n\
+        "extern queue : ({} -> {}) -> {} = \"queueMicrotask\"\n\
+         extern parse : String -> {} = \"JSON.parse\"\n\
          let queued = queue (fn _ => parse \"{\")\n",
     )
     .unwrap();
@@ -2999,7 +3016,7 @@ fn run_drains_queued_jobs_and_preserves_installed_files_on_runtime_failure() {
     assert_eq!(error.exit_code(), 1);
     assert!(!error.is_usage());
     let rendered = error.to_string().replace('\\', "/");
-    assert!(rendered.contains("JavaScript runtime"), "{rendered}");
+    assert!(rendered.contains("Node.js exited"), "{rendered}");
     assert!(rendered.contains("SyntaxError"), "{rendered}");
     assert!(rendered.contains("build/queued.js"), "{rendered}");
     assert!(rendered.contains(" at "), "{rendered}");
@@ -3027,7 +3044,7 @@ fn javascript_evaluation_rejection_does_not_wait_for_recurring_jobs() {
 }
 
 #[test]
-fn javascript_reports_unhandled_promises_despite_recurring_jobs() {
+fn node_reports_unhandled_promises_despite_recurring_jobs() {
     let directory = tempfile::tempdir().unwrap();
     let module = directory.path().join("unhandled.mjs");
     fs::write(
@@ -3039,10 +3056,7 @@ fn javascript_reports_unhandled_promises_despite_recurring_jobs() {
 
     let error = execute_javascript_module(&module).unwrap_err();
     assert_eq!(error.exit_code(), 1);
-    assert!(
-        error.to_string().contains("unhandled promise rejection"),
-        "{error}"
-    );
+    assert!(error.to_string().contains("Node.js exited"), "{error}");
     assert!(error.to_string().contains("orphaned rejection"), "{error}");
 }
 
@@ -3078,10 +3092,7 @@ fn javascript_reports_a_rejection_before_a_zero_delay_timer_can_handle_it() {
     .unwrap();
 
     let error = execute_javascript_module(&module).unwrap_err();
-    assert!(
-        error.to_string().contains("unhandled promise rejection"),
-        "{error}"
-    );
+    assert!(error.to_string().contains("Node.js exited"), "{error}");
     assert!(error.to_string().contains("timer was too late"), "{error}");
 }
 
@@ -3157,7 +3168,7 @@ fn run_rejects_an_effectful_callback_through_a_polymorphic_extern_boundary() {
     fs::write(
         app.join("main.hc"),
         "effect Tick = Nat -> Nat\n\
-         extern run : fn('a) -> Nat = host.run\n\
+         extern run : fn('a) -> Nat = \"host.run\"\n\
          let result = handle run (fn n => !Tick n) with\n\
            | !Tick n => n\n\
          end\n",
@@ -3188,13 +3199,13 @@ fn run_rejects_an_effectful_callback_through_a_polymorphic_extern_boundary() {
 }
 
 #[test]
-fn run_reports_missing_externs_with_javascript_source_locations() {
+fn run_reports_invalid_extern_expressions_with_javascript_source_locations() {
     let directory = tempfile::tempdir().unwrap();
     let app = directory.path().join("missing");
     write_project(&app, "missing", "1.0.0", &[]);
     fs::write(
         app.join("main.hc"),
-        "extern unavailable : Nat = ruddy_runtime.unavailable\n",
+        "extern unavailable : Nat = \"ruddy_runtime.unavailable\"\n",
     )
     .unwrap();
     let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
@@ -3210,8 +3221,10 @@ fn run_reports_missing_externs_with_javascript_source_locations() {
     let error = run_project(&app).unwrap_err();
     assert_eq!(error.exit_code(), 1);
     let rendered = error.to_string().replace('\\', "/");
-    assert!(rendered.contains("missing Ruddy extern"), "{rendered}");
-    assert!(rendered.contains("ruddy_runtime.unavailable"), "{rendered}");
+    assert!(
+        rendered.contains("ruddy_runtime is not defined"),
+        "{rendered}"
+    );
     assert!(rendered.contains("build/missing.js"), "{rendered}");
     assert!(app.join("build/missing.js").is_file());
     assert!(app.join("build/missing.artifact").is_file());

@@ -791,9 +791,8 @@ pub struct Lir {
 pub struct Extern {
     /// The qualified Ruddy name used by [`Op::Global`] references.
     pub name: QualifiedName,
-    /// The nonempty target namespace path, whose nonempty segments are joined
-    /// with dots by a backend (for example, `["console", "log"]`).
-    pub target: Vec<String>,
+    /// Target-specific source, interpreted only by the backend.
+    pub target: String,
     pub rep: Rep,
 }
 
@@ -2711,9 +2710,7 @@ pub mod text {
         L(vec![
             A("extern".into()),
             Q(value.name.clone()),
-            L(std::iter::once(A("target".into()))
-                .chain(value.target.iter().cloned().map(Q))
-                .collect()),
+            L(vec![A("target".into()), Q(value.target.clone())]),
             A(rep_name(value.rep).into()),
         ])
     }
@@ -3929,17 +3926,10 @@ pub mod text {
         fn read_extern(&self, value: S) -> Extern {
             let mut value = self.exact(self.list(value, "extern"), 3, "extern");
             let name = self.string(self.take(&mut value));
-            let target: Vec<String> = self
-                .many(self.take(&mut value), "target")
-                .into_iter()
-                .map(|value| self.string(value))
-                .collect();
-            if target.is_empty() || target.iter().any(String::is_empty) {
-                self.fail("extern target must contain nonempty path segments");
-            }
+            let mut target = self.exact(self.list(self.take(&mut value), "target"), 1, "target");
             Extern {
                 name,
-                target,
+                target: self.string(self.take(&mut target)),
                 rep: self.read_rep(self.take(&mut value)),
             }
         }
@@ -4425,5 +4415,59 @@ pub mod text {
                 _ => self.invalid("invalid literal", Literal::Boolean(false)),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn artifact_with_target(target: &str) -> Artifact {
+        Artifact {
+            header: Header {
+                identity: Identity {
+                    name: "test".into(),
+                    version: "1".into(),
+                },
+                dependencies: Vec::new(),
+                values: Vec::new(),
+                types: Vec::new(),
+                effects: Vec::new(),
+            },
+            lir: Lir {
+                externs: vec![Extern {
+                    name: "test@1::Main::foreign".into(),
+                    target: target.into(),
+                    rep: Rep::Any,
+                }],
+                functions: Vec::new(),
+                globals: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn extern_target_uses_one_canonical_string() {
+        for (target, target_form) in [
+            ("", "(target \"\")"),
+            ("console.log", "(target \"console.log\")"),
+            (
+                "(value) => value\n+ 1",
+                "(target \"(value) => value\\n+ 1\")",
+            ),
+            ("a \"quote\"", "(target \"a \\\"quote\\\"\")"),
+        ] {
+            let artifact = artifact_with_target(target);
+            let printed = print(&artifact);
+            assert_eq!(try_parse(&printed).unwrap(), artifact);
+            assert!(printed.contains(target_form), "{printed}");
+        }
+    }
+
+    #[test]
+    fn extern_target_rejects_old_path_encoding() {
+        let printed = print(&artifact_with_target("console.log"));
+        let old = printed.replace("(target \"console.log\")", "(target \"console\" \"log\")");
+        assert_eq!(try_parse(&old).unwrap_err().message(), "bad `target` arity");
     }
 }

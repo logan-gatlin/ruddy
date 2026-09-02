@@ -26,6 +26,7 @@ mod sat;
 mod session;
 mod snapshot;
 mod stage;
+mod stdlib;
 mod symbol;
 mod token;
 mod tracking;

@@ -9,6 +9,9 @@ autotests = false
 members = ["cli", "debug", "tests"]
 
 [dependencies]
+boa_ast = "0.22"
+boa_interner = "0.22"
+boa_parser = "0.22"
 indexmap = "2"
 pretty = "0.12.5"
 semver = "1.0.28"

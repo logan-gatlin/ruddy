@@ -936,7 +936,7 @@ fn artifact_stage_renders_one_dependency() {
         lir: Lir {
             externs: vec![ruddy::artifact::Extern {
                 name: "demo@1.0.0::log".to_string(),
-                target: vec!["console".to_string(), "log".to_string()],
+                target: "console.log".to_string(),
                 rep: ruddy::artifact::Rep::Fn,
             }],
             functions: Vec::new(),
@@ -997,7 +997,7 @@ fn artifact_stage_renders_one_dependency() {
     assert_eq!(stage.nodes[1].children[0].label, "extern");
     assert_eq!(
         stage.nodes[1].children[0].text,
-        "demo@1.0.0::log = console.log · Fn"
+        "demo@1.0.0::log = \"console.log\" · Fn"
     );
 
     let dependency_spec = REGISTRY
@@ -1130,7 +1130,7 @@ fn link_failure_is_distinct_from_a_skip_and_a_panic() {
 fn linked_artifact_is_a_distinct_final_phase_tab() {
     let linked = stage(
         "linked",
-        "extern host : Nat = runtime.host\nlet id = fn x => x\n",
+        "extern host : Nat = \"runtime.host\"\nlet id = fn x => x\n",
     );
     assert_eq!(linked.title, "Linked Artifact");
     assert_eq!(linked.status, Status::Ok);
@@ -1143,7 +1143,11 @@ fn linked_artifact_is_a_distinct_final_phase_tab() {
     );
     assert!(linked.summary.contains("1 externs"), "{}", linked.summary);
     assert_eq!(linked.nodes[1].children[0].label, "extern");
-    assert!(linked.nodes[1].children[0].text.contains("runtime.host"));
+    assert!(
+        linked.nodes[1].children[0]
+            .text
+            .contains("\"runtime.host\"")
+    );
 
     let skipped = stage("linked", "let bad : Nat = fn x => x\n");
     assert_eq!(skipped.status, Status::Skipped);

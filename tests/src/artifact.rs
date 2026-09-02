@@ -356,7 +356,7 @@ fn model_artifact() -> Artifact {
         lir: Lir {
             externs: vec![artifact::Extern {
                 name: "bundle@1.0.0::consoleLog".to_string(),
-                target: vec!["console".to_string(), "log".to_string()],
+                target: "console.log".to_string(),
                 rep: Rep::Fn,
             }],
             functions: vec![artifact::Function {
@@ -672,7 +672,7 @@ fn nested_existential_result_boundaries_survive_artifact_text() {
     let artifact = built(
         "extern nested: ((Nat ->\n\
          { left when 'p: Nat, right when 'q: Nat }) -> Nat) -> Nat\n\
-         where 'p != 'q = host.nested\n",
+         where 'p != 'q = \"host.nested\"\n",
     );
     let value = artifact
         .header
@@ -726,7 +726,7 @@ fn nested_existential_result_boundaries_survive_artifact_text() {
 fn mixed_universal_input_to_existential_result_guarantee_round_trips() {
     let artifact = built(
         "extern relate: { input when 'u: Nat } ->\n\
-         { result when 'e: Nat } where 'u = 'e = host.relate\n",
+         { result when 'e: Nat } where 'u = 'e = \"host.relate\"\n",
     );
     let value = artifact
         .header
@@ -799,7 +799,7 @@ fn a_compiled_bundle_round_trips_through_canonical_text() {
 fn compiler_externs_cross_the_artifact_boundary_without_symbols_or_spans() {
     let artifact = built(
         "module Host =\n\
-         extern log : String -> () = console.log\n\
+         extern log : String -> () = \"console.log\"\n\
          end\n\
          let main = Host::log \"hello\"\n",
     );
@@ -810,13 +810,13 @@ fn compiler_externs_cross_the_artifact_boundary_without_symbols_or_spans() {
         artifact.lir.externs,
         [artifact::Extern {
             name: "tests@0.1.0::Host::log".to_string(),
-            target: vec!["console".to_string(), "log".to_string()],
+            target: "console.log".to_string(),
             rep: Rep::Fn,
         }]
     );
     let printed = assert_round_trip(&artifact);
     assert!(
-        printed.contains("(extern \"tests@0.1.0::Host::log\" (target \"console\" \"log\") fn)"),
+        printed.contains("(extern \"tests@0.1.0::Host::log\" (target \"console.log\") fn)"),
         "{printed}"
     );
     assert!(!printed.contains("Span"), "{printed}");
@@ -1378,11 +1378,11 @@ fn malformed_text_exercises_every_parser_and_reader_error_shape() {
     // Invalid values of each S-expression shape reach reader paths that a tag
     // miss or arity error does not.
     assert_bad_replacement(&valid, "(param 0 nat)", "(param 0 ())");
-    assert_bad_replacement(&valid, "(target \"console\" \"log\")", "(target)");
+    assert_bad_replacement(&valid, "(target \"console.log\")", "(target)");
     assert_bad_replacement(
         &valid,
+        "(target \"console.log\")",
         "(target \"console\" \"log\")",
-        "(target \"console\" \"\")",
     );
     assert_bad_replacement(&valid, "(selector named \"write\")", "\"write\"");
     assert_bad_replacement(

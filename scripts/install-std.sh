@@ -9,8 +9,8 @@ if ! source=$(cd -P -- "$source_input" 2>/dev/null && pwd); then
   printf 'standard-library source %q is not a directory\n' "$source_input" >&2
   exit 1
 fi
-if [[ ! -f "$source/Ruddy.toml" || ! -f "$source/main.hc" ]]; then
-  printf 'standard-library source %q is not a Ruddy project\n' "$source_input" >&2
+if [[ ! -f "$source/Ruddy.toml" || ! -f "$source/lib.hc" ]]; then
+  printf 'standard-library source %q is not a Ruddy standard-library project\n' "$source_input" >&2
   exit 1
 fi
 

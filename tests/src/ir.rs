@@ -9090,7 +9090,7 @@ fn dependency_interfaces_import_every_semantic_form() {
 
 #[test]
 fn externs_bind_terms_without_becoming_initializer_groups() {
-    let source = "extern log : String -> {} = console.log\nlet written = log \"hello\"";
+    let source = "extern log : String -> {} = \"console.log\"\nlet written = log \"hello\"";
     let (mint, output) = built(source);
     assert_eq!(output.program.externs.len(), 1);
     assert_eq!(output.program.terms.len(), 1);
@@ -9101,24 +9101,15 @@ fn externs_bind_terms_without_becoming_initializer_groups() {
         .first()
         .expect("the extern is lowered");
     assert_eq!(mint.name(*symbol), "log");
-    assert_eq!(
-        external
-            .value
-            .target
-            .segments
-            .iter()
-            .map(|part| part.tracked.as_str())
-            .collect::<Vec<_>>(),
-        ["console", "log"]
-    );
+    assert_eq!(external.value.target.tracked, "console.log");
     assert_eq!(
         display_program(source),
-        "extern log : String -> () = console.log\nlet written = log \"hello\""
+        "extern log : String -> () = \"console.log\"\nlet written = log \"hello\""
     );
 
     for source in [
-        "extern log : String -> () = console.log\nlet log = fn x => x",
-        "let log = fn x => x\nextern log : String -> () = console.log",
+        "extern log : String -> () = \"console.log\"\nlet log = fn x => x",
+        "let log = fn x => x\nextern log : String -> () = \"console.log\"",
     ] {
         let (_, output) = build_src(source);
         assert!(matches!(
@@ -9135,7 +9126,7 @@ fn externs_bind_terms_without_becoming_initializer_groups() {
 fn extern_abi_retains_resolved_arity_callback_nesting_and_effects() {
     let (_, output) = build_src(
         "effect Log = { write: () -> () }\n\
-         extern schedule : fn((fn(Nat, String) -> Boolean + !Log), Nat) -> (fn() -> String) + !Log = host.schedule",
+         extern schedule : fn((fn(Nat, String) -> Boolean + !Log), Nat) -> (fn() -> String) + !Log = \"host.schedule\"",
     );
     assert!(output.errors.is_empty(), "{:#?}", output.errors);
     let external = &output.program.externs.first().unwrap().1.value;
@@ -9197,7 +9188,7 @@ fn extern_abi_retains_resolved_arity_callback_nesting_and_effects() {
 #[test]
 fn invalid_names_inside_an_extern_abi_are_diagnosed_once_and_shape_is_retained() {
     let (_, output) =
-        build_src("extern broken : fn(Missing) -> fn() -> Other + !Absent = host.broken");
+        build_src("extern broken : fn(Missing) -> fn() -> Other + !Absent = \"host.broken\"");
     assert_eq!(output.errors.len(), 3, "{:#?}", output.errors);
     let abi = &output.program.externs.first().unwrap().1.value.abi;
     let ExternTypeKind::Function { result, .. } = &abi.tracked else {
@@ -9210,9 +9201,9 @@ fn invalid_names_inside_an_extern_abi_are_diagnosed_once_and_shape_is_retained()
 fn externs_accept_every_annotation_type() {
     let (_, output) = build_src(
         "effect Log = { write: () -> () }\n\
-         extern count : Nat = host.count\n\
-         extern point : { x: Nat } = host.point\n\
-         extern log : String -> () + !Log = console.log",
+         extern count : Nat = \"host.count\"\n\
+         extern point : { x: Nat } = \"host.point\"\n\
+         extern log : String -> () + !Log = \"console.log\"",
     );
     assert!(output.errors.is_empty(), "{:#?}", output.errors);
     assert_eq!(output.program.externs.len(), 3);
