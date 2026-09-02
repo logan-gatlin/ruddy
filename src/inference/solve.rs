@@ -15,9 +15,9 @@ use crate::{
 };
 
 use super::{
-    Batch, Constraint, ConstraintKind, DeferredRequirement, Effect, Error, ErrorCause, ErrorId,
-    ErrorKind, ExplainedScheme, Goal, GuardedArm, GuardedObligation, GuardedOrigin, Known, Named,
-    Origin, ReasonId, ReasonOrigin, RecursiveCycleShape, Refinement, RefinementFact, Rule,
+    Batch, Constraint, ConstraintKind, DeferredRequirement, Effect, Error, ErrorCause, ErrorKind,
+    ExplainedScheme, Goal, GuardedArm, GuardedObligation, GuardedOrigin, Known, Named, Origin,
+    ReasonId, ReasonOrigin, RecursiveCycleShape, Refinement, RefinementFact, Rule,
     SchemeProvenance, Side, Slot, Step, Table,
 };
 
@@ -600,13 +600,7 @@ impl Solve<'_> {
                     expected: Rc::new(Ty::unit()),
                     actual: exposed.clone(),
                 };
-                let error = Error {
-                    id: ErrorId::pending(),
-                    cause: ErrorCause::Direct,
-                    span: base_span,
-                    kind: ErrorKind::NotAStruct { base: exposed },
-                    explanation: None,
-                };
+                let error = Error::new(base_span, ErrorKind::NotAStruct { base: exposed });
                 self.fail(
                     base_span,
                     Rule::Mismatch,
@@ -616,18 +610,15 @@ impl Solve<'_> {
                 );
             }
             Ty::Rigid { id, name } => {
-                let error = Error {
-                    id: ErrorId::pending(),
-                    cause: ErrorCause::Direct,
-                    span: field_span,
-                    kind: ErrorKind::RigidField {
+                let error = Error::new(
+                    field_span,
+                    ErrorKind::RigidField {
                         shape: Shape::Struct,
                         field: field.to_string(),
                         name: name.clone(),
                         declared: self.table.declared(*id),
                     },
-                    explanation: None,
-                };
+                );
                 let goal = Goal::Type {
                     expected: Rc::new(Ty::unit()),
                     actual: exposed.clone(),
@@ -1438,13 +1429,7 @@ impl Solve<'_> {
                 span,
                 Rule::Performs,
                 goal,
-                Error {
-                    id: ErrorId::pending(),
-                    cause: ErrorCause::Direct,
-                    span,
-                    kind,
-                    explanation: None,
-                },
+                Error::new(span, kind),
                 &abandoned,
             );
             return;
@@ -2232,34 +2217,28 @@ impl Solve<'_> {
         sense: Sense,
         found: &Rc<Ty>,
     ) -> bool {
-        let error = Error {
-            id: ErrorId::pending(),
-            cause: ErrorCause::Direct,
+        let error = Error::new(
             span,
-            kind: ErrorKind::RigidBroken {
+            ErrorKind::RigidBroken {
                 found: found.clone(),
                 name,
                 sense,
                 declared: self.table.declared(id),
             },
-            explanation: None,
-        };
+        );
         let abandoned = [Assigned::Ty(found.clone())];
         self.fail(span, Rule::Mismatch, goal, error, &abandoned);
         false
     }
 
     fn mismatch(&mut self, span: Span, goal: Goal, lhs: &Rc<Ty>, rhs: &Rc<Ty>) -> bool {
-        let error = Error {
-            id: ErrorId::pending(),
-            cause: ErrorCause::Direct,
+        let error = Error::new(
             span,
-            kind: ErrorKind::Mismatch {
+            ErrorKind::Mismatch {
                 expected: lhs.clone(),
                 actual: rhs.clone(),
             },
-            explanation: None,
-        };
+        );
         let abandoned = [Assigned::Ty(lhs.clone()), Assigned::Ty(rhs.clone())];
         self.fail(span, Rule::Mismatch, goal, error, &abandoned);
         false
@@ -2320,13 +2299,7 @@ impl Solve<'_> {
                 only_want.clear();
                 only_have.clear();
             } else {
-                let error = Error {
-                    id: ErrorId::pending(),
-                    cause: ErrorCause::Direct,
-                    span,
-                    kind: ErrorKind::Recursive,
-                    explanation: None,
-                };
+                let error = Error::new(span, ErrorKind::Recursive);
                 let abandoned = [
                     expected.tail.value(expected.labels.clone()),
                     actual.tail.value(actual.labels.clone()),
@@ -2581,13 +2554,7 @@ impl Solve<'_> {
                     span,
                     Rule::Presence { shape },
                     goal,
-                    Error {
-                        id: ErrorId::pending(),
-                        cause: ErrorCause::Direct,
-                        span,
-                        kind,
-                        explanation: None,
-                    },
+                    Error::new(span, kind),
                     &abandoned,
                 );
                 None
@@ -2841,18 +2808,15 @@ impl Solve<'_> {
             // A label still being decided is not a demand and is not refused:
             // it settles absent below, the one answer the promise leaves open.
             if let (Presence::Present, Some((rigid, id))) = (&presence, &rigid) {
-                let error = Error {
-                    id: ErrorId::pending(),
-                    cause: ErrorCause::Direct,
+                let error = Error::new(
                     span,
-                    kind: ErrorKind::RigidField {
+                    ErrorKind::RigidField {
                         shape,
                         field: name.clone(),
                         name: rigid.clone(),
                         declared: self.table.declared(*id),
                     },
-                    explanation: None,
-                };
+                );
                 let goal = Goal::Presence {
                     expected: Presence::Absent,
                     actual: presence.clone(),
@@ -2877,13 +2841,7 @@ impl Solve<'_> {
                         base: self.frozen(base),
                         field: name.clone(),
                     };
-                    let error = Error {
-                        id: ErrorId::pending(),
-                        cause: ErrorCause::Direct,
-                        span,
-                        kind,
-                        explanation: None,
-                    };
+                    let error = Error::new(span, kind);
                     let abandoned = [Assigned::Ty(field.ty.clone())];
                     self.fail(span, Rule::Presence { shape }, goal, error, &abandoned);
                 }
@@ -2897,13 +2855,7 @@ impl Solve<'_> {
                         base: self.frozen(base),
                         field: name.clone(),
                     };
-                    let error = Error {
-                        id: ErrorId::pending(),
-                        cause: ErrorCause::Direct,
-                        span,
-                        kind,
-                        explanation: None,
-                    };
+                    let error = Error::new(span, kind);
                     let abandoned = [Assigned::Ty(field.ty.clone())];
                     self.fail(span, Rule::Presence { shape }, goal, error, &abandoned);
                 }
@@ -2957,13 +2909,7 @@ impl Solve<'_> {
     /// answer [`Solve::absorb`] gives the same label against a closed row.
     fn assign(&mut self, span: Span, goal: Goal, var: TyVar, value: Assigned) {
         if let Some(route) = self.table.occurs(var, &value) {
-            let error = Error {
-                id: ErrorId::pending(),
-                cause: ErrorCause::Direct,
-                span,
-                kind: ErrorKind::Recursive,
-                explanation: None,
-            };
+            let error = Error::new(span, ErrorKind::Recursive);
             let abandoned = [value.variable(var), value];
             self.fail_recursive(span, goal, error, &abandoned, route);
             return;
@@ -2990,18 +2936,15 @@ impl Solve<'_> {
                 .iter()
                 .find(|(_, presence, _)| matches!(presence, Presence::Present))
             {
-                let error = Error {
-                    id: ErrorId::pending(),
-                    cause: ErrorCause::Direct,
+                let error = Error::new(
                     span,
-                    kind: ErrorKind::RepeatedField {
+                    ErrorKind::RepeatedField {
                         shape: lacked.shape,
                         field: lacked.label.clone(),
                         introduction: introduction.clone(),
                         forbidden: lacked.origin.clone(),
                     },
-                    explanation: None,
-                };
+                );
                 if let Some(origin) = &lacked.origin {
                     self.table.note_binding_read(origin.reason);
                 }

@@ -2087,8 +2087,8 @@ pub enum ErrorCause {
 }
 
 impl Error {
-    /// Construct an error for focused semantic/UI tests. Inference replaces
-    /// this pending identity before publishing an [`Output`].
+    /// A direct, not-yet-explained error. Inference replaces the pending
+    /// identity before publishing an [`Output`].
     pub fn new(span: Span, kind: ErrorKind) -> Self {
         Self {
             id: ErrorId::pending(),
@@ -2365,7 +2365,9 @@ type Lacks = IndexMap<String, LacksEntry>;
 /// only during unification or have their own congruence rollback in [`Solve`].
 struct Known {
     vars: Vec<Slot>,
-    var_meta: Vec<VarMeta>,
+    /// [`Table::var_meta`] is append-only, so its snapshot is its length and
+    /// putting it back is a truncate.
+    var_meta_len: usize,
     levels: Vec<u32>,
     lacks: HashMap<TyVar, Lacks>,
     active_lacks_origin: Option<RowFactOrigin>,
@@ -4275,20 +4277,26 @@ fn explanatory_name(base: &str, visible_names: &HashSet<String>) -> String {
     }
 }
 
+/// Keep the earliest and latest entries of an ordered list, dropping the
+/// middle, so a bounded slice preserves both defining endpoints. Returns how
+/// many entries were dropped.
+fn keep_endpoints(items: &mut Vec<ReasonId>, limit: usize) -> usize {
+    if items.len() <= limit {
+        return 0;
+    }
+    let dropped = items.len() - limit;
+    let low = limit / 2;
+    let high = limit - low;
+    let tail_start = items.len() - high;
+    items.drain(low..tail_start);
+    dropped
+}
+
 fn budget_reason_slice(mut reasons: Vec<ReasonId>) -> (Vec<ReasonId>, usize) {
     const MAX_EXPLANATION_REASONS: usize = 16_384;
     reasons.sort_unstable();
-    let omitted = reasons.len().saturating_sub(MAX_EXPLANATION_REASONS);
-    if omitted == 0 {
-        return (reasons, 0);
-    }
-    let half = MAX_EXPLANATION_REASONS / 2;
-    let kept = reasons[..half]
-        .iter()
-        .chain(&reasons[reasons.len() - half..])
-        .copied()
-        .collect();
-    (kept, omitted)
+    let omitted = keep_endpoints(&mut reasons, MAX_EXPLANATION_REASONS);
+    (reasons, omitted)
 }
 
 struct ExplanationSources<'a> {
@@ -6376,7 +6384,7 @@ impl Table {
     fn snapshot(&self) -> Known {
         Known {
             vars: self.vars.clone(),
-            var_meta: self.var_meta.clone(),
+            var_meta_len: self.var_meta.len(),
             levels: self.levels.clone(),
             lacks: self.lacks.clone(),
             active_lacks_origin: self.active_lacks_origin.clone(),
@@ -6393,7 +6401,7 @@ impl Table {
     /// into something, and every binding made since is being undone here too.
     fn restore(&mut self, known: Known) {
         self.vars = known.vars;
-        self.var_meta = known.var_meta;
+        self.var_meta.truncate(known.var_meta_len);
         self.levels = known.levels;
         self.lacks = known.lacks;
         self.active_lacks_origin = known.active_lacks_origin;
@@ -9168,23 +9176,11 @@ impl Table {
         // earliest defining and latest relevant endpoints at both levels.
         const PER_POSITION: usize = 64;
         const TOTAL: usize = 256;
-        fn trim(roots: &mut Vec<ReasonId>, omitted: &mut usize, limit: usize) {
-            if roots.len() <= limit {
-                return;
-            }
-            let old = roots.len();
-            let low = limit / 2;
-            let high = limit - low;
-            let mut kept = roots[..low].to_vec();
-            kept.extend_from_slice(&roots[old - high..]);
-            *roots = kept;
-            *omitted += old - limit;
-        }
         for node in &mut nodes {
-            trim(&mut node.roots, &mut node.omitted, PER_POSITION);
+            node.omitted += keep_endpoints(&mut node.roots, PER_POSITION);
         }
         for slot in &mut quantified {
-            trim(&mut slot.roots, &mut slot.omitted, PER_POSITION);
+            slot.omitted += keep_endpoints(&mut slot.roots, PER_POSITION);
         }
         let mut all = nodes
             .iter()
@@ -9193,14 +9189,8 @@ impl Table {
             .collect::<Vec<_>>();
         all.sort_unstable();
         all.dedup();
-        if all.len() > TOTAL {
-            let low = TOTAL / 2;
-            let high = TOTAL - low;
-            let keep: HashSet<_> = all[..low]
-                .iter()
-                .chain(&all[all.len() - high..])
-                .copied()
-                .collect();
+        if keep_endpoints(&mut all, TOTAL) > 0 {
+            let keep: HashSet<_> = all.iter().copied().collect();
             for node in &mut nodes {
                 let old = node.roots.len();
                 node.roots.retain(|root| keep.contains(root));
