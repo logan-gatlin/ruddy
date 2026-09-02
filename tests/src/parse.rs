@@ -644,7 +644,7 @@ fn a_mismatched_closer_points_to_the_innermost_opener() {
         ("let {) = value", "}", '{', ')'),
         ("type T = {)", "}", '{', ')'),
         ("effect E = {)", "}", '{', ')'),
-        ("extern f : fn(} -> Nat = host.f", ")", '(', '}'),
+        ("extern f : fn(} -> Nat = \"host.f\"", ")", '(', '}'),
         // Each shape nested in the other: the innermost unmatched opener wins.
         ("let value = { field: ( }", ")", '(', '}'),
         ("let value = ({ field: item )", "}", '{', ')'),
@@ -685,7 +685,7 @@ fn a_delimiter_boundary_asks_for_the_matching_closer() {
         ("let { = value", "}", '{', "="),
         ("let value = let inner = ( in inner", ")", '(', "in inner"),
         ("let value = let inner = { in inner", "}", '{', "in inner"),
-        ("extern f : fn( -> Nat = host.f", ")", '(', "->"),
+        ("extern f : fn( -> Nat = \"host.f\"", ")", '(', "->"),
         // A trailing comma is legal; at the boundary it is the closer, not
         // another tuple element or field, which is absent.
         ("let value : (Nat, = source", ")", '(', "="),
@@ -2643,7 +2643,7 @@ fn an_extern_declares_a_string_foreign_target_of_any_type() {
     assert_eq!(target.span, FileID::GENERATED.span(22, 13));
 
     for source in [
-        "extern answer = host.answer",
+        "extern answer = \"host.answer\"",
         "extern answer : Nat",
         "extern answer : Nat = host",
     ] {

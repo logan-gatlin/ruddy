@@ -1,1 +1,1 @@
-extern run : fn('a) -> Nat = host.run
+extern run : fn('a) -> Nat = "host.run"

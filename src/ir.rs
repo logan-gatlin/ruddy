@@ -10588,37 +10588,6 @@ fn sense(shape: Shape) -> Sense {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        parse,
-        symbol::{Bundle, Version},
-        token,
-        tracking::FileID,
-    };
-
-    #[test]
-    fn extern_target_text_and_literal_span_survive_lowering() {
-        let source = r#"extern value : String = "globalThis.answer""#;
-        let lexed = token::lex(source, FileID::GENERATED);
-        assert!(lexed.errors.is_empty());
-        let parsed = parse::parse(lexed.tokens);
-        assert!(parsed.errors.is_empty());
-
-        let bundle = Bundle::new("test", Version::new(0, 0, 0)).unwrap();
-        let mut mint = Mint::new(bundle);
-        let lowered = build(&mut mint, parsed.stmts);
-        assert!(lowered.errors.is_empty(), "IR errors: {:?}", lowered.errors);
-
-        let external = lowered.program.externs.values().next().unwrap();
-        assert_eq!(external.value.target.tracked, "globalThis.answer");
-        let start = source.find('"').unwrap();
-        assert_eq!(external.value.target.span.start, start);
-        assert_eq!(external.value.target.span.width, source.len() - start);
-    }
-}
-
 /// What a variable written here is told, or `None` where one may be written.
 ///
 /// The two positions that hold for every use of what they describe refuse one,
@@ -10668,4 +10637,35 @@ fn tails_a_parameter(tail: &Option<Tail>) -> bool {
             ..
         })
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        parse,
+        symbol::{Bundle, Version},
+        token,
+        tracking::FileID,
+    };
+
+    #[test]
+    fn extern_target_text_and_literal_span_survive_lowering() {
+        let source = r#"extern value : String = "globalThis.answer""#;
+        let lexed = token::lex(source, FileID::GENERATED);
+        assert!(lexed.errors.is_empty());
+        let parsed = parse::parse(lexed.tokens);
+        assert!(parsed.errors.is_empty());
+
+        let bundle = Bundle::new("test", Version::new(0, 0, 0)).unwrap();
+        let mut mint = Mint::new(bundle);
+        let lowered = build(&mut mint, parsed.stmts);
+        assert!(lowered.errors.is_empty(), "IR errors: {:?}", lowered.errors);
+
+        let external = lowered.program.externs.values().next().unwrap();
+        assert_eq!(external.value.target.tracked, "globalThis.answer");
+        let start = source.find('"').unwrap();
+        assert_eq!(external.value.target.span.start, start);
+        assert_eq!(external.value.target.span.width, source.len() - start);
+    }
 }

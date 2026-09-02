@@ -990,7 +990,7 @@ fn unrelated_definitions_do_not_change_cross_definition_abridgement() {
 
 #[test]
 fn imported_contracts_fall_back_to_local_authoritative_uses() {
-    let source = "extern consume : Nat -> Nat = host.consume\nlet bad = consume false";
+    let source = "extern consume : Nat -> Nat = \"host.consume\"\nlet bad = consume false";
     let facts = explained_facts(source);
     let argument = source.rfind("false").unwrap();
     assert!(facts.iter().any(|fact| fact.span.start == argument));

@@ -8278,7 +8278,7 @@ fn extern_boundary_errors_publish_exact_source_payloads_and_paths() {
     let (_, _, output) = infer_src(
         "effect Read = () -> ()\n\
          effect Write = () -> ()\n\
-         extern install : fn(fn(()) -> () + !Read + !Write) -> () = host.install",
+         extern install : fn(fn(()) -> () + !Read + !Write) -> () = \"host.install\"",
     );
     let [error] = output.errors.as_slice() else {
         panic!("expected one callback boundary error: {:#?}", output.errors);
@@ -8324,7 +8324,7 @@ fn extern_boundary_errors_publish_exact_source_payloads_and_paths() {
 
     let (_, _, output) = infer_src(
         "effect Fail = () -> ()\n\
-         extern nested : fn(fn((), fn(fn(()) -> () + !Fail) -> ()) -> ()) -> () = host.nested",
+         extern nested : fn(fn((), fn(fn(()) -> () + !Fail) -> ()) -> ()) -> () = \"host.nested\"",
     );
     let error = output
         .errors
@@ -8340,7 +8340,7 @@ fn extern_boundary_errors_publish_exact_source_payloads_and_paths() {
     );
 
     let (_, _, output) =
-        infer_src("type Identity 'a = 'a\nextern make : fn(Nat) -> Identity 'a = host.make");
+        infer_src("type Identity 'a = 'a\nextern make : fn(Nat) -> Identity 'a = \"host.make\"");
     let [error] = output.errors.as_slice() else {
         panic!("{:#?}", output.errors)
     };
@@ -8379,7 +8379,7 @@ fn extern_boundary_aggregates_paths_and_retains_callback_evidence() {
     let (_, _, output) = infer_src(
         "effect Read = () -> ()\n\
          effect Write = () -> ()\n\
-         extern install : fn(fn(()) -> () + !Read, fn(()) -> () + !Write) -> () = host.install",
+         extern install : fn(fn(()) -> () + !Read, fn(()) -> () + !Write) -> () = \"host.install\"",
     );
     let [error] = output.errors.as_slice() else {
         panic!("{:#?}", output.errors)
@@ -8418,7 +8418,7 @@ fn extern_boundary_aggregates_paths_and_retains_callback_evidence() {
 
     let (_, _, output) = infer_src(
         "effect Fail = () -> ()\n\
-         extern install : fn(fn('a) -> () + !Fail) -> () = host.install",
+         extern install : fn(fn('a) -> () + !Fail) -> () = \"host.install\"",
     );
     let [error] = output.errors.as_slice() else {
         panic!("{:#?}", output.errors)
@@ -8440,7 +8440,7 @@ fn conditional_callback_failure_keeps_its_later_path_and_formula() {
     use ruddy::inference::ErrorKind;
     let (_, lowered, output) = infer_src(
         "effect Fail = () -> ()\n\
-         extern install : fn(fn(()) -> () + !Fail (when 'first), fn(()) -> () + !Fail (when 'second)) -> () + !Fail (when 'carried) where not 'first or 'carried = host.install",
+         extern install : fn(fn(()) -> () + !Fail (when 'first), fn(()) -> () + !Fail (when 'second)) -> () + !Fail (when 'carried) where not 'first or 'carried = \"host.install\"",
     );
     assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
     let [error] = output.errors.as_slice() else {
@@ -8468,11 +8468,11 @@ fn extern_boundary_reports_row_and_presence_kinds() {
     use ruddy::inference::{ErrorKind, ExternVariableKind};
     for (source, expected) in [
         (
-            "extern x : fn({ value: Nat, ..'fields }) -> () = host.x",
+            "extern x : fn({ value: Nat, ..'fields }) -> () = \"host.x\"",
             ExternVariableKind::Row,
         ),
         (
-            "extern x : fn({ value when 'present: Nat }) -> () = host.x",
+            "extern x : fn({ value when 'present: Nat }) -> () = \"host.x\"",
             ExternVariableKind::Presence,
         ),
     ] {
@@ -8497,7 +8497,7 @@ fn extern_boundary_alias_presence_and_multiple_variables_keep_exact_sources() {
     use ruddy::inference::{ErrorKind, ExternVariableKind};
 
     let maybe_source = "type Maybe 'r = #Nil | ..'r\n\
-         extern consume : fn(Maybe (#Some (when 'some) Nat)) -> () = host.consume";
+         extern consume : fn(Maybe (#Some (when 'some) Nat)) -> () = \"host.consume\"";
     let (_, lowered, output) = infer_src(maybe_source);
     assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
     let [error] = output.errors.as_slice() else {
@@ -8517,7 +8517,7 @@ fn extern_boundary_alias_presence_and_multiple_variables_keep_exact_sources() {
     );
     assert!(presence.position.contains("`Some` presence"));
 
-    let variables_source = "extern choose : fn('first, 'second) -> () = host.choose";
+    let variables_source = "extern choose : fn('first, 'second) -> () = \"host.choose\"";
     let (_, lowered, output) = infer_src(variables_source);
     assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
     let [error] = output.errors.as_slice() else {
@@ -8544,7 +8544,7 @@ fn local_and_imported_alias_callback_tails_keep_exact_relations() {
     use ruddy::inference::ErrorKind;
 
     let source = "type Callback 'e = () -> () + ..'e\n\
-         extern install : fn(Callback (..'needed)) -> () + ..'carried = host.install";
+         extern install : fn(Callback (..'needed)) -> () + ..'carried = \"host.install\"";
     let (_, lowered, output) = infer_src(source);
     assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
     let [error] = output.errors.as_slice() else {
@@ -8612,7 +8612,7 @@ fn polymorphic_leaf_and_callback_effect_tail_failures_share_one_error() {
     let (_, lowered, output) = infer_src(
         "effect Fail = () -> ()\n\
          type Callback 'a 'e = 'a -> () + !Fail + ..'e\n\
-         extern install : fn(Callback 'value (..'needed)) -> () + ..'carried = host.install",
+         extern install : fn(Callback 'value (..'needed)) -> () + ..'carried = \"host.install\"",
     );
     assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
     let [error] = output.errors.as_slice() else {
@@ -8673,7 +8673,7 @@ fn callback_diagnostic_renders_all_effects_tails_and_conditions() {
     let (_, _, output) = infer_src(
         "effect Read = () -> ()\n\
          effect Write = () -> ()\n\
-         extern install : fn(fn(()) -> () + !Read + !Write) -> () = host.install",
+         extern install : fn(fn(()) -> () + !Read + !Write) -> () = \"host.install\"",
     );
     let [error] = output.errors.as_slice() else {
         panic!("{:#?}", output.errors)
@@ -8689,7 +8689,7 @@ fn callback_diagnostic_renders_all_effects_tails_and_conditions() {
 
     let (_, _, output) = infer_src(
         "effect Fail = () -> ()\n\
-         extern install : fn(fn(()) -> () + !Fail (when 'needed), fn(()) -> () + !Fail (when 'needed)) -> () + !Fail (when 'carried) = host.install",
+         extern install : fn(fn(()) -> () + !Fail (when 'needed), fn(()) -> () + !Fail (when 'needed)) -> () + !Fail (when 'carried) = \"host.install\"",
     );
     let [error] = output.errors.as_slice() else {
         panic!("{:#?}", output.errors)
@@ -8726,7 +8726,7 @@ fn aggregated_callback_requirements_keep_each_effects_condition() {
     let (_, lowered, output) = infer_src(
         "effect Read = () -> ()\n\
          effect Write = () -> ()\n\
-         extern install : fn(fn(()) -> (() -> () + !Write (when 'needed)) + !Read) -> () = host.install",
+         extern install : fn(fn(()) -> (() -> () + !Write (when 'needed)) + !Read) -> () = \"host.install\"",
     );
     assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
     let [error] = output.errors.as_slice() else {
@@ -8764,7 +8764,7 @@ fn tail_only_callback_issue_does_not_claim_a_satisfied_label_condition() {
     use ruddy::inference::ErrorKind;
     let (_, lowered, output) = infer_src(
         "effect Fail = () -> ()\n\
-         extern install : fn(fn(()) -> () + !Fail (when 'needed) + ..'tail) -> () + !Fail (when 'carried) + ..'other where not 'needed or 'carried = host.install",
+         extern install : fn(fn(()) -> () + !Fail (when 'needed) + ..'tail) -> () + !Fail (when 'carried) + ..'other where not 'needed or 'carried = \"host.install\"",
     );
     assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
     let [error] = output.errors.as_slice() else {
@@ -8785,7 +8785,7 @@ fn complete_extern_callback_repairs_cover_labels_and_remainders() {
     let (_, lowered, output) = infer_src(
         "effect Fail = () -> ()\n\
          type Callback 'a 'e = 'a -> () + !Fail + ..'e\n\
-         extern install : fn(Callback Nat (..'shared)) -> () + !Fail + ..'shared = host.install",
+         extern install : fn(Callback Nat (..'shared)) -> () + !Fail + ..'shared = \"host.install\"",
     );
     assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
     assert!(output.errors.is_empty(), "{:#?}", output.errors);
@@ -8794,7 +8794,7 @@ fn complete_extern_callback_repairs_cover_labels_and_remainders() {
     // caller-chosen fixed relation. It can acquire the callback's exact label.
     let (_, lowered, output) = infer_src(
         "effect Fail = () -> ()\n\
-         extern install : fn(fn(()) -> () + !Fail) -> () + .. = host.install",
+         extern install : fn(fn(()) -> () + !Fail) -> () + .. = \"host.install\"",
     );
     assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
     assert!(output.errors.is_empty(), "{:#?}", output.errors);
@@ -8805,7 +8805,7 @@ fn callback_result_spine_issues_deduplicate_by_path() {
     use ruddy::inference::ErrorKind;
     let (_, lowered, output) = infer_src(
         "effect Read = () -> ()\n\
-         extern install : fn(fn(()) -> (() -> () + !Read) + !Read) -> () = host.install",
+         extern install : fn(fn(()) -> (() -> () + !Read) + !Read) -> () = \"host.install\"",
     );
     assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
     let [error] = output.errors.as_slice() else {
@@ -8823,7 +8823,7 @@ fn extern_callback_solver_causes_resolve_to_published_constraints() {
     use ruddy::inference::ErrorKind;
     let (_, _, output) = infer_src(
         "type Callback 'e = () -> () + ..'e\n\
-         extern install : fn(Callback (..'e)) -> () + ..'f = host.install",
+         extern install : fn(Callback (..'e)) -> () + ..'f = \"host.install\"",
     );
     let error = output
         .errors
@@ -9392,7 +9392,7 @@ fn callback_steps_resolve_to_published_callback_constraints() {
     let (_, _, output) = infer_src(
         "effect Fail = { abort: () -> () }\n\
          type Callback = () -> () + !Fail\n\
-         extern install : fn(Callback) -> () + !Fail = host.install",
+         extern install : fn(Callback) -> () + !Fail = \"host.install\"",
     );
     let mut constraints = Vec::new();
     for generated in output.constraints.values() {
@@ -9451,7 +9451,7 @@ fn ordinary_solve_errors_link_directly_to_their_failed_steps() {
 fn callback_rewrite_updates_the_linked_failed_step_effect() {
     let (_, _, output) = infer_src(
         "type Callback 'e = () -> () + ..'e\n\
-         extern install : fn(Callback (..'e)) -> () + ..'f = host.install",
+         extern install : fn(Callback (..'e)) -> () + ..'f = \"host.install\"",
     );
     let [error] = output.errors.as_slice() else {
         panic!("expected one callback error: {:#?}", output.errors);
@@ -9494,7 +9494,7 @@ fn sat_errors_link_directly_to_their_flipped_batches() {
 
 #[test]
 fn direct_boundary_errors_have_stable_ids_without_solve_steps() {
-    let (_, _, output) = infer_src("extern echo : fn('a) -> 'a = host.echo");
+    let (_, _, output) = infer_src("extern echo : fn('a) -> 'a = \"host.echo\"");
     let [error] = output.errors.as_slice() else {
         panic!("expected one boundary error: {:#?}", output.errors);
     };

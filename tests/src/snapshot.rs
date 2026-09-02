@@ -1680,7 +1680,7 @@ fn an_argument_wears_its_type_through_a_declared_type() {
 fn extern_boundary_explanations_reach_the_debugger_with_cli_vocabulary() {
     let callback = snapshot(
         "effect Fail = () -> ()\n\
-         extern install : fn(fn(()) -> () + !Fail) -> () = host.install\n",
+         extern install : fn(fn(()) -> () + !Fail) -> () = \"host.install\"\n",
     );
     let diagnostic = callback
         .diagnostics
@@ -1710,7 +1710,7 @@ fn extern_boundary_explanations_reach_the_debugger_with_cli_vocabulary() {
     );
     assert_eq!(explanation.full.len(), explanation.abridged.len());
 
-    let polymorphic = snapshot("extern run : fn('a) -> Nat = host.run\n");
+    let polymorphic = snapshot("extern run : fn('a) -> Nat = \"host.run\"\n");
     let diagnostic = polymorphic
         .diagnostics
         .iter()
@@ -2615,7 +2615,7 @@ fn zero_step_solves_still_publish_machine_readable_arenas() {
 fn inference_stage_rows_serialize_compiler_identities() {
     let source = "effect Fail = { abort: () -> () }\n\
                   type Callback = () -> () + !Fail\n\
-                  extern install : fn(Callback) -> () + !Fail = host.install\n\
+                  extern install : fn(Callback) -> () + !Fail = \"host.install\"\n\
                   let choose : { x when 'a: Nat, y when 'b: Nat } -> Nat where 'a != 'b = fn v => match v with | {x} => x | {y} => y end\n\
                   let local = fn tag => match tag with | {a} => let g = fn w => choose w in g {} | {b} => 0n end\n\
                   let bad = (1n).missing\n";
