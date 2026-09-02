@@ -9,6 +9,7 @@ pub mod artifact;
 pub mod ast;
 pub mod constraints;
 pub mod dependencies;
+pub mod errors;
 pub mod externs;
 pub mod ir;
 pub mod js;
@@ -41,6 +42,11 @@ pub struct Cx<'a> {
     /// indexes them. A stage naming the file a node came from reads its path
     /// from here.
     pub files: &'a [FileInfo],
+    /// Source text in the same order as `files`, retained server-side for
+    /// panels that quote it without sending a second copy over the wire.
+    pub sources: &'a [String],
+    /// Diagnostics in the same source order as the always-visible strip.
+    pub diagnostics: &'a [crate::wire::Diagnostic],
     /// What the load produced: the tokens and parse errors of every file, and
     /// the spliced statement tree.
     pub bundle: Option<&'a ruddy::bundle::Output>,
@@ -181,6 +187,15 @@ const TEMPS: &str = r"%\d+";
 /// annotates another owns no tab, so its place in the list does not matter to
 /// the page; the annotators sit at the end to keep the tab order readable.
 pub const REGISTRY: &[Spec] = &[
+    Spec {
+        id: "errors",
+        title: "Errors",
+        view: View::Terminal,
+        highlight: None,
+        scoped: false,
+        annotates: None,
+        build: Build::Panel(errors::build),
+    },
     Spec {
         id: "tokens",
         title: "Tokens",
@@ -403,6 +418,7 @@ impl Spec {
 fn views(view: View) -> &'static [View] {
     match view {
         View::Text => &[View::Text, View::Tree],
+        View::Terminal => &[View::Terminal],
         View::List => &[View::List],
         View::Tree => &[View::Tree],
         View::Steps => &[View::Steps],

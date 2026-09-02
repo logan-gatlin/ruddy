@@ -163,7 +163,10 @@ fn unrelated_same_span_batches_do_not_hide_match_coverage() {
         .expect("the qualifying match has a coverage batch");
     let (definition, span) = (coverage.definition, coverage.span);
 
-    let named = || inference::Named { labels: Vec::new() };
+    let named = || inference::Named {
+        labels: Vec::new(),
+        shape: None,
+    };
     for origin in [
         inference::Origin::Instance(named()),
         inference::Origin::Annotation(named()),
@@ -178,9 +181,11 @@ fn unrelated_same_span_batches_do_not_hide_match_coverage() {
         altered.store.batches.insert(
             0,
             inference::Batch {
+                id: inference::BatchId::synthetic(0),
                 definition,
                 span,
                 origin,
+                reason: inference::ReasonId::synthetic(0),
                 formula: Formula::True,
                 flipped: false,
             },
@@ -434,7 +439,7 @@ fn a_qualifying_column_is_exhaustive_by_its_constraint() {
 /// store allowed before it.
 #[test]
 fn a_scrutinee_that_contradicts_the_coverage_is_unhandled() {
-    let src = "let bad = match {x: 1n, y: 2n} with {x} => {} | {y} => {} end";
+    let src = "let bad = match {x: 1n, y: 2n} with | {x} => {} | {y} => {} end";
     let (out, inferred, checks) = checked(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);

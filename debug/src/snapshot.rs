@@ -21,15 +21,15 @@ use ruddy::{
     bundle::{self, Files},
     inference, ir, lir, patterns,
     symbol::{Bundle, Mint, Version},
-    tracking::{FileID, FileManager, Span},
+    tracking::{FileID, FileManager},
     ui,
 };
 
 use crate::{
     stage::{self, Build, Cx, Phases, Trace},
     wire::{
-        CompileRequest, Diagnostic, FileInfo, FileSpec, Loc, Panic, Related, Severity, Snapshot,
-        line_starts, loc, locate,
+        CompileRequest, Diagnostic, FileInfo, FileSpec, InferenceCause, Loc, Panic, Related,
+        Severity, Snapshot, line_starts, loc, locate,
     },
 };
 
@@ -122,41 +122,73 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     // loader, which reads an absent file as an empty one: only the debugger
     // knows that the page is meant to have put one there.
     if fs.read(&req.root).is_none() {
-        diagnostics.push(raw(
+        let mut diagnostic = raw(
             "bundle",
-            "missing-root-file",
-            if req.root == ROOT {
-                format!("a document needs a `{ROOT}`; it is the bundle's root file")
-            } else {
-                format!("a document needs its configured root `{}`", req.root)
-            },
+            "project-root-missing",
+            format!("this document needs its root file `{}`", req.root),
             None,
-        ));
+        );
+        diagnostic
+            .help
+            .push(format!("create `{}` or choose another root file", req.root));
+        diagnostics.push(diagnostic);
     }
 
     // Identity is project configuration, not source syntax. Keep malformed
     // wire input recoverable like every compiler error: report it, mint under
     // a stable fallback, and still show all later phases that can run.
-    let configured = Version::parse(&req.version)
-        .ok()
+    let parsed_version = Version::parse(&req.version).ok();
+    let configured = parsed_version
+        .clone()
         .filter(|version| version.build.is_empty())
         .and_then(|version| Bundle::new(&req.name, version));
     if configured.is_none() {
-        diagnostics.push(raw(
-            "bundle",
-            "bad-bundle-identity",
-            format!(
-                "`{}@{}` is not a valid Ruddy bundle identity",
-                req.name, req.version
-            ),
-            None,
-        ));
+        let mut diagnostic = if parsed_version.is_none() {
+            raw(
+                "bundle",
+                "project-version-invalid",
+                format!("`{}` is not a valid project version", req.version),
+                None,
+            )
+        } else if parsed_version
+            .as_ref()
+            .is_some_and(|version| !version.build.is_empty())
+        {
+            raw(
+                "bundle",
+                "project-version-build-suffix",
+                format!(
+                    "project version `{}` has an unsupported `+` suffix",
+                    req.version
+                ),
+                None,
+            )
+        } else {
+            raw(
+                "bundle",
+                "project-name-invalid",
+                format!("`{}` is not a valid project name", req.name),
+                None,
+            )
+        };
+        diagnostic.help.push(if parsed_version.is_none() {
+            "use three numbers such as `1.2.3`".to_string()
+        } else if parsed_version
+            .as_ref()
+            .is_some_and(|version| !version.build.is_empty())
+        {
+            "remove the `+...` suffix from the version".to_string()
+        } else {
+            "start with an ASCII letter and use only ASCII letters, digits, `-`, or `_`".to_string()
+        });
+        diagnostics.push(diagnostic);
     }
     let identity = configured.as_ref().map(ToString::to_string);
 
     // Resolve and compile saved dependency projects, including the standard
     // library synthesized ahead of explicit declarations. Configuration
-    // failures are recoverable so active source phases remain inspectable.
+    // failures are recoverable so source, token, and AST views remain
+    // inspectable, but semantic phases wait for the requested imports.
     let dependency_started = Instant::now();
     let mut dependency_artifacts = Vec::new();
     let mut dependency_aliases = Vec::new();
@@ -164,22 +196,33 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     let mut linked_interfaces = Vec::new();
     if !req.std.is_disabled() || !req.dependencies.is_empty() {
         match scratch {
-            None => diagnostics.push(raw(
-                "dependencies",
-                "missing-scratch-root",
-                "dependency projects require a debugger scratch root".to_string(),
-                None,
-            )),
+            None => {
+                let mut diagnostic = raw(
+                    "dependencies",
+                    "dependency-workspace-missing",
+                    "saved dependencies need a document workspace".to_string(),
+                    None,
+                );
+                diagnostic.help.push(
+                    "open the debugger with a scratch directory before adding dependencies"
+                        .to_string(),
+                );
+                diagnostics.push(diagnostic);
+            }
             Some(scratch) => {
                 let project = match crate::docs::path(scratch, &req.document) {
                     Some(project) => project,
                     None => {
-                        diagnostics.push(raw(
+                        let mut diagnostic = raw(
                             "dependencies",
-                            "bad-document",
-                            "the active document name is invalid".to_string(),
+                            "document-name-invalid",
+                            "this document name cannot be used for saved dependencies".to_string(),
                             None,
-                        ));
+                        );
+                        diagnostic.help.push(
+                            "rename the document using letters, digits, `-`, or `_`".to_string(),
+                        );
+                        diagnostics.push(diagnostic);
                         PathBuf::from("invalid-document")
                     }
                 };
@@ -219,12 +262,12 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
                             .collect();
                         dependency_artifacts = direct;
                     }
-                    Err(error) => diagnostics.push(raw(
-                        "dependencies",
-                        "dependency-build",
-                        error.to_string(),
-                        None,
-                    )),
+                    Err(error) => diagnostics.extend(
+                        error
+                            .into_diagnostics()
+                            .into_iter()
+                            .map(dependency_diagnostic),
+                    ),
                 }
             }
         }
@@ -237,24 +280,38 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     };
     let mut mint = Mint::new(configured.unwrap_or_else(fallback));
 
-    let mut built = loaded.as_ref().and_then(|loaded| {
-        let started = Instant::now();
-        let out = guard("ir", &mut panicked, || {
-            let imports: Vec<_> = dependency_aliases
+    let dependencies_valid = !diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.stage == "dependencies");
+    let frontend_clean = loaded.as_ref().is_some_and(|loaded| {
+        loaded.errors.is_empty()
+            && loaded
+                .loaded
                 .iter()
-                .zip(&dependency_interfaces)
-                .map(|(alias, artifact)| ir::DependencyImport { alias, artifact })
-                .collect();
-            ir::build_with_dependency_imports(
-                &mut mint,
-                loaded.stmts.clone(),
-                &imports,
-                &linked_interfaces,
-            )
-        });
-        micros.build = started.elapsed().as_micros() as u64;
-        out
+                .all(|file| file.lex_errors.is_empty() && file.parse_errors.is_empty())
     });
+
+    let mut built = loaded
+        .as_ref()
+        .filter(|_| frontend_clean && dependencies_valid)
+        .and_then(|loaded| {
+            let started = Instant::now();
+            let out = guard("ir", &mut panicked, || {
+                let imports: Vec<_> = dependency_aliases
+                    .iter()
+                    .zip(&dependency_interfaces)
+                    .map(|(alias, artifact)| ir::DependencyImport { alias, artifact })
+                    .collect();
+                ir::build_with_dependency_imports(
+                    &mut mint,
+                    loaded.stmts.clone(),
+                    &imports,
+                    &linked_interfaces,
+                )
+            });
+            micros.build = started.elapsed().as_micros() as u64;
+            out
+        });
 
     // Inference mutates the program it types, so it borrows `built` mutably
     // and finishes before any stage looks at either.
@@ -283,58 +340,53 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
 
     // Every phase words and codes its own errors in `ruddy::ui`, so the strip
     // and the CLI driver cannot describe the same program differently, and a
-    // new error kind reaches both the moment it exists. What is added here is
-    // what only the strip has: the quoted snippet, and the second span a
-    // duplicate points back at.
-    //
-    // The source a span is quoted out of is the file it was written in, which
-    // the loader registered and the file manager still holds — so a complaint
-    // about a module file quotes that file rather than whatever the editor has
-    // in front of it.
-    let source = |span: Span| sources.get(&span.file_id).cloned().unwrap_or_default();
+    // new error kind reaches both the moment it exists. This layer only maps
+    // the shared diagnostic's spans into debugger file locations.
     if let Some(loaded) = &loaded {
         for file in &loaded.loaded {
-            diagnostics.extend(file.lex_errors.iter().map(|error| {
-                raw(
-                    "lex",
-                    error.kind.code(),
-                    format!("{} {}", error.kind, quote(&source(error.span), error.span)),
-                    loc(error.span, &index),
+            let mut source_errors: Vec<_> = file
+                .lex_errors
+                .iter()
+                .map(|error| source_error("lex", error.diagnostic(), &index))
+                .chain(
+                    file.parse_errors
+                        .iter()
+                        .map(|error| source_error("parse", error.diagnostic(), &index)),
                 )
-            }));
-            diagnostics.extend(file.parse_errors.iter().map(|error| {
-                raw(
-                    "parse",
-                    error.code(),
-                    format!("{error} {}", quote(&source(error.span), error.span)),
-                    loc(error.span, &index),
-                )
-            }));
+                .collect();
+            source_errors.sort_by_key(|error| error.span.map_or(usize::MAX, |span| span.range[0]));
+            diagnostics.extend(source_errors);
         }
-        diagnostics.extend(loaded.errors.iter().map(|error| {
-            raw(
-                "bundle",
-                error.kind.code(),
-                error.kind.to_string(),
-                loc(error.span, &index),
-            )
-        }));
+        diagnostics.extend(
+            loaded
+                .errors
+                .iter()
+                .map(|error| source_error("bundle", error.diagnostic(), &index)),
+        );
     }
     if let Some(built) = &built {
         diagnostics.extend(
             built
                 .errors
                 .iter()
-                .map(|error| ir_diagnostic(&source(error.span), error, &index)),
+                .map(|error| source_error("ir", error.diagnostic(), &index)),
         );
     }
     if let Some(inferred) = &inferred {
-        diagnostics.extend(
-            inferred
-                .errors
-                .iter()
-                .map(|error| inference_diagnostic(error, &index)),
-        );
+        diagnostics.extend(inferred.errors.iter().map(|error| {
+            let mut diagnostic = source_error("types", error.diagnostic(), &index);
+            diagnostic.inference_error_id = Some(error.id.get());
+            diagnostic.inference_cause = Some(match error.cause {
+                inference::ErrorCause::Step(id) => InferenceCause::Step { step_id: id.get() },
+                inference::ErrorCause::Batch(id) => InferenceCause::Batch { batch_id: id.get() },
+                inference::ErrorCause::Direct => InferenceCause::Direct,
+            });
+            diagnostic.inference_explanation = error
+                .explanation
+                .as_ref()
+                .map(|explanation| wire_explanation(explanation, &index));
+            diagnostic
+        }));
     }
     if let Some(checked) = &checked {
         diagnostics.extend(checked.errors.iter().map(|error| {
@@ -453,22 +505,27 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     // turn any `Loc` into a line and a column. Built from the loader's own list
     // rather than from the request, so a file no module declares is not in it
     // and a file that could not be read still is.
+    let stage_sources: Vec<String> = loaded
+        .iter()
+        .flat_map(|loaded| loaded.loaded.iter())
+        .map(|file| sources.get(&file.id).cloned().unwrap_or_default())
+        .collect();
     let infos: Vec<FileInfo> = loaded
         .iter()
         .flat_map(|loaded| loaded.loaded.iter())
-        .map(|file| {
-            let content = source(file.id.span(0, 0));
-            FileInfo {
-                path: file.path.clone(),
-                len: content.len(),
-                line_starts: line_starts(&content),
-            }
+        .zip(&stage_sources)
+        .map(|(file, content)| FileInfo {
+            path: file.path.clone(),
+            len: content.len(),
+            line_starts: line_starts(content),
         })
         .collect();
 
     let symbols = stage::symbols::index(&mint);
     let cx = Cx {
         files: &infos,
+        sources: &stage_sources,
+        diagnostics: &diagnostics,
         bundle: loaded.as_ref(),
         program: built.as_ref().map(|built| &built.program),
         inference: inferred.as_ref(),
@@ -602,80 +659,263 @@ pub fn install_hook() {
     });
 }
 
-/// Lowering's errors, which are the only ones with a second place to point at.
-fn ir_diagnostic(source: &str, error: &ir::Error, files: &HashMap<FileID, u32>) -> Diagnostic {
-    let mut diagnostic = raw(
-        "ir",
-        error.kind.code(),
-        format!("{} {}", error.kind, quote(source, error.span)),
-        loc(error.span, files),
-    );
-    // One diagnostic with two highlights, rather than the two loose lines the
-    // CLI prints: the repeat is only legible next to what it repeats. Both of
-    // lowering's repeats carry the span, a name given two rests carries where
-    // the first one was written, and a panel that cross-highlighted one pair
-    // and not the others would be showing the reader less than the compiler had
-    // already worked out.
-    let elsewhere = match &error.kind {
-        ir::ErrorKind::Duplicate { previous, .. }
-        | ir::ErrorKind::DuplicateParameter { previous } => Some((*previous, ui::FIRST_DEFINITION)),
-        ir::ErrorKind::MixedTail { previous, .. } => Some((*previous, ui::FIRST_USE)),
-        ir::ErrorKind::IncompatiblePresenceOwnership { previous, .. } => {
-            Some((*previous, ui::FIRST_PRODUCTION_LIFETIME))
+fn wire_explanation(
+    explanation: &inference::InferenceExplanation,
+    files: &HashMap<FileID, u32>,
+) -> crate::wire::InferenceExplanation {
+    fn description(value: inference::TypeDescription) -> &'static str {
+        use inference::TypeDescription as T;
+        match value {
+            T::NaturalNumber => "natural-number",
+            T::Integer => "integer",
+            T::RealNumber => "real-number",
+            T::Text => "text",
+            T::Boolean => "boolean",
+            T::Function => "function",
+            T::Struct => "struct",
+            T::TaggedValue => "tagged-value",
+            T::DeclaredType => "declared-type",
+            T::Undecided => "undecided",
         }
-        _ => None,
-    };
-    if let Some((previous, note)) = elsewhere {
-        diagnostic.related.push(Related {
-            span: loc(previous, files),
-            message: note.to_string(),
-        });
     }
+    fn fact(
+        fact: &inference::ExplanationFact,
+        files: &HashMap<FileID, u32>,
+    ) -> crate::wire::ExplanationFact {
+        let payload = match fact.payload {
+            inference::ExplanationFactPayload::RequiresType => "requires-type",
+            inference::ExplanationFactPayload::UsedAsFunction => "used-as-function",
+            inference::ExplanationFactPayload::SuppliesArgument => "supplies-argument",
+            inference::ExplanationFactPayload::BranchResult => "branch-result",
+            inference::ExplanationFactPayload::LabelDemand => "label-demand",
+            inference::ExplanationFactPayload::ClosedRow => "closed-row",
+            inference::ExplanationFactPayload::LabelIntroduction => "label-introduction",
+            inference::ExplanationFactPayload::LabelForbidden => "label-forbidden",
+            inference::ExplanationFactPayload::CallerChoiceDeclaration => {
+                "caller-choice-declaration"
+            }
+            inference::ExplanationFactPayload::CallerChoiceUse => "caller-choice-use",
+            inference::ExplanationFactPayload::CallerChoiceDestination => {
+                "caller-choice-destination"
+            }
+            inference::ExplanationFactPayload::EffectUse => "effect-use",
+            inference::ExplanationFactPayload::EffectBoundary => "effect-boundary",
+            inference::ExplanationFactPayload::EffectDeclaration => "effect-declaration",
+            inference::ExplanationFactPayload::CallbackRequirement => "callback-requirement",
+            inference::ExplanationFactPayload::ExternCapability => "extern-capability",
+            inference::ExplanationFactPayload::ExternDeclaration => "extern-declaration",
+            inference::ExplanationFactPayload::PolymorphicExternLeaf => "polymorphic-extern-leaf",
+            inference::ExplanationFactPayload::ExternPosition => "extern-position",
+        };
+        crate::wire::ExplanationFact {
+            span: loc(fact.span, files),
+            constraint_id: (!fact.direct).then(|| fact.constraint.get()),
+            direct: fact.direct,
+            origin: fact.origin.code(),
+            subject: fact.subject.code(),
+            payload,
+        }
+    }
+    let full: Vec<_> = explanation
+        .full_facts
+        .iter()
+        .map(|item| fact(item, files))
+        .collect();
+    let abridged = explanation
+        .abridged
+        .iter()
+        .filter_map(|at| full.get(*at).cloned())
+        .collect();
+    let contradiction = &explanation.contradiction;
+    crate::wire::InferenceExplanation {
+        abridged,
+        full,
+        pivot: explanation
+            .pivot
+            .as_ref()
+            .map(|pivot| crate::wire::ExplanationPivot {
+                name: pivot.name.clone(),
+                kind: match pivot.kind {
+                    inference::ExplanationPivotKind::WrittenValue => "written-value",
+                    inference::ExplanationPivotKind::FunctionInput => "function-input",
+                    inference::ExplanationPivotKind::BranchResult => "branch-result",
+                    inference::ExplanationPivotKind::ProjectedField => "projected-field",
+                    inference::ExplanationPivotKind::FunctionEffects => "function-effects",
+                    inference::ExplanationPivotKind::Value => "value",
+                },
+                references: pivot.references.clone(),
+                introduced_at: pivot.introduced_at,
+            }),
+        omitted_facts: explanation.omitted_facts,
+        contradiction: crate::wire::ExplanationContradiction {
+            kind: match contradiction.kind {
+                inference::ContradictionKind::IncompatibleTypes => "incompatible-types",
+                inference::ContradictionKind::ValueUsedAsFunction => "value-used-as-function",
+                inference::ContradictionKind::RecursiveValue => "recursive-value",
+                inference::ContradictionKind::ProjectionOnNonStruct => "projection-on-non-struct",
+                inference::ContradictionKind::LabelUnavailable => "label-unavailable",
+                inference::ContradictionKind::RepeatedLabel => "repeated-label",
+                inference::ContradictionKind::CallerChoice => "caller-choice",
+                inference::ContradictionKind::CallerChoiceEscape => "caller-choice-escape",
+                inference::ContradictionKind::UnhandledEffect => "unhandled-effect",
+                inference::ContradictionKind::EffectNotAllowed => "effect-not-allowed",
+                inference::ContradictionKind::CallbackEffectsNotCovered => {
+                    "callback-effects-not-covered"
+                }
+                inference::ContradictionKind::PolymorphicExternBoundary => {
+                    "polymorphic-extern-boundary"
+                }
+            },
+            left: description(contradiction.left),
+            right: description(contradiction.right),
+            row: contradiction
+                .row
+                .as_ref()
+                .map(|row| crate::wire::ExplanationRow {
+                    shape: match row.shape {
+                        ruddy::types::Shape::Struct => "struct",
+                        ruddy::types::Shape::Sum => "sum",
+                        ruddy::types::Shape::Effect => "effect",
+                    },
+                    label: row.label.clone(),
+                }),
+            repairs: contradiction.repairs.map(|repair| match repair {
+                inference::RepairDirection::ChangeFirstUse => "change-first-use",
+                inference::RepairDirection::ChangeSecondUse => "change-second-use",
+            }),
+        },
+        cause: crate::wire::ExplanationCause {
+            error_id: explanation.cause.error.get(),
+            seed_reason_id: explanation.cause.seed.map(|id| id.get()),
+            constraint_ids: explanation
+                .cause
+                .constraints
+                .iter()
+                .map(|id| id.get())
+                .collect(),
+            reason_ids: explanation
+                .cause
+                .reasons
+                .iter()
+                .map(|id| id.get())
+                .collect(),
+            omitted_reasons: explanation.cause.omitted_reasons,
+        },
+    }
+}
+
+fn source_error(
+    stage: &'static str,
+    source_diagnostic: ui::Diagnostic,
+    files: &HashMap<FileID, u32>,
+) -> Diagnostic {
+    let mut diagnostic = raw(
+        stage,
+        source_diagnostic.code,
+        source_diagnostic.title,
+        loc(source_diagnostic.primary.span, files),
+    );
+    diagnostic.label = source_diagnostic.primary.message;
+    diagnostic.help = source_diagnostic.help;
+    diagnostic.notes = source_diagnostic.notes;
+    diagnostic.related = source_diagnostic
+        .related
+        .into_iter()
+        .filter(|annotation| !annotation.span.is_generated())
+        .map(|annotation| Related {
+            span: loc(annotation.span, files),
+            message: annotation.message,
+        })
+        .collect();
     diagnostic
 }
 
-/// Inference's errors, two of which have a second place to point at: the
-/// a variable that declared the variable a body broke its promise about. The
-/// same pairing [`ir_diagnostic`] makes one phase earlier, and shown the same
-/// way — one diagnostic with two highlights, because a broken promise is only
-/// legible next to the promise.
-fn inference_diagnostic(error: &inference::Error, files: &HashMap<FileID, u32>) -> Diagnostic {
-    let mut diagnostic = raw(
-        "types",
-        error.kind.code(),
-        error.kind.to_string(),
-        loc(error.span, files),
-    );
-    let declared = match &error.kind {
-        inference::ErrorKind::RigidBroken { declared, .. }
-        | inference::ErrorKind::RigidField { declared, .. } => Some(*declared),
-        _ => None,
+fn dependency_diagnostic(report: ruddy_cli::CompileDiagnostic) -> Diagnostic {
+    let code = if report.code() == "project-error" {
+        "dependency-build"
+    } else {
+        report.code()
     };
-    if let Some(declared) = declared {
-        diagnostic.related.push(Related {
-            span: loc(declared, files),
-            message: ui::DECLARED_HERE.to_string(),
-        });
+    Diagnostic {
+        id: 0,
+        inference_error_id: None,
+        inference_cause: None,
+        inference_explanation: None,
+        stage: "dependencies",
+        severity: Severity::Error,
+        code,
+        message: report.message().to_string(),
+        label: String::new(),
+        help: report.help().to_vec(),
+        notes: report.notes().to_vec(),
+        report: Some(report),
+        span: None,
+        related: Vec::new(),
     }
-    diagnostic
 }
 
 fn raw(stage: &'static str, code: &'static str, message: String, span: Option<Loc>) -> Diagnostic {
     Diagnostic {
         id: 0,
+        inference_error_id: None,
+        inference_cause: None,
+        inference_explanation: None,
         stage,
         severity: Severity::Error,
         code,
         message,
+        label: String::new(),
+        help: Vec::new(),
+        notes: Vec::new(),
+        report: None,
         span,
         related: Vec::new(),
     }
 }
 
-/// The source text a span covers, quoted for a message.
-fn quote(source: &str, span: Span) -> String {
-    match source.get(span.start..span.end()) {
-        Some("") | None => "at end of input".to_string(),
-        Some(text) => format!("`{text}`"),
+#[cfg(test)]
+mod tests {
+    use indexmap::IndexMap;
+
+    use super::*;
+    use crate::wire::StdConfig;
+
+    #[test]
+    fn effect_primary_and_related_roles_match_the_shared_cli_diagnostic() {
+        let source = concat!(
+            "effect Log = { write: Nat -> () }\n",
+            "let action : () -> () + !Log = fn _ => !Log.write 0n\n",
+            "let bad = action ()\n",
+        );
+        let request = CompileRequest {
+            name: "test".into(),
+            version: "0.1.0".into(),
+            root: ROOT.into(),
+            files: vec![FileSpec {
+                path: ROOT.into(),
+                source: source.into(),
+            }],
+            std: StdConfig::Disabled,
+            dependencies: IndexMap::new(),
+            document: "test".into(),
+            revision: 0,
+        };
+        let snapshot = compile(&request, 0);
+        let diagnostic = snapshot
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "unhandled-effect")
+            .expect("effect diagnostic");
+        assert_eq!(diagnostic.label, "this may perform effect `!Log`");
+        assert_eq!(
+            diagnostic.span.expect("primary location").range,
+            [source.rfind("action ()").unwrap(), source.len() - 1]
+        );
+        assert!(
+            diagnostic
+                .related
+                .iter()
+                .any(|related| related.message == "effect `!Log` is declared here")
+        );
     }
 }

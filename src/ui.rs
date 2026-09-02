@@ -41,7 +41,7 @@
 //! sharing can only run in this direction: `ruddy-debug` depends on `ruddy`,
 //! and nothing may make the dependency run back.
 
-use std::{collections::HashSet, fmt};
+use std::{collections::HashSet, fmt, path::Path as FsPath};
 
 use crate::{
     bundle,
@@ -49,6 +49,7 @@ use crate::{
     ir, parse, patterns,
     symbol::{Bundle, LOCAL_SEGMENT, Mint, Namespace, Symbol},
     token::{self, Kind},
+    tracking::Span,
     types::{
         Assigned, Atom, EffectId, Formula, Presence, Prim, Rest, Row, RowField, Scheme, Sense,
         Shape, Ty,
@@ -60,6 +61,12 @@ use crate::{
 /// wording because it is a second line about a second place, and only a
 /// reporter knows how to attach one.
 pub const FIRST_DEFINITION: &str = "first defined here";
+/// The earlier source item in a repeated list.
+pub const FIRST_WRITTEN: &str = "first written here";
+/// The earlier binder in a pattern.
+pub const FIRST_BINDING: &str = "first bound here";
+/// The earlier arm in a handler.
+pub const FIRST_ARM: &str = "first arm here";
 
 /// The note a clash of tails points back with, printed against the span of the
 /// `..` that decided what the name stands for. [`FIRST_DEFINITION`]'s
@@ -67,7 +74,7 @@ pub const FIRST_DEFINITION: &str = "first defined here";
 /// defined twice — see [`ir::ErrorKind::MixedTail`].
 pub const FIRST_USE: &str = "first used here";
 /// The other result boundary participating in an existential lifetime clash.
-pub const FIRST_PRODUCTION_LIFETIME: &str = "the conflicting production lifetime begins here";
+pub const FIRST_PRODUCTION_LIFETIME: &str = "another result makes a separate choice here";
 
 /// The note a repeated variable points back with, printed against the
 /// span of the declaration that stands.
@@ -243,15 +250,176 @@ struct Named<'a> {
     labels: &'a [(String, Presence)],
 }
 
+/// One piece of source text explained by a diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Annotation {
+    pub span: Span,
+    pub message: String,
+}
+
+/// A compiler complaint before a terminal, browser, or editor lays it out.
+///
+/// Compiler phases keep deciding facts, this module turns those facts into
+/// reader-facing words, and reporters only decide presentation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Diagnostic {
+    pub code: &'static str,
+    pub title: String,
+    pub primary: Annotation,
+    pub related: Vec<Annotation>,
+    pub help: Vec<String>,
+    pub notes: Vec<String>,
+}
+
+impl Diagnostic {
+    fn new(code: &'static str, title: impl Into<String>, span: Span) -> Self {
+        Self {
+            code,
+            title: title.into(),
+            primary: Annotation {
+                span,
+                message: String::new(),
+            },
+            related: Vec::new(),
+            help: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    fn label(mut self, message: impl Into<String>) -> Self {
+        self.primary.message = message.into();
+        self
+    }
+
+    fn related(mut self, span: Span, message: impl Into<String>) -> Self {
+        self.related.push(Annotation {
+            span,
+            message: message.into(),
+        });
+        self
+    }
+
+    fn help(mut self, message: impl Into<String>) -> Self {
+        self.help.push(message.into());
+        self
+    }
+
+    fn note(mut self, message: impl Into<String>) -> Self {
+        self.notes.push(message.into());
+        self
+    }
+}
+
 impl token::ErrorKind {
     /// A stable, greppable name for this kind of error. Reporters key on it
     /// rather than on the message, which is prose and may be reworded.
     pub fn code(&self) -> &'static str {
         match self {
-            token::ErrorKind::Unrecognized => "unrecognized-character",
-            token::ErrorKind::MalformedNatural => "malformed-natural",
-            token::ErrorKind::NaturalTooLarge => "natural-too-large",
-            token::ErrorKind::MalformedString => "malformed-string",
+            token::ErrorKind::InvalidCharacter { .. } => "character-not-used",
+            token::ErrorKind::MalformedTag => "tag-needs-name",
+            token::ErrorKind::MalformedEffectLabel => "effect-needs-name",
+            token::ErrorKind::MalformedVariable => "variable-needs-name",
+            token::ErrorKind::NumberFollowedByName => "number-joined-to-name",
+            token::ErrorKind::DecimalWithWholeSuffix { .. } => "decimal-marked-whole",
+            token::ErrorKind::MalformedNumericField => "invalid-field-number",
+            token::ErrorKind::NaturalTooLarge => "whole-number-too-large",
+            token::ErrorKind::IntegerTooLarge => "integer-too-large",
+            token::ErrorKind::RealTooLarge => "number-too-large",
+            token::ErrorKind::NumericFieldTooLarge => "field-number-too-large",
+            token::ErrorKind::UnknownStringEscape { .. } => "unknown-string-escape",
+            token::ErrorKind::MissingClosingQuote => "missing-closing-quote",
+        }
+    }
+}
+
+impl token::Error {
+    pub fn diagnostic(&self) -> Diagnostic {
+        use token::ErrorKind as E;
+        match self.kind {
+            E::InvalidCharacter { character } => Diagnostic::new(
+                self.kind.code(),
+                format!("Ruddy does not use `{character}`"),
+                self.span,
+            )
+            .label("remove this character"),
+            E::MalformedTag => Diagnostic::new(
+                self.kind.code(),
+                "`#` must be followed by a name or quoted text",
+                self.span,
+            )
+            .label("the name cannot start here"),
+            E::MalformedEffectLabel => Diagnostic::new(
+                self.kind.code(),
+                "`!` must be followed by a name",
+                self.span,
+            )
+            .label("the name cannot start here"),
+            E::MalformedVariable => Diagnostic::new(
+                self.kind.code(),
+                "`'` must be followed by a name",
+                self.span,
+            )
+            .label("the name cannot start here"),
+            E::NumberFollowedByName => Diagnostic::new(
+                self.kind.code(),
+                "a number cannot run directly into a name",
+                self.span,
+            )
+            .label("the number and name are joined")
+            .help("add a space, or start the whole name with a letter"),
+            E::DecimalWithWholeSuffix { suffix } => Diagnostic::new(
+                self.kind.code(),
+                format!("`{suffix}` is only used with whole numbers"),
+                self.span,
+            )
+            .label("this number has a decimal point")
+            .help(format!("remove the decimal part or remove `{suffix}`")),
+            E::MalformedNumericField => Diagnostic::new(
+                self.kind.code(),
+                "a numbered field can contain only digits",
+                self.span,
+            )
+            .label("this is not a field number")
+            .help("remove the suffix or decimal part"),
+            E::NaturalTooLarge => Diagnostic::new(
+                self.kind.code(),
+                "this whole number is too large",
+                self.span,
+            )
+            .help("the largest allowed value is `18446744073709551615n`"),
+            E::IntegerTooLarge => {
+                Diagnostic::new(self.kind.code(), "this integer is too large", self.span)
+                    .help("the largest allowed value is `9223372036854775807i`")
+            }
+            E::RealTooLarge => {
+                Diagnostic::new(self.kind.code(), "this number is too large", self.span)
+            }
+            E::NumericFieldTooLarge => Diagnostic::new(
+                self.kind.code(),
+                "this field number is too large",
+                self.span,
+            ),
+            E::UnknownStringEscape { escape } => Diagnostic::new(
+                self.kind.code(),
+                format!("`\\{escape}` has no special meaning in a string"),
+                self.span,
+            )
+            .label("this escape is not supported")
+            .help("use `\\\"`, `\\\\`, `\\n`, `\\r`, or `\\t`"),
+            E::MissingClosingQuote => {
+                let mut diagnostic = Diagnostic::new(
+                    self.kind.code(),
+                    "this string is missing its closing `\"`",
+                    self.span.file_id.span(self.span.end(), 0),
+                )
+                .label("add `\"` here")
+                .help("strings must start and finish on the same line");
+                diagnostic.related.push(Annotation {
+                    span: self.span.file_id.span(self.span.start, 1),
+                    message: "the string starts here".into(),
+                });
+                diagnostic
+            }
         }
     }
 }
@@ -338,14 +506,11 @@ pub fn write_tag_label(f: &mut fmt::Formatter<'_>, name: &str) -> fmt::Result {
 
 impl fmt::Display for token::ErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            token::ErrorKind::Unrecognized => "unrecognized character",
-            token::ErrorKind::MalformedNatural => "malformed natural number",
-            // The bound is worth naming: it is the one limit here that a
-            // person can do arithmetic against.
-            token::ErrorKind::NaturalTooLarge => "natural number too large to fit in 64 bits",
-            token::ErrorKind::MalformedString => "malformed string literal",
-        })
+        let error = token::Error {
+            span: Span::default(),
+            kind: *self,
+        };
+        f.write_str(&error.diagnostic().title)
     }
 }
 
@@ -409,49 +574,183 @@ impl fmt::Display for Kind {
             Kind::Real(value) => write!(f, "{value}"),
             Kind::String(value) => write_string(f, value),
             Kind::Boolean(value) => write!(f, "{value}"),
+            // Invalid input is never printed as source: its original spelling
+            // remains in the file and its diagnostic owns the explanation.
+            Kind::Invalid => f.write_str("<invalid>"),
+        }
+    }
+}
+
+impl parse::Expected {
+    fn words(self) -> String {
+        match self {
+            Self::Statement => "a definition".into(),
+            Self::Name => "a name".into(),
+            Self::Value => "a value".into(),
+            Self::Type => "a type".into(),
+            Self::Pattern => "a name or shape to take apart".into(),
+            Self::Field => "a field name".into(),
+            Self::Argument => "at least one argument name".into(),
+            Self::Clause => "a condition".into(),
+            Self::Effect => "an effect name".into(),
+            Self::Case => "another case".into(),
+            Self::FunctionType => "a function type such as `Nat -> Nat`".into(),
+            Self::EndOfClause => "the end of this condition".into(),
+            Self::ExternTarget => "a quoted JavaScript expression such as `\"host.log\"`".into(),
+            Self::Keyword(word) | Self::Punctuation(word) => format!("`{word}`"),
+        }
+    }
+
+    fn code(self) -> &'static str {
+        match self {
+            Self::Statement => "expected-definition",
+            Self::Name => "expected-name",
+            Self::Value => "expected-value",
+            Self::Type => "expected-type",
+            Self::Pattern => "expected-name-or-shape",
+            Self::Field => "expected-field-name",
+            Self::Argument => "expected-argument",
+            Self::Clause => "expected-condition",
+            Self::Effect => "expected-effect",
+            Self::Case => "expected-case",
+            Self::FunctionType => "expected-function-type",
+            Self::EndOfClause => "expected-condition-end",
+            Self::ExternTarget => "expected-extern-target",
+            Self::Keyword("=") | Self::Punctuation("=") => "expected-equals",
+            Self::Keyword("=>") | Self::Punctuation("=>") => "expected-function-arrow",
+            Self::Keyword("end") => "expected-end",
+            Self::Keyword("with") => "expected-with",
+            Self::Keyword("then") => "expected-then",
+            Self::Keyword("else") => "expected-else",
+            Self::Keyword("in") => "expected-in",
+            Self::Keyword(_) => "expected-word",
+            Self::Punctuation(")") => "expected-closing-parenthesis",
+            Self::Punctuation("}") => "expected-closing-brace",
+            Self::Punctuation(_) => "expected-punctuation",
         }
     }
 }
 
 impl parse::Error {
-    /// A stable, greppable name for this kind of error, the way every other
-    /// phase's are coded. One code for the wildcard wherever it landed: what
-    /// went wrong is the `_`, and the position only polishes the wording.
+    /// A stable, greppable name for this kind of error.
     pub fn code(&self) -> &'static str {
         match self.kind {
-            parse::ErrorKind::Unexpected => "unexpected-token",
-            parse::ErrorKind::Wildcard { .. } => "misplaced-wildcard",
+            parse::ErrorKind::Expected { expected, .. } => expected.code(),
+            parse::ErrorKind::Wildcard { .. } => "misplaced-discard",
+        }
+    }
+
+    pub fn diagnostic(&self) -> Diagnostic {
+        match self.kind {
+            parse::ErrorKind::Expected {
+                expected,
+                found,
+                related,
+                context,
+            } => {
+                let words = expected.words();
+                let title = match (expected, related, context) {
+                    (
+                        parse::Expected::Punctuation("|"),
+                        _,
+                        Some(parse::Related {
+                            kind: parse::RelatedKind::Construct("match"),
+                            ..
+                        }),
+                    ) => "each match case must begin with `|`".into(),
+                    (
+                        parse::Expected::Keyword("end"),
+                        _,
+                        Some(parse::Related {
+                            kind: parse::RelatedKind::Construct(name),
+                            ..
+                        }),
+                    ) => format!("this {name} needs a closing `end`"),
+                    (
+                        parse::Expected::Punctuation(mark),
+                        Some(parse::Related {
+                            kind: parse::RelatedKind::Opener,
+                            ..
+                        }),
+                        _,
+                    ) => format!("add `{mark}` to close this part"),
+                    (
+                        _,
+                        Some(parse::Related {
+                            kind: parse::RelatedKind::Operator | parse::RelatedKind::Separator,
+                            ..
+                        }),
+                        _,
+                    ) => format!("write {words} after this"),
+                    _ => format!("expected {words} here"),
+                };
+                let mut diagnostic = Diagnostic::new(expected.code(), title, self.span);
+                diagnostic.primary.message = match (expected, found, context) {
+                    (parse::Expected::Punctuation("|"), parse::Found::Token, Some(_)) => {
+                        "add `|` before this case".into()
+                    }
+                    (parse::Expected::Keyword("end"), parse::Found::Token, Some(_)) => {
+                        "write `end` before this".into()
+                    }
+                    (parse::Expected::Punctuation(mark), parse::Found::Token, _) => {
+                        format!("write `{mark}` before this")
+                    }
+                    (_, parse::Found::End, _) => format!("write {words} here"),
+                    (_, parse::Found::Token, _) => "this cannot be used here".into(),
+                };
+                if let Some(related) = related
+                    && !(matches!(expected, parse::Expected::Keyword("end"))
+                        && context.is_some()
+                        && matches!(related.kind, parse::RelatedKind::Anchor))
+                {
+                    diagnostic.related.push(Annotation {
+                        span: related.span,
+                        message: match related.kind {
+                            parse::RelatedKind::Opener => "opened here".into(),
+                            parse::RelatedKind::Separator => {
+                                "this mark promises more after it".into()
+                            }
+                            parse::RelatedKind::Operator => {
+                                "this operation needs a value after it".into()
+                            }
+                            parse::RelatedKind::Anchor => "the missing part belongs here".into(),
+                            parse::RelatedKind::Construct(name) => {
+                                format!("this {name} starts here")
+                            }
+                        },
+                    });
+                }
+                if let Some(context) = context {
+                    diagnostic.related.push(Annotation {
+                        span: context.span,
+                        message: match context.kind {
+                            parse::RelatedKind::Construct(name) => {
+                                format!("this {name} starts here")
+                            }
+                            _ => "this part starts here".into(),
+                        },
+                    });
+                }
+                diagnostic
+            }
+            parse::ErrorKind::Wildcard { place } => {
+                let title = match place {
+                    parse::Place::Value => "`_` throws a value away, so it cannot be read here",
+                    parse::Place::Field => "a field needs a name other than `_`",
+                    parse::Place::Pun => "write a field name, or give the field a value after `:`",
+                    parse::Place::Projection => "write the name of the field to read",
+                    parse::Place::Type => "this place needs a name rather than `_`",
+                };
+                Diagnostic::new("misplaced-discard", title, self.span)
+                    .label("`_` does not provide a name here")
+            }
         }
     }
 }
 
-/// What the parser could not read, in a phrase. The wildcard's five wordings
-/// are one meaning — `_` stands for a value being thrown away, so it can't be
-/// *used* — said in the noun of the position it landed in.
 impl fmt::Display for parse::Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.kind {
-            parse::ErrorKind::Unexpected => f.write_str("unexpected token"),
-            parse::ErrorKind::Wildcard { place } => f.write_str(match place {
-                parse::Place::Value => {
-                    "`_` stands for a value being thrown away, so it can't be used as a value here"
-                }
-                parse::Place::Field => {
-                    "`_` stands for a value being thrown away, so it can't be a field's name"
-                }
-                // A pun binds a field to its own name, so what is missing here
-                // is the name — the value never gets a say.
-                parse::Place::Pun => {
-                    "`_` stands for a value being thrown away, and a field written bare binds to its own name, so there is no name here to bind"
-                }
-                parse::Place::Projection => {
-                    "`_` stands for a value being thrown away, so it can't name a field to read"
-                }
-                parse::Place::Type => {
-                    "`_` stands for a value being thrown away, so it can't be used as a type"
-                }
-            }),
-        }
+        f.write_str(&self.diagnostic().title)
     }
 }
 
@@ -635,25 +934,47 @@ impl bundle::ErrorKind {
     }
 }
 
-/// What loading could not do, in a phrase.
-///
-/// The two about a module's file name the exact paths that were looked for,
-/// because that is the whole of the fix: a reader who is told "no file" still
-/// has to work out where one would have gone, and the loader already knows.
+impl bundle::Error {
+    /// Describe a module-file failure using paths relative to the bundle root.
+    pub fn diagnostic(&self) -> Diagnostic {
+        self.diagnostic_in(FsPath::new(""))
+    }
+
+    /// Describe a module-file failure using paths relative to `directory`.
+    /// Filesystem reporters use this to name paths from the project root while
+    /// in-memory reporters keep the loader's bundle-relative spellings.
+    pub fn diagnostic_in(&self, directory: &FsPath) -> Diagnostic {
+        let path = |candidate: &str| directory.join(candidate).display().to_string();
+        let convention = "a module written without a body uses either `Name.hc` or `Name/module.hc`, and exactly one of them must exist";
+        match &self.kind {
+            bundle::ErrorKind::ModuleFileMissing { beside, inside } => {
+                Diagnostic::new(self.kind.code(), "this module needs a file", self.span)
+                    .label("no file was found for this module")
+                    .help(format!("create `{}` or `{}`", path(beside), path(inside)))
+                    .note(convention)
+            }
+            bundle::ErrorKind::ModuleFileAmbiguous { beside, inside } => Diagnostic::new(
+                self.kind.code(),
+                "this module has two possible files",
+                self.span,
+            )
+            .label("Ruddy cannot choose which file defines this module")
+            .help(format!(
+                "keep one of `{}` or `{}` and delete the other",
+                path(beside),
+                path(inside)
+            ))
+            .note(convention),
+        }
+    }
+}
+
 impl fmt::Display for bundle::ErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            bundle::ErrorKind::ModuleFileMissing { beside, inside } => write!(
-                f,
-                "this module has no file; create `{beside}` or `{inside}`",
-            ),
-            // Which of the two was meant is not the compiler's to guess, so it
-            // says what to delete rather than which one it took.
-            bundle::ErrorKind::ModuleFileAmbiguous { beside, inside } => write!(
-                f,
-                "this module has two files; delete one of `{beside}` or `{inside}`",
-            ),
-        }
+        f.write_str(match self {
+            bundle::ErrorKind::ModuleFileMissing { .. } => "this module needs a file",
+            bundle::ErrorKind::ModuleFileAmbiguous { .. } => "this module has two possible files",
+        })
     }
 }
 
@@ -667,7 +988,7 @@ impl ir::ErrorKind {
             ir::ErrorKind::InvalidDependencyAlias { .. } => "invalid-dependency-alias",
             ir::ErrorKind::DuplicateDependencyAlias { .. } => "duplicate-dependency-alias",
             ir::ErrorKind::DuplicateDependency { .. } => "duplicate-dependency",
-            ir::ErrorKind::Undefined { namespace } => match namespace {
+            ir::ErrorKind::Undefined { namespace, .. } => match namespace {
                 Namespace::Types => "undefined-type",
                 Namespace::Effects => "undefined-effect",
                 Namespace::Modules => "undefined-module",
@@ -679,7 +1000,7 @@ impl ir::ErrorKind {
                 Namespace::Modules => "duplicate-module",
                 Namespace::Terms => "duplicate-term",
             },
-            ir::ErrorKind::DuplicateField => "duplicate-field",
+            ir::ErrorKind::DuplicateField { .. } => "duplicate-field",
             // The shape is not part of the code, for the reason a repeated row
             // field's is not: the wording quotes the label the way it was
             // written, and that already says which kind of row it sits in.
@@ -693,8 +1014,9 @@ impl ir::ErrorKind {
             },
             ir::ErrorKind::OpenDeclaredType { .. } => "open-declared-type",
             ir::ErrorKind::ClauseInDeclaration => "declared-where-clause",
-            ir::ErrorKind::VariableInDeclaration => "variable-in-declaration",
+            ir::ErrorKind::VariableInDeclaration { .. } => "variable-in-declaration",
             ir::ErrorKind::HoleInDeclaration => "hole-in-declaration",
+            ir::ErrorKind::HoleInOperation => "hole-in-operation",
             // The name is not part of the code, only of the wording: what went
             // wrong is that the clause names something no label wears, and
             // which name it was is the span's to show. The two below say the
@@ -705,10 +1027,10 @@ impl ir::ErrorKind {
             }
             ir::ErrorKind::Arity { .. } => "wrong-argument-count",
             ir::ErrorKind::NotAConstructor => "not-a-type-constructor",
-            ir::ErrorKind::ParameterApplied => "applied-parameter",
+            ir::ErrorKind::ParameterApplied { .. } => "applied-parameter",
             ir::ErrorKind::DuplicateParameter { .. } => "duplicate-parameter",
             ir::ErrorKind::GrowingRecursion => "growing-recursion",
-            ir::ErrorKind::DuplicateCase => "duplicate-case",
+            ir::ErrorKind::DuplicateCase { .. } => "duplicate-case",
             // The shape is not part of these codes, only of their wording: a
             // reporter that treats a struct's row differently from a sum's is
             // reading the type, not the complaint. The namespace on
@@ -723,9 +1045,9 @@ impl ir::ErrorKind {
             // number only points at where.
             ir::ErrorKind::RefutableBinding { .. } => "binding-can-fail",
             ir::ErrorKind::DuplicateBinding { .. } => "duplicate-binding",
-            ir::ErrorKind::DuplicateOperation => "duplicate-operation",
+            ir::ErrorKind::DuplicateOperation { .. } => "duplicate-operation",
             ir::ErrorKind::NotAnOperation { .. } => "not-an-operation",
-            ir::ErrorKind::ImpureOperation => "impure-operation",
+            ir::ErrorKind::ImpureOperation { .. } => "impure-operation",
             ir::ErrorKind::EffectsOutsideRow => "effects-outside-row",
             ir::ErrorKind::OperationOnAlias { .. } => "operation-on-alias",
             ir::ErrorKind::UnknownOperation { .. } => "unknown-operation",
@@ -735,241 +1057,432 @@ impl ir::ErrorKind {
             ir::ErrorKind::DuplicateArm { .. } => "duplicate-arm",
             ir::ErrorKind::DuplicateReturn { .. } => "duplicate-return-arm",
             ir::ErrorKind::RaiseOutsideArm => "raise-outside-arm",
-            ir::ErrorKind::RaiseInFunction => "raise-in-function",
+            ir::ErrorKind::RaiseInFunction { .. } => "raise-in-function",
         }
     }
 }
 
-/// What lowering could not resolve, in a phrase. [`ir::ErrorKind::Duplicate`]
-/// says nothing here about the definition it repeats, and
-/// [`ir::ErrorKind::MixedTail`] nothing about the first `..` it clashes with:
-/// each is a second span in another place, and pointing at one is layout — see
-/// [`FIRST_DEFINITION`] and [`FIRST_USE`].
+impl ir::Error {
+    /// Turn a lowering failure into reporter-independent words and annotations.
+    pub fn diagnostic(&self) -> Diagnostic {
+        use ir::ErrorKind as E;
+
+        let code = self.kind.code();
+        let span = self.span;
+        match &self.kind {
+            E::InvalidDependencyAlias { alias } => Diagnostic::new(
+                code,
+                format!("`{alias}` cannot be used as a module name"),
+                span,
+            )
+            .label("this name is not valid in Ruddy source")
+            .help("start with a letter or `_`, use only letters, digits, and `_`, and do not use a reserved word"),
+            E::DuplicateDependencyAlias { alias } => Diagnostic::new(
+                code,
+                format!("dependency alias `{alias}` was imported more than once"),
+                span,
+            )
+            .label("this alias is already in use")
+            .help("remove one import or give it a different alias"),
+            E::DuplicateDependency { name, version } => Diagnostic::new(
+                code,
+                format!("dependency `{name}@{version}` was imported more than once"),
+                span,
+            )
+            .label("this exact dependency is already imported")
+            .help("remove one of the duplicate dependencies"),
+            E::Undefined { namespace, name } => {
+                let kind = namespace_name(*namespace);
+                Diagnostic::new(code, format!("cannot find {kind} `{name}`"), span)
+                    .label(format!("no {kind} of this name is in scope"))
+            }
+            E::Duplicate {
+                namespace,
+                name,
+                previous,
+            } => {
+                let kind = namespace_name(*namespace);
+                Diagnostic::new(code, format!("`{name}` is defined more than once"), span)
+                    .label(format!("this {kind} is defined again"))
+                    .related(*previous, FIRST_DEFINITION)
+            }
+            E::DuplicateField { name, previous } => {
+                Diagnostic::new(code, format!("field `{name}` is written more than once"), span)
+                    .label("written again here")
+                    .related(*previous, FIRST_WRITTEN)
+            }
+            E::DuplicateCase {
+                shape,
+                name,
+                previous,
+            } => {
+                let name = label(*shape, name);
+                Diagnostic::new(
+                    code,
+                    format!("{} `{name}` is included more than once", noun(*shape)),
+                    span,
+                )
+                .label("included again here")
+                .related(*previous, FIRST_WRITTEN)
+            }
+            E::AbsentInClosed { shape, label: name } => Diagnostic::new(
+                code,
+                format!(
+                    "a type with no `..` already says `{}` is not there",
+                    label(*shape, name)
+                ),
+                span,
+            )
+            .label("this mark repeats what the closed type already says")
+            .help("remove this `\\` mark; a closed type already excludes labels it does not list"),
+            E::Circular { namespace } => match namespace {
+                Namespace::Types => {
+                    Diagnostic::new(code, "type defined only as another name", span)
+                        .label("following these names never reaches an actual type")
+                        .help("put a struct, sum, or arrow between the type and itself")
+                }
+                Namespace::Terms | Namespace::Effects | Namespace::Modules => Diagnostic::new(
+                    code,
+                    "this definition is never given a value of its own",
+                    span,
+                )
+                .label("following these names leads back here")
+                .help("give the definition a value instead of only another name"),
+            },
+            E::OpenDeclaredType { shape } => Diagnostic::new(
+                code,
+                format!("a declared type must list its {}s exactly", noun(*shape)),
+                span,
+            )
+            .label("this leaves part of the declared type undecided")
+            .help("list every label, use one of the declaration's parameters, or move this type to an annotation"),
+            E::ClauseInDeclaration => {
+                Diagnostic::new(code, "a declared type cannot have a `where` clause", span)
+                    .label("there is nothing in a declaration for this clause to decide")
+                    .help("move the `where` clause to an annotation")
+            }
+            E::VariableInDeclaration { name } => Diagnostic::new(
+                code,
+                format!("`'{name}` is not declared in this type's header"),
+                span,
+            )
+            .label("this name is not one of the type's parameters")
+            .help(format!("add `'{name}` to the header, or use an existing parameter")),
+            E::HoleInDeclaration => {
+                Diagnostic::new(code, "a declared type cannot contain `_`", span)
+                    .label("a declaration cannot leave its type open")
+                    .help("write the type that every use of this declaration should have")
+            }
+            E::HoleInOperation => {
+                Diagnostic::new(code, "an effect function's type cannot contain `_`", span)
+                    .label("an effect function must have one fixed type")
+                    .help("write the type that every call to this function should have")
+            }
+            E::UnboundPresence { name } => Diagnostic::new(
+                code,
+                format!("`'{name}` does not control any field or case"),
+                span,
+            )
+            .label(format!("used here, but no label has `when '{name}`"))
+            .help(format!("add `when '{name}` to the intended label, or correct the name")),
+            E::IncompatiblePresenceOwnership { name, previous } => Diagnostic::new(
+                code,
+                format!("`'{name}` cannot describe choices made by two separate results"),
+                span,
+            )
+            .label("this result makes its own choice")
+            .related(*previous, FIRST_PRODUCTION_LIFETIME)
+            .help("use a different name for each result's choice"),
+            E::Arity {
+                name,
+                expected,
+                found,
+            } => Diagnostic::new(
+                code,
+                format!(
+                    "`{name}` expects {}, but {} written",
+                    arguments(*expected),
+                    supplied(*found)
+                ),
+                span,
+            )
+            .label(if found < expected {
+                "not enough arguments are supplied"
+            } else {
+                "too many arguments are supplied"
+            })
+            .help(if found < expected {
+                "add the missing type arguments"
+            } else {
+                "remove the extra type arguments"
+            }),
+            E::NotAConstructor => Diagnostic::new(
+                code,
+                "this type cannot take arguments",
+                span,
+            )
+            .label("arguments are applied here")
+            .help("apply a named type declaration that has parameters"),
+            E::ParameterApplied { name } => Diagnostic::new(
+                code,
+                format!("type parameter `'{name}` cannot take arguments"),
+                span,
+            )
+            .label("this parameter already represents one complete type")
+            .help("apply a declared type with parameters instead"),
+            E::DuplicateParameter { name, previous } => {
+                Diagnostic::new(code, format!("parameter `'{name}` is declared more than once"), span)
+                    .label("declared again here")
+                    .related(*previous, FIRST_DECLARATION)
+            }
+            E::GrowingRecursion => {
+                Diagnostic::new(code, "recursive type arguments grow without bound", span)
+                    .label("each trip around this recursion builds a larger type")
+                    .help("pass recursive parameters through unchanged, use a fixed type, or break the recursion")
+            }
+            E::MixedTail {
+                first,
+                second,
+                previous,
+            } => Diagnostic::new(
+                code,
+                format!("one variable cannot stand for both {first} and {second}"),
+                span,
+            )
+            .label(format!("used as {second} here"))
+            .related(*previous, format!("first used as {first} here"))
+            .help("use a different name for each purpose"),
+            E::MixedParameter { first, second } => Diagnostic::new(
+                code,
+                format!("this parameter is used as {first} and as {second}"),
+                span,
+            )
+            .label(format!("some uses need {first}, while others need {second}"))
+            .help("use a separate parameter name for each purpose"),
+            E::NotARow { sense } => Diagnostic::new(
+                code,
+                format!("this argument must provide {sense}"),
+                span,
+            )
+            .label(format!("this type cannot provide {sense}")),
+            E::RepeatedRowField { shape, field } => Diagnostic::new(
+                code,
+                format!(
+                    "`{}` would appear twice in this {shape}",
+                    label(*shape, field)
+                ),
+                span,
+            )
+            .label("the declaration and this argument both provide this name")
+            .help("remove or rename the repeated field or case"),
+            E::EndlessFields => {
+                Diagnostic::new(code, "this recursive type adds more fields on every cycle", span)
+                    .label("the fields never reach a finite end")
+                    .help("place the recursion inside a field, or stop extending the `..` part")
+            }
+            E::RefutableBinding { found } => {
+                let message = match found {
+                    ir::Refuter::Case(name) => {
+                        format!("a value here might not be `{}`", label(Shape::Sum, name))
+                    }
+                    ir::Refuter::Literal(value) => {
+                        format!("a value here might not equal `{}`", SourceLiteral(value))
+                    }
+                };
+                Diagnostic::new(code, "this pattern can fail, but a binding must accept every value", span)
+                    .label(message)
+                    .help("use `match` for this case or literal, or bind a name instead")
+            }
+            E::DuplicateBinding { name, previous } => {
+                Diagnostic::new(code, format!("this pattern binds `{name}` more than once"), span)
+                    .label("bound again here")
+                    .related(*previous, FIRST_BINDING)
+                    .help("rename one binding or replace it with `_`")
+            }
+            E::DuplicateOperation { name, previous } => {
+                Diagnostic::new(code, format!("effect function `{name}` is declared more than once"), span)
+                    .label("declared again here")
+                    .related(*previous, FIRST_DECLARATION)
+            }
+            E::NotAnOperation { name } => {
+                Diagnostic::new(code, format!("`{name}` is not a function"), span)
+                    .label("what an effect declares must be a function type")
+                    .help(format!("write a signature such as `{name} : Nat -> ()`"))
+            }
+            E::ImpureOperation { found } => match found {
+                ir::OperationTypeProblem::Effects => Diagnostic::new(
+                    code,
+                    "an effect function cannot declare effects of its own",
+                    span,
+                )
+                .label("calling it already performs this effect")
+                .help("remove this `+` effect list"),
+                ir::OperationTypeProblem::OpenPart => Diagnostic::new(
+                    code,
+                    "an effect function must have one fixed function type",
+                    span,
+                )
+                .label("this leaves part of the function's type undecided")
+                .help("write this part explicitly; use `..` and `when` in annotations instead"),
+                ir::OperationTypeProblem::Variable(name) => Diagnostic::new(
+                    code,
+                    format!("`'{name}` is not declared by this effect function"),
+                    span,
+                )
+                .label("an effect function cannot introduce type variables")
+                .help("replace it with a fixed type or a declared type application"),
+            },
+            E::EffectsOutsideRow => Diagnostic::new(
+                code,
+                "effects cannot be used as a type by themselves",
+                span,
+            )
+            .label("there is no function arrow here to carry these effects")
+            .help("write them after a function result, as in `Nat -> Nat + !Log`"),
+            E::OperationOnAlias { effect } => Diagnostic::new(
+                code,
+                format!(
+                    "effect alias `{}` declares nothing to perform",
+                    label(Shape::Effect, effect)
+                ),
+                span,
+            )
+            .label("an alias groups effects but declares nothing of its own")
+            .help("perform one of the functions declared by the concrete effects this alias names"),
+            E::UnknownOperation { effect, op } => Diagnostic::new(
+                code,
+                format!(
+                    "effect `{}` does not declare `{op}`",
+                    label(Shape::Effect, effect)
+                ),
+                span,
+            )
+            .label("the effect does not declare this name")
+            .help("use one of the names the effect declares, or add this one to its declaration"),
+            E::BareOperationUnavailable { effect, suggestion } => {
+                let effect = label(Shape::Effect, effect);
+                match suggestion {
+                    Some(op) => Diagnostic::new(
+                        code,
+                        format!("performing `{effect}` requires a function name"),
+                        span,
+                    )
+                    .label("this effect declares only named functions")
+                    .help(format!("write `{effect}.{op}`")),
+                    None => Diagnostic::new(
+                        code,
+                        format!("effect `{effect}` declares nothing to perform"),
+                        span,
+                    )
+                    .label("there is nothing in this effect to perform")
+                    .help("remove this use, or declare a function on the effect"),
+                }
+            }
+            E::NamedOperationOnUnnamed { effect, op } => {
+                let effect = label(Shape::Effect, effect);
+                Diagnostic::new(
+                    code,
+                    format!("effect `{effect}` declares one unnamed function"),
+                    span,
+                )
+                .label(format!("`{op}` does not name anything this effect declares"))
+                .help(format!("write `{effect}` instead"))
+            }
+            E::PartialHandler { effect, missing } => Diagnostic::new(
+                code,
+                format!(
+                    "this handler does not cover effect `{}`",
+                    label(Shape::Effect, effect)
+                ),
+                span,
+            )
+            .label(format!("missing {}", operation_arms(missing)))
+            .help(format!("add {}", operation_arms(missing))),
+            E::DuplicateArm {
+                effect,
+                selector,
+                previous,
+            } => Diagnostic::new(
+                code,
+                format!(
+                    "duplicate arm for `{}{selector}`",
+                    label(Shape::Effect, effect)
+                ),
+                span,
+            )
+            .label("handled again here")
+            .related(*previous, FIRST_ARM),
+            E::DuplicateReturn { previous } => Diagnostic::new(
+                code,
+                "this handler has more than one `return` arm",
+                span,
+            )
+            .label("second return arm")
+            .related(*previous, FIRST_ARM),
+            E::RaiseOutsideArm => Diagnostic::new(
+                code,
+                "`raise` can be used only directly inside a handler arm",
+                span,
+            )
+            .label("there is no enclosing arm for this `raise`")
+            .help("move it into a handler arm, or remove it"),
+            E::RaiseInFunction { function } => Diagnostic::new(
+                code,
+                "`raise` cannot cross a function boundary",
+                span,
+            )
+            .label("this `raise` is separated from its handler arm")
+            .related(*function, "the intervening function starts here")
+            .help("move `raise` directly into the handler arm, or return a value from the function"),
+        }
+    }
+}
+
+/// The diagnostic headline, retained for callers that only need a phrase.
 impl fmt::Display for ir::ErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ir::ErrorKind::InvalidDependencyAlias { alias } => write!(
-                f,
-                "dependency alias `{alias}` is not a valid source identifier"
-            ),
-            ir::ErrorKind::DuplicateDependencyAlias { alias } => {
-                write!(f, "dependency alias `{alias}` was imported more than once")
-            }
-            ir::ErrorKind::DuplicateDependency { name, version } => {
-                write!(f, "dependency `{name}@{version}` was imported more than once")
-            }
-            ir::ErrorKind::Undefined { namespace } => write!(f, "undefined {namespace}"),
-            ir::ErrorKind::Duplicate { namespace, .. } => write!(f, "duplicate {namespace}"),
-            ir::ErrorKind::DuplicateField => f.write_str("duplicate field"),
-            ir::ErrorKind::DuplicateCase => f.write_str("duplicate case"),
-            // Said as what the type already does rather than as the mark that
-            // repeats it: a `\` rules a label out of the `..` beside it, and a
-            // type with no `..` has already ruled out everything it does not
-            // name. The label is quoted the way it was written — `#` and all
-            // for a case — like every label a complaint quotes.
-            ir::ErrorKind::AbsentInClosed { shape, label } => write!(
-                f,
-                "a type with no `..` already says `{}` is not there",
-                self::label(*shape, label),
-            ),
-            // Not "recursive": a definition is welcome to lead back to itself,
-            // and what is wrong here is that there is nothing in the way when
-            // it does. Said as what the reader can change — give it a shape —
-            // rather than as the loop the compiler noticed. Two wordings for
-            // the one rule, because a reader who wrote `let` is being told
-            // about a value rather than about a type.
-            ir::ErrorKind::Circular { namespace } => match namespace {
-                Namespace::Types => f.write_str("type defined only as another name"),
-                Namespace::Terms | Namespace::Effects | Namespace::Modules => {
-                    f.write_str("this definition is never given a value of its own")
-                }
-            },
-            // The noun follows the shape that was written: someone who wrote
-            // `#`s is told about cases, and the `when` and the `..` are the
-            // same two marks either way.
-            ir::ErrorKind::OpenDeclaredType { shape } => write!(
-                f,
-                "a declared type must list its {}s exactly; `..` and `when` belong in annotations",
-                noun(*shape),
-            ),
-            // The same refusal about the clause beside the type rather than
-            // about a label inside it, so it has no noun to be worded in.
-            ir::ErrorKind::ClauseInDeclaration => f.write_str(
-                "a declared type says the same thing wherever it is used, so there is nothing here for a `where` clause to decide; it belongs in an annotation",
-            ),
-            // The same refusal about a variable rather than a comparison, and
-            // said as what a declaration's variables already are: writing one
-            // in the header is the fix, and naming it is shorter than
-            // describing it.
-            ir::ErrorKind::VariableInDeclaration => f.write_str(
-                "a declared type's variables are its parameters, so this one has to be written in its header; write `type T 'a = ...`",
-            ),
-            // And the same about a `_`, which leaves open the one thing a
-            // declaration has no way to leave open.
-            ir::ErrorKind::HoleInDeclaration => f.write_str(
-                "a declared type says the same thing wherever it is used, so there is nothing here for `_` to leave open",
-            ),
-            // Said as what the type would have to do rather than as what the
-            // clause failed to find: a formula is about presences, a presence
-            // is what a `when` puts on a label, and putting the name on one is
-            // the fix whether it was declared or not.
-            ir::ErrorKind::UnboundPresence { name } => write!(
-                f,
-                "this clause names `'{name}`, but no `when` in the type beside it gives it a label",
-            ),
-            ir::ErrorKind::IncompatiblePresenceOwnership { name, .. } => write!(
-                f,
-                "presence `'{name}` is produced at more than one lifetime; use a different name at each result boundary",
-            ),
-            // Counted in words, and said as what the type takes rather than as
-            // what the reader failed to supply — the count is the fact, and
-            // which side is short of it follows from the two numbers.
-            ir::ErrorKind::Arity { expected, found } => write!(
-                f,
-                "this type takes {}, and {} written",
-                arguments(*expected),
-                supplied(*found),
-            ),
-            ir::ErrorKind::NotAConstructor => {
-                f.write_str("only a declared type can be given arguments")
-            }
-            ir::ErrorKind::ParameterApplied => {
-                f.write_str("this stands for one type, so there is nothing to give arguments to")
-            }
-            ir::ErrorKind::DuplicateParameter { .. } => {
-                f.write_str("this type already takes something of this name")
-            }
-            // Said as the rule rather than as the loop: what the reader can
-            // change is the arguments at this one mention, and naming the whole
-            // cycle would point at declarations they got right.
-            ir::ErrorKind::GrowingRecursion => f.write_str(
-                "types that lead back to each other may hand on the names they take, but not types built out of them, which get bigger every time round",
-            ),
-            // Said as the readings rather than as "kind", which names a thing
-            // this language does not otherwise have and the reader has never
-            // been shown. One sentence for the two, because it is one thing
-            // gone wrong: a name that has to stand for one thing was given two.
-            // Which name it is, the span already says; where the other reading
-            // was is a second place, and pointing at one is layout — see
-            // [`FIRST_USE`].
-            ir::ErrorKind::MixedTail { first, second, .. } => write!(
-                f,
-                "this is used as {second} here and as {first} before it, and a name can only stand for one of them",
-            ),
-            ir::ErrorKind::MixedParameter { first, second } => write!(
-                f,
-                "this stands for {first} in one place and for {second} in another",
-            ),
-            ir::ErrorKind::NotARow { sense } => {
-                write!(f, "{sense} goes here, and this is not that")
-            }
-            // Said as what the argument does rather than as what goes here: a
-            // struct's `..` takes any type at all, so there is no reading to
-            // open with, and what is wrong is that the label would be named
-            // twice. The reader can change the field they wrote, and the type
-            // the declaration would end up with is not one anybody put on the
-            // page.
-            ir::ErrorKind::RepeatedRowField { shape, field } => write!(
-                f,
-                "this names `{}`, which the {} it goes into already has",
-                label(*shape, field),
-                shape,
-            ),
-            // Said as what the type does rather than as the loop the compiler
-            // noticed, the way [`ir::ErrorKind::Circular`] is: a type that adds
-            // fields to itself has more of them every time round, so there is no
-            // finite set of fields for it to have.
-            ir::ErrorKind::EndlessFields => {
-                f.write_str("this type adds fields to itself, so it never has all of them")
-            }
-            // Said as what a binding has to do — take whatever arrives — with
-            // the tag or number that breaks the promise quoted the way it was
-            // written. Two sentences for the two, because a case is something
-            // a value might not be and a number is something it might not
-            // equal.
-            ir::ErrorKind::RefutableBinding { found } => match found {
-                ir::Refuter::Case(name) => write!(
-                    f,
-                    "this binding has to accept every value, but a value here might not be `{}`",
-                    label(Shape::Sum, name),
-                ),
-                ir::Refuter::Literal(ir::Literal::Natural(value)) => write!(
-                    f,
-                    "this binding has to accept every value, but the number `{value}` makes it able to fail",
-                ),
-                ir::Refuter::Literal(value) => write!(
-                    f,
-                    "this binding has to accept every value, but `{value:?}` makes it able to fail",
-                ),
-            },
-            ir::ErrorKind::DuplicateBinding { name } => {
-                write!(f, "this binds `{name}` twice")
-            }
-            ir::ErrorKind::DuplicateOperation => f.write_str("duplicate operation"),
-            // Said as what to write instead, since the shape of the fix is the
-            // whole of what a reader needs: performing an operation is applying
-            // it, so an operation has to be something that can be applied.
-            ir::ErrorKind::NotAnOperation { name } => write!(
-                f,
-                "an operation must be a function: write `{name} : Nat -> ()`",
-            ),
-            ir::ErrorKind::ImpureOperation => f.write_str(
-                "an operation's signature must be plain; `+`, `..` and `when` belong in annotations",
-            ),
-            // Said as where effects do go, since the reader has written
-            // something that means one thing and put it where nothing means
-            // it: what is missing is an arrow to carry them.
-            ir::ErrorKind::EffectsOutsideRow => f.write_str(
-                "effects belong on an arrow, or at a parameter a type uses as its own",
-            ),
-            ir::ErrorKind::OperationOnAlias { effect } => write!(
-                f,
-                "an alias names effects and declares no operations, so `{}` has none to perform",
-                label(Shape::Effect, effect),
-            ),
-            ir::ErrorKind::UnknownOperation { effect, op } => write!(
-                f,
-                "no operation `{op}` on effect `{}`",
-                label(Shape::Effect, effect),
-            ),
-            ir::ErrorKind::BareOperationUnavailable { effect, suggestion } => match suggestion {
-                Some(op) => write!(
-                    f,
-                    "effect `{}` has only named operations; write `!{effect}.{op}`",
-                    label(Shape::Effect, effect),
-                ),
-                None => write!(f, "empty effect `{}` has no operation", label(Shape::Effect, effect)),
-            },
-            ir::ErrorKind::NamedOperationOnUnnamed { effect, op } => write!(
-                f,
-                "effect `{}` has one unnamed operation; write `!{effect}` instead of `!{effect}.{op}`",
-                label(Shape::Effect, effect),
-            ),
-            // Named rather than counted: the reader has to write an arm for
-            // each of them, and the list is the whole of what they have to do.
-            ir::ErrorKind::PartialHandler { effect, missing } => write!(
-                f,
-                "handling `{}` needs an arm for {} too",
-                label(Shape::Effect, effect),
-                listed(missing),
-            ),
-            ir::ErrorKind::DuplicateArm { effect, selector } => write!(
-                f,
-                "duplicate arm for `{}{selector}`",
-                label(Shape::Effect, effect),
-            ),
-            ir::ErrorKind::DuplicateReturn { .. } => f.write_str("duplicate return arm"),
-            ir::ErrorKind::RaiseOutsideArm => f.write_str("raise belongs in a handler arm"),
-            ir::ErrorKind::RaiseInFunction => f.write_str(
-                "raise may not be written inside a function: it answers the handler around it, and a function can outlive one",
-            ),
-        }
+        let error = ir::Error {
+            span: Span::default(),
+            kind: self.clone(),
+        };
+        f.write_str(&error.diagnostic().title)
     }
 }
 
 /// A list of operations as a sentence reads them: `a`, `a and b`, `a, b and
 /// c`. Every one is named, because every one is an arm the reader has to
 /// write.
+fn namespace_name(namespace: Namespace) -> &'static str {
+    match namespace {
+        Namespace::Terms => "value",
+        Namespace::Types => "type",
+        Namespace::Effects => "effect",
+        Namespace::Modules => "module",
+    }
+}
+
+/// A scalar literal written with Ruddy's own suffixes and escaping.
+struct SourceLiteral<'a>(&'a ir::Literal);
+
+impl fmt::Display for SourceLiteral<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            ir::Literal::Natural(value) => write!(f, "{value}n"),
+            ir::Literal::Integer(value) => write!(f, "{value}i"),
+            ir::Literal::Real(value) => write!(f, "{value:?}"),
+            ir::Literal::String(value) => write_string(f, value),
+            ir::Literal::Boolean(value) => write!(f, "{value}"),
+        }
+    }
+}
+
+fn operation_arms(names: &[String]) -> String {
+    match names.len() {
+        1 => format!("an arm for {}", listed(names)),
+        count => format!("{count} arms: {}", listed(names)),
+    }
+}
+
 fn listed(names: &[String]) -> String {
     let quoted: Vec<String> = names.iter().map(|name| format!("`{name}`")).collect();
     // Indexed rather than matched for emptiness: a handler that covers every
@@ -1915,7 +2428,7 @@ impl fmt::Display for Effect {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Effect::None => f.write_str("no change"),
-            Effect::Bound { var, value } => write!(f, "?{var} := {value}"),
+            Effect::Bound { var, value, .. } => write!(f, "?{var} := {value}"),
             // Not "smaller goals": an unfolding replaces a goal with the same
             // question asked about a shape, which is a step towards an answer
             // without being any smaller.
@@ -2021,6 +2534,7 @@ impl fmt::Display for ConstraintKind {
             ConstraintKind::CallbackCoverage {
                 required,
                 available,
+                ..
             } => write!(
                 f,
                 "callback {} covered by {}",
@@ -2054,6 +2568,665 @@ impl fmt::Display for Goal {
     }
 }
 
+fn type_description(description: inference::TypeDescription) -> &'static str {
+    use inference::TypeDescription as T;
+    match description {
+        T::NaturalNumber => "a natural number",
+        T::Integer => "an integer",
+        T::RealNumber => "a real number",
+        T::Text => "text",
+        T::Boolean => "a boolean",
+        T::Function => "a function",
+        T::Struct => "a struct",
+        T::TaggedValue => "a tagged value",
+        T::DeclaredType => "a declared type",
+        T::Undecided => "another type",
+    }
+}
+
+fn explanation_fact(
+    fact: &inference::ExplanationFact,
+    contradiction: &inference::Contradiction,
+) -> String {
+    use inference::ExplanationFactPayload as P;
+    if contradiction.kind == inference::ContradictionKind::RecursiveValue {
+        return match (fact.origin, fact.subject) {
+            (inference::ConstraintOrigin::ApplicationCallee, _)
+            | (_, inference::Subject::Callee | inference::Subject::CallShape) => {
+                "this call requires the value to accept an input".into()
+            }
+            (inference::ConstraintOrigin::ApplicationArgument, inference::Subject::Argument) => {
+                "this input is required to be the value itself".into()
+            }
+            (inference::ConstraintOrigin::ApplicationArgument, _) => {
+                "this call requires the input to accept itself".into()
+            }
+            (inference::ConstraintOrigin::Projection, inference::Subject::PatternDemand) => {
+                "this field requires the value to contain itself".into()
+            }
+            (_, inference::Subject::Argument | inference::Subject::Parameter) => {
+                "this input is required to contain itself".into()
+            }
+            _ => "this use requires the value to contain itself".into(),
+        };
+    }
+    match fact.payload {
+        P::UsedAsFunction => "this expression is called as a function".into(),
+        P::SuppliesArgument => match fact.subject {
+            inference::Subject::Parameter => {
+                "this call fixes what type the argument must have".into()
+            }
+            inference::Subject::Argument => "this argument supplies a type to the call".into(),
+            _ => "this call relates the argument and parameter types".into(),
+        },
+        P::BranchResult => match fact.subject {
+            inference::Subject::MatchArm => {
+                "this branch contributes its type to the match result".into()
+            }
+            inference::Subject::MatchResult => {
+                "all branches must contribute one result type".into()
+            }
+            _ => "this match requires its branches to agree".into(),
+        },
+        P::LabelDemand => {
+            if let Some(row) = &contradiction.row {
+                let (noun, label) = about(row.shape, &row.label);
+                format!("this use requires {noun} `{label}`")
+            } else {
+                "this field access requires a struct".into()
+            }
+        }
+        P::ClosedRow => {
+            if let Some(row) = &contradiction.row {
+                let (noun, label) = about(row.shape, &row.label);
+                format!("this use limits the type so {noun} `{label}` is unavailable")
+            } else {
+                "this value supplies a non-struct type here".into()
+            }
+        }
+        P::LabelIntroduction => {
+            let row = contradiction.row.as_ref().expect("overlap row metadata");
+            let (noun, label) = about(row.shape, &row.label);
+            format!("this use introduces {noun} `{label}`")
+        }
+        P::LabelForbidden => {
+            let row = contradiction.row.as_ref().expect("overlap row metadata");
+            let (noun, label) = about(row.shape, &row.label);
+            format!("this `..` remainder already follows named {noun} `{label}`")
+        }
+        P::CallerChoiceDeclaration => "this annotation leaves the choice to each caller".into(),
+        P::CallerChoiceUse => match contradiction.row.as_ref() {
+            Some(row) => {
+                let label = label(row.shape, &row.label);
+                match row.shape {
+                    Shape::Struct => format!("this reads field `{label}` from the caller's choice"),
+                    Shape::Sum => format!("this matches case `{label}` from the caller's choice"),
+                    Shape::Effect => {
+                        format!("this requires effect `{label}` from the caller's choice")
+                    }
+                }
+            }
+            None => "this use fixes a type that the caller must be free to choose".into(),
+        },
+        P::CallerChoiceDestination => {
+            "this binding's type would carry that choice outside its annotation".into()
+        }
+        P::EffectUse => {
+            let row = contradiction.row.as_ref().expect("effect metadata");
+            format!("this may perform effect `{}`", label(row.shape, &row.label))
+        }
+        P::EffectBoundary => {
+            let row = contradiction.row.as_ref().expect("effect metadata");
+            let effect = label(row.shape, &row.label);
+            match contradiction.kind {
+                inference::ContradictionKind::UnhandledEffect => {
+                    format!("this top-level computation has no handler for effect `{effect}`")
+                }
+                inference::ContradictionKind::EffectNotAllowed => {
+                    format!("this enclosing function does not allow effect `{effect}`")
+                }
+                _ => unreachable!("effect boundary payload on non-effect contradiction"),
+            }
+        }
+        P::EffectDeclaration => {
+            let row = contradiction.row.as_ref().expect("effect metadata");
+            format!("effect `{}` is declared here", label(row.shape, &row.label))
+        }
+        P::CallbackRequirement => {
+            "this callback can perform effects when host code invokes it".into()
+        }
+        P::ExternCapability => {
+            "this extern declaration does not list those callback effects".into()
+        }
+        P::ExternDeclaration => "this extern declaration owns the host boundary".into(),
+        P::PolymorphicExternLeaf => {
+            "this variable can produce differently shaped host values".into()
+        }
+        P::ExternPosition => "host code needs one fixed kind of value at this position".into(),
+        P::RequiresType => match fact.subject {
+            inference::Subject::Binding
+            | inference::Subject::TopLevelBinding
+            | inference::Subject::LocalBinding => {
+                "this binding keeps one type across all of its uses".into()
+            }
+            inference::Subject::Annotation => "the annotation fixes the type here".into(),
+            inference::Subject::Argument => "this argument has to fit the call".into(),
+            inference::Subject::Parameter => "the function requires one parameter type".into(),
+            inference::Subject::Term => "this expression supplies its type here".into(),
+            _ => "this use contributes one of the conflicting type requirements".into(),
+        },
+    }
+}
+
+fn displayed_explanation_fact(
+    fact: &inference::ExplanationFact,
+    at: usize,
+    explanation: &inference::InferenceExplanation,
+) -> String {
+    let message = explanation_fact(fact, &explanation.contradiction);
+    let Some(pivot) = explanation
+        .pivot
+        .as_ref()
+        .filter(|pivot| pivot.references.contains(&at))
+    else {
+        return message;
+    };
+    if at == pivot.introduced_at {
+        let description = match pivot.kind {
+            inference::ExplanationPivotKind::WrittenValue => "written value",
+            inference::ExplanationPivotKind::FunctionInput => "function input",
+            inference::ExplanationPivotKind::BranchResult => "branch result",
+            inference::ExplanationPivotKind::ProjectedField => "projected field",
+            inference::ExplanationPivotKind::FunctionEffects => "function effects",
+            inference::ExplanationPivotKind::Value => "shared value",
+        };
+        format!("Let’s call this {description} `{}` — {message}", pivot.name)
+    } else {
+        format!("{message}; this is another requirement on `{}`", pivot.name)
+    }
+}
+
+fn add_abridgement_note(
+    diagnostic: Diagnostic,
+    explanation: &inference::InferenceExplanation,
+) -> Diagnostic {
+    match explanation.omitted_facts {
+        0 => diagnostic,
+        1 => diagnostic.note("1 intermediate use is omitted from this short explanation"),
+        count => diagnostic.note(format!(
+            "{count} intermediate uses are omitted from this short explanation"
+        )),
+    }
+}
+
+fn mismatch_title(contradiction: &inference::Contradiction) -> String {
+    use inference::ContradictionKind as K;
+    let left = type_description(contradiction.left);
+    let right = type_description(contradiction.right);
+    match contradiction.kind {
+        K::ValueUsedAsFunction => {
+            let value = if contradiction.left == inference::TypeDescription::Function {
+                right
+            } else {
+                left
+            };
+            format!("{value} cannot be called as a function")
+        }
+        K::IncompatibleTypes => format!("{left} and {right} cannot be the same type"),
+        K::RecursiveValue => "this value would have to contain or accept itself".into(),
+        K::ProjectionOnNonStruct => format!("{left} cannot provide struct fields"),
+        K::LabelUnavailable => {
+            let row = contradiction
+                .row
+                .as_ref()
+                .expect("row contradiction metadata");
+            let (noun, label) = about(row.shape, &row.label);
+            format!("{noun} `{label}` is required by one use but excluded by another")
+        }
+        K::RepeatedLabel => {
+            let row = contradiction
+                .row
+                .as_ref()
+                .expect("row contradiction metadata");
+            let (noun, label) = about(row.shape, &row.label);
+            format!("{noun} `{label}` cannot be both named and included by `..`")
+        }
+        K::CallerChoice => match &contradiction.row {
+            Some(row) => {
+                let (noun, label) = about(row.shape, &row.label);
+                format!("the body cannot assume caller-chosen {noun} `{label}`")
+            }
+            None => "the body cannot fix a choice that belongs to each caller".into(),
+        },
+        K::CallerChoiceEscape => "a caller choice cannot cross into another binding's type".into(),
+        K::UnhandledEffect => {
+            let row = contradiction.row.as_ref().expect("effect metadata");
+            format!(
+                "effect `{}` has no enclosing handler",
+                label(row.shape, &row.label)
+            )
+        }
+        K::EffectNotAllowed => {
+            let row = contradiction.row.as_ref().expect("effect metadata");
+            format!(
+                "effect `{}` is not allowed by the enclosing function",
+                label(row.shape, &row.label)
+            )
+        }
+        K::CallbackEffectsNotCovered => {
+            "a callback can perform effects not listed by the extern declaration".into()
+        }
+        K::PolymorphicExternBoundary => {
+            "host code needs one fixed kind of value at this extern position".into()
+        }
+    }
+}
+
+fn effect_row_has_specific_operation(ty: &Ty) -> bool {
+    let Ty::Arrow(_, _, effects) = ty else {
+        return false;
+    };
+    effects
+        .labels
+        .values()
+        .any(|field| matches!(field.presence, Presence::Present))
+}
+
+fn causal_diagnostic(
+    mut diagnostic: Diagnostic,
+    explanation: &inference::InferenceExplanation,
+) -> Diagnostic {
+    diagnostic.title = mismatch_title(&explanation.contradiction);
+    let mut selected = explanation
+        .abridged
+        .iter()
+        .copied()
+        .filter_map(|at| explanation.full_facts.get(at).map(|fact| (at, fact)));
+    if let Some((at, primary)) = selected.next() {
+        diagnostic.primary.span = primary.span;
+        diagnostic.primary.message = displayed_explanation_fact(primary, at, explanation);
+    } else {
+        diagnostic.primary.message = "these uses contribute conflicting requirements".into();
+    }
+    for (at, fact) in selected {
+        diagnostic =
+            diagnostic.related(fact.span, displayed_explanation_fact(fact, at, explanation));
+    }
+    add_abridgement_note(diagnostic, explanation)
+}
+
+fn callback_effects(effects: &[String]) -> String {
+    effects
+        .iter()
+        .map(|effect| format!("`{}`", label(Shape::Effect, effect)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn callback_issue_details(
+    mut diagnostic: Diagnostic,
+    issues: &[inference::ExternCallbackIssue],
+) -> Diagnostic {
+    let mut all_effects = Vec::new();
+    let mut tails = Vec::new();
+    let mut conditional_repairs = Vec::new();
+    for issue in issues {
+        let requirements = if issue.requirements.is_empty() {
+            issue
+                .missing_effects
+                .iter()
+                .map(|effect| inference::ExternCallbackRequirement {
+                    effect: effect.clone(),
+                    condition: None,
+                })
+                .collect::<Vec<_>>()
+        } else {
+            issue.requirements.clone()
+        };
+        let mut unconditional = Vec::new();
+        for requirement in requirements {
+            let effect = callback_effects(std::slice::from_ref(&requirement.effect));
+            if let Some(condition) = requirement.condition {
+                diagnostic = diagnostic.note(format!(
+                    "at {}, callback coverage requires {effect} whenever {condition}",
+                    issue.callback_path
+                ));
+                let repair =
+                    format!("list {effect} on this extern declaration whenever {condition} holds");
+                if !conditional_repairs.contains(&repair) {
+                    conditional_repairs.push(repair);
+                }
+            } else {
+                if !all_effects.contains(&requirement.effect) {
+                    all_effects.push(requirement.effect.clone());
+                }
+                unconditional.push(requirement.effect);
+            }
+        }
+        if !unconditional.is_empty() {
+            diagnostic = diagnostic.note(format!(
+                "at {}, the callback can perform {} without matching extern capability",
+                issue.callback_path,
+                callback_effects(&unconditional),
+            ));
+        }
+        for tail in &issue.missing_tails {
+            diagnostic = diagnostic.note(format!("at {}, {tail}", issue.callback_path));
+            if !tails.contains(tail) {
+                tails.push(tail.clone());
+            }
+        }
+    }
+    if !all_effects.is_empty() {
+        diagnostic = diagnostic.help(format!(
+            "list {} on this extern declaration",
+            callback_effects(&all_effects)
+        ));
+    }
+    for repair in conditional_repairs {
+        diagnostic = diagnostic.help(repair);
+    }
+    if !tails.is_empty() {
+        diagnostic = diagnostic.help(
+            "make the extern declaration's effects cover the callback remainder noted at each path",
+        );
+    }
+    diagnostic.help("or handle those effects before the callback returns to host code")
+}
+
+impl inference::Error {
+    /// Turn an inference failure into reporter-independent words and source
+    /// annotations. This is deliberately the only presentation boundary for
+    /// type errors: terminals and the debugger must not reconstruct evidence
+    /// from the error kind themselves.
+    pub fn diagnostic(&self) -> Diagnostic {
+        use inference::ErrorKind as E;
+
+        let mut diagnostic = Diagnostic::new(self.kind.code(), self.kind.to_string(), self.span);
+        match &self.kind {
+            E::NotAStruct { .. } => {
+                if let Some(explanation) = &self.explanation {
+                    diagnostic = causal_diagnostic(diagnostic, explanation)
+                        .help("change the value to a struct")
+                        .help("or change/remove the field access");
+                } else {
+                    diagnostic = diagnostic
+                        .label("this field access requires a struct")
+                        .help("change this value to a struct, or change/remove the field access");
+                }
+            }
+            E::Mismatch { .. } => {
+                if let Some(explanation) = &self.explanation {
+                    diagnostic.title = mismatch_title(&explanation.contradiction);
+                    let mut selected = explanation
+                        .abridged
+                        .iter()
+                        .copied()
+                        .filter_map(|at| explanation.full_facts.get(at).map(|fact| (at, fact)));
+                    if let Some((at, primary)) = selected.next() {
+                        diagnostic.primary.span = primary.span;
+                        diagnostic.primary.message =
+                            displayed_explanation_fact(primary, at, explanation);
+                    } else {
+                        diagnostic.primary.message =
+                            "these uses contribute incompatible type requirements".into();
+                    }
+                    for (at, fact) in selected {
+                        diagnostic = diagnostic
+                            .related(fact.span, displayed_explanation_fact(fact, at, explanation));
+                    }
+                    diagnostic = add_abridgement_note(diagnostic, explanation)
+                        .help("change the first use so it agrees with the other one")
+                        .help("or change the other use so it agrees with the first one");
+                } else {
+                    diagnostic = diagnostic
+                        .label("these uses contribute incompatible type requirements")
+                        .help("change either use so both require the same type");
+                }
+            }
+            E::Recursive => {
+                if let Some(explanation) = &self.explanation {
+                    diagnostic = causal_diagnostic(diagnostic, explanation);
+                    diagnostic = match explanation.contradiction.recursive {
+                        Some(inference::RecursiveCycleShape::CallInput) => diagnostic
+                            .help("change the call so a value is not passed to itself")
+                            .help("or change the called value so it accepts a different input"),
+                        Some(inference::RecursiveCycleShape::Containment) => diagnostic
+                            .help("change the value so it does not contain itself")
+                            .help("or change the field that creates the containment"),
+                        Some(inference::RecursiveCycleShape::Neutral) | None => diagnostic
+                            .help("change one of these uses so the type is finite")
+                            .help("or separate the uses so they no longer require the same type"),
+                    };
+                } else {
+                    diagnostic = diagnostic
+                        .label("this use requires the value to contain or accept itself")
+                        .help("change one of these uses so the type is finite");
+                }
+            }
+            E::MissingField { shape, field, .. } | E::ExtraField { shape, field, .. } => {
+                let (noun, field) = about(*shape, field);
+                if let Some(explanation) = &self.explanation {
+                    diagnostic = causal_diagnostic(diagnostic, explanation)
+                        .help(format!("allow {noun} `{field}` in the limiting use"))
+                        .help(format!("or change the use that requires {noun} `{field}`"));
+                } else {
+                    diagnostic = diagnostic
+                        .label(format!("this use conflicts over {noun} `{field}`"))
+                        .help(format!(
+                            "allow {noun} `{field}`, or change the use that requires it"
+                        ));
+                }
+            }
+            E::RigidBroken {
+                declared,
+                sense,
+                found,
+                ..
+            } => {
+                if let Some(explanation) = &self.explanation {
+                    diagnostic = causal_diagnostic(diagnostic, explanation);
+                } else {
+                    diagnostic = diagnostic
+                        .label("this use narrows a choice that belongs to the caller")
+                        .related(*declared, DECLARED_HERE);
+                }
+                diagnostic = match sense {
+                    Sense::Type => diagnostic
+                        .help("return or pass through the annotated value instead of replacing its type")
+                        .help("or change the annotation to name the concrete type the body uses"),
+                    Sense::Fields => diagnostic
+                        .help("preserve the caller-chosen struct remainder instead of closing it")
+                        .help("or remove the open remainder from the annotation"),
+                    Sense::Cases => diagnostic
+                        .help("preserve the caller-chosen remaining cases instead of closing them")
+                        .help("or remove the open remainder from the annotation"),
+                    Sense::Effects if effect_row_has_specific_operation(found) => diagnostic
+                        .help("handle the performed effect inside the body")
+                        .help("or list that effect explicitly in the annotation"),
+                    Sense::Effects => diagnostic
+                        .help("preserve the caller-chosen effect remainder instead of closing it")
+                        .help("or remove or change the open effect remainder in the annotation"),
+                    Sense::Presence => diagnostic
+                        .help("preserve the annotation's label condition in the body")
+                        .help("or change the annotation's `where` condition"),
+                };
+            }
+            E::RigidField {
+                shape, declared, ..
+            } => {
+                let choices = match shape {
+                    Shape::Struct => "struct fields",
+                    Shape::Sum => "cases",
+                    Shape::Effect => "effects",
+                };
+                if let Some(explanation) = &self.explanation {
+                    diagnostic = causal_diagnostic(diagnostic, explanation);
+                } else {
+                    diagnostic = diagnostic
+                        .label(format!(
+                            "this assumes one of the {choices} chosen by the caller"
+                        ))
+                        .related(
+                            *declared,
+                            format!("the caller's choice of {choices} starts here"),
+                        );
+                }
+                diagnostic = match shape {
+                    Shape::Struct => diagnostic
+                        .help("read caller-chosen struct fields only when named explicitly before the annotation's `..` remainder")
+                        .help("or add this field explicitly to the annotation"),
+                    Shape::Sum => diagnostic
+                        .help("match caller-chosen cases only when named explicitly before the annotation's `..` remainder")
+                        .help("or add this case explicitly to the annotation"),
+                    Shape::Effect => diagnostic
+                        .help("handle this effect instead of requiring it from the caller-chosen effects")
+                        .help("or list this effect explicitly before the annotation's effect remainder"),
+                };
+            }
+            E::RigidEscapes {
+                destination,
+                destination_name,
+                destination_span,
+                ..
+            } => {
+                if let Some(explanation) = &self.explanation {
+                    diagnostic = causal_diagnostic(diagnostic, explanation);
+                    // The synthetic escape explanation already contributes a
+                    // destination fact. Replace it rather than appending a
+                    // second label for the same binding and span.
+                    diagnostic
+                        .related
+                        .retain(|annotation| annotation.span != *destination_span);
+                } else {
+                    diagnostic = diagnostic
+                        .label("this type carries a caller choice outside its annotation");
+                }
+                diagnostic = diagnostic
+                    .related(
+                        *destination_span,
+                        format!(
+                            "binding `{destination_name}` has inferred type `{destination}`, which would carry this choice outside its annotation"
+                        ),
+                    )
+                    .help("change or remove the source annotation so its caller choice does not enter this value")
+                    .help(format!(
+                        "or keep this value from flowing into binding `{destination_name}`"
+                    ));
+            }
+            E::RepeatedField { shape, field, .. } => {
+                let (noun, field) = about(*shape, field);
+                if let Some(explanation) = &self.explanation {
+                    diagnostic = causal_diagnostic(diagnostic, explanation)
+                        .help(format!("remove {noun} `{field}` from the named side"))
+                        .help("or keep it out of the `..` remainder");
+                } else {
+                    diagnostic = diagnostic
+                        .label(format!("{noun} `{field}` is already named outside `..`"))
+                        .help(format!(
+                            "remove the repeated {noun}, or remove it from the remainder"
+                        ));
+                }
+            }
+            E::PresenceRequired { .. } => {
+                diagnostic = diagnostic
+                    .label("this value does not meet the required combination")
+                    .help("change the value or loosen the required combination")
+            }
+            E::PresenceImpossible { .. } => {
+                diagnostic = diagnostic
+                    .label("the annotation and definition rule out every combination")
+                    .help("change the annotation or change how the definition uses the value")
+            }
+            E::ClauseImpossible { .. } => {
+                diagnostic = diagnostic
+                    .label("this clause rules out every combination")
+                    .help("remove one of the conflicting requirements in this clause")
+            }
+            E::AnnotationAllows { .. } => {
+                diagnostic = diagnostic
+                    .label("this annotation promises more combinations than the body accepts")
+                    .help("strengthen the annotation or loosen the body")
+            }
+            E::Unhandled { effect } => {
+                if let Some(explanation) = &self.explanation {
+                    diagnostic = causal_diagnostic(diagnostic, explanation);
+                } else {
+                    diagnostic = diagnostic.label(format!(
+                        "effect `{}` has no enclosing handler",
+                        label(Shape::Effect, effect)
+                    ));
+                }
+                diagnostic = diagnostic.help("handle this effect, or perform it inside a function")
+            }
+            E::NotAllowed { effect } => {
+                if let Some(explanation) = &self.explanation {
+                    diagnostic = causal_diagnostic(diagnostic, explanation);
+                } else {
+                    diagnostic = diagnostic.label(format!(
+                        "effect `{}` is not listed by this function",
+                        label(Shape::Effect, effect)
+                    ));
+                }
+                diagnostic =
+                    diagnostic.help("add the effect to the function type, or handle it here")
+            }
+            E::CallbackEffectsNotCovered {
+                missing_effects,
+                issues,
+                ..
+            } => {
+                if let Some(explanation) = &self.explanation {
+                    diagnostic = causal_diagnostic(diagnostic, explanation);
+                } else {
+                    let effects = if missing_effects.is_empty() {
+                        "callback evidence not carried by this extern".into()
+                    } else {
+                        callback_effects(missing_effects)
+                    };
+                    diagnostic = diagnostic.label(format!(
+                        "this callback requires {effects}, which the extern does not permit"
+                    ));
+                }
+                if issues.is_empty() {
+                    let effects = if missing_effects.is_empty() {
+                        "effects selected by a conditional callback type".into()
+                    } else {
+                        callback_effects(missing_effects)
+                    };
+                    diagnostic = diagnostic
+                        .note(format!(
+                            "the callback can perform {effects}, which the extern does not permit"
+                        ))
+                        .help(format!(
+                            "list {effects} on this extern declaration whenever the callback condition holds"
+                        ))
+                        .help("or handle those effects before the callback returns to host code");
+                } else {
+                    diagnostic = callback_issue_details(diagnostic, issues);
+                }
+            }
+            E::PolymorphicExternBoundary {
+                callback_issues, ..
+            } => {
+                if let Some(explanation) = &self.explanation {
+                    diagnostic = causal_diagnostic(diagnostic, explanation);
+                } else {
+                    diagnostic = diagnostic
+                        .label("host code needs one fixed kind of value at this position");
+                }
+                diagnostic = diagnostic
+                    .help("use a fixed type at this position")
+                    .help("or expose a concrete host-facing type and convert the value in Ruddy");
+                if !callback_issues.is_empty() {
+                    diagnostic = callback_issue_details(diagnostic, callback_issues);
+                }
+            }
+        }
+        diagnostic
+    }
+}
+
 impl inference::ErrorKind {
     /// A stable, greppable name for this kind of error. Reporters key on it
     /// rather than on the message, which is prose and may be reworded.
@@ -2082,8 +3255,10 @@ impl inference::ErrorKind {
             inference::ErrorKind::AnnotationAllows { .. } => "annotation-allows-more",
             inference::ErrorKind::Unhandled { .. } => "unhandled-effect",
             inference::ErrorKind::NotAllowed { .. } => "effect-not-allowed",
-            inference::ErrorKind::CallbackEffectsNotCovered => "callback-effects-not-covered",
-            inference::ErrorKind::PolymorphicExternBoundary => "polymorphic-extern-boundary",
+            inference::ErrorKind::CallbackEffectsNotCovered { .. } => {
+                "callback-effects-not-covered"
+            }
+            inference::ErrorKind::PolymorphicExternBoundary { .. } => "polymorphic-extern-boundary",
         }
     }
 }
@@ -2122,11 +3297,20 @@ impl fmt::Display for inference::ErrorKind {
             // at an arrow nobody wrote.
             inference::ErrorKind::RigidBroken {
                 sense: Sense::Effects,
+                found,
+                name,
+                ..
+            } if effect_row_has_specific_operation(found) => write!(
+                f,
+                "this restricts which effect it may perform, but `'{name}` stands for whatever effects the caller allows",
+            ),
+            inference::ErrorKind::RigidBroken {
+                sense: Sense::Effects,
                 name,
                 ..
             } => write!(
                 f,
-                "this decides what it may perform, but `'{name}` stands for whatever effects the caller allows",
+                "this closes the effects it may perform, but `'{name}` stands for whatever effects the caller allows",
             ),
             inference::ErrorKind::RigidBroken {
                 found,
@@ -2137,6 +3321,15 @@ impl fmt::Display for inference::ErrorKind {
                 f,
                 "this is `{found}`, but `'{name}` stands for whatever the caller picks for the rest of a struct's fields",
             ),
+            inference::ErrorKind::RigidBroken {
+                found,
+                name,
+                sense: Sense::Cases,
+                ..
+            } => write!(
+                f,
+                "this is `{found}`, but `'{name}` stands for whatever the caller picks for the remaining cases",
+            ),
             inference::ErrorKind::RigidBroken { found, name, .. } => write!(
                 f,
                 "this is `{found}`, but `'{name}` stands for whatever type the caller picks",
@@ -2144,23 +3337,33 @@ impl fmt::Display for inference::ErrorKind {
             inference::ErrorKind::RigidField {
                 shape, field, name, ..
             } => {
-                let (noun, field) = about(*shape, field);
+                let field = label(*shape, field);
+                let (action, choices) = match shape {
+                    Shape::Struct => ("reads field", "other struct fields"),
+                    Shape::Sum => ("matches case", "other cases"),
+                    Shape::Effect => ("requires effect", "other effects"),
+                };
                 write!(
                     f,
-                    "this reads a {noun} `{field}`, but `'{name}` stands for whatever type the caller picks, so it may not have one",
+                    "this {action} `{field}`, but `'{name}` stands for whatever {choices} the caller chooses, so `{field}` cannot be assumed",
                 )
             }
             // Said at the declaration, because that is the line that has to
             // change: the type the variable leaked into is somewhere the reader
             // never wrote it down.
-            inference::ErrorKind::RigidEscapes { name } => write!(
+            inference::ErrorKind::RigidEscapes {
+                name,
+                destination,
+                destination_name,
+                ..
+            } => write!(
                 f,
-                "`'{name}` stands for whatever the caller picks, so it can't be part of a type outside the annotation that declared it",
+                "`'{name}` stands for whatever that annotation's caller picks, but binding `{destination_name}` would publish it as `{destination}` outside that annotation",
             ),
             // Said as what `..` means rather than as the two rows that
             // disagreed: neither of those is a type the reader wrote, and the
             // field is the whole of what they can change.
-            inference::ErrorKind::RepeatedField { shape, field } => write!(
+            inference::ErrorKind::RepeatedField { shape, field, .. } => write!(
                 f,
                 "`..` covers only the {}s a type does not already name, and here it would have to cover `{}`",
                 noun(*shape),
@@ -2168,12 +3371,19 @@ impl fmt::Display for inference::ErrorKind {
             ),
             // Said in the labels the reader wrote rather than in the presence
             // variables the compiler gave them: what has to change is the value
-            // on this line, and its fields are the whole of what they can
-            // change about it.
-            inference::ErrorKind::PresenceRequired { formula } => write!(
-                f,
-                "this value needs `{formula}` among its fields, and it does not have that",
-            ),
+            // on this line, and the labels of this shape are the whole of what
+            // they can change about it.
+            inference::ErrorKind::PresenceRequired { formula, shape } => match shape {
+                Some(shape) => write!(
+                    f,
+                    "this value needs `{formula}` among its {}s, and it does not have that",
+                    noun(*shape),
+                ),
+                None => write!(
+                    f,
+                    "this value needs `{formula}` among its labels, and it does not have that",
+                ),
+            },
             inference::ErrorKind::PresenceImpossible { formula } => write!(
                 f,
                 "nothing can satisfy `{formula}`: what this definition does with the type has already ruled it out",
@@ -2203,14 +3413,48 @@ impl fmt::Display for inference::ErrorKind {
                 "this function performs `{}`, which its type does not allow",
                 label(Shape::Effect, effect),
             ),
-            inference::ErrorKind::CallbackEffectsNotCovered => write!(
-                f,
-                "callback effects are not covered by the containing extern call",
-            ),
-            inference::ErrorKind::PolymorphicExternBoundary => write!(
-                f,
-                "an extern boundary leaf must have a fixed runtime representation",
-            ),
+            inference::ErrorKind::CallbackEffectsNotCovered {
+                missing_effects,
+                callback_path,
+                callback_type,
+                extern_name,
+                ..
+            } => {
+                let effects = if missing_effects.is_empty() {
+                    "effects selected by a conditional callback type".into()
+                } else {
+                    missing_effects
+                        .iter()
+                        .map(|effect| format!("`{}`", label(Shape::Effect, effect)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                write!(
+                    f,
+                    "callback `{callback_type}` at {callback_path} can perform {effects}, which extern `{extern_name}` does not permit"
+                )
+            }
+            inference::ErrorKind::PolymorphicExternBoundary {
+                variable,
+                variable_kind,
+                position,
+                extern_name,
+                ..
+            } => {
+                let varies = match variable_kind {
+                    inference::ExternVariableKind::Type => "can be many different types",
+                    inference::ExternVariableKind::Row => {
+                        "leaves open which fields or effects the value carries"
+                    }
+                    inference::ExternVariableKind::Presence => {
+                        "leaves open whether parts of the value are present"
+                    }
+                };
+                write!(
+                    f,
+                    "host code needs one fixed kind of value at {position}, but `{variable}` in extern `{extern_name}` {varies}"
+                )
+            }
         }
     }
 }
@@ -2677,9 +3921,8 @@ pub fn write_let(
 /// Nothing here needs grouping. The scrutinee ends at the `with` however far
 /// right it runs, each arm's body ends at the next `|` or the `end` — none of
 /// the three begins an atom — and the `end` closes the whole form. The
-/// leading `|` is written on every arm, first included; the grammar makes it
-/// optional there, so the printed form re-parses, and a match with no arms is
-/// `match <scrutinee> with end` with no bar at all.
+/// leading `|` is written on every arm, first included, as the grammar
+/// requires. A match with no arms is `match <scrutinee> with end` with no bar.
 pub fn write_match<P: fmt::Display, B: fmt::Display>(
     f: &mut fmt::Formatter<'_>,
     scrutinee: &dyn fmt::Display,

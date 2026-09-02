@@ -11,6 +11,10 @@ use ruddy_cli::{
     Lockfile, Outcome, build_project, check_project, clean_project, compile,
     execute_javascript_module, new_project, run, run_project,
 };
+use ruddy_debug::{
+    snapshot::{ROOT as DEBUG_ROOT, compile as debug_compile},
+    wire::{CompileRequest, FileSpec, StdConfig},
+};
 use tempfile::TempDir;
 
 fn project() -> TempDir {
@@ -48,6 +52,85 @@ fn error(directory: &TempDir) -> String {
 }
 
 #[test]
+fn inference_diagnostics_keep_structured_parity_across_real_consumers() {
+    let source = include_str!("../diagnostics/inference/rigid-field-struct.hc");
+    let directory = tempfile::tempdir().unwrap();
+    write_project(directory.path(), "diagnostics", "0.1.0", &[]);
+    fs::write(directory.path().join("main.hc"), source).unwrap();
+
+    let failure = compile(directory.path()).expect_err("the fixture does not type-check");
+    let [cli] = failure.diagnostics() else {
+        panic!("expected one CLI diagnostic: {failure}");
+    };
+    let snapshot = debug_compile(
+        &CompileRequest {
+            name: "diagnostics".into(),
+            version: "0.1.0".into(),
+            root: DEBUG_ROOT.into(),
+            document: "diagnostics".into(),
+            files: vec![FileSpec {
+                path: DEBUG_ROOT.into(),
+                source: source.into(),
+            }],
+            std: StdConfig::Disabled,
+            dependencies: indexmap::IndexMap::new(),
+            revision: 0,
+        },
+        1,
+    );
+    let [debugger] = snapshot.diagnostics.as_slice() else {
+        panic!(
+            "expected one debugger diagnostic: {:#?}",
+            snapshot.diagnostics
+        );
+    };
+
+    assert_eq!(cli.stage(), debugger.stage);
+    assert_eq!(cli.code(), debugger.code);
+    assert_eq!(cli.message(), debugger.message);
+    assert_eq!(cli.help(), debugger.help);
+    assert_eq!(cli.notes(), debugger.notes);
+    for prose in std::iter::once(debugger.message.as_str())
+        .chain(std::iter::once(debugger.label.as_str()))
+        .chain(debugger.help.iter().map(String::as_str))
+        .chain(
+            debugger
+                .related
+                .iter()
+                .map(|related| related.message.as_str()),
+        )
+    {
+        assert!(!prose.to_lowercase().contains("rigid"), "{prose}");
+    }
+    let explanation = debugger
+        .inference_explanation
+        .as_ref()
+        .expect("caller-choice diagnostics are structured");
+    assert_eq!(explanation.contradiction.kind, "caller-choice");
+    assert!((2..=4).contains(&explanation.abridged.len()));
+    assert!(
+        explanation
+            .full
+            .iter()
+            .any(|fact| fact.payload == "caller-choice-declaration")
+    );
+    assert!(
+        explanation
+            .full
+            .iter()
+            .any(|fact| fact.payload == "caller-choice-use")
+    );
+
+    // The CLI's public adapter renders labels while the debugger keeps them as
+    // wire fields. Ensure those fields came through both real consumers too.
+    let rendered = cli.render(false);
+    assert!(rendered.contains(&debugger.label), "{rendered}");
+    for related in &debugger.related {
+        assert!(rendered.contains(&related.message), "{rendered}");
+    }
+}
+
+#[test]
 fn shared_std_configuration_accepts_only_false_or_dependency_syntax() {
     let disabled: ruddy_cli::StdConfig = toml::Value::Boolean(false).try_into().unwrap();
     assert!(disabled.is_disabled());
@@ -71,7 +154,7 @@ fn std_manifest_forms_are_strict_and_contextual() {
     for (setting, expected) in [
         ("1", "invalid type"),
         ("[]", "invalid type"),
-        ("{}", "either `path` or `git`"),
+        ("{}", "[dependency-source-missing] Error"),
         (
             "{ path = \"std\", git = \"https://example.test/std\" }",
             "both `path` and `git`",
@@ -115,7 +198,7 @@ fn bundled_std_installer_first_install_does_not_require_gnu_mv_flags() {
     fs::create_dir_all(&source).unwrap();
     fs::create_dir_all(&bin).unwrap();
     fs::write(source.join("Ruddy.toml"), "manifest").unwrap();
-    fs::write(source.join("main.hc"), "").unwrap();
+    fs::write(source.join("lib.hc"), "").unwrap();
 
     let real_mv = String::from_utf8(
         Command::new("sh")
@@ -170,7 +253,7 @@ fn bundled_std_installer_replaces_only_source_files() {
     fs::create_dir_all(source.join("build")).unwrap();
     fs::create_dir_all(home.join("std")).unwrap();
     fs::write(source.join("Ruddy.toml"), "manifest").unwrap();
-    fs::write(source.join("main.hc"), "").unwrap();
+    fs::write(source.join("lib.hc"), "").unwrap();
     fs::write(source.join("Nested/module.hc"), "let value = 0n\n").unwrap();
     fs::write(source.join("build/app.artifact"), "artifact").unwrap();
     fs::write(source.join("notes.txt"), "notes").unwrap();
@@ -195,13 +278,13 @@ fn bundled_std_installer_replaces_only_source_files() {
         fs::read_to_string(home.join("std/Ruddy.toml")).unwrap(),
         "manifest"
     );
-    assert!(home.join("std/main.hc").is_file());
+    assert!(home.join("std/lib.hc").is_file());
     assert!(home.join("std/Nested/module.hc").is_file());
     assert!(!home.join("std/old.hc").exists());
     assert!(!home.join("std/build").exists());
     assert!(!home.join("std/notes.txt").exists());
 
-    fs::remove_file(source.join("main.hc")).unwrap();
+    fs::remove_file(source.join("lib.hc")).unwrap();
     let output = Command::new(script)
         .arg(&source)
         .env("RUDDY_HOME", &home)
@@ -225,9 +308,9 @@ fn bundled_std_installer_releases_lock_when_old_tree_cleanup_fails() {
     fs::create_dir_all(home.join("std")).unwrap();
     fs::create_dir_all(&bin).unwrap();
     fs::write(source.join("Ruddy.toml"), "new").unwrap();
-    fs::write(source.join("main.hc"), "new main").unwrap();
+    fs::write(source.join("lib.hc"), "new main").unwrap();
     fs::write(home.join("std/Ruddy.toml"), "old").unwrap();
-    fs::write(home.join("std/main.hc"), "old main").unwrap();
+    fs::write(home.join("std/lib.hc"), "old main").unwrap();
 
     let real_rm = String::from_utf8(
         Command::new("sh")
@@ -300,10 +383,10 @@ fn bundled_std_installer_discovery_failure_preserves_existing_installation() {
     fs::create_dir_all(home.join("std")).unwrap();
     fs::create_dir_all(&bin).unwrap();
     fs::write(source.join("Ruddy.toml"), "new").unwrap();
-    fs::write(source.join("main.hc"), "new main").unwrap();
+    fs::write(source.join("lib.hc"), "new main").unwrap();
     fs::write(source.join("Nested/module.hc"), "new nested").unwrap();
     fs::write(home.join("std/Ruddy.toml"), "old").unwrap();
-    fs::write(home.join("std/main.hc"), "old main").unwrap();
+    fs::write(home.join("std/lib.hc"), "old main").unwrap();
 
     let real_find = String::from_utf8(
         Command::new("sh")
@@ -345,7 +428,7 @@ fn bundled_std_installer_discovery_failure_preserves_existing_installation() {
         "old"
     );
     assert_eq!(
-        fs::read_to_string(home.join("std/main.hc")).unwrap(),
+        fs::read_to_string(home.join("std/lib.hc")).unwrap(),
         "old main"
     );
     assert!(fs::read_dir(&home).unwrap().all(|entry| {
@@ -370,7 +453,7 @@ fn bundled_std_installer_reports_missing_exchange_capability_before_copying() {
     fs::create_dir_all(home.join("std")).unwrap();
     fs::create_dir_all(&bin).unwrap();
     fs::write(source.join("Ruddy.toml"), "new").unwrap();
-    fs::write(source.join("main.hc"), "").unwrap();
+    fs::write(source.join("lib.hc"), "").unwrap();
     fs::write(home.join("std/Ruddy.toml"), "old").unwrap();
     let fake_mv = bin.join("mv");
     fs::write(&fake_mv, "#!/bin/sh\necho 'minimal mv'\n").unwrap();
@@ -429,7 +512,7 @@ fn bundled_std_installer_never_hides_an_existing_installation() {
     fs::create_dir_all(&source).unwrap();
     fs::create_dir_all(home.join("std")).unwrap();
     fs::write(source.join("Ruddy.toml"), "new").unwrap();
-    fs::write(source.join("main.hc"), "").unwrap();
+    fs::write(source.join("lib.hc"), "").unwrap();
     fs::write(home.join("std/Ruddy.toml"), "old").unwrap();
 
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -491,7 +574,7 @@ fn bundled_std_installer_interruption_preserves_existing_installation() {
     fs::create_dir_all(&source).unwrap();
     fs::create_dir_all(home.join("std")).unwrap();
     fs::write(source.join("Ruddy.toml"), "new").unwrap();
-    fs::write(source.join("main.hc"), "").unwrap();
+    fs::write(source.join("lib.hc"), "").unwrap();
     fs::write(home.join("std/Ruddy.toml"), "old").unwrap();
 
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -546,7 +629,7 @@ fn bundled_std_installer_resolves_symlinked_metacharacter_source_roots() {
     fs::create_dir_all(source.join("Nested")).unwrap();
     fs::create_dir_all(source.join("build")).unwrap();
     fs::write(source.join("Ruddy.toml"), "manifest").unwrap();
-    fs::write(source.join("main.hc"), "main").unwrap();
+    fs::write(source.join("lib.hc"), "main").unwrap();
     fs::write(source.join("Nested/module.hc"), "nested").unwrap();
     fs::write(source.join("build/generated.hc"), "generated").unwrap();
     symlink(&source, &source_link).unwrap();
@@ -566,10 +649,7 @@ fn bundled_std_installer_resolves_symlinked_metacharacter_source_roots() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        fs::read_to_string(home.join("std/main.hc")).unwrap(),
-        "main"
-    );
+    assert_eq!(fs::read_to_string(home.join("std/lib.hc")).unwrap(), "main");
     assert_eq!(
         fs::read_to_string(home.join("std/Nested/module.hc")).unwrap(),
         "nested"
@@ -590,7 +670,7 @@ fn bundled_std_installer_serializes_concurrent_first_installs() {
     for (source, contents) in [(&first, "first"), (&second, "second")] {
         fs::create_dir_all(source).unwrap();
         fs::write(source.join("Ruddy.toml"), contents).unwrap();
-        fs::write(source.join("main.hc"), contents).unwrap();
+        fs::write(source.join("lib.hc"), contents).unwrap();
     }
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -645,7 +725,7 @@ fn bundled_std_installer_preserves_a_stale_lock_for_manual_recovery() {
     fs::create_dir_all(&source).unwrap();
     fs::create_dir_all(home.join(".std.install.lock")).unwrap();
     fs::write(source.join("Ruddy.toml"), "manifest").unwrap();
-    fs::write(source.join("main.hc"), "main").unwrap();
+    fs::write(source.join("lib.hc"), "main").unwrap();
     fs::write(home.join(".std.install.lock/owner"), "999999999\n").unwrap();
 
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -686,7 +766,7 @@ fn bundled_std_installer_preserves_a_stale_lock_for_manual_recovery() {
         "{}",
         String::from_utf8_lossy(&retry.stderr)
     );
-    assert!(home.join("std/main.hc").is_file());
+    assert!(home.join("std/lib.hc").is_file());
 }
 
 #[cfg(target_os = "linux")]
@@ -702,7 +782,7 @@ fn bundled_std_installer_never_reaps_a_new_owner_after_waiting() {
     fs::create_dir_all(&source).unwrap();
     fs::create_dir_all(&lock).unwrap();
     fs::write(source.join("Ruddy.toml"), "manifest").unwrap();
-    fs::write(source.join("main.hc"), "main").unwrap();
+    fs::write(source.join("lib.hc"), "main").unwrap();
     fs::write(lock.join("owner"), "stale owner\n").unwrap();
 
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -752,7 +832,7 @@ fn bundled_std_installer_does_not_reap_an_empty_lock() {
     fs::create_dir_all(&source).unwrap();
     fs::create_dir_all(&lock).unwrap();
     fs::write(source.join("Ruddy.toml"), "manifest").unwrap();
-    fs::write(source.join("main.hc"), "main").unwrap();
+    fs::write(source.join("lib.hc"), "main").unwrap();
     fs::write(lock.join("owner"), "").unwrap();
     fs::write(lock.join("candidate.abandoned"), "999999 abandoned\n").unwrap();
 
@@ -790,7 +870,7 @@ fn bundled_std_installer_cleans_a_probe_interrupted_during_creation() {
     fs::create_dir_all(home.join("std")).unwrap();
     fs::create_dir_all(&bin).unwrap();
     fs::write(source.join("Ruddy.toml"), "new").unwrap();
-    fs::write(source.join("main.hc"), "new").unwrap();
+    fs::write(source.join("lib.hc"), "new").unwrap();
     fs::write(home.join("std/Ruddy.toml"), "old").unwrap();
     let real_mktemp = String::from_utf8(
         Command::new("sh")
@@ -1037,7 +1117,10 @@ fn automatic_std_graph_child() {
     )
     .unwrap();
     let found = compile(&versions).unwrap_err().to_string();
-    assert!(found.contains("both declare bundle std@1.0.0"), "{found}");
+    assert!(
+        found.contains("[project-identity-conflict] Error") && found.contains("`std@1.0.0`"),
+        "{found}"
+    );
 
     let cycle = root.join("cycle");
     fs::create_dir_all(&cycle).unwrap();
@@ -1111,7 +1194,8 @@ fn disabled_std_does_not_open_an_implicit_prelude() {
     )
     .unwrap();
     let found = error(&directory);
-    assert!(found.contains("undefined term"), "{found}");
+    assert!(found.contains("[undefined-term] Error"), "{found}");
+    assert!(found.contains("cannot find value `answer`"), "{found}");
 }
 
 #[test]
@@ -1242,7 +1326,7 @@ fn detailed_dependencies_alias_hyphenated_bundle_identities() {
     .unwrap();
     let error = error(&directory);
     assert!(
-        error.contains("not a valid Ruddy source identifier"),
+        error.contains("[dependency-alias-invalid] Error"),
         "{error}"
     );
 }
@@ -1282,7 +1366,8 @@ fn transitive_dependencies_are_linkable_but_not_source_visible() {
 
     fs::write(directory.path().join("main.hc"), "let main = base::foo\n").unwrap();
     let error = error(&directory);
-    assert!(error.contains("undefined module"), "{error}");
+    assert!(error.contains("[undefined-module] Error"), "{error}");
+    assert!(error.contains("cannot find module `base`"), "{error}");
 }
 
 #[test]
@@ -1300,10 +1385,22 @@ fn missing_dependency_paths_report_the_requested_namespace() {
     )
     .unwrap();
     let error = error(&directory);
-    assert!(error.contains("undefined term"), "{error}");
-    assert!(error.contains("undefined type"), "{error}");
-    assert!(error.contains("undefined effect"), "{error}");
-    assert!(error.contains("undefined module"), "{error}");
+    assert!(
+        error.contains("[undefined-term] Error: cannot find value `missing`"),
+        "{error}"
+    );
+    assert!(
+        error.contains("[undefined-type] Error: cannot find type `Missing`"),
+        "{error}"
+    );
+    assert!(
+        error.contains("[undefined-effect] Error: cannot find effect `MissingEffect`"),
+        "{error}"
+    );
+    assert!(
+        error.contains("[undefined-module] Error: cannot find module `NoModule`"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -1321,7 +1418,8 @@ fn a_local_module_cannot_shadow_a_direct_dependency_root() {
     )
     .unwrap();
     let error = error(&directory);
-    assert!(error.contains("duplicate module"), "{error}");
+    assert!(error.contains("[duplicate-module] Error"), "{error}");
+    assert!(error.contains("`std` is defined more than once"), "{error}");
 }
 
 #[test]
@@ -1374,6 +1472,12 @@ fn nested_root_diagnostics_preserve_root_and_module_paths() {
 
     fs::remove_file(directory.path().join("src/Child.hc")).expect("remove the module file");
     let missing = error(&directory).replace('\\', "/");
+    assert!(missing.contains("[module-file-missing] Error"), "{missing}");
+    assert!(missing.contains("this module needs a file"), "{missing}");
+    assert!(
+        missing.contains("no file was found for this module"),
+        "{missing}"
+    );
     assert!(
         missing.contains("create `src/Child.hc` or `src/Child/module.hc`"),
         "{missing}",
@@ -1389,7 +1493,13 @@ fn nested_root_diagnostics_preserve_root_and_module_paths() {
     .expect("write the inside candidate");
     let ambiguous = error(&directory).replace('\\', "/");
     assert!(
-        ambiguous.contains("delete one of `src/Child.hc` or `src/Child/module.hc`"),
+        ambiguous.contains("[module-file-ambiguous] Error")
+            && ambiguous.contains("this module has two possible files"),
+        "{ambiguous}"
+    );
+    assert!(
+        ambiguous
+            .contains("keep one of `src/Child.hc` or `src/Child/module.hc` and delete the other"),
         "{ambiguous}",
     );
 }
@@ -1398,7 +1508,7 @@ fn nested_root_diagnostics_preserve_root_and_module_paths() {
 fn the_manifest_is_required_and_must_be_valid_and_supported() {
     let directory = project();
     let missing = error(&directory);
-    assert!(missing.contains("could not read manifest"), "{missing}");
+    assert!(missing.contains("[manifest-unreadable] Error"), "{missing}");
     assert!(missing.contains("Ruddy.toml"), "{missing}");
 
     for (manifest, expected) in [
@@ -1421,7 +1531,7 @@ fn the_manifest_is_required_and_must_be_valid_and_supported() {
             "name = \"app\"\nversion = \"1.0.0\"\nroot = 1\n[dependencies]\n",
             "invalid type",
         ),
-        ("[dependencies", "could not parse manifest"),
+        ("[dependencies", "[manifest-invalid] Error"),
         (
             "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\ntitle = \"app\"\n[dependencies]\nstd = false\n",
             "unknown field `title`",
@@ -1460,34 +1570,49 @@ fn the_manifest_is_required_and_must_be_valid_and_supported() {
         let found = error(&directory);
         assert!(found.contains(expected), "`{expected}` in:\n{found}");
     }
+
+    fs::write(
+        directory.path().join("Ruddy.toml"),
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nbase = { git = [\"https://user:secret@example.test/repo\"] }\n",
+    )
+    .unwrap();
+    let redacted = error(&directory);
+    assert!(redacted.contains("[manifest-invalid] Error"), "{redacted}");
+    assert!(!redacted.contains("user:secret"), "{redacted}");
 }
 
 #[test]
 fn git_dependency_manifest_validation_is_strict_and_contextual() {
     let directory = project();
     for (specification, expected) in [
-        ("{ git = \"http://example.test/repo\" }", "must use HTTPS"),
-        ("{ git = \"ssh://example.test/repo\" }", "must use HTTPS"),
+        (
+            "{ git = \"http://example.test/repo\" }",
+            "[dependency-git-not-https] Error",
+        ),
+        (
+            "{ git = \"ssh://example.test/repo\" }",
+            "[dependency-git-not-https] Error",
+        ),
         (
             "{ path = \"dep\", git = \"https://example.test/repo\" }",
-            "both `path` and `git`",
+            "[dependency-source-conflict] Error",
         ),
-        ("{ bundle = \"base\" }", "either `path` or `git`"),
+        ("{ bundle = \"base\" }", "[dependency-source-missing] Error"),
         (
             "{ path = \"dep\", branch = \"main\" }",
-            "selectors require a `git`",
+            "[dependency-selector-without-git] Error",
         ),
         (
             "{ git = \"https://example.test/repo\", branch = \"\" }",
-            "must not be empty",
+            "[dependency-selector-empty] Error",
         ),
         (
             "{ git = \"https://example.test/repo\", branch = \"main\", tag = \"v1\" }",
-            "conflicting",
+            "[dependency-selectors-conflict] Error",
         ),
         (
             "{ git = \"https://example.test/repo\", branch = \"bad..name\" }",
-            "valid Git reference names",
+            "[dependency-selector-invalid] Error",
         ),
         (
             "{ git = \"https://example.test/repo\", unknown = true }",
@@ -1502,6 +1627,31 @@ fn git_dependency_manifest_validation_is_strict_and_contextual() {
         }
         assert!(!directory.path().join("Ruddy.lock").exists());
     }
+
+    fs::write(
+        directory.path().join("Ruddy.toml"),
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nbase = { git = \"http://user:secret@example.test/repo?token=hidden\" }\n",
+    )
+    .unwrap();
+    let redacted = error(&directory);
+    assert!(!redacted.contains("user:secret"), "{redacted}");
+    assert!(!redacted.contains("token=hidden"), "{redacted}");
+    assert!(
+        redacted.contains("this Git dependency URL must use HTTPS"),
+        "{redacted}"
+    );
+
+    fs::write(
+        directory.path().join("Ruddy.toml"),
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nbase = { git = \"user:secret@example.test/repo\" }\n",
+    )
+    .unwrap();
+    let malformed = error(&directory);
+    assert!(!malformed.contains("user:secret"), "{malformed}");
+    assert!(
+        malformed.contains("[dependency-git-not-https] Error"),
+        "{malformed}"
+    );
 }
 
 #[test]
@@ -1545,7 +1695,7 @@ fn hostile_git_configuration_child() {
     let app = PathBuf::from(std::env::var_os("RUDDY_TEST_GIT_APP").unwrap());
     let found = compile(app).unwrap_err().to_string();
     assert!(
-        found.contains("effective Git remote URL must use HTTPS"),
+        found.contains("rewrote the dependency URL to a non-HTTPS address"),
         "{found}"
     );
 }
@@ -1609,7 +1759,7 @@ fn ruddy_home_layout_child() {
             ruddy_cli::ruddy_home()
                 .unwrap_err()
                 .to_string()
-                .contains("set RUDDY_HOME")
+                .contains("[ruddy-home-unavailable] Error")
         ),
     }
 }
@@ -1821,7 +1971,7 @@ fn exact_revisions_require_unambiguous_hex_prefixes_before_network_access() {
     let directory = project();
     fs::write(directory.path().join("Ruddy.toml"), "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nbase = { git = \"https://127.0.0.1:9/repository\", rev = \"abc123\" }\n").unwrap();
     let found = error(&directory);
-    assert!(found.contains("7 to 40 hexadecimal digits"), "{found}");
+    assert!(found.contains("7 to 40 hexadecimal characters"), "{found}");
     assert!(!directory.path().join("Ruddy.lock").exists());
 }
 
@@ -1869,15 +2019,21 @@ fn malformed_and_unsupported_lockfiles_are_diagnosed_without_replacement() {
         "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
-    for source in [
-        "not toml =",
-        "version = 2\n",
-        "version = 1\n[[git]]\nurl = \"https://example.test/repo\"\ncommit = \"short\"\n",
-        "version = 1\n[[git]]\nurl = \"https://example.test/repo\"\nbranch = \"main\"\ntag = \"v1\"\ncommit = \"0000000000000000000000000000000000000000\"\n",
+    for (source, code) in [
+        ("not toml =", "lockfile-invalid"),
+        ("version = 2\n", "lockfile-version-unsupported"),
+        (
+            "version = 1\n[[git]]\nurl = \"https://example.test/repo\"\ncommit = \"short\"\n",
+            "lockfile-invalid-commit",
+        ),
+        (
+            "version = 1\n[[git]]\nurl = \"https://example.test/repo\"\nbranch = \"main\"\ntag = \"v1\"\ncommit = \"0000000000000000000000000000000000000000\"\n",
+            "lockfile-selectors-conflict",
+        ),
     ] {
         fs::write(directory.path().join("Ruddy.lock"), source).unwrap();
         let found = error(&directory);
-        assert!(found.contains("lockfile"), "{found}");
+        assert!(found.contains(&format!("[{code}] Error")), "{found}");
         assert_eq!(
             fs::read_to_string(directory.path().join("Ruddy.lock")).unwrap(),
             source
@@ -1901,9 +2057,9 @@ fn public_lockfile_format_round_trips_deterministically() {
 fn manifest_bundle_identity_must_be_valid() {
     let directory = project();
     for (name, version, expected) in [
-        ("app", "not-semver", "invalid semantic version"),
-        ("not.a.name", "1.0.0", "not a valid Ruddy bundle name"),
-        ("app", "1.0.0+local", "unsupported build metadata"),
+        ("app", "not-semver", "[project-version-invalid] Error"),
+        ("not.a.name", "1.0.0", "[project-name-invalid] Error"),
+        ("app", "1.0.0+local", "[project-version-build-suffix] Error"),
     ] {
         fs::write(
             directory.path().join("Ruddy.toml"),
@@ -1923,7 +2079,12 @@ fn dependency_projects_must_exist_compile_and_match_the_table_key() {
 
     write_project(&directory.path().join("child"), "other", "1.0.0", &[]);
     fs::write(directory.path().join("Ruddy.toml"), "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nbase = \"child\"\n").unwrap();
-    assert!(error(&directory).contains("contains project `other` instead"));
+    let mismatch = error(&directory);
+    assert!(
+        mismatch.contains("[dependency-name-mismatch] Error")
+            && mismatch.contains("declares `other`"),
+        "{mismatch}"
+    );
 
     write_project(&directory.path().join("child"), "base", "1.0.0", &[]);
     fs::write(
@@ -1931,9 +2092,19 @@ fn dependency_projects_must_exist_compile_and_match_the_table_key() {
         "let bad : Nat = fn x => x\n",
     )
     .unwrap();
-    let found = error(&directory);
+    let diagnostics = compile(directory.path()).expect_err("the dependency does not type-check");
+    assert_eq!(diagnostics.diagnostics().len(), 1, "{diagnostics}");
+    assert_eq!(diagnostics.diagnostics()[0].code(), "type-mismatch");
+    assert!(
+        diagnostics.diagnostics()[0]
+            .notes()
+            .iter()
+            .any(|note| note.contains("dependency `base`"))
+    );
+    let found = diagnostics.to_string();
     assert!(found.contains("dependency `base`"));
-    assert!(found.contains("error[types/"));
+    assert!(found.contains("[type-mismatch] Error"), "{found}");
+    assert!(!found.contains("error: dependency"), "{found}");
 }
 
 #[test]
@@ -2094,7 +2265,10 @@ fn distinct_projects_cannot_claim_one_bundle_identity() {
     let error = ruddy_cli::compile_dependency_graph([("same", &left), ("same", &right)])
         .unwrap_err()
         .to_string();
-    assert!(error.contains("both declare bundle same@1.0.0"), "{error}");
+    assert!(
+        error.contains("[project-identity-conflict] Error") && error.contains("`same@1.0.0`"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -2156,7 +2330,7 @@ fn bundle_and_compiler_failures_are_returned_as_cli_diagnostics() {
         .expect_err("the configured root is missing")
         .to_string();
     assert!(
-        root_error.contains("could not read bundle root"),
+        root_error.contains("[project-root-missing] Error") && root_error.contains("missing.hc"),
         "{root_error}"
     );
 
@@ -2172,11 +2346,136 @@ fn bundle_and_compiler_failures_are_returned_as_cli_diagnostics() {
     )
     .unwrap();
     let compiler = error(&directory);
-    assert!(compiler.contains("error[types/"), "{compiler}");
+    assert!(compiler.contains("[type-mismatch] Error"), "{compiler}");
     assert!(compiler.contains("main.hc:1:"), "{compiler}");
 
     let diagnostics = compile(directory.path()).expect_err("the program has a type error");
     assert_eq!(diagnostics.messages().len(), 1, "{diagnostics}");
+}
+
+#[test]
+fn frontend_errors_stop_compilation_without_parse_or_semantic_cascades() {
+    let directory = project();
+    write_project(directory.path(), "app", "1.0.0", &[]);
+    fs::write(directory.path().join("main.hc"), "let n = 1x\n").unwrap();
+
+    let diagnostics = compile(directory.path()).expect_err("the joined name is invalid");
+    assert_eq!(diagnostics.messages().len(), 1, "{diagnostics}");
+    let rendered = diagnostics.to_string();
+    assert!(
+        rendered.contains("[number-joined-to-name] Error"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("expected-"), "{rendered}");
+    assert!(!rendered.contains("[ir/"), "{rendered}");
+    assert!(!rendered.contains("[types/"), "{rendered}");
+}
+
+#[test]
+fn rendering_without_color_has_no_ansi_and_omits_the_internal_phase() {
+    let sources = [ruddy_cli::DiagnosticSource {
+        path: "main.hc",
+        source: "let n = 1x\n",
+    }];
+    let primary = ruddy_cli::DiagnosticLabel {
+        source: 0,
+        range: 8..10,
+        message: "the number and name are joined",
+    };
+    let rendered = ruddy_cli::render_diagnostic_with_advice(
+        "lex",
+        "number-joined-to-name",
+        "a number cannot run directly into a name",
+        &sources,
+        Some(&primary),
+        &[],
+        Some("add a space"),
+        &[],
+        false,
+    );
+
+    assert!(!rendered.contains('\x1b'), "{rendered:?}");
+    assert!(
+        rendered.contains("[number-joined-to-name] Error"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("[lex/"), "{rendered}");
+    assert!(
+        rendered.contains("a number cannot run directly into a name"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("the number and name are joined"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("Help: add a space") || rendered.contains("help: add a space"),
+        "{rendered}"
+    );
+
+    let plain = ruddy_cli::render_diagnostic_with_advice(
+        "dependencies",
+        "dependency-source-missing",
+        "a dependency needs either a local `path` or a `git` URL",
+        &[],
+        None,
+        &[],
+        Some("add one source"),
+        &["declared in `Ruddy.toml`"],
+        false,
+    );
+    assert!(
+        plain.starts_with("[dependency-source-missing] Error:"),
+        "{plain}"
+    );
+    assert!(!plain.contains("error["), "{plain}");
+    assert!(plain.contains("help: add one source"), "{plain}");
+    assert!(plain.contains("note: declared in `Ruddy.toml`"), "{plain}");
+}
+
+#[test]
+fn no_color_overrides_forced_cli_color() {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "cli::no_color_child"])
+        .env("NO_COLOR", "1")
+        .env("CLICOLOR_FORCE", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "run in isolation with controlled color environment variables"]
+fn no_color_child() {
+    let directory = project();
+    write_project(directory.path(), "app", "1.0.0", &[]);
+    fs::write(directory.path().join("main.hc"), "let n = 1x\n").unwrap();
+    let rendered = error(&directory);
+    assert!(!rendered.contains('\x1b'), "{rendered:?}");
+    assert!(
+        rendered.contains("[number-joined-to-name] Error"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn compiler_diagnostics_treat_spans_as_byte_offsets() {
+    let directory = project();
+    write_project(directory.path(), "app", "1.0.0", &[]);
+    fs::write(
+        directory.path().join("main.hc"),
+        "let café = 1n\nlet bad : Nat = false\n",
+    )
+    .unwrap();
+
+    let compiler = error(&directory);
+    assert!(compiler.contains("main.hc:2:11"), "{compiler}");
+    assert!(compiler.contains("2 │let bad : Nat = false"), "{compiler}");
 }
 
 #[test]
@@ -2192,7 +2491,7 @@ fn the_configured_root_must_name_a_file() {
             .expect_err("the root does not name a file")
             .to_string();
         assert!(
-            error.contains("field `root` must name a file"),
+            error.contains("[project-root-invalid] Error"),
             "root `{root}`: {error}"
         );
     }
@@ -2438,7 +2737,7 @@ fn unsupported_manifest_targets_use_manifest_parse_diagnostics() {
         )
         .unwrap();
         let error = compile(directory.path()).unwrap_err().to_string();
-        assert!(error.contains("could not parse manifest"), "{error}");
+        assert!(error.contains("[manifest-invalid] Error"), "{error}");
     }
 }
 
@@ -2449,7 +2748,7 @@ fn build_surfaces_compile_directory_and_artifact_write_failures() {
     assert!(
         compile_error
             .to_string()
-            .contains("could not read manifest")
+            .contains("[manifest-unreadable] Error")
     );
     assert!(!compile_error.is_usage());
 
@@ -2889,10 +3188,7 @@ fn run_rejects_an_effectful_callback_through_a_polymorphic_extern_boundary() {
         rendered.contains("polymorphic-extern-boundary"),
         "{rendered}"
     );
-    assert!(
-        rendered.contains("fixed runtime representation"),
-        "{rendered}"
-    );
+    assert!(rendered.contains("one fixed kind of value"), "{rendered}");
     assert!(
         !app.join("build/polymorphic-callback.js").exists(),
         "an unsound module reached execution"
@@ -2945,7 +3241,10 @@ fn check_compiles_without_build_output_and_reports_failures() {
     let error = check_project(&app).unwrap_err();
     assert!(!error.is_usage());
     assert_eq!(error.exit_code(), 1);
-    assert!(error.to_string().contains("error[types/"), "{error}");
+    assert!(
+        error.to_string().contains("[type-mismatch] Error"),
+        "{error}"
+    );
     assert!(!app.join("build").exists());
 }
 

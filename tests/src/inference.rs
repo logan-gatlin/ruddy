@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use indexmap::IndexMap;
 use ruddy::{
-    inference::{self, ConstraintKind, Effect, ErrorKind, Rule},
+    inference::{self, ConstraintKind, Effect, ErrorCause, ErrorKind, Rule},
     ir::{self, Decl, Term, TermKind},
     parse,
     symbol::{Bundle, Mint, Namespace, Symbol, Version},
@@ -992,8 +992,8 @@ fn a_declared_variable_is_the_definitions_to_leave_alone() {
     assert_eq!(error.kind.code(), "rigid-field");
     assert_eq!(
         error.kind.to_string(),
-        "this reads a field `x`, but `'a` stands for whatever type the caller picks, \
-         so it may not have one"
+        "this reads field `x`, but `'a` stands for whatever other struct fields the caller chooses, \
+         so `x` cannot be assumed"
     );
     assert_eq!(error.span.start, src.rfind('x').expect("the field"));
     // And it points back at the declaration, which is the promise it broke.
@@ -1402,6 +1402,58 @@ fn nested_projections_solve_in_one_pass() {
 /// itself, because a person wrote down what it is; a term may not ask the
 /// solver to invent a type that contains itself, because nothing they could
 /// write is what it would be.
+#[test]
+fn compact_exponential_dag_failure_recovers_in_linear_work() {
+    const DEPTH: usize = 28;
+    let mut mint = dummy_mint();
+    let definition = mint
+        .global(None, Namespace::Terms, "dag-failure")
+        .expect("a test definition");
+    let started = std::time::Instant::now();
+    let (errors, steps) = inference::compact_dag_failure_for_tests(definition, DEPTH);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "compact DAG recovery expanded an exponential tree"
+    );
+    let [error] = errors.as_slice() else {
+        panic!("one direct mismatch was expected: {errors:#?}");
+    };
+    assert!(matches!(
+        error.kind,
+        ErrorKind::Mismatch {
+            expected: _,
+            actual: _
+        }
+    ));
+    let ErrorCause::Step(failed_id) = error.cause else {
+        panic!("the mismatch must name its failed solver step")
+    };
+    let failed = steps
+        .iter()
+        .find(|step| step.id == failed_id)
+        .expect("the error cause resolves");
+    assert!(matches!(
+        failed.effect,
+        Effect::Failed(ErrorKind::Mismatch { .. })
+    ));
+    let recoveries: Vec<_> = steps
+        .iter()
+        .filter(|step| step.rule == Rule::Recover)
+        .collect();
+    assert_eq!(recoveries.len(), 1, "the shared leaf is recovered once");
+    assert!(matches!(
+        recoveries[0].effect,
+        Effect::Bound {
+            because: Some(cause),
+            ..
+        } if cause == failed.reason
+    ));
+    assert!(
+        steps.len() <= 3,
+        "recovery emitted duplicate effects: {steps:#?}"
+    );
+}
+
 #[test]
 fn self_application_is_recursive_not_divergent() {
     let (_, _, output) = infer_src("let w = fn x => x x");
@@ -4539,8 +4591,8 @@ fn a_sums_open_tail_is_the_definitions_to_leave_alone() {
     assert_eq!(output.errors[0].kind.code(), "rigid-field");
     assert_eq!(
         output.errors[0].kind.to_string(),
-        "this reads a case `#B`, but `'r` stands for whatever type the caller picks, \
-         so it may not have one"
+        "this matches case `#B`, but `'r` stands for whatever other cases the caller chooses, \
+         so `#B` cannot be assumed"
     );
 
     // And the other way: a declared rest handed to something that allows
@@ -5194,7 +5246,7 @@ fn columns_type_as_unions_across_arms() {
 /// `()` as a pattern demands unit of its position, in a match as on a `let`.
 #[test]
 fn a_unit_pattern_demands_unit() {
-    let (mint, _, output) = inferred("let f = fn v => match v with () => 1n end");
+    let (mint, _, output) = inferred("let f = fn v => match v with | () => 1n end");
     assert_eq!(scheme(&mint, &output, "f"), "() -> Nat");
 }
 
@@ -5210,7 +5262,7 @@ fn an_empty_match_eliminates_the_empty_sum() {
 /// type, so bodies that cannot agree are the mismatch, reported at the body.
 #[test]
 fn arm_bodies_unify_with_the_match() {
-    let (mint, _, output) = inferred("let sole = fn v => match v with w => w end");
+    let (mint, _, output) = inferred("let sole = fn v => match v with | w => w end");
     assert_eq!(scheme(&mint, &output, "sole"), "'a -> 'a");
 
     let (_, _, output) = infer_src("let f = fn v => match v with | #A x => 0n | #B y => {} end");
@@ -5439,7 +5491,7 @@ fn a_wildcard_struct_leaf_still_demands_its_field() {
     let (mint, _, output) = inferred("let use_y = fn p => let {x: _, y} = p in y");
     assert_eq!(scheme(&mint, &output, "use_y"), "{ x: 'a, y: 'b } -> 'b");
 
-    let (mint, _, output) = inferred("let use_y = fn p => match p with {x: _, y} => y end");
+    let (mint, _, output) = inferred("let use_y = fn p => match p with | {x: _, y} => y end");
     assert_eq!(scheme(&mint, &output, "use_y"), "{ x: 'a, y: 'b } -> 'b");
 }
 
@@ -5495,11 +5547,11 @@ fn the_motivating_program_infers_optional_fields() {
 /// named fields, and a use site with one more is refused.
 #[test]
 fn an_exact_column_closes_the_row() {
-    let (mint, _, output) = inferred("let f = fn v => match v with {a, b} => a end");
+    let (mint, _, output) = inferred("let f = fn v => match v with | {a, b} => a end");
     assert_eq!(scheme(&mint, &output, "f"), "{ a: 'a, b: 'b } -> 'a");
 
     let (_, _, output) = infer_src(
-        "let f = fn v => match v with {a, b} => a end\n\
+        "let f = fn v => match v with | {a, b} => a end\n\
          let bad = f { a: 1n, b: 2n, c: 3n }",
     );
     assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
@@ -5514,7 +5566,7 @@ fn an_exact_column_closes_the_row() {
 #[test]
 fn a_rest_or_binder_entry_opens_the_row() {
     let (mint, _, output) = inferred(
-        "let f = fn v => match v with {a, ..} => a end\n\
+        "let f = fn v => match v with | {a, ..} => a end\n\
          let ok = f { a: 1n, b: 2n }",
     );
     assert_eq!(scheme(&mint, &output, "f"), "{ a: 'a, ..'b } -> 'a");
@@ -5573,7 +5625,7 @@ fn an_exact_let_pattern_is_exact() {
 /// as on a `let`, so the two spellings demand the same thing and mix freely.
 #[test]
 fn unit_and_empty_braces_demand_the_same() {
-    let (mint, _, output) = inferred("let f = fn v => match v with {} => 1n end");
+    let (mint, _, output) = inferred("let f = fn v => match v with | {} => 1n end");
     assert_eq!(scheme(&mint, &output, "f"), "() -> Nat");
 
     let (mint, _, output) = inferred("let g = fn v => match v with | {a} => a | () => 0n end");
@@ -6375,6 +6427,19 @@ fn local_instance_requirements_keep_their_reserved_source_slot() {
     let first_empty = src.find("g {}").expect("the local call") + "g ".len();
     assert_eq!(flipped.span.start, first_empty, "{:#?}", output.store);
     assert_eq!(output.errors[0].span.start, first_empty);
+    // Generation reserved IDs 2 and 3 for the two use-site slots. Solving
+    // instantiates `g` through a temporary batch allocated after those slots;
+    // replacement must retain 2 rather than publishing that temporary ID.
+    assert_eq!(flipped.id.get(), 2, "{:#?}", output.store);
+    assert_eq!(
+        output
+            .store
+            .batches
+            .iter()
+            .map(|batch| batch.id.get())
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2, 3]
+    );
 }
 
 #[test]
@@ -6510,6 +6575,41 @@ fn a_use_site_that_cannot_satisfy_the_scheme_is_refused() {
         .map(|batch| batch.origin.code())
         .collect();
     assert_eq!(flipped, ["use-site"]);
+}
+
+/// A required presence formula keeps the shape of the labels it constrains;
+/// sum cases must never be described as struct fields.
+#[test]
+fn a_required_case_combination_uses_sum_vocabulary() {
+    let src = "let p : (#X (when 'a) | #Y (when 'b)) -> () where 'a != 'b = fn _ => ()\n\
+               let both : #X () | #Y () = #X ()\n\
+               let bad = p both";
+    let (_, _, output) = infer_src(src);
+    let [error] = output.errors.as_slice() else {
+        panic!("expected one error: {:#?}", output.errors);
+    };
+    assert_eq!(error.kind.code(), "presence-required");
+    assert_eq!(
+        error.kind.to_string(),
+        "this value needs `X != Y` among its cases, and it does not have that"
+    );
+}
+
+/// A formula can relate labels from nested rows of different shapes. There is
+/// then no single truthful noun for every label in it, so use the neutral one.
+#[test]
+fn a_required_mixed_nested_combination_uses_neutral_vocabulary() {
+    let src = "let p : { outer when 'a: (#X (when 'b) | #Y ()) } -> () where 'a != 'b = fn _ => ()\n\
+               let bad = p { outer: #X () }";
+    let (_, _, output) = infer_src(src);
+    let [error] = output.errors.as_slice() else {
+        panic!("expected one error: {:#?}", output.errors);
+    };
+    assert_eq!(error.kind.code(), "presence-required");
+    assert_eq!(
+        error.kind.to_string(),
+        "this value needs `outer != X` among its labels, and it does not have that"
+    );
 }
 
 /// Constraints are per instance, never per scheme: two uses with different
@@ -7284,7 +7384,14 @@ fn a_body_that_closes_a_declared_effect_tail_breaks_it() {
     assert_eq!(error.kind.code(), "rigid-broken");
     assert_eq!(
         error.kind.to_string(),
-        "this decides what it may perform, but `'e` stands for whatever effects the caller allows"
+        "this closes the effects it may perform, but `'e` stands for whatever effects the caller allows"
+    );
+    assert_eq!(
+        error.diagnostic().help,
+        [
+            "preserve the caller-chosen effect remainder instead of closing it",
+            "or remove or change the open effect remainder in the annotation",
+        ]
     );
 }
 
@@ -7618,8 +7725,8 @@ fn the_written_examples_are_refused_where_they_go_wrong() {
         .unwrap_or_else(|| panic!("{:#?}", output.errors));
     assert_eq!(
         read.kind.to_string(),
-        "this reads a field `x`, but `'r` stands for whatever type the caller picks, \
-         so it may not have one"
+        "this reads field `x`, but `'r` stands for whatever other struct fields the caller chooses, \
+         so `x` cannot be assumed"
     );
     assert!(
         read.span.start == src.find("{ x").unwrap() || read.span.start == src.rfind('x').unwrap()
@@ -7660,8 +7767,8 @@ fn the_written_examples_are_refused_where_they_go_wrong() {
     assert_eq!(error.kind.code(), "rigid-escapes");
     assert_eq!(
         error.kind.to_string(),
-        "`\'a` stands for whatever the caller picks, so it can't be part of a type \
-         outside the annotation that declared it"
+        "`\'a` stands for whatever that annotation's caller picks, but binding `bad` would \
+         publish it as `('a -> 'a) -> Nat` outside that annotation"
     );
     assert_eq!(error.span.start, src.find("'a").expect("the first use"));
 
@@ -7676,6 +7783,111 @@ fn the_written_examples_are_refused_where_they_go_wrong() {
     );
     assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
     assert_eq!(output.errors[0].kind.code(), "rigid-escapes");
+}
+
+/// Caller-owned type, remainder, case, and effect choices retain a short
+/// structured route from the exact annotation declaration to the body use.
+#[test]
+fn caller_choices_have_shape_specific_causal_paths() {
+    let sources = [
+        "let f : 'a -> 'a = fn x => 0n".to_string(),
+        "let f : { x: Nat, ..'r } -> Nat = fn p => p.y".to_string(),
+        "let f : (#A Nat | ..'r) -> Nat = fn p => match p with | #A x => 1n | #B y => 0n end"
+            .to_string(),
+        format!(
+            "{EFFECTS}let greet : () -> Nat + !Log = fn _ => let _ = !Log.write 1n in 0n\n\
+             let f : () -> Nat + ..'e = fn _ => greet ()"
+        ),
+    ];
+    for source in sources {
+        let (_, _, output) = infer_src(&source);
+        let [error] = output.errors.as_slice() else {
+            panic!("{source}: {:#?}", output.errors);
+        };
+        let explanation = error
+            .explanation
+            .as_ref()
+            .unwrap_or_else(|| panic!("{source}: no caller-choice explanation"));
+        assert_eq!(
+            explanation.contradiction.kind,
+            inference::ContradictionKind::CallerChoice,
+            "{source}"
+        );
+        assert!((2..=4).contains(&explanation.abridged.len()), "{source}");
+        assert!(explanation.full_facts.iter().any(|fact| {
+            fact.payload == inference::ExplanationFactPayload::CallerChoiceDeclaration
+        }));
+        assert!(
+            explanation
+                .full_facts
+                .iter()
+                .any(|fact| { fact.payload == inference::ExplanationFactPayload::CallerChoiceUse })
+        );
+    }
+}
+
+/// Escape explanations preserve both bindings and the complete destination
+/// type, even when the choice crosses a deeply nested type path.
+#[test]
+fn caller_choice_escape_names_its_destination_and_deep_type_path() {
+    let source = "let bad = fn outer =>\n\
+                  \x20 let source : 'a -> 'a = outer in\n\
+                  \x20 { nested: { value: outer } }";
+    let (_, _, output) = infer_src(source);
+    let escape = output
+        .errors
+        .iter()
+        .find(|error| error.kind.code() == "rigid-escapes")
+        .unwrap_or_else(|| panic!("{:#?}", output.errors));
+    let ErrorKind::RigidEscapes {
+        destination,
+        destination_name,
+        destination_span,
+        declared,
+        ..
+    } = &escape.kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(&**destination_name, "bad");
+    assert_eq!(destination_span.start, source.find("bad").unwrap());
+    assert_eq!(declared.start, source.find("'a").unwrap());
+    assert!(destination.to_string().contains("nested"), "{destination}");
+    let explanation = escape.explanation.as_ref().expect("escape explanation");
+    assert_eq!(explanation.abridged.len(), 2);
+    assert_eq!(
+        explanation.full_facts[1].payload,
+        inference::ExplanationFactPayload::CallerChoiceDestination
+    );
+
+    let diagnostic = escape.diagnostic();
+    assert_eq!(diagnostic.related.len(), 1, "{diagnostic:#?}");
+    assert_eq!(diagnostic.related[0].span, *destination_span);
+    assert!(
+        diagnostic.related[0].message.contains("binding `bad`")
+            && diagnostic.related[0].message.contains("nested")
+            && !diagnostic.related[0].message.contains("TyVar"),
+        "destination fact must name the source binding and surface type: {diagnostic:#?}"
+    );
+    assert!(
+        diagnostic
+            .help
+            .iter()
+            .all(|repair| !repair.contains("give `bad` an annotation")),
+        "an annotation on the destination cannot own the source annotation's choice: {diagnostic:#?}"
+    );
+    assert!(
+        diagnostic
+            .help
+            .iter()
+            .any(|repair| { repair.contains("change or remove the source annotation") })
+    );
+    assert!(
+        diagnostic
+            .help
+            .iter()
+            .any(|repair| repair.contains("flowing into binding `bad`"))
+    );
 }
 
 /// A rigid is equal to a rigid with the same id and to nothing else. Every
@@ -7747,7 +7959,7 @@ fn a_label_demanded_of_a_rigid_is_refused() {
     };
     assert_eq!(error.kind.code(), "rigid-field");
     assert!(
-        error.kind.to_string().starts_with("this reads a field `y`"),
+        error.kind.to_string().starts_with("this reads field `y`"),
         "{}",
         error.kind
     );
@@ -7771,6 +7983,18 @@ fn a_label_demanded_of_a_rigid_is_refused() {
         "this is `()`, but `'r` stands for whatever the caller picks for the rest of a struct's fields"
     );
 
+    // The same closed-row conflict on a sum describes the caller-chosen
+    // remaining cases, not an arbitrary caller-chosen type.
+    let (_, _, output) = infer_src("let f : (#A Nat | ..'r) -> #A Nat = fn value => value");
+    let [error] = output.errors.as_slice() else {
+        panic!("expected one error: {:#?}", output.errors);
+    };
+    assert_eq!(error.kind.code(), "rigid-broken");
+    assert_eq!(
+        error.kind.to_string(),
+        "this is `|`, but `'r` stands for whatever the caller picks for the remaining cases"
+    );
+
     // A field the row *does* name is no demand on the rest at all.
     let (mint, _, output) = inferred("let f : { x: Nat, ..'r } -> Nat = fn p => p.x");
     assert_eq!(scheme(&mint, &output, "f"), "{ x: Nat, ..'a } -> Nat");
@@ -7785,7 +8009,7 @@ fn a_label_demanded_of_a_rigid_is_refused() {
     };
     assert_eq!(error.kind.code(), "rigid-field");
     assert!(
-        error.kind.to_string().starts_with("this reads a case `#B`"),
+        error.kind.to_string().starts_with("this matches case `#B`"),
         "{}",
         error.kind
     );
@@ -7889,7 +8113,7 @@ fn a_declared_sum_rest_is_equal_to_itself_and_to_nothing_else() {
     assert_eq!(error.kind.code(), "rigid-broken");
     assert_eq!(
         error.kind.to_string(),
-        "this is `|`, but `'r` stands for whatever type the caller picks"
+        "this is `|`, but `'r` stands for whatever the caller picks for the remaining cases"
     );
 }
 
@@ -7982,7 +8206,7 @@ fn polymorphic_extern_boundary_leaves_are_rejected_before_callback_instantiation
     assert!(matches!(
         output.errors.as_slice(),
         [ruddy::inference::Error {
-            kind: ruddy::inference::ErrorKind::PolymorphicExternBoundary,
+            kind: ruddy::inference::ErrorKind::PolymorphicExternBoundary { .. },
             ..
         }]
     ));
@@ -7991,7 +8215,7 @@ fn polymorphic_extern_boundary_leaves_are_rejected_before_callback_instantiation
         output.errors[0]
             .kind
             .to_string()
-            .contains("fixed runtime representation")
+            .contains("one fixed kind of value")
     );
 
     // A forwarding alias does not make the representation any less
@@ -8004,7 +8228,7 @@ fn polymorphic_extern_boundary_leaves_are_rejected_before_callback_instantiation
     assert!(matches!(
         output.errors.as_slice(),
         [ruddy::inference::Error {
-            kind: ruddy::inference::ErrorKind::PolymorphicExternBoundary,
+            kind: ruddy::inference::ErrorKind::PolymorphicExternBoundary { .. },
             ..
         }]
     ));
@@ -8031,7 +8255,7 @@ fn extern_callback_coverage_uses_semantic_rows_and_aliases() {
     assert!(matches!(
         invalid.errors.as_slice(),
         [ruddy::inference::Error {
-            kind: ruddy::inference::ErrorKind::CallbackEffectsNotCovered,
+            kind: ruddy::inference::ErrorKind::CallbackEffectsNotCovered { .. },
             ..
         }]
     ));
@@ -8043,6 +8267,584 @@ fn extern_callback_coverage_uses_semantic_rows_and_aliases() {
     );
     assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
     assert!(valid.errors.is_empty(), "{:#?}", valid.errors);
+}
+
+#[test]
+fn extern_boundary_errors_publish_exact_source_payloads_and_paths() {
+    use ruddy::inference::{
+        ContradictionKind, ErrorKind, ExplanationFactPayload as P, ExternVariableKind,
+    };
+
+    let (_, _, output) = infer_src(
+        "effect Read = () -> ()\n\
+         effect Write = () -> ()\n\
+         extern install : fn(fn(()) -> () + !Read + !Write) -> () = \"host.install\"",
+    );
+    let [error] = output.errors.as_slice() else {
+        panic!("expected one callback boundary error: {:#?}", output.errors);
+    };
+    let ErrorKind::CallbackEffectsNotCovered {
+        missing_effects,
+        extern_effects,
+        callback_path,
+        callback_type,
+        extern_name,
+        issues,
+    } = &error.kind
+    else {
+        panic!("wrong boundary error: {error:#?}");
+    };
+    assert_eq!(missing_effects.len(), 2, "{missing_effects:#?}");
+    assert!(extern_effects.is_empty());
+    assert!(callback_path.contains("parameter 1"), "{callback_path}");
+    assert!(callback_type.contains("!Read") && callback_type.contains("!Write"));
+    assert_eq!(extern_name, "install");
+    assert_eq!(issues.len(), 1);
+    let explanation = error
+        .explanation
+        .as_ref()
+        .expect("structured callback cause");
+    assert_eq!(
+        explanation.contradiction.kind,
+        ContradictionKind::CallbackEffectsNotCovered
+    );
+    assert_eq!(explanation.full_facts.len(), 3);
+    assert_eq!(
+        explanation
+            .full_facts
+            .iter()
+            .map(|fact| fact.payload)
+            .collect::<Vec<_>>(),
+        [
+            P::CallbackRequirement,
+            P::ExternCapability,
+            P::ExternDeclaration
+        ]
+    );
+
+    let (_, _, output) = infer_src(
+        "effect Fail = () -> ()\n\
+         extern nested : fn(fn((), fn(fn(()) -> () + !Fail) -> ()) -> ()) -> () = \"host.nested\"",
+    );
+    let error = output
+        .errors
+        .iter()
+        .find(|error| matches!(error.kind, ErrorKind::CallbackEffectsNotCovered { .. }))
+        .expect("nested callback boundary");
+    let ErrorKind::CallbackEffectsNotCovered { callback_path, .. } = &error.kind else {
+        unreachable!()
+    };
+    assert!(
+        callback_path.matches("parameter").count() >= 2,
+        "{callback_path}"
+    );
+
+    let (_, _, output) =
+        infer_src("type Identity 'a = 'a\nextern make : fn(Nat) -> Identity 'a = \"host.make\"");
+    let [error] = output.errors.as_slice() else {
+        panic!("{:#?}", output.errors)
+    };
+    let ErrorKind::PolymorphicExternBoundary {
+        variable,
+        variable_kind,
+        position,
+        extern_name,
+        leaves,
+        callback_issues,
+    } = &error.kind
+    else {
+        panic!("{error:#?}")
+    };
+    assert_eq!(variable, "'a");
+    assert_eq!(*variable_kind, ExternVariableKind::Type);
+    assert!(position.contains("result"), "{position}");
+    assert_eq!(extern_name, "make");
+    assert_eq!(leaves.len(), 1);
+    assert!(callback_issues.is_empty());
+    let explanation = error
+        .explanation
+        .as_ref()
+        .expect("structured polymorphic cause");
+    assert_eq!(
+        explanation.contradiction.kind,
+        ContradictionKind::PolymorphicExternBoundary
+    );
+    assert_eq!(explanation.full_facts.len(), 3);
+}
+
+#[test]
+fn extern_boundary_aggregates_paths_and_retains_callback_evidence() {
+    use ruddy::inference::{ErrorKind, ExplanationFactPayload};
+
+    let (_, _, output) = infer_src(
+        "effect Read = () -> ()\n\
+         effect Write = () -> ()\n\
+         extern install : fn(fn(()) -> () + !Read, fn(()) -> () + !Write) -> () = \"host.install\"",
+    );
+    let [error] = output.errors.as_slice() else {
+        panic!("{:#?}", output.errors)
+    };
+    let ErrorKind::CallbackEffectsNotCovered { issues, .. } = &error.kind else {
+        panic!("{error:#?}")
+    };
+    assert_eq!(issues.len(), 2);
+    assert!(
+        issues
+            .iter()
+            .any(|issue| issue.callback_path.contains("parameter 1"))
+    );
+    assert!(
+        issues
+            .iter()
+            .any(|issue| issue.callback_path.contains("parameter 2"))
+    );
+    let facts = &error.explanation.as_ref().unwrap().full_facts;
+    assert_eq!(
+        facts
+            .iter()
+            .filter(|fact| fact.payload == ExplanationFactPayload::ExternCapability)
+            .count(),
+        1,
+        "{facts:#?}"
+    );
+    assert_eq!(
+        facts
+            .iter()
+            .filter(|fact| fact.payload == ExplanationFactPayload::ExternDeclaration)
+            .count(),
+        1,
+        "{facts:#?}"
+    );
+
+    let (_, _, output) = infer_src(
+        "effect Fail = () -> ()\n\
+         extern install : fn(fn('a) -> () + !Fail) -> () = \"host.install\"",
+    );
+    let [error] = output.errors.as_slice() else {
+        panic!("{:#?}", output.errors)
+    };
+    let ErrorKind::PolymorphicExternBoundary {
+        leaves,
+        callback_issues,
+        ..
+    } = &error.kind
+    else {
+        panic!("{error:#?}")
+    };
+    assert!(!leaves.is_empty());
+    assert_eq!(callback_issues.len(), 1);
+}
+
+#[test]
+fn conditional_callback_failure_keeps_its_later_path_and_formula() {
+    use ruddy::inference::ErrorKind;
+    let (_, lowered, output) = infer_src(
+        "effect Fail = () -> ()\n\
+         extern install : fn(fn(()) -> () + !Fail (when 'first), fn(()) -> () + !Fail (when 'second)) -> () + !Fail (when 'carried) where not 'first or 'carried = \"host.install\"",
+    );
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    let [error] = output.errors.as_slice() else {
+        panic!("{:#?}", output.errors)
+    };
+    let ErrorKind::CallbackEffectsNotCovered { issues, .. } = &error.kind else {
+        panic!("{error:#?}")
+    };
+    assert_eq!(issues.len(), 1, "{issues:#?}");
+    assert!(issues[0].callback_path.contains("parameter 2"));
+    assert!(
+        issues[0].condition.contains("second"),
+        "{}",
+        issues[0].condition
+    );
+    assert!(
+        issues[0].condition.contains("carried"),
+        "{}",
+        issues[0].condition
+    );
+}
+
+#[test]
+fn extern_boundary_reports_row_and_presence_kinds() {
+    use ruddy::inference::{ErrorKind, ExternVariableKind};
+    for (source, expected) in [
+        (
+            "extern x : fn({ value: Nat, ..'fields }) -> () = \"host.x\"",
+            ExternVariableKind::Row,
+        ),
+        (
+            "extern x : fn({ value when 'present: Nat }) -> () = \"host.x\"",
+            ExternVariableKind::Presence,
+        ),
+    ] {
+        let (_, lowered, output) = infer_src(source);
+        assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+        let [error] = output.errors.as_slice() else {
+            panic!("{:#?}", output.errors)
+        };
+        let ErrorKind::PolymorphicExternBoundary { leaves, .. } = &error.kind else {
+            panic!("{error:#?}")
+        };
+        assert!(
+            leaves.iter().any(|leaf| leaf.kind == expected),
+            "{leaves:#?}"
+        );
+        assert!(leaves.iter().all(|leaf| !leaf.position.is_empty()));
+    }
+}
+
+#[test]
+fn extern_boundary_alias_presence_and_multiple_variables_keep_exact_sources() {
+    use ruddy::inference::{ErrorKind, ExternVariableKind};
+
+    let maybe_source = "type Maybe 'r = #Nil | ..'r\n\
+         extern consume : fn(Maybe (#Some (when 'some) Nat)) -> () = \"host.consume\"";
+    let (_, lowered, output) = infer_src(maybe_source);
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    let [error] = output.errors.as_slice() else {
+        panic!("{:#?}", output.errors)
+    };
+    let ErrorKind::PolymorphicExternBoundary { leaves, .. } = &error.kind else {
+        panic!("{error:#?}")
+    };
+    let presence = leaves
+        .iter()
+        .find(|leaf| leaf.kind == ExternVariableKind::Presence)
+        .expect("presence from the row spliced through Maybe");
+    assert_eq!(presence.variable, "'some");
+    assert_eq!(
+        &maybe_source[presence.span.start..presence.span.start + presence.span.width],
+        "'some"
+    );
+    assert!(presence.position.contains("`Some` presence"));
+
+    let variables_source = "extern choose : fn('first, 'second) -> () = \"host.choose\"";
+    let (_, lowered, output) = infer_src(variables_source);
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    let [error] = output.errors.as_slice() else {
+        panic!("{:#?}", output.errors)
+    };
+    let ErrorKind::PolymorphicExternBoundary { leaves, .. } = &error.kind else {
+        panic!("{error:#?}")
+    };
+    for (name, path) in [("'first", "parameter 1"), ("'second", "parameter 2")] {
+        let leaf = leaves
+            .iter()
+            .find(|leaf| leaf.variable == name)
+            .unwrap_or_else(|| panic!("missing {name}: {leaves:#?}"));
+        assert!(leaf.position.contains(path), "{}", leaf.position);
+        assert_eq!(
+            &variables_source[leaf.span.start..leaf.span.start + leaf.span.width],
+            name
+        );
+    }
+}
+
+#[test]
+fn local_and_imported_alias_callback_tails_keep_exact_relations() {
+    use ruddy::inference::ErrorKind;
+
+    let source = "type Callback 'e = () -> () + ..'e\n\
+         extern install : fn(Callback (..'needed)) -> () + ..'carried = \"host.install\"";
+    let (_, lowered, output) = infer_src(source);
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    let [error] = output.errors.as_slice() else {
+        panic!("{:#?}", output.errors)
+    };
+    let ErrorKind::CallbackEffectsNotCovered { issues, .. } = &error.kind else {
+        panic!("{error:#?}")
+    };
+    assert_eq!(issues.len(), 1);
+    assert!(
+        issues[0]
+            .missing_tails
+            .iter()
+            .any(|tail| { tail.contains("..'needed") && tail.contains("..'carried") })
+    );
+
+    let parsed = parse::parse(lex(source, FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    let mut mint = dummy_mint();
+    let mut lowered = ir::build(&mut mint, parsed.stmts);
+    let callback = lowered
+        .program
+        .types
+        .keys()
+        .copied()
+        .find(|symbol| mint.name(*symbol) == "Callback")
+        .expect("local callback declaration");
+    lowered.program.types.shift_remove(&callback);
+    lowered.program.external_types.insert(
+        callback,
+        ir::ExternalType {
+            params: vec![ParamKind::Effects {
+                lacks: Default::default(),
+            }],
+            relevant: vec![true],
+            scheme: Scheme::new(
+                1,
+                Rc::new(Ty::Arrow(
+                    Rc::new(Ty::unit()),
+                    Rc::new(Ty::unit()),
+                    Row::of(Rest::Bound(0)),
+                )),
+            ),
+            unresolved: None,
+        },
+    );
+    let output = inference::infer(&mint, &mut lowered.program);
+    let [error] = output.errors.as_slice() else {
+        panic!("{:#?}", output.errors)
+    };
+    let ErrorKind::CallbackEffectsNotCovered { issues, .. } = &error.kind else {
+        panic!("{error:#?}")
+    };
+    assert!(
+        issues[0]
+            .missing_tails
+            .iter()
+            .any(|tail| { tail.contains("..'needed") && tail.contains("..'carried") })
+    );
+}
+
+#[test]
+fn polymorphic_leaf_and_callback_effect_tail_failures_share_one_error() {
+    use ruddy::inference::{ErrorKind, ExplanationFactPayload};
+    let (_, lowered, output) = infer_src(
+        "effect Fail = () -> ()\n\
+         type Callback 'a 'e = 'a -> () + !Fail + ..'e\n\
+         extern install : fn(Callback 'value (..'needed)) -> () + ..'carried = \"host.install\"",
+    );
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    let [error] = output.errors.as_slice() else {
+        panic!("{:#?}", output.errors)
+    };
+    let ErrorKind::PolymorphicExternBoundary {
+        leaves,
+        callback_issues,
+        ..
+    } = &error.kind
+    else {
+        panic!("{error:#?}")
+    };
+    assert!(leaves.iter().any(|leaf| leaf.variable == "'value"));
+    assert_eq!(callback_issues.len(), 1);
+    assert_eq!(callback_issues[0].missing_effects.len(), 1);
+    assert!(!callback_issues[0].missing_tails.is_empty());
+    let diagnostic = error.diagnostic();
+    assert!(
+        diagnostic
+            .notes
+            .iter()
+            .any(|note| note.contains("needed") && note.contains("carried")),
+        "{diagnostic:#?}"
+    );
+    assert!(
+        diagnostic
+            .help
+            .iter()
+            .any(|help| help.contains("callback remainder")),
+        "{diagnostic:#?}"
+    );
+    assert!(error.explanation.as_ref().is_some_and(|explanation| {
+        explanation.cause.constraints.iter().all(|id| {
+            output
+                .constraints
+                .values()
+                .flatten()
+                .any(|constraint| constraint.id == *id)
+        }) && explanation
+            .full_facts
+            .iter()
+            .filter(|fact| fact.payload == ExplanationFactPayload::ExternCapability)
+            .count()
+            == 1
+            && explanation
+                .full_facts
+                .iter()
+                .filter(|fact| fact.payload == ExplanationFactPayload::ExternDeclaration)
+                .count()
+                == 1
+    }));
+}
+
+#[test]
+fn callback_diagnostic_renders_all_effects_tails_and_conditions() {
+    use ruddy::inference::ErrorKind;
+    let (_, _, output) = infer_src(
+        "effect Read = () -> ()\n\
+         effect Write = () -> ()\n\
+         extern install : fn(fn(()) -> () + !Read + !Write) -> () = \"host.install\"",
+    );
+    let [error] = output.errors.as_slice() else {
+        panic!("{:#?}", output.errors)
+    };
+    let diagnostic = error.diagnostic();
+    assert!(
+        diagnostic
+            .help
+            .iter()
+            .any(|help| { help.contains("Read") && help.contains("Write") }),
+        "{diagnostic:#?}"
+    );
+
+    let (_, _, output) = infer_src(
+        "effect Fail = () -> ()\n\
+         extern install : fn(fn(()) -> () + !Fail (when 'needed), fn(()) -> () + !Fail (when 'needed)) -> () + !Fail (when 'carried) = \"host.install\"",
+    );
+    let [error] = output.errors.as_slice() else {
+        panic!("{:#?}", output.errors)
+    };
+    let ErrorKind::CallbackEffectsNotCovered { issues, .. } = &error.kind else {
+        panic!("{error:#?}")
+    };
+    assert_eq!(issues.len(), 2);
+    assert!(issues.iter().all(|issue| issue.conditions.len() == 1));
+    let diagnostic = error.diagnostic();
+    assert_eq!(
+        diagnostic
+            .notes
+            .iter()
+            .filter(|note| note.contains("coverage requires")
+                && note.contains("needed")
+                && note.contains("carried"))
+            .count(),
+        2,
+        "{diagnostic:#?}"
+    );
+    assert!(
+        diagnostic
+            .help
+            .iter()
+            .any(|help| { help.contains("needed") && help.contains("carried") }),
+        "{diagnostic:#?}"
+    );
+}
+
+#[test]
+fn aggregated_callback_requirements_keep_each_effects_condition() {
+    use ruddy::inference::ErrorKind;
+    let (_, lowered, output) = infer_src(
+        "effect Read = () -> ()\n\
+         effect Write = () -> ()\n\
+         extern install : fn(fn(()) -> (() -> () + !Write (when 'needed)) + !Read) -> () = \"host.install\"",
+    );
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    let [error] = output.errors.as_slice() else {
+        panic!("{:#?}", output.errors)
+    };
+    let ErrorKind::CallbackEffectsNotCovered { issues, .. } = &error.kind else {
+        panic!("{error:#?}")
+    };
+    assert_eq!(issues.len(), 1, "{issues:#?}");
+    assert!(
+        issues[0]
+            .requirements
+            .iter()
+            .any(|item| item.effect.contains("Read") && item.condition.is_none())
+    );
+    assert!(issues[0].requirements.iter().any(|item| {
+        item.effect.contains("Write")
+            && item
+                .condition
+                .as_ref()
+                .is_some_and(|condition| condition.contains("needed"))
+    }));
+    let diagnostic = error.diagnostic();
+    assert!(diagnostic.help.iter().any(|help| help.contains("Read")));
+    assert!(
+        diagnostic
+            .help
+            .iter()
+            .any(|help| help.contains("Write") && help.contains("needed"))
+    );
+}
+
+#[test]
+fn tail_only_callback_issue_does_not_claim_a_satisfied_label_condition() {
+    use ruddy::inference::ErrorKind;
+    let (_, lowered, output) = infer_src(
+        "effect Fail = () -> ()\n\
+         extern install : fn(fn(()) -> () + !Fail (when 'needed) + ..'tail) -> () + !Fail (when 'carried) + ..'other where not 'needed or 'carried = \"host.install\"",
+    );
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    let [error] = output.errors.as_slice() else {
+        panic!("{:#?}", output.errors)
+    };
+    let ErrorKind::CallbackEffectsNotCovered { issues, .. } = &error.kind else {
+        panic!("{error:#?}")
+    };
+    assert_eq!(issues.len(), 1, "{issues:#?}");
+    assert!(issues[0].requirements.is_empty(), "{issues:#?}");
+    assert!(issues[0].conditions.is_empty(), "{issues:#?}");
+    assert_eq!(issues[0].condition, "true");
+    assert!(!issues[0].missing_tails.is_empty());
+}
+
+#[test]
+fn complete_extern_callback_repairs_cover_labels_and_remainders() {
+    let (_, lowered, output) = infer_src(
+        "effect Fail = () -> ()\n\
+         type Callback 'a 'e = 'a -> () + !Fail + ..'e\n\
+         extern install : fn(Callback Nat (..'shared)) -> () + !Fail + ..'shared = \"host.install\"",
+    );
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+
+    // An anonymous capability remainder is an inference site, not a
+    // caller-chosen fixed relation. It can acquire the callback's exact label.
+    let (_, lowered, output) = infer_src(
+        "effect Fail = () -> ()\n\
+         extern install : fn(fn(()) -> () + !Fail) -> () + .. = \"host.install\"",
+    );
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+}
+
+#[test]
+fn callback_result_spine_issues_deduplicate_by_path() {
+    use ruddy::inference::ErrorKind;
+    let (_, lowered, output) = infer_src(
+        "effect Read = () -> ()\n\
+         extern install : fn(fn(()) -> (() -> () + !Read) + !Read) -> () = \"host.install\"",
+    );
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    let [error] = output.errors.as_slice() else {
+        panic!("{:#?}", output.errors)
+    };
+    let ErrorKind::CallbackEffectsNotCovered { issues, .. } = &error.kind else {
+        panic!("{error:#?}")
+    };
+    assert_eq!(issues.len(), 1, "{issues:#?}");
+    assert_eq!(issues[0].missing_effects.len(), 1, "{issues:#?}");
+}
+
+#[test]
+fn extern_callback_solver_causes_resolve_to_published_constraints() {
+    use ruddy::inference::ErrorKind;
+    let (_, _, output) = infer_src(
+        "type Callback 'e = () -> () + ..'e\n\
+         extern install : fn(Callback (..'e)) -> () + ..'f = \"host.install\"",
+    );
+    let error = output
+        .errors
+        .iter()
+        .find(|error| matches!(error.kind, ErrorKind::CallbackEffectsNotCovered { .. }))
+        .unwrap();
+    let explanation = error.explanation.as_ref().unwrap();
+    assert!(!explanation.cause.constraints.is_empty());
+    let published: Vec<_> = output
+        .constraints
+        .values()
+        .flatten()
+        .map(|constraint| constraint.id)
+        .collect();
+    assert!(
+        explanation
+            .cause
+            .constraints
+            .iter()
+            .all(|id| published.contains(id))
+    );
 }
 
 #[test]
@@ -8091,7 +8893,7 @@ fn extern_callback_coverage_uses_where_implications() {
         matches!(
             invalid.errors.as_slice(),
             [ruddy::inference::Error {
-                kind: ruddy::inference::ErrorKind::CallbackEffectsNotCovered,
+                kind: ruddy::inference::ErrorKind::CallbackEffectsNotCovered { .. },
                 ..
             }]
         ),
@@ -8117,7 +8919,7 @@ fn extern_callback_coverage_respects_shared_open_effect_tails() {
     assert!(matches!(
         invalid.errors.as_slice(),
         [ruddy::inference::Error {
-            kind: ruddy::inference::ErrorKind::CallbackEffectsNotCovered,
+            kind: ruddy::inference::ErrorKind::CallbackEffectsNotCovered { .. },
             ..
         }]
     ));
@@ -8134,7 +8936,7 @@ fn legacy_outer_extern_arrows_check_callback_coverage() {
     assert!(matches!(
         output.errors.as_slice(),
         [ruddy::inference::Error {
-            kind: ruddy::inference::ErrorKind::CallbackEffectsNotCovered,
+            kind: ruddy::inference::ErrorKind::CallbackEffectsNotCovered { .. },
             ..
         }]
     ));
@@ -8276,4 +9078,890 @@ fn explicit_variant_edges_are_solved_in_both_directions() {
                 .any(|error| error.kind.code() == "type-mismatch")
         );
     }
+}
+
+fn all_constraints<'a>(
+    constraints: &'a [inference::Constraint],
+    out: &mut Vec<&'a inference::Constraint>,
+) {
+    for constraint in constraints {
+        out.push(constraint);
+        match &constraint.kind {
+            inference::ConstraintKind::Let { value, body, .. } => {
+                all_constraints(value, out);
+                all_constraints(body, out);
+            }
+            inference::ConstraintKind::Match { arms, .. } => {
+                for arm in arms {
+                    all_constraints(&arm.constraints, out);
+                    out.push(&arm.result);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn inference_records_have_unique_direct_identities_across_nested_constraints() {
+    use std::collections::HashSet;
+
+    let (_, _, output) = infer_src(
+        "let f = fn v => let read = fn x => x.field in match v with\n\
+         | {a} => read { field: 1n } | {b} => read { field: true } end",
+    );
+    let mut constraints = Vec::new();
+    for generated in output.constraints.values() {
+        all_constraints(generated, &mut constraints);
+    }
+    let constraint_ids: HashSet<_> = constraints.iter().map(|constraint| constraint.id).collect();
+    assert_eq!(constraint_ids.len(), constraints.len());
+    assert!(!constraint_ids.is_empty());
+
+    let step_ids: HashSet<_> = output.steps.iter().map(|step| step.id).collect();
+    assert_eq!(step_ids.len(), output.steps.len());
+    assert!(output.steps.iter().all(|step| {
+        step.constraint
+            .is_none_or(|constraint| constraint_ids.contains(&constraint))
+    }));
+
+    let batch_ids: HashSet<_> = output.store.batches.iter().map(|batch| batch.id).collect();
+    assert_eq!(batch_ids.len(), output.store.batches.len());
+
+    let error_ids: HashSet<_> = output.errors.iter().map(|error| error.id).collect();
+    assert_eq!(error_ids.len(), output.errors.len());
+    assert!(output.errors.iter().all(|error| error.id.get() != u64::MAX));
+}
+
+#[test]
+fn generated_constraints_retain_source_origins_and_ordered_subjects() {
+    let (_, _, output) = infer_src(
+        "let get = fn value => value.answer\n\
+         let found = get { answer: 1n }",
+    );
+    let mut constraints = Vec::new();
+    for generated in output.constraints.values() {
+        all_constraints(generated, &mut constraints);
+    }
+    assert!(constraints.iter().any(|constraint| {
+        constraint.origin == inference::ConstraintOrigin::Projection
+            && constraint.subjects
+                == inference::ConstraintSubjects::pair(
+                    inference::Subject::ProjectionBase,
+                    inference::Subject::ProjectionResult,
+                )
+    }));
+    assert!(constraints.iter().any(|constraint| {
+        constraint.origin == inference::ConstraintOrigin::ApplicationArgument
+            && constraint.subjects.secondary == Some(inference::Subject::Argument)
+    }));
+    assert!(constraints.iter().any(|constraint| {
+        constraint.origin == inference::ConstraintOrigin::ApplicationEffects
+            && constraint.subjects
+                == inference::ConstraintSubjects::pair(
+                    inference::Subject::PerformedEffects,
+                    inference::Subject::AmbientEffects,
+                )
+    }));
+}
+
+#[test]
+fn contextual_checks_retain_exact_spans_and_expected_side_provenance() {
+    use inference::{ConstraintOrigin as Origin, ConstraintSubjects as Subjects, Subject};
+
+    let src = "let unary = not 1n\n\
+               let binary = true and 2n\n\
+               let call = 3n {}\n\
+               let inferred = 4n\n\
+               let annotated : Nat = 5n\n\
+               let nested = let local = 6n in let noted : Nat = 7n in noted";
+    let (_, _, output) = infer_src(src);
+    let mut constraints = Vec::new();
+    for generated in output.constraints.values() {
+        all_constraints(generated, &mut constraints);
+    }
+    let exact = |needle: &str, occurrence: usize, origin, subjects| {
+        let start = src
+            .match_indices(needle)
+            .nth(occurrence)
+            .unwrap_or_else(|| panic!("missing occurrence {occurrence} of {needle:?}"))
+            .0;
+        let found: Vec<_> = constraints
+            .iter()
+            .filter(|constraint| {
+                constraint.span.start == start
+                    && constraint.span.end() == start + needle.len()
+                    && constraint.origin == origin
+                    && constraint.subjects == subjects
+            })
+            .collect();
+        assert_eq!(found.len(), 1, "{needle:?}: {constraints:#?}");
+    };
+
+    exact(
+        "1n",
+        0,
+        Origin::ContextualCheck,
+        Subjects::pair(Subject::Context, Subject::Term),
+    );
+    exact(
+        "true",
+        0,
+        Origin::ContextualCheck,
+        Subjects::pair(Subject::Context, Subject::Term),
+    );
+    exact(
+        "2n",
+        0,
+        Origin::ContextualCheck,
+        Subjects::pair(Subject::Context, Subject::Term),
+    );
+    exact(
+        "3n",
+        0,
+        Origin::ApplicationCallee,
+        Subjects::pair(Subject::CallShape, Subject::Callee),
+    );
+    exact(
+        "4n",
+        0,
+        Origin::ContextualCheck,
+        Subjects::pair(Subject::TopLevelBinding, Subject::Term),
+    );
+    exact(
+        "5n",
+        0,
+        Origin::ContextualCheck,
+        Subjects::pair(Subject::Annotation, Subject::Term),
+    );
+    exact(
+        "6n",
+        0,
+        Origin::ContextualCheck,
+        Subjects::pair(Subject::LocalBinding, Subject::Term),
+    );
+    exact(
+        "7n",
+        0,
+        Origin::ContextualCheck,
+        Subjects::pair(Subject::Annotation, Subject::Term),
+    );
+    exact("local", 0, Origin::Binding, Subjects::one(Subject::Binding));
+    exact("noted", 0, Origin::Binding, Subjects::one(Subject::Binding));
+}
+
+#[test]
+fn match_result_checks_are_ordered_children_at_each_written_body() {
+    use inference::{
+        ConstraintKind, ConstraintOrigin as Origin, ConstraintSubjects as Subjects, Subject,
+    };
+
+    let src = "let guarded = fn v => match v with | {x} => 1n | {} => 2n end\n\
+               let ordinary = match true with | true => 3n | false => 4n end";
+    let (_, _, output) = infer_src(src);
+    let matches: Vec<_> = output
+        .constraints
+        .values()
+        .flatten()
+        .filter_map(|constraint| match &constraint.kind {
+            ConstraintKind::Match { arms, .. } => Some((constraint, arms)),
+            _ => None,
+        })
+        .collect();
+    let (guarded_match, arms) = matches
+        .iter()
+        .find(|(_, arms)| !arms.is_empty())
+        .expect("the qualifying match");
+    let match_start = src.find("match v").unwrap();
+    let match_end = src[match_start..].find(" end").unwrap() + match_start + " end".len();
+    assert_eq!(guarded_match.span.start, match_start);
+    assert_eq!(guarded_match.span.end(), match_end);
+    assert_eq!(guarded_match.origin, Origin::Match);
+    assert_eq!(
+        guarded_match.subjects,
+        Subjects::pair(Subject::MatchScrutinee, Subject::MatchResult)
+    );
+    assert_eq!(arms.len(), 2);
+    for (arm, body) in arms.iter().zip(["1n", "2n"]) {
+        let at = src.find(body).unwrap();
+        assert_eq!(arm.result.span.start, at);
+        assert_eq!(arm.result.span.end(), at + body.len());
+        assert_eq!(arm.result.origin, Origin::MatchArm);
+        assert_eq!(
+            arm.result.subjects,
+            Subjects::pair(Subject::MatchResult, Subject::MatchArm)
+        );
+        assert!(matches!(arm.result.kind, ConstraintKind::Equal { .. }));
+        assert!(
+            output
+                .steps
+                .iter()
+                .any(|step| step.constraint == Some(arm.result.id)),
+            "guarded child {:?} had no directly linked solve step",
+            arm.result.id
+        );
+    }
+
+    let mut constraints = Vec::new();
+    for generated in output.constraints.values() {
+        all_constraints(generated, &mut constraints);
+    }
+    for (scrutinee, occurrence) in [("v", 1), ("true", 0)] {
+        let at = src.match_indices(scrutinee).nth(occurrence).unwrap().0;
+        assert!(constraints.iter().any(|constraint| {
+            constraint.span.start == at
+                && constraint.span.end() == at + scrutinee.len()
+                && constraint.origin == Origin::MatchScrutinee
+                && constraint.subjects
+                    == Subjects::pair(Subject::PatternDemand, Subject::MatchScrutinee)
+        }));
+    }
+    for body in ["3n", "4n"] {
+        let at = src.find(body).unwrap();
+        assert!(constraints.iter().any(|constraint| {
+            constraint.span.start == at
+                && constraint.span.end() == at + body.len()
+                && constraint.origin == Origin::MatchArm
+                && constraint.subjects == Subjects::pair(Subject::MatchResult, Subject::MatchArm)
+        }));
+    }
+}
+
+#[test]
+fn handler_checks_distinguish_arms_explicit_returns_and_body_fallbacks() {
+    use inference::{ConstraintOrigin as Origin, ConstraintSubjects as Subjects, Subject};
+
+    let src = "effect Log = { write: Nat -> () }\n\
+               let explicit = handle 1n with | !Log.write n => {} | return value => value end\n\
+               let implicit = handle 2n with | !Log.write n => {} end";
+    let (_, _, output) = infer_src(src);
+    let mut constraints = Vec::new();
+    for generated in output.constraints.values() {
+        all_constraints(generated, &mut constraints);
+    }
+    let has = |needle: &str, origin, subjects| {
+        let at = src.find(needle).unwrap();
+        constraints.iter().any(|constraint| {
+            constraint.span.start == at
+                && constraint.span.end() == at + needle.len()
+                && constraint.origin == origin
+                && constraint.subjects == subjects
+        })
+    };
+    let returned = src.rfind("value").unwrap();
+    assert!(constraints.iter().any(|constraint| {
+        constraint.span.start == returned
+            && constraint.span.end() == returned + "value".len()
+            && constraint.origin == Origin::HandlerReturn
+            && constraint.subjects == Subjects::pair(Subject::HandlerAnswer, Subject::HandlerReturn)
+    }));
+    assert!(has(
+        "2n",
+        Origin::HandlerFallback,
+        Subjects::pair(Subject::HandlerAnswer, Subject::HandlerBody)
+    ));
+    assert_eq!(
+        constraints
+            .iter()
+            .filter(|constraint| constraint.origin == Origin::HandlerReturn)
+            .count(),
+        1
+    );
+    assert_eq!(
+        constraints
+            .iter()
+            .filter(|constraint| constraint.origin == Origin::HandlerFallback)
+            .count(),
+        1
+    );
+    let arm_checks = constraints
+        .iter()
+        .filter(|constraint| constraint.origin == Origin::HandlerArm)
+        .collect::<Vec<_>>();
+    assert_eq!(arm_checks.len(), 2, "{arm_checks:#?}");
+    assert!(arm_checks.iter().all(|constraint| {
+        constraint.subjects == Subjects::pair(Subject::Context, Subject::HandlerArm)
+            && &src[constraint.span.start..constraint.span.end()] == "{}"
+    }));
+}
+
+#[test]
+fn callback_steps_resolve_to_published_callback_constraints() {
+    use std::collections::HashSet;
+
+    let (_, _, output) = infer_src(
+        "effect Fail = { abort: () -> () }\n\
+         type Callback = () -> () + !Fail\n\
+         extern install : fn(Callback) -> () + !Fail = \"host.install\"",
+    );
+    let mut constraints = Vec::new();
+    for generated in output.constraints.values() {
+        all_constraints(generated, &mut constraints);
+    }
+    let callbacks: Vec<_> = constraints
+        .iter()
+        .filter(|constraint| {
+            matches!(
+                &constraint.kind,
+                inference::ConstraintKind::CallbackCoverage { .. }
+            )
+        })
+        .collect();
+    assert!(callbacks.iter().all(|constraint| {
+        constraint.origin == inference::ConstraintOrigin::CallbackBoundary
+            && constraint.subjects
+                == inference::ConstraintSubjects::pair(
+                    inference::Subject::CallbackRequired,
+                    inference::Subject::CallbackAvailable,
+                )
+    }));
+    let callback_ids: HashSet<_> = callbacks
+        .into_iter()
+        .map(|constraint| constraint.id)
+        .collect();
+    assert!(!callback_ids.is_empty(), "{:#?}", output.constraints);
+    assert!(
+        output
+            .steps
+            .iter()
+            .any(|step| step.constraint.is_some_and(|id| callback_ids.contains(&id))),
+        "{:#?}",
+        output.steps
+    );
+}
+
+#[test]
+fn ordinary_solve_errors_link_directly_to_their_failed_steps() {
+    let (_, _, output) = infer_src("let bad = (1n).missing");
+    let [error] = output.errors.as_slice() else {
+        panic!("expected one error: {:#?}", output.errors);
+    };
+    let inference::ErrorCause::Step(step_id) = error.cause else {
+        panic!("ordinary solve error did not link a step: {error:#?}");
+    };
+    let step = output.steps.iter().find(|step| step.id == step_id).unwrap();
+    assert_eq!(step.error, Some(error.id));
+    let inference::Effect::Failed(step_kind) = &step.effect else {
+        panic!("linked step was not failed: {step:#?}");
+    };
+    assert_eq!(step_kind.code(), error.kind.code());
+}
+
+#[test]
+fn callback_rewrite_updates_the_linked_failed_step_effect() {
+    let (_, _, output) = infer_src(
+        "type Callback 'e = () -> () + ..'e\n\
+         extern install : fn(Callback (..'e)) -> () + ..'f = \"host.install\"",
+    );
+    let [error] = output.errors.as_slice() else {
+        panic!("expected one callback error: {:#?}", output.errors);
+    };
+    assert_eq!(error.kind.code(), "callback-effects-not-covered");
+    let inference::ErrorCause::Step(step_id) = error.cause else {
+        panic!("callback solve error did not link a step: {error:#?}");
+    };
+    let step = output.steps.iter().find(|step| step.id == step_id).unwrap();
+    assert_eq!(step.error, Some(error.id));
+    let inference::Effect::Failed(step_kind) = &step.effect else {
+        panic!("linked callback step was not failed: {step:#?}");
+    };
+    assert_eq!(step_kind.code(), error.kind.code());
+}
+
+#[test]
+fn sat_errors_link_directly_to_their_flipped_batches() {
+    let (_, _, output) = infer_src(
+        "let one : { x when 'x: Nat, y when 'y: Nat } -> Nat where 'x != 'y =\n\
+           fn value => match value with | { x } => x | { y } => y end\n\
+         let bad = one {}",
+    );
+    let error = output
+        .errors
+        .iter()
+        .find(|error| matches!(error.cause, inference::ErrorCause::Batch(_)))
+        .expect("a SAT error");
+    let inference::ErrorCause::Batch(batch_id) = error.cause else {
+        unreachable!()
+    };
+    let batch = output
+        .store
+        .batches
+        .iter()
+        .find(|batch| batch.id == batch_id)
+        .expect("the linked batch is published");
+    assert!(batch.flipped);
+}
+
+#[test]
+fn direct_boundary_errors_have_stable_ids_without_solve_steps() {
+    let (_, _, output) = infer_src("extern echo : fn('a) -> 'a = \"host.echo\"");
+    let [error] = output.errors.as_slice() else {
+        panic!("expected one boundary error: {:#?}", output.errors);
+    };
+    assert!(matches!(error.cause, inference::ErrorCause::Direct));
+    assert_ne!(error.id.get(), u64::MAX);
+    assert!(output.steps.iter().all(|step| step.error != Some(error.id)));
+}
+
+#[test]
+fn source_sorting_moves_errors_without_renumbering_their_identities() {
+    let (_, _, output) = infer_src("let a = { dep: b, bad: (true).missing }\nlet b = (1n).missing");
+    assert_eq!(output.errors.len(), 2, "{:#?}", output.errors);
+    assert!(output.errors[0].span.start < output.errors[1].span.start);
+    assert!(output.errors[0].id.get() > output.errors[1].id.get());
+    for error in &output.errors {
+        let inference::ErrorCause::Step(step_id) = error.cause else {
+            panic!("sorted solve error lost its step cause: {error:#?}");
+        };
+        let step = output.steps.iter().find(|step| step.id == step_id).unwrap();
+        let reason = output
+            .reasons
+            .iter()
+            .find(|reason| reason.id == step.reason)
+            .unwrap();
+        assert!(matches!(
+            reason.origin,
+            inference::ReasonOrigin::Step(id) if id == step_id
+        ));
+    }
+}
+
+#[test]
+fn variables_and_solver_changes_link_into_the_immutable_reason_arena() {
+    use std::collections::HashSet;
+
+    let (_, _, output) = infer_src(
+        "let id = fn x => x\n\
+         let good = id 1n\n\
+         let bad = (true).missing",
+    );
+    assert!(!output.variables.is_empty());
+    let ids: HashSet<_> = output.reasons.iter().map(|reason| reason.id).collect();
+    assert_eq!(ids.len(), output.reasons.len());
+    assert!(
+        output
+            .reasons
+            .iter()
+            .all(|reason| reason.parents.iter().all(|parent| ids.contains(parent)))
+    );
+    for meta in &output.variables {
+        let reason = output
+            .reasons
+            .iter()
+            .find(|reason| reason.id == meta.minted_by)
+            .expect("a variable's mint reason remains in the arena");
+        assert!(matches!(
+            reason.origin,
+            inference::ReasonOrigin::Variable { sort, subject }
+                if sort == meta.sort && subject == meta.subject
+        ));
+    }
+    for step in &output.steps {
+        assert!(ids.contains(&step.reason));
+        if let inference::Effect::Bound { by, because, .. } = &step.effect {
+            assert_eq!(*by, step.reason);
+            assert_eq!(because.is_some(), step.rule == inference::Rule::Recover);
+            if let Some(cause) = because {
+                assert!(ids.contains(cause));
+            }
+        }
+    }
+}
+
+#[test]
+fn constraints_keep_reason_roots_for_raise_pattern_and_instance_origins() {
+    use inference::ConstraintOrigin as Origin;
+
+    let (_, _, output) = infer_src(
+        "effect Fail = { oops: () -> () }\n\
+         let run = fn v => handle !Fail.oops () with\n\
+           | !Fail.oops _ => match v with\n\
+             | {x} => let local = fn y => y in local (raise 0n)\n\
+             | 0n => 1n end\n\
+           end",
+    );
+    let mut constraints = Vec::new();
+    for generated in output.constraints.values() {
+        all_constraints(generated, &mut constraints);
+    }
+    for origin in [Origin::Raise, Origin::Pattern, Origin::Instance] {
+        let constraint = constraints
+            .iter()
+            .find(|constraint| constraint.origin == origin)
+            .unwrap_or_else(|| panic!("missing {origin:?}: {constraints:#?}"));
+        let reason = output
+            .reasons
+            .iter()
+            .find(|reason| reason.id == constraint.reason)
+            .expect("constraint reason is published");
+        assert!(matches!(
+            reason.origin,
+            inference::ReasonOrigin::Constraint(id) if id == constraint.id
+        ));
+    }
+}
+
+#[test]
+fn equality_constraints_preserve_expected_then_actual_side_ordering() {
+    let (_, _, output) = infer_src("let bad : Nat = true");
+    let mut constraints = Vec::new();
+    for generated in output.constraints.values() {
+        all_constraints(generated, &mut constraints);
+    }
+    let constraint = constraints
+        .iter()
+        .find(|constraint| {
+            constraint.origin == inference::ConstraintOrigin::ContextualCheck
+                && constraint.subjects
+                    == inference::ConstraintSubjects::pair(
+                        inference::Subject::Annotation,
+                        inference::Subject::Term,
+                    )
+        })
+        .expect("the annotation check");
+    let inference::ConstraintKind::Equal { expected, actual } = &constraint.kind else {
+        unreachable!()
+    };
+    assert!(matches!(&**expected, Ty::Nat));
+    assert!(matches!(&**actual, Ty::Boolean));
+}
+
+#[test]
+fn sat_and_effect_defaults_are_first_class_binding_reasons() {
+    let (_, _, output) = infer_src(
+        "let pure = fn x => x\n\
+         let folded = fn v =>\n\
+         \x20 let {x, ..} = v in\n\
+         \x20 match v with | {x} => {} | {y} => {} end",
+    );
+    assert!(output.reasons.iter().any(|reason| matches!(
+        reason.origin,
+        inference::ReasonOrigin::DefaultBinding {
+            kind: inference::DefaultBinding::CloseEffects,
+            ..
+        }
+    )));
+    assert!(output.reasons.iter().any(|reason| matches!(
+        reason.origin,
+        inference::ReasonOrigin::DefaultBinding {
+            kind: inference::DefaultBinding::Sat,
+            ..
+        }
+    )));
+    let arena: std::collections::HashMap<_, _> = output
+        .reasons
+        .iter()
+        .map(|reason| (reason.id, reason))
+        .collect();
+    for reason in output.reasons.iter().filter(|reason| {
+        matches!(
+            reason.origin,
+            inference::ReasonOrigin::DefaultBinding { .. }
+        )
+    }) {
+        assert!(!reason.parents.is_empty(), "default omitted its mint cause");
+        if let inference::ReasonOrigin::DefaultBinding {
+            kind: inference::DefaultBinding::Sat,
+            assigned,
+            ..
+        } = reason.origin
+        {
+            assert!(matches!(
+                assigned,
+                inference::DefaultAssignment::Present | inference::DefaultAssignment::Absent
+            ));
+            assert!(
+                reason.parents.iter().any(|parent| matches!(
+                    arena[parent].origin,
+                    inference::ReasonOrigin::Batch(_)
+                ))
+            );
+        }
+    }
+}
+
+#[test]
+fn replaced_and_guarded_batches_keep_referentially_integral_reason_roots() {
+    let (_, _, local) = infer_src(
+        "let outer =\n\
+         \x20 let choice : { x when 'a: Nat, y when 'b: Nat } where 'a != 'b = { x: 1n } in\n\
+         \x20 choice",
+    );
+    let reasons: std::collections::HashMap<_, _> = local
+        .reasons
+        .iter()
+        .map(|reason| (reason.id, reason))
+        .collect();
+    let mut constraints = Vec::new();
+    for generated in local.constraints.values() {
+        all_constraints(generated, &mut constraints);
+    }
+    let instance = constraints
+        .iter()
+        .find(|constraint| constraint.origin == inference::ConstraintOrigin::Instance)
+        .expect("the local instance constraint");
+    let batch = local
+        .store
+        .batches
+        .iter()
+        .find(|batch| matches!(batch.origin, inference::Origin::Instance(_)))
+        .expect("the local instance requirement");
+    let reason = reasons[&batch.reason];
+    assert!(matches!(reason.origin, inference::ReasonOrigin::Batch(id) if id == batch.id));
+    assert!(reason.parents.contains(&instance.reason));
+
+    let (_, _, guarded) = infer_src(
+        "let choose : { x when 'a: Nat, y when 'b: Nat } -> Nat where 'a != 'b = fn r => 1n\n\
+         let use = fn value => match value with\n\
+         \x20 | { x } => choose value\n\
+         \x20 | { y } => 0n end",
+    );
+    let reasons: std::collections::HashMap<_, _> = guarded
+        .reasons
+        .iter()
+        .map(|reason| (reason.id, reason))
+        .collect();
+    let transformed = guarded
+        .store
+        .batches
+        .iter()
+        .find(|batch| matches!(batch.origin, inference::Origin::Guarded(_)))
+        .expect("a requirement transformed by the active arm premise");
+    let reason = reasons[&transformed.reason];
+    assert!(matches!(reason.origin, inference::ReasonOrigin::Batch(id) if id == transformed.id));
+    assert!(reason.parents.iter().any(|parent| matches!(
+        reasons[parent].origin,
+        inference::ReasonOrigin::Batch(id) if id == transformed.id
+    )));
+    assert!(reason.parents.iter().any(|parent| matches!(
+        reasons[parent].origin,
+        inference::ReasonOrigin::Batch(id)
+            if guarded.store.batches.iter().any(|batch| {
+                batch.id == id && matches!(batch.origin, inference::Origin::Coverage(_))
+            })
+    )));
+}
+
+#[test]
+fn zero_step_rules_and_recovery_components_do_not_contaminate_later_steps() {
+    let (_, _, output) = infer_src("let bad : {} -> Boolean = fn x => let {} = x in 1n");
+    let failure = output
+        .steps
+        .iter()
+        .find(|step| matches!(step.effect, inference::Effect::Failed(_)))
+        .expect("the result mismatch");
+    let ancestors: std::collections::HashSet<_> = output
+        .reason_ancestors(failure.reason)
+        .into_iter()
+        .collect();
+    let mut constraints = Vec::new();
+    for generated in output.constraints.values() {
+        all_constraints(generated, &mut constraints);
+    }
+    assert!(!constraints.iter().any(|constraint| {
+        constraint.origin == inference::ConstraintOrigin::Pattern
+            && ancestors.contains(&constraint.reason)
+    }));
+
+    let (_, _, output) = infer_src("let bad : Nat = (fn x => { first: x, second: fn y => y }) 1n");
+    let reasons: std::collections::HashMap<_, _> = output
+        .reasons
+        .iter()
+        .map(|reason| (reason.id, reason))
+        .collect();
+    let recovered = output
+        .steps
+        .iter()
+        .find(|step| {
+            step.rule == inference::Rule::Recover
+                && matches!(
+                    step.effect,
+                    inference::Effect::Bound {
+                        var,
+                        ..
+                    } if output.variables[var as usize].subject == inference::Subject::Parameter
+                )
+        })
+        .expect("the abandoned inner parameter");
+    assert!(
+        reasons[&recovered.reason]
+            .parents
+            .iter()
+            .all(|parent| !matches!(reasons[parent].origin, inference::ReasonOrigin::Step(_)))
+    );
+}
+
+#[test]
+fn causal_reads_do_not_leak_across_solver_and_publication_boundaries() {
+    let (mint, _, output) = infer_src("let first = fn x => x\nlet second = fn y => y");
+    let first = output
+        .steps
+        .iter()
+        .find(|step| mint.name(step.definition) == "first")
+        .unwrap()
+        .definition;
+    let second = output
+        .steps
+        .iter()
+        .find(|step| mint.name(step.definition) == "second")
+        .unwrap()
+        .definition;
+    let first_steps: std::collections::HashSet<_> = output
+        .steps
+        .iter()
+        .filter(|step| step.definition == first)
+        .map(|step| step.reason)
+        .collect();
+    let second_seed = output
+        .steps
+        .iter()
+        .find(|step| step.definition == second)
+        .expect("second definition step")
+        .reason;
+    let ancestors: std::collections::HashSet<_> =
+        output.reason_ancestors(second_seed).into_iter().collect();
+    assert!(first_steps.is_disjoint(&ancestors));
+}
+
+#[test]
+fn recovery_names_the_failure_or_absorption_that_requested_it() {
+    let (_, _, output) = infer_src("let bad : Nat = true\nlet absorbed = fn x => bad x");
+    let steps: std::collections::HashMap<_, _> = output
+        .steps
+        .iter()
+        .map(|step| (step.reason, step))
+        .collect();
+    for step in output
+        .steps
+        .iter()
+        .filter(|step| step.rule == inference::Rule::Recover)
+    {
+        let inference::Effect::Bound {
+            because: Some(because),
+            ..
+        } = step.effect
+        else {
+            panic!("recovery omitted its explicit cause")
+        };
+        let cause = steps[&because];
+        assert!(
+            matches!(cause.effect, inference::Effect::Failed(_))
+                || cause.rule == inference::Rule::Absorb
+        );
+    }
+}
+
+#[test]
+fn raise_result_has_its_own_semantic_subject() {
+    let (_, _, output) = infer_src(
+        "effect Fail = { abort: Nat -> Boolean }\nlet f = fn unit => raise Fail.abort 1n",
+    );
+    assert!(output.variables.iter().any(|meta| {
+        meta.sort == inference::VarSort::Type && meta.subject == inference::Subject::RaiseResult
+    }));
+}
+
+#[test]
+fn a_failure_slice_crosses_the_constraints_whose_bindings_it_resolved() {
+    let (_, _, output) = infer_src("let id = fn x => x\nlet bad : Nat = id true");
+    let failure = output
+        .steps
+        .iter()
+        .find(|step| matches!(step.effect, inference::Effect::Failed(_)))
+        .expect("a failed annotation step");
+    let slice = output.reason_ancestors(failure.reason);
+    let roots: std::collections::HashSet<_> = output
+        .reasons
+        .iter()
+        .filter(|reason| slice.contains(&reason.id))
+        .filter_map(|reason| match reason.origin {
+            inference::ReasonOrigin::Constraint(id) => Some(id),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        roots.len() >= 2,
+        "slice stopped at one constraint: {roots:?}"
+    );
+}
+
+#[test]
+fn published_reason_links_never_reach_rolled_back_origins() {
+    let (_, _, output) = infer_src(
+        "type Box 'a = { value: 'a, next: Box 'a }\n\
+         let bad : Box Nat -> Nat = fn x =>\n\
+         \x20 let wrong : Box Boolean = x in 1n",
+    );
+    assert!(output.reasons.iter().any(|reason| !reason.reachable));
+    let reasons: std::collections::HashMap<_, _> = output
+        .reasons
+        .iter()
+        .map(|reason| (reason.id, reason))
+        .collect();
+    for reason in output.reasons.iter().filter(|reason| reason.reachable) {
+        assert!(
+            reason
+                .parents
+                .iter()
+                .all(|parent| reasons[parent].reachable)
+        );
+        if let inference::ReasonOrigin::Step(step) = reason.origin {
+            assert!(output.steps.iter().any(|candidate| candidate.id == step));
+        }
+    }
+}
+
+#[test]
+fn variable_metadata_uses_semantic_subjects_for_narrow_mint_sites() {
+    let programs = [
+        "let annotated : _ -> { x when _: Nat, .. } = fn p => { x: 1n }",
+        "let id = fn x => x\nlet instance = id 1n",
+        "let projected = fn p => p.x",
+        "let matched = fn v => match v with | {x} => {y: x} | {y} => {y: y} end",
+    ];
+    let mut subjects = std::collections::HashSet::new();
+    for program in programs {
+        let (_, _, output) = infer_src(program);
+        subjects.extend(
+            output
+                .variables
+                .iter()
+                .map(|meta| (meta.sort, meta.subject)),
+        );
+    }
+    use inference::{Subject as S, VarSort as V};
+    for expected in [
+        (V::Type, S::Annotation),
+        (V::Row, S::Annotation),
+        (V::Presence, S::Annotation),
+        (V::Type, S::Instance),
+        (V::Row, S::ProjectionBase),
+        (V::Type, S::MatchResult),
+        (V::Row, S::AmbientEffects),
+    ] {
+        assert!(
+            subjects.contains(&expected),
+            "missing metadata {expected:?}: {subjects:?}"
+        );
+    }
+}
+
+#[test]
+fn deep_reason_slices_are_iterative() {
+    let (_, _, mut output) = infer_src("let x = 1n");
+    let base = output.reasons.len() as u64 + 100;
+    let depth = 30_000u64;
+    for at in 0..depth {
+        output.reasons.push(inference::Reason {
+            id: inference::ReasonId::synthetic(base + at),
+            parents: (at > 0)
+                .then(|| inference::ReasonId::synthetic(base + at - 1))
+                .into_iter()
+                .collect(),
+            origin: inference::ReasonOrigin::Recovery,
+            reachable: true,
+        });
+    }
+    let slice = output.reason_ancestors(inference::ReasonId::synthetic(base + depth - 1));
+    assert_eq!(slice.len(), depth as usize);
 }

@@ -17,12 +17,54 @@
 //! row already says which question was taken as answered, and a field for it
 //! would print the goal column twice.
 
-use ruddy::inference::Effect;
+use std::collections::HashMap;
+
+use ruddy::inference::{DefaultAssignment, DefaultBinding, Effect, ReasonOrigin, VarSort};
 
 use crate::{
     stage::{Cx, Ids, Spec, plural},
     wire::{Node, Stage},
 };
+
+fn sort_code(sort: VarSort) -> &'static str {
+    match sort {
+        VarSort::Type => "type",
+        VarSort::Row => "row",
+        VarSort::Presence => "presence",
+    }
+}
+
+fn reason_fields(
+    origin: ReasonOrigin,
+) -> (
+    &'static str,
+    Option<u64>,
+    Option<&'static str>,
+    Option<&'static str>,
+) {
+    match origin {
+        ReasonOrigin::Variable { sort, subject } => (
+            "variable",
+            None,
+            Some(subject.code()),
+            Some(sort_code(sort)),
+        ),
+        ReasonOrigin::Constraint(id) => ("constraint", Some(id.get()), None, None),
+        ReasonOrigin::Contract(id) => ("contract", Some(id.get()), None, None),
+        ReasonOrigin::Batch(id) => ("batch", Some(id.get()), None, None),
+        ReasonOrigin::Step(id) => ("step", Some(id.get()), None, None),
+        ReasonOrigin::Recovery => ("recovery", None, None, None),
+        ReasonOrigin::DefaultBinding { var, kind, .. } => (
+            match kind {
+                DefaultBinding::Sat => "sat-binding",
+                DefaultBinding::CloseEffects => "close-effects-binding",
+            },
+            Some(var as u64),
+            None,
+            None,
+        ),
+    }
+}
 
 pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     // A step names its definition by symbol and carries its own types, so the
@@ -34,8 +76,13 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         return crate::stage::skipped(spec, "inference did not run");
     };
 
+    let error_messages: HashMap<_, _> = output
+        .errors
+        .iter()
+        .map(|error| (error.id, error.diagnostic().title))
+        .collect();
     let mut ids = Ids::default();
-    let nodes: Vec<Node> = output
+    let mut nodes: Vec<Node> = output
         .steps
         .iter()
         .map(|step| {
@@ -47,6 +94,20 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                 .field("_rule", step.rule.to_string())
                 .field("_effect", effect.clone())
                 .field("_depth", step.depth.to_string())
+                .field("_step_id", step.id.get().to_string())
+                .field("_reason_id", step.reason.get().to_string())
+                .field(
+                    "_constraint_id",
+                    step.constraint
+                        .map(|id| id.get().to_string())
+                        .unwrap_or_default(),
+                )
+                .field(
+                    "_error_id",
+                    step.error
+                        .map(|id| id.get().to_string())
+                        .unwrap_or_default(),
+                )
                 .field("_def", mint.name(step.definition).to_string());
 
             // The two fields the page accumulates, present only on the steps
@@ -57,8 +118,21 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                 // own `Display for Effect` — rather than spelling `?4 := Nat`
                 // a second time here. It had been spelled twice, identically,
                 // which is two places for one notation to change in.
-                Effect::Bound { .. } => node = node.field("_bind", effect),
-                Effect::Failed(kind) => node = node.field("_error", kind.to_string()).error(),
+                Effect::Bound { by, because, .. } => {
+                    node = node
+                        .field("_bind", effect)
+                        .field("_bind_by", by.get().to_string());
+                    if let Some(because) = because {
+                        node = node.field("_recovery_because", because.get().to_string());
+                    }
+                }
+                Effect::Failed(kind) => {
+                    let message = step
+                        .error
+                        .and_then(|id| error_messages.get(&id).cloned())
+                        .unwrap_or_else(|| kind.to_string());
+                    node = node.field("_error", message).error();
+                }
                 Effect::None | Effect::Decomposed | Effect::Guarded { .. } => {}
             }
 
@@ -73,12 +147,95 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         })
         .collect();
 
+    // Provenance is debugger wire data, not an opaque Rust Debug appendix.
+    // Per-step scalar fields make the common query cheap; complete JSON arenas
+    // ride on one explicitly tagged metadata record, present even when there
+    // are no steps and excluded from solve replay by wire consumers.
+    let reason_by_id: HashMap<_, _> = output
+        .reasons
+        .iter()
+        .map(|reason| (reason.id, reason))
+        .collect();
+    for (step, node) in output.steps.iter().zip(&mut nodes) {
+        let reason = reason_by_id
+            .get(&step.reason)
+            .expect("every published step has a reason");
+        let mut decorated = std::mem::take(node)
+            .field(
+                "_reason_parents",
+                reason
+                    .parents
+                    .iter()
+                    .map(|id| id.get().to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )
+            .field("_reason_origin", "step");
+        if let Effect::Bound { var, .. } = step.effect {
+            let meta = &output.variables[var as usize];
+            decorated = decorated
+                .field("_var_id", var.to_string())
+                .field("_var_sort", sort_code(meta.sort))
+                .field("_var_subject", meta.subject.code())
+                .field("_var_minted_by", meta.minted_by.get().to_string());
+        }
+        *node = decorated;
+    }
+    {
+        let variables: Vec<_> = output
+            .variables
+            .iter()
+            .enumerate()
+            .map(|(var, meta)| {
+                serde_json::json!({
+                    "id": var,
+                    "sort": sort_code(meta.sort),
+                    "subject": meta.subject.code(),
+                    "minted_by": meta.minted_by.get(),
+                })
+            })
+            .collect();
+        let reasons: Vec<_> = output
+            .reasons
+            .iter()
+            .map(|reason| {
+                let (origin, origin_id, subject, sort) = reason_fields(reason.origin);
+                let assigned = match reason.origin {
+                    ReasonOrigin::DefaultBinding { assigned, .. } => Some(match assigned {
+                        DefaultAssignment::Present => "present",
+                        DefaultAssignment::Absent => "absent",
+                        DefaultAssignment::EmptyRow => "empty-row",
+                    }),
+                    _ => None,
+                };
+                serde_json::json!({
+                    "id": reason.id.get(),
+                    "parents": reason.parents.iter().map(|id| id.get()).collect::<Vec<_>>(),
+                    "origin": origin,
+                    "origin_id": origin_id,
+                    "sort": sort,
+                    "subject": subject,
+                    "assigned": assigned,
+                    "reachable": reason.reachable,
+                })
+            })
+            .collect();
+        let metadata = Node::new(ids.next(), "metadata", "")
+            .field("_record", "metadata")
+            .field("_variables", serde_json::to_string(&variables).unwrap())
+            .field("_reasons", serde_json::to_string(&reasons).unwrap());
+        nodes.insert(0, metadata);
+    }
+
     // No time of its own: the inference phase is timed once, on `Types`, which
     // is what leaving `micros` unset says.
-    let summary = plural(nodes.len(), "step");
+    let summary = plural(output.steps.len(), "step");
     Stage {
         nodes,
-        debug: format!("{:#?}", output.steps),
+        debug: format!(
+            "steps = {:#?}\nvariables = {:#?}\nreasons = {:#?}",
+            output.steps, output.variables, output.reasons
+        ),
         ..spec.stage(cx.status(), summary)
     }
 }

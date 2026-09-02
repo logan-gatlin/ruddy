@@ -71,8 +71,15 @@ fn rows(ids: &mut Ids, constraints: &[Constraint]) -> Vec<Node> {
         .map(|constraint| {
             // Each constraint wears the span the program said it at, which is
             // what lets clicking one highlight the term that demanded it.
-            let node = Node::new(ids.next(), constraint.kind.code(), constraint.to_string())
-                .at(constraint.span);
+            let mut node = Node::new(ids.next(), constraint.kind.code(), constraint.to_string())
+                .at(constraint.span)
+                .field("_constraint_id", constraint.id.get().to_string())
+                .field("_reason_id", constraint.reason.get().to_string())
+                .field("_origin", constraint.origin.code())
+                .field("_primary_subject", constraint.subjects.primary.code());
+            if let Some(subject) = constraint.subjects.secondary {
+                node = node.field("_secondary_subject", subject.code());
+            }
             match &constraint.kind {
                 ConstraintKind::Let { value, body, .. } => {
                     node.children(rows(ids, value)).children(rows(ids, body))
@@ -95,10 +102,13 @@ fn rows(ids: &mut Ids, constraints: &[Constraint]) -> Vec<Node> {
                                             requirement.batch.origin.code(),
                                             requirement.batch.formula.to_string(),
                                         )
-                                        .at(requirement.batch.span),
+                                        .at(requirement.batch.span)
+                                        .field("_batch_id", requirement.batch.id.get().to_string()),
                                     )
                                 });
-                            arm_node.children(rows(ids, &arm.constraints))
+                            arm_node
+                                .children(rows(ids, &arm.constraints))
+                                .children(rows(ids, std::slice::from_ref(&arm.result)))
                         })
                         .collect::<Vec<_>>(),
                 ),
@@ -123,7 +133,7 @@ fn counted(constraints: &[Constraint]) -> usize {
             ConstraintKind::Match { arms, .. } => {
                 1 + arms
                     .iter()
-                    .map(|arm| arm.requirements.len() + counted(&arm.constraints))
+                    .map(|arm| arm.requirements.len() + counted(&arm.constraints) + 1)
                     .sum::<usize>()
             }
             ConstraintKind::Project { .. }

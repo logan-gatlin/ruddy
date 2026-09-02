@@ -1225,17 +1225,26 @@ pub enum ErrorKind {
     },
     /// A name with no definition in scope at the point it was written.
     Undefined {
+        name: String,
         namespace: Namespace,
     },
     /// A second definition of a name. The first one is the one that stands.
     Duplicate {
+        name: String,
         namespace: Namespace,
         previous: Span,
     },
-    DuplicateField,
+    DuplicateField {
+        name: String,
+        previous: Span,
+    },
     /// A second case of a name in one sum, one effect row, or one alias — all
     /// three being a set of labels a name may appear in once.
-    DuplicateCase,
+    DuplicateCase {
+        shape: Shape,
+        name: String,
+        previous: Span,
+    },
     /// An explicitly absent label in a composite with no `..` tail, as in
     /// `{ a: Nat, \y }` or `#A | \#B`.
     ///
@@ -1321,7 +1330,9 @@ pub enum ErrorKind {
     /// The fix is the header, which is why this is one complaint rather than
     /// two: `type Bad = { x: Nat, ..'r }` left a row open by naming something
     /// nothing binds, and writing `'r` beside the name is what closes it.
-    VariableInDeclaration,
+    VariableInDeclaration {
+        name: String,
+    },
     /// A `_` in a `type` declaration's body, as in `type Bad = { x: _ }`.
     ///
     /// [`ErrorKind::OpenDeclaredType`]'s sibling: a hole is a position left for
@@ -1330,6 +1341,10 @@ pub enum ErrorKind {
     /// of its own rather than that one because a hole is not a row's openness —
     /// there is no shape to word it in.
     HoleInDeclaration,
+    /// A `_` in an operation signature. Operation signatures are fixed
+    /// interfaces just like declared types, but this context is kept distinct
+    /// so diagnostics do not describe the hole as part of a type declaration.
+    HoleInOperation,
     /// A `where` clause naming something no `when` in the same type gives a
     /// label to, as in `{ x when 'a: Nat } -> Nat where 'a = 'c`.
     ///
@@ -1360,6 +1375,7 @@ pub enum ErrorKind {
     /// wherever it is written, so a name short of its arguments is the same
     /// complaint as one given too many.
     Arity {
+        name: String,
         expected: usize,
         found: usize,
     },
@@ -1373,9 +1389,12 @@ pub enum ErrorKind {
     /// types of its own. Refusing this is what keeps every declaration's
     /// parameters plain — each one a type, and nothing higher — so that
     /// checking an application is counting rather than a language of its own.
-    ParameterApplied,
+    ParameterApplied {
+        name: String,
+    },
     /// One declaration binding a name twice: `type Pair 'A 'A = ...`.
     DuplicateParameter {
+        name: String,
         previous: Span,
     },
     /// A type that leads back to itself having been given an argument built out
@@ -1539,6 +1558,7 @@ pub enum ErrorKind {
     /// arms — may of course bind the same name.
     DuplicateBinding {
         name: String,
+        previous: Span,
     },
     /// A second operation of a name in one effect:
     /// `effect Log = { write: Nat -> (), write: () -> () }`.
@@ -1546,7 +1566,10 @@ pub enum ErrorKind {
     /// [`ErrorKind::DuplicateCase`]'s twin, and scoped the same way: an
     /// operation belongs to its own declaration, so two effects may each
     /// declare a `write` and two `write` in one may not.
-    DuplicateOperation,
+    DuplicateOperation {
+        name: String,
+        previous: Span,
+    },
     /// An operation whose signature is not a function, retained after the
     /// parser rejects `effect Log = { write: Nat }`.
     ///
@@ -1559,16 +1582,12 @@ pub enum ErrorKind {
         /// instead.
         name: String,
     },
-    /// An operation's signature that is not plain: an effect row, a `..` tail
-    /// or a `when` anywhere inside it.
-    ///
-    /// All three say something a definition gets to decide, and an operation's
-    /// signature holds for every performance of it — the reason a `type`
-    /// declaration refuses the same three. It is a complaint of its own rather
-    /// than [`ErrorKind::OpenDeclaredType`] because the `+` is refused here and
-    /// nowhere else, and one sentence naming all three is what a reader can act
-    /// on.
-    ImpureOperation,
+    /// The part of an operation signature that prevents it from being one
+    /// fixed function type. The reason is retained so the diagnostic can name
+    /// the exact construct to change rather than listing every possible one.
+    ImpureOperation {
+        found: OperationTypeProblem,
+    },
     /// A row of effects written where a type goes: `let x : !Log = 1`.
     ///
     /// A row is not a type. The one place one may be written without an arrow
@@ -1624,6 +1643,7 @@ pub enum ErrorKind {
     DuplicateArm {
         effect: String,
         selector: OperationSelector,
+        previous: Span,
     },
     /// Two `return` arms in one handler. Reported at the second; the first is
     /// the one that stands.
@@ -1639,7 +1659,20 @@ pub enum ErrorKind {
     /// returned by the computation, outlive the `handle`, and be called with no
     /// handler on the stack. The mirror case needs no rule, because the row
     /// already tracks it.
-    RaiseInFunction,
+    RaiseInFunction {
+        function: Span,
+    },
+}
+
+/// What prevents an operation signature from being one fixed function type.
+#[derive(Debug, Clone)]
+pub enum OperationTypeProblem {
+    /// An explicit `+ effects` on an operation arrow.
+    Effects,
+    /// A `..` tail or `when` condition that leaves part of the signature open.
+    OpenPart,
+    /// A variable that no operation declaration can bind.
+    Variable(String),
 }
 
 /// What made a binding's pattern able to fail: the first tag or literal found
@@ -1946,7 +1979,7 @@ enum Answering {
     /// An arm encloses it, and nothing has come between.
     Arm,
     /// An arm encloses it, but a `fn` lies between the two.
-    UnderFn,
+    UnderFn(Span),
 }
 
 /// Where one parameter sits: the declaration that binds it, and its position
@@ -3568,24 +3601,30 @@ fn structuralize_effects(
                 // written case gets its own expansion, so two differently
                 // named aliases that reach the same structural effect are not
                 // silently collapsed by the expansion map.
-                let mut seen = HashSet::new();
+                let mut seen: HashMap<EffectId, Span> = HashMap::new();
                 for item in named.values() {
-                    let mut duplicate = false;
+                    let mut duplicate = None;
                     for concrete in expansions
                         .get(&item.symbol)
                         .into_iter()
                         .flat_map(IndexMap::values)
                     {
-                        if let Some(id) = ids.get(concrete)
-                            && !seen.insert(id.clone())
-                        {
-                            duplicate = true;
+                        if let Some(id) = ids.get(concrete) {
+                            if let Some(previous) = seen.get(id) {
+                                duplicate.get_or_insert_with(|| (id.name().to_string(), *previous));
+                            } else {
+                                seen.insert(id.clone(), item.name_span);
+                            }
                         }
                     }
-                    if duplicate {
+                    if let Some((name, previous)) = duplicate {
                         errors.push(Error {
                             span: item.name_span,
-                            kind: ErrorKind::DuplicateCase,
+                            kind: ErrorKind::DuplicateCase {
+                                shape: Shape::Effect,
+                                name,
+                                previous,
+                            },
                         });
                     }
                 }
@@ -5002,10 +5041,14 @@ fn rekey_row(row: &mut EffectRow, ids: &IndexMap<Symbol, EffectId>, errors: &mut
         let Some(id) = ids.get(&label.symbol()) else {
             continue;
         }; // aliases never survive expansion
-        if row.effects.contains_key(id) {
+        if let Some(previous) = row.effects.get(id) {
             errors.push(Error {
                 span: label.name_span(),
-                kind: ErrorKind::DuplicateCase,
+                kind: ErrorKind::DuplicateCase {
+                    shape: Shape::Effect,
+                    name: id.name().to_string(),
+                    previous: previous.name_span(),
+                },
             });
         } else {
             row.effects.insert(id.clone(), label);
@@ -5112,24 +5155,30 @@ fn rekey_term(
             // Coverage is structural, not nominal. Equivalent declarations may
             // contribute different selectors to one evidence record, while a
             // repeated selector across either spelling is still one duplicate.
-            let mut covered: IndexMap<EffectId, (Tracked<Symbol>, IndexSet<OperationSelector>)> =
-                IndexMap::new();
+            let mut covered: IndexMap<
+                EffectId,
+                (Tracked<Symbol>, IndexMap<OperationSelector, Span>),
+            > = IndexMap::new();
             let mut unique = Vec::new();
             for arm in std::mem::take(&mut handler.arms) {
                 let effect = ids[&arm.effect.tracked].clone();
                 let group = covered
                     .entry(effect.clone())
-                    .or_insert_with(|| (arm.effect, IndexSet::new()));
-                if group.1.insert(arm.selector.tracked.clone()) {
-                    unique.push(arm);
-                } else {
+                    .or_insert_with(|| (arm.effect, IndexMap::new()));
+                if let Some(previous) = group.1.get(&arm.selector.tracked) {
                     errors.push(Error {
                         span: arm.selector.span,
                         kind: ErrorKind::DuplicateArm {
                             effect: effect.name().to_string(),
                             selector: arm.selector.tracked,
+                            previous: *previous,
                         },
                     });
+                } else {
+                    group
+                        .1
+                        .insert(arm.selector.tracked.clone(), arm.selector.span);
+                    unique.push(arm);
                 }
             }
             handler.arms = unique;
@@ -5137,7 +5186,7 @@ fn rekey_term(
             for (effect, (representative, arms)) in covered {
                 let missing: Vec<String> = operations[&effect]
                     .iter()
-                    .filter(|selector| !arms.contains(*selector))
+                    .filter(|selector| !arms.contains_key(*selector))
                     .map(OperationSelector::source_name)
                     .collect();
                 if missing.is_empty() {
@@ -7881,6 +7930,7 @@ impl Builder<'_> {
             self.error(
                 name.span,
                 ErrorKind::Duplicate {
+                    name: name.tracked.clone(),
                     namespace,
                     previous,
                 },
@@ -8363,6 +8413,7 @@ impl Builder<'_> {
             self.error(
                 name.span,
                 ErrorKind::Duplicate {
+                    name: name.tracked.clone(),
                     namespace: Namespace::Modules,
                     previous,
                 },
@@ -8450,6 +8501,7 @@ impl Builder<'_> {
                 self.error(
                     segment.span,
                     ErrorKind::Undefined {
+                        name: segment.tracked.clone(),
                         namespace: Namespace::Modules,
                     },
                 );
@@ -8494,7 +8546,13 @@ impl Builder<'_> {
             Ok(symbol) => Some(symbol),
             Err(Missing::Segment) => None,
             Err(Missing::Name) => {
-                self.error(path.name.span, ErrorKind::Undefined { namespace });
+                self.error(
+                    path.name.span,
+                    ErrorKind::Undefined {
+                        name: path.name.tracked.clone(),
+                        namespace,
+                    },
+                );
                 None
             }
         }
@@ -8518,7 +8576,13 @@ impl Builder<'_> {
         let mut seen: Vec<(&str, Span)> = Vec::new();
         for name in params {
             if let Some(&(_, previous)) = seen.iter().find(|(seen, _)| *seen == name.tracked) {
-                self.error(name.span, ErrorKind::DuplicateParameter { previous });
+                self.error(
+                    name.span,
+                    ErrorKind::DuplicateParameter {
+                        name: name.tracked.clone(),
+                        previous,
+                    },
+                );
                 continue;
             }
             seen.push((&name.tracked, name.span));
@@ -8559,15 +8623,22 @@ impl Builder<'_> {
         match body {
             parse::EffectBody::Empty => Effect::Operations(IndexMap::new()),
             parse::EffectBody::Alias(cases) => {
-                let mut names = IndexMap::new();
+                let mut names: IndexMap<String, Named> = IndexMap::new();
                 for (name, ()) in cases {
                     let at = name.span();
                     let Some(symbol) = self.resolve(&name, Namespace::Effects) else {
                         continue;
                     };
                     let label = effect_key(self.mint, symbol);
-                    if names.contains_key(&label) {
-                        self.error(at, ErrorKind::DuplicateCase);
+                    if let Some(previous) = names.get(&label) {
+                        self.error(
+                            at,
+                            ErrorKind::DuplicateCase {
+                                shape: Shape::Effect,
+                                name: label,
+                                previous: previous.name_span,
+                            },
+                        );
                         continue;
                     }
                     names.insert(
@@ -8587,12 +8658,18 @@ impl Builder<'_> {
                 Effect::Operations([(selector, operation)].into_iter().collect())
             }
             parse::EffectBody::Named(fields) => {
-                let mut operations = IndexMap::new();
+                let mut operations: IndexMap<OperationSelector, Operation> = IndexMap::new();
                 for (name, signature) in fields {
                     let selector = OperationSelector::Named(name.tracked.clone());
                     let operation = self.operation(&name, *signature);
-                    if operations.contains_key(&selector) {
-                        self.error(name.span, ErrorKind::DuplicateOperation);
+                    if let Some(previous) = operations.get(&selector) {
+                        self.error(
+                            name.span,
+                            ErrorKind::DuplicateOperation {
+                                name: name.tracked,
+                                previous: previous.name_span,
+                            },
+                        );
                         continue;
                     }
                     operations.insert(selector, operation);
@@ -8669,7 +8746,7 @@ impl Builder<'_> {
         // nor an operation's signature has one: each says the same thing
         // wherever it is used. Reported and dropped, the way a refused `..` is —
         // the type beside it stands.
-        if let Some(kind) = wherever(place) {
+        if let Some(kind) = wherever(place, &name.tracked) {
             self.error(name.span, kind);
             return Some(Row::Anything);
         }
@@ -9085,7 +9162,10 @@ impl Builder<'_> {
                 if !self.params.contains_key(&name.tracked) {
                     self.variable(&name, Sense::Type);
                 }
-                self.error(head_span, ErrorKind::ParameterApplied);
+                self.error(
+                    head_span,
+                    ErrorKind::ParameterApplied { name: name.tracked },
+                );
                 return span.track(TypeKind::Error);
             }
             // Something that is not a name cannot be applied, but it is still a
@@ -9108,11 +9188,19 @@ impl Builder<'_> {
                 // be one — a primitive lives in no module, so a path can never
                 // reach it.
                 if name.modules.is_empty() && Prim::from_name(&name.name.tracked).is_some() {
-                    self.error(span, ErrorKind::Arity { expected: 0, found });
+                    self.error(
+                        span,
+                        ErrorKind::Arity {
+                            name: name.name.tracked.clone(),
+                            expected: 0,
+                            found,
+                        },
+                    );
                 } else {
                     self.error(
                         name.name.span,
                         ErrorKind::Undefined {
+                            name: name.name.tracked.clone(),
                             namespace: Namespace::Types,
                         },
                     );
@@ -9129,7 +9217,14 @@ impl Builder<'_> {
             // the first guesswork, and pairing them up to say more would be
             // inventing what was meant. See [`TypeKind::Apply::head_span`],
             // which exists for the complaints that *are* about the name.
-            self.error(span, ErrorKind::Arity { expected, found });
+            self.error(
+                span,
+                ErrorKind::Arity {
+                    name: name.name.tracked.clone(),
+                    expected,
+                    found,
+                },
+            );
             return span.track(TypeKind::Error);
         }
         span.track(TypeKind::Apply {
@@ -9223,7 +9318,7 @@ impl Builder<'_> {
                 // nothing that is certain to still be on the stack. See R17.
                 let inner = match self.answering {
                     Answering::Nowhere => Answering::Nowhere,
-                    Answering::Arm | Answering::UnderFn => Answering::UnderFn,
+                    Answering::Arm | Answering::UnderFn(_) => Answering::UnderFn(span),
                 };
                 let outer = std::mem::replace(&mut self.answering, inner);
                 let body = self.term(*body);
@@ -9400,7 +9495,7 @@ impl Builder<'_> {
             ExprKind::Raise(value) => {
                 let kind = match self.answering {
                     Answering::Arm => None,
-                    Answering::UnderFn => Some(ErrorKind::RaiseInFunction),
+                    Answering::UnderFn(function) => Some(ErrorKind::RaiseInFunction { function }),
                     Answering::Nowhere => Some(ErrorKind::RaiseOutsideArm),
                 };
                 if let Some(kind) = kind {
@@ -9609,8 +9704,12 @@ impl Builder<'_> {
             // thing wherever they are used and so have nothing to leave open.
             // Refused there and absorbed, the way an open row written there is.
             parse::TypeKind::Hole => match place {
-                Place::Declaration | Place::Operation => {
+                Place::Declaration => {
                     self.error(span, ErrorKind::HoleInDeclaration);
+                    span.track(TypeKind::Error)
+                }
+                Place::Operation => {
+                    self.error(span, ErrorKind::HoleInOperation);
                     span.track(TypeKind::Error)
                 }
                 Place::Annotation => span.track(TypeKind::Hole),
@@ -9629,7 +9728,7 @@ impl Builder<'_> {
                 // A declaration and an operation's signature each say the same
                 // thing wherever they are used, so neither has anything for a
                 // caller to pick — and each says so in its own words.
-                if let Some(kind) = wherever(place) {
+                if let Some(kind) = wherever(place, &name.tracked) {
                     self.error(name.span, kind);
                     return span.track(TypeKind::Error);
                 }
@@ -9652,7 +9751,14 @@ impl Builder<'_> {
                 Ok(symbol) => match self.arity(symbol) {
                     0 => span.track(TypeKind::Ident(symbol)),
                     expected => {
-                        self.error(name.span(), ErrorKind::Arity { expected, found: 0 });
+                        self.error(
+                            name.span(),
+                            ErrorKind::Arity {
+                                name: name.name.tracked.clone(),
+                                expected,
+                                found: 0,
+                            },
+                        );
                         span.track(TypeKind::Error)
                     }
                 },
@@ -9672,6 +9778,7 @@ impl Builder<'_> {
                             self.error(
                                 name.name.span,
                                 ErrorKind::Undefined {
+                                    name: name.name.tracked.clone(),
                                     namespace: Namespace::Types,
                                 },
                             );
@@ -9774,13 +9881,21 @@ impl Builder<'_> {
             // case may not have.
             parse::TypeKind::Sum { cases, tail } => {
                 let lowered: IndexMap<String, SumCase> = self
-                    .labels(cases, ErrorKind::DuplicateCase, |b, case| match case {
-                        parse::SumCase::Written { when, payload } => {
-                            let when = b.when(when, place);
-                            Some((when, payload.map(|payload| b.ty(payload, place))))
-                        }
-                        parse::SumCase::Absent => None,
-                    })
+                    .labels(
+                        cases,
+                        |name, previous| ErrorKind::DuplicateCase {
+                            shape: Shape::Sum,
+                            name,
+                            previous,
+                        },
+                        |b, case| match case {
+                            parse::SumCase::Written { when, payload } => {
+                                let when = b.when(when, place);
+                                Some((when, payload.map(|payload| b.ty(payload, place))))
+                            }
+                            parse::SumCase::Absent => None,
+                        },
+                    )
                     .into_iter()
                     .map(|(name, case)| {
                         let lowered = match case.value {
@@ -9864,7 +9979,12 @@ impl Builder<'_> {
         // distinguishes invalid interfaces in every later phase.
         let impure_operation = place == Place::Operation;
         if impure_operation {
-            self.error(written.span, ErrorKind::ImpureOperation);
+            self.error(
+                written.span,
+                ErrorKind::ImpureOperation {
+                    found: OperationTypeProblem::Effects,
+                },
+            );
         }
         // Every label, expanded: a name declaring operations stands for itself,
         // and an alias for the effects it reaches. So no alias survives into
@@ -9898,7 +10018,7 @@ impl Builder<'_> {
             if expanded.is_empty() {
                 expanded.push((self.mint.name(symbol).to_string(), symbol));
             }
-            for (_label_name, label_symbol) in expanded {
+            for (label_name, label_symbol) in expanded {
                 // Whether the reader wrote *this* effect's name here, or an
                 // alias standing for it among others.
                 let expanded = label_symbol != symbol;
@@ -9916,8 +10036,15 @@ impl Builder<'_> {
                     },
                 };
                 let label_key = EffectId::pending(label_symbol);
-                if effects.contains_key(&label_key) {
-                    self.error(at, ErrorKind::DuplicateCase);
+                if let Some(previous) = effects.get(&label_key) {
+                    self.error(
+                        at,
+                        ErrorKind::DuplicateCase {
+                            shape: Shape::Effect,
+                            name: label_name,
+                            previous: previous.name_span(),
+                        },
+                    );
                     continue;
                 }
                 effects.insert(label_key, lowered);
@@ -9970,7 +10097,11 @@ impl Builder<'_> {
         fields: IndexMap<TrackedString, S>,
         lower: impl Fn(&mut Self, S) -> T,
     ) -> IndexMap<String, Field<T>> {
-        self.labels(fields, ErrorKind::DuplicateField, lower)
+        self.labels(
+            fields,
+            |name, previous| ErrorKind::DuplicateField { name, previous },
+            lower,
+        )
     }
 
     /// Re-key surface labels by name, lowering each value with `lower`.
@@ -9981,15 +10112,15 @@ impl Builder<'_> {
     fn labels<S, T>(
         &mut self,
         labels: IndexMap<TrackedString, S>,
-        repeat: ErrorKind,
+        repeat: impl Fn(String, Span) -> ErrorKind,
         lower: impl Fn(&mut Self, S) -> T,
     ) -> IndexMap<String, Field<T>> {
-        let mut lowered = IndexMap::new();
+        let mut lowered: IndexMap<String, Field<T>> = IndexMap::new();
         for (name, value) in labels {
             let name_span = name.span;
             let value = lower(self, value);
-            if lowered.contains_key(&name.tracked) {
-                self.error(name_span, repeat.clone());
+            if let Some(previous) = lowered.get(&name.tracked) {
+                self.error(name_span, repeat(name.tracked.clone(), previous.name_span));
                 continue;
             }
             lowered.insert(name.tracked, Field { name_span, value });
@@ -10012,19 +10143,24 @@ impl Builder<'_> {
     fn bound(
         &mut self,
         name: TrackedString,
-        seen: &mut Vec<String>,
+        seen: &mut Vec<(String, Span)>,
         binders: &mut Binders,
     ) -> Tracked<Symbol> {
-        let repeat = seen.contains(&name.tracked);
-        if repeat {
+        let previous = seen
+            .iter()
+            .find(|(seen, _)| *seen == name.tracked)
+            .map(|(_, span)| *span);
+        let repeat = previous.is_some();
+        if let Some(previous) = previous {
             self.error(
                 name.span,
                 ErrorKind::DuplicateBinding {
                     name: name.tracked.clone(),
+                    previous,
                 },
             );
         } else {
-            seen.push(name.tracked.clone());
+            seen.push((name.tracked.clone(), name.span));
         }
         match binders {
             Binders::Local => {
@@ -10069,7 +10205,7 @@ impl Builder<'_> {
     fn pattern(
         &mut self,
         pattern: parse::Pattern,
-        seen: &mut Vec<String>,
+        seen: &mut Vec<(String, Span)>,
         binders: &mut Binders,
         dropped: &mut Vec<Tracked<Symbol>>,
     ) -> Pattern {
@@ -10116,21 +10252,27 @@ impl Builder<'_> {
                 fields: entries,
                 rest,
             } => {
-                let mut named: Vec<(String, bool)> = Vec::new();
+                let mut named: Vec<(String, bool, Span)> = Vec::new();
                 let mut fields: IndexMap<String, Field<Pattern>> = IndexMap::new();
                 for (name, sub) in entries {
                     let pun = sub.is_none();
-                    let keep = match named.iter().find(|(seen, _)| *seen == name.tracked) {
+                    let keep = match named.iter().find(|(seen, _, _)| *seen == name.tracked) {
                         // Two puns of one name are `{x, x}`: the same name
                         // bound twice, which the binder walk below words
                         // better than a complaint about the field would.
-                        Some((_, earlier)) if !(pun && *earlier) => {
-                            self.error(name.span, ErrorKind::DuplicateField);
+                        Some((_, earlier, previous)) if !(pun && *earlier) => {
+                            self.error(
+                                name.span,
+                                ErrorKind::DuplicateField {
+                                    name: name.tracked.clone(),
+                                    previous: *previous,
+                                },
+                            );
                             false
                         }
                         Some(_) => false,
                         None => {
-                            named.push((name.tracked.clone(), pun));
+                            named.push((name.tracked.clone(), pun, name.span));
                             true
                         }
                     };
@@ -10446,6 +10588,57 @@ fn sense(shape: Shape) -> Sense {
     }
 }
 
+/// What a variable written here is told, or `None` where one may be written.
+///
+/// The two positions that hold for every use of what they describe refuse one,
+/// and each in its own words: a declaration's variables are its parameters, and
+/// an operation's signature is the one place the same sentence is worded about
+/// the `+`, the `..` and the `when` beside it.
+fn wherever(place: Place, name: &str) -> Option<ErrorKind> {
+    match place {
+        Place::Annotation => None,
+        Place::Declaration => Some(ErrorKind::VariableInDeclaration {
+            name: name.to_string(),
+        }),
+        Place::Operation => Some(ErrorKind::ImpureOperation {
+            found: OperationTypeProblem::Variable(name.to_string()),
+        }),
+    }
+}
+
+/// What a row written here is told when it is left open, or `None` where being
+/// open is allowed.
+///
+/// One question in one place, because the answer travels: a `when` and a `..`
+/// each stand for something a definition gets to decide, and the two positions
+/// that hold for every definition — a `type` declaration's body and an
+/// operation's signature — therefore refuse both. They differ only in the words:
+/// an operation's signature refuses the `+` beside them, which a declaration's
+/// body allows, so a reader who wrote one is told about all three at once.
+fn openness(place: Place, shape: Shape) -> Option<ErrorKind> {
+    match place {
+        Place::Annotation => None,
+        Place::Declaration => Some(ErrorKind::OpenDeclaredType { shape }),
+        Place::Operation => Some(ErrorKind::ImpureOperation {
+            found: OperationTypeProblem::OpenPart,
+        }),
+    }
+}
+
+/// Whether a row's `..` names one of its declaration's parameters. The one
+/// place a parameter appears without being a [`TypeKind::Param`] node, so every
+/// walk that asks about parameters has to ask about this too — and both shapes
+/// of row have one.
+fn tails_a_parameter(tail: &Option<Tail>) -> bool {
+    matches!(
+        tail,
+        Some(Tail {
+            of: Row::Param { .. },
+            ..
+        })
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10475,49 +10668,4 @@ mod tests {
         assert_eq!(external.value.target.span.start, start);
         assert_eq!(external.value.target.span.width, source.len() - start);
     }
-}
-
-/// What a variable written here is told, or `None` where one may be written.
-///
-/// The two positions that hold for every use of what they describe refuse one,
-/// and each in its own words: a declaration's variables are its parameters, and
-/// an operation's signature is the one place the same sentence is worded about
-/// the `+`, the `..` and the `when` beside it.
-fn wherever(place: Place) -> Option<ErrorKind> {
-    match place {
-        Place::Annotation => None,
-        Place::Declaration => Some(ErrorKind::VariableInDeclaration),
-        Place::Operation => Some(ErrorKind::ImpureOperation),
-    }
-}
-
-/// What a row written here is told when it is left open, or `None` where being
-/// open is allowed.
-///
-/// One question in one place, because the answer travels: a `when` and a `..`
-/// each stand for something a definition gets to decide, and the two positions
-/// that hold for every definition — a `type` declaration's body and an
-/// operation's signature — therefore refuse both. They differ only in the words:
-/// an operation's signature refuses the `+` beside them, which a declaration's
-/// body allows, so a reader who wrote one is told about all three at once.
-fn openness(place: Place, shape: Shape) -> Option<ErrorKind> {
-    match place {
-        Place::Annotation => None,
-        Place::Declaration => Some(ErrorKind::OpenDeclaredType { shape }),
-        Place::Operation => Some(ErrorKind::ImpureOperation),
-    }
-}
-
-/// Whether a row's `..` names one of its declaration's parameters. The one
-/// place a parameter appears without being a [`TypeKind::Param`] node, so every
-/// walk that asks about parameters has to ask about this too — and both shapes
-/// of row have one.
-fn tails_a_parameter(tail: &Option<Tail>) -> bool {
-    matches!(
-        tail,
-        Some(Tail {
-            of: Row::Param { .. },
-            ..
-        })
-    )
 }

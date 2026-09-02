@@ -4,8 +4,8 @@ use std::fmt::{self, Write};
 
 use ruddy::{
     parse::{
-        ErrorKind, ExprKind, ExternTypeKind, Path, PatternKind, Place, StmtKind, SumCase, Type,
-        TypeField, TypeKind, parse,
+        ErrorKind, Expected, ExprKind, ExternTypeKind, Found, Path, PatternKind, Place, Related,
+        RelatedKind, StmtKind, SumCase, Type, TypeField, TypeKind, parse,
     },
     token::lex,
     tracking::FileID,
@@ -349,10 +349,10 @@ fn a_where_clause_is_a_statement_list() {
     }
 }
 
-/// A `;` promises another statement, so a trailing one is the unexpected token
-/// it looks like — the treatment every other separator in the language gets.
+/// A `;` promises another condition, so a trailing one asks specifically for
+/// the condition that is missing.
 #[test]
-fn a_trailing_separator_is_unexpected() {
+fn a_trailing_separator_requires_another_condition() {
     for src in [
         "type T = { x when 'a: A } where 'a;",
         "type T = { x when 'a: A } where ",
@@ -362,7 +362,16 @@ fn a_trailing_separator_is_unexpected() {
         let [error] = out.errors.as_slice() else {
             panic!("{src:?}: expected one error: {:#?}", out.errors);
         };
-        assert_eq!(error.kind, ErrorKind::Unexpected, "{src}");
+        assert!(
+            matches!(
+                error.kind,
+                ErrorKind::Expected {
+                    expected: Expected::Clause,
+                    ..
+                }
+            ),
+            "{src}: {error:#?}"
+        );
     }
 }
 
@@ -468,7 +477,6 @@ fn a_tail_ends_the_field_list() {
         "let x : { a: A, ..'r, } = y",
         "let x : { a: A .. } = y",
         "let x : { ..1 } = y",
-        "let x : { a? A } = y",
         "let x : { a: A, ... } = y",
     ] {
         let out = parse(lex(src, FileID::GENERATED).tokens);
@@ -623,6 +631,161 @@ fn unmatched_closing_paren_is_an_error() {
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
     // Recovery resumes at the next statement keyword.
     assert_eq!(out.stmts.len(), 2, "stmts: {:#?}", out.stmts);
+}
+
+/// A closing delimiter belongs to the innermost delimiter still open. The
+/// complaint names that opener's matching mark regardless of whether the
+/// parser was reading a value, pattern, type, field, or foreign parameter.
+#[test]
+fn a_mismatched_closer_points_to_the_innermost_opener() {
+    for (source, expected, opener, found) in [
+        ("let value = (}", ")", '(', '}'),
+        ("let value : (} = source", ")", '(', '}'),
+        ("let {) = value", "}", '{', ')'),
+        ("type T = {)", "}", '{', ')'),
+        ("effect E = {)", "}", '{', ')'),
+        ("extern f : fn(} -> Nat = \"host.f\"", ")", '(', '}'),
+        // Each shape nested in the other: the innermost unmatched opener wins.
+        ("let value = { field: ( }", ")", '(', '}'),
+        ("let value = ({ field: item )", "}", '{', ')'),
+    ] {
+        let out = parse(lex(source, FileID::GENERATED).tokens);
+        let [error] = out.errors.as_slice() else {
+            panic!("{source:?}: expected one error: {:#?}", out.errors);
+        };
+        let ErrorKind::Expected {
+            expected: Expected::Punctuation(actual),
+            found: Found::Token,
+            related: Some(related),
+            ..
+        } = error.kind
+        else {
+            panic!("{source:?}: wrong error: {error:#?}");
+        };
+        assert_eq!(actual, expected, "{source:?}");
+        assert_eq!(related.kind, RelatedKind::Opener, "{source:?}");
+        assert_eq!(
+            related.span.start,
+            source.rfind(opener).unwrap(),
+            "{source:?}"
+        );
+        assert_eq!(error.span.start, source.rfind(found).unwrap(), "{source:?}");
+    }
+}
+
+/// A closer that matched nothing spends the opener it was diagnosed against.
+/// The spent opener must not hijack the diagnosis of a stray closer in a
+/// later statement, which has no opener of its own.
+#[test]
+fn a_diagnosed_opener_does_not_hijack_a_later_stray_closer() {
+    let source = "let a = (1}\nlet c = 3}";
+    let out = parse(lex(source, FileID::GENERATED).tokens);
+    let opener = source.find('(').unwrap();
+    // The first complaint is the line-1 mismatch, pointing at its own opener.
+    let first = out.errors.first().expect("the mismatch is diagnosed");
+    assert!(
+        matches!(
+            first.kind,
+            ErrorKind::Expected {
+                expected: Expected::Punctuation(")"),
+                related: Some(related),
+                ..
+            } if related.span.start == opener
+        ),
+        "first error: {first:#?}"
+    );
+    assert!(
+        out.errors.len() > 1,
+        "the stray closer on the second line is diagnosed too: {:#?}",
+        out.errors
+    );
+    // Every later complaint is about its own statement, not the spent opener.
+    for error in &out.errors[1..] {
+        let hijacked = matches!(
+            error.kind,
+            ErrorKind::Expected {
+                related: Some(related),
+                ..
+            } if related.span.start == opener
+        );
+        assert!(!hijacked, "spent opener reused: {error:#?}");
+    }
+}
+
+/// Empty `()` and `{}` are complete values, patterns, and types. If the token
+/// after an opener belongs to the surrounding construct, the missing part is
+/// therefore the closer—not imaginary content before that token.
+#[test]
+fn a_delimiter_boundary_asks_for_the_matching_closer() {
+    for (source, expected, opener, boundary) in [
+        ("let value : ( = source", ")", '(', "="),
+        ("let value : { = source", "}", '{', "="),
+        ("let ( = value", ")", '(', "="),
+        ("let { = value", "}", '{', "="),
+        ("let value = let inner = ( in inner", ")", '(', "in inner"),
+        ("let value = let inner = { in inner", "}", '{', "in inner"),
+        ("extern f : fn( -> Nat = \"host.f\"", ")", '(', "->"),
+        // A trailing comma is legal; at the boundary it is the closer, not
+        // another tuple element or field, which is absent.
+        ("let value : (Nat, = source", ")", '(', "="),
+        ("let value : { field: Nat, = source", "}", '{', "="),
+        ("let (item, = value", ")", '(', "="),
+    ] {
+        let out = parse(lex(source, FileID::GENERATED).tokens);
+        let [error] = out.errors.as_slice() else {
+            panic!("{source:?}: expected one error: {:#?}", out.errors);
+        };
+        let ErrorKind::Expected {
+            expected: Expected::Punctuation(actual),
+            found: Found::Token,
+            related: Some(related),
+            ..
+        } = error.kind
+        else {
+            panic!("{source:?}: wrong error: {error:#?}");
+        };
+        assert_eq!(actual, expected, "{source:?}");
+        assert_eq!(related.kind, RelatedKind::Opener, "{source:?}");
+        assert_eq!(
+            related.span.start,
+            source.rfind(opener).unwrap(),
+            "{source:?}"
+        );
+        assert_eq!(
+            error.span.start,
+            source.rfind(boundary).unwrap(),
+            "{source:?}"
+        );
+    }
+}
+
+/// A matching closer does not hide genuinely missing content, and an invalid
+/// token inside a delimiter is not mistaken for syntax outside it.
+#[test]
+fn delimiter_diagnostics_preserve_missing_content() {
+    for (source, expected) in [
+        ("let value = (,)", Expected::Value),
+        ("let (,) = value", Expected::Pattern),
+        ("let value : (42n) = source", Expected::Type),
+        ("let value = { field: }", Expected::Value),
+        ("let value : { field: = source }", Expected::Type),
+    ] {
+        let out = parse(lex(source, FileID::GENERATED).tokens);
+        let Some(error) = out.errors.first() else {
+            panic!("{source:?}: expected an error");
+        };
+        assert!(
+            matches!(
+                error.kind,
+                ErrorKind::Expected {
+                    expected: actual,
+                    ..
+                } if actual == expected
+            ),
+            "{source:?}: {:#?}",
+            out.errors
+        );
+    }
 }
 
 #[test]
@@ -790,6 +953,36 @@ fn a_dot_dot_cannot_follow_an_expression() {
 /// Nothing is silently stood in for a missing expression or type: a position
 /// with nothing usable in it is reported where it was written, so a truncated
 /// edit cannot pass for a program that happens to mean something else.
+#[test]
+fn an_operator_points_to_the_value_it_requires() {
+    let src = "let x = 1n +";
+    let out = parse(lex(src, FileID::GENERATED).tokens);
+    let [error] = out.errors.as_slice() else {
+        panic!("expected one error: {:#?}", out.errors);
+    };
+    assert!(matches!(
+        error.kind,
+        ErrorKind::Expected {
+            expected: Expected::Value,
+            found: Found::End,
+            related: Some(related),
+        ..
+        } if related.kind == RelatedKind::Operator
+    ));
+    assert_eq!(error.span.start, src.len());
+}
+
+/// An invalid token has already been explained by the lexer. Its placeholder
+/// lets parsing abandon the construct without issuing a redundant expectation.
+#[test]
+fn an_invalid_token_does_not_cascade_into_a_parse_error() {
+    let lexed = lex("let x = @", FileID::GENERATED);
+    assert_eq!(lexed.errors.len(), 1, "{:#?}", lexed.errors);
+    let out = parse(lexed.tokens);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(out.stmts.is_empty(), "{:#?}", out.stmts);
+}
+
 #[test]
 fn a_missing_expression_or_type_is_reported() {
     let errors = |src: &str| {
@@ -961,15 +1154,32 @@ fn a_sum_with_no_cases_is_a_bare_bar() {
 /// wrote is still there to be checked.
 #[test]
 fn a_bar_promising_a_case_that_never_comes_is_reported() {
-    for (src, at) in [
-        ("let x : #A Nat | = 1n", 15),
-        ("let x : #A Nat | | #B = 1n", 15),
-        ("type T = #A | ", 12),
+    for (src, found) in [
+        ("let x : #A Nat | = 1n", Found::Token),
+        ("let x : #A Nat | | #B = 1n", Found::Token),
+        ("type T = #A | ", Found::End),
     ] {
         let out = parse(lex(src, FileID::GENERATED).tokens);
         let first = out.errors.first().unwrap_or_else(|| panic!("{src}"));
-        assert_eq!(first.span.start, at, "{src}: {:#?}", out.errors);
-        assert_eq!(first.span.width, 1, "{src}: {:#?}", out.errors);
+        let separator = src.find('|').expect("the source writes the separator");
+        assert!(
+            matches!(
+                first.kind,
+                ErrorKind::Expected {
+                    expected: Expected::Case,
+                    found: actual,
+                    related: Some(related),
+                ..
+                } if actual == found
+                    && related.kind == RelatedKind::Separator
+                    && related.span.start == separator
+            ),
+            "{src}: {:#?}",
+            out.errors
+        );
+        let expected_start = separator + if found == Found::Token { 2 } else { 1 };
+        assert_eq!(first.span.start, expected_start, "{src}: {:#?}", out.errors);
+        assert_eq!(first.span.width, usize::from(found == Found::Token));
     }
 
     // The leading bar promises nothing, and neither does a case with no bar
@@ -1185,8 +1395,7 @@ fn every_position_that_can_fail_reports_before_it_does() {
         // An application's argument: the token begins an atom, and the atom
         // still does not parse.
         "let v = f {",
-        // Inside a struct term: the label, the colon, the value, the brace.
-        "let v = { 1n: 2n }",
+        // Inside a struct term: the colon, the value, and the brace.
         "let v = { x 2n }",
         "let v = { x: }",
         "let v = { x: 1n",
@@ -1209,7 +1418,6 @@ fn every_position_that_can_fail_reports_before_it_does() {
         // argument, a field's label, a field's type, and the parentheses.
         "type X = #A {",
         "type X = Box {",
-        "type X = { 1n: Nat }",
         "type X = { a: }",
         "type X = (let)",
         "type X = (Nat",
@@ -1493,17 +1701,16 @@ fn an_if_reports_each_missing_part() {
     }
 }
 
-/// The match expression, printed back as written: leading `|` on every arm —
-/// the grammar makes the first one optional, so both spellings read back to
-/// one printed form — zero arms, a sole arm, and projection off the `end`.
+/// The match expression: every arm begins with `|`, including the first.
+/// A match with no arms needs no bar; sole and multiple arms parse, as does a
+/// projection off the closing `end`.
 #[test]
 fn parses_match_expressions() {
     assert_eq!(
-        parse_one("let a = match x with #Some y => y | #None => 0n end"),
+        parse_one("let a = match x with | #Some y => y | #None => 0n end"),
         "let a = match x with | #Some y => y | #None => 0n end"
     );
-    // The leading bar is optional and not recorded: both spellings are one
-    // tree.
+    // The first arm keeps the same marker as every arm after it.
     assert_eq!(
         parse_one("let a = match x with | #Some y => y end"),
         "let a = match x with | #Some y => y end"
@@ -1513,8 +1720,30 @@ fn parses_match_expressions() {
         "let a = match x with end"
     );
     assert_eq!(
-        parse_one("let a = match x with w => w end"),
+        parse_one("let a = match x with | w => w end"),
         "let a = match x with | w => w end"
+    );
+
+    let missing = "let a = match x with w => w end";
+    let out = parse(lex(missing, FileID::GENERATED).tokens);
+    let [error] = out.errors.as_slice() else {
+        panic!("expected one error: {:#?}", out.errors);
+    };
+    assert!(matches!(
+        error.kind,
+        ErrorKind::Expected {
+            expected: Expected::Punctuation("|"),
+            found: Found::Token,
+            context: Some(Related {
+                kind: RelatedKind::Construct("match"),
+                ..
+            }),
+            ..
+        }
+    ));
+    assert_eq!(
+        out.errors[0].span.start,
+        missing.find("with ").unwrap() + "with ".len()
     );
     // The scrutinee is a full expression, ending at the `with` of its own
     // accord.
@@ -1561,48 +1790,48 @@ fn a_match_is_not_an_application_argument() {
 fn parses_every_kind_of_pattern() {
     for (src, printed) in [
         (
-            "let a = match x with { p, q: r } => r end",
+            "let a = match x with | { p, q: r } => r end",
             "let a = match x with | { p, q: r } => r end",
         ),
         (
-            "let a = match x with {} => 1n end",
+            "let a = match x with | {} => 1n end",
             "let a = match x with | () => 1n end",
         ),
         // A trailing comma among the fields is allowed, as in a struct
         // expression.
         (
-            "let a = match x with { p, } => p end",
+            "let a = match x with | { p, } => p end",
             "let a = match x with | { p } => p end",
         ),
         (
-            "let a = match x with { pos: { x, y } } => x end",
+            "let a = match x with | { pos: { x, y } } => x end",
             "let a = match x with | { pos: { x, y } } => x end",
         ),
         (
-            "let a = match x with #A #B y => y end",
+            "let a = match x with | #A #B y => y end",
             "let a = match x with | #A (#B y) => y end",
         ),
         // The parenthesized spelling is the same tree.
         (
-            "let a = match x with #A (#B y) => y end",
+            "let a = match x with | #A (#B y) => y end",
             "let a = match x with | #A (#B y) => y end",
         ),
         (
-            "let a = match x with 0n => 1n | k => k end",
+            "let a = match x with | 0n => 1n | k => k end",
             "let a = match x with | 0n => 1n | k => k end",
         ),
         (
-            "let a = match x with () => 1n end",
+            "let a = match x with | () => 1n end",
             "let a = match x with | () => 1n end",
         ),
         // Grouping parentheses around a pattern are discarded, as around an
         // expression.
         (
-            "let a = match x with (w) => w end",
+            "let a = match x with | (w) => w end",
             "let a = match x with | w => w end",
         ),
         (
-            "let a = match x with #Cons { head: #Some y, tail: t } => y end",
+            "let a = match x with | #Cons { head: #Some y, tail: t } => y end",
             "let a = match x with | #Cons { head: #Some y, tail: t } => y end",
         ),
     ] {
@@ -1636,13 +1865,13 @@ fn parses_pattern_lets() {
 fn a_match_reports_where_it_fails() {
     for (src, from) in [
         // An arm needs a pattern, and `=>` does not begin one.
-        ("let a = match x with => 1n end", "=> 1n end"),
+        ("let a = match x with | => 1n end", "=> 1n end"),
         // A `|` between arms promises another one; `end` is where the promise
         // breaks.
-        ("let a = match x with #A y => 1n | end", "end"),
+        ("let a = match x with | #A y => 1n | end", "end"),
         // An arm without a body: `|` begins no expression.
         (
-            "let a = match x with #A y => | #B z => 2n end",
+            "let a = match x with | #A y => | #B z => 2n end",
             "| #B z => 2n end",
         ),
         // `match` is a keyword now, so it no longer names anything.
@@ -1657,11 +1886,36 @@ fn a_match_reports_where_it_fails() {
     }
 
     // A match with no `end` runs out of input, and is reported there.
-    let src = "let a = match x with #A y => 1n";
+    let src = "let a = match x with | #A y => 1n";
     let out = parse(lex(src, FileID::GENERATED).tokens);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(out.errors[0].span.start, src.len());
     assert_eq!(out.errors[0].span.width, 0);
+
+    // When another definition follows, it is where `end` was noticed missing,
+    // but the related pointer belongs at the completed arm body—not at the
+    // `match` keyword, which is not where the closing word is written.
+    let src = "let _ = match 1 with | f => ()\n\nlet a = 1";
+    let out = parse(lex(src, FileID::GENERATED).tokens);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    let ErrorKind::Expected {
+        expected: Expected::Keyword("end"),
+        found: Found::Token,
+        related: Some(related),
+        ..
+    } = out.errors[0].kind
+    else {
+        panic!("wrong error: {:#?}", out.errors[0]);
+    };
+    assert_eq!(out.errors[0].span.start, src.rfind("let").unwrap());
+    assert_eq!(related.kind, RelatedKind::Anchor);
+    assert_eq!(related.span.start, src.find("()").unwrap());
+    assert_eq!(related.span.width, 2);
+    assert_eq!(
+        out.stmts.len(),
+        1,
+        "the following definition should recover"
+    );
 }
 
 /// A pattern position at the end of input is reported there — `let` alone,
@@ -1682,7 +1936,7 @@ fn a_pattern_at_the_end_of_input_is_reported_there() {
 #[test]
 fn a_bare_tag_payload_is_bracketed() {
     assert_eq!(
-        parse_one("let a = match x with #A #B => 1n end"),
+        parse_one("let a = match x with | #A #B => 1n end"),
         "let a = match x with | #A (#B) => 1n end"
     );
 }
@@ -1695,21 +1949,21 @@ fn a_wildcard_parses_in_every_pattern_position() {
     for (src, printed) in [
         // A whole arm, and grouping parentheses discarded around one.
         (
-            "let a = match x with _ => 1n end",
+            "let a = match x with | _ => 1n end",
             "let a = match x with | _ => 1n end",
         ),
         (
-            "let a = match x with (_) => 1n end",
+            "let a = match x with | (_) => 1n end",
             "let a = match x with | _ => 1n end",
         ),
         // A struct pattern's sub-pattern, beside a pun and a named binder.
         (
-            "let a = match x with { p: _, q } => q end",
+            "let a = match x with | { p: _, q } => q end",
             "let a = match x with | { p: _, q } => q end",
         ),
         // A tag's payload, taken greedily like any other.
         (
-            "let a = match x with #Some _ => 1n | #None => 0n end",
+            "let a = match x with | #Some _ => 1n | #None => 0n end",
             "let a = match x with | #Some _ => 1n | #None => 0n end",
         ),
         // The pattern of a `let`, statement and expression.
@@ -1719,7 +1973,7 @@ fn a_wildcard_parses_in_every_pattern_position() {
         // Nested, and repeated: two `_` in one pattern parse — whether that
         // binds anything twice is not a question, since it binds nothing.
         (
-            "let a = match x with #Pair { a: _, b: _ } => 1n | _ => 2n end",
+            "let a = match x with | #Pair { a: _, b: _ } => 1n | _ => 2n end",
             "let a = match x with | #Pair { a: _, b: _ } => 1n | _ => 2n end",
         ),
     ] {
@@ -1752,9 +2006,9 @@ fn a_misplaced_wildcard_gets_its_own_complaint() {
         ("let y = f _", Place::Value),
         // A field's name, in a struct expression and a struct pattern.
         ("let v = {_: 1n}", Place::Field),
-        ("let a = match x with { _: 1n } => 0n end", Place::Field),
+        ("let a = match x with | { _: 1n } => 0n end", Place::Field),
         // The pun: a field bound to its own name, which `_` is not.
-        ("let a = match x with {_} => 0n end", Place::Pun),
+        ("let a = match x with | {_} => 0n end", Place::Pun),
         // A projection, and the operation that most nearly is one: `!Log._`
         // names nothing to perform the way `x._` names no field.
         ("let p = x._", Place::Projection),
@@ -1828,7 +2082,7 @@ fn a_struct_pattern_may_end_with_a_rest() {
 
 /// R1's refusals: `..` is only legal as the final element of a struct
 /// pattern. Anything after it — a comma, a second field, the name a future
-/// named-rest might want — is the parser's usual unexpected-token complaint,
+/// named-rest might want — leaves the opening brace waiting for its close,
 /// at the token after the `..`; input running out is reported at the end.
 #[test]
 fn a_rest_must_end_the_struct_pattern() {
@@ -1840,7 +2094,19 @@ fn a_rest_must_end_the_struct_pattern() {
         let out = parse(lex(src, FileID::GENERATED).tokens);
         assert!(!out.errors.is_empty(), "{src:?} parsed without complaint");
         assert!(out.stmts.is_empty(), "{src:?} kept: {:#?}", out.stmts);
-        assert_eq!(out.errors[0].kind, ErrorKind::Unexpected, "{src:?}");
+        assert!(
+            matches!(
+                out.errors[0].kind,
+                ErrorKind::Expected {
+                    expected: Expected::Punctuation("}"),
+                    found: Found::Token,
+                    related: Some(related),
+                ..
+                } if related.kind == RelatedKind::Opener
+            ),
+            "{src:?}: {:#?}",
+            out.errors
+        );
         let at = src.len() - from.len();
         assert_eq!(out.errors[0].span.start, at, "{src:?}: {:#?}", out.errors);
     }
@@ -1850,7 +2116,15 @@ fn a_rest_must_end_the_struct_pattern() {
     let src = "let {..";
     let out = parse(lex(src, FileID::GENERATED).tokens);
     assert!(!out.errors.is_empty(), "{src:?} parsed without complaint");
-    assert_eq!(out.errors[0].kind, ErrorKind::Unexpected);
+    assert!(matches!(
+        out.errors[0].kind,
+        ErrorKind::Expected {
+            expected: Expected::Punctuation("}"),
+            found: Found::End,
+            related: Some(related),
+        ..
+        } if related.kind == RelatedKind::Opener
+    ));
     assert_eq!(out.errors[0].span.start, src.len());
     assert_eq!(out.errors[0].span.width, 0);
 }
@@ -1900,7 +2174,15 @@ fn effect_declarations() {
 fn an_effect_case_list_ends_at_a_bar_that_promised_one() {
     let out = parse(lex("effect E = !a + ", FileID::GENERATED).tokens);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
-    assert_eq!(out.errors[0].kind, ErrorKind::Unexpected);
+    assert!(matches!(
+        out.errors[0].kind,
+        ErrorKind::Expected {
+            expected: Expected::Effect,
+            found: Found::End,
+            related: Some(related),
+        ..
+        } if related.kind == RelatedKind::Separator
+    ));
 }
 
 /// The `+` clause binds to the arrow parsed at its own level, which the
@@ -2018,15 +2300,27 @@ fn a_row_with_no_arrow_is_a_parse_error() {
     for source in ["let x : Nat + !Log = 1n", "type T = Nat + !Log"] {
         let out = parse(lex(source, FileID::GENERATED).tokens);
         assert_eq!(out.errors.len(), 1, "{source}: {:#?}", out.errors);
-        assert_eq!(out.errors[0].kind, ErrorKind::Unexpected, "{source}");
+        assert!(
+            matches!(
+                out.errors[0].kind,
+                ErrorKind::Expected {
+                    expected: Expected::FunctionType,
+                    found: Found::Token,
+                    related: None,
+                    ..
+                }
+            ),
+            "{source}: {:#?}",
+            out.errors
+        );
         let plus = source.find('+').expect("the source writes one");
         assert_eq!(out.errors[0].span.start, plus, "{source}");
     }
 }
 
-/// `handle` keeps a `match`'s shape: the leading `|` is optional, zero arms
-/// parse, and each body ends at the next `|` or the `end` of its own accord.
-/// The `return` arm may sit anywhere 'among them.
+/// `handle` uses the same `with`/`|`/`end` shape as `match`, but retains its
+/// optional leading `|`. Zero arms parse, and each body ends at the next `|`
+/// or `end` of its own accord. The `return` arm may sit anywhere among them.
 #[test]
 fn handle_expressions() {
     for source in [
@@ -2132,8 +2426,8 @@ fn the_effect_grammar_reports_what_it_cannot_read() {
         assert_eq!(out.errors[0].span.start, start, "{source}");
     }
 
-    // A `|` between effects promises another one, so nothing after it is
-    // reported at the bar — the leading one promises nothing.
+    // A `+` between effects promises another one, so the unusable token after
+    // it is primary and the separator is retained as related context.
     // A `+` with no row after it at all promises nothing: the row is empty,
     // and what follows is somebody else's token to refuse.
     let out = parse(lex("let f : A -> B + = g", FileID::GENERATED).tokens);
@@ -2141,8 +2435,17 @@ fn the_effect_grammar_reports_what_it_cannot_read() {
 
     let out = parse(lex("let f : A -> B + !Log + = g", FileID::GENERATED).tokens);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
-    let bar = "let f : A -> B + !Log ".len();
-    assert_eq!(out.errors[0].span.start, bar);
+    let separator = "let f : A -> B + !Log ".len();
+    assert!(matches!(
+        out.errors[0].kind,
+        ErrorKind::Expected {
+            expected: Expected::Effect,
+            found: Found::Token,
+            related: Some(related),
+        ..
+        } if related.kind == RelatedKind::Separator && related.span.start == separator
+    ));
+    assert_eq!(out.errors[0].span.start, separator + 2);
 }
 
 /// Running out of input where 'an arm's binder goes is reported at the end of
@@ -2152,7 +2455,15 @@ fn a_handler_arm_that_runs_out_reports_where_the_input_ended() {
     let source = "let a = handle e with | !Log.write";
     let out = parse(lex(source, FileID::GENERATED).tokens);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
-    assert_eq!(out.errors[0].kind, ErrorKind::Unexpected);
+    assert!(matches!(
+        out.errors[0].kind,
+        ErrorKind::Expected {
+            expected: Expected::Argument,
+            found: Found::End,
+            related: None,
+            ..
+        }
+    ));
     assert_eq!(out.errors[0].span.start, source.len());
 }
 
@@ -2289,13 +2600,16 @@ fn a_path_that_is_not_an_effect_is_read_as_a_type() {
 /// takes one apart. Each is the unexpected `::` it looks like.
 #[test]
 fn a_path_is_refused_where_a_name_is_bound() {
-    for source in [
-        "let A::x = 1n",
-        "module A::B = end",
-        "type A::T = Nat",
-        "effect A::E",
-        "let f = fn A::x => x",
-        "let a = match e with A::x => 1n end",
+    for (source, expected) in [
+        ("let A::x = 1n", Expected::Punctuation("=")),
+        ("module A::B = end", Expected::Statement),
+        ("type A::T = Nat", Expected::Punctuation("=")),
+        ("effect A::E", Expected::Statement),
+        ("let f = fn A::x => x", Expected::Punctuation("=>")),
+        (
+            "let a = match e with | A::x => 1n end",
+            Expected::Punctuation("=>"),
+        ),
     ] {
         let out = parse(lex(source, FileID::GENERATED).tokens);
         assert!(
@@ -2303,7 +2617,18 @@ fn a_path_is_refused_where_a_name_is_bound() {
             "{source:?} parsed: {:#?}",
             out.stmts
         );
-        assert_eq!(out.errors[0].kind, ErrorKind::Unexpected, "{source:?}");
+        assert!(
+            matches!(
+                out.errors[0].kind,
+                ErrorKind::Expected {
+                    expected: found,
+                    found: Found::Token,
+                    ..
+                } if found == expected
+            ),
+            "{source:?}: {:#?}",
+            out.errors
+        );
     }
     // At the `::` itself for the two the error table names.
     for source in ["let A::x = 1n", "module A::B = end"] {
@@ -2323,7 +2648,15 @@ fn a_path_is_refused_where_a_name_is_bound() {
 fn a_module_body_recovers_at_its_end() {
     let out = parse(lex("module A = let x = 1n", FileID::GENERATED).tokens);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
-    assert_eq!(out.errors[0].kind, ErrorKind::Unexpected);
+    assert!(matches!(
+        out.errors[0].kind,
+        ErrorKind::Expected {
+            expected: Expected::Keyword("end"),
+            found: Found::End,
+            related: Some(related),
+        ..
+        } if related.kind == RelatedKind::Anchor
+    ));
 
     let source = "module A = with end let after = 1n";
     let out = parse(lex(source, FileID::GENERATED).tokens);
@@ -2349,7 +2682,7 @@ fn an_extern_declares_a_string_foreign_target_of_any_type() {
     assert_eq!(target.span, FileID::GENERATED.span(22, 13));
 
     for source in [
-        "extern answer = host.answer",
+        "extern answer = \"host.answer\"",
         "extern answer : Nat",
         "extern answer : Nat = host",
     ] {

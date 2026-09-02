@@ -27,28 +27,127 @@ use ruddy::{
 };
 use ruddy_debug::print;
 
+/// One value of every inference error variant. Shared by the inventory and the
+/// structured-diagnostic audit so those two hand-maintained checks cannot
+/// silently drift apart.
+fn inference_error_kinds(span: Span) -> Vec<TypeError> {
+    let nat = Rc::new(Ty::plain(Ty::Nat));
+    vec![
+        TypeError::NotAStruct { base: nat.clone() },
+        TypeError::Mismatch {
+            expected: nat.clone(),
+            actual: Rc::new(Ty::default()),
+        },
+        TypeError::Recursive,
+        TypeError::MissingField {
+            shape: Shape::Struct,
+            base: nat.clone(),
+            field: "x".to_string(),
+        },
+        TypeError::ExtraField {
+            shape: Shape::Struct,
+            base: nat.clone(),
+            field: "x".to_string(),
+        },
+        TypeError::RigidBroken {
+            found: nat.clone(),
+            name: "a".into(),
+            sense: Sense::Type,
+            declared: span,
+        },
+        TypeError::RigidField {
+            shape: Shape::Struct,
+            field: "x".to_string(),
+            name: "a".into(),
+            declared: span,
+        },
+        TypeError::RigidEscapes {
+            name: "a".into(),
+            declared: span,
+            destination: nat.clone(),
+            destination_name: "outside".into(),
+            destination_span: span,
+        },
+        TypeError::RepeatedField {
+            shape: Shape::Struct,
+            field: "x".to_string(),
+            introduction: None,
+            forbidden: None,
+        },
+        TypeError::PresenceRequired {
+            formula: "x != y".to_string(),
+            shape: Some(Shape::Struct),
+        },
+        TypeError::PresenceImpossible {
+            formula: "x and y".to_string(),
+        },
+        TypeError::ClauseImpossible {
+            formula: "a and not a".to_string(),
+        },
+        TypeError::AnnotationAllows {
+            allowed: "a or b".to_string(),
+            required: "a".to_string(),
+        },
+        TypeError::Unhandled {
+            effect: "Log".to_string(),
+        },
+        TypeError::NotAllowed {
+            effect: "Log".to_string(),
+        },
+        TypeError::CallbackEffectsNotCovered {
+            missing_effects: vec!["Log".into()],
+            extern_effects: Vec::new(),
+            callback_path: "extern parameter 1".into(),
+            callback_type: "() -> () + !Log".into(),
+            extern_name: "install".into(),
+            issues: Vec::new(),
+        },
+        TypeError::PolymorphicExternBoundary {
+            variable: "'a".into(),
+            variable_kind: ruddy::inference::ExternVariableKind::Type,
+            position: "extern parameter 1".into(),
+            extern_name: "run".into(),
+            leaves: Vec::new(),
+            callback_issues: Vec::new(),
+        },
+    ]
+}
+
 /// Every error kind in the compiler, with the phase that raises it. Listed by
 /// hand because nothing can force it: a new variant added without a line here
 /// is the exact thing this module exists to catch, so it is worth the reminder
 /// that adding one means coming back.
 fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
     let span = Span::generated(0, 1);
-    let nat = Rc::new(Ty::plain(Ty::Nat));
 
     let mut all: Vec<(&str, &str, String)> = Vec::new();
     for kind in [
-        LexError::Unrecognized,
-        LexError::MalformedNatural,
+        LexError::InvalidCharacter { character: '@' },
+        LexError::MalformedTag,
+        LexError::MalformedEffectLabel,
+        LexError::MalformedVariable,
+        LexError::NumberFollowedByName,
+        LexError::DecimalWithWholeSuffix { suffix: 'n' },
+        LexError::MalformedNumericField,
         LexError::NaturalTooLarge,
-        LexError::MalformedString,
+        LexError::IntegerTooLarge,
+        LexError::RealTooLarge,
+        LexError::NumericFieldTooLarge,
+        LexError::UnknownStringEscape { escape: 'q' },
+        LexError::MissingClosingQuote,
     ] {
         all.push(("lex", kind.code(), kind.to_string()));
     }
 
-    // Every kind and, for the wildcard, every position it can be worded for:
-    // one meaning, five phrasings, and each has to hold to the phrase rules.
+    // Every kind. The expected category supplies the specific code and prose;
+    // focused tests below cover its context-sensitive forms.
     for kind in [
-        parse::ErrorKind::Unexpected,
+        parse::ErrorKind::Expected {
+            expected: parse::Expected::Value,
+            found: parse::Found::Token,
+            related: None,
+            context: None,
+        },
         parse::ErrorKind::Wildcard {
             place: parse::Place::Value,
         },
@@ -81,8 +180,12 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         Namespace::Modules,
     ] {
         for kind in [
-            IrError::Undefined { namespace },
+            IrError::Undefined {
+                name: "x".to_string(),
+                namespace,
+            },
             IrError::Duplicate {
+                name: "x".to_string(),
                 namespace,
                 previous: span,
             },
@@ -108,7 +211,10 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
             name: "math".to_string(),
             version: "1.2.3".to_string(),
         },
-        IrError::DuplicateField,
+        IrError::DuplicateField {
+            name: "x".to_string(),
+            previous: span,
+        },
         IrError::AbsentInClosed {
             shape: Shape::Struct,
             label: "x".to_string(),
@@ -117,14 +223,24 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
             shape: Shape::Struct,
         },
         IrError::Arity {
+            name: "Pair".to_string(),
             expected: 2,
             found: 1,
         },
         IrError::NotAConstructor,
-        IrError::ParameterApplied,
-        IrError::DuplicateParameter { previous: span },
+        IrError::ParameterApplied {
+            name: "f".to_string(),
+        },
+        IrError::DuplicateParameter {
+            name: "a".to_string(),
+            previous: span,
+        },
         IrError::GrowingRecursion,
-        IrError::DuplicateCase,
+        IrError::DuplicateCase {
+            shape: Shape::Sum,
+            name: "A".to_string(),
+            previous: span,
+        },
         IrError::MixedTail {
             first: Sense::Type,
             second: Sense::Cases,
@@ -147,18 +263,32 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         },
         IrError::DuplicateBinding {
             name: "x".to_string(),
+            previous: span,
         },
         IrError::ClauseInDeclaration,
-        IrError::VariableInDeclaration,
+        IrError::VariableInDeclaration {
+            name: "a".to_string(),
+        },
         IrError::HoleInDeclaration,
+        IrError::HoleInOperation,
         IrError::UnboundPresence {
             name: "c".to_string(),
         },
-        IrError::DuplicateOperation,
+        IrError::IncompatiblePresenceOwnership {
+            name: "c".to_string(),
+            previous: span,
+        },
+        IrError::DuplicateOperation {
+            name: "write".to_string(),
+            previous: span,
+        },
         IrError::NotAnOperation {
             name: "here".to_string(),
         },
-        IrError::ImpureOperation,
+        IrError::ImpureOperation {
+            found: ir::OperationTypeProblem::OpenPart,
+        },
+        IrError::EffectsOutsideRow,
         IrError::BareOperationUnavailable {
             effect: "Log".to_string(),
             suggestion: Some("write".to_string()),
@@ -181,10 +311,11 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         IrError::DuplicateArm {
             effect: "Log".to_string(),
             selector: ir::OperationSelector::Named("write".to_string()),
+            previous: span,
         },
         IrError::DuplicateReturn { previous: span },
         IrError::RaiseOutsideArm,
-        IrError::RaiseInFunction,
+        IrError::RaiseInFunction { function: span },
     ] {
         all.push(("ir", kind.code(), kind.to_string()));
     }
@@ -205,60 +336,7 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         all.push(("patterns", kind.code(), kind.to_string()));
     }
 
-    for kind in [
-        TypeError::NotAStruct { base: nat.clone() },
-        TypeError::Mismatch {
-            expected: nat.clone(),
-            actual: Rc::new(Ty::default()),
-        },
-        TypeError::Recursive,
-        TypeError::MissingField {
-            shape: Shape::Struct,
-            base: nat.clone(),
-            field: "x".to_string(),
-        },
-        TypeError::ExtraField {
-            shape: Shape::Struct,
-            base: nat.clone(),
-            field: "x".to_string(),
-        },
-        TypeError::RigidBroken {
-            found: nat.clone(),
-            name: "a".into(),
-            sense: Sense::Type,
-            declared: Span::generated(0, 1),
-        },
-        TypeError::RigidField {
-            shape: Shape::Struct,
-            field: "x".to_string(),
-            name: "a".into(),
-            declared: Span::generated(0, 1),
-        },
-        TypeError::RigidEscapes { name: "a".into() },
-        TypeError::RepeatedField {
-            shape: Shape::Struct,
-            field: "x".to_string(),
-        },
-        TypeError::PresenceRequired {
-            formula: "x != y".to_string(),
-        },
-        TypeError::PresenceImpossible {
-            formula: "x and y".to_string(),
-        },
-        TypeError::ClauseImpossible {
-            formula: "a and not a".to_string(),
-        },
-        TypeError::AnnotationAllows {
-            allowed: "a or b".to_string(),
-            required: "a".to_string(),
-        },
-        TypeError::Unhandled {
-            effect: "Log".to_string(),
-        },
-        TypeError::NotAllowed {
-            effect: "Log".to_string(),
-        },
-    ] {
+    for kind in inference_error_kinds(span) {
         all.push(("types", kind.code(), kind.to_string()));
     }
     all
@@ -307,7 +385,10 @@ fn every_complaint_is_a_phrase_a_reporter_can_place() {
             .chars()
             .next()
             .unwrap_or_else(|| panic!("{phase}/{code} says something"));
-        assert!(!first.is_ascii_uppercase(), "{phase}/{code}: {message}");
+        assert!(
+            !first.is_ascii_uppercase() || message.starts_with("Ruddy "),
+            "{phase}/{code}: {message}"
+        );
         assert!(!message.ends_with('.'), "{phase}/{code}: {message}");
     }
 }
@@ -316,6 +397,50 @@ fn every_complaint_is_a_phrase_a_reporter_can_place() {
 /// and a test greps for one — so two kinds sharing a code would silently
 /// conflate them. Checked across the whole compiler rather than per phase: the
 /// strip mixes every phase's diagnostics into one list.
+#[test]
+fn numeric_lexer_complaints_name_the_number_category_written() {
+    for (kind, code, message) in [
+        (
+            LexError::NumberFollowedByName,
+            "number-joined-to-name",
+            "a number cannot run directly into a name",
+        ),
+        (
+            LexError::DecimalWithWholeSuffix { suffix: 'i' },
+            "decimal-marked-whole",
+            "`i` is only used with whole numbers",
+        ),
+        (
+            LexError::MalformedNumericField,
+            "invalid-field-number",
+            "a numbered field can contain only digits",
+        ),
+        (
+            LexError::NaturalTooLarge,
+            "whole-number-too-large",
+            "this whole number is too large",
+        ),
+        (
+            LexError::IntegerTooLarge,
+            "integer-too-large",
+            "this integer is too large",
+        ),
+        (
+            LexError::RealTooLarge,
+            "number-too-large",
+            "this number is too large",
+        ),
+        (
+            LexError::NumericFieldTooLarge,
+            "field-number-too-large",
+            "this field number is too large",
+        ),
+    ] {
+        assert_eq!(kind.code(), code);
+        assert_eq!(kind.to_string(), message);
+    }
+}
+
 #[test]
 fn no_two_kinds_of_error_are_coded_the_same() {
     let all = diagnostics();
@@ -475,7 +600,14 @@ fn a_constraint_reads_as_what_it_demands() {
     let span = Span::generated(0, 1);
 
     let equal = Constraint {
+        id: inference::ConstraintId::synthetic(0),
+        reason: inference::ReasonId::synthetic(0),
         span,
+        origin: inference::ConstraintOrigin::ContextualCheck,
+        subjects: inference::ConstraintSubjects::pair(
+            inference::Subject::Context,
+            inference::Subject::Term,
+        ),
         kind: ConstraintKind::Equal {
             expected: nat.clone(),
             actual: Rc::new(Ty::plain(Ty::Var(0))),
@@ -495,7 +627,9 @@ fn an_effect_reads_as_the_one_thing_that_changed() {
     assert_eq!(
         Effect::Bound {
             var: 3,
-            value: Assigned::Ty(Rc::new(Ty::plain(Ty::Nat)))
+            value: Assigned::Ty(Rc::new(Ty::plain(Ty::Nat))),
+            by: inference::ReasonId::synthetic(0),
+            because: None,
         }
         .to_string(),
         "?3 := Nat"
@@ -516,9 +650,145 @@ fn an_effect_reads_as_the_one_thing_that_changed() {
 }
 
 #[test]
+fn every_inference_error_exposes_a_complete_structured_diagnostic() {
+    let use_span = Span::generated(4, 5);
+    let declared = Span::generated(1, 2);
+    let kinds = inference_error_kinds(declared);
+    assert_eq!(kinds.len(), 17);
+
+    for kind in kinds {
+        let diagnostic = inference::Error::new(use_span, kind).diagnostic();
+        assert_eq!(diagnostic.primary.span, use_span, "{}", diagnostic.code);
+        assert!(!diagnostic.code.is_empty());
+        assert!(!diagnostic.title.is_empty(), "{}", diagnostic.code);
+        assert!(
+            !diagnostic.primary.message.is_empty(),
+            "{} has no primary label",
+            diagnostic.code
+        );
+        assert!(
+            !diagnostic.help.is_empty() && diagnostic.help.iter().all(|line| !line.is_empty()),
+            "{} has no repair help",
+            diagnostic.code
+        );
+    }
+}
+
+/// Phase 1 owns user-facing inference prose even though it does not yet own the
+/// provenance needed to replace every expected/found or unknown-type fallback.
+/// Keep solver implementation terms out of the structured fields it did migrate.
+#[test]
+fn inference_diagnostic_prose_avoids_solver_jargon() {
+    let span = Span::generated(0, 1);
+    for kind in inference_error_kinds(span) {
+        let diagnostic = inference::Error::new(span, kind).diagnostic();
+        let prose = std::iter::once(diagnostic.title.as_str())
+            .chain(std::iter::once(diagnostic.primary.message.as_str()))
+            .chain(diagnostic.related.iter().map(|note| note.message.as_str()))
+            .chain(diagnostic.help.iter().map(String::as_str))
+            .chain(diagnostic.notes.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
+        let words: HashSet<_> = prose
+            .split(|character: char| !character.is_ascii_alphabetic())
+            .filter(|word| !word.is_empty())
+            .collect();
+        for forbidden in [
+            "unify",
+            "unification",
+            "rigid",
+            "row",
+            "presence",
+            "sat",
+            "cnf",
+            "covered",
+        ] {
+            assert!(
+                !words.contains(forbidden),
+                "{} exposes `{forbidden}`: {prose}",
+                diagnostic.code
+            );
+        }
+        for forbidden in ["occurs check", "runtime representation", "boundary leaf"] {
+            assert!(
+                !prose.contains(forbidden),
+                "{} exposes `{forbidden}`: {prose}",
+                diagnostic.code
+            );
+        }
+        assert!(
+            !prose.contains('~'),
+            "{} exposes `~`: {prose}",
+            diagnostic.code
+        );
+        assert!(
+            !prose
+                .as_bytes()
+                .windows(2)
+                .any(|pair| pair[0] == b'?' && pair[1].is_ascii_digit()),
+            "{} exposes a solver variable: {prose}",
+            diagnostic.code
+        );
+    }
+}
+
+#[test]
+fn rigid_field_diagnostics_name_the_caller_chosen_set_by_shape() {
+    let use_span = Span::generated(4, 5);
+    let declared = Span::generated(1, 2);
+    for (shape, field, action, choices) in [
+        (Shape::Struct, "item", "reads field", "struct fields"),
+        (Shape::Sum, "Some", "matches case", "cases"),
+        (Shape::Effect, "Log", "requires effect", "effects"),
+    ] {
+        let diagnostic = inference::Error::new(
+            use_span,
+            TypeError::RigidField {
+                shape,
+                field: field.to_string(),
+                name: "r".into(),
+                declared,
+            },
+        )
+        .diagnostic();
+
+        assert_eq!(diagnostic.code, "rigid-field");
+        assert_eq!(diagnostic.related[0].span, declared);
+        assert_eq!(
+            diagnostic.related[0].message,
+            format!("the caller's choice of {choices} starts here")
+        );
+        assert!(diagnostic.title.starts_with(&format!("this {action} `")));
+        assert!(diagnostic.primary.message.contains(choices));
+        assert!(diagnostic.help[0].contains(choices));
+        assert!(!diagnostic.title.contains("whatever type"));
+    }
+}
+
+#[test]
+fn required_presence_diagnostics_name_labels_by_shape() {
+    for (shape, labels) in [
+        (Shape::Struct, "fields"),
+        (Shape::Sum, "cases"),
+        (Shape::Effect, "effects"),
+    ] {
+        let kind = TypeError::PresenceRequired {
+            formula: "x and y".to_string(),
+            shape: Some(shape),
+        };
+        assert_eq!(
+            kind.to_string(),
+            format!("this value needs `x and y` among its {labels}, and it does not have that")
+        );
+    }
+}
+
+#[test]
 fn guarded_origins_keep_their_source_and_premise_readable() {
     let source = inference::Origin::Refinement(inference::Named {
         labels: vec![("x".to_string(), Presence::Var(1))],
+        shape: Some(Shape::Struct),
     });
     assert_eq!(source.code(), "branch-refinement");
     assert!(source.to_string().contains("structural presence relation"));
@@ -545,6 +815,1404 @@ fn guarded_origins_keep_their_source_and_premise_readable() {
 /// rather than a string the test would have to re-derive the grouping rules to
 /// predict — which would be the rules under test standing in as their own
 /// expectation.
+fn inference_fixture_errors(source: &str) -> Vec<inference::Error> {
+    let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
+    assert!(
+        parsed.errors.is_empty(),
+        "parse errors: {:#?}",
+        parsed.errors
+    );
+    let bundle = Bundle::new("diagnostics", Version::new(0, 1, 0)).expect("valid bundle");
+    let mut mint = Mint::new(bundle);
+    let mut built = ir::build(&mut mint, parsed.stmts);
+    assert!(built.errors.is_empty(), "IR errors: {:#?}", built.errors);
+    inference::infer(&mint, &mut built.program).errors
+}
+
+fn inference_fixture_diagnostics(source: &str) -> Vec<ui::Diagnostic> {
+    inference_fixture_errors(source)
+        .into_iter()
+        .map(|error| error.diagnostic())
+        .collect()
+}
+
+fn explained_facts(source: &str) -> Vec<inference::ExplanationFact> {
+    let errors = inference_fixture_errors(source);
+    let error = errors.last().expect("fixture error");
+    error
+        .explanation
+        .as_ref()
+        .expect("structured explanation")
+        .full_facts
+        .clone()
+}
+
+#[test]
+fn generalized_accessor_explains_its_original_projection() {
+    let source = "let field = fn value => value.x\nlet bad = field 1n";
+    let facts = explained_facts(source);
+    let projection = source.find(".x").unwrap() + 1;
+    assert!(
+        facts.iter().any(|fact| {
+            fact.span.start == projection && fact.origin == inference::ConstraintOrigin::Projection
+        }),
+        "the scheme must reopen the accessor's source demand: {facts:#?}"
+    );
+}
+
+#[test]
+fn wide_definition_keeps_a_late_semantically_relevant_fact() {
+    let mut source = String::from("let field = fn value => { ");
+    for at in 0..300 {
+        source.push_str(&format!("noise{at}: {at}n, "));
+    }
+    source.push_str("target: value.target }\nlet bad = field 1n");
+    let facts = explained_facts(&source);
+    let target = source.find(".target").unwrap() + 1;
+    assert!(
+        facts.iter().any(|fact| fact.span.start == target),
+        "{facts:#?}"
+    );
+    let first_noise = source.find("noise0").unwrap();
+    assert!(
+        facts.iter().all(|fact| fact.span.start != first_noise),
+        "{facts:#?}"
+    );
+}
+
+#[test]
+fn annotated_definition_publishes_contract_not_unrelated_body_facts() {
+    let source = "let fixed : Nat -> Nat = fn value => value\nlet bad = fixed false";
+    let facts = explained_facts(source);
+    let annotation = source.find("Nat -> Nat").unwrap();
+    let body = source.find("fn value => value").unwrap();
+    assert!(facts.iter().any(|fact| fact.span.start == annotation));
+    assert!(
+        facts
+            .iter()
+            .all(|fact| fact.span.start < body || fact.span.start >= body + 17)
+    );
+}
+
+#[test]
+fn annotated_row_rigid_reopens_as_a_row_and_keeps_contract_provenance() {
+    let source = "let field : { x: Nat, ..'r } -> Nat = fn value => value.x\nlet bad = field 1n";
+    let facts = explained_facts(source);
+    let annotation = source.find("{ x: Nat, ..'r }").unwrap();
+    assert!(
+        facts.iter().any(|fact| fact.span.start == annotation),
+        "{facts:#?}"
+    );
+}
+
+#[test]
+fn authoritative_provenance_uses_the_owning_annotation() {
+    let source = "let outer : Nat -> Nat = fn value => let inner : Boolean -> Boolean = fn flag => flag in value\nlet bad = outer false";
+    let facts = explained_facts(source);
+    let outer = source.find("Nat -> Nat").unwrap();
+    let inner = source.find("Boolean -> Boolean").unwrap();
+    assert!(
+        facts.iter().any(|fact| fact.span.start == outer),
+        "{facts:#?}"
+    );
+    assert!(
+        facts.iter().all(|fact| fact.span.start != inner),
+        "{facts:#?}"
+    );
+}
+
+#[test]
+fn scheme_provenance_survives_a_long_definition_chain_iteratively() {
+    let mut source = String::from("let root = fn value => value.x\n");
+    let mut previous = "root".to_string();
+    for at in 0..2_000 {
+        let next = format!("link{at}");
+        source.push_str(&format!("let {next} = {previous}\n"));
+        previous = next;
+    }
+    source.push_str(&format!("let bad = {previous} 1n"));
+    let errors = inference_fixture_errors(&source);
+    let explanation = errors.last().unwrap().explanation.as_ref().unwrap();
+    let projection = source.find(".x").unwrap() + 1;
+    assert!(
+        explanation
+            .full_facts
+            .iter()
+            .any(|fact| fact.span.start == projection)
+    );
+    assert!((2..=4).contains(&explanation.abridged.len()));
+    assert!(explanation.cause.reasons.len() <= 16_384);
+}
+
+#[test]
+fn repeated_accessor_uses_each_reach_the_shared_definition_fact() {
+    let source = "let field = fn value => value.x\nlet first = field 1n\nlet second = field false";
+    let errors = inference_fixture_errors(source);
+    assert_eq!(errors.len(), 2);
+    let projection = source.find(".x").unwrap() + 1;
+    for error in errors {
+        assert!(error.explanation.unwrap().full_facts.iter().any(|fact| {
+            fact.span.start == projection && fact.origin == inference::ConstraintOrigin::Projection
+        }));
+    }
+}
+
+#[test]
+fn unrelated_definitions_do_not_change_cross_definition_abridgement() {
+    fn selected(
+        source: &str,
+    ) -> Vec<(
+        inference::ConstraintOrigin,
+        inference::Subject,
+        inference::ExplanationFactPayload,
+        String,
+    )> {
+        let errors = inference_fixture_errors(source);
+        let explanation = errors.last().unwrap().explanation.as_ref().unwrap();
+        explanation
+            .abridged
+            .iter()
+            .map(|at| {
+                let fact = &explanation.full_facts[*at];
+                (
+                    fact.origin,
+                    fact.subject,
+                    fact.payload,
+                    source[fact.span.start..fact.span.end()].to_string(),
+                )
+            })
+            .collect()
+    }
+    let base = "let field = fn value => value.x\nlet bad = field 1n";
+    let unrelated = "let field = fn value => value.x\nlet noise = fn x => x\nlet bad = field 1n";
+    assert_eq!(selected(base), selected(unrelated));
+}
+
+#[test]
+fn imported_contracts_fall_back_to_local_authoritative_uses() {
+    let source = "extern consume : Nat -> Nat = \"host.consume\"\nlet bad = consume false";
+    let facts = explained_facts(source);
+    let argument = source.rfind("false").unwrap();
+    assert!(facts.iter().any(|fact| fact.span.start == argument));
+    assert!(
+        facts
+            .iter()
+            .all(|fact| fact.span.start >= source.find("let bad").unwrap())
+    );
+}
+
+#[test]
+fn ordinary_mismatch_explanations_keep_full_and_abridged_causal_evidence() {
+    let source = include_str!("../diagnostics/inference/repeated-calls.hc");
+    let first = inference_fixture_errors(source);
+    let second = inference_fixture_errors(source);
+    let [first] = first.as_slice() else {
+        panic!("the repeated calls fixture must have one error: {first:#?}");
+    };
+    let [second] = second.as_slice() else {
+        panic!("the repeated calls fixture must be deterministic: {second:#?}");
+    };
+    let explanation = first.explanation.as_ref().expect("mismatch explanation");
+    let repeated = second.explanation.as_ref().expect("second explanation");
+    assert_eq!(explanation, repeated);
+    assert!((2..=4).contains(&explanation.abridged.len()));
+    assert!(explanation.full_facts.len() >= explanation.abridged.len());
+    let selected_spans: HashSet<_> = explanation
+        .abridged
+        .iter()
+        .map(|at| explanation.full_facts[*at].span)
+        .collect();
+    for endpoint in [source.find("1n").unwrap(), source.find("false").unwrap()] {
+        assert!(
+            selected_spans.iter().any(|span| span.start == endpoint),
+            "both conflicting call arguments need their own label: {explanation:#?}"
+        );
+    }
+    assert_eq!(
+        explanation.contradiction.kind,
+        inference::ContradictionKind::IncompatibleTypes,
+        "an argument mismatch is not a non-function callee failure"
+    );
+    assert!(!explanation.cause.reasons.is_empty());
+    assert!(!explanation.cause.constraints.is_empty());
+    assert_eq!(
+        explanation.contradiction.repairs,
+        [
+            inference::RepairDirection::ChangeFirstUse,
+            inference::RepairDirection::ChangeSecondUse,
+        ]
+    );
+    let rendered = first.diagnostic();
+    for forbidden in ["expected", "found", "?", "~", "->"] {
+        assert!(
+            !rendered.title.contains(forbidden)
+                && !rendered.primary.message.contains(forbidden)
+                && rendered
+                    .related
+                    .iter()
+                    .all(|note| !note.message.contains(forbidden)),
+            "migrated mismatch leaked `{forbidden}`: {rendered:#?}"
+        );
+    }
+}
+
+#[test]
+fn pivots_name_repeated_inputs_branches_and_anonymous_shared_values_once() {
+    let cases = [
+        (
+            include_str!("../diagnostics/inference/repeated-calls.hc"),
+            inference::ExplanationPivotKind::FunctionInput,
+            "`Input`",
+        ),
+        (
+            include_str!("../diagnostics/inference/branches.hc"),
+            inference::ExplanationPivotKind::BranchResult,
+            "`Result`",
+        ),
+        (
+            "let value = { x: 1n }\nlet bad : Boolean = value.x",
+            inference::ExplanationPivotKind::ProjectedField,
+            "`Field`",
+        ),
+        (
+            "let bad : Nat = false",
+            inference::ExplanationPivotKind::Value,
+            "`Value`",
+        ),
+    ];
+    for (source, kind, spelling) in cases {
+        let errors = inference_fixture_errors(source);
+        let explanation = errors.last().unwrap().explanation.as_ref().unwrap();
+        let pivot = explanation
+            .pivot
+            .as_ref()
+            .unwrap_or_else(|| panic!("shared semantic pivot: {source}\n{explanation:#?}"));
+        assert_eq!(pivot.kind, kind);
+        assert!(pivot.references.len() >= 2);
+        assert!(
+            pivot
+                .references
+                .iter()
+                .all(|at| explanation.abridged.contains(at))
+        );
+        let diagnostic = errors.last().unwrap().diagnostic();
+        let prose = std::iter::once(diagnostic.primary.message.as_str())
+            .chain(diagnostic.related.iter().map(|note| note.message.as_str()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(prose.matches("Let’s call").count(), 1, "{prose}");
+        assert!(prose.matches(spelling).count() >= 2, "{prose}");
+    }
+}
+
+#[test]
+fn pivot_labels_avoid_visible_source_names_without_solver_spelling() {
+    let source = "let Input = fn use => { first: use 1n, second: use false }";
+    let errors = inference_fixture_errors(source);
+    let pivot = errors[0]
+        .explanation
+        .as_ref()
+        .and_then(|explanation| explanation.pivot.as_ref())
+        .expect("the repeated function input is shared");
+    assert_eq!(pivot.kind, inference::ExplanationPivotKind::FunctionInput);
+    assert_eq!(pivot.name, "Input A");
+}
+
+#[test]
+fn unrelated_whole_path_facts_do_not_create_a_false_pivot() {
+    let errors = inference_fixture_errors(include_str!("../diagnostics/inference/non-function.hc"));
+    let explanation = errors[0].explanation.as_ref().unwrap();
+    assert!(explanation.full_facts.len() >= explanation.abridged.len());
+    assert!(explanation.pivot.is_none());
+}
+
+#[test]
+fn a_failure_without_two_grounded_facts_has_no_pivot() {
+    let errors = inference_fixture_errors(include_str!("../diagnostics/inference/non-function.hc"));
+    let explanation = errors[0].explanation.as_ref().unwrap();
+    assert_eq!(explanation.abridged.len(), 1);
+    assert!(explanation.pivot.is_none());
+    assert!(
+        !errors[0]
+            .diagnostic()
+            .primary
+            .message
+            .contains("Let’s call")
+    );
+}
+
+#[test]
+fn abridgement_is_source_ordered_counts_omissions_and_ignores_noise() {
+    fn account(source: &str) -> (Vec<String>, usize, Option<String>) {
+        let errors = inference_fixture_errors(source);
+        let explanation = errors.last().unwrap().explanation.as_ref().unwrap();
+        assert!(
+            explanation
+                .abridged
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+        );
+        assert_eq!(
+            explanation.omitted_facts,
+            explanation.full_facts.len() - explanation.abridged.len()
+        );
+        (
+            explanation
+                .abridged
+                .iter()
+                .map(|at| {
+                    let span = explanation.full_facts[*at].span;
+                    source[span.start..span.end()].to_string()
+                })
+                .collect(),
+            explanation.omitted_facts,
+            explanation.pivot.as_ref().map(|pivot| pivot.name.clone()),
+        )
+    }
+    let base = "let repeated = fn use => { first: use 1n, second: use false }";
+    let noisy = "let noise = fn unrelated => unrelated\nlet repeated = fn use => { first: use 1n, second: use false }";
+    assert_eq!(account(base), account(noisy));
+    assert!(account(base).1 > 0);
+}
+
+#[test]
+fn recursive_types_have_grounded_structured_cycle_explanations() {
+    let cases = [
+        // Direct self-application.
+        (
+            "let bad = fn f => f f",
+            inference::RecursiveCycleShape::CallInput,
+        ),
+        // The cycle closes below another function application.
+        (
+            "let id = fn x => x  let bad = fn f => id (f f)",
+            inference::RecursiveCycleShape::CallInput,
+        ),
+        // A value nested through a field contains itself.
+        (
+            "let bad = { outer: { inner: bad } }",
+            inference::RecursiveCycleShape::Containment,
+        ),
+        // Two independently written uses close the cycle across a binding.
+        // The field-containing sibling must not override the first exact
+        // self-call route when choosing repair advice.
+        (
+            "let bad = fn f => let keep = f in { call: keep f, value: { self: f } }",
+            inference::RecursiveCycleShape::CallInput,
+        ),
+        // One shared row tail cannot absorb the extra field on one side. The
+        // call is the source operation, but the actual cycle closes through
+        // the row, so containment advice takes precedence.
+        (
+            "let use : { x: Nat, ..'r } -> { x: Nat, y: Nat, ..'r } -> Nat = fn a => fn b => 1n  let bad = fn p => use p p",
+            inference::RecursiveCycleShape::Containment,
+        ),
+        // The closing constraint is an application argument, but the argument
+        // contains the value in a field rather than passing it directly to
+        // itself.
+        (
+            "let bad = fn f => f { self: f }",
+            inference::RecursiveCycleShape::Containment,
+        ),
+        // A recursive result with neither a call-input nor row containment.
+        (
+            "let bad = fn x => bad",
+            inference::RecursiveCycleShape::Neutral,
+        ),
+    ];
+
+    for (source, expected_shape) in cases {
+        let errors = inference_fixture_errors(source);
+        let [error] = errors.as_slice() else {
+            panic!("expected one recursive error for {source}: {errors:#?}");
+        };
+        assert!(matches!(error.kind, inference::ErrorKind::Recursive));
+        let explanation = error
+            .explanation
+            .as_ref()
+            .unwrap_or_else(|| panic!("missing recursive explanation for {source}"));
+        assert_eq!(
+            explanation.contradiction.kind,
+            inference::ContradictionKind::RecursiveValue
+        );
+        assert_eq!(
+            explanation.contradiction.recursive,
+            Some(expected_shape),
+            "{source}: {explanation:#?}"
+        );
+        assert!(
+            (2..=4).contains(&explanation.abridged.len()),
+            "{source}: {explanation:#?}"
+        );
+        assert!(explanation.full_facts.len() >= explanation.abridged.len());
+        assert!(!explanation.cause.constraints.is_empty());
+        assert!(!explanation.cause.reasons.is_empty());
+        assert_eq!(
+            explanation.contradiction.repairs,
+            [
+                inference::RepairDirection::ChangeFirstUse,
+                inference::RepairDirection::ChangeSecondUse,
+            ]
+        );
+
+        let rendered = error.diagnostic();
+        let text = std::iter::once(rendered.title.as_str())
+            .chain(std::iter::once(rendered.primary.message.as_str()))
+            .chain(rendered.related.iter().map(|note| note.message.as_str()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains("contain") || text.contains("accept"),
+            "{source}: {rendered:#?}"
+        );
+        for forbidden in ["occurs", "?", "~", "solver"] {
+            assert!(
+                !text.contains(forbidden),
+                "recursive explanation leaked `{forbidden}` for {source}: {rendered:#?}"
+            );
+        }
+        assert_eq!(
+            rendered.help.len(),
+            2,
+            "repairs must name both editable sides"
+        );
+        match expected_shape {
+            inference::RecursiveCycleShape::CallInput => {
+                assert!(rendered.help.iter().all(|help| !help.contains("field")));
+                assert!(rendered.help.iter().any(|help| help.contains("call")));
+            }
+            inference::RecursiveCycleShape::Containment => {
+                assert!(rendered.help.iter().all(|help| !help.contains("call")));
+                assert!(rendered.help.iter().any(|help| help.contains("field")));
+            }
+            inference::RecursiveCycleShape::Neutral => {
+                assert!(
+                    rendered
+                        .help
+                        .iter()
+                        .all(|help| !help.contains("call") && !help.contains("field"))
+                );
+                assert!(rendered.help.iter().any(|help| help.contains("finite")));
+            }
+        }
+    }
+}
+
+#[test]
+fn recursive_failure_path_excludes_siblings_and_recovers_for_the_next_error() {
+    let source = "let bad = fn f => { cycle: f f, innocent: 1n }  let later : Nat = false";
+    let errors = inference_fixture_errors(source);
+    assert_eq!(errors.len(), 2, "{errors:#?}");
+    let recursive = errors
+        .iter()
+        .find(|error| matches!(error.kind, inference::ErrorKind::Recursive))
+        .expect("recursive failure");
+    let later = errors
+        .iter()
+        .find(|error| matches!(error.kind, inference::ErrorKind::Mismatch { .. }))
+        .expect("independent post-recovery mismatch");
+    let explanation = recursive.explanation.as_ref().expect("recursive path");
+    let innocent = source.find("1n").unwrap();
+    let later_at = source.rfind("false").unwrap();
+    assert!(
+        explanation
+            .full_facts
+            .iter()
+            .all(|fact| fact.span.start != innocent && fact.span.start != later_at),
+        "unrelated siblings must not enter the exact cycle: {explanation:#?}"
+    );
+    assert!(
+        explanation
+            .full_facts
+            .iter()
+            .any(|fact| fact.span.start == source.find("f f").unwrap()),
+        "the closing call stays in the cycle path: {explanation:#?}"
+    );
+    let later_explanation = later.explanation.as_ref().expect("later path");
+    assert!(
+        later_explanation
+            .full_facts
+            .iter()
+            .any(|fact| fact.span.start == later_at)
+    );
+    assert!(
+        later_explanation
+            .full_facts
+            .iter()
+            .all(|fact| fact.span.start >= source.find("let later").unwrap())
+    );
+}
+
+#[test]
+fn row_explanations_keep_both_source_sides_and_normalize_solver_direction() {
+    let projection = include_str!("../diagnostics/inference/projection-closed-later.hc");
+    let errors = inference_fixture_errors(projection);
+    let [error] = errors.as_slice() else {
+        panic!("projection closed by a later use must have one error");
+    };
+    assert!(matches!(
+        error.kind,
+        inference::ErrorKind::MissingField { .. } | inference::ErrorKind::ExtraField { .. }
+    ));
+    let explanation = error.explanation.as_ref().expect("causal row explanation");
+    assert_eq!(
+        explanation.contradiction.kind,
+        inference::ContradictionKind::LabelUnavailable
+    );
+    assert!((2..=4).contains(&explanation.abridged.len()));
+    assert!(
+        explanation
+            .full_facts
+            .iter()
+            .any(|fact| { fact.payload == inference::ExplanationFactPayload::LabelDemand })
+    );
+    assert!(
+        explanation
+            .full_facts
+            .iter()
+            .any(|fact| { fact.payload == inference::ExplanationFactPayload::ClosedRow })
+    );
+
+    for (source, introduction, forbidden) in [
+        (
+            include_str!("../diagnostics/inference/repeated-field-struct.hc"),
+            110..119,
+            104..109,
+        ),
+        (
+            include_str!("../diagnostics/inference/repeated-field-sum.hc"),
+            109..116,
+            103..108,
+        ),
+    ] {
+        let errors = inference_fixture_errors(source);
+        let [error] = errors.as_slice() else {
+            panic!("each repeated-label shape must have one error");
+        };
+        let explanation = error
+            .explanation
+            .as_ref()
+            .unwrap_or_else(|| panic!("repeated-label explanation for {source}"));
+        assert_eq!(
+            explanation.contradiction.kind,
+            inference::ContradictionKind::RepeatedLabel
+        );
+        assert!((2..=4).contains(&explanation.abridged.len()));
+        let introduced = explanation
+            .full_facts
+            .iter()
+            .find(|fact| fact.payload == inference::ExplanationFactPayload::LabelIntroduction)
+            .expect("actual label introduction");
+        let lacked = explanation
+            .full_facts
+            .iter()
+            .find(|fact| fact.payload == inference::ExplanationFactPayload::LabelForbidden)
+            .expect("remainder/lacks origin");
+        assert_eq!(introduced.span.start..introduced.span.end(), introduction);
+        assert_eq!(lacked.span.start..lacked.span.end(), forbidden);
+        assert_ne!(introduced.span, lacked.span);
+        let selected: HashSet<_> = explanation
+            .abridged
+            .iter()
+            .map(|at| explanation.full_facts[*at].payload)
+            .collect();
+        assert!(selected.contains(&inference::ExplanationFactPayload::LabelIntroduction));
+        assert!(selected.contains(&inference::ExplanationFactPayload::LabelForbidden));
+    }
+
+    let errors = inference_fixture_errors(include_str!(
+        "../diagnostics/inference/repeated-field-effect.hc"
+    ));
+    let [effect_error] = errors.as_slice() else {
+        panic!("repeated effect fixture must have one error: {errors:#?}");
+    };
+    assert!(
+        effect_error.explanation.is_none(),
+        "a repeated effect without an exact forbidden origin must not invent one: {effect_error:#?}"
+    );
+
+    // A genuinely deep tail-binding chain, rather than one wide row, keeps
+    // provenance iterative and parents the original lack through every hop.
+    let mut deep = String::from("let read = fn value => value.target\n");
+    let mut previous = "read".to_string();
+    for at in 0..256 {
+        deep.push_str(&format!("let pass{at} = fn value => value\n"));
+        deep.push_str(&format!("let link{at} = pass{at} {previous}\n"));
+        previous = format!("link{at}");
+    }
+    deep.push_str(&format!("let close : {{}} -> Nat = {previous}\n"));
+    let errors = inference_fixture_errors(&deep);
+    assert_eq!(errors.len(), 1, "deep closed rows retain one complaint");
+    let explanation = errors[0].explanation.as_ref().expect("deep row cause");
+    let selected: HashSet<_> = explanation
+        .abridged
+        .iter()
+        .map(|at| explanation.full_facts[*at].payload)
+        .collect();
+    assert!(selected.contains(&inference::ExplanationFactPayload::LabelDemand));
+    assert!(selected.contains(&inference::ExplanationFactPayload::ClosedRow));
+}
+
+#[test]
+fn repeated_labels_keep_the_full_intermediate_path_and_exact_endpoints() {
+    let mut source = String::from(
+        "let id = fn value => value\nlet split : { x: Nat, ..'r } -> { ..'r } -> Nat = fn whole => fn rest => 0n\n",
+    );
+    let mut partial = "split value".to_string();
+    for _ in 0..12 {
+        partial = format!("id ({partial})");
+    }
+    source.push_str(&format!("let bad = fn value => ({partial}) {{ x: 1n }}\n"));
+    let errors = inference_fixture_errors(&source);
+    let [error] = errors.as_slice() else {
+        panic!("repeated intermediate fixture must have one error: {errors:#?}");
+    };
+    let explanation = error.explanation.as_ref().expect("repeated row cause");
+    assert!(
+        explanation.full_facts.len() > 2,
+        "the full slice must retain facts between the exact endpoints: {explanation:#?}"
+    );
+    let introduced = explanation
+        .full_facts
+        .iter()
+        .position(|fact| {
+            (fact.span.start..fact.span.end()) == (199..208)
+                && fact.origin == inference::ConstraintOrigin::ApplicationArgument
+                && fact.subject == inference::Subject::Argument
+                && fact.payload == inference::ExplanationFactPayload::LabelIntroduction
+        })
+        .expect("exact introduction endpoint");
+    let forbidden = explanation
+        .full_facts
+        .iter()
+        .position(|fact| {
+            (fact.span.start..fact.span.end()) == (180..185)
+                && fact.origin == inference::ConstraintOrigin::ApplicationArgument
+                && fact.subject == inference::Subject::Argument
+                && fact.payload == inference::ExplanationFactPayload::LabelForbidden
+        })
+        .expect("exact forbidden endpoint");
+    assert_eq!(explanation.abridged, [forbidden, introduced]);
+}
+
+#[test]
+fn same_label_performs_facts_do_not_invent_repeated_endpoints() {
+    let source = concat!(
+        "effect Log = { write: Nat -> () }\n",
+        "effect Tick = { tick: () -> () }\n",
+        "let bad = fn _ => handle !Log.write 1n with | !Log.write n =>\n",
+        "  (fn action => action ()) (fn _ => let _ = !Tick.tick () in !Log.write n)\n",
+        "end\n",
+    );
+    let errors = inference_fixture_errors(source);
+    let [error] = errors.as_slice() else {
+        panic!("same-label intermediate fixture must have one error: {errors:#?}");
+    };
+    let inference::ErrorKind::RepeatedField {
+        introduction: Some(introduction),
+        forbidden,
+        ..
+    } = &error.kind
+    else {
+        panic!("same-label intermediate must retain its exact origin: {error:#?}");
+    };
+    assert_eq!(introduction.span.start..introduction.span.end(), 190..202);
+    assert!(forbidden.is_none());
+    assert!(
+        error.explanation.is_none(),
+        "an unrelated same-!Log Performs fact must not fabricate the missing endpoint: {error:#?}"
+    );
+}
+
+#[test]
+fn repeated_effects_keep_full_facts_and_exact_abridged_endpoints() {
+    let source = concat!(
+        "effect Log = { write: Nat -> () }\n",
+        "let split : (() -> () + !Log + ..'r) -> (() -> () + ..'r) -> Nat = fn whole => fn rest => 0n\n",
+        "let bad = fn action => split action (fn _ => !Log.write 0n)\n",
+    );
+    let errors = inference_fixture_errors(source);
+    let [error] = errors.as_slice() else {
+        panic!("exact repeated-effect fixture must have one error: {errors:#?}");
+    };
+    let explanation = error.explanation.as_ref().expect("repeated effect cause");
+    let facts: Vec<_> = explanation
+        .full_facts
+        .iter()
+        .map(|fact| {
+            (
+                fact.span.start..fact.span.end(),
+                fact.origin,
+                fact.subject,
+                fact.payload,
+            )
+        })
+        .collect();
+    assert_eq!(
+        facts,
+        [
+            (
+                46..98,
+                inference::ConstraintOrigin::ContextualCheck,
+                inference::Subject::Annotation,
+                inference::ExplanationFactPayload::RequiresType,
+            ),
+            (
+                150..155,
+                inference::ConstraintOrigin::ApplicationArgument,
+                inference::Subject::Parameter,
+                inference::ExplanationFactPayload::RequiresType,
+            ),
+            (
+                150..162,
+                inference::ConstraintOrigin::ApplicationArgument,
+                inference::Subject::Parameter,
+                inference::ExplanationFactPayload::RequiresType,
+            ),
+            (
+                156..162,
+                inference::ConstraintOrigin::ApplicationArgument,
+                inference::Subject::Argument,
+                inference::ExplanationFactPayload::LabelForbidden,
+            ),
+            (
+                167..185,
+                inference::ConstraintOrigin::ApplicationArgument,
+                inference::Subject::Argument,
+                inference::ExplanationFactPayload::RequiresType,
+            ),
+            (
+                172..185,
+                inference::ConstraintOrigin::ApplicationEffects,
+                inference::Subject::PerformedEffects,
+                inference::ExplanationFactPayload::LabelIntroduction,
+            ),
+        ]
+    );
+    assert_eq!(explanation.abridged, [3, 5]);
+    assert!(
+        explanation.pivot.is_none(),
+        "effect facts from different source families must not share a name"
+    );
+}
+
+#[test]
+fn effect_boundaries_keep_source_causal_paths_and_repairs() {
+    use inference::{ContradictionKind as K, ExplanationFactPayload as P};
+
+    for (source, expected) in [
+        (
+            concat!(
+                "effect Log = { write: Nat -> () }\n",
+                "let bad = !Log.write 1n\n",
+            ),
+            K::UnhandledEffect,
+        ),
+        (
+            include_str!("../diagnostics/inference/unhandled-effect.hc"),
+            K::UnhandledEffect,
+        ),
+        (
+            include_str!("../diagnostics/inference/effect-not-allowed.hc"),
+            K::EffectNotAllowed,
+        ),
+        (
+            concat!(
+                "effect Log = { write: Nat -> () }\n",
+                "effect Tick = { tick: () -> () }\n",
+                "let bad : () -> () = fn _ => handle !Log.write 0n with ",
+                "| !Log.write n => !Tick.tick () end\n",
+            ),
+            K::EffectNotAllowed,
+        ),
+        (
+            concat!(
+                "effect Log = { write: Nat -> () }\n",
+                "effect Tick = { tick: () -> () }\n",
+                "let bad : () -> () = fn _ => handle !Log.write 0n with ",
+                "| !Log.write n => () | return value => !Tick.tick () end\n",
+            ),
+            K::EffectNotAllowed,
+        ),
+        (
+            concat!(
+                "effect Log = { write: Nat -> () }\n",
+                "let bad = fn _ => let inner : () -> () = ",
+                "fn _ => !Log.write 0n in inner\n",
+            ),
+            K::EffectNotAllowed,
+        ),
+        (
+            concat!(
+                "effect Log = { write: Nat -> () }\n",
+                "effect Tick = { tick: () -> () }\n",
+                "effect Both = !Log + !Tick\n",
+                "let action : () -> () + !Both = fn _ => ",
+                "let _ = !Log.write 0n in !Tick.tick ()\n",
+                "let bad : () -> () = fn _ => action ()\n",
+            ),
+            K::EffectNotAllowed,
+        ),
+    ] {
+        let errors = inference_fixture_errors(source);
+        let error = errors
+            .iter()
+            .find(|error| {
+                matches!(
+                    error.kind,
+                    inference::ErrorKind::Unhandled { .. }
+                        | inference::ErrorKind::NotAllowed { .. }
+                )
+            })
+            .unwrap_or_else(|| panic!("effect fixture has no boundary error: {errors:#?}"));
+        let explanation = error.explanation.as_ref().expect("structured effect path");
+        assert_eq!(explanation.contradiction.kind, expected);
+        assert!(
+            (2..=4).contains(&explanation.abridged.len()),
+            "{explanation:#?}"
+        );
+        let selected: HashSet<_> = explanation
+            .abridged
+            .iter()
+            .map(|at| explanation.full_facts[*at].payload)
+            .collect();
+        assert!(selected.contains(&P::EffectUse), "{explanation:#?}");
+        assert!(selected.contains(&P::EffectBoundary), "{explanation:#?}");
+        assert!(selected.contains(&P::EffectDeclaration), "{explanation:#?}");
+        assert!(
+            explanation.pivot.is_none(),
+            "effect paths need no invented name"
+        );
+
+        let diagnostic = error.diagnostic();
+        let prose = format!("{diagnostic:?}");
+        for forbidden in ["solver", "constraint", "row tail", "unification"] {
+            assert!(!prose.contains(forbidden), "{prose}");
+        }
+        match expected {
+            K::UnhandledEffect => assert_eq!(
+                diagnostic.help,
+                ["handle this effect, or perform it inside a function"]
+            ),
+            K::EffectNotAllowed => assert_eq!(
+                diagnostic.help,
+                ["add the effect to the function type, or handle it here"]
+            ),
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn effect_declarations_keep_qualified_identity_through_aliases_and_primary_roles() {
+    use inference::{ContradictionKind as K, ExplanationFactPayload as P};
+
+    let source = concat!(
+        "module A = effect Log = { write: Nat -> () } end\n",
+        "module B = effect Log = { write: () -> () } end\n",
+        "module C = effect Log = { write: Nat -> () } end\n",
+        "let action : () -> () + C::!Log = fn _ => C::!Log.write 0n\n",
+        "let bad = action ()\n",
+    );
+    let errors = inference_fixture_errors(source);
+    let error = errors
+        .iter()
+        .find(|error| matches!(error.kind, inference::ErrorKind::Unhandled { .. }))
+        .expect("aliased operation must escape at the top level");
+    let explanation = error.explanation.as_ref().expect("effect explanation");
+    assert_eq!(explanation.contradiction.kind, K::UnhandledEffect);
+    let declaration = explanation
+        .abridged
+        .iter()
+        .map(|at| &explanation.full_facts[*at])
+        .find(|fact| fact.payload == P::EffectDeclaration)
+        .expect("resolved declaration evidence");
+    assert_eq!(
+        &source[declaration.span.start..declaration.span.end()],
+        "Log"
+    );
+    assert!(
+        declaration.span.start > source.find("module C").unwrap(),
+        "the coalesced A::!Log declaration must not overwrite C::!Log evidence, while distinct B::!Log remains separate"
+    );
+    let primary = &explanation.full_facts[explanation.abridged[0]];
+    assert_eq!(primary.payload, P::EffectUse);
+    assert_eq!(&source[primary.span.start..primary.span.end()], "action ()");
+    let diagnostic = error.diagnostic();
+    assert_eq!(diagnostic.primary.span, primary.span);
+    assert!(
+        diagnostic
+            .related
+            .iter()
+            .any(|related| related.span == declaration.span)
+    );
+}
+
+#[test]
+fn bare_operation_values_keep_exact_origins_through_value_flow() {
+    use inference::ExplanationFactPayload as P;
+
+    for tail in [
+        "let write = C::!Log.write\nlet bad = write 0n\n",
+        "let stored = { write: C::!Log.write }\nlet bad = stored.write 0n\n",
+        "let forward = fn callback => callback\nlet write = forward C::!Log.write\nlet bad = write 0n\n",
+        "let invoke = fn callback => callback 0n\nlet bad = invoke C::!Log.write\n",
+        "let store = fn callback => { run: callback }\nlet bad = (store C::!Log.write).run 0n\n",
+        "let invoke = fn holder => holder.run 0n\nlet bad = invoke { run: C::!Log.write }\n",
+        "let invoke = fn holder => holder.run 0n\nlet forward = fn holder => invoke holder\nlet bad = forward { run: C::!Log.write }\n",
+        "let invoke : { run: Nat -> () + C::!Log } -> () + C::!Log = fn holder => holder.run 0n\nlet bad = invoke { run: C::!Log.write }\n",
+        "let bad = let invoke = fn holder => holder.run 0n in invoke { run: C::!Log.write }\n",
+        "let bad = let invoke : { run: Nat -> () + C::!Log } -> () + C::!Log = fn holder => holder.run 0n in invoke { run: C::!Log.write }\n",
+        "let return = fn holder => fn _ => holder.run 0n\nlet callback = return { run: C::!Log.write }\nlet bad = callback ()\n",
+        "let produce = fn _ => { run: C::!Log.write }\nlet invoke = fn maker => (maker ()).run 0n\nlet bad = invoke produce\n",
+        "let produce = fn _ => { next: fn _ => { run: C::!Log.write } }\nlet invoke = fn maker => ((maker ()).next ()).run 0n\nlet bad = invoke produce\n",
+    ] {
+        let source = format!(
+            "module A = effect Log = {{ write: Nat -> () }} end\nmodule C = effect Log = {{ write: Nat -> () }} end\n{tail}"
+        );
+        let errors = inference_fixture_errors(&source);
+        let error = errors
+            .iter()
+            .find(|error| matches!(error.kind, inference::ErrorKind::Unhandled { .. }))
+            .unwrap_or_else(|| panic!("forwarded operation must escape: {errors:#?}"));
+        let declaration = error
+            .explanation
+            .as_ref()
+            .expect("effect explanation")
+            .full_facts
+            .iter()
+            .find(|fact| fact.payload == P::EffectDeclaration)
+            .expect("resolved operation declaration");
+        assert!(
+            declaration.span.start > source.find("module C").unwrap(),
+            "value flow must retain C::!Log rather than coalesced A::!Log: {tail}"
+        );
+    }
+}
+
+#[test]
+fn returning_an_effectful_callback_does_not_perform_its_body() {
+    for source in [
+        "module A = effect Log = { write: Nat -> () } end\nmodule C = effect Log = { write: Nat -> () } end\nlet return = fn holder => fn _ => holder.run 0n\nlet callback = return { run: C::!Log.write }\n",
+        "module A = effect Log = { write: Nat -> () } end\nmodule C = effect Log = { write: Nat -> () } end\nlet produce = fn _ => { run: C::!Log.write }\nlet saved = produce ()\n",
+    ] {
+        let errors = inference_fixture_errors(source);
+        assert!(
+            !errors
+                .iter()
+                .any(|error| matches!(error.kind, inference::ErrorKind::Unhandled { .. })),
+            "obtaining an effectful invocation result must not invoke it: {errors:#?}"
+        );
+    }
+}
+
+#[test]
+fn call_result_and_field_provenance_paths_remain_bounded() {
+    const DEPTH: usize = 24;
+    let mut producer = String::from("C::!Log.write");
+    for _ in 0..DEPTH {
+        producer = format!("fn _ => {{ next: {producer} }}");
+    }
+    let mut selected = String::from("maker");
+    for _ in 0..DEPTH {
+        selected = format!("({selected} ()).next");
+    }
+    let source = format!(
+        "module A = effect Log = {{ write: Nat -> () }} end\nmodule C = effect Log = {{ write: Nat -> () }} end\nlet produce = {producer}\nlet invoke = fn maker => {selected} 0n\nlet bad = invoke produce\n"
+    );
+    let errors = inference_fixture_errors(&source);
+    let error = errors
+        .iter()
+        .find(|error| matches!(error.kind, inference::ErrorKind::Unhandled { .. }))
+        .unwrap_or_else(|| panic!("deep call-result path must retain the operation: {errors:#?}"));
+    let declaration = error
+        .explanation
+        .as_ref()
+        .expect("effect explanation")
+        .full_facts
+        .iter()
+        .find(|fact| fact.payload == inference::ExplanationFactPayload::EffectDeclaration)
+        .expect("resolved operation declaration");
+    assert!(declaration.span.start > source.find("module C").unwrap());
+}
+
+#[test]
+fn thirty_duplicate_struct_substitutions_remain_bounded_and_project_invocation_origin() {
+    const DEPTH: usize = 32;
+
+    let chain = |seed: &str, prefix: &str| {
+        let mut source = format!("let {prefix}0 = {seed}\n");
+        for at in 0..DEPTH {
+            // Select after every duplication so this source-level correctness
+            // check does not independently construct an exponential type. The
+            // provenance-only regression exercises the retained binary DAG.
+            source.push_str(&format!("let {prefix}{} = (dup {prefix}{at}).a\n", at + 1));
+        }
+        source
+    };
+
+    // The empty seed exercises immediate pruning: no binary provenance tree is
+    // retained merely because the value's structural type is duplicated.
+    let empty = format!(
+        "let dup = fn x => {{ a: x, b: x }}\n{}",
+        chain("0n", "empty")
+    );
+    assert!(
+        inference_fixture_errors(&empty).is_empty(),
+        "duplicating an origin-free value must remain origin-free"
+    );
+
+    let projection = format!("(dup real{DEPTH}).b");
+    let source = format!(
+        "module C = effect Log = {{ write: Nat -> () }} end\nlet dup = fn x => {{ a: x, b: x }}\n{}let bad = {projection} 0n\n",
+        chain("C::!Log.write", "real")
+    );
+    let errors = inference_fixture_errors(&source);
+    let error = errors
+        .iter()
+        .find(|error| matches!(error.kind, inference::ErrorKind::Unhandled { .. }))
+        .unwrap_or_else(|| panic!("later projected invocation retains its origin: {errors:#?}"));
+    let declaration = error
+        .explanation
+        .as_ref()
+        .expect("effect explanation")
+        .full_facts
+        .iter()
+        .find(|fact| fact.payload == inference::ExplanationFactPayload::EffectDeclaration)
+        .expect("operation declaration");
+    assert_eq!(
+        &source[declaration.span.start..declaration.span.end()],
+        "Log"
+    );
+}
+
+#[test]
+fn deep_and_multiple_effect_boundaries_remain_bounded_and_counted() {
+    use inference::ExplanationFactPayload as P;
+
+    let mut deep =
+        String::from("effect Log = { write: Nat -> () }\nlet id = fn value => value\nlet bad = ");
+    for _ in 0..24 {
+        deep.push_str("id (");
+    }
+    deep.push_str("fn _ => !Log.write 0n");
+    for _ in 0..24 {
+        deep.push(')');
+    }
+    deep.push_str(" ()\n");
+    let errors = inference_fixture_errors(&deep);
+    let [error] = errors.as_slice() else {
+        panic!("a deep propagated effect remains one error: {errors:#?}");
+    };
+    let explanation = error.explanation.as_ref().expect("deep effect cause");
+    assert!((2..=4).contains(&explanation.abridged.len()));
+    assert!(explanation.full_facts.len() > explanation.abridged.len());
+    assert_eq!(
+        explanation.omitted_facts,
+        explanation.full_facts.len() - explanation.abridged.len()
+    );
+    assert!(
+        explanation
+            .full_facts
+            .iter()
+            .any(|fact| fact.payload == P::EffectUse)
+    );
+
+    let multiple = concat!(
+        "effect Log = { write: Nat -> () }\n",
+        "effect Tick = { tick: () -> () }\n",
+        "effect Both = !Log + !Tick\n",
+        "let bad : () -> () = fn _ => let _ = !Log.write 0n in !Tick.tick ()\n",
+    );
+    let errors = inference_fixture_errors(multiple);
+    assert_eq!(errors.len(), 2, "one diagnostic per refused source effect");
+    let declared: HashSet<_> = errors
+        .iter()
+        .map(|error| {
+            let explanation = error.explanation.as_ref().expect("effect explanation");
+            assert!(
+                explanation
+                    .full_facts
+                    .iter()
+                    .any(|fact| fact.payload == P::EffectDeclaration)
+            );
+            explanation
+                .contradiction
+                .row
+                .as_ref()
+                .unwrap()
+                .label
+                .clone()
+        })
+        .collect();
+    assert_eq!(
+        declared.len(),
+        2,
+        "aliases must not merge distinct source effects"
+    );
+}
+
+#[test]
+fn row_roles_follow_the_resolved_rejected_side() {
+    for (source, demand_subject, limiter_subject) in [
+        (
+            "let f = fn p => p.x\nlet bad = f {}\n",
+            inference::Subject::Parameter,
+            inference::Subject::Argument,
+        ),
+        (
+            "let f : ({} -> Nat) -> Nat = fn callback => 1n\nlet bad = f (fn p => p.x)\n",
+            inference::Subject::Argument,
+            inference::Subject::Parameter,
+        ),
+        (
+            "let projected = fn p => p.x\nlet indirect : {} -> Nat = projected\n",
+            inference::Subject::Term,
+            inference::Subject::Annotation,
+        ),
+    ] {
+        let errors = inference_fixture_errors(source);
+        let [error] = errors.as_slice() else {
+            panic!("direction-neutral fixture must have one error: {errors:#?}");
+        };
+        let explanation = error.explanation.as_ref().expect("row cause");
+        let selected: Vec<_> = explanation
+            .abridged
+            .iter()
+            .map(|at| &explanation.full_facts[*at])
+            .collect();
+        assert!(
+            selected.iter().any(|fact| {
+                fact.payload == inference::ExplanationFactPayload::LabelDemand
+                    && fact.subject == demand_subject
+            }),
+            "{explanation:#?}"
+        );
+        assert!(
+            selected.iter().any(|fact| {
+                fact.payload == inference::ExplanationFactPayload::ClosedRow
+                    && fact.subject == limiter_subject
+            }),
+            "{explanation:#?}"
+        );
+    }
+}
+
+#[test]
+fn a_lone_projection_does_not_invent_closed_row_evidence() {
+    let errors = inference_fixture_errors("let direct : {} -> Nat = fn p => p.x\n");
+    let [error] = errors.as_slice() else {
+        panic!("lone projection fixture must have one error: {errors:#?}");
+    };
+    assert!(
+        error.explanation.is_none(),
+        "the projection has demand spans but no independently grounded limiter"
+    );
+}
+
+#[test]
+fn a_function_argument_mismatch_is_not_called_a_non_function_callee() {
+    let source = include_str!("../diagnostics/inference/function-argument.hc");
+    let errors = inference_fixture_errors(source);
+    let [error] = errors.as_slice() else {
+        panic!("function argument fixture must produce one mismatch: {errors:#?}");
+    };
+    let explanation = error.explanation.as_ref().expect("grounded explanation");
+    assert_eq!(
+        explanation.contradiction.kind,
+        inference::ContradictionKind::IncompatibleTypes
+    );
+    assert_eq!(
+        (
+            explanation.contradiction.left,
+            explanation.contradiction.right
+        ),
+        (
+            inference::TypeDescription::NaturalNumber,
+            inference::TypeDescription::Boolean,
+        )
+    );
+    assert!(!error.diagnostic().title.contains("called as a function"));
+}
+
+/// Source-owned examples pin the diagnostic a reader is meant to see, rather
+/// than only constructing semantic payloads. Spans are deliberately omitted
+/// from this abridged form: the corpus owns source shapes, while later
+/// provenance phases will improve and then pin the causal locations.
+#[test]
+fn inference_source_corpus_matches_abridged_structured_goldens() {
+    let fixtures = [
+        (
+            "not-a-struct",
+            include_str!("../diagnostics/inference/not-a-struct.hc"),
+        ),
+        (
+            "type-mismatch",
+            include_str!("../diagnostics/inference/type-mismatch.hc"),
+        ),
+        (
+            "recursive-type",
+            include_str!("../diagnostics/inference/recursive-type.hc"),
+        ),
+        (
+            "missing-field",
+            include_str!("../diagnostics/inference/missing-field.hc"),
+        ),
+        (
+            "extra-field-struct",
+            include_str!("../diagnostics/inference/extra-field-struct.hc"),
+        ),
+        (
+            "extra-field-sum",
+            include_str!("../diagnostics/inference/extra-field-sum.hc"),
+        ),
+        (
+            "rigid-broken",
+            include_str!("../diagnostics/inference/rigid-broken.hc"),
+        ),
+        (
+            "rigid-broken-effect-closure",
+            include_str!("../diagnostics/inference/rigid-broken-effect-closure.hc"),
+        ),
+        (
+            "rigid-field-struct",
+            include_str!("../diagnostics/inference/rigid-field-struct.hc"),
+        ),
+        (
+            "rigid-field-sum",
+            include_str!("../diagnostics/inference/rigid-field-sum.hc"),
+        ),
+        (
+            "rigid-field-effect",
+            include_str!("../diagnostics/inference/rigid-field-effect.hc"),
+        ),
+        (
+            "rigid-escapes",
+            include_str!("../diagnostics/inference/rigid-escapes.hc"),
+        ),
+        (
+            "repeated-field-struct",
+            include_str!("../diagnostics/inference/repeated-field-struct.hc"),
+        ),
+        (
+            "repeated-field-sum",
+            include_str!("../diagnostics/inference/repeated-field-sum.hc"),
+        ),
+        (
+            "repeated-field-effect",
+            include_str!("../diagnostics/inference/repeated-field-effect.hc"),
+        ),
+        (
+            "presence-required",
+            include_str!("../diagnostics/inference/presence-required.hc"),
+        ),
+        (
+            "presence-impossible",
+            include_str!("../diagnostics/inference/presence-impossible.hc"),
+        ),
+        (
+            "clause-impossible",
+            include_str!("../diagnostics/inference/clause-impossible.hc"),
+        ),
+        (
+            "annotation-allows-more",
+            include_str!("../diagnostics/inference/annotation-allows-more.hc"),
+        ),
+        (
+            "unhandled-effect",
+            include_str!("../diagnostics/inference/unhandled-effect.hc"),
+        ),
+        (
+            "effect-not-allowed",
+            include_str!("../diagnostics/inference/effect-not-allowed.hc"),
+        ),
+        (
+            "callback-effects-not-covered",
+            include_str!("../diagnostics/inference/callback-effects-not-covered.hc"),
+        ),
+        (
+            "polymorphic-extern-boundary",
+            include_str!("../diagnostics/inference/polymorphic-extern-boundary.hc"),
+        ),
+        (
+            "repeated-calls",
+            include_str!("../diagnostics/inference/repeated-calls.hc"),
+        ),
+        (
+            "branches",
+            include_str!("../diagnostics/inference/branches.hc"),
+        ),
+        (
+            "non-function",
+            include_str!("../diagnostics/inference/non-function.hc"),
+        ),
+        (
+            "cross-definition",
+            include_str!("../diagnostics/inference/cross-definition.hc"),
+        ),
+        (
+            "long-alias",
+            include_str!("../diagnostics/inference/long-alias.hc"),
+        ),
+    ];
+
+    let mut found = String::new();
+    let mut seen = HashSet::new();
+    for (name, source) in fixtures {
+        writeln!(found, "## {name}").unwrap();
+        let diagnostics = inference_fixture_diagnostics(source);
+        assert!(!diagnostics.is_empty(), "{name} produced no diagnostic");
+        if name == "repeated-calls" {
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!(
+                    "repeated monomorphic calls should produce one diagnostic: {diagnostics:#?}"
+                );
+            };
+            assert_eq!(diagnostic.code, "type-mismatch");
+            assert_eq!(
+                diagnostic.title,
+                "a natural number and a boolean cannot be the same type"
+            );
+            assert!(
+                diagnostic.primary.message.contains("argument")
+                    && diagnostic
+                        .related
+                        .iter()
+                        .any(|related| related.message.contains("argument")),
+                "both repeated call arguments must be displayed: {diagnostic:#?}"
+            );
+        }
+        for diagnostic in diagnostics {
+            seen.insert(diagnostic.code);
+            writeln!(found, "[{}] {}", diagnostic.code, diagnostic.title).unwrap();
+            writeln!(found, "primary: {}", diagnostic.primary.message).unwrap();
+            for related in diagnostic.related {
+                writeln!(found, "related: {}", related.message).unwrap();
+            }
+            for help in diagnostic.help {
+                writeln!(found, "help: {help}").unwrap();
+            }
+            for note in diagnostic.notes {
+                writeln!(found, "note: {note}").unwrap();
+            }
+        }
+        writeln!(found).unwrap();
+    }
+    found.pop();
+    let expected: HashSet<_> = inference_error_kinds(Span::generated(0, 1))
+        .into_iter()
+        .map(|kind| kind.code())
+        .collect();
+    assert_eq!(
+        seen, expected,
+        "the source corpus must reach every ErrorKind"
+    );
+    assert_eq!(
+        found,
+        include_str!("../diagnostics/inference/abridged.golden")
+    );
+}
+
 fn round_trip(prelude: &str, printed: &str) -> String {
     let source = format!("{prelude}let f : {{ v: {printed} }} -> Nat = fn r => 1n\n");
     let lexed = token::lex(&source, FileID::GENERATED);
@@ -863,6 +2531,8 @@ fn a_complaint_about_a_sum_says_case_and_writes_the_sigil() {
     let repeated = TypeError::RepeatedField {
         shape: Shape::Sum,
         field: "A".to_string(),
+        introduction: None,
+        forbidden: None,
     };
     assert!(repeated.to_string().contains("cases"), "{repeated}");
     assert!(repeated.to_string().contains("`#A`"), "{repeated}");
@@ -953,8 +2623,7 @@ fn a_mixed_parameter_names_both_readings() {
     };
     assert_eq!(
         mixed.to_string(),
-        "this stands for a whole type in one place \
-         and for the rest of a sum's cases in another"
+        "this parameter is used as a whole type and as the rest of a sum's cases"
     );
 }
 
@@ -1075,24 +2744,25 @@ fn literal_patterns_print_as_written() {
 /// problem the sentence is not going to help with.
 #[test]
 fn an_arity_complaint_counts_in_words_as_far_as_words_go() {
-    let said = |expected, found| IrError::Arity { expected, found }.to_string();
+    let said = |expected, found| {
+        IrError::Arity {
+            name: "T".to_string(),
+            expected,
+            found,
+        }
+        .to_string()
+    };
 
-    assert_eq!(
-        said(0, 1),
-        "this type takes no arguments, and one was written"
-    );
-    assert_eq!(
-        said(1, 0),
-        "this type takes one argument, and none was written"
-    );
+    assert_eq!(said(0, 1), "`T` expects no arguments, but one was written");
+    assert_eq!(said(1, 0), "`T` expects one argument, but none was written");
     assert_eq!(
         said(2, 9),
-        "this type takes two arguments, and nine were written"
+        "`T` expects two arguments, but nine were written"
     );
     // Beyond the words, the numeral — on both sides.
     assert_eq!(
         said(10, 13),
-        "this type takes 10 arguments, and 13 were written"
+        "`T` expects 10 arguments, but 13 were written"
     );
 }
 
@@ -1398,6 +3068,7 @@ fn a_printer_reports_a_writer_that_refuses_it() {
             level: 1,
             promised: Formula::var(0),
             rigids: Vec::new(),
+            effect_provenance: Default::default(),
             value: Vec::new(),
             body: Vec::new(),
         },
@@ -1665,7 +3336,13 @@ fn the_three_sorts_each_print_on_their_own() {
         (Assigned::Presence(Presence::Absent), "?2 := absent"),
     ] {
         assert_eq!(
-            Effect::Bound { var: 2, value }.to_string(),
+            Effect::Bound {
+                var: 2,
+                value,
+                by: inference::ReasonId::synthetic(0),
+                because: None,
+            }
+            .to_string(),
             printed.to_string()
         );
     }
@@ -1811,24 +3488,45 @@ fn nothing_is_coded_as_annotation_too_open_any_more() {
 #[test]
 fn the_variable_complaints_read_as_what_went_wrong() {
     let span = Span::generated(0, 1);
+    let variable = ir::Error {
+        span,
+        kind: IrError::VariableInDeclaration {
+            name: "a".to_string(),
+        },
+    }
+    .diagnostic();
+    assert_eq!(variable.title, "`'a` is not declared in this type's header");
     assert_eq!(
-        IrError::VariableInDeclaration.to_string(),
-        "a declared type's variables are its parameters, so this one has to be \
-         written in its header; write `type T 'a = ...`"
+        variable.primary.message,
+        "this name is not one of the type's parameters"
     );
+    assert_eq!(
+        variable.help,
+        ["add `'a` to the header, or use an existing parameter"]
+    );
+
     assert_eq!(
         IrError::HoleInDeclaration.to_string(),
-        "a declared type says the same thing wherever it is used, so there is \
-         nothing here for `_` to leave open"
+        "a declared type cannot contain `_`"
     );
-    // Reworded for the new grammar: what a formula needs of a name is that a
-    // label wears it, which is the fix whether or not anything declared it.
-    assert_eq!(
-        IrError::UnboundPresence {
+    // What a formula needs of a name and how to repair it remain structured:
+    // the headline identifies the unused presence, while the label and help
+    // connect it to the `when` spelling the reader can change.
+    let unbound = ir::Error {
+        span,
+        kind: IrError::UnboundPresence {
             name: "b".to_string(),
-        }
-        .to_string(),
-        "this clause names `'b`, but no `when` in the type beside it gives it a label"
+        },
+    }
+    .diagnostic();
+    assert_eq!(unbound.title, "`'b` does not control any field or case");
+    assert_eq!(
+        unbound.primary.message,
+        "used here, but no label has `when 'b`"
+    );
+    assert_eq!(
+        unbound.help,
+        ["add `when 'b` to the intended label, or correct the name"]
     );
 
     // And the three inference raises, each naming what the expression turned
@@ -1843,18 +3541,71 @@ fn the_variable_complaints_read_as_what_went_wrong() {
         .to_string(),
         "this is `Nat`, but `'a` stands for whatever type the caller picks"
     );
-    // The effect reading quotes no arrow: the rows differ only in their
-    // tails, and the reader's fix is at the expression, not a type nobody
-    // wrote.
-    assert_eq!(
-        TypeError::RigidBroken {
-            found: Rc::new(Ty::plain(Ty::Nat)),
+    // Closing an open effect remainder is distinct from restricting it with a
+    // performed operation, because the two mistakes have different repairs.
+    let closed_effects = Rc::new(Ty::plain(Ty::Arrow(
+        Rc::new(Ty::unit()),
+        Rc::new(Ty::unit()),
+        Row::closed(),
+    )));
+    let closure = inference::Error {
+        id: inference::ErrorId::synthetic(0),
+        cause: inference::ErrorCause::Direct,
+        span,
+        kind: TypeError::RigidBroken {
+            found: closed_effects,
             name: "e".into(),
             sense: Sense::Effects,
             declared: span,
-        }
-        .to_string(),
-        "this decides what it may perform, but `'e` stands for whatever effects the caller allows"
+        },
+        explanation: None,
+    };
+    assert_eq!(
+        closure.kind.to_string(),
+        "this closes the effects it may perform, but `'e` stands for whatever effects the caller allows"
+    );
+    assert_eq!(
+        closure.diagnostic().help,
+        [
+            "preserve the caller-chosen effect remainder instead of closing it",
+            "or remove or change the open effect remainder in the annotation",
+        ]
+    );
+
+    let mut performed_row = Row::closed();
+    performed_row.labels.insert(
+        "Log".into(),
+        RowField {
+            presence: Presence::Present,
+            ty: Rc::new(Ty::unit()),
+        },
+    );
+    let restriction = inference::Error {
+        id: inference::ErrorId::synthetic(1),
+        cause: inference::ErrorCause::Direct,
+        span,
+        kind: TypeError::RigidBroken {
+            found: Rc::new(Ty::plain(Ty::Arrow(
+                Rc::new(Ty::unit()),
+                Rc::new(Ty::unit()),
+                performed_row,
+            ))),
+            name: "e".into(),
+            sense: Sense::Effects,
+            declared: span,
+        },
+        explanation: None,
+    };
+    assert_eq!(
+        restriction.kind.to_string(),
+        "this restricts which effect it may perform, but `'e` stands for whatever effects the caller allows"
+    );
+    assert_eq!(
+        restriction.diagnostic().help,
+        [
+            "handle the performed effect inside the body",
+            "or list that effect explicitly in the annotation",
+        ]
     );
     assert_eq!(
         TypeError::RigidField {
@@ -1864,8 +3615,8 @@ fn the_variable_complaints_read_as_what_went_wrong() {
             declared: span,
         }
         .to_string(),
-        "this reads a field `x`, but `'r` stands for whatever type the caller picks, \
-         so it may not have one"
+        "this reads field `x`, but `'r` stands for whatever other struct fields the caller chooses, \
+         so `x` cannot be assumed"
     );
     // In the reader's own nouns: someone who wrote `#`s is told about a
     // case, and the label is quoted with the `#` that makes it one.
@@ -1877,13 +3628,20 @@ fn the_variable_complaints_read_as_what_went_wrong() {
             declared: span,
         }
         .to_string(),
-        "this reads a case `#B`, but `'r` stands for whatever type the caller picks, \
-         so it may not have one"
+        "this matches case `#B`, but `'r` stands for whatever other cases the caller chooses, \
+         so `#B` cannot be assumed"
     );
     assert_eq!(
-        TypeError::RigidEscapes { name: "a".into() }.to_string(),
-        "`\'a` stands for whatever the caller picks, so it can't be part of a type \
-         outside the annotation that declared it"
+        TypeError::RigidEscapes {
+            name: "a".into(),
+            declared: span,
+            destination: Rc::new(Ty::Nat),
+            destination_name: "outside".into(),
+            destination_span: span,
+        }
+        .to_string(),
+        "`\'a` stands for whatever that annotation's caller picks, but binding `outside` \
+         would publish it as `Nat` outside that annotation"
     );
 }
 
@@ -1892,9 +3650,22 @@ fn the_variable_complaints_read_as_what_went_wrong() {
 #[test]
 fn the_complaints_about_a_declarations_own_labels_are_worded_once() {
     assert_eq!(IrError::EndlessFields.code(), "endless-fields");
+    let endless = ir::Error {
+        span: Span::generated(0, 1),
+        kind: IrError::EndlessFields,
+    }
+    .diagnostic();
     assert_eq!(
-        IrError::EndlessFields.to_string(),
-        "this type adds fields to itself, so it never has all of them"
+        endless.title,
+        "this recursive type adds more fields on every cycle"
+    );
+    assert_eq!(
+        endless.primary.message,
+        "the fields never reach a finite end"
+    );
+    assert_eq!(
+        endless.help,
+        ["place the recursion inside a field, or stop extending the `..` part"]
     );
 
     // The repeat is worded as what the argument does rather than as what goes
@@ -1905,18 +3676,12 @@ fn the_complaints_about_a_declarations_own_labels_are_worded_once() {
         shape: Shape::Struct,
         field: "x".to_string(),
     };
-    assert_eq!(
-        field.to_string(),
-        "this names `x`, which the struct it goes into already has"
-    );
+    assert_eq!(field.to_string(), "`x` would appear twice in this struct");
     let case = IrError::RepeatedRowField {
         shape: Shape::Sum,
         field: "A".to_string(),
     };
-    assert_eq!(
-        case.to_string(),
-        "this names `#A`, which the sum it goes into already has"
-    );
+    assert_eq!(case.to_string(), "`#A` would appear twice in this sum");
     assert_eq!(field.code(), case.code());
 }
 
@@ -1938,25 +3703,21 @@ fn a_mixed_tail_names_the_two_senses_it_was_given() {
     };
     assert_eq!(
         said(Sense::Type, Sense::Cases),
-        "this is used as the rest of a sum's cases here and as a whole type \
-         before it, and a name can only stand for one of them"
+        "one variable cannot stand for both a whole type and the rest of a sum's cases"
     );
     assert_eq!(
         said(Sense::Cases, Sense::Type),
-        "this is used as a whole type here and as the rest of a sum's cases \
-         before it, and a name can only stand for one of them"
+        "one variable cannot stand for both the rest of a sum's cases and a whole type"
     );
     // The third sense, which only a `where 'let` variable can have: a formula is
     // written about presences, so a name in one is read as a presence.
     assert_eq!(
         said(Sense::Type, Sense::Presence),
-        "this is used as a presence here and as a whole type \
-         before it, and a name can only stand for one of them"
+        "one variable cannot stand for both a whole type and a presence"
     );
     assert_eq!(
         said(Sense::Presence, Sense::Cases),
-        "this is used as the rest of a sum's cases here and as a presence \
-         before it, and a name can only stand for one of them"
+        "one variable cannot stand for both a presence and the rest of a sum's cases"
     );
 }
 
@@ -2084,6 +3845,7 @@ fn no_two_kinds_of_constraint_are_coded_the_same() {
             level: 1,
             promised: Formula::True,
             rigids: Vec::new(),
+            effect_provenance: Default::default(),
             value: Vec::new(),
             body: Vec::new(),
         },
@@ -2101,6 +3863,8 @@ fn no_two_kinds_of_constraint_are_coded_the_same() {
         ConstraintKind::Performs {
             performed: Row::closed(),
             ambient: Row::closed(),
+            effect_origins: Vec::new(),
+            ambient_label_spans: IndexMap::new(),
             inside: true,
         },
     ];
@@ -2126,13 +3890,18 @@ fn the_scoping_constraints_read_as_what_they_do() {
     let symbol = mint.local(None, Namespace::Terms, "x");
 
     let bound = Constraint {
+        id: inference::ConstraintId::synthetic(0),
+        reason: inference::ReasonId::synthetic(0),
         span: Span::generated(0, 1),
+        origin: inference::ConstraintOrigin::Binding,
+        subjects: inference::ConstraintSubjects::one(inference::Subject::Binding),
         kind: ConstraintKind::Let {
             symbol,
             bound: nat.clone(),
             level: 2,
             promised: Formula::True,
             rigids: Vec::new(),
+            effect_provenance: Default::default(),
             value: Vec::new(),
             body: Vec::new(),
         },
@@ -2147,6 +3916,7 @@ fn the_scoping_constraints_read_as_what_they_do() {
         level: 2,
         promised: Formula::var(0).xor(Formula::var(1)),
         rigids: Vec::new(),
+        effect_provenance: Default::default(),
         value: Vec::new(),
         body: Vec::new(),
     };
@@ -2173,31 +3943,41 @@ fn the_scoping_constraints_read_as_what_they_do() {
 /// error tests in `ir.rs` key on.
 #[test]
 fn the_pattern_complaints_say_what_was_written() {
-    let case = IrError::RefutableBinding {
-        found: ir::Refuter::Case("Some".to_string()),
+    let diagnose = |kind| {
+        ir::Error {
+            span: Span::generated(0, 1),
+            kind,
+        }
+        .diagnostic()
     };
-    assert_eq!(case.code(), "binding-can-fail");
+    let case = diagnose(IrError::RefutableBinding {
+        found: ir::Refuter::Case("Some".to_string()),
+    });
+    assert_eq!(case.code, "binding-can-fail");
     assert_eq!(
-        case.to_string(),
-        "this binding has to accept every value, but a value here might not be `#Some`"
+        case.title,
+        "this pattern can fail, but a binding must accept every value"
     );
+    assert_eq!(case.primary.message, "a value here might not be `#Some`");
+    assert_eq!(
+        case.help,
+        ["use `match` for this case or literal, or bind a name instead"]
+    );
+
     // A number is the same complaint made about the other kind of test, and
     // the same code: what went wrong is the binding either way.
-    let number = IrError::RefutableBinding {
+    let number = diagnose(IrError::RefutableBinding {
         found: ir::Refuter::Literal(ir::Literal::Natural(0)),
-    };
-    assert_eq!(number.code(), "binding-can-fail");
-    assert_eq!(
-        number.to_string(),
-        "this binding has to accept every value, but the number `0` makes it able to fail"
-    );
-    let string = IrError::RefutableBinding {
+    });
+    assert_eq!(number.code, "binding-can-fail");
+    assert_eq!(number.primary.message, "a value here might not equal `0n`");
+    let string = diagnose(IrError::RefutableBinding {
         found: ir::Refuter::Literal(ir::Literal::String("x".to_string())),
-    };
-    assert_eq!(string.code(), number.code());
+    });
+    assert_eq!(string.code, number.code);
     assert_eq!(
-        string.to_string(),
-        "this binding has to accept every value, but `String(\"x\")` makes it able to fail"
+        string.primary.message,
+        "a value here might not equal `\"x\"`"
     );
 
     assert_eq!(PatternError::UnreachableArm.code(), "unreachable-arm");
@@ -2264,9 +4044,10 @@ fn the_pattern_complaints_say_what_was_written() {
 
     let bound = IrError::DuplicateBinding {
         name: "x".to_string(),
+        previous: Span::generated(0, 1),
     };
     assert_eq!(bound.code(), "duplicate-binding");
-    assert_eq!(bound.to_string(), "this binds `x` twice");
+    assert_eq!(bound.to_string(), "this pattern binds `x` more than once");
 }
 
 /// Every shape a witness takes, rendered: numbers as themselves, tags bare
@@ -2399,10 +4180,72 @@ fn no_complaint_speaks_in_pattern_jargon() {
     }
 }
 
-/// The misplaced wildcard is one meaning worded five ways: every position's
-/// phrasing opens with what `_` stands for, every wording is distinct, all
-/// share one code, and each holds to the phrase rules like any diagnostic.
-/// The wording per position is pinned so a reworded meaning cannot slip by.
+#[test]
+fn parse_expectations_are_worded_for_their_source_context() {
+    let primary = Span::generated(8, 1);
+    let related = Span::generated(4, 1);
+    let error = |expected, kind| parse::Error {
+        span: primary,
+        kind: parse::ErrorKind::Expected {
+            expected,
+            found: parse::Found::Token,
+            related: Some(parse::Related {
+                span: related,
+                kind,
+            }),
+            context: None,
+        },
+    };
+    let said = |expected, kind| error(expected, kind).to_string();
+
+    assert_eq!(
+        said(
+            parse::Expected::Punctuation("}"),
+            parse::RelatedKind::Opener
+        ),
+        "add `}` to close this part"
+    );
+    assert_eq!(
+        said(parse::Expected::Value, parse::RelatedKind::Operator),
+        "write a value after this"
+    );
+    assert_eq!(
+        said(parse::Expected::Effect, parse::RelatedKind::Separator),
+        "write an effect name after this"
+    );
+
+    // A token after an unclosed delimiter belongs to the surrounding syntax;
+    // do not blame it as unusable. Name the insertion before it and retain the
+    // opener as the related source location.
+    for (mark, code) in [
+        (")", "expected-closing-parenthesis"),
+        ("}", "expected-closing-brace"),
+    ] {
+        let diagnostic = error(
+            parse::Expected::Punctuation(mark),
+            parse::RelatedKind::Opener,
+        )
+        .diagnostic();
+        assert_eq!(diagnostic.code, code);
+        assert_eq!(diagnostic.title, format!("add `{mark}` to close this part"));
+        assert_eq!(
+            diagnostic.primary.message,
+            format!("write `{mark}` before this")
+        );
+        assert_eq!(
+            diagnostic.related,
+            vec![ui::Annotation {
+                span: related,
+                message: "opened here".into(),
+            }]
+        );
+    }
+}
+
+/// The misplaced discard is one meaning worded five ways. Every wording is
+/// distinct, all share one code, and each holds to the phrase rules like any
+/// diagnostic. The wording per position is pinned so a reworded meaning cannot
+/// slip by.
 #[test]
 fn a_misplaced_wildcard_is_worded_for_its_position() {
     let span = Span::generated(0, 1);
@@ -2411,34 +4254,34 @@ fn a_misplaced_wildcard_is_worded_for_its_position() {
             span,
             kind: parse::ErrorKind::Wildcard { place },
         };
-        assert_eq!(error.code(), "misplaced-wildcard", "{place:?}");
+        assert_eq!(error.code(), "misplaced-discard", "{place:?}");
         error.to_string()
     };
 
     assert_eq!(
         said(parse::Place::Value),
-        "`_` stands for a value being thrown away, so it can't be used as a value here"
+        "`_` throws a value away, so it cannot be read here"
     );
     assert_eq!(
         said(parse::Place::Field),
-        "`_` stands for a value being thrown away, so it can't be a field's name"
+        "a field needs a name other than `_`"
     );
     assert_eq!(
         said(parse::Place::Pun),
-        "`_` stands for a value being thrown away, and a field written bare binds to its own name, so there is no name here to bind"
+        "write a field name, or give the field a value after `:`"
     );
     assert_eq!(
         said(parse::Place::Projection),
-        "`_` stands for a value being thrown away, so it can't name a field to read"
+        "write the name of the field to read"
     );
     assert_eq!(
         said(parse::Place::Type),
-        "`_` stands for a value being thrown away, so it can't be used as a type"
+        "this place needs a name rather than `_`"
     );
 
-    // One meaning, five phrasings: each opens with what `_` stands for, no
-    // two are the same sentence, and each is a placeable phrase — no leading
-    // capital, no trailing period — that names no machinery.
+    // One meaning, five phrasings: no two are the same sentence, and each is a
+    // placeable phrase — no leading capital, no trailing period — that names
+    // no machinery.
     let places = [
         parse::Place::Value,
         parse::Place::Field,
@@ -2449,10 +4292,6 @@ fn a_misplaced_wildcard_is_worded_for_its_position() {
     let wordings: HashSet<String> = places.iter().map(|place| said(*place)).collect();
     assert_eq!(wordings.len(), places.len(), "{wordings:?}");
     for wording in &wordings {
-        assert!(
-            wording.starts_with("`_` stands for a value being thrown away"),
-            "{wording}"
-        );
         assert!(!wording.ends_with('.'), "{wording}");
         assert!(!wording.to_lowercase().contains("wildcard"), "{wording}");
     }
@@ -2630,36 +4469,39 @@ fn the_effect_complaints_are_read_in_effects() {
             IrError::NotAnOperation {
                 name: "here".to_string(),
             },
-            "an operation must be a function: write `here : Nat -> ()`",
+            "`here` is not a function",
         ),
         (
-            IrError::ImpureOperation,
-            "an operation's signature must be plain; `+`, `..` and `when` belong in annotations",
+            IrError::ImpureOperation {
+                found: ir::OperationTypeProblem::OpenPart,
+            },
+            "an effect function must have one fixed function type",
         ),
         (
             IrError::OperationOnAlias {
                 effect: "Console".to_string(),
             },
-            "an alias names effects and declares no operations, so `!Console` has none to perform",
+            "effect alias `!Console` declares nothing to perform",
         ),
         (
             IrError::UnknownOperation {
                 effect: "Log".to_string(),
                 op: "writ".to_string(),
             },
-            "no operation `writ` on effect `!Log`",
+            "effect `!Log` does not declare `writ`",
         ),
         (
             IrError::PartialHandler {
                 effect: "Log".to_string(),
                 missing: vec!["flush".to_string()],
             },
-            "handling `!Log` needs an arm for `flush` too",
+            "this handler does not cover effect `!Log`",
         ),
         (
             IrError::DuplicateArm {
                 effect: "Log".to_string(),
                 selector: ir::OperationSelector::Named("write".to_string()),
+                previous: Span::generated(0, 1),
             },
             "duplicate arm for `!Log.write`",
         ),
@@ -2667,6 +4509,7 @@ fn the_effect_complaints_are_read_in_effects() {
             IrError::DuplicateArm {
                 effect: "Log".to_string(),
                 selector: ir::OperationSelector::Unnamed,
+                previous: Span::generated(0, 1),
             },
             "duplicate arm for `!Log`",
         ),
@@ -2674,34 +4517,82 @@ fn the_effect_complaints_are_read_in_effects() {
             IrError::DuplicateReturn {
                 previous: Span::generated(0, 1),
             },
-            "duplicate return arm",
+            "this handler has more than one `return` arm",
         ),
-        (IrError::RaiseOutsideArm, "raise belongs in a handler arm"),
+        (
+            IrError::RaiseOutsideArm,
+            "`raise` can be used only directly inside a handler arm",
+        ),
         (
             IrError::EffectsOutsideRow,
-            "effects belong on an arrow, or at a parameter a type uses as its own",
+            "effects cannot be used as a type by themselves",
         ),
         (
-            IrError::RaiseInFunction,
-            "raise may not be written inside a function: it answers the handler around it, and a function can outlive one",
+            IrError::RaiseInFunction {
+                function: Span::generated(0, 1),
+            },
+            "`raise` cannot cross a function boundary",
         ),
         (
             IrError::OpenDeclaredType {
                 shape: Shape::Effect,
             },
-            "a declared type must list its effects exactly; `..` and `when` belong in annotations",
+            "a declared type must list its effects exactly",
         ),
     ] {
         assert_eq!(kind.to_string(), message, "{}", kind.code());
     }
 
-    assert_eq!(
-        IrError::BareOperationUnavailable {
+    // Each reason an operation signature is rejected keeps the actionable
+    // detail in its label and repair rather than forcing reporters to split a
+    // headline apart.
+    let span = Span::generated(0, 1);
+    for (found, title, label, help) in [
+        (
+            ir::OperationTypeProblem::Effects,
+            "an effect function cannot declare effects of its own",
+            "calling it already performs this effect",
+            "remove this `+` effect list",
+        ),
+        (
+            ir::OperationTypeProblem::OpenPart,
+            "an effect function must have one fixed function type",
+            "this leaves part of the function's type undecided",
+            "write this part explicitly; use `..` and `when` in annotations instead",
+        ),
+        (
+            ir::OperationTypeProblem::Variable("a".to_string()),
+            "`'a` is not declared by this effect function",
+            "an effect function cannot introduce type variables",
+            "replace it with a fixed type or a declared type application",
+        ),
+    ] {
+        let diagnostic = ir::Error {
+            span,
+            kind: IrError::ImpureOperation { found },
+        }
+        .diagnostic();
+        assert_eq!(diagnostic.title, title);
+        assert_eq!(diagnostic.primary.message, label);
+        assert_eq!(diagnostic.help, [help]);
+    }
+
+    let empty = ir::Error {
+        span,
+        kind: IrError::BareOperationUnavailable {
             effect: "Nil".to_string(),
             suggestion: None,
-        }
-        .to_string(),
-        "empty effect `!Nil` has no operation"
+        },
+    }
+    .diagnostic();
+    assert_eq!(empty.title, "effect `!Nil` declares nothing to perform");
+    assert_eq!(
+        empty.primary.message,
+        "there is nothing in this effect to perform"
+    );
+    assert_eq!(
+        empty.help,
+        ["remove this use, or declare a function on the effect"]
     );
 
     for (kind, message) in [
@@ -2732,6 +4623,8 @@ fn the_effect_complaints_are_read_in_effects() {
             TypeError::RepeatedField {
                 shape: Shape::Effect,
                 field: "Log".to_string(),
+                introduction: None,
+                forbidden: None,
             },
             "`..` covers only the effects a type does not already name, and here it would have to cover `!Log`",
         ),
@@ -2746,24 +4639,32 @@ fn the_effect_complaints_are_read_in_effects() {
 #[test]
 fn a_partial_handler_names_every_operation_with_no_arm() {
     let named = |missing: &[&str]| {
-        IrError::PartialHandler {
-            effect: "Log".to_string(),
-            missing: missing.iter().map(|name| name.to_string()).collect(),
+        ir::Error {
+            span: Span::generated(0, 1),
+            kind: IrError::PartialHandler {
+                effect: "Log".to_string(),
+                missing: missing.iter().map(|name| name.to_string()).collect(),
+            },
         }
-        .to_string()
+        .diagnostic()
     };
-    assert_eq!(
-        named(&["flush"]),
-        "handling `!Log` needs an arm for `flush` too"
-    );
-    assert_eq!(
-        named(&["flush", "close"]),
-        "handling `!Log` needs an arm for `flush` and `close` too"
-    );
-    assert_eq!(
-        named(&["flush", "close", "sync"]),
-        "handling `!Log` needs an arm for `flush`, `close` and `sync` too"
-    );
+    for (missing, listed) in [
+        (&["flush"][..], "`flush`"),
+        (&["flush", "close"][..], "`flush` and `close`"),
+        (
+            &["flush", "close", "sync"][..],
+            "`flush`, `close` and `sync`",
+        ),
+    ] {
+        let diagnostic = named(missing);
+        let arms = if missing.len() == 1 {
+            format!("an arm for {listed}")
+        } else {
+            format!("{} arms: {listed}", missing.len())
+        };
+        assert_eq!(diagnostic.primary.message, format!("missing {arms}"));
+        assert_eq!(diagnostic.help, [format!("add {arms}")]);
+    }
 }
 
 /// The one rule that widens rather than equates reads as the widening it is,
@@ -2782,6 +4683,8 @@ fn the_performs_constraint_reads_as_a_widening() {
     let kind = ConstraintKind::Performs {
         performed: row(&["Log"], Rest::Closed),
         ambient: row(&["Log", "IO"], Rest::Var(3)),
+        effect_origins: Vec::new(),
+        ambient_label_spans: IndexMap::new(),
         inside: true,
     };
     assert_eq!(kind.code(), "performs");
@@ -2794,6 +4697,8 @@ fn the_performs_constraint_reads_as_a_widening() {
     let empty = ConstraintKind::Performs {
         performed: row(&[], Rest::Closed),
         ambient: row(&[], Rest::Closed),
+        effect_origins: Vec::new(),
+        ambient_label_spans: IndexMap::new(),
         inside: false,
     };
     assert_eq!(empty.to_string(), "| performed where | is allowed");
@@ -2817,6 +4722,150 @@ fn the_effect_tokens_print_as_they_were_written() {
     }
 }
 
+/// Duplicate lowering complaints retain both actionable locations: the repeat
+/// is primary and the occurrence that already stood is secondary. The variants
+/// below cover each source-level duplicate payload, including the return arm
+/// whose previous span predated the other redesigned variants.
+#[test]
+fn ir_duplicate_diagnostics_point_back_to_the_first_occurrence() {
+    let primary = Span::generated(12, 2);
+    let previous = Span::generated(3, 1);
+    let examples = [
+        (
+            IrError::DuplicateField {
+                name: "x".to_string(),
+                previous,
+            },
+            "field `x` is written more than once",
+            "written again here",
+            ui::FIRST_WRITTEN,
+        ),
+        (
+            IrError::DuplicateCase {
+                shape: Shape::Sum,
+                name: "Ready".to_string(),
+                previous,
+            },
+            "case `#Ready` is included more than once",
+            "included again here",
+            ui::FIRST_WRITTEN,
+        ),
+        (
+            IrError::DuplicateBinding {
+                name: "value".to_string(),
+                previous,
+            },
+            "this pattern binds `value` more than once",
+            "bound again here",
+            ui::FIRST_BINDING,
+        ),
+        (
+            IrError::DuplicateOperation {
+                name: "write".to_string(),
+                previous,
+            },
+            "effect function `write` is declared more than once",
+            "declared again here",
+            ui::FIRST_DECLARATION,
+        ),
+        (
+            IrError::DuplicateArm {
+                effect: "Log".to_string(),
+                selector: ir::OperationSelector::Named("write".to_string()),
+                previous,
+            },
+            "duplicate arm for `!Log.write`",
+            "handled again here",
+            ui::FIRST_ARM,
+        ),
+        (
+            IrError::DuplicateReturn { previous },
+            "this handler has more than one `return` arm",
+            "second return arm",
+            ui::FIRST_ARM,
+        ),
+    ];
+
+    for (kind, title, label, related_label) in examples {
+        let diagnostic = ir::Error {
+            span: primary,
+            kind,
+        }
+        .diagnostic();
+        assert_eq!(diagnostic.title, title);
+        assert_eq!(diagnostic.primary.span, primary);
+        assert_eq!(diagnostic.primary.message, label);
+        assert_eq!(
+            diagnostic.related,
+            [ui::Annotation {
+                span: previous,
+                message: related_label.to_string(),
+            }]
+        );
+    }
+}
+
+/// Headline, local explanation, and repair are separate parts of an IR
+/// diagnostic. Pin representative declaration, row, and operation failures so
+/// a reporter never has to split prose back apart to present them.
+#[test]
+fn redesigned_ir_diagnostics_expose_labels_and_help() {
+    let span = Span::generated(9, 1);
+    for (kind, title, label, help) in [
+        (
+            IrError::OpenDeclaredType { shape: Shape::Sum },
+            "a declared type must list its cases exactly",
+            "this leaves part of the declared type undecided",
+            "list every label, use one of the declaration's parameters, or move this type to an annotation",
+        ),
+        (
+            IrError::AbsentInClosed {
+                shape: Shape::Sum,
+                label: "Missing".to_string(),
+            },
+            "a type with no `..` already says `#Missing` is not there",
+            "this mark repeats what the closed type already says",
+            "remove this `\\` mark; a closed type already excludes labels it does not list",
+        ),
+        (
+            IrError::EffectsOutsideRow,
+            "effects cannot be used as a type by themselves",
+            "there is no function arrow here to carry these effects",
+            "write them after a function result, as in `Nat -> Nat + !Log`",
+        ),
+        (
+            IrError::NotAnOperation {
+                name: "write".to_string(),
+            },
+            "`write` is not a function",
+            "what an effect declares must be a function type",
+            "write a signature such as `write : Nat -> ()`",
+        ),
+    ] {
+        let diagnostic = ir::Error { span, kind }.diagnostic();
+        assert_eq!(diagnostic.title, title);
+        assert_eq!(diagnostic.primary.message, label);
+        assert_eq!(diagnostic.help, [help]);
+    }
+}
+
+/// Operation signatures are declarations of a fixed interface, but a hole in
+/// one has its own identity and headline rather than borrowing the declared-
+/// type complaint.
+#[test]
+fn a_hole_in_an_operation_has_its_own_code_and_title() {
+    let diagnostic = ir::Error {
+        span: Span::generated(5, 1),
+        kind: IrError::HoleInOperation,
+    }
+    .diagnostic();
+    assert_eq!(diagnostic.code, "hole-in-operation");
+    assert_eq!(
+        diagnostic.title,
+        "an effect function's type cannot contain `_`"
+    );
+}
+
 /// The two codes `ui::code` used to fold into the term namespace's. A reporter
 /// that wants to treat an undefined module differently from an undefined term
 /// should not have to re-inspect the variant to tell them apart, which is the
@@ -2824,17 +4873,19 @@ fn the_effect_tokens_print_as_they_were_written() {
 #[test]
 fn the_module_namespace_has_codes_of_its_own() {
     let undefined = IrError::Undefined {
+        name: "Math".to_string(),
         namespace: Namespace::Modules,
     };
     assert_eq!(undefined.code(), "undefined-module");
-    assert_eq!(undefined.to_string(), "undefined module");
+    assert_eq!(undefined.to_string(), "cannot find module `Math`");
 
     let duplicate = IrError::Duplicate {
+        name: "Math".to_string(),
         namespace: Namespace::Modules,
         previous: Span::generated(0, 1),
     };
     assert_eq!(duplicate.code(), "duplicate-module");
-    assert_eq!(duplicate.to_string(), "duplicate module");
+    assert_eq!(duplicate.to_string(), "`Math` is defined more than once");
 }
 
 /// The two things reading a bundle's files can refuse, worded and coded like
@@ -2842,25 +4893,45 @@ fn the_module_namespace_has_codes_of_its_own() {
 /// a reader told only "no file" still has to work out where one would have gone.
 #[test]
 fn the_bundle_phase_words_and_codes_its_refusals() {
-    let missing = BundleError::ModuleFileMissing {
-        beside: "Math.hc".to_string(),
-        inside: "Math/module.hc".to_string(),
+    let span = Span::generated(7, 4);
+    let missing = ruddy::bundle::Error {
+        span,
+        kind: BundleError::ModuleFileMissing {
+            beside: "Math.hc".to_string(),
+            inside: "Math/module.hc".to_string(),
+        },
     };
-    assert_eq!(missing.code(), "module-file-missing");
+    let diagnostic = missing.diagnostic();
+    assert_eq!(diagnostic.code, "module-file-missing");
+    assert_eq!(diagnostic.title, "this module needs a file");
+    assert_eq!(diagnostic.primary.span, span);
     assert_eq!(
-        missing.to_string(),
-        "this module has no file; create `Math.hc` or `Math/module.hc`"
+        diagnostic.primary.message,
+        "no file was found for this module"
     );
+    assert_eq!(diagnostic.help, ["create `Math.hc` or `Math/module.hc`"]);
+    assert_eq!(diagnostic.notes.len(), 1);
+    assert!(diagnostic.related.is_empty());
 
-    let ambiguous = BundleError::ModuleFileAmbiguous {
-        beside: "Math.hc".to_string(),
-        inside: "Math/module.hc".to_string(),
+    let ambiguous = ruddy::bundle::Error {
+        span,
+        kind: BundleError::ModuleFileAmbiguous {
+            beside: "Math.hc".to_string(),
+            inside: "Math/module.hc".to_string(),
+        },
     };
-    assert_eq!(ambiguous.code(), "module-file-ambiguous");
+    let diagnostic = ambiguous.diagnostic();
+    assert_eq!(diagnostic.code, "module-file-ambiguous");
+    assert_eq!(diagnostic.title, "this module has two possible files");
     assert_eq!(
-        ambiguous.to_string(),
-        "this module has two files; delete one of `Math.hc` or `Math/module.hc`"
+        diagnostic.primary.message,
+        "Ruddy cannot choose which file defines this module"
     );
+    assert_eq!(
+        diagnostic.help,
+        ["keep one of `Math.hc` or `Math/module.hc` and delete the other"]
+    );
+    assert_eq!(diagnostic.notes.len(), 1);
 }
 
 /// The tokens the module grammar added print as the lexemes they were written

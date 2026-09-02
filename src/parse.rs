@@ -212,13 +212,13 @@ pub enum ExprKind {
         value: Box<Expr>,
         body: Box<Expr>,
     },
-    /// `match <expr> with [|] <pattern> => <expr> (| <pattern> => <expr>)* end`
+    /// `match <expr> with | <pattern> => <expr> (| <pattern> => <expr>)* end`
     /// — dispatch on what a value is.
     ///
     /// The scrutinee is a full expression: it ends at the `with` of its own
     /// accord, because `with` begins no atom. Zero arms parse — the empty
-    /// match is the empty sum's eliminator — and the leading `|` before the
-    /// first arm is optional, the same convention a sum type keeps.
+    /// match is the empty sum's eliminator — while every arm in a nonempty
+    /// match begins with `|`, the first included.
     Match {
         scrutinee: Box<Expr>,
         arms: Vec<Arm>,
@@ -257,8 +257,8 @@ pub enum ExprKind {
     /// discharged.
     ///
     /// The `with`/`end`/`|` shape a [`Match`](ExprKind::Match) has, over arms
-    /// that name operations rather than patterns. Zero arms parse, and the
-    /// leading `|` is optional, the same two conventions a match keeps.
+    /// that name operations rather than patterns. Handler syntax retains its
+    /// optional leading `|` and permits zero arms independently of matches.
     Handle {
         body: Box<Expr>,
         arms: Vec<HandlerArm>,
@@ -714,15 +714,67 @@ pub struct Error {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
-    /// A token no production had a reading for, or input that ran out where
-    /// more was needed. The parser's one complaint before the wildcard got
-    /// its own.
-    Unexpected,
+    /// A construct or exact piece of syntax was required here.
+    Expected {
+        expected: Expected,
+        found: Found,
+        /// The delimiter, separator, operator, or last complete part which
+        /// created this expectation, when one is worth pointing out.
+        related: Option<Related>,
+        /// The construct that owns the missing syntax. Kept separately so an
+        /// error can point both to where the construct began and where its
+        /// missing closing word belongs.
+        context: Option<Related>,
+    },
     /// `_` written where nothing is being thrown away: an expression, a field
     /// name, a projection, a type. One meaning wherever it lands — `_` stands
     /// for a value being discarded, so it can never be *used* — with the
     /// position carried for the wording alone. See [`Place`].
     Wildcard { place: Place },
+}
+
+/// What the parser needed at the primary error span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Expected {
+    Statement,
+    Name,
+    Value,
+    Type,
+    Pattern,
+    Field,
+    Argument,
+    Clause,
+    Effect,
+    Case,
+    FunctionType,
+    EndOfClause,
+    /// The quoted JavaScript expression on the right of an `extern` `=`.
+    ExternTarget,
+    /// Exact reserved word, without source quotes.
+    Keyword(&'static str),
+    /// Exact punctuation, in its source spelling.
+    Punctuation(&'static str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Found {
+    Token,
+    End,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Related {
+    pub span: Span,
+    pub kind: RelatedKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelatedKind {
+    Opener,
+    Separator,
+    Operator,
+    Anchor,
+    Construct(&'static str),
 }
 
 /// Where a stray `_` was written, carried so [`ui`](crate::ui) can word the
@@ -761,6 +813,13 @@ struct Parser {
     toks: Vec<Token>,
     pos: usize,
     errors: Vec<Error>,
+    /// How far [`Parser::mismatched_closer`] has folded the token prefix into
+    /// `scan_open`, so error-dense input scans each token once rather than
+    /// rescanning the whole prefix at every error.
+    scan_pos: usize,
+    /// The still-open delimiters of the scanned prefix: the closer each one
+    /// needs and where it was opened.
+    scan_open: Vec<(&'static str, Span)>,
 }
 
 impl Path {
@@ -813,6 +872,8 @@ impl Parser {
             toks,
             pos: 0,
             errors: Vec::new(),
+            scan_pos: 0,
+            scan_open: Vec::new(),
         }
     }
 
@@ -830,6 +891,30 @@ impl Parser {
     }
 
     fn error(&mut self, span: Span, kind: ErrorKind) {
+        // Recursive productions commonly discover the same bad token while
+        // unwinding. Keep the first, most local diagnosis at a source point.
+        if let Some(previous) = self.errors.last_mut().filter(|error| error.span == span) {
+            // Prefer an equally local diagnosis which can also point back to
+            // the syntax that created the expectation.
+            let new_is_related = matches!(
+                kind,
+                ErrorKind::Expected {
+                    related: Some(_),
+                    ..
+                }
+            );
+            let old_is_related = matches!(
+                previous.kind,
+                ErrorKind::Expected {
+                    related: Some(_),
+                    ..
+                }
+            );
+            if new_is_related && !old_is_related {
+                previous.kind = kind;
+            }
+            return;
+        }
         self.errors.push(Error { span, kind });
     }
 
@@ -841,39 +926,79 @@ impl Parser {
         })
     }
 
-    /// Report the next token — or the end of input — as one that cannot be used
-    /// here, and fail. Every path that gives up goes through this: a production
-    /// that returned `None` quietly would drop the statement it was parsing and
-    /// leave the run looking successful.
-    ///
-    /// A `_` at the cursor gets the wildcard's own complaint rather than the
-    /// generic one, so every position it trips is told what the token means
-    /// rather than only that it did not fit. The positions with a better
-    /// wording — a field name, a pun, a projection, a type — say so before
-    /// falling through to here.
-    fn unexpected<T>(&mut self) -> Option<T> {
-        let (span, kind) = self.unexpected_error();
-        self.error(span, kind);
-        None
+    /// Report what was required at the cursor. A wildcard in value position
+    /// retains its more useful dedicated diagnosis.
+    fn expected<T>(&mut self, expected: Expected) -> Option<T> {
+        self.expected_related(expected, None)
     }
 
-    /// The non-generic decision behind [`unexpected`](Self::unexpected). Kept
-    /// separate so every return type shares the one wildcard/value branch.
-    fn unexpected_error(&self) -> (Span, ErrorKind) {
-        if self.at_wildcard() {
+    fn expected_related<T>(&mut self, expected: Expected, related: Option<Related>) -> Option<T> {
+        self.expected_with_context(expected, related, None)
+    }
+
+    fn expected_with_context<T>(
+        &mut self,
+        mut expected: Expected,
+        mut related: Option<Related>,
+        context: Option<Related>,
+    ) -> Option<T> {
+        // The lexer already explained this source text. Consume its placeholder
+        // and let the enclosing construct recover without inventing a second
+        // complaint about the gap it would otherwise leave behind.
+        if matches!(self.peek().map(|token| &token.tracked), Some(Kind::Invalid)) {
+            self.advance();
+            return None;
+        }
+        if self.at_wildcard() && matches!(expected, Expected::Value) {
             let span = self.peek().expect("the cursor is on a wildcard").span;
-            return (
+            self.error(
                 span,
                 ErrorKind::Wildcard {
                     place: Place::Value,
                 },
             );
+            return None;
         }
-        let span = match self.peek() {
-            Some(tok) => tok.span,
-            None => self.eof_span(),
-        };
-        (span, ErrorKind::Unexpected)
+        // Unless an inner keyword-delimited construct already owns the error,
+        // a closing mark of the wrong shape is more local than whatever the
+        // production inside it happened to be reading. Point to the innermost
+        // unmatched opener and name the mark which closes that opener instead
+        // of calling the stray `)` a bad field, or the stray `}` a bad value.
+        if context.is_none()
+            && let Some((closer, opener)) = self.mismatched_closer()
+        {
+            expected = Expected::Punctuation(closer);
+            related = Some(Related {
+                span: opener,
+                kind: RelatedKind::Opener,
+            });
+        }
+        let (span, found) = self.peek().map_or_else(
+            || (self.eof_span(), Found::End),
+            |token| (token.span, Found::Token),
+        );
+        self.error(
+            span,
+            ErrorKind::Expected {
+                expected,
+                found,
+                related,
+                context,
+            },
+        );
+        None
+    }
+
+    fn expected_at(&mut self, span: Span, expected: Expected, related: Option<Related>) {
+        self.error(
+            span,
+            ErrorKind::Expected {
+                expected,
+                found: Found::Token,
+                related,
+                context: None,
+            },
+        );
     }
 
     /// Whether the next token is the wildcard `_`.
@@ -897,9 +1022,68 @@ impl Parser {
     /// Consume the next token if it is the same variant as `want`, ignoring any
     /// payload. Records an error and consumes nothing on mismatch or EOF.
     fn eat(&mut self, want: &Kind) -> Option<Token> {
+        self.eat_related(want, None)
+    }
+
+    fn eat_related(&mut self, want: &Kind, related: Option<Related>) -> Option<Token> {
+        self.eat_with_context(want, related, None)
+    }
+
+    fn eat_with_context(
+        &mut self,
+        want: &Kind,
+        related: Option<Related>,
+        context: Option<Related>,
+    ) -> Option<Token> {
         match self.eat_if(want) {
             Some(tok) => Some(tok),
-            None => self.unexpected(),
+            None => self.expected_with_context(Self::expected_token(want), related, context),
+        }
+    }
+
+    fn expected_token(kind: &Kind) -> Expected {
+        match kind {
+            Kind::Let => Expected::Keyword("let"),
+            Kind::Extern => Expected::Keyword("extern"),
+            Kind::In => Expected::Keyword("in"),
+            Kind::Type => Expected::Keyword("type"),
+            Kind::End => Expected::Keyword("end"),
+            Kind::With => Expected::Keyword("with"),
+            Kind::Match => Expected::Keyword("match"),
+            Kind::If => Expected::Keyword("if"),
+            Kind::Then => Expected::Keyword("then"),
+            Kind::Else => Expected::Keyword("else"),
+            Kind::Fn => Expected::Keyword("fn"),
+            Kind::Effect => Expected::Keyword("effect"),
+            Kind::Handle => Expected::Keyword("handle"),
+            Kind::Raise => Expected::Keyword("raise"),
+            Kind::And => Expected::Keyword("and"),
+            Kind::Or => Expected::Keyword("or"),
+            Kind::Xor => Expected::Keyword("xor"),
+            Kind::Not => Expected::Keyword("not"),
+            Kind::Module => Expected::Keyword("module"),
+            Kind::Equal => Expected::Punctuation("="),
+            Kind::FatArrow => Expected::Punctuation("=>"),
+            Kind::Arrow => Expected::Punctuation("->"),
+            Kind::Colon => Expected::Punctuation(":"),
+            Kind::ColonColon => Expected::Punctuation("::"),
+            Kind::Comma => Expected::Punctuation(","),
+            Kind::Semicolon => Expected::Punctuation(";"),
+            Kind::Dot => Expected::Punctuation("."),
+            Kind::DotDot => Expected::Punctuation(".."),
+            Kind::NotEqual => Expected::Punctuation("!="),
+            Kind::Plus => Expected::Punctuation("+"),
+            Kind::Minus => Expected::Punctuation("-"),
+            Kind::Star => Expected::Punctuation("*"),
+            Kind::Slash => Expected::Punctuation("/"),
+            Kind::Backslash => Expected::Punctuation("\\"),
+            Kind::Pipe => Expected::Punctuation("|"),
+            Kind::PipeForward => Expected::Punctuation("|>"),
+            Kind::LeftBrace => Expected::Punctuation("{"),
+            Kind::RightBrace => Expected::Punctuation("}"),
+            Kind::LeftParen => Expected::Punctuation("("),
+            Kind::RightParen => Expected::Punctuation(")"),
+            _ => Expected::Name,
         }
     }
 
@@ -945,7 +1129,7 @@ impl Parser {
                 self.advance();
                 Some(name)
             }
-            None => self.unexpected(),
+            None => self.expected(Expected::Name),
         }
     }
 
@@ -967,7 +1151,7 @@ impl Parser {
                 self.advance();
                 Some(name)
             }
-            None => self.unexpected(),
+            None => self.expected(Expected::Field),
         }
     }
 
@@ -1037,6 +1221,14 @@ impl Parser {
                         self.advance();
                     }
                     self.recover();
+                    // At file level an `end` reached while recovering belongs
+                    // to the broken construct we just abandoned. Leaving it
+                    // behind would turn one mistake inside a match, if, or
+                    // module into a second complaint that merely says a new
+                    // definition cannot start with `end`.
+                    if closing.is_none() && self.at(&Kind::End) {
+                        self.advance();
+                    }
                 }
             }
         }
@@ -1050,7 +1242,7 @@ impl Parser {
             Some(Kind::Type) => self.type_stmt(),
             Some(Kind::Effect) => self.effect_stmt(),
             Some(Kind::Module) => self.module_stmt(),
-            _ => self.unexpected(),
+            _ => self.expected(Expected::Statement),
         }
     }
 
@@ -1067,9 +1259,20 @@ impl Parser {
         let mut span = kw.span.merge(name.span);
         let body = match self.eat_if(&Kind::Equal) {
             None => None,
-            Some(_) => {
+            Some(equal) => {
                 let stmts = self.stmts(Some(&Kind::End));
-                let close = self.eat(&Kind::End)?;
+                let anchor = stmts.last().map_or(equal.span, |statement| statement.span);
+                let close = self.eat_with_context(
+                    &Kind::End,
+                    Some(Related {
+                        span: anchor,
+                        kind: RelatedKind::Anchor,
+                    }),
+                    Some(Related {
+                        span: kw.span,
+                        kind: RelatedKind::Construct("module"),
+                    }),
+                )?;
                 span = span.merge(close.span);
                 Some(stmts)
             }
@@ -1081,6 +1284,135 @@ impl Parser {
     fn at(&self, want: &Kind) -> bool {
         self.peek()
             .is_some_and(|tok| std::mem::discriminant(&tok.tracked) == std::mem::discriminant(want))
+    }
+
+    /// If the token at the cursor closes a different delimiter than the
+    /// innermost one still open, return the closer that delimiter needs and
+    /// the opener to point back to. This is lexical on purpose: every parser
+    /// production agrees that `(` pairs with `)` and `{` with `}`, so the
+    /// useful diagnosis does not depend on which kind of value was inside.
+    fn mismatched_closer(&mut self) -> Option<(&'static str, Span)> {
+        let found = match self.peek().map(|token| &token.tracked) {
+            Some(Kind::RightParen) => ")",
+            Some(Kind::RightBrace) => "}",
+            _ => return None,
+        };
+        // Resume the scan where the previous error left it. Recovery can move
+        // the cursor backward past scanned tokens; then the prefix is folded
+        // again from the start.
+        if self.scan_pos > self.pos {
+            self.scan_pos = 0;
+            self.scan_open.clear();
+        }
+        for token in &self.toks[self.scan_pos..self.pos] {
+            let closer = match token.tracked {
+                Kind::LeftParen => {
+                    self.scan_open.push((")", token.span));
+                    continue;
+                }
+                Kind::LeftBrace => {
+                    self.scan_open.push(("}", token.span));
+                    continue;
+                }
+                Kind::RightParen => ")",
+                Kind::RightBrace => "}",
+                _ => continue,
+            };
+            if matches!(self.scan_open.last(), Some((needed, _)) if *needed == closer) {
+                self.scan_open.pop();
+            } else if let Some(matching) = self
+                .scan_open
+                .iter()
+                .rposition(|(needed, _)| *needed == closer)
+            {
+                // The closer pairs with an opener further out; the unclosed
+                // delimiters inside it were diagnosed when the parser stood on
+                // this closer, so they are spent along with the pair.
+                self.scan_open.truncate(matching);
+            } else {
+                // A closer with no opener of its own shape anywhere: it was
+                // diagnosed against the innermost opener when the parser stood
+                // on it. That opener is spent — leaving it here would make it
+                // hijack the diagnosis of every later stray closer.
+                self.scan_open.pop();
+            }
+        }
+        self.scan_pos = self.pos;
+        self.scan_open
+            .last()
+            .copied()
+            .filter(|(expected, _)| *expected != found)
+    }
+
+    /// A token which belongs after a complete expression rather than at the
+    /// start of one inside an unclosed delimiter. EOF belongs here because
+    /// both `()` and `{}` are complete values.
+    fn at_expr_boundary(&self) -> bool {
+        matches!(
+            self.peek().map(|token| &token.tracked),
+            None | Some(
+                Kind::In
+                    | Kind::With
+                    | Kind::Then
+                    | Kind::Else
+                    | Kind::End
+                    | Kind::Pipe
+                    | Kind::RightParen
+                    | Kind::RightBrace
+            )
+        )
+    }
+
+    /// A token which may follow a complete pattern. Empty parentheses and
+    /// braces are unit patterns, so meeting one of these immediately after an
+    /// opener means the closer is the missing part.
+    fn at_pattern_boundary(&self) -> bool {
+        matches!(
+            self.peek().map(|token| &token.tracked),
+            None | Some(Kind::Equal | Kind::FatArrow | Kind::RightParen | Kind::RightBrace)
+        )
+    }
+
+    /// A token which may follow a complete type. In particular, `=` ends an
+    /// annotation, so `: ( =` and `: { =` are incomplete `()` and `{}` rather
+    /// than annotations containing an unusable `=`.
+    fn at_type_boundary(&self) -> bool {
+        matches!(
+            self.peek().map(|token| &token.tracked),
+            None | Some(
+                Kind::Equal | Kind::Arrow | Kind::Plus | Kind::RightParen | Kind::RightBrace
+            )
+        ) || self.at_keyword("where")
+    }
+
+    /// The same boundary while a struct type is waiting for a field. A field
+    /// may itself be called `where`; only a completed type treats that spelling
+    /// as the start of its clause.
+    fn at_type_field_boundary(&self) -> bool {
+        !self.at_keyword("where") && self.at_type_boundary()
+    }
+
+    /// Report the matching close for a delimiter already consumed.
+    fn expected_closer<T>(&mut self, open: Span, close: &Kind) -> Option<T> {
+        self.expected_related(
+            Self::expected_token(close),
+            Some(Related {
+                span: open,
+                kind: RelatedKind::Opener,
+            }),
+        )
+    }
+
+    /// Consume a delimiter's matching close, reporting the opener if it is
+    /// missing or has the wrong shape.
+    fn close_delimiter(&mut self, open: Span, close: &Kind) -> Option<Token> {
+        self.eat_related(
+            close,
+            Some(Related {
+                span: open,
+                kind: RelatedKind::Opener,
+            }),
+        )
     }
 
     /// The `<module>::` prefix of a path at the cursor, consumed. Empty when
@@ -1163,7 +1495,13 @@ impl Parser {
                     break;
                 };
                 if !self.at_effect_label(self.pos) {
-                    self.error(plus.span, ErrorKind::Unexpected);
+                    self.expected_related::<()>(
+                        Expected::Effect,
+                        Some(Related {
+                            span: plus.span,
+                            kind: RelatedKind::Separator,
+                        }),
+                    );
                     break;
                 }
             }
@@ -1174,7 +1512,14 @@ impl Parser {
             let open = self.advance().expect("just peeked `{`");
             let mut fields = Vec::new();
             if matches!(self.peek().map(|t| &t.tracked), Some(Kind::RightBrace)) {
-                self.error(open.span, ErrorKind::Unexpected);
+                self.expected_at(
+                    open.span,
+                    Expected::Field,
+                    Some(Related {
+                        span: open.span,
+                        kind: RelatedKind::Opener,
+                    }),
+                );
             }
             while !matches!(
                 self.peek().map(|t| &t.tracked),
@@ -1185,21 +1530,27 @@ impl Parser {
                 let signature = self.type_expr()?;
                 span = span.merge(signature.span);
                 if !matches!(&signature.tracked, TypeKind::Arrow { .. }) {
-                    self.error(signature.span, ErrorKind::Unexpected);
+                    self.expected_at(signature.span, Expected::FunctionType, None);
                 }
                 fields.push((field, Box::new(signature)));
                 if self.eat_if(&Kind::Comma).is_none() {
                     break;
                 }
             }
-            let close = self.eat(&Kind::RightBrace)?;
+            let close = self.eat_related(
+                &Kind::RightBrace,
+                Some(Related {
+                    span: open.span,
+                    kind: RelatedKind::Opener,
+                }),
+            )?;
             span = span.merge(close.span);
             EffectBody::Named(fields)
         } else {
             let signature = self.type_expr()?;
             span = span.merge(signature.span);
             if !matches!(&signature.tracked, TypeKind::Arrow { .. }) {
-                self.error(signature.span, ErrorKind::Unexpected);
+                self.expected_at(signature.span, Expected::FunctionType, None);
             }
             EffectBody::Unnamed {
                 signature: Box::new(signature),
@@ -1272,7 +1623,13 @@ impl Parser {
         if self.at_grouped_extern_function() {
             let open = self.eat(&Kind::LeftParen).expect("just peeked `(`");
             let (mut ty, inner) = self.extern_type(false)?;
-            let close = self.eat(&Kind::RightParen)?;
+            let close = self.eat_related(
+                &Kind::RightParen,
+                Some(Related {
+                    span: open.span,
+                    kind: RelatedKind::Opener,
+                }),
+            )?;
             let span = open.span.merge(close.span);
             ty.span = span;
             return Some((ty, span.track(ExternTypeKind::Group(Box::new(inner)))));
@@ -1306,18 +1663,18 @@ impl Parser {
         let keyword = self.eat(&Kind::Fn).expect("the caller peeked `fn`");
         let open = self.eat(&Kind::LeftParen)?;
         let mut parameters = Vec::new();
-        if !self.at(&Kind::RightParen) {
+        if !self.at(&Kind::RightParen) && !self.at_type_boundary() {
             loop {
                 parameters.push(self.extern_type(false)?);
                 if self.eat_if(&Kind::Comma).is_none() {
                     break;
                 }
-                if self.at(&Kind::RightParen) {
+                if self.at(&Kind::RightParen) || self.at_type_boundary() {
                     break;
                 }
             }
         }
-        let close = self.eat(&Kind::RightParen)?;
+        let close = self.close_delimiter(open.span, &Kind::RightParen)?;
         self.eat(&Kind::Arrow)?;
         let (result_ty, result) = self.extern_type(false)?;
         let effects = match self.at_plus() {
@@ -1373,7 +1730,7 @@ impl Parser {
                 self.advance();
                 Some(target)
             }
-            None => self.unexpected(),
+            None => self.expected(Expected::ExternTarget),
         }
     }
 
@@ -1464,8 +1821,20 @@ impl Parser {
     /// `x |> f |> g` is `g (f x)`.
     fn expr(&mut self) -> Option<Expr> {
         let mut value = self.boolean_or()?;
-        while self.eat_if(&Kind::PipeForward).is_some() {
-            let function = self.boolean_or()?;
+        while let Some(operator) = self.eat_if(&Kind::PipeForward) {
+            let function = match self.boolean_or() {
+                Some(function) => function,
+                None => {
+                    self.expected_related::<Expr>(
+                        Expected::Value,
+                        Some(Related {
+                            span: operator.span,
+                            kind: RelatedKind::Operator,
+                        }),
+                    );
+                    return None;
+                }
+            };
             let span = value.span.merge(function.span);
             value = span.track(ExprKind::Pipe {
                 value: Box::new(value),
@@ -1514,8 +1883,20 @@ impl Parser {
             let Some((_, op)) = operators.iter().find(|(kind, _)| self.at(kind)) else {
                 return Some(left);
             };
-            self.advance();
-            let right = operand(self)?;
+            let operator = self.advance().expect("just found a binary operator");
+            let right = match operand(self) {
+                Some(right) => right,
+                None => {
+                    self.expected_related::<Expr>(
+                        Expected::Value,
+                        Some(Related {
+                            span: operator.span,
+                            kind: RelatedKind::Operator,
+                        }),
+                    );
+                    return None;
+                }
+            };
             let span = left.span.merge(right.span);
             left = span.track(ExprKind::Binary {
                 op: *op,
@@ -1532,7 +1913,19 @@ impl Parser {
             _ => return self.application(),
         };
         let start = self.advance().expect("just peeked a unary operator").span;
-        let value = self.unary()?;
+        let value = match self.unary() {
+            Some(value) => value,
+            None => {
+                self.expected_related::<Expr>(
+                    Expected::Value,
+                    Some(Related {
+                        span: start,
+                        kind: RelatedKind::Operator,
+                    }),
+                );
+                return None;
+            }
+        };
         Some(start.merge(value.span).track(ExprKind::Unary {
             op,
             value: Box::new(value),
@@ -1572,7 +1965,7 @@ impl Parser {
         let mut base = self.atom()?;
         loop {
             if matches!(self.peek().map(|tok| &tok.tracked), Some(Kind::DotDot)) {
-                return self.unexpected();
+                return self.expected(Expected::Field);
             }
             if self.eat_if(&Kind::Dot).is_none() {
                 return Some(base);
@@ -1591,7 +1984,7 @@ impl Parser {
                     }
                     _ => self.field_label()?,
                 },
-                None => return self.unexpected(),
+                None => return self.expected(Expected::Field),
             };
             let span = base.span.merge(field.span);
             base = span.track(ExprKind::Project {
@@ -1603,7 +1996,7 @@ impl Parser {
 
     fn atom(&mut self) -> Option<Expr> {
         let Some(tok) = self.peek() else {
-            return self.unexpected();
+            return self.expected(Expected::Value);
         };
         let span = tok.span;
         match &tok.tracked {
@@ -1663,7 +2056,7 @@ impl Parser {
                 Some(span.track(ExprKind::Real(value)))
             }
             // Nothing here begins an expression
-            _ => self.unexpected(),
+            _ => self.expected(Expected::Value),
         }
     }
 
@@ -1673,10 +2066,7 @@ impl Parser {
         let open = self.eat(&Kind::LeftBrace).expect("the caller peeked `{`");
         let mut fields = IndexMap::new();
 
-        while !matches!(
-            self.peek().map(|t| &t.tracked),
-            Some(Kind::RightBrace) | None
-        ) {
+        while !self.at_expr_boundary() {
             // `{ _: 1 }` names a field nothing: the complaint is the
             // wildcard's, worded for the field name it fails to be.
             if self.at_wildcard() {
@@ -1693,7 +2083,7 @@ impl Parser {
             }
         }
 
-        let close = self.eat(&Kind::RightBrace)?;
+        let close = self.close_delimiter(open.span, &Kind::RightBrace)?;
         let span = open.span.merge(close.span);
         Some(span.track(ExprKind::Struct(fields)))
     }
@@ -1755,19 +2145,22 @@ impl Parser {
         if let Some(close) = self.eat_if(&Kind::RightParen) {
             return Some(open.span.merge(close.span).track(ExprKind::Unit));
         }
+        if self.at_expr_boundary() {
+            return self.expected_closer(open.span, &Kind::RightParen);
+        }
         let first = self.expr()?;
         if self.eat_if(&Kind::Comma).is_none() {
-            let close = self.eat(&Kind::RightParen)?;
+            let close = self.close_delimiter(open.span, &Kind::RightParen)?;
             return Some(open.span.merge(close.span).track(first.tracked));
         }
         let mut elements = vec![first];
-        while !self.at(&Kind::RightParen) {
+        while !self.at(&Kind::RightParen) && !self.at_expr_boundary() {
             elements.push(self.expr()?);
             if self.eat_if(&Kind::Comma).is_none() {
                 break;
             }
         }
-        let close = self.eat(&Kind::RightParen)?;
+        let close = self.close_delimiter(open.span, &Kind::RightParen)?;
         Some(open.span.merge(close.span).track(ExprKind::Tuple(elements)))
     }
 
@@ -1814,14 +2207,12 @@ impl Parser {
         }))
     }
 
-    /// `match <expr> with [|] <arm> (| <arm>)* end`, where an arm is
+    /// `match <expr> with | <arm> (| <arm>)* end`, where an arm is
     /// `<pattern> => <expr>`.
     ///
-    /// The leading `|` is optional and a trailing one is refused, the same
-    /// convention a sum type keeps; a `|` between arms promises another arm,
-    /// so nothing after one is reported where the missing pattern was
-    /// expected. Zero arms parse — `match e with end` — and the leading `|`
-    /// with no arm after it does not: the bar promised one.
+    /// Every arm begins with `|`, including the first. A trailing one is
+    /// refused because it promises another arm. Zero arms still parse as
+    /// `match e with end`, with no `|` because there is no arm to introduce.
     ///
     /// Each arm's body is a full expression and extends as far right as it
     /// can; it ends in front of the next `|` or the `end` of its own accord,
@@ -1829,10 +2220,17 @@ impl Parser {
     fn match_expr(&mut self) -> Option<Expr> {
         let kw = self.advance().expect("the caller peeked `match`");
         let scrutinee = self.expr()?;
-        self.eat(&Kind::With)?;
+        let with = self.eat(&Kind::With)?;
         let mut arms = Vec::new();
-        let leading = self.eat_if(&Kind::Pipe).is_some();
-        if leading || !matches!(self.peek().map(|tok| &tok.tracked), Some(Kind::End)) {
+        if !matches!(self.peek().map(|tok| &tok.tracked), Some(Kind::End)) {
+            self.eat_with_context(
+                &Kind::Pipe,
+                None,
+                Some(Related {
+                    span: kw.span,
+                    kind: RelatedKind::Construct("match"),
+                }),
+            )?;
             loop {
                 let pattern = self.pattern()?;
                 self.eat(&Kind::FatArrow)?;
@@ -1843,7 +2241,18 @@ impl Parser {
                 }
             }
         }
-        let close = self.eat(&Kind::End)?;
+        let anchor = arms.last().map_or(with.span, |arm| arm.body.span);
+        let close = self.eat_with_context(
+            &Kind::End,
+            Some(Related {
+                span: anchor,
+                kind: RelatedKind::Anchor,
+            }),
+            Some(Related {
+                span: kw.span,
+                kind: RelatedKind::Construct("match"),
+            }),
+        )?;
         let span = kw.span.merge(close.span);
         Some(span.track(ExprKind::Match {
             scrutinee: Box::new(scrutinee),
@@ -1872,7 +2281,19 @@ impl Parser {
                 self.if_clause()?
             } else {
                 let alternative = self.expr()?;
-                let close = self.eat(&Kind::End)?.span;
+                let close = self
+                    .eat_with_context(
+                        &Kind::End,
+                        Some(Related {
+                            span: alternative.span,
+                            kind: RelatedKind::Anchor,
+                        }),
+                        Some(Related {
+                            span: kw.span,
+                            kind: RelatedKind::Construct("if"),
+                        }),
+                    )?
+                    .span;
                 (alternative, close)
             };
         let span = kw.span.merge(close);
@@ -1896,7 +2317,7 @@ impl Parser {
     fn handle_expr(&mut self) -> Option<Expr> {
         let kw = self.advance().expect("the caller peeked `handle`");
         let body = self.expr()?;
-        self.eat(&Kind::With)?;
+        let with = self.eat(&Kind::With)?;
         let mut arms = Vec::new();
         let leading = self.eat_if(&Kind::Pipe).is_some();
         if leading || !matches!(self.peek().map(|tok| &tok.tracked), Some(Kind::End)) {
@@ -1907,7 +2328,18 @@ impl Parser {
                 }
             }
         }
-        let close = self.eat(&Kind::End)?;
+        let anchor = arms.last().map_or(with.span, |arm| arm.body.span);
+        let close = self.eat_with_context(
+            &Kind::End,
+            Some(Related {
+                span: anchor,
+                kind: RelatedKind::Anchor,
+            }),
+            Some(Related {
+                span: kw.span,
+                kind: RelatedKind::Construct("handle"),
+            }),
+        )?;
         let span = kw.span.merge(close.span);
         Some(span.track(ExprKind::Handle {
             body: Box::new(body),
@@ -1929,7 +2361,7 @@ impl Parser {
             }
             false => {
                 let Some(effect) = self.effect() else {
-                    return self.unexpected();
+                    return self.expected(Expected::Effect);
                 };
                 let at = effect.span();
                 let selector = if self.eat_if(&Kind::Dot).is_some() {
@@ -1953,13 +2385,13 @@ impl Parser {
     /// plain names.
     fn binder(&mut self) -> Option<Arg> {
         let Some(tok) = self.peek() else {
-            return self.unexpected();
+            return self.expected(Expected::Argument);
         };
         let span = tok.span;
         let kind = match &tok.tracked {
             Kind::Identifier(name) => ArgKind::Name(name.clone()),
             Kind::Underscore => ArgKind::Wildcard,
-            _ => return self.unexpected(),
+            _ => return self.expected(Expected::Argument),
         };
         self.advance();
         Some(span.track(kind))
@@ -2003,7 +2435,7 @@ impl Parser {
     /// pattern, or a tag pattern carrying another. See [`PatternKind`].
     fn pattern(&mut self) -> Option<Pattern> {
         let Some(tok) = self.peek() else {
-            return self.unexpected();
+            return self.expected(Expected::Pattern);
         };
         let span = tok.span;
         match &tok.tracked {
@@ -2060,7 +2492,7 @@ impl Parser {
             Kind::LeftParen => self.paren_pattern(),
             // Nothing here begins a pattern — an arm written `=> 1` is missing
             // one, and this is where it is told so.
-            _ => self.unexpected(),
+            _ => self.expected(Expected::Pattern),
         }
     }
 
@@ -2077,10 +2509,7 @@ impl Parser {
         let mut fields = IndexMap::new();
         let mut rest = None;
 
-        while !matches!(
-            self.peek().map(|t| &t.tracked),
-            Some(Kind::RightBrace) | None
-        ) {
+        while !self.at_pattern_boundary() {
             if let Some(dots) = self.eat_if(&Kind::DotDot) {
                 rest = Some(dots.span);
                 // Nothing but the brace may follow: the `eat` below reports
@@ -2123,7 +2552,7 @@ impl Parser {
             }
         }
 
-        let close = self.eat(&Kind::RightBrace)?;
+        let close = self.close_delimiter(open.span, &Kind::RightBrace)?;
         let span = open.span.merge(close.span);
         Some(span.track(PatternKind::Struct { fields, rest }))
     }
@@ -2135,19 +2564,22 @@ impl Parser {
         if let Some(close) = self.eat_if(&Kind::RightParen) {
             return Some(open.span.merge(close.span).track(PatternKind::Unit));
         }
+        if self.at_pattern_boundary() {
+            return self.expected_closer(open.span, &Kind::RightParen);
+        }
         let first = self.pattern()?;
         if self.eat_if(&Kind::Comma).is_none() {
-            let close = self.eat(&Kind::RightParen)?;
+            let close = self.close_delimiter(open.span, &Kind::RightParen)?;
             return Some(open.span.merge(close.span).track(first.tracked));
         }
         let mut elements = vec![first];
-        while !self.at(&Kind::RightParen) {
+        while !self.at(&Kind::RightParen) && !self.at_pattern_boundary() {
             elements.push(self.pattern()?);
             if self.eat_if(&Kind::Comma).is_none() {
                 break;
             }
         }
-        let close = self.eat(&Kind::RightParen)?;
+        let close = self.close_delimiter(open.span, &Kind::RightParen)?;
         Some(
             open.span
                 .merge(close.span)
@@ -2173,7 +2605,7 @@ impl Parser {
         let arrow = self.eat(&Kind::FatArrow)?;
         if args.is_empty() {
             // `fn => ...` takes nothing; reject it at the arrow.
-            self.error(arrow.span, ErrorKind::Unexpected);
+            self.expected_at(arrow.span, Expected::Argument, None);
             return None;
         }
         Some(args)
@@ -2323,7 +2755,7 @@ impl Parser {
             ),
         };
         if chained {
-            return self.unexpected();
+            return self.expected(Expected::EndOfClause);
         }
         Some(span.track(kind))
     }
@@ -2368,7 +2800,13 @@ impl Parser {
             // Inside parentheses nothing follows the clause but the `)`, so a
             // chain written there is a chain however the annotation ends.
             let inner = self.clause(false)?;
-            let close = self.eat(&Kind::RightParen)?;
+            let close = self.eat_related(
+                &Kind::RightParen,
+                Some(Related {
+                    span: open.span,
+                    kind: RelatedKind::Opener,
+                }),
+            )?;
             return Some(open.span.merge(close.span).track(inner.tracked));
         }
         if self.at_wildcard() {
@@ -2378,7 +2816,7 @@ impl Parser {
         // a bare name here would be a type, which a formula has nothing to say
         // about.
         let Some(name) = self.variable() else {
-            return self.unexpected();
+            return self.expected(Expected::Clause);
         };
         Some(name.span.track(ClauseKind::Name(name.tracked)))
     }
@@ -2411,14 +2849,20 @@ impl Parser {
                 // A presence is a variable and nothing else: no declaration
                 // binds one, and no parameter may stand for one.
                 let Some(name) = self.variable() else {
-                    return self.unexpected();
+                    return self.expected(Expected::Name);
                 };
                 span = span.merge(name.span);
                 Some(name)
             }
         };
         if parens {
-            let close = self.eat(&Kind::RightParen)?;
+            let close = self.eat_related(
+                &Kind::RightParen,
+                open.as_ref().map(|open| Related {
+                    span: open.span,
+                    kind: RelatedKind::Opener,
+                }),
+            )?;
             span = span.merge(close.span);
         }
         Some(When { span, name })
@@ -2454,7 +2898,7 @@ impl Parser {
         let from = self.type_sum()?;
         if self.eat_if(&Kind::Arrow).is_none() {
             if outermost && self.at_plus() {
-                return self.unexpected();
+                return self.expected(Expected::FunctionType);
             }
             return Some(from);
         }
@@ -2504,7 +2948,14 @@ impl Parser {
         // mark is reported where it was written rather than left to whatever
         // was going to be read next.
         if row.span == plus.span {
-            self.error(plus.span, ErrorKind::Unexpected);
+            self.expected_at(
+                plus.span,
+                Expected::Effect,
+                Some(Related {
+                    span: plus.span,
+                    kind: RelatedKind::Operator,
+                }),
+            );
             return None;
         }
         Some(row)
@@ -2567,7 +3018,13 @@ impl Parser {
                 // A `\` promises an effect, so anything else after it is
                 // reported — the rule the sum's own absent case keeps.
                 let Some(name) = self.effect() else {
-                    return self.unexpected();
+                    return self.expected_related(
+                        Expected::Effect,
+                        Some(Related {
+                            span: slash.span,
+                            kind: RelatedKind::Operator,
+                        }),
+                    );
                 };
                 span = span.merge(name.span());
                 // The `\` rides on the key's own span, so a complaint about the
@@ -2581,7 +3038,13 @@ impl Parser {
             } else {
                 let Some(name) = self.effect() else {
                     if let Some(mark) = separator {
-                        self.error(mark, ErrorKind::Unexpected);
+                        self.expected_related::<()>(
+                            Expected::Effect,
+                            Some(Related {
+                                span: mark,
+                                kind: RelatedKind::Separator,
+                            }),
+                        );
                     }
                     break;
                 };
@@ -2668,7 +3131,13 @@ impl Parser {
                 // whatever follows but a `|` is somebody else's token to
                 // refuse, exactly as it is after a written case's payload.
                 let Some(name) = self.tag() else {
-                    return self.unexpected();
+                    return self.expected_related(
+                        Expected::Case,
+                        Some(Related {
+                            span: slash.span,
+                            kind: RelatedKind::Operator,
+                        }),
+                    );
                 };
                 span = span.merge(name.span);
                 // The key's span is the whole `\#Name`, for the reason a
@@ -2687,7 +3156,13 @@ impl Parser {
                 // still there to be checked.
                 let Some(name) = self.tag() else {
                     if let Some(bar) = separator {
-                        self.error(bar, ErrorKind::Unexpected);
+                        self.expected_related::<()>(
+                            Expected::Case,
+                            Some(Related {
+                                span: bar,
+                                kind: RelatedKind::Separator,
+                            }),
+                        );
                     }
                     break;
                 };
@@ -2795,7 +3270,7 @@ impl Parser {
     /// argument without parentheses.
     fn type_atom(&mut self) -> Option<Type> {
         let Some(tok) = self.peek() else {
-            return self.unexpected();
+            return self.expected(Expected::Type);
         };
         let span = tok.span;
         match &tok.tracked {
@@ -2824,7 +3299,7 @@ impl Parser {
             }
             // As in [`atom`](Self::atom): a type position with no type in it is
             // reported, so `let x : = ()` cannot pass for `let x : () = ()`.
-            _ => self.unexpected(),
+            _ => self.expected(Expected::Type),
         }
     }
 
@@ -2841,10 +3316,7 @@ impl Parser {
         let mut fields = IndexMap::new();
         let mut tail = None;
 
-        while !matches!(
-            self.peek().map(|t| &t.tracked),
-            Some(Kind::RightBrace) | None
-        ) {
+        while !self.at_type_field_boundary() {
             if let Some(dots) = self.eat_if(&Kind::DotDot) {
                 let of = self.rest_name();
                 let span = of.span().map_or(dots.span, |name| dots.span.merge(name));
@@ -2878,7 +3350,7 @@ impl Parser {
             }
         }
 
-        let close = self.eat(&Kind::RightBrace)?;
+        let close = self.close_delimiter(open.span, &Kind::RightBrace)?;
         let span = open.span.merge(close.span);
         Some(span.track(TypeKind::Struct { fields, tail }))
     }
@@ -2890,19 +3362,22 @@ impl Parser {
         if let Some(close) = self.eat_if(&Kind::RightParen) {
             return Some(open.span.merge(close.span).track(TypeKind::Unit));
         }
+        if self.at_type_boundary() {
+            return self.expected_closer(open.span, &Kind::RightParen);
+        }
         let first = self.type_expr()?;
         if self.eat_if(&Kind::Comma).is_none() {
-            let close = self.eat(&Kind::RightParen)?;
+            let close = self.close_delimiter(open.span, &Kind::RightParen)?;
             return Some(open.span.merge(close.span).track(first.tracked));
         }
         let mut elements = vec![first];
-        while !self.at(&Kind::RightParen) {
+        while !self.at(&Kind::RightParen) && !self.at_type_boundary() {
             elements.push(self.type_expr()?);
             if self.eat_if(&Kind::Comma).is_none() {
                 break;
             }
         }
-        let close = self.eat(&Kind::RightParen)?;
+        let close = self.close_delimiter(open.span, &Kind::RightParen)?;
         Some(open.span.merge(close.span).track(TypeKind::Tuple(elements)))
     }
 
@@ -2972,7 +3447,13 @@ mod tests {
         let output = parse_source(source);
         assert!(output.stmts.is_empty());
         assert_eq!(output.errors.len(), 1);
-        assert_eq!(output.errors[0].kind, ErrorKind::Unexpected);
+        assert!(matches!(
+            output.errors[0].kind,
+            ErrorKind::Expected {
+                expected: Expected::ExternTarget,
+                ..
+            }
+        ));
         assert_eq!(output.errors[0].span.start, source.find("console").unwrap());
     }
 }

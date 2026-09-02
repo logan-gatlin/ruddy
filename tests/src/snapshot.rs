@@ -8,12 +8,18 @@ use ruddy_debug::{
     snapshot::{ROOT, compile, compile_at, guard, install_hook},
     stage::REGISTRY,
     wire::{
-        CompileRequest, DependencyDetail, DependencySpec, FileSpec, Loc, Node, Snapshot, Stage,
-        Status, StdConfig, View,
+        CompileRequest, DependencyDetail, DependencySpec, FileSpec, InferenceCause, Loc, Node,
+        Snapshot, Stage, Status, StdConfig, View,
     },
 };
 
 const DEMO: &str = include_str!("../../demo.hc");
+
+fn clean_demo() -> &'static str {
+    DEMO.split_once("\nlet bad = @")
+        .expect("the demo's deliberate frontend errors")
+        .0
+}
 
 /// A bundle of three files, one per shape a module's body can come from: an
 /// inline module, a module beside its parent, and a module inside the directory
@@ -152,7 +158,11 @@ fn dependency_paths_without_a_scratch_root_are_recoverable() {
         1,
     );
     assert_eq!(snapshot.diagnostics[0].stage, "dependencies");
-    assert_eq!(snapshot.diagnostics[0].code, "missing-scratch-root");
+    assert_eq!(snapshot.diagnostics[0].code, "dependency-workspace-missing");
+    assert_eq!(
+        snapshot.diagnostics[0].help,
+        ["open the debugger with a scratch directory before adding dependencies"]
+    );
     assert_eq!(
         snapshot
             .stages
@@ -160,7 +170,7 @@ fn dependency_paths_without_a_scratch_root_are_recoverable() {
             .find(|stage| stage.id == "ir")
             .unwrap()
             .status,
-        Status::Partial
+        Status::Skipped
     );
     assert_eq!(
         snapshot
@@ -224,7 +234,7 @@ fn custom_standard_library_is_source_visible_rendered_and_sandboxed() {
     };
     let failed = compile_at(&escaped, 2, &scratch);
     assert!(failed.diagnostics.iter().any(|diagnostic| {
-        diagnostic.stage == "dependencies" && diagnostic.message.contains("escapes sandbox")
+        diagnostic.stage == "dependencies" && diagnostic.code == "project-outside-workspace"
     }));
 }
 
@@ -300,9 +310,7 @@ fn installed_standard_library_child() {
     };
     let rejected = compile_at(&custom, 2, &scratch);
     assert!(rejected.diagnostics.iter().any(|diagnostic| {
-        diagnostic.stage == "dependencies"
-            && (diagnostic.message.contains("absolute dependency paths")
-                || diagnostic.message.contains("escapes sandbox"))
+        diagnostic.stage == "dependencies" && diagnostic.code == "project-outside-workspace"
     }));
 }
 
@@ -379,6 +387,24 @@ fn saved_dependency_projects_supply_artifact_identity_and_gate_lir() {
     fs::write(base.join("main.hc"), "let bad : Nat = fn x => x\n").unwrap();
     let failed = compile_at(&request, 1, scratch.path());
     assert_eq!(failed.diagnostics[0].stage, "dependencies");
+    assert_eq!(failed.diagnostics[0].code, "type-mismatch");
+    assert!(
+        failed.diagnostics[0]
+            .notes
+            .iter()
+            .any(|note| note.contains("dependency `base`")),
+        "{:#?}",
+        failed.diagnostics[0]
+    );
+    let errors = &failed
+        .stages
+        .iter()
+        .find(|stage| stage.id == "errors")
+        .expect("the Errors tab renders the dependency report")
+        .debug;
+    assert!(errors.contains("[type-mismatch]"), "{errors}");
+    assert!(errors.contains("let bad : Nat = fn x => x"), "{errors}");
+    assert!(errors.contains("dependency `base`"), "{errors}");
     assert_eq!(
         failed
             .stages
@@ -396,6 +422,21 @@ fn saved_dependency_projects_supply_artifact_identity_and_gate_lir() {
             .unwrap()
             .status,
         Status::Skipped
+    );
+
+    fs::write(
+        base.join("main.hc"),
+        "let one : Nat = false\nlet two : String = 2n\n",
+    )
+    .unwrap();
+    let multiple = compile_at(&request, 2, scratch.path());
+    assert_eq!(multiple.diagnostics.len(), 2, "{:#?}", multiple.diagnostics);
+    assert!(
+        multiple
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.stage == "dependencies"
+                && diagnostic.code == "type-mismatch")
     );
 }
 
@@ -540,13 +581,17 @@ fn failed_graph_validation_is_reported_for_the_dependency_build() {
     ]));
 
     let snapshot = compile_at(&request, 1, scratch.path());
-    assert_eq!(
-        snapshot
-            .diagnostics
+    let unavailable: Vec<_> = snapshot
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "project-unavailable")
+        .collect();
+    assert_eq!(unavailable.len(), 1);
+    assert!(
+        unavailable[0]
+            .notes
             .iter()
-            .filter(|diagnostic| diagnostic.code == "dependency-build")
-            .count(),
-        1
+            .any(|note| note.contains("dependency `missing`"))
     );
 }
 
@@ -574,10 +619,12 @@ fn dependency_roots_cannot_be_absolute_or_escape_the_scratch_folder() {
             &scratch,
         );
         assert!(
-            snapshot
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "dependency-build"),
+            snapshot.diagnostics.iter().any(|diagnostic| {
+                matches!(
+                    diagnostic.code,
+                    "project-root-outside-workspace" | "project-outside-workspace"
+                )
+            }),
             "{:#?}",
             snapshot.diagnostics
         );
@@ -605,13 +652,16 @@ fn symlinked_dependency_manifests_are_confined_to_the_scratch_folder() {
         snapshot
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.code == "dependency-build"),
+            .any(|diagnostic| diagnostic.code == "manifest-outside-workspace"),
         "{:#?}",
         snapshot.diagnostics
     );
     let error =
         ruddy_cli::compile_sandboxed_dependency_graph([("base", &base)], &scratch).unwrap_err();
-    assert!(error.to_string().contains("escapes sandbox"), "{error}");
+    assert!(
+        error.to_string().contains("outside the debugger workspace"),
+        "{error}"
+    );
 
     fs::remove_file(base.join("Ruddy.toml")).unwrap();
     let shared = scratch.join("base-manifest.toml");
@@ -656,7 +706,7 @@ fn symlinked_dependency_modules_cannot_escape_the_scratch_folder() {
         snapshot
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.code == "dependency-build"),
+            .any(|diagnostic| diagnostic.code == "module-file-missing"),
         "{:#?}",
         snapshot.diagnostics
     );
@@ -741,6 +791,7 @@ fn every_stage_reports_on_the_demo() {
     assert_eq!(
         ids,
         [
+            "errors",
             "tokens",
             "dependencies",
             "ast",
@@ -762,11 +813,32 @@ fn every_stage_reports_on_the_demo() {
     assert_eq!(snapshot.revision, 3);
     assert!(snapshot.panic.is_none());
     for stage in &snapshot.stages {
-        // The demo ends in three deliberate mistakes, and LIR runs on accepted
-        // programs alone — so its tab is the one that reports `Skipped` here,
-        // with a summary saying so and no rows behind it.
-        if matches!(stage.id, "lir" | "artifact" | "linked" | "js") {
-            assert_eq!(stage.status, Status::Skipped);
+        if stage.id == "errors" {
+            assert_eq!(stage.status, Status::Partial);
+            assert!(stage.text.as_deref().is_some_and(|text| !text.is_empty()));
+            assert!(!stage.summary.is_empty());
+            continue;
+        }
+        // The demo contains deliberate syntax mistakes. Tokens and the
+        // recovery AST remain inspectable, but no semantic stage receives that
+        // recovery tree; every stage that depends on lowering reports a skip.
+        if matches!(
+            stage.id,
+            "externs"
+                | "ir"
+                | "constraints"
+                | "solve"
+                | "types"
+                | "presence"
+                | "patterns"
+                | "lir"
+                | "artifact"
+                | "linked"
+                | "js"
+                | "symbols"
+                | "types-ir"
+        ) {
+            assert_eq!(stage.status, Status::Skipped, "{}", stage.id);
             assert!(stage.nodes.is_empty(), "a skipped stage rendered rows");
             assert!(!stage.summary.is_empty(), "{} counted nothing", stage.id);
             continue;
@@ -788,6 +860,7 @@ fn every_stage_reports_on_the_demo() {
     assert_eq!(
         titles,
         [
+            "Errors",
             "Tokens",
             "Dependencies",
             "AST",
@@ -870,7 +943,8 @@ fn every_span_lies_inside_the_source() {
 /// without the span has `Node::owner` for it.
 #[test]
 fn a_node_naming_a_symbol_is_spanned_at_the_name() {
-    let snapshot = bundle(&[(ROOT, DEMO)]);
+    let source = clean_demo();
+    let snapshot = bundle(&[(ROOT, source)]);
     let symbols = snapshot
         .stages
         .iter()
@@ -904,7 +978,7 @@ fn a_node_naming_a_symbol_is_spanned_at_the_name() {
             // name it heads: a type parameter is written `'a` and named `a`,
             // the way a tag's `#` and an effect's `!` are no part of theirs.
             assert_eq!(
-                DEMO[start..end].trim_start_matches(['\'', '#', '!']),
+                source[start..end].trim_start_matches(['\'', '#', '!']),
                 *name,
                 "{}: {} claims to name {name} at {start}..{end}",
                 stage.id,
@@ -942,8 +1016,17 @@ fn diagnostics_are_reported_in_source_order() {
         .iter()
         .map(|diagnostic| diagnostic.code)
         .collect();
-    assert!(codes.contains(&"undefined-term"), "{codes:?}");
-    assert!(codes.contains(&"unrecognized-character"), "{codes:?}");
+    assert_eq!(
+        codes,
+        [
+            "character-not-used",
+            "number-joined-to-name",
+            "expected-name"
+        ]
+    );
+    // The demo also contains semantic mistakes, but frontend gating keeps
+    // those recovery trees out of lowering and therefore out of this list.
+    assert!(!codes.contains(&"undefined-term"), "{codes:?}");
 
     // Where the reader would look for them: the file first, then the offset
     // inside it, since a bundle's diagnostics come from more than one file.
@@ -992,7 +1075,13 @@ fn a_natural_reaches_every_stage() {
         assert_eq!(node.symbol, None, "{id}");
     }
 
-    let tokens = nodes(&snapshot.stages[0]);
+    let tokens = nodes(
+        snapshot
+            .stages
+            .iter()
+            .find(|stage| stage.id == "tokens")
+            .expect("the tokens stage"),
+    );
     let literal = tokens
         .iter()
         .find(|node| node.label == "Natural" && node.text == "42n")
@@ -1012,10 +1101,16 @@ fn a_numeric_field_is_coloured_as_a_number() {
     let snapshot = snapshot("let first = fn p => p.0\n");
     assert!(snapshot.diagnostics.is_empty());
 
-    let field = nodes(&snapshot.stages[0])
-        .into_iter()
-        .find(|node| node.label == "NumericField" && node.text == "0")
-        .expect("the tokens tab renders the numeric field");
+    let field = nodes(
+        snapshot
+            .stages
+            .iter()
+            .find(|stage| stage.id == "tokens")
+            .expect("the tokens stage"),
+    )
+    .into_iter()
+    .find(|node| node.label == "NumericField" && node.text == "0")
+    .expect("the tokens tab renders the numeric field");
     let class = field
         .fields
         .iter()
@@ -1202,18 +1297,80 @@ fn a_bad_literal_is_a_diagnostic_of_its_own() {
             .map(|diagnostic| diagnostic.code)
             .collect::<Vec<_>>()
     };
-    // The lexer emits no token for a literal it rejected, so the `let` is left
-    // with no body — which the parser reports where the body would have gone,
-    // just before the characters the lexer is complaining about, rather than
-    // standing a `()` in for it.
-    assert_eq!(
-        codes("let n = 1x\n"),
-        ["unexpected-token", "malformed-natural"]
-    );
+    // An invalid lexeme is retained as one invalid token. The parser consumes
+    // that placeholder without inventing a second complaint about the same
+    // bytes, and semantic phases never inspect its recovery tree.
+    assert_eq!(codes("let n = 1x\n"), ["number-joined-to-name"]);
     assert_eq!(
         codes(&format!("let n = {}0n\n", u64::MAX)),
-        ["unexpected-token", "natural-too-large"]
+        ["whole-number-too-large"]
     );
+}
+
+#[test]
+fn a_missing_match_end_points_to_the_match_without_repeating_the_fix() {
+    let source = "let _ = match 1 with | f => ()\n\nlet a = 1";
+    let snapshot = snapshot(source);
+    let [diagnostic] = snapshot.diagnostics.as_slice() else {
+        panic!("expected one diagnostic: {:#?}", snapshot.diagnostics);
+    };
+    assert_eq!(diagnostic.code, "expected-end");
+    assert_eq!(diagnostic.message, "this match needs a closing `end`");
+    assert_eq!(diagnostic.label, "write `end` before this");
+    assert_eq!(
+        diagnostic.span.unwrap().range[0],
+        source.rfind("let").unwrap()
+    );
+    let [start] = diagnostic.related.as_slice() else {
+        panic!("expected only the match location: {diagnostic:#?}");
+    };
+    let match_at = source.find("match").unwrap();
+    assert_eq!(start.span.unwrap().range, [match_at, match_at + 5]);
+    assert_eq!(start.message, "this match starts here");
+}
+
+#[test]
+fn frontend_errors_keep_reader_advice_and_skip_semantic_debugger_stages() {
+    let snapshot = snapshot("let n = 1x\n");
+    let [diagnostic] = snapshot.diagnostics.as_slice() else {
+        panic!("expected one diagnostic: {:#?}", snapshot.diagnostics);
+    };
+    assert_eq!(diagnostic.stage, "lex");
+    assert_eq!(diagnostic.code, "number-joined-to-name");
+    assert!(
+        diagnostic
+            .message
+            .starts_with("a number cannot run directly into a name"),
+        "{}",
+        diagnostic.message
+    );
+    assert_eq!(diagnostic.label, "the number and name are joined");
+    assert_eq!(
+        diagnostic.help,
+        ["add a space, or start the whole name with a letter"]
+    );
+
+    for id in [
+        "ir",
+        "constraints",
+        "solve",
+        "types",
+        "presence",
+        "patterns",
+        "lir",
+        "artifact",
+        "linked",
+        "js",
+        "symbols",
+        "types-ir",
+    ] {
+        let stage = snapshot
+            .stages
+            .iter()
+            .find(|stage| stage.id == id)
+            .unwrap_or_else(|| panic!("{id} is registered"));
+        assert_eq!(stage.status, Status::Skipped, "{id}: {stage:#?}");
+    }
 }
 
 /// A repeat is only legible next to what it repeats, so it has to arrive as
@@ -1250,7 +1407,10 @@ fn a_mixed_tail_carries_the_use_it_clashes_with() {
     assert_eq!(mixed.related[0].span, at([first, first + 2]));
     // Worded as a use rather than as a definition: nothing here was defined
     // twice.
-    assert_eq!(mixed.related[0].message, "first used here");
+    assert_eq!(
+        mixed.related[0].message,
+        "first used as the rest of a struct's fields here"
+    );
 }
 
 /// The types stage reports what inference concluded, and the annotating
@@ -1517,6 +1677,68 @@ fn an_argument_wears_its_type_through_a_declared_type() {
 /// CLI driver's, and the two had already drifted apart on this very sentence —
 /// `tests/src/inference.rs` pins the other end of it.
 #[test]
+fn extern_boundary_explanations_reach_the_debugger_with_cli_vocabulary() {
+    let callback = snapshot(
+        "effect Fail = () -> ()\n\
+         extern install : fn(fn(()) -> () + !Fail) -> () = \"host.install\"\n",
+    );
+    let diagnostic = callback
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "callback-effects-not-covered")
+        .expect("callback diagnostic");
+    assert!(diagnostic.message.contains("extern declaration"));
+    let explanation = diagnostic
+        .inference_explanation
+        .as_ref()
+        .expect("callback explanation on wire");
+    assert_eq!(
+        explanation.contradiction.kind,
+        "callback-effects-not-covered"
+    );
+    assert_eq!(
+        explanation
+            .full
+            .iter()
+            .map(|fact| fact.payload)
+            .collect::<Vec<_>>(),
+        [
+            "callback-requirement",
+            "extern-capability",
+            "extern-declaration"
+        ]
+    );
+    assert_eq!(explanation.full.len(), explanation.abridged.len());
+
+    let polymorphic = snapshot("extern run : fn('a) -> Nat = \"host.run\"\n");
+    let diagnostic = polymorphic
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "polymorphic-extern-boundary")
+        .expect("polymorphic diagnostic");
+    let explanation = diagnostic
+        .inference_explanation
+        .as_ref()
+        .expect("polymorphic explanation on wire");
+    assert_eq!(
+        explanation.contradiction.kind,
+        "polymorphic-extern-boundary"
+    );
+    assert_eq!(
+        explanation
+            .full
+            .iter()
+            .map(|fact| fact.payload)
+            .collect::<Vec<_>>(),
+        [
+            "polymorphic-extern-leaf",
+            "extern-position",
+            "extern-declaration"
+        ]
+    );
+}
+
+#[test]
 fn a_type_error_is_a_diagnostic() {
     let mismatch = snapshot("let n : Nat = fn x => x\n");
     let codes: Vec<_> = mismatch
@@ -1525,6 +1747,19 @@ fn a_type_error_is_a_diagnostic() {
         .map(|diagnostic| diagnostic.code)
         .collect();
     assert_eq!(codes, ["type-mismatch"]);
+    let explanation = mismatch.diagnostics[0]
+        .inference_explanation
+        .as_ref()
+        .expect("debugger mismatch explanation");
+    assert!(!explanation.full.is_empty());
+    assert!(!explanation.abridged.is_empty());
+    assert_eq!(explanation.contradiction.kind, "incompatible-types");
+    assert!(
+        explanation
+            .abridged
+            .iter()
+            .all(|fact| fact.span.is_some() && !fact.origin.is_empty())
+    );
 
     let missing = snapshot("let f : { x: Nat } -> Nat = fn p => p.y\n");
     let [diagnostic] = missing.diagnostics.as_slice() else {
@@ -1532,6 +1767,106 @@ fn a_type_error_is_a_diagnostic() {
     };
     assert_eq!(diagnostic.code, "missing-field");
     assert_eq!(diagnostic.message, "no field `y` on `{ x: Nat }`");
+    assert!(
+        diagnostic.inference_explanation.is_none(),
+        "one projection cannot supply its own opposing limiter"
+    );
+
+    let repeated_source = concat!(
+        "let split : { x: Nat, ..'r } -> { ..'r } -> Nat = fn whole => fn rest => 0n\n",
+        "let bad = fn value => split value { x: 1n }\n",
+    );
+    let repeated = snapshot(repeated_source);
+    let explanation = repeated.diagnostics[0]
+        .inference_explanation
+        .as_ref()
+        .expect("repeated row explanation crosses the full debugger path");
+    assert_eq!(explanation.contradiction.kind, "repeated-label");
+    assert_eq!(
+        explanation.contradiction.repairs,
+        ["change-first-use", "change-second-use"]
+    );
+    assert_eq!(
+        explanation
+            .abridged
+            .iter()
+            .map(|fact| fact.payload)
+            .collect::<std::collections::HashSet<_>>(),
+        std::collections::HashSet::from(["label-introduction", "label-forbidden"]),
+    );
+    assert!(explanation.abridged.iter().all(|fact| fact.span.is_some()));
+
+    let calls = snapshot("let repeated = fn use => { first: use 1n, second: use false }\n");
+    let diagnostic = &calls.diagnostics[0];
+    let explanation = diagnostic
+        .inference_explanation
+        .as_ref()
+        .expect("repeated calls keep the shared debugger explanation");
+    let pivot = explanation.pivot.as_ref().expect("named shared input");
+    assert_eq!(pivot.kind, "function-input");
+    assert_eq!(pivot.name, "Input");
+    assert_eq!(
+        explanation.omitted_facts,
+        explanation.full.len() - explanation.abridged.len()
+    );
+    assert_eq!(diagnostic.label.matches("Let’s call").count(), 1);
+    assert_eq!(
+        diagnostic
+            .notes
+            .iter()
+            .filter(|note| note.contains("omitted"))
+            .count(),
+        usize::from(explanation.omitted_facts > 0),
+        "the shared diagnostic prose and debugger account must agree"
+    );
+
+    let projection = snapshot("let value = { x: 1n }\nlet bad : Boolean = value.x\n");
+    let projection = projection.diagnostics[0]
+        .inference_explanation
+        .as_ref()
+        .expect("projection keeps its debugger explanation");
+    assert_eq!(
+        projection.pivot.as_ref().map(|pivot| pivot.kind),
+        Some("projected-field")
+    );
+    assert!(
+        projection
+            .pivot
+            .as_ref()
+            .is_some_and(|pivot| pivot.references.len() >= 2)
+    );
+
+    let effects = snapshot(concat!(
+        "effect Log = { write: Nat -> () }\n",
+        "let split : (() -> () + !Log + ..'r) -> (() -> () + ..'r) -> Nat = fn whole => fn rest => 0n\n",
+        "let bad = fn action => split action (fn _ => !Log.write 0n)\n",
+    ));
+    let effects = effects.diagnostics[0]
+        .inference_explanation
+        .as_ref()
+        .expect("effect contradiction keeps its debugger explanation");
+    assert!(effects.pivot.is_none());
+    assert!(effects.full.windows(2).all(|facts| {
+        let [one, two] = facts else { return true };
+        one.span.as_ref().map(|span| (span.file, span.range))
+            <= two.span.as_ref().map(|span| (span.file, span.range))
+    }));
+
+    let recursive = snapshot("let bad = fn f => f f\n");
+    let explanation = recursive.diagnostics[0]
+        .inference_explanation
+        .as_ref()
+        .expect("recursive cycle keeps its debugger explanation");
+    assert_eq!(explanation.contradiction.kind, "recursive-value");
+    assert!((2..=4).contains(&explanation.abridged.len()));
+    assert!(explanation.full.len() >= explanation.abridged.len());
+    assert!(explanation.abridged.iter().all(|fact| fact.span.is_some()));
+    assert!(!explanation.cause.constraint_ids.is_empty());
+    assert!(!explanation.cause.reason_ids.is_empty());
+    assert_eq!(
+        explanation.contradiction.repairs,
+        ["change-first-use", "change-second-use"]
+    );
 }
 
 /// Projection failures keep their shape-specific diagnostics and spans in the
@@ -1562,10 +1897,35 @@ fn a_row_error_reaches_the_strip_and_the_solve_tab() {
         panic!("expected one error: {:#?}", rigid.diagnostics);
     };
     assert_eq!(diagnostic.code, "rigid-field");
-    let field = rigid_source.rfind('x').unwrap();
-    assert_eq!(diagnostic.span, at([field, field + 1]));
+    assert_eq!(
+        diagnostic.message,
+        "the body cannot assume caller-chosen field `x`"
+    );
+    assert_eq!(
+        diagnostic.label,
+        "this annotation leaves the choice to each caller"
+    );
+    assert_eq!(
+        diagnostic.help,
+        [
+            "read caller-chosen struct fields only when named explicitly before the annotation's `..` remainder",
+            "or add this field explicitly to the annotation"
+        ]
+    );
+    assert_eq!(
+        diagnostic.related[0].message,
+        "this reads field `x` from the caller's choice"
+    );
     let declared = rigid_source.find("'a").unwrap();
-    assert_eq!(diagnostic.related[0].span, at([declared, declared + 2]));
+    assert_eq!(diagnostic.span, at([declared, declared + 2]));
+    let field = rigid_source.rfind('x').unwrap();
+    assert_eq!(diagnostic.related[0].span, at([field, field + 1]));
+    let explanation = diagnostic
+        .inference_explanation
+        .as_ref()
+        .expect("structured caller-choice explanation");
+    assert_eq!(explanation.contradiction.kind, "caller-choice");
+    assert_eq!(explanation.abridged.len(), 2);
 
     for snapshot in [&not_struct, &missing, &rigid] {
         let constraints = stage_named(snapshot, "constraints");
@@ -1681,7 +2041,8 @@ fn a_panic_becomes_a_result() {
 
 #[test]
 fn a_snapshot_survives_the_wire() {
-    let snapshot = bundle(&[(ROOT, DEMO)]);
+    let source = clean_demo();
+    let snapshot = bundle(&[(ROOT, source)]);
     let json = serde_json::to_string(&snapshot).expect("serializes");
     let back: serde_json::Value = serde_json::from_str(&json).expect("parses");
 
@@ -1692,8 +2053,9 @@ fn a_snapshot_survives_the_wire() {
         back["stages"].as_array().expect("stages").len(),
         REGISTRY.len()
     );
-    assert_eq!(back["stages"][0]["view"], "list");
-    assert_eq!(back["stages"][1]["view"], "tree");
+    assert_eq!(back["stages"][0]["view"], "terminal");
+    assert_eq!(back["stages"][1]["view"], "list");
+    assert_eq!(back["stages"][2]["view"], "tree");
     let artifact = back["stages"]
         .as_array()
         .expect("stages")
@@ -1715,7 +2077,7 @@ fn a_snapshot_survives_the_wire() {
     let files = back["files"].as_array().expect("files");
     assert_eq!(files.len(), 1);
     assert_eq!(files[0]["path"], ROOT);
-    assert_eq!(files[0]["len"], DEMO.len());
+    assert_eq!(files[0]["len"], source.len());
     assert!(
         files[0]["line_starts"]
             .as_array()
@@ -1772,10 +2134,10 @@ fn an_empty_buffer_is_not_an_error() {
 /// it is reported, the mint falls back, and every later phase still runs.
 #[test]
 fn a_bad_bundle_is_reported_rather_than_fatal() {
-    for (name, version) in [
-        ("_x", "0.1.0"),
-        ("demo", "not-a-version"),
-        ("demo", "1.2.3+unsupported"),
+    for (name, version, code) in [
+        ("_x", "0.1.0", "project-name-invalid"),
+        ("demo", "not-a-version", "project-version-invalid"),
+        ("demo", "1.2.3+unsupported", "project-version-build-suffix"),
     ] {
         let snapshot = compile(
             &CompileRequest {
@@ -1793,7 +2155,8 @@ fn a_bad_bundle_is_reported_rather_than_fatal() {
             },
             1,
         );
-        assert_eq!(snapshot.diagnostics[0].code, "bad-bundle-identity");
+        assert_eq!(snapshot.diagnostics[0].code, code);
+        assert!(!snapshot.diagnostics[0].help.is_empty());
         // And the chip has nothing to show because the supplied identity was
         // invalid.
         assert_eq!(snapshot.bundle, None);
@@ -1805,6 +2168,47 @@ fn a_bad_bundle_is_reported_rather_than_fatal() {
             .expect("ir stage");
         assert_eq!(ir.nodes.len(), 1);
     }
+}
+
+/// Module file candidates are relative to the configured root's directory,
+/// including when the in-memory debugger filesystem names that directory.
+#[test]
+fn a_nested_debugger_root_resolves_module_files_beside_its_root() {
+    let snapshot = compile(
+        &CompileRequest {
+            name: "demo".into(),
+            version: "0.1.0".into(),
+            root: "src/main.hc".into(),
+            document: "demo".into(),
+            files: vec![
+                FileSpec {
+                    path: "src/main.hc".into(),
+                    source: "module Math\n".into(),
+                },
+                FileSpec {
+                    path: "src/Math.hc".into(),
+                    source: "let four = 4n\n".into(),
+                },
+            ],
+            std: StdConfig::Disabled,
+            dependencies: IndexMap::new(),
+            revision: 1,
+        },
+        1,
+    );
+    assert!(
+        snapshot.diagnostics.is_empty(),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+    assert_eq!(
+        snapshot
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>(),
+        ["src/main.hc", "src/Math.hc"]
+    );
 }
 
 /// The file list is the index every `Loc` on the wire points into, so it has to
@@ -1888,6 +2292,10 @@ fn a_missing_module_file_reaches_the_strip() {
     };
     assert_eq!(diagnostic.stage, "bundle");
     assert_eq!(diagnostic.code, "module-file-missing");
+    assert_eq!(diagnostic.message, "this module needs a file");
+    assert_eq!(diagnostic.label, "no file was found for this module");
+    assert_eq!(diagnostic.help, ["create `Math.hc` or `Math/module.hc`"]);
+    assert_eq!(diagnostic.notes.len(), 1);
     // At the name, which is what the file's path was spelled from.
     let at = root.find("Math").expect("the declaration");
     assert_eq!(
@@ -1898,10 +2306,37 @@ fn a_missing_module_file_reaches_the_strip() {
         })
     );
 
-    // And the rest of the bundle is still compiled: one missing file may not
-    // hide every other complaint, or every other answer.
+    // The loader's recovery AST remains inspectable, but a missing module is
+    // a frontend error and its incomplete tree never reaches semantic phases.
+    let ast = stage_named(&snapshot, "ast");
+    assert!(!ast.nodes.is_empty(), "{ast:#?}");
     let ir = stage_named(&snapshot, "ir");
-    assert!(!ir.nodes.is_empty(), "{ir:#?}");
+    assert_eq!(ir.status, Status::Skipped, "{ir:#?}");
+    let types = stage_named(&snapshot, "types");
+    assert_eq!(types.status, Status::Skipped, "{types:#?}");
+}
+
+#[test]
+fn two_module_files_explain_how_to_choose_one() {
+    let root = "module Math\n";
+    let snapshot = bundle(&[
+        (ROOT, root),
+        ("Math.hc", "let beside = 1n\n"),
+        ("Math/module.hc", "let inside = 2n\n"),
+    ]);
+    let [diagnostic] = snapshot.diagnostics.as_slice() else {
+        panic!("expected one error: {:#?}", snapshot.diagnostics);
+    };
+    assert_eq!(diagnostic.code, "module-file-ambiguous");
+    assert_eq!(diagnostic.message, "this module has two possible files");
+    assert_eq!(
+        diagnostic.label,
+        "Ruddy cannot choose which file defines this module"
+    );
+    assert_eq!(
+        diagnostic.help,
+        ["keep one of `Math.hc` or `Math/module.hc` and delete the other"]
+    );
 }
 
 /// A document is a bundle, and a bundle starts somewhere. Only the debugger
@@ -1916,16 +2351,20 @@ fn a_request_without_a_root_file_is_told_so() {
         .iter()
         .map(|diagnostic| diagnostic.code)
         .collect();
-    assert!(codes.contains(&"missing-root-file"), "{codes:?}");
+    assert!(codes.contains(&"project-root-missing"), "{codes:?}");
     let missing = snapshot
         .diagnostics
         .iter()
-        .find(|diagnostic| diagnostic.code == "missing-root-file")
+        .find(|diagnostic| diagnostic.code == "project-root-missing")
         .expect("the complaint is there");
     assert_eq!(missing.stage, "bundle");
     assert_eq!(
         missing.message,
-        "a document needs a `main.hc`; it is the bundle's root file"
+        "this document needs its root file `main.hc`"
+    );
+    assert_eq!(
+        missing.help,
+        ["create `main.hc` or choose another root file"]
     );
     // Nowhere to point at: there is no file for the missing one to be missing
     // from.
@@ -1967,6 +2406,9 @@ fn a_solver_step_declares_what_it_added_to_the_state() {
     let mut bound = Vec::new();
     let mut failed = Vec::new();
     for node in &stage.nodes {
+        if field(node, "_record").as_deref() == Some("metadata") {
+            continue;
+        }
         // Everything the page reads off every step, on every step.
         for name in ["_rule", "_effect", "_depth", "_def"] {
             assert!(field(node, name).is_some(), "{} has no {name}", node.label);
@@ -2026,7 +2468,7 @@ fn a_solver_step_declares_what_it_added_to_the_state() {
 #[test]
 fn only_the_stages_that_own_a_phase_report_a_time() {
     let clean = snapshot("let f = fn a => a\n");
-    let snapshot = bundle(&[(ROOT, DEMO)]);
+    let snapshot = snapshot("let bad : Nat = fn x => x\n");
     let ids = |timed: bool| -> Vec<&str> {
         snapshot
             .stages
@@ -2049,11 +2491,12 @@ fn only_the_stages_that_own_a_phase_report_a_time() {
         ]
     );
     // LIR owns a phase too, and reports nothing here for the other reason a
-    // stage can: the demo has errors in it, so lowering never ran and there is
-    // no duration to report rather than no phase to have one.
+    // stage can: inference rejected this source, so lowering never ran and
+    // there is no duration to report rather than no phase to have one.
     assert_eq!(
         ids(false),
         [
+            "errors",
             "externs",
             "constraints",
             "solve",
@@ -2141,6 +2584,196 @@ fn a_raw_dump_carries_only_its_own_tab() {
         !types.debug.contains("Constraint"),
         "the Types dump repeats the constraints"
     );
+}
+
+#[test]
+fn zero_step_solves_still_publish_machine_readable_arenas() {
+    let snapshot = snapshot("");
+    let solve = snapshot
+        .stages
+        .iter()
+        .find(|stage| stage.id == "solve")
+        .expect("solve stage");
+    assert_eq!(solve.summary, "0 steps");
+    assert_eq!(solve.nodes.len(), 1);
+    let metadata = &solve.nodes[0];
+    let field = |name| {
+        metadata
+            .fields
+            .iter()
+            .find(|field| field.name == name)
+            .map(|field| field.value.as_str())
+    };
+    assert_eq!(field("_record"), Some("metadata"));
+    for arena in ["_variables", "_reasons"] {
+        let value: serde_json::Value = serde_json::from_str(field(arena).unwrap()).unwrap();
+        assert!(value.is_array());
+    }
+}
+
+#[test]
+fn inference_stage_rows_serialize_compiler_identities() {
+    let source = "effect Fail = { abort: () -> () }\n\
+                  type Callback = () -> () + !Fail\n\
+                  extern install : fn(Callback) -> () + !Fail = \"host.install\"\n\
+                  let choose : { x when 'a: Nat, y when 'b: Nat } -> Nat where 'a != 'b = fn v => match v with | {x} => x | {y} => y end\n\
+                  let local = fn tag => match tag with | {a} => let g = fn w => choose w in g {} | {b} => 0n end\n\
+                  let bad = (1n).missing\n";
+    let snapshot = snapshot(source);
+    let stage = |id| snapshot.stages.iter().find(|stage| stage.id == id).unwrap();
+    let field = |node: &Node, name| {
+        node.fields
+            .iter()
+            .find(|field| field.name == name)
+            .map(|field| field.value.clone())
+    };
+
+    let constraint_rows = nodes(stage("constraints"));
+    let constraint_ids: std::collections::HashSet<_> = constraint_rows
+        .iter()
+        .filter_map(|node| field(node, "_constraint_id"))
+        .collect();
+    assert!(!constraint_ids.is_empty());
+    assert!(constraint_rows.iter().all(|node| {
+        field(node, "_constraint_id").is_none()
+            || (field(node, "_reason_id").is_some()
+                && field(node, "_origin").is_some()
+                && field(node, "_primary_subject").is_some())
+    }));
+    assert!(constraint_rows.iter().any(|node| {
+        field(node, "_origin").as_deref() == Some("callback-boundary")
+            && field(node, "_primary_subject").as_deref() == Some("callback-required")
+            && field(node, "_secondary_subject").as_deref() == Some("callback-available")
+    }));
+
+    let solve = nodes(stage("solve"));
+    let metadata = solve
+        .iter()
+        .find(|node| field(node, "_record").as_deref() == Some("metadata"))
+        .expect("always-present inference metadata record");
+    let steps: Vec<_> = solve
+        .iter()
+        .copied()
+        .filter(|node| field(node, "_record").is_none())
+        .collect();
+    let step_ids: std::collections::HashSet<_> = steps
+        .iter()
+        .filter_map(|node| field(node, "_step_id"))
+        .collect();
+    assert_eq!(step_ids.len(), steps.len());
+    let reason_ids: std::collections::HashSet<_> = steps
+        .iter()
+        .filter_map(|node| field(node, "_reason_id"))
+        .collect();
+    assert_eq!(reason_ids.len(), steps.len());
+    assert!(
+        steps
+            .iter()
+            .filter(|node| field(node, "_bind").is_some())
+            .all(|node| field(node, "_bind_by") == field(node, "_reason_id"))
+    );
+    assert!(
+        steps
+            .iter()
+            .any(|node| field(node, "_recovery_because").is_some())
+    );
+    assert!(
+        steps.iter().all(
+            |node| field(node, "_constraint_id").is_some_and(|id| constraint_ids.contains(&id))
+        )
+    );
+    let variables: serde_json::Value = serde_json::from_str(
+        &field(metadata, "_variables").expect("machine-readable variable arena"),
+    )
+    .unwrap();
+    assert!(variables.as_array().unwrap().iter().all(|variable| {
+        variable.get("sort").is_some()
+            && variable.get("subject").is_some()
+            && variable.get("minted_by").is_some()
+    }));
+    let reasons: serde_json::Value =
+        serde_json::from_str(&field(metadata, "_reasons").expect("machine-readable reason arena"))
+            .unwrap();
+    assert!(reasons.as_array().unwrap().iter().all(|reason| {
+        reason.get("parents").is_some()
+            && reason.get("origin").is_some()
+            && reason.get("reachable").is_some()
+    }));
+    let guarded_results: Vec<_> = constraint_rows
+        .iter()
+        .filter(|node| field(node, "_origin").as_deref() == Some("match-arm"))
+        .collect();
+    assert!(!guarded_results.is_empty());
+    assert!(guarded_results.iter().any(|result| {
+        result
+            .span
+            .is_some_and(|span| matches!(&source[span.range[0]..span.range[1]], "x" | "y"))
+    }));
+    for result in guarded_results {
+        assert_eq!(
+            field(result, "_primary_subject").as_deref(),
+            Some("match-result")
+        );
+        assert_eq!(
+            field(result, "_secondary_subject").as_deref(),
+            Some("match-arm")
+        );
+        let span = result
+            .span
+            .expect("a guarded result points at its arm body");
+        assert!(!source[span.range[0]..span.range[1]].is_empty());
+        let id = field(result, "_constraint_id").expect("guarded result identity");
+        assert!(
+            solve
+                .iter()
+                .any(|step| field(step, "_constraint_id").as_deref() == Some(id.as_str()))
+        );
+    }
+
+    let batches = nodes(stage("presence"))
+        .into_iter()
+        .filter_map(|node| field(node, "_batch_id"))
+        .collect::<std::collections::HashSet<_>>();
+    assert!(!batches.is_empty());
+    let deferred = nodes(stage("constraints"))
+        .into_iter()
+        .filter_map(|node| field(node, "_batch_id"))
+        .collect::<std::collections::HashSet<_>>();
+    assert!(!deferred.is_empty());
+    assert!(deferred.is_subset(&batches));
+
+    let diagnostic = snapshot
+        .diagnostics
+        .iter()
+        .find(|diagnostic| {
+            matches!(
+                &diagnostic.inference_cause,
+                Some(InferenceCause::Step { .. })
+            )
+        })
+        .expect("a solve-caused inference diagnostic");
+    let error_id = diagnostic
+        .inference_error_id
+        .expect("stable inference error identity");
+    let Some(InferenceCause::Step { step_id }) = diagnostic.inference_cause.as_ref() else {
+        panic!("ordinary inference error should carry its step cause");
+    };
+    let linked = solve
+        .iter()
+        .find(|node| field(node, "_step_id").as_deref() == Some(&step_id.to_string()))
+        .expect("diagnostic cause resolves to a solve row");
+    assert_eq!(field(linked, "_error_id"), Some(error_id.to_string()));
+
+    let wire = serde_json::to_value(&snapshot).expect("snapshot serializes");
+    let serialized = wire["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["inference_error_id"] == error_id)
+        .expect("stable inference metadata reaches the wire");
+    assert!(serialized.get("id").is_some(), "display id remains present");
+    assert_eq!(serialized["inference_cause"]["kind"], "step");
+    assert_eq!(serialized["inference_cause"]["step_id"], *step_id);
 }
 
 #[test]
@@ -2796,16 +3429,17 @@ fn a_misplaced_wildcard_reaches_the_strip() {
     let diagnostic = snapshot
         .diagnostics
         .iter()
-        .find(|diagnostic| diagnostic.code == "misplaced-wildcard")
+        .find(|diagnostic| diagnostic.code == "misplaced-discard")
         .unwrap_or_else(|| panic!("{:#?}", snapshot.diagnostics));
     assert_eq!(diagnostic.stage, "parse");
     assert!(
         diagnostic
             .message
-            .starts_with("`_` stands for a value being thrown away"),
+            .starts_with("`_` throws a value away, so it cannot be read here"),
         "{}",
         diagnostic.message
     );
+    assert_eq!(diagnostic.label, "`_` does not provide a name here");
     let wildcard = source.find('_').expect("the `_`");
     assert_eq!(diagnostic.span, at([wildcard, wildcard + 1]));
 }

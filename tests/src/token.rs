@@ -36,7 +36,14 @@ fn lexes_numeric_literals() {
         kinds(&format!("{}n", u64::MAX))[..],
         [Kind::Natural(u64::MAX)]
     ));
-    assert_eq!(errors("1.5n")[0].kind, ErrorKind::MalformedNatural);
+    assert_eq!(
+        errors("1.5n")[0].kind,
+        ErrorKind::DecimalWithWholeSuffix { suffix: 'n' }
+    );
+    assert_eq!(
+        errors("1.5i")[0].kind,
+        ErrorKind::DecimalWithWholeSuffix { suffix: 'i' }
+    );
 }
 
 #[test]
@@ -47,9 +54,40 @@ fn strings_finish_and_fail_at_every_boundary() {
     assert!(
         matches!(&kinds(r#""\"\\\n\r\t""#)[..], [Kind::String(value)] if value == "\"\\\n\r\t")
     );
-    for malformed in ["\"unterminated", "\"slash\\", "\"bad\\q\""] {
-        assert_eq!(errors(malformed)[0].kind, ErrorKind::MalformedString);
+    for malformed in ["\"unterminated", "\"slash\\"] {
+        assert_eq!(errors(malformed)[0].kind, ErrorKind::MissingClosingQuote);
     }
+    assert_eq!(
+        errors("\"bad\\q\"")[0].kind,
+        ErrorKind::UnknownStringEscape { escape: 'q' }
+    );
+}
+
+#[test]
+fn strings_cannot_span_lines_and_recover_at_the_next_declaration() {
+    let out = lex("\"first line\nlet recovered = 1n", FileID::GENERATED);
+    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
+    assert_eq!(out.errors[0].kind, ErrorKind::MissingClosingQuote);
+    assert!(matches!(out.tokens[0].tracked, Kind::Invalid));
+    assert!(matches!(out.tokens[1].tracked, Kind::Let));
+    assert!(matches!(&out.tokens[2].tracked, Kind::Identifier(name) if name == "recovered"));
+    assert!(matches!(out.tokens[3].tracked, Kind::Equal));
+    assert!(matches!(out.tokens[4].tracked, Kind::Natural(1)));
+}
+
+#[test]
+fn unknown_escapes_make_one_invalid_lexeme_and_preserve_following_tokens() {
+    let out = lex("\"bad\\q\\z\\\"tail\" let good = 2n", FileID::GENERATED);
+    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
+    assert_eq!(
+        out.errors[0].kind,
+        ErrorKind::UnknownStringEscape { escape: 'q' }
+    );
+    assert!(matches!(out.tokens[0].tracked, Kind::Invalid));
+    assert!(matches!(out.tokens[1].tracked, Kind::Let));
+    assert!(matches!(&out.tokens[2].tracked, Kind::Identifier(name) if name == "good"));
+    assert!(matches!(out.tokens[3].tracked, Kind::Equal));
+    assert!(matches!(out.tokens[4].tracked, Kind::Natural(2)));
 }
 
 #[test]
@@ -72,27 +110,47 @@ fn an_identifier_may_still_contain_digits() {
 fn a_literal_running_into_a_name_is_one_broken_literal() {
     let out = errors("1x");
     assert_eq!(out.len(), 1, "errors: {out:#?}");
-    assert_eq!(out[0].kind, ErrorKind::MalformedNatural);
+    assert_eq!(out[0].kind, ErrorKind::NumberFollowedByName);
     // The whole word is the error, so the `x` is not left to be lexed as a
     // name of its own.
     assert_eq!(out[0].span.start, 0);
     assert_eq!(out[0].span.width, 2);
+    assert!(matches!(tokens_of("1x")[..], [Kind::Invalid]));
 
     // A non-ASCII digit is alphanumeric, so it lands here too.
-    assert_eq!(errors("1٣")[0].kind, ErrorKind::MalformedNatural);
+    assert_eq!(errors("1٣")[0].kind, ErrorKind::NumberFollowedByName);
 }
 
 #[test]
-fn a_literal_too_large_to_hold_is_rejected() {
-    let over = format!("{}0n", u64::MAX);
-    let out = errors(&over);
-    assert_eq!(out.len(), 1, "errors: {out:#?}");
-    assert_eq!(out[0].kind, ErrorKind::NaturalTooLarge);
-    assert_eq!(
-        out[0].kind.to_string(),
-        "natural number too large to fit in 64 bits"
-    );
-    assert_eq!(out[0].span.width, over.len());
+fn each_numeric_category_reports_its_own_failure() {
+    let natural = format!("{}0n", u64::MAX);
+    let integer = format!("{}0i", i64::MAX);
+    let real = format!("1{}", "0".repeat(400));
+
+    for (src, expected, message) in [
+        (
+            natural.as_str(),
+            ErrorKind::NaturalTooLarge,
+            "this whole number is too large",
+        ),
+        (
+            integer.as_str(),
+            ErrorKind::IntegerTooLarge,
+            "this integer is too large",
+        ),
+        (
+            real.as_str(),
+            ErrorKind::RealTooLarge,
+            "this number is too large",
+        ),
+    ] {
+        let out = lex(src, FileID::GENERATED);
+        assert_eq!(out.errors.len(), 1, "errors for {src}: {:#?}", out.errors);
+        assert_eq!(out.errors[0].kind, expected);
+        assert_eq!(out.errors[0].kind.to_string(), message);
+        assert_eq!(out.errors[0].span.width, src.len());
+        assert!(matches!(out.tokens[..], [ref token] if matches!(token.tracked, Kind::Invalid)));
+    }
 }
 
 #[test]
@@ -180,11 +238,12 @@ fn numeric_struct_fields_reject_number_forms_and_overflow() {
             "errors for {malformed:?}: {:#?}",
             out.errors
         );
-        assert_eq!(out.errors[0].kind, ErrorKind::MalformedNatural);
+        assert_eq!(out.errors[0].kind, ErrorKind::MalformedNumericField);
+        assert!(matches!(out.tokens[1].tracked, Kind::Invalid));
     }
 
     let over = format!("{{{}0: x}}", u64::MAX);
-    assert_eq!(errors(&over)[0].kind, ErrorKind::NaturalTooLarge);
+    assert_eq!(errors(&over)[0].kind, ErrorKind::NumericFieldTooLarge);
 }
 
 #[test]
@@ -197,7 +256,8 @@ fn numeric_projection_fields_reject_number_forms() {
             "errors for {malformed:?}: {:#?}",
             out.errors
         );
-        assert_eq!(out.errors[0].kind, ErrorKind::MalformedNatural);
+        assert_eq!(out.errors[0].kind, ErrorKind::MalformedNumericField);
+        assert!(matches!(out.tokens[2].tracked, Kind::Invalid));
         assert_eq!(
             out.errors[0].span.width,
             malformed.len() - "pair.".len(),
@@ -206,7 +266,7 @@ fn numeric_projection_fields_reject_number_forms() {
     }
 
     let over = format!("pair.{}0", u64::MAX);
-    assert_eq!(errors(&over)[0].kind, ErrorKind::NaturalTooLarge);
+    assert_eq!(errors(&over)[0].kind, ErrorKind::NumericFieldTooLarge);
     // Away from a dot the same spelling remains an ordinary real literal.
     assert!(matches!(kinds("001")[..], [Kind::Real(value)] if value == 1.0));
 }
@@ -344,7 +404,7 @@ fn a_sigilled_name_is_an_effect() {
 
     let out = errors("a ! b");
     assert_eq!(out.len(), 1, "errors: {out:#?}");
-    assert_eq!(out[0].kind, ErrorKind::Unrecognized);
+    assert_eq!(out[0].kind, ErrorKind::MalformedEffectLabel);
     assert_eq!(out[0].span.width, 1);
 }
 
@@ -363,7 +423,7 @@ fn lexes_a_variable() {
     for (src, width) in [("'", 1), ("' ", 1), ("'1", 2), ("'1abc", 5)] {
         let out = errors(src);
         assert_eq!(out.len(), 1, "{src}: {out:#?}");
-        assert_eq!(out[0].kind, ErrorKind::Unrecognized, "{src}");
+        assert_eq!(out[0].kind, ErrorKind::MalformedVariable, "{src}");
         assert_eq!(out[0].span.start, 0, "{src}");
         assert_eq!(out[0].span.width, width, "{src}");
     }
@@ -387,13 +447,18 @@ fn lexes_the_effect_mark() {
 fn the_question_mark_is_no_longer_a_token() {
     let out = errors("a?: A");
     assert_eq!(out.len(), 1, "errors: {out:#?}");
-    assert_eq!(out[0].kind, ErrorKind::Unrecognized);
+    assert_eq!(out[0].kind, ErrorKind::InvalidCharacter { character: '?' });
     assert_eq!(out[0].span.start, 1);
     assert_eq!(out[0].span.width, 1);
     // And nothing in the stream stands for it: the rest lexes as it always did.
     assert!(matches!(
         tokens_of("a?: A")[..],
-        [Kind::Identifier(_), Kind::Colon, Kind::Identifier(_)]
+        [
+            Kind::Identifier(_),
+            Kind::Invalid,
+            Kind::Colon,
+            Kind::Identifier(_)
+        ]
     ));
 }
 
@@ -409,7 +474,24 @@ fn a_lone_minus_is_a_token() {
 fn an_unrecognized_character_is_still_its_own_error() {
     let out = errors("@");
     assert_eq!(out.len(), 1, "errors: {out:#?}");
-    assert_eq!(out[0].kind, ErrorKind::Unrecognized);
+    assert_eq!(out[0].kind, ErrorKind::InvalidCharacter { character: '@' });
+    assert!(matches!(
+        tokens_of("@;")[..],
+        [Kind::Invalid, Kind::Semicolon]
+    ));
+}
+
+#[test]
+fn every_malformed_lexeme_remains_as_an_invalid_token() {
+    for src in ["@", "#1x", "!1x", "'1x", "1name", "1.5n", "\"bad\\q\""] {
+        let out = lex(src, FileID::GENERATED);
+        assert_eq!(out.errors.len(), 1, "{src:?}: {:#?}", out.errors);
+        assert!(
+            matches!(out.tokens[..], [ref token] if matches!(token.tracked, Kind::Invalid)),
+            "{src:?}: {:#?}",
+            out.tokens
+        );
+    }
 }
 
 #[test]
@@ -447,19 +529,22 @@ fn lexes_quoted_tags_as_one_decoded_token() {
 fn a_quoted_tag_must_be_adjacent_and_well_formed() {
     let separated = lex(r###"# "Case""###, FileID::GENERATED);
     assert_eq!(separated.errors.len(), 1, "{:#?}", separated.errors);
-    assert_eq!(separated.errors[0].kind, ErrorKind::Unrecognized);
+    assert_eq!(separated.errors[0].kind, ErrorKind::MalformedTag);
     assert_eq!(separated.errors[0].span.width, 1);
-    assert!(
-        matches!(&separated.tokens[..], [token] if matches!(&token.tracked, Kind::String(value) if value == "Case"))
-    );
+    assert!(matches!(
+        &separated.tokens[..],
+        [invalid, token]
+            if matches!(invalid.tracked, Kind::Invalid)
+                && matches!(&token.tracked, Kind::String(value) if value == "Case")
+    ));
 
     let unterminated = r###"#"unterminated"###;
     let out = lex(unterminated, FileID::GENERATED);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
-    assert_eq!(out.errors[0].kind, ErrorKind::MalformedString);
+    assert_eq!(out.errors[0].kind, ErrorKind::MissingClosingQuote);
     assert_eq!(out.errors[0].span.start, 0);
     assert_eq!(out.errors[0].span.width, unterminated.len());
-    assert!(out.tokens.is_empty());
+    assert!(matches!(&out.tokens[..], [token] if matches!(token.tracked, Kind::Invalid)));
 
     // The quoted tag remains one malformed lexeme after an unsupported escape,
     // including when an escaped quote occurs before its real closing quote.
@@ -477,10 +562,13 @@ fn a_quoted_tag_must_be_adjacent_and_well_formed() {
             "{malformed_escape:?}: {:#?}",
             out.errors
         );
-        assert_eq!(out.errors[0].kind, ErrorKind::MalformedString);
+        assert_eq!(
+            out.errors[0].kind,
+            ErrorKind::UnknownStringEscape { escape: 'q' }
+        );
         assert_eq!(out.errors[0].span.start, 0);
         assert_eq!(out.errors[0].span.width, malformed_escape.len());
-        assert!(out.tokens.is_empty());
+        assert!(matches!(&out.tokens[..], [token] if matches!(token.tracked, Kind::Invalid)));
     }
 }
 
@@ -511,7 +599,7 @@ fn a_sigil_that_begins_no_name_is_unrecognized() {
     for (src, width) in [("#", 1), ("# ", 1), ("#|", 1), ("#1", 2), ("#1abc", 5)] {
         let out = errors(src);
         assert_eq!(out.len(), 1, "{src}: {out:#?}");
-        assert_eq!(out[0].kind, ErrorKind::Unrecognized, "{src}");
+        assert_eq!(out[0].kind, ErrorKind::MalformedTag, "{src}");
         assert_eq!(out[0].span.start, 0, "{src}");
         assert_eq!(out[0].span.width, width, "{src}");
     }

@@ -1,0 +1,193 @@
+## not-a-struct
+[not-a-struct] `Nat` is not a struct, so it has no fields to read
+primary: this field access requires a struct
+help: change this value to a struct, or change/remove the field access
+
+## type-mismatch
+[type-mismatch] a natural number and a struct cannot be the same type
+primary: Let’s call this shared value `Value` — the annotation fixes the type here
+related: this expression supplies its type here; this is another requirement on `Value`
+help: change the first use so it agrees with the other one
+help: or change the other use so it agrees with the first one
+
+## recursive-type
+[recursive-type] this value would have to contain or accept itself
+primary: Let’s call this function input `Input` — this call requires the input to accept itself
+related: this input is required to be the value itself; this is another requirement on `Input`
+help: change the call so a value is not passed to itself
+help: or change the called value so it accepts a different input
+note: 2 intermediate uses are omitted from this short explanation
+
+## missing-field
+[missing-field] no field `y` on `{ x: Nat }`
+primary: this use conflicts over field `y`
+help: allow field `y`, or change the use that requires it
+
+## extra-field-struct
+[extra-field] field `y` is required by one use but excluded by another
+primary: Let’s call this function input `Input` — this use limits the type so field `y` is unavailable
+related: this use requires field `y`; this is another requirement on `Input`
+help: allow field `y` in the limiting use
+help: or change the use that requires field `y`
+note: 1 intermediate use is omitted from this short explanation
+
+## extra-field-sum
+[extra-field] case `#None` is required by one use but excluded by another
+primary: Let’s call this function input `Input` — this use limits the type so case `#None` is unavailable
+related: this use requires case `#None`; this is another requirement on `Input`
+help: allow case `#None` in the limiting use
+help: or change the use that requires case `#None`
+note: 1 intermediate use is omitted from this short explanation
+
+## rigid-broken
+[rigid-broken] the body cannot fix a choice that belongs to each caller
+primary: this annotation leaves the choice to each caller
+related: this use fixes a type that the caller must be free to choose
+help: return or pass through the annotated value instead of replacing its type
+help: or change the annotation to name the concrete type the body uses
+
+## rigid-broken-effect-closure
+[rigid-broken] the body cannot fix a choice that belongs to each caller
+primary: this annotation leaves the choice to each caller
+related: this use fixes a type that the caller must be free to choose
+help: preserve the caller-chosen effect remainder instead of closing it
+help: or remove or change the open effect remainder in the annotation
+note: 1 intermediate use is omitted from this short explanation
+
+## rigid-field-struct
+[rigid-field] the body cannot assume caller-chosen field `x`
+primary: this annotation leaves the choice to each caller
+related: this reads field `x` from the caller's choice
+help: read caller-chosen struct fields only when named explicitly before the annotation's `..` remainder
+help: or add this field explicitly to the annotation
+note: 1 intermediate use is omitted from this short explanation
+
+## rigid-field-sum
+[rigid-field] the body cannot assume caller-chosen case `#B`
+primary: this annotation leaves the choice to each caller
+related: this matches case `#B` from the caller's choice
+help: match caller-chosen cases only when named explicitly before the annotation's `..` remainder
+help: or add this case explicitly to the annotation
+
+## rigid-field-effect
+[rigid-field] the body cannot assume caller-chosen effect `!Log`
+primary: this annotation leaves the choice to each caller
+related: this requires effect `!Log` from the caller's choice
+help: handle this effect instead of requiring it from the caller-chosen effects
+help: or list this effect explicitly before the annotation's effect remainder
+
+## rigid-escapes
+[rigid-escapes] a caller choice cannot cross into another binding's type
+primary: this annotation leaves the choice to each caller
+related: binding `bad` has inferred type `('a -> 'a) -> Nat`, which would carry this choice outside its annotation
+help: change or remove the source annotation so its caller choice does not enter this value
+help: or keep this value from flowing into binding `bad`
+
+## repeated-field-struct
+[repeated-field] field `x` cannot be both named and included by `..`
+primary: this `..` remainder already follows named field `x`
+related: this use introduces field `x`
+help: remove field `x` from the named side
+help: or keep it out of the `..` remainder
+note: 3 intermediate uses are omitted from this short explanation
+
+## repeated-field-sum
+[repeated-field] case `#A` cannot be both named and included by `..`
+primary: this `..` remainder already follows named case `#A`
+related: this use introduces case `#A`
+help: remove case `#A` from the named side
+help: or keep it out of the `..` remainder
+note: 3 intermediate uses are omitted from this short explanation
+
+## repeated-field-effect
+[repeated-field] `..` covers only the effects a type does not already name, and here it would have to cover `!Log`
+primary: effect `!Log` is already named outside `..`
+help: remove the repeated effect, or remove it from the remainder
+
+## presence-required
+[presence-required] this value needs `x != y` among its fields, and it does not have that
+primary: this value does not meet the required combination
+help: change the value or loosen the required combination
+
+## presence-impossible
+[presence-impossible] nothing can satisfy `'x != 'y`: what this definition does with the type has already ruled it out
+primary: the annotation and definition rule out every combination
+help: change the annotation or change how the definition uses the value
+
+## clause-impossible
+[clause-impossible] nothing can satisfy `'x and not 'x`: this clause rules out every value at once
+primary: this clause rules out every combination
+help: remove one of the conflicting requirements in this clause
+
+## annotation-allows-more
+[annotation-allows-more] the annotation allows `'x or 'y`, but the definition requires `'x != 'y`
+primary: this annotation promises more combinations than the body accepts
+help: strengthen the annotation or loosen the body
+
+## unhandled-effect
+[unhandled-effect] effect `!Log` has no enclosing handler
+primary: this may perform effect `!Log`
+related: this top-level computation has no handler for effect `!Log`
+related: effect `!Log` is declared here
+help: handle this effect, or perform it inside a function
+
+## effect-not-allowed
+[effect-not-allowed] effect `!Log` is not allowed by the enclosing function
+primary: this enclosing function does not allow effect `!Log`
+related: this may perform effect `!Log`
+related: effect `!Log` is declared here
+help: add the effect to the function type, or handle it here
+
+## callback-effects-not-covered
+[callback-effects-not-covered] a callback can perform effects not listed by the extern declaration
+primary: this callback can perform effects when host code invokes it
+related: this extern declaration does not list those callback effects
+related: this extern declaration owns the host boundary
+help: list `!Fail` on this extern declaration
+help: or handle those effects before the callback returns to host code
+note: at extern parameter 1, the callback can perform `!Fail` without matching extern capability
+
+## polymorphic-extern-boundary
+[polymorphic-extern-boundary] host code needs one fixed kind of value at this extern position
+primary: this variable can produce differently shaped host values
+related: host code needs one fixed kind of value at this position
+related: this extern declaration owns the host boundary
+help: use a fixed type at this position
+help: or expose a concrete host-facing type and convert the value in Ruddy
+
+## repeated-calls
+[type-mismatch] a natural number and a boolean cannot be the same type
+primary: Let’s call this function input `Input` — this argument supplies a type to the call
+related: this call fixes what type the argument must have; this is another requirement on `Input`
+related: this argument supplies a type to the call; this is another requirement on `Input`
+help: change the first use so it agrees with the other one
+help: or change the other use so it agrees with the first one
+note: 2 intermediate uses are omitted from this short explanation
+
+## branches
+[type-mismatch] a natural number and a struct cannot be the same type
+primary: Let’s call this branch result `Result` — this branch contributes its type to the match result
+related: this branch contributes its type to the match result; this is another requirement on `Result`
+help: change the first use so it agrees with the other one
+help: or change the other use so it agrees with the first one
+
+## non-function
+[type-mismatch] a natural number cannot be called as a function
+primary: this expression is called as a function
+help: change the first use so it agrees with the other one
+help: or change the other use so it agrees with the first one
+
+## cross-definition
+[type-mismatch] a natural number and a struct cannot be the same type
+primary: Let’s call this function input `Input` — this call fixes what type the argument must have
+related: this argument supplies a type to the call; this is another requirement on `Input`
+help: change the first use so it agrees with the other one
+help: or change the other use so it agrees with the first one
+note: 1 intermediate use is omitted from this short explanation
+
+## long-alias
+[type-mismatch] a natural number and a struct cannot be the same type
+primary: Let’s call this shared value `Value` — the annotation fixes the type here
+related: this expression supplies its type here; this is another requirement on `Value`
+help: change the first use so it agrees with the other one
+help: or change the other use so it agrees with the first one

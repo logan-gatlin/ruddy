@@ -75,9 +75,11 @@ pub mod sat;
 mod solve;
 
 use std::{
-    collections::{HashMap, HashSet},
+    cell::RefCell,
+    collections::{HashMap, HashSet, hash_map::DefaultHasher},
+    hash::{Hash, Hasher},
     ops::Range,
-    rc::Rc,
+    rc::{Rc, Weak},
 };
 
 use indexmap::{IndexMap, IndexSet};
@@ -88,7 +90,7 @@ use crate::{
     tracking::Span,
     types::{
         Assigned, Atom, EffectId, Formula, ParamKind, Presence, Rest, Row, RowField, Scheme, Sense,
-        Shape, Ty, TyVar, same_finite_syntax,
+        Shape, Ty, TyVar, same_finite_syntax, same_finite_syntax_metered,
     },
 };
 use constrain::Constrain;
@@ -175,6 +177,11 @@ pub struct Output {
     /// The branch-local presence assumptions inference used, one report per
     /// arm of every qualifying match, in solve order.
     pub refinements: Vec<Refinement>,
+    /// Metadata indexed by `TyVar`, parallel to the solver's private slots.
+    pub variables: Vec<VarMeta>,
+    /// Append-only reason arena. Speculative nodes remain retired but readable
+    /// after rollback; no surviving link can be retargeted by identity reuse.
+    pub reasons: Vec<Reason>,
     pub errors: Vec<Error>,
 }
 
@@ -190,6 +197,123 @@ pub struct Output {
 /// not care what order it is asked in, but *which batch made the store
 /// unsatisfiable* does — so the batches are kept as a sequence, replayed in it,
 /// and the first one that flips the verdict owns the error. See [`Batch`].
+macro_rules! inference_id {
+    ($name:ident) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name(u64);
+
+        impl $name {
+            pub fn get(self) -> u64 {
+                self.0
+            }
+
+            #[doc(hidden)]
+            pub const fn synthetic(value: u64) -> Self {
+                Self(value)
+            }
+
+            #[allow(dead_code)]
+            fn pending() -> Self {
+                Self(u64::MAX)
+            }
+        }
+    };
+}
+
+inference_id!(ConstraintId);
+inference_id!(StepId);
+inference_id!(ErrorId);
+inference_id!(BatchId);
+inference_id!(ReasonId);
+
+/// The semantic sort of a solver variable. Kept outside [`Ty`] so provenance
+/// never changes type equality or user-facing type notation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VarSort {
+    Type,
+    Row,
+    Presence,
+}
+
+/// Immutable information recorded when a solver variable is minted.
+#[derive(Debug, Clone)]
+pub struct VarMeta {
+    pub sort: VarSort,
+    pub subject: Subject,
+    pub minted_by: ReasonId,
+}
+
+/// One immutable node in the inference reason arena. Parents always name
+/// earlier nodes, so consumers can walk the graph iteratively without needing
+/// the solver table or risking recursion on deeply nested imported types.
+#[derive(Debug, Clone)]
+pub struct Reason {
+    pub id: ReasonId,
+    pub parents: Vec<ReasonId>,
+    pub origin: ReasonOrigin,
+    /// False when the causal act belonged to speculative work that was rolled
+    /// back. IDs remain retired and are never reused.
+    pub reachable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasonOrigin {
+    Variable {
+        sort: VarSort,
+        subject: Subject,
+    },
+    Constraint(ConstraintId),
+    /// A written annotation reopened as an authoritative scheme contract.
+    Contract(ConstraintId),
+    Batch(BatchId),
+    Step(StepId),
+    Recovery,
+    DefaultBinding {
+        var: TyVar,
+        kind: DefaultBinding,
+        assigned: DefaultAssignment,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultBinding {
+    Sat,
+    CloseEffects,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultAssignment {
+    Present,
+    Absent,
+    EmptyRow,
+}
+
+impl Output {
+    /// Reachable causal slice rooted at `seed`, walked iteratively so debugger
+    /// queries remain safe for arbitrarily deep chains of solved aliases.
+    pub fn reason_ancestors(&self, seed: ReasonId) -> Vec<ReasonId> {
+        let arena: HashMap<_, _> = self
+            .reasons
+            .iter()
+            .map(|reason| (reason.id, reason))
+            .collect();
+        let mut seen = HashSet::new();
+        let mut work = vec![seed];
+        let mut out = Vec::new();
+        while let Some(id) = work.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(reason) = arena.get(&id).filter(|reason| reason.reachable) else {
+                continue;
+            };
+            out.push(id);
+            work.extend(reason.parents.iter().rev().copied());
+        }
+        out
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Store {
     pub batches: Vec<Batch>,
@@ -199,11 +323,15 @@ pub struct Store {
 /// said.
 #[derive(Debug, Clone)]
 pub struct Batch {
+    /// Stable identity allocated when this source-order slot is reserved.
+    pub id: BatchId,
     /// Top-level definition whose generation/solve emitted this batch.
     pub definition: Option<Symbol>,
     /// Where the program said it: the match, the use site, or the annotation.
     pub span: Span,
     pub origin: Origin,
+    /// Root of this batch's causal explanation.
+    pub reason: ReasonId,
     /// What it requires, over the presence variables that existed when it was
     /// emitted. Kept as it was emitted, not as the solve later resolved it —
     /// the debugger shows the pass being read rather than its result, exactly
@@ -297,9 +425,14 @@ pub struct GuardedArm {
     pub span: Span,
     pub raw: Formula,
     pub effective: Formula,
+    /// Coverage batch whose arm condition supplies this premise.
+    pub premise_reason: ReasonId,
     pub constraints: Vec<Constraint>,
     pub requirements: Vec<DeferredRequirement>,
-    pub ty: Rc<Ty>,
+    /// The guarded equality between this body's type and the match result
+    /// family. It is a child constraint because it is solved under this arm's
+    /// premise, not as undifferentiated work owned by the enclosing match.
+    pub result: Constraint,
 }
 
 /// A generation-time store batch held inert in its original source-order slot
@@ -349,6 +482,10 @@ pub struct GuardedObligation {
 #[derive(Debug, Clone)]
 pub struct Named {
     pub labels: Vec<(String, Presence)>,
+    /// The row shape whose labels the formula names. Annotation-only origins
+    /// do not need one; required-use diagnostics do, so they can call the
+    /// labels fields, cases, or effects without guessing from their spelling.
+    pub shape: Option<Shape>,
 }
 
 /// One act of the solver: the rule it applied, what it applied it to, and what
@@ -361,6 +498,15 @@ pub struct Named {
 /// replay does not.
 #[derive(Debug, Clone)]
 pub struct Step {
+    /// Stable identity in this inference run. Retired, never reused, on rollback.
+    pub id: StepId,
+    /// The constraint whose solve produced this step.
+    pub constraint: Option<ConstraintId>,
+    /// Immutable reason node for this act of the solver.
+    pub reason: ReasonId,
+    /// The error this step emitted, if it failed. Kept separately from the
+    /// rendered effect so correlation never depends on error wording.
+    pub error: Option<ErrorId>,
     /// The definition being solved. Solving runs per definition, so this is
     /// what divides one solve from the next in the flat list.
     pub definition: Symbol,
@@ -377,6 +523,9 @@ pub struct Step {
     /// presences, and neither of those is a question about types. So a goal is
     /// three-sorted where a constraint is one.
     pub goal: Goal,
+    /// Exact structural route selected by the occurs walk, captured before
+    /// recovery rewrites the graph. `None` for every non-recursive step.
+    pub recursive: Option<RecursiveCycleShape>,
     pub effect: Effect,
 }
 
@@ -507,7 +656,15 @@ pub enum Effect {
     /// The goal already held, or was put back for later.
     None,
     /// A variable now points at a value of its own sort.
-    Bound { var: TyVar, value: Assigned },
+    Bound {
+        var: TyVar,
+        value: Assigned,
+        /// The solver-step reason that made this binding.
+        by: ReasonId,
+        /// For recovery bindings, the failed/absorbing step that caused the
+        /// value to be abandoned. Ordinary bindings have no `because` link.
+        because: Option<ReasonId>,
+    },
     /// The goal was replaced by the goals that follow it one level deeper —
     /// the halves of an arrow, the fields of a struct, or the same goal asked
     /// again about what a name stands for.
@@ -525,8 +682,193 @@ pub enum Effect {
 /// said so.
 #[derive(Debug, Clone)]
 pub struct Constraint {
+    /// Stable identity in generation order, including nested constraints.
+    pub id: ConstraintId,
+    /// Immutable root reason for this generated requirement.
+    pub reason: ReasonId,
     pub span: Span,
+    /// The source operation that required this constraint.
+    pub origin: ConstraintOrigin,
+    /// Source-facing names for the ordered operands carried by `kind`.
+    pub subjects: ConstraintSubjects,
     pub kind: ConstraintKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticPivot {
+    FunctionInput(Symbol),
+    BranchResult(Span),
+}
+
+/// Why generation emitted a constraint. This describes generation rather than
+/// the solver rule that eventually handles it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConstraintOrigin {
+    Binding,
+    ContextualCheck,
+    ApplicationCallee,
+    ApplicationArgument,
+    ApplicationEffects,
+    Raise,
+    Projection,
+    Match,
+    MatchScrutinee,
+    MatchArm,
+    HandlerArm,
+    HandlerReturn,
+    HandlerFallback,
+    Pattern,
+    Instance,
+    CallbackBoundary,
+}
+
+impl ConstraintOrigin {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Binding => "binding",
+            Self::ContextualCheck => "contextual-check",
+            Self::ApplicationCallee => "application-callee",
+            Self::ApplicationArgument => "application-argument",
+            Self::ApplicationEffects => "application-effects",
+            Self::Raise => "raise",
+            Self::Projection => "projection",
+            Self::Match => "match",
+            Self::MatchScrutinee => "match-scrutinee",
+            Self::MatchArm => "match-arm",
+            Self::HandlerArm => "handler-arm",
+            Self::HandlerReturn => "handler-return",
+            Self::HandlerFallback => "handler-fallback",
+            Self::Pattern => "pattern",
+            Self::Instance => "instance",
+            Self::CallbackBoundary => "callback-boundary",
+        }
+    }
+}
+
+/// Source roles of a constraint's ordered operands. Unary and scoping
+/// constraints use only `primary`.
+#[derive(Debug, Clone, Copy, Eq)]
+pub struct ConstraintSubjects {
+    pub semantic_pivot: Option<SemanticPivot>,
+    pub primary: Subject,
+    pub primary_span: Option<Span>,
+    pub secondary: Option<Subject>,
+    pub secondary_span: Option<Span>,
+}
+
+impl PartialEq for ConstraintSubjects {
+    fn eq(&self, other: &Self) -> bool {
+        self.primary == other.primary && self.secondary == other.secondary
+    }
+}
+
+impl ConstraintSubjects {
+    pub const fn one(primary: Subject) -> Self {
+        Self {
+            semantic_pivot: None,
+            primary,
+            primary_span: None,
+            secondary: None,
+            secondary_span: None,
+        }
+    }
+
+    pub const fn pair(primary: Subject, secondary: Subject) -> Self {
+        Self {
+            semantic_pivot: None,
+            primary,
+            primary_span: None,
+            secondary: Some(secondary),
+            secondary_span: None,
+        }
+    }
+
+    /// Two source roles with the independent ranges that actually wrote them.
+    /// `None` means the role is semantic context rather than source syntax and
+    /// must not be turned into a diagnostic annotation.
+    pub const fn pair_at(
+        primary: Subject,
+        primary_span: Option<Span>,
+        secondary: Subject,
+        secondary_span: Option<Span>,
+    ) -> Self {
+        Self {
+            semantic_pivot: None,
+            primary,
+            primary_span,
+            secondary: Some(secondary),
+            secondary_span,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Subject {
+    Binding,
+    Annotation,
+    TopLevelBinding,
+    LocalBinding,
+    Context,
+    Term,
+    Callee,
+    CallShape,
+    Argument,
+    Parameter,
+    PerformedEffects,
+    AmbientEffects,
+    RaisedValue,
+    RaiseResult,
+    HandlerAnswer,
+    ProjectionBase,
+    ProjectionResult,
+    MatchScrutinee,
+    PatternDemand,
+    MatchResult,
+    MatchArm,
+    HandlerArm,
+    HandlerReturn,
+    HandlerBody,
+    Scheme,
+    Instance,
+    CallbackRequired,
+    CallbackAvailable,
+    EffectDeclaration,
+}
+
+impl Subject {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Binding => "binding",
+            Self::Annotation => "annotation",
+            Self::TopLevelBinding => "top-level-binding",
+            Self::LocalBinding => "local-binding",
+            Self::Context => "context",
+            Self::Term => "term",
+            Self::Callee => "callee",
+            Self::CallShape => "call-shape",
+            Self::Argument => "argument",
+            Self::Parameter => "parameter",
+            Self::PerformedEffects => "performed-effects",
+            Self::AmbientEffects => "ambient-effects",
+            Self::RaisedValue => "raised-value",
+            Self::RaiseResult => "raise-result",
+            Self::HandlerAnswer => "handler-answer",
+            Self::ProjectionBase => "projection-base",
+            Self::ProjectionResult => "projection-result",
+            Self::MatchScrutinee => "match-scrutinee",
+            Self::PatternDemand => "pattern-demand",
+            Self::MatchResult => "match-result",
+            Self::MatchArm => "match-arm",
+            Self::HandlerArm => "handler-arm",
+            Self::HandlerReturn => "handler-return",
+            Self::HandlerBody => "handler-body",
+            Self::Scheme => "scheme",
+            Self::Instance => "instance",
+            Self::CallbackRequired => "callback-required",
+            Self::CallbackAvailable => "callback-available",
+            Self::EffectDeclaration => "effect-declaration",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -570,6 +912,9 @@ pub enum ConstraintKind {
         /// ones the scheme this publishes may quantify. Empty where none was
         /// written. See [`ErrorKind::RigidEscapes`].
         rigids: Vec<u32>,
+        /// Operation values produced by the bound expression, kept outside its
+        /// semantic scheme while the solver publishes that scheme.
+        effect_provenance: EffectProvenance,
         /// What the value requires, including that it match the annotation when
         /// one was written. Solved first, at `level`.
         value: Vec<Constraint>,
@@ -613,6 +958,13 @@ pub enum ConstraintKind {
     Performs {
         performed: Row,
         ambient: Row,
+        /// The exact declaration selected by a directly written operation.
+        /// This is diagnostic provenance, not row identity: structurally equal
+        /// declarations may coalesce in `performed` while retaining distinct
+        /// source origins through calls and generalized aliases.
+        effect_origins: Vec<EffectSource>,
+        /// Source labels of handlers which extend `ambient`.
+        ambient_label_spans: IndexMap<String, Span>,
         /// Whether a `fn` encloses the application. What tells the two readings
         /// of a failure apart: outside every function the ambient is a
         /// definition's own, so nothing could ever have handled the effect,
@@ -622,13 +974,1130 @@ pub enum ConstraintKind {
     },
     /// An effectful callback crossing a foreign boundary must be callable with
     /// the evidence carried by that boundary.
-    CallbackCoverage { required: Row, available: Row },
+    CallbackCoverage {
+        required: Row,
+        available: Row,
+        boundary: CallbackBoundary,
+    },
+}
+
+/// Source context retained on a foreign callback obligation.  Rows deliberately
+/// contain no declaration or path information, so keeping this beside the
+/// constraint is what lets a failed solve still explain the written boundary.
+#[derive(Debug, Clone)]
+pub struct CallbackBoundary {
+    pub callback_span: Span,
+    pub callback_path: String,
+    pub callback_type: String,
+    /// One exact required-presence => available-presence implication per
+    /// semantic effect label. Keeping the labels separate lets declaration
+    /// validation name every failed implication instead of collapsing a row to
+    /// its definitely-present subset.
+    pub effects: Vec<CallbackEffectCondition>,
+    /// Their conjunction, retained for debugger consumers and source rendering.
+    pub condition: Formula,
+    /// The exact terminal relation after every `Rest::More` segment is
+    /// flattened. `None` means the callback row is closed.
+    pub tail: Option<CallbackTailRelation>,
+    pub extern_name: String,
+    pub extern_span: Span,
+    pub capability_span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct CallbackEffectCondition {
+    pub effect: String,
+    pub condition: Formula,
+}
+
+#[derive(Debug, Clone)]
+pub struct CallbackTailRelation {
+    /// Source spelling of the callback remainder, including its `..` sigil.
+    pub required: String,
+    /// Source spelling of the extern remainder, or `None` for a closed row.
+    pub available: Option<String>,
+}
+
+/// Source identity of an effect use, kept separate from structural row
+/// equality so equivalent interfaces cannot overwrite one another's evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectOrigin {
+    pub symbol: Symbol,
+    pub interface: crate::types::EffectId,
+    pub declaration_span: Span,
+}
+
+/// Either an exact operation declaration or a callable supplied through a
+/// function parameter. Parameter sources are substituted as values flow; only
+/// exact origins ever reach a diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EffectSource {
+    Origin(EffectOrigin),
+    Parameter {
+        symbol: Symbol,
+        path: Vec<EffectPathStep>,
+    },
+}
+
+/// One value-flow step from a symbolic higher-order parameter. Kept beside
+/// provenance rather than in [`Ty`] so paths do not affect type identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EffectPathStep {
+    CallResult,
+    Field(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EffectParameter {
+    symbol: Symbol,
+    path: Vec<EffectPathStep>,
+}
+
+/// Shared value-flow provenance. Children are immutable DAG edges: substituting
+/// one argument into several fields therefore installs the same node at every
+/// occurrence instead of recursively cloning its complete replacement tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectProvenance(Rc<EffectProvenanceNode>);
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct EffectProvenanceNode {
+    callable: Vec<EffectSource>,
+    value_parameter: Option<EffectParameter>,
+    argument: Option<Symbol>,
+    result: Option<EffectProvenance>,
+    fields: IndexMap<String, EffectProvenance>,
+    /// A small, argument-independent cache used when a bounded rewrite has to
+    /// cut this node off.  In particular, declarations below the cutoff are
+    /// not lost merely because their structural route was too expensive.
+    exact_origins: Vec<EffectOrigin>,
+}
+
+impl Default for EffectProvenance {
+    fn default() -> Self {
+        Self(Rc::new(EffectProvenanceNode::default()))
+    }
+}
+
+impl Drop for EffectProvenance {
+    fn drop(&mut self) {
+        // Rc normally destroys a uniquely-owned chain recursively. Provenance
+        // paths are generated data and can be much deeper than the machine
+        // stack, so detach unique children breadth-first before Rc drops them.
+        let mut work = Vec::new();
+        if let Some(node) = Rc::get_mut(&mut self.0) {
+            work.extend(node.result.take());
+            work.extend(std::mem::take(&mut node.fields).into_values());
+        }
+        while let Some(mut child) = work.pop() {
+            if let Some(node) = Rc::get_mut(&mut child.0) {
+                work.extend(node.result.take());
+                work.extend(std::mem::take(&mut node.fields).into_values());
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for EffectProvenance {
+    type Target = EffectProvenanceNode;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ProvenanceMeter {
+    left: usize,
+}
+
+impl ProvenanceMeter {
+    fn spend(&mut self, amount: usize) -> bool {
+        if let Some(left) = self.left.checked_sub(amount) {
+            self.left = left;
+            true
+        } else {
+            self.left = 0;
+            false
+        }
+    }
+}
+
+impl EffectProvenance {
+    const PATH_BUDGET: usize = 256;
+    const NODE_BUDGET: usize = 4096;
+    const SUMMARY_BUDGET: usize = 16;
+
+    fn node(mut node: EffectProvenanceNode) -> Self {
+        if node.exact_origins.is_empty() {
+            for source in &node.callable {
+                if let EffectSource::Origin(origin) = source
+                    && !node.exact_origins.contains(origin)
+                {
+                    node.exact_origins.push(origin.clone());
+                    if node.exact_origins.len() == Self::SUMMARY_BUDGET {
+                        break;
+                    }
+                }
+            }
+            for child in node.result.iter().chain(node.fields.values()) {
+                for origin in &child.exact_origins {
+                    if !node.exact_origins.contains(origin) {
+                        node.exact_origins.push(origin.clone());
+                        if node.exact_origins.len() == Self::SUMMARY_BUDGET {
+                            break;
+                        }
+                    }
+                }
+                if node.exact_origins.len() == Self::SUMMARY_BUDGET {
+                    break;
+                }
+            }
+        }
+        Self::node_summarized(node)
+    }
+
+    /// Construct a node whose summary was already assembled by metered work.
+    fn node_summarized(node: EffectProvenanceNode) -> Self {
+        if node.callable.is_empty()
+            && node.value_parameter.is_none()
+            && node.argument.is_none()
+            && node.result.is_none()
+            && node.fields.is_empty()
+        {
+            Self::default()
+        } else {
+            Self(Rc::new(node))
+        }
+    }
+
+    fn parameter(symbol: Symbol) -> Self {
+        Self::node(EffectProvenanceNode {
+            value_parameter: Some(EffectParameter {
+                symbol,
+                path: Vec::new(),
+            }),
+            ..Default::default()
+        })
+    }
+
+    fn function(callable: Vec<EffectSource>, argument: Symbol, result: Self) -> Self {
+        Self::node(EffectProvenanceNode {
+            callable: deduplicate(callable),
+            argument: Some(argument),
+            result: (result != Self::default()).then_some(result),
+            ..Default::default()
+        })
+    }
+
+    fn origin(origin: EffectOrigin) -> Self {
+        Self::node(EffectProvenanceNode {
+            callable: vec![EffectSource::Origin(origin)],
+            ..Default::default()
+        })
+    }
+
+    fn from_fields(fields: IndexMap<String, Self>) -> Self {
+        Self::node(EffectProvenanceNode {
+            fields: fields
+                .into_iter()
+                .filter(|(_, p)| *p != Self::default())
+                .collect(),
+            ..Default::default()
+        })
+    }
+
+    fn select_metered(
+        &self,
+        path: &[EffectPathStep],
+        meter: &mut ProvenanceMeter,
+    ) -> Result<Option<Self>, Self> {
+        // Missing structure and a bounded traversal cutoff have different
+        // meanings. A genuinely missing route contributes nothing; a cutoff
+        // conservatively contributes this node's cached declaration summary.
+        if path.len() > Self::PATH_BUDGET || !meter.spend(1) {
+            return Err(self.exact_summary());
+        }
+        let mut work: Vec<_> = path.iter().enumerate().rev().collect();
+        let mut selected = self;
+        while let Some((at, step)) = work.pop() {
+            // One path step and one traversed edge (including a missing edge).
+            if !meter.spend(2) {
+                return Err(selected.exact_summary());
+            }
+            let known = match step {
+                EffectPathStep::CallResult => selected.result.as_ref(),
+                EffectPathStep::Field(field) => selected.fields.get(field),
+            };
+            if let Some(known) = known {
+                selected = known;
+                if !meter.spend(1) {
+                    return Err(selected.exact_summary());
+                } // selected node
+                continue;
+            }
+            let Some(mut parameter) = selected.value_parameter.clone() else {
+                return Ok(None);
+            };
+            let tail = &path[at..];
+            if parameter.path.len() + tail.len() > Self::PATH_BUDGET || !meter.spend(tail.len()) {
+                return Err(selected.exact_summary());
+            }
+            parameter.path.extend_from_slice(tail);
+            return Ok(Some(Self::node(EffectProvenanceNode {
+                value_parameter: Some(parameter),
+                ..Default::default()
+            })));
+        }
+        Ok(Some(selected.clone()))
+    }
+
+    fn select(&self, path: &[EffectPathStep]) -> Option<Self> {
+        let mut meter = ProvenanceMeter {
+            left: Self::NODE_BUDGET,
+        };
+        match self.select_metered(path, &mut meter) {
+            Ok(selected) => selected,
+            Err(summary) => Some(summary),
+        }
+    }
+
+    fn projected(&self, field: String) -> Option<Self> {
+        self.select(&[EffectPathStep::Field(field)])
+    }
+
+    fn call_result(&self) -> Option<Self> {
+        self.select(&[EffectPathStep::CallResult])
+    }
+
+    fn substitute(&self, symbol: Symbol, value: &Self) -> Self {
+        let mut memo = HashMap::new();
+        let mut budget = Self::NODE_BUDGET;
+        self.substitute_bounded(symbol, value, &mut memo, &mut budget)
+    }
+
+    fn exact_summary(&self) -> Self {
+        Self::node_summarized(EffectProvenanceNode {
+            callable: self
+                .exact_origins
+                .iter()
+                .cloned()
+                .map(EffectSource::Origin)
+                .collect(),
+            exact_origins: self.exact_origins.clone(),
+            ..Default::default()
+        })
+    }
+
+    fn exhausted_with(&self, symbol: Symbol, extra: &[EffectOrigin]) -> Self {
+        let mut exact_origins = self.exact_origins.clone();
+        for origin in extra {
+            if exact_origins.len() == Self::SUMMARY_BUDGET {
+                break;
+            }
+            if !exact_origins.contains(origin) {
+                exact_origins.push(origin.clone());
+            }
+        }
+        let callable = exact_origins
+            .iter()
+            .cloned()
+            .map(EffectSource::Origin)
+            .collect();
+        Self::node_summarized(EffectProvenanceNode {
+            callable,
+            // Never leave a source naming the argument we just claimed to
+            // substitute. An unresolved projection is omission, not stale data.
+            value_parameter: self.value_parameter.clone().filter(|p| p.symbol != symbol),
+            argument: self.argument,
+            exact_origins,
+            ..Default::default()
+        })
+    }
+
+    fn exhausted(&self, symbol: Symbol) -> Self {
+        self.exhausted_with(symbol, &[])
+    }
+
+    fn substitute_bounded(
+        &self,
+        symbol: Symbol,
+        value: &Self,
+        memo: &mut HashMap<*const EffectProvenanceNode, Self>,
+        budget: &mut usize,
+    ) -> Self {
+        #[derive(Clone, Copy)]
+        enum Stage {
+            ResultStart,
+            ResultFinish,
+            FieldStart(usize),
+            FieldFinish(usize),
+            Callable(usize),
+            Finish,
+        }
+        struct Frame {
+            original: EffectProvenance,
+            stage: Stage,
+            result: Option<EffectProvenance>,
+            fields: IndexMap<String, EffectProvenance>,
+            callable: Vec<EffectSource>,
+            exact: Vec<EffectOrigin>,
+        }
+        enum Task {
+            Visit(EffectProvenance),
+            Resume(Frame),
+        }
+
+        fn add_unique<T: PartialEq>(
+            out: &mut Vec<T>,
+            item: T,
+            meter: &mut ProvenanceMeter,
+        ) -> bool {
+            let found = out.iter().position(|v| v == &item);
+            let comparisons = found.map_or(out.len(), |at| at + 1);
+            if !meter.spend(comparisons) {
+                return false;
+            }
+            if found.is_none() {
+                out.push(item);
+            }
+            true
+        }
+        fn add_exact(
+            frame: &mut Frame,
+            origins: &[EffectOrigin],
+            meter: &mut ProvenanceMeter,
+        ) -> bool {
+            for origin in origins
+                .iter()
+                .take(EffectProvenance::SUMMARY_BUDGET - frame.exact.len())
+            {
+                if !meter.spend(1) || !add_unique(&mut frame.exact, origin.clone(), meter) {
+                    return false;
+                }
+            }
+            true
+        }
+
+        let mut meter = ProvenanceMeter { left: *budget };
+        let root = Rc::as_ptr(&self.0);
+        let mut work = vec![Task::Visit(self.clone())];
+        while let Some(task) = work.pop() {
+            match task {
+                Task::Visit(original) => {
+                    let key = Rc::as_ptr(&original.0);
+                    if memo.contains_key(&key) {
+                        continue;
+                    }
+                    if !meter.spend(1) {
+                        memo.insert(key, original.exhausted(symbol));
+                        continue;
+                    }
+                    if let Some(parameter) = &original.value_parameter
+                        && parameter.symbol == symbol
+                    {
+                        let selected = match value.select_metered(&parameter.path, &mut meter) {
+                            Ok(Some(selected)) => selected,
+                            Ok(None) => Self::default(),
+                            Err(summary) => summary,
+                        };
+                        memo.insert(key, selected);
+                        continue;
+                    }
+                    work.push(Task::Resume(Frame {
+                        original,
+                        stage: Stage::ResultStart,
+                        result: None,
+                        fields: IndexMap::new(),
+                        callable: Vec::new(),
+                        exact: Vec::new(),
+                    }));
+                }
+                Task::Resume(mut frame) => {
+                    let key = Rc::as_ptr(&frame.original.0);
+                    let failed = match frame.stage {
+                        Stage::ResultStart => {
+                            if let Some(child) = frame.original.result.clone() {
+                                if !meter.spend(1) {
+                                    true
+                                } else {
+                                    frame.stage = Stage::ResultFinish;
+                                    work.push(Task::Resume(frame));
+                                    work.push(Task::Visit(child));
+                                    continue;
+                                }
+                            } else {
+                                frame.stage = Stage::FieldStart(0);
+                                work.push(Task::Resume(frame));
+                                continue;
+                            }
+                        }
+                        Stage::ResultFinish => {
+                            let child = frame
+                                .original
+                                .result
+                                .as_ref()
+                                .and_then(|c| memo.get(&Rc::as_ptr(&c.0)))
+                                .cloned()
+                                .unwrap_or_default();
+                            if !add_exact(&mut frame, &child.exact_origins, &mut meter) {
+                                true
+                            } else {
+                                frame.result = (child != Self::default()).then_some(child);
+                                frame.stage = Stage::FieldStart(0);
+                                work.push(Task::Resume(frame));
+                                continue;
+                            }
+                        }
+                        Stage::FieldStart(at) => {
+                            if let Some(child) = frame
+                                .original
+                                .fields
+                                .get_index(at)
+                                .map(|(_, child)| child.clone())
+                            {
+                                if !meter.spend(1) {
+                                    true
+                                } else {
+                                    frame.stage = Stage::FieldFinish(at);
+                                    work.push(Task::Resume(frame));
+                                    work.push(Task::Visit(child));
+                                    continue;
+                                }
+                            } else {
+                                frame.stage = Stage::Callable(0);
+                                work.push(Task::Resume(frame));
+                                continue;
+                            }
+                        }
+                        Stage::FieldFinish(at) => {
+                            let (name, old) = frame
+                                .original
+                                .fields
+                                .get_index(at)
+                                .map(|(name, old)| (name.clone(), old.clone()))
+                                .expect("field frame");
+                            let child = memo.get(&Rc::as_ptr(&old.0)).cloned().unwrap_or_default();
+                            if !add_exact(&mut frame, &child.exact_origins, &mut meter) {
+                                true
+                            } else {
+                                if child != Self::default() {
+                                    frame.fields.insert(name, child);
+                                }
+                                frame.stage = Stage::FieldStart(at + 1);
+                                work.push(Task::Resume(frame));
+                                continue;
+                            }
+                        }
+                        Stage::Callable(at) => {
+                            if let Some(source) = frame.original.callable.get(at) {
+                                if !meter.spend(1) {
+                                    true
+                                } else {
+                                    let mut ok = true;
+                                    match source {
+                                        EffectSource::Parameter { symbol: p, path }
+                                            if *p == symbol =>
+                                        {
+                                            let replacement =
+                                                match value.select_metered(path, &mut meter) {
+                                                    Ok(Some(replacement)) => Some(replacement),
+                                                    Ok(None) => None,
+                                                    Err(summary) => Some(summary),
+                                                };
+                                            if let Some(replacement) = replacement {
+                                                // Preserve the bounded endpoint cache before
+                                                // walking entries. If admission exhausts midway,
+                                                // the fallback still names declarations introduced
+                                                // by this substitution.
+                                                ok = add_exact(
+                                                    &mut frame,
+                                                    &replacement.exact_origins,
+                                                    &mut meter,
+                                                );
+                                                if ok {
+                                                    // Do not collect or clone the replacement list:
+                                                    // every entry is metered before it is admitted.
+                                                    for replacement_source in &replacement.callable
+                                                    {
+                                                        let entry_work = match replacement_source {
+                                                            EffectSource::Origin(_) => 1,
+                                                            EffectSource::Parameter {
+                                                                path,
+                                                                ..
+                                                            } => path.len() + 1,
+                                                        };
+                                                        if entry_work > Self::PATH_BUDGET + 1
+                                                            || !meter.spend(entry_work)
+                                                            || !add_unique(
+                                                                &mut frame.callable,
+                                                                replacement_source.clone(),
+                                                                &mut meter,
+                                                            )
+                                                        {
+                                                            ok = false;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                if ok
+                                                    && let Some(parameter) =
+                                                        &replacement.value_parameter
+                                                    && (parameter.path.len() > Self::PATH_BUDGET
+                                                        || !meter.spend(parameter.path.len() + 1)
+                                                        || !add_unique(
+                                                            &mut frame.callable,
+                                                            EffectSource::Parameter {
+                                                                symbol: parameter.symbol,
+                                                                path: parameter.path.clone(),
+                                                            },
+                                                            &mut meter,
+                                                        ))
+                                                {
+                                                    ok = false;
+                                                }
+                                            }
+                                        }
+                                        source => {
+                                            let path_work = match source {
+                                                EffectSource::Origin(_) => 1,
+                                                EffectSource::Parameter { path, .. } => {
+                                                    path.len() + 1
+                                                }
+                                            };
+                                            if path_work > Self::PATH_BUDGET + 1
+                                                || !meter.spend(path_work)
+                                            {
+                                                ok = false;
+                                            } else {
+                                                // Clone only this admitted entry, after charging
+                                                // for its path-sized allocation.
+                                                let source = source.clone();
+                                                if let EffectSource::Origin(origin) = &source
+                                                    && !add_exact(
+                                                        &mut frame,
+                                                        std::slice::from_ref(origin),
+                                                        &mut meter,
+                                                    )
+                                                {
+                                                    ok = false;
+                                                }
+                                                if ok
+                                                    && !add_unique(
+                                                        &mut frame.callable,
+                                                        source,
+                                                        &mut meter,
+                                                    )
+                                                {
+                                                    ok = false;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if !ok {
+                                        true
+                                    } else {
+                                        frame.stage = Stage::Callable(at + 1);
+                                        work.push(Task::Resume(frame));
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                frame.stage = Stage::Finish;
+                                work.push(Task::Resume(frame));
+                                continue;
+                            }
+                        }
+                        Stage::Finish => {
+                            let out = Self::node_summarized(EffectProvenanceNode {
+                                callable: frame.callable,
+                                value_parameter: frame.original.value_parameter.clone(),
+                                argument: frame.original.argument,
+                                result: frame.result,
+                                fields: frame.fields,
+                                exact_origins: frame.exact,
+                            });
+                            memo.insert(key, out);
+                            continue;
+                        }
+                    };
+                    if failed {
+                        memo.insert(key, frame.original.exhausted_with(symbol, &frame.exact));
+                    }
+                }
+            }
+        }
+        *budget = meter.left;
+        memo.get(&root)
+            .cloned()
+            .unwrap_or_else(|| self.exhausted(symbol))
+    }
+}
+fn deduplicate<T: PartialEq>(values: Vec<T>) -> Vec<T> {
+    let mut unique = Vec::with_capacity(values.len());
+    for value in values {
+        if !unique.contains(&value) {
+            unique.push(value);
+        }
+    }
+    unique
+}
+
+#[cfg(test)]
+mod effect_provenance_tests {
+    use super::*;
+    use crate::symbol::{Bundle, Mint, Namespace};
+    use semver::Version;
+
+    fn symbol(mint: &mut Mint, name: &str) -> Symbol {
+        mint.local(None, Namespace::Terms, name)
+    }
+
+    fn unique_nodes(root: &EffectProvenance) -> usize {
+        let mut seen = std::collections::HashSet::new();
+        let mut work = vec![root];
+        while let Some(node) = work.pop() {
+            if !seen.insert(Rc::as_ptr(&node.0)) {
+                continue;
+            }
+            work.extend(node.fields.values());
+            work.extend(node.result.iter());
+        }
+        seen.len()
+    }
+
+    #[test]
+    fn duplicate_substitution_is_a_bounded_shared_dag() {
+        const DEPTH: usize = 40;
+        let bundle = Bundle::new("provenance-test", Version::new(0, 0, 0)).unwrap();
+        let mut mint = Mint::new(bundle);
+        let parameter = symbol(&mut mint, "x");
+        let effect = symbol(&mut mint, "Log");
+        let parameter_node = EffectProvenance::parameter(parameter);
+        let duplicated = EffectProvenance::from_fields(
+            [
+                ("a".into(), parameter_node.clone()),
+                ("b".into(), parameter_node),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let duplicate = EffectProvenance::function(Vec::new(), parameter, duplicated);
+
+        let mut operations = 0;
+        let mut empty = EffectProvenance::default();
+        for _ in 0..DEPTH {
+            let mut memo = HashMap::new();
+            let mut budget = EffectProvenance::NODE_BUDGET;
+            empty = duplicate
+                .substitute_bounded(parameter, &empty, &mut memo, &mut budget)
+                .call_result()
+                .unwrap_or_default();
+            operations += EffectProvenance::NODE_BUDGET - budget;
+        }
+        assert_eq!(
+            empty,
+            EffectProvenance::default(),
+            "empty branches are pruned"
+        );
+        assert!(
+            operations <= DEPTH * 32,
+            "empty substitution work is linear"
+        );
+
+        let origin = EffectOrigin {
+            symbol: effect,
+            interface: crate::types::EffectId::structural("Log".into(), "test".into()),
+            declaration_span: Span::generated(1, 3),
+        };
+        let mut operations = 0;
+        let mut real = EffectProvenance::origin(origin.clone());
+        for _ in 0..DEPTH {
+            let mut memo = HashMap::new();
+            let mut budget = EffectProvenance::NODE_BUDGET;
+            real = duplicate
+                .substitute_bounded(parameter, &real, &mut memo, &mut budget)
+                .call_result()
+                .expect("duplicate has a result");
+            operations += EffectProvenance::NODE_BUDGET - budget;
+        }
+        assert!(operations <= DEPTH * 32, "real substitution work is linear");
+        assert!(
+            unique_nodes(&real) <= DEPTH + 1,
+            "forty binary duplications must retain a linear number of nodes"
+        );
+        let mut selected = real;
+        for _ in 0..DEPTH {
+            let a = selected.fields.get("a").expect("duplicated a");
+            let b = selected.fields.get("b").expect("duplicated b");
+            assert!(Rc::ptr_eq(&a.0, &b.0), "identical branches share one node");
+            selected = selected.projected("a".into()).expect("projected a");
+        }
+        assert_eq!(selected.callable, [EffectSource::Origin(origin)]);
+    }
+
+    #[test]
+    fn deep_substitution_and_destruction_fit_a_small_stack() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(|| {
+                let bundle = Bundle::new("deep-provenance", Version::new(0, 0, 0)).unwrap();
+                let mut mint = Mint::new(bundle);
+                let target = symbol(&mut mint, "target");
+                let other = symbol(&mut mint, "other");
+                let mut provenance = EffectProvenance::parameter(target);
+                for _ in 0..5000 {
+                    provenance = EffectProvenance::from_fields(
+                        [("next".into(), provenance)].into_iter().collect(),
+                    );
+                }
+                let rewritten = provenance.substitute(other, &EffectProvenance::default());
+                assert!(!rewritten.exact_origins.iter().any(|_| false));
+                drop(rewritten);
+                drop(provenance);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn wide_graph_work_is_bounded_and_shared_fallback_is_memoized() {
+        let bundle = Bundle::new("wide-provenance", Version::new(0, 0, 0)).unwrap();
+        let mut mint = Mint::new(bundle);
+        let target = symbol(&mut mint, "target");
+        let shared = EffectProvenance::parameter(target);
+        let wide = EffectProvenance::from_fields(
+            (0..10_000)
+                .map(|n| (format!("f{n:05}"), shared.clone()))
+                .collect(),
+        );
+        let mut memo = HashMap::new();
+        let mut budget = EffectProvenance::NODE_BUDGET;
+        let rewritten =
+            wide.substitute_bounded(target, &EffectProvenance::default(), &mut memo, &mut budget);
+        assert_eq!(budget, 0);
+        assert!(unique_nodes(&rewritten) <= EffectProvenance::NODE_BUDGET);
+    }
+
+    #[test]
+    fn huge_callable_replacement_is_admitted_with_bounded_work_and_allocation() {
+        let bundle = Bundle::new("huge-callable", Version::new(0, 0, 0)).unwrap();
+        let mut mint = Mint::new(bundle);
+        let target = symbol(&mut mint, "target");
+        let effect = symbol(&mut mint, "Log");
+        let origin = EffectOrigin {
+            symbol: effect,
+            interface: crate::types::EffectId::structural("Log".into(), "test".into()),
+            declaration_span: Span::generated(7, 9),
+        };
+        // Construct directly: function() deliberately deduplicates its normal,
+        // source-sized input, while this test models an adversarial replacement.
+        let replacement = EffectProvenance::node(EffectProvenanceNode {
+            callable: vec![EffectSource::Origin(origin.clone()); 100_000],
+            ..Default::default()
+        });
+        let source = EffectProvenance::function(
+            vec![EffectSource::Parameter {
+                symbol: target,
+                path: Vec::new(),
+            }],
+            target,
+            EffectProvenance::default(),
+        );
+        let mut memo = HashMap::new();
+        let mut budget = EffectProvenance::NODE_BUDGET;
+        let rewritten = source.substitute_bounded(target, &replacement, &mut memo, &mut budget);
+        assert_eq!(budget, 0, "the traversal must stop at its work budget");
+        assert_eq!(rewritten.callable, [EffectSource::Origin(origin)]);
+        assert!(
+            rewritten.callable.capacity() <= EffectProvenance::SUMMARY_BUDGET,
+            "fallback allocation is bounded rather than sized to the replacement"
+        );
+    }
+
+    #[test]
+    fn selection_exhaustion_retains_exact_origin_but_missing_path_does_not() {
+        let bundle = Bundle::new("selection-exhaustion", Version::new(0, 0, 0)).unwrap();
+        let mut mint = Mint::new(bundle);
+        let target = symbol(&mut mint, "target");
+        let effect = symbol(&mut mint, "Log");
+        let origin = EffectOrigin {
+            symbol: effect,
+            interface: crate::types::EffectId::structural("Log".into(), "test".into()),
+            declaration_span: Span::generated(11, 13),
+        };
+        let replacement = EffectProvenance::origin(origin.clone());
+        let too_long = vec![EffectPathStep::CallResult; EffectProvenance::PATH_BUDGET + 1];
+
+        let mut meter = ProvenanceMeter { left: usize::MAX };
+        let Err(summary) = replacement.select_metered(&too_long, &mut meter) else {
+            panic!("PATH_BUDGET exhaustion must be distinct from a missing path");
+        };
+        assert_eq!(summary.callable, [EffectSource::Origin(origin.clone())]);
+        let mut meter = ProvenanceMeter { left: usize::MAX };
+        assert!(matches!(
+            replacement.select_metered(&[EffectPathStep::CallResult], &mut meter),
+            Ok(None)
+        ));
+
+        let source = EffectProvenance::function(
+            vec![EffectSource::Parameter {
+                symbol: target,
+                path: too_long,
+            }],
+            target,
+            EffectProvenance::default(),
+        );
+        let rewritten = source.substitute(target, &replacement);
+        assert_eq!(rewritten.callable, [EffectSource::Origin(origin)]);
+    }
+
+    #[test]
+    fn exhausted_rewrite_retains_deep_exact_origin_without_stale_parameter() {
+        let bundle = Bundle::new("exhausted-provenance", Version::new(0, 0, 0)).unwrap();
+        let mut mint = Mint::new(bundle);
+        let target = symbol(&mut mint, "target");
+        let effect = symbol(&mut mint, "Log");
+        let origin = EffectOrigin {
+            symbol: effect,
+            interface: crate::types::EffectId::structural("Log".into(), "test".into()),
+            declaration_span: Span::generated(2, 4),
+        };
+        let mut deep = EffectProvenance::origin(origin.clone());
+        for _ in 0..100 {
+            deep = EffectProvenance::from_fields([("next".into(), deep)].into_iter().collect());
+        }
+        let source = EffectProvenance::function(
+            vec![EffectSource::Parameter {
+                symbol: target,
+                path: vec![],
+            }],
+            target,
+            deep,
+        );
+        let mut memo = HashMap::new();
+        let mut budget = 0;
+        let rewritten =
+            source.substitute_bounded(target, &EffectProvenance::default(), &mut memo, &mut budget);
+        assert!(rewritten.callable.contains(&EffectSource::Origin(origin)));
+        assert!(!rewritten.callable.iter().any(
+            |source| matches!(source, EffectSource::Parameter { symbol, .. } if *symbol == target)
+        ));
+        assert!(
+            rewritten
+                .value_parameter
+                .as_ref()
+                .is_none_or(|p| p.symbol != target)
+        );
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct Error {
+    /// Stable identity allocated when the error is emitted. Source sorting moves
+    /// but never renumbers it, and speculative identities are never reused.
+    pub id: ErrorId,
+    /// The compiler record that directly emitted this error. A direct error is
+    /// produced by a boundary/final check rather than by a solve step or SAT
+    /// batch.
+    pub cause: ErrorCause,
     pub span: Span,
     pub kind: ErrorKind,
+    /// Source-level account extracted from the immutable reason graph. Families
+    /// not migrated yet deliberately leave this empty and use their established
+    /// diagnostic wording.
+    pub explanation: Option<InferenceExplanation>,
+}
+
+/// A reporter-independent explanation of an inference contradiction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InferenceExplanation {
+    /// Complete source facts in deterministic causal order.
+    pub full_facts: Vec<ExplanationFact>,
+    /// Indices into `full_facts` selected for the ordinary source-ordered view.
+    pub abridged: Vec<usize>,
+    /// The one source-facing name, if any, which ties displayed facts together.
+    /// It is presentation metadata, never a solver-variable name.
+    pub pivot: Option<ExplanationPivot>,
+    /// Grounded facts retained by the full path but left out of `abridged`.
+    pub omitted_facts: usize,
+    pub contradiction: Contradiction,
+    /// Both the source constraint slice and the unabridged raw reason slice.
+    pub cause: ExplanationCause,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplanationFact {
+    pub span: Span,
+    /// True for source facts established by a direct boundary check.
+    pub direct: bool,
+    pub constraint: ConstraintId,
+    pub origin: ConstraintOrigin,
+    pub subject: Subject,
+    pub payload: ExplanationFactPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplanationPivot {
+    /// Explanatory spelling chosen without exposing or consulting solver IDs.
+    pub name: String,
+    pub kind: ExplanationPivotKind,
+    /// Displayed facts which refer to this pivot, as indices into `full_facts`.
+    pub references: Vec<usize>,
+    /// The one fact whose label introduces the spelling.
+    pub introduced_at: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExplanationPivotKind {
+    WrittenValue,
+    FunctionInput,
+    BranchResult,
+    ProjectedField,
+    FunctionEffects,
+    Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExplanationFactPayload {
+    RequiresType,
+    UsedAsFunction,
+    SuppliesArgument,
+    BranchResult,
+    /// The written `.name` / pattern operation that demands a label.
+    LabelDemand,
+    /// A source use that fixes or closes the other side of a row.
+    ClosedRow,
+    /// The source use which actually introduces the repeated label.
+    LabelIntroduction,
+    /// The source row remainder whose adjacent label forbids that introduction.
+    LabelForbidden,
+    /// The annotation spelling which leaves this choice to each caller.
+    CallerChoiceDeclaration,
+    /// The body operation which fixes or assumes part of the caller's choice.
+    CallerChoiceUse,
+    /// The binding whose published type would carry another annotation's choice.
+    CallerChoiceDestination,
+    /// A written operation application, including calls which propagate an
+    /// operation performed deeper in their callee.
+    EffectUse,
+    /// The function or top-level computation whose effect boundary refuses it.
+    EffectBoundary,
+    /// The source declaration which gives the effect its name.
+    EffectDeclaration,
+    /// The callback type at the exact host parameter path which requires effects.
+    CallbackRequirement,
+    /// The containing extern call's written effect capability.
+    ExternCapability,
+    /// The declaration which owns a foreign boundary.
+    ExternDeclaration,
+    /// The generic leaf whose runtime representation is not fixed.
+    PolymorphicExternLeaf,
+    /// The host input/result path which needs a fixed representation.
+    ExternPosition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Contradiction {
+    pub kind: ContradictionKind,
+    pub left: TypeDescription,
+    pub right: TypeDescription,
+    /// Present for row-shaped contradictions. The label is retained as source
+    /// syntax rather than reconstructed from a rendered solver row.
+    pub row: Option<RowContradiction>,
+    /// Source shape of a recursive cycle, used to keep repair advice specific.
+    pub recursive: Option<RecursiveCycleShape>,
+    /// Neutral failures always retain both possible repair directions.
+    pub repairs: [RepairDirection; 2],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowContradiction {
+    pub shape: Shape,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContradictionKind {
+    IncompatibleTypes,
+    ValueUsedAsFunction,
+    /// A finite value would have to contain itself, or a callable value would
+    /// have to accept itself as one of its own inputs.
+    RecursiveValue,
+    ProjectionOnNonStruct,
+    LabelUnavailable,
+    RepeatedLabel,
+    /// A body fixed or inspected a choice its annotation leaves to callers.
+    CallerChoice,
+    /// A binding would export a choice owned by another annotation.
+    CallerChoiceEscape,
+    /// An operation reaches a top-level computation with no enclosing handler.
+    UnhandledEffect,
+    /// An operation reaches an enclosing function whose type does not list it.
+    EffectNotAllowed,
+    CallbackEffectsNotCovered,
+    PolymorphicExternBoundary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepairDirection {
+    ChangeFirstUse,
+    ChangeSecondUse,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecursiveCycleShape {
+    CallInput,
+    Containment,
+    Neutral,
+}
+
+/// Deliberately source-facing and finite: no solver variable, row-tail, or
+/// compiler-synthesized arrow can enter migrated diagnostic prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeDescription {
+    NaturalNumber,
+    Integer,
+    RealNumber,
+    Text,
+    Boolean,
+    Function,
+    Struct,
+    TaggedValue,
+    DeclaredType,
+    Undecided,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplanationCause {
+    pub error: ErrorId,
+    pub seed: Option<ReasonId>,
+    pub constraints: Vec<ConstraintId>,
+    pub reasons: Vec<ReasonId>,
+    /// Reachable reason nodes not visited because the source-facing full view
+    /// hit its work budget. Nonzero means the slice is explicitly abridged.
+    pub omitted_reasons: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorCause {
+    Step(StepId),
+    Batch(BatchId),
+    Direct,
+}
+
+impl Error {
+    /// A direct, not-yet-explained error. Inference replaces the pending
+    /// identity before publishing an [`Output`].
+    pub fn new(span: Span, kind: ErrorKind) -> Self {
+        Self {
+            id: ErrorId::pending(),
+            cause: ErrorCause::Direct,
+            span,
+            kind,
+            explanation: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -733,7 +2202,13 @@ pub enum ErrorKind {
     /// means nothing anywhere else: a scheme quantifying one would be promising
     /// its own callers something only somebody else's caller decides. Reported
     /// at the declaring name, which is the line that has to change.
-    RigidEscapes { name: Rc<str> },
+    RigidEscapes {
+        name: Rc<str>,
+        declared: Span,
+        destination: Rc<Ty>,
+        destination_name: Rc<str>,
+        destination_span: Span,
+    },
     /// A `..` was decided to stand for a label the row it tails already names.
     /// `{ x: Nat, ..'r }` says "an `x`, plus whatever else `'r` is", so `'r`
     /// standing for anything that certainly has an `x` of its own would name
@@ -744,7 +2219,12 @@ pub enum ErrorKind {
     /// and what kind of row it was found in are carried: those are the two
     /// things both halves of the contradiction have in common, and the rows
     /// themselves are each half a type the reader never wrote down.
-    RepeatedField { shape: Shape, field: String },
+    RepeatedField {
+        shape: Shape,
+        field: String,
+        introduction: Option<RowFactOrigin>,
+        forbidden: Option<RowFactOrigin>,
+    },
     /// A use of a definition whose type requires a combination of labels the
     /// value written there cannot have: `p {}` where `p` accepts exactly one of
     /// `x` and `y`.
@@ -757,7 +2237,10 @@ pub enum ErrorKind {
     /// The formula is carried already worded in the reader's own nouns: the
     /// labels their type names, rather than the presence variables the compiler
     /// gave them.
-    PresenceRequired { formula: String },
+    PresenceRequired {
+        formula: String,
+        shape: Option<Shape>,
+    },
     /// An annotation whose `where` clause nothing can satisfy once the
     /// definition under it has had its say.
     ///
@@ -802,10 +2285,36 @@ pub enum ErrorKind {
     /// function says what calling it may do, and this would do more.
     NotAllowed { effect: String },
     /// A foreign callback requires evidence the containing host call cannot carry.
-    CallbackEffectsNotCovered,
+    CallbackEffectsNotCovered {
+        missing_effects: Vec<String>,
+        extern_effects: Vec<String>,
+        callback_path: String,
+        callback_type: String,
+        extern_name: String,
+        /// Every offending callback path in this declaration. The scalar
+        /// fields above retain the first issue for compatibility and prose.
+        issues: Vec<ExternCallbackIssue>,
+    },
     /// An ordinary foreign boundary leaf has no fixed runtime representation:
     /// an annotation variable there could instantiate to a Ruddy closure.
-    PolymorphicExternBoundary,
+    PolymorphicExternBoundary {
+        variable: String,
+        variable_kind: ExternVariableKind,
+        position: String,
+        extern_name: String,
+        /// All representation-varying leaves in source/path order.
+        leaves: Vec<PolymorphicExternLeaf>,
+        /// Callback evidence is retained even when a polymorphic leaf is the
+        /// declaration's primary existing diagnostic kind.
+        callback_issues: Vec<ExternCallbackIssue>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternVariableKind {
+    Type,
+    Row,
+    Presence,
 }
 
 /// What one type variable is known to be. Private to inference, and rightly so:
@@ -815,7 +2324,7 @@ pub enum ErrorKind {
 #[derive(Debug, Clone)]
 enum Slot {
     Unbound,
-    Bound(Assigned),
+    Bound { value: Assigned, by: ReasonId },
 }
 
 /// What one variable may not stand for: the labels, and the kind of row the
@@ -825,17 +2334,47 @@ enum Slot {
 /// because there is no longer anywhere to read it from — a row-tail variable stands
 /// for a whole type, and the labels forbidden of it are that type's fields. See
 /// [`Table::lacks`].
-type Lacks = (Shape, IndexSet<String>);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowFactOrigin {
+    pub constraint: ConstraintId,
+    pub reason: ReasonId,
+    pub origin: ConstraintOrigin,
+    pub subject: Subject,
+    pub span: Span,
+}
 
-/// Everything a solve can change about a [`Table`]: what the variables are
-/// known to be, which level each belongs to, and what they may not stand for.
-/// Taken and put back by [`Rule::Congruent`], which is the one rule that asks a
-/// question before it is sure the question is the right one to have asked.
+#[derive(Debug, Clone)]
+struct LacksEntry {
+    shape: Shape,
+    label: String,
+    origin: Option<RowFactOrigin>,
+}
+
+type Lacks = IndexMap<String, LacksEntry>;
+
+/// Everything speculative solving can change about a [`Table`]. Taken and put
+/// back by [`Rule::Congruent`], which is the one rule that asks a question
+/// before it is sure the question is the right one to have asked.
 ///
 /// The levels travel with the slots rather than beside them: the two lists are
 /// indexed by the same variable, so putting one back without the other would
-/// leave a variable minted since the snapshot with a level and no slot.
-type Known = (Vec<Slot>, Vec<u32>, HashMap<TyVar, Lacks>);
+/// leave a variable minted since the snapshot with a level and no slot. The
+/// existential sets travel with them too: presence aliasing propagates sealed
+/// identity, and opening a fresh package records its new variable as both a
+/// witness and abstract. The remaining semantic side tables are either read
+/// only during unification or have their own congruence rollback in [`Solve`].
+struct Known {
+    vars: Vec<Slot>,
+    /// [`Table::var_meta`] is append-only, so its snapshot is its length and
+    /// putting it back is a truncate.
+    var_meta_len: usize,
+    levels: Vec<u32>,
+    lacks: HashMap<TyVar, Lacks>,
+    active_lacks_origin: Option<RowFactOrigin>,
+    existential_witnesses: HashSet<TyVar>,
+    abstract_existentials: HashSet<TyVar>,
+    reason_len: usize,
+}
 
 /// What one name in scope means. Private for the same reason as [`Slot`]: a
 /// binding exists only while a definition is being walked, and what survives
@@ -843,7 +2382,7 @@ type Known = (Vec<Slot>, Vec<u32>, HashMap<TyVar, Lacks>);
 #[derive(Debug, Clone)]
 enum Binding {
     Mono(Rc<Ty>),
-    Poly(Scheme),
+    Poly(ExplainedScheme),
     /// A name a nested `let` bound, whose scheme only the solver will know.
     ///
     /// Generation cannot name what a use of one is a copy of: the scheme is
@@ -854,12 +2393,92 @@ enum Binding {
     Local,
 }
 
+/// A semantic scheme paired with the causal roots that produced its shape.
+///
+/// This deliberately stays outside [`Scheme`]: spans and inference identity are
+/// compilation-local evidence, not part of type equality or an exported type.
+/// Opening the scheme opens this compact skeleton at the same time, attaching
+/// its shared roots to the freshly instantiated variables (and to the opened
+/// root for closed contracts).
+#[derive(Debug, Clone)]
+struct ExplainedScheme {
+    scheme: Scheme,
+    provenance: SchemeProvenance,
+    effect_provenance: Box<EffectProvenance>,
+}
+
+/// A compact causal skeleton keyed like the zonked scheme body. Child edges,
+/// rather than incidental traversal order, align evidence when a scheme is
+/// opened; this matters when packages disappear and absent payloads are
+/// pruned.
+#[derive(Debug, Clone, Default)]
+struct SchemeProvenance {
+    nodes: Vec<ProvenanceNode>,
+    quantified: Vec<QuantifiedProvenance>,
+}
+
+#[derive(Debug, Clone)]
+struct QuantifiedProvenance {
+    sort: VarSort,
+    roots: Vec<ReasonId>,
+    omitted: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ProvenanceNode {
+    shape: ProvenanceShape,
+    roots: Vec<ReasonId>,
+    omitted: usize,
+    children: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProvenanceShape {
+    Ty(ProvenanceTy),
+    Row(Vec<(String, bool)>),
+    Presence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProvenanceTy {
+    Leaf,
+    Arrow,
+    Package,
+    Struct,
+    Sum,
+    Named(usize),
+}
+
+impl ExplainedScheme {
+    /// An imported contract is authoritative but has no definition span in
+    /// this compilation, so only its local use can become a displayed fact.
+    fn imported(scheme: Scheme) -> Self {
+        Self {
+            scheme,
+            provenance: SchemeProvenance::default(),
+            effect_provenance: Box::default(),
+        }
+    }
+
+    fn local(
+        scheme: Scheme,
+        provenance: SchemeProvenance,
+        effect_provenance: EffectProvenance,
+    ) -> Self {
+        Self {
+            scheme,
+            provenance,
+            effect_provenance: Box::new(effect_provenance),
+        }
+    }
+}
+
 /// Which side of a goal a row's tail sits on. [`Solve::unify`] decomposes
 /// without swapping, so an act performed on a tail's behalf — a binding, a
 /// field settled absent, a mismatch — has to know which way round to say
 /// itself, or a complaint about an annotation would read as one about the
 /// term.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Side {
     Expected,
     Actual,
@@ -927,6 +2546,8 @@ struct Solved {
     generated: Vec<Constraint>,
     /// Every annotation written on a nested `let` inside it. See [`Annotated`].
     annotated: Vec<Annotated>,
+    /// Exact operation-value provenance inferred for this value.
+    effect_provenance: EffectProvenance,
     /// Where the schemes this definition's nested lets published begin in the
     /// shared list, so that each can be numbered for printing once the group is
     /// solved. See [`Table::published`].
@@ -956,6 +2577,8 @@ struct PackageGuarantee {
 
 #[derive(Default)]
 struct Table {
+    /// Source spellings for bindings whose nested generalization may report an escape.
+    binding_names: HashMap<Symbol, Rc<str>>,
     /// One slot per variable; [`Ty::Var`] indexes into it.
     ///
     /// A group rather than a definition, and the difference is only where the
@@ -964,6 +2587,8 @@ struct Table {
     /// walked. It is still nobody's but the group's, because the group is
     /// finished before anything outside it is looked at.
     vars: Vec<Slot>,
+    /// Source-semantic metadata parallel to `vars`.
+    var_meta: Vec<VarMeta>,
     /// The generalization level each variable was minted at, parallel to
     /// `vars`. A binding group is level 0, a nested `let`'s value is one deeper
     /// than whatever it was written in, and everything still unbound at or
@@ -1076,6 +2701,43 @@ struct Table {
     /// disagreement, a scheme's `where` clause — is suppressed, because all of
     /// them would be the same contradiction said again.
     unsat: bool,
+    /// Append-only identity arenas. These counters are deliberately absent from
+    /// `snapshot`/`restore`: speculative records are retired on rollback rather
+    /// than letting a later record inherit an observed identity.
+    next_constraint_id: u64,
+    next_step_id: u64,
+    next_error_id: u64,
+    next_batch_id: u64,
+    /// Immutable append-only causal records. Unlike variable metadata this is
+    /// deliberately not restored after speculative congruence.
+    reasons: Vec<Reason>,
+    /// Publication roots omitted before a marker entered the public arena.
+    omitted_reason_parents: HashMap<ReasonId, usize>,
+    /// Reasons descended from recovery, retained for debugging but excluded
+    /// from publishable scheme evidence in O(1).
+    unpublishable_reasons: HashSet<ReasonId>,
+    next_reason_id: u64,
+    /// Binding reasons observed during one solver act. `None` outside a solve
+    /// makes publication, generalization, and zonking incapable of leaking
+    /// incidental reads into a later step.
+    causal_reads: RefCell<Option<Vec<IndexSet<ReasonId>>>>,
+    causal_scope_depth: usize,
+    /// Source cause currently introducing row syntax. Lacks facts copy this
+    /// value when they are created and retain it across every tail binding.
+    active_lacks_origin: Option<RowFactOrigin>,
+    /// Opened scheme roots keyed by the root `Rc<Ty>` identity. This covers
+    /// closed schemes, which mint no variable on which to hang provenance.
+    /// Entries live only for this inference run and never affect semantics.
+    opened_provenance: HashMap<usize, (Weak<Ty>, Vec<ReasonId>)>,
+    /// Presence-position evidence follows the opened presence variable itself.
+    /// It must not ride on the field payload's `Rc`: distinct sibling fields
+    /// may deliberately share a payload node without sharing presence causes.
+    opened_presence_provenance: HashMap<TyVar, (ReasonId, Vec<ReasonId>)>,
+    /// Nested bindings whose written contracts, rather than implementation
+    /// evidence, are authoritative when their schemes are published.
+    authoritative_bindings: HashSet<Symbol>,
+    /// Binding-specific annotation identity used when publishing local schemes.
+    authoritative_spans: HashMap<Symbol, Span>,
 }
 
 /// Which quantified position each thing a scheme closes over was given, in the
@@ -1096,6 +2758,9 @@ struct Subst {
     /// quantified position once it has been. See [`ErrorKind::RigidEscapes`]
     /// for the one that may not be.
     rigids: HashMap<u32, u32>,
+    /// A rigid may occur as a whole type or as a row tail. Keep that semantic
+    /// sort when the annotation's rigid is reopened as an ordinary variable.
+    rigid_sorts: HashMap<u32, VarSort>,
 }
 
 impl Subst {
@@ -1105,6 +2770,59 @@ impl Subst {
     fn next(&self) -> u32 {
         (self.presences.len() + self.types.len() + self.rigids.len()) as u32
     }
+}
+
+/// Run a real failing equality over a compact, exponentially expanding type
+/// DAG. Integration regressions use this to cover recovery independently of
+/// source parsing, which cannot express shared Rc identity.
+#[doc(hidden)]
+pub fn compact_dag_failure_for_tests(definition: Symbol, depth: usize) -> (Vec<Error>, Vec<Step>) {
+    let mut table = Table::default();
+    let leaf = table.fresh_type_for(Subject::Term);
+    let mut dag = leaf;
+    for _ in 0..depth {
+        dag = Rc::new(Ty::Arrow(dag.clone(), dag, Row::closed()));
+    }
+    let constraint_id = ConstraintId::synthetic(0);
+    let reason = table.reason(ReasonOrigin::Constraint(constraint_id), Vec::new());
+    let constraints = [Constraint {
+        id: constraint_id,
+        reason,
+        span: Span::default(),
+        origin: ConstraintOrigin::ContextualCheck,
+        subjects: ConstraintSubjects::pair(Subject::Context, Subject::Term),
+        kind: ConstraintKind::Equal {
+            expected: Rc::new(Ty::Nat),
+            actual: dag,
+        },
+    }];
+    let mut errors = Vec::new();
+    let mut steps = Vec::new();
+    let aliases = IndexMap::new();
+    let nominal = HashSet::new();
+    let mut locals = IndexMap::new();
+    let mut refinements = Vec::new();
+    Solve {
+        table: &mut table,
+        errors: &mut errors,
+        steps: &mut steps,
+        aliases: &aliases,
+        nominal: &nominal,
+        definition,
+        depth: 0,
+        constraint: None,
+        constraint_reason: None,
+        assumed: Vec::new(),
+        schemes: HashMap::new(),
+        locals: &mut locals,
+        guard: None,
+        active_refinement: None,
+        guard_reasons: Vec::new(),
+        refinements: &mut refinements,
+        generated_end: constraints.len(),
+    }
+    .run(&constraints);
+    (errors, steps)
 }
 
 /// Exercise the match-result family builder without constructing a source
@@ -1130,11 +2848,14 @@ pub fn structural_family_for_tests(
         nominal: &nominal,
         definition,
         depth: 0,
+        constraint: None,
+        constraint_reason: None,
         assumed: Vec::new(),
         schemes: HashMap::new(),
         locals: &mut locals,
         guard: None,
         active_refinement: None,
+        guard_reasons: Vec::new(),
         refinements: &mut refinements,
         generated_end: 0,
     }
@@ -1172,231 +2893,2441 @@ fn expose_packages(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Rc<Ty> {
 /// polymorphic. Such a leaf cannot be adapted once at declaration lowering:
 /// in particular, an instantiation to an arrow would otherwise send a Ruddy
 /// evidence-taking closure directly to the host.
-fn polymorphic_extern_boundary(
-    aliases: &IndexMap<Symbol, Scheme>,
-    abi: &ir::ExternType,
-    ty: &Rc<Ty>,
-) -> Option<Span> {
-    fn boundary(
-        aliases: &IndexMap<Symbol, Scheme>,
-        abi: &ir::ExternType,
-        ty: &Rc<Ty>,
-        seen: &mut Vec<(*const ir::ExternType, Rc<Ty>)>,
-    ) -> Option<Span> {
-        let state = abi as *const ir::ExternType;
-        if seen.iter().any(|(prior_state, prior_ty)| {
-            *prior_state == state && same_finite_syntax(prior_ty, ty)
-        }) {
-            return None;
-        }
-        seen.push((state, ty.clone()));
-        match &abi.tracked {
-            ir::ExternTypeKind::Group(inner) => boundary(aliases, inner, ty, seen),
-            ir::ExternTypeKind::Function {
-                parameters, result, ..
-            } => {
-                let mut cursor = ty.clone();
-                for parameter in parameters {
-                    let exposed = expose_packages(aliases, &cursor);
-                    let Ty::Arrow(from, to, _) = &*exposed else {
-                        return None;
-                    };
-                    if let Some(span) = boundary(aliases, parameter, from, seen) {
-                        return Some(span);
-                    }
-                    cursor = to.clone();
-                }
-                // A nullary marked function is represented by the desugared
-                // unit arrow, but its unit input is synthetic rather than a
-                // boundary leaf written by the reader.
-                if parameters.is_empty() {
-                    let exposed = expose_packages(aliases, &cursor);
-                    let Ty::Arrow(_, to, _) = &*exposed else {
-                        return None;
-                    };
-                    cursor = to.clone();
-                }
-                boundary(aliases, result, &cursor, seen)
-            }
-            ir::ExternTypeKind::Ordinary(_) => match &*expose_packages(aliases, ty) {
-                Ty::Package(_) => unreachable!("package exposure reaches a fixed point"),
-                Ty::Bound(_) | Ty::Var(_) | Ty::Rigid { .. } => Some(abi.span),
-                Ty::Arrow(from, to, _) => {
-                    boundary(aliases, abi, from, seen).or_else(|| boundary(aliases, abi, to, seen))
-                }
-                // Primitive and structural outer representations are fixed.
-                // Their members do not individually cross the function ABI.
-                Ty::Nat
-                | Ty::Int
-                | Ty::Real
-                | Ty::String
-                | Ty::Boolean
-                | Ty::Struct(_)
-                | Ty::Sum(_)
-                | Ty::Undecided
-                | Ty::Named { .. } => None,
-            },
-        }
-    }
-
-    boundary(aliases, abi, ty, &mut Vec::new())
+#[derive(Debug, Clone)]
+pub struct PolymorphicExternLeaf {
+    pub span: Span,
+    pub variable: String,
+    pub kind: ExternVariableKind,
+    pub position: String,
 }
 
-/// Build callback evidence obligations from the resolved semantic type. The
-/// ABI tree contributes only host grouping; aliases, row tails and conditional
-/// presences all come from the same rows ordinary inference solves.
-fn callback_coverage_constraints(
-    aliases: &IndexMap<Symbol, Scheme>,
-    abi: &ir::ExternType,
-    ty: &Rc<Ty>,
-) -> (Vec<Constraint>, Formula) {
-    fn presence_formula(presence: &Presence) -> Option<Formula> {
-        match presence {
-            Presence::Present => Some(Formula::True),
-            Presence::Absent => Some(Formula::False),
-            Presence::Var(var) => Some(Formula::Atom(Atom::Var(*var))),
-            Presence::Bound(bound) => Some(Formula::Atom(Atom::Bound(*bound))),
-            Presence::Recovered(_) | Presence::Undecided => None,
-        }
+#[derive(Debug, Clone)]
+pub struct ExternCallbackIssue {
+    pub callback_span: Span,
+    pub callback_path: String,
+    pub callback_type: String,
+    pub missing_effects: Vec<String>,
+    pub extern_effects: Vec<String>,
+    /// Effect/condition pairs retain which symbolic requirement belongs to
+    /// which effect after several callback result arrows share one path.
+    pub requirements: Vec<ExternCallbackRequirement>,
+    /// Every open callback remainder not covered by the extern remainder.
+    pub missing_tails: Vec<String>,
+    /// Every distinct source-level implication the declaration fails to
+    /// guarantee at this callback path.
+    pub conditions: Vec<String>,
+    /// Conjunction of this issue's conditions. Retained as the compatibility
+    /// scalar for structured consumers; new presentation uses `requirements`.
+    pub condition: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternCallbackRequirement {
+    pub effect: String,
+    /// `None` means the effect is required unconditionally.
+    pub condition: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct ExternPath(usize);
+
+struct ExternPathNode {
+    parent: Option<usize>,
+    segment: String,
+}
+
+fn root_path(paths: &mut Vec<ExternPathNode>) -> ExternPath {
+    paths.push(ExternPathNode {
+        parent: None,
+        segment: "extern".into(),
+    });
+    ExternPath(0)
+}
+
+fn child_path(
+    paths: &mut Vec<ExternPathNode>,
+    parent: ExternPath,
+    segment: impl Into<String>,
+) -> ExternPath {
+    let at = paths.len();
+    paths.push(ExternPathNode {
+        parent: Some(parent.0),
+        segment: segment.into(),
+    });
+    ExternPath(at)
+}
+
+fn render_path(paths: &[ExternPathNode], path: ExternPath) -> String {
+    let mut parts = Vec::new();
+    let mut cursor = Some(path.0);
+    while let Some(at) = cursor {
+        parts.push(paths[at].segment.as_str());
+        cursor = paths[at].parent;
+    }
+    parts.reverse();
+    parts.join(" ")
+}
+
+fn render_child_path(
+    paths: &mut Vec<ExternPathNode>,
+    parent: ExternPath,
+    segment: impl Into<String>,
+) -> String {
+    let child = child_path(paths, parent, segment);
+    render_path(paths, child)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ExternVariableIdentity {
+    TypeVar(TyVar),
+    TypeRigid(u32),
+    TypeBound(u32),
+    RowVar(TyVar),
+    RowRigid(u32),
+    RowBound(u32),
+    PresenceVar(TyVar),
+    PresenceBound(u32),
+}
+
+#[derive(Debug, Clone)]
+struct ExternVariableSource {
+    span: Span,
+    name: String,
+    hidden: bool,
+}
+
+/// Identity-indexed source provenance for one annotation boundary. Alias
+/// expansion substitutes the same semantic identities into local and imported
+/// bodies (including `Rest::More` row splices), so this map remains exact where
+/// rescanning an alias application cannot possibly recover the originating
+/// quantifier.
+#[derive(Debug, Clone, Default)]
+struct ExternSourceMap {
+    variables: HashMap<ExternVariableIdentity, ExternVariableSource>,
+}
+
+impl ExternSourceMap {
+    fn insert(&mut self, identity: ExternVariableIdentity, span: Span, name: impl Into<String>) {
+        self.insert_with_ownership(identity, span, name, false);
     }
 
-    fn expose(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Rc<Ty> {
-        let mut ty = unfold(aliases, ty);
-        while let Ty::Package(body) = &*ty {
-            ty = unfold(aliases, body);
-        }
-        ty
-    }
-
-    fn callback_rows(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Vec<Row> {
-        let mut rows = Vec::new();
-        let mut cursor = ty.clone();
-        let mut seen = Vec::new();
-        loop {
-            if matches!(&*cursor, Ty::Named { .. }) {
-                if seen.iter().any(|prior| same_finite_syntax(prior, &cursor)) {
-                    break;
-                }
-                seen.push(cursor.clone());
-            }
-            let exposed = expose(aliases, &cursor);
-            let Ty::Arrow(_, to, row) = &*exposed else {
-                break;
-            };
-            rows.push(row.clone());
-            cursor = to.clone();
-        }
-        rows
-    }
-
-    fn cover(
-        aliases: &IndexMap<Symbol, Scheme>,
+    fn insert_with_ownership(
+        &mut self,
+        identity: ExternVariableIdentity,
         span: Span,
-        callback: &Rc<Ty>,
-        available: &Row,
-        out: &mut Vec<Constraint>,
+        name: impl Into<String>,
+        hidden: bool,
     ) {
-        out.extend(
-            callback_rows(aliases, callback)
-                .into_iter()
-                .map(|required| Constraint {
-                    span,
-                    kind: ConstraintKind::CallbackCoverage {
-                        required,
-                        available: available.clone(),
-                    },
-                }),
-        );
+        self.variables
+            .entry(identity)
+            .or_insert(ExternVariableSource {
+                span,
+                name: name.into(),
+                hidden,
+            });
     }
 
-    fn boundary(
-        aliases: &IndexMap<Symbol, Scheme>,
-        abi: &ir::ExternType,
-        ty: &Rc<Ty>,
-        out: &mut Vec<Constraint>,
-        seen: &mut Vec<(*const ir::ExternType, Rc<Ty>)>,
-    ) {
-        let state = abi as *const ir::ExternType;
-        if seen.iter().any(|(prior_state, prior_ty)| {
-            *prior_state == state && same_finite_syntax(prior_ty, ty)
-        }) {
-            return;
+    fn get(&self, identity: ExternVariableIdentity) -> Option<&ExternVariableSource> {
+        self.variables.get(&identity)
+    }
+}
+
+fn type_variable_identity(ty: &Ty) -> Option<ExternVariableIdentity> {
+    match ty {
+        Ty::Var(var) => Some(ExternVariableIdentity::TypeVar(*var)),
+        Ty::Rigid { id, .. } => Some(ExternVariableIdentity::TypeRigid(*id)),
+        Ty::Bound(index) => Some(ExternVariableIdentity::TypeBound(*index)),
+        _ => None,
+    }
+}
+
+fn row_variable_identity(rest: &Rest) -> Option<ExternVariableIdentity> {
+    match rest {
+        Rest::Var(var) => Some(ExternVariableIdentity::RowVar(*var)),
+        Rest::Rigid { id, .. } => Some(ExternVariableIdentity::RowRigid(*id)),
+        Rest::Bound(index) => Some(ExternVariableIdentity::RowBound(*index)),
+        Rest::Closed | Rest::Undecided | Rest::More(_) => None,
+    }
+}
+
+fn presence_variable_identity(presence: &Presence) -> Option<ExternVariableIdentity> {
+    match presence {
+        Presence::Var(var) => Some(ExternVariableIdentity::PresenceVar(*var)),
+        Presence::Bound(index) => Some(ExternVariableIdentity::PresenceBound(*index)),
+        Presence::Present | Presence::Absent | Presence::Recovered(_) | Presence::Undecided => None,
+    }
+}
+
+fn flatten_row(row: &Row) -> Row {
+    let mut labels = IndexMap::new();
+    let mut segment = row;
+    loop {
+        for (name, field) in &segment.labels {
+            labels.entry(name.clone()).or_insert_with(|| field.clone());
         }
-        seen.push((state, ty.clone()));
+        match &segment.rest {
+            Rest::More(more) => segment = more,
+            rest => {
+                return Row {
+                    labels,
+                    rest: rest.clone(),
+                };
+            }
+        }
+    }
+}
+
+fn presence_formula(presence: &Presence) -> Option<Formula> {
+    match presence {
+        Presence::Present => Some(Formula::True),
+        Presence::Absent => Some(Formula::False),
+        Presence::Var(var) => Some(Formula::Atom(Atom::Var(*var))),
+        Presence::Bound(bound) => Some(Formula::Atom(Atom::Bound(*bound))),
+        Presence::Recovered(_) | Presence::Undecided => None,
+    }
+}
+
+fn callback_rows(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Vec<Row> {
+    let mut rows = Vec::new();
+    let mut cursor = ty.clone();
+    let mut seen = Vec::new();
+    loop {
+        if matches!(&*cursor, Ty::Named { .. }) {
+            if seen.iter().any(|prior| same_finite_syntax(prior, &cursor)) {
+                break;
+            }
+            seen.push(cursor.clone());
+        }
+        let exposed = expose_packages(aliases, &cursor);
+        let Ty::Arrow(_, to, row) = &*exposed else {
+            break;
+        };
+        rows.push(row.clone());
+        cursor = to.clone();
+    }
+    rows
+}
+
+fn callback_tail_spelling(rest: &Rest, sources: &ExternSourceMap) -> Option<String> {
+    if matches!(rest, Rest::Closed | Rest::Undecided) {
+        return None;
+    }
+    if let Some(source) = row_variable_identity(rest).and_then(|identity| sources.get(identity)) {
+        return Some(match source.name.as_str() {
+            "generic row" => "`..`".into(),
+            name => format!("`..{name}`"),
+        });
+    }
+    Some(match rest {
+        Rest::Var(var) => format!("open callback tail `?{var}`"),
+        Rest::Bound(index) => format!("open callback tail `bound {index}`"),
+        Rest::Rigid { name, .. } => format!("`..'{name}`"),
+        Rest::More(_) => unreachable!("callback rows are flattened"),
+        Rest::Closed | Rest::Undecided => return None,
+    })
+}
+
+fn callback_effect_conditions(required: &Row, available: &Row) -> Vec<CallbackEffectCondition> {
+    required
+        .labels
+        .iter()
+        .map(|(name, required)| {
+            let required = presence_formula(&required.presence).unwrap_or(Formula::True);
+            let available = match available.labels.get(name) {
+                Some(field) => presence_formula(&field.presence).unwrap_or(Formula::True),
+                // A flexible row hole can acquire this exact conditional
+                // label. Fixed abstract tails cannot: their lacks promise
+                // excludes every label written beside them.
+                None if matches!(available.rest, Rest::Var(_) | Rest::Undecided) => Formula::True,
+                None => Formula::False,
+            };
+            CallbackEffectCondition {
+                effect: name.clone(),
+                condition: required.not().or(available),
+            }
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_callback_coverage(
+    aliases: &IndexMap<Symbol, Scheme>,
+    callback: &Rc<Ty>,
+    available: &Row,
+    sources: &ExternSourceMap,
+    callback_span: Span,
+    callback_path: String,
+    extern_name: &str,
+    extern_span: Span,
+    capability_span: Span,
+    out: &mut Vec<Constraint>,
+) {
+    let available = flatten_row(available);
+    for required in callback_rows(aliases, callback) {
+        let required = flatten_row(&required);
+        let effects = callback_effect_conditions(&required, &available);
+        let condition = Formula::all(effects.iter().map(|effect| effect.condition.clone()));
+        let tail =
+            callback_tail_spelling(&required.rest, sources).map(|required| CallbackTailRelation {
+                required,
+                available: callback_tail_spelling(&available.rest, sources),
+            });
+        let boundary = CallbackBoundary {
+            callback_span,
+            callback_path: callback_path.clone(),
+            callback_type: callback.to_string(),
+            effects,
+            condition,
+            tail,
+            extern_name: extern_name.into(),
+            extern_span,
+            capability_span,
+        };
+        out.push(Constraint {
+            id: ConstraintId::pending(),
+            reason: ReasonId::pending(),
+            span: callback_span,
+            origin: ConstraintOrigin::CallbackBoundary,
+            subjects: ConstraintSubjects::pair(
+                Subject::CallbackRequired,
+                Subject::CallbackAvailable,
+            ),
+            kind: ConstraintKind::CallbackCoverage {
+                required,
+                available: available.clone(),
+                boundary,
+            },
+        });
+    }
+}
+
+#[derive(Default)]
+struct ExternBoundaryReview {
+    leaves: Vec<PolymorphicExternLeaf>,
+    coverage: Vec<Constraint>,
+}
+
+/// Review one extern's semantic boundary once. The ABI contributes only host
+/// grouping and source spans; the lowered type supplies representation leaves,
+/// callback formulas, and composed rows. Exact lowered identities recover the
+/// source variable which survived alias substitution and row expansion.
+fn extern_boundary_review(
+    aliases: &IndexMap<Symbol, Scheme>,
+    root_abi: &ir::ExternType,
+    root_ty: &Rc<Ty>,
+    sources: &ExternSourceMap,
+    extern_name: &str,
+    extern_span: Span,
+) -> ExternBoundaryReview {
+    // This is intentionally an explicit work list. Extern annotations are user
+    // input and generated annotations can contain tens of thousands of nested
+    // arrows; diagnostics must not consume the Rust call stack.
+    let mut review = ExternBoundaryReview::default();
+    let mut paths = Vec::new();
+    let root = root_path(&mut paths);
+    let mut work = vec![(root_abi, root_ty.clone(), root, Vec::<Rc<Ty>>::new(), true)];
+    let mut seen: HashSet<(*const ir::ExternType, *const Ty)> = HashSet::new();
+    while let Some((abi, mut ty, path, mut active_aliases, mut report_row_leaves)) = work.pop() {
+        // A package fixes the representation choices it encloses, but callbacks
+        // inside it still cross the host boundary and need effect coverage.
+        while let Ty::Package(inner) = &*ty {
+            report_row_leaves = false;
+            ty = inner.clone();
+        }
+        let original = ty.clone();
+        // Lowered semantic types are DAGs. An invariant alias reuses the same
+        // argument for both sides of every arrow, so walking occurrences rather
+        // than nodes turns depth N into 2^N work. The ABI node is part of the
+        // key so distinct written parameters still retain distinct paths.
+        if !seen.insert((abi as *const ir::ExternType, Rc::as_ptr(&original))) {
+            continue;
+        }
+        if matches!(&*original, Ty::Named { .. }) {
+            if active_aliases
+                .iter()
+                .any(|prior| same_finite_syntax(prior, &original))
+            {
+                continue;
+            }
+            active_aliases.push(original.clone());
+        }
+
         match &abi.tracked {
-            ir::ExternTypeKind::Group(inner) => boundary(aliases, inner, ty, out, seen),
+            ir::ExternTypeKind::Group(inner) => {
+                work.push((inner, ty, path, active_aliases, report_row_leaves))
+            }
             ir::ExternTypeKind::Function {
                 parameters, result, ..
             } => {
-                let mut cursor = ty.clone();
-                let mut inputs = Vec::new();
+                let mut cursor = ty;
+                let mut children = Vec::new();
                 let mut available = Row::closed();
-                for _ in 0..parameters.len().max(1) {
-                    let exposed = expose(aliases, &cursor);
+                for at in 0..parameters.len().max(1) {
+                    let exposed = expose_packages(aliases, &cursor);
                     let Ty::Arrow(from, to, row) = &*exposed else {
-                        return;
+                        break;
                     };
-                    if !parameters.is_empty() {
-                        inputs.push(from.clone());
+                    if let Some(parameter) = parameters.get(at) {
+                        children.push((
+                            parameter,
+                            from.clone(),
+                            child_path(&mut paths, path, format!("parameter {}", at + 1)),
+                            active_aliases.clone(),
+                        ));
                     }
                     available = row.clone();
                     cursor = to.clone();
                 }
-                for (parameter, input) in parameters.iter().zip(inputs) {
-                    cover(aliases, parameter.span, &input, &available, out);
-                    boundary(aliases, parameter, &input, out, seen);
+
+                // Preserve source callback order in the boundary evidence. The
+                // traversal stack below is reversed separately so leaves also
+                // remain in source/path order.
+                for (parameter, input, child, _) in &children {
+                    if matches!(&*expose_packages(aliases, input), Ty::Arrow(..)) {
+                        push_callback_coverage(
+                            aliases,
+                            input,
+                            &available,
+                            sources,
+                            parameter.span,
+                            render_path(&paths, *child),
+                            extern_name,
+                            extern_span,
+                            abi.span,
+                            &mut review.coverage,
+                        );
+                    }
                 }
-                boundary(aliases, result, &cursor, out, seen);
+
+                work.push((
+                    result,
+                    cursor,
+                    child_path(&mut paths, path, "result"),
+                    active_aliases,
+                    report_row_leaves,
+                ));
+                work.extend(
+                    children.into_iter().rev().map(|(abi, ty, path, aliases)| {
+                        (abi, ty, path, aliases, report_row_leaves)
+                    }),
+                );
             }
-            ir::ExternTypeKind::Ordinary(_) => {
-                let exposed = expose(aliases, ty);
-                let Ty::Arrow(from, to, available) = &*exposed else {
-                    return;
+            ir::ExternTypeKind::Ordinary(written) => {
+                // An alias may expose an existential package even when the
+                // work item itself is still nominal. Preserve that boundary
+                // instead of looking through its hidden witness.
+                let unfolded = unfold(aliases, &original);
+                if matches!(&*unfolded, Ty::Package(_)) {
+                    continue;
+                }
+                let exposed = expose_packages(aliases, &unfolded);
+                match &*exposed {
+                    Ty::Bound(_) | Ty::Var(_) | Ty::Rigid { .. } => {
+                        let source = type_variable_identity(&exposed)
+                            .and_then(|identity| sources.get(identity));
+                        if let Some(source) = source.filter(|source| !source.hidden) {
+                            review.leaves.push(PolymorphicExternLeaf {
+                                span: source.span,
+                                variable: source.name.clone(),
+                                kind: ExternVariableKind::Type,
+                                position: render_path(&paths, path),
+                            });
+                        }
+                    }
+                    Ty::Arrow(from, to, available) => {
+                        let callback_path = child_path(&mut paths, path, "callback input");
+                        if matches!(&*expose_packages(aliases, from), Ty::Arrow(..)) {
+                            push_callback_coverage(
+                                aliases,
+                                from,
+                                available,
+                                sources,
+                                abi.span,
+                                render_path(&paths, callback_path),
+                                extern_name,
+                                extern_span,
+                                abi.span,
+                                &mut review.coverage,
+                            );
+                        }
+                        // Effect-row variables are evidence relations rather
+                        // than runtime representation choices. Coverage above
+                        // retains their exact tails and label formulas.
+                        // With legacy ordinary-arrow spelling, the reused ABI
+                        // node cannot identify a nested row token. Keep its
+                        // established representation behavior instead of
+                        // attributing an unrelated outer presence or tail.
+                        let child_row_leaves = report_row_leaves
+                            && !matches!(written.tracked, ir::TypeKind::Arrow { .. });
+                        work.push((
+                            abi,
+                            to.clone(),
+                            child_path(&mut paths, path, "callback result"),
+                            active_aliases.clone(),
+                            child_row_leaves,
+                        ));
+                        work.push((
+                            abi,
+                            from.clone(),
+                            callback_path,
+                            active_aliases,
+                            child_row_leaves,
+                        ));
+                    }
+                    Ty::Struct(semantic_row) | Ty::Sum(semantic_row) => {
+                        let row = flatten_row(semantic_row);
+                        if report_row_leaves
+                            && let Some(source) = row_variable_identity(&row.rest)
+                                .and_then(|identity| sources.get(identity))
+                                .filter(|source| !source.hidden)
+                        {
+                            review.leaves.push(PolymorphicExternLeaf {
+                                span: source.span,
+                                variable: source.name.clone(),
+                                kind: ExternVariableKind::Row,
+                                position: render_child_path(&mut paths, path, "row tail"),
+                            });
+                        }
+                        for (label, field) in row.labels.iter().rev() {
+                            if report_row_leaves
+                                && let Some(source) = presence_variable_identity(&field.presence)
+                                    .and_then(|identity| sources.get(identity))
+                                    .filter(|source| !source.hidden)
+                            {
+                                review.leaves.push(PolymorphicExternLeaf {
+                                    span: source.span,
+                                    variable: source.name.clone(),
+                                    kind: ExternVariableKind::Presence,
+                                    position: render_child_path(
+                                        &mut paths,
+                                        path,
+                                        format!("`{label}` presence"),
+                                    ),
+                                });
+                            }
+                            // Payload polymorphism has a fixed outer host
+                            // representation supplied by the surrounding row;
+                            // only the row's own tail/presence can vary it.
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    review
+}
+
+#[cfg(test)]
+mod extern_boundary_depth_tests {
+    use super::*;
+    use crate::{tracking::Tracked, types::Prim};
+
+    #[test]
+    fn thirty_thousand_arrow_boundary_walk_is_stack_safe() {
+        let span = Span::generated(0, 1);
+        let written = Tracked {
+            tracked: ir::TypeKind::Prim(Prim::Nat),
+            span,
+        };
+        let abi = Tracked {
+            tracked: ir::ExternTypeKind::Ordinary(written),
+            span,
+        };
+        let mut ty = Rc::new(Ty::Nat);
+        for _ in 0..30_000 {
+            ty = Rc::new(Ty::Arrow(Rc::new(Ty::Nat), ty, Row::closed()));
+        }
+        let aliases = IndexMap::new();
+        let sources = ExternSourceMap::default();
+        let review = extern_boundary_review(&aliases, &abi, &ty, &sources, "deep", span);
+        assert!(review.leaves.is_empty());
+        assert!(review.coverage.is_empty());
+        // A 30k recursively represented test value also needs iterative
+        // destruction; leaking this one synthetic value keeps the test focused
+        // on the boundary walkers rather than `Rc<Ty>`'s destructor.
+        std::mem::forget(ty);
+    }
+}
+
+fn describe_type(ty: &Rc<Ty>) -> TypeDescription {
+    let mut ty = ty;
+    while let Ty::Package(inner) = &**ty {
+        ty = inner;
+    }
+    match &**ty {
+        Ty::Nat => TypeDescription::NaturalNumber,
+        Ty::Int => TypeDescription::Integer,
+        Ty::Real => TypeDescription::RealNumber,
+        Ty::String => TypeDescription::Text,
+        Ty::Boolean => TypeDescription::Boolean,
+        Ty::Arrow(..) => TypeDescription::Function,
+        Ty::Struct(..) => TypeDescription::Struct,
+        Ty::Sum(..) => TypeDescription::TaggedValue,
+        Ty::Named { .. } => TypeDescription::DeclaredType,
+        Ty::Bound(_) | Ty::Var(_) | Ty::Rigid { .. } | Ty::Undecided => TypeDescription::Undecided,
+        Ty::Package(_) => unreachable!("packages were removed iteratively"),
+    }
+}
+
+struct MismatchWork {
+    left: Rc<Ty>,
+    right: Rc<Ty>,
+    alias_path: Option<usize>,
+    alias_work: usize,
+    root: bool,
+}
+
+struct AliasGoal {
+    left_symbol: Symbol,
+    left_args: Rc<[Rc<Ty>]>,
+    right_symbol: Symbol,
+    right_args: Rc<[Rc<Ty>]>,
+    parent: Option<usize>,
+    depth: usize,
+    fingerprint: u64,
+}
+
+/// Memoized, stack-safe hashes used only to reject unequal alias goals cheaply.
+/// Hash matches are still checked with metered exact finite-syntax equality, so
+/// collisions can cost bounded work but cannot alter a diagnostic.
+struct MismatchFingerprints {
+    types: HashMap<*const Ty, (Rc<Ty>, u64)>,
+    argument_hash_mask: u64,
+}
+
+impl Default for MismatchFingerprints {
+    fn default() -> Self {
+        Self {
+            types: HashMap::new(),
+            argument_hash_mask: u64::MAX,
+        }
+    }
+}
+
+enum MismatchFingerprintWork {
+    Type(Rc<Ty>),
+    Finish(*const Ty, Rc<Ty>, u8, usize, Option<Symbol>),
+    Row(Row),
+    FinishRow(Vec<(String, Presence, bool)>, Rest, usize),
+}
+
+impl MismatchFingerprints {
+    fn arguments(&mut self, args: &[Rc<Ty>], work_left: &mut usize) -> Option<u64> {
+        fn tagged(tag: u8, parts: impl IntoIterator<Item = u64>) -> u64 {
+            let mut hash = DefaultHasher::new();
+            tag.hash(&mut hash);
+            for part in parts {
+                part.hash(&mut hash);
+            }
+            hash.finish()
+        }
+        fn presence_hash(p: &Presence) -> u64 {
+            match p {
+                Presence::Present => tagged(0, []),
+                Presence::Absent => tagged(1, []),
+                Presence::Undecided => tagged(2, []),
+                Presence::Var(id) => tagged(3, [u64::from(*id)]),
+                Presence::Bound(id) => tagged(4, [u64::from(*id)]),
+                Presence::Recovered(id) => tagged(5, [u64::from(*id)]),
+            }
+        }
+        fn rest_leaf_hash(rest: &Rest) -> Option<u64> {
+            Some(match rest {
+                Rest::Closed => tagged(0, []),
+                Rest::Undecided => tagged(1, []),
+                Rest::Var(id) => tagged(2, [u64::from(*id)]),
+                Rest::Bound(id) => tagged(3, [u64::from(*id)]),
+                Rest::Rigid { id, .. } => tagged(4, [u64::from(*id)]),
+                Rest::More(_) => return None,
+            })
+        }
+
+        let mut pending: Vec<_> = args
+            .iter()
+            .rev()
+            .cloned()
+            .map(MismatchFingerprintWork::Type)
+            .collect();
+        let mut values = Vec::new();
+        while let Some(next) = pending.pop() {
+            if *work_left == 0 {
+                return None;
+            }
+            *work_left -= 1;
+            match next {
+                MismatchFingerprintWork::Type(ty) => {
+                    let key = Rc::as_ptr(&ty);
+                    if let Some((_, hash)) = self.types.get(&key) {
+                        values.push(*hash);
+                        continue;
+                    }
+                    match &*ty {
+                        Ty::Nat => values.push(tagged(0, [])),
+                        Ty::Int => values.push(tagged(1, [])),
+                        Ty::Real => values.push(tagged(2, [])),
+                        Ty::String => values.push(tagged(3, [])),
+                        Ty::Boolean => values.push(tagged(4, [])),
+                        Ty::Var(id) => values.push(tagged(5, [u64::from(*id)])),
+                        Ty::Bound(id) => values.push(tagged(6, [u64::from(*id)])),
+                        Ty::Rigid { id, .. } => values.push(tagged(7, [u64::from(*id)])),
+                        Ty::Undecided => values.push(tagged(8, [])),
+                        Ty::Arrow(from, to, row) => {
+                            pending.push(MismatchFingerprintWork::Finish(
+                                key,
+                                ty.clone(),
+                                9,
+                                3,
+                                None,
+                            ));
+                            pending.push(MismatchFingerprintWork::Row(row.clone()));
+                            pending.push(MismatchFingerprintWork::Type(to.clone()));
+                            pending.push(MismatchFingerprintWork::Type(from.clone()));
+                            continue;
+                        }
+                        Ty::Package(inner) => {
+                            pending.push(MismatchFingerprintWork::Finish(
+                                key,
+                                ty.clone(),
+                                10,
+                                1,
+                                None,
+                            ));
+                            pending.push(MismatchFingerprintWork::Type(inner.clone()));
+                            continue;
+                        }
+                        Ty::Struct(row) | Ty::Sum(row) => {
+                            let tag = if matches!(&*ty, Ty::Struct(_)) {
+                                11
+                            } else {
+                                12
+                            };
+                            pending.push(MismatchFingerprintWork::Finish(
+                                key,
+                                ty.clone(),
+                                tag,
+                                1,
+                                None,
+                            ));
+                            pending.push(MismatchFingerprintWork::Row(row.clone()));
+                            continue;
+                        }
+                        Ty::Named { symbol, args, .. } => {
+                            pending.push(MismatchFingerprintWork::Finish(
+                                key,
+                                ty.clone(),
+                                13,
+                                args.len(),
+                                Some(*symbol),
+                            ));
+                            pending.extend(
+                                args.iter()
+                                    .rev()
+                                    .cloned()
+                                    .map(MismatchFingerprintWork::Type),
+                            );
+                            continue;
+                        }
+                    }
+                    self.types.insert(key, (ty, *values.last().unwrap()));
+                }
+                MismatchFingerprintWork::Finish(key, ty, tag, count, symbol) => {
+                    let parts = values.split_off(values.len() - count);
+                    let mut hash = DefaultHasher::new();
+                    tag.hash(&mut hash);
+                    symbol.hash(&mut hash);
+                    parts.hash(&mut hash);
+                    let hash = hash.finish();
+                    self.types.insert(key, (ty, hash));
+                    values.push(hash);
+                }
+                MismatchFingerprintWork::Row(row) => {
+                    // Flatten composed rows exactly as solver canon does: an
+                    // outer spelling wins over a duplicate in its tail.
+                    let mut flattened = IndexMap::new();
+                    let mut segment = &row;
+                    let rest = loop {
+                        for (name, field) in &segment.labels {
+                            if *work_left == 0 {
+                                return None;
+                            }
+                            *work_left -= 1;
+                            flattened
+                                .entry(name.clone())
+                                .or_insert_with(|| field.clone());
+                        }
+                        match &segment.rest {
+                            Rest::More(more) => segment = more,
+                            rest => break rest.clone(),
+                        }
+                    };
+                    let mut fields: Vec<_> = flattened
+                        .into_iter()
+                        .map(|(name, field)| {
+                            let payload = matches!(field.presence, Presence::Present);
+                            (name, field.presence, payload, field.ty)
+                        })
+                        .collect();
+                    // Charge each comparison performed by the sort, not merely
+                    // the eventual label hashes.
+                    let mut exhausted = false;
+                    fields.sort_unstable_by(|left, right| {
+                        if let Some(next) = work_left.checked_sub(1) {
+                            *work_left = next;
+                        } else {
+                            exhausted = true;
+                        }
+                        left.0.cmp(&right.0)
+                    });
+                    if exhausted {
+                        return None;
+                    }
+                    let payloads = fields.iter().filter(|field| field.2).count();
+                    let completion = fields
+                        .iter()
+                        .map(|(n, p, has, _)| (n.clone(), p.clone(), *has))
+                        .collect();
+                    pending.push(MismatchFingerprintWork::FinishRow(
+                        completion, rest, payloads,
+                    ));
+                    pending.extend(
+                        fields
+                            .into_iter()
+                            .rev()
+                            .filter(|field| field.2)
+                            .map(|field| MismatchFingerprintWork::Type(field.3)),
+                    );
+                }
+                MismatchFingerprintWork::FinishRow(fields, rest, payloads) => {
+                    let mut parts = values.split_off(values.len() - payloads).into_iter();
+                    let mut hash = DefaultHasher::new();
+                    fields.len().hash(&mut hash);
+                    for (name, presence, payload) in fields {
+                        if *work_left == 0 {
+                            return None;
+                        }
+                        *work_left -= 1;
+                        name.hash(&mut hash);
+                        presence_hash(&presence).hash(&mut hash);
+                        if payload {
+                            parts.next().unwrap().hash(&mut hash);
+                        }
+                    }
+                    rest_leaf_hash(&rest).unwrap().hash(&mut hash);
+                    values.push(hash.finish());
+                }
+            }
+        }
+        let parts = values.split_off(values.len() - args.len());
+        Some(tagged(14, parts) & self.argument_hash_mask)
+    }
+}
+
+/// Pick the first incompatible semantic leaf on an explicit stack. The walk
+/// follows every payload-bearing type position and unfolds declarations one
+/// layer at a time; malformed/missing alias provenance is reported honestly as
+/// a declared or undecided type rather than guessed from solver variables.
+fn smallest_incompatible(
+    aliases: &IndexMap<Symbol, Scheme>,
+    left: &Rc<Ty>,
+    right: &Rc<Ty>,
+) -> (TypeDescription, TypeDescription) {
+    let mut operations = 0;
+    smallest_incompatible_counted(aliases, left, right, &mut operations)
+}
+
+fn smallest_incompatible_counted(
+    aliases: &IndexMap<Symbol, Scheme>,
+    left: &Rc<Ty>,
+    right: &Rc<Ty>,
+    operations: &mut usize,
+) -> (TypeDescription, TypeDescription) {
+    smallest_incompatible_counted_with_mask(aliases, left, right, operations, u64::MAX)
+}
+
+fn smallest_incompatible_counted_with_mask(
+    aliases: &IndexMap<Symbol, Scheme>,
+    left: &Rc<Ty>,
+    right: &Rc<Ty>,
+    operations: &mut usize,
+    argument_hash_mask: u64,
+) -> (TypeDescription, TypeDescription) {
+    const MAX_ALIAS_WORK: usize = 1_048_576;
+    let mut work = vec![MismatchWork {
+        left: left.clone(),
+        right: right.clone(),
+        alias_path: None,
+        alias_work: MAX_ALIAS_WORK,
+        root: true,
+    }];
+    let fallback = (describe_type(left), describe_type(right));
+    let mut unfolded_fallback = None;
+    let mut incomplete_alias_walk = false;
+    // Recursive declarations return to the same applications. Arguments are
+    // part of the goal: the same pair of names can occur at independent
+    // substitutions in sibling fields, and suppressing one must not suppress
+    // the other. Keep the finite syntax itself because opening can rebuild a
+    // semantically identical substitution at a different allocation. Arena
+    // indices make paths persistent without recursive destruction or cloning.
+    let mut alias_goals: Vec<AliasGoal> = Vec::new();
+    let mut forwarding = Forwarding::default();
+    let mut fingerprints = MismatchFingerprints {
+        argument_hash_mask,
+        ..MismatchFingerprints::default()
+    };
+    // Malformed imported declarations can manufacture fresh, ever larger
+    // substitutions. Charge fingerprint nodes and ancestor probes to a strict
+    // branch-local budget; queued siblings retain the budget at their fork.
+    while let Some(MismatchWork {
+        mut left,
+        mut right,
+        mut alias_path,
+        mut alias_work,
+        root,
+    }) = work.pop()
+    {
+        while let Ty::Package(inner) = &*left {
+            left = inner.clone();
+        }
+        while let Ty::Package(inner) = &*right {
+            right = inner.clone();
+        }
+
+        // Names are source spelling, not semantic leaves. Only unfold when the
+        // published declaration is actually available; imported recovery holes
+        // retain the honest `DeclaredType` fallback. Record a pair before
+        // unfolding it so a recursive field is skipped without abandoning the
+        // other fields already on the explicit DFS stack.
+        if let (
+            Ty::Named {
+                symbol: left_symbol,
+                args: left_args,
+                ..
+            },
+            Ty::Named {
+                symbol: right_symbol,
+                args: right_args,
+                ..
+            },
+        ) = (&*left, &*right)
+            && aliases.contains_key(left_symbol)
+            && aliases.contains_key(right_symbol)
+        {
+            // Forwarding spellings do not change a substitution. Without
+            // removing them, `Stream (Id 'a)` appears successively as
+            // `Stream (Id 'a)`, `Stream (Id (Id 'a))`, ... and defeats the
+            // coinductive key. The forwarding classifier is the same semantic
+            // machinery used by alias opening; it is iterative and also marks
+            // mutually-forwarding recovery cycles.
+            let left_args: Rc<[Rc<Ty>]> = left_args
+                .iter()
+                .map(|arg| canonical_alias_argument(aliases, &mut forwarding, arg))
+                .collect::<Vec<_>>()
+                .into();
+            let right_args: Rc<[Rc<Ty>]> = right_args
+                .iter()
+                .map(|arg| canonical_alias_argument(aliases, &mut forwarding, arg))
+                .collect::<Vec<_>>()
+                .into();
+            let Some(left_fingerprint) = fingerprints.arguments(&left_args, &mut alias_work) else {
+                *operations += MAX_ALIAS_WORK - alias_work;
+                incomplete_alias_walk = true;
+                continue;
+            };
+            let Some(right_fingerprint) = fingerprints.arguments(&right_args, &mut alias_work)
+            else {
+                *operations += MAX_ALIAS_WORK - alias_work;
+                incomplete_alias_walk = true;
+                continue;
+            };
+            let mut goal_hash = DefaultHasher::new();
+            left_symbol.hash(&mut goal_hash);
+            right_symbol.hash(&mut goal_hash);
+            left_fingerprint.hash(&mut goal_hash);
+            right_fingerprint.hash(&mut goal_hash);
+            let fingerprint = goal_hash.finish();
+            let mut ancestor = alias_path;
+            let mut seen = false;
+            while let Some(index) = ancestor {
+                if alias_work == 0 {
+                    break;
+                }
+                // The ancestor probe itself and every exact collision-check
+                // node share one allowance. A hostile hash collision therefore
+                // cannot smuggle an unbounded structural walk past the meter.
+                alias_work -= 1;
+                let goal = &alias_goals[index];
+                let mut same_arguments = |known: &[Rc<Ty>], current: &[Rc<Ty>]| {
+                    if known.len() != current.len() {
+                        return Some(false);
+                    }
+                    for (known, current) in known.iter().zip(current) {
+                        if !same_finite_syntax_metered(known, current, &mut alias_work)? {
+                            return Some(false);
+                        }
+                    }
+                    Some(true)
                 };
-                cover(aliases, abi.span, from, available, out);
-                // An ordinary leaf may conceal arbitrarily much foreign shape
-                // behind aliases. Every arrow remains a unary host boundary.
-                boundary(aliases, abi, from, out, seen);
-                boundary(aliases, abi, to, out, seen);
+                if goal.fingerprint == fingerprint
+                    && goal.left_symbol == *left_symbol
+                    && goal.right_symbol == *right_symbol
+                    && same_arguments(&goal.left_args, &left_args) == Some(true)
+                    && same_arguments(&goal.right_args, &right_args) == Some(true)
+                {
+                    seen = true;
+                    break;
+                }
+                ancestor = goal.parent;
+            }
+            let depth = alias_path.map_or(0, |index| alias_goals[index].depth);
+            if seen || alias_work == 0 {
+                *operations += MAX_ALIAS_WORK - alias_work;
+                incomplete_alias_walk = true;
+                continue;
+            }
+            alias_goals.push(AliasGoal {
+                left_symbol: *left_symbol,
+                left_args,
+                right_symbol: *right_symbol,
+                right_args,
+                parent: alias_path,
+                depth: depth + 1,
+                fingerprint,
+            });
+            alias_path = Some(alias_goals.len() - 1);
+        }
+        if matches!(&*left, Ty::Named { symbol, .. } if aliases.contains_key(symbol)) {
+            left = unfold(aliases, &left);
+        }
+        if matches!(&*right, Ty::Named { symbol, .. } if aliases.contains_key(symbol)) {
+            right = unfold(aliases, &right);
+        }
+        // An alias may publish a packaged container. Packages are transparent
+        // to mismatch structure, including when they only become visible after
+        // opening the declaration.
+        while let Ty::Package(inner) = &*left {
+            left = inner.clone();
+        }
+        while let Ty::Package(inner) = &*right {
+            right = inner.clone();
+        }
+
+        let descriptions = (describe_type(&left), describe_type(&right));
+        // The input pair is known to be incompatible. Once its declarations
+        // have been opened, their semantic container is the honest fallback if
+        // payload walking finds no narrower leaf (for example, an arrow whose
+        // only disagreement is its effect row). Child jobs are not themselves
+        // known to be incompatible, so they must not replace this root fallback
+        // merely because an equal child also happens to be an alias.
+        if root
+            && matches!(
+                descriptions,
+                (
+                    TypeDescription::Function
+                        | TypeDescription::Struct
+                        | TypeDescription::TaggedValue,
+                    TypeDescription::Function
+                        | TypeDescription::Struct
+                        | TypeDescription::TaggedValue
+                )
+            )
+        {
+            unfolded_fallback = Some(descriptions);
+        }
+        // A name left here has no declaration we can honestly inspect. Even
+        // when both sides spell the same name, its arguments are not known to
+        // be the declaration's semantic parameters, so they cannot supply a
+        // more specific mismatch.
+        if matches!(&*left, Ty::Named { .. }) || matches!(&*right, Ty::Named { .. }) {
+            return descriptions;
+        }
+        match (&*left, &*right) {
+            (Ty::Arrow(l_from, l_to, l_effects), Ty::Arrow(r_from, r_to, r_effects)) => {
+                // An incompatible effect row contributes no payload jobs. Keep
+                // walking parameter and result first; if neither has a leaf,
+                // the enclosing function fallback remains the honest answer.
+                let mut effect_alias_work = alias_work;
+                push_row_payloads(
+                    &mut work,
+                    l_effects,
+                    r_effects,
+                    alias_path,
+                    &mut effect_alias_work,
+                );
+                // Source order: parameter, result, then effects. Effect-row
+                // work is its own queued branch and cannot starve these siblings.
+                work.push(MismatchWork {
+                    left: l_to.clone(),
+                    right: r_to.clone(),
+                    alias_path,
+                    alias_work,
+                    root: false,
+                });
+                work.push(MismatchWork {
+                    left: l_from.clone(),
+                    right: r_from.clone(),
+                    alias_path,
+                    alias_work,
+                    root: false,
+                });
+            }
+            (Ty::Struct(left), Ty::Struct(right)) | (Ty::Sum(left), Ty::Sum(right)) => {
+                if !push_row_payloads(&mut work, left, right, alias_path, &mut alias_work) {
+                    return descriptions;
+                }
+            }
+            (Ty::Nat, Ty::Nat)
+            | (Ty::Int, Ty::Int)
+            | (Ty::Real, Ty::Real)
+            | (Ty::String, Ty::String)
+            | (Ty::Boolean, Ty::Boolean)
+            | (Ty::Bound(_), Ty::Bound(_))
+            | (Ty::Var(_), Ty::Var(_))
+            | (Ty::Rigid { .. }, Ty::Rigid { .. })
+            | (Ty::Undecided, Ty::Undecided) => {}
+            _ => return descriptions,
+        }
+    }
+    if incomplete_alias_walk {
+        fallback
+    } else {
+        unfolded_fallback.unwrap_or(fallback)
+    }
+}
+
+/// Remove head aliases that only select one of their arguments. This consumes
+/// the finite argument syntax rather than rebuilding it. A forwarding cycle
+/// has no observable body in recovery input, so all its applications share the
+/// same undecided canonical form regardless of the ignored arguments.
+fn canonical_alias_argument(
+    aliases: &IndexMap<Symbol, Scheme>,
+    forwarding: &mut Forwarding,
+    argument: &Rc<Ty>,
+) -> Rc<Ty> {
+    let mut argument = argument.clone();
+    loop {
+        let Ty::Named { symbol, args, .. } = &*argument else {
+            return argument;
+        };
+        let Some(scheme) = aliases.get(symbol) else {
+            return argument;
+        };
+        match forwarding.projection(aliases, scheme.body()) {
+            Some(index) => match args.get(index as usize) {
+                Some(selected) => argument = selected.clone(),
+                None => return Rc::new(Ty::Undecided),
+            },
+            None if forwarding.cycles.contains(symbol) => return Rc::new(Ty::Undecided),
+            None => return argument,
+        }
+    }
+}
+
+fn push_row_payloads(
+    work: &mut Vec<MismatchWork>,
+    left: &Row,
+    right: &Row,
+    alias_path: Option<usize>,
+    alias_work: &mut usize,
+) -> bool {
+    fn flatten<'a>(
+        mut row: &'a Row,
+        work_left: &mut usize,
+    ) -> Option<(IndexMap<&'a str, &'a RowField>, &'a Rest)> {
+        let mut labels = IndexMap::new();
+        loop {
+            for (name, field) in &row.labels {
+                *work_left = work_left.checked_sub(1)?;
+                labels.entry(name.as_str()).or_insert(field);
+            }
+            match &row.rest {
+                Rest::More(more) => row = more,
+                rest => return Some((labels, rest)),
             }
         }
     }
 
-    let mut out = Vec::new();
-    boundary(aliases, abi, ty, &mut out, &mut Vec::new());
-    let conditional = Formula::all(out.iter().flat_map(|constraint| {
-        let ConstraintKind::CallbackCoverage {
-            required,
-            available,
-        } = &constraint.kind
-        else {
-            return None;
+    // Compare canonical flattened maps rather than segment boundaries. This is
+    // solver canon's outer-label precedence and makes a segmented row equal to
+    // the same finite row represented in one segment.
+    let Some((left_labels, left_rest)) = flatten(left, alias_work) else {
+        return false;
+    };
+    let Some((right_labels, right_rest)) = flatten(right, alias_work) else {
+        return false;
+    };
+    if left_labels.len() != right_labels.len() {
+        return false;
+    }
+    let mut payloads = Vec::new();
+    for (name, left_field) in left_labels {
+        let Some(next) = alias_work.checked_sub(1) else {
+            return false;
         };
-        Some(Formula::all(required.labels.iter().filter_map(
-            |(name, required)| {
-                let required = presence_formula(&required.presence)?;
-                let available = match available.labels.get(name) {
-                    Some(field) => presence_formula(&field.presence)?,
-                    None if matches!(
-                        available.rest,
-                        Rest::Closed | Rest::Bound(_) | Rest::Rigid { .. }
-                    ) =>
-                    {
-                        Formula::False
-                    }
-                    None => return None,
+        *alias_work = next;
+        let Some(right_field) = right_labels.get(name) else {
+            return false;
+        };
+        if left_field.presence != right_field.presence {
+            return false;
+        }
+        if matches!(left_field.presence, Presence::Present) {
+            payloads.push((left_field.ty.clone(), right_field.ty.clone()));
+        }
+    }
+    let same_rest = match (left_rest, right_rest) {
+        (Rest::Closed, Rest::Closed) | (Rest::Undecided, Rest::Undecided) => true,
+        (Rest::Var(left), Rest::Var(right)) | (Rest::Bound(left), Rest::Bound(right)) => {
+            left == right
+        }
+        (Rest::Rigid { id: left, .. }, Rest::Rigid { id: right, .. }) => left == right,
+        _ => false,
+    };
+    if !same_rest {
+        return false;
+    }
+    for (left, right) in payloads.into_iter().rev() {
+        work.push(MismatchWork {
+            left,
+            right,
+            alias_path,
+            alias_work: *alias_work,
+            root: false,
+        });
+    }
+    true
+}
+
+fn all_constraints(
+    constraints: &IndexMap<Symbol, Vec<Constraint>>,
+) -> HashMap<ConstraintId, &Constraint> {
+    let mut out = HashMap::new();
+    let mut work: Vec<&Constraint> = constraints.values().flatten().collect();
+    while let Some(constraint) = work.pop() {
+        if out.insert(constraint.id, constraint).is_some() {
+            continue;
+        }
+        match &constraint.kind {
+            ConstraintKind::Let { value, body, .. } => {
+                work.extend(value);
+                work.extend(body);
+            }
+            ConstraintKind::Match { arms, .. } => {
+                for arm in arms {
+                    work.extend(&arm.constraints);
+                    work.push(&arm.result);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum PivotKey {
+    FunctionInput(PivotAnchor),
+    BranchResult(Span),
+    ProjectedField { base: Span, field: String },
+    FunctionEffects(Span),
+    WrittenBinder(Span),
+    Anonymous { span: Span, origin: &'static str },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum PivotAnchor {
+    Binder(Symbol),
+    Span(Span),
+}
+
+impl PivotKey {
+    fn kind(&self) -> ExplanationPivotKind {
+        match self {
+            Self::FunctionInput(_) => ExplanationPivotKind::FunctionInput,
+            Self::BranchResult(_) => ExplanationPivotKind::BranchResult,
+            Self::ProjectedField { .. } => ExplanationPivotKind::ProjectedField,
+            Self::FunctionEffects(_) => ExplanationPivotKind::FunctionEffects,
+            Self::WrittenBinder(_) => ExplanationPivotKind::WrittenValue,
+            Self::Anonymous { .. } => ExplanationPivotKind::Value,
+        }
+    }
+
+    fn priority(&self) -> u8 {
+        match self {
+            Self::FunctionInput(_) => 0,
+            Self::BranchResult(_) => 1,
+            Self::ProjectedField { .. } => 2,
+            Self::FunctionEffects(_) => 3,
+            Self::WrittenBinder(_) => 4,
+            Self::Anonymous { .. } => 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PivotContext {
+    branch: Option<Span>,
+    binder: Option<Span>,
+}
+
+fn pivot_contexts(
+    constraints: &IndexMap<Symbol, Vec<Constraint>>,
+) -> HashMap<ConstraintId, PivotContext> {
+    let mut contexts = HashMap::new();
+    let mut work: Vec<_> = constraints
+        .values()
+        .flatten()
+        .map(|constraint| (constraint, PivotContext::default()))
+        .collect();
+    while let Some((constraint, inherited)) = work.pop() {
+        if contexts.insert(constraint.id, inherited).is_some() {
+            continue;
+        }
+        match &constraint.kind {
+            ConstraintKind::Let { value, body, .. } => {
+                let nested = PivotContext {
+                    binder: Some(constraint.span),
+                    ..inherited
                 };
-                Some(required.not().or(available))
+                work.extend(value.iter().map(|child| (child, nested)));
+                work.extend(body.iter().map(|child| (child, inherited)));
+            }
+            ConstraintKind::Match { arms, .. } => {
+                let nested = PivotContext {
+                    branch: Some(constraint.span),
+                    ..inherited
+                };
+                for arm in arms {
+                    work.extend(arm.constraints.iter().map(|child| (child, nested)));
+                    work.push((&arm.result, nested));
+                }
+            }
+            _ => {}
+        }
+    }
+    contexts
+}
+
+fn pivot_key(
+    fact: &ExplanationFact,
+    constraint: &Constraint,
+    context: PivotContext,
+    instance_binders: &HashMap<Span, Symbol>,
+) -> PivotKey {
+    if constraint.origin == ConstraintOrigin::ApplicationArgument {
+        let call = constraint.subjects.primary_span.unwrap_or(constraint.span);
+        return PivotKey::FunctionInput(match constraint.subjects.semantic_pivot {
+            Some(SemanticPivot::FunctionInput(symbol)) => PivotAnchor::Binder(symbol),
+            _ => instance_binders
+                .get(&call)
+                .copied()
+                .map_or(PivotAnchor::Span(call), PivotAnchor::Binder),
+        });
+    }
+    if matches!(
+        constraint.origin,
+        ConstraintOrigin::Match | ConstraintOrigin::MatchArm
+    ) {
+        return PivotKey::BranchResult(match constraint.subjects.semantic_pivot {
+            Some(SemanticPivot::BranchResult(span)) => span,
+            _ => context.branch.unwrap_or(constraint.span),
+        });
+    }
+    if let ConstraintKind::Project {
+        field, base_span, ..
+    } = &constraint.kind
+    {
+        return PivotKey::ProjectedField {
+            base: *base_span,
+            field: field.clone(),
+        };
+    }
+    if matches!(constraint.kind, ConstraintKind::Performs { .. }) {
+        return PivotKey::FunctionEffects(constraint.span);
+    }
+    if matches!(
+        fact.subject,
+        Subject::Binding | Subject::TopLevelBinding | Subject::LocalBinding
+    ) {
+        return PivotKey::WrittenBinder(context.binder.unwrap_or(fact.span));
+    }
+    PivotKey::Anonymous {
+        span: constraint.span,
+        origin: constraint.origin.code(),
+    }
+}
+
+fn explanatory_name(base: &str, visible_names: &HashSet<String>) -> String {
+    if !visible_names.contains(base) {
+        return base.into();
+    }
+    for suffix in 'A'..='Z' {
+        let candidate = format!("{base} {suffix}");
+        if !visible_names.contains(&candidate) {
+            return candidate;
+        }
+    }
+    let mut suffix = 2usize;
+    loop {
+        let candidate = format!("{base} {suffix}");
+        if !visible_names.contains(&candidate) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
+/// Keep the earliest and latest entries of an ordered list, dropping the
+/// middle, so a bounded slice preserves both defining endpoints. Returns how
+/// many entries were dropped.
+fn keep_endpoints(items: &mut Vec<ReasonId>, limit: usize) -> usize {
+    if items.len() <= limit {
+        return 0;
+    }
+    let dropped = items.len() - limit;
+    let low = limit / 2;
+    let high = limit - low;
+    let tail_start = items.len() - high;
+    items.drain(low..tail_start);
+    dropped
+}
+
+fn budget_reason_slice(mut reasons: Vec<ReasonId>) -> (Vec<ReasonId>, usize) {
+    const MAX_EXPLANATION_REASONS: usize = 16_384;
+    reasons.sort_unstable();
+    let omitted = keep_endpoints(&mut reasons, MAX_EXPLANATION_REASONS);
+    (reasons, omitted)
+}
+
+struct ExplanationSources<'a> {
+    aliases: &'a IndexMap<Symbol, Scheme>,
+}
+
+fn attach_ordinary_explanations(
+    mint: &Mint,
+    errors: &mut [Error],
+    constraints: &IndexMap<Symbol, Vec<Constraint>>,
+    steps: &[Step],
+    reasons: &[Reason],
+    omitted_reason_parents: &HashMap<ReasonId, usize>,
+    sources: ExplanationSources<'_>,
+) {
+    let ExplanationSources { aliases } = sources;
+    let pivot_contexts = pivot_contexts(constraints);
+    let all = all_constraints(constraints);
+    // `all` iterates in hash order, so when desugaring reuses one span for
+    // several instances the earliest constraint wins explicitly — collecting
+    // directly would print a different binder from run to run.
+    let mut instances: Vec<(ConstraintId, Span, Symbol)> = all
+        .values()
+        .filter_map(|constraint| match constraint.kind {
+            ConstraintKind::Instance { symbol, .. } => {
+                Some((constraint.id, constraint.span, symbol))
+            }
+            _ => None,
+        })
+        .collect();
+    instances.sort_unstable_by_key(|(id, ..)| *id);
+    let mut instance_binders: HashMap<Span, Symbol> = HashMap::new();
+    for (_, span, symbol) in instances {
+        instance_binders.entry(span).or_insert(symbol);
+    }
+    let visible_names: HashSet<String> = constraints
+        .keys()
+        .copied()
+        .chain(all.values().filter_map(|constraint| match constraint.kind {
+            ConstraintKind::Let { symbol, .. } | ConstraintKind::Instance { symbol, .. } => {
+                Some(symbol)
+            }
+            _ => match constraint.subjects.semantic_pivot {
+                Some(SemanticPivot::FunctionInput(symbol)) => Some(symbol),
+                _ => None,
             },
-        )))
-    }));
-    (out, conditional)
+        }))
+        .map(|symbol| mint.name(symbol).to_owned())
+        .collect();
+    let constraints = all;
+    let steps: HashMap<_, _> = steps.iter().map(|step| (step.id, step)).collect();
+    let reasons_by_id: HashMap<_, _> = reasons.iter().map(|reason| (reason.id, reason)).collect();
+
+    for error in errors {
+        let (left, right, kind, row) = match &error.kind {
+            ErrorKind::Mismatch { expected, actual } => {
+                (describe_type(expected), describe_type(actual), None, None)
+            }
+            ErrorKind::NotAStruct { base } => (
+                describe_type(base),
+                TypeDescription::Struct,
+                Some(ContradictionKind::ProjectionOnNonStruct),
+                None,
+            ),
+            ErrorKind::MissingField { shape, field, .. }
+            | ErrorKind::ExtraField { shape, field, .. } => (
+                match shape {
+                    Shape::Struct => TypeDescription::Struct,
+                    Shape::Sum => TypeDescription::TaggedValue,
+                    Shape::Effect => TypeDescription::Function,
+                },
+                TypeDescription::Undecided,
+                Some(ContradictionKind::LabelUnavailable),
+                Some(RowContradiction {
+                    shape: *shape,
+                    label: field.clone(),
+                }),
+            ),
+            ErrorKind::RepeatedField { shape, field, .. } => (
+                match shape {
+                    Shape::Struct => TypeDescription::Struct,
+                    Shape::Sum => TypeDescription::TaggedValue,
+                    Shape::Effect => TypeDescription::Function,
+                },
+                TypeDescription::Undecided,
+                Some(ContradictionKind::RepeatedLabel),
+                Some(RowContradiction {
+                    shape: *shape,
+                    label: field.clone(),
+                }),
+            ),
+            ErrorKind::Recursive => (
+                TypeDescription::Undecided,
+                TypeDescription::Undecided,
+                Some(ContradictionKind::RecursiveValue),
+                None,
+            ),
+            ErrorKind::RigidBroken { found, .. } => (
+                describe_type(found),
+                TypeDescription::Undecided,
+                Some(ContradictionKind::CallerChoice),
+                None,
+            ),
+            ErrorKind::RigidField { shape, field, .. } => (
+                match shape {
+                    Shape::Struct => TypeDescription::Struct,
+                    Shape::Sum => TypeDescription::TaggedValue,
+                    Shape::Effect => TypeDescription::Function,
+                },
+                TypeDescription::Undecided,
+                Some(ContradictionKind::CallerChoice),
+                Some(RowContradiction {
+                    shape: *shape,
+                    label: field.clone(),
+                }),
+            ),
+            ErrorKind::RigidEscapes { .. } => continue,
+            ErrorKind::Unhandled { effect } => (
+                TypeDescription::Function,
+                TypeDescription::Undecided,
+                Some(ContradictionKind::UnhandledEffect),
+                Some(RowContradiction {
+                    shape: Shape::Effect,
+                    label: effect.clone(),
+                }),
+            ),
+            ErrorKind::NotAllowed { effect } => (
+                TypeDescription::Function,
+                TypeDescription::Undecided,
+                Some(ContradictionKind::EffectNotAllowed),
+                Some(RowContradiction {
+                    shape: Shape::Effect,
+                    label: effect.clone(),
+                }),
+            ),
+            _ => continue,
+        };
+        // Presence failures retain which side supplied the required label after
+        // solving. Source roles must follow that evidence rather than assuming,
+        // for example, that every application argument is the demand.
+        let required_side = match error.kind {
+            ErrorKind::MissingField { .. } => Some(Side::Expected),
+            ErrorKind::ExtraField { .. } => Some(Side::Actual),
+            _ => None,
+        };
+        let seed = match error.cause {
+            ErrorCause::Step(id) => steps.get(&id).map(|step| step.reason),
+            ErrorCause::Batch(_) | ErrorCause::Direct => None,
+        };
+        let repeated_origins = match &error.kind {
+            ErrorKind::RepeatedField {
+                introduction,
+                forbidden,
+                ..
+            } => Some((introduction.as_ref(), forbidden.as_ref())),
+            _ => None,
+        };
+
+        // Iterative, parent-order DFS. IDs are immutable and parents precede
+        // children, so this is deterministic even when bindings share causes.
+        let mut walked_reasons = Vec::new();
+        let mut omitted_by_roots = 0usize;
+        let mut seen_reasons = HashSet::new();
+        let mut work: Vec<ReasonId> = seed.into_iter().collect();
+        while let Some(id) = work.pop() {
+            if !seen_reasons.insert(id) {
+                continue;
+            }
+            let Some(reason) = reasons_by_id.get(&id).filter(|reason| reason.reachable) else {
+                continue;
+            };
+            walked_reasons.push(id);
+            omitted_by_roots = omitted_by_roots
+                .saturating_add(omitted_reason_parents.get(&id).copied().unwrap_or(0));
+            work.extend(reason.parents.iter().rev().copied());
+        }
+        // Preserve both semantic endpoints: the newest nodes contain the
+        // failing act, while the oldest tail contains the defining fact. A
+        // bounded full view says exactly how much middle was omitted.
+        let (reason_slice, omitted_reasons) = budget_reason_slice(walked_reasons);
+        let omitted_reasons = omitted_reasons.saturating_add(omitted_by_roots);
+        let mut seen_constraints = HashSet::new();
+        let mut authoritative_constraints = HashSet::new();
+        let mut constraint_slice: Vec<_> = reason_slice
+            .iter()
+            .filter_map(|id| reasons_by_id.get(id))
+            .filter_map(|reason| match reason.origin {
+                ReasonOrigin::Constraint(id) if seen_constraints.insert(id) => Some(id),
+                ReasonOrigin::Contract(id) => {
+                    authoritative_constraints.insert(id);
+                    seen_constraints.insert(id).then_some(id)
+                }
+                _ => None,
+            })
+            .collect();
+        constraint_slice.sort_by_key(|id| {
+            constraints
+                .get(id)
+                .map_or((true, Span::default(), "", "", ""), |constraint| {
+                    (
+                        constraint.span.is_generated(),
+                        constraint.span,
+                        constraint.origin.code(),
+                        constraint.subjects.primary.code(),
+                        constraint.subjects.secondary.map_or("", Subject::code),
+                    )
+                })
+        });
+
+        let mut full_facts = Vec::new();
+        for id in &constraint_slice {
+            let Some(constraint) = constraints.get(id) else {
+                continue;
+            };
+            let mut endpoints = vec![
+                (
+                    constraint.subjects.primary,
+                    constraint.subjects.primary_span,
+                    Some(Side::Expected),
+                ),
+                (
+                    constraint
+                        .subjects
+                        .secondary
+                        .unwrap_or(constraint.subjects.primary),
+                    constraint.subjects.secondary_span,
+                    Some(Side::Actual),
+                ),
+            ];
+            // A projection's two source ranges live in its structured payload:
+            // the field token is the demand and `base_span` is the value which
+            // supplies the other side. Do not invent spans for its fresh result.
+            if let ConstraintKind::Project { base_span, .. } = &constraint.kind {
+                endpoints = vec![
+                    (Subject::ProjectionBase, Some(*base_span), None),
+                    (Subject::PatternDemand, Some(constraint.span), None),
+                ];
+            } else if let ConstraintKind::Performs {
+                ambient_label_spans,
+                ..
+            } = &constraint.kind
+                && kind == Some(ContradictionKind::RepeatedLabel)
+            {
+                endpoints = vec![(Subject::PerformedEffects, Some(constraint.span), None)];
+                if let Some(ambient_span) = row
+                    .as_ref()
+                    .and_then(|row| ambient_label_spans.get(&row.label))
+                {
+                    endpoints.push((Subject::AmbientEffects, Some(*ambient_span), None));
+                }
+            } else if matches!(constraint.kind, ConstraintKind::Performs { .. })
+                && !matches!(
+                    kind,
+                    Some(ContradictionKind::UnhandledEffect | ContradictionKind::EffectNotAllowed)
+                )
+            {
+                // The ambient owner is effect-boundary provenance only. Other
+                // contradiction families retain the operation endpoint they
+                // had before boundaries became structured.
+                endpoints = vec![(Subject::PerformedEffects, Some(constraint.span), None)];
+            } else if kind == Some(ContradictionKind::RecursiveValue) {
+                // A recursive cycle needs both source concepts even when one
+                // operand is semantic context (most notably a definition's
+                // pre-minted result variable). The closing constraint's own
+                // written range grounds that role; no solver-variable range is
+                // invented. Keeping both subjects also makes a one-edge cycle
+                // a useful two-fact explanation rather than a lone headline.
+                for (_, span, _) in &mut endpoints {
+                    if span.is_none() {
+                        *span = Some(constraint.span);
+                    }
+                }
+                if constraint.subjects.secondary.is_none() {
+                    endpoints[1].0 = Subject::Context;
+                }
+            } else if kind.is_some() && endpoints.iter().all(|(_, span, _)| span.is_none()) {
+                // Unary/scoping constraints still own their written operation's
+                // range even when no independently written second operand exists.
+                endpoints[0].1 = Some(constraint.span);
+            }
+            for &(subject, span, side) in &endpoints {
+                let Some(span) = span else { continue };
+                if authoritative_constraints.contains(id) && subject != Subject::Annotation {
+                    continue;
+                }
+                let payload = if kind == Some(ContradictionKind::RepeatedLabel) {
+                    // A same-label effects application can be an intermediate in
+                    // another repeated-effect path. Assign endpoint roles only
+                    // when every available piece of row-fact provenance agrees;
+                    // label membership alone is not causal evidence.
+                    let matches = |origin: &RowFactOrigin| {
+                        origin.constraint == *id
+                            && origin.reason == constraint.reason
+                            && origin.origin == constraint.origin
+                            && origin.subject == subject
+                            && origin.span == span
+                    };
+                    match repeated_origins {
+                        Some((Some(introduction), _)) if matches(introduction) => {
+                            ExplanationFactPayload::LabelIntroduction
+                        }
+                        Some((_, Some(forbidden))) if matches(forbidden) => {
+                            ExplanationFactPayload::LabelForbidden
+                        }
+                        _ => ExplanationFactPayload::RequiresType,
+                    }
+                } else {
+                    match (&constraint.kind, constraint.origin, subject, side) {
+                        // A projection contributes two views of one requirement:
+                        // the written access and the base it demands the field of.
+                        // It never supplies evidence that a row is closed.
+                        (ConstraintKind::Project { .. }, ConstraintOrigin::Projection, _, _)
+                            if kind.is_some() =>
+                        {
+                            ExplanationFactPayload::LabelDemand
+                        }
+                        (ConstraintKind::Equal { .. }, _, _, Some(side))
+                            if matches!(kind, Some(ContradictionKind::LabelUnavailable))
+                                && required_side.is_some() =>
+                        {
+                            if Some(side) == required_side {
+                                ExplanationFactPayload::LabelDemand
+                            } else {
+                                ExplanationFactPayload::ClosedRow
+                            }
+                        }
+                        (_, ConstraintOrigin::Pattern, Subject::PatternDemand, _)
+                            if matches!(kind, Some(ContradictionKind::LabelUnavailable)) =>
+                        {
+                            ExplanationFactPayload::LabelDemand
+                        }
+                        (
+                            ConstraintKind::Performs { .. },
+                            ConstraintOrigin::ApplicationEffects,
+                            Subject::AmbientEffects,
+                            _,
+                        ) if matches!(
+                            kind,
+                            Some(
+                                ContradictionKind::UnhandledEffect
+                                    | ContradictionKind::EffectNotAllowed
+                            )
+                        ) =>
+                        {
+                            ExplanationFactPayload::EffectBoundary
+                        }
+                        (
+                            ConstraintKind::Performs { .. },
+                            ConstraintOrigin::ApplicationEffects,
+                            _,
+                            _,
+                        ) if matches!(
+                            kind,
+                            Some(
+                                ContradictionKind::UnhandledEffect
+                                    | ContradictionKind::EffectNotAllowed
+                            )
+                        ) =>
+                        {
+                            ExplanationFactPayload::EffectUse
+                        }
+                        (_, ConstraintOrigin::ApplicationCallee, Subject::Callee, _) => {
+                            ExplanationFactPayload::UsedAsFunction
+                        }
+                        (_, ConstraintOrigin::ApplicationArgument, _, _) => {
+                            ExplanationFactPayload::SuppliesArgument
+                        }
+                        (_, ConstraintOrigin::MatchArm | ConstraintOrigin::Match, _, _) => {
+                            ExplanationFactPayload::BranchResult
+                        }
+                        _ => ExplanationFactPayload::RequiresType,
+                    }
+                };
+                full_facts.push(ExplanationFact {
+                    span,
+                    direct: false,
+                    constraint: *id,
+                    origin: constraint.origin,
+                    subject,
+                    payload,
+                });
+            }
+        }
+        if let Some(declared) = match &error.kind {
+            ErrorKind::RigidBroken { declared, .. } | ErrorKind::RigidField { declared, .. } => {
+                Some(*declared)
+            }
+            _ => None,
+        } {
+            for fact in &mut full_facts {
+                if fact.span == error.span {
+                    fact.payload = ExplanationFactPayload::CallerChoiceUse;
+                }
+                if fact.span == declared {
+                    fact.payload = ExplanationFactPayload::CallerChoiceDeclaration;
+                }
+            }
+            if !full_facts.iter().any(|fact| fact.span == declared)
+                && let Some(constraint) = constraint_slice.first().copied()
+            {
+                full_facts.push(ExplanationFact {
+                    direct: false,
+                    span: declared,
+                    constraint,
+                    origin: ConstraintOrigin::ContextualCheck,
+                    subject: Subject::Annotation,
+                    payload: ExplanationFactPayload::CallerChoiceDeclaration,
+                });
+            }
+        }
+        if matches!(
+            kind,
+            Some(ContradictionKind::UnhandledEffect | ContradictionKind::EffectNotAllowed)
+        ) && let Some(row) = &row
+            && let Some((constraint, origin)) = constraint_slice.iter().rev().find_map(|id| {
+                let ConstraintKind::Performs { effect_origins, .. } = &constraints.get(id)?.kind
+                else {
+                    return None;
+                };
+                effect_origins.iter().find_map(|source| {
+                    let EffectSource::Origin(origin) = source else {
+                        return None;
+                    };
+                    (origin.interface.row_key() == row.label).then_some((*id, origin))
+                })
+            })
+        {
+            // Declaration evidence follows the resolved operation identity, not
+            // a structural row-key lookup. Same-named equivalent interfaces may
+            // share a row while still naming different declarations here.
+            full_facts.push(ExplanationFact {
+                direct: false,
+                span: origin.declaration_span,
+                constraint,
+                origin: ConstraintOrigin::ContextualCheck,
+                subject: Subject::EffectDeclaration,
+                payload: ExplanationFactPayload::EffectDeclaration,
+            });
+        }
+        if let ErrorKind::RepeatedField {
+            introduction: Some(introduction),
+            forbidden: Some(forbidden),
+            ..
+        } = &error.kind
+            && introduction.span != forbidden.span
+        {
+            // Keep the complete causal slice. Exact row-fact provenance either
+            // corrects the corresponding sliced fact in place or adds a missing
+            // endpoint; it must never replace the intermediate path.
+            for (origin, payload) in [
+                (introduction, ExplanationFactPayload::LabelIntroduction),
+                (forbidden, ExplanationFactPayload::LabelForbidden),
+            ] {
+                if let Some(at) = full_facts.iter().position(|fact| {
+                    fact.span == origin.span
+                        && fact.constraint == origin.constraint
+                        && fact.origin == origin.origin
+                        && fact.subject == origin.subject
+                }) {
+                    full_facts[at].payload = payload;
+                } else {
+                    full_facts.push(ExplanationFact {
+                        direct: false,
+                        span: origin.span,
+                        constraint: origin.constraint,
+                        origin: origin.origin,
+                        subject: origin.subject,
+                        payload,
+                    });
+                }
+            }
+        }
+        // Overlays can append or change roles. Restore source order afterwards;
+        // no diagnostic order is allowed to inherit a solver identity.
+        full_facts.sort_by_key(|fact| {
+            (
+                fact.span.is_generated(),
+                fact.span,
+                fact.origin.code(),
+                fact.subject.code(),
+                fact.payload as u8,
+            )
+        });
+        // A reason without a written endpoint cannot support source labels.
+        // Keep the established diagnostic rather than inventing context.
+        if full_facts.is_empty() {
+            continue;
+        }
+        let mut candidates = Vec::new();
+        let mut included = HashSet::new();
+        for (at, fact) in full_facts.iter().enumerate() {
+            // Constraint IDs distinguish solver records, not source facts.
+            // Shared paths may repeat one written fact through several records.
+            if included.insert((fact.span, fact.origin, fact.subject, fact.payload)) {
+                candidates.push(at);
+            }
+        }
+        let opposing_roles = match kind {
+            Some(ContradictionKind::RepeatedLabel) => Some((
+                ExplanationFactPayload::LabelIntroduction,
+                ExplanationFactPayload::LabelForbidden,
+            )),
+            Some(
+                ContradictionKind::LabelUnavailable | ContradictionKind::ProjectionOnNonStruct,
+            ) => Some((
+                ExplanationFactPayload::LabelDemand,
+                ExplanationFactPayload::ClosedRow,
+            )),
+            _ => None,
+        };
+        let caller_endpoints = (kind == Some(ContradictionKind::CallerChoice))
+            .then(|| {
+                let declared = candidates.iter().copied().find(|at| {
+                    full_facts[*at].payload == ExplanationFactPayload::CallerChoiceDeclaration
+                })?;
+                let used = candidates.iter().rev().copied().find(|at| {
+                    full_facts[*at].payload == ExplanationFactPayload::CallerChoiceUse
+                })?;
+                Some([declared, used])
+            })
+            .flatten();
+        let opposing_endpoints = opposing_roles.and_then(|(first, second)| {
+            let first = candidates
+                .iter()
+                .rev()
+                .copied()
+                .find(|at| full_facts[*at].payload == first)?;
+            let second = candidates.iter().rev().copied().find(|at| {
+                full_facts[*at].payload == second && full_facts[*at].span != full_facts[first].span
+            })?;
+            Some([first, second])
+        });
+        // Row prose is causal only when independently grounded evidence names
+        // both the demand/introduction and the use which limits/forbids it.
+        if opposing_roles.is_some() && opposing_endpoints.is_none() {
+            continue;
+        }
+
+        // Keep the two contradiction endpoints and, at most, one useful
+        // semantic handoff between them. The complete path above is untouched;
+        // this only chooses the ordinary reading of it.
+        let mut shared_keys: Vec<(PivotKey, Vec<usize>)> = Vec::new();
+        let mut keyed: HashMap<PivotKey, Vec<usize>> = HashMap::new();
+        for at in candidates.iter().copied() {
+            let fact = &full_facts[at];
+            let Some(constraint) = constraints.get(&fact.constraint) else {
+                continue;
+            };
+            let key = pivot_key(
+                fact,
+                constraint,
+                pivot_contexts
+                    .get(&fact.constraint)
+                    .copied()
+                    .unwrap_or_default(),
+                &instance_binders,
+            );
+            keyed.entry(key).or_default().push(at);
+        }
+        shared_keys.extend(
+            keyed
+                .into_iter()
+                .filter(|(_, references)| references.len() >= 2),
+        );
+        shared_keys.sort_by_key(|(key, references)| (key.priority(), key.clone(), references[0]));
+        let endpoint_family = shared_keys.first().map(|(key, matching)| {
+            let preferred: Vec<_> = matching
+                .iter()
+                .copied()
+                .filter(|at| match key {
+                    PivotKey::FunctionInput(_) => full_facts[*at].subject == Subject::Argument,
+                    PivotKey::BranchResult(_) => full_facts[*at].subject == Subject::MatchArm,
+                    _ => true,
+                })
+                .collect();
+            let matching = if preferred.len() >= 2 {
+                &preferred
+            } else {
+                matching
+            };
+            [matching[0], *matching.last().expect("shared pivot key")]
+        });
+        let effect_endpoints = matches!(
+            kind,
+            Some(ContradictionKind::UnhandledEffect | ContradictionKind::EffectNotAllowed)
+        )
+        .then(|| {
+            let use_at = candidates
+                .iter()
+                .rev()
+                .copied()
+                .find(|at| full_facts[*at].payload == ExplanationFactPayload::EffectUse)?;
+            let boundary = candidates
+                .iter()
+                .copied()
+                .find(|at| full_facts[*at].payload == ExplanationFactPayload::EffectBoundary)?;
+            Some(match kind {
+                Some(ContradictionKind::UnhandledEffect) => [use_at, boundary],
+                Some(ContradictionKind::EffectNotAllowed) => [boundary, use_at],
+                _ => unreachable!("effect endpoints require an effect contradiction"),
+            })
+        })
+        .flatten();
+        let endpoints = caller_endpoints
+            .or(opposing_endpoints)
+            .or(effect_endpoints)
+            .or(endpoint_family)
+            .unwrap_or_else(|| {
+                [
+                    candidates[0],
+                    *candidates.last().expect("nonempty candidates"),
+                ]
+            });
+        let mut abridged = vec![endpoints[0], endpoints[1]];
+        if effect_endpoints.is_some() {
+            if let Some(declaration) = candidates
+                .iter()
+                .copied()
+                .find(|at| full_facts[*at].payload == ExplanationFactPayload::EffectDeclaration)
+            {
+                abridged.push(declaration);
+            }
+            if let Some(first_use) = candidates.iter().copied().find(|at| {
+                full_facts[*at].payload == ExplanationFactPayload::EffectUse && *at != endpoints[0]
+            }) {
+                abridged.push(first_use);
+            }
+        }
+        let lo = endpoints[0].min(endpoints[1]);
+        let hi = endpoints[0].max(endpoints[1]);
+        if opposing_endpoints.is_none()
+            && caller_endpoints.is_none()
+            && effect_endpoints.is_none()
+            && let Some(handoff) = candidates.iter().copied().find(|at| {
+                lo < *at
+                    && *at < hi
+                    && matches!(
+                        full_facts[*at].subject,
+                        Subject::Parameter
+                            | Subject::MatchResult
+                            | Subject::ProjectionResult
+                            | Subject::AmbientEffects
+                    )
+            })
+        {
+            abridged.push(handoff);
+        }
+        if effect_endpoints.is_some() {
+            // Effect diagnostics have a semantic primary: the call which makes
+            // a top-level escape unavoidable, or the function boundary which
+            // refuses it. Source sorting must not promote a declaration fact.
+            let mut seen = HashSet::new();
+            abridged.retain(|at| seen.insert(*at));
+        } else {
+            abridged.sort_unstable();
+            abridged.dedup();
+        }
+
+        let pivot_candidate = shared_keys.iter().find_map(|(key, all_references)| {
+            if matches!(
+                kind,
+                Some(
+                    ContradictionKind::CallerChoice
+                        | ContradictionKind::UnhandledEffect
+                        | ContradictionKind::EffectNotAllowed
+                )
+            ) || opposing_endpoints.is_some() && matches!(key, PivotKey::Anonymous { .. })
+            {
+                return None;
+            }
+            let references: Vec<_> = all_references
+                .iter()
+                .copied()
+                .filter(|at| abridged.contains(at))
+                .collect();
+            (references.len() >= 2).then_some((key.kind(), references))
+        });
+        let pivot = pivot_candidate.map(|(kind, references)| {
+            let base = match kind {
+                ExplanationPivotKind::FunctionInput => "Input",
+                ExplanationPivotKind::BranchResult => "Result",
+                ExplanationPivotKind::ProjectedField => "Field",
+                ExplanationPivotKind::FunctionEffects => "Effects",
+                ExplanationPivotKind::WrittenValue | ExplanationPivotKind::Value => "Value",
+            };
+            ExplanationPivot {
+                name: explanatory_name(base, &visible_names),
+                kind,
+                introduced_at: references[0],
+                references,
+            }
+        });
+        let omitted_facts = candidates.len().saturating_sub(abridged.len());
+        let leaf = match &error.kind {
+            ErrorKind::Mismatch { expected, actual } => {
+                smallest_incompatible(aliases, expected, actual)
+            }
+            _ => (left, right),
+        };
+        let failing_constraint = match error.cause {
+            ErrorCause::Step(id) => steps.get(&id).and_then(|step| step.constraint),
+            ErrorCause::Batch(_) | ErrorCause::Direct => None,
+        };
+        let value_used_as_function = kind.is_none()
+            && failing_constraint
+                .and_then(|id| constraints.get(&id))
+                .is_some_and(|constraint| {
+                    constraint.origin == ConstraintOrigin::ApplicationCallee
+                        && (leaf.0 == TypeDescription::Function
+                            || leaf.1 == TypeDescription::Function)
+                });
+        let recursive =
+            (kind == Some(ContradictionKind::RecursiveValue)).then(|| match error.cause {
+                ErrorCause::Step(id) => steps
+                    .get(&id)
+                    .and_then(|step| step.recursive)
+                    .unwrap_or(RecursiveCycleShape::Neutral),
+                ErrorCause::Batch(_) | ErrorCause::Direct => RecursiveCycleShape::Neutral,
+            });
+        error.explanation = Some(InferenceExplanation {
+            full_facts,
+            abridged,
+            pivot,
+            omitted_facts,
+            contradiction: Contradiction {
+                kind: kind.unwrap_or(if value_used_as_function {
+                    ContradictionKind::ValueUsedAsFunction
+                } else {
+                    ContradictionKind::IncompatibleTypes
+                }),
+                left: leaf.0,
+                right: leaf.1,
+                row,
+                recursive,
+                repairs: [
+                    RepairDirection::ChangeFirstUse,
+                    RepairDirection::ChangeSecondUse,
+                ],
+            },
+            cause: ExplanationCause {
+                error: error.id,
+                seed,
+                constraints: constraint_slice,
+                reasons: reason_slice,
+                omitted_reasons,
+            },
+        });
+    }
 }
 
 /// Assign a type to every term in the program, in place, and return the
 /// schemes of its top-level definitions.
+fn direct_extern_explanation(
+    error: ErrorId,
+    facts: Vec<(Span, ConstraintOrigin, Subject, ExplanationFactPayload)>,
+    kind: ContradictionKind,
+    row: Option<RowContradiction>,
+) -> InferenceExplanation {
+    // Direct source facts deliberately do not claim a forgeable arena
+    // identity. `pending` is never published in the cause's constraint slice.
+    let constraint = ConstraintId::pending();
+    let mut full_facts = Vec::new();
+    for (span, origin, subject, payload) in facts {
+        if full_facts.iter().any(|fact: &ExplanationFact| {
+            fact.span == span
+                && fact.origin == origin
+                && fact.subject == subject
+                && fact.payload == payload
+        }) {
+            continue;
+        }
+        full_facts.push(ExplanationFact {
+            span,
+            direct: true,
+            constraint,
+            origin,
+            subject,
+            payload,
+        });
+    }
+    InferenceExplanation {
+        abridged: (0..full_facts.len()).collect(),
+        full_facts,
+        pivot: None,
+        omitted_facts: 0,
+        contradiction: Contradiction {
+            kind,
+            left: TypeDescription::Function,
+            right: TypeDescription::Undecided,
+            row,
+            recursive: None,
+            repairs: [
+                RepairDirection::ChangeFirstUse,
+                RepairDirection::ChangeSecondUse,
+            ],
+        },
+        cause: ExplanationCause {
+            error,
+            seed: None,
+            constraints: Vec::new(),
+            reasons: Vec::new(),
+            omitted_reasons: 0,
+        },
+    }
+}
+
+fn listed_effects(row: &Row) -> Vec<String> {
+    flatten_row(row)
+        .into_parts()
+        .0
+        .into_iter()
+        .filter(|(_, field)| !matches!(field.presence, Presence::Absent))
+        .map(|(name, _)| name)
+        .collect()
+}
+
+fn same_callback_tail(required: &Rest, available: &Rest) -> bool {
+    match (required, available) {
+        (Rest::Closed, Rest::Closed) | (Rest::Undecided, Rest::Undecided) => true,
+        (Rest::Var(left), Rest::Var(right)) | (Rest::Bound(left), Rest::Bound(right)) => {
+            left == right
+        }
+        (Rest::Rigid { id: left, .. }, Rest::Rigid { id: right, .. }) => left == right,
+        _ => false,
+    }
+}
+
+/// A fixed abstract callback remainder cannot be supplied by a closed or
+/// differently-quantified extern remainder. Flexible holes are intentionally
+/// left for the published solver constraint: constraining such a hole is valid
+/// inference, not a declaration error by itself.
+fn callback_tail_definitely_missing(required: &Row, available: &Row) -> bool {
+    let required = flatten_row(required);
+    let available = flatten_row(available);
+    if matches!(required.rest, Rest::Closed | Rest::Undecided)
+        || same_callback_tail(&required.rest, &available.rest)
+    {
+        return false;
+    }
+    matches!(required.rest, Rest::Bound(_) | Rest::Rigid { .. })
+        && matches!(
+            available.rest,
+            Rest::Closed | Rest::Bound(_) | Rest::Rigid { .. }
+        )
+}
+
+fn tail_issue(relation: &CallbackTailRelation) -> String {
+    match &relation.available {
+        Some(available) => format!(
+            "callback remainder {} is not covered by extern remainder {available}",
+            relation.required
+        ),
+        None => format!(
+            "callback remainder {} is not covered by the extern declaration's fixed effects",
+            relation.required
+        ),
+    }
+}
+
+fn push_distinct(values: &mut Vec<String>, value: String) {
+    if !values.contains(&value) {
+        values.push(value);
+    }
+}
+
+fn aggregate_callback_issues(
+    issues: impl IntoIterator<Item = ExternCallbackIssue>,
+) -> Vec<ExternCallbackIssue> {
+    let mut merged: IndexMap<String, ExternCallbackIssue> = IndexMap::new();
+    for issue in issues {
+        let entry = merged
+            .entry(issue.callback_path.clone())
+            .or_insert_with(|| ExternCallbackIssue {
+                callback_span: issue.callback_span,
+                callback_path: issue.callback_path.clone(),
+                callback_type: issue.callback_type.clone(),
+                missing_effects: Vec::new(),
+                extern_effects: Vec::new(),
+                requirements: Vec::new(),
+                missing_tails: Vec::new(),
+                conditions: Vec::new(),
+                condition: String::new(),
+            });
+        for effect in issue.missing_effects {
+            push_distinct(&mut entry.missing_effects, effect);
+        }
+        for effect in issue.extern_effects {
+            push_distinct(&mut entry.extern_effects, effect);
+        }
+        for requirement in issue.requirements {
+            if !entry.requirements.contains(&requirement) {
+                entry.requirements.push(requirement);
+            }
+        }
+        for tail in issue.missing_tails {
+            push_distinct(&mut entry.missing_tails, tail);
+        }
+        for condition in issue.conditions {
+            push_distinct(&mut entry.conditions, condition);
+        }
+        entry.condition = match entry.conditions.as_slice() {
+            [] => "true".into(),
+            [condition] => condition.clone(),
+            conditions => conditions
+                .iter()
+                .map(|condition| format!("({condition})"))
+                .collect::<Vec<_>>()
+                .join(" and "),
+        };
+    }
+    merged.into_values().collect()
+}
+
+fn set_callback_issues(error: &mut Error, additional: Vec<ExternCallbackIssue>) {
+    match &mut error.kind {
+        ErrorKind::CallbackEffectsNotCovered {
+            missing_effects,
+            extern_effects,
+            callback_path,
+            callback_type,
+            issues,
+            ..
+        } => {
+            let merged = aggregate_callback_issues(issues.iter().cloned().chain(additional));
+            if let Some(first) = merged.first() {
+                *missing_effects = first.missing_effects.clone();
+                *extern_effects = first.extern_effects.clone();
+                *callback_path = first.callback_path.clone();
+                *callback_type = first.callback_type.clone();
+            }
+            *issues = merged;
+        }
+        ErrorKind::PolymorphicExternBoundary {
+            callback_issues, ..
+        } => {
+            *callback_issues =
+                aggregate_callback_issues(callback_issues.iter().cloned().chain(additional));
+        }
+        _ => {}
+    }
+}
+
+fn deduplicate_extern_facts(facts: Vec<ExplanationFact>) -> Vec<ExplanationFact> {
+    let mut found = Vec::new();
+    for fact in facts {
+        if let Some(at) = found.iter().position(|prior: &ExplanationFact| {
+            prior.span == fact.span
+                && prior.origin == fact.origin
+                && prior.subject == fact.subject
+                && prior.payload == fact.payload
+        }) {
+            // A solved endpoint carries a published constraint identity. Prefer
+            // it over an otherwise equivalent direct declaration-time fact.
+            if found[at].direct && !fact.direct {
+                found[at] = fact;
+            }
+            continue;
+        }
+        found.push(fact);
+    }
+    found
+}
+
+fn direct_callback_issue(
+    constraint: &Constraint,
+    promised: &Formula,
+    names: &[(String, Presence)],
+) -> Option<ExternCallbackIssue> {
+    let ConstraintKind::CallbackCoverage {
+        required,
+        available,
+        boundary,
+    } = &constraint.kind
+    else {
+        return None;
+    };
+    let failed: Vec<_> = boundary
+        .effects
+        .iter()
+        .filter(|effect| !sat::entails(promised, &effect.condition))
+        .collect();
+    let missing_tail = callback_tail_definitely_missing(required, available);
+    if failed.is_empty() && !missing_tail {
+        return None;
+    }
+    let requirements: Vec<_> = failed
+        .iter()
+        .map(|effect| {
+            let mut atoms = Vec::new();
+            effect.condition.atoms(&mut atoms);
+            ExternCallbackRequirement {
+                effect: effect.effect.clone(),
+                condition: (!atoms.is_empty())
+                    .then(|| crate::ui::in_labels(&effect.condition, names)),
+            }
+        })
+        .collect();
+    let conditions: Vec<_> = requirements
+        .iter()
+        .filter_map(|requirement| requirement.condition.clone())
+        .collect();
+    let condition = crate::ui::in_labels(
+        &Formula::all(failed.iter().map(|effect| effect.condition.clone())),
+        names,
+    );
+    Some(ExternCallbackIssue {
+        callback_span: boundary.callback_span,
+        callback_path: boundary.callback_path.clone(),
+        callback_type: boundary.callback_type.clone(),
+        missing_effects: failed.iter().map(|effect| effect.effect.clone()).collect(),
+        extern_effects: listed_effects(available),
+        requirements,
+        missing_tails: missing_tail
+            .then(|| boundary.tail.as_ref().map(tail_issue))
+            .flatten()
+            .into_iter()
+            .collect(),
+        conditions,
+        condition,
+    })
+}
+
 pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     let mut table = Table::default();
+    table.binding_names.extend(
+        program
+            .terms
+            .keys()
+            .copied()
+            .map(|symbol| (symbol, Rc::from(mint.name(symbol)))),
+    );
     let mut env = HashMap::new();
     let mut aliases = IndexMap::new();
     let mut errors = Vec::new();
@@ -1462,6 +5393,11 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     // the reason the aliases above are: a signature is a plain closed arrow, so
     // it mentions no variable and lowering one twice would only mint two copies
     // of nothing.
+    let effect_declaration_spans: IndexMap<_, _> = program
+        .effects
+        .iter()
+        .map(|(symbol, declaration)| (*symbol, declaration.name_span))
+        .collect();
     let mut operations = program.external_operations.clone();
     for (symbol, decl) in &program.effects {
         let ir::Effect::Operations(declared) = &decl.value else {
@@ -1491,50 +5427,186 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
         // global store. `lowered.scheme` carries its closed copy; validate an
         // intrinsically impossible contract here without leaking its
         // assumptions into later declarations.
-        if !sat::satisfiable(&lowered.formula) {
+        let clause_valid = sat::satisfiable(&lowered.formula);
+        if !clause_valid {
             errors.push(Error {
+                id: table.error_id(),
+                cause: ErrorCause::Direct,
                 span: annotation.ty.span,
                 kind: ErrorKind::ClauseImpossible {
                     formula: crate::ui::in_labels(&lowered.formula, &lowered.names),
                 },
+                explanation: None,
             });
         }
-        if let Some(span) =
-            polymorphic_extern_boundary(&aliases, &decl.value.abi, lowered.scheme.body())
-        {
-            errors.push(Error {
-                span,
-                kind: ErrorKind::PolymorphicExternBoundary,
-            });
+        let extern_name = mint.name(*symbol).to_string();
+        let ExternBoundaryReview {
+            leaves,
+            mut coverage,
+        } = if clause_valid {
+            extern_boundary_review(
+                &aliases,
+                &decl.value.abi,
+                &lowered.ty,
+                &lowered.extern_sources,
+                &extern_name,
+                decl.name_span,
+            )
         } else {
-            let (coverage, conditional) =
-                callback_coverage_constraints(&aliases, &decl.value.abi, &lowered.ty);
-            if sat::entails(&lowered.formula, &conditional) {
-                extern_coverage.push((*symbol, coverage));
-            } else {
-                errors.push(Error {
-                    span: decl.value.abi.span,
-                    kind: ErrorKind::CallbackEffectsNotCovered,
-                });
-            }
+            ExternBoundaryReview::default()
+        };
+        for constraint in &mut coverage {
+            constraint.id = table.constraint_id();
+            constraint.reason = table.constraint_reason(constraint.id);
         }
-        env.insert(*symbol, Binding::Poly(lowered.scheme.clone()));
+        let callback_issues = aggregate_callback_issues(coverage.iter().filter_map(|constraint| {
+            direct_callback_issue(constraint, &lowered.formula, &lowered.names)
+        }));
+
+        let baseline_error = if let Some(first) = leaves.first().cloned() {
+            let id = table.error_id();
+            let mut facts = Vec::new();
+            for leaf in &leaves {
+                facts.push((
+                    leaf.span,
+                    ConstraintOrigin::ContextualCheck,
+                    Subject::Annotation,
+                    ExplanationFactPayload::PolymorphicExternLeaf,
+                ));
+            }
+            for issue in &callback_issues {
+                facts.push((
+                    issue.callback_span,
+                    ConstraintOrigin::CallbackBoundary,
+                    Subject::CallbackRequired,
+                    ExplanationFactPayload::CallbackRequirement,
+                ));
+            }
+            facts.push((
+                decl.name_span,
+                ConstraintOrigin::Binding,
+                Subject::Binding,
+                ExplanationFactPayload::ExternPosition,
+            ));
+            facts.push((
+                decl.name_span,
+                ConstraintOrigin::Binding,
+                Subject::Binding,
+                ExplanationFactPayload::ExternDeclaration,
+            ));
+            let explanation = direct_extern_explanation(
+                id,
+                facts,
+                ContradictionKind::PolymorphicExternBoundary,
+                None,
+            );
+            errors.push(Error {
+                id,
+                cause: ErrorCause::Direct,
+                span: first.span,
+                kind: ErrorKind::PolymorphicExternBoundary {
+                    variable: first.variable.clone(),
+                    variable_kind: first.kind,
+                    position: first.position.clone(),
+                    extern_name,
+                    leaves,
+                    callback_issues,
+                },
+                explanation: Some(explanation),
+            });
+            Some(id)
+        } else if let Some(first) = callback_issues
+            .iter()
+            .find(|issue| !issue.missing_effects.is_empty())
+            .cloned()
+        {
+            // Label implications are declaration-level SAT failures and do
+            // not bind caller choices in the solver. A tail-only issue is left
+            // to its real solver failure so the diagnostic retains the failed
+            // step which established that structural relation.
+            let id = table.error_id();
+            let mut facts = Vec::new();
+            for issue in &callback_issues {
+                facts.push((
+                    issue.callback_span,
+                    ConstraintOrigin::CallbackBoundary,
+                    Subject::CallbackRequired,
+                    ExplanationFactPayload::CallbackRequirement,
+                ));
+            }
+            facts.push((
+                decl.value.abi.span,
+                ConstraintOrigin::CallbackBoundary,
+                Subject::CallbackAvailable,
+                ExplanationFactPayload::ExternCapability,
+            ));
+            facts.push((
+                decl.name_span,
+                ConstraintOrigin::Binding,
+                Subject::Binding,
+                ExplanationFactPayload::ExternDeclaration,
+            ));
+            let explanation = direct_extern_explanation(
+                id,
+                facts,
+                ContradictionKind::CallbackEffectsNotCovered,
+                first
+                    .missing_effects
+                    .first()
+                    .map(|effect| RowContradiction {
+                        shape: Shape::Effect,
+                        label: effect.clone(),
+                    }),
+            );
+            errors.push(Error {
+                id,
+                cause: ErrorCause::Direct,
+                span: first.callback_span,
+                kind: ErrorKind::CallbackEffectsNotCovered {
+                    missing_effects: first.missing_effects.clone(),
+                    extern_effects: first.extern_effects.clone(),
+                    callback_path: first.callback_path.clone(),
+                    callback_type: first.callback_type.clone(),
+                    extern_name,
+                    issues: callback_issues,
+                },
+                explanation: Some(explanation),
+            });
+            Some(id)
+        } else {
+            None
+        };
+        // Coverage remains real solver evidence even when another boundary
+        // defect already owns this declaration's one diagnostic. Static SAT
+        // checks above decide written symbolic labels; solving retains labels
+        // in anonymous row holes, evaluates exact open-tail relations, and
+        // preserves every published constraint id.
+        extern_coverage.push((*symbol, coverage, baseline_error));
+        env.insert(
+            *symbol,
+            Binding::Poly(ExplainedScheme::imported(lowered.scheme.clone())),
+        );
         externs.insert(*symbol, lowered.scheme);
     }
 
     let mut schemes = IndexMap::new();
-    env.extend(
-        program
-            .external_schemes
-            .iter()
-            .map(|(symbol, scheme)| (*symbol, Binding::Poly(scheme.clone()))),
-    );
+    env.extend(program.external_schemes.iter().map(|(symbol, scheme)| {
+        (
+            *symbol,
+            Binding::Poly(ExplainedScheme::imported(scheme.clone())),
+        )
+    }));
     let mut locals = IndexMap::new();
     let mut constraints = IndexMap::new();
     let mut promises = IndexMap::new();
     let mut steps = Vec::new();
     let mut refinements = Vec::new();
-    for (symbol, coverage) in extern_coverage {
+    for (symbol, coverage, baseline_error) in extern_coverage {
+        let error_start = errors.len();
+        // Callback coverage is solver input just like generated definition
+        // constraints. Keep it in the published arena so every step's direct
+        // constraint identity remains resolvable by debugger consumers.
+        constraints.insert(symbol, coverage.clone());
         Solve {
             table: &mut table,
             errors: &mut errors,
@@ -1543,16 +5615,113 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             nominal: &nominal,
             definition: symbol,
             depth: 0,
+            constraint: None,
+            constraint_reason: None,
             assumed: Vec::new(),
             schemes: HashMap::new(),
             locals: &mut locals,
             guard: None,
             active_refinement: None,
+            guard_reasons: Vec::new(),
             refinements: &mut refinements,
             generated_end: 0,
         }
         .run(&coverage);
-        report_flip(&mut table, &mut errors);
+        let flipped_now = report_flip(&mut table, &mut errors);
+        if errors.len() == error_start {
+            // A coverage-origin flip reports no error of its own. Leaving the
+            // store marked unsatisfiable with nothing on screen would silently
+            // suppress every later definition's presence diagnostics, so the
+            // mark rolls back; a genuine contradiction resurfaces during the
+            // definition solves, where the flip owns a surviving error.
+            if let Some(at) = flipped_now {
+                table.unsat = false;
+                table.store.batches[at].flipped = false;
+            }
+            continue;
+        }
+
+        let generated_issues = errors[error_start..]
+            .iter()
+            .flat_map(|error| match &error.kind {
+                ErrorKind::CallbackEffectsNotCovered { issues, .. } => issues.clone(),
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let generated_facts = errors[error_start..]
+            .iter()
+            .filter_map(|error| error.explanation.as_ref())
+            .flat_map(|explanation| explanation.full_facts.iter().cloned())
+            .collect::<Vec<_>>();
+        let generated_constraints = errors[error_start..]
+            .iter()
+            .filter_map(|error| error.explanation.as_ref())
+            .flat_map(|explanation| explanation.cause.constraints.iter().copied())
+            .collect::<Vec<_>>();
+        let generated_reasons = errors[error_start..]
+            .iter()
+            .filter_map(|error| error.explanation.as_ref())
+            .flat_map(|explanation| explanation.cause.reasons.iter().copied())
+            .collect::<Vec<_>>();
+
+        // One extern declaration remains one diagnostic. A representation
+        // defect may already own it; otherwise the first solved tail failure
+        // does. In either case merge every callback path and every real causal
+        // id, while emitting shared capability/declaration facts only once.
+        let primary_at = baseline_error
+            .and_then(|id| {
+                errors[..error_start]
+                    .iter()
+                    .position(|error| error.id == id)
+            })
+            .unwrap_or(error_start);
+        let primary_id = errors[primary_at].id;
+        set_callback_issues(&mut errors[primary_at], generated_issues);
+        if let Some(explanation) = &mut errors[primary_at].explanation {
+            let mut facts = explanation.full_facts.clone();
+            facts.extend(generated_facts);
+            explanation.full_facts = deduplicate_extern_facts(facts);
+            explanation.abridged = (0..explanation.full_facts.len()).collect();
+            explanation.cause.constraints = deduplicate(
+                explanation
+                    .cause
+                    .constraints
+                    .iter()
+                    .copied()
+                    .chain(generated_constraints)
+                    .collect(),
+            );
+            explanation.cause.reasons = deduplicate(
+                explanation
+                    .cause
+                    .reasons
+                    .iter()
+                    .copied()
+                    .chain(generated_reasons)
+                    .collect(),
+            );
+        }
+        for step in &mut steps {
+            if step.definition == symbol && step.error.is_some() {
+                step.error = Some(primary_id);
+            }
+        }
+        match baseline_error {
+            Some(_) => errors.truncate(error_start),
+            None => errors.truncate(error_start + 1),
+        }
+        // The merge keeps one extern diagnostic and discards the rest of the
+        // window, which may include the flip error just reported. The cascade
+        // rule suppresses later presence diagnostics only while the flip's
+        // own error is on screen, so when the merge dropped that error the
+        // store's mark rolls back with it.
+        if let Some(at) = flipped_now {
+            let cause = ErrorCause::Batch(table.store.batches[at].id);
+            if !errors.iter().any(|error| error.cause == cause) {
+                table.unsat = false;
+                table.store.batches[at].flipped = false;
+            }
+        }
     }
     // The groups are read out before anything is solved: solving mutates the
     // definitions they name, and which definitions have to be typed together is
@@ -1607,6 +5776,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                     if !lowered.formula.is_true() {
                         let origin = Origin::Annotation(Named {
                             labels: lowered.names.clone(),
+                            shape: None,
                         });
                         // A true placeholder preserves source/debug ordering
                         // for a wholly package-owned clause without making its
@@ -1626,11 +5796,14 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                     .map_or_else(Vec::new, |lowered| lowered.rigids.clone());
                 let bound = match &lowered {
                     Some(lowered) => {
-                        env.insert(*symbol, Binding::Poly(lowered.scheme.clone()));
+                        env.insert(
+                            *symbol,
+                            Binding::Poly(ExplainedScheme::imported(lowered.scheme.clone())),
+                        );
                         lowered.ty.clone()
                     }
                     None => {
-                        let bound = table.fresh_type();
+                        let bound = table.fresh_type_for(Subject::TopLevelBinding);
                         env.insert(*symbol, Binding::Mono(bound.clone()));
                         bound
                     }
@@ -1675,6 +5848,11 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 annotated: Vec::new(),
                 operations: &operations,
                 effect_ids: &program.effect_ids,
+                effect_declaration_spans: &effect_declaration_spans,
+                term_effect_provenance: HashMap::new(),
+                local_effect_provenance: HashMap::new(),
+                binding_effect_provenance: HashMap::new(),
+                callable_effect_scopes: Vec::new(),
                 // A definition's value is computed where no handler can reach
                 // it, so it is walked at the empty closed row and outside every
                 // function — which is what makes performing an effect at the
@@ -1682,6 +5860,8 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 ambient: constrain::Ambient {
                     row: Row::closed(),
                     inside: false,
+                    boundary_span: decl.name_span,
+                    label_spans: IndexMap::new(),
                 },
                 answer: None,
                 presence_guard: Formula::True,
@@ -1692,7 +5872,26 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             // the definition, and checking against a bare variable is inferring
             // and equating — see [`Constrain::check_term`]. The equation is what
             // ties the name the body used to the type the body has.
-            constrain.check_term(&mut decl.value, &scoped.bound);
+            let expected_subject = if decl.annotation.is_some() {
+                Subject::Annotation
+            } else {
+                Subject::TopLevelBinding
+            };
+            let expected_span = decl
+                .annotation
+                .as_ref()
+                .map(|annotation| annotation.ty.span);
+            constrain.check_term(
+                &mut decl.value,
+                &scoped.bound,
+                expected_subject,
+                expected_span,
+            );
+            let effect_provenance = constrain
+                .term_effect_provenance
+                .get(&decl.value.span)
+                .cloned()
+                .unwrap_or_default();
             let generated = constrain.out;
             let annotated = constrain.annotated;
             let ty = match &decl.annotation {
@@ -1711,11 +5910,14 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 nominal: &nominal,
                 definition: scoped.symbol,
                 depth: 0,
+                constraint: None,
+                constraint_reason: None,
                 assumed: Vec::new(),
                 schemes: HashMap::new(),
                 locals: &mut locals,
                 guard: None,
                 active_refinement: None,
+                guard_reasons: Vec::new(),
                 refinements: &mut refinements,
                 generated_end,
             }
@@ -1734,6 +5936,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 ty,
                 generated,
                 annotated,
+                effect_provenance,
                 reported,
                 locals: published,
             });
@@ -1773,7 +5976,13 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             // caller picks, so it means nothing in anybody else's type. A
             // scheme that would quantify one it did not declare is refused at
             // the declaration, which is the line the reader has to change.
-            table.escapes(&member.ty, &member.scoped.rigids, &mut errors);
+            table.escapes(
+                &member.ty,
+                &member.scoped.rigids,
+                Rc::from(mint.name(symbol)),
+                decl.name_span,
+                &mut errors,
+            );
             // An annotation's `where` clause is the contract, so the body may
             // not need more of its presences than the clause allows: a use of
             // the name sees the clause and nothing of the body, and one that
@@ -1798,8 +6007,11 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 )
             {
                 errors.push(Error {
+                    id: table.error_id(),
+                    cause: ErrorCause::Direct,
                     span: annotation.ty.span,
                     kind: ErrorKind::AnnotationAllows { allowed, required },
+                    explanation: None,
                 });
             }
             // An annotation on a nested binding is the same promise about a
@@ -1825,8 +6037,11 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                     )
                 {
                     errors.push(Error {
+                        id: table.error_id(),
+                        cause: ErrorCause::Direct,
                         span: annotated.span,
                         kind: ErrorKind::AnnotationAllows { allowed, required },
+                        explanation: None,
                     });
                 }
             }
@@ -1881,7 +6096,32 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 let zonked = table.zonk_error(&errors[at].kind, &mut subst);
                 errors[at].kind = zonked;
             }
-            env.insert(symbol, Binding::Poly(scheme.clone()));
+            // Written contracts are authoritative: their implementation and
+            // any recovery used to finish it must not leak into consumers.
+            // Likewise a failed definition publishes no causal evidence.
+            let failed = from != to || told != errors.len();
+            let provenance = if failed {
+                SchemeProvenance::default()
+            } else if decl.annotation.is_some() {
+                table.authoritative_provenance(
+                    &member.ty,
+                    scheme.body(),
+                    &subst,
+                    scheme.count(),
+                    &member.generated,
+                    decl.annotation.as_ref().expect("annotated").ty.span,
+                )
+            } else {
+                table.scheme_provenance(&member.ty, scheme.body(), &subst, scheme.count())
+            };
+            env.insert(
+                symbol,
+                Binding::Poly(ExplainedScheme::local(
+                    scheme.clone(),
+                    provenance,
+                    member.effect_provenance,
+                )),
+            );
             schemes.insert(symbol, scheme);
             constraints.insert(symbol, member.generated);
         }
@@ -1892,14 +6132,25 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     // had to be solved first is the solver's business rather than theirs.
     // [`Output::steps`] is that business exactly, and stays in solve order.
     let position: HashMap<Symbol, usize> = program
-        .terms
+        .externs
         .keys()
+        .chain(program.terms.keys())
         .enumerate()
         .map(|(at, symbol)| (*symbol, at))
         .collect();
     schemes.sort_by(|one, _, other, _| position[one].cmp(&position[other]));
     constraints.sort_by(|one, _, other, _| position[one].cmp(&position[other]));
     promises.sort_by(|one, _, other, _| position[one].cmp(&position[other]));
+
+    attach_ordinary_explanations(
+        mint,
+        &mut errors,
+        &constraints,
+        &steps,
+        &table.reasons,
+        &table.omitted_reason_parents,
+        ExplanationSources { aliases: &aliases },
+    );
 
     // Constraints are solved in the order the walk emitted them, which is not
     // quite the order anyone reads a file in — a body's demands come before
@@ -1938,6 +6189,8 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
         store,
         promises,
         refinements,
+        variables: table.var_meta.clone(),
+        reasons: table.reasons.clone(),
         errors,
     }
 }
@@ -1972,19 +6225,19 @@ fn unguarded_formula<'a>(origin: &'a Origin, formula: &'a Formula) -> &'a Formul
     }
 }
 
-fn report_flip(table: &mut Table, errors: &mut Vec<Error>) {
+/// Returns the index of the batch this call newly marked as the flip, so a
+/// caller which then discards the flip's error can roll the mark back.
+fn report_flip(table: &mut Table, errors: &mut Vec<Error>) -> Option<usize> {
     if table.unsat {
-        return;
+        return None;
     }
-    let Some(at) = table.flip() else {
-        return;
-    };
+    let at = table.flip()?;
     table.unsat = true;
     table.store.batches[at].flipped = true;
     let batch = table.store.batches[at].clone();
     let base = unguarded_origin(&batch.origin);
     let kind = match base {
-        UnguardedOrigin::Coverage => return,
+        UnguardedOrigin::Coverage => return Some(at),
         UnguardedOrigin::Annotation(named) => {
             // Which of the two annotation complaints it is: a clause with no
             // model of its own is wrong by itself, and the body under it —
@@ -2004,16 +6257,123 @@ fn report_flip(table: &mut Table, errors: &mut Vec<Error>) {
         }
         UnguardedOrigin::Required(named) => {
             let formula = crate::ui::in_labels(&batch.formula, &named.labels);
-            ErrorKind::PresenceRequired { formula }
+            ErrorKind::PresenceRequired {
+                formula,
+                shape: named.shape,
+            }
         }
     };
     errors.push(Error {
+        id: table.error_id(),
+        cause: ErrorCause::Batch(batch.id),
         span: batch.span,
         kind,
+        explanation: None,
     });
+    Some(at)
 }
 
 impl Table {
+    fn constraint_id(&mut self) -> ConstraintId {
+        let id = ConstraintId(self.next_constraint_id);
+        self.next_constraint_id += 1;
+        id
+    }
+
+    fn reason(&mut self, origin: ReasonOrigin, parents: Vec<ReasonId>) -> ReasonId {
+        self.reason_with_omissions(origin, parents, 0)
+    }
+
+    fn reason_with_omissions(
+        &mut self,
+        origin: ReasonOrigin,
+        parents: Vec<ReasonId>,
+        omitted_parents: usize,
+    ) -> ReasonId {
+        let id = ReasonId(self.next_reason_id);
+        self.next_reason_id += 1;
+        if origin == ReasonOrigin::Recovery
+            || parents
+                .iter()
+                .any(|parent| self.unpublishable_reasons.contains(parent))
+        {
+            self.unpublishable_reasons.insert(id);
+        }
+        if omitted_parents != 0 {
+            self.omitted_reason_parents.insert(id, omitted_parents);
+        }
+        self.reasons.push(Reason {
+            id,
+            parents,
+            origin,
+            reachable: true,
+        });
+        id
+    }
+
+    fn constraint_reason(&mut self, id: ConstraintId) -> ReasonId {
+        self.reason(ReasonOrigin::Constraint(id), Vec::new())
+    }
+
+    fn note_opened_type(&self, ty: &Rc<Ty>) {
+        if let Some((opened, reasons)) = self.opened_provenance.get(&(Rc::as_ptr(ty) as usize))
+            && opened
+                .upgrade()
+                .is_some_and(|opened| Rc::ptr_eq(&opened, ty))
+        {
+            for reason in reasons {
+                self.note_binding_read(*reason);
+            }
+        }
+    }
+
+    fn constraint_reason_for(&mut self, id: ConstraintId, kind: &ConstraintKind) -> ReasonId {
+        let roots: Vec<&Rc<Ty>> = match kind {
+            ConstraintKind::Project { base, result, .. } => vec![base, result],
+            ConstraintKind::Equal { expected, actual } => vec![expected, actual],
+            ConstraintKind::Let { bound, .. } => vec![bound],
+            ConstraintKind::Instance { ty, .. } => vec![ty],
+            ConstraintKind::Match {
+                scrutinee, result, ..
+            } => vec![scrutinee, result],
+            ConstraintKind::Performs { .. } | ConstraintKind::CallbackCoverage { .. } => Vec::new(),
+        };
+        let mut parents = Vec::new();
+        for ty in roots {
+            if let Some((opened, opened_parents)) =
+                self.opened_provenance.get(&(Rc::as_ptr(ty) as usize))
+                && opened
+                    .upgrade()
+                    .is_some_and(|opened| Rc::ptr_eq(&opened, ty))
+            {
+                for parent in opened_parents {
+                    if !parents.contains(parent) {
+                        parents.push(*parent);
+                    }
+                }
+            }
+        }
+        self.reason(ReasonOrigin::Constraint(id), parents)
+    }
+
+    fn step_id(&mut self) -> StepId {
+        let id = StepId(self.next_step_id);
+        self.next_step_id += 1;
+        id
+    }
+
+    fn error_id(&mut self) -> ErrorId {
+        let id = ErrorId(self.next_error_id);
+        self.next_error_id += 1;
+        id
+    }
+
+    fn batch_id(&mut self) -> BatchId {
+        let id = BatchId(self.next_batch_id);
+        self.next_batch_id += 1;
+        id
+    }
+
     /// What is known now, to be handed back to [`restore`](Self::restore) if
     /// what follows turns out not to have been asked.
     ///
@@ -2022,7 +6382,16 @@ impl Table {
     /// honest; this is one line, and the one caller takes it once for the
     /// outermost open congruence rather than per binding or nominal depth.
     fn snapshot(&self) -> Known {
-        (self.vars.clone(), self.levels.clone(), self.lacks.clone())
+        Known {
+            vars: self.vars.clone(),
+            var_meta_len: self.var_meta.len(),
+            levels: self.levels.clone(),
+            lacks: self.lacks.clone(),
+            active_lacks_origin: self.active_lacks_origin.clone(),
+            existential_witnesses: self.existential_witnesses.clone(),
+            abstract_existentials: self.abstract_existentials.clone(),
+            reason_len: self.reasons.len(),
+        }
     }
 
     /// Put back what [`snapshot`](Self::snapshot) took.
@@ -2030,37 +6399,205 @@ impl Table {
     /// The variables minted since go with it. Nothing can still be pointing at
     /// one: a fresh variable reaches the rest of the solve only by being bound
     /// into something, and every binding made since is being undone here too.
-    fn restore(&mut self, (vars, levels, lacks): Known) {
-        self.vars = vars;
-        self.levels = levels;
-        self.lacks = lacks;
+    fn restore(&mut self, known: Known) {
+        self.vars = known.vars;
+        self.var_meta.truncate(known.var_meta_len);
+        self.levels = known.levels;
+        self.lacks = known.lacks;
+        self.active_lacks_origin = known.active_lacks_origin;
+        self.existential_witnesses = known.existential_witnesses;
+        self.abstract_existentials = known.abstract_existentials;
+        for reason in &mut self.reasons[known.reason_len..] {
+            reason.reachable = false;
+        }
+        if let Some(captures) = self.causal_reads.borrow_mut().as_mut()
+            && let Some(reads) = captures.last_mut()
+        {
+            reads.clear();
+        }
+    }
+
+    fn enter_solver_scope(&mut self) {
+        if self.causal_scope_depth == 0 {
+            let previous = self.causal_reads.replace(Some(Vec::new()));
+            assert!(
+                previous.is_none(),
+                "causal reads active outside a solver scope"
+            );
+        }
+        self.causal_scope_depth += 1;
+    }
+
+    fn leave_solver_scope(&mut self) {
+        self.causal_scope_depth = self
+            .causal_scope_depth
+            .checked_sub(1)
+            .expect("solver scope");
+        if self.causal_scope_depth == 0 {
+            let _discarded = self
+                .causal_reads
+                .replace(None)
+                .expect("solver reads active");
+            assert!(self.causal_reads.borrow().is_none());
+        }
+    }
+
+    /// Start an independent boundary such as one generated constraint. Any
+    /// unfinished reads in the enclosing act are discarded: crossing a nested
+    /// solve cannot make them causes of work performed after that solve.
+    fn begin_solver_act(&self) {
+        let mut captures = self.causal_reads.borrow_mut();
+        let captures = captures.as_mut().expect("solver act outside solver scope");
+        if let Some(enclosing) = captures.last_mut() {
+            enclosing.clear();
+        }
+        captures.push(IndexSet::new());
+    }
+
+    /// Start one rule, handing it reads made while exposing its goal. A rule
+    /// which records no step discards those reads at completion rather than
+    /// allowing the next rule to claim them.
+    fn begin_solver_rule(&self) {
+        let mut captures = self.causal_reads.borrow_mut();
+        let captures = captures.as_mut().expect("solver rule outside solver scope");
+        let inherited = captures.last_mut().map(std::mem::take).unwrap_or_default();
+        captures.push(inherited);
+    }
+
+    fn end_solver_act(&self) {
+        self.causal_reads
+            .borrow_mut()
+            .as_mut()
+            .expect("solver act outside solver scope")
+            .pop()
+            .expect("solver act capture");
+    }
+
+    fn note_binding_read(&self, reason: ReasonId) {
+        if let Some(captures) = self.causal_reads.borrow_mut().as_mut()
+            && let Some(reads) = captures.last_mut()
+        {
+            reads.insert(reason);
+        }
+    }
+
+    fn take_binding_reads(&self) -> Vec<ReasonId> {
+        self.causal_reads
+            .borrow_mut()
+            .as_mut()
+            .expect("causal reads consumed outside a solver act")
+            .last_mut()
+            .expect("causal reads consumed without an active act")
+            .drain(..)
+            .collect()
+    }
+
+    fn binding_parents(&self, var: TyVar, root: Option<ReasonId>) -> Vec<ReasonId> {
+        let mut parents = Vec::new();
+        if let Some(root) = root {
+            parents.push(root);
+        }
+        parents.push(self.var_meta[var as usize].minted_by);
+        for reason in self.take_binding_reads() {
+            if !parents.contains(&reason) {
+                parents.push(reason);
+            }
+        }
+        parents
+    }
+
+    fn default_bind(
+        &mut self,
+        var: TyVar,
+        value: Assigned,
+        kind: DefaultBinding,
+        assigned: DefaultAssignment,
+        mut causes: Vec<ReasonId>,
+    ) -> ReasonId {
+        causes.insert(0, self.var_meta[var as usize].minted_by);
+        causes.dedup();
+        let reason = self.reason(
+            ReasonOrigin::DefaultBinding {
+                var,
+                kind,
+                assigned,
+            },
+            causes,
+        );
+        self.vars[var as usize] = Slot::Bound { value, by: reason };
+        reason
     }
 
     /// One more variable, of no sort yet, at the level being walked. A
     /// variable's sort is fixed by the position it was minted for, and the four
     /// functions below are those positions; nothing else may call this.
-    fn mint(&mut self) -> TyVar {
+    fn mint(&mut self, sort: VarSort, subject: Subject) -> TyVar {
+        self.mint_from(sort, subject, Vec::new())
+    }
+
+    fn mint_from(&mut self, sort: VarSort, subject: Subject, parents: Vec<ReasonId>) -> TyVar {
+        self.mint_from_budgeted(sort, subject, parents, 0)
+    }
+
+    fn mint_from_budgeted(
+        &mut self,
+        sort: VarSort,
+        subject: Subject,
+        parents: Vec<ReasonId>,
+        omitted: usize,
+    ) -> TyVar {
         let var = self.vars.len() as TyVar;
+        let minted_by =
+            self.reason_with_omissions(ReasonOrigin::Variable { sort, subject }, parents, omitted);
         self.vars.push(Slot::Unbound);
+        self.var_meta.push(VarMeta {
+            sort,
+            subject,
+            minted_by,
+        });
         self.levels.push(self.level);
         var
     }
 
     /// A variable standing for a whole type: an unconstrained type
     /// of its own, so that binding it takes whatever it is against entire.
-    fn fresh_type(&mut self) -> Rc<Ty> {
-        let var = self.mint();
+    fn fresh_type_for(&mut self, subject: Subject) -> Rc<Ty> {
+        let var = self.mint(VarSort::Type, subject);
         Rc::new(Ty::plain(Ty::Var(var)))
     }
 
     /// A variable standing for the rest of a row.
     fn fresh_row(&mut self) -> Rest {
-        Rest::Var(self.mint())
+        self.fresh_row_for(Subject::Term)
+    }
+
+    fn fresh_row_for(&mut self, subject: Subject) -> Rest {
+        Rest::Var(self.mint(VarSort::Row, subject))
     }
 
     /// A variable standing for whether one label is there.
     fn fresh_presence(&mut self) -> Presence {
-        Presence::Var(self.mint())
+        self.fresh_presence_for(Subject::Term)
+    }
+
+    fn fresh_presence_for(&mut self, subject: Subject) -> Presence {
+        Presence::Var(self.mint(VarSort::Presence, subject))
+    }
+
+    fn fresh_instance_presence(&mut self) -> Presence {
+        self.fresh_presence_for(Subject::Instance)
+    }
+
+    fn fresh_match_family_type(&mut self) -> Rc<Ty> {
+        self.fresh_type_for(Subject::MatchResult)
+    }
+
+    fn fresh_match_family_row(&mut self) -> Rest {
+        self.fresh_row_for(Subject::MatchResult)
+    }
+
+    fn fresh_match_family_presence(&mut self) -> Presence {
+        self.fresh_presence_for(Subject::MatchResult)
     }
 
     /// Follow bound variables until reaching something that is not one. Only
@@ -2085,9 +6622,14 @@ impl Table {
         let mut ty = ty.clone();
         let mut budget = self.vars.len();
         while let Ty::Var(v) = &*ty {
-            let Slot::Bound(Assigned::Ty(inner)) = &self.vars[*v as usize] else {
+            let Slot::Bound {
+                value: Assigned::Ty(inner),
+                by,
+            } = &self.vars[*v as usize]
+            else {
                 break;
             };
+            self.note_binding_read(*by);
             budget = budget.checked_sub(1).expect("bound type cycle");
             ty = inner.clone();
         }
@@ -2131,7 +6673,11 @@ impl Table {
             let deeper = match &row.rest {
                 Rest::More(more) => (**more).clone(),
                 Rest::Var(var) => match &self.vars[*var as usize] {
-                    Slot::Bound(Assigned::Row(bound)) => {
+                    Slot::Bound {
+                        value: Assigned::Row(bound),
+                        by,
+                    } => {
+                        self.note_binding_read(*by);
                         budget = budget.checked_sub(1).expect(
                             "a chain of bound row variables closed a cycle the occurs check should refuse",
                         );
@@ -2173,9 +6719,21 @@ impl Table {
         let mut presence = presence.clone();
         let mut budget = self.vars.len();
         while let Presence::Var(var) = presence {
-            let Slot::Bound(Assigned::Presence(inner)) = &self.vars[var as usize] else {
+            if let Some((identity, reasons)) = self.opened_presence_provenance.get(&var)
+                && self.var_meta[var as usize].minted_by == *identity
+            {
+                for reason in reasons {
+                    self.note_binding_read(*reason);
+                }
+            }
+            let Slot::Bound {
+                value: Assigned::Presence(inner),
+                by,
+            } = &self.vars[var as usize]
+            else {
                 break;
             };
+            self.note_binding_read(*by);
             budget = budget.checked_sub(1).expect(
                 "a chain of bound presence variables closed a cycle the occurs check should refuse",
             );
@@ -2300,47 +6858,271 @@ impl Table {
     /// that is. One variable space, so a row-tail variable hiding inside a row is
     /// as much a cycle as one hiding inside a type.
     ///
-    /// Asked by listing every variable the value mentions and then looking for
-    /// this one, rather than by asking "is this it?" at each position in turn.
-    /// The question is one question, and asking it once is what keeps the walk
-    /// a walk: the positions differ in where they look, not in what they are
-    /// looking for.
+    /// The walk deliberately follows the raw tree instead of calling
+    /// [`resolve`](Self::resolve) or [`canon`](Self::canon). Those readers are
+    /// right for equality but flatten away the bound-variable edges which form
+    /// the causal route around a cycle. On the first route back to `var`, this
+    /// returns that route's source-facing shape and records exactly its binding
+    /// reasons. [`Solve::fail`] joins them to the active constraint reason, so
+    /// the explanation keeps both the iterative path and the source operation
+    /// which closed it.
     ///
-    /// Which is also the only form of it this codebase can hold itself to. Asked
-    /// per position, the comparison at a row's tail and the one at a presence
-    /// could never answer yes — the paragraph below is why — so two of the
-    /// walk's own branches would be unreachable, and a rule with a branch nobody
-    /// can exercise is a rule nobody can rely on. One comparison, at the end, is
-    /// a comparison both answers of which a program can produce. Walking the
-    /// whole value to reach it is what that costs, and this is not the place the
-    /// solver's time goes.
-    ///
-    /// It is answered yes only about a row-tail variable, and that is a fact about
-    /// the solver rather than a hole in the walk. Two reasons, and between them
-    /// they cover every route here:
-    ///
-    /// - A variable's sort is fixed where it was minted and never changes, so a
-    ///   presence variable is never the same variable as a row or type one. Most
-    ///   of what this walk turns up is therefore of the wrong sort to be the one
-    ///   being bound, and no comparison across two sorts can say yes.
-    /// - The same-sort cases are turned away before a binding is ever proposed.
-    ///   Two sides that share an open end and differ in labels either way round
-    ///   are refused in [`Solve::labels`], where the complaint can name both
-    ///   types instead of one variable; two tails that flatten to the same
-    ///   variable are [`Rule::Same`] in [`Solve::rests`]; two presences that are
-    ///   the same variable are [`Rule::Same`] in [`Solve::presences`], and both
-    ///   of its callers — [`Solve::field`] and [`Solve::absorb`] — put each
-    ///   presence through [`Table::presence_of`] first, so no chain of aliases
-    ///   arrives back at the variable being bound.
-    ///
-    /// The walk stays whole regardless. Those interceptions are where they are
-    /// because they word a better complaint, not because this cannot answer;
-    /// a rule with a hole in it is a rule nobody can rely on, and the next
-    /// person to move one of them should find this check already correct.
-    fn occurs(&self, var: TyVar, value: &Assigned) -> bool {
-        let mut mentioned = Vec::new();
-        self.mentions(value, &mut mentioned);
-        mentioned.contains(&var)
+    /// The explicit work and trace stacks keep deeply nested types bounded by
+    /// heap space. A field whose presence resolves absent, or whose imported,
+    /// quantified, or recovered presence makes its payload unavailable, is
+    /// skipped: that payload denotes nothing locally and cannot participate in
+    /// a real cycle. Shared
+    /// row-tail cycles with no intervening binding are caught earlier by
+    /// [`Solve::labels`]; their closing constraint still enters the same
+    /// structured explanation path.
+    fn occurs(&self, var: TyVar, value: &Assigned) -> Option<RecursiveCycleShape> {
+        // Do not flatten the value before searching it. Flattening is useful
+        // for equality, but it loses which bound-variable edges led back to
+        // `var` and records reads from innocent sibling branches. This raw,
+        // iterative walk follows one concrete route and retains precisely the
+        // binding reasons on that route in the active solver rule. The failed
+        // step then joins those reasons to the current constraint reason,
+        // preserving both the cycle path and its source-level closing edge.
+        #[derive(Clone)]
+        enum Part {
+            Ty(Rc<Ty>),
+            Row(Rc<Row>),
+            Presence(Presence),
+            Field(Rc<Ty>, Presence),
+        }
+        struct Trace {
+            reason: ReasonId,
+            parent: Option<usize>,
+        }
+
+        fn assigned_part(value: &Assigned) -> Part {
+            match value {
+                Assigned::Ty(ty) => Part::Ty(ty.clone()),
+                Assigned::Row(row) => Part::Row(row.clone()),
+                Assigned::Presence(presence) => Part::Presence(presence.clone()),
+            }
+        }
+
+        #[derive(Clone, Copy, Default)]
+        struct Route {
+            call_input: bool,
+            containment: bool,
+        }
+
+        let mut work = vec![(assigned_part(value), None, Route::default())];
+        let mut traces: Vec<Trace> = Vec::new();
+        let mut seen_tys = HashSet::new();
+        let mut seen_rows = HashSet::new();
+        // Keep visited allocations alive: inline rows are wrapped for this
+        // walk, and otherwise an allocator could reuse a recorded address.
+        let mut visited_tys = Vec::new();
+        let mut visited_rows = Vec::new();
+        let mut seen_vars = HashSet::new();
+        // Presence resolution in a field has a continuation: two fields may
+        // share one presence variable but carry different payloads.
+        let mut seen_field_presences = HashSet::new();
+        while let Some((part, trace, route)) = work.pop() {
+            let found_target = match part {
+                Part::Ty(ty) => {
+                    if let Ty::Var(found) = &*ty {
+                        if *found == var {
+                            true
+                        } else if !seen_vars.insert(*found) {
+                            false
+                        } else if let Slot::Bound { value, by } = &self.vars[*found as usize] {
+                            let next = traces.len();
+                            traces.push(Trace {
+                                reason: *by,
+                                parent: trace,
+                            });
+                            work.push((assigned_part(value), Some(next), route));
+                            false
+                        } else {
+                            false
+                        }
+                    } else if !seen_tys.insert(Rc::as_ptr(&ty) as usize) {
+                        false
+                    } else {
+                        visited_tys.push(ty.clone());
+                        match &*ty {
+                            Ty::Package(body) => work.push((Part::Ty(body.clone()), trace, route)),
+                            Ty::Arrow(from, to, effects) => {
+                                // Reverse pushes preserve written order: input,
+                                // output, then effects. This ordering is semantic:
+                                // the first exact route wins, not a union of sibling routes.
+                                work.push((
+                                    Part::Row(Rc::new(effects.clone())),
+                                    trace,
+                                    Route {
+                                        containment: true,
+                                        ..route
+                                    },
+                                ));
+                                work.push((Part::Ty(to.clone()), trace, route));
+                                work.push((
+                                    Part::Ty(from.clone()),
+                                    trace,
+                                    Route {
+                                        call_input: true,
+                                        ..route
+                                    },
+                                ));
+                            }
+                            Ty::Struct(row) | Ty::Sum(row) => {
+                                work.push((
+                                    Part::Row(Rc::new(row.clone())),
+                                    trace,
+                                    Route {
+                                        containment: true,
+                                        ..route
+                                    },
+                                ));
+                            }
+                            Ty::Named { args, .. } => work.extend(
+                                args.iter()
+                                    .rev()
+                                    .cloned()
+                                    .map(|ty| (Part::Ty(ty), trace, route)),
+                            ),
+                            Ty::Var(_)
+                            | Ty::Nat
+                            | Ty::Int
+                            | Ty::Real
+                            | Ty::String
+                            | Ty::Boolean
+                            | Ty::Bound(_)
+                            | Ty::Rigid { .. }
+                            | Ty::Undecided => {}
+                        }
+                        false
+                    }
+                }
+                Part::Row(row) => {
+                    if !seen_rows.insert(Rc::as_ptr(&row) as usize) {
+                        false
+                    } else {
+                        visited_rows.push(row.clone());
+                        // Push payloads first so the tail is visited first. A
+                        // later sibling therefore cannot pollute the retained
+                        // binding route.
+                        for field in row.labels.values().rev() {
+                            work.push((
+                                Part::Field(field.ty.clone(), field.presence.clone()),
+                                trace,
+                                Route {
+                                    containment: true,
+                                    ..route
+                                },
+                            ));
+                        }
+                        if matches!(&row.rest, Rest::Var(found) if *found == var) {
+                            true
+                        } else {
+                            match &row.rest {
+                                Rest::More(more) => {
+                                    work.push((Part::Row(more.clone()), trace, route))
+                                }
+                                Rest::Var(found) if seen_vars.insert(*found) => {
+                                    if let Slot::Bound {
+                                        value: Assigned::Row(row),
+                                        by,
+                                    } = &self.vars[*found as usize]
+                                    {
+                                        let next = traces.len();
+                                        traces.push(Trace {
+                                            reason: *by,
+                                            parent: trace,
+                                        });
+                                        work.push((Part::Row(row.clone()), Some(next), route));
+                                    }
+                                }
+                                Rest::Var(_)
+                                | Rest::Closed
+                                | Rest::Undecided
+                                | Rest::Bound(_)
+                                | Rest::Rigid { .. } => {}
+                            }
+                            false
+                        }
+                    }
+                }
+                Part::Presence(presence) => {
+                    if let Presence::Var(found) = presence {
+                        if found == var {
+                            true
+                        } else if seen_vars.insert(found)
+                            && let Slot::Bound {
+                                value: Assigned::Presence(presence),
+                                by,
+                            } = &self.vars[found as usize]
+                        {
+                            let next = traces.len();
+                            traces.push(Trace {
+                                reason: *by,
+                                parent: trace,
+                            });
+                            work.push((Part::Presence(presence.clone()), Some(next), route));
+                            false
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                }
+                Part::Field(ty, presence) => match presence {
+                    Presence::Absent => false,
+                    Presence::Present => {
+                        work.push((Part::Ty(ty), trace, route));
+                        false
+                    }
+                    // These presences do not make a payload locally available.
+                    // In particular, recovery placeholders must not turn an
+                    // abandoned sibling into a real occurs route.
+                    Presence::Undecided | Presence::Recovered(_) | Presence::Bound(_) => false,
+                    Presence::Var(found) if found == var => true,
+                    Presence::Var(found)
+                        if seen_field_presences.insert((Rc::as_ptr(&ty) as usize, found)) =>
+                    {
+                        if let Slot::Bound {
+                            value: Assigned::Presence(next_presence),
+                            by,
+                        } = &self.vars[found as usize]
+                        {
+                            let next = traces.len();
+                            traces.push(Trace {
+                                reason: *by,
+                                parent: trace,
+                            });
+                            work.push((Part::Field(ty, next_presence.clone()), Some(next), route));
+                        } else {
+                            work.push((Part::Ty(ty), trace, route));
+                        }
+                        false
+                    }
+                    Presence::Var(_) => false,
+                },
+            };
+            if found_target {
+                let mut path = Vec::new();
+                let mut at = trace;
+                while let Some(index) = at {
+                    path.push(traces[index].reason);
+                    at = traces[index].parent;
+                }
+                for reason in path.into_iter().rev() {
+                    self.note_binding_read(reason);
+                }
+                return Some(if route.containment {
+                    RecursiveCycleShape::Containment
+                } else if route.call_input {
+                    RecursiveCycleShape::CallInput
+                } else {
+                    RecursiveCycleShape::Neutral
+                });
+            }
+        }
+        None
     }
 
     /// Lower the level of everything `value` mentions to no more than `var`'s
@@ -2356,10 +7138,9 @@ impl Table {
     /// the variables minted inside a let would quantify it; generalizing the
     /// ones still at or above the let's level does not.
     ///
-    /// Walked the way the occurs check is walked, and by the same walk: the two
-    /// ask about the variables one value mentions, and asking once per position
-    /// is what would make either of them a rule with a branch nobody can
-    /// exercise. See [`Table::occurs`].
+    /// Unlike [`Table::occurs`], this needs every mentioned variable rather
+    /// than one exact causal route, so the exhaustive mention collector remains
+    /// the appropriate walk here.
     fn demote(&mut self, var: TyVar, value: &Assigned) {
         let level = self.levels[var as usize];
         let mut mentioned = Vec::new();
@@ -2543,9 +7324,7 @@ impl Table {
                             })
                             .map(|field| Work::Ty(field.ty.clone())),
                     );
-                    if let Rest::Var(var) = flat.rest {
-                        self.forbidden(var, shape, labels);
-                    }
+                    self.forbid(&flat, shape, &labels);
                 }
             }
         }
@@ -2562,9 +7341,7 @@ impl Table {
                 self.note_lacks(&field.ty);
             }
         }
-        if let Rest::Var(var) = flat.rest {
-            self.forbidden(var, shape, labels);
-        }
+        self.forbid(&flat, shape, &labels);
     }
 
     /// Record that whatever is still open past a sum's cases may not stand for
@@ -2577,30 +7354,72 @@ impl Table {
     /// [`ir::kinds`](crate::ir) already worked out and this table never sees a
     /// variable for.
     fn forbid(&mut self, row: &Row, shape: Shape, labels: &IndexSet<String>) {
+        let origin = self.active_lacks_origin.clone();
+        let entries = labels.iter().cloned().map(|label| LacksEntry {
+            shape,
+            label,
+            origin: origin.clone(),
+        });
+        self.forbid_entries(row, entries);
+    }
+
+    fn forbid_entries(&mut self, row: &Row, entries: impl IntoIterator<Item = LacksEntry>) {
         if let Rest::Var(var) = self.canon(row).rest {
-            self.forbidden(var, shape, labels.iter().cloned());
+            self.forbidden(var, entries);
         }
     }
 
-    /// Put one condition on one variable. The shape is the row the condition
-    /// came from, and the first one recorded stands: a variable sits at the
-    /// open end of one row, so every condition on it is about the same shape.
-    ///
-    /// A condition forbidding nothing is not recorded at all. It would say
-    /// nothing about what the variable may stand for and would fix the shape
-    /// every later condition on it is read in — so a tail carried across a
-    /// binding by a row that happened to name no labels would leave a sum's
-    /// tail being complained about in fields.
-    fn forbidden(&mut self, var: TyVar, shape: Shape, labels: impl IntoIterator<Item = String>) {
-        let mut labels = labels.into_iter().peekable();
-        if labels.peek().is_none() {
+    /// Put conditions on one variable without losing where each label was
+    /// introduced. Existing entries win: they are the earliest grounded
+    /// introduction and remain the causal parent through arbitrarily many
+    /// tail bindings.
+    fn forbidden_labels(
+        &mut self,
+        var: TyVar,
+        shape: Shape,
+        labels: impl IntoIterator<Item = String>,
+    ) {
+        let origin = self.active_lacks_origin.clone();
+        self.forbidden(
+            var,
+            labels.into_iter().map(|label| LacksEntry {
+                shape,
+                label,
+                origin: origin.clone(),
+            }),
+        );
+    }
+
+    fn forbidden(&mut self, var: TyVar, entries: impl IntoIterator<Item = LacksEntry>) {
+        let mut entries = entries.into_iter().peekable();
+        if entries.peek().is_none() {
             return;
         }
-        let (_, recorded) = self
-            .lacks
-            .entry(var)
-            .or_insert_with(|| (shape, IndexSet::new()));
-        recorded.extend(labels);
+        let recorded = self.lacks.entry(var).or_default();
+        for entry in entries {
+            match recorded.entry(entry.label.clone()) {
+                indexmap::map::Entry::Vacant(slot) => {
+                    slot.insert(entry);
+                }
+                indexmap::map::Entry::Occupied(mut slot)
+                    if slot.get().origin.is_none() && entry.origin.is_some() =>
+                {
+                    slot.insert(entry);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn with_lacks_origin<T>(
+        &mut self,
+        origin: Option<RowFactOrigin>,
+        f: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let previous = std::mem::replace(&mut self.active_lacks_origin, origin);
+        let result = f(self);
+        self.active_lacks_origin = previous;
+        result
     }
 
     /// Record one more thing the program requires of its presences.
@@ -2609,14 +7428,29 @@ impl Table {
     /// origin the readers downstream need — a match's coverage is what the
     /// patterns phase asks its reachability questions of, whether or not the
     /// arms happened to relate anything.
-    fn require(&mut self, span: Span, origin: Origin, formula: Formula) {
+    fn require(&mut self, span: Span, origin: Origin, formula: Formula) -> ReasonId {
+        self.require_because(span, origin, formula, None)
+    }
+
+    fn require_because(
+        &mut self,
+        span: Span,
+        origin: Origin,
+        formula: Formula,
+        because: Option<ReasonId>,
+    ) -> ReasonId {
+        let id = self.batch_id();
+        let reason = self.reason(ReasonOrigin::Batch(id), because.into_iter().collect());
         self.store.batches.push(Batch {
+            id,
             definition: self.definition,
             span,
             origin,
+            reason,
             formula,
             flipped: false,
         });
+        reason
     }
 
     /// Point the use-site batches emitted since `from`, and still carrying
@@ -2658,9 +7492,11 @@ impl Table {
             .enumerate()
             .filter(|(at, _)| !self.empty_batches.contains(at))
             .map(|(_, batch)| Batch {
+                id: batch.id,
                 definition: batch.definition,
                 span: batch.span,
                 origin: self.settled_origin(&batch.origin),
+                reason: batch.reason,
                 formula: self.resolved(&batch.formula),
                 flipped: batch.flipped,
             })
@@ -2732,6 +7568,7 @@ impl Table {
                 .iter()
                 .map(|(name, presence)| (name.clone(), self.presence_of(presence)))
                 .collect(),
+            shape: named.shape,
         }
     }
 
@@ -2909,6 +7746,7 @@ impl Table {
         // asked for the other would find nothing and print the number.
         let named = self.settled_names(&Named {
             labels: names.to_vec(),
+            shape: None,
         });
         Some((
             crate::ui::in_labels(&sat::project(&promised, &promised_atoms), &named.labels),
@@ -2944,7 +7782,39 @@ impl Table {
             } else {
                 continue;
             };
-            self.vars[var as usize] = Slot::Bound(Assigned::Presence(settled));
+            let assigned = match settled {
+                Presence::Present => DefaultAssignment::Present,
+                Presence::Absent => DefaultAssignment::Absent,
+                _ => unreachable!("SAT only settles literals"),
+            };
+            let mut causes = Vec::new();
+            let mut wanted = IndexSet::from([Atom::Var(var)]);
+            let mut taken = vec![false; self.store.batches.len()];
+            let mut grew = true;
+            while grew {
+                grew = false;
+                for (at, batch) in self.store.batches.iter().enumerate() {
+                    if taken[at] {
+                        continue;
+                    }
+                    let formula = self.resolved(&batch.formula);
+                    let mut atoms = Vec::new();
+                    formula.atoms(&mut atoms);
+                    if atoms.iter().any(|atom| wanted.contains(atom)) {
+                        taken[at] = true;
+                        grew = true;
+                        wanted.extend(atoms);
+                        causes.push(batch.reason);
+                    }
+                }
+            }
+            self.default_bind(
+                var,
+                Assigned::Presence(settled),
+                DefaultBinding::Sat,
+                assigned,
+                causes,
+            );
         }
     }
 
@@ -3017,7 +7887,13 @@ impl Table {
     /// Open a nested value binding. Only an explicit producer package is
     /// coherent for the binding; arrow shape is no longer used as a proxy.
     /// Packages nested in an arrow remain wrapped until result destruction.
-    fn instantiate_local(&mut self, span: Span, symbol: Symbol, scheme: &Scheme) -> Rc<Ty> {
+    fn instantiate_local(
+        &mut self,
+        span: Span,
+        symbol: Symbol,
+        explained: &ExplainedScheme,
+    ) -> Rc<Ty> {
+        let scheme = &explained.scheme;
         // Only slots occurring directly in the root package are coherent for a
         // lexical value. Nested package nodes are separate production
         // boundaries and must remain fresh even when the same scheme also owns
@@ -3060,19 +7936,184 @@ impl Table {
             }
         }
         let coherent = (!root_slots.is_empty()).then_some((symbol, root_slots));
-        let instantiated = self.instantiate_scoped(span, scheme, coherent);
-        match &*instantiated {
+        let instantiated = self.instantiate_scoped(span, explained, coherent);
+        let opened = match &*instantiated {
             Ty::Package(_) => self.open_package(span, &instantiated),
             _ => instantiated,
+        };
+        self.mark_opened_type(&opened, &explained.provenance);
+        opened
+    }
+
+    /// Replay a scheme's semantic skeleton over the exact opened structure.
+    /// A marker is minted only for a node with contributors of its own; sibling
+    /// fields and branches therefore cannot inherit one another's body facts.
+    fn mark_opened_type(&mut self, root: &Rc<Ty>, provenance: &SchemeProvenance) {
+        enum Opened {
+            Ty(Rc<Ty>),
+            Row(Row, Rc<Ty>),
+            Presence(Presence),
+        }
+        let Some(mut root_node) = (!provenance.nodes.is_empty()).then_some(0) else {
+            return;
+        };
+        // A lexical package is destructed before it is returned. Follow the
+        // explicit body edge rather than shifting an unlabelled preorder.
+        if matches!(
+            provenance.nodes[root_node].shape,
+            ProvenanceShape::Ty(ProvenanceTy::Package)
+        ) && !matches!(&**root, Ty::Package(_))
+        {
+            let Some(body) = provenance.nodes[root_node].children.first() else {
+                return;
+            };
+            root_node = *body;
+        }
+        let mut work = vec![(Opened::Ty(root.clone()), root_node)];
+        while let Some((opened, at)) = work.pop() {
+            let Some(node) = provenance.nodes.get(at) else {
+                continue;
+            };
+            let attach = |table: &mut Self, owner: &Rc<Ty>| {
+                if node.roots.is_empty() && node.omitted == 0 {
+                    return;
+                }
+                let marker = table.reason_with_omissions(
+                    ReasonOrigin::Variable {
+                        sort: match node.shape {
+                            ProvenanceShape::Ty(_) => VarSort::Type,
+                            ProvenanceShape::Row(_) => VarSort::Row,
+                            ProvenanceShape::Presence => VarSort::Presence,
+                        },
+                        subject: Subject::Scheme,
+                    },
+                    node.roots.clone(),
+                    node.omitted,
+                );
+                let entry = table
+                    .opened_provenance
+                    .entry(Rc::as_ptr(owner) as usize)
+                    .or_insert_with(|| (Rc::downgrade(owner), Vec::new()));
+                if entry
+                    .0
+                    .upgrade()
+                    .is_some_and(|opened| Rc::ptr_eq(&opened, owner))
+                {
+                    entry.1.push(marker);
+                } else {
+                    *entry = (Rc::downgrade(owner), vec![marker]);
+                }
+            };
+            match opened {
+                Opened::Ty(ty) => {
+                    let shape = match &*ty {
+                        Ty::Arrow(..) => ProvenanceTy::Arrow,
+                        Ty::Package(..) => ProvenanceTy::Package,
+                        Ty::Struct(..) => ProvenanceTy::Struct,
+                        Ty::Sum(..) => ProvenanceTy::Sum,
+                        Ty::Named { args, .. } => ProvenanceTy::Named(args.len()),
+                        _ => ProvenanceTy::Leaf,
+                    };
+                    if node.shape != ProvenanceShape::Ty(shape) {
+                        continue;
+                    }
+                    attach(self, &ty);
+                    let children: Vec<Opened> = match &*ty {
+                        Ty::Arrow(from, to, effects) => vec![
+                            Opened::Ty(from.clone()),
+                            Opened::Ty(to.clone()),
+                            Opened::Row(effects.clone(), ty.clone()),
+                        ],
+                        Ty::Package(body) => vec![Opened::Ty(body.clone())],
+                        Ty::Struct(row) | Ty::Sum(row) => {
+                            vec![Opened::Row(self.canon(row), ty.clone())]
+                        }
+                        Ty::Named { args, .. } => args.iter().cloned().map(Opened::Ty).collect(),
+                        _ => Vec::new(),
+                    };
+                    if children.len() != node.children.len() {
+                        continue;
+                    }
+                    work.extend(
+                        children
+                            .into_iter()
+                            .zip(node.children.iter().copied())
+                            .rev(),
+                    );
+                }
+                Opened::Row(row, owner) => {
+                    let row = self.canon(&row);
+                    let layout: Vec<_> = row
+                        .labels
+                        .iter()
+                        .map(|(name, field)| {
+                            (
+                                name.clone(),
+                                !matches!(self.presence_of(&field.presence), Presence::Absent),
+                            )
+                        })
+                        .collect();
+                    if node.shape != ProvenanceShape::Row(layout) {
+                        continue;
+                    }
+                    attach(self, &owner);
+                    let mut children = Vec::new();
+                    for field in row.labels.values() {
+                        let presence = self.presence_of(&field.presence);
+                        children.push(Opened::Presence(presence.clone()));
+                        if !matches!(presence, Presence::Absent) {
+                            children.push(Opened::Ty(field.ty.clone()));
+                        }
+                    }
+                    if children.len() != node.children.len() {
+                        continue;
+                    }
+                    work.extend(
+                        children
+                            .into_iter()
+                            .zip(node.children.iter().copied())
+                            .rev(),
+                    );
+                }
+                Opened::Presence(presence) => {
+                    if node.shape != ProvenanceShape::Presence {
+                        continue;
+                    }
+                    if let Presence::Var(var) = presence
+                        && (!node.roots.is_empty() || node.omitted != 0)
+                    {
+                        let marker = self.reason_with_omissions(
+                            ReasonOrigin::Variable {
+                                sort: VarSort::Presence,
+                                subject: Subject::Scheme,
+                            },
+                            node.roots.clone(),
+                            node.omitted,
+                        );
+                        let identity = self.var_meta[var as usize].minted_by;
+                        self.opened_presence_provenance
+                            .entry(var)
+                            .and_modify(|entry| {
+                                if entry.0 == identity {
+                                    entry.1.push(marker);
+                                } else {
+                                    *entry = (identity, vec![marker]);
+                                }
+                            })
+                            .or_insert_with(|| (identity, vec![marker]));
+                    }
+                }
+            }
         }
     }
 
     fn instantiate_scoped(
         &mut self,
         span: Span,
-        scheme: &Scheme,
+        explained: &ExplainedScheme,
         coherent: Option<(Symbol, IndexSet<u32>)>,
     ) -> Rc<Ty> {
+        let scheme = &explained.scheme;
         // One fresh variable per position the scheme bound, handed over as a
         // bare type: which sort each one is, is decided where it lands, since
         // that is what a scheme records. See [`Assigned::as_row`]. A presence
@@ -3087,7 +8128,23 @@ impl Table {
                     let presence = key
                         .and_then(|key| self.local_package_instances.get(&key).cloned())
                         .unwrap_or_else(|| {
-                            let fresh = self.fresh_presence();
+                            let fresh = Presence::Var(
+                                self.mint_from_budgeted(
+                                    VarSort::Presence,
+                                    Subject::Instance,
+                                    explained
+                                        .provenance
+                                        .quantified
+                                        .get(at as usize)
+                                        .map(|slot| slot.roots.clone())
+                                        .unwrap_or_default(),
+                                    explained
+                                        .provenance
+                                        .quantified
+                                        .get(at as usize)
+                                        .map_or(0, |slot| slot.omitted),
+                                ),
+                            );
                             if let Some(key) = key {
                                 self.local_package_instances.insert(key, fresh.clone());
                             }
@@ -3101,7 +8158,27 @@ impl Table {
                     }
                     Assigned::Presence(presence)
                 }
-                false => Assigned::Ty(self.fresh_type()),
+                false => Assigned::Ty(Rc::new(Ty::plain(Ty::Var(
+                    self.mint_from_budgeted(
+                        explained
+                            .provenance
+                            .quantified
+                            .get(at as usize)
+                            .map_or(VarSort::Type, |slot| slot.sort),
+                        Subject::Instance,
+                        explained
+                            .provenance
+                            .quantified
+                            .get(at as usize)
+                            .map(|slot| slot.roots.clone())
+                            .unwrap_or_default(),
+                        explained
+                            .provenance
+                            .quantified
+                            .get(at as usize)
+                            .map_or(0, |slot| slot.omitted),
+                    ),
+                )))),
             })
             .collect();
         let ty = scheme.body().open(&fresh);
@@ -3117,9 +8194,10 @@ impl Table {
         let immediate = self.register_package_guarantees(&ty, formula);
         if !immediate.is_true() {
             let mut labels = IndexMap::new();
-            self.labels_in(&ty, &mut labels);
+            let mut shape = None;
+            self.labels_in(&ty, &mut labels, &mut shape, &immediate);
             let labels = labels.into_values().collect();
-            self.require(span, Origin::Instance(Named { labels }), immediate);
+            self.require(span, Origin::Instance(Named { labels, shape }), immediate);
         }
         ty
     }
@@ -3223,7 +8301,7 @@ impl Table {
         let mut renames = HashMap::new();
         if guarantee.as_ref().is_some_and(|guarantee| guarantee.fresh) {
             for var in collect_owned_existentials(body, &self.abstract_existentials) {
-                let fresh = self.fresh_presence();
+                let fresh = self.fresh_instance_presence();
                 if let Presence::Var(fresh_var) = fresh {
                     // The alpha-renamed identity is just as sealed as the
                     // scheme witness it replaces. Otherwise a consumer could
@@ -3249,11 +8327,13 @@ impl Table {
             });
             if !formula.is_true() {
                 let mut labels = IndexMap::new();
-                self.labels_in(&opened, &mut labels);
+                let mut shape = None;
+                self.labels_in(&opened, &mut labels, &mut shape, &formula);
                 self.require(
                     span,
                     Origin::Instance(Named {
                         labels: labels.into_values().collect(),
+                        shape,
                     }),
                     formula,
                 );
@@ -3290,14 +8370,31 @@ impl Table {
     /// Every label a type names and what decides whether it is there, in the
     /// order the type names them — what a use-site complaint quotes its formula
     /// in. The first spelling of a label wins, which is the one a reader
-    /// reading the type left to right meets.
-    fn labels_in(&self, ty: &Rc<Ty>, found: &mut IndexMap<String, (String, Presence)>) {
+    /// reading the type left to right meets. A formula gets a shape only when
+    /// all of its named presences belong to that shape; a relation spanning
+    /// nested shapes must use the neutral diagnostic vocabulary.
+    fn labels_in(
+        &self,
+        ty: &Rc<Ty>,
+        found: &mut IndexMap<String, (String, Presence)>,
+        formula_shape: &mut Option<Shape>,
+        formula: &Formula,
+    ) {
         enum Work {
             Ty(Rc<Ty>),
-            Field(String, RowField),
+            Field(Shape, String, RowField),
             Effects(Row),
         }
 
+        let mut atoms = Vec::new();
+        formula.atoms(&mut atoms);
+        let names_atom = |presence: &Presence| match presence {
+            Presence::Var(var) => atoms.contains(&Atom::Var(*var)),
+            Presence::Bound(index) => atoms.contains(&Atom::Bound(*index)),
+            _ => false,
+        };
+        let mut matched_shape = None;
+        let mut mixed_shapes = false;
         let mut work = vec![Work::Ty(ty.clone())];
         while let Some(part) = work.pop() {
             match part {
@@ -3311,12 +8408,17 @@ impl Table {
                             work.push(Work::Ty(a.clone()));
                         }
                         Ty::Struct(row) | Ty::Sum(row) => {
+                            let shape = match &*ty {
+                                Ty::Struct(_) => Shape::Struct,
+                                Ty::Sum(_) => Shape::Sum,
+                                _ => unreachable!(),
+                            };
                             let (labels, _) = self.canon(row).into_parts();
                             work.extend(
                                 labels
                                     .into_iter()
                                     .rev()
-                                    .map(|(name, field)| Work::Field(name, field)),
+                                    .map(|(name, field)| Work::Field(shape, name, field)),
                             );
                         }
                         Ty::Named { args, .. } => {
@@ -3325,8 +8427,15 @@ impl Table {
                         _ => {}
                     }
                 }
-                Work::Field(name, field) => {
+                Work::Field(shape, name, field) => {
                     let presence = self.presence_of(&field.presence);
+                    if names_atom(&presence) {
+                        match matched_shape {
+                            Some(found) if found != shape => mixed_shapes = true,
+                            None => matched_shape = Some(shape),
+                            _ => {}
+                        }
+                    }
                     found
                         .entry(name.clone())
                         .or_insert_with(|| (name, presence.clone()));
@@ -3338,15 +8447,24 @@ impl Table {
                 Work::Effects(row) => {
                     let (labels, _) = self.canon(&row).into_parts();
                     for (name, field) in labels {
+                        let presence = self.presence_of(&field.presence);
+                        if names_atom(&presence) {
+                            match matched_shape {
+                                Some(Shape::Effect) => {}
+                                Some(_) => mixed_shapes = true,
+                                None => matched_shape = Some(Shape::Effect),
+                            }
+                        }
                         found.entry(name.clone()).or_insert_with(|| {
                             let shown =
                                 EffectId::parse_row_key(&name).map_or(name.as_str(), |x| x.0);
-                            (shown.to_string(), self.presence_of(&field.presence))
+                            (shown.to_string(), presence)
                         });
                     }
                 }
             }
         }
+        *formula_shape = (!mixed_shapes).then_some(matched_shape).flatten();
     }
 
     /// [`unfold`] with the row conditions its result implies recorded against
@@ -3401,17 +8519,76 @@ impl Table {
     /// Said once per variable across the whole program. A rigid that reaches
     /// two schemes it does not belong to is still one annotation to rewrite,
     /// and a reader sent to the same line twice learns nothing the second time.
-    fn escapes(&mut self, ty: &Rc<Ty>, owned: &[u32], errors: &mut Vec<Error>) {
+    fn escapes(
+        &mut self,
+        ty: &Rc<Ty>,
+        owned: &[u32],
+        destination_name: Rc<str>,
+        destination_span: Span,
+        errors: &mut Vec<Error>,
+    ) {
         let mut found = IndexMap::new();
         self.rigids_in(ty, &mut found);
         for (id, name) in found {
             if owned.contains(&id) || !self.escaped.insert(id) {
                 continue;
             }
-            let span = self.rigids[&id];
+            let declared = self.rigids[&id];
+            let error_id = self.error_id();
+            let constraint = ConstraintId::synthetic(error_id.get());
+            let full_facts = vec![
+                ExplanationFact {
+                    direct: false,
+                    span: declared,
+                    constraint,
+                    origin: ConstraintOrigin::ContextualCheck,
+                    subject: Subject::Annotation,
+                    payload: ExplanationFactPayload::CallerChoiceDeclaration,
+                },
+                ExplanationFact {
+                    direct: false,
+                    span: destination_span,
+                    constraint,
+                    origin: ConstraintOrigin::Binding,
+                    subject: Subject::Binding,
+                    payload: ExplanationFactPayload::CallerChoiceDestination,
+                },
+            ];
             errors.push(Error {
-                span,
-                kind: ErrorKind::RigidEscapes { name },
+                id: error_id,
+                cause: ErrorCause::Direct,
+                span: declared,
+                kind: ErrorKind::RigidEscapes {
+                    name,
+                    declared,
+                    destination: ty.clone(),
+                    destination_name: destination_name.clone(),
+                    destination_span,
+                },
+                explanation: Some(InferenceExplanation {
+                    full_facts,
+                    abridged: vec![0, 1],
+                    pivot: None,
+                    omitted_facts: 0,
+                    contradiction: Contradiction {
+                        kind: ContradictionKind::CallerChoiceEscape,
+                        left: TypeDescription::Undecided,
+                        right: describe_type(ty),
+                        row: None,
+                        recursive: None,
+                        repairs: [
+                            RepairDirection::ChangeFirstUse,
+                            RepairDirection::ChangeSecondUse,
+                        ],
+                    },
+                    cause: ExplanationCause {
+                        error: error_id,
+                        seed: None,
+                        constraints: vec![constraint],
+                        reasons: Vec::new(),
+                        omitted_reasons: 0,
+                    },
+                }),
             });
         }
     }
@@ -3482,24 +8659,30 @@ impl Table {
     /// first reading the type left to right. The shape comes off the recorded
     /// condition, since a row-tail variable's labels are the fields of whatever it
     /// is being bound to and there is no row here to read a shape from.
-    fn lacked(&self, var: TyVar, value: &Assigned) -> Option<(Shape, Vec<(String, Presence)>)> {
-        let (shape, lacks) = self.lacks.get(&var)?;
-        // Whatever labels the value would bring with it, read at the shape the
-        // condition was recorded in: the fields of a whole type, or the cases a
-        // sum's rest stands for. A presence brings neither, which
-        // [`Assigned::as_row`] says by answering with a row that names nothing
-        // and [`Assigned::as_ty`] by answering with a type that carries none.
-        let labels: IndexMap<String, RowField> = match shape {
-            Shape::Struct | Shape::Sum | Shape::Effect => {
-                self.canon(&value.as_row()).into_parts().0
-            }
+    fn lacked(
+        &self,
+        var: TyVar,
+        value: &Assigned,
+    ) -> Option<Vec<(LacksEntry, Presence, Option<RowFactOrigin>)>> {
+        let lacks = self.lacks.get(&var)?;
+        let row = self.canon(&value.as_row());
+        let introduction = match row.rest {
+            Rest::Var(tail) => self.lacks.get(&tail),
+            _ => None,
         };
-        let named = labels
+        let named = row
+            .labels
             .iter()
-            .filter(|(name, _)| lacks.contains(*name))
-            .map(|(name, field)| (name.clone(), self.presence_of(&field.presence)))
+            .filter_map(|(name, field)| {
+                let lacked = lacks.get(name)?.clone();
+                let introduced = introduction
+                    .and_then(|entries| entries.get(name))
+                    .and_then(|entry| entry.origin.clone())
+                    .or_else(|| self.active_lacks_origin.clone());
+                Some((lacked, self.presence_of(&field.presence), introduced))
+            })
             .collect();
-        Some((*shape, named))
+        Some(named)
     }
 
     /// Carry the lacks condition across a binding. What `var` may not stand
@@ -3512,11 +8695,11 @@ impl Table {
     /// next field to conflict would arrive.
     fn inherit_lacks(&mut self, var: TyVar, value: &Assigned) {
         self.note_lacks_value(value, self.lacks_shape(var));
-        let Some((shape, labels)) = self.lacks.get(&var).cloned() else {
+        let Some(entries) = self.lacks.get(&var).cloned() else {
             return;
         };
         let row = value.as_row();
-        self.forbid(&row, shape, &labels);
+        self.forbid_entries(&row, entries.into_values());
     }
 
     /// [`note_lacks`](Self::note_lacks) about a value of any sort. `shape` is
@@ -3543,10 +8726,10 @@ impl Table {
     /// complaint would be worded in depends on it, and a tail with no condition
     /// recorded has nothing to complain about.
     fn lacks_shape(&self, var: TyVar) -> Shape {
-        match self.lacks.get(&var) {
-            Some((shape, _)) => *shape,
-            None => Shape::Struct,
-        }
+        self.lacks
+            .get(&var)
+            .and_then(|entries| entries.first().map(|(_, entry)| entry.shape))
+            .unwrap_or(Shape::Struct)
     }
 
     /// Close every effect row variable this type mentions exactly once.
@@ -3573,7 +8756,13 @@ impl Table {
             if count != 1 || self.levels[var as usize] < level {
                 continue;
             }
-            self.vars[var as usize] = Slot::Bound(Assigned::Row(Rc::new(Row::closed())));
+            self.default_bind(
+                var,
+                Assigned::Row(Rc::new(Row::closed())),
+                DefaultBinding::CloseEffects,
+                DefaultAssignment::EmptyRow,
+                Vec::new(),
+            );
         }
     }
 
@@ -3667,6 +8856,418 @@ impl Table {
             ),
             subst,
         )
+    }
+
+    /// Capture only causal bindings which survive in the published semantic
+    /// shape. This preorder is replayed over the opened scheme, bounding work
+    /// by semantic nodes rather than by the size of the defining body.
+    fn scheme_provenance(
+        &self,
+        ty: &Rc<Ty>,
+        published: &Rc<Ty>,
+        subst: &Subst,
+        count: u32,
+    ) -> SchemeProvenance {
+        enum Work {
+            Ty(Rc<Ty>, Option<usize>),
+            Row(Row, Option<usize>),
+            Presence(Presence, Option<usize>),
+        }
+        let mut quantified = (0..count)
+            .map(|_| QuantifiedProvenance {
+                sort: VarSort::Type,
+                roots: Vec::new(),
+                omitted: 0,
+            })
+            .collect::<Vec<_>>();
+        for (var, at) in &subst.types {
+            if let Some(slot) = quantified.get_mut(*at as usize) {
+                slot.sort = self.var_meta[*var as usize].sort;
+                slot.roots.push(self.var_meta[*var as usize].minted_by);
+            }
+        }
+        for (var, at) in &subst.presences {
+            if let Some(slot) = quantified.get_mut(*at as usize) {
+                slot.sort = VarSort::Presence;
+                slot.roots.push(self.var_meta[*var as usize].minted_by);
+            }
+        }
+        for (id, at) in &subst.rigids {
+            if let Some(slot) = quantified.get_mut(*at as usize) {
+                slot.sort = subst.rigid_sorts.get(id).copied().unwrap_or(VarSort::Type);
+            }
+        }
+        let mut nodes = Vec::<ProvenanceNode>::new();
+        let mut work = vec![Work::Ty(ty.clone(), None)];
+        while let Some(item) = work.pop() {
+            let parent = match &item {
+                Work::Ty(_, p) | Work::Row(_, p) | Work::Presence(_, p) => *p,
+            };
+            let (shape, mut roots, children): (ProvenanceShape, Vec<ReasonId>, Vec<Work>) =
+                match item {
+                    Work::Ty(mut ty, _) => {
+                        let mut roots = Vec::new();
+                        if let Some((opened, reasons)) =
+                            self.opened_provenance.get(&(Rc::as_ptr(&ty) as usize))
+                            && opened
+                                .upgrade()
+                                .is_some_and(|opened| Rc::ptr_eq(&opened, &ty))
+                        {
+                            roots.extend(reasons);
+                        }
+                        let mut seen = HashSet::new();
+                        while let Ty::Var(var) = &*ty {
+                            if !seen.insert(*var) {
+                                break;
+                            }
+                            match &self.vars[*var as usize] {
+                                Slot::Bound {
+                                    value: Assigned::Ty(next),
+                                    by,
+                                } => {
+                                    roots.push(*by);
+                                    ty = next.clone();
+                                }
+                                _ => break,
+                            }
+                        }
+                        let (tag, children) = match &*ty {
+                            Ty::Arrow(from, to, effects) => (
+                                ProvenanceTy::Arrow,
+                                vec![
+                                    Work::Ty(from.clone(), None),
+                                    Work::Ty(to.clone(), None),
+                                    Work::Row(effects.clone(), None),
+                                ],
+                            ),
+                            Ty::Package(body) => {
+                                (ProvenanceTy::Package, vec![Work::Ty(body.clone(), None)])
+                            }
+                            Ty::Struct(row) => {
+                                (ProvenanceTy::Struct, vec![Work::Row(row.clone(), None)])
+                            }
+                            Ty::Sum(row) => (ProvenanceTy::Sum, vec![Work::Row(row.clone(), None)]),
+                            Ty::Named { args, .. } => (
+                                ProvenanceTy::Named(args.len()),
+                                args.iter().cloned().map(|ty| Work::Ty(ty, None)).collect(),
+                            ),
+                            _ => (ProvenanceTy::Leaf, Vec::new()),
+                        };
+                        (ProvenanceShape::Ty(tag), roots, children)
+                    }
+                    Work::Row(row, _) => {
+                        let canonical = self.canon(&row);
+                        let mut roots = Vec::new();
+                        let mut rest = row.rest.clone();
+                        let mut seen = HashSet::new();
+                        while let Rest::Var(var) = rest {
+                            if !seen.insert(var) {
+                                break;
+                            }
+                            match &self.vars[var as usize] {
+                                Slot::Bound {
+                                    value: Assigned::Row(next),
+                                    by,
+                                } => {
+                                    roots.push(*by);
+                                    rest = next.rest.clone();
+                                }
+                                _ => break,
+                            }
+                        }
+                        let mut layout = Vec::new();
+                        let mut children = Vec::new();
+                        for (name, field) in &canonical.labels {
+                            let presence = self.presence_of(&field.presence);
+                            let payload = !matches!(presence, Presence::Absent);
+                            layout.push((name.clone(), payload));
+                            children.push(Work::Presence(presence, None));
+                            if payload {
+                                children.push(Work::Ty(field.ty.clone(), None));
+                            }
+                        }
+                        (ProvenanceShape::Row(layout), roots, children)
+                    }
+                    Work::Presence(mut presence, _) => {
+                        let mut roots = Vec::new();
+                        let mut seen = HashSet::new();
+                        while let Presence::Var(var) = presence {
+                            if !seen.insert(var) {
+                                break;
+                            }
+                            match &self.vars[var as usize] {
+                                Slot::Bound {
+                                    value: Assigned::Presence(next),
+                                    by,
+                                } => {
+                                    roots.push(*by);
+                                    presence = next.clone();
+                                }
+                                _ => break,
+                            }
+                        }
+                        (ProvenanceShape::Presence, roots, Vec::new())
+                    }
+                };
+            roots.retain(|root| self.publishable_reason(*root));
+            roots.sort_unstable();
+            roots.dedup();
+            let id = nodes.len();
+            nodes.push(ProvenanceNode {
+                shape,
+                roots,
+                omitted: 0,
+                children: Vec::new(),
+            });
+            if let Some(parent) = parent {
+                nodes[parent].children.push(id);
+            }
+            for child in children.into_iter().rev() {
+                let child = match child {
+                    Work::Ty(x, _) => Work::Ty(x, Some(id)),
+                    Work::Row(x, _) => Work::Row(x, Some(id)),
+                    Work::Presence(x, _) => Work::Presence(x, Some(id)),
+                };
+                work.push(child);
+            }
+        }
+        // Positive-presence packaging runs after zonking and may synthesize a
+        // package at any covariant structural position. Rebuild the skeleton
+        // from the exact body that is actually published, carrying evidence
+        // through matching nodes and inserting evidence-free package wrappers
+        // in lockstep. Opening can therefore replay nested synthesized packages
+        // without guessing from the pre-packaging body.
+        enum Published {
+            Ty(Rc<Ty>, Option<usize>, Option<usize>),
+            Row(Row, Option<usize>, Option<usize>),
+            Presence(Option<usize>, Option<usize>),
+        }
+        let before = nodes;
+        let mut exact = Vec::<ProvenanceNode>::new();
+        let mut work = vec![Published::Ty(published.clone(), None, Some(0))];
+        while let Some(item) = work.pop() {
+            let (shape, parent, old, children): (_, _, _, Vec<Published>) = match item {
+                Published::Ty(ty, parent, old) => {
+                    let (tag, child_types): (ProvenanceTy, Vec<Published>) = match &*ty {
+                        Ty::Arrow(from, to, effects) => (
+                            ProvenanceTy::Arrow,
+                            vec![
+                                Published::Ty(from.clone(), None, None),
+                                Published::Ty(to.clone(), None, None),
+                                Published::Row(effects.clone(), None, None),
+                            ],
+                        ),
+                        Ty::Package(body) => (
+                            ProvenanceTy::Package,
+                            vec![Published::Ty(body.clone(), None, None)],
+                        ),
+                        Ty::Struct(row) => (
+                            ProvenanceTy::Struct,
+                            vec![Published::Row(row.clone(), None, None)],
+                        ),
+                        Ty::Sum(row) => (
+                            ProvenanceTy::Sum,
+                            vec![Published::Row(row.clone(), None, None)],
+                        ),
+                        Ty::Named { args, .. } => (
+                            ProvenanceTy::Named(args.len()),
+                            args.iter()
+                                .cloned()
+                                .map(|arg| Published::Ty(arg, None, None))
+                                .collect(),
+                        ),
+                        _ => (ProvenanceTy::Leaf, Vec::new()),
+                    };
+                    let shape = ProvenanceShape::Ty(tag);
+                    let synthesized = matches!(shape, ProvenanceShape::Ty(ProvenanceTy::Package))
+                        && old.is_some_and(|at| before.get(at).is_some_and(|n| n.shape != shape));
+                    let old_children = if synthesized {
+                        vec![old]
+                    } else {
+                        old.and_then(|at| before.get(at))
+                            .filter(|node| node.shape == shape)
+                            .map(|node| node.children.iter().copied().map(Some).collect())
+                            .unwrap_or_default()
+                    };
+                    let children = child_types
+                        .into_iter()
+                        .enumerate()
+                        .map(|(at, child)| match child {
+                            Published::Ty(ty, _, _) => {
+                                Published::Ty(ty, None, old_children.get(at).copied().flatten())
+                            }
+                            Published::Row(row, _, _) => {
+                                Published::Row(row, None, old_children.get(at).copied().flatten())
+                            }
+                            Published::Presence(_, _) => unreachable!(),
+                        })
+                        .collect();
+                    (
+                        shape,
+                        parent,
+                        (!synthesized).then_some(old).flatten(),
+                        children,
+                    )
+                }
+                Published::Row(row, parent, old) => {
+                    let layout: Vec<_> = row
+                        .labels
+                        .iter()
+                        .map(|(name, field)| {
+                            (name.clone(), !matches!(field.presence, Presence::Absent))
+                        })
+                        .collect();
+                    let shape = ProvenanceShape::Row(layout);
+                    let old_children = old
+                        .and_then(|at| before.get(at))
+                        .filter(|node| node.shape == shape)
+                        .map(|node| node.children.clone())
+                        .unwrap_or_default();
+                    let mut children = Vec::new();
+                    let mut at = 0;
+                    for field in row.labels.values() {
+                        children.push(Published::Presence(None, old_children.get(at).copied()));
+                        at += 1;
+                        if !matches!(field.presence, Presence::Absent) {
+                            children.push(Published::Ty(
+                                field.ty.clone(),
+                                None,
+                                old_children.get(at).copied(),
+                            ));
+                            at += 1;
+                        }
+                    }
+                    (shape, parent, old, children)
+                }
+                Published::Presence(parent, old) => {
+                    (ProvenanceShape::Presence, parent, old, Vec::new())
+                }
+            };
+            let id = exact.len();
+            let (roots, omitted) = old
+                .and_then(|at| before.get(at))
+                .filter(|node| node.shape == shape)
+                .map(|node| (node.roots.clone(), node.omitted))
+                .unwrap_or_default();
+            exact.push(ProvenanceNode {
+                shape,
+                roots,
+                omitted,
+                children: Vec::new(),
+            });
+            if let Some(parent) = parent {
+                exact[parent].children.push(id);
+            }
+            for child in children.into_iter().rev() {
+                work.push(match child {
+                    Published::Ty(ty, _, old) => Published::Ty(ty, Some(id), old),
+                    Published::Row(row, _, old) => Published::Row(row, Some(id), old),
+                    Published::Presence(_, old) => Published::Presence(Some(id), old),
+                });
+            }
+        }
+        let mut nodes = exact;
+        for slot in &mut quantified {
+            slot.roots.sort_unstable();
+            slot.roots.dedup();
+            slot.roots.retain(|root| self.publishable_reason(*root));
+        }
+        // Bound each position and then the whole publication, preserving the
+        // earliest defining and latest relevant endpoints at both levels.
+        const PER_POSITION: usize = 64;
+        const TOTAL: usize = 256;
+        for node in &mut nodes {
+            node.omitted += keep_endpoints(&mut node.roots, PER_POSITION);
+        }
+        for slot in &mut quantified {
+            slot.omitted += keep_endpoints(&mut slot.roots, PER_POSITION);
+        }
+        let mut all = nodes
+            .iter()
+            .flat_map(|n| n.roots.iter().copied())
+            .chain(quantified.iter().flat_map(|q| q.roots.iter().copied()))
+            .collect::<Vec<_>>();
+        all.sort_unstable();
+        all.dedup();
+        if keep_endpoints(&mut all, TOTAL) > 0 {
+            let keep: HashSet<_> = all.iter().copied().collect();
+            for node in &mut nodes {
+                let old = node.roots.len();
+                node.roots.retain(|root| keep.contains(root));
+                node.omitted += old - node.roots.len();
+            }
+            for slot in &mut quantified {
+                let old = slot.roots.len();
+                slot.roots.retain(|root| keep.contains(root));
+                slot.omitted += old - slot.roots.len();
+            }
+        }
+        SchemeProvenance { nodes, quantified }
+    }
+
+    /// Preserve a written contract as the sole defining contributor. Its body
+    /// is walked only to reproduce the compact semantic skeleton; recovered or
+    /// incidental implementation facts are never published through it.
+    fn authoritative_provenance(
+        &mut self,
+        ty: &Rc<Ty>,
+        published: &Rc<Ty>,
+        subst: &Subst,
+        count: u32,
+        constraints: &[Constraint],
+        annotation_span: Span,
+    ) -> SchemeProvenance {
+        let mut provenance = self.scheme_provenance(ty, published, subst, count);
+        for node in &mut provenance.nodes {
+            node.roots.clear();
+            node.omitted = 0;
+        }
+        for slot in &mut provenance.quantified {
+            slot.roots.clear();
+            slot.omitted = 0;
+        }
+        let mut work: Vec<_> = constraints.iter().rev().collect();
+        let mut contract = None;
+        while let Some(constraint) = work.pop() {
+            let exact = (constraint.subjects.primary == Subject::Annotation
+                && constraint.subjects.primary_span == Some(annotation_span))
+                || (constraint.subjects.secondary == Some(Subject::Annotation)
+                    && constraint.subjects.secondary_span == Some(annotation_span));
+            if constraint.origin == ConstraintOrigin::ContextualCheck && exact {
+                contract = Some(self.reason(ReasonOrigin::Contract(constraint.id), Vec::new()));
+                break;
+            }
+            match &constraint.kind {
+                ConstraintKind::Let { value, body, .. } => {
+                    work.extend(body.iter().rev());
+                    work.extend(value.iter().rev());
+                }
+                ConstraintKind::Match { arms, .. } => {
+                    for arm in arms.iter().rev() {
+                        work.push(&arm.result);
+                        work.extend(arm.constraints.iter().rev());
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(contract) = contract {
+            // Structural decomposition of a written contract remains the same
+            // contract at each corresponding semantic position.
+            for node in &mut provenance.nodes {
+                node.roots.push(contract);
+            }
+        }
+        provenance
+    }
+
+    /// Recovery nodes and rolled-back work can settle the compiler enough to
+    /// continue, but are not facts a later consumer may attribute to a scheme.
+    fn publishable_reason(&self, seed: ReasonId) -> bool {
+        self.reasons
+            .get(seed.get() as usize)
+            .is_some_and(|reason| reason.reachable)
+            && !self.unpublishable_reasons.contains(&seed)
     }
 
     /// What the scheme of a type generalized here should require of its
@@ -3765,6 +9366,7 @@ impl Table {
             // one into a [`Ty::Bound`] before it published anything, so
             // there is nothing here left to shift.
             rigids: HashMap::new(),
+            rigid_sorts: HashMap::new(),
         };
         let mut existentials = scheme.existentials().clone();
         existentials.extend(
@@ -3828,6 +9430,7 @@ impl Table {
                         Ty::Rigid { id, .. } if !presences => {
                             let next = subst.next();
                             subst.rigids.entry(*id).or_insert(next);
+                            subst.rigid_sorts.entry(*id).or_insert(VarSort::Type);
                         }
                         Ty::Arrow(from, to, effects) => {
                             work.push(Work::Row(effects.clone()));
@@ -3865,6 +9468,7 @@ impl Table {
                 Work::Tail(Rest::Rigid { id, .. }) => {
                     let next = subst.next();
                     subst.rigids.entry(id).or_insert(next);
+                    subst.rigid_sorts.entry(id).or_insert(VarSort::Row);
                 }
                 Work::Tail(Rest::Closed | Rest::Bound(_) | Rest::Undecided | Rest::More(_)) => {}
             }
@@ -4180,13 +9784,26 @@ impl Table {
                 name: name.clone(),
                 declared: *declared,
             },
-            ErrorKind::RigidEscapes { name } => ErrorKind::RigidEscapes { name: name.clone() },
+            ErrorKind::RigidEscapes {
+                name,
+                declared,
+                destination,
+                destination_name,
+                destination_span,
+            } => ErrorKind::RigidEscapes {
+                name: name.clone(),
+                declared: *declared,
+                destination: self.close(destination, subst),
+                destination_name: destination_name.clone(),
+                destination_span: *destination_span,
+            },
             // The presence complaints carry prose rather than types:
             // their formulas were already worded, at the moment the variables
             // in them still had labels to be named by. There is nothing here
             // for a later substitution to improve.
-            ErrorKind::PresenceRequired { formula } => ErrorKind::PresenceRequired {
+            ErrorKind::PresenceRequired { formula, shape } => ErrorKind::PresenceRequired {
                 formula: formula.clone(),
+                shape: *shape,
             },
             ErrorKind::PresenceImpossible { formula } => ErrorKind::PresenceImpossible {
                 formula: formula.clone(),
@@ -4198,9 +9815,16 @@ impl Table {
                 allowed: allowed.clone(),
                 required: required.clone(),
             },
-            ErrorKind::RepeatedField { shape, field } => ErrorKind::RepeatedField {
+            ErrorKind::RepeatedField {
+                shape,
+                field,
+                introduction,
+                forbidden,
+            } => ErrorKind::RepeatedField {
                 shape: *shape,
                 field: field.clone(),
+                introduction: introduction.clone(),
+                forbidden: forbidden.clone(),
             },
             // The two effect complaints carry a label rather than a type, for
             // the reason the presence ones carry prose: what the reader can
@@ -4212,8 +9836,36 @@ impl Table {
             ErrorKind::NotAllowed { effect } => ErrorKind::NotAllowed {
                 effect: effect.clone(),
             },
-            ErrorKind::CallbackEffectsNotCovered => ErrorKind::CallbackEffectsNotCovered,
-            ErrorKind::PolymorphicExternBoundary => ErrorKind::PolymorphicExternBoundary,
+            ErrorKind::CallbackEffectsNotCovered {
+                missing_effects,
+                extern_effects,
+                callback_path,
+                callback_type,
+                extern_name,
+                issues,
+            } => ErrorKind::CallbackEffectsNotCovered {
+                missing_effects: missing_effects.clone(),
+                extern_effects: extern_effects.clone(),
+                callback_path: callback_path.clone(),
+                callback_type: callback_type.clone(),
+                extern_name: extern_name.clone(),
+                issues: issues.clone(),
+            },
+            ErrorKind::PolymorphicExternBoundary {
+                variable,
+                variable_kind,
+                position,
+                extern_name,
+                leaves,
+                callback_issues,
+            } => ErrorKind::PolymorphicExternBoundary {
+                variable: variable.clone(),
+                variable_kind: *variable_kind,
+                position: position.clone(),
+                extern_name: extern_name.clone(),
+                leaves: leaves.clone(),
+                callback_issues: callback_issues.clone(),
+            },
         }
     }
 }
@@ -4923,6 +10575,160 @@ struct Tails {
     anonymous: HashMap<u32, Presence>,
 }
 
+fn extern_annotation_sources(
+    annotation: &Annotation,
+    tails: &Tails,
+    semantic: &Rc<Ty>,
+) -> ExternSourceMap {
+    fn source_when(
+        sources: &mut ExternSourceMap,
+        when: &Option<Box<ir::When>>,
+        presence: &Presence,
+    ) {
+        let Some(when) = when else { return };
+        if when.name.is_none()
+            && let Some(identity) = presence_variable_identity(presence)
+        {
+            // Anonymous presence holes are declaration-local inference sites,
+            // not caller-chosen polymorphism at the host boundary. This is true
+            // whether polarity later packages them existentially or leaves the
+            // one monomorphic hole to inference.
+            sources.insert_with_ownership(identity, when.span, "conditional presence", true);
+        }
+    }
+
+    fn source_tail(sources: &mut ExternSourceMap, tail: &Option<ir::Tail>, rest: &Rest) {
+        let Some(tail) = tail else { return };
+        if matches!(tail.of, ir::Row::Anything)
+            && let Some(identity) = row_variable_identity(rest)
+        {
+            sources.insert(identity, tail.span, "generic row");
+        }
+    }
+
+    let mut sources = ExternSourceMap::default();
+    for variable in &annotation.variables {
+        let name = format!("'{}", variable.name);
+        match variable.sense {
+            Sense::Type => {
+                if let Some(ty) = tails.types.get(&variable.name)
+                    && let Some(identity) = type_variable_identity(ty)
+                {
+                    sources.insert(identity, variable.span, name);
+                }
+            }
+            Sense::Fields | Sense::Cases | Sense::Effects => {
+                if let Some(rest) = tails.rows.get(&variable.name)
+                    && let Some(identity) = row_variable_identity(rest)
+                {
+                    sources.insert(identity, variable.span, name);
+                }
+            }
+            Sense::Presence => {
+                if let Some(presence) = tails.presences.get(&variable.name)
+                    && let Some(identity) = presence_variable_identity(presence)
+                {
+                    sources.insert_with_ownership(
+                        identity,
+                        variable.span,
+                        name,
+                        matches!(
+                            variable.ownership,
+                            crate::ir::PresenceOwnership::Existential { .. }
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    // Walk the still-written annotation and its unexpanded semantic spelling in
+    // lockstep. This records anonymous holes at their exact occurrence while
+    // named variables above deliberately retain their declaration span. Alias
+    // arguments are visited here before unfolding; their semantic identities
+    // are what later survive substitution into local or imported bodies.
+    let mut work = vec![(&annotation.ty, semantic.clone())];
+    while let Some((written, mut semantic)) = work.pop() {
+        while let Ty::Package(inner) = &*semantic {
+            semantic = inner.clone();
+        }
+        match (&written.tracked, &*semantic) {
+            (ir::TypeKind::Hole, Ty::Var(var)) => sources.insert(
+                ExternVariableIdentity::TypeVar(*var),
+                written.span,
+                "generic type",
+            ),
+            (ir::TypeKind::Apply { args, .. }, Ty::Named { args: lowered, .. }) => {
+                work.extend(
+                    args.iter()
+                        .zip(lowered.iter())
+                        .rev()
+                        .map(|(written, semantic)| (written, semantic.clone())),
+                );
+            }
+            (
+                ir::TypeKind::Arrow { from, to, effects },
+                Ty::Arrow(lowered_from, lowered_to, lowered_effects),
+            ) => {
+                let lowered_effects = flatten_row(lowered_effects);
+                source_tail(&mut sources, &effects.tail, &lowered_effects.rest);
+                for (effect, written) in &effects.effects {
+                    let ir::EffectLabel::Written { when, .. } = written else {
+                        continue;
+                    };
+                    if let Some(field) = lowered_effects.labels.get(&effect.row_key()) {
+                        source_when(&mut sources, when, &field.presence);
+                    }
+                }
+                work.push((to, lowered_to.clone()));
+                work.push((from, lowered_from.clone()));
+            }
+            (ir::TypeKind::Struct { fields, tail }, Ty::Struct(row)) => {
+                let row = flatten_row(row);
+                source_tail(&mut sources, tail, &row.rest);
+                for (name, written) in fields.iter().rev() {
+                    let ir::TypeField::Written { when, value, .. } = written else {
+                        continue;
+                    };
+                    if let Some(field) = row.labels.get(name) {
+                        source_when(&mut sources, when, &field.presence);
+                        work.push((value, field.ty.clone()));
+                    }
+                }
+            }
+            (ir::TypeKind::Sum { cases, tail }, Ty::Sum(row)) => {
+                let row = flatten_row(row);
+                source_tail(&mut sources, tail, &row.rest);
+                for (name, written) in cases.iter().rev() {
+                    let ir::SumCase::Written { when, payload, .. } = written else {
+                        continue;
+                    };
+                    if let Some(field) = row.labels.get(name) {
+                        source_when(&mut sources, when, &field.presence);
+                        if let Some(payload) = payload {
+                            work.push((payload, field.ty.clone()));
+                        }
+                    }
+                }
+            }
+            (ir::TypeKind::Effects(effects), Ty::Sum(row)) => {
+                let row = flatten_row(row);
+                source_tail(&mut sources, &effects.tail, &row.rest);
+                for (effect, written) in &effects.effects {
+                    let ir::EffectLabel::Written { when, .. } = written else {
+                        continue;
+                    };
+                    if let Some(field) = row.labels.get(&effect.row_key()) {
+                        source_when(&mut sources, when, &field.presence);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    sources
+}
+
 /// Everything one lowered annotation says: the type its body is checked
 /// against, the scheme a use of its own name inside that body instantiates, and
 /// what it promised about its presences.
@@ -4954,6 +10760,8 @@ struct Lowered {
     /// The ids of the type and row variables it declared, which are the ones
     /// its own scheme may quantify. See [`Table::escapes`].
     rigids: Vec<u32>,
+    /// Exact source provenance for variables which may reach a host boundary.
+    extern_sources: ExternSourceMap,
 }
 
 /// The semantic type a written annotation denotes, with everything else the
@@ -4999,7 +10807,7 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
             // clause beside it and the SAT store are what govern it, and
             // nothing here is skolemized.
             Sense::Presence => {
-                let presence = table.fresh_presence();
+                let presence = table.fresh_presence_for(Subject::Annotation);
                 if matches!(
                     variable.ownership,
                     crate::ir::PresenceOwnership::Existential { .. }
@@ -5030,6 +10838,7 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
         )
         .collect();
     let ty = lower_scoped(mint, table, &mut tails, &annotation.ty, Some(&boundaries));
+    let extern_sources = extern_annotation_sources(annotation, &tails, &ty);
     for (id, _) in &annotation.anonymous_existentials {
         if let Some(Presence::Var(var)) = tails.anonymous.get(id) {
             table.existential_witnesses.insert(*var);
@@ -5082,6 +10891,18 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
             .iter()
             .map(|(id, index)| (*id, presences + index))
             .collect(),
+        rigid_sorts: annotation
+            .variables
+            .iter()
+            .filter_map(|variable| {
+                let sort = match variable.sense {
+                    Sense::Type => VarSort::Type,
+                    Sense::Fields | Sense::Cases | Sense::Effects => VarSort::Row,
+                    Sense::Presence => return None,
+                };
+                Some((variable.id, sort))
+            })
+            .collect(),
     };
     let scheme = Scheme::existential(
         presences + at.len() as u32,
@@ -5119,6 +10940,7 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
         assumptions,
         names,
         rigids,
+        extern_sources,
     }
 }
 
@@ -5256,7 +11078,7 @@ fn lower_scoped(
         // pattern desugar's exact demand are the same thing — a position left
         // to be decided, whoever left it — and the variable is what lets a
         // projection of a field and the demand for it share one answer.
-        TypeKind::Hole => Ty::Var(table.mint()),
+        TypeKind::Hole => Ty::Var(table.mint(VarSort::Type, Subject::Annotation)),
         // A variable in a type position: the rigid its declaration
         // minted, shared by every mention of the name in this one annotation.
         //
@@ -5289,7 +11111,7 @@ fn presence(table: &mut Table, tails: &mut Tails, when: &Option<Box<ir::When>>) 
         return tails
             .anonymous
             .entry(when.id)
-            .or_insert_with(|| table.fresh_presence())
+            .or_insert_with(|| table.fresh_presence_for(Subject::Annotation))
             .clone();
     };
     tails.presences[name].clone()
@@ -5307,7 +11129,7 @@ fn row(
 ) -> Row {
     let rest = match tail.as_ref().map(|tail| &tail.of) {
         None => Rest::Closed,
-        Some(ir::Row::Anything) => table.fresh_row(),
+        Some(ir::Row::Anything) => table.fresh_row_for(Subject::Annotation),
         // The rigid its declaration minted, shared by every `..'r` in this one
         // annotation. Indexed for the reason [`presence`] is.
         Some(ir::Row::Named(name)) => tails.rows[name].clone(),
@@ -5837,6 +11659,1268 @@ mod existential_regressions {
     }
 
     #[test]
+    fn failed_nominal_congruence_restores_abstract_presence_aliasing() {
+        use crate::symbol::{Bundle, Mint, Namespace, Version};
+
+        let bundle = Bundle::new("rollback-test", Version::new(1, 0, 0)).unwrap();
+        let mut mint = Mint::new(bundle);
+        let wrapper = mint.global(None, Namespace::Types, "Wrapper").unwrap();
+        let definition = mint.global(None, Namespace::Terms, "definition").unwrap();
+
+        let mut table = Table::default();
+        let Presence::Var(hidden) = table.fresh_presence() else {
+            unreachable!()
+        };
+        let Presence::Var(alias) = table.fresh_presence() else {
+            unreachable!()
+        };
+        // This is the state after a package has been opened: its witness is a
+        // sealed identity, while the ordinary variable beside it is flexible.
+        table.existential_witnesses.insert(hidden);
+        table.abstract_existentials.insert(hidden);
+
+        let presence_arg = |presence| {
+            Rc::new(Ty::Struct(Row {
+                labels: [(
+                    "hidden".into(),
+                    RowField {
+                        presence,
+                        ty: Rc::new(Ty::Nat),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                rest: Rest::Closed,
+            }))
+        };
+        let named = |args: Vec<Rc<Ty>>| {
+            Rc::new(Ty::Named {
+                symbol: wrapper,
+                name: Rc::from("Wrapper"),
+                args: args.into(),
+            })
+        };
+        // The first argument speculatively aliases `alias` to the abstract
+        // identity. The second fails, forcing congruence to discard that work.
+        let expected = named(vec![presence_arg(Presence::Var(hidden)), Rc::new(Ty::Nat)]);
+        let actual = named(vec![
+            presence_arg(Presence::Var(alias)),
+            Rc::new(Ty::String),
+        ]);
+        let aliases = IndexMap::new();
+        let nominal = [wrapper].into_iter().collect();
+        let constraint = table.constraint_id();
+        let reason = table.constraint_reason(constraint);
+        let mut errors = Vec::new();
+        let mut steps = Vec::new();
+        let mut locals = IndexMap::new();
+        let mut refinements = Vec::new();
+        {
+            let mut solve = Solve {
+                table: &mut table,
+                errors: &mut errors,
+                steps: &mut steps,
+                aliases: &aliases,
+                nominal: &nominal,
+                definition,
+                depth: 0,
+                constraint: None,
+                constraint_reason: None,
+                assumed: Vec::new(),
+                schemes: HashMap::new(),
+                locals: &mut locals,
+                guard: None,
+                active_refinement: None,
+                guard_reasons: Vec::new(),
+                refinements: &mut refinements,
+                generated_end: 0,
+            };
+            solve.run(&[Constraint {
+                id: constraint,
+                reason,
+                span: Span::default(),
+                origin: ConstraintOrigin::ContextualCheck,
+                subjects: ConstraintSubjects::pair(Subject::Context, Subject::Term),
+                kind: ConstraintKind::Equal { expected, actual },
+            }]);
+        }
+
+        assert!(table.abstract_existentials.contains(&hidden));
+        assert!(!table.abstract_existentials.contains(&alias));
+        assert!(table.existential_witnesses.contains(&hidden));
+        assert!(!table.existential_witnesses.contains(&alias));
+
+        assert_eq!(errors.len(), 1);
+        let ErrorCause::Step(cause) = errors[0].cause else {
+            panic!("failed congruence must retain its direct solve cause")
+        };
+        let failed = steps.iter().find(|step| step.id == cause).unwrap();
+        assert_eq!(failed.error, Some(errors[0].id));
+        assert_eq!(failed.constraint, Some(constraint));
+        // The discarded congruence, binding, and inner failure consumed their
+        // identities. The surviving failure must not reuse any of them.
+        assert!(failed.id.get() > 0);
+        assert!(errors[0].id.get() > 0);
+    }
+
+    #[test]
+    fn mismatch_leaf_walks_nested_rows_effect_payloads_and_alias_arguments() {
+        use crate::symbol::{Bundle, Mint, Namespace, Version};
+
+        let bundle = Bundle::new("leaf-test", Version::new(1, 0, 0)).unwrap();
+        let mut mint = Mint::new(bundle);
+        let wrapper = mint.global(None, Namespace::Types, "Wrapper").unwrap();
+        let unit = Rc::new(Ty::unit());
+        let effect = Row {
+            labels: [("effect".into(), RowField::present(Rc::new(Ty::Bound(0))))]
+                .into_iter()
+                .collect(),
+            rest: Rest::Closed,
+        };
+        let arrow = Rc::new(Ty::Arrow(unit.clone(), unit, effect));
+        let sum = Rc::new(Ty::Sum(Row {
+            labels: [("Case".into(), RowField::present(arrow))]
+                .into_iter()
+                .collect(),
+            rest: Rest::Closed,
+        }));
+        let body = Rc::new(Ty::Struct(Row {
+            labels: [("field".into(), RowField::present(sum))]
+                .into_iter()
+                .collect(),
+            rest: Rest::Closed,
+        }));
+        let aliases = [(wrapper, Scheme::new(1, body))].into_iter().collect();
+        let named = |argument| {
+            Rc::new(Ty::Named {
+                symbol: wrapper,
+                name: "Wrapper".into(),
+                args: Rc::from([Rc::new(argument)]),
+            })
+        };
+        assert_eq!(
+            smallest_incompatible(&aliases, &named(Ty::Nat), &named(Ty::Boolean)),
+            (TypeDescription::NaturalNumber, TypeDescription::Boolean)
+        );
+
+        let missing_left = mint.global(None, Namespace::Types, "MissingLeft").unwrap();
+        let missing_right = mint.global(None, Namespace::Types, "MissingRight").unwrap();
+        let missing = |symbol, name: &'static str, args: Rc<[Rc<Ty>]>| {
+            Rc::new(Ty::Named {
+                symbol,
+                name: name.into(),
+                args,
+            })
+        };
+        assert_eq!(
+            smallest_incompatible(
+                &aliases,
+                &missing(missing_left, "MissingLeft", Rc::from([])),
+                &missing(missing_right, "MissingRight", Rc::from([])),
+            ),
+            (TypeDescription::DeclaredType, TypeDescription::DeclaredType),
+            "missing semantic definitions must keep the declared-type fallback"
+        );
+        assert_eq!(
+            smallest_incompatible(
+                &aliases,
+                &missing(missing_left, "MissingLeft", Rc::from([Rc::new(Ty::Nat)])),
+                &missing(
+                    missing_left,
+                    "MissingLeft",
+                    Rc::from([Rc::new(Ty::Boolean)]),
+                ),
+            ),
+            (TypeDescription::DeclaredType, TypeDescription::DeclaredType),
+            "arguments of the same unavailable alias have no honest semantics"
+        );
+        assert_eq!(
+            smallest_incompatible(
+                &aliases,
+                &missing(missing_left, "MissingLeft", Rc::from([Rc::new(Ty::Nat)])),
+                &Rc::new(Ty::Boolean),
+            ),
+            (TypeDescription::DeclaredType, TypeDescription::Boolean),
+            "one unavailable alias must remain declared without hiding the other side"
+        );
+    }
+
+    #[test]
+    fn mismatch_alias_function_keeps_unfolded_fallback_for_effect_disagreement() {
+        use crate::symbol::{Bundle, Mint, Namespace, Version};
+
+        let bundle = Bundle::new("function-fallback", Version::new(1, 0, 0)).unwrap();
+        let mut mint = Mint::new(bundle);
+        let left_name = mint.global(None, Namespace::Types, "Left").unwrap();
+        let right_name = mint.global(None, Namespace::Types, "Right").unwrap();
+        let unit = Rc::new(Ty::unit());
+        let arrow = |effect: &'static str| {
+            Rc::new(Ty::Arrow(
+                unit.clone(),
+                unit.clone(),
+                Row {
+                    labels: [(effect.into(), RowField::present(Rc::new(Ty::unit())))]
+                        .into_iter()
+                        .collect(),
+                    rest: Rest::Closed,
+                },
+            ))
+        };
+        let aliases = [
+            (left_name, Scheme::new(0, arrow("read"))),
+            (right_name, Scheme::new(0, arrow("write"))),
+        ]
+        .into_iter()
+        .collect();
+        let named = |symbol, name: &'static str| {
+            Rc::new(Ty::Named {
+                symbol,
+                name: name.into(),
+                args: Rc::from([]),
+            })
+        };
+
+        assert_eq!(
+            smallest_incompatible(
+                &aliases,
+                &named(left_name, "Left"),
+                &named(right_name, "Right"),
+            ),
+            (TypeDescription::Function, TypeDescription::Function),
+            "an effect-only disagreement must not fall back to the aliases' spelling"
+        );
+    }
+
+    #[test]
+    fn mismatch_alias_containers_keep_unfolded_fallback_without_payload_leaf() {
+        use crate::symbol::{Bundle, Mint, Namespace, Version};
+
+        let bundle = Bundle::new("container-fallback", Version::new(1, 0, 0)).unwrap();
+        let mut mint = Mint::new(bundle);
+        let struct_left = mint.global(None, Namespace::Types, "StructLeft").unwrap();
+        let struct_right = mint.global(None, Namespace::Types, "StructRight").unwrap();
+        let sum_left = mint.global(None, Namespace::Types, "SumLeft").unwrap();
+        let sum_right = mint.global(None, Namespace::Types, "SumRight").unwrap();
+        let hidden_row = |presence, ty| Row {
+            labels: [(
+                "hidden".into(),
+                RowField {
+                    presence,
+                    ty: Rc::new(ty),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            rest: Rest::Closed,
+        };
+        let aliases = [
+            (
+                struct_left,
+                Scheme::new(
+                    0,
+                    Rc::new(Ty::Struct(hidden_row(Presence::Absent, Ty::Nat))),
+                ),
+            ),
+            (
+                struct_right,
+                Scheme::new(
+                    0,
+                    Rc::new(Ty::Struct(hidden_row(Presence::Absent, Ty::Boolean))),
+                ),
+            ),
+            (
+                sum_left,
+                Scheme::new(
+                    0,
+                    Rc::new(Ty::Package(Rc::new(Ty::Sum(hidden_row(
+                        Presence::Recovered(1),
+                        Ty::Nat,
+                    ))))),
+                ),
+            ),
+            (
+                sum_right,
+                Scheme::new(
+                    0,
+                    Rc::new(Ty::Package(Rc::new(Ty::Sum(hidden_row(
+                        Presence::Recovered(1),
+                        Ty::Boolean,
+                    ))))),
+                ),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let named = |symbol, name: &'static str| {
+            Rc::new(Ty::Named {
+                symbol,
+                name: name.into(),
+                args: Rc::from([]),
+            })
+        };
+
+        assert_eq!(
+            smallest_incompatible(
+                &aliases,
+                &named(struct_left, "StructLeft"),
+                &named(struct_right, "StructRight"),
+            ),
+            (TypeDescription::Struct, TypeDescription::Struct)
+        );
+        assert_eq!(
+            smallest_incompatible(
+                &aliases,
+                &named(sum_left, "SumLeft"),
+                &named(sum_right, "SumRight"),
+            ),
+            (TypeDescription::TaggedValue, TypeDescription::TaggedValue),
+            "packages exposed by aliases must remain transparent while preserving the sum fallback"
+        );
+    }
+
+    #[test]
+    fn mismatch_rows_ignore_label_order_and_walk_composed_tail_payloads() {
+        let field = |ty| RowField::present(Rc::new(ty));
+        let left = Rc::new(Ty::Struct(Row {
+            labels: [
+                ("first".into(), field(Ty::unit())),
+                ("second".into(), field(Ty::unit())),
+            ]
+            .into_iter()
+            .collect(),
+            rest: Rest::More(Rc::new(Row {
+                labels: [("tail".into(), field(Ty::Nat))].into_iter().collect(),
+                rest: Rest::Closed,
+            })),
+        }));
+        let right = Rc::new(Ty::Struct(Row {
+            labels: [
+                ("second".into(), field(Ty::unit())),
+                ("first".into(), field(Ty::unit())),
+            ]
+            .into_iter()
+            .collect(),
+            rest: Rest::More(Rc::new(Row {
+                labels: [("tail".into(), field(Ty::Boolean))].into_iter().collect(),
+                rest: Rest::Closed,
+            })),
+        }));
+        assert_eq!(
+            smallest_incompatible(&IndexMap::new(), &left, &right),
+            (TypeDescription::NaturalNumber, TypeDescription::Boolean),
+            "reordered map keys must not hide a mismatch in a composed tail"
+        );
+    }
+
+    #[test]
+    fn mismatch_rows_compare_segmented_and_flat_canonical_shapes() {
+        let field = |ty| RowField::present(Rc::new(ty));
+        let left = Rc::new(Ty::Struct(Row {
+            labels: [("outer".into(), field(Ty::unit()))].into_iter().collect(),
+            rest: Rest::More(Rc::new(Row {
+                labels: [("leaf".into(), field(Ty::Nat))].into_iter().collect(),
+                rest: Rest::Closed,
+            })),
+        }));
+        let right = Rc::new(Ty::Struct(Row {
+            labels: [
+                ("leaf".into(), field(Ty::Boolean)),
+                ("outer".into(), field(Ty::unit())),
+            ]
+            .into_iter()
+            .collect(),
+            rest: Rest::Closed,
+        }));
+        assert_eq!(
+            smallest_incompatible(&IndexMap::new(), &left, &right),
+            (TypeDescription::NaturalNumber, TypeDescription::Boolean)
+        );
+    }
+
+    #[test]
+    fn mismatch_rows_give_duplicate_outer_labels_precedence() {
+        let field = |ty| RowField::present(Rc::new(ty));
+        let segmented = |outer, hidden, leaf| {
+            Rc::new(Ty::Struct(Row {
+                labels: [("duplicate".into(), field(outer))].into_iter().collect(),
+                rest: Rest::More(Rc::new(Row {
+                    labels: [
+                        ("duplicate".into(), field(hidden)),
+                        ("leaf".into(), field(leaf)),
+                    ]
+                    .into_iter()
+                    .collect(),
+                    rest: Rest::Closed,
+                })),
+            }))
+        };
+        assert_eq!(
+            smallest_incompatible(
+                &IndexMap::new(),
+                &segmented(Ty::unit(), Ty::Nat, Ty::Nat),
+                &segmented(Ty::unit(), Ty::Boolean, Ty::Boolean),
+            ),
+            (TypeDescription::NaturalNumber, TypeDescription::Boolean),
+            "the hidden duplicate payload must not become the first mismatch"
+        );
+    }
+
+    #[test]
+    fn mismatch_row_fingerprints_meter_unavailable_labels_and_ignore_their_payloads() {
+        let unavailable = |presence: Presence, payload: Ty| {
+            let labels = (0..10_000)
+                .map(|at| {
+                    (
+                        format!("f{at}"),
+                        RowField {
+                            presence: presence.clone(),
+                            ty: Rc::new(payload.clone()),
+                        },
+                    )
+                })
+                .collect();
+            Rc::new(Ty::Struct(Row {
+                labels,
+                rest: Rest::Closed,
+            }))
+        };
+        for presence in [Presence::Absent, Presence::Recovered(7)] {
+            let left = unavailable(presence.clone(), Ty::Nat);
+            let right = unavailable(presence, Ty::Boolean);
+            let mut compare_budget = 128;
+            assert_eq!(
+                same_finite_syntax_metered(&left, &right, &mut compare_budget),
+                None
+            );
+            assert_eq!(
+                compare_budget, 0,
+                "each canonical row-label comparison must be metered"
+            );
+
+            let mut fingerprint_budget = 128;
+            assert!(
+                MismatchFingerprints::default()
+                    .arguments(std::slice::from_ref(&left), &mut fingerprint_budget)
+                    .is_none()
+            );
+            assert_eq!(
+                fingerprint_budget, 0,
+                "each row-label fingerprint operation must be metered"
+            );
+
+            let mut left_fingerprints = MismatchFingerprints::default();
+            let mut right_fingerprints = MismatchFingerprints::default();
+            let mut left_budget = usize::MAX;
+            let mut right_budget = usize::MAX;
+            assert_eq!(
+                left_fingerprints.arguments(&[left], &mut left_budget),
+                right_fingerprints.arguments(&[right], &mut right_budget),
+                "unavailable recovery payloads must not enter fingerprints"
+            );
+        }
+    }
+
+    #[test]
+    fn mismatch_rows_do_not_read_semantically_unavailable_payloads() {
+        let row = |presence, ty| {
+            Rc::new(Ty::Struct(Row {
+                labels: [(
+                    "x".into(),
+                    RowField {
+                        presence,
+                        ty: Rc::new(ty),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                rest: Rest::Closed,
+            }))
+        };
+        for (left_presence, right_presence) in [
+            (Presence::Absent, Presence::Absent),
+            (Presence::Recovered(7), Presence::Recovered(7)),
+            (Presence::Present, Presence::Absent),
+        ] {
+            assert_eq!(
+                smallest_incompatible(
+                    &IndexMap::new(),
+                    &row(left_presence, Ty::Nat),
+                    &row(right_presence, Ty::Boolean),
+                ),
+                (TypeDescription::Struct, TypeDescription::Struct),
+                "absent, recovery, and incompatible presences require the honest row fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn recursive_alias_mismatch_skips_cycle_and_finds_sibling_leaf() {
+        use crate::symbol::{Bundle, Mint, Namespace, Version};
+
+        let bundle = Bundle::new("recursive-leaf", Version::new(1, 0, 0)).unwrap();
+        let mut mint = Mint::new(bundle);
+        let stream = mint.global(None, Namespace::Types, "Stream").unwrap();
+        // Put the recursive field first: the DFS must encounter and suppress
+        // that cycle, then continue to the value field rather than returning a
+        // container fallback or looping forever.
+        let recursive = Rc::new(Ty::Named {
+            symbol: stream,
+            name: "Stream".into(),
+            args: Rc::from([Rc::new(Ty::Bound(0))]),
+        });
+        let body = Rc::new(Ty::Struct(Row {
+            labels: [
+                ("tail".into(), RowField::present(recursive)),
+                ("value".into(), RowField::present(Rc::new(Ty::Bound(0)))),
+            ]
+            .into_iter()
+            .collect(),
+            rest: Rest::Closed,
+        }));
+        let aliases = [(stream, Scheme::new(1, body))].into_iter().collect();
+        let named = |argument| {
+            Rc::new(Ty::Named {
+                symbol: stream,
+                name: "Stream".into(),
+                args: Rc::from([argument]),
+            })
+        };
+        let left = named(Rc::new(Ty::Nat));
+        let right = named(Rc::new(Ty::Boolean));
+        for _ in 0..32 {
+            assert_eq!(
+                smallest_incompatible(&aliases, &left, &right),
+                (TypeDescription::NaturalNumber, TypeDescription::Boolean),
+                "the recursive walk must be deterministic"
+            );
+        }
+    }
+
+    #[test]
+    fn growing_alias_branch_does_not_starve_later_sibling() {
+        use crate::symbol::{Bundle, Mint, Namespace, Version};
+
+        let bundle = Bundle::new("growing-branch-leaf", Version::new(1, 0, 0)).unwrap();
+        let mut mint = Mint::new(bundle);
+        let growth: Vec<_> = (0..4_200)
+            .map(|at| {
+                mint.global(None, Namespace::Types, &format!("Growth{at}"))
+                    .unwrap()
+            })
+            .collect();
+        let wrapper = mint.global(None, Namespace::Types, "Wrapper").unwrap();
+        let mut aliases = IndexMap::new();
+        for (at, symbols) in growth.windows(2).enumerate() {
+            let argument = Rc::new(Ty::Struct(Row {
+                labels: [("x".into(), RowField::present(Rc::new(Ty::Bound(0))))]
+                    .into_iter()
+                    .collect(),
+                rest: Rest::Closed,
+            }));
+            aliases.insert(
+                symbols[0],
+                Scheme::new(
+                    1,
+                    Rc::new(Ty::Named {
+                        symbol: symbols[1],
+                        name: format!("Growth{}", at + 1).into(),
+                        args: Rc::from([argument]),
+                    }),
+                ),
+            );
+        }
+        aliases.insert(wrapper, Scheme::new(1, Rc::new(Ty::Bound(0))));
+        let named = |symbol, name: String, argument| {
+            Rc::new(Ty::Named {
+                symbol,
+                name: name.into(),
+                args: Rc::from([argument]),
+            })
+        };
+        let row = |bad, good| {
+            Rc::new(Ty::Struct(Row {
+                labels: [
+                    ("bad".into(), RowField::present(bad)),
+                    ("good".into(), RowField::present(good)),
+                ]
+                .into_iter()
+                .collect(),
+                rest: Rest::Closed,
+            }))
+        };
+        let left = row(
+            named(growth[0], "Growth0".into(), Rc::new(Ty::Nat)),
+            named(wrapper, "Wrapper".into(), Rc::new(Ty::Nat)),
+        );
+        let right = row(
+            named(growth[0], "Growth0".into(), Rc::new(Ty::Nat)),
+            named(wrapper, "Wrapper".into(), Rc::new(Ty::Boolean)),
+        );
+
+        assert_eq!(
+            smallest_incompatible(&aliases, &left, &right),
+            (TypeDescription::NaturalNumber, TypeDescription::Boolean),
+            "a growing first branch must not spend its sibling's alias depth"
+        );
+    }
+
+    #[test]
+    fn pure_alias_growth_has_a_bounded_declared_fallback() {
+        use crate::symbol::{Bundle, Mint, Namespace, Version};
+
+        let bundle = Bundle::new("pure-growth-leaf", Version::new(1, 0, 0)).unwrap();
+        let mut mint = Mint::new(bundle);
+        let growth: Vec<_> = (0..30_000)
+            .map(|at| {
+                mint.global(None, Namespace::Types, &format!("Growth{at}"))
+                    .unwrap()
+            })
+            .collect();
+        let mut aliases = IndexMap::new();
+        for (at, symbols) in growth.windows(2).enumerate() {
+            let argument = Rc::new(Ty::Struct(Row {
+                labels: [("x".into(), RowField::present(Rc::new(Ty::Bound(0))))]
+                    .into_iter()
+                    .collect(),
+                rest: Rest::Closed,
+            }));
+            aliases.insert(
+                symbols[0],
+                Scheme::new(
+                    1,
+                    Rc::new(Ty::Named {
+                        symbol: symbols[1],
+                        name: format!("Growth{}", at + 1).into(),
+                        args: Rc::from([argument]),
+                    }),
+                ),
+            );
+        }
+        let named = Rc::new(Ty::Named {
+            symbol: growth[0],
+            name: "Growth0".into(),
+            args: Rc::from([Rc::new(Ty::Nat)]),
+        });
+        assert_eq!(
+            smallest_incompatible(&aliases, &named, &named),
+            (TypeDescription::DeclaredType, TypeDescription::DeclaredType),
+            "pure growth must stop at the per-branch bound"
+        );
+    }
+
+    #[test]
+    fn fingerprint_collisions_in_self_growth_have_a_strict_operation_bound() {
+        use crate::symbol::{Bundle, Mint, Namespace, Version};
+
+        let bundle = Bundle::new("self-growing-leaf", Version::new(1, 0, 0)).unwrap();
+        let mut mint = Mint::new(bundle);
+        let grow = mint.global(None, Namespace::Types, "Grow").unwrap();
+        // Recovery input equivalent to `type Grow 'a = Grow { x: 'a }`.
+        // Every opening has a distinct, one-node-larger argument, so an
+        // ancestor-by-ancestor deep equality walk is superlinear.
+        let larger = Rc::new(Ty::Struct(Row {
+            labels: [("x".into(), RowField::present(Rc::new(Ty::Bound(0))))]
+                .into_iter()
+                .collect(),
+            rest: Rest::Closed,
+        }));
+        let recursive = Rc::new(Ty::Named {
+            symbol: grow,
+            name: "Grow".into(),
+            args: Rc::from([larger]),
+        });
+        let body = Rc::new(Ty::Struct(Row {
+            labels: [("next".into(), RowField::present(recursive))]
+                .into_iter()
+                .collect(),
+            rest: Rest::Closed,
+        }));
+        let aliases = [(grow, Scheme::new(1, body))].into_iter().collect();
+        let named = Rc::new(Ty::Named {
+            symbol: grow,
+            name: "Grow".into(),
+            args: Rc::from([Rc::new(Ty::Nat)]),
+        });
+        let mut operations = 0;
+        assert_eq!(
+            // Mask every argument fingerprint to zero. Every ancestor is now
+            // an intentional collision and exact verification must still be
+            // charged to the same bounded node-work allowance.
+            smallest_incompatible_counted_with_mask(&aliases, &named, &named, &mut operations, 0,),
+            (TypeDescription::DeclaredType, TypeDescription::DeclaredType)
+        );
+        assert_eq!(
+            operations, 1_048_576,
+            "self-growth must stop exactly at the branch budget"
+        );
+    }
+
+    #[test]
+    fn recursive_alias_mismatch_canonicalizes_forwarding_arguments() {
+        use crate::symbol::{Bundle, Mint, Namespace, Version};
+
+        let bundle = Bundle::new("forwarding-recursive-leaf", Version::new(1, 0, 0)).unwrap();
+        let mut mint = Mint::new(bundle);
+        let stream = mint.global(None, Namespace::Types, "Stream").unwrap();
+        let id = mint.global(None, Namespace::Types, "Id").unwrap();
+        let forward = mint.global(None, Namespace::Types, "Forward").unwrap();
+        let pass = mint.global(None, Namespace::Types, "Pass").unwrap();
+        let id_body = Rc::new(Ty::Bound(0));
+        // Malformed imported interfaces can also contain a mutually-forwarding
+        // cycle. It has no observable body and canonicalizes deterministically
+        // to recovery instead of retaining an ever-growing argument spelling.
+        let forward_body = Rc::new(Ty::Named {
+            symbol: pass,
+            name: "Pass".into(),
+            args: Rc::from([Rc::new(Ty::Bound(0))]),
+        });
+        let pass_body = Rc::new(Ty::Named {
+            symbol: forward,
+            name: "Forward".into(),
+            args: Rc::from([Rc::new(Ty::Bound(0))]),
+        });
+        let recursive = Rc::new(Ty::Named {
+            symbol: stream,
+            name: "Stream".into(),
+            args: Rc::from([Rc::new(Ty::Named {
+                symbol: id,
+                name: "Id".into(),
+                args: Rc::from([Rc::new(Ty::Bound(0))]),
+            })]),
+        });
+        let stream_body = Rc::new(Ty::Struct(Row {
+            labels: [
+                ("tail".into(), RowField::present(recursive)),
+                ("value".into(), RowField::present(Rc::new(Ty::Bound(0)))),
+            ]
+            .into_iter()
+            .collect(),
+            rest: Rest::Closed,
+        }));
+        let aliases = [
+            (stream, Scheme::new(1, stream_body)),
+            (id, Scheme::new(1, id_body)),
+            (forward, Scheme::new(1, forward_body)),
+            (pass, Scheme::new(1, pass_body)),
+        ]
+        .into_iter()
+        .collect();
+        let named = |argument| {
+            Rc::new(Ty::Named {
+                symbol: stream,
+                name: "Stream".into(),
+                args: Rc::from([argument]),
+            })
+        };
+        assert_eq!(
+            smallest_incompatible(
+                &aliases,
+                &named(Rc::new(Ty::Nat)),
+                &named(Rc::new(Ty::Boolean)),
+            ),
+            (TypeDescription::NaturalNumber, TypeDescription::Boolean)
+        );
+        let cyclic = Rc::new(Ty::Named {
+            symbol: forward,
+            name: "Forward".into(),
+            args: Rc::from([Rc::new(Ty::Nat)]),
+        });
+        for _ in 0..32 {
+            assert!(matches!(
+                &*canonical_alias_argument(&aliases, &mut Forwarding::default(), &cyclic),
+                Ty::Undecided
+            ));
+        }
+    }
+
+    #[test]
+    fn recursive_alias_forwarding_argument_is_deep_stack_safe() {
+        use crate::symbol::{Bundle, Mint, Namespace, Version};
+
+        std::thread::Builder::new()
+            .name("deep-forwarding-recursive-leaf".into())
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                let bundle = Bundle::new("deep-forwarding-leaf", Version::new(1, 0, 0)).unwrap();
+                let mut mint = Mint::new(bundle);
+                let stream = mint.global(None, Namespace::Types, "Stream").unwrap();
+                let forwards: Vec<_> = (0..30_000)
+                    .map(|at| {
+                        mint.global(None, Namespace::Types, &format!("Forward{at}"))
+                            .unwrap()
+                    })
+                    .collect();
+                let mut aliases = IndexMap::new();
+                for (at, symbol) in forwards.iter().copied().enumerate() {
+                    let body = match forwards.get(at + 1) {
+                        Some(next) => Rc::new(Ty::Named {
+                            symbol: *next,
+                            name: format!("Forward{}", at + 1).into(),
+                            args: Rc::from([Rc::new(Ty::Bound(0))]),
+                        }),
+                        None => Rc::new(Ty::Bound(0)),
+                    };
+                    aliases.insert(symbol, Scheme::new(1, body));
+                }
+                let recursive = Rc::new(Ty::Named {
+                    symbol: stream,
+                    name: "Stream".into(),
+                    args: Rc::from([Rc::new(Ty::Named {
+                        symbol: forwards[0],
+                        name: "Forward0".into(),
+                        args: Rc::from([Rc::new(Ty::Bound(0))]),
+                    })]),
+                });
+                aliases.insert(
+                    stream,
+                    Scheme::new(
+                        1,
+                        Rc::new(Ty::Struct(Row {
+                            labels: [
+                                ("tail".into(), RowField::present(recursive)),
+                                ("value".into(), RowField::present(Rc::new(Ty::Bound(0)))),
+                            ]
+                            .into_iter()
+                            .collect(),
+                            rest: Rest::Closed,
+                        })),
+                    ),
+                );
+                let named = |argument| {
+                    Rc::new(Ty::Named {
+                        symbol: stream,
+                        name: "Stream".into(),
+                        args: Rc::from([argument]),
+                    })
+                };
+                assert_eq!(
+                    smallest_incompatible(
+                        &aliases,
+                        &named(Rc::new(Ty::Nat)),
+                        &named(Rc::new(Ty::Boolean)),
+                    ),
+                    (TypeDescription::NaturalNumber, TypeDescription::Boolean)
+                );
+            })
+            .unwrap()
+            .join()
+            .expect("forwarding normalization stays on the explicit stack");
+    }
+
+    #[test]
+    fn recursive_alias_pure_cycle_keeps_declared_fallback() {
+        use crate::symbol::{Bundle, Mint, Namespace, Version};
+
+        let bundle = Bundle::new("recursive-fallback", Version::new(1, 0, 0)).unwrap();
+        let mut mint = Mint::new(bundle);
+        let cycle = mint.global(None, Namespace::Types, "Cycle").unwrap();
+        let named = || {
+            Rc::new(Ty::Named {
+                symbol: cycle,
+                name: "Cycle".into(),
+                args: Rc::from([]),
+            })
+        };
+        let body = Rc::new(Ty::Struct(Row {
+            labels: [("next".into(), RowField::present(named()))]
+                .into_iter()
+                .collect(),
+            rest: Rest::Closed,
+        }));
+        let aliases = [(cycle, Scheme::new(0, body))].into_iter().collect();
+        assert_eq!(
+            smallest_incompatible(&aliases, &named(), &named()),
+            (TypeDescription::DeclaredType, TypeDescription::DeclaredType)
+        );
+    }
+
+    #[test]
+    fn recursive_alias_mismatch_is_deep_stack_safe() {
+        use crate::symbol::{Bundle, Mint, Namespace, Version};
+
+        std::thread::Builder::new()
+            .name("deep-recursive-mismatch-leaf".into())
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                let bundle = Bundle::new("deep-recursive-leaf", Version::new(1, 0, 0)).unwrap();
+                let mut mint = Mint::new(bundle);
+                let stream = mint.global(None, Namespace::Types, "Stream").unwrap();
+                let recursive = Rc::new(Ty::Named {
+                    symbol: stream,
+                    name: "Stream".into(),
+                    args: Rc::from([Rc::new(Ty::Bound(0))]),
+                });
+                let body = Rc::new(Ty::Struct(Row {
+                    labels: [
+                        ("tail".into(), RowField::present(recursive)),
+                        ("value".into(), RowField::present(Rc::new(Ty::Bound(0)))),
+                    ]
+                    .into_iter()
+                    .collect(),
+                    rest: Rest::Closed,
+                }));
+                let aliases: IndexMap<_, _> =
+                    [(stream, Scheme::new(1, body))].into_iter().collect();
+                let mut left_argument = Rc::new(Ty::Nat);
+                let mut right_argument = Rc::new(Ty::Boolean);
+                for _ in 0..30_000 {
+                    left_argument = Rc::new(Ty::Struct(Row {
+                        labels: [("x".into(), RowField::present(left_argument))]
+                            .into_iter()
+                            .collect(),
+                        rest: Rest::Closed,
+                    }));
+                    right_argument = Rc::new(Ty::Struct(Row {
+                        labels: [("x".into(), RowField::present(right_argument))]
+                            .into_iter()
+                            .collect(),
+                        rest: Rest::Closed,
+                    }));
+                }
+                let named = |argument| {
+                    Rc::new(Ty::Named {
+                        symbol: stream,
+                        name: "Stream".into(),
+                        args: Rc::from([argument]),
+                    })
+                };
+                let left = named(left_argument);
+                let right = named(right_argument);
+                assert_eq!(
+                    smallest_incompatible(&aliases, &left, &right),
+                    (TypeDescription::NaturalNumber, TypeDescription::Boolean)
+                );
+                std::mem::forget(left);
+                std::mem::forget(right);
+            })
+            .unwrap()
+            .join()
+            .expect("recursive mismatch leaves stay on the explicit stack");
+    }
+
+    #[test]
+    fn smallest_mismatch_leaf_is_deep_stack_safe() {
+        std::thread::Builder::new()
+            .name("deep-mismatch-leaf".into())
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                let mut left = Rc::new(Ty::Nat);
+                let mut right = Rc::new(Ty::Boolean);
+                for _ in 0..30_000 {
+                    left = Rc::new(Ty::Struct(Row {
+                        labels: [("x".into(), RowField::present(left))]
+                            .into_iter()
+                            .collect(),
+                        rest: Rest::Closed,
+                    }));
+                    right = Rc::new(Ty::Struct(Row {
+                        labels: [("x".into(), RowField::present(right))]
+                            .into_iter()
+                            .collect(),
+                        rest: Rest::Closed,
+                    }));
+                }
+                assert_eq!(
+                    smallest_incompatible(&IndexMap::new(), &left, &right),
+                    (TypeDescription::NaturalNumber, TypeDescription::Boolean)
+                );
+                // Deep Rc destruction is unrelated to the iterative reader.
+                std::mem::forget(left);
+                std::mem::forget(right);
+            })
+            .unwrap()
+            .join()
+            .expect("smallest mismatch leaf stays on its explicit stack");
+    }
+
+    #[test]
+    fn recursive_cycle_retains_only_the_exact_binding_path() {
+        let mut table = Table::default();
+        let target = table.mint(VarSort::Type, Subject::Term);
+        let first = table.mint(VarSort::Type, Subject::Term);
+        let second = table.mint(VarSort::Type, Subject::Term);
+        let first_reason = table.reason(ReasonOrigin::Recovery, Vec::new());
+        let second_reason = table.reason(ReasonOrigin::Recovery, Vec::new());
+        table.vars[first as usize] = Slot::Bound {
+            value: Assigned::Ty(Rc::new(Ty::plain(Ty::Var(second)))),
+            by: first_reason,
+        };
+        table.vars[second as usize] = Slot::Bound {
+            value: Assigned::Ty(Rc::new(Ty::plain(Ty::Var(target)))),
+            by: second_reason,
+        };
+        // The input closes the first exact route. A containment route in the
+        // result is an innocent sibling and must not override call advice.
+        let candidate = Assigned::Ty(Rc::new(Ty::Arrow(
+            Rc::new(Ty::plain(Ty::Var(first))),
+            Rc::new(Ty::Struct(Row {
+                labels: [(
+                    "sibling".into(),
+                    RowField::present(Rc::new(Ty::Var(target))),
+                )]
+                .into_iter()
+                .collect(),
+                rest: Rest::Closed,
+            })),
+            Row::closed(),
+        )));
+
+        table.enter_solver_scope();
+        table.begin_solver_act();
+        assert_eq!(
+            table.occurs(target, &candidate),
+            Some(RecursiveCycleShape::CallInput)
+        );
+        assert_eq!(table.take_binding_reads(), [first_reason, second_reason]);
+
+        // An absent call-input sibling has no payload. The later present
+        // containment route is therefore the exact route returned.
+        let absent_sibling = Assigned::Ty(Rc::new(Ty::Arrow(
+            Rc::new(Ty::Struct(Row {
+                labels: [(
+                    "gone".into(),
+                    RowField {
+                        ty: Rc::new(Ty::Var(target)),
+                        presence: Presence::Absent,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                rest: Rest::Closed,
+            })),
+            Rc::new(Ty::Struct(Row {
+                labels: [("kept".into(), RowField::present(Rc::new(Ty::Var(target))))]
+                    .into_iter()
+                    .collect(),
+                rest: Rest::Closed,
+            })),
+            Row::closed(),
+        )));
+        assert_eq!(
+            table.occurs(target, &absent_sibling),
+            Some(RecursiveCycleShape::Containment)
+        );
+        assert!(table.take_binding_reads().is_empty());
+        table.end_solver_act();
+        table.leave_solver_scope();
+    }
+
+    #[test]
+    fn recursive_cycle_walk_is_linear_over_a_compact_exponential_dag() {
+        let mut table = Table::default();
+        let target = table.mint(VarSort::Type, Subject::Term);
+        let mut shared = Rc::new(Ty::Nat);
+        for _ in 0..28 {
+            shared = Rc::new(Ty::Arrow(shared.clone(), shared.clone(), Row::closed()));
+        }
+
+        table.enter_solver_scope();
+        table.begin_solver_act();
+        assert!(table.occurs(target, &Assigned::Ty(shared)).is_none());
+        assert!(table.take_binding_reads().is_empty());
+        table.end_solver_act();
+        table.leave_solver_scope();
+    }
+
+    #[test]
+    fn unrelated_bound_variable_cycle_is_bounded_and_does_not_leak_reads() {
+        let mut table = Table::default();
+        let target = table.mint(VarSort::Type, Subject::Term);
+        let first = table.mint(VarSort::Type, Subject::Term);
+        let second = table.mint(VarSort::Type, Subject::Term);
+        let first_reason = table.reason(ReasonOrigin::Recovery, Vec::new());
+        let second_reason = table.reason(ReasonOrigin::Recovery, Vec::new());
+        table.vars[first as usize] = Slot::Bound {
+            value: Assigned::Ty(Rc::new(Ty::Var(second))),
+            by: first_reason,
+        };
+        table.vars[second as usize] = Slot::Bound {
+            value: Assigned::Ty(Rc::new(Ty::Var(first))),
+            by: second_reason,
+        };
+
+        table.enter_solver_scope();
+        table.begin_solver_act();
+        assert!(
+            table
+                .occurs(target, &Assigned::Ty(Rc::new(Ty::Var(first))))
+                .is_none()
+        );
+        assert!(table.take_binding_reads().is_empty());
+        // A failed search must not suppress or pollute the next independent
+        // search in the same solver act.
+        let direct = Assigned::Ty(Rc::new(Ty::Var(target)));
+        assert_eq!(
+            table.occurs(target, &direct),
+            Some(RecursiveCycleShape::Neutral)
+        );
+        assert!(table.take_binding_reads().is_empty());
+        table.end_solver_act();
+        table.leave_solver_scope();
+    }
+
+    #[test]
+    fn recursive_cycle_paths_cover_row_tails_presences_and_first_shared_sibling() {
+        let mut table = Table::default();
+        let row_target = table.mint(VarSort::Row, Subject::Term);
+        let row_first = table.mint(VarSort::Row, Subject::Term);
+        let row_reason = table.reason(ReasonOrigin::Recovery, Vec::new());
+        table.vars[row_first as usize] = Slot::Bound {
+            value: Assigned::Row(Rc::new(Row::of(Rest::Var(row_target)))),
+            by: row_reason,
+        };
+
+        let presence_target = table.mint(VarSort::Presence, Subject::Term);
+        let presence_first = table.mint(VarSort::Presence, Subject::Term);
+        let presence_reason = table.reason(ReasonOrigin::Recovery, Vec::new());
+        table.vars[presence_first as usize] = Slot::Bound {
+            value: Assigned::Presence(Presence::Var(presence_target)),
+            by: presence_reason,
+        };
+
+        let ty_target = table.mint(VarSort::Type, Subject::Term);
+        let left = table.mint(VarSort::Type, Subject::Term);
+        let right = table.mint(VarSort::Type, Subject::Term);
+        let left_reason = table.reason(ReasonOrigin::Recovery, Vec::new());
+        let right_reason = table.reason(ReasonOrigin::Recovery, Vec::new());
+        let shared_target = Rc::new(Ty::Var(ty_target));
+        table.vars[left as usize] = Slot::Bound {
+            value: Assigned::Ty(shared_target.clone()),
+            by: left_reason,
+        };
+        table.vars[right as usize] = Slot::Bound {
+            value: Assigned::Ty(shared_target),
+            by: right_reason,
+        };
+        let siblings = Assigned::Ty(Rc::new(Ty::Arrow(
+            Rc::new(Ty::Var(left)),
+            Rc::new(Ty::Var(right)),
+            Row::closed(),
+        )));
+
+        table.enter_solver_scope();
+        table.begin_solver_act();
+        assert_eq!(
+            table.occurs(
+                row_target,
+                &Assigned::Row(Rc::new(Row::of(Rest::Var(row_first))))
+            ),
+            Some(RecursiveCycleShape::Neutral)
+        );
+        assert_eq!(table.take_binding_reads(), [row_reason]);
+        assert_eq!(
+            table.occurs(
+                presence_target,
+                &Assigned::Presence(Presence::Var(presence_first))
+            ),
+            Some(RecursiveCycleShape::Neutral)
+        );
+        assert_eq!(table.take_binding_reads(), [presence_reason]);
+        assert_eq!(
+            table.occurs(ty_target, &siblings),
+            Some(RecursiveCycleShape::CallInput)
+        );
+        assert_eq!(table.take_binding_reads(), [left_reason]);
+
+        let shared_presence = table.mint(VarSort::Presence, Subject::Term);
+        let shared_presence_reason = table.reason(ReasonOrigin::Recovery, Vec::new());
+        table.vars[shared_presence as usize] = Slot::Bound {
+            value: Assigned::Presence(Presence::Present),
+            by: shared_presence_reason,
+        };
+        let shared_fields = Assigned::Row(Rc::new(Row {
+            labels: [
+                (
+                    "first".into(),
+                    RowField {
+                        ty: Rc::new(Ty::Nat),
+                        presence: Presence::Var(shared_presence),
+                    },
+                ),
+                (
+                    "second".into(),
+                    RowField {
+                        ty: Rc::new(Ty::Var(ty_target)),
+                        presence: Presence::Var(shared_presence),
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            rest: Rest::Closed,
+        }));
+        assert_eq!(
+            table.occurs(ty_target, &shared_fields),
+            Some(RecursiveCycleShape::Containment)
+        );
+        assert_eq!(table.take_binding_reads(), [shared_presence_reason]);
+
+        let absent_presence = table.mint(VarSort::Presence, Subject::Term);
+        let absent_reason = table.reason(ReasonOrigin::Recovery, Vec::new());
+        table.vars[absent_presence as usize] = Slot::Bound {
+            value: Assigned::Presence(Presence::Absent),
+            by: absent_reason,
+        };
+        for unavailable in [
+            Presence::Var(absent_presence),
+            Presence::Recovered(77),
+            Presence::Bound(0),
+            Presence::Undecided,
+        ] {
+            let unavailable_payload = Assigned::Row(Rc::new(Row {
+                labels: [(
+                    "gone".into(),
+                    RowField {
+                        ty: Rc::new(Ty::Var(ty_target)),
+                        presence: unavailable,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                rest: Rest::Closed,
+            }));
+            assert!(
+                table.occurs(ty_target, &unavailable_payload).is_none(),
+                "an unavailable field payload is not an occurs route"
+            );
+            assert!(table.take_binding_reads().is_empty());
+        }
+        table.end_solver_act();
+        table.leave_solver_scope();
+    }
+
+    #[test]
+    fn recursive_cycle_detection_is_stack_safe_at_thirty_thousand_fields() {
+        std::thread::Builder::new()
+            .name("deep-recursive-cycle".into())
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                let mut table = Table::default();
+                let target = table.fresh_type_for(Subject::Term);
+                let Ty::Var(var) = &*target else {
+                    unreachable!()
+                };
+                let var = *var;
+                let mut nested = target;
+                for at in 0..30_000 {
+                    nested = Rc::new(Ty::Struct(Row {
+                        labels: [(format!("f{at}"), RowField::present(nested))]
+                            .into_iter()
+                            .collect(),
+                        rest: Rest::Closed,
+                    }));
+                }
+                assert!(table.occurs(var, &Assigned::Ty(nested.clone())).is_some());
+                // The property under test is the explicit walk, not recursive
+                // destruction of a deliberately pathological Rc tree.
+                std::mem::forget(nested);
+            })
+            .unwrap()
+            .join()
+            .expect("recursive-cycle detection stays on its explicit stack");
+    }
+
+    #[test]
     fn publication_shift_captures_deep_composed_rows_without_recursing() {
         std::thread::Builder::new()
             .name("deep-publication-shift".into())
@@ -5882,5 +12966,249 @@ mod existential_regressions {
             .unwrap()
             .join()
             .expect("publication shift stays on its explicit stack");
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::{
+        ConstraintId, ExplainedScheme, ProvenanceNode, ProvenanceShape, ProvenanceTy,
+        QuantifiedProvenance, ReasonId, ReasonOrigin, SchemeProvenance, Subject, Table, VarSort,
+        budget_reason_slice,
+    };
+    use crate::tracking::Span;
+    use crate::types::{Presence, Rest, Row, RowField, Scheme, Ty};
+    use indexmap::IndexMap;
+    use std::rc::Rc;
+
+    #[test]
+    fn full_reason_budget_preserves_oldest_and_failure_endpoints_and_counts_omissions() {
+        let chain: Vec<_> = (0..17_000).rev().map(ReasonId::synthetic).collect();
+        let (kept, omitted) = budget_reason_slice(chain);
+        assert_eq!(kept.len(), 16_384);
+        assert_eq!(omitted, 616);
+        assert_eq!(kept.first().copied(), Some(ReasonId::synthetic(0)));
+        assert_eq!(kept.last().copied(), Some(ReasonId::synthetic(16_999)));
+    }
+
+    #[test]
+    fn package_and_absent_payload_provenance_follow_zonked_structure() {
+        let table = Table::default();
+        let absent_payload = Rc::new(Ty::Arrow(
+            Rc::new(Ty::Nat),
+            Rc::new(Ty::Boolean),
+            Row::closed(),
+        ));
+        let mut labels = IndexMap::new();
+        labels.insert(
+            "hidden".into(),
+            RowField {
+                presence: Presence::Absent,
+                ty: absent_payload,
+            },
+        );
+        labels.insert("shown".into(), RowField::present(Rc::new(Ty::Nat)));
+        let root = Rc::new(Ty::Package(Rc::new(Ty::Struct(Row {
+            labels,
+            rest: Rest::Closed,
+        }))));
+        let provenance = table.scheme_provenance(&root, &root, &Default::default(), 0);
+        assert_eq!(provenance.nodes.len(), 6);
+        assert!(matches!(
+            provenance.nodes[0].shape,
+            super::ProvenanceShape::Ty(super::ProvenanceTy::Package)
+        ));
+        assert_eq!(provenance.nodes[0].children, [1]);
+        let super::ProvenanceShape::Row(layout) = &provenance.nodes[2].shape else {
+            panic!()
+        };
+        assert_eq!(layout, &[("hidden".into(), false), ("shown".into(), true)]);
+        assert_eq!(provenance.nodes[2].children.len(), 3);
+    }
+
+    #[test]
+    fn synthesized_nested_packages_rebuild_the_published_provenance_body() {
+        let table = Table::default();
+        let result = Rc::new(Ty::Struct(Row {
+            labels: [(
+                "hidden".into(),
+                RowField {
+                    presence: Presence::Bound(0),
+                    ty: Rc::new(Ty::Nat),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            rest: Rest::Closed,
+        }));
+        let source = Rc::new(Ty::Arrow(Rc::new(Ty::Nat), result.clone(), Row::closed()));
+        let published = Rc::new(Ty::Arrow(
+            Rc::new(Ty::Nat),
+            Rc::new(Ty::Package(result)),
+            Row::closed(),
+        ));
+
+        let provenance = table.scheme_provenance(&source, &published, &Default::default(), 1);
+        assert_eq!(
+            provenance.nodes[provenance.nodes[0].children[1]].shape,
+            ProvenanceShape::Ty(ProvenanceTy::Package)
+        );
+        assert_eq!(
+            provenance.nodes[provenance.nodes[0].children[1]]
+                .children
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn shared_payload_rc_does_not_share_sibling_presence_provenance() {
+        let mut table = Table::default();
+        let left_root = table.constraint_reason(ConstraintId::synthetic(10));
+        let right_root = table.constraint_reason(ConstraintId::synthetic(20));
+        let left = table.fresh_instance_presence();
+        let right = table.fresh_instance_presence();
+        let shared = Rc::new(Ty::Nat);
+        let root = Rc::new(Ty::Struct(Row {
+            labels: [
+                (
+                    "left".into(),
+                    RowField {
+                        presence: left.clone(),
+                        ty: shared.clone(),
+                    },
+                ),
+                (
+                    "right".into(),
+                    RowField {
+                        presence: right.clone(),
+                        ty: shared,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            rest: Rest::Closed,
+        }));
+        let provenance = SchemeProvenance {
+            nodes: vec![
+                ProvenanceNode {
+                    shape: ProvenanceShape::Ty(ProvenanceTy::Struct),
+                    roots: vec![],
+                    omitted: 0,
+                    children: vec![1],
+                },
+                ProvenanceNode {
+                    shape: ProvenanceShape::Row(vec![
+                        ("left".into(), true),
+                        ("right".into(), true),
+                    ]),
+                    roots: vec![],
+                    omitted: 0,
+                    children: vec![2, 3, 4, 5],
+                },
+                ProvenanceNode {
+                    shape: ProvenanceShape::Presence,
+                    roots: vec![left_root],
+                    omitted: 0,
+                    children: vec![],
+                },
+                ProvenanceNode {
+                    shape: ProvenanceShape::Ty(ProvenanceTy::Leaf),
+                    roots: vec![],
+                    omitted: 0,
+                    children: vec![],
+                },
+                ProvenanceNode {
+                    shape: ProvenanceShape::Presence,
+                    roots: vec![right_root],
+                    omitted: 0,
+                    children: vec![],
+                },
+                ProvenanceNode {
+                    shape: ProvenanceShape::Ty(ProvenanceTy::Leaf),
+                    roots: vec![],
+                    omitted: 0,
+                    children: vec![],
+                },
+            ],
+            quantified: vec![],
+        };
+        table.mark_opened_type(&root, &provenance);
+        table.enter_solver_scope();
+
+        table.begin_solver_act();
+        table.presence_of(&left);
+        let left_reads = table.take_binding_reads();
+        table.end_solver_act();
+        table.begin_solver_act();
+        table.presence_of(&right);
+        let right_reads = table.take_binding_reads();
+        table.end_solver_act();
+        table.leave_solver_scope();
+
+        assert_eq!(left_reads.len(), 1);
+        assert_eq!(right_reads.len(), 1);
+        assert_eq!(
+            table.reasons[left_reads[0].get() as usize].parents,
+            [left_root]
+        );
+        assert_eq!(
+            table.reasons[right_reads[0].get() as usize].parents,
+            [right_root]
+        );
+    }
+
+    #[test]
+    fn quantified_row_positions_keep_their_sort_when_opened() {
+        let mut table = Table::default();
+        let explained = ExplainedScheme {
+            scheme: Scheme::new(1, Rc::new(Ty::Struct(Row::of(Rest::Bound(0))))),
+            provenance: SchemeProvenance {
+                nodes: Vec::new(),
+                quantified: vec![QuantifiedProvenance {
+                    sort: VarSort::Row,
+                    roots: Vec::new(),
+                    omitted: 0,
+                }],
+            },
+            effect_provenance: Box::default(),
+        };
+        table.instantiate_scoped(Span::default(), &explained, None);
+        assert_eq!(table.var_meta.last().unwrap().sort, VarSort::Row);
+        assert!(matches!(
+            table.reasons[table.var_meta.last().unwrap().minted_by.get() as usize].origin,
+            ReasonOrigin::Variable {
+                sort: VarSort::Row,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rollback_retires_allocated_identities_instead_of_reusing_them() {
+        let mut table = Table::default();
+        let known = table.snapshot();
+        let abandoned_step = table.step_id();
+        let abandoned_batch = table.batch_id();
+        let abandoned_var = table.mint(VarSort::Type, Subject::Term);
+        let abandoned_reason = table.var_meta[abandoned_var as usize].minted_by;
+
+        table.restore(known);
+
+        assert_ne!(table.step_id(), abandoned_step);
+        assert_ne!(table.batch_id(), abandoned_batch);
+        assert!(table.var_meta.is_empty());
+        assert!(table.reasons.iter().any(|reason| {
+            reason.id == abandoned_reason
+                && !reason.reachable
+                && matches!(reason.origin, ReasonOrigin::Variable { .. })
+        }));
+        let surviving = table.mint(VarSort::Type, Subject::Term);
+        assert_eq!(surviving, abandoned_var);
+        assert_ne!(
+            table.var_meta[surviving as usize].minted_by,
+            abandoned_reason
+        );
     }
 }

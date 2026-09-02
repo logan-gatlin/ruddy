@@ -15,9 +15,10 @@ use crate::{
 };
 
 use super::{
-    Batch, Constraint, ConstraintKind, DeferredRequirement, Effect, Error, ErrorKind, Goal,
-    GuardedArm, GuardedObligation, GuardedOrigin, Known, Named, Origin, Refinement, RefinementFact,
-    Rule, Side, Slot, Step, Table,
+    Batch, Constraint, ConstraintKind, DeferredRequirement, Effect, Error, ErrorCause, ErrorKind,
+    ExplainedScheme, Goal, GuardedArm, GuardedObligation, GuardedOrigin, Known, Named, Origin,
+    ReasonId, ReasonOrigin, RecursiveCycleShape, Refinement, RefinementFact, Rule,
+    SchemeProvenance, Side, Slot, Step, Table,
 };
 
 /// What a set of labels says about the ones it does not name.
@@ -216,6 +217,7 @@ struct Scoping<'a> {
     level: u32,
     promised: &'a Formula,
     rigids: &'a [u32],
+    effect_provenance: &'a super::EffectProvenance,
     value: &'a [Constraint],
     body: &'a [Constraint],
 }
@@ -301,6 +303,11 @@ pub struct Solve<'a> {
     pub definition: Symbol,
     /// How deep inside a decomposition the solver currently is.
     pub depth: u32,
+    /// Constraint currently being expanded; absent for work started directly
+    /// at a non-constraint boundary.
+    pub constraint: Option<super::ConstraintId>,
+    /// Root reason of the constraint currently being expanded.
+    pub constraint_reason: Option<ReasonId>,
     /// The goals about two declared types that the goals currently open were
     /// reached by unfolding, innermost last.
     ///
@@ -319,7 +326,7 @@ pub struct Solve<'a> {
     /// The scheme each nested `let` currently in scope published, for as long
     /// as its body is being solved. [`Constrain`](super::Constrain)'s
     /// environment, about the one kind of name generation could not decide.
-    pub schemes: HashMap<Symbol, Scheme>,
+    pub schemes: HashMap<Symbol, ExplainedScheme>,
     /// Every scheme published, kept. [`Output::locals`](super::Output::locals).
     pub locals: &'a mut IndexMap<Symbol, Scheme>,
     /// The reachable ordered arm premise currently in force. `None` is the
@@ -327,6 +334,8 @@ pub struct Solve<'a> {
     pub guard: Option<Formula>,
     /// The arm report guarded obligations are appended to.
     pub active_refinement: Option<usize>,
+    /// Coverage batches establishing the active (possibly nested) premise.
+    pub guard_reasons: Vec<ReasonId>,
     pub refinements: &'a mut Vec<Refinement>,
     /// End of generation-time store slots for this definition. Guarded
     /// structural relations appended while solving participate in later arm
@@ -340,8 +349,44 @@ impl Solve<'_> {
     /// projection's demand is an ordinary type with an open field row, so
     /// nothing has to wait for a later round to know what its base is.
     pub fn run(&mut self, constraints: &[Constraint]) {
+        self.table.enter_solver_scope();
         for constraint in constraints {
+            // Resolution performed while publishing/generalizing the previous
+            // constraint is not an input to this one.
+            self.table.begin_solver_act();
+            let previous = self.constraint.replace(constraint.id);
+            let previous_reason = self.constraint_reason.replace(constraint.reason);
             let span = constraint.span;
+            let source = matches!(
+                constraint.origin,
+                super::ConstraintOrigin::ApplicationArgument
+                    | super::ConstraintOrigin::ContextualCheck
+                    | super::ConstraintOrigin::MatchScrutinee
+                    | super::ConstraintOrigin::HandlerArm
+                    | super::ConstraintOrigin::HandlerReturn
+                    | super::ConstraintOrigin::HandlerFallback
+            )
+            .then(|| {
+                constraint
+                    .subjects
+                    .secondary
+                    .zip(constraint.subjects.secondary_span)
+            })
+            .flatten()
+            .unwrap_or((
+                constraint.subjects.primary,
+                constraint.subjects.primary_span.unwrap_or(span),
+            ));
+            let previous_lacks_origin =
+                self.table
+                    .active_lacks_origin
+                    .replace(super::RowFactOrigin {
+                        constraint: constraint.id,
+                        reason: constraint.reason,
+                        origin: constraint.origin,
+                        subject: source.0,
+                        span: source.1,
+                    });
             match &constraint.kind {
                 ConstraintKind::Project {
                     base,
@@ -356,15 +401,18 @@ impl Solve<'_> {
                     level,
                     promised,
                     rigids,
+                    effect_provenance,
                     value,
                     body,
                 } => self.bind_local(
                     *symbol,
+                    span,
                     &Scoping {
                         bound,
                         level: *level,
                         promised,
                         rigids,
+                        effect_provenance,
                         value,
                         body,
                     },
@@ -384,19 +432,149 @@ impl Solve<'_> {
                     performed,
                     ambient,
                     inside,
+                    ..
                 } => self.performs(span, performed, ambient, *inside),
                 ConstraintKind::CallbackCoverage {
                     required,
                     available,
+                    boundary,
                 } => {
                     let reported = self.errors.len();
-                    self.performs(span, required, available, true);
+                    let required = self.table.canon(required);
+                    let mut available = self.table.canon(available);
+                    // Publish one exact, non-mutating review step even when
+                    // static formula validation settled every label and there
+                    // is no tail to solve. Debugger consumers can therefore
+                    // correlate every callback constraint with solver evidence
+                    // without equating caller-chosen presences.
+                    self.step(
+                        span,
+                        Rule::Performs,
+                        Goal::Row {
+                            expected: Rc::new(required.clone()),
+                            actual: Rc::new(available.clone()),
+                        },
+                        Effect::Decomposed,
+                    );
+                    // Presence implications over written labels were validated
+                    // against the annotation's complete formula before solving.
+                    // Equating those presences here would narrow a caller
+                    // choice. An anonymous row hole is different: it is an
+                    // inference site, so retain the exact missing labels in it.
+                    if matches!(available.rest, Rest::Var(_)) {
+                        let inferred = Row {
+                            labels: required
+                                .labels
+                                .iter()
+                                .filter(|(name, _)| !available.labels.contains_key(*name))
+                                .map(|(name, field)| (name.clone(), field.clone()))
+                                .collect(),
+                            rest: Rest::Closed,
+                        };
+                        if !inferred.labels.is_empty() {
+                            self.performs(span, &inferred, &available, true);
+                            available = self.table.canon(&available);
+                        }
+                    }
+                    // Fixed open remainders remain a structural relation of
+                    // their own and are never collapsed to definitely-present
+                    // labels.
+                    if !matches!(required.rest, Rest::Closed | Rest::Undecided)
+                        && !super::same_callback_tail(&required.rest, &available.rest)
+                    {
+                        self.performs(
+                            span,
+                            &Row::of(required.rest.clone()),
+                            &Row::of(available.rest.clone()),
+                            true,
+                        );
+                    }
                     for error in &mut self.errors[reported..] {
-                        error.kind = ErrorKind::CallbackEffectsNotCovered;
+                        let missing_effects = Vec::new();
+                        let missing_tails: Vec<_> = boundary
+                            .tail
+                            .as_ref()
+                            .map(super::tail_issue)
+                            .into_iter()
+                            .collect();
+                        error.kind = ErrorKind::CallbackEffectsNotCovered {
+                            missing_effects: missing_effects.clone(),
+                            extern_effects: super::listed_effects(&available),
+                            callback_path: boundary.callback_path.clone(),
+                            callback_type: boundary.callback_type.clone(),
+                            extern_name: boundary.extern_name.clone(),
+                            issues: vec![super::ExternCallbackIssue {
+                                callback_span: boundary.callback_span,
+                                callback_path: boundary.callback_path.clone(),
+                                callback_type: boundary.callback_type.clone(),
+                                missing_effects: missing_effects.clone(),
+                                extern_effects: super::listed_effects(&available),
+                                requirements: Vec::new(),
+                                missing_tails,
+                                conditions: Vec::new(),
+                                condition: boundary.condition.to_string(),
+                            }],
+                        };
+                        let mut explanation = super::direct_extern_explanation(
+                            error.id,
+                            vec![
+                                (
+                                    boundary.callback_span,
+                                    super::ConstraintOrigin::CallbackBoundary,
+                                    super::Subject::CallbackRequired,
+                                    super::ExplanationFactPayload::CallbackRequirement,
+                                ),
+                                (
+                                    boundary.capability_span,
+                                    super::ConstraintOrigin::CallbackBoundary,
+                                    super::Subject::CallbackAvailable,
+                                    super::ExplanationFactPayload::ExternCapability,
+                                ),
+                                (
+                                    boundary.extern_span,
+                                    super::ConstraintOrigin::Binding,
+                                    super::Subject::Binding,
+                                    super::ExplanationFactPayload::ExternDeclaration,
+                                ),
+                            ],
+                            super::ContradictionKind::CallbackEffectsNotCovered,
+                            missing_effects
+                                .first()
+                                .map(|effect| super::RowContradiction {
+                                    shape: Shape::Effect,
+                                    label: effect.clone(),
+                                }),
+                        );
+                        if let Some(constraint) = self.constraint {
+                            for fact in &mut explanation.full_facts {
+                                fact.direct = false;
+                                fact.constraint = constraint;
+                            }
+                            explanation.cause.constraints = vec![constraint];
+                            explanation.cause.seed = self.constraint_reason;
+                            if let Some(reason) = self.constraint_reason {
+                                explanation.cause.reasons = vec![reason];
+                            }
+                        }
+                        error.explanation = Some(explanation);
+                        let ErrorCause::Step(step_id) = error.cause else {
+                            continue;
+                        };
+                        let step = self
+                            .steps
+                            .iter_mut()
+                            .find(|step| step.id == step_id)
+                            .expect("a solve-caused error links its failed step");
+                        step.effect = Effect::Failed(error.kind.clone());
                     }
                 }
             }
+            self.constraint = previous;
+            self.constraint_reason = previous_reason;
+            self.table.active_lacks_origin = previous_lacks_origin;
+            self.table.end_solver_act();
         }
+        self.table.leave_solver_scope();
     }
 
     /// Solve a field projection after exposing only the base's outer constructor.
@@ -422,10 +600,7 @@ impl Solve<'_> {
                     expected: Rc::new(Ty::unit()),
                     actual: exposed.clone(),
                 };
-                let error = Error {
-                    span: base_span,
-                    kind: ErrorKind::NotAStruct { base: exposed },
-                };
+                let error = Error::new(base_span, ErrorKind::NotAStruct { base: exposed });
                 self.fail(
                     base_span,
                     Rule::Mismatch,
@@ -435,15 +610,15 @@ impl Solve<'_> {
                 );
             }
             Ty::Rigid { id, name } => {
-                let error = Error {
-                    span: field_span,
-                    kind: ErrorKind::RigidField {
+                let error = Error::new(
+                    field_span,
+                    ErrorKind::RigidField {
                         shape: Shape::Struct,
                         field: field.to_string(),
                         name: name.clone(),
                         declared: self.table.declared(*id),
                     },
-                };
+                );
                 let goal = Goal::Type {
                     expected: Rc::new(Ty::unit()),
                     actual: exposed.clone(),
@@ -461,9 +636,15 @@ impl Solve<'_> {
                     labels: [(field.to_string(), RowField::present(result.clone()))]
                         .into_iter()
                         .collect(),
-                    rest: self.table.fresh_row(),
+                    rest: self.table.fresh_row_for(super::Subject::ProjectionBase),
                 }));
-                self.table.note_lacks(&want);
+                let origin = self.table.active_lacks_origin.clone().map(|mut origin| {
+                    origin.subject = super::Subject::PatternDemand;
+                    origin.span = field_span;
+                    origin
+                });
+                self.table
+                    .with_lacks_origin(origin, |table| table.note_lacks(&want));
                 self.unify(field_span, &want, &base);
             }
         }
@@ -483,6 +664,7 @@ impl Solve<'_> {
     ) {
         let enclosing_guard = self.guard.clone();
         let enclosing_refinement = self.active_refinement;
+        let enclosing_guard_reasons = self.guard_reasons.clone();
         let mut guards = Vec::with_capacity(arms.len());
         let mut reports = Vec::with_capacity(arms.len());
 
@@ -548,6 +730,10 @@ impl Solve<'_> {
             let guard = (reachable && !effective.is_true()).then_some(effective);
             guards.push(guard.clone());
             self.guard = guard;
+            self.guard_reasons = enclosing_guard_reasons.clone();
+            if self.guard.is_some() {
+                self.guard_reasons.push(arm.premise_reason);
+            }
             self.active_refinement = Some(report);
             for requirement in &arm.requirements {
                 self.commit_deferred(requirement.clone());
@@ -560,20 +746,39 @@ impl Solve<'_> {
         // relating those to each arm under that arm's premise is where the
         // input/output relationship is published.
         self.guard = None;
+        self.guard_reasons.clear();
         self.active_refinement = enclosing_refinement;
-        let body_types: Vec<Rc<Ty>> = arms.iter().map(|arm| arm.ty.clone()).collect();
+        let body_types: Vec<Rc<Ty>> = arms
+            .iter()
+            .map(|arm| match &arm.result.kind {
+                ConstraintKind::Equal { actual, .. } => actual.clone(),
+                _ => unreachable!("a guarded arm result is an equality"),
+            })
+            .collect();
         let family = self.family_type(&body_types);
         self.unify(span, result, &family);
-        for ((arm, guard), report) in arms.iter().zip(guards).zip(reports) {
+        for (((arm, body_ty), guard), report) in
+            arms.iter().zip(body_types).zip(guards).zip(reports)
+        {
             self.guard = guard;
+            self.guard_reasons = enclosing_guard_reasons.clone();
+            if self.guard.is_some() {
+                self.guard_reasons.push(arm.premise_reason);
+            }
             self.active_refinement = Some(report);
-            self.unify(arm.span, &family, &arm.ty);
+            let previous = self.constraint.replace(arm.result.id);
+            let previous_reason = self.constraint_reason.replace(arm.result.reason);
+            self.unify(arm.result.span, &family, &body_ty);
+            self.constraint = previous;
+            self.constraint_reason = previous_reason;
         }
         self.guard = None;
+        self.guard_reasons.clear();
         self.active_refinement = enclosing_refinement;
         self.alias_result_presences(span, &family, scrutinee);
 
         self.guard = enclosing_guard;
+        self.guard_reasons = enclosing_guard_reasons;
         self.active_refinement = enclosing_refinement;
     }
 
@@ -904,7 +1109,7 @@ impl Solve<'_> {
                         .iter()
                         .find(|ty| !matches!(&***ty, Ty::Var(_) | Ty::Undecided))
                     else {
-                        type_values.push(self.table.fresh_type());
+                        type_values.push(self.table.fresh_match_family_type());
                         continue;
                     };
                     match &**chosen {
@@ -1033,7 +1238,7 @@ impl Solve<'_> {
                             .iter()
                             .any(|row| matches!(row.rest, Rest::Var(_)))
                         {
-                            self.table.fresh_row()
+                            self.table.fresh_match_family_row()
                         } else {
                             state.flat[0].rest.clone()
                         };
@@ -1057,7 +1262,7 @@ impl Solve<'_> {
                         state.labels.insert(
                             name,
                             RowField {
-                                presence: self.table.fresh_presence(),
+                                presence: self.table.fresh_match_family_presence(),
                                 ty: Rc::new(Ty::default()),
                             },
                         );
@@ -1073,7 +1278,7 @@ impl Solve<'_> {
                     state.labels.insert(
                         name,
                         RowField {
-                            presence: self.table.fresh_presence(),
+                            presence: self.table.fresh_match_family_presence(),
                             ty,
                         },
                     );
@@ -1144,10 +1349,19 @@ impl Solve<'_> {
             obligation.clone(),
             formula.clone(),
         );
+        let mut parents = vec![batch.reason];
+        for cause in &self.guard_reasons {
+            if !parents.contains(cause) {
+                parents.push(*cause);
+            }
+        }
+        let reason = self.table.reason(ReasonOrigin::Batch(batch.id), parents);
         Batch {
+            id: batch.id,
             definition: batch.definition,
             span: batch.span,
             origin,
+            reason,
             formula,
             flipped: false,
         }
@@ -1211,7 +1425,13 @@ impl Solve<'_> {
                 false => ErrorKind::Unhandled { effect },
             };
             let abandoned = [Assigned::Row(Rc::new(want.clone()))];
-            self.fail(span, Rule::Performs, goal, Error { span, kind }, &abandoned);
+            self.fail(
+                span,
+                Rule::Performs,
+                goal,
+                Error::new(span, kind),
+                &abandoned,
+            );
             return;
         }
         // A closed row is opened with a fresh tail, which is what makes the row
@@ -1291,16 +1511,18 @@ impl Solve<'_> {
     /// The scheme is released when the body ends, the way lowering released the
     /// name. Nothing could reach it afterwards — a symbol is unique — but a
     /// scope that is not closed is a scope that is not a scope.
-    fn bind_local(&mut self, symbol: Symbol, scoping: &Scoping<'_>) {
+    fn bind_local(&mut self, symbol: Symbol, binding_span: Span, scoping: &Scoping<'_>) {
         let &Scoping {
             bound,
             level,
             promised,
             rigids,
+            effect_provenance,
             value,
             body,
         } = scoping;
         self.table.level = level;
+        let error_start = self.errors.len();
         self.run(value);
         // R23's closing rule, said about a nested binding on the same terms: a
         // `let` in the middle of a body is generalized exactly as one at the
@@ -1324,11 +1546,39 @@ impl Solve<'_> {
         // A variable this binding did not declare means nothing in
         // the scheme it is about to publish, exactly as it means nothing in a
         // definition's. See [`Table::escapes`](super::Table).
-        self.table.escapes(bound, rigids, self.errors);
-        let (scheme, _) = self.table.generalize(bound, level, required);
+        self.table.escapes(
+            bound,
+            rigids,
+            self.table
+                .binding_names
+                .get(&symbol)
+                .cloned()
+                .unwrap_or_else(|| Rc::from("local binding")),
+            binding_span,
+            self.errors,
+        );
+        let (scheme, subst) = self.table.generalize(bound, level, required);
         self.table.level = level - 1;
         self.locals.insert(symbol, scheme.clone());
-        self.schemes.insert(symbol, scheme);
+        let provenance = if self.errors.len() != error_start {
+            SchemeProvenance::default()
+        } else if let Some(annotation_span) = self.table.authoritative_spans.get(&symbol).copied() {
+            self.table.authoritative_provenance(
+                bound,
+                scheme.body(),
+                &subst,
+                scheme.count(),
+                value,
+                annotation_span,
+            )
+        } else {
+            self.table
+                .scheme_provenance(bound, scheme.body(), &subst, scheme.count())
+        };
+        self.schemes.insert(
+            symbol,
+            ExplainedScheme::local(scheme, provenance, effect_provenance.clone()),
+        );
         self.run(body);
         self.schemes.remove(&symbol);
     }
@@ -1347,12 +1597,23 @@ impl Solve<'_> {
         // at.
         let required = self.table.store.batches.len();
         let copy = self.table.instantiate_local(span, symbol, &scheme);
+        // Local schemes open during solving, after their Instance constraint's
+        // reason was minted. Seed the next rule with the opened root just as
+        // generation-time opening parents a top-level constraint directly.
+        self.table.note_opened_type(&copy);
         let mut batches: Vec<Batch> = self.table.store.batches.drain(required..).collect();
         match batches.pop() {
             Some(mut batch) => {
                 // Application generation may have aimed the reserved slot at
                 // the argument; retain that source attribution.
-                batch.span = self.table.store.batches[requirement].span;
+                let reserved_id = self.table.store.batches[requirement].id;
+                let reserved_span = self.table.store.batches[requirement].span;
+                batch.id = reserved_id;
+                batch.span = reserved_span;
+                batch.reason = self.table.reason(
+                    ReasonOrigin::Batch(reserved_id),
+                    self.constraint_reason.into_iter().collect(),
+                );
                 let replacement = self.guarded_batch(batch);
                 self.table.store.batches[requirement] = replacement;
             }
@@ -1413,6 +1674,10 @@ impl Solve<'_> {
         let mut assumption_arguments: HashMap<usize, Arguments> = HashMap::new();
         let mut work = vec![SolveWork::Ty(lhs, rhs, original_depth)];
         while let Some(part) = work.pop() {
+            // Each trampoline item is one solver rule candidate. Preserve the
+            // reads used to expose its goal, but discard them if the candidate
+            // is a zero-step equality rather than lending them to its sibling.
+            self.table.begin_solver_rule();
             match part {
                 SolveWork::Ty(lhs, rhs, depth) => {
                     self.depth = depth;
@@ -1444,18 +1709,18 @@ impl Solve<'_> {
                             work.push(SolveWork::Ty(lhs.clone(), body, depth + 1));
                         }
                         (Ty::Undecided, _) => {
-                            self.step(span, Rule::Absorb, goal, Effect::None);
-                            self.recover_ty(span, &rhs);
+                            let absorbing = self.step(span, Rule::Absorb, goal, Effect::None);
+                            self.recover_ty(span, &rhs, absorbing);
                         }
                         (_, Ty::Undecided) => {
-                            self.step(span, Rule::Absorb, goal, Effect::None);
-                            self.recover_ty(span, &lhs);
+                            let absorbing = self.step(span, Rule::Absorb, goal, Effect::None);
+                            self.recover_ty(span, &lhs, absorbing);
                         }
                         (Ty::Var(a), Ty::Var(b)) if a == b => {
-                            self.step(span, Rule::Same, goal, Effect::None)
+                            self.step(span, Rule::Same, goal, Effect::None);
                         }
                         (Ty::Rigid { id: a, .. }, Ty::Rigid { id: b, .. }) if a == b => {
-                            self.step(span, Rule::Same, goal, Effect::None)
+                            self.step(span, Rule::Same, goal, Effect::None);
                         }
                         (Ty::Var(_), _)
                         | (_, Ty::Var(_))
@@ -1676,9 +1941,9 @@ impl Solve<'_> {
                             if already {
                                 self.step(span, Rule::Assume, goal, Effect::None);
                             } else if growing {
-                                self.step(span, Rule::Absorb, goal, Effect::None);
-                                self.recover_ty(span, &lhs);
-                                self.recover_ty(span, &rhs);
+                                let absorbing = self.step(span, Rule::Absorb, goal, Effect::None);
+                                self.recover_ty(span, &lhs, absorbing);
+                                self.recover_ty(span, &rhs, absorbing);
                             } else {
                                 let exposed_left = self.table.unfolded(self.aliases, &lhs);
                                 let exposed_right = self.table.unfolded(self.aliases, &rhs);
@@ -1768,6 +2033,7 @@ impl Solve<'_> {
                     }
                 }
             }
+            self.table.end_solver_act();
         }
         self.depth = original_depth;
     }
@@ -1951,28 +2217,28 @@ impl Solve<'_> {
         sense: Sense,
         found: &Rc<Ty>,
     ) -> bool {
-        let error = Error {
+        let error = Error::new(
             span,
-            kind: ErrorKind::RigidBroken {
+            ErrorKind::RigidBroken {
                 found: found.clone(),
                 name,
                 sense,
                 declared: self.table.declared(id),
             },
-        };
+        );
         let abandoned = [Assigned::Ty(found.clone())];
         self.fail(span, Rule::Mismatch, goal, error, &abandoned);
         false
     }
 
     fn mismatch(&mut self, span: Span, goal: Goal, lhs: &Rc<Ty>, rhs: &Rc<Ty>) -> bool {
-        let error = Error {
+        let error = Error::new(
             span,
-            kind: ErrorKind::Mismatch {
+            ErrorKind::Mismatch {
                 expected: lhs.clone(),
                 actual: rhs.clone(),
             },
-        };
+        );
         let abandoned = [Assigned::Ty(lhs.clone()), Assigned::Ty(rhs.clone())];
         self.fail(span, Rule::Mismatch, goal, error, &abandoned);
         false
@@ -2023,7 +2289,7 @@ impl Solve<'_> {
             if guarded || only_want.values().all(&absent) && only_have.values().all(&absent) {
                 let labels: Vec<String> =
                     only_want.keys().chain(only_have.keys()).cloned().collect();
-                self.table.forbidden(a, expected.shape(), labels);
+                self.table.forbidden_labels(a, expected.shape(), labels);
                 if guarded {
                     for field in only_want.values().chain(only_have.values()) {
                         let presence = self.table.presence_of(&field.presence);
@@ -2033,15 +2299,18 @@ impl Solve<'_> {
                 only_want.clear();
                 only_have.clear();
             } else {
-                let error = Error {
-                    span,
-                    kind: ErrorKind::Recursive,
-                };
+                let error = Error::new(span, ErrorKind::Recursive);
                 let abandoned = [
                     expected.tail.value(expected.labels.clone()),
                     actual.tail.value(actual.labels.clone()),
                 ];
-                self.fail(span, Rule::Occurs, goal, error, &abandoned);
+                self.fail_recursive(
+                    span,
+                    goal,
+                    error,
+                    &abandoned,
+                    RecursiveCycleShape::Containment,
+                );
                 return Vec::new();
             }
         }
@@ -2139,21 +2408,21 @@ impl Solve<'_> {
         };
         match (&want.rest, &have.rest) {
             (Rest::Undecided, _) => {
-                self.step(span, Rule::Absorb, goal, Effect::None);
-                self.recover_row(span, &have);
+                let absorbing = self.step(span, Rule::Absorb, goal, Effect::None);
+                self.recover_row(span, &have, absorbing);
             }
             (_, Rest::Undecided) => {
-                self.step(span, Rule::Absorb, goal, Effect::None);
-                self.recover_row(span, &want);
+                let absorbing = self.step(span, Rule::Absorb, goal, Effect::None);
+                self.recover_row(span, &want, absorbing);
             }
             (Rest::Var(a), Rest::Var(b)) if a == b => {
-                self.step(span, Rule::Same, goal, Effect::None)
+                self.step(span, Rule::Same, goal, Effect::None);
             }
             // The row-tail rule's arms about a sum's rest, and the same rule: a
             // declared rest is equal to itself, takes an unbound variable as
             // any row would, and breaks its promise against anything else.
             (Rest::Rigid { id: a, .. }, Rest::Rigid { id: b, .. }) if a == b => {
-                self.step(span, Rule::Same, goal, Effect::None)
+                self.step(span, Rule::Same, goal, Effect::None);
             }
             (Rest::Rigid { name, id }, other) if !matches!(other, Rest::Var(_)) => {
                 let (name, id) = (name.clone(), *id);
@@ -2175,7 +2444,9 @@ impl Solve<'_> {
             }
             // Two tails that are already the same thing: two closed ones, which
             // is what a row closed from both sides comes to.
-            _ => self.step(span, Rule::Same, goal, Effect::None),
+            _ => {
+                self.step(span, Rule::Same, goal, Effect::None);
+            }
         }
     }
 
@@ -2283,7 +2554,7 @@ impl Solve<'_> {
                     span,
                     Rule::Presence { shape },
                     goal,
-                    Error { span, kind },
+                    Error::new(span, kind),
                     &abandoned,
                 );
                 None
@@ -2321,15 +2592,15 @@ impl Solve<'_> {
         };
         match (lhs, rhs) {
             (Presence::Undecided, _) => {
-                self.step(span, Rule::Absorb, goal, Effect::None);
-                self.recover(span, &Assigned::Presence(rhs.clone()));
+                let absorbing = self.step(span, Rule::Absorb, goal, Effect::None);
+                self.recover(span, &Assigned::Presence(rhs.clone()), absorbing);
             }
             (_, Presence::Undecided) => {
-                self.step(span, Rule::Absorb, goal, Effect::None);
-                self.recover(span, &Assigned::Presence(lhs.clone()));
+                let absorbing = self.step(span, Rule::Absorb, goal, Effect::None);
+                self.recover(span, &Assigned::Presence(lhs.clone()), absorbing);
             }
             (Presence::Var(a), Presence::Var(b)) if a == b => {
-                self.step(span, Rule::Same, goal, Effect::None)
+                self.step(span, Rule::Same, goal, Effect::None);
             }
             (Presence::Var(var), Presence::Var(other))
                 if self.table.abstract_existentials.contains(var)
@@ -2346,19 +2617,27 @@ impl Solve<'_> {
             (Presence::Var(var), other) if self.table.existential_witnesses.contains(var) => {
                 let formula = lhs.formula().iff(other.formula());
                 self.step(span, Rule::Refine, goal, Effect::None);
-                self.table.require(
+                self.table.require_because(
                     span,
-                    Origin::Instance(Named { labels: Vec::new() }),
+                    Origin::Instance(Named {
+                        labels: Vec::new(),
+                        shape: None,
+                    }),
                     formula,
+                    self.constraint_reason,
                 );
             }
             (other, Presence::Var(var)) if self.table.existential_witnesses.contains(var) => {
                 let formula = other.formula().iff(rhs.formula());
                 self.step(span, Rule::Refine, goal, Effect::None);
-                self.table.require(
+                self.table.require_because(
                     span,
-                    Origin::Instance(Named { labels: Vec::new() }),
+                    Origin::Instance(Named {
+                        labels: Vec::new(),
+                        shape: None,
+                    }),
                     formula,
+                    self.constraint_reason,
                 );
             }
             (Presence::Var(var), other) => {
@@ -2369,7 +2648,9 @@ impl Solve<'_> {
                 let (var, other) = (*var, other.clone());
                 self.assign(span, goal, var, Assigned::Presence(other));
             }
-            _ => self.step(span, Rule::Same, goal, Effect::None),
+            _ => {
+                self.step(span, Rule::Same, goal, Effect::None);
+            }
         }
     }
 
@@ -2428,10 +2709,14 @@ impl Solve<'_> {
         let origin = Origin::Guarded(GuardedOrigin {
             premise: premise.clone(),
             obligation: obligation.clone(),
-            origin: Box::new(Origin::Refinement(Named { labels })),
+            origin: Box::new(Origin::Refinement(Named {
+                labels,
+                shape: Some(Shape::Struct),
+            })),
         });
         if !obligation.is_true() {
-            self.table.require(span, origin, formula.clone());
+            self.table
+                .require_because(span, origin, formula.clone(), self.constraint_reason);
         }
         let goal = Goal::Presence {
             expected: lhs,
@@ -2503,8 +2788,8 @@ impl Solve<'_> {
             match tail.var() {
                 Some(var) => self.assign(span, goal, var, value),
                 None => {
-                    self.step(span, Rule::Absorb, goal, Effect::None);
-                    self.recover(span, &value);
+                    let absorbing = self.step(span, Rule::Absorb, goal, Effect::None);
+                    self.recover(span, &value, absorbing);
                 }
             }
             return;
@@ -2523,15 +2808,15 @@ impl Solve<'_> {
             // A label still being decided is not a demand and is not refused:
             // it settles absent below, the one answer the promise leaves open.
             if let (Presence::Present, Some((rigid, id))) = (&presence, &rigid) {
-                let error = Error {
+                let error = Error::new(
                     span,
-                    kind: ErrorKind::RigidField {
+                    ErrorKind::RigidField {
                         shape,
                         field: name.clone(),
                         name: rigid.clone(),
                         declared: self.table.declared(*id),
                     },
-                };
+                );
                 let goal = Goal::Presence {
                     expected: Presence::Absent,
                     actual: presence.clone(),
@@ -2556,7 +2841,7 @@ impl Solve<'_> {
                         base: self.frozen(base),
                         field: name.clone(),
                     };
-                    let error = Error { span, kind };
+                    let error = Error::new(span, kind);
                     let abandoned = [Assigned::Ty(field.ty.clone())];
                     self.fail(span, Rule::Presence { shape }, goal, error, &abandoned);
                 }
@@ -2570,7 +2855,7 @@ impl Solve<'_> {
                         base: self.frozen(base),
                         field: name.clone(),
                     };
-                    let error = Error { span, kind };
+                    let error = Error::new(span, kind);
                     let abandoned = [Assigned::Ty(field.ty.clone())];
                     self.fail(span, Rule::Presence { shape }, goal, error, &abandoned);
                 }
@@ -2623,13 +2908,10 @@ impl Solve<'_> {
     /// decides it: absent is the one answer both sides allow, and it is the
     /// answer [`Solve::absorb`] gives the same label against a closed row.
     fn assign(&mut self, span: Span, goal: Goal, var: TyVar, value: Assigned) {
-        if self.table.occurs(var, &value) {
-            let error = Error {
-                span,
-                kind: ErrorKind::Recursive,
-            };
+        if let Some(route) = self.table.occurs(var, &value) {
+            let error = Error::new(span, ErrorKind::Recursive);
             let abandoned = [value.variable(var), value];
-            self.fail(span, Rule::Occurs, goal, error, &abandoned);
+            self.fail_recursive(span, goal, error, &abandoned, route);
             return;
         }
         // Binding a shared structural variable still installs the ordinary
@@ -2644,25 +2926,41 @@ impl Solve<'_> {
             // fallback is also the ordinary, unguarded assignment path.
             (_, value) => value,
         };
-        if let Some((shape, named)) = self.table.lacked(var, &value) {
+        if let Some(named) = self.table.lacked(var, &value) {
             // One complaint per binding, not per label: a tail that would have
             // to repeat two fields is one thing gone wrong with one row, and
             // naming the first of them is what the reader has to look at
             // either way. Ruled on before anything is settled, so a refusal
             // leaves no binding behind that only this goal wanted.
-            if let Some((field, _)) = named
+            if let Some((lacked, _, introduction)) = named
                 .iter()
-                .find(|(_, presence)| matches!(presence, Presence::Present))
+                .find(|(_, presence, _)| matches!(presence, Presence::Present))
             {
-                let error = Error {
+                let error = Error::new(
                     span,
-                    kind: ErrorKind::RepeatedField {
-                        shape,
-                        field: field.clone(),
+                    ErrorKind::RepeatedField {
+                        shape: lacked.shape,
+                        field: lacked.label.clone(),
+                        introduction: introduction.clone(),
+                        forbidden: lacked.origin.clone(),
                     },
-                };
+                );
+                if let Some(origin) = &lacked.origin {
+                    self.table.note_binding_read(origin.reason);
+                }
+                if let Some(origin) = introduction {
+                    self.table.note_binding_read(origin.reason);
+                }
                 let abandoned = [value.variable(var), value];
-                self.fail(span, Rule::Overlap { shape }, goal, error, &abandoned);
+                self.fail(
+                    span,
+                    Rule::Overlap {
+                        shape: lacked.shape,
+                    },
+                    goal,
+                    error,
+                    &abandoned,
+                );
                 return;
             }
             // No label is certainly there, so the ones still being decided are
@@ -2672,7 +2970,7 @@ impl Solve<'_> {
             // abandoned by a failure that was reported where it happened —
             // and two labels never share a presence variable, so no entry
             // here is a stale reading of another.
-            for (_, presence) in &named {
+            for (_, presence, _) in &named {
                 if matches!(presence, Presence::Var(_)) {
                     self.presences(span, &Presence::Absent, presence);
                 }
@@ -2690,8 +2988,7 @@ impl Solve<'_> {
         // variable stands for is as old as this variable is, so everything
         // inside it belongs no deeper. See [`Table::demote`](super::Table).
         self.table.demote(var, &value);
-        self.table.vars[var as usize] = Slot::Bound(value.clone());
-        self.step(span, Rule::Bind, goal, Effect::Bound { var, value });
+        self.bound_step(span, Rule::Bind, goal, var, value, None);
     }
 
     fn guarded_type(&mut self, span: Span, ty: &Rc<Ty>) -> Rc<Ty> {
@@ -2873,11 +3170,57 @@ impl Solve<'_> {
     /// The error carries its own span rather than taking `span`, because the
     /// two need not be the same.
     fn fail(&mut self, span: Span, rule: Rule, goal: Goal, error: Error, abandoned: &[Assigned]) {
+        self.fail_with_route(span, rule, goal, error, abandoned, None);
+    }
+
+    fn fail_recursive(
+        &mut self,
+        span: Span,
+        goal: Goal,
+        error: Error,
+        abandoned: &[Assigned],
+        route: RecursiveCycleShape,
+    ) {
+        self.fail_with_route(span, Rule::Occurs, goal, error, abandoned, Some(route));
+    }
+
+    fn fail_with_route(
+        &mut self,
+        span: Span,
+        rule: Rule,
+        goal: Goal,
+        mut error: Error,
+        abandoned: &[Assigned],
+        recursive: Option<RecursiveCycleShape>,
+    ) {
         let kind = error.kind.clone();
+        let error_id = self.table.error_id();
+        let step_id = self.table.step_id();
+        error.id = error_id;
+        error.cause = ErrorCause::Step(step_id);
         self.errors.push(error);
-        self.step(span, rule, goal, Effect::Failed(kind));
+        let mut parents = self.table.take_binding_reads();
+        if let Some(parent) = self.constraint_reason
+            && !parents.contains(&parent)
+        {
+            parents.insert(0, parent);
+        }
+        let reason = self.table.reason(ReasonOrigin::Step(step_id), parents);
+        self.steps.push(Step {
+            id: step_id,
+            constraint: self.constraint,
+            reason,
+            error: Some(error_id),
+            definition: self.definition,
+            span,
+            depth: self.depth,
+            rule,
+            goal,
+            recursive,
+            effect: Effect::Failed(kind),
+        });
         for value in abandoned {
-            self.recover(span, value);
+            self.recover(span, value, reason);
         }
     }
 
@@ -2891,40 +3234,59 @@ impl Solve<'_> {
     /// arms that meet something already undecided — an undecided presence or an
     /// undecided tail absorbs whatever it was put against, and everything that
     /// would have decided it is abandoned with it.
-    fn recover(&mut self, span: Span, value: &Assigned) {
+    fn recover(&mut self, span: Span, value: &Assigned, because: ReasonId) {
         match value {
-            Assigned::Ty(ty) => self.recover_ty(span, ty),
-            Assigned::Row(row) => self.recover_row(span, row),
-            Assigned::Presence(presence) => self.recover_presence(span, presence),
+            Assigned::Ty(ty) => self.recover_ty(span, ty, because),
+            Assigned::Row(row) => self.recover_parts(span, None, Some(row.clone()), because),
+            Assigned::Presence(presence) => self.recover_presence(span, presence, because),
         }
     }
 
     /// [`recover`](Self::recover) over a type: its constructor, and then the fields it
     /// carries. A composite is abandoned by abandoning what it is made of —
     /// the goal that would have decided `?1 -> ?2` decided neither half.
-    fn recover_ty(&mut self, span: Span, ty: &Rc<Ty>) {
-        self.recover_parts(span, Some(ty.clone()), None);
+    fn recover_ty(&mut self, span: Span, ty: &Rc<Ty>, because: ReasonId) {
+        self.recover_parts(span, Some(ty.clone()), None, because);
     }
 
     /// [`recover`](Self::recover) over a sum's cases: every label, and then the
     /// tail saying what else the row might have had.
-    fn recover_row(&mut self, span: Span, row: &Row) {
-        self.recover_parts(span, None, Some(row.clone()));
+    fn recover_row(&mut self, span: Span, row: &Row, because: ReasonId) {
+        self.recover_parts(span, None, Some(Rc::new(row.clone())), because);
     }
 
-    /// Iterative recovery for imported semantic trees. A failure can abandon a
-    /// value whose artifact contains 30,000 arrows, names, rows, or field
+    /// Iterative recovery for imported semantic graphs. A failure can abandon
+    /// a value whose artifact contains 30,000 arrows, names, rows, or field
     /// payloads; recovery still has to settle every variable and presence in
     /// it without borrowing the native call stack from the malformed input.
-    fn recover_parts(&mut self, span: Span, ty: Option<Rc<Ty>>, row: Option<Row>) {
+    /// Rc identities and variable identities are visited once. This matters
+    /// for compact artifacts whose two children repeatedly share the same
+    /// node: walking their expanded tree would make failure recovery
+    /// exponential even though the artifact itself is small.
+    fn recover_parts(
+        &mut self,
+        span: Span,
+        ty: Option<Rc<Ty>>,
+        row: Option<Rc<Row>>,
+        because: ReasonId,
+    ) {
         enum Work {
             Type(Rc<Ty>),
-            Row(Row),
-            Presence(Presence),
+            Row(Rc<Row>),
+            Presence(Presence, Option<Rc<Ty>>),
             Rest(Rest),
         }
 
         let mut work = Vec::new();
+        let mut types = HashSet::new();
+        let mut rows = HashSet::new();
+        // Pointer sets are identities only while their allocations remain
+        // alive; retain each visited node so allocator reuse cannot suppress a
+        // later, distinct embedded row.
+        let mut retained_types = Vec::new();
+        let mut retained_rows = Vec::new();
+        let mut variables = HashSet::new();
+        let mut presence_absence = HashMap::new();
         if let Some(row) = row {
             work.push(Work::Row(row));
         }
@@ -2932,66 +3294,171 @@ impl Solve<'_> {
             work.push(Work::Type(ty));
         }
         while let Some(part) = work.pop() {
-            match part {
-                Work::Type(ty) => {
-                    let ty = self.table.resolve(&ty);
-                    match &*ty {
-                        Ty::Var(var) => {
-                            self.settle(span, *var, Assigned::Ty(Rc::new(Ty::Undecided)))
-                        }
-                        Ty::Arrow(from, to, effects) => {
-                            work.push(Work::Row(effects.clone()));
-                            work.push(Work::Type(to.clone()));
-                            work.push(Work::Type(from.clone()));
-                        }
-                        Ty::Package(body) => work.push(Work::Type(body.clone())),
-                        Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(row.clone())),
-                        Ty::Named { args, .. } => {
-                            work.extend(args.iter().rev().cloned().map(Work::Type));
-                        }
-                        Ty::Nat
-                        | Ty::Int
-                        | Ty::Real
-                        | Ty::String
-                        | Ty::Boolean
-                        | Ty::Bound(_)
-                        | Ty::Rigid { .. }
-                        | Ty::Undecided => {}
-                    }
-                }
-                Work::Row(row) => {
-                    let (labels, rest) = self.table.canon(&row).into_parts();
-                    work.push(Work::Rest(rest));
-                    for field in labels.into_values().rev() {
-                        let presence = self.table.presence_of(&field.presence);
-                        if !matches!(presence, Presence::Absent) {
-                            work.push(Work::Type(field.ty));
-                        }
-                        work.push(Work::Presence(presence));
-                    }
-                }
-                Work::Presence(presence) => self.recover_presence(span, &presence),
-                Work::Rest(rest) => {
-                    if let Rest::Var(var) = self.table.canon(&Row::of(rest)).rest {
-                        self.settle(span, var, Assigned::Row(Rc::new(Row::of(Rest::Undecided))));
-                    }
-                }
+            let fresh = match &part {
+                Work::Type(ty) => types.insert(Rc::as_ptr(ty) as usize),
+                Work::Row(row) => rows.insert(Rc::as_ptr(row) as usize),
+                Work::Presence(_, _) | Work::Rest(_) => true,
+            };
+            if !fresh {
+                continue;
             }
+            match &part {
+                Work::Type(ty) => retained_types.push(ty.clone()),
+                Work::Row(row) => retained_rows.push(row.clone()),
+                Work::Presence(_, _) | Work::Rest(_) => {}
+            }
+            // Recovery is a traversal of independent settling rules. A bound
+            // component which needs no settling must not lend its read to the
+            // next component that does.
+            self.table.begin_solver_rule();
+            match part {
+                Work::Type(ty) => match &*ty {
+                    Ty::Var(var) if variables.insert(*var) => match &self.table.vars[*var as usize]
+                    {
+                        Slot::Bound {
+                            value: Assigned::Ty(inner),
+                            by,
+                        } => {
+                            self.table.note_binding_read(*by);
+                            work.push(Work::Type(inner.clone()));
+                        }
+                        Slot::Unbound => {
+                            self.settle(span, *var, Assigned::Ty(Rc::new(Ty::Undecided)), because)
+                        }
+                        Slot::Bound { .. } => {}
+                    },
+                    Ty::Var(_) => {}
+                    Ty::Arrow(from, to, effects) => {
+                        work.push(Work::Row(Rc::new(effects.clone())));
+                        work.push(Work::Type(to.clone()));
+                        work.push(Work::Type(from.clone()));
+                    }
+                    Ty::Package(body) => work.push(Work::Type(body.clone())),
+                    Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(Rc::new(row.clone()))),
+                    Ty::Named { args, .. } => {
+                        work.extend(args.iter().rev().cloned().map(Work::Type));
+                    }
+                    Ty::Nat
+                    | Ty::Int
+                    | Ty::Real
+                    | Ty::String
+                    | Ty::Boolean
+                    | Ty::Bound(_)
+                    | Ty::Rigid { .. }
+                    | Ty::Undecided => {}
+                },
+                Work::Row(row) => {
+                    work.push(Work::Rest(row.rest.clone()));
+                    for field in row.labels.values().rev() {
+                        work.push(Work::Presence(
+                            field.presence.clone(),
+                            Some(field.ty.clone()),
+                        ));
+                    }
+                }
+                Work::Presence(mut presence, payload) => {
+                    let mut chain = Vec::new();
+                    let absent = loop {
+                        match presence {
+                            Presence::Var(var) => {
+                                if let Some(absent) = presence_absence.get(&var) {
+                                    break *absent;
+                                }
+                                if !variables.insert(var) {
+                                    break false;
+                                }
+                                chain.push(var);
+                                match &self.table.vars[var as usize] {
+                                    Slot::Bound {
+                                        value: Assigned::Presence(inner),
+                                        by,
+                                    } => {
+                                        self.table.note_binding_read(*by);
+                                        presence = inner.clone();
+                                    }
+                                    Slot::Unbound => {
+                                        self.settle(
+                                            span,
+                                            var,
+                                            Assigned::Presence(Presence::Undecided),
+                                            because,
+                                        );
+                                        break false;
+                                    }
+                                    Slot::Bound { .. } => break false,
+                                }
+                            }
+                            Presence::Absent => break true,
+                            _ => break false,
+                        }
+                    };
+                    for var in chain {
+                        presence_absence.insert(var, absent);
+                    }
+                    if !absent && let Some(payload) = payload {
+                        work.push(Work::Type(payload));
+                    }
+                }
+                Work::Rest(rest) => match rest {
+                    Rest::More(more) => work.push(Work::Row(more)),
+                    Rest::Var(var) if variables.insert(var) => {
+                        match &self.table.vars[var as usize] {
+                            Slot::Bound {
+                                value: Assigned::Row(inner),
+                                by,
+                            } => {
+                                self.table.note_binding_read(*by);
+                                work.push(Work::Row(inner.clone()));
+                            }
+                            Slot::Unbound => self.settle(
+                                span,
+                                var,
+                                Assigned::Row(Rc::new(Row::of(Rest::Undecided))),
+                                because,
+                            ),
+                            Slot::Bound { .. } => {}
+                        }
+                    }
+                    Rest::Var(_)
+                    | Rest::Closed
+                    | Rest::Bound(_)
+                    | Rest::Rigid { .. }
+                    | Rest::Undecided => {}
+                },
+            }
+            self.table.end_solver_act();
         }
     }
 
     /// [`recover`](Self::recover) over a presence.
-    fn recover_presence(&mut self, span: Span, presence: &Presence) {
-        if let Presence::Var(var) = self.table.presence_of(presence) {
-            self.settle(span, var, Assigned::Presence(Presence::Undecided));
+    fn recover_presence(&mut self, span: Span, presence: &Presence, because: ReasonId) {
+        let mut presence = presence.clone();
+        let mut visited = HashSet::new();
+        while let Presence::Var(var) = presence {
+            if !visited.insert(var) {
+                return;
+            }
+            match &self.table.vars[var as usize] {
+                Slot::Bound {
+                    value: Assigned::Presence(inner),
+                    by,
+                } => {
+                    self.table.note_binding_read(*by);
+                    presence = inner.clone();
+                }
+                Slot::Unbound => {
+                    self.settle(span, var, Assigned::Presence(Presence::Undecided), because);
+                    return;
+                }
+                Slot::Bound { .. } => return,
+            }
         }
     }
 
     /// Bind one abandoned variable, and say so: a reader following the state
     /// would otherwise see a variable acquire a value that no rule they were
     /// shown gave it.
-    fn settle(&mut self, span: Span, var: TyVar, value: Assigned) {
-        self.table.vars[var as usize] = Slot::Bound(value.clone());
+    fn settle(&mut self, span: Span, var: TyVar, value: Assigned, because: ReasonId) {
         let goal = match &value {
             Assigned::Ty(ty) => Goal::Type {
                 expected: Rc::new(Ty::plain(Ty::Var(var))),
@@ -3006,18 +3473,76 @@ impl Solve<'_> {
                 actual: presence.clone(),
             },
         };
-        self.step(span, Rule::Recover, goal, Effect::Bound { var, value });
+        self.bound_step(span, Rule::Recover, goal, var, value, Some(because));
     }
 
-    fn step(&mut self, span: Span, rule: Rule, goal: Goal, effect: Effect) {
+    fn bound_step(
+        &mut self,
+        span: Span,
+        rule: Rule,
+        goal: Goal,
+        var: TyVar,
+        value: Assigned,
+        because: Option<ReasonId>,
+    ) {
+        let id = self.table.step_id();
+        let mut recovery_parents = Vec::new();
+        if let Some(parent) = because {
+            recovery_parents.push(parent);
+        }
+        let recovery = (rule == Rule::Recover)
+            .then(|| self.table.reason(ReasonOrigin::Recovery, recovery_parents));
+        let parents = self
+            .table
+            .binding_parents(var, recovery.or(self.constraint_reason));
+        let reason = self.table.reason(ReasonOrigin::Step(id), parents);
+        self.table.vars[var as usize] = Slot::Bound {
+            value: value.clone(),
+            by: reason,
+        };
         self.steps.push(Step {
+            id,
+            constraint: self.constraint,
+            reason,
+            error: None,
             definition: self.definition,
             span,
             depth: self.depth,
             rule,
             goal,
+            recursive: None,
+            effect: Effect::Bound {
+                var,
+                value,
+                by: reason,
+                because,
+            },
+        });
+    }
+
+    fn step(&mut self, span: Span, rule: Rule, goal: Goal, effect: Effect) -> ReasonId {
+        let id = self.table.step_id();
+        let mut parents = self.table.take_binding_reads();
+        if let Some(parent) = self.constraint_reason
+            && !parents.contains(&parent)
+        {
+            parents.insert(0, parent);
+        }
+        let reason = self.table.reason(ReasonOrigin::Step(id), parents);
+        self.steps.push(Step {
+            id,
+            constraint: self.constraint,
+            reason,
+            error: None,
+            definition: self.definition,
+            span,
+            depth: self.depth,
+            rule,
+            goal,
+            recursive: None,
             effect,
         });
+        reason
     }
 }
 

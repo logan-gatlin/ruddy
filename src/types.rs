@@ -818,9 +818,44 @@ impl Drop for Row {
 /// their symbols and minted ids are. The explicit work list keeps deeply nested
 /// alias arguments and [`Rest::More`] chains off the native stack.
 pub fn same_finite_syntax(left: &Rc<Ty>, right: &Rc<Ty>) -> bool {
+    let mut unlimited = usize::MAX;
+    same_finite_syntax_metered(left, right, &mut unlimited).unwrap_or(false)
+}
+
+/// The bounded form of [`same_finite_syntax`]. Each distinct type or row pair
+/// inspected consumes one unit; `None` means the caller's work allowance was
+/// exhausted before equality was decided.
+pub(crate) fn same_finite_syntax_metered(
+    left: &Rc<Ty>,
+    right: &Rc<Ty>,
+    work_left: &mut usize,
+) -> Option<bool> {
     enum Pair<'a> {
         Ty(&'a Ty, &'a Ty),
         Row(&'a Row, &'a Row),
+    }
+
+    fn charge(work_left: &mut usize) -> Option<()> {
+        *work_left = work_left.checked_sub(1)?;
+        Some(())
+    }
+
+    fn flatten<'a>(
+        mut row: &'a Row,
+        work_left: &mut usize,
+    ) -> Option<(IndexMap<&'a str, &'a RowField>, &'a Rest)> {
+        let mut labels = IndexMap::new();
+        loop {
+            for (name, field) in &row.labels {
+                charge(work_left)?;
+                // This is the same outer-label precedence as solver canon.
+                labels.entry(name.as_str()).or_insert(field);
+            }
+            match &row.rest {
+                Rest::More(more) => row = more,
+                rest => return Some((labels, rest)),
+            }
+        }
     }
 
     fn same_presence(left: &Presence, right: &Presence) -> bool {
@@ -839,6 +874,10 @@ pub fn same_finite_syntax(left: &Rc<Ty>, right: &Rc<Ty>) -> bool {
     let mut seen_types = std::collections::HashSet::new();
     let mut seen_rows = std::collections::HashSet::new();
     while let Some(pair) = pending.pop() {
+        if *work_left == 0 {
+            return None;
+        }
+        *work_left -= 1;
         match pair {
             Pair::Ty(left, right) => {
                 if std::ptr::eq(left, right)
@@ -855,12 +894,12 @@ pub fn same_finite_syntax(left: &Rc<Ty>, right: &Rc<Ty>) -> bool {
                     | (Ty::Undecided, Ty::Undecided) => {}
                     (Ty::Var(left), Ty::Var(right)) | (Ty::Bound(left), Ty::Bound(right)) => {
                         if left != right {
-                            return false;
+                            return Some(false);
                         }
                     }
                     (Ty::Rigid { id: left, .. }, Ty::Rigid { id: right, .. }) => {
                         if left != right {
-                            return false;
+                            return Some(false);
                         }
                     }
                     (
@@ -888,7 +927,7 @@ pub fn same_finite_syntax(left: &Rc<Ty>, right: &Rc<Ty>) -> bool {
                         },
                     ) => {
                         if left_symbol != right_symbol || left_args.len() != right_args.len() {
-                            return false;
+                            return Some(false);
                         }
                         pending.extend(
                             left_args
@@ -897,7 +936,7 @@ pub fn same_finite_syntax(left: &Rc<Ty>, right: &Rc<Ty>) -> bool {
                                 .map(|(left, right)| Pair::Ty(left, right)),
                         );
                     }
-                    _ => return false,
+                    _ => return Some(false),
                 }
             }
             Pair::Row(left, right) => {
@@ -906,44 +945,50 @@ pub fn same_finite_syntax(left: &Rc<Ty>, right: &Rc<Ty>) -> bool {
                 {
                     continue;
                 }
-                if left.labels.len() != right.labels.len() {
-                    return false;
+                let (left_labels, left_rest) = flatten(left, work_left)?;
+                let (right_labels, right_rest) = flatten(right, work_left)?;
+                if left_labels.len() != right_labels.len() {
+                    return Some(false);
                 }
-                for (name, left_field) in &left.labels {
-                    let Some(right_field) = right.labels.get(name) else {
-                        return false;
+                for (name, left_field) in left_labels {
+                    charge(work_left)?;
+                    let Some(right_field) = right_labels.get(name) else {
+                        return Some(false);
                     };
                     if !same_presence(&left_field.presence, &right_field.presence) {
-                        return false;
+                        return Some(false);
                     }
-                    // An absent label has no payload; recovery is free to leave
-                    // any finite type in that semantically unreachable slot.
-                    if !matches!(left_field.presence, Presence::Absent) {
+                    // Present and variable-presence labels carry payloads the
+                    // program can reach — lowering switches on them — so those
+                    // payloads are part of the syntax. Absent, undecided, and
+                    // recovered slots may retain arbitrary recovery types
+                    // which are not.
+                    if matches!(
+                        left_field.presence,
+                        Presence::Present | Presence::Var(_) | Presence::Bound(_)
+                    ) {
                         pending.push(Pair::Ty(&left_field.ty, &right_field.ty));
                     }
                 }
-                match (&left.rest, &right.rest) {
+                match (left_rest, right_rest) {
                     (Rest::Closed, Rest::Closed) | (Rest::Undecided, Rest::Undecided) => {}
                     (Rest::Var(left), Rest::Var(right))
                     | (Rest::Bound(left), Rest::Bound(right)) => {
                         if left != right {
-                            return false;
+                            return Some(false);
                         }
                     }
                     (Rest::Rigid { id: left, .. }, Rest::Rigid { id: right, .. }) => {
                         if left != right {
-                            return false;
+                            return Some(false);
                         }
                     }
-                    (Rest::More(left), Rest::More(right)) => {
-                        pending.push(Pair::Row(left, right));
-                    }
-                    _ => return false,
+                    _ => return Some(false),
                 }
             }
         }
     }
-    true
+    Some(true)
 }
 
 impl Ty {

@@ -23,6 +23,7 @@ mod patterns;
 mod print;
 mod runtime;
 mod sat;
+mod session;
 mod snapshot;
 mod stage;
 mod stdlib;
