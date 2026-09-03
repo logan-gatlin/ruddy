@@ -120,6 +120,9 @@ pub enum RecoveryFact {
         name: QualifiedName,
         reason: String,
     },
+    /// Executable data referred outside its local function table and could not
+    /// safely be given a meaning during dependency recovery.
+    ExecutableDiscarded { reason: String },
 }
 
 /// A complete, serializable bundle artifact.
@@ -162,6 +165,7 @@ impl UncheckedArtifact {
         if self.header.values.iter().any(|value| value.name.is_empty()) {
             return Err(ValidationError::new("artifact value name is empty"));
         }
+        validate_executable_relationships(&self.lir)?;
         // Text decoding is the single semantic translation implementation.
         // Rendering this portable tree and decoding it again deliberately
         // routes hand-built data through the same stack-safe checks as a disk
@@ -208,10 +212,86 @@ impl UncheckedArtifact {
                         facts.push(RecoveryFact::ValueNameReplaced { index, replacement });
                     }
                 }
+                let (lir, executable_facts) = recover_executable(lir);
+                facts.extend(executable_facts);
                 let (artifact, discarded) = recover_parts(header, lir);
                 facts.extend(discarded);
                 (artifact, facts)
             }
+        }
+    }
+}
+
+/// Verify the executable relationships which later consumers rely on without
+/// rechecking a target adapter's own syntax or semantics. The traversal is
+/// iterative because portable blocks can be arbitrarily deeply nested.
+fn validate_executable_relationships(lir: &Lir) -> Result<(), ValidationError> {
+    let function_count = lir.functions.len() as u64;
+    let mut pending: Vec<&Block> = lir
+        .functions
+        .iter()
+        .map(|function| &function.body)
+        .chain(lir.globals.iter().map(|global| &global.body))
+        .collect();
+
+    while let Some(block) = pending.pop() {
+        for instruction in &block.instrs {
+            match &instruction.op {
+                Op::Closure { func, .. }
+                | Op::Call {
+                    callee: Callee::Direct(func),
+                    ..
+                } if *func >= function_count => {
+                    return Err(ValidationError::new(format!(
+                        "artifact function reference {func} is outside its function table"
+                    )));
+                }
+                Op::Catch { body, .. } => pending.push(body),
+                Op::SwitchTag {
+                    cases, fallback, ..
+                } => {
+                    pending.extend(cases.iter().map(|case| &case.block));
+                    pending.extend(fallback.as_deref());
+                }
+                Op::SwitchPrim {
+                    cases, fallback, ..
+                } => {
+                    pending.extend(cases.iter().map(|case| &case.block));
+                    pending.extend(fallback.as_deref());
+                }
+                Op::SwitchPresence {
+                    present, absent, ..
+                } => {
+                    pending.push(present);
+                    pending.push(absent);
+                }
+                Op::SwitchRest { none, some, .. } => {
+                    pending.push(none);
+                    pending.push(some);
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// An invalid local function reference has no target-neutral repair. Keep the
+/// recoverable semantic interface, but remove executable content rather than
+/// publishing an `Artifact` that could make a linker or backend dereference an
+/// invalid table entry.
+fn recover_executable(mut lir: Lir) -> (Lir, Vec<RecoveryFact>) {
+    match validate_executable_relationships(&lir) {
+        Ok(()) => (lir, Vec::new()),
+        Err(error) => {
+            lir.functions.clear();
+            lir.globals.clear();
+            (
+                lir,
+                vec![RecoveryFact::ExecutableDiscarded {
+                    reason: error.to_string(),
+                }],
+            )
         }
     }
 }
@@ -4724,5 +4804,62 @@ mod tests {
         let printed = print(&artifact_with_target("console.log"));
         let old = printed.replace("(target \"console.log\")", "(target \"console\" \"log\")");
         assert_eq!(try_parse(&old).unwrap_err().message(), "bad `target` arity");
+    }
+
+    #[test]
+    fn validation_rejects_out_of_range_function_references() {
+        for op in [
+            Op::Closure {
+                func: 1,
+                captures: Vec::new(),
+            },
+            Op::Call {
+                callee: Callee::Direct(1),
+                args: Vec::new(),
+            },
+        ] {
+            let mut unchecked = artifact_with_target("host.value").to_unchecked();
+            unchecked.lir.globals.push(Global {
+                name: "test@1::value".into(),
+                body: Block {
+                    instrs: vec![Instr {
+                        temp: 0,
+                        rep: Rep::Any,
+                        op,
+                    }],
+                    end: End::Ret(0),
+                },
+            });
+            assert_eq!(
+                unchecked.validate().unwrap_err().message(),
+                "artifact function reference 1 is outside its function table"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_discards_unrepairable_executable_data() {
+        let mut unchecked = artifact_with_target("host.value").to_unchecked();
+        unchecked.lir.globals.push(Global {
+            name: "test@1::value".into(),
+            body: Block {
+                instrs: vec![Instr {
+                    temp: 0,
+                    rep: Rep::Any,
+                    op: Op::Closure {
+                        func: 1,
+                        captures: Vec::new(),
+                    },
+                }],
+                end: End::Ret(0),
+            },
+        });
+        let (recovered, facts) = unchecked.recover();
+        assert!(recovered.lir().functions.is_empty());
+        assert!(recovered.lir().globals.is_empty());
+        assert!(matches!(
+            facts.as_slice(),
+            [RecoveryFact::ExecutableDiscarded { .. }]
+        ));
     }
 }

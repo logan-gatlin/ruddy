@@ -49,7 +49,7 @@ impl ExternPlan {
 
 /// Turn inference-reviewed extern facts into the in-memory lowering plan.
 /// This is infallible: accepted inference has already established ABI facts.
-pub fn plan(semantics: &inference::Semantics) -> ExternPlan {
+pub(crate) fn plan(semantics: &inference::Semantics) -> ExternPlan {
     ExternPlan {
         entries: semantics
             .reviewed_externs()

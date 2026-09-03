@@ -155,12 +155,12 @@ pub struct Semantics {
 /// reinterpret a raw IR declaration to rebuild facts inference already
 /// reviewed.
 #[derive(Debug, Clone)]
-pub struct ReviewedExtern {
-    pub scheme: Scheme,
-    pub abi: ir::ExternType,
-    pub target: String,
-    pub target_span: Span,
-    pub declaration_span: Span,
+pub(crate) struct ReviewedExtern {
+    pub(crate) scheme: Scheme,
+    pub(crate) abi: ir::ExternType,
+    pub(crate) target: String,
+    pub(crate) target_span: Span,
+    pub(crate) declaration_span: Span,
 }
 
 /// The diagnostic account of one inference run: its errors, and — when a
@@ -273,7 +273,12 @@ impl Semantics {
     }
 
     /// The complete reviewed target-neutral facts for each extern.
-    pub fn reviewed_externs(&self) -> &IndexMap<Symbol, ReviewedExtern> {
+    ///
+    /// This is the private hand-off to post-inference planning. Public callers
+    /// consume the resulting [`ExternPlan`](crate::externs::ExternPlan) from
+    /// an [`AcceptedProgram`](crate::compile::AcceptedProgram), rather than
+    /// reinterpreting the reviewed ABI facts themselves.
+    pub(crate) fn reviewed_externs(&self) -> &IndexMap<Symbol, ReviewedExtern> {
         &self.reviewed_externs
     }
 
