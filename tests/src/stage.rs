@@ -1092,6 +1092,20 @@ fn the_artifact_tab_exposes_canonical_text_and_skips_with_errors() {
         .expect("artifact outline includes the effect");
     assert_eq!(effect.children[0].label, "selector");
     assert_eq!(effect.children[0].text, "unnamed");
+    // A parameterized effect lists what each parameter stands for before its
+    // operations.
+    let parameterized = stage(
+        "artifact",
+        "effect State 'r = { get: () -> { x: Nat, ..'r } }\nlet main = fn _ => 0n\n",
+    );
+    let effect = parameterized.nodes[0]
+        .children
+        .iter()
+        .find(|node| node.label == "effect")
+        .expect("artifact outline includes the effect");
+    assert_eq!(effect.children[0].label, "param");
+    assert_eq!(effect.children[0].text, "fields");
+    assert_eq!(effect.children[1].label, "selector");
     let text = unnamed.text.as_deref().expect("canonical artifact text");
     assert!(text.contains("(field-key unnamed-operation)"), "{text}");
     assert!(!text.contains("ruddy:unnamed-operation"), "{text}");

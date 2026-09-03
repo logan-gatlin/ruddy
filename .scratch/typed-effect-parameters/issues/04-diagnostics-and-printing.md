@@ -1,6 +1,6 @@
 # 04 Diagnostics and printing
 
-Status: open
+Status: resolved
 Type: task
 
 Codes, titles, spans, help for arity, kind, lacks, alias-cycle, modifier and inferred-argument

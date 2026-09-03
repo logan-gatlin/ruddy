@@ -3144,6 +3144,12 @@ fn imported_symbol(
     symbol
 }
 
+/// Whether a published type is the empty closed struct: what an effects
+/// argument's arrow goes from and to.
+fn is_unit(ty: &artifact::Type) -> bool {
+    matches!(ty, artifact::Type::Struct(row) if row.labels.is_empty() && matches!(row.rest, artifact::Rest::Closed))
+}
+
 /// A published type read back as the written type it stands for, so that an
 /// imported alias body can be substituted into and spliced exactly as a local
 /// one is. Bound positions become the alias's parameters, named types the
@@ -3282,8 +3288,33 @@ fn imported_syntax(
                     artifact::Type::Struct(payload) => payload
                         .labels
                         .iter()
-                        .map(|(_, arg)| {
-                            imported_syntax(
+                        .map(|(_, arg)| match &arg.ty {
+                            // An effects argument: the row its arrow carries,
+                            // read back as the row of effects it was.
+                            artifact::Type::Arrow(from, to, effects)
+                                if is_unit(from) && is_unit(to) =>
+                            {
+                                let arrow = imported_syntax(
+                                    mint,
+                                    &artifact::Type::Arrow(
+                                        from.clone(),
+                                        to.clone(),
+                                        effects.clone(),
+                                    ),
+                                    params,
+                                    symbols,
+                                    names,
+                                    effect_rows,
+                                    depth + 1,
+                                );
+                                match arrow.tracked {
+                                    TypeKind::Arrow { effects, .. } => {
+                                        span.track(TypeKind::Effects(effects))
+                                    }
+                                    other => span.track(other),
+                                }
+                            }
+                            _ => imported_syntax(
                                 mint,
                                 &arg.ty,
                                 params,
@@ -3291,7 +3322,7 @@ fn imported_syntax(
                                 names,
                                 effect_rows,
                                 depth + 1,
-                            )
+                            ),
                         })
                         .collect(),
                     _ => Vec::new(),
@@ -7441,6 +7472,22 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
             {
                 for (at, arg) in args.iter_mut().enumerate() {
                     let kind = kinds.get(&head).and_then(|kinds| kinds.get(at));
+                    // The empty row is written `|` whichever row it is, and
+                    // the parser reads a bare `|` as the sum with no cases.
+                    // Where a row of effects is asked for, that is the row of
+                    // effects with none — which is what a printed pure
+                    // effects argument reads back as.
+                    if matches!(kind, Some(kind) if kind.row().is_some_and(|(shape, _)| shape == Shape::Effect))
+                        && matches!(&arg.tracked, TypeKind::Sum { cases, tail: None } if cases.is_empty())
+                    {
+                        let span = arg.span;
+                        *arg = span.track(TypeKind::Effects(Box::new(EffectRow {
+                            span,
+                            written: true,
+                            effects: IndexMap::new(),
+                            tail: None,
+                        })));
+                    }
                     let refused = match kind {
                         // A sum's rest and an arrow's effects are both
                         // spliced into a row, so only a row can go there —

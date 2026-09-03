@@ -1,6 +1,6 @@
 # 02 IR effect parameters, arity, kinds and alias expansion
 
-Status: open
+Status: resolved
 Type: task
 
 Effect declarations bind parameters; labels carry arguments; arity errors; kind inference spans

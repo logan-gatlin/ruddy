@@ -1668,7 +1668,8 @@ impl Constrain<'_> {
                     self.table.forbid(&row, shape, lacks);
                     Assigned::Ty(Rc::new(match shape {
                         Shape::Struct => Ty::Struct(row),
-                        Shape::Sum | Shape::Effect => Ty::Sum(row),
+                        Shape::Sum => Ty::Sum(row),
+                        Shape::Effect => Ty::effects_argument(row),
                     }))
                 }
             })

@@ -280,7 +280,9 @@ fn generated_runtime_preserves_arithmetic_switch_record_effect_and_literal_seman
          effect Plus = { apply: Real -> Real }\n\
          effect Times = { apply: Real -> Real }\n\
          let calculate : Real -> Real + !Plus + !Times = fn n => let x = !Plus.apply n in !Times.apply x\n\
-         let calculated = fn n => handle (handle calculate n with | !Plus.apply value => value + 1.0 end) with | !Times.apply value => value * 2.0 end\n",
+         let calculated = fn n => handle (handle calculate n with | !Plus.apply value => value + 1.0 end) with | !Times.apply value => value * 2.0 end\n\
+         effect Ask 'a = { get: () -> 'a }\n\
+         let asked = fn n => handle (let x = !Ask.get () in x + n) with | !Ask.get _ => 1.0 end\n",
     )
     .to_unchecked();
     retag_numeric_global(&mut artifact, "nat_sub", artifact::Rep::Nat);
@@ -301,7 +303,7 @@ fn generated_runtime_preserves_arithmetic_switch_record_effect_and_literal_seman
     );
     fs::write(&path, module).unwrap();
     let probe = format!(
-        "const app = await import({}); const values = [app.nat_sub, app.int_div, Object.is(app.int_negative_zero, -0), Number.isFinite(app.real_div), app.real_literal, app.classify_nat(-0), app.classify_nat(7), app.classify_int(app.int_negative_zero), app.classify_real(0), app.classify_real(-0), app.payload, app.tag_fallback, app.shape({{x: 4}}), app.shape({{x: 4, y: 5}}), app.shape({{y: 5}}), app.merged.left + app.merged.right, app.bump(4), app.read(null), app.calculated(4)]; console.log(JSON.stringify(values));",
+        "const app = await import({}); const values = [app.nat_sub, app.int_div, Object.is(app.int_negative_zero, -0), Number.isFinite(app.real_div), app.real_literal, app.classify_nat(-0), app.classify_nat(7), app.classify_int(app.int_negative_zero), app.classify_real(0), app.classify_real(-0), app.payload, app.tag_fallback, app.shape({{x: 4}}), app.shape({{x: 4, y: 5}}), app.shape({{y: 5}}), app.merged.left + app.merged.right, app.bump(4), app.read(null), app.calculated(4), app.asked(4)]; console.log(JSON.stringify(values));",
         serde_json::to_string(path.to_str().unwrap()).unwrap()
     );
     let output = Command::new("node")
@@ -315,7 +317,7 @@ fn generated_runtime_preserves_arithmetic_switch_record_effect_and_literal_seman
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap().trim(),
-        "[0,-3,true,false,1.5,\"zero\",\"other\",\"zero\",\"positive zero\",\"other\",8,99,1,2,3,3,5,42,10]"
+        "[0,-3,true,false,1.5,\"zero\",\"other\",\"zero\",\"positive zero\",\"other\",8,99,1,2,3,3,5,42,10,5]"
     );
 }
 

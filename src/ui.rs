@@ -2071,7 +2071,15 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                     && let Some(order) = tuple_field_order(row.labels.keys().map(String::as_str))
                 {
                     for insertion in order.into_iter().rev() {
-                        work.push(SemanticJob::Applied(&row.labels[insertion].ty));
+                        let arg = &row.labels[insertion].ty;
+                        match arg.effects_argument_row() {
+                            Some(effects) => {
+                                work.push(SemanticJob::Text(")"));
+                                work.push(SemanticJob::Effects(effects));
+                                work.push(SemanticJob::Text("("));
+                            }
+                            None => work.push(SemanticJob::Applied(arg)),
+                        }
                         work.push(SemanticJob::Text(" "));
                     }
                 }

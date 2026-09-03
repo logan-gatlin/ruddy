@@ -19,8 +19,8 @@ use ruddy::{
 
 use crate::print::{
     Entry, Grouped, Mark, Prec, Shape, label, string, tuple_field_order, write_applied,
-    write_apply, write_arrow, write_binary, write_effects, write_let, write_match, write_project,
-    write_row, write_struct, write_sum, write_tag, write_tuple, write_unary,
+    write_apply, write_arrow, write_binary, write_let, write_match, write_project, write_row,
+    write_struct, write_sum, write_tag, write_tuple, write_unary,
 };
 
 /// Pairs a node with the mint that can name its symbols. Printing an IR node
@@ -118,6 +118,9 @@ impl fmt::Display for Show<'_, Program> {
             }
             first = false;
             write!(f, "effect {}", self.mint.name(*symbol))?;
+            for param in &decl.params {
+                write!(f, " '{}", self.mint.name(param.symbol))?;
+            }
             match &decl.value {
                 Effect::Operations(operations) if operations.is_empty() => {}
                 Effect::Operations(operations) => {
@@ -725,15 +728,27 @@ impl Show<'_, TypeKind> {
         let effects = row
             .effects
             .iter()
-            .map(|(name, label)| match label {
-                EffectLabel::Written { when, .. } => Entry::Written {
-                    name: name.name().to_string(),
-                    mark: mark(when),
-                    holds: (),
-                },
-                EffectLabel::Absent { .. } => Entry::Absent {
-                    name: name.name().to_string(),
-                },
+            .map(|(name, label)| {
+                // The label applied to its arguments, spelled as a type
+                // application is: each argument an atom, anything larger
+                // parenthesized.
+                let mut applied = label_of(Shape::Effect, name.name());
+                for arg in label.args() {
+                    let arg = self.show(arg);
+                    applied.push(' ');
+                    match arg.prec() < Prec::Atom {
+                        true => applied.push_str(&format!("({arg})")),
+                        false => applied.push_str(&arg.to_string()),
+                    }
+                }
+                match label {
+                    EffectLabel::Written { when, .. } => Entry::Written {
+                        name: applied,
+                        mark: mark(when),
+                        holds: (),
+                    },
+                    EffectLabel::Absent { .. } => Entry::Absent { name: applied },
+                }
             })
             .collect();
         let tail = row.tail.as_ref().map(|tail| match &tail.of {
@@ -754,37 +769,46 @@ struct Effects {
     tail: Option<String>,
 }
 
+/// A lowered row, spelled here rather than by [`write_effects`]: each entry's
+/// name is already the whole applied label, sigil and arguments alike, so the
+/// compiler's writer — which puts the sigil in front of a bare name — would
+/// have nothing left to do but get the arguments wrong.
 impl fmt::Display for Effects {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let effects: Vec<Entry<&str, ()>> = self
-            .effects
-            .iter()
-            .map(|entry| match entry {
-                Entry::Written { name, mark, .. } => Entry::Written {
-                    name: name.as_str(),
-                    mark: mark.as_ref().map(clone_mark),
-                    holds: (),
-                },
-                Entry::Absent { name } => Entry::Absent {
-                    name: name.as_str(),
-                },
-            })
-            .collect();
-        write_effects(
-            f,
-            &effects,
-            self.tail.as_ref().map(|tail| tail as &dyn fmt::Display),
-        )
+        let mut first = true;
+        for effect in &self.effects {
+            if !first {
+                f.write_str(" + ")?;
+            }
+            first = false;
+            match effect {
+                Entry::Written { name, mark, .. } => {
+                    f.write_str(name)?;
+                    match mark {
+                        Some(Mark::Undecided) => f.write_str("?")?,
+                        Some(Mark::When(name_of)) => write!(f, " (when {name_of})")?,
+                        None => {}
+                    }
+                }
+                Entry::Absent { name } => write!(f, "\\{name}")?,
+            }
+        }
+        match &self.tail {
+            Some(tail) => {
+                if !first {
+                    f.write_str(" + ")?;
+                }
+                write!(f, "..{tail}")
+            }
+            None if first => f.write_str("|"),
+            None => Ok(()),
+        }
     }
 }
 
-/// One presence mark, copied. [`Mark`] carries no `Clone`, and the alternative
-/// is borrowing a row that has already gone out of scope.
-fn clone_mark(mark: &Mark) -> Mark {
-    match mark {
-        Mark::Undecided => Mark::Undecided,
-        Mark::When(name) => Mark::When(name.clone()),
-    }
+/// One effect label as the compiler spells it: `!Name`, or `Mod::!Name`.
+fn label_of(shape: Shape, name: &str) -> String {
+    label(shape, name)
 }
 
 /// The `when` clause a lowered label wears. `when _` is the anonymous presence,

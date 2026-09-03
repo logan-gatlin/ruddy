@@ -287,3 +287,27 @@ fn imported_effects_and_aliases_behave_like_local_declarations() {
     };
     assert_eq!(codes(&partial), ["effect-arity", "effect-arity"]);
 }
+
+/// A parameter standing for a row is instantiated as a fresh row: a fields
+/// parameter from what an operation's struct carries beyond the fields the
+/// declaration names, and an effects parameter from what a callback may
+/// perform.
+#[test]
+fn row_parameters_are_inferred_from_their_uses() {
+    let source = "effect Log = { write: Nat -> () }\n\
+                  effect State 'r = { get: () -> { x: Nat, ..'r }, put: { x: Nat, ..'r } -> () }\n\
+                  effect Run 'e = { run: (() -> () + ..'e) -> () }\n\
+                  let read = fn _ => (!State.get ()).x\n\
+                  let write = fn _ => !State.put { x: 1n, y: 2n }\n\
+                  let both = fn _ => let s = !State.get () in !State.put s\n\
+                  let run = fn _ => !Run.run (fn _ => !Log.write 1n)\n\
+                  let pure = fn _ => !Run.run (fn _ => ())";
+    let accepted = accepted(source);
+    assert_eq!(scheme(&accepted, "read"), "'a -> Nat + !State { ..'b }");
+    assert_eq!(scheme(&accepted, "write"), "'a -> () + !State { y: Nat }");
+    assert_eq!(scheme(&accepted, "both"), "'a -> () + !State { ..'b }");
+    // A callback's row that links nothing else is closed, as any lone effect
+    // row is.
+    assert_eq!(scheme(&accepted, "run"), "'a -> () + !Run (!Log)");
+    assert_eq!(scheme(&accepted, "pure"), "'a -> () + !Run (|)");
+}

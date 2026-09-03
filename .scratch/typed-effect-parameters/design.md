@@ -32,7 +32,7 @@ follows so every phase agrees.
   expands to nothing. A negative or conditional application of an alias whose expansion keeps an
   open tail is `ModifiedOpenAlias { name }`; otherwise the modifier distributes to every label.
 - Kinds: `kinds` runs over type declarations and effect declarations (operation signatures and
-  alias bodies) in one fixpoint. Effect label arguments feed the same facts a type application
+  each alias's `expanded` row over its own parameters) in one fixpoint. Effect label arguments feed the same facts a type application
   does (`Hands` for a bare parameter, `Tails` + descent otherwise). It runs twice: once before
   structural identities exist (lacks keyed by pending symbols, only senses used) and once after
   (final kinds, lacks and mixed-parameter errors).
@@ -41,9 +41,10 @@ follows so every phase agrees.
 - Operation signatures may mention declared parameters anywhere (`'a` as a type, `..'r` as a
   field/case/effect tail). Anonymous tails, holes, `when`, undeclared variables and an outer
   effect row remain refused as before.
-- Structural identity: the canonical interface node gains `arity`, one `param:{i}:{sense}` edge
-  per parameter, and operations whose parameter references are `param:{i}` atoms; effect label
-  arguments become `arg:{i}` edges beside the label's interface. Row keys stay
+- Structural identity: the canonical interface node gains an `arity` edge and one `param:{i}`
+  edge per parameter (to an atom naming its sense); operation types are built over `param:{i}`
+  atoms for the parameter positions; effect label arguments become `arg:{i}` edges beside the
+  label's identity and payload. Imported identities keep their published interface text. Row keys stay
   `EffectId::row_key()` (name + interface), so applications of one constructor share a label.
 - `Program::effect_params: IndexMap<Symbol, Vec<ParamKind>>` carries every effect's ordered kinds
   (local and imported) for inference and export.
@@ -52,8 +53,12 @@ follows so every phase agrees.
 
 - A row label's payload (`RowField::ty`) is the ordered argument tuple: `Ty::Struct` with
   positional labels `"0"`, `"1"`, … (`Ty::unit()` for a zero-arity effect, as today). Type
-  arguments are plain types; fields arguments are `Ty::Struct(row)`; cases and effects arguments
-  are `Ty::Sum(row)` (the same encoding a declaration's row argument already uses).
+  arguments are plain types; fields arguments are `Ty::Struct(row)`; cases arguments are
+  `Ty::Sum(row)`; effects arguments are `Ty::effects_argument(row)`, an arrow from unit to unit
+  carrying the row, so that two of them unify as effect rows, carry lacks in effect nouns, and
+  print as a row of effects. The empty effects argument prints as `(|)`, which the parser reads
+  as the empty sum; the IR's argument check turns an empty closed sum at an effects-kinded
+  parameter into the empty effects row.
 - Operations are stored generically (`Ty::Bound(i)` / `Rest::Bound(i)`). An operation reference
   mints fresh arguments per parameter kind (type variable, or a fresh row variable wrapped in
   `Ty::Struct`/`Ty::Sum`), opens `from`/`to` with them, notes lacks, and puts the tuple in the
@@ -70,11 +75,23 @@ follows so every phase agrees.
 - `DeclaredEffect { name, params: Vec<Parameter>, identity: Option<EffectIdentity>, kind }`.
 - `EffectKind::Operations(Vec<Operation>)` with generic `from`/`to`, or
   `EffectKind::Alias(AliasRow { cases: Vec<AliasCase { name, args: Vec<Type> }>, tail: Option<u32> })`.
-- Text: `(effect "q" (params (param …)…) (identity …) (operations …|alias (cases (case "q" (args <ty>…))…) (tail closed|<n>)))`.
-- Reader validates arity of arguments against the named effect's parameter count when the effect is
-  in the same artifact, bound positions, tail index, and alias cycles.
+- Text: `(effect "q" (params (param …)…) (identity …) (operations …))` or
+  `(effect "q" (params …) (identity none) (alias (cases (case "q" <ty>…)…) (tail none|<n>)))`.
+- Reader validates bound positions in operation signatures and alias arguments against the
+  effect's parameter count, the tail index, alias arities against effects of the same artifact,
+  and alias rings. Recovery drops a declaration that fails on its own.
+- Inference publishes each alias's row semantically (`Semantics::effect_aliases`) for export.
 - Import translates alias bodies back to syntactic `ir::Type` arguments (`imported_syntax`) so
   expansion is one implementation; operations import as generic semantic types.
+
+## Alias lowering
+
+- Alias bodies are lowered on first use (`Builder::alias_body`), in the alias's own module with its
+  parameters in scope, so an operation signature above an alias may apply it. Every alias is
+  forced after the effect declarations and expanded over its own parameters into
+  `Alias::expanded`, the row the parameter fixpoint and the argument checks read.
+- Cycles are detected on the expansion stack; the alias met again is reported (locally) or
+  silently emptied (imported) and stands for nothing from then on.
 
 ## Erasure
 

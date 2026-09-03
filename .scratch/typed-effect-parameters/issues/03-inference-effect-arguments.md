@@ -1,6 +1,6 @@
 # 03 Inference over effect arguments
 
-Status: open
+Status: resolved
 Type: task
 
 Argument tuples as label payloads; fresh instantiation at operation references and handlers;

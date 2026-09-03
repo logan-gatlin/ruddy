@@ -11532,7 +11532,17 @@ fn effect_row(
         let args: Vec<Assigned> = label
             .args()
             .iter()
-            .map(|arg| Assigned::Ty(lower_scoped(mint, table, tails, arg, boundaries)))
+            .map(|arg| {
+                Assigned::Ty(match &arg.tracked {
+                    // A row of effects written as an argument travels as an
+                    // effects argument, not as the sum a declaration's row
+                    // argument lowers to: see [`Ty::effects_argument`].
+                    TypeKind::Effects(row) => Rc::new(Ty::effects_argument(effect_row(
+                        mint, table, tails, row, boundaries,
+                    ))),
+                    _ => lower_scoped(mint, table, tails, arg, boundaries),
+                })
+            })
             .collect();
         let ty = constrain::effect_arguments(&args);
         let lowered = match label {

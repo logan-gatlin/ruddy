@@ -1,6 +1,6 @@
 # 06 Runtime erasure, debugger and grammar
 
-Status: open
+Status: resolved
 Type: task
 
 One compile-to-JavaScript execution test performing and handling a parameterized effect;

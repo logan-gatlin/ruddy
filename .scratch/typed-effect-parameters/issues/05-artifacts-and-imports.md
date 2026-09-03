@@ -1,6 +1,6 @@
 # 05 Artifact schema and dependency imports
 
-Status: open
+Status: resolved
 Type: task
 
 Breaking artifact schema with ordered effect parameters, generic interfaces and unexpanded alias
