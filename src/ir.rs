@@ -49,17 +49,45 @@ pub struct Program {
 /// stands for itself alone.
 #[derive(Debug, Clone)]
 pub enum Effect {
-    /// An unnamed singleton or named interface, keyed by selector in source
-    /// order. Empty for the empty effect, `effect Nil`,
-    /// which declares nothing.
+    /// The operations the effect declares, in the order written.
     Operations(IndexMap<OperationSelector, Operation>),
-    /// `effect Console = !Log + !IO` — the effects this name stands for.
-    ///
-    /// Kept as it was written, though nothing downstream reads an alias: a row
-    /// naming one is expanded to its labels at lowering, so no alias survives
-    /// into the semantic type language and a printed type shows the effects
-    /// rather than the name. See [`Builder::expansions`].
-    Alias(IndexMap<String, Named>),
+    /// A way of writing a row rather than an effect of its own. See [`Alias`].
+    Alias(Alias),
+}
+
+/// What an alias stands for, as written and as it comes to.
+///
+/// An alias is a checked way of writing a row: it applies effects to its own
+/// parameters and may end in one of them, and every row that names it gets
+/// the effects it names with the arguments substituted. Nothing is performed
+/// through one and no row is keyed by one.
+#[derive(Debug, Clone)]
+pub struct Alias {
+    /// The row as the declaration wrote it: applications, alias or concrete,
+    /// and at most one tail naming a parameter.
+    pub body: AliasBody,
+    /// The row it comes to with its own parameters as the arguments: every
+    /// alias it names expanded, so every label is a concrete effect. What the
+    /// parameter fixpoint and the argument checks read, since it says of the
+    /// parameters exactly what a use of the alias says of the arguments.
+    /// Always a [`TypeKind::Effects`].
+    pub expanded: Type,
+}
+
+/// An alias body: the applications it names and the tail it ends in.
+#[derive(Debug, Clone, Default)]
+pub struct AliasBody {
+    pub span: Span,
+    pub cases: Vec<AliasCase>,
+    pub tail: Option<Tail>,
+}
+
+/// One application an alias body names: `!Ask 'a`, or `Sys::!Log`.
+#[derive(Debug, Clone)]
+pub struct AliasCase {
+    pub name_span: Span,
+    pub symbol: Symbol,
+    pub args: Vec<Type>,
 }
 
 /// One operation of an effect: the plain closed arrow performing it has.
@@ -1392,6 +1420,25 @@ pub enum ErrorKind {
         expected: usize,
         found: usize,
     },
+    /// A ring of aliases each standing for the next. Every one is refused,
+    /// since expanding it would never end; `growing` says the ring adds to the
+    /// row on the way round rather than only handing it on, which is a
+    /// different mistake to look for.
+    AliasCycle {
+        name: String,
+        growing: bool,
+    },
+    /// An alias written absent or under a `when` whose expansion keeps an open
+    /// tail: the modifier distributes to every effect the alias stands for,
+    /// and a tail nobody has named yet is not one of them.
+    ModifiedOpenAlias {
+        name: String,
+    },
+    /// A row given two tails: one it wrote, and one an alias it names brought
+    /// with it.
+    TwoTails {
+        previous: Span,
+    },
     /// Something that is not a declared type, applied: a primitive, a struct,
     /// a parenthesized arrow.
     NotAConstructor,
@@ -1830,6 +1877,23 @@ struct Builder<'a> {
     /// wrote: a repeated name binds nothing, so there is nothing in the body
     /// that could name the argument it would ask for.
     arities: HashMap<Symbol, usize>,
+    /// Alias declarations not yet lowered, by symbol. An alias body is read
+    /// the first time anything names it — which may be another declaration
+    /// above it — so the bodies are kept as written until then. See
+    /// [`Builder::alias_body`].
+    pending_aliases: HashMap<Symbol, PendingAlias>,
+    /// Every alias body lowered so far, local or imported.
+    alias_bodies: HashMap<Symbol, AliasBody>,
+    /// The aliases being expanded, innermost last: an alias met again while it
+    /// is on this stack is a cycle.
+    expanding: Vec<Symbol>,
+    /// The aliases a cycle was reported at, which expand to nothing from then
+    /// on so the one complaint stands alone.
+    cyclic: HashSet<Symbol>,
+    /// The aliases a dependency declared. A cycle through these is the
+    /// dependency's mistake, recovered silently rather than reported at a
+    /// declaration the reader cannot see.
+    imported_aliases: HashSet<Symbol>,
     /// The parameters of the declaration being lowered, by the name they were
     /// written under, with the symbol each was minted as and where it sits in
     /// the list. Empty outside a `type` body, which is what makes a parameter
@@ -1873,6 +1937,21 @@ struct Builder<'a> {
 /// written in, depth-first through the modules, so a repeat is still reported
 /// against the first and the reports come in the order a reader would meet
 /// them.
+/// An alias declaration as written, waiting to be lowered on first use.
+struct PendingAlias {
+    module: Option<Module>,
+    params: Vec<Param>,
+    row: parse::EffectRow,
+}
+
+/// What an alias application comes to: the labels it stands for, each a
+/// concrete effect applied to substituted arguments, and the tail it ends in.
+#[derive(Default)]
+struct Expansion {
+    labels: Vec<EffectLabel>,
+    tail: Option<Tail>,
+}
+
 #[derive(Default)]
 struct Flat {
     types: Vec<(Option<Module>, TrackedString, Vec<TrackedString>, Annotated)>,
@@ -2459,6 +2538,11 @@ fn build_with_dependency_imports_inner(
         operations: HashMap::new(),
         answering: Answering::Nowhere,
         arities: HashMap::new(),
+        pending_aliases: HashMap::new(),
+        alias_bodies: HashMap::new(),
+        expanding: Vec::new(),
+        cyclic: HashSet::new(),
+        imported_aliases: HashSet::new(),
         params: HashMap::new(),
         vars: IndexMap::new(),
         rigids: 0,
@@ -2537,12 +2621,39 @@ fn build_with_dependency_imports_inner(
             (symbol, params)
         })
         .collect();
+    let mut aliases = Vec::new();
     for ((symbol, params), (module, name, _, cases)) in named.into_iter().zip(flat.effects) {
         b.module = module;
-        // In scope for the length of the body, the way a type's are.
-        b.scope_params(&params);
-        let value = b.effect(cases);
-        b.params.clear();
+        let value = match cases {
+            // An alias body is read when something first names it, which
+            // may be an operation signature above it. Its declaration takes
+            // its place in the table now, so the table keeps the order the
+            // effects were written in, and is filled in below.
+            parse::EffectBody::Alias(row) => {
+                if let Some(symbol) = symbol {
+                    b.pending_aliases.insert(
+                        symbol,
+                        PendingAlias {
+                            module,
+                            params: params.clone(),
+                            row,
+                        },
+                    );
+                    aliases.push(symbol);
+                }
+                Effect::Alias(Alias {
+                    body: AliasBody::default(),
+                    expanded: name.span.track(TypeKind::Error),
+                })
+            }
+            cases => {
+                // In scope for the length of the body, the way a type's are.
+                b.scope_params(&params);
+                let value = b.effect(cases);
+                b.params.clear();
+                value
+            }
+        };
         if let Some(symbol) = symbol {
             program.effects.insert(
                 symbol,
@@ -2555,10 +2666,18 @@ fn build_with_dependency_imports_inner(
             );
         }
     }
+    // Every alias body, lowered if nothing has asked for it yet, and expanded
+    // over its own parameters: what the alias says of them is what any use
+    // says of the arguments, so that is the row its parameters are read off.
+    for symbol in aliases {
+        let params = program.effects[&symbol].params.clone();
+        let value = b.declared_alias(symbol, &params);
+        program.effects[&symbol].value = Effect::Alias(value);
+    }
     // What each effect name stands for, once every declaration is in: itself,
     // or — for an alias — the effects it names, through however many aliases it
     // takes to reach them.
-    b.expanded = expansions(b.mint, &program.effects, &b.expanded);
+    b.expanded = expansions(b.mint, &program.effects, &b.expanded, &b.cyclic);
     b.operations.extend(
         program
             .effects
@@ -3660,13 +3779,22 @@ fn structuralize_effects(
                     rekey_type(&mut operation.to, &ids, errors);
                 }
             }
-            Effect::Alias(named) => {
+            Effect::Alias(alias) => {
+                // The row an alias comes to is keyed like any other, but two
+                // of its labels meeting at one identity is the overlap
+                // reported below, at the case that brought the second.
+                rekey_type(&mut alias.expanded, &ids, &mut Vec::new());
+                for case in &mut alias.body.cases {
+                    for arg in &mut case.args {
+                        rekey_type(arg, &ids, errors);
+                    }
+                }
                 // Diagnose overlap after closing aliases transitively. Each
                 // written case gets its own expansion, so two differently
                 // named aliases that reach the same structural effect are not
                 // silently collapsed by the expansion map.
                 let mut seen: HashMap<EffectId, Span> = HashMap::new();
-                for item in named.values() {
+                for item in &alias.body.cases {
                     let mut duplicate = None;
                     for concrete in expansions
                         .get(&item.symbol)
@@ -5091,13 +5219,14 @@ impl<'a> EffectCanonicalizer<'a> {
                                     }),
                                 );
                             }
-                            Some((_, Effect::Alias(named))) => {
-                                work.push(CanonicalWork::FinishAlias(symbol, name, named.len()));
+                            Some((_, Effect::Alias(alias))) => {
+                                let cases = &alias.body.cases;
+                                work.push(CanonicalWork::FinishAlias(symbol, name, cases.len()));
                                 work.extend(
-                                    named
-                                        .values()
+                                    cases
+                                        .iter()
                                         .rev()
-                                        .map(|named| CanonicalWork::Effect(named.symbol)),
+                                        .map(|case| CanonicalWork::Effect(case.symbol)),
                                 );
                             }
                             None => {
@@ -5424,6 +5553,7 @@ fn expansions(
     mint: &Mint,
     effects: &IndexMap<Symbol, Decl<Effect>>,
     imported: &HashMap<Symbol, IndexMap<String, Symbol>>,
+    cyclic: &HashSet<Symbol>,
 ) -> HashMap<Symbol, IndexMap<String, Symbol>> {
     // A declaration with operations is the effect itself, whatever it declares
     // — including the empty one, which declares nothing and is still an effect
@@ -5441,12 +5571,16 @@ fn expansions(
     loop {
         let mut grew = false;
         for (symbol, decl) in effects {
-            let Effect::Alias(cases) = &decl.value else {
+            let Effect::Alias(alias) = &decl.value else {
                 continue;
             };
+            // An alias a cycle was reported at stands for nothing.
+            if cyclic.contains(symbol) {
+                continue;
+            }
             let mut found: IndexMap<String, Symbol> = IndexMap::new();
-            for named in cases.values() {
-                for (name, reached) in out.get(&named.symbol).into_iter().flatten() {
+            for case in &alias.body.cases {
+                for (name, reached) in out.get(&case.symbol).into_iter().flatten() {
                     found.insert(name.clone(), *reached);
                 }
             }
@@ -6671,7 +6805,7 @@ fn kinds(
                     .values()
                     .flat_map(|operation| [&operation.from, &operation.to])
                     .collect(),
-                Effect::Alias(_) => Vec::new(),
+                Effect::Alias(alias) => vec![&alias.expanded],
             };
             (*symbol, decl.params.as_slice(), bodies)
         }))
@@ -7172,11 +7306,14 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
             .filter(|param| param.kind.row().is_some())
             .map(|param| (param.symbol, param.kind.sense()))
             .collect();
-        if let Effect::Operations(operations) = &mut decl.value {
-            for operation in operations.values_mut() {
-                walk(&mut operation.from, kinds, &carries, &rows, &mut out);
-                walk(&mut operation.to, kinds, &carries, &rows, &mut out);
+        match &mut decl.value {
+            Effect::Operations(operations) => {
+                for operation in operations.values_mut() {
+                    walk(&mut operation.from, kinds, &carries, &rows, &mut out);
+                    walk(&mut operation.to, kinds, &carries, &rows, &mut out);
+                }
             }
+            Effect::Alias(alias) => walk(&mut alias.expanded, kinds, &carries, &rows, &mut out),
         }
     }
     out
@@ -8517,20 +8654,33 @@ impl Builder<'_> {
                         }
                     }
                     artifact::EffectKind::Alias(names) => {
-                        let expansion = names
-                            .iter()
-                            .map(|name| {
-                                let target = imported_symbol(
-                                    self.mint,
-                                    Namespace::Effects,
-                                    name,
-                                    &mut symbols,
-                                    &mut program.external_names,
-                                );
-                                (name.clone(), target)
-                            })
-                            .collect();
+                        let mut cases = Vec::new();
+                        let mut expansion = IndexMap::new();
+                        for name in names {
+                            let target = imported_symbol(
+                                self.mint,
+                                Namespace::Effects,
+                                name,
+                                &mut symbols,
+                                &mut program.external_names,
+                            );
+                            expansion.insert(name.clone(), target);
+                            cases.push(AliasCase {
+                                name_span: Span::default(),
+                                symbol: target,
+                                args: Vec::new(),
+                            });
+                        }
                         self.expanded.insert(symbol, expansion);
+                        self.imported_aliases.insert(symbol);
+                        self.alias_bodies.insert(
+                            symbol,
+                            AliasBody {
+                                span: Span::default(),
+                                cases,
+                                tail: None,
+                            },
+                        );
                     }
                 }
             }
@@ -8836,35 +8986,11 @@ impl Builder<'_> {
     fn effect(&mut self, body: EffectBody) -> Effect {
         match body {
             parse::EffectBody::Empty => Effect::Operations(IndexMap::new()),
-            parse::EffectBody::Alias(cases) => {
-                let mut names: IndexMap<String, Named> = IndexMap::new();
-                for name in cases.effects.into_keys() {
-                    let at = name.span();
-                    let Some(symbol) = self.resolve(&name, Namespace::Effects) else {
-                        continue;
-                    };
-                    let label = effect_key(self.mint, symbol);
-                    if let Some(previous) = names.get(&label) {
-                        self.error(
-                            at,
-                            ErrorKind::DuplicateCase {
-                                shape: Shape::Effect,
-                                name: label,
-                                previous: previous.name_span,
-                            },
-                        );
-                        continue;
-                    }
-                    names.insert(
-                        label,
-                        Named {
-                            name_span: at,
-                            symbol,
-                        },
-                    );
-                }
-                Effect::Alias(names)
-            }
+            // Alias bodies are lowered when first named; see [`build`].
+            parse::EffectBody::Alias(row) => Effect::Alias(Alias {
+                body: AliasBody::default(),
+                expanded: row.span.track(TypeKind::Error),
+            }),
             parse::EffectBody::Unnamed { signature } => {
                 let span = signature.span;
                 let selector = OperationSelector::Unnamed;
@@ -8890,6 +9016,458 @@ impl Builder<'_> {
                 }
                 Effect::Operations(operations)
             }
+        }
+    }
+
+    /// Whether a name resolved in the effect namespace is an alias — local,
+    /// lowered or not yet, or imported.
+    fn is_alias(&self, symbol: Symbol) -> bool {
+        self.pending_aliases.contains_key(&symbol) || self.alias_bodies.contains_key(&symbol)
+    }
+
+    /// One alias body, lowered the first time it is asked for.
+    ///
+    /// Lowered in the alias's own module with its own parameters in scope,
+    /// whatever was being lowered when it was named, and put back exactly as
+    /// found. A body asked for while it is itself being lowered — an alias
+    /// naming itself through an argument's row — is the empty one: the cycle
+    /// is [`expand_alias`](Self::expand_alias)'s to report.
+    fn alias_body(&mut self, symbol: Symbol) -> AliasBody {
+        if let Some(body) = self.alias_bodies.get(&symbol) {
+            return body.clone();
+        }
+        let Some(pending) = self.pending_aliases.remove(&symbol) else {
+            return AliasBody::default();
+        };
+        let module = std::mem::replace(&mut self.module, pending.module);
+        let params = std::mem::take(&mut self.params);
+        let vars = std::mem::take(&mut self.vars);
+        self.scope_params(&pending.params);
+        let body = self.alias_row(pending.row);
+        self.module = module;
+        self.params = params;
+        self.vars = vars;
+        self.alias_bodies.insert(symbol, body.clone());
+        body
+    }
+
+    /// Lower the row an alias declaration wrote: each application resolved,
+    /// counted and its arguments lowered, each effect named once, and a tail
+    /// that names one of the declaration's parameters.
+    fn alias_row(&mut self, row: parse::EffectRow) -> AliasBody {
+        let mut cases: Vec<AliasCase> = Vec::new();
+        for (name, label) in row.effects {
+            let at = name.span();
+            let Some(symbol) = self.resolve(&name, Namespace::Effects) else {
+                continue;
+            };
+            let args = match label {
+                parse::EffectLabel::Written { args, .. } | parse::EffectLabel::Absent { args } => {
+                    args
+                }
+            };
+            let expected = self.arity(symbol);
+            if args.len() != expected {
+                self.error(
+                    at,
+                    ErrorKind::EffectArity {
+                        name: self.mint.name(symbol).to_string(),
+                        expected,
+                        found: args.len(),
+                    },
+                );
+                continue;
+            }
+            if let Some(previous) = cases.iter().find(|case| case.symbol == symbol) {
+                self.error(
+                    at,
+                    ErrorKind::DuplicateCase {
+                        shape: Shape::Effect,
+                        name: effect_key(self.mint, symbol),
+                        previous: previous.name_span,
+                    },
+                );
+                continue;
+            }
+            let args = args
+                .into_iter()
+                .map(|arg| self.argument(arg, Place::Declaration))
+                .collect();
+            cases.push(AliasCase {
+                name_span: at,
+                symbol,
+                args,
+            });
+        }
+        let tail = self
+            .tail(row.tail, Place::Declaration, Shape::Effect)
+            .unwrap_or_default();
+        AliasBody {
+            span: row.span,
+            cases,
+            tail,
+        }
+    }
+
+    /// An alias declaration's value: its body, and the row it comes to over
+    /// its own parameters.
+    fn declared_alias(&mut self, symbol: Symbol, params: &[Param]) -> Alias {
+        let args: Vec<Type> = params
+            .iter()
+            .enumerate()
+            .map(|(index, param)| {
+                param.span.track(TypeKind::Param {
+                    symbol: param.symbol,
+                    index: index as u32,
+                })
+            })
+            .collect();
+        let body = self.alias_body(symbol);
+        let at = body.span;
+        let expansion = self.expand_alias(symbol, &args, at);
+        let mut effects: IndexMap<EffectId, EffectLabel> = IndexMap::new();
+        for label in expansion.labels {
+            effects
+                .entry(EffectId::pending(label.symbol()))
+                .or_insert(label);
+        }
+        let expanded = at.track(TypeKind::Effects(Box::new(EffectRow {
+            span: at,
+            written: true,
+            effects,
+            tail: expansion.tail,
+        })));
+        Alias { body, expanded }
+    }
+
+    /// What one application of an effect stands for.
+    ///
+    /// A concrete effect stands for itself, applied as written. An alias
+    /// stands for the effects its body names with the arguments substituted
+    /// for its parameters, each expanded in turn, and for the row its tail's
+    /// argument writes. An alias met again while it is being expanded is a
+    /// cycle: reported once, at its declaration, after which it stands for
+    /// nothing — the row that named it still stands for whatever else it
+    /// named.
+    fn expand_alias(&mut self, symbol: Symbol, args: &[Type], at: Span) -> Expansion {
+        if !self.is_alias(symbol) {
+            return Expansion {
+                labels: vec![EffectLabel::Written {
+                    name_span: at,
+                    symbol,
+                    args: args.to_vec(),
+                    expanded: false,
+                    when: None,
+                }],
+                tail: None,
+            };
+        }
+        if self.cyclic.contains(&symbol) {
+            return Expansion::default();
+        }
+        if let Some(start) = self.expanding.iter().position(|open| *open == symbol) {
+            // A ring is a forwarding one when every alias on it does nothing
+            // but hand its parameters to the next: a body of one application
+            // whose arguments are all bare parameters, with no tail. Anything
+            // else adds to the row every time round.
+            let growing = !self.expanding[start..].iter().all(|open| {
+                self.alias_bodies.get(open).is_some_and(|body| {
+                    body.tail.is_none()
+                        && matches!(body.cases.as_slice(), [case] if case
+                            .args
+                            .iter()
+                            .all(|arg| matches!(arg.tracked, TypeKind::Param { .. })))
+                })
+            });
+            if !self.imported_aliases.contains(&symbol) {
+                let name = self.mint.name(symbol).to_string();
+                self.error(at, ErrorKind::AliasCycle { name, growing });
+            }
+            self.cyclic.insert(symbol);
+            return Expansion::default();
+        }
+        self.expanding.push(symbol);
+        let body = self.alias_body(symbol);
+        let mut expansion = Expansion::default();
+        for case in &body.cases {
+            let case_args: Vec<Type> = case
+                .args
+                .iter()
+                .map(|arg| self.substituted(arg, args))
+                .collect();
+            let inner = self.expand_alias(case.symbol, &case_args, at);
+            for mut label in inner.labels {
+                let (EffectLabel::Written { expanded, .. } | EffectLabel::Absent { expanded, .. }) =
+                    &mut label;
+                *expanded = true;
+                expansion.labels.push(label);
+            }
+            if let Some(tail) = inner.tail {
+                self.adopt_tail(&mut expansion.tail, tail);
+            }
+        }
+        if let Some(Tail {
+            span,
+            of: Row::Param { index, .. },
+        }) = &body.tail
+        {
+            match args.get(*index as usize).map(|arg| &arg.tracked) {
+                Some(TypeKind::Effects(row)) => {
+                    expansion.labels.extend(row.effects.values().cloned());
+                    if let Some(tail) = row.tail.clone() {
+                        self.adopt_tail(&mut expansion.tail, tail);
+                    }
+                }
+                Some(TypeKind::Param {
+                    symbol: param,
+                    index: outer,
+                }) => {
+                    let tail = Tail {
+                        span: *span,
+                        of: Row::Param {
+                            symbol: *param,
+                            index: *outer,
+                        },
+                    };
+                    self.adopt_tail(&mut expansion.tail, tail);
+                }
+                Some(TypeKind::Error) | None => {}
+                Some(_) => {
+                    let span = args[*index as usize].span;
+                    self.error(
+                        span,
+                        ErrorKind::NotARow {
+                            sense: Sense::Effects,
+                        },
+                    );
+                }
+            }
+        }
+        self.expanding.pop();
+        expansion
+    }
+
+    /// Give a row the tail an expansion brought, or refuse the second one.
+    fn adopt_tail(&mut self, into: &mut Option<Tail>, tail: Tail) {
+        match into {
+            Some(previous) => {
+                let previous = previous.span;
+                self.error(tail.span, ErrorKind::TwoTails { previous });
+            }
+            None => *into = Some(tail),
+        }
+    }
+
+    /// One alias's written type with the alias's parameters replaced by the
+    /// arguments it was applied to. A parameter standing in a row's tail is
+    /// spliced: the argument's own labels join the row, and its tail becomes
+    /// the row's.
+    fn substituted(&mut self, ty: &Type, args: &[Type]) -> Type {
+        let span = ty.span;
+        let tracked = match &ty.tracked {
+            TypeKind::Param { index, .. } => {
+                return args
+                    .get(*index as usize)
+                    .cloned()
+                    .unwrap_or_else(|| span.track(TypeKind::Error));
+            }
+            TypeKind::Struct { fields, tail } => {
+                let mut fields: IndexMap<String, TypeField> = fields
+                    .iter()
+                    .map(|(name, field)| {
+                        let field = match field {
+                            TypeField::Written {
+                                name_span,
+                                when,
+                                value,
+                            } => TypeField::Written {
+                                name_span: *name_span,
+                                when: when.clone(),
+                                value: self.substituted(value, args),
+                            },
+                            absent => absent.clone(),
+                        };
+                        (name.clone(), field)
+                    })
+                    .collect();
+                let mut tail = tail.clone();
+                if let Some(Tail {
+                    of: Row::Param { index, .. },
+                    ..
+                }) = &tail
+                {
+                    match args.get(*index as usize).map(|arg| &arg.tracked) {
+                        Some(TypeKind::Struct {
+                            fields: more,
+                            tail: rest,
+                        }) => {
+                            for (name, field) in more {
+                                fields.entry(name.clone()).or_insert_with(|| field.clone());
+                            }
+                            tail = rest.clone();
+                        }
+                        Some(TypeKind::Param { symbol, index }) => {
+                            tail = tail.map(|tail| Tail {
+                                span: tail.span,
+                                of: Row::Param {
+                                    symbol: *symbol,
+                                    index: *index,
+                                },
+                            });
+                        }
+                        Some(TypeKind::Error) | None => tail = None,
+                        Some(_) => {
+                            self.error(
+                                args[*index as usize].span,
+                                ErrorKind::NotARow {
+                                    sense: Sense::Fields,
+                                },
+                            );
+                            tail = None;
+                        }
+                    }
+                }
+                TypeKind::Struct { fields, tail }
+            }
+            TypeKind::Sum { cases, tail } => {
+                let mut cases: IndexMap<String, SumCase> = cases
+                    .iter()
+                    .map(|(name, case)| {
+                        let case = match case {
+                            SumCase::Written {
+                                name_span,
+                                when,
+                                payload,
+                            } => SumCase::Written {
+                                name_span: *name_span,
+                                when: when.clone(),
+                                payload: payload
+                                    .as_ref()
+                                    .map(|payload| self.substituted(payload, args)),
+                            },
+                            absent => absent.clone(),
+                        };
+                        (name.clone(), case)
+                    })
+                    .collect();
+                let mut tail = tail.clone();
+                if let Some(Tail {
+                    of: Row::Param { index, .. },
+                    ..
+                }) = &tail
+                {
+                    match args.get(*index as usize).map(|arg| &arg.tracked) {
+                        Some(TypeKind::Sum {
+                            cases: more,
+                            tail: rest,
+                        }) => {
+                            for (name, case) in more {
+                                cases.entry(name.clone()).or_insert_with(|| case.clone());
+                            }
+                            tail = rest.clone();
+                        }
+                        Some(TypeKind::Param { symbol, index }) => {
+                            tail = tail.map(|tail| Tail {
+                                span: tail.span,
+                                of: Row::Param {
+                                    symbol: *symbol,
+                                    index: *index,
+                                },
+                            });
+                        }
+                        Some(TypeKind::Error) | None => tail = None,
+                        Some(_) => {
+                            self.error(
+                                args[*index as usize].span,
+                                ErrorKind::NotARow {
+                                    sense: Sense::Cases,
+                                },
+                            );
+                            tail = None;
+                        }
+                    }
+                }
+                TypeKind::Sum { cases, tail }
+            }
+            TypeKind::Arrow { from, to, effects } => TypeKind::Arrow {
+                from: Box::new(self.substituted(from, args)),
+                to: Box::new(self.substituted(to, args)),
+                effects: Box::new(self.substituted_row(effects, args)),
+            },
+            TypeKind::Effects(effects) => {
+                TypeKind::Effects(Box::new(self.substituted_row(effects, args)))
+            }
+            TypeKind::Apply {
+                head,
+                head_span,
+                args: applied,
+            } => TypeKind::Apply {
+                head: *head,
+                head_span: *head_span,
+                args: applied
+                    .iter()
+                    .map(|arg| self.substituted(arg, args))
+                    .collect(),
+            },
+            TypeKind::Ident(_)
+            | TypeKind::Prim(_)
+            | TypeKind::Var(_)
+            | TypeKind::Hole
+            | TypeKind::Error => ty.tracked.clone(),
+        };
+        span.track(tracked)
+    }
+
+    /// [`substituted`](Self::substituted) for a row of effects: the arguments
+    /// of each label substituted, and a parameter in the tail spliced.
+    fn substituted_row(&mut self, row: &EffectRow, args: &[Type]) -> EffectRow {
+        let mut effects: IndexMap<EffectId, EffectLabel> = IndexMap::new();
+        for (key, label) in &row.effects {
+            let mut label = label.clone();
+            for arg in label.args_mut() {
+                *arg = self.substituted(arg, args);
+            }
+            effects.insert(key.clone(), label);
+        }
+        let mut tail = row.tail.clone();
+        if let Some(Tail {
+            of: Row::Param { index, .. },
+            ..
+        }) = &tail
+        {
+            match args.get(*index as usize).map(|arg| &arg.tracked) {
+                Some(TypeKind::Effects(more)) => {
+                    for (key, label) in &more.effects {
+                        effects.entry(key.clone()).or_insert_with(|| label.clone());
+                    }
+                    tail = more.tail.clone();
+                }
+                Some(TypeKind::Param { symbol, index }) => {
+                    tail = tail.map(|tail| Tail {
+                        span: tail.span,
+                        of: Row::Param {
+                            symbol: *symbol,
+                            index: *index,
+                        },
+                    });
+                }
+                Some(TypeKind::Error) | None => tail = None,
+                Some(_) => {
+                    self.error(
+                        args[*index as usize].span,
+                        ErrorKind::NotARow {
+                            sense: Sense::Effects,
+                        },
+                    );
+                    tail = None;
+                }
+            }
+        }
+        EffectRow {
+            span: row.span,
+            written: row.written,
+            effects,
+            tail,
         }
     }
 
@@ -10207,6 +10785,8 @@ impl Builder<'_> {
         // what a definition is checked against, and a printed type shows the
         // effects rather than the name.
         let mut effects: IndexMap<EffectId, EffectLabel> = IndexMap::new();
+        // The tail an alias application brought with it, if one did.
+        let mut brought: Option<Tail> = None;
         for (name, label) in written.effects {
             let at = name.span();
             let Some(symbol) = self.resolve(&name, Namespace::Effects) else {
@@ -10239,47 +10819,66 @@ impl Builder<'_> {
                 .into_iter()
                 .map(|arg| self.argument(arg, place))
                 .collect();
-            let mut expanded: Vec<(String, Symbol)> = self
-                .expanded
-                .get(&symbol)
-                .into_iter()
-                .flatten()
-                .map(|(name, symbol)| (name.clone(), *symbol))
-                .collect();
-            // Effect declarations are themselves lowered before the alias
-            // expansion table is complete. Keep a direct reference in that
-            // recovery-only window so an operation signature's identity still
-            // sees the effect row it wrote; aliases are expanded once ordinary
-            // types and terms are lowered later.
-            if expanded.is_empty() {
-                expanded.push((self.mint.name(symbol).to_string(), symbol));
-            }
-            for (label_name, label_symbol) in expanded {
-                // Whether the reader wrote *this* effect's name here, or an
-                // alias standing for it among others.
-                let expanded = label_symbol != symbol;
-                let lowered = match absent {
-                    false => EffectLabel::Written {
-                        name_span: at,
-                        symbol: label_symbol,
-                        args: args.clone(),
-                        expanded,
-                        when: when.clone(),
+            let expansion = self.expand_alias(symbol, &args, at);
+            // A `\` or a `when` on an alias distributes to every effect it
+            // stands for, which is only a row when the expansion is closed:
+            // an open tail is nobody's to mark.
+            if (absent || when.is_some()) && expansion.tail.is_some() {
+                self.error(
+                    at,
+                    ErrorKind::ModifiedOpenAlias {
+                        name: self.mint.name(symbol).to_string(),
                     },
-                    true => EffectLabel::Absent {
+                );
+                continue;
+            }
+            if let Some(tail) = expansion.tail {
+                self.adopt_tail(&mut brought, tail);
+            }
+            for label in expansion.labels {
+                // Whether the reader wrote *this* effect's name here, or an
+                // alias standing for it among others. A label's own mark
+                // stands; the application's mark goes on the rest.
+                let label_symbol = label.symbol();
+                let expanded = label_symbol != symbol;
+                let lowered = match (absent, label) {
+                    (true, label) => EffectLabel::Absent {
                         name_span: at,
                         symbol: label_symbol,
-                        args: args.clone(),
+                        args: label.args().to_vec(),
                         expanded,
+                    },
+                    (false, EffectLabel::Absent { args, .. }) => EffectLabel::Absent {
+                        name_span: at,
+                        symbol: label_symbol,
+                        args,
+                        expanded,
+                    },
+                    (
+                        false,
+                        EffectLabel::Written {
+                            args, when: inner, ..
+                        },
+                    ) => EffectLabel::Written {
+                        name_span: at,
+                        symbol: label_symbol,
+                        args,
+                        expanded,
+                        when: inner.or_else(|| when.clone()),
                     },
                 };
                 let label_key = EffectId::pending(label_symbol);
                 if let Some(previous) = effects.get(&label_key) {
+                    // An alias standing for one effect twice was refused at
+                    // its declaration; here it stands for the effect once.
+                    if expanded && previous.expanded() {
+                        continue;
+                    }
                     self.error(
                         at,
                         ErrorKind::DuplicateCase {
                             shape: Shape::Effect,
-                            name: label_name,
+                            name: effect_key(self.mint, label_symbol),
                             previous: previous.name_span(),
                         },
                     );
@@ -10291,6 +10890,18 @@ impl Builder<'_> {
         let tail = match self.tail(written.tail, place, Shape::Effect) {
             Ok(tail) => tail,
             Err(()) => return None,
+        };
+        let tail = match (tail, brought) {
+            (Some(written), Some(brought)) => {
+                self.error(
+                    brought.span,
+                    ErrorKind::TwoTails {
+                        previous: written.span,
+                    },
+                );
+                Some(written)
+            }
+            (written, brought) => written.or(brought),
         };
         // The same two checks a struct and a sum make, in the effect reading:
         // a position that holds for every definition may leave nothing open,

@@ -150,14 +150,31 @@ impl fmt::Display for Show<'_, Program> {
                         f.write_str(" }")?;
                     }
                 }
-                Effect::Alias(named) if named.is_empty() => {}
-                Effect::Alias(named) => {
+                Effect::Alias(alias)
+                    if alias.body.cases.is_empty() && alias.body.tail.is_none() => {}
+                Effect::Alias(alias) => {
                     f.write_str(" =")?;
-                    for (at, name) in named.keys().enumerate() {
-                        match at {
-                            0 => write!(f, " {}", label(Shape::Effect, name))?,
-                            _ => write!(f, " + {}", label(Shape::Effect, name))?,
+                    let mut first = true;
+                    for case in &alias.body.cases {
+                        f.write_str(if first { " " } else { " + " })?;
+                        first = false;
+                        f.write_str(&label(Shape::Effect, self.mint.name(case.symbol)))?;
+                        for arg in &case.args {
+                            let arg = self.show(arg);
+                            f.write_str(" ")?;
+                            match arg.prec() < Prec::Atom {
+                                true => write!(f, "({arg})")?,
+                                false => write!(f, "{arg}")?,
+                            }
                         }
+                    }
+                    if let Some(tail) = &alias.body.tail {
+                        f.write_str(if first { " .." } else { " + .." })?;
+                        f.write_str(&match &tail.of {
+                            Row::Anything => String::new(),
+                            Row::Named(name) => format!("'{name}"),
+                            Row::Param { symbol, .. } => format!("'{}", self.mint.name(*symbol)),
+                        })?;
                     }
                 }
             }

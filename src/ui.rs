@@ -1027,6 +1027,10 @@ impl ir::ErrorKind {
             }
             ir::ErrorKind::Arity { .. } => "wrong-argument-count",
             ir::ErrorKind::EffectArity { .. } => "effect-arity",
+            ir::ErrorKind::AliasCycle { growing: false, .. } => "alias-cycle",
+            ir::ErrorKind::AliasCycle { growing: true, .. } => "growing-alias-cycle",
+            ir::ErrorKind::ModifiedOpenAlias { .. } => "modified-open-alias",
+            ir::ErrorKind::TwoTails { .. } => "two-tails",
             ir::ErrorKind::NotAConstructor => "not-a-type-constructor",
             ir::ErrorKind::ParameterApplied { .. } => "applied-parameter",
             ir::ErrorKind::DuplicateParameter { .. } => "duplicate-parameter",
@@ -1240,6 +1244,34 @@ impl ir::Error {
             } else {
                 "remove the extra effect arguments"
             }),
+            E::AliasCycle { name, growing } => Diagnostic::new(
+                code,
+                match growing {
+                    true => format!("effect `!{name}` grows every time it stands for itself"),
+                    false => format!("effect `!{name}` only ever stands for itself"),
+                },
+                span,
+            )
+            .label(match growing {
+                true => "this alias adds effects and then names itself again",
+                false => "this alias leads back to itself through other aliases",
+            })
+            .help("name the effects the alias stands for without going through itself"),
+            E::ModifiedOpenAlias { name } => Diagnostic::new(
+                code,
+                format!("`!{name}` leaves its effects open here, so it cannot be marked"),
+                span,
+            )
+            .label("this mark would have to apply to effects that are not named yet")
+            .help("close the alias's tail with a row of effects, or mark each effect yourself"),
+            E::TwoTails { previous } => Diagnostic::new(
+                code,
+                "this row is given two tails",
+                span,
+            )
+            .label("this tail is the second")
+            .related(*previous, "the first tail is here")
+            .help("keep one tail: write the other's effects out, or drop one"),
             E::NotAConstructor => Diagnostic::new(
                 code,
                 "this type cannot take arguments",

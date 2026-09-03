@@ -232,6 +232,18 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
             expected: 1,
             found: 0,
         },
+        IrError::AliasCycle {
+            name: "Loop".to_string(),
+            growing: false,
+        },
+        IrError::AliasCycle {
+            name: "Grow".to_string(),
+            growing: true,
+        },
+        IrError::ModifiedOpenAlias {
+            name: "Both".to_string(),
+        },
+        IrError::TwoTails { previous: span },
         IrError::NotAConstructor,
         IrError::ParameterApplied {
             name: "f".to_string(),

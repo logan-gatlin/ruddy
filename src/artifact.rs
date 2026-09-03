@@ -1985,10 +1985,12 @@ pub fn build_with_dependencies(
                             })
                             .collect(),
                     ),
-                    ir::Effect::Alias(effects) => EffectKind::Alias(
-                        effects
-                            .values()
-                            .map(|effect| qualified(mint, effect.symbol))
+                    ir::Effect::Alias(alias) => EffectKind::Alias(
+                        alias
+                            .body
+                            .cases
+                            .iter()
+                            .map(|case| qualified(mint, case.symbol))
                             .collect(),
                     ),
                 },

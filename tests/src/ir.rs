@@ -6,7 +6,7 @@ use ruddy::{
     ir::{
         Annotation, ClauseKind, DependencyImport, Effect, EffectLabel, ErrorKind, ExternTypeKind,
         Field, OperationSelector, OperationTypeProblem, Output, PatternKind, PresenceOwnership,
-        SumCase, Term, TermKind, TypeField, TypeKind, build, build_with_dependencies,
+        Row, SumCase, Tail, Term, TermKind, TypeField, TypeKind, build, build_with_dependencies,
         build_with_dependency_imports,
     },
     parse,
@@ -4193,6 +4193,120 @@ fn structural_identity_includes_parameters_and_their_positions() {
     assert_eq!(out.program.effect_ids.len(), 1);
 }
 
+/// A parameterized alias is a way of writing a row: its arguments are
+/// substituted into the effects it names, an effects parameter it ends in is
+/// spliced as the row's tail, and every alias it names is expanded in turn.
+#[test]
+fn a_parameterized_alias_expands_to_the_row_it_writes() {
+    let base = "effect Log = { write: Nat -> () }\n\
+                effect IO = { print: Nat -> () }\n\
+                effect Ask 'a = { get: () -> 'a }\n\
+                effect Both 'a 'e = !Ask 'a + !Log + ..'e\n\
+                effect Forward 'e = ..'e\n\
+                effect Nested 'x 'e = !Both 'x (!IO + ..'e)\n";
+    let (mint, out) = built(&format!(
+        "{base}let f : () -> Nat + !Nested Nat (..'r) = fn _ => 0n\n\
+         let g : () -> Nat + !Forward (!Log) = fn _ => 0n\n\
+         let h : () -> Nat + !Both String (!IO) (when 'p) = fn _ => 0n\n\
+         let i : () -> Nat + \\!Both String (!IO) + ..'e = fn _ => 0n"
+    ));
+    let row = |name: &str| {
+        let term = &out.program.terms[&term_symbol(&mint, &out, name)];
+        let TypeKind::Arrow { effects, .. } =
+            &term.annotation.as_ref().expect("annotated").ty.tracked
+        else {
+            panic!("expected an arrow");
+        };
+        (*effects).clone()
+    };
+    let f = row("f");
+    let names: Vec<_> = f.effects.keys().map(|id| id.name().to_string()).collect();
+    assert_eq!(names, ["Ask", "Log", "IO"]);
+    let ask = f.effects.values().next().expect("Ask");
+    assert!(matches!(ask.args(), [arg] if matches!(arg.tracked, TypeKind::Prim(Prim::Nat))));
+    assert!(ask.expanded());
+    assert!(matches!(&f.tail, Some(Tail { of: Row::Named(name), .. }) if name == "r"));
+    let g = row("g");
+    assert_eq!(g.effects.len(), 1);
+    assert!(g.tail.is_none());
+    // A closed application takes a modifier, which distributes to every
+    // effect it stands for.
+    let h = row("h");
+    assert!(h.effects.values().all(|label| label.when().is_some()));
+    let i = row("i");
+    assert_eq!(i.effects.len(), 3);
+    assert!(
+        i.effects
+            .values()
+            .all(|label| matches!(label, EffectLabel::Absent { .. }))
+    );
+
+    // The alias's own parameters are read off the row it comes to.
+    let kind = |name: &str| {
+        let symbol = *out
+            .program
+            .effects
+            .keys()
+            .find(|symbol| mint.name(**symbol) == name)
+            .unwrap_or_else(|| panic!("no effect named {name}"));
+        out.program.effects[&symbol]
+            .params
+            .iter()
+            .map(|param| param.kind.sense())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(kind("Both"), [Sense::Type, Sense::Effects]);
+    assert_eq!(kind("Nested"), [Sense::Type, Sense::Effects]);
+    assert_eq!(kind("Forward"), [Sense::Effects]);
+
+    // A modifier on an application that stays open has no row to distribute
+    // over; a type where the tail's row goes is not a row; a second tail is
+    // one too many; and an alias declares no operation to perform.
+    for (source, code) in [
+        (
+            "let f : () -> Nat + \\!Both Nat (..'e) + ..'e = fn _ => 0n",
+            "modified-open-alias",
+        ),
+        (
+            "let f : () -> Nat + !Both Nat (..'e) (when 'p) + ..'e = fn _ => 0n",
+            "modified-open-alias",
+        ),
+        ("let f : () -> Nat + !Forward Nat = fn _ => 0n", "not-a-row"),
+        (
+            "let f : () -> Nat + !Both Nat (..'e) + ..'f = fn _ => 0n",
+            "two-tails",
+        ),
+        ("let f = fn _ => !Both.get ()", "operation-on-alias"),
+    ] {
+        assert_eq!(codes_of(&format!("{base}{source}")), [code], "{source}");
+    }
+
+    // Every cycle of aliases is refused: one that only forwards, and one that
+    // grows the row on the way round, each in its own words.
+    assert_eq!(
+        codes_of("effect A 'e = !B 'e\neffect B 'e = !A 'e"),
+        ["alias-cycle"]
+    );
+    let (_, out) = build_src("effect Log = { write: Nat -> () }\neffect Grow 'e = !Log + !Grow 'e");
+    let [error] = &out.errors[..] else {
+        panic!("{:#?}", out.errors);
+    };
+    assert_eq!(error.kind.code(), "growing-alias-cycle");
+    assert!(matches!(&error.kind, ErrorKind::AliasCycle { name, growing: true } if name == "Grow"));
+    // A recursive concrete interface is not a cycle of aliases.
+    assert!(
+        build_src("effect Visit 'a = { run: (() -> 'a + !Visit 'a) -> 'a }")
+            .1
+            .errors
+            .is_empty()
+    );
+    // Two branches reaching one constructor overlap whatever the arguments.
+    assert_eq!(
+        codes_of("effect Ask 'a = { get: () -> 'a }\neffect Twice 'a 'b = !Ask 'a + !Ask 'b"),
+        ["duplicate-case"]
+    );
+}
+
 /// An operation declaration keeps its operations in the order they were
 /// written, each as the two sides of the plain closed arrow performing it has —
 /// which is what a handler arm's binder and body type come off. The empty
@@ -4244,12 +4358,17 @@ fn an_alias_expands_to_the_effects_it_names() {
                effect All = !Console\n\
                let f : Nat -> Nat + !All = fn x => x";
     let (mint, out) = built(src);
-    let Effect::Alias(named) = effect_of(&mint, &out, "Console") else {
+    let Effect::Alias(alias) = effect_of(&mint, &out, "Console") else {
         panic!("expected an alias");
     };
     assert_eq!(
-        named.keys().collect::<Vec<_>>(),
-        ["Log", "IO"].iter().collect::<Vec<_>>()
+        alias
+            .body
+            .cases
+            .iter()
+            .map(|case| mint.name(case.symbol))
+            .collect::<Vec<_>>(),
+        ["Log", "IO"]
     );
 
     // And an alias of an alias reaches through: what a row writes is the
@@ -4913,10 +5032,10 @@ fn same_named_effects_in_different_modules_do_not_collide() {
     let (_, out) = build_src(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     let (mint, out) = built(src);
-    let Effect::Alias(named) = effect_of(&mint, &out, "Both") else {
+    let Effect::Alias(alias) = effect_of(&mint, &out, "Both") else {
         panic!("expected an alias");
     };
-    assert_eq!(named.len(), 2);
+    assert_eq!(alias.body.cases.len(), 2);
 }
 
 /// An alias's cases are effect names and are resolved like any other: one that
@@ -4934,10 +5053,10 @@ fn an_aliass_cases_are_resolved_and_deduplicated() {
         out.errors.iter().map(|e| e.kind.code()).collect::<Vec<_>>(),
         ["duplicate-case"]
     );
-    let Effect::Alias(named) = effect_of(&mint, &out, "Console") else {
+    let Effect::Alias(alias) = effect_of(&mint, &out, "Console") else {
         panic!("expected an alias");
     };
-    assert_eq!(named.len(), 1);
+    assert_eq!(alias.body.cases.len(), 1);
 }
 
 /// An effect a row names has to be one: an unknown name is dropped from the
@@ -6440,8 +6559,8 @@ fn configured_std_prelude_opens_only_direct_members_in_every_namespace() {
             if external(symbol) == Some("foundation@1.0.0::prelude::Shared")
     ));
     assert!(
-        matches!(effect_of(&mint, &out, "Alias"), Effect::Alias(names)
-        if names.values().any(|named| external(named.symbol) == Some("foundation@1.0.0::prelude::Shared")))
+        matches!(effect_of(&mint, &out, "Alias"), Effect::Alias(alias)
+        if alias.body.cases.iter().any(|case| external(case.symbol) == Some("foundation@1.0.0::prelude::Shared")))
     );
     let TermKind::Ident(child) = term_value(&mint, &out, "child") else {
         panic!("prelude child module was not available")
@@ -6600,8 +6719,8 @@ fn user_types_effects_and_child_modules_shadow_prelude_names_independently() {
         .expect("local Shared effect");
     assert!(matches!(
         effect_of(&mint, &out, "Alias"),
-        Effect::Alias(names)
-            if names.values().any(|named| named.symbol == local_effect)
+        Effect::Alias(alias)
+            if alias.body.cases.iter().any(|case| case.symbol == local_effect)
     ));
 
     let local_inside = out
@@ -7381,8 +7500,6 @@ fn recovery_signatures_keep_every_normalized_source_form_structural() {
                type Choice 'r = #Some Nat | #None | \\#Hidden | ..'r\n\
                type Runner 'e = () -> () + \\!IO + ..'e\n\
                effect Alias = !IO\n\
-               effect CycleA = !CycleB\n\
-               effect CycleB = !CycleA\n\
                effect Probe = {\n\
                  record: Record { extra: String } -> (),\n\
                  choice: Choice (#Other Boolean) -> (),\n\
