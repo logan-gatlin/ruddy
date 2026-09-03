@@ -171,12 +171,15 @@ impl UncheckedArtifact {
         // routes hand-built data through the same stack-safe checks as a disk
         // artifact: bounds, formulas, package preorder ownership, rows and
         // absent payloads cannot acquire a second, weaker validation policy.
+        // The tree is decoded without laying it out as text: a block nested
+        // thirty thousand deep is indented thirty thousand times per line, so
+        // the layout alone would be quadratic in the artifact, while the
+        // decoder's checks are the same either way.
         let portable = Artifact {
             header: self.header,
             lir: self.lir,
         };
-        let text = print(&portable);
-        text::try_parse(&text).map_err(|error| ValidationError::new(error.to_string()))
+        text::decode(&portable).map_err(|error| ValidationError::new(error.to_string()))
     }
 
     /// Admit a dependency artifact while recording that validation had to be
@@ -450,6 +453,10 @@ pub enum Sense {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclaredEffect {
     pub name: QualifiedName,
+    /// The parameters the effect binds, in the order it is applied to them.
+    /// Operation signatures refer to them by position through
+    /// [`Type::Bound`] and [`Rest::Bound`]; an alias row does the same.
+    pub params: Vec<Parameter>,
     /// `None` for an alias: aliases expand to other effects and do not name a
     /// row label of their own.
     pub identity: Option<EffectIdentity>,
@@ -463,11 +470,48 @@ pub struct EffectIdentity {
     pub interface: String,
 }
 
-/// An effect's operations, or the effects an alias expands to.
+/// An effect's operations, or the row an alias writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EffectKind {
     Operations(Vec<Operation>),
-    Alias(Vec<QualifiedName>),
+    Alias(AliasRow),
+}
+
+/// The row an alias stands for, unexpanded: the effects it applies, each to
+/// arguments over the alias's own parameters, and the parameter it ends in.
+/// Kept as written because an open alias is expanded at each use with that
+/// use's arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AliasRow {
+    pub cases: Vec<AliasCase>,
+    /// The parameter position spliced as the row's tail, if the alias ends in
+    /// one.
+    pub tail: Option<u32>,
+}
+
+impl AliasRow {
+    /// A closed row naming effects that take nothing.
+    pub fn naming(names: Vec<QualifiedName>) -> Self {
+        AliasRow {
+            cases: names
+                .into_iter()
+                .map(|name| AliasCase {
+                    name,
+                    args: Vec::new(),
+                })
+                .collect(),
+            tail: None,
+        }
+    }
+}
+
+/// One application an alias row names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AliasCase {
+    pub name: QualifiedName,
+    /// One argument per parameter the named effect declares, over the
+    /// alias's own parameters.
+    pub args: Vec<Type>,
 }
 
 /// One operation's public signature.
@@ -1960,6 +2004,22 @@ pub fn build_with_dependencies(
             .iter()
             .map(|(symbol, declaration)| DeclaredEffect {
                 name: qualified(mint, *symbol),
+                params: declaration
+                    .params
+                    .iter()
+                    .map(|param| Parameter {
+                        sense: match param.kind {
+                            types::ParamKind::Type { .. } => Sense::Type,
+                            types::ParamKind::Fields { .. } => Sense::Fields,
+                            types::ParamKind::Cases { .. } => Sense::Cases,
+                            types::ParamKind::Effects { .. } => Sense::Effects,
+                        },
+                        lacks: param.kind.lacks().iter().cloned().collect(),
+                        // Every effect parameter counts: even one no operation
+                        // mentions tells two applications apart.
+                        relevant: true,
+                    })
+                    .collect(),
                 identity: program.effect_ids.get(symbol).map(effect_id),
                 kind: match &declaration.value {
                     ir::Effect::Operations(operations) => EffectKind::Operations(
@@ -1982,12 +2042,20 @@ pub fn build_with_dependencies(
                             })
                             .collect(),
                     ),
-                    ir::Effect::Alias(effects) => EffectKind::Alias(
-                        effects
-                            .values()
-                            .map(|effect| qualified(mint, effect.symbol))
-                            .collect(),
-                    ),
+                    ir::Effect::Alias(_) => {
+                        let row = &inference.effect_aliases()[symbol];
+                        EffectKind::Alias(AliasRow {
+                            cases: row
+                                .cases
+                                .iter()
+                                .map(|(symbol, args)| AliasCase {
+                                    name: qualified(mint, *symbol),
+                                    args: args.iter().map(|arg| ty(mint, arg)).collect(),
+                                })
+                                .collect(),
+                            tail: row.tail,
+                        })
+                    }
                 },
             })
             .collect(),
@@ -2622,6 +2690,50 @@ pub mod text {
         out.push(b'\n');
         String::from_utf8(out).expect("artifact text is UTF-8")
     }
+    /// Decode an artifact's own portable tree through the reader, which is
+    /// what parsing its canonical text would do minus the text.
+    pub(crate) fn decode(value: &Artifact) -> Result<Artifact, ParseError> {
+        Reader::new().artifact(expanded(artifact(value))?)
+    }
+    /// Replace every compact type spelling in a tree with the list it reads
+    /// as, so the tree is exactly what parsing its text would have produced.
+    /// Iterative, since the tree is as deep as the artifact.
+    fn expanded(root: S) -> Result<S, ParseError> {
+        enum Work {
+            Value(S),
+            Close(usize),
+        }
+        let mut work = vec![Work::Value(root)];
+        let mut out: Vec<S> = Vec::new();
+        while let Some(part) = work.pop() {
+            match part {
+                // Taken out rather than matched out: the tree has a drop of
+                // its own, so its parts are moved through `take`.
+                Work::Value(mut value) => match &mut value {
+                    Raw(text) => {
+                        let text = std::mem::take(text);
+                        let mut parser = Parser {
+                            input: &text,
+                            at: 0,
+                        };
+                        out.push(parser.value()?);
+                    }
+                    L(values) => {
+                        let values = std::mem::take(values);
+                        work.push(Work::Close(values.len()));
+                        work.extend(values.into_iter().rev().map(Work::Value));
+                    }
+                    A(_) | Q(_) => out.push(value),
+                },
+                Work::Close(count) => {
+                    let at = out.len() - count;
+                    let children = out.split_off(at);
+                    out.push(L(children));
+                }
+            }
+        }
+        Ok(out.pop().expect("a tree expands to one value"))
+    }
     /// Parse canonical trusted text; malformed text panics.
     pub fn parse(input: &str) -> Artifact {
         try_parse(input).unwrap_or_else(|error| panic!("{error}"))
@@ -2711,6 +2823,9 @@ pub mod text {
         L(vec![
             A("effect".into()),
             Q(value.name.clone()),
+            L(std::iter::once(A("params".into()))
+                .chain(value.params.iter().map(parameter))
+                .collect()),
             match &value.identity {
                 Some(identity) => L(vec![
                     A("identity".into()),
@@ -2723,9 +2838,24 @@ pub mod text {
                 EffectKind::Operations(values) => L(std::iter::once(A("operations".into()))
                     .chain(values.iter().map(operation))
                     .collect()),
-                EffectKind::Alias(values) => L(std::iter::once(A("alias".into()))
-                    .chain(values.iter().cloned().map(Q))
-                    .collect()),
+                EffectKind::Alias(row) => L(vec![
+                    A("alias".into()),
+                    L(std::iter::once(A("cases".into()))
+                        .chain(row.cases.iter().map(|case| {
+                            L(std::iter::once(A("case".into()))
+                                .chain(std::iter::once(Q(case.name.clone())))
+                                .chain(case.args.iter().map(ty))
+                                .collect())
+                        }))
+                        .collect()),
+                    L(vec![
+                        A("tail".into()),
+                        match row.tail {
+                            Some(index) => A(index.to_string()),
+                            None => A("none".into()),
+                        },
+                    ]),
+                ]),
             },
         ])
     }
@@ -3073,22 +3203,70 @@ pub mod text {
             block(&value.body),
         ])
     }
-    fn block(value: &Block) -> S {
-        L(vec![
-            A("block".into()),
-            L(std::iter::once(A("instrs".into()))
-                .chain(value.instrs.iter().map(instr))
-                .collect()),
-            end(&value.end),
-        ])
-    }
-    fn instr(value: &Instr) -> S {
-        L(vec![
-            A("instr".into()),
-            A(value.temp.to_string()),
-            A(rep_name(value.rep).into()),
-            op(&value.op),
-        ])
+    /// Render one block. Nested blocks are data, not control flow: a `catch`
+    /// or `switch` thirty thousand levels deep has to print on the same stack
+    /// the reader decodes it on, so the walk keeps its continuations on the
+    /// heap and every closure below assembles one node from children already
+    /// rendered.
+    fn block(root: &Block) -> S {
+        type Wrap<'a> = Box<dyn FnOnce(Vec<S>) -> S + 'a>;
+        enum Task<'a> {
+            Block(&'a Block),
+            Instr(&'a Instr),
+            Op(&'a Op),
+            /// Take the last `count` rendered values and combine them.
+            Wrap(usize, Wrap<'a>),
+        }
+        let mut work = vec![Task::Block(root)];
+        let mut out: Vec<S> = Vec::new();
+        while let Some(task) = work.pop() {
+            match task {
+                Task::Block(block) => {
+                    let count = block.instrs.len();
+                    let end = &block.end;
+                    work.push(Task::Wrap(
+                        count,
+                        Box::new(move |instrs| {
+                            L(vec![
+                                A("block".into()),
+                                L(std::iter::once(A("instrs".into())).chain(instrs).collect()),
+                                self::end(end),
+                            ])
+                        }),
+                    ));
+                    work.extend(block.instrs.iter().rev().map(Task::Instr));
+                }
+                Task::Instr(instr) => {
+                    let (temp, rep) = (instr.temp, instr.rep);
+                    work.push(Task::Wrap(
+                        1,
+                        Box::new(move |mut op| {
+                            L(vec![
+                                A("instr".into()),
+                                A(temp.to_string()),
+                                A(rep_name(rep).into()),
+                                op.pop().expect("an instruction renders one operation"),
+                            ])
+                        }),
+                    ));
+                    work.push(Task::Op(&instr.op));
+                }
+                Task::Op(op) => {
+                    let children = nested(op);
+                    work.push(Task::Wrap(
+                        children.len(),
+                        Box::new(move |rendered| self::op(op, rendered)),
+                    ));
+                    work.extend(children.into_iter().rev().map(Task::Block));
+                }
+                Task::Wrap(count, wrap) => {
+                    let at = out.len() - count;
+                    let children = out.split_off(at);
+                    out.push(wrap(children));
+                }
+            }
+        }
+        out.pop().expect("a block renders one value")
     }
     fn field_key(value: &FieldKey) -> S {
         match value {
@@ -3102,7 +3280,35 @@ pub mod text {
             }
         }
     }
-    fn op(value: &Op) -> S {
+    /// The blocks an operation holds, in the order [`op`] consumes them once
+    /// they are rendered.
+    fn nested(value: &Op) -> Vec<&Block> {
+        match value {
+            Op::Catch { body, .. } => vec![body],
+            Op::SwitchTag {
+                cases, fallback, ..
+            } => cases
+                .iter()
+                .map(|case| &case.block)
+                .chain(fallback.iter().map(|block| &**block))
+                .collect(),
+            Op::SwitchPrim {
+                cases, fallback, ..
+            } => cases
+                .iter()
+                .map(|case| &case.block)
+                .chain(fallback.iter().map(|block| &**block))
+                .collect(),
+            Op::SwitchPresence {
+                present, absent, ..
+            } => vec![present, absent],
+            Op::SwitchRest { none, some, .. } => vec![none, some],
+            _ => Vec::new(),
+        }
+    }
+    /// Render one operation, given its nested blocks already rendered by
+    /// [`block`] in the order [`nested`] lists them.
+    fn op(value: &Op, mut blocks: Vec<S>) -> S {
         match value {
             Op::Const(value) => L(vec![A("const".into()), literal(value)]),
             Op::Neg(value) => unary("neg", *value),
@@ -3161,65 +3367,71 @@ pub mod text {
             Op::Extern { target } => L(vec![A("extern".into()), Q(target.clone())]),
             Op::Global { target } => L(vec![A("global".into()), Q(target.clone())]),
             Op::NewTag => A("new-tag".into()),
-            Op::Catch { tag, body } => L(vec![A("catch".into()), A(tag.to_string()), block(body)]),
-            Op::SwitchTag {
-                on,
-                cases,
-                fallback,
-            } => L(vec![
-                A("switch-tag".into()),
-                A(on.to_string()),
-                L(std::iter::once(A("cases".into()))
-                    .chain(
-                        cases
-                            .iter()
-                            .map(|case| L(vec![Q(case.name.clone()), block(&case.block)])),
-                    )
-                    .collect()),
-                optional_block("fallback", fallback),
+            Op::Catch { tag, .. } => L(vec![
+                A("catch".into()),
+                A(tag.to_string()),
+                blocks.pop().expect("a catch renders one body"),
             ]),
-            Op::SwitchPrim {
-                on,
-                cases,
-                fallback,
-            } => L(vec![
-                A("switch-prim".into()),
-                A(on.to_string()),
-                L(std::iter::once(A("cases".into()))
-                    .chain(
-                        cases
-                            .iter()
-                            .map(|case| L(vec![literal(&case.value), block(&case.block)])),
-                    )
-                    .collect()),
-                optional_block("fallback", fallback),
-            ]),
-            Op::SwitchPresence {
-                on,
-                field,
-                present,
-                absent,
-            } => L(vec![
-                A("switch-presence".into()),
-                A(on.to_string()),
-                Q(field.clone()),
-                block(present),
-                block(absent),
-            ]),
-            Op::SwitchRest {
-                on,
-                fields,
-                none,
-                some,
-            } => L(vec![
-                A("switch-rest".into()),
-                A(on.to_string()),
-                L(std::iter::once(A("fields".into()))
-                    .chain(fields.iter().cloned().map(Q))
-                    .collect()),
-                block(none),
-                block(some),
-            ]),
+            Op::SwitchTag { on, cases, .. } => {
+                let fallback = blocks.split_off(cases.len());
+                L(vec![
+                    A("switch-tag".into()),
+                    A(on.to_string()),
+                    L(std::iter::once(A("cases".into()))
+                        .chain(
+                            cases
+                                .iter()
+                                .zip(blocks)
+                                .map(|(case, block)| L(vec![Q(case.name.clone()), block])),
+                        )
+                        .collect()),
+                    L(std::iter::once(A("fallback".into()))
+                        .chain(fallback)
+                        .collect()),
+                ])
+            }
+            Op::SwitchPrim { on, cases, .. } => {
+                let fallback = blocks.split_off(cases.len());
+                L(vec![
+                    A("switch-prim".into()),
+                    A(on.to_string()),
+                    L(std::iter::once(A("cases".into()))
+                        .chain(
+                            cases
+                                .iter()
+                                .zip(blocks)
+                                .map(|(case, block)| L(vec![literal(&case.value), block])),
+                        )
+                        .collect()),
+                    L(std::iter::once(A("fallback".into()))
+                        .chain(fallback)
+                        .collect()),
+                ])
+            }
+            Op::SwitchPresence { on, field, .. } => {
+                let absent = blocks.pop().expect("an absent branch renders");
+                let present = blocks.pop().expect("a present branch renders");
+                L(vec![
+                    A("switch-presence".into()),
+                    A(on.to_string()),
+                    Q(field.clone()),
+                    present,
+                    absent,
+                ])
+            }
+            Op::SwitchRest { on, fields, .. } => {
+                let some = blocks.pop().expect("a some branch renders");
+                let none = blocks.pop().expect("a none branch renders");
+                L(vec![
+                    A("switch-rest".into()),
+                    A(on.to_string()),
+                    L(std::iter::once(A("fields".into()))
+                        .chain(fields.iter().cloned().map(Q))
+                        .collect()),
+                    none,
+                    some,
+                ])
+            }
         }
     }
     fn unary(tag: &str, value: u32) -> S {
@@ -3231,11 +3443,6 @@ pub mod text {
             A(left.to_string()),
             A(right.to_string()),
         ])
-    }
-    fn optional_block(tag: &str, value: &Option<Box<Block>>) -> S {
-        L(std::iter::once(A(tag.into()))
-            .chain(value.iter().map(|value| block(value)))
-            .collect())
     }
     fn end(value: &End) -> S {
         match value {
@@ -3664,11 +3871,15 @@ pub mod text {
                     .into_iter()
                     .map(|value| self.read_declared_type(value))
                     .collect(),
-                effects: self
-                    .many(self.take(&mut values), "effects")
-                    .into_iter()
-                    .map(|value| self.read_effect(value))
-                    .collect(),
+                effects: {
+                    let effects: Vec<DeclaredEffect> = self
+                        .many(self.take(&mut values), "effects")
+                        .into_iter()
+                        .map(|value| self.read_effect(value))
+                        .collect();
+                    self.check_effects(&effects);
+                    effects
+                },
             }
         }
         fn read_dependency(&self, value: S) -> Dependency {
@@ -3716,8 +3927,14 @@ pub mod text {
             }
         }
         fn read_effect(&self, value: S) -> DeclaredEffect {
-            let mut value = self.exact(self.list(value, "effect"), 3, "effect");
+            let mut value = self.exact(self.list(value, "effect"), 4, "effect");
             let name = self.string(self.take(&mut value));
+            let params: Vec<Parameter> = self
+                .many(self.take(&mut value), "params")
+                .into_iter()
+                .map(|value| self.read_parameter(value))
+                .collect();
+            let count = params.len() as u32;
             let id = self.list(self.take(&mut value), "identity");
             let identity = match id.as_slice() {
                 [A(none)] if none == "none" => None,
@@ -3736,21 +3953,186 @@ pub mod text {
                         "operations" => EffectKind::Operations(
                             values
                                 .into_iter()
-                                .map(|value| self.read_operation(value))
+                                .map(|value| {
+                                    let operation = self.read_operation(value);
+                                    // A signature refers to the effect's own
+                                    // parameters and to nothing else that is
+                                    // bound: no presence is quantified there.
+                                    self.check_bounds(&operation.from, count, 0);
+                                    self.check_bounds(&operation.to, count, 0);
+                                    operation
+                                })
                                 .collect(),
                         ),
-                        "alias" => EffectKind::Alias(
-                            values.into_iter().map(|value| self.string(value)).collect(),
+                        "alias" => {
+                            let mut values = self.exact(values, 2, "alias");
+                            let cases = self
+                                .many(self.take(&mut values), "cases")
+                                .into_iter()
+                                .map(|value| {
+                                    let mut value = self.list(value, "case");
+                                    if value.is_empty() {
+                                        return self.invalid(
+                                            "alias case names no effect",
+                                            AliasCase {
+                                                name: String::new(),
+                                                args: Vec::new(),
+                                            },
+                                        );
+                                    }
+                                    let name = self.string(self.take(&mut value));
+                                    let args: Vec<Type> = value
+                                        .into_iter()
+                                        .map(|value| self.read_ty(value))
+                                        .collect();
+                                    for arg in &args {
+                                        self.check_bounds(arg, count, 0);
+                                    }
+                                    AliasCase { name, args }
+                                })
+                                .collect();
+                            let mut tail =
+                                self.exact(self.list(self.take(&mut values), "tail"), 1, "tail");
+                            let tail = match self.take(&mut tail) {
+                                A(ref none) if none == "none" => None,
+                                value => {
+                                    let index = self.number(value);
+                                    if index >= count {
+                                        self.fail("alias tail is outside the effect's parameters");
+                                    }
+                                    Some(index)
+                                }
+                            };
+                            EffectKind::Alias(AliasRow { cases, tail })
+                        }
+                        _ => self.invalid(
+                            "invalid effect kind",
+                            EffectKind::Alias(AliasRow::naming(Vec::new())),
                         ),
-                        _ => self.invalid("invalid effect kind", EffectKind::Alias(Vec::new())),
                     }
                 }
-                _ => self.invalid("invalid effect kind", EffectKind::Alias(Vec::new())),
+                _ => self.invalid(
+                    "invalid effect kind",
+                    EffectKind::Alias(AliasRow::naming(Vec::new())),
+                ),
             };
             DeclaredEffect {
                 name,
+                params,
                 identity,
                 kind,
+            }
+        }
+
+        /// Every bound position in a type refers inside the quantifier space
+        /// it is read in: `count` type and row positions, of which the first
+        /// `presences` are presences.
+        fn check_bounds(&self, root: &Type, count: u32, presences: u32) {
+            enum Part<'a> {
+                Ty(&'a Type),
+                Row(&'a Row),
+            }
+            let mut parts = vec![Part::Ty(root)];
+            while let Some(part) = parts.pop() {
+                match part {
+                    Part::Ty(ty) => match ty {
+                        Type::Bound(index) => {
+                            if *index < presences || *index >= count {
+                                self.fail("type bound is outside the type quantifier space");
+                            }
+                        }
+                        Type::Package(inner) => parts.push(Part::Ty(inner)),
+                        Type::Arrow(from, to, row) => {
+                            parts.push(Part::Row(row));
+                            parts.push(Part::Ty(to));
+                            parts.push(Part::Ty(from));
+                        }
+                        Type::Struct(row) | Type::Sum(row) => parts.push(Part::Row(row)),
+                        Type::Named { args, .. } => {
+                            parts.extend(args.iter().rev().map(Part::Ty));
+                        }
+                        _ => {}
+                    },
+                    Part::Row(row) => {
+                        if let Rest::Bound(index) = row.rest
+                            && (index < presences || index >= count)
+                        {
+                            self.fail("row bound is outside the row quantifier space");
+                        }
+                        if let Rest::More(more) = &row.rest {
+                            parts.push(Part::Row(more));
+                        }
+                        for (_, field) in row.labels.iter().rev() {
+                            if let Presence::Bound(index) = field.presence
+                                && index >= presences
+                            {
+                                self.fail(
+                                    "presence bound is outside the presence quantifier space",
+                                );
+                            }
+                            parts.push(Part::Ty(&field.ty));
+                        }
+                    }
+                }
+            }
+        }
+
+        /// What one header's effects say about each other: an alias applies an
+        /// effect of the same header to as many arguments as it takes, and no
+        /// ring of aliases stands for itself.
+        fn check_effects(&self, effects: &[DeclaredEffect]) {
+            let arity: HashMap<&str, usize> = effects
+                .iter()
+                .map(|effect| (effect.name.as_str(), effect.params.len()))
+                .collect();
+            let aliases: HashMap<&str, &AliasRow> = effects
+                .iter()
+                .filter_map(|effect| match &effect.kind {
+                    EffectKind::Alias(row) => Some((effect.name.as_str(), row)),
+                    EffectKind::Operations(_) => None,
+                })
+                .collect();
+            for row in aliases.values() {
+                for case in &row.cases {
+                    if let Some(expected) = arity.get(case.name.as_str())
+                        && *expected != case.args.len()
+                    {
+                        self.fail("alias applies an effect to the wrong number of arguments");
+                    }
+                }
+            }
+            // Every alias, walked through the aliases it names; one met again
+            // on the way down is a ring. An alias walked to the end once is
+            // done for good, so a diamond of aliases is walked once rather
+            // than once per path to it.
+            let mut done: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for start in aliases.keys() {
+                if done.contains(start) {
+                    continue;
+                }
+                let mut stack = vec![(*start, 0usize)];
+                let mut path = vec![*start];
+                while let Some((name, at)) = stack.pop() {
+                    let Some(row) = aliases.get(name) else {
+                        continue;
+                    };
+                    let Some(case) = row.cases.get(at) else {
+                        path.pop();
+                        done.insert(name);
+                        continue;
+                    };
+                    stack.push((name, at + 1));
+                    let next = case.name.as_str();
+                    if !aliases.contains_key(next) || done.contains(next) {
+                        continue;
+                    }
+                    if path.contains(&next) {
+                        self.fail("alias effects stand for themselves");
+                        return;
+                    }
+                    path.push(next);
+                    stack.push((next, 0));
+                }
             }
         }
         fn read_operation(&self, value: S) -> Operation {

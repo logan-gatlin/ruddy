@@ -217,10 +217,17 @@ module.exports = grammar({
       field('body', $.annotation),
     ),
 
-    /** Empty, alias, unnamed singleton, and named closed-interface effects. */
+    /**
+     * Empty, alias, unnamed singleton, and named closed-interface effects.
+     *
+     * The parameters are the ones a `type` declaration binds, written the
+     * same way: `effect Ask 'a = { get: () -> 'a }` takes one, and every row
+     * naming `!Ask` hands it an argument.
+     */
     effect_definition: $ => seq(
       'effect',
       field('name', $.identifier),
+      repeat(field('parameter', $.type_variable)),
       optional(seq('=', field('body', choice(
         prec(1, $.effect_alias_union),
         $._effect_operation_signature,
@@ -228,7 +235,16 @@ module.exports = grammar({
       )))),
     ),
 
-    effect_alias_union: $ => sepBy1('+', $.effect_alias),
+    /**
+     * `!Ask 'a + !Log + ..'e` — the row an alias stands for: applications of
+     * other effects, and at most one tail naming a declared parameter.
+     */
+    effect_alias_union: $ => $._effect_alias_row,
+
+    _effect_alias_row: $ => choice(
+      $.rest,
+      prec.right(seq($.effect_alias, optional(seq('+', $._effect_alias_row)))),
+    ),
 
     named_effect_interface: $ => seq(
       '{',
@@ -257,8 +273,14 @@ module.exports = grammar({
       ')',
     ),
 
-    /** `!Log`, or `Sys::!Log` — an effect this declaration stands for. */
-    effect_alias: $ => prec(2, choice($.effect_label, $.effect_path)),
+    /**
+     * `!Log`, `Sys::!Log`, or `!Ask 'a` — an effect this declaration stands
+     * for, applied to the arguments its declaration takes.
+     */
+    effect_alias: $ => prec(2, seq(
+      field('name', choice($.effect_label, $.effect_path)),
+      repeat(field('argument', $._type_atom)),
+    )),
 
     // ── Paths ─────────────────────────────────────────────────────────────
 
@@ -713,16 +735,23 @@ module.exports = grammar({
       optional(seq('+', $._effect_row_body)),
     )),
 
-    /** `!Log`, or `!Log (when 'a)` — an effect the arrow may perform. */
+    /**
+     * `!Log`, `!Ask Nat`, or `!Log (when 'a)` — an effect the arrow may
+     * perform, applied to the arguments its declaration takes. The arguments
+     * are gathered the way a type application's are: one atom each, and a
+     * `(when` after the label is its presence clause rather than an argument.
+     */
     effect_case: $ => seq(
       field('name', choice($.effect_label, $.effect_path)),
+      repeat(field('argument', $._type_atom)),
       optional(field('when', $.parenthesized_when)),
     ),
 
-    /** `\!Log` — the effect is definitely not performed. */
+    /** `\!Log`, or `\!Ask Nat` — the effect is definitely not performed. */
     absent_effect: $ => seq(
       '\\',
       field('name', choice($.effect_label, $.effect_path)),
+      repeat(field('argument', $._type_atom)),
     ),
 
     /** `Pair Nat Nat` — a type applied to arguments, gathered flat. */

@@ -980,7 +980,7 @@ fn automatic_std_environment_child() {
                 graph
                     .projects
                     .iter()
-                    .map(|project| project.artifact.header.identity.name.as_str())
+                    .map(|project| project.artifact.header().identity.name.as_str())
                     .collect::<Vec<_>>(),
                 ["std", "app"]
             );
@@ -1011,7 +1011,7 @@ fn automatic_std_environment_child() {
                 "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = \"standard\"\n",
             )
             .unwrap();
-            assert_eq!(compile(&root).unwrap().header.identity.name, "app");
+            assert_eq!(compile(&root).unwrap().header().identity.name, "app");
         }
         "disabled" => {
             fs::write(
@@ -1019,7 +1019,7 @@ fn automatic_std_environment_child() {
                 "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
             )
             .unwrap();
-            assert_eq!(compile(&root).unwrap().header.identity.name, "app");
+            assert_eq!(compile(&root).unwrap().header().identity.name, "app");
         }
         _ => panic!("unexpected mode {mode}"),
     }
@@ -1069,18 +1069,18 @@ fn automatic_std_graph_child() {
         graph
             .projects
             .iter()
-            .map(|project| project.artifact.header.identity.name.as_str())
+            .map(|project| project.artifact.header().identity.name.as_str())
             .collect::<Vec<_>>(),
         ["std", "dep", "app"]
     );
     assert_eq!(
-        graph.projects[1].artifact.header.dependencies[0].name,
+        graph.projects[1].artifact.header().dependencies[0].name,
         "std"
     );
     assert_eq!(
         graph.projects[2]
             .artifact
-            .header
+            .header()
             .dependencies
             .iter()
             .map(|dependency| dependency.name.as_str())
@@ -1106,8 +1106,8 @@ fn automatic_std_graph_child() {
     let std_versions = graph
         .projects
         .iter()
-        .filter(|project| project.artifact.header.identity.name == "std")
-        .map(|project| project.artifact.header.identity.version.as_str())
+        .filter(|project| project.artifact.header().identity.name == "std")
+        .map(|project| project.artifact.header().identity.version.as_str())
         .collect::<Vec<_>>();
     assert_eq!(std_versions, ["1.0.0", "2.0.0"]);
 
@@ -1168,12 +1168,12 @@ fn configured_std_is_injected_first_and_is_source_visible() {
         graph
             .projects
             .iter()
-            .map(|project| project.artifact.header.identity.name.as_str())
+            .map(|project| project.artifact.header().identity.name.as_str())
             .collect::<Vec<_>>(),
         ["foundation", "app"]
     );
     assert_eq!(
-        graph.projects[1].artifact.header.dependencies[0].name,
+        graph.projects[1].artifact.header().dependencies[0].name,
         "foundation"
     );
     assert!(
@@ -1232,15 +1232,15 @@ fn manifest_dependencies_reach_the_artifact_in_declaration_order() {
         .last()
         .unwrap()
         .artifact
-        .header
+        .header()
         .dependencies
         .iter()
         .map(|dependency| (dependency.name.as_str(), dependency.version.as_str()))
         .collect();
     assert_eq!(identities, [("zeta", "2.0.0"), ("alpha", "1.2.3-beta.1")]);
     let built = compile(directory.path()).unwrap();
-    assert_eq!(built.header.identity.name, "app");
-    assert!(built.header.dependencies.is_empty());
+    assert_eq!(built.header().identity.name, "app");
+    assert!(built.header().dependencies.is_empty());
     assert!(!directory.path().join("zeta/build/zeta.artifact").exists());
     assert!(!directory.path().join("alpha/build/alpha.artifact").exists());
 }
@@ -1270,12 +1270,12 @@ fn direct_dependency_exports_resolve_and_keep_their_artifact_owner() {
     let printed = built.print();
     assert!(printed.contains("std@0.1.0::Nested::foo"), "{printed}");
     assert!(printed.contains("std@0.1.0::Nested::Number"), "{printed}");
-    assert_eq!(built.lir.externs.len(), 1);
-    assert_eq!(built.lir.externs[0].name, "std@0.1.0::Nested::runtime");
-    assert_eq!(built.lir.externs[0].target, "host.runtime");
-    assert_eq!(built.header.values.len(), 3);
-    assert!(built.header.types.is_empty());
-    assert!(built.header.effects.is_empty());
+    assert_eq!(built.lir().externs.len(), 1);
+    assert_eq!(built.lir().externs[0].name, "std@0.1.0::Nested::runtime");
+    assert_eq!(built.lir().externs[0].target, "host.runtime");
+    assert_eq!(built.header().values.len(), 3);
+    assert!(built.header().types.is_empty());
+    assert!(built.header().effects.is_empty());
 }
 
 #[test]
@@ -1297,13 +1297,20 @@ fn detailed_dependencies_alias_hyphenated_bundle_identities() {
 
     let graph = ruddy_cli::compile_graph(directory.path()).expect("the source alias resolves");
     assert_eq!(
-        graph.projects.last().unwrap().artifact.header.dependencies[0].name,
+        graph
+            .projects
+            .last()
+            .unwrap()
+            .artifact
+            .header()
+            .dependencies[0]
+            .name,
         "http-core"
     );
     assert!(
         compile(directory.path())
             .unwrap()
-            .header
+            .header()
             .dependencies
             .is_empty()
     );
@@ -1438,7 +1445,7 @@ fn the_configured_root_is_resolved_relative_to_the_manifest() {
     .expect("write the manifest");
 
     let built = compile(directory.path()).expect("compile the configured root");
-    assert!(built.header.dependencies.is_empty());
+    assert!(built.header().dependencies.is_empty());
     assert_eq!(
         Artifact::try_parse(&built.print())
             .unwrap()
@@ -1890,7 +1897,7 @@ fn locked_cached_git_dependency_child() {
     fs::write(home.join("cache/git/cache.lock"), "left behind by a crash").unwrap();
     let first = compile(&app).unwrap();
     assert!(!stale.exists());
-    assert!(first.header.dependencies.is_empty());
+    assert!(first.header().dependencies.is_empty());
 
     // Every use restores both tracked and untracked cache contents while the
     // cross-process cache lock remains held for compilation.
@@ -2148,14 +2155,14 @@ fn transitive_diamond_graphs_are_unique_dependency_first_and_direct_only() {
     let names: Vec<_> = graph
         .projects
         .iter()
-        .map(|project| project.artifact.header.identity.name.as_str())
+        .map(|project| project.artifact.header().identity.name.as_str())
         .collect();
     assert_eq!(names, ["shared", "left", "right", "app"]);
-    assert_eq!(graph.projects[1].artifact.header.dependencies.len(), 1);
+    assert_eq!(graph.projects[1].artifact.header().dependencies.len(), 1);
     assert_eq!(
         graph.projects[3]
             .artifact
-            .header
+            .header()
             .dependencies
             .iter()
             .map(|dependency| dependency.name.as_str())
@@ -2169,12 +2176,26 @@ fn transitive_diamond_graphs_are_unique_dependency_first_and_direct_only() {
         dependencies
             .projects
             .iter()
-            .map(|project| project.artifact.header.identity.name.as_str())
+            .map(|project| project.artifact.header().identity.name.as_str())
             .collect::<Vec<_>>(),
         ["shared", "left", "right"]
     );
-    assert!(dependencies.projects[1].artifact.header.dependencies.len() == 1);
-    assert!(dependencies.projects[2].artifact.header.dependencies.len() == 1);
+    assert!(
+        dependencies.projects[1]
+            .artifact
+            .header()
+            .dependencies
+            .len()
+            == 1
+    );
+    assert!(
+        dependencies.projects[2]
+            .artifact
+            .header()
+            .dependencies
+            .len()
+            == 1
+    );
     assert_eq!(
         direct
             .iter()
@@ -2293,7 +2314,7 @@ fn imported_signature_types_participate_in_effect_identity() {
     .unwrap();
     let artifact = compile(&app).unwrap();
     let identities: Vec<_> = artifact
-        .header
+        .header()
         .effects
         .iter()
         .filter_map(|effect| effect.identity.as_ref())
@@ -2538,7 +2559,7 @@ fn new_scaffolds_a_compilable_project_without_overwriting() {
     );
     disable_std(&destination);
     assert_eq!(
-        compile(&destination).unwrap().header.identity,
+        compile(&destination).unwrap().header().identity,
         ruddy::artifact::Identity {
             name: "my_app".into(),
             version: "0.1.0".into(),

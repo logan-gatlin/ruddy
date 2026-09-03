@@ -177,21 +177,21 @@ fn stmt_node(ids: &mut Ids, stmt: &Stmt) -> Node {
             }
             type_node_.child(annotation_node(ids, body))
         }
-        StmtKind::Effect { name, body } => {
+        StmtKind::Effect { name, params, body } => {
             let mut effect_node = Node {
                 label: "Effect".into(),
                 ..node
             }
             .child(Node::new(ids.next(), "Name", name.tracked.clone()).at(name.span));
+            for param in params {
+                effect_node = effect_node.child(
+                    Node::new(ids.next(), "Param", format!("'{}", param.tracked)).at(param.span),
+                );
+            }
             match body {
                 EffectBody::Empty => {}
-                EffectBody::Alias(cases) => {
-                    for effect in cases.keys() {
-                        effect_node = effect_node.child(
-                            Node::new(ids.next(), "Names", print::ast::effect(effect))
-                                .at(effect.span()),
-                        );
-                    }
+                EffectBody::Alias(row) => {
+                    effect_node = effect_node.child(effects_node(ids, row));
                 }
                 EffectBody::Unnamed { signature } => {
                     effect_node = effect_node.child(
@@ -639,23 +639,33 @@ fn effects_node(ids: &mut Ids, effects: &EffectRow) -> Node {
         .effects
         .iter()
         .map(|(name, label)| match label {
-            EffectLabel::Written { when } => {
+            EffectLabel::Written { args, when } => {
                 let mark = when_text(when);
-                Node::new(
+                let mut label = Node::new(
                     ids.next(),
                     format!("{}{mark}", print::ast::effect(name)),
                     String::new(),
                 )
-                .at(name.span())
+                .at(name.span());
+                for arg in args {
+                    label = label.child(type_node(ids, arg));
+                }
+                label
             }
             // The absent effect is a leaf wearing the `\`, spanning the whole
             // `\!Name` — the struct's absent field again.
-            EffectLabel::Absent => Node::new(
-                ids.next(),
-                format!("\\{}", print::ast::effect(name)),
-                String::new(),
-            )
-            .at(name.span()),
+            EffectLabel::Absent { args } => {
+                let mut label = Node::new(
+                    ids.next(),
+                    format!("\\{}", print::ast::effect(name)),
+                    String::new(),
+                )
+                .at(name.span());
+                for arg in args {
+                    label = label.child(type_node(ids, arg));
+                }
+                label
+            }
         })
         .collect();
     if let Some(tail) = &effects.tail {

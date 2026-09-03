@@ -142,12 +142,27 @@ pub type Operations = IndexMap<(Symbol, ir::OperationSelector), (Rc<Ty>, Rc<Ty>)
 pub struct Semantics {
     pub(crate) aliases: IndexMap<Symbol, Scheme>,
     pub(crate) operations: Operations,
+    /// Each effect alias's row over its own parameters, unexpanded, for the
+    /// artifact to publish: an open alias is expanded at each use with that
+    /// use's arguments, so what is published is what it was declared as.
+    pub(crate) effect_aliases: IndexMap<Symbol, EffectAliasRow>,
     pub(crate) externs: IndexMap<Symbol, Scheme>,
     pub(crate) reviewed_externs: IndexMap<Symbol, ReviewedExtern>,
     pub(crate) schemes: IndexMap<Symbol, Scheme>,
     pub(crate) locals: IndexMap<Symbol, Scheme>,
     pub(crate) store: Store,
     pub(crate) promises: IndexMap<Symbol, Formula>,
+}
+
+/// An effect alias's row as declared, semantically: the effects it applies,
+/// each to arguments over the alias's parameters ([`Ty::Bound`]), and the
+/// parameter position it ends in.
+#[derive(Debug, Clone)]
+pub struct EffectAliasRow {
+    /// The effects the alias applies, each with its arguments in order.
+    pub cases: Vec<(Symbol, Vec<Rc<Ty>>)>,
+    /// The parameter position the alias ends in, if it ends in one.
+    pub tail: Option<u32>,
 }
 
 /// Complete target-neutral facts inference accepted about an extern
@@ -262,6 +277,12 @@ impl Semantics {
     /// carry a solved type.
     pub fn operations(&self) -> &Operations {
         &self.operations
+    }
+
+    /// Each effect alias's row over its own parameters, unexpanded. See
+    /// [`EffectAliasRow`].
+    pub fn effect_aliases(&self) -> &IndexMap<Symbol, EffectAliasRow> {
+        &self.effect_aliases
     }
 
     /// The scheme each target-provided top-level value declared. Externs have
@@ -2321,6 +2342,16 @@ pub enum ErrorKind {
     /// shape a call site needs — and `actual` is what the term turned out to
     /// be.
     Mismatch { expected: Rc<Ty>, actual: Rc<Ty> },
+    /// Two applications of one effect met and their arguments at one
+    /// position could not be made equal: one computation would be using
+    /// incompatible versions of the effect. The failure the arguments met
+    /// with is kept as the cause, so the reader is told which requirement on
+    /// the argument clashed with which.
+    EffectArgument {
+        effect: String,
+        position: u32,
+        cause: Box<ErrorKind>,
+    },
     /// The occurs check fired: a variable would have to contain itself, as in
     /// `fn x => x x`. The cycle is reported rather than constructed, so the
     /// type language stays finite trees. A row closes the same cycle when the
@@ -2520,6 +2551,28 @@ pub enum ErrorKind {
         /// declaration's primary existing diagnostic kind.
         callback_issues: Vec<ExternCallbackIssue>,
     },
+}
+
+impl ErrorKind {
+    /// The failure this one reports, looking through an effect-argument
+    /// clash to the failure its arguments met with.
+    pub fn cause(&self) -> &ErrorKind {
+        match self {
+            ErrorKind::EffectArgument { cause, .. } => cause,
+            other => other,
+        }
+    }
+
+    /// This failure, reported as a clash between two applications of
+    /// `effect` at argument `position` that it descends from.
+    pub(crate) fn as_effect_argument(&mut self, effect: String, position: u32) {
+        let cause = Box::new(std::mem::replace(self, ErrorKind::Recursive));
+        *self = ErrorKind::EffectArgument {
+            effect,
+            position,
+            cause,
+        };
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2928,6 +2981,11 @@ struct Table {
     /// Reasons descended from recovery, retained for debugging but excluded
     /// from publishable scheme evidence in O(1).
     unpublishable_reasons: HashSet<ReasonId>,
+    /// The reasons minted while two applications of one effect had their
+    /// arguments made equal, by the effect and the argument's position. A
+    /// failure whose cause runs through one of these is a clash between two
+    /// uses of the effect, however far from the meeting it surfaced.
+    effect_argument_reasons: HashMap<ReasonId, (String, u32)>,
     next_reason_id: u64,
     /// Binding reasons observed during one solver act. `None` outside a solve
     /// makes publication, generalization, and zonking incapable of leaking
@@ -4513,6 +4571,8 @@ fn budget_reason_slice(mut reasons: Vec<ReasonId>) -> (Vec<ReasonId>, usize) {
 
 struct ExplanationSources<'a> {
     aliases: &'a IndexMap<Symbol, Scheme>,
+    /// See [`Table::effect_argument_reasons`].
+    effect_arguments: &'a HashMap<ReasonId, (String, u32)>,
 }
 
 fn attach_ordinary_explanations(
@@ -4524,7 +4584,10 @@ fn attach_ordinary_explanations(
     omitted_reason_parents: &HashMap<ReasonId, usize>,
     sources: ExplanationSources<'_>,
 ) {
-    let ExplanationSources { aliases } = sources;
+    let ExplanationSources {
+        aliases,
+        effect_arguments,
+    } = sources;
     let pivot_contexts = pivot_contexts(constraints);
     let all = all_constraints(constraints);
     // `all` iterates in hash order, so when desugaring reuses one span for
@@ -4563,7 +4626,10 @@ fn attach_ordinary_explanations(
     let reasons_by_id: HashMap<_, _> = reasons.iter().map(|reason| (reason.id, reason)).collect();
 
     for error in errors {
-        let (left, right, kind, row) = match &error.kind {
+        // An effect-argument clash is explained by the failure its arguments
+        // met with: the facts that led there are the ones the reader can act
+        // on, and the effect and position are the title's to say.
+        let (left, right, kind, row) = match error.kind.cause() {
             ErrorKind::Mismatch { expected, actual } => {
                 (describe_type(expected), describe_type(actual), None, None)
             }
@@ -4685,6 +4751,17 @@ fn attach_ordinary_explanations(
                 .saturating_add(omitted_reason_parents.get(&id).copied().unwrap_or(0));
             work.extend(reason.parents.iter().rev().copied());
         }
+        // A failure that descends from making two applications of one effect
+        // agree is a clash between those uses, wherever it surfaced: the
+        // annotation that finally refused an argument was refusing what the
+        // other use had already decided.
+        let clash = match error.kind {
+            ErrorKind::EffectArgument { .. } => None,
+            _ => walked_reasons
+                .iter()
+                .find_map(|id| effect_arguments.get(id))
+                .cloned(),
+        };
         // Preserve both semantic endpoints: the newest nodes contain the
         // failing act, while the oldest tail contains the defining fact. A
         // bounded full view says exactly how much middle was omitted.
@@ -5202,7 +5279,7 @@ fn attach_ordinary_explanations(
             }
         });
         let omitted_facts = candidates.len().saturating_sub(abridged.len());
-        let leaf = match &error.kind {
+        let leaf = match error.kind.cause() {
             ErrorKind::Mismatch { expected, actual } => {
                 smallest_incompatible(aliases, expected, actual)
             }
@@ -5256,6 +5333,9 @@ fn attach_ordinary_explanations(
                 omitted_reasons,
             },
         });
+        if let Some((effect, position)) = clash {
+            error.kind.as_effect_argument(effect, position);
+        }
     }
 }
 
@@ -5611,14 +5691,39 @@ pub fn infer(mint: &Mint, program: &mut Program, trace: Trace) -> Output {
         .map(|(symbol, declaration)| (*symbol, declaration.name_span))
         .collect();
     let mut operations = program.external_operations.clone();
+    let mut effect_aliases = IndexMap::new();
     for (symbol, decl) in &program.effects {
-        let ir::Effect::Operations(declared) = &decl.value else {
-            continue;
-        };
-        for (name, operation) in declared {
-            let from = lower_type(mint, &mut table, &operation.from);
-            let to = lower_type(mint, &mut table, &operation.to);
-            operations.insert((*symbol, name.clone()), (from, to));
+        match &decl.value {
+            ir::Effect::Operations(declared) => {
+                for (name, operation) in declared {
+                    let from = lower_type(mint, &mut table, &operation.from);
+                    let to = lower_type(mint, &mut table, &operation.to);
+                    operations.insert((*symbol, name.clone()), (from, to));
+                }
+            }
+            ir::Effect::Alias(alias) => {
+                let cases = alias
+                    .body
+                    .cases
+                    .iter()
+                    .map(|case| {
+                        let args = case
+                            .args
+                            .iter()
+                            .map(|arg| lower_type(mint, &mut table, arg))
+                            .collect();
+                        (case.symbol, args)
+                    })
+                    .collect();
+                let tail = match &alias.body.tail {
+                    Some(ir::Tail {
+                        of: ir::Row::Param { index, .. },
+                        ..
+                    }) => Some(*index),
+                    _ => None,
+                };
+                effect_aliases.insert(*symbol, EffectAliasRow { cases, tail });
+            }
         }
     }
 
@@ -6060,6 +6165,7 @@ pub fn infer(mint: &Mint, program: &mut Program, trace: Trace) -> Output {
                 annotated: Vec::new(),
                 operations: &operations,
                 effect_ids: &program.effect_ids,
+                effect_params: &program.effect_params,
                 effect_declaration_spans: &effect_declaration_spans,
                 term_effect_provenance: HashMap::new(),
                 local_effect_provenance: HashMap::new(),
@@ -6361,7 +6467,10 @@ pub fn infer(mint: &Mint, program: &mut Program, trace: Trace) -> Output {
         &steps,
         &table.reasons,
         &table.omitted_reason_parents,
-        ExplanationSources { aliases: &aliases },
+        ExplanationSources {
+            aliases: &aliases,
+            effect_arguments: &table.effect_argument_reasons,
+        },
     );
 
     // Constraints are solved in the order the walk emitted them, which is not
@@ -6409,6 +6518,7 @@ pub fn infer(mint: &Mint, program: &mut Program, trace: Trace) -> Output {
     let semantics = Semantics {
         aliases,
         operations,
+        effect_aliases,
         externs,
         reviewed_externs,
         schemes,
@@ -10000,6 +10110,15 @@ impl Table {
                 expected: self.close(expected, subst),
                 actual: self.close(actual, subst),
             },
+            ErrorKind::EffectArgument {
+                effect,
+                position,
+                cause,
+            } => ErrorKind::EffectArgument {
+                effect: effect.clone(),
+                position: *position,
+                cause: Box::new(self.zonk_error(cause, subst)),
+            },
             ErrorKind::Recursive => ErrorKind::Recursive,
             ErrorKind::MissingField { shape, base, field } => ErrorKind::MissingField {
                 shape: *shape,
@@ -11261,7 +11380,7 @@ fn lower_scoped(
         TypeKind::Arrow { from, to, effects } => Ty::Arrow(
             lower_scoped(mint, table, tails, from, boundaries),
             lower_scoped(mint, table, tails, to, boundaries),
-            effect_row(table, tails, effects),
+            effect_row(mint, table, tails, effects, boundaries),
         ),
         // A row handed to a declaration as an argument, which is the one place
         // a row arrives without an arrow around it. It lowers to the row it is
@@ -11269,7 +11388,7 @@ fn lower_scoped(
         // effects is too — and the position it is spliced into is what says
         // which of the three it is being read as. See
         // [`types::Shape`](crate::types::Shape).
-        TypeKind::Effects(effects) => Ty::Sum(effect_row(table, tails, effects)),
+        TypeKind::Effects(effects) => Ty::Sum(effect_row(mint, table, tails, effects, boundaries)),
         // A written struct is unit carrying the fields that were written: the
         // fields are what the type says, and there is nothing else to it. A
         // field written `\name` is [`Presence::Absent`] in the position it was
@@ -11406,19 +11525,44 @@ fn row(
 /// decide ([`Table::close_effects`]). A tail the reader *named* is out of R23's
 /// reach by construction — `..'e` lowers to a rigid, which is no solver variable
 /// and is never counted.
-fn effect_row(table: &mut Table, tails: &mut Tails, effects: &ir::EffectRow) -> Row {
+///
+/// Each label's arguments are lowered in the scope of the type around it and
+/// become the label's payload, as the positional struct a tuple is; a label
+/// written absent carries them too, so a printed row can still say which
+/// application is not performed.
+fn effect_row(
+    mint: &Mint,
+    table: &mut Table,
+    tails: &mut Tails,
+    effects: &ir::EffectRow,
+    boundaries: Option<&HashSet<Span>>,
+) -> Row {
     let mut labels = IndexMap::new();
     for (name, label) in &effects.effects {
+        let args: Vec<Assigned> = label
+            .args()
+            .iter()
+            .map(|arg| {
+                Assigned::Ty(match &arg.tracked {
+                    // A row of effects written as an argument travels as an
+                    // effects argument, not as the sum a declaration's row
+                    // argument lowers to: see [`Ty::effects_argument`].
+                    TypeKind::Effects(row) => Rc::new(Ty::effects_argument(effect_row(
+                        mint, table, tails, row, boundaries,
+                    ))),
+                    _ => lower_scoped(mint, table, tails, arg, boundaries),
+                })
+            })
+            .collect();
+        let ty = constrain::argument_tuple(&args);
         let lowered = match label {
             ir::EffectLabel::Written { when, .. } => RowField {
                 presence: presence(table, tails, when),
-                ty: Rc::new(Ty::unit()),
+                ty,
             },
-            // The struct's absent field again: an effect that is definitely
-            // not performed carries nothing worth constraining.
             ir::EffectLabel::Absent { .. } => RowField {
                 presence: Presence::Absent,
-                ty: Rc::new(Ty::default()),
+                ty,
             },
         };
         labels.insert(name.row_key(), lowered);

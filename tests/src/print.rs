@@ -1043,3 +1043,65 @@ fn printed_ast(source: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+/// Both trees render a parameterized effect declaration, an applied label,
+/// and a parameterized alias back as the source they came from — the IR with
+/// the alias expanded.
+#[test]
+fn both_trees_render_effect_parameters_and_applications() {
+    for source in [
+        "effect Ask 'a = { get: () -> 'a }",
+        "effect Log 'a = 'a -> ()",
+        "effect Nil 'a 'b",
+        "effect Ask 'a = { get: () -> 'a }\n\
+         let f : () -> Nat + !Ask Nat = fn x => 0n",
+        "effect Ask 'a = { get: () -> 'a }\n\
+         let f : () -> Nat + !Ask (Nat -> Nat) + ..'e = fn x => 0n",
+        "effect Ask 'a = { get: () -> 'a }\n\
+         let f : () -> Nat + \\!Ask Nat + ..'e = fn x => 0n",
+        "effect State 'r = { get: () -> { x: Nat, ..'r } }\n\
+         let f : () -> Nat + !State { y: Nat } (when 'p) + ..'e = fn x => 0n",
+        "effect Log = { write: Nat -> () }\n\
+         effect Ask 'a = { get: () -> 'a }\n\
+         effect Both 'a 'e = !Ask 'a + !Log + ..'e",
+    ] {
+        let (ast, ir) = printed(source);
+        assert_eq!(ast, source, "{source}");
+        assert_eq!(ir, source, "{source}");
+    }
+    let source = "effect Log = { write: Nat -> () }\n\
+                  effect Ask 'a = { get: () -> 'a }\n\
+                  effect Both 'a 'e = !Ask 'a + !Log + ..'e\n\
+                  let f : () -> Nat + !Both Nat (..'e) = fn x => 0n";
+    let (ast, ir) = printed(source);
+    assert_eq!(ast, source);
+    assert_eq!(
+        ir,
+        "effect Log = { write: Nat -> () }\n\
+         effect Ask 'a = { get: () -> 'a }\n\
+         effect Both 'a 'e = !Ask 'a + !Log + ..'e\n\
+         let f : () -> Nat + !Ask Nat + !Log + ..'e = fn x => 0n"
+    );
+}
+
+/// A printed scheme carrying applied effects re-lowers to itself.
+#[test]
+fn a_printed_applied_effect_re_lowers_to_itself() {
+    let effects = "effect Ask 'a = { get: () -> 'a }\n\
+                   effect State 'r = { get: () -> { x: Nat, ..'r } }\n\
+                   effect Log = { write: Nat -> () }\n\
+                   effect Run 'e = { run: (() -> () + ..'e) -> () }\n";
+    for annotation in [
+        "Nat -> Nat + !Ask Nat",
+        "Nat -> Nat + !Ask (Nat -> Nat) + !Log",
+        "Nat -> Nat + !State { y: Nat }",
+        "Nat -> Nat + !Run (!Log)",
+        "Nat -> Nat + !Run (|)",
+    ] {
+        let source = format!("{effects}let f : {annotation} = fn x => x");
+        let (_, scheme) = types_of(&source);
+        assert_eq!(scheme, annotation, "{annotation}");
+        let again = format!("{effects}let f : {scheme} = fn x => x");
+        assert_eq!(types_of(&again).1, annotation, "{annotation}");
+    }
+}

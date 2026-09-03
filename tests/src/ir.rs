@@ -4,9 +4,9 @@ use indexmap::IndexMap;
 use ruddy::{
     artifact as a, inference,
     ir::{
-        Annotation, ClauseKind, DependencyImport, Effect, ErrorKind, ExternTypeKind, Field,
-        OperationSelector, OperationTypeProblem, Output, PatternKind, PresenceOwnership, SumCase,
-        Term, TermKind, TypeField, TypeKind, build, build_with_dependencies,
+        Annotation, ClauseKind, DependencyImport, Effect, EffectLabel, ErrorKind, ExternTypeKind,
+        Field, OperationSelector, OperationTypeProblem, Output, PatternKind, PresenceOwnership,
+        Row, SumCase, Tail, Term, TermKind, TypeField, TypeKind, build, build_with_dependencies,
         build_with_dependency_imports,
     },
     parse,
@@ -3858,6 +3858,455 @@ fn effect_of<'a>(mint: &Mint, out: &'a Output, name: &str) -> &'a Effect {
     &out.program.effects[&symbol].value
 }
 
+/// An effect binds parameters the way a type declaration does: its
+/// operations may mention them, a row applies it to exactly that many
+/// arguments, and a variable no parameter binds is still refused.
+#[test]
+fn an_effect_binds_parameters_its_operations_mention() {
+    let source = "effect Ask 'a = { get: () -> 'a }\n\
+                  let f : () -> Nat + !Ask Nat = fn _ => 0n";
+    let (mint, out) = built(source);
+    let symbol = *out
+        .program
+        .effects
+        .keys()
+        .find(|symbol| mint.name(**symbol) == "Ask")
+        .expect("the effect is declared");
+    let decl = &out.program.effects[&symbol];
+    assert_eq!(decl.params.len(), 1);
+    assert_eq!(mint.name(decl.params[0].symbol), "a");
+    assert_eq!(decl.params[0].kind, ParamKind::Type { lacks: [].into() });
+    let Effect::Operations(operations) = &decl.value else {
+        panic!("expected operations");
+    };
+    let get = &operations[&OperationSelector::Named("get".to_string())];
+    assert!(matches!(get.to.tracked, TypeKind::Param { index: 0, .. }));
+
+    let term = &out.program.terms[&term_symbol(&mint, &out, "f")];
+    let TypeKind::Arrow { effects, .. } = &term.annotation.as_ref().expect("annotated").ty.tracked
+    else {
+        panic!("expected an arrow");
+    };
+    let (id, label) = effects.effects.first().expect("the row names the effect");
+    assert_eq!(id.name(), "Ask");
+    let EffectLabel::Written { args, .. } = label else {
+        panic!("expected a written label");
+    };
+    assert!(matches!(args.as_slice(), [arg] if matches!(arg.tracked, TypeKind::Prim(Prim::Nat))));
+
+    // Too few or too many arguments is counted at the application, and the
+    // label is dropped rather than paired up by guesswork.
+    for row in ["!Ask", "!Ask Nat Nat", "\\!Ask + ..'e"] {
+        let src =
+            format!("effect Ask 'a = {{ get: () -> 'a }}\nlet f : () -> Nat + {row} = fn _ => 0n");
+        let (_, out) = build_src(&src);
+        let [error] = &out.errors[..] else {
+            panic!("{row}: {:#?}", out.errors);
+        };
+        assert_eq!(error.kind.code(), "effect-arity", "{row}");
+        assert!(
+            matches!(
+                &error.kind,
+                ErrorKind::EffectArity { name, expected: 1, .. } if name == "Ask"
+            ),
+            "{row}: {:#?}",
+            error.kind
+        );
+    }
+    let (_, out) =
+        build_src("effect Ask 'a = { get: () -> 'a }\nlet f : () -> Nat + !Ask = fn _ => 0n");
+    let diagnostic = out.errors[0].diagnostic();
+    assert_eq!(
+        diagnostic.title,
+        "effect `!Ask` expects one argument, but none was written"
+    );
+    assert_eq!(diagnostic.help, ["add the missing effect arguments"]);
+    // And an effect declared without parameters takes none, as before.
+    assert_eq!(
+        codes_of("effect Log = Nat -> ()\nlet f : () -> Nat + !Log Nat = fn _ => 0n"),
+        ["effect-arity"]
+    );
+    // A variable no parameter binds is the one an operation cannot have.
+    let (_, out) = build_src("effect Ask 'a = { get: () -> 'b }");
+    assert!(
+        matches!(
+            out.errors.as_slice(),
+            [error] if matches!(
+                error.kind,
+                ErrorKind::ImpureOperation { found: OperationTypeProblem::Variable(ref name) } if name == "b"
+            )
+        ),
+        "{:#?}",
+        out.errors
+    );
+}
+
+/// What an effect's parameter stands for is read off its operations the way a
+/// type's is read off its body — the same fixpoint, so a parameter handed on
+/// to an effect inherits that effect's reading, and one used two ways is
+/// refused at its declaration. An operation may carry effects on an arrow
+/// nested inside its signature; only its own outer arrow stays pure.
+#[test]
+fn an_effect_parameter_stands_for_what_its_operations_use_it_as() {
+    let source = "effect Log = { write: Nat -> () }\n\
+                  effect Ask 'a = { get: () -> 'a }\n\
+                  effect State 'r = { get: () -> { x: Nat, ..'r }, put: { x: Nat, ..'r } -> () }\n\
+                  effect Choose 'c = { pick: (#A | ..'c) -> () }\n\
+                  effect Run 'e = { run: (() -> () + !Log + ..'e) -> () }\n\
+                  effect Wrap 'f = { wrap: (() -> () + !Run 'f) -> () }\n\
+                  effect Nil 'u\n\
+                  type Runner 'g = () -> () + !Run 'g";
+    let (mint, out) = built(source);
+    let kind = |name: &str| {
+        let symbol = *out
+            .program
+            .effects
+            .keys()
+            .find(|symbol| mint.name(**symbol) == name)
+            .unwrap_or_else(|| panic!("no effect named {name}"));
+        out.program.effects[&symbol].params[0].kind.clone()
+    };
+    assert_eq!(kind("Ask"), ParamKind::Type { lacks: [].into() });
+    assert_eq!(
+        kind("State"),
+        ParamKind::Fields {
+            lacks: ["x".to_string()].into()
+        }
+    );
+    assert_eq!(
+        kind("Choose"),
+        ParamKind::Cases {
+            lacks: ["A".to_string()].into()
+        }
+    );
+    let log = out.program.effect_ids[&out
+        .program
+        .effects
+        .keys()
+        .copied()
+        .find(|symbol| mint.name(*symbol) == "Log")
+        .expect("Log is declared")]
+        .row_key();
+    assert_eq!(
+        kind("Run"),
+        ParamKind::Effects {
+            lacks: [log.clone()].into()
+        }
+    );
+    // Handed straight on to `Run`, `Wrap`'s parameter reads as `Run`'s does,
+    // and so does the type declaration's.
+    assert_eq!(
+        kind("Wrap"),
+        ParamKind::Effects {
+            lacks: [log].into()
+        }
+    );
+    let runner = &out.program.types[&type_symbol(&mint, &out, "Runner")];
+    assert_eq!(runner.params[0].kind.sense(), Sense::Effects);
+    // A parameter nothing uses stands for a type.
+    assert_eq!(kind("Nil"), ParamKind::Type { lacks: [].into() });
+
+    // Read as a type by one operation and as a sum's rest by another: the
+    // declaration is told, at the parameter.
+    let (_, out) = build_src("effect Bad 'a = { one: 'a -> (), two: (#A | ..'a) -> () }");
+    let [error] = &out.errors[..] else {
+        panic!("{:#?}", out.errors);
+    };
+    assert_eq!(error.kind.code(), "mixed-parameter");
+    assert!(matches!(
+        error.kind,
+        ErrorKind::MixedParameter {
+            first: Sense::Type,
+            second: Sense::Cases
+        }
+    ));
+
+    // The outer arrow of an operation is still the one place effects cannot
+    // be declared.
+    let (_, out) =
+        build_src("effect Log = { write: Nat -> () }\neffect Bad = { op: Nat -> () + !Log }");
+    assert!(
+        matches!(
+            out.errors.as_slice(),
+            [error] if matches!(error.kind, ErrorKind::ImpureOperation { found: OperationTypeProblem::Effects })
+        ),
+        "{:#?}",
+        out.errors
+    );
+    // And a nested row is held to an operation's rules: nothing anonymous.
+    for source in [
+        "effect Bad = { op: (() -> () + ..) -> () }",
+        "effect Log = { write: Nat -> () }\neffect Bad = { op: (() -> () + !Log (when 'p)) -> () }",
+        "effect Bad = { op: (() -> () + ..'e) -> () }",
+    ] {
+        let (_, out) = build_src(source);
+        assert!(
+            matches!(
+                out.errors.as_slice(),
+                [error] if matches!(error.kind, ErrorKind::ImpureOperation { .. })
+            ),
+            "{source}: {:#?}",
+            out.errors
+        );
+    }
+}
+
+/// An argument handed to an effect is held to the parameter's reading the way
+/// a type application's is: a row goes where a row is asked for, and it may
+/// not name what the declaration already names beside the parameter.
+#[test]
+fn an_effect_argument_is_held_to_its_parameters_reading() {
+    let base = "effect Log = { write: Nat -> () }\n\
+                effect Run 'e = { run: (() -> () + !Log + ..'e) -> () }\n\
+                effect State 'r = { get: () -> { x: Nat, ..'r } }\n\
+                effect Choose 'c = { pick: (#A | ..'c) -> () }\n";
+    for (row, sense) in [
+        ("!Run Nat", Sense::Effects),
+        ("!State Nat", Sense::Fields),
+        ("!Choose Nat", Sense::Cases),
+    ] {
+        let (_, out) = build_src(&format!("{base}let f : () -> Nat + {row} = fn _ => 0n"));
+        assert!(
+            matches!(
+                out.errors.as_slice(),
+                [error] if matches!(error.kind, ErrorKind::NotARow { sense: found } if found == sense)
+            ),
+            "{row}: {:#?}",
+            out.errors
+        );
+    }
+    let (mint, out) = built(base);
+    let log = out.program.effect_ids[&out
+        .program
+        .effects
+        .keys()
+        .copied()
+        .find(|symbol| mint.name(*symbol) == "Log")
+        .expect("Log is declared")]
+        .row_key();
+    for (row, shape, field) in [
+        ("!Run (!Log)", Shape::Effect, log.as_str()),
+        ("!State { x: Nat }", Shape::Struct, "x"),
+        ("!Choose (#A)", Shape::Sum, "A"),
+    ] {
+        let (_, out) = build_src(&format!("{base}let f : () -> Nat + {row} = fn _ => 0n"));
+        assert!(
+            matches!(
+                out.errors.as_slice(),
+                [error] if matches!(
+                    &error.kind,
+                    ErrorKind::RepeatedRowField { shape: found, field: name } if *found == shape && name == field
+                )
+            ),
+            "{row}: {:#?}",
+            out.errors
+        );
+    }
+    // Wherever a row is written: a declared type's body, an operation's
+    // nested arrow, and an extern's annotation are checked alike.
+    for source in [
+        format!("{base}type T = () -> () + !Run Nat"),
+        format!("{base}effect Nested = {{ op: (() -> () + !Run Nat) -> () }}"),
+        format!("{base}extern host : () -> Nat + !Run Nat = \"host\""),
+    ] {
+        assert_eq!(codes_of(&source), ["not-a-row"], "{source}");
+    }
+    // And an argument that keeps to the reading is taken as written.
+    let (mint, out) = built(&format!(
+        "{base}effect IO = {{ print: Nat -> () }}\nlet f : () -> Nat + !Run (!IO + ..'e) = fn _ => 0n"
+    ));
+    let term = &out.program.terms[&term_symbol(&mint, &out, "f")];
+    let TypeKind::Arrow { effects, .. } = &term.annotation.as_ref().expect("annotated").ty.tracked
+    else {
+        panic!("expected an arrow");
+    };
+    let label = effects.effects.values().next().expect("the row names Run");
+    assert!(matches!(label.args(), [arg] if matches!(arg.tracked, TypeKind::Effects(_))));
+}
+
+/// Structural identity belongs to the generic constructor: its leaf name, how
+/// many parameters it takes and what each stands for, and its operations with
+/// the parameters as positions. Names of parameters are not part of it; a
+/// parameter no operation mentions still is; and an effect applied inside an
+/// interface is told apart by its arguments.
+#[test]
+fn structural_identity_includes_parameters_and_their_positions() {
+    let source = "module Renamed = effect Ask 'a = { get: () -> 'a } end\n\
+                  module Same = effect Ask 'b = { get: () -> 'b } end\n\
+                  module Wider = effect Ask 'a 'b = { get: () -> 'a } end\n\
+                  module Other = effect Ask 'a 'b = { get: () -> 'b } end\n\
+                  module Fixed = effect Ask 'a = { get: () -> Nat } end\n\
+                  module Fields = effect Ask 'a = { get: () -> { x: Nat, ..'a } } end\n\
+                  module Bare = effect Ask = { get: () -> Nat } end\n\
+                  module Phantom = effect Ask 'a = { get: () -> Nat } end";
+    let (mint, out) = built(source);
+    let identity = |module: &str| {
+        let symbol = *out
+            .program
+            .effects
+            .keys()
+            .find(|symbol| {
+                mint.name(**symbol) == "Ask"
+                    && mint
+                        .parent(**symbol)
+                        .is_some_and(|parent| mint.name(parent.symbol()) == module)
+            })
+            .unwrap_or_else(|| panic!("no Ask in {module}"));
+        out.program.effect_ids[&symbol].clone()
+    };
+    assert_eq!(identity("Renamed"), identity("Same"));
+    assert_eq!(identity("Fixed"), identity("Phantom"));
+    let distinct = [
+        identity("Renamed"),
+        identity("Wider"),
+        identity("Other"),
+        identity("Fixed"),
+        identity("Fields"),
+        identity("Bare"),
+    ];
+    for (at, left) in distinct.iter().enumerate() {
+        for right in &distinct[at + 1..] {
+            assert_ne!(left, right);
+        }
+    }
+
+    // Applied inside an interface, an effect's arguments are part of what the
+    // interface says, so two interfaces differing only there are two.
+    let source = "effect Ask 'a = { get: () -> 'a }\n\
+                  module N = effect Probe = { run: (() -> () + !Ask Nat) -> () } end\n\
+                  module S = effect Probe = { run: (() -> () + !Ask String) -> () } end\n\
+                  module M = effect Probe = { run: (() -> () + !Ask Nat) -> () } end";
+    let (mint, out) = built(source);
+    let probes: Vec<_> = out
+        .program
+        .effect_ids
+        .iter()
+        .filter(|(symbol, _)| mint.name(**symbol) == "Probe")
+        .map(|(_, identity)| identity.clone())
+        .collect();
+    assert_eq!(probes.len(), 3);
+    assert_ne!(probes[0], probes[1]);
+    assert_eq!(probes[0], probes[2]);
+
+    // An interface may refer back to its own parameterized effect.
+    let (_, out) = built("effect Visit 'a = { run: (() -> 'a + !Visit 'a) -> 'a }");
+    assert_eq!(out.program.effect_ids.len(), 1);
+}
+
+/// A parameterized alias is a way of writing a row: its arguments are
+/// substituted into the effects it names, an effects parameter it ends in is
+/// spliced as the row's tail, and every alias it names is expanded in turn.
+#[test]
+fn a_parameterized_alias_expands_to_the_row_it_writes() {
+    let base = "effect Log = { write: Nat -> () }\n\
+                effect IO = { print: Nat -> () }\n\
+                effect Ask 'a = { get: () -> 'a }\n\
+                effect Both 'a 'e = !Ask 'a + !Log + ..'e\n\
+                effect Forward 'e = ..'e\n\
+                effect Nested 'x 'e = !Both 'x (!IO + ..'e)\n";
+    let (mint, out) = built(&format!(
+        "{base}let f : () -> Nat + !Nested Nat (..'r) = fn _ => 0n\n\
+         let g : () -> Nat + !Forward (!Log) = fn _ => 0n\n\
+         let h : () -> Nat + !Both String (!IO) (when 'p) = fn _ => 0n\n\
+         let i : () -> Nat + \\!Both String (!IO) + ..'e = fn _ => 0n"
+    ));
+    let row = |name: &str| {
+        let term = &out.program.terms[&term_symbol(&mint, &out, name)];
+        let TypeKind::Arrow { effects, .. } =
+            &term.annotation.as_ref().expect("annotated").ty.tracked
+        else {
+            panic!("expected an arrow");
+        };
+        (*effects).clone()
+    };
+    let f = row("f");
+    let names: Vec<_> = f.effects.keys().map(|id| id.name().to_string()).collect();
+    assert_eq!(names, ["Ask", "Log", "IO"]);
+    let ask = f.effects.values().next().expect("Ask");
+    assert!(matches!(ask.args(), [arg] if matches!(arg.tracked, TypeKind::Prim(Prim::Nat))));
+    assert!(ask.expanded());
+    assert!(matches!(&f.tail, Some(Tail { of: Row::Named(name), .. }) if name == "r"));
+    let g = row("g");
+    assert_eq!(g.effects.len(), 1);
+    assert!(g.tail.is_none());
+    // A closed application takes a modifier, which distributes to every
+    // effect it stands for.
+    let h = row("h");
+    assert!(h.effects.values().all(|label| label.when().is_some()));
+    let i = row("i");
+    assert_eq!(i.effects.len(), 3);
+    assert!(
+        i.effects
+            .values()
+            .all(|label| matches!(label, EffectLabel::Absent { .. }))
+    );
+
+    // The alias's own parameters are read off the row it comes to.
+    let kind = |name: &str| {
+        let symbol = *out
+            .program
+            .effects
+            .keys()
+            .find(|symbol| mint.name(**symbol) == name)
+            .unwrap_or_else(|| panic!("no effect named {name}"));
+        out.program.effects[&symbol]
+            .params
+            .iter()
+            .map(|param| param.kind.sense())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(kind("Both"), [Sense::Type, Sense::Effects]);
+    assert_eq!(kind("Nested"), [Sense::Type, Sense::Effects]);
+    assert_eq!(kind("Forward"), [Sense::Effects]);
+
+    // A modifier on an application that stays open has no row to distribute
+    // over; a type where the tail's row goes is not a row; a second tail is
+    // one too many; and an alias declares no operation to perform.
+    for (source, code) in [
+        (
+            "let f : () -> Nat + \\!Both Nat (..'e) + ..'e = fn _ => 0n",
+            "modified-open-alias",
+        ),
+        (
+            "let f : () -> Nat + !Both Nat (..'e) (when 'p) + ..'e = fn _ => 0n",
+            "modified-open-alias",
+        ),
+        ("let f : () -> Nat + !Forward Nat = fn _ => 0n", "not-a-row"),
+        (
+            "let f : () -> Nat + !Both Nat (..'e) + ..'f = fn _ => 0n",
+            "two-tails",
+        ),
+        ("let f = fn _ => !Both.get ()", "operation-on-alias"),
+    ] {
+        assert_eq!(codes_of(&format!("{base}{source}")), [code], "{source}");
+    }
+
+    // Every cycle of aliases is refused: one that only forwards, and one that
+    // grows the row on the way round, each in its own words.
+    assert_eq!(
+        codes_of("effect A 'e = !B 'e\neffect B 'e = !A 'e"),
+        ["alias-cycle"]
+    );
+    let (_, out) = build_src("effect Log = { write: Nat -> () }\neffect Grow 'e = !Log + !Grow 'e");
+    let [error] = &out.errors[..] else {
+        panic!("{:#?}", out.errors);
+    };
+    assert_eq!(error.kind.code(), "growing-alias-cycle");
+    assert!(matches!(&error.kind, ErrorKind::AliasCycle { name, growing: true } if name == "Grow"));
+    // A recursive concrete interface is not a cycle of aliases.
+    assert!(
+        build_src("effect Visit 'a = { run: (() -> 'a + !Visit 'a) -> 'a }")
+            .1
+            .errors
+            .is_empty()
+    );
+    // Two branches reaching one constructor overlap whatever the arguments.
+    assert_eq!(
+        codes_of("effect Ask 'a = { get: () -> 'a }\neffect Twice 'a 'b = !Ask 'a + !Ask 'b"),
+        ["duplicate-case"]
+    );
+}
+
 /// An operation declaration keeps its operations in the order they were
 /// written, each as the two sides of the plain closed arrow performing it has —
 /// which is what a handler arm's binder and body type come off. The empty
@@ -3909,12 +4358,17 @@ fn an_alias_expands_to_the_effects_it_names() {
                effect All = !Console\n\
                let f : Nat -> Nat + !All = fn x => x";
     let (mint, out) = built(src);
-    let Effect::Alias(named) = effect_of(&mint, &out, "Console") else {
+    let Effect::Alias(alias) = effect_of(&mint, &out, "Console") else {
         panic!("expected an alias");
     };
     assert_eq!(
-        named.keys().collect::<Vec<_>>(),
-        ["Log", "IO"].iter().collect::<Vec<_>>()
+        alias
+            .body
+            .cases
+            .iter()
+            .map(|case| mint.name(case.symbol))
+            .collect::<Vec<_>>(),
+        ["Log", "IO"]
     );
 
     // And an alias of an alias reaches through: what a row writes is the
@@ -4578,10 +5032,10 @@ fn same_named_effects_in_different_modules_do_not_collide() {
     let (_, out) = build_src(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     let (mint, out) = built(src);
-    let Effect::Alias(named) = effect_of(&mint, &out, "Both") else {
+    let Effect::Alias(alias) = effect_of(&mint, &out, "Both") else {
         panic!("expected an alias");
     };
-    assert_eq!(named.len(), 2);
+    assert_eq!(alias.body.cases.len(), 2);
 }
 
 /// An alias's cases are effect names and are resolved like any other: one that
@@ -4599,10 +5053,10 @@ fn an_aliass_cases_are_resolved_and_deduplicated() {
         out.errors.iter().map(|e| e.kind.code()).collect::<Vec<_>>(),
         ["duplicate-case"]
     );
-    let Effect::Alias(named) = effect_of(&mint, &out, "Console") else {
+    let Effect::Alias(alias) = effect_of(&mint, &out, "Console") else {
         panic!("expected an alias");
     };
-    assert_eq!(named.len(), 1);
+    assert_eq!(alias.body.cases.len(), 1);
 }
 
 /// An effect a row names has to be one: an unknown name is dropped from the
@@ -5885,6 +6339,36 @@ fn artifact_scheme(body: a::Type) -> a::Scheme {
     }
 }
 
+/// Hand-built dependency data crosses the same strict artifact boundary as a
+/// bundle read from disk before the IR may see it. Validation renders and
+/// decodes canonical text, which is not what the bounded-stack regressions in
+/// this file measure, so it always runs on a generously sized thread of its
+/// own: the deliberately small stacks then bound only the IR and inference
+/// work under test.
+fn checked(dependency: a::UncheckedArtifact) -> a::Artifact {
+    std::thread::Builder::new()
+        .name("artifact-validation".into())
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || dependency.validate())
+        .expect("the artifact validation thread starts")
+        .join()
+        .expect("artifact validation completes")
+        .expect("hand-built dependency validates")
+}
+
+/// [`checked`] for a dependency that is deliberately malformed in part: the
+/// tolerant boundary a compiler caller crosses keeps every declaration that
+/// validates on its own and reports the rest as recovery facts.
+fn recovered(dependency: a::UncheckedArtifact) -> (a::Artifact, Vec<a::RecoveryFact>) {
+    std::thread::Builder::new()
+        .name("artifact-recovery".into())
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || dependency.recover())
+        .expect("the artifact recovery thread starts")
+        .join()
+        .expect("artifact recovery completes")
+}
+
 #[test]
 fn imported_schemes_preserve_and_sanitize_existential_ownership() {
     let mut dependency = prelude_artifact("dep");
@@ -5905,6 +6389,17 @@ fn imported_schemes_preserve_and_sanitize_existential_ownership() {
 
     let parsed = parse::parse(lex("let value = dep::prelude::shared", FileID::GENERATED).tokens);
     let mut mint = dummy_mint();
+    // A witness position outside the scheme is not sanitized into a plain
+    // quantifier: the value carrying it is discarded at the boundary, and the
+    // one with a coherent witness keeps it.
+    let (dependency, facts) = recovered(dependency);
+    assert!(
+        matches!(
+            facts.as_slice(),
+            [a::RecoveryFact::ValueDiscarded { index: 1, .. }]
+        ),
+        "{facts:#?}"
+    );
     let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     let mut schemes = out.program.external_schemes.values();
@@ -5913,11 +6408,7 @@ fn imported_schemes_preserve_and_sanitize_existential_ownership() {
             .next()
             .is_some_and(|scheme| scheme.is_existential(0))
     );
-    assert!(
-        schemes
-            .next()
-            .is_some_and(|scheme| scheme.existentials().is_empty())
-    );
+    assert!(schemes.next().is_none());
 }
 
 #[test]
@@ -5959,8 +6450,8 @@ fn canonical_bundle_import_preserves_mixed_input_result_guarantee() {
     // Exercise the complete bundle disk boundary before importing it. The
     // universal atom remains in scope even though existential atoms determine
     // which result package owns the indivisible proposition.
-    let text = dependency.print();
-    dependency = a::Artifact::try_parse(&text)
+    let text = checked(dependency).print();
+    let dependency = a::Artifact::try_parse(&text)
         .expect("canonical dependency parses")
         .validate()
         .expect("canonical dependency validates");
@@ -5980,9 +6471,9 @@ fn canonical_bundle_import_preserves_mixed_input_result_guarantee() {
     );
 }
 
-fn prelude_artifact(bundle: &str) -> a::Artifact {
+fn prelude_artifact(bundle: &str) -> a::UncheckedArtifact {
     let qualified = |name: &str| format!("{bundle}@1.0.0::prelude::{name}");
-    a::Artifact {
+    a::UncheckedArtifact {
         header: a::Header {
             identity: a::Identity {
                 name: bundle.into(),
@@ -6013,6 +6504,7 @@ fn prelude_artifact(bundle: &str) -> a::Artifact {
             ],
             effects: vec![a::DeclaredEffect {
                 name: qualified("Shared"),
+                params: Vec::new(),
                 identity: Some(a::EffectIdentity {
                     name: "Shared".into(),
                     interface: "shared:{}->{}".into(),
@@ -6028,12 +6520,13 @@ fn prelude_artifact(bundle: &str) -> a::Artifact {
     }
 }
 
-fn build_imported(src: &str, alias: &str, dependency: &a::Artifact) -> (Mint, Output) {
+fn build_imported(src: &str, alias: &str, dependency: &a::UncheckedArtifact) -> (Mint, Output) {
     let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    let dependency = checked(dependency.clone());
     let imports = [DependencyImport {
         alias,
-        artifact: dependency,
+        artifact: &dependency,
     }];
     let mut mint = dummy_mint();
     let out = build_with_dependency_imports(&mut mint, parsed.stmts, &imports, &[]);
@@ -6067,8 +6560,8 @@ fn configured_std_prelude_opens_only_direct_members_in_every_namespace() {
             if external(symbol) == Some("foundation@1.0.0::prelude::Shared")
     ));
     assert!(
-        matches!(effect_of(&mint, &out, "Alias"), Effect::Alias(names)
-        if names.values().any(|named| external(named.symbol) == Some("foundation@1.0.0::prelude::Shared")))
+        matches!(effect_of(&mint, &out, "Alias"), Effect::Alias(alias)
+        if alias.body.cases.iter().any(|case| external(case.symbol) == Some("foundation@1.0.0::prelude::Shared")))
     );
     let TermKind::Ident(child) = term_value(&mint, &out, "child") else {
         panic!("prelude child module was not available")
@@ -6227,8 +6720,8 @@ fn user_types_effects_and_child_modules_shadow_prelude_names_independently() {
         .expect("local Shared effect");
     assert!(matches!(
         effect_of(&mint, &out, "Alias"),
-        Effect::Alias(names)
-            if names.values().any(|named| named.symbol == local_effect)
+        Effect::Alias(alias)
+            if alias.body.cases.iter().any(|case| case.symbol == local_effect)
     ));
 
     let local_inside = out
@@ -6273,8 +6766,8 @@ fn std_prelude_type_precedes_primitives_but_user_types_precede_the_prelude() {
     ));
 }
 
-fn effect_artifact(bundle: &str, interface: &str) -> a::Artifact {
-    a::Artifact {
+fn effect_artifact(bundle: &str, interface: &str) -> a::UncheckedArtifact {
+    a::UncheckedArtifact {
         header: a::Header {
             identity: a::Identity {
                 name: bundle.into(),
@@ -6285,6 +6778,7 @@ fn effect_artifact(bundle: &str, interface: &str) -> a::Artifact {
             types: Vec::new(),
             effects: vec![a::DeclaredEffect {
                 name: format!("{bundle}@1.0.0::IO"),
+                params: Vec::new(),
                 identity: Some(a::EffectIdentity {
                     name: "IO".into(),
                     interface: interface.into(),
@@ -6328,7 +6822,7 @@ fn imported_unnamed_operation_selectors_are_preserved() {
     let parsed = parse::parse(lex("let operation = dep::!IO", FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty());
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert!(
         out.program
@@ -6353,7 +6847,7 @@ fn imported_unnamed_handlers_are_complete_without_panicking() {
     let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty());
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     let mut node = term_value(&mint, &out, "main");
     while let TermKind::Fn { body, .. } = node {
@@ -6467,7 +6961,7 @@ fn imported_effect_row_keys_follow_canonical_identities_by_shape() {
     );
     assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
     let mut mint = dummy_mint();
-    let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
 
     let imported_value = |name: &str| {
@@ -6586,7 +7080,7 @@ fn legacy_operation_effects_get_fallback_identity_before_row_normalization() {
         .tokens,
     );
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     let identity = out
         .program
@@ -6626,8 +7120,7 @@ fn imported_named_handler_coverage_and_diagnostics_use_artifact_selectors() {
         let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
         assert!(parsed.errors.is_empty());
         let mut mint = dummy_mint();
-        let out =
-            build_with_dependencies(&mut mint, parsed.stmts, std::slice::from_ref(&dependency));
+        let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency.clone())]);
         (mint, out)
     };
     let complete = "let main = fn n => handle dep::!IO.write n with\n\
@@ -6672,7 +7165,7 @@ fn imported_named_handler_coverage_and_diagnostics_use_artifact_selectors() {
     );
 }
 
-fn named_io_artifact(bundle: &str, interface: &str) -> a::Artifact {
+fn named_io_artifact(bundle: &str, interface: &str) -> a::UncheckedArtifact {
     let mut dependency = effect_artifact(bundle, interface);
     let a::EffectKind::Operations(operations) = &mut dependency.header.effects[0].kind else {
         unreachable!()
@@ -6707,7 +7200,7 @@ fn dependency_and_local_structural_handlers_share_one_discharge() {
     let parsed = parse::parse(lex(&src, FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty());
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     let mut node = term_value(&mint, &out, "main");
     while let TermKind::Fn { body, .. } = node {
@@ -6733,8 +7226,11 @@ fn structurally_equivalent_dependencies_share_coverage_and_duplicates() {
         let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
         assert!(parsed.errors.is_empty());
         let mut mint = dummy_mint();
-        let out =
-            build_with_dependencies(&mut mint, parsed.stmts, &[first.clone(), second.clone()]);
+        let out = build_with_dependencies(
+            &mut mint,
+            parsed.stmts,
+            &[checked(first.clone()), checked(second.clone())],
+        );
         (mint, out)
     };
 
@@ -6777,7 +7273,7 @@ fn structurally_equivalent_dependencies_share_coverage_and_duplicates() {
 /// portable type/formula/row form rather than relying on source re-lowering.
 #[test]
 fn a_direct_only_interface_with_a_transitive_type_recovers_without_panicking() {
-    let dependency = a::Artifact {
+    let dependency = a::UncheckedArtifact {
         header: a::Header {
             identity: a::Identity {
                 name: "dep".to_string(),
@@ -6807,7 +7303,7 @@ fn a_direct_only_interface_with_a_transitive_type_recovers_without_panicking() {
     let parsed = parse::parse(lex("let value : dep::Wrapper = 0n", FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty());
     let mut mint = dummy_mint();
-    let mut built = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let mut built = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     let _inferred = inference::infer(&mint, &mut built.program, inference::Trace::Complete);
     assert_eq!(built.program.external_types.len(), 2);
 }
@@ -6822,7 +7318,7 @@ fn missing_transitive_type_applications_keep_distinct_effect_identities() {
             args: vec![artifact_type(argument)],
         })),
     };
-    let dependency = a::Artifact {
+    let dependency = a::UncheckedArtifact {
         header: a::Header {
             identity: a::Identity {
                 name: "dep".into(),
@@ -6850,7 +7346,7 @@ fn missing_transitive_type_applications_keep_distinct_effect_identities() {
     let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty());
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     let identities: Vec<_> = out.program.effect_ids.values().collect();
     assert_eq!(identities.len(), 2);
@@ -6906,7 +7402,7 @@ fn fixed_argument_recursive_types_terminate_during_effect_canonicalization() {
 
 #[test]
 fn direct_only_transitive_effects_keep_qualified_recovery_identity() {
-    let dependency = a::Artifact {
+    let dependency = a::UncheckedArtifact {
         header: a::Header {
             identity: a::Identity {
                 name: "dep".into(),
@@ -6925,11 +7421,13 @@ fn direct_only_transitive_effects_keep_qualified_recovery_identity() {
             .into_iter()
             .map(|(name, target)| a::DeclaredEffect {
                 name: format!("dep@1.0.0::{name}"),
+                params: Vec::new(),
                 identity: None,
-                kind: a::EffectKind::Alias(vec![target.into()]),
+                kind: a::EffectKind::Alias(a::AliasRow::naming(vec![target.into()])),
             })
             .chain(std::iter::once(a::DeclaredEffect {
                 name: "dep@1.0.0::Legacy".into(),
+                params: Vec::new(),
                 identity: None,
                 kind: a::EffectKind::Operations(Vec::new()),
             }))
@@ -6952,6 +7450,7 @@ fn direct_only_transitive_effects_keep_qualified_recovery_identity() {
     );
     assert!(parsed.errors.is_empty());
     let mut mint = dummy_mint();
+    let dependency = checked(dependency);
     let imports = [DependencyImport {
         alias: "dep",
         artifact: &dependency,
@@ -7005,8 +7504,6 @@ fn recovery_signatures_keep_every_normalized_source_form_structural() {
                type Choice 'r = #Some Nat | #None | \\#Hidden | ..'r\n\
                type Runner 'e = () -> () + \\!IO + ..'e\n\
                effect Alias = !IO\n\
-               effect CycleA = !CycleB\n\
-               effect CycleB = !CycleA\n\
                effect Probe = {\n\
                  record: Record { extra: String } -> (),\n\
                  choice: Choice (#Other Boolean) -> (),\n\
@@ -7105,7 +7602,7 @@ fn generated_and_malformed_imported_effect_keys_decode_exactly_and_totally() {
         .tokens,
     );
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     let imported = out
         .program
         .effect_ids
@@ -7152,7 +7649,7 @@ fn generated_and_malformed_imported_effect_keys_decode_exactly_and_totally() {
             .tokens,
         );
         let mut mint = dummy_mint();
-        let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+        let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
         assert!(out.program.effect_ids.values().any(|identity| matches!(
             identity,
             ruddy::types::EffectId::Structural { name, .. } if name == "Wrap"
@@ -7195,7 +7692,7 @@ fn generated_and_malformed_imported_effect_keys_decode_exactly_and_totally() {
         .tokens,
     );
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[semantic]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(semantic)]);
     assert!(
         out.program
             .effect_ids
@@ -7207,33 +7704,41 @@ fn generated_and_malformed_imported_effect_keys_decode_exactly_and_totally() {
 #[test]
 fn imported_presence_variables_keep_alpha_correlation_in_effect_identity() {
     let mut dependency = effect_artifact("dep", "presence-correlation");
+    // Two quantified presences per declaration, so a bound position is in
+    // range whether the two labels share one or take one each.
     let declaration = |name: &str, left, right| a::DeclaredType {
         name: format!("dep@1.0.0::{name}"),
         params: Vec::new(),
-        scheme: artifact_scheme(a::Type::Struct(a::Row {
-            labels: vec![
-                (
-                    "x".into(),
-                    a::RowField {
-                        presence: left,
-                        ty: a::Type::Nat,
-                    },
-                ),
-                (
-                    "y".into(),
-                    a::RowField {
-                        presence: right,
-                        ty: a::Type::Nat,
-                    },
-                ),
-            ],
-            rest: a::Rest::Closed,
-        })),
+        scheme: a::Scheme {
+            count: 2,
+            presences: 2,
+            existentials: Vec::new(),
+            formula: a::Formula::True,
+            body: a::Type::Struct(a::Row {
+                labels: vec![
+                    (
+                        "x".into(),
+                        a::RowField {
+                            presence: left,
+                            ty: a::Type::Nat,
+                        },
+                    ),
+                    (
+                        "y".into(),
+                        a::RowField {
+                            presence: right,
+                            ty: a::Type::Nat,
+                        },
+                    ),
+                ],
+                rest: a::Rest::Closed,
+            }),
+        },
     };
     dependency.header.types = vec![
-        declaration("Bound", a::Presence::Bound(9), a::Presence::Bound(9)),
+        declaration("Bound", a::Presence::Bound(0), a::Presence::Bound(0)),
         declaration("Var", a::Presence::Var(41), a::Presence::Var(41)),
-        declaration("Independent", a::Presence::Bound(9), a::Presence::Bound(10)),
+        declaration("Independent", a::Presence::Bound(0), a::Presence::Bound(1)),
         declaration("Unknown", a::Presence::Undecided, a::Presence::Undecided),
     ];
     let parsed = parse::parse(
@@ -7247,7 +7752,7 @@ fn imported_presence_variables_keep_alpha_correlation_in_effect_identity() {
         .tokens,
     );
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(
         out.errors
             .iter()
@@ -7365,7 +7870,7 @@ fn imported_bound_presences_are_local_to_each_scheme_instantiation() {
         .tokens,
     );
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     let identities: Vec<_> = out
         .program
         .effect_ids
@@ -7415,7 +7920,7 @@ fn imported_presence_vars_use_a_disjoint_recovery_variant() {
         .tokens,
     );
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     let carrier = out
         .program
         .external_types
@@ -7522,7 +8027,7 @@ fn source_and_imported_absent_effect_payloads_have_one_identity() {
     );
     let parsed = parse::parse(lex(&source, FileID::GENERATED).tokens);
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(
         out.errors
             .iter()
@@ -7562,12 +8067,7 @@ fn recovery_row_tails_remain_unknown_in_every_canonical_shape() {
             .iter()
             .map(|error| error.kind.code())
             .collect::<Vec<_>>(),
-        [
-            "impure-operation",
-            "impure-operation",
-            "impure-operation",
-            "impure-operation"
-        ],
+        ["impure-operation", "impure-operation", "impure-operation"],
         "an unknown recovery tail must not collapse to a closed tail"
     );
     for name in ["Struct", "Cases", "Effects"] {
@@ -7592,14 +8092,9 @@ fn canonicalization_substitutes_struct_sum_and_effect_row_tails() {
                type Runs 'e = () -> () + ..'e\n\
                module Y =\n  effect RecordPick = { get: Record { y: Nat } -> () }\n  effect CasePick = { get: Cases (#Y) -> () }\n  effect RunPick = { get: Runs (!A) -> () }\nend\n\
                module Z =\n  effect RecordPick = { get: Record { z: Nat } -> () }\n  effect CasePick = { get: Cases (#Z) -> () }\n  effect RunPick = { get: Runs (!B) -> () }\nend";
-    let (mint, out) = build_src(src);
-    assert_eq!(
-        out.errors
-            .iter()
-            .map(|error| error.kind.code())
-            .collect::<Vec<_>>(),
-        ["impure-operation", "impure-operation"]
-    );
+    // An arrow nested in an operation's signature may carry effects; only the
+    // operation's own arrow may not.
+    let (mint, out) = built(src);
     for name in ["RecordPick", "CasePick", "RunPick"] {
         let identities: Vec<_> = out
             .program
@@ -7624,14 +8119,7 @@ fn local_row_applications_flatten_records_sums_and_effects_without_losing_labels
                module Flat =\n  effect Record = { get: { x: Nat, y: Nat } -> () }\n  effect Cases = { get: (#X | #Y) -> () }\n  effect Runs = { get: (() -> () + !A + !B) -> () }\nend\n\
                module Composed =\n  effect Record = { get: Record { y: Nat } -> () }\n  effect Cases = { get: Cases (#Y) -> () }\n  effect Runs = { get: Runs (!B) -> () }\nend\n\
                module Different =\n  effect Record = { get: Record { z: Nat } -> () }\n  effect Cases = { get: Cases (#Z) -> () }\n  effect Runs = { get: Runs (!C) -> () }\nend";
-    let (mint, out) = build_src(src);
-    assert_eq!(
-        out.errors
-            .iter()
-            .map(|error| error.kind.code())
-            .collect::<Vec<_>>(),
-        ["impure-operation", "impure-operation", "impure-operation"]
-    );
+    let (mint, out) = built(src);
     for name in ["Record", "Cases", "Runs"] {
         let ids: Vec<_> = out
             .program
@@ -7753,7 +8241,7 @@ fn imported_structural_identity_respects_effect_and_case_parameter_senses() {
         .tokens,
     );
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(
         out.errors
             .iter()
@@ -7795,7 +8283,7 @@ fn row_composition_is_flattened_across_local_and_imported_types() {
         labels: vec![(label.into(), present(artifact_type(artifact_unit())))],
         rest: a::Rest::Closed,
     };
-    let dependency = a::Artifact {
+    let dependency = a::UncheckedArtifact {
         header: a::Header {
             identity: a::Identity {
                 name: "dep".into(),
@@ -7848,7 +8336,7 @@ fn row_composition_is_flattened_across_local_and_imported_types() {
     let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     for name in ["Record", "Cases"] {
         let ids: Vec<_> = out
@@ -7895,7 +8383,7 @@ fn structural_rows_mask_inner_duplicates_and_preserve_ordinary_separator_labels(
         name: format!("dep@1.0.0::{name}"),
         args,
     };
-    let dependency = a::Artifact {
+    let dependency = a::UncheckedArtifact {
         header: a::Header {
             identity: a::Identity {
                 name: "dep".into(),
@@ -7951,7 +8439,7 @@ fn structural_rows_mask_inner_duplicates_and_preserve_ordinary_separator_labels(
                module D = effect Separator = { get: dep::LooksGenerated -> () } end";
     let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     let identities = |name: &str| {
         out.program
@@ -8006,7 +8494,7 @@ fn absent_semantic_payloads_do_not_affect_structural_identity() {
             ]
         })
         .collect();
-    let dependency = a::Artifact {
+    let dependency = a::UncheckedArtifact {
         header: a::Header {
             identity: a::Identity {
                 name: "dep".into(),
@@ -8028,7 +8516,7 @@ fn absent_semantic_payloads_do_not_affect_structural_identity() {
     let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty());
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     for name in ["Record", "Cases"] {
         let ids: Vec<_> = out
@@ -8126,7 +8614,7 @@ fn absent_imported_payloads_do_not_create_visible_quantifiers_or_effect_counts()
         .tokens,
     );
     let mut mint = dummy_mint();
-    let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     let inferred = inference::infer(&mint, &mut out.program, inference::Trace::Complete);
     assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
@@ -8157,7 +8645,7 @@ fn local_and_imported_structural_types_share_one_canonical_encoding() {
         params: Vec::new(),
         scheme: artifact_scheme(body),
     };
-    let dependency = a::Artifact {
+    let dependency = a::UncheckedArtifact {
         header: a::Header {
             identity: a::Identity {
                 name: "dep".into(),
@@ -8197,7 +8685,7 @@ fn local_and_imported_structural_types_share_one_canonical_encoding() {
     let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty());
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     for name in ["Cases", "Alias"] {
         let ids: Vec<_> = out
@@ -8227,7 +8715,7 @@ fn local_and_imported_structural_types_share_one_canonical_encoding() {
 
 #[test]
 fn imported_interfaces_keep_applied_types_effects_and_alias_overlap_structural() {
-    let dependency = a::Artifact {
+    let dependency = a::UncheckedArtifact {
         header: a::Header {
             identity: a::Identity {
                 name: "dep".into(),
@@ -8258,6 +8746,7 @@ fn imported_interfaces_keep_applied_types_effects_and_alias_overlap_structural()
             .into_iter()
             .map(|(name, interface)| a::DeclaredEffect {
                 name: format!("dep@1.0.0::{name}"),
+                params: Vec::new(),
                 identity: Some(a::EffectIdentity {
                     name: name.into(),
                     interface: interface.into(),
@@ -8266,8 +8755,9 @@ fn imported_interfaces_keep_applied_types_effects_and_alias_overlap_structural()
             })
             .chain(["A", "B"].into_iter().map(|name| a::DeclaredEffect {
                 name: format!("dep@1.0.0::{name}"),
+                params: Vec::new(),
                 identity: None,
-                kind: a::EffectKind::Alias(vec!["dep@1.0.0::Log".into()]),
+                kind: a::EffectKind::Alias(a::AliasRow::naming(vec!["dep@1.0.0::Log".into()])),
             }))
             .collect(),
         },
@@ -8285,13 +8775,13 @@ fn imported_interfaces_keep_applied_types_effects_and_alias_overlap_structural()
     let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty());
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert_eq!(
         out.errors
             .iter()
             .map(|error| error.kind.code())
             .collect::<Vec<_>>(),
-        ["impure-operation", "impure-operation", "duplicate-case"]
+        ["duplicate-case"]
     );
     let identities = |name: &str| {
         out.program
@@ -8313,14 +8803,14 @@ fn imported_interfaces_keep_applied_types_effects_and_alias_overlap_structural()
         recovered[0], recovered[1],
         "imported effect ids stay distinct"
     );
-    assert_eq!(out.errors[2].span.start, src.rfind("dep::!B").unwrap());
+    assert_eq!(out.errors[0].span.start, src.rfind("dep::!B").unwrap());
 }
 
 #[test]
 fn imported_effects_in_recovery_signatures_compare_structurally() {
-    let first = effect_artifact("first", "read:{}->Nat");
-    let second = effect_artifact("second", "read:{}->Nat");
-    let distinct = effect_artifact("distinct", "read:{}->String");
+    let first = checked(effect_artifact("first", "read:{}->Nat"));
+    let second = checked(effect_artifact("second", "read:{}->Nat"));
+    let distinct = checked(effect_artifact("distinct", "read:{}->String"));
     let imports = [
         DependencyImport {
             alias: "first",
@@ -8375,6 +8865,19 @@ fn imported_declared_types_exercise_every_semantic_identity_form() {
         params: Vec::new(),
         scheme: artifact_scheme(body),
     };
+    // A bound position has to sit inside its scheme's quantifier space, so
+    // the forms that use one quantify enough positions to hold it.
+    let quantified = |name: &str, count, presences, body| a::DeclaredType {
+        name: format!("dep@1.0.0::{name}"),
+        params: Vec::new(),
+        scheme: a::Scheme {
+            count,
+            presences,
+            existentials: Vec::new(),
+            formula: a::Formula::True,
+            body,
+        },
+    };
     let mut types = vec![
         declared("Int", artifact_type(a::Type::Int)),
         declared("Real", artifact_type(a::Type::Real)),
@@ -8388,7 +8891,7 @@ fn imported_declared_types_exercise_every_semantic_identity_form() {
             }),
         ),
         declared("Undecided", artifact_type(a::Type::Undecided)),
-        declared("Bound", artifact_type(a::Type::Bound(10))),
+        quantified("Bound", 11, 0, artifact_type(a::Type::Bound(10))),
         declared(
             "Arrow",
             artifact_type(a::Type::Arrow(
@@ -8403,25 +8906,39 @@ fn imported_declared_types_exercise_every_semantic_identity_form() {
                 },
             )),
         ),
-        declared(
+        quantified(
             "Fields",
+            3,
+            3,
             artifact_struct(vec![
                 ("variable".into(), field(a::Presence::Var(1), unit())),
                 ("bound".into(), field(a::Presence::Bound(2), unit())),
                 ("unknown".into(), field(a::Presence::Undecided, unit())),
             ]),
         ),
-        row_type(
+        quantified(
             "RowPresences",
-            vec![
-                ("Variable".into(), field(a::Presence::Var(3), unit())),
-                ("Bound".into(), field(a::Presence::Bound(4), unit())),
-                ("Unknown".into(), field(a::Presence::Undecided, unit())),
-            ],
-            a::Rest::Closed,
+            5,
+            5,
+            artifact_type(a::Type::Sum(a::Row {
+                labels: vec![
+                    ("Variable".into(), field(a::Presence::Var(3), unit())),
+                    ("Bound".into(), field(a::Presence::Bound(4), unit())),
+                    ("Unknown".into(), field(a::Presence::Undecided, unit())),
+                ],
+                rest: a::Rest::Closed,
+            })),
         ),
         row_type("RowVar", Vec::new(), a::Rest::Var(5)),
-        row_type("RowBound", Vec::new(), a::Rest::Bound(6)),
+        quantified(
+            "RowBound",
+            7,
+            0,
+            artifact_type(a::Type::Sum(a::Row {
+                labels: Vec::new(),
+                rest: a::Rest::Bound(6),
+            })),
+        ),
         row_type(
             "RowRigid",
             Vec::new(),
@@ -8445,7 +8962,7 @@ fn imported_declared_types_exercise_every_semantic_identity_form() {
             args: Vec::new(),
         }),
     ));
-    let dependency = a::Artifact {
+    let dependency = a::UncheckedArtifact {
         header: a::Header {
             identity: a::Identity {
                 name: "dep".into(),
@@ -8474,7 +8991,7 @@ fn imported_declared_types_exercise_every_semantic_identity_form() {
     let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(
         out.errors
             .iter()
@@ -8505,6 +9022,7 @@ fn malformed_dependency_declarations_are_ignored_without_shadow_symbols() {
     });
     dependency.header.effects.push(a::DeclaredEffect {
         name: "other@1.0.0::Ignored".into(),
+        params: Vec::new(),
         identity: Some(a::EffectIdentity {
             name: "Ignored".into(),
             interface: String::new(),
@@ -8514,7 +9032,7 @@ fn malformed_dependency_declarations_are_ignored_without_shadow_symbols() {
     let parsed = parse::parse(lex("let value = dep::answer", FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty());
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert_eq!(out.program.external_schemes.len(), 1);
     assert!(
@@ -8527,7 +9045,7 @@ fn malformed_dependency_declarations_are_ignored_without_shadow_symbols() {
 
 #[test]
 fn imported_alias_cycles_recover_without_a_spurious_structural_identity() {
-    let dependency = a::Artifact {
+    let dependency = a::UncheckedArtifact {
         header: a::Header {
             identity: a::Identity {
                 name: "dep".into(),
@@ -8540,8 +9058,9 @@ fn imported_alias_cycles_recover_without_a_spurious_structural_identity() {
                 .into_iter()
                 .map(|(name, target)| a::DeclaredEffect {
                     name: format!("dep@1.0.0::{name}"),
+                    params: Vec::new(),
                     identity: None,
-                    kind: a::EffectKind::Alias(vec![target.into()]),
+                    kind: a::EffectKind::Alias(a::AliasRow::naming(vec![target.into()])),
                 })
                 .collect(),
         },
@@ -8557,15 +9076,39 @@ fn imported_alias_cycles_recover_without_a_spurious_structural_identity() {
     let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty());
     let mut mint = dummy_mint();
+    // The ring is the dependency's mistake: the boundary keeps the alias that
+    // stands on its own and drops the one that closes the ring, and what the
+    // kept alias names becomes one recovery effect.
+    let (dependency, facts) = recovered(dependency);
+    assert!(
+        matches!(
+            facts.as_slice(),
+            [a::RecoveryFact::EffectDiscarded { name, .. }] if name == "dep@1.0.0::B"
+        ),
+        "{facts:#?}"
+    );
     let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    assert_eq!(out.program.effect_ids.len(), 1);
+    // `Probe`'s own identity, and the one the dropped alias is recovered as.
+    assert_eq!(out.program.effect_ids.len(), 2);
+    assert_eq!(
+        out.program
+            .effect_ids
+            .values()
+            .filter(|identity| matches!(
+                identity,
+                ruddy::types::EffectId::Structural { interface, .. }
+                    if interface.starts_with("unresolved:dep@1.0.0::B")
+            ))
+            .count(),
+        1
+    );
     assert!(matches!(effect_of(&mint, &out, "Local"), Effect::Alias(_)));
 }
 
 #[test]
 fn ir_dependency_aliases_reject_reserved_identifiers() {
-    let dependency = effect_artifact("dep", "read:{}->Nat");
+    let dependency = checked(effect_artifact("dep", "read:{}->Nat"));
     let imports = ["let", "1dep", "a-b"].map(|alias| DependencyImport {
         alias,
         artifact: &dependency,
@@ -8586,10 +9129,11 @@ fn ir_dependency_aliases_reject_reserved_identifiers() {
 
 #[test]
 fn duplicate_dependency_aliases_are_rejected_without_merging_roots() {
-    let first = effect_artifact("first", "read:{}->Nat");
+    let first = checked(effect_artifact("first", "read:{}->Nat"));
     let mut second = effect_artifact("second", "send:String->{}");
     second.header.effects[0].name = "second@1.0.0::Net".to_string();
     second.header.effects[0].identity.as_mut().unwrap().name = "Net".to_string();
+    let second = checked(second);
     let imports = [
         DependencyImport {
             alias: "shared",
@@ -8657,7 +9201,7 @@ fn dependency_interfaces_import_every_semantic_form() {
         name: "dep@1.0.0::M::rich".to_string(),
         scheme: a::Scheme {
             count: 3,
-            presences: 1,
+            presences: 2,
             existentials: Vec::new(),
             formula,
             body: rich,
@@ -8749,9 +9293,15 @@ fn dependency_interfaces_import_every_semantic_form() {
             }),
         ),
     ] {
+        // A bound position needs a quantifier to stand in; the other forms
+        // quantify nothing.
+        let count = u32::from(name.contains("bound"));
         values.push(a::Value {
             name: format!("dep@1.0.0::{name}"),
-            scheme: artifact_scheme(artifact_type(core)),
+            scheme: a::Scheme {
+                count,
+                ..artifact_scheme(artifact_type(core))
+            },
         });
     }
     values.push(a::Value {
@@ -8759,7 +9309,7 @@ fn dependency_interfaces_import_every_semantic_form() {
         scheme: artifact_scheme(unit()),
     });
 
-    let dependency = a::Artifact {
+    let dependency = a::UncheckedArtifact {
         header: a::Header {
             identity: a::Identity {
                 name: "dep".to_string(),
@@ -8795,49 +9345,53 @@ fn dependency_interfaces_import_every_semantic_form() {
                 a::DeclaredType {
                     name: "dep@1.0.0::StructMore".into(),
                     params: Vec::new(),
-                    scheme: artifact_scheme(artifact_type(a::Type::Struct(a::Row {
-                        labels: vec![
-                            (
-                                "present".into(),
-                                a::RowField {
-                                    presence: a::Presence::Present,
-                                    ty: artifact_type(a::Type::Nat),
-                                },
-                            ),
-                            (
-                                "absent".into(),
-                                a::RowField {
-                                    presence: a::Presence::Absent,
-                                    ty: artifact_type(a::Type::Nat),
-                                },
-                            ),
-                            (
-                                "var".into(),
-                                a::RowField {
-                                    presence: a::Presence::Var(1),
-                                    ty: artifact_type(a::Type::Nat),
-                                },
-                            ),
-                            (
-                                "bound".into(),
-                                a::RowField {
-                                    presence: a::Presence::Bound(2),
-                                    ty: artifact_type(a::Type::Nat),
-                                },
-                            ),
-                            (
-                                "unknown".into(),
-                                a::RowField {
-                                    presence: a::Presence::Undecided,
-                                    ty: artifact_type(a::Type::Nat),
-                                },
-                            ),
-                        ],
-                        rest: a::Rest::More(Box::new(a::Row {
-                            labels: Vec::new(),
-                            rest: a::Rest::Closed,
-                        })),
-                    }))),
+                    scheme: a::Scheme {
+                        count: 3,
+                        presences: 3,
+                        ..artifact_scheme(artifact_type(a::Type::Struct(a::Row {
+                            labels: vec![
+                                (
+                                    "present".into(),
+                                    a::RowField {
+                                        presence: a::Presence::Present,
+                                        ty: artifact_type(a::Type::Nat),
+                                    },
+                                ),
+                                (
+                                    "absent".into(),
+                                    a::RowField {
+                                        presence: a::Presence::Absent,
+                                        ty: artifact_type(a::Type::Nat),
+                                    },
+                                ),
+                                (
+                                    "var".into(),
+                                    a::RowField {
+                                        presence: a::Presence::Var(1),
+                                        ty: artifact_type(a::Type::Nat),
+                                    },
+                                ),
+                                (
+                                    "bound".into(),
+                                    a::RowField {
+                                        presence: a::Presence::Bound(2),
+                                        ty: artifact_type(a::Type::Nat),
+                                    },
+                                ),
+                                (
+                                    "unknown".into(),
+                                    a::RowField {
+                                        presence: a::Presence::Undecided,
+                                        ty: artifact_type(a::Type::Nat),
+                                    },
+                                ),
+                            ],
+                            rest: a::Rest::More(Box::new(a::Row {
+                                labels: Vec::new(),
+                                rest: a::Rest::Closed,
+                            })),
+                        })))
+                    },
                 },
                 a::DeclaredType {
                     name: "dep@1.0.0::StructVar".into(),
@@ -8868,10 +9422,15 @@ fn dependency_interfaces_import_every_semantic_form() {
                 a::DeclaredType {
                     name: "dep@1.0.0::StructMissing".into(),
                     params: Vec::new(),
-                    scheme: artifact_scheme(artifact_type(a::Type::Struct(a::Row {
-                        labels: Vec::new(),
-                        rest: a::Rest::Bound(9),
-                    }))),
+                    // A quantified tail no parameter of the declaration
+                    // supplies: in range for the scheme, missing for the use.
+                    scheme: a::Scheme {
+                        count: 10,
+                        ..artifact_scheme(artifact_type(a::Type::Struct(a::Row {
+                            labels: Vec::new(),
+                            rest: a::Rest::Bound(9),
+                        })))
+                    },
                 },
                 a::DeclaredType {
                     name: "dep@1.0.0::StructRigid".into(),
@@ -8925,6 +9484,13 @@ fn dependency_interfaces_import_every_semantic_form() {
             effects: vec![
                 a::DeclaredEffect {
                     name: "dep@1.0.0::M::Read".to_string(),
+                    // One fields parameter, which the `bound` operation's row
+                    // ends in.
+                    params: vec![a::Parameter {
+                        sense: a::Sense::Fields,
+                        lacks: Vec::new(),
+                        relevant: true,
+                    }],
                     identity: Some(a::EffectIdentity {
                         name: "Read".to_string(),
                         interface: "get:{}->Nat".to_string(),
@@ -8964,7 +9530,7 @@ fn dependency_interfaces_import_every_semantic_form() {
                             selector: a::OperationSelector::Named("bound".into()),
                             from: artifact_type(a::Type::Struct(a::Row {
                                 labels: Vec::new(),
-                                rest: a::Rest::Bound(4),
+                                rest: a::Rest::Bound(0),
                             })),
                             to: unit(),
                         },
@@ -9034,11 +9600,21 @@ fn dependency_interfaces_import_every_semantic_form() {
                 },
                 a::DeclaredEffect {
                     name: "dep@1.0.0::Alias".to_string(),
+                    params: Vec::new(),
                     identity: None,
-                    kind: a::EffectKind::Alias(vec![
-                        "dep@1.0.0::M::Read".to_string(),
-                        "other@2.0.0::IO".to_string(),
-                    ]),
+                    kind: a::EffectKind::Alias(a::AliasRow {
+                        cases: vec![
+                            a::AliasCase {
+                                name: "dep@1.0.0::M::Read".to_string(),
+                                args: vec![artifact_type(artifact_unit())],
+                            },
+                            a::AliasCase {
+                                name: "other@2.0.0::IO".to_string(),
+                                args: Vec::new(),
+                            },
+                        ],
+                        tail: None,
+                    }),
                 },
             ],
         },
@@ -9071,7 +9647,11 @@ fn dependency_interfaces_import_every_semantic_form() {
     );
     assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency, duplicate]);
+    let out = build_with_dependencies(
+        &mut mint,
+        parsed.stmts,
+        &[checked(dependency), checked(duplicate)],
+    );
 
     assert_eq!(out.errors.len(), 1);
     assert!(matches!(
@@ -9327,7 +9907,7 @@ fn sum_row_aliases_are_normalized_for_repetition_and_lacks() {
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
 }
 
-fn forwarding_rows_artifact(include_cycle: bool) -> a::Artifact {
+fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
     let mut dependency = effect_artifact("dep", "forwarding");
     dependency.header.types = vec![
         a::DeclaredType {
@@ -9578,7 +10158,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::Artifact {
     dependency
 }
 
-fn case_rows_artifact() -> a::Artifact {
+fn case_rows_artifact() -> a::UncheckedArtifact {
     let mut dependency = forwarding_rows_artifact(false);
     dependency.header.types.extend([
         a::DeclaredType {
@@ -9710,7 +10290,7 @@ fn imported_case_rows_are_normalized_and_bad_slots_do_not_escape() {
         .tokens,
     );
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert_eq!(out.errors.len(), 4, "{:#?}", out.errors);
     assert!(out.errors.iter().all(|error| matches!(
         &error.kind,
@@ -9741,7 +10321,7 @@ fn imported_forwarding_aliases_classify_local_recursion() {
         .tokens,
     );
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert_eq!(out.errors.len(), 6, "{:#?}", out.errors);
     assert_eq!(
         out.errors
@@ -9792,7 +10372,7 @@ fn malformed_named_applications_of_unequal_arity_are_not_congruent() {
     });
     let parsed = parse::parse(lex("let use : dep::Box Nat = dep::short", FileID::GENERATED).tokens);
     let mut mint = dummy_mint();
-    let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     let inferred = inference::infer(&mint, &mut out.program, inference::Trace::Complete);
     assert!(
@@ -9851,7 +10431,7 @@ fn malformed_nested_imported_applications_recover_during_effect_identity() {
         .tokens,
     );
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert!(out.program.effect_ids.values().any(|identity| {
         matches!(identity, ruddy::types::EffectId::Structural { name, .. } if name == "Local")
@@ -10000,7 +10580,7 @@ fn imported_effect_identity_graph_is_stack_safe_and_absorbs_growing_types() {
             );
             assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
             let mut mint = dummy_mint();
-            let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+            let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
             assert!(
                 out.errors
                     .iter()
@@ -10069,7 +10649,7 @@ fn imported_recursive_instantiations_close_through_forwarding_aliases() {
         .tokens,
     );
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     let interface = out
         .program
@@ -10188,7 +10768,7 @@ fn a_finite_imported_rotation_longer_than_256_states_remains_exact() {
     );
     assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     let interface = |name: &str| {
         out.program
@@ -10293,7 +10873,7 @@ fn structurally_growing_imported_rotation_recovers_without_a_depth_cap() {
     );
     assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     let interface = out
         .program
@@ -10367,7 +10947,7 @@ fn sequential_imported_instantiations_do_not_exhaust_the_active_recursion_limit(
     );
     assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     let interface = out
         .program
@@ -10392,7 +10972,7 @@ fn canonical_unknown_effect_interfaces_decode_as_graph_nodes() {
     let dependency = effect_artifact("dep", "0#u;");
     let parsed = parse::parse(lex("type Use = Nat", FileID::GENERATED).tokens);
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(out.program.effect_ids.values().any(|identity| matches!(
         identity,
         ruddy::types::EffectId::Structural { interface, .. } if interface == "0#u;"
@@ -10415,7 +10995,11 @@ fn malformed_interfaces_cannot_collide_with_encoded_ordinary_atoms() {
     );
     assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[raw, ordinary, round_trip]);
+    let out = build_with_dependencies(
+        &mut mint,
+        parsed.stmts,
+        &[checked(raw), checked(ordinary), checked(round_trip)],
+    );
     assert!(
         out.errors
             .iter()
@@ -10447,7 +11031,7 @@ fn imported_effect_ids_are_normalized_before_alias_duplicate_checks() {
         parse::parse(lex("effect Both = raw::!IO + encoded::!IO", FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[raw, encoded]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(raw), checked(encoded)]);
     assert_eq!(
         out.errors
             .iter()
@@ -10493,7 +11077,8 @@ fn noncanonical_graph_encodings_are_opaque_without_identity_collisions() {
             parsed.errors
         );
         let mut mint = dummy_mint();
-        let out = build_with_dependencies(&mut mint, parsed.stmts, &[bad, opaque]);
+        let out =
+            build_with_dependencies(&mut mint, parsed.stmts, &[checked(bad), checked(opaque)]);
         assert_eq!(
             out.errors
                 .iter()
@@ -10547,7 +11132,7 @@ fn malformed_effect_keys_cannot_collide_with_encoded_unknown_atoms() {
     );
     assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(
         out.errors
             .iter()
@@ -10609,7 +11194,7 @@ fn forwarded_field_addition_respects_outer_absent_shadowing() {
     }];
     let parsed = parse::parse(lex("type Loop = dep::Shadow Loop", FileID::GENERATED).tokens);
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(
         matches!(
             out.errors.as_slice(),
@@ -10638,7 +11223,7 @@ fn imported_field_rows_forward_outer_lacks_constraints() {
     );
     assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert_eq!(out.errors.len(), 3, "{:#?}", out.errors);
     assert!(
         out.errors.iter().all(|error| matches!(
@@ -10653,7 +11238,7 @@ fn imported_field_rows_forward_outer_lacks_constraints() {
     );
 }
 
-fn deep_field_summary_artifact(depth: usize, cycle: bool) -> a::Artifact {
+fn deep_field_summary_artifact(depth: usize, cycle: bool) -> a::UncheckedArtifact {
     let mut dependency = effect_artifact("dep", "empty");
     dependency.header.types = (0..depth)
         .map(|index| {
@@ -10715,7 +11300,7 @@ fn deeply_nested_imported_more_rows_are_imported_and_clamped_iteratively() {
             const DEPTH: usize = 30_000;
             let mut row = a::Row {
                 labels: Vec::new(),
-                rest: a::Rest::Bound(DEPTH as u32 + 1),
+                rest: a::Rest::Undecided,
             };
             for index in (0..DEPTH).rev() {
                 row = a::Row {
@@ -10742,7 +11327,7 @@ fn deeply_nested_imported_more_rows_are_imported_and_clamped_iteratively() {
             let parsed = parse::parse(lex("type Use = dep::Deep", FileID::GENERATED).tokens);
             let mut mint = dummy_mint();
             let out =
-                build_with_dependencies(&mut mint, parsed.stmts, std::slice::from_ref(&dependency));
+                build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency.clone())]);
             assert!(out.errors.is_empty(), "{:#?}", out.errors);
             let imported = out
                 .program
@@ -10884,7 +11469,7 @@ fn deeply_nested_imported_semantics_are_preserved_on_a_small_stack() {
                 .tokens,
             );
             let mut mint = dummy_mint();
-            let dependencies = vec![dependency];
+            let dependencies = vec![checked(dependency)];
             let out = build_with_dependencies(&mut mint, parsed.stmts, &dependencies);
             assert!(out.errors.is_empty(), "{:#?}", out.errors);
             assert!(out.program.external_types.len() >= 2);
@@ -11045,9 +11630,32 @@ fn malformed_imported_scheme_bounds_recover_for_types_and_values() {
         params: Vec::new(),
         scheme: malformed,
     });
+    // Malformed bounds never reach the IR: the tolerant boundary drops each
+    // declaration that fails on its own and says why, and the ones whose
+    // bounds are in range import unchanged.
+    let (dependency, facts) = recovered(dependency);
+    let discarded: Vec<&str> = facts
+        .iter()
+        .map(|fact| match fact {
+            a::RecoveryFact::TypeDiscarded { name, .. }
+            | a::RecoveryFact::ValueDiscarded { name, .. } => name.as_str(),
+            other => panic!("{other:#?}"),
+        })
+        .collect();
+    assert_eq!(
+        discarded,
+        [
+            "dep@1.0.0::Broken",
+            "dep@1.0.0::bad",
+            "dep@1.0.0::not",
+            "dep@1.0.0::or",
+            "dep@1.0.0::xor",
+            "dep@1.0.0::presence_as_row",
+        ]
+    );
     let parsed = parse::parse(
         lex(
-            "type Local = dep::Broken\nlet recovered = dep::bad",
+            "let kept = dep::and\nlet also = dep::iff",
             FileID::GENERATED,
         )
         .tokens,
@@ -11055,14 +11663,13 @@ fn malformed_imported_scheme_bounds_recover_for_types_and_values() {
     let mut mint = dummy_mint();
     let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    let value = out
-        .program
-        .external_schemes
-        .values()
-        .find(|scheme| scheme.count() == 1)
-        .expect("the malformed value scheme was imported");
-    assert_eq!(value.presences(), 1);
-    assert!(value.formula().is_true());
+    assert_eq!(out.program.external_schemes.len(), 2);
+    assert!(
+        out.program
+            .external_schemes
+            .values()
+            .all(|scheme| scheme.count() == 2 && scheme.presences() == 1)
+    );
 }
 
 #[test]
@@ -11180,7 +11787,7 @@ fn imported_interfaces_discard_foreign_solver_local_ids_before_inference() {
     );
     assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
     let mut mint = dummy_mint();
-    let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert!(
         out.program
@@ -11284,7 +11891,7 @@ fn arrow_effect_more_rows_use_one_canonical_form_in_both_directions() {
         .tokens,
     );
     let mut mint = dummy_mint();
-    let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     let inferred = inference::infer(&mint, &mut out.program, inference::Trace::Complete);
     assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
@@ -11444,7 +12051,7 @@ fn deep_equal_imported_types_unify_on_a_bounded_stack() {
             assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
             let mut mint = dummy_mint();
             let mut out =
-                build_with_dependencies(&mut mint, parsed.stmts, std::slice::from_ref(&dependency));
+                build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency.clone())]);
             assert!(out.errors.is_empty(), "{:#?}", out.errors);
             let inferred = inference::infer(&mint, &mut out.program, inference::Trace::Complete);
             assert_eq!(inferred.errors().len(), 1, "{:#?}", inferred.errors());
@@ -11546,7 +12153,7 @@ fn deep_alias_reentry_shares_one_congruence_transaction() {
                 .tokens,
             );
             let mut mint = dummy_mint();
-            let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+            let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
             assert!(out.errors.is_empty(), "{:#?}", out.errors);
             let inferred = inference::infer(&mint, &mut out.program, inference::Trace::Complete);
             assert_eq!(inferred.errors().len(), 1, "{:#?}", inferred.errors());
@@ -11642,7 +12249,7 @@ fn recursive_imported_alias_reentry_compares_malformed_arities() {
     let parsed =
         parse::parse(lex("let compared = dep::accept dep::value", FileID::GENERATED).tokens);
     let mut mint = dummy_mint();
-    let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     let inferred = inference::infer(&mint, &mut out.program, inference::Trace::Complete);
     assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
@@ -11747,7 +12354,8 @@ fn deep_unequal_imported_struct_rows_unify_on_a_bounded_stack() {
                     lex("let mismatch = dep::accept dep::bad", FileID::GENERATED).tokens,
                 );
                 let mut mint = dummy_mint();
-                let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+                let mut out =
+                    build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
                 assert!(out.errors.is_empty(), "{:#?}", out.errors);
                 let inferred =
                     inference::infer(&mint, &mut out.program, inference::Trace::Complete);
@@ -11789,7 +12397,7 @@ fn deep_imported_field_summaries_are_stack_safe_when_unused_and_used() {
             let dependency = deep_field_summary_artifact(DEPTH, false);
             let parsed = parse::parse(lex("let answer = 1n", FileID::GENERATED).tokens);
             let mut mint = dummy_mint();
-            let unused = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+            let unused = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
             assert!(unused.errors.is_empty(), "{:#?}", unused.errors);
 
             let dependency = deep_field_summary_artifact(DEPTH, false);
@@ -11802,7 +12410,7 @@ fn deep_imported_field_summaries_are_stack_safe_when_unused_and_used() {
                 .tokens,
             );
             let mut mint = dummy_mint();
-            let used = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+            let used = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
             assert!(
                 used.errors.iter().any(|error| matches!(
                     &error.kind,
@@ -11818,7 +12426,7 @@ fn deep_imported_field_summaries_are_stack_safe_when_unused_and_used() {
             let dependency = deep_field_summary_artifact(DEPTH, true);
             let parsed = parse::parse(lex("let answer = 1n", FileID::GENERATED).tokens);
             let mut mint = dummy_mint();
-            let unused = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+            let unused = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
             assert!(unused.errors.is_empty(), "{:#?}", unused.errors);
 
             let dependency = deep_field_summary_artifact(DEPTH, true);
@@ -11831,7 +12439,7 @@ fn deep_imported_field_summaries_are_stack_safe_when_unused_and_used() {
                 .tokens,
             );
             let mut mint = dummy_mint();
-            let used = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+            let used = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
             assert!(
                 used.errors.iter().any(|error| matches!(
                     error.kind,
@@ -11858,7 +12466,7 @@ fn deep_used_imported_forwarding_is_stack_safe_for_recursion_classification() {
             let parsed = parse::parse(lex("type Used = dep::Link0 {}", FileID::GENERATED).tokens);
             assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
             let mut mint = dummy_mint();
-            let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+            let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
             assert!(out.errors.is_empty(), "{:#?}", out.errors);
         })
         .expect("the bounded-stack regression thread starts")
@@ -11884,16 +12492,30 @@ fn malformed_imported_alias_cycles_are_absorbed_without_recursing() {
             );
             assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
             let mut mint = dummy_mint();
+            let (dependency, facts) = recovered(dependency);
+            assert!(
+                matches!(
+                    facts.as_slice(),
+                    [a::RecoveryFact::TypeDiscarded { name, .. }] if name == "dep@1.0.0::BrokenSlot"
+                ),
+                "{facts:#?}"
+            );
             let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+            // The cycle is refused as the non-row it is, and the slot the
+            // boundary discarded is simply a name the dependency no longer
+            // declares.
             assert!(
                 matches!(
                     out.errors.as_slice(),
-                    [error]
+                    [cycle, missing]
                         if matches!(
-                            error.kind,
+                            cycle.kind,
                             ErrorKind::NotARow {
                                 sense: Sense::Fields
                             }
+                        ) && matches!(
+                            &missing.kind,
+                            ErrorKind::Undefined { name, namespace: Namespace::Types } if name == "BrokenSlot"
                         )
                 ),
                 "{:#?}",
@@ -11984,7 +12606,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
             params: Vec::new(),
             scheme: artifact_scheme(artifact_type(a::Type::Struct(a::Row {
                 labels: Vec::new(),
-                rest: a::Rest::Bound(9),
+                rest: a::Rest::Undecided,
             }))),
         },
         a::DeclaredType {
@@ -12118,7 +12740,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
     );
     assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, std::slice::from_ref(&dependency));
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency.clone())]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
 
     for argument in ["dep::Cases", "dep::Cycle", "dep::Nat"] {
@@ -12130,8 +12752,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
             .tokens,
         );
         let mut mint = dummy_mint();
-        let out =
-            build_with_dependencies(&mut mint, parsed.stmts, std::slice::from_ref(&dependency));
+        let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency.clone())]);
         assert!(
             matches!(
                 out.errors.as_slice(),
@@ -12152,7 +12773,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
         .tokens,
     );
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(
         matches!(
             out.errors.as_slice(),
@@ -12183,7 +12804,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
         .tokens,
     );
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(
         matches!(
             out.errors.as_slice(),

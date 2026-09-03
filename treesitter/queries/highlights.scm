@@ -31,6 +31,9 @@
 (extern_definition type: (extern_annotation type: (identifier) @type))
 (extern_function_type parameter: (identifier) @type)
 (extern_function_type result: (identifier) @type)
+(effect_case argument: (identifier) @type)
+(absent_effect argument: (identifier) @type)
+(effect_alias argument: (identifier) @type)
 
 ; A path written where a type goes: the name at the end of it is the type, and
 ; the modules in front of it are painted with every other path's, below.
@@ -50,6 +53,9 @@
 (extern_definition type: (extern_annotation type: (path name: (identifier) @type)))
 (extern_function_type parameter: (path name: (identifier) @type))
 (extern_function_type result: (path name: (identifier) @type))
+(effect_case argument: (path name: (identifier) @type))
+(absent_effect argument: (path name: (identifier) @type))
+(effect_alias argument: (path name: (identifier) @type))
 
 (type_definition name: (identifier) @type.definition)
 

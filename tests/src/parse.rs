@@ -4,8 +4,9 @@ use std::fmt::{self, Write};
 
 use ruddy::{
     parse::{
-        ErrorKind, Expected, ExprKind, ExternTypeKind, Found, Path, PatternKind, Place, Related,
-        RelatedKind, StmtKind, SumCase, Type, TypeField, TypeKind, parse,
+        EffectBody, EffectLabel, ErrorKind, Expected, ExprKind, ExternTypeKind, Found, Path,
+        PatternKind, Place, Related, RelatedKind, StmtKind, SumCase, Type, TypeField, TypeKind,
+        parse,
     },
     token::lex,
     tracking::FileID,
@@ -2166,6 +2167,91 @@ fn effect_declarations() {
         let out = parse(lex(source, FileID::GENERATED).tokens);
         assert!(!out.errors.is_empty(), "{source}: {:#?}", out.errors);
     }
+}
+
+/// An effect declaration binds parameters the way a type declaration does,
+/// and an alias body may apply effects and end in one spliced tail.
+#[test]
+fn effect_declarations_bind_parameters() {
+    for source in [
+        "effect Ask 'a = { get: () -> 'a }",
+        "effect Log 'a = 'a -> ()",
+        "effect Nil 'a 'b",
+        "effect State 's = { get: () -> 's, put: 's -> () }",
+        "effect Both 'a 'e = !Ask 'a + !Log + ..'e",
+        "effect Forward 'e = ..'e",
+        "effect Fields 'r = !State { x: Nat, ..'r }",
+        "effect Deep 'a = !Ask (List 'a) + Sys::!Log Nat",
+    ] {
+        assert_eq!(parse_one(source), source);
+    }
+    let StmtKind::Effect { params, body, .. } = parse_stmt("effect Both 'a 'e = !Ask 'a + ..'e")
+    else {
+        panic!("expected an effect declaration");
+    };
+    assert_eq!(
+        params
+            .iter()
+            .map(|param| param.tracked.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "e"]
+    );
+    let EffectBody::Alias(row) = body else {
+        panic!("expected an alias body");
+    };
+    let (_, label) = row.effects.first().expect("the alias names an effect");
+    let EffectLabel::Written { args, .. } = label else {
+        panic!("expected a written label");
+    };
+    assert_eq!(args.len(), 1);
+    assert!(row.tail.is_some());
+    // An alias body is a row of applications and one tail: the marks a written
+    // row may wear are not its to wear.
+    for source in [
+        "effect Quiet 'e = \\!Log + ..'e",
+        "effect Maybe 'e = !Log (when 'p) + ..'e",
+        "effect Twice 'e = ..'e + !Log",
+    ] {
+        let out = parse(lex(source, FileID::GENERATED).tokens);
+        assert!(!out.errors.is_empty(), "{source}: {:#?}", out.errors);
+    }
+}
+
+/// An effect used in a row is applied with the grammar a type application
+/// has: atoms follow the label, and anything larger is parenthesized. A
+/// `(when` after the label is its presence clause, never an argument.
+#[test]
+fn effect_applications_use_type_argument_syntax() {
+    for source in [
+        "let f : () -> Nat + !Ask Nat = g",
+        "let f : () -> Nat + !Ask (List Nat) = g",
+        "let f : () -> Nat + !Ask Nat + !Log = g",
+        "let f : () -> Nat + !State { x: Nat, ..'r } = g",
+        "let f : () -> Nat + !Run (!Log + !IO) = g",
+        "let f : () -> Nat + !Ask Nat (when 'p) + ..'e = g",
+        "let f : () -> Nat + \\!Ask Nat + ..'e = g",
+        "let f : () -> Nat + Sys::!Ask Nat = g",
+        "let f : Runner (!Ask Nat + !Log) -> Nat = g",
+        "let f : () -> Nat + !Ask 'a = g",
+        "let f : () -> Nat + !Pair Nat (Nat -> Nat) = g",
+        "let f : () -> Nat + !Ask _ = g",
+    ] {
+        assert_eq!(parse_one(source), source);
+    }
+    let stmt = parse_stmt("let f : () -> Nat + !Pair Nat (Nat -> Nat) (when 'p) = g");
+    let TypeKind::Arrow {
+        effects: Some(effects),
+        ..
+    } = arrow_of(&stmt)
+    else {
+        panic!("expected an arrow with a row");
+    };
+    let (_, label) = effects.effects.first().expect("one label");
+    let EffectLabel::Written { args, when } = label else {
+        panic!("expected a written label");
+    };
+    assert_eq!(args.len(), 2);
+    assert!(when.is_some());
 }
 
 /// A mark between cases promises another one, so nothing after it is reported

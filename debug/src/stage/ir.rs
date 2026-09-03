@@ -177,17 +177,24 @@ fn effect_node(ids: &mut Ids, cx: &Cx, mint: &Mint, effect: &Effect) -> Node {
                 })
                 .collect::<Vec<_>>(),
         ),
-        Effect::Alias(aliases) => node.children(
-            aliases
+        Effect::Alias(alias) => node.children(
+            alias
+                .body
+                .cases
                 .iter()
-                .map(|(name, aliased)| {
-                    with_symbol(
+                .map(|case| {
+                    let name = mint.name(case.symbol);
+                    let mut case_node = with_symbol(
                         Node::new(ids.next(), "Names", print::label(Shape::Effect, name))
-                            .at(named(aliased.name_span, name)),
+                            .at(named(case.name_span, name)),
                         cx,
                         mint,
-                        aliased.symbol,
-                    )
+                        case.symbol,
+                    );
+                    for arg in &case.args {
+                        case_node = case_node.child(type_node(ids, cx, mint, arg, &[]));
+                    }
+                    case_node
                 })
                 .collect::<Vec<_>>(),
         ),

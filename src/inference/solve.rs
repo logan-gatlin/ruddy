@@ -1479,18 +1479,60 @@ impl Solve<'_> {
             tail: right,
         };
         for field in self.labels(span, expected, actual) {
-            self.field(
+            if let Some((left, right)) = self.field(
                 span,
                 &field.name,
                 field.expected.view(),
                 field.actual.view(),
                 &field.want,
                 &field.have,
-            )
-            .into_iter()
-            .for_each(|(left, right)| self.unify(span, &left, &right));
+            ) {
+                self.effect_arguments(span, &field.name, &left, &right);
+            }
         }
         self.depth -= 1;
+    }
+
+    /// Make two applications of one effect agree, argument by argument.
+    ///
+    /// The payloads are the argument tuples. Each position is unified on its
+    /// own, and a failure there is reported as the effect-argument clash it
+    /// is — with the failure the arguments met with kept as its cause — rather
+    /// than as a mismatch between two tuples nobody wrote.
+    fn effect_arguments(&mut self, span: Span, label: &str, want: &Rc<Ty>, have: &Rc<Ty>) {
+        let effect = crate::types::EffectId::parse_row_key(label)
+            .map_or(label, |(name, _)| name)
+            .to_string();
+        let (want, have) = (self.table.resolve(want), self.table.resolve(have));
+        let positions = match (&*want, &*have) {
+            (Ty::Struct(left), Ty::Struct(right)) if left.labels.len() == right.labels.len() => {
+                left.labels
+                    .values()
+                    .zip(right.labels.values())
+                    .map(|(left, right)| (left.ty.clone(), right.ty.clone()))
+                    .collect::<Vec<_>>()
+            }
+            // Anything else is a payload nobody wrote — an undecided one, or
+            // a recovered one — and unifies as it stands.
+            _ => vec![(want.clone(), have.clone())],
+        };
+        for (position, (left, right)) in positions.into_iter().enumerate() {
+            let before = self.errors.len();
+            let first_reason = self.table.next_reason_id;
+            self.unify(span, &left, &right);
+            // Every reason minted making this position agree is one a later
+            // failure may descend from; see [`Table::effect_argument_reasons`].
+            for id in first_reason..self.table.next_reason_id {
+                self.table
+                    .effect_argument_reasons
+                    .insert(ReasonId(id), (effect.clone(), position as u32));
+            }
+            for error in &mut self.errors[before..] {
+                error
+                    .kind
+                    .as_effect_argument(effect.clone(), position as u32);
+            }
+        }
     }
 
     /// A name bound for the length of a body: solve what its value requires,
@@ -1986,10 +2028,16 @@ impl Solve<'_> {
                     depth,
                 } => {
                     self.depth = depth;
+                    let shape = expected.tail.shape();
                     if let Some((left, right)) =
                         self.field(span, &name, expected.view(), actual.view(), &want, &have)
                     {
-                        work.push(SolveWork::Ty(left, right, depth));
+                        match shape {
+                            Shape::Effect => self.effect_arguments(span, &name, &left, &right),
+                            Shape::Struct | Shape::Sum => {
+                                work.push(SolveWork::Ty(left, right, depth))
+                            }
+                        }
                     }
                 }
                 SolveWork::FinishCongruent {
@@ -2558,6 +2606,12 @@ impl Solve<'_> {
                     &abandoned,
                 );
                 None
+            }
+            // Two applications of one effect both written absent still name
+            // one application: absence and presence cannot disagree about
+            // which, so their arguments agree as present ones do.
+            (Presence::Absent, Presence::Absent) if shape == Shape::Effect => {
+                Some((want.ty.clone(), have.ty.clone()))
             }
             // At least one side is still a variable or undecided: the
             // presences unify as anything else does, and the types follow

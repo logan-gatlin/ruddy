@@ -60,21 +60,49 @@ pub fn render(spec: &Spec, cx: &Cx, artifact: &Artifact, micros: u64) -> Stage {
     }
     for effect in &artifact.header().effects {
         let mut node = Node::new(ids.next(), "effect", &effect.name);
-        if let ruddy::artifact::EffectKind::Operations(operations) = &effect.kind {
-            node = node.children(
-                operations
-                    .iter()
-                    .map(|operation| {
-                        let selector = match &operation.selector {
-                            ruddy::artifact::OperationSelector::Unnamed => "unnamed".to_string(),
-                            ruddy::artifact::OperationSelector::Named(name) => {
-                                format!("named {name}")
-                            }
-                        };
-                        Node::new(ids.next(), "selector", selector)
-                    })
-                    .collect::<Vec<_>>(),
-            );
+        for param in &effect.params {
+            node = node.child(Node::new(
+                ids.next(),
+                "param",
+                format!("{:?}", param.sense).to_lowercase(),
+            ));
+        }
+        match &effect.kind {
+            ruddy::artifact::EffectKind::Operations(operations) => {
+                node = node.children(
+                    operations
+                        .iter()
+                        .map(|operation| {
+                            let selector = match &operation.selector {
+                                ruddy::artifact::OperationSelector::Unnamed => {
+                                    "unnamed".to_string()
+                                }
+                                ruddy::artifact::OperationSelector::Named(name) => {
+                                    format!("named {name}")
+                                }
+                            };
+                            Node::new(ids.next(), "selector", selector)
+                        })
+                        .collect::<Vec<_>>(),
+                );
+            }
+            // An alias: the effects it applies, each with how many arguments,
+            // and the parameter it ends in.
+            ruddy::artifact::EffectKind::Alias(row) => {
+                for case in &row.cases {
+                    node = node.child(Node::new(
+                        ids.next(),
+                        "case",
+                        match case.args.len() {
+                            0 => case.name.clone(),
+                            n => format!("{} ({n} arguments)", case.name),
+                        },
+                    ));
+                }
+                if let Some(index) = row.tail {
+                    node = node.child(Node::new(ids.next(), "tail", format!("parameter {index}")));
+                }
+            }
         }
         interface.push(node);
     }
@@ -83,7 +111,8 @@ pub fn render(spec: &Spec, cx: &Cx, artifact: &Artifact, micros: u64) -> Stage {
         "header",
         format!(
             "{}@{}",
-            artifact.header().identity.name, artifact.header().identity.version
+            artifact.header().identity.name,
+            artifact.header().identity.version
         ),
     )
     .children(interface);

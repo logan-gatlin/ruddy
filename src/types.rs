@@ -117,6 +117,17 @@ impl EffectId {
             Self::Pending(_) => "<unresolved effect>",
         }
     }
+
+    /// The row key, or a provisional spelling for an effect whose identity is
+    /// still being computed. What the parameter-kind fixpoint labels a row's
+    /// lacks with: before identities exist it needs only to tell labels
+    /// apart, and after they do it is the row key itself.
+    pub fn label_key(&self) -> String {
+        match self {
+            Self::Structural { .. } => self.row_key(),
+            Self::Pending(symbol) => format!("\u{1e}p{symbol:?}"),
+        }
+    }
 }
 
 /// Which of the two sets of labels a rule is being read about.
@@ -694,6 +705,10 @@ impl Assigned {
             Assigned::Ty(ty) => match &**ty {
                 Ty::Var(var) => Row::of(Rest::Var(*var)),
                 Ty::Struct(row) | Ty::Sum(row) => row.clone(),
+                // An effects argument: the row an arrow from nothing to
+                // nothing carries, which is how one is handed to an effect.
+                // See [`Ty::effects_argument`].
+                Ty::Arrow(_, _, row) => row.clone(),
                 _ => Row::of(Rest::Undecided),
             },
             Assigned::Presence(_) => Row::closed(),
@@ -1023,6 +1038,29 @@ impl Ty {
     /// The empty closed struct, also used for unit.
     pub fn unit() -> Self {
         Self::Struct(Row::closed())
+    }
+
+    /// A row of effects handed to an effect's parameter, as the type it
+    /// travels as: an arrow from nothing to nothing carrying the row. The
+    /// arrow is what says the row is effects — a struct's row would be
+    /// fields and a sum's cases — so two such arguments unify as effect rows,
+    /// are forbidden labels in effect nouns, and print as a row of effects.
+    pub fn effects_argument(row: Row) -> Self {
+        Self::Arrow(Rc::new(Self::unit()), Rc::new(Self::unit()), row)
+    }
+
+    /// The row this is an effects argument of, if it is one. See
+    /// [`Ty::effects_argument`].
+    pub fn effects_argument_row(&self) -> Option<&Row> {
+        match self {
+            Ty::Arrow(from, to, row)
+                if matches!(&**from, Ty::Struct(row) if row.labels.is_empty() && matches!(row.rest, Rest::Closed))
+                    && matches!(&**to, Ty::Struct(row) if row.labels.is_empty() && matches!(row.rest, Rest::Closed)) =>
+            {
+                Some(row)
+            }
+            _ => None,
+        }
     }
 
     /// The field row inside a struct, if this is one.

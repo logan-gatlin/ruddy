@@ -38,6 +38,14 @@ fn inference_error_kinds(span: Span) -> Vec<TypeError> {
             expected: nat.clone(),
             actual: Rc::new(Ty::default()),
         },
+        TypeError::EffectArgument {
+            effect: "Ask".to_string(),
+            position: 0,
+            cause: Box::new(TypeError::Mismatch {
+                expected: nat.clone(),
+                actual: Rc::new(Ty::default()),
+            }),
+        },
         TypeError::Recursive,
         TypeError::MissingField {
             shape: Shape::Struct,
@@ -227,6 +235,23 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
             expected: 2,
             found: 1,
         },
+        IrError::EffectArity {
+            name: "Ask".to_string(),
+            expected: 1,
+            found: 0,
+        },
+        IrError::AliasCycle {
+            name: "Loop".to_string(),
+            growing: false,
+        },
+        IrError::AliasCycle {
+            name: "Grow".to_string(),
+            growing: true,
+        },
+        IrError::ModifiedOpenAlias {
+            name: "Both".to_string(),
+        },
+        IrError::TwoTails { previous: span },
         IrError::NotAConstructor,
         IrError::ParameterApplied {
             name: "f".to_string(),
@@ -597,7 +622,7 @@ fn every_inference_error_exposes_a_complete_structured_diagnostic() {
     let use_span = Span::generated(4, 5);
     let declared = Span::generated(1, 2);
     let kinds = inference_error_kinds(declared);
-    assert_eq!(kinds.len(), 17);
+    assert_eq!(kinds.len(), 18);
 
     for kind in kinds {
         let diagnostic = inference::Error::new(use_span, kind).diagnostic();
@@ -1994,6 +2019,10 @@ fn inference_source_corpus_matches_abridged_structured_goldens() {
         (
             "type-mismatch",
             include_str!("../diagnostics/inference/type-mismatch.hc"),
+        ),
+        (
+            "effect-argument-mismatch",
+            include_str!("../diagnostics/inference/effect-argument-mismatch.hc"),
         ),
         (
             "recursive-type",
@@ -4754,4 +4783,168 @@ fn the_module_tokens_print_as_they_were_written() {
 fn a_qualified_effect_label_keeps_its_sigil_on_the_effect() {
     assert_eq!(ui::label(Shape::Effect, "Log"), "!Log");
     assert_eq!(ui::label(Shape::Effect, "Math::Log"), "Math::!Log");
+}
+
+/// Every complaint an applied effect can draw at lowering, pinned: its code,
+/// its title, where it points, and how to repair it — each naming the effect
+/// and, where there is one, the position or the constructor at fault.
+#[test]
+fn applied_effect_complaints_name_the_effect_and_the_repair() {
+    let base = "effect Log = { write: Nat -> () }\n\
+                effect Ask 'a = { get: () -> 'a }\n\
+                effect Run 'e = { run: (() -> () + !Log + ..'e) -> () }\n\
+                effect Both 'a 'e = !Ask 'a + !Log + ..'e\n";
+    let lowered = |source: &str| {
+        let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
+        assert!(parsed.errors.is_empty(), "{source}: {:#?}", parsed.errors);
+        let mut mint = Mint::new(Bundle::new("tests", Version::new(0, 1, 0)).unwrap());
+        let out = ir::build(&mut mint, parsed.stmts);
+        let [error] = out.errors.as_slice() else {
+            panic!("{source}: {:#?}", out.errors);
+        };
+        (error.diagnostic(), source.to_string())
+    };
+    let (diagnostic, source) = lowered(&format!("{base}let f : () -> Nat + !Ask = fn _ => 0n"));
+    assert_eq!(diagnostic.code, "effect-arity");
+    assert_eq!(
+        diagnostic.title,
+        "effect `!Ask` expects one argument, but none was written"
+    );
+    assert_eq!(
+        diagnostic.primary.message,
+        "not enough arguments are supplied"
+    );
+    assert_eq!(diagnostic.primary.span.start, source.rfind("!Ask").unwrap());
+    assert_eq!(diagnostic.help, ["add the missing effect arguments"]);
+
+    let (diagnostic, source) = lowered(&format!(
+        "{base}let f : () -> Nat + !Ask Nat Nat = fn _ => 0n"
+    ));
+    assert_eq!(diagnostic.code, "effect-arity");
+    assert_eq!(
+        diagnostic.title,
+        "effect `!Ask` expects one argument, but two were written"
+    );
+    assert_eq!(diagnostic.help, ["remove the extra effect arguments"]);
+    assert_eq!(diagnostic.primary.span.start, source.rfind("!Ask").unwrap());
+
+    let (diagnostic, source) = lowered(&format!("{base}let f : () -> Nat + !Run Nat = fn _ => 0n"));
+    assert_eq!(diagnostic.code, "not-a-row");
+    assert_eq!(
+        diagnostic.primary.span.start,
+        source.rfind("Nat =").unwrap()
+    );
+
+    let (diagnostic, _) = lowered(&format!(
+        "{base}let f : () -> Nat + !Run (!Log) = fn _ => 0n"
+    ));
+    assert_eq!(diagnostic.code, "repeated-row-field");
+    assert!(diagnostic.title.contains("`!Log`"), "{}", diagnostic.title);
+
+    let (diagnostic, source) = lowered(&format!(
+        "{base}let f : () -> Nat + !Both Nat (!Log) = fn _ => 0n"
+    ));
+    assert_eq!(diagnostic.code, "repeated-row-field");
+    assert_eq!(
+        diagnostic.primary.span.start,
+        source.rfind("(!Log)").unwrap()
+    );
+
+    let (diagnostic, source) = lowered(&format!(
+        "{base}let f : () -> Nat + \\!Both Nat (..'e) + ..'e = fn _ => 0n"
+    ));
+    assert_eq!(diagnostic.code, "modified-open-alias");
+    assert_eq!(
+        diagnostic.title,
+        "`!Both` leaves some effects unnamed here, so it cannot be marked"
+    );
+    assert_eq!(
+        diagnostic.primary.message,
+        "this mark would have to apply to effects that are not named yet"
+    );
+    assert_eq!(
+        diagnostic.primary.span.start,
+        source.rfind("\\!Both").unwrap()
+    );
+    assert_eq!(
+        diagnostic.help,
+        ["give the alias every effect it stands for, or mark each effect yourself"]
+    );
+
+    let (diagnostic, source) = lowered(&format!(
+        "{base}let f : () -> Nat + !Both Nat (..'e) + ..'f = fn _ => 0n"
+    ));
+    assert_eq!(diagnostic.code, "two-tails");
+    assert_eq!(diagnostic.title, "these effects are left open twice");
+    assert_eq!(diagnostic.primary.message, "this `..` is the second");
+    assert_eq!(diagnostic.related.len(), 1);
+    assert_eq!(diagnostic.related[0].message, "the first `..` is here");
+    assert_eq!(
+        diagnostic.related[0].span.start,
+        source.rfind("..'f").unwrap()
+    );
+    assert_eq!(
+        diagnostic.help,
+        ["keep one `..`: write the other's effects out, or drop one"]
+    );
+
+    let (diagnostic, source) = lowered("effect A 'e = !B 'e\neffect B 'e = !A 'e");
+    assert_eq!(diagnostic.code, "alias-cycle");
+    assert_eq!(diagnostic.title, "effect `!A` only ever stands for itself");
+    assert_eq!(
+        diagnostic.primary.message,
+        "this alias leads back to itself through other aliases"
+    );
+    assert_eq!(
+        diagnostic.primary.span.start,
+        source.rfind("!A 'e").unwrap()
+    );
+    assert_eq!(
+        diagnostic.help,
+        ["name the effects the alias stands for without going through itself"]
+    );
+
+    let (diagnostic, _) =
+        lowered("effect Log = { write: Nat -> () }\neffect Grow 'e = !Log + !Grow 'e");
+    assert_eq!(diagnostic.code, "growing-alias-cycle");
+    assert_eq!(
+        diagnostic.title,
+        "effect `!Grow` grows every time it stands for itself"
+    );
+    assert_eq!(
+        diagnostic.primary.message,
+        "this alias adds effects and then names itself again"
+    );
+}
+
+/// An inferred argument clash renders the instantiation involved and keeps
+/// the causal detail of the arguments that could not agree.
+#[test]
+fn an_argument_clash_renders_the_applications_and_its_cause() {
+    let errors = inference_fixture_errors(include_str!(
+        "../diagnostics/inference/effect-argument-mismatch.hc"
+    ));
+    let [error] = errors.as_slice() else {
+        panic!("{errors:#?}");
+    };
+    let diagnostic = error.diagnostic();
+    assert_eq!(diagnostic.code, "effect-argument-mismatch");
+    assert_eq!(
+        diagnostic.title,
+        "effect `!Ask` is used with incompatible first arguments"
+    );
+    assert!(
+        diagnostic
+            .notes
+            .iter()
+            .any(|note| note.contains("text and a natural number cannot be the same type")),
+        "{:#?}",
+        diagnostic.notes
+    );
+    assert!(error.explanation.is_some());
+    // And the applications themselves print with their arguments.
+    assert_eq!(
+        error.kind.to_string(),
+        "effect `!Ask` is used with incompatible first arguments: type mismatch: expected `String`, found `Nat`"
+    );
 }

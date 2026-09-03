@@ -1026,6 +1026,11 @@ impl ir::ErrorKind {
                 "incompatible-presence-ownership"
             }
             ir::ErrorKind::Arity { .. } => "wrong-argument-count",
+            ir::ErrorKind::EffectArity { .. } => "effect-arity",
+            ir::ErrorKind::AliasCycle { growing: false, .. } => "alias-cycle",
+            ir::ErrorKind::AliasCycle { growing: true, .. } => "growing-alias-cycle",
+            ir::ErrorKind::ModifiedOpenAlias { .. } => "modified-open-alias",
+            ir::ErrorKind::TwoTails { .. } => "two-tails",
             ir::ErrorKind::NotAConstructor => "not-a-type-constructor",
             ir::ErrorKind::ParameterApplied { .. } => "applied-parameter",
             ir::ErrorKind::DuplicateParameter { .. } => "duplicate-parameter",
@@ -1216,6 +1221,57 @@ impl ir::Error {
             } else {
                 "remove the extra type arguments"
             }),
+            E::EffectArity {
+                name,
+                expected,
+                found,
+            } => Diagnostic::new(
+                code,
+                format!(
+                    "effect `!{name}` expects {}, but {} written",
+                    arguments(*expected),
+                    supplied(*found)
+                ),
+                span,
+            )
+            .label(if found < expected {
+                "not enough arguments are supplied"
+            } else {
+                "too many arguments are supplied"
+            })
+            .help(if found < expected {
+                "add the missing effect arguments"
+            } else {
+                "remove the extra effect arguments"
+            }),
+            E::AliasCycle { name, growing } => Diagnostic::new(
+                code,
+                match growing {
+                    true => format!("effect `!{name}` grows every time it stands for itself"),
+                    false => format!("effect `!{name}` only ever stands for itself"),
+                },
+                span,
+            )
+            .label(match growing {
+                true => "this alias adds effects and then names itself again",
+                false => "this alias leads back to itself through other aliases",
+            })
+            .help("name the effects the alias stands for without going through itself"),
+            E::ModifiedOpenAlias { name } => Diagnostic::new(
+                code,
+                format!("`!{name}` leaves some effects unnamed here, so it cannot be marked"),
+                span,
+            )
+            .label("this mark would have to apply to effects that are not named yet")
+            .help("give the alias every effect it stands for, or mark each effect yourself"),
+            E::TwoTails { previous } => Diagnostic::new(
+                code,
+                "these effects are left open twice",
+                span,
+            )
+            .label("this `..` is the second")
+            .related(*previous, "the first `..` is here")
+            .help("keep one `..`: write the other's effects out, or drop one"),
             E::NotAConstructor => Diagnostic::new(
                 code,
                 "this type cannot take arguments",
@@ -1553,6 +1609,23 @@ impl fmt::Display for patterns::Verdict {
     }
 }
 
+/// `first`, `second`, `third` — the position of an argument, in the word a
+/// sentence wants; further along, the numeral with its ending, since an
+/// effect taking a dozen arguments is already past what a word helps with.
+fn ordinal(position: u32) -> String {
+    let nth = position + 1;
+    match nth {
+        1 => "first".to_string(),
+        2 => "second".to_string(),
+        3 => "third".to_string(),
+        n if (11..=13).contains(&(n % 100)) => format!("{n}th"),
+        n if n % 10 == 1 => format!("{n}st"),
+        n if n % 10 == 2 => format!("{n}nd"),
+        n if n % 10 == 3 => format!("{n}rd"),
+        n => format!("{n}th"),
+    }
+}
+
 /// `no arguments`, `one argument`, `two arguments` — small counts in words,
 /// because a message is a sentence and a sentence does not open with a numeral.
 ///
@@ -1794,7 +1867,8 @@ enum SemanticJob<'a> {
     Field(&'a str, &'a RowField),
     TupleField(&'a RowField),
     Case(&'a str, &'a RowField, bool),
-    Effect(&'a str, &'a Presence),
+    Effect(&'a str, &'a RowField),
+    Mark(&'a Presence),
     Text(&'static str),
 }
 
@@ -1964,7 +2038,7 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                     }
                 }
                 for (at, (name, field)) in effects.into_iter().enumerate().rev() {
-                    work.push(SemanticJob::Effect(name, &field.presence));
+                    work.push(SemanticJob::Effect(name, field));
                     if at != 0 {
                         work.push(SemanticJob::Text(" + "));
                     }
@@ -1994,10 +2068,30 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                     work.push(SemanticJob::Ty(&field.ty, field.ty.prec() < Prec::Atom));
                 }
             }
-            SemanticJob::Effect(name, presence) => {
+            // An applied effect: the label, its arguments as a type
+            // application writes them, and the mark it wears after those.
+            SemanticJob::Effect(name, field) => {
                 f.write_str(&label(Shape::Effect, name))?;
-                write_semantic_mark(f, presence, true)?;
+                work.push(SemanticJob::Mark(&field.presence));
+                if let Ty::Struct(row) = unpackaged(&field.ty)
+                    && matches!(row.rest, Rest::Closed)
+                    && let Some(order) = tuple_field_order(row.labels.keys().map(String::as_str))
+                {
+                    for insertion in order.into_iter().rev() {
+                        let arg = &row.labels[insertion].ty;
+                        match arg.effects_argument_row() {
+                            Some(effects) => {
+                                work.push(SemanticJob::Text(")"));
+                                work.push(SemanticJob::Effects(effects));
+                                work.push(SemanticJob::Text("("));
+                            }
+                            None => work.push(SemanticJob::Applied(arg)),
+                        }
+                        work.push(SemanticJob::Text(" "));
+                    }
+                }
             }
+            SemanticJob::Mark(presence) => write_semantic_mark(f, presence, true)?,
         }
     }
     Ok(())
@@ -2955,6 +3049,47 @@ impl inference::Error {
                         .help("change this value to a struct, or change/remove the field access");
                 }
             }
+            E::EffectArgument {
+                effect, position, ..
+            } => {
+                let title = format!(
+                    "effect `!{effect}` is used with incompatible {} arguments",
+                    ordinal(*position)
+                );
+                if let Some(explanation) = &self.explanation {
+                    diagnostic.title = title;
+                    let mut selected = explanation
+                        .abridged
+                        .iter()
+                        .copied()
+                        .filter_map(|at| explanation.full_facts.get(at).map(|fact| (at, fact)));
+                    if let Some((at, primary)) = selected.next() {
+                        diagnostic.primary.span = primary.span;
+                        diagnostic.primary.message =
+                            displayed_explanation_fact(primary, at, explanation);
+                    } else {
+                        diagnostic.primary.message =
+                            "these uses of the effect disagree about this argument".into();
+                    }
+                    for (at, fact) in selected {
+                        diagnostic = diagnostic
+                            .related(fact.span, displayed_explanation_fact(fact, at, explanation));
+                    }
+                    diagnostic = add_abridgement_note(diagnostic, explanation)
+                        .note(format!(
+                            "the arguments cannot agree: {}",
+                            mismatch_title(&explanation.contradiction)
+                        ))
+                        .help("use the effect with one argument throughout this computation")
+                        .help("or handle one of the uses separately");
+                } else {
+                    diagnostic = Diagnostic::new(self.kind.code(), title, self.span)
+                        .label("these uses of the effect disagree about this argument")
+                        .note(format!("the arguments cannot agree: {}", self.kind.cause()))
+                        .help("use the effect with one argument throughout this computation")
+                        .help("or handle one of the uses separately");
+                }
+            }
             E::Mismatch { .. } => {
                 if let Some(explanation) = &self.explanation {
                     diagnostic.title = mismatch_title(&explanation.contradiction);
@@ -3234,6 +3369,7 @@ impl inference::ErrorKind {
         match self {
             inference::ErrorKind::NotAStruct { .. } => "not-a-struct",
             inference::ErrorKind::Mismatch { .. } => "type-mismatch",
+            inference::ErrorKind::EffectArgument { .. } => "effect-argument-mismatch",
             inference::ErrorKind::Recursive => "recursive-type",
             // A missing case and a missing field are one complaint, so they
             // are one code: what went wrong is that a row was asked for a
@@ -3273,6 +3409,15 @@ impl fmt::Display for inference::ErrorKind {
             inference::ErrorKind::Mismatch { expected, actual } => {
                 write!(f, "type mismatch: expected `{expected}`, found `{actual}`")
             }
+            inference::ErrorKind::EffectArgument {
+                effect,
+                position,
+                cause,
+            } => write!(
+                f,
+                "effect `!{effect}` is used with incompatible {} arguments: {cause}",
+                ordinal(*position)
+            ),
             inference::ErrorKind::Recursive => {
                 f.write_str("this type would have to contain itself")
             }

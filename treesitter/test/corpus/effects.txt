@@ -176,3 +176,45 @@ let rested : Runner (..'e) -> Nat = f
                 (type_variable)))))
         (identifier)))
     (identifier)))
+
+================================================================================
+An effect applied to arguments
+================================================================================
+
+let f : () -> Nat + !Ask Nat + !State { x: Nat, ..'r } (when 'p) + \!Run (!Log + !IO) + ..'e = g
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (annotation
+      (function_type
+        (unit)
+        (identifier)
+        (effect_row
+          (effect_case
+            (effect_label)
+            (identifier))
+          (effect_case
+            (effect_label)
+            (struct_type
+              (struct_type_field
+                (identifier)
+                (identifier))
+              (rest
+                (type_variable)))
+            (parenthesized_when
+              (when_clause
+                (type_variable))))
+          (absent_effect
+            (effect_label)
+            (parenthesized_type
+              (effect_type
+                (effect_case
+                  (effect_label))
+                (effect_case
+                  (effect_label)))))
+          (rest
+            (type_variable)))))
+    (identifier)))
