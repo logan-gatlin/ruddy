@@ -1064,7 +1064,7 @@ impl Lower<'_> {
         for entry in entries {
             let symbol = entry.symbol;
             let name = self.mint.name(symbol).to_string();
-            let ty = entry.scheme.body().clone();
+            let ty = entry.ty.clone();
             externs.push(Extern {
                 symbol,
                 name: name.clone(),
@@ -1089,7 +1089,7 @@ impl Lower<'_> {
                         name: name.clone(),
                     },
                 );
-                let value = self.host_to_ruddy(&entry.abi, &ty, raw, &mut body);
+                let value = self.host_to_ruddy(&entry.conversion, &ty, raw, &mut body);
                 self.globals.push(Global {
                     symbol,
                     name,
@@ -1106,16 +1106,16 @@ impl Lower<'_> {
 
     fn host_to_ruddy(
         &mut self,
-        abi: &crate::ir::ExternType,
+        conversion: &crate::externs::Conversion,
         ty: &Rc<Ty>,
         raw: Temp,
         body: &mut Body,
     ) -> Temp {
-        use crate::ir::ExternTypeKind;
-        match &abi.tracked {
-            ExternTypeKind::Group(inner) => self.host_to_ruddy(inner, ty, raw, body),
-            ExternTypeKind::Function {
-                parameters, result, ..
+        match conversion {
+            crate::externs::Conversion::MarkedFunction {
+                parameters,
+                result,
+                nullary,
             } => {
                 let arity = parameters.len().max(1);
                 let id = self.marked_extern_level(
@@ -1124,14 +1124,14 @@ impl Lower<'_> {
                     Vec::new(),
                     ty.clone(),
                     arity,
-                    parameters.is_empty(),
+                    *nullary,
                     parameters.clone(),
-                    result.as_ref().clone(),
+                    *result.clone(),
                     0,
                 );
                 self.emit(
                     body,
-                    abi.span,
+                    Span::default(),
                     Rep::Fn,
                     Op::Closure {
                         func: id,
@@ -1139,11 +1139,11 @@ impl Lower<'_> {
                     },
                 )
             }
-            ExternTypeKind::Ordinary(_) if self.rep(ty) == Rep::Fn => {
+            crate::externs::Conversion::OrdinaryFunction if self.rep(ty) == Rep::Fn => {
                 let id = self.ordinary_extern_level(ty.clone());
                 self.emit(
                     body,
-                    abi.span,
+                    Span::default(),
                     Rep::Fn,
                     Op::Closure {
                         func: id,
@@ -1151,7 +1151,7 @@ impl Lower<'_> {
                     },
                 )
             }
-            ExternTypeKind::Ordinary(_) => raw,
+            crate::externs::Conversion::Value | crate::externs::Conversion::OrdinaryFunction => raw,
         }
     }
 
@@ -1188,10 +1188,13 @@ impl Lower<'_> {
             rep: self.rep(&from),
         });
         let mut body = Body::default();
-        let ordinary = Span::default().track(crate::ir::ExternTypeKind::Ordinary(
-            Span::default().track(crate::ir::TypeKind::Error),
-        ));
-        let argument = self.ruddy_to_host(&ordinary, &from, argument, &row, &mut body);
+        let argument = self.ruddy_to_host(
+            &crate::externs::Conversion::OrdinaryFunction,
+            &from,
+            argument,
+            &row,
+            &mut body,
+        );
         let result = self.emit(
             &mut body,
             Span::default(),
@@ -1201,7 +1204,12 @@ impl Lower<'_> {
                 args: vec![argument],
             },
         );
-        let result = self.host_to_ruddy(&ordinary, &to, result, &mut body);
+        let result = self.host_to_ruddy(
+            &crate::externs::Conversion::OrdinaryFunction,
+            &to,
+            result,
+            &mut body,
+        );
         self.frames.pop().expect("the extern frame just pushed");
         self.fill(
             id,
@@ -1294,16 +1302,14 @@ impl Lower<'_> {
     /// their parameter list deliberately has no Ruddy evidence slots.
     fn ruddy_to_host(
         &mut self,
-        abi: &crate::ir::ExternType,
+        conversion: &crate::externs::Conversion,
         ty: &Rc<Ty>,
         value: Temp,
         available: &Row,
         body: &mut Body,
     ) -> Temp {
-        use crate::ir::ExternTypeKind;
-        match &abi.tracked {
-            ExternTypeKind::Group(inner) => self.ruddy_to_host(inner, ty, value, available, body),
-            ExternTypeKind::Function {
+        match conversion {
+            crate::externs::Conversion::MarkedFunction {
                 parameters, result, ..
             } => {
                 let required = self.callback_evidence(ty, available);
@@ -1312,17 +1318,29 @@ impl Lower<'_> {
                     self.marked_callback(ty.clone(), parameters.clone(), *result.clone(), required);
                 let mut captures = vec![value];
                 captures.extend(evidence);
-                self.emit(body, abi.span, Rep::Fn, Op::Closure { func: id, captures })
+                self.emit(
+                    body,
+                    Span::default(),
+                    Rep::Fn,
+                    Op::Closure { func: id, captures },
+                )
             }
-            ExternTypeKind::Ordinary(_) if self.rep(ty) == Rep::Fn => {
+            crate::externs::Conversion::OrdinaryFunction if self.rep(ty) == Rep::Fn => {
                 let required = self.callback_evidence(ty, available);
                 let evidence = self.evidence_args(&required, available, body);
                 let id = self.ordinary_callback(ty.clone(), required);
                 let mut captures = vec![value];
                 captures.extend(evidence);
-                self.emit(body, abi.span, Rep::Fn, Op::Closure { func: id, captures })
+                self.emit(
+                    body,
+                    Span::default(),
+                    Rep::Fn,
+                    Op::Closure { func: id, captures },
+                )
             }
-            ExternTypeKind::Ordinary(_) => value,
+            crate::externs::Conversion::Value | crate::externs::Conversion::OrdinaryFunction => {
+                value
+            }
         }
     }
 
@@ -1358,11 +1376,13 @@ impl Lower<'_> {
             temp: raw_argument,
             rep: self.rep(&from),
         });
-        let ordinary = Span::default().track(crate::ir::ExternTypeKind::Ordinary(
-            Span::default().track(crate::ir::TypeKind::Error),
-        ));
         let mut body = Body::default();
-        let argument = self.host_to_ruddy(&ordinary, &from, raw_argument, &mut body);
+        let argument = self.host_to_ruddy(
+            &crate::externs::Conversion::OrdinaryFunction,
+            &from,
+            raw_argument,
+            &mut body,
+        );
         let mut args = self.evidence_args(&row, &row, &mut body);
         args.push(argument);
         let result = self.emit(
@@ -1374,7 +1394,13 @@ impl Lower<'_> {
                 args,
             },
         );
-        let result = self.ruddy_to_host(&ordinary, &to, result, &available, &mut body);
+        let result = self.ruddy_to_host(
+            &crate::externs::Conversion::OrdinaryFunction,
+            &to,
+            result,
+            &available,
+            &mut body,
+        );
         self.frames.pop().expect("the callback frame just pushed");
         self.fill(
             id,
@@ -1399,8 +1425,8 @@ impl Lower<'_> {
     fn marked_callback(
         &mut self,
         ty: Rc<Ty>,
-        parameter_abis: Vec<crate::ir::ExternType>,
-        result_abi: crate::ir::ExternType,
+        parameter_conversions: Vec<crate::externs::Conversion>,
+        result_conversion: crate::externs::Conversion,
         available: Row,
     ) -> FuncId {
         let id = self.slot(format!("{}#callback#{}", self.stem, self.serial));
@@ -1415,9 +1441,9 @@ impl Lower<'_> {
         let mut raw_parameters = Vec::new();
         let mut arrows = Vec::new();
         let mut cursor = ty;
-        for _ in 0..parameter_abis.len().max(1) {
+        for _ in 0..parameter_conversions.len().max(1) {
             let (from, to, row) = self.arrow(&cursor);
-            if !parameter_abis.is_empty() {
+            if !parameter_conversions.is_empty() {
                 let temp = self.fresh(self.rep(&from));
                 params.push(Param {
                     temp,
@@ -1431,7 +1457,7 @@ impl Lower<'_> {
 
         let mut body = Body::default();
         let mut current = closure;
-        if parameter_abis.is_empty() {
+        if parameter_conversions.is_empty() {
             let unit = self.emit(
                 &mut body,
                 Span::default(),
@@ -1450,8 +1476,10 @@ impl Lower<'_> {
                 },
             );
         } else {
-            for ((abi, raw), (from, to, row)) in
-                parameter_abis.iter().zip(raw_parameters).zip(arrows.iter())
+            for ((abi, raw), (from, to, row)) in parameter_conversions
+                .iter()
+                .zip(raw_parameters)
+                .zip(arrows.iter())
             {
                 let argument = self.host_to_ruddy(abi, from, raw, &mut body);
                 let mut args = self.evidence_args(row, row, &mut body);
@@ -1467,7 +1495,8 @@ impl Lower<'_> {
                 );
             }
         }
-        let result = self.ruddy_to_host(&result_abi, &cursor, current, &available, &mut body);
+        let result =
+            self.ruddy_to_host(&result_conversion, &cursor, current, &available, &mut body);
         self.frames.pop().expect("the callback frame just pushed");
         self.fill(
             id,
@@ -1493,8 +1522,8 @@ impl Lower<'_> {
         ty: Rc<Ty>,
         arity: usize,
         nullary: bool,
-        parameter_abis: Vec<crate::ir::ExternType>,
-        result_abi: crate::ir::ExternType,
+        parameter_conversions: Vec<crate::externs::Conversion>,
+        result_conversion: crate::externs::Conversion,
         step: usize,
     ) -> FuncId {
         let id = self.slot(format!("{}#{}", self.stem, self.serial));
@@ -1528,7 +1557,7 @@ impl Lower<'_> {
             let gathered = gathered
                 .into_iter()
                 .zip(carried_types.iter().chain(std::iter::once(&from)))
-                .zip(parameter_abis.iter())
+                .zip(parameter_conversions.iter())
                 .map(|((argument, ty), abi)| self.ruddy_to_host(abi, ty, argument, &row, &mut body))
                 .collect();
             let result = self.emit(
@@ -1540,7 +1569,7 @@ impl Lower<'_> {
                     args: gathered,
                 },
             );
-            self.host_to_ruddy(&result_abi, &to, result, &mut body)
+            self.host_to_ruddy(&result_conversion, &to, result, &mut body)
         } else {
             let mut next_carried = carried;
             next_carried.push(argument_rep);
@@ -1553,8 +1582,8 @@ impl Lower<'_> {
                 to.clone(),
                 arity,
                 false,
-                parameter_abis,
-                result_abi,
+                parameter_conversions,
+                result_conversion,
                 step + 1,
             );
             let mut captures = vec![raw];

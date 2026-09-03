@@ -181,35 +181,75 @@ impl UncheckedArtifact {
                         value.name = "<recovered>::value".into();
                     }
                 }
-                let artifact = UncheckedArtifact { header, lir }.validate().unwrap_or_else(|_| {
-                    // A malformed semantic tree cannot be made meaningful by
-                    // guessing at its bounds or package owners. Preserve the
-                    // trusted compiler path by admitting an empty recovered
-                    // interface instead of publishing invalid meaning.
-                    UncheckedArtifact {
-                        header: Header {
-                            identity: Identity {
-                                name: "<recovered>".into(),
-                                version: "0".into(),
-                            },
-                            dependencies: Vec::new(),
-                            values: Vec::new(),
-                            types: Vec::new(),
-                            effects: Vec::new(),
-                        },
-                        lir: Lir {
-                            externs: Vec::new(),
-                            functions: Vec::new(),
-                            globals: Vec::new(),
-                        },
-                    }
-                    .validate()
-                    .expect("empty recovery interface is valid")
-                });
+                let artifact = recover_parts(header, lir);
                 (artifact, vec![RecoveryFact::Recovered { message }])
             }
         }
     }
+}
+
+/// Retain every independently valid declaration while excluding only portable
+/// semantic fragments that cannot establish the artifact invariant.  A valid
+/// LIR is carried through every candidate validation, so a bad interface tree
+/// never erases executable content that does not depend on it.
+fn recover_parts(header: Header, lir: Lir) -> Artifact {
+    let mut recovered = Header {
+        identity: header.identity,
+        dependencies: header.dependencies,
+        values: Vec::new(),
+        types: Vec::new(),
+        effects: Vec::new(),
+    };
+
+    // Types precede values because an exported value may name a local type.
+    // Each candidate takes the same strict route as text input; recovery is
+    // selection, never a weaker semantic decoder.
+    for declaration in header.types {
+        let mut candidate = recovered.clone();
+        candidate.types.push(declaration.clone());
+        if (UncheckedArtifact {
+            header: candidate.clone(),
+            lir: lir.clone(),
+        })
+        .validate()
+        .is_ok()
+        {
+            recovered = candidate;
+        }
+    }
+    for declaration in header.effects {
+        let mut candidate = recovered.clone();
+        candidate.effects.push(declaration.clone());
+        if (UncheckedArtifact {
+            header: candidate.clone(),
+            lir: lir.clone(),
+        })
+        .validate()
+        .is_ok()
+        {
+            recovered = candidate;
+        }
+    }
+    for declaration in header.values {
+        let mut candidate = recovered.clone();
+        candidate.values.push(declaration.clone());
+        if (UncheckedArtifact {
+            header: candidate.clone(),
+            lir: lir.clone(),
+        })
+        .validate()
+        .is_ok()
+        {
+            recovered = candidate;
+        }
+    }
+
+    UncheckedArtifact {
+        header: recovered,
+        lir,
+    }
+    .validate()
+    .expect("a recovery candidate is admitted only after strict validation")
 }
 
 impl Drop for Artifact {
