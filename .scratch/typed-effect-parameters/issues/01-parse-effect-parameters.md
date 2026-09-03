@@ -1,6 +1,6 @@
 # 01 Parse effect parameters and applied labels
 
-Status: open
+Status: resolved
 Type: task
 
 Parser and surface printer support for `effect Name 'a 'b = …`, applied labels `!Ask Nat` in

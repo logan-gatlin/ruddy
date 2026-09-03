@@ -154,20 +154,14 @@ impl fmt::Display for Ast<'_, StmtKind> {
                 }
                 write!(f, " = {}", annotation(body))
             }
-            StmtKind::Effect { name, body } => {
+            StmtKind::Effect { name, params, body } => {
                 write!(f, "effect {}", name.tracked)?;
+                for param in params {
+                    write!(f, " '{}", param.tracked)?;
+                }
                 match body {
                     EffectBody::Empty => Ok(()),
-                    EffectBody::Alias(cases) => {
-                        f.write_str(" = ")?;
-                        for (at, effect) in cases.keys().enumerate() {
-                            if at > 0 {
-                                f.write_str(" + ")?;
-                            }
-                            write!(f, "{}", labelled(effect))?;
-                        }
-                        Ok(())
-                    }
+                    EffectBody::Alias(row) => write!(f, " = {}", effect_row(row)),
                     EffectBody::Unnamed { signature } => {
                         write!(f, " = {}", Ast(&signature.tracked))
                     }
@@ -244,6 +238,22 @@ fn labelled(path: &Path) -> String {
         out.push_str("::");
     }
     out.push_str(&label(Shape::Effect, &path.name.tracked));
+    out
+}
+
+/// One effect label applied to its arguments, spelled as a type application
+/// is: each argument an atom, and anything larger parenthesized so that it
+/// reads back as one argument rather than several.
+fn applied(path: &Path, args: &[ruddy::parse::Type]) -> String {
+    let mut out = labelled(path);
+    for arg in args {
+        let rendered = Ast(&arg.tracked);
+        out.push(' ');
+        match rendered.prec() < Prec::Atom {
+            true => out.push_str(&format!("({rendered})")),
+            false => out.push_str(&rendered.to_string()),
+        }
+    }
     out
 }
 
@@ -697,13 +707,13 @@ fn effect_row(row: &EffectRow) -> Effects {
         .effects
         .iter()
         .map(|(name, label)| match label {
-            EffectLabel::Written { when } => Entry::Written {
-                name: labelled(name),
+            EffectLabel::Written { args, when } => Entry::Written {
+                name: applied(name, args),
                 mark: mark(when),
                 holds: (),
             },
-            EffectLabel::Absent => Entry::Absent {
-                name: labelled(name),
+            EffectLabel::Absent { args } => Entry::Absent {
+                name: applied(name, args),
             },
         })
         .collect();

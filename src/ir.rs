@@ -1863,7 +1863,12 @@ struct Builder<'a> {
 #[derive(Default)]
 struct Flat {
     types: Vec<(Option<Module>, TrackedString, Vec<TrackedString>, Annotated)>,
-    effects: Vec<(Option<Module>, TrackedString, EffectBody)>,
+    effects: Vec<(
+        Option<Module>,
+        TrackedString,
+        Vec<TrackedString>,
+        EffectBody,
+    )>,
     terms: Vec<Defined>,
     externs: Vec<External>,
     /// Shared term/extern source order, which preserves duplicate precedence.
@@ -2493,13 +2498,14 @@ fn build_with_dependency_imports_inner(
     let named: Vec<_> = flat
         .effects
         .iter()
-        .map(|(module, name, _)| {
+        .map(|(module, name, _, _)| {
             b.module = *module;
             b.declare(Scope::Effects, name)
         })
         .collect();
-    for (symbol, (module, name, cases)) in named.into_iter().zip(flat.effects) {
+    for (symbol, (module, name, params, cases)) in named.into_iter().zip(flat.effects) {
         b.module = module;
+        let params = b.declare_params(&params);
         let value = b.effect(cases);
         if let Some(symbol) = symbol {
             program.effects.insert(
@@ -2507,9 +2513,7 @@ fn build_with_dependency_imports_inner(
                 Decl {
                     name_span: name.span,
                     annotation: None,
-                    // An effect takes no parameters: it stands for the same
-                    // thing wherever it is written.
-                    params: Vec::new(),
+                    params,
                     value,
                 },
             );
@@ -7892,7 +7896,9 @@ impl Builder<'_> {
                 StmtKind::Type { name, params, body } => {
                     flat.types.push((outer, name, params, body))
                 }
-                StmtKind::Effect { name, body } => flat.effects.push((outer, name, body)),
+                StmtKind::Effect { name, params, body } => {
+                    flat.effects.push((outer, name, params, body))
+                }
                 StmtKind::Let { pattern, ty, body } => {
                     let at = flat.terms.len();
                     flat.terms.push((outer, pattern, ty, body));
@@ -8625,7 +8631,7 @@ impl Builder<'_> {
             parse::EffectBody::Empty => Effect::Operations(IndexMap::new()),
             parse::EffectBody::Alias(cases) => {
                 let mut names: IndexMap<String, Named> = IndexMap::new();
-                for (name, ()) in cases {
+                for name in cases.effects.into_keys() {
                     let at = name.span();
                     let Some(symbol) = self.resolve(&name, Namespace::Effects) else {
                         continue;
@@ -10001,8 +10007,8 @@ impl Builder<'_> {
             // a `where` beside it can use is bound exactly once however many
             // effects an alias stands for.
             let when = match &label {
-                parse::EffectLabel::Written { when } => self.when(when.clone(), place),
-                parse::EffectLabel::Absent => None,
+                parse::EffectLabel::Written { when, .. } => self.when(when.clone(), place),
+                parse::EffectLabel::Absent { .. } => None,
             };
             let mut expanded: Vec<(String, Symbol)> = self
                 .expanded
@@ -10030,7 +10036,7 @@ impl Builder<'_> {
                         expanded,
                         when: when.clone(),
                     },
-                    parse::EffectLabel::Absent => EffectLabel::Absent {
+                    parse::EffectLabel::Absent { .. } => EffectLabel::Absent {
                         name_span: at,
                         symbol: label_symbol,
                         expanded,

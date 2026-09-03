@@ -345,3 +345,50 @@ let after = 1n
   (let_definition
     (identifier)
     (natural)))
+
+================================================================================
+An effect binding parameters
+================================================================================
+
+effect Ask 'a = { get: () -> 'a }
+effect Nil 'a 'b
+effect Both 'a 'e = !Ask 'a + Sys::!Log Nat + ..'e
+effect Forward 'e = ..'e
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (effect_definition
+    (identifier)
+    (type_variable)
+    (named_effect_interface
+      (effect_operation_field
+        (identifier)
+        (function_type
+          (unit)
+          (type_variable)))))
+  (effect_definition
+    (identifier)
+    (type_variable)
+    (type_variable))
+  (effect_definition
+    (identifier)
+    (type_variable)
+    (type_variable)
+    (effect_alias_union
+      (effect_alias
+        (effect_label)
+        (type_variable))
+      (effect_alias
+        (effect_path
+          (identifier)
+          (effect_label))
+        (identifier))
+      (rest
+        (type_variable))))
+  (effect_definition
+    (identifier)
+    (type_variable)
+    (effect_alias_union
+      (rest
+        (type_variable)))))

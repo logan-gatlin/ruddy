@@ -102,10 +102,15 @@ pub enum StmtKind {
         /// already refuses the `..` beside them for the same reason.
         body: Annotation,
     },
-    /// An effect declaration: empty, an alias union, an unnamed singleton, or
+    /// An effect declaration: empty, an alias row, an unnamed singleton, or
     /// a closed named interface.
+    ///
+    /// The parameters are the ones a `type` declaration binds, written the
+    /// same way: `effect Ask 'a = { get: () -> 'a }` takes one, and every row
+    /// that names `!Ask` hands it an argument.
     Effect {
         name: TrackedString,
+        params: Vec<TrackedString>,
         body: EffectBody,
     },
     /// `module A = <stmts> end`, or `module A` for one whose body is another
@@ -126,8 +131,14 @@ pub enum StmtKind {
 #[derive(Debug, Clone)]
 pub enum EffectBody {
     Empty,
-    Alias(IndexMap<Path, ()>),
-    Unnamed { signature: Box<Type> },
+    /// `!Ask 'a + !Log + ..'e` — the row the alias stands for: applications
+    /// of other effects, and at most one tail naming a declared parameter.
+    /// Neither a `\` nor a `when` may be written here, since an alias is not
+    /// a row of its own but a way of writing one.
+    Alias(EffectRow),
+    Unnamed {
+        signature: Box<Type>,
+    },
     Named(Vec<(TrackedString, Box<Type>)>),
 }
 
@@ -588,11 +599,15 @@ pub struct EffectRow {
 /// [`SumCase`]'s twin minus the payload; see [`EffectRow`].
 #[derive(Debug, Clone)]
 pub enum EffectLabel {
-    /// `!Log`, or `!Log (when a)` — an effect the arrow may perform.
-    Written { when: Option<Box<When>> },
+    /// `!Log`, `!Ask Nat`, or `!Log (when a)` — an effect the arrow may
+    /// perform, applied to the arguments its declaration takes.
+    Written {
+        args: Vec<Type>,
+        when: Option<Box<When>>,
+    },
     /// `\!Log` — the effect is definitely not performed: the `..` beside it
     /// may not stand for it. The map key's span covers the whole `\!Log`.
-    Absent,
+    Absent { args: Vec<Type> },
 }
 
 /// The `when` clause on one label of a written type: the name it binds a
@@ -1476,36 +1491,25 @@ impl Parser {
         }
         let name = self.ident()?;
         let mut span = kw.span.merge(name.span);
+        // The parameters a `type` declaration binds, bound the same way.
+        let mut params = Vec::new();
+        while matches!(self.peek().map(|tok| &tok.tracked), Some(Kind::Variable(_))) {
+            let param = self.variable().expect("the loop peeked a variable");
+            span = span.merge(param.span);
+            params.push(param);
+        }
         if self.eat_if(&Kind::Equal).is_none() {
             return Some(span.track(StmtKind::Effect {
                 name,
+                params,
                 body: EffectBody::Empty,
             }));
         }
 
-        let body = if self.at_effect_label(self.pos) {
-            let mut aliases = IndexMap::new();
-            loop {
-                let effect = self
-                    .effect()
-                    .expect("the branch established an effect label");
-                span = span.merge(effect.span());
-                aliases.insert(effect, ());
-                let Some(plus) = self.eat_if(&Kind::Plus) else {
-                    break;
-                };
-                if !self.at_effect_label(self.pos) {
-                    self.expected_related::<()>(
-                        Expected::Effect,
-                        Some(Related {
-                            span: plus.span,
-                            kind: RelatedKind::Separator,
-                        }),
-                    );
-                    break;
-                }
-            }
-            EffectBody::Alias(aliases)
+        let body = if self.at_effect_label(self.pos) || self.at_dot_dot() {
+            let row = self.alias_body()?;
+            span = span.merge(row.span);
+            EffectBody::Alias(row)
         } else if matches!(self.peek().map(|t| &t.tracked), Some(Kind::LeftBrace))
             && !self.brace_heads_arrow()
         {
@@ -1556,7 +1560,83 @@ impl Parser {
                 signature: Box::new(signature),
             }
         };
-        Some(span.track(StmtKind::Effect { name, body }))
+        Some(span.track(StmtKind::Effect { name, params, body }))
+    }
+
+    /// Whether the next token is the `..` that opens a tail.
+    fn at_dot_dot(&self) -> bool {
+        matches!(self.peek().map(|tok| &tok.tracked), Some(Kind::DotDot))
+    }
+
+    /// The row an alias stands for: `!Ask 'a + !Log + ..'e`.
+    ///
+    /// [`effect_labels`](Self::effect_labels) minus the marks: an alias is a
+    /// way of writing a row rather than a row of its own, so it applies
+    /// effects and may end in one tail, and neither a `\` nor a `when` has a
+    /// meaning here. The tail comes last for the reason a struct's does, and a
+    /// `+` after one promises a label that cannot follow.
+    fn alias_body(&mut self) -> Option<EffectRow> {
+        let mut span = self.peek().expect("the caller peeked the body").span;
+        let mut effects = IndexMap::new();
+        let mut tail = None;
+        loop {
+            if let Some(dots) = self.eat_if(&Kind::DotDot) {
+                let of = self.rest_name();
+                let at = of.span().map_or(dots.span, |name| dots.span.merge(name));
+                span = span.merge(at);
+                tail = Some(Tail { span: at, of });
+                if let Some(plus) = self.eat_if(&Kind::Plus) {
+                    return self.expected_related(
+                        Expected::Effect,
+                        Some(Related {
+                            span: plus.span,
+                            kind: RelatedKind::Separator,
+                        }),
+                    );
+                }
+                break;
+            }
+            let Some(name) = self.effect() else {
+                return self.expected(Expected::Effect);
+            };
+            span = span.merge(name.span());
+            let args = self.effect_arguments(&mut span)?;
+            effects.insert(name, EffectLabel::Written { args, when: None });
+            match self.eat_if(&Kind::Plus) {
+                Some(plus) => {
+                    if !self.at_effect_label(self.pos) && !self.at_dot_dot() {
+                        return self.expected_related(
+                            Expected::Effect,
+                            Some(Related {
+                                span: plus.span,
+                                kind: RelatedKind::Separator,
+                            }),
+                        );
+                    }
+                }
+                None => break,
+            }
+        }
+        Some(EffectRow {
+            span,
+            effects,
+            tail,
+        })
+    }
+
+    /// The arguments an effect label is applied to: the atoms after it, the
+    /// way [`type_apply`](Self::type_apply) gathers a type's. A `(when` after
+    /// the label is its presence clause and ends the arguments.
+    fn effect_arguments(&mut self, span: &mut Span) -> Option<Vec<Type>> {
+        let mut args = Vec::new();
+        while self.at_type_atom()
+            && !(self.at_left_paren() && self.keyword_at(self.pos + 1, "when"))
+        {
+            let arg = self.type_atom()?;
+            *span = span.merge(arg.span);
+            args.push(arg);
+        }
+        Some(args)
     }
 
     /// Whether the brace-delimited type at the cursor is immediately the input
@@ -3034,7 +3114,8 @@ impl Parser {
                     name: slash.span.merge(name.name.span).track(name.name.tracked),
                     modules: name.modules,
                 };
-                effects.insert(key, EffectLabel::Absent);
+                let args = self.effect_arguments(&mut span)?;
+                effects.insert(key, EffectLabel::Absent { args });
             } else {
                 let Some(name) = self.effect() else {
                     if let Some(mark) = separator {
@@ -3049,6 +3130,7 @@ impl Parser {
                     break;
                 };
                 span = span.merge(name.span());
+                let args = self.effect_arguments(&mut span)?;
                 // A `when` takes parentheses here for the reason a sum case's
                 // does: an effect has no colon to end a bare clause.
                 let when = match self.at_left_paren() && self.keyword_at(self.pos + 1, "when") {
@@ -3059,7 +3141,7 @@ impl Parser {
                     }
                     false => None,
                 };
-                effects.insert(name, EffectLabel::Written { when });
+                effects.insert(name, EffectLabel::Written { args, when });
             }
             match self.eat_if(&Kind::Plus) {
                 Some(plus) => separator = Some(plus.span),
