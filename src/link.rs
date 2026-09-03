@@ -42,32 +42,32 @@ pub fn link(artifacts: &[Artifact]) -> Result<Artifact, LinkError> {
     let mut functions = Vec::new();
     let mut globals = Vec::new();
     for artifact in artifacts {
-        externs.extend(artifact.lir.externs.iter().cloned());
+        externs.extend(artifact.lir().externs.iter().cloned());
         // Artifact indices are u64 and Rust vectors cannot exceed u64::MAX
         // entries on supported targets.
         let offset = functions.len() as u64;
-        for function in &artifact.lir.functions {
+        for function in &artifact.lir().functions {
             let mut function = function.clone();
             relocate_block(&mut function.body, offset);
             functions.push(function);
         }
-        for global in &artifact.lir.globals {
+        for global in &artifact.lir().globals {
             let mut global = global.clone();
             relocate_block(&mut global.body, offset);
             globals.push(global);
         }
     }
 
-    let mut header = root.header.clone();
+    let mut header = root.header().clone();
     header.dependencies.clear();
-    Ok(Artifact {
+    Ok(Artifact::from_validated_parts(
         header,
-        lir: artifact::Lir {
+        artifact::Lir {
             externs,
             functions,
             globals,
         },
-    })
+    ))
 }
 
 fn relocate_block(block: &mut artifact::Block, offset: u64) {

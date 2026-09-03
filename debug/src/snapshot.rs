@@ -411,8 +411,15 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     // list rather than on any one phase having produced a value. Its tab
     // reports `Skipped` the moment the reader types something wrong.
     let accepted = loaded.as_ref().filter(|_| diagnostics.is_empty()).and_then(|loaded| {
-        let imports: Vec<_> = dependency_aliases.iter().zip(&dependency_interfaces)
-            .map(|(alias, artifact)| ir::DependencyImport { alias, artifact }).collect();
+        let unchecked: Vec<_> = dependency_interfaces
+            .iter()
+            .map(ruddy::artifact::Artifact::to_unchecked)
+            .collect();
+        let imports: Vec<_> = dependency_aliases
+            .iter()
+            .zip(&unchecked)
+            .map(|(alias, artifact)| ruddy::compile::DependencyImport { alias, artifact })
+            .collect();
         ruddy::compile::compile_with_dependency_imports(
             Mint::new(mint.bundle().clone()), loaded.stmts.clone(), &imports,
             &linked_interfaces, inference::Trace::Complete,

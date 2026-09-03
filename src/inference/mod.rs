@@ -174,6 +174,7 @@ pub(crate) struct Diagnostics {
     pub(crate) refinements: Vec<Refinement>,
     pub(crate) variables: Vec<VarMeta>,
     pub(crate) reasons: Vec<Reason>,
+    pub(crate) recovery_facts: Vec<crate::artifact::RecoveryFact>,
 }
 
 /// The supported read-only view of an inference run's diagnostics.
@@ -205,6 +206,17 @@ impl Output {
     /// diagnostic every caller reads.
     pub fn errors(&self) -> &[Error] {
         &self.diagnostics.errors
+    }
+
+    /// Publish non-fatal repairs made while admitting dependency artifacts.
+    /// Core compilation is the only caller: source inference does not invent
+    /// artifact recovery facts, but its diagnostic view is their supported
+    /// publication seam.
+    pub(crate) fn publish_recovery_facts(
+        &mut self,
+        facts: impl IntoIterator<Item = crate::artifact::RecoveryFact>,
+    ) {
+        self.diagnostics.recovery_facts.extend(facts);
     }
 
     /// Crate-private mutable access, for tests that deliberately corrupt an
@@ -326,6 +338,12 @@ impl<'a> DiagnosticView<'a> {
     /// where its family has one.
     pub fn errors(self) -> &'a [Error] {
         &self.inner.errors
+    }
+
+    /// Repairs made while accepting portable dependency data. These are facts
+    /// for tooling, never source compilation errors.
+    pub fn recovery_facts(self) -> &'a [crate::artifact::RecoveryFact] {
+        &self.inner.recovery_facts
     }
 
     /// What generation asked of each definition, in the order it asked, and
@@ -6404,6 +6422,7 @@ pub fn infer(mint: &Mint, program: &mut Program, trace: Trace) -> Output {
             refinements,
             variables: table.var_meta.clone(),
             reasons: table.reasons.clone(),
+            recovery_facts: Vec::new(),
         },
         Trace::Off => Diagnostics {
             trace,
@@ -6413,6 +6432,7 @@ pub fn infer(mint: &Mint, program: &mut Program, trace: Trace) -> Output {
             refinements: Vec::new(),
             variables: Vec::new(),
             reasons: Vec::new(),
+            recovery_facts: Vec::new(),
         },
     };
     Output {

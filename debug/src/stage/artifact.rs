@@ -33,7 +33,7 @@ pub fn render(spec: &Spec, cx: &Cx, artifact: &Artifact, micros: u64) -> Stage {
     let mut ids = Ids::default();
 
     let dependency_nodes: Vec<_> = artifact
-        .header
+        .header()
         .dependencies
         .iter()
         .map(|dependency| {
@@ -48,17 +48,17 @@ pub fn render(spec: &Spec, cx: &Cx, artifact: &Artifact, micros: u64) -> Stage {
         Node::new(
             ids.next(),
             "dependencies",
-            format!("{} declared", artifact.header.dependencies.len()),
+            format!("{} declared", artifact.header().dependencies.len()),
         )
         .children(dependency_nodes),
     ];
-    for value in &artifact.header.values {
+    for value in &artifact.header().values {
         interface.push(Node::new(ids.next(), "value", &value.name));
     }
-    for ty in &artifact.header.types {
+    for ty in &artifact.header().types {
         interface.push(Node::new(ids.next(), "type", &ty.name));
     }
-    for effect in &artifact.header.effects {
+    for effect in &artifact.header().effects {
         let mut node = Node::new(ids.next(), "effect", &effect.name);
         if let ruddy::artifact::EffectKind::Operations(operations) = &effect.kind {
             node = node.children(
@@ -83,13 +83,13 @@ pub fn render(spec: &Spec, cx: &Cx, artifact: &Artifact, micros: u64) -> Stage {
         "header",
         format!(
             "{}@{}",
-            artifact.header.identity.name, artifact.header.identity.version
+            artifact.header().identity.name, artifact.header().identity.version
         ),
     )
     .children(interface);
 
     let mut lowered = Vec::new();
-    for external in &artifact.lir.externs {
+    for external in &artifact.lir().externs {
         lowered.push(Node::new(
             ids.next(),
             "extern",
@@ -101,10 +101,10 @@ pub fn render(spec: &Spec, cx: &Cx, artifact: &Artifact, micros: u64) -> Stage {
             ),
         ));
     }
-    for function in &artifact.lir.functions {
+    for function in &artifact.lir().functions {
         lowered.push(Node::new(ids.next(), "function", &function.name));
     }
-    for global in &artifact.lir.globals {
+    for global in &artifact.lir().globals {
         lowered.push(Node::new(ids.next(), "global", &global.name));
     }
     let lir = Node::new(
@@ -112,14 +112,14 @@ pub fn render(spec: &Spec, cx: &Cx, artifact: &Artifact, micros: u64) -> Stage {
         "lir",
         format!(
             "{} externs · {} functions · {} globals",
-            artifact.lir.externs.len(),
-            artifact.lir.functions.len(),
-            artifact.lir.globals.len()
+            artifact.lir().externs.len(),
+            artifact.lir().functions.len(),
+            artifact.lir().globals.len()
         ),
     )
     .children(lowered);
 
-    let dependencies = match artifact.header.dependencies.len() {
+    let dependencies = match artifact.header().dependencies.len() {
         1 => "1 dependency".to_string(),
         count => format!("{count} dependencies"),
     };
@@ -134,12 +134,12 @@ pub fn render(spec: &Spec, cx: &Cx, artifact: &Artifact, micros: u64) -> Stage {
             format!(
                 "{} · {} values · {} types · {} effects · {} externs · {} functions · {} globals",
                 dependencies,
-                artifact.header.values.len(),
-                artifact.header.types.len(),
-                artifact.header.effects.len(),
-                artifact.lir.externs.len(),
-                artifact.lir.functions.len(),
-                artifact.lir.globals.len(),
+                artifact.header().values.len(),
+                artifact.header().types.len(),
+                artifact.header().effects.len(),
+                artifact.lir().externs.len(),
+                artifact.lir().functions.len(),
+                artifact.lir().globals.len(),
             ),
         )
     }

@@ -104,8 +104,8 @@ pub enum RecoveryFact {
 /// A complete, serializable bundle artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Artifact {
-    pub header: Header,
-    pub lir: Lir,
+    pub(crate) header: Header,
+    pub(crate) lir: Lir,
 }
 
 /// An internal placeholder used only while core compilation establishes the
@@ -141,10 +141,17 @@ impl UncheckedArtifact {
         if self.header.values.iter().any(|value| value.name.is_empty()) {
             return Err(ValidationError::new("artifact value name is empty"));
         }
-        Ok(Artifact {
+        // Text decoding is the single semantic translation implementation.
+        // Rendering this portable tree and decoding it again deliberately
+        // routes hand-built data through the same stack-safe checks as a disk
+        // artifact: bounds, formulas, package preorder ownership, rows and
+        // absent payloads cannot acquire a second, weaker validation policy.
+        let portable = Artifact {
             header: self.header,
             lir: self.lir,
-        })
+        };
+        let text = print(&portable);
+        text::try_parse(&text).map_err(|error| ValidationError::new(error.to_string()))
     }
 
     /// Admit a dependency artifact while recording that validation had to be
@@ -174,7 +181,31 @@ impl UncheckedArtifact {
                         value.name = "<recovered>::value".into();
                     }
                 }
-                let artifact = Artifact { header, lir };
+                let artifact = UncheckedArtifact { header, lir }.validate().unwrap_or_else(|_| {
+                    // A malformed semantic tree cannot be made meaningful by
+                    // guessing at its bounds or package owners. Preserve the
+                    // trusted compiler path by admitting an empty recovered
+                    // interface instead of publishing invalid meaning.
+                    UncheckedArtifact {
+                        header: Header {
+                            identity: Identity {
+                                name: "<recovered>".into(),
+                                version: "0".into(),
+                            },
+                            dependencies: Vec::new(),
+                            values: Vec::new(),
+                            types: Vec::new(),
+                            effects: Vec::new(),
+                        },
+                        lir: Lir {
+                            externs: Vec::new(),
+                            functions: Vec::new(),
+                            globals: Vec::new(),
+                        },
+                    }
+                    .validate()
+                    .expect("empty recovery interface is valid")
+                });
                 (artifact, vec![RecoveryFact::Recovered { message }])
             }
         }
@@ -1806,6 +1837,28 @@ pub fn build_with_dependencies(
 }
 
 impl Artifact {
+    /// The validated public interface of this artifact.
+    pub fn header(&self) -> &Header {
+        &self.header
+    }
+
+    /// The validated executable representation of this artifact.
+    pub fn lir(&self) -> &Lir {
+        &self.lir
+    }
+
+    /// Copy this validated artifact back to portable data for a caller that
+    /// needs to pass it through a dependency-admission boundary.
+    pub fn to_unchecked(&self) -> UncheckedArtifact {
+        UncheckedArtifact {
+            header: self.header.clone(),
+            lir: self.lir.clone(),
+        }
+    }
+
+    pub(crate) fn from_validated_parts(header: Header, lir: Lir) -> Self {
+        Self { header, lir }
+    }
     /// Build an artifact after inference and LIR lowering succeeded.
     pub fn build(accepted: &AcceptedProgram) -> Self {
         build(accepted)

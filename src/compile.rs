@@ -30,6 +30,14 @@ pub struct PartialCompilation {
     pub errors: Vec<Error>,
 }
 
+/// A portable direct dependency. Core compilation admits it through tolerant
+/// artifact recovery before the IR phase sees its semantic interface.
+#[derive(Debug, Clone, Copy)]
+pub struct DependencyImport<'a> {
+    pub alias: &'a str,
+    pub artifact: &'a artifact::UncheckedArtifact,
+}
+
 /// The coherent program that has passed every checking phase.
 #[derive(Debug)]
 pub struct AcceptedProgram {
@@ -90,20 +98,41 @@ pub fn compile(
 pub fn compile_with_dependency_imports(
     mint: Mint,
     stmts: Vec<parse::Stmt>,
-    dependencies: &[ir::DependencyImport<'_>],
+    dependencies: &[DependencyImport<'_>],
     linked: &[artifact::Artifact],
     trace: Trace,
 ) -> Result<AcceptedProgram, PartialCompilation> {
-    let artifact_dependencies = dependencies
+    let recovered: Vec<_> = dependencies
         .iter()
-        .map(|dependency| artifact::Dependency {
-            name: dependency.artifact.header.identity.name.clone(),
-            version: dependency.artifact.header.identity.version.clone(),
+        .map(|dependency| dependency.artifact.clone().recover())
+        .collect();
+    let facts: Vec<_> = recovered
+        .iter()
+        .flat_map(|(_, facts)| facts.iter().cloned())
+        .collect();
+    let imports: Vec<_> = dependencies
+        .iter()
+        .zip(&recovered)
+        .map(|(dependency, (artifact, _))| ir::DependencyImport {
+            alias: dependency.alias,
+            artifact,
         })
         .collect();
-    compile_with(mint, stmts, trace, artifact_dependencies, |mint, stmts| {
-        ir::build_with_dependency_imports(mint, stmts, dependencies, linked)
-    })
+    let artifact_dependencies = recovered
+        .iter()
+        .map(|(artifact, _)| artifact::Dependency {
+            name: artifact.header().identity.name.clone(),
+            version: artifact.header().identity.version.clone(),
+        })
+        .collect();
+    let mut result = compile_with(mint, stmts, trace, artifact_dependencies, |mint, stmts| {
+        ir::build_with_dependency_imports(mint, stmts, &imports, linked)
+    });
+    match &mut result {
+        Ok(accepted) => accepted.inference.publish_recovery_facts(facts),
+        Err(partial) => partial.inference.publish_recovery_facts(facts),
+    }
+    result
 }
 
 fn compile_with(

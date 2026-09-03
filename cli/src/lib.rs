@@ -17,7 +17,7 @@ use indexmap::IndexMap;
 use ruddy::{
     artifact::{Artifact, Dependency},
     bundle::{self, Disk, Files},
-    inference, ir,
+    inference,
     symbol::{Bundle, Mint, Version},
     tracking::{FileManager, Span},
     ui,
@@ -366,7 +366,7 @@ fn install_project(directory: &Path) -> Result<InstalledBuild, CliError> {
         })?;
         let artifact_path = build.join(format!(
             "{}.artifact",
-            project.artifact.header.identity.name
+            project.artifact.header().identity.name
         ));
         let artifact = if Some(index) == last {
             &linked
@@ -379,7 +379,7 @@ fn install_project(directory: &Path) -> Result<InstalledBuild, CliError> {
                 // The generated `.js` is always ESM, independent of any
                 // ancestor package scope in which the project happens to live.
                 replace_file(&build.join("package.json"), NODE_PACKAGE)?;
-                let path = build.join(format!("{}.js", project.artifact.header.identity.name));
+                let path = build.join(format!("{}.js", project.artifact.header().identity.name));
                 replace_file(&path, javascript.as_bytes())?;
                 root_javascript = Some(path);
             }
@@ -1449,8 +1449,8 @@ where
             .map_err(&contextualize)?;
         let artifact = &compiler.projects[index].artifact;
         direct.push(Dependency {
-            name: artifact.header.identity.name.clone(),
-            version: artifact.header.identity.version.clone(),
+            name: artifact.header().identity.name.clone(),
+            version: artifact.header().identity.version.clone(),
         });
         paths.push(directory);
     }
@@ -1533,8 +1533,8 @@ where
             .map_err(&contextualize)?;
         let artifact = &compiler.projects[index].artifact;
         direct.push(Dependency {
-            name: artifact.header.identity.name.clone(),
-            version: artifact.header.identity.version.clone(),
+            name: artifact.header().identity.name.clone(),
+            version: artifact.header().identity.version.clone(),
         });
     }
     Ok((
@@ -1994,9 +1994,14 @@ fn compile_one(
     }
 
     let mint = Mint::new(identity);
+    let unchecked: Vec<_> = dependencies
+        .iter()
+        .map(|(_, artifact)| artifact.to_unchecked())
+        .collect();
     let imports: Vec<_> = dependencies
         .iter()
-        .map(|(alias, artifact)| ir::DependencyImport { alias, artifact })
+        .zip(&unchecked)
+        .map(|((alias, _), artifact)| ruddy::compile::DependencyImport { alias, artifact })
         .collect();
     let accepted = ruddy::compile::compile_with_dependency_imports(
         mint,
