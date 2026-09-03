@@ -187,13 +187,103 @@ fn an_operation_reference_instantiates_its_effects_parameters() {
          let bad : () -> Nat + !Ask String = fn _ => !Ask.get ()",
     ] {
         let partial = rejected(source);
+        assert_eq!(codes(&partial), ["effect-argument-mismatch"], "{source}");
+        let Some(Error::Inference(error)) = partial.errors.first() else {
+            unreachable!()
+        };
         assert!(
-            partial
-                .errors
-                .iter()
-                .any(|error| matches!(error, Error::Inference(_))),
+            matches!(
+                &error.kind,
+                inference::ErrorKind::EffectArgument { effect, position: 0, cause }
+                    if effect == "Ask" && matches!(**cause, inference::ErrorKind::Mismatch { .. })
+            ),
             "{source}: {:#?}",
-            codes(&partial)
+            error.kind
+        );
+        assert!(
+            error.explanation.is_some(),
+            "{source}: the clash keeps its causal detail"
         );
     }
+}
+
+/// Compile one source to the artifact another compilation may depend on.
+fn exported(source: &str) -> ruddy::artifact::UncheckedArtifact {
+    accepted(source).artifact().to_unchecked()
+}
+
+/// Compile one source against a dependency, under the alias `dep`.
+fn accepted_with(
+    source: &str,
+    dependency: &ruddy::artifact::UncheckedArtifact,
+) -> compile::AcceptedProgram {
+    let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty(), "{source}: {:#?}", parsed.errors);
+    compile::compile_with_dependencies(
+        Mint::new(Bundle::new("app", Version::new(0, 1, 0)).unwrap()),
+        parsed.stmts,
+        &[compile::Dependency {
+            alias: Some("dep"),
+            artifact: dependency,
+        }],
+        inference::Trace::Off,
+    )
+    .unwrap_or_else(|partial| panic!("{source}: {:#?}", partial.errors))
+}
+
+/// An imported effect keeps its parameters and generic interface, an imported
+/// alias expands with the consumer's arguments, and a local declaration with
+/// the same generic interface is the same effect whatever its parameters are
+/// called.
+#[test]
+fn imported_effects_and_aliases_behave_like_local_declarations() {
+    let dependency = exported(
+        "effect Log = { write: Nat -> () }\n\
+         effect Ask 'a = { get: () -> 'a }\n\
+         effect Both 'a 'e = !Ask 'a + !Log + ..'e\n\
+         let ask : () -> Nat + !Ask Nat = fn _ => !Ask.get ()",
+    );
+    let accepted = accepted_with(
+        "effect IO = { print: Nat -> () }\n\
+         effect Ask 'b = { get: () -> 'b }\n\
+         let num : () -> Nat + dep::!Ask Nat = fn _ => dep::!Ask.get ()\n\
+         let any = fn _ => dep::!Ask.get ()\n\
+         let same : () -> Nat + !Ask Nat = fn _ => dep::!Ask.get ()\n\
+         let both : () -> Nat + dep::!Both Nat (!IO) = fn _ => let _ = !IO.print 1n in dep::!Ask.get ()\n\
+         let open = fn _ => let _ = dep::!Log.write 1n in dep::!Ask.get ()\n\
+         let run = fn _ => handle dep::!Ask.get () with | dep::!Ask.get _ => 1n end",
+        &dependency,
+    );
+    assert_eq!(scheme(&accepted, "num"), "() -> Nat + !Ask Nat");
+    assert_eq!(scheme(&accepted, "any"), "'a -> 'b + !Ask 'b");
+    assert_eq!(scheme(&accepted, "same"), "() -> Nat + !Ask Nat");
+    assert_eq!(
+        scheme(&accepted, "both"),
+        "() -> Nat + !Ask Nat + !Log + !IO"
+    );
+    assert_eq!(scheme(&accepted, "open"), "'a -> 'b + !Log + !Ask 'b");
+    assert_eq!(scheme(&accepted, "run"), "'a -> Nat");
+
+    // Diagnostics involving an imported application are the local ones.
+    let partial = {
+        let parsed = parse::parse(
+            token::lex(
+                "let bad : () -> Nat + dep::!Ask = fn _ => 0n\n\
+                 let worse : () -> Nat + dep::!Both Nat = fn _ => 0n",
+                FileID::GENERATED,
+            )
+            .tokens,
+        );
+        compile::compile_with_dependencies(
+            Mint::new(Bundle::new("app", Version::new(0, 1, 0)).unwrap()),
+            parsed.stmts,
+            &[compile::Dependency {
+                alias: Some("dep"),
+                artifact: &dependency,
+            }],
+            inference::Trace::Off,
+        )
+        .expect_err("the applications are refused")
+    };
+    assert_eq!(codes(&partial), ["effect-arity", "effect-arity"]);
 }

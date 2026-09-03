@@ -1614,6 +1614,16 @@ impl fmt::Display for patterns::Verdict {
 ///
 /// Beyond what is worth spelling out, the numeral: a type taking thirteen
 /// arguments has a problem this message is not going to help with.
+/// `first`, `second`, … for the position of an argument, as far as words go.
+fn ordinal(position: u32) -> String {
+    match position {
+        0 => "first".to_string(),
+        1 => "second".to_string(),
+        2 => "third".to_string(),
+        n => format!("{}th", n + 1),
+    }
+}
+
 fn arguments(count: usize) -> String {
     match count {
         0 => "no arguments".to_string(),
@@ -3024,6 +3034,47 @@ impl inference::Error {
                         .help("change this value to a struct, or change/remove the field access");
                 }
             }
+            E::EffectArgument {
+                effect, position, ..
+            } => {
+                let title = format!(
+                    "effect `!{effect}` is used with incompatible {} arguments",
+                    ordinal(*position)
+                );
+                if let Some(explanation) = &self.explanation {
+                    diagnostic.title = title;
+                    let mut selected = explanation
+                        .abridged
+                        .iter()
+                        .copied()
+                        .filter_map(|at| explanation.full_facts.get(at).map(|fact| (at, fact)));
+                    if let Some((at, primary)) = selected.next() {
+                        diagnostic.primary.span = primary.span;
+                        diagnostic.primary.message =
+                            displayed_explanation_fact(primary, at, explanation);
+                    } else {
+                        diagnostic.primary.message =
+                            "these uses of the effect disagree about this argument".into();
+                    }
+                    for (at, fact) in selected {
+                        diagnostic = diagnostic
+                            .related(fact.span, displayed_explanation_fact(fact, at, explanation));
+                    }
+                    diagnostic = add_abridgement_note(diagnostic, explanation)
+                        .note(format!(
+                            "the arguments cannot agree: {}",
+                            mismatch_title(&explanation.contradiction)
+                        ))
+                        .help("use the effect with one argument throughout this computation")
+                        .help("or handle one of the uses separately");
+                } else {
+                    diagnostic = Diagnostic::new(self.kind.code(), title, self.span)
+                        .label("these uses of the effect disagree about this argument")
+                        .note(format!("the arguments cannot agree: {}", self.kind.cause()))
+                        .help("use the effect with one argument throughout this computation")
+                        .help("or handle one of the uses separately");
+                }
+            }
             E::Mismatch { .. } => {
                 if let Some(explanation) = &self.explanation {
                     diagnostic.title = mismatch_title(&explanation.contradiction);
@@ -3303,6 +3354,7 @@ impl inference::ErrorKind {
         match self {
             inference::ErrorKind::NotAStruct { .. } => "not-a-struct",
             inference::ErrorKind::Mismatch { .. } => "type-mismatch",
+            inference::ErrorKind::EffectArgument { .. } => "effect-argument-mismatch",
             inference::ErrorKind::Recursive => "recursive-type",
             // A missing case and a missing field are one complaint, so they
             // are one code: what went wrong is that a row was asked for a
@@ -3342,6 +3394,15 @@ impl fmt::Display for inference::ErrorKind {
             inference::ErrorKind::Mismatch { expected, actual } => {
                 write!(f, "type mismatch: expected `{expected}`, found `{actual}`")
             }
+            inference::ErrorKind::EffectArgument {
+                effect,
+                position,
+                cause,
+            } => write!(
+                f,
+                "effect `!{effect}` is used with incompatible {} arguments: {cause}",
+                ordinal(*position)
+            ),
             inference::ErrorKind::Recursive => {
                 f.write_str("this type would have to contain itself")
             }

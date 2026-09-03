@@ -38,6 +38,14 @@ fn inference_error_kinds(span: Span) -> Vec<TypeError> {
             expected: nat.clone(),
             actual: Rc::new(Ty::default()),
         },
+        TypeError::EffectArgument {
+            effect: "Ask".to_string(),
+            position: 0,
+            cause: Box::new(TypeError::Mismatch {
+                expected: nat.clone(),
+                actual: Rc::new(Ty::default()),
+            }),
+        },
         TypeError::Recursive,
         TypeError::MissingField {
             shape: Shape::Struct,
@@ -614,7 +622,7 @@ fn every_inference_error_exposes_a_complete_structured_diagnostic() {
     let use_span = Span::generated(4, 5);
     let declared = Span::generated(1, 2);
     let kinds = inference_error_kinds(declared);
-    assert_eq!(kinds.len(), 17);
+    assert_eq!(kinds.len(), 18);
 
     for kind in kinds {
         let diagnostic = inference::Error::new(use_span, kind).diagnostic();
@@ -2011,6 +2019,10 @@ fn inference_source_corpus_matches_abridged_structured_goldens() {
         (
             "type-mismatch",
             include_str!("../diagnostics/inference/type-mismatch.hc"),
+        ),
+        (
+            "effect-argument-mismatch",
+            include_str!("../diagnostics/inference/effect-argument-mismatch.hc"),
         ),
         (
             "recursive-type",

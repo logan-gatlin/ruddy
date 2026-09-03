@@ -60,6 +60,13 @@ pub fn render(spec: &Spec, cx: &Cx, artifact: &Artifact, micros: u64) -> Stage {
     }
     for effect in &artifact.header().effects {
         let mut node = Node::new(ids.next(), "effect", &effect.name);
+        for param in &effect.params {
+            node = node.child(Node::new(
+                ids.next(),
+                "param",
+                format!("{:?}", param.sense).to_lowercase(),
+            ));
+        }
         if let ruddy::artifact::EffectKind::Operations(operations) = &effect.kind {
             node = node.children(
                 operations

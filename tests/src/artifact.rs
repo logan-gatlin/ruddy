@@ -371,6 +371,7 @@ fn model_artifact() -> Artifact {
             effects: vec![
                 artifact::DeclaredEffect {
                     name: "bundle@1.0.0::Log".to_string(),
+                    params: Vec::new(),
                     identity: Some(artifact::EffectIdentity {
                         name: "Log".to_string(),
                         interface: "write".to_string(),
@@ -383,8 +384,11 @@ fn model_artifact() -> Artifact {
                 },
                 artifact::DeclaredEffect {
                     name: "bundle@1.0.0::Alias".to_string(),
+                    params: Vec::new(),
                     identity: None,
-                    kind: artifact::EffectKind::Alias(vec!["bundle@1.0.0::Log".to_string()]),
+                    kind: artifact::EffectKind::Alias(artifact::AliasRow::naming(vec![
+                        "bundle@1.0.0::Log".to_string(),
+                    ])),
                 },
             ],
         },
@@ -2195,4 +2199,77 @@ fn artifact_function_indices_are_fixed_width_and_checked_by_the_parser() {
 
     let overflow = printed.replacen(&u64::MAX.to_string(), "18446744073709551616", 1);
     assert_malformed(&overflow);
+}
+
+/// A parameterized effect publishes its parameters and its generic interface,
+/// and an alias publishes the row it writes, unexpanded, over its own
+/// parameters — and both come back as themselves.
+#[test]
+fn parameterized_effects_and_generic_aliases_round_trip() {
+    let artifact = built(
+        "effect Log = { write: Nat -> () }\n\
+         effect Ask 'a = { get: () -> 'a }\n\
+         effect State 'r = { get: () -> { x: Nat, ..'r } }\n\
+         effect Both 'a 'e = !Ask 'a + !Log + ..'e\n\
+         let f : () -> Nat + !Both Nat (!Log) = fn _ => 0n",
+    );
+    let effect = |name: &str| {
+        artifact
+            .header()
+            .effects
+            .iter()
+            .find(|effect| effect.name == format!("tests@0.1.0::{name}"))
+            .unwrap_or_else(|| panic!("no effect {name}"))
+    };
+    let ask = effect("Ask");
+    assert_eq!(ask.params.len(), 1);
+    assert_eq!(ask.params[0].sense, artifact::Sense::Type);
+    assert!(ask.params[0].relevant);
+    let artifact::EffectKind::Operations(operations) = &ask.kind else {
+        panic!("Ask declares operations");
+    };
+    assert!(matches!(operations[0].to, Type::Bound(0)));
+    let state = effect("State");
+    assert_eq!(state.params[0].sense, artifact::Sense::Fields);
+    assert_eq!(state.params[0].lacks, ["x"]);
+    let both = effect("Both");
+    assert_eq!(
+        both.params
+            .iter()
+            .map(|param| param.sense)
+            .collect::<Vec<_>>(),
+        [artifact::Sense::Type, artifact::Sense::Effects]
+    );
+    assert!(both.identity.is_none());
+    let artifact::EffectKind::Alias(row) = &both.kind else {
+        panic!("Both is an alias");
+    };
+    assert_eq!(row.tail, Some(1));
+    assert_eq!(row.cases.len(), 2);
+    assert_eq!(row.cases[0].name, "tests@0.1.0::Ask");
+    assert!(matches!(row.cases[0].args.as_slice(), [Type::Bound(0)]));
+    assert!(row.cases[1].args.is_empty());
+
+    let printed = assert_round_trip(&artifact);
+    // The row a use writes carries the arguments the label was applied to.
+    assert!(
+        compact(&printed).contains("(effect \"tests@0.1.0::Both\" (params (param type true (lacks)) (param effects true (lacks"),
+        "{printed}"
+    );
+
+    // And every part of the new schema is held to its shape: a bound outside
+    // the effect's parameters, a tail outside them, an alias applying an
+    // effect to the wrong number of arguments, and a ring of aliases.
+    assert_bad_replacement(&printed, "(ty (bound 0))", "(ty (bound 3))");
+    assert_bad_replacement(&printed, "(tail 1)", "(tail 2)");
+    assert_bad_replacement(
+        &printed,
+        "(case \"tests@0.1.0::Log\")",
+        "(case \"tests@0.1.0::Log\" (ty nat))",
+    );
+    assert_bad_replacement(
+        &printed,
+        "(case \"tests@0.1.0::Log\")",
+        "(case \"tests@0.1.0::Both\" (ty nat) (ty nat))",
+    );
 }

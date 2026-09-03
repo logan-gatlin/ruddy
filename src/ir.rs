@@ -1899,6 +1899,8 @@ struct Builder<'a> {
     /// dependency's mistake, recovered silently rather than reported at a
     /// declaration the reader cannot see.
     imported_aliases: HashSet<Symbol>,
+    /// What each imported effect's parameters stand for, from its header.
+    imported_effect_params: HashMap<Symbol, Vec<ParamKind>>,
     /// The parameters of the declaration being lowered, by the name they were
     /// written under, with the symbol each was minted as and where it sits in
     /// the list. Empty outside a `type` body, which is what makes a parameter
@@ -2548,6 +2550,7 @@ fn build_with_dependency_imports_inner(
         expanding: Vec::new(),
         cyclic: HashSet::new(),
         imported_aliases: HashSet::new(),
+        imported_effect_params: HashMap::new(),
         params: HashMap::new(),
         vars: IndexMap::new(),
         rigids: 0,
@@ -2823,6 +2826,9 @@ fn build_with_dependency_imports_inner(
             *symbol,
             decl.params.iter().map(|param| param.kind.clone()).collect(),
         );
+    }
+    for (symbol, kinds) in &b.imported_effect_params {
+        program.effect_params.insert(*symbol, kinds.clone());
     }
     for symbol in program.effect_ids.keys() {
         program.effect_params.entry(*symbol).or_default();
@@ -3136,6 +3142,210 @@ fn imported_symbol(
     mint.register_external(symbol, qualified);
     names.insert(symbol, qualified.to_owned());
     symbol
+}
+
+/// A published type read back as the written type it stands for, so that an
+/// imported alias body can be substituted into and spliced exactly as a local
+/// one is. Bound positions become the alias's parameters, named types the
+/// imported declarations, and effect labels the imported effects; what has
+/// no written form — a solver variable, a rigid, an undecided type — absorbs
+/// as the error type. Bounded in depth, since an imported tree is data.
+fn imported_syntax(
+    mint: &mut Mint,
+    ty: &artifact::Type,
+    params: &[Symbol],
+    symbols: &mut HashMap<(Namespace, String), Symbol>,
+    names: &mut IndexMap<Symbol, artifact::QualifiedName>,
+    effect_rows: &ImportedEffectRows,
+    depth: usize,
+) -> Type {
+    let span = Span::default();
+    if depth > 256 {
+        return span.track(TypeKind::Error);
+    }
+    let tail_of = |rest: &artifact::Rest| match rest {
+        artifact::Rest::Closed => None,
+        artifact::Rest::Bound(index) => params.get(*index as usize).map(|symbol| Tail {
+            span,
+            of: Row::Param {
+                symbol: *symbol,
+                index: *index,
+            },
+        }),
+        _ => Some(Tail {
+            span,
+            of: Row::Anything,
+        }),
+    };
+    let tracked = match ty {
+        artifact::Type::Nat => TypeKind::Prim(Prim::Nat),
+        artifact::Type::Int => TypeKind::Prim(Prim::Int),
+        artifact::Type::Real => TypeKind::Prim(Prim::Real),
+        artifact::Type::String => TypeKind::Prim(Prim::String),
+        artifact::Type::Boolean => TypeKind::Prim(Prim::Boolean),
+        artifact::Type::Bound(index) => match params.get(*index as usize) {
+            Some(symbol) => TypeKind::Param {
+                symbol: *symbol,
+                index: *index,
+            },
+            None => TypeKind::Error,
+        },
+        artifact::Type::Package(body) => {
+            return imported_syntax(mint, body, params, symbols, names, effect_rows, depth + 1);
+        }
+        artifact::Type::Named { name, args } => {
+            let head = imported_symbol(mint, Namespace::Types, name, symbols, names);
+            match args.is_empty() {
+                true => TypeKind::Ident(head),
+                false => TypeKind::Apply {
+                    head,
+                    head_span: span,
+                    args: args
+                        .iter()
+                        .map(|arg| {
+                            imported_syntax(
+                                mint,
+                                arg,
+                                params,
+                                symbols,
+                                names,
+                                effect_rows,
+                                depth + 1,
+                            )
+                        })
+                        .collect(),
+                },
+            }
+        }
+        artifact::Type::Struct(row) => {
+            let mut fields = IndexMap::new();
+            for (name, field) in &row.labels {
+                let field = match field.presence {
+                    artifact::Presence::Present => TypeField::Written {
+                        name_span: span,
+                        when: None,
+                        value: imported_syntax(
+                            mint,
+                            &field.ty,
+                            params,
+                            symbols,
+                            names,
+                            effect_rows,
+                            depth + 1,
+                        ),
+                    },
+                    artifact::Presence::Absent => TypeField::Absent { name_span: span },
+                    _ => return span.track(TypeKind::Error),
+                };
+                fields.insert(name.clone(), field);
+            }
+            TypeKind::Struct {
+                fields,
+                tail: tail_of(&row.rest),
+            }
+        }
+        artifact::Type::Sum(row) => {
+            let mut cases = IndexMap::new();
+            for (name, field) in &row.labels {
+                let case = match field.presence {
+                    artifact::Presence::Present => SumCase::Written {
+                        name_span: span,
+                        when: None,
+                        payload: Some(imported_syntax(
+                            mint,
+                            &field.ty,
+                            params,
+                            symbols,
+                            names,
+                            effect_rows,
+                            depth + 1,
+                        )),
+                    },
+                    artifact::Presence::Absent => SumCase::Absent { name_span: span },
+                    _ => return span.track(TypeKind::Error),
+                };
+                cases.insert(name.clone(), case);
+            }
+            TypeKind::Sum {
+                cases,
+                tail: tail_of(&row.rest),
+            }
+        }
+        artifact::Type::Arrow(from, to, row) => {
+            let mut effects = IndexMap::new();
+            for (label, field) in &row.labels {
+                let key = effect_rows.label(label);
+                let Some(symbol) = effect_rows.symbol(&key, symbols) else {
+                    continue;
+                };
+                let args = match &field.ty {
+                    artifact::Type::Struct(payload) => payload
+                        .labels
+                        .iter()
+                        .map(|(_, arg)| {
+                            imported_syntax(
+                                mint,
+                                &arg.ty,
+                                params,
+                                symbols,
+                                names,
+                                effect_rows,
+                                depth + 1,
+                            )
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                let lowered = match field.presence {
+                    artifact::Presence::Absent => EffectLabel::Absent {
+                        name_span: span,
+                        symbol,
+                        args,
+                        expanded: false,
+                    },
+                    _ => EffectLabel::Written {
+                        name_span: span,
+                        symbol,
+                        args,
+                        expanded: false,
+                        when: None,
+                    },
+                };
+                effects.insert(EffectId::pending(symbol), lowered);
+            }
+            let written = !effects.is_empty() || !matches!(row.rest, artifact::Rest::Closed);
+            TypeKind::Arrow {
+                from: Box::new(imported_syntax(
+                    mint,
+                    from,
+                    params,
+                    symbols,
+                    names,
+                    effect_rows,
+                    depth + 1,
+                )),
+                to: Box::new(imported_syntax(
+                    mint,
+                    to,
+                    params,
+                    symbols,
+                    names,
+                    effect_rows,
+                    depth + 1,
+                )),
+                effects: Box::new(EffectRow {
+                    span,
+                    written,
+                    effects,
+                    tail: tail_of(&row.rest),
+                }),
+            }
+        }
+        artifact::Type::Var(_) | artifact::Type::Rigid { .. } | artifact::Type::Undecided => {
+            TypeKind::Error
+        }
+    };
+    span.track(tracked)
 }
 
 fn import_scheme(
@@ -3470,6 +3680,16 @@ impl ImportedEffectRows {
                 }
             }
         }
+    }
+
+    /// The imported effect an identity's row key names, when this bundle
+    /// imported one with that identity.
+    fn symbol(&self, key: &str, symbols: &HashMap<(Namespace, String), Symbol>) -> Option<Symbol> {
+        self.identities
+            .iter()
+            .find(|(_, identity)| identity.row_key() == key)
+            .and_then(|(qualified, _)| symbols.get(&(Namespace::Effects, qualified.clone())))
+            .copied()
     }
 
     fn label(&self, label: &str) -> String {
@@ -8615,6 +8835,32 @@ impl Builder<'_> {
                 if let Some(identity) = effect_rows.identities.get(&declaration.name) {
                     program.effect_ids.insert(symbol, identity.clone());
                 }
+                // The parameters the effect binds, read as the header says
+                // them: an application in this bundle is counted against
+                // them, and inference mints one fresh argument per entry.
+                let kinds: Vec<ParamKind> = declaration
+                    .params
+                    .iter()
+                    .map(|param| {
+                        let lacks: IndexSet<String> = param
+                            .lacks
+                            .iter()
+                            .map(|label| match param.sense {
+                                artifact::Sense::Effects => effect_rows.label(label),
+                                _ => label.clone(),
+                            })
+                            .collect();
+                        match param.sense {
+                            artifact::Sense::Type => ParamKind::Type { lacks },
+                            artifact::Sense::Fields => ParamKind::Fields { lacks },
+                            artifact::Sense::Cases => ParamKind::Cases { lacks },
+                            artifact::Sense::Effects => ParamKind::Effects { lacks },
+                        }
+                    })
+                    .collect();
+                let count = kinds.len();
+                self.arities.insert(symbol, count);
+                self.imported_effect_params.insert(symbol, kinds);
                 match &declaration.kind {
                     artifact::EffectKind::Operations(operations) => {
                         // Trusted artifacts always carry the structural identity
@@ -8651,7 +8897,7 @@ impl Builder<'_> {
                                 &mut program.external_names,
                                 &effect_rows,
                             );
-                            let from = clamp_bounds(from, 0, 0);
+                            let from = clamp_bounds(from, count, 0);
                             let to = import_type(
                                 self.mint,
                                 &operation.to,
@@ -8659,7 +8905,7 @@ impl Builder<'_> {
                                 &mut program.external_names,
                                 &effect_rows,
                             );
-                            let to = clamp_bounds(to, 0, 0);
+                            let to = clamp_bounds(to, count, 0);
                             let selector = match &operation.selector {
                                 artifact::OperationSelector::Unnamed => OperationSelector::Unnamed,
                                 artifact::OperationSelector::Named(name) => {
@@ -8671,24 +8917,61 @@ impl Builder<'_> {
                                 .insert((symbol, selector), (from, to));
                         }
                     }
-                    artifact::EffectKind::Alias(names) => {
+                    artifact::EffectKind::Alias(row) => {
+                        // The alias's own parameters, as the positions its
+                        // row refers to; each becomes a parameter symbol the
+                        // syntactic row can name, so the alias expands at a
+                        // use exactly as a local one does.
+                        let params: Vec<Symbol> = (0..count)
+                            .map(|index| {
+                                self.mint.local(
+                                    None,
+                                    Namespace::Types,
+                                    &format!("{}'{index}", declaration.name),
+                                )
+                            })
+                            .collect();
                         let mut cases = Vec::new();
                         let mut expansion = IndexMap::new();
-                        for name in names {
+                        for case in &row.cases {
                             let target = imported_symbol(
                                 self.mint,
                                 Namespace::Effects,
-                                name,
+                                &case.name,
                                 &mut symbols,
                                 &mut program.external_names,
                             );
-                            expansion.insert(name.clone(), target);
+                            expansion.insert(case.name.clone(), target);
+                            let args = case
+                                .args
+                                .iter()
+                                .map(|arg| {
+                                    imported_syntax(
+                                        self.mint,
+                                        arg,
+                                        &params,
+                                        &mut symbols,
+                                        &mut program.external_names,
+                                        &effect_rows,
+                                        0,
+                                    )
+                                })
+                                .collect();
                             cases.push(AliasCase {
                                 name_span: Span::default(),
                                 symbol: target,
-                                args: Vec::new(),
+                                args,
                             });
                         }
+                        let tail = row.tail.and_then(|index| {
+                            params.get(index as usize).map(|symbol| Tail {
+                                span: Span::default(),
+                                of: Row::Param {
+                                    symbol: *symbol,
+                                    index,
+                                },
+                            })
+                        });
                         self.expanded.insert(symbol, expansion);
                         self.imported_aliases.insert(symbol);
                         self.alias_bodies.insert(
@@ -8696,7 +8979,7 @@ impl Builder<'_> {
                             AliasBody {
                                 span: Span::default(),
                                 cases,
-                                tail: None,
+                                tail,
                             },
                         );
                     }

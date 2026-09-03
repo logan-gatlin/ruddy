@@ -10,6 +10,15 @@ related: this expression supplies its type here; this is another requirement on 
 help: change the first use so it agrees with the other one
 help: or change the other use so it agrees with the first one
 
+## effect-argument-mismatch
+[effect-argument-mismatch] effect `!Ask` is used with incompatible first arguments
+primary: Let’s call this shared value `Value` — the annotation fixes the type here
+related: this expression supplies its type here; this is another requirement on `Value`
+help: use the effect with one argument throughout this computation
+help: or handle one of the uses separately
+note: 3 intermediate uses are omitted from this short explanation
+note: the arguments cannot agree: text and a natural number cannot be the same type
+
 ## recursive-type
 [recursive-type] this value would have to contain or accept itself
 primary: Let’s call this function input `Input` — this call requires the input to accept itself

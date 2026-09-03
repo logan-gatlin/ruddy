@@ -6504,6 +6504,7 @@ fn prelude_artifact(bundle: &str) -> a::UncheckedArtifact {
             ],
             effects: vec![a::DeclaredEffect {
                 name: qualified("Shared"),
+                params: Vec::new(),
                 identity: Some(a::EffectIdentity {
                     name: "Shared".into(),
                     interface: "shared:{}->{}".into(),
@@ -6777,6 +6778,7 @@ fn effect_artifact(bundle: &str, interface: &str) -> a::UncheckedArtifact {
             types: Vec::new(),
             effects: vec![a::DeclaredEffect {
                 name: format!("{bundle}@1.0.0::IO"),
+                params: Vec::new(),
                 identity: Some(a::EffectIdentity {
                     name: "IO".into(),
                     interface: interface.into(),
@@ -7419,11 +7421,13 @@ fn direct_only_transitive_effects_keep_qualified_recovery_identity() {
             .into_iter()
             .map(|(name, target)| a::DeclaredEffect {
                 name: format!("dep@1.0.0::{name}"),
+                params: Vec::new(),
                 identity: None,
-                kind: a::EffectKind::Alias(vec![target.into()]),
+                kind: a::EffectKind::Alias(a::AliasRow::naming(vec![target.into()])),
             })
             .chain(std::iter::once(a::DeclaredEffect {
                 name: "dep@1.0.0::Legacy".into(),
+                params: Vec::new(),
                 identity: None,
                 kind: a::EffectKind::Operations(Vec::new()),
             }))
@@ -8742,6 +8746,7 @@ fn imported_interfaces_keep_applied_types_effects_and_alias_overlap_structural()
             .into_iter()
             .map(|(name, interface)| a::DeclaredEffect {
                 name: format!("dep@1.0.0::{name}"),
+                params: Vec::new(),
                 identity: Some(a::EffectIdentity {
                     name: name.into(),
                     interface: interface.into(),
@@ -8750,8 +8755,9 @@ fn imported_interfaces_keep_applied_types_effects_and_alias_overlap_structural()
             })
             .chain(["A", "B"].into_iter().map(|name| a::DeclaredEffect {
                 name: format!("dep@1.0.0::{name}"),
+                params: Vec::new(),
                 identity: None,
-                kind: a::EffectKind::Alias(vec!["dep@1.0.0::Log".into()]),
+                kind: a::EffectKind::Alias(a::AliasRow::naming(vec!["dep@1.0.0::Log".into()])),
             }))
             .collect(),
         },
@@ -9016,6 +9022,7 @@ fn malformed_dependency_declarations_are_ignored_without_shadow_symbols() {
     });
     dependency.header.effects.push(a::DeclaredEffect {
         name: "other@1.0.0::Ignored".into(),
+        params: Vec::new(),
         identity: Some(a::EffectIdentity {
             name: "Ignored".into(),
             interface: String::new(),
@@ -9051,8 +9058,9 @@ fn imported_alias_cycles_recover_without_a_spurious_structural_identity() {
                 .into_iter()
                 .map(|(name, target)| a::DeclaredEffect {
                     name: format!("dep@1.0.0::{name}"),
+                    params: Vec::new(),
                     identity: None,
-                    kind: a::EffectKind::Alias(vec![target.into()]),
+                    kind: a::EffectKind::Alias(a::AliasRow::naming(vec![target.into()])),
                 })
                 .collect(),
         },
@@ -9068,9 +9076,33 @@ fn imported_alias_cycles_recover_without_a_spurious_structural_identity() {
     let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty());
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
+    // The ring is the dependency's mistake: the boundary keeps the alias that
+    // stands on its own and drops the one that closes the ring, and what the
+    // kept alias names becomes one recovery effect.
+    let (dependency, facts) = recovered(dependency);
+    assert!(
+        matches!(
+            facts.as_slice(),
+            [a::RecoveryFact::EffectDiscarded { name, .. }] if name == "dep@1.0.0::B"
+        ),
+        "{facts:#?}"
+    );
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    assert_eq!(out.program.effect_ids.len(), 1);
+    // `Probe`'s own identity, and the one the dropped alias is recovered as.
+    assert_eq!(out.program.effect_ids.len(), 2);
+    assert_eq!(
+        out.program
+            .effect_ids
+            .values()
+            .filter(|identity| matches!(
+                identity,
+                ruddy::types::EffectId::Structural { interface, .. }
+                    if interface.starts_with("unresolved:dep@1.0.0::B")
+            ))
+            .count(),
+        1
+    );
     assert!(matches!(effect_of(&mint, &out, "Local"), Effect::Alias(_)));
 }
 
@@ -9452,6 +9484,13 @@ fn dependency_interfaces_import_every_semantic_form() {
             effects: vec![
                 a::DeclaredEffect {
                     name: "dep@1.0.0::M::Read".to_string(),
+                    // One fields parameter, which the `bound` operation's row
+                    // ends in.
+                    params: vec![a::Parameter {
+                        sense: a::Sense::Fields,
+                        lacks: Vec::new(),
+                        relevant: true,
+                    }],
                     identity: Some(a::EffectIdentity {
                         name: "Read".to_string(),
                         interface: "get:{}->Nat".to_string(),
@@ -9491,7 +9530,7 @@ fn dependency_interfaces_import_every_semantic_form() {
                             selector: a::OperationSelector::Named("bound".into()),
                             from: artifact_type(a::Type::Struct(a::Row {
                                 labels: Vec::new(),
-                                rest: a::Rest::Bound(4),
+                                rest: a::Rest::Bound(0),
                             })),
                             to: unit(),
                         },
@@ -9561,11 +9600,21 @@ fn dependency_interfaces_import_every_semantic_form() {
                 },
                 a::DeclaredEffect {
                     name: "dep@1.0.0::Alias".to_string(),
+                    params: Vec::new(),
                     identity: None,
-                    kind: a::EffectKind::Alias(vec![
-                        "dep@1.0.0::M::Read".to_string(),
-                        "other@2.0.0::IO".to_string(),
-                    ]),
+                    kind: a::EffectKind::Alias(a::AliasRow {
+                        cases: vec![
+                            a::AliasCase {
+                                name: "dep@1.0.0::M::Read".to_string(),
+                                args: vec![artifact_type(artifact_unit())],
+                            },
+                            a::AliasCase {
+                                name: "other@2.0.0::IO".to_string(),
+                                args: Vec::new(),
+                            },
+                        ],
+                        tail: None,
+                    }),
                 },
             ],
         },

@@ -860,6 +860,7 @@ fn imported_and_local_handler_arms_build_one_complete_evidence_record() {
             types: Vec::new(),
             effects: vec![a::DeclaredEffect {
                 name: "dep@1.0.0::Log".into(),
+                params: Vec::new(),
                 identity: Some(a::EffectIdentity {
                     name: "Log".into(),
                     interface,
