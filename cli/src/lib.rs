@@ -17,7 +17,7 @@ use indexmap::IndexMap;
 use ruddy::{
     artifact::{Artifact, Dependency},
     bundle::{self, Disk, Files},
-    inference, ir, lir,
+    inference, ir,
     symbol::{Bundle, Mint, Version},
     tracking::{FileManager, Span},
     ui,
@@ -2038,12 +2038,11 @@ fn compile_one(
             ));
         }
         return Err(CompileError::from_diagnostics(diagnostics));
-    }
+            }
         unreachable!("partial compilation always has an error")
         }
     };
 
-    let lowered = lir::lower(&accepted);
     let identities = dependencies
         .iter()
         .map(|(_, artifact)| Dependency {
@@ -2051,11 +2050,7 @@ fn compile_one(
             version: artifact.header.identity.version.clone(),
         })
         .collect();
-    Ok(ruddy::artifact::build_with_dependencies(
-        &accepted,
-        &lowered,
-        identities,
-    ))
+    Ok(ruddy::artifact::build_with_dependencies(&accepted, identities))
 }
 
 fn toml_error_note(source: &str, error: &toml::de::Error) -> String {

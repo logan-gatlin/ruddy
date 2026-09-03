@@ -431,16 +431,12 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     // The artifact is the first disk-boundary representation. Like LIR, it
     // only exists for an accepted program, and retains no source spans.
     let mut artifact_panicked = false;
-    let artifact = match (&accepted, &lowered) {
-        (Some(accepted), Some(lowered)) => {
+    let artifact = match &accepted {
+        Some(accepted) => {
             let started = Instant::now();
             let dependencies = dependency_artifacts.clone();
             let out = guard("artifact", &mut panicked, || {
-                artifact::build_with_dependencies(
-                    accepted,
-                    lowered,
-                    dependencies,
-                )
+                artifact::build_with_dependencies(accepted, dependencies)
             });
             artifact_panicked = out.is_none();
             micros.artifact = started.elapsed().as_micros() as u64;

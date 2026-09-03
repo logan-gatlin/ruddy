@@ -25,20 +25,31 @@ impl ExternPlan {
     pub fn get(&self, symbol: Symbol) -> &Extern {
         &self.entries[&symbol]
     }
-    pub fn iter(&self) -> impl Iterator<Item = &Extern> { self.entries.values() }
+    pub fn iter(&self) -> impl Iterator<Item = &Extern> {
+        self.entries.values()
+    }
 }
 
 /// Turn inference-reviewed extern facts into the in-memory lowering plan.
 /// This is infallible: accepted inference has already established ABI facts.
-pub fn plan(program: &ir::Program, semantics: &inference::Semantics) -> ExternPlan {
+pub fn plan(semantics: &inference::Semantics) -> ExternPlan {
     ExternPlan {
-        entries: program.externs.iter().map(|(symbol, declaration)| (*symbol, Extern {
-            symbol: *symbol,
-            scheme: semantics.externs()[symbol].clone(),
-            abi: declaration.value.abi.clone(),
-            target: declaration.value.target.tracked.clone(),
-            target_span: declaration.value.target.span,
-            declaration_span: declaration.name_span,
-        })).collect(),
+        entries: semantics
+            .reviewed_externs()
+            .iter()
+            .map(|(symbol, reviewed)| {
+                (
+                    *symbol,
+                    Extern {
+                        symbol: *symbol,
+                        scheme: reviewed.scheme.clone(),
+                        abi: reviewed.abi.clone(),
+                        target: reviewed.target.clone(),
+                        target_span: reviewed.target_span,
+                        declaration_span: reviewed.declaration_span,
+                    },
+                )
+            })
+            .collect(),
     }
 }

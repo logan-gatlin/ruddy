@@ -10,7 +10,8 @@
 use std::{collections::HashMap, error::Error, fmt};
 
 use crate::{
-    compile::AcceptedProgram, ir, lir,
+    compile::AcceptedProgram,
+    ir, lir,
     symbol::{Mint, Symbol},
     types,
 };
@@ -75,12 +76,20 @@ pub struct ValidationError {
 }
 
 impl ValidationError {
-    fn new(message: impl Into<String>) -> Self { Self { message: message.into() } }
-    pub fn message(&self) -> &str { &self.message }
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+    pub fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 impl fmt::Display for ValidationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(&self.message) }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
 }
 impl Error for ValidationError {}
 
@@ -103,24 +112,47 @@ impl UncheckedArtifact {
     /// Strictly establish the portable artifact invariants.
     pub fn validate(self) -> Result<Artifact, ValidationError> {
         if self.header.identity.name.is_empty() || self.header.identity.version.is_empty() {
-            return Err(ValidationError::new("artifact identity must name a bundle and version"));
+            return Err(ValidationError::new(
+                "artifact identity must name a bundle and version",
+            ));
         }
         if self.header.values.iter().any(|value| value.name.is_empty()) {
             return Err(ValidationError::new("artifact value name is empty"));
         }
-        Ok(Artifact { header: self.header, lir: self.lir })
+        Ok(Artifact {
+            header: self.header,
+            lir: self.lir,
+        })
     }
 
     /// Admit a dependency artifact while recording that validation had to be
     /// relaxed. Recovery facts are diagnostics, not source compilation errors.
     pub fn recover(self) -> (Artifact, Vec<RecoveryFact>) {
-        match self.validate() {
+        let UncheckedArtifact { header, lir } = self;
+        match (UncheckedArtifact {
+            header: header.clone(),
+            lir: lir.clone(),
+        })
+        .validate()
+        {
             Ok(artifact) => (artifact, Vec::new()),
             Err(error) => {
                 let message = error.to_string();
-                // Recovery preserves the portable shape; later consumers see a
-                // validated wrapper and can report this explicit repair fact.
-                let artifact = Artifact { header: Header { identity: Identity { name: "<recovered>".into(), version: "0".into() }, dependencies: Vec::new(), values: Vec::new(), types: Vec::new(), effects: Vec::new() }, lir: Lir { externs: Vec::new(), functions: Vec::new(), globals: Vec::new() } };
+                // Recovery is deliberately local. One malformed spelling must
+                // not erase unaffected declarations or executable content.
+                let mut header = header;
+                if header.identity.name.is_empty() {
+                    header.identity.name = "<recovered>".into();
+                }
+                if header.identity.version.is_empty() {
+                    header.identity.version = "0".into();
+                }
+                for value in &mut header.values {
+                    if value.name.is_empty() {
+                        value.name = "<recovered>::value".into();
+                    }
+                }
+                let artifact = Artifact { header, lir };
                 (artifact, vec![RecoveryFact::Recovered { message }])
             }
         }
@@ -1646,19 +1678,16 @@ impl Drop for Op {
 }
 
 /// Build an artifact after inference and LIR lowering succeeded.
-pub fn build(
-    accepted: &AcceptedProgram,
-    lir: &lir::Output,
-) -> Artifact {
-    build_with_dependencies(accepted, lir, Vec::new())
+pub fn build(accepted: &AcceptedProgram) -> Artifact {
+    build_with_dependencies(accepted, Vec::new())
 }
 
 /// Build an artifact with the dependency identities supplied by its driver.
 pub fn build_with_dependencies(
     accepted: &AcceptedProgram,
-    lir: &lir::Output,
     dependencies: Vec<Dependency>,
 ) -> Artifact {
+    let lir = accepted.lower();
     let mint = accepted.mint();
     let program = accepted.ir();
     let inference = accepted.semantics();
@@ -1750,17 +1779,14 @@ pub fn build_with_dependencies(
     };
     Artifact {
         header,
-        lir: lower_lir(mint, lir),
+        lir: lower_lir(mint, &lir),
     }
 }
 
 impl Artifact {
     /// Build an artifact after inference and LIR lowering succeeded.
-    pub fn build(
-        accepted: &AcceptedProgram,
-        lir: &lir::Output,
-    ) -> Self {
-        build(accepted, lir)
+    pub fn build(accepted: &AcceptedProgram) -> Self {
+        build(accepted)
     }
 
     /// Canonical textual serialization.
@@ -1785,12 +1811,18 @@ pub fn print(artifact: &Artifact) -> String {
 /// Parse trusted internal artifact text. Malformed input panics.
 pub fn parse(input: &str) -> UncheckedArtifact {
     let artifact = text::parse(input);
-    UncheckedArtifact { header: artifact.header.clone(), lir: artifact.lir.clone() }
+    UncheckedArtifact {
+        header: artifact.header.clone(),
+        lir: artifact.lir.clone(),
+    }
 }
 
 /// Parse artifact text without panicking on malformed input.
 pub fn try_parse(input: &str) -> Result<UncheckedArtifact, ParseError> {
-    text::try_parse(input).map(|artifact| UncheckedArtifact { header: artifact.header.clone(), lir: artifact.lir.clone() })
+    text::try_parse(input).map(|artifact| UncheckedArtifact {
+        header: artifact.header.clone(),
+        lir: artifact.lir.clone(),
+    })
 }
 
 fn qualified(mint: &Mint, symbol: Symbol) -> QualifiedName {

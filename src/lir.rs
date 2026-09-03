@@ -3867,7 +3867,7 @@ mod tests {
     ) -> Output {
         let (mint, mut out, mut inferred, _) = test_support::accepted(source);
         adjust(&mut out.program, &mut inferred);
-        let plan = crate::externs::plan(&out.program, inferred.semantics());
+        let plan = crate::externs::plan(inferred.semantics());
         lower_parts(&mint, &out.program, inferred.semantics(), &plan)
     }
 

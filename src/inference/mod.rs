@@ -143,10 +143,24 @@ pub struct Semantics {
     pub(crate) aliases: IndexMap<Symbol, Scheme>,
     pub(crate) operations: Operations,
     pub(crate) externs: IndexMap<Symbol, Scheme>,
+    pub(crate) reviewed_externs: IndexMap<Symbol, ReviewedExtern>,
     pub(crate) schemes: IndexMap<Symbol, Scheme>,
     pub(crate) locals: IndexMap<Symbol, Scheme>,
     pub(crate) store: Store,
     pub(crate) promises: IndexMap<Symbol, Formula>,
+}
+
+/// Complete target-neutral facts inference accepted about an extern
+/// declaration.  This is the hand-off to extern planning: later phases do not
+/// reinterpret a raw IR declaration to rebuild facts inference already
+/// reviewed.
+#[derive(Debug, Clone)]
+pub struct ReviewedExtern {
+    pub scheme: Scheme,
+    pub abi: ir::ExternType,
+    pub target: String,
+    pub target_span: Span,
+    pub declaration_span: Span,
 }
 
 /// The diagnostic account of one inference run: its errors, and — when a
@@ -244,6 +258,11 @@ impl Semantics {
     /// initializer.
     pub fn externs(&self) -> &IndexMap<Symbol, Scheme> {
         &self.externs
+    }
+
+    /// The complete reviewed target-neutral facts for each extern.
+    pub fn reviewed_externs(&self) -> &IndexMap<Symbol, ReviewedExtern> {
+        &self.reviewed_externs
     }
 
     /// The scheme each top-level term was inferred, or checked, to have.
@@ -6348,10 +6367,27 @@ pub fn infer(mint: &Mint, program: &mut Program, trace: Trace) -> Output {
         )
     });
 
+    let reviewed_externs = program
+        .externs
+        .iter()
+        .map(|(symbol, declaration)| {
+            (
+                *symbol,
+                ReviewedExtern {
+                    scheme: externs[symbol].clone(),
+                    abi: declaration.value.abi.clone(),
+                    target: declaration.value.target.tracked.clone(),
+                    target_span: declaration.value.target.span,
+                    declaration_span: declaration.name_span,
+                },
+            )
+        })
+        .collect();
     let semantics = Semantics {
         aliases,
         operations,
         externs,
+        reviewed_externs,
         schemes,
         locals,
         store,
