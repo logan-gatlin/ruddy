@@ -9,7 +9,7 @@ use indexmap::{IndexMap, IndexSet};
 use ruddy::{
     artifact::{
         self, Artifact, Block, Callee, End, Formula, Global, Instr, Lir, Literal, Op, Param,
-        Presence, Rep, Rest, Row, RowField, Scheme, Type,
+        Presence, RecoveryFact, Rep, Rest, Row, RowField, Scheme, Type,
     },
     compile, inference, ir, lir, parse, patterns,
     symbol::{Bundle, Mint, Namespace, Version},
@@ -589,6 +589,36 @@ fn assert_round_trip(value: &Artifact) -> String {
     );
     assert_eq!(artifact::text::try_parse(&printed), Ok(parsed));
     printed
+}
+
+#[test]
+fn tolerant_recovery_reports_each_repair_it_applies() {
+    let mut unchecked = built("let kept = 1n\nlet discarded = 2n").to_unchecked();
+    unchecked.header.identity.name.clear();
+    unchecked.header.identity.version.clear();
+    unchecked.header.values[0].name.clear();
+    unchecked.header.values[1].scheme.body = Type::Bound(99);
+
+    let (recovered, facts) = unchecked.recover();
+    assert_eq!(recovered.header().values.len(), 1);
+    assert!(facts.iter().any(|fact| matches!(
+        fact,
+        RecoveryFact::IdentityNameReplaced { replacement } if replacement == "<recovered>"
+    )));
+    assert!(facts.iter().any(|fact| matches!(
+        fact,
+        RecoveryFact::IdentityVersionReplaced { replacement } if replacement == "0"
+    )));
+    assert!(facts.iter().any(|fact| matches!(
+        fact,
+        RecoveryFact::ValueNameReplaced { index: 0, replacement }
+            if replacement == "<recovered>::value-0"
+    )));
+    assert!(facts.iter().any(|fact| matches!(
+        fact,
+        RecoveryFact::ValueDiscarded { index: 1, name, reason }
+            if name.ends_with("::discarded") && !reason.is_empty()
+    )));
 }
 
 fn assert_parse_error(error: &artifact::ParseError) {

@@ -96,9 +96,30 @@ impl Error for ValidationError {}
 /// A repair made while admitting foreign in-memory portable data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecoveryFact {
-    /// The input did not pass strict validation and was retained through the
-    /// dependency-recovery boundary.
-    Recovered { message: String },
+    /// The dependency did not provide a bundle name, so recovery supplied one.
+    IdentityNameReplaced { replacement: String },
+    /// The dependency did not provide a bundle version, so recovery supplied one.
+    IdentityVersionReplaced { replacement: String },
+    /// An exported value lacked a name, so recovery supplied one.
+    ValueNameReplaced { index: usize, replacement: String },
+    /// A type declaration could not join the validated artifact.
+    TypeDiscarded {
+        index: usize,
+        name: QualifiedName,
+        reason: String,
+    },
+    /// An effect declaration could not join the validated artifact.
+    EffectDiscarded {
+        index: usize,
+        name: QualifiedName,
+        reason: String,
+    },
+    /// A value declaration could not join the validated artifact.
+    ValueDiscarded {
+        index: usize,
+        name: QualifiedName,
+        reason: String,
+    },
 }
 
 /// A complete, serializable bundle artifact.
@@ -165,24 +186,31 @@ impl UncheckedArtifact {
         .validate()
         {
             Ok(artifact) => (artifact, Vec::new()),
-            Err(error) => {
-                let message = error.to_string();
+            Err(_) => {
                 // Recovery is deliberately local. One malformed spelling must
                 // not erase unaffected declarations or executable content.
                 let mut header = header;
+                let mut facts = Vec::new();
                 if header.identity.name.is_empty() {
-                    header.identity.name = "<recovered>".into();
+                    let replacement = String::from("<recovered>");
+                    header.identity.name = replacement.clone();
+                    facts.push(RecoveryFact::IdentityNameReplaced { replacement });
                 }
                 if header.identity.version.is_empty() {
-                    header.identity.version = "0".into();
+                    let replacement = String::from("0");
+                    header.identity.version = replacement.clone();
+                    facts.push(RecoveryFact::IdentityVersionReplaced { replacement });
                 }
-                for value in &mut header.values {
+                for (index, value) in header.values.iter_mut().enumerate() {
                     if value.name.is_empty() {
-                        value.name = "<recovered>::value".into();
+                        let replacement = format!("<recovered>::value-{index}");
+                        value.name = replacement.clone();
+                        facts.push(RecoveryFact::ValueNameReplaced { index, replacement });
                     }
                 }
-                let artifact = recover_parts(header, lir);
-                (artifact, vec![RecoveryFact::Recovered { message }])
+                let (artifact, discarded) = recover_parts(header, lir);
+                facts.extend(discarded);
+                (artifact, facts)
             }
         }
     }
@@ -192,7 +220,7 @@ impl UncheckedArtifact {
 /// semantic fragments that cannot establish the artifact invariant.  A valid
 /// LIR is carried through every candidate validation, so a bad interface tree
 /// never erases executable content that does not depend on it.
-fn recover_parts(header: Header, lir: Lir) -> Artifact {
+fn recover_parts(header: Header, lir: Lir) -> (Artifact, Vec<RecoveryFact>) {
     let mut recovered = Header {
         identity: header.identity,
         dependencies: header.dependencies,
@@ -204,52 +232,66 @@ fn recover_parts(header: Header, lir: Lir) -> Artifact {
     // Types precede values because an exported value may name a local type.
     // Each candidate takes the same strict route as text input; recovery is
     // selection, never a weaker semantic decoder.
-    for declaration in header.types {
+    let mut facts = Vec::new();
+    for (index, declaration) in header.types.into_iter().enumerate() {
         let mut candidate = recovered.clone();
         candidate.types.push(declaration.clone());
-        if (UncheckedArtifact {
+        match (UncheckedArtifact {
             header: candidate.clone(),
             lir: lir.clone(),
         })
         .validate()
-        .is_ok()
         {
-            recovered = candidate;
+            Ok(_) => recovered = candidate,
+            Err(error) => facts.push(RecoveryFact::TypeDiscarded {
+                index,
+                name: declaration.name,
+                reason: error.to_string(),
+            }),
         }
     }
-    for declaration in header.effects {
+    for (index, declaration) in header.effects.into_iter().enumerate() {
         let mut candidate = recovered.clone();
         candidate.effects.push(declaration.clone());
-        if (UncheckedArtifact {
+        match (UncheckedArtifact {
             header: candidate.clone(),
             lir: lir.clone(),
         })
         .validate()
-        .is_ok()
         {
-            recovered = candidate;
+            Ok(_) => recovered = candidate,
+            Err(error) => facts.push(RecoveryFact::EffectDiscarded {
+                index,
+                name: declaration.name,
+                reason: error.to_string(),
+            }),
         }
     }
-    for declaration in header.values {
+    for (index, declaration) in header.values.into_iter().enumerate() {
         let mut candidate = recovered.clone();
         candidate.values.push(declaration.clone());
-        if (UncheckedArtifact {
+        match (UncheckedArtifact {
             header: candidate.clone(),
             lir: lir.clone(),
         })
         .validate()
-        .is_ok()
         {
-            recovered = candidate;
+            Ok(_) => recovered = candidate,
+            Err(error) => facts.push(RecoveryFact::ValueDiscarded {
+                index,
+                name: declaration.name,
+                reason: error.to_string(),
+            }),
         }
     }
 
-    UncheckedArtifact {
+    let artifact = UncheckedArtifact {
         header: recovered,
         lir,
     }
     .validate()
-    .expect("a recovery candidate is admitted only after strict validation")
+    .expect("a recovery candidate is admitted only after strict validation");
+    (artifact, facts)
 }
 
 impl Drop for Artifact {
