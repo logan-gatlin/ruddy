@@ -44,3 +44,64 @@ fn failed_compilation_preserves_completed_phases_and_aggregates_checking_errors(
             .any(|error| matches!(error, Error::Patterns(_)))
     );
 }
+
+/// The core seam preserves rich errors independently of trace retention. Only
+/// a debugger that asks for a complete trace receives the solver replay data.
+#[test]
+fn compilation_trace_retention_does_not_change_causal_errors() {
+    let source = "let bad = 1n + \"text\"\n\
+                  let inspect = fn value => match value with | { field } => field | {} => 0n end";
+    let compile = |trace| {
+        let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
+        assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+        compile::compile(
+            Mint::new(Bundle::new("tests", Version::new(0, 1, 0)).unwrap()),
+            parsed.stmts,
+            trace,
+        )
+        .expect_err("the type mismatch must leave a partial compilation")
+    };
+
+    let off = compile(inference::Trace::Off);
+    let complete = compile(inference::Trace::Complete);
+
+    assert_eq!(
+        off.inference.errors().len(),
+        complete.inference.errors().len()
+    );
+    for (without_trace, with_trace) in off
+        .inference
+        .errors()
+        .iter()
+        .zip(complete.inference.errors())
+    {
+        assert_eq!(without_trace.explanation, with_trace.explanation);
+        assert_eq!(
+            without_trace.diagnostic().title,
+            with_trace.diagnostic().title
+        );
+    }
+    assert!(
+        off.inference
+            .errors()
+            .iter()
+            .any(|error| error.explanation.is_some()),
+        "the public compilation error keeps its causal explanation: {off:#?}"
+    );
+
+    let diagnostics = off.inference.diagnostics();
+    assert_eq!(diagnostics.trace(), inference::Trace::Off);
+    assert!(diagnostics.constraints().is_empty());
+    assert!(diagnostics.steps().is_empty());
+    assert!(diagnostics.reasons().is_empty());
+    assert!(diagnostics.variables().is_empty());
+    assert!(diagnostics.refinements().is_empty());
+
+    let diagnostics = complete.inference.diagnostics();
+    assert_eq!(diagnostics.trace(), inference::Trace::Complete);
+    assert!(!diagnostics.constraints().is_empty());
+    assert!(!diagnostics.steps().is_empty());
+    assert!(!diagnostics.reasons().is_empty());
+    assert!(!diagnostics.variables().is_empty());
+    assert!(!diagnostics.refinements().is_empty());
+}
