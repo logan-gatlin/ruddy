@@ -30,11 +30,15 @@ pub struct PartialCompilation {
     pub errors: Vec<Error>,
 }
 
-/// A portable direct dependency. Core compilation admits it through tolerant
-/// artifact recovery before the IR phase sees its semantic interface.
+/// One member of the dependency graph admitted by core compilation.
+///
+/// An alias makes this artifact directly source-visible. An absent alias keeps
+/// it available solely to resolve the interfaces named by direct dependencies.
+/// Both roles point at the same portable artifact collection, so source
+/// interfaces and linked implementations cannot drift into separate inputs.
 #[derive(Debug, Clone, Copy)]
-pub struct DependencyImport<'a> {
-    pub alias: &'a str,
+pub struct Dependency<'a> {
+    pub alias: Option<&'a str>,
     pub artifact: &'a artifact::UncheckedArtifact,
 }
 
@@ -94,12 +98,16 @@ pub fn compile(
     })
 }
 
-/// Compile a parsed source bundle against dependency interfaces.
-pub fn compile_with_dependency_imports(
+/// Compile a parsed source bundle against one coherent dependency graph.
+///
+/// Every direct dependency is represented by a [`Dependency`] with an alias;
+/// transitive dependencies are represented by entries without one. This keeps
+/// the source-visible interface and the linked implementation set together at
+/// the public compilation seam.
+pub fn compile_with_dependencies(
     mint: Mint,
     stmts: Vec<parse::Stmt>,
-    dependencies: &[DependencyImport<'_>],
-    linked: &[artifact::Artifact],
+    dependencies: &[Dependency<'_>],
     trace: Trace,
 ) -> Result<AcceptedProgram, PartialCompilation> {
     let recovered: Vec<_> = dependencies
@@ -113,20 +121,27 @@ pub fn compile_with_dependency_imports(
     let imports: Vec<_> = dependencies
         .iter()
         .zip(&recovered)
-        .map(|(dependency, (artifact, _))| ir::DependencyImport {
-            alias: dependency.alias,
-            artifact,
+        .filter_map(|(dependency, (artifact, _))| {
+            dependency
+                .alias
+                .map(|alias| ir::DependencyImport { alias, artifact })
         })
         .collect();
     let artifact_dependencies = recovered
         .iter()
-        .map(|(artifact, _)| artifact::Dependency {
+        .zip(dependencies)
+        .filter(|(_, dependency)| dependency.alias.is_some())
+        .map(|((artifact, _), _)| artifact::Dependency {
             name: artifact.header().identity.name.clone(),
             version: artifact.header().identity.version.clone(),
         })
         .collect();
+    let linked: Vec<_> = recovered
+        .iter()
+        .map(|(artifact, _)| artifact.clone())
+        .collect();
     let mut result = compile_with(mint, stmts, trace, artifact_dependencies, |mint, stmts| {
-        ir::build_with_dependency_imports(mint, stmts, &imports, linked)
+        ir::build_with_dependency_imports(mint, stmts, &imports, &linked)
     });
     match &mut result {
         Ok(accepted) => accepted.inference.publish_recovery_facts(facts),

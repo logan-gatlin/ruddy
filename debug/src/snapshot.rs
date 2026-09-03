@@ -410,21 +410,45 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     // the rule `main.rs` follows too — so it is gated on the whole diagnostic
     // list rather than on any one phase having produced a value. Its tab
     // reports `Skipped` the moment the reader types something wrong.
-    let accepted = loaded.as_ref().filter(|_| diagnostics.is_empty()).and_then(|loaded| {
-        let unchecked: Vec<_> = dependency_interfaces
-            .iter()
-            .map(ruddy::artifact::Artifact::to_unchecked)
-            .collect();
-        let imports: Vec<_> = dependency_aliases
-            .iter()
-            .zip(&unchecked)
-            .map(|(alias, artifact)| ruddy::compile::DependencyImport { alias, artifact })
-            .collect();
-        ruddy::compile::compile_with_dependency_imports(
-            Mint::new(mint.bundle().clone()), loaded.stmts.clone(), &imports,
-            &linked_interfaces, inference::Trace::Complete,
-        ).ok()
-    });
+    let accepted = loaded
+        .as_ref()
+        .filter(|_| diagnostics.is_empty())
+        .and_then(|loaded| {
+            let mut unchecked: Vec<_> = linked_interfaces
+                .iter()
+                .map(ruddy::artifact::Artifact::to_unchecked)
+                .collect();
+            for dependency in &dependency_interfaces {
+                if !unchecked.iter().any(|artifact| {
+                    artifact.header.identity.name == dependency.header().identity.name
+                        && artifact.header.identity.version == dependency.header().identity.version
+                }) {
+                    unchecked.push(dependency.to_unchecked());
+                }
+            }
+            let dependencies: Vec<_> = unchecked
+                .iter()
+                .map(|artifact| ruddy::compile::Dependency {
+                    alias: dependency_aliases
+                        .iter()
+                        .zip(&dependency_interfaces)
+                        .find(|(_, dependency)| {
+                            artifact.header.identity.name == dependency.header().identity.name
+                                && artifact.header.identity.version
+                                    == dependency.header().identity.version
+                        })
+                        .map(|(alias, _)| alias.as_str()),
+                    artifact,
+                })
+                .collect();
+            ruddy::compile::compile_with_dependencies(
+                Mint::new(mint.bundle().clone()),
+                loaded.stmts.clone(),
+                &dependencies,
+                inference::Trace::Complete,
+            )
+            .ok()
+        });
     let lowered = match &accepted {
         Some(accepted) => {
             let started = Instant::now();

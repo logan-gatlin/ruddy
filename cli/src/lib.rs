@@ -1994,20 +1994,35 @@ fn compile_one(
     }
 
     let mint = Mint::new(identity);
-    let unchecked: Vec<_> = dependencies
+    // The core seam receives one dependency graph. Direct interfaces select
+    // their aliases from this linked collection rather than arriving as an
+    // unrelated second slice.
+    let mut unchecked: Vec<_> = linked.iter().map(Artifact::to_unchecked).collect();
+    for (_, dependency) in &dependencies {
+        if !unchecked.iter().any(|artifact| {
+            artifact.header.identity.name == dependency.header().identity.name
+                && artifact.header.identity.version == dependency.header().identity.version
+        }) {
+            unchecked.push(dependency.to_unchecked());
+        }
+    }
+    let dependencies: Vec<_> = unchecked
         .iter()
-        .map(|(_, artifact)| artifact.to_unchecked())
+        .map(|artifact| ruddy::compile::Dependency {
+            alias: dependencies
+                .iter()
+                .find(|(_, dependency)| {
+                    artifact.header.identity.name == dependency.header().identity.name
+                        && artifact.header.identity.version == dependency.header().identity.version
+                })
+                .map(|(alias, _)| alias.as_str()),
+            artifact,
+        })
         .collect();
-    let imports: Vec<_> = dependencies
-        .iter()
-        .zip(&unchecked)
-        .map(|((alias, _), artifact)| ruddy::compile::DependencyImport { alias, artifact })
-        .collect();
-    let accepted = ruddy::compile::compile_with_dependency_imports(
+    let accepted = ruddy::compile::compile_with_dependencies(
         mint,
         loaded.stmts,
-        &imports,
-        &linked,
+        &dependencies,
         inference::Trace::Off,
     );
     let accepted = match accepted {

@@ -52,17 +52,18 @@ fn lowered_with_dependencies_after_check(
     assert!(parsed.errors.is_empty(), "{source}: {:#?}", parsed.errors);
 
     let bundle = Bundle::new("tests", Version::new(0, 1, 0)).expect("the bundle name is valid");
-    let accepted = ruddy::compile::compile_with_dependency_imports(
+    let unchecked: Vec<_> = dependencies.iter().map(a::Artifact::to_unchecked).collect();
+    let imports: Vec<_> = unchecked
+        .iter()
+        .map(|artifact| ruddy::compile::Dependency {
+            alias: Some(&artifact.header.identity.name),
+            artifact,
+        })
+        .collect();
+    let accepted = ruddy::compile::compile_with_dependencies(
         Mint::new(bundle),
         parsed.stmts,
-        &dependencies
-            .iter()
-            .map(|artifact| ir::DependencyImport {
-                alias: &artifact.header.identity.name,
-                artifact,
-            })
-            .collect::<Vec<_>>(),
-        &[],
+        &imports,
         inference::Trace::Off,
     )
     .unwrap_or_else(|partial| panic!("{source}: {partial:#?}"));
