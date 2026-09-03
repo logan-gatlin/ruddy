@@ -509,6 +509,7 @@ pub enum Type {
     Boolean,
     Arrow(Box<Type>, Box<Type>, Row),
     Package(Box<Type>),
+    Array(Box<Type>),
     Struct(Row),
     Sum(Row),
     Var(u32),
@@ -622,6 +623,9 @@ fn semantic_eq(root: SemanticPair<'_>) -> bool {
                     pending.push(SemanticPair::Type(left_from, right_from));
                 }
                 (Type::Package(left), Type::Package(right)) => {
+                    pending.push(SemanticPair::Type(left, right));
+                }
+                (Type::Array(left), Type::Array(right)) => {
                     pending.push(SemanticPair::Type(left, right));
                 }
                 (Type::Struct(left), Type::Struct(right)) | (Type::Sum(left), Type::Sum(right)) => {
@@ -744,6 +748,7 @@ enum CloneWork<'a> {
     Semantic(SemanticRef<'a>),
     Arrow,
     Package,
+    Array,
     Struct,
     Sum,
     Named {
@@ -777,6 +782,10 @@ fn clone_semantic(root: SemanticRef<'_>) -> (Vec<Type>, Vec<Row>) {
                 Type::Package(body) => {
                     work.push(CloneWork::Package);
                     work.push(CloneWork::Semantic(SemanticRef::Type(body)));
+                }
+                Type::Array(element) => {
+                    work.push(CloneWork::Array);
+                    work.push(CloneWork::Semantic(SemanticRef::Type(element)));
                 }
                 Type::Struct(row) => {
                     work.push(CloneWork::Struct);
@@ -843,6 +852,10 @@ fn clone_semantic(root: SemanticRef<'_>) -> (Vec<Type>, Vec<Row>) {
             CloneWork::Package => {
                 let body = types.pop().expect("cloned package body");
                 types.push(Type::Package(Box::new(body)));
+            }
+            CloneWork::Array => {
+                let element = types.pop().expect("cloned array element");
+                types.push(Type::Array(Box::new(element)));
             }
             CloneWork::Struct => {
                 types.push(Type::Struct(rows.pop().expect("cloned struct row")));
@@ -913,6 +926,10 @@ fn drain_type(value: &mut Type, pending: &mut Vec<SemanticOwned>) {
     match value {
         Type::Package(body) => pending.push(SemanticOwned::Type(std::mem::replace(
             body.as_mut(),
+            Type::Undecided,
+        ))),
+        Type::Array(element) => pending.push(SemanticOwned::Type(std::mem::replace(
+            element.as_mut(),
             Type::Undecided,
         ))),
         Type::Arrow(from, to, effects) => {
@@ -1183,6 +1200,7 @@ pub enum Op {
         right: u32,
     },
     Struct(Vec<(FieldKey, u32)>),
+    Array(Vec<u32>),
     Merge(Vec<u32>),
     Project {
         base: u32,
@@ -1293,6 +1311,7 @@ pub enum Rep {
     Boolean,
     Unit,
     Struct,
+    Array,
     Sum,
     Fn,
     Any,
@@ -1385,6 +1404,7 @@ fn clone_lir_tree(root: LirCloneWork<'_>) -> (Vec<Block>, Vec<Op>) {
                     right: *right,
                 }),
                 Op::Struct(fields) => ops.push(Op::Struct(fields.clone())),
+                Op::Array(values) => ops.push(Op::Array(values.clone())),
                 Op::Merge(values) => ops.push(Op::Merge(values.clone())),
                 Op::Project { base, field } => ops.push(Op::Project {
                     base: *base,
@@ -1585,6 +1605,7 @@ enum OpHead<'a> {
     Unary(u8, u32),
     Binary(u8, u32, u32),
     Struct(&'a [(FieldKey, u32)]),
+    Array(&'a [u32]),
     Merge(&'a [u32]),
     Project(u32, &'a FieldKey),
     Tag(&'a str, Option<u32>),
@@ -1615,6 +1636,7 @@ impl<'a> From<&'a Op> for OpHead<'a> {
             Op::Mul { left, right } => Self::Binary(5, *left, *right),
             Op::Div { left, right } => Self::Binary(6, *left, *right),
             Op::Struct(fields) => Self::Struct(fields),
+            Op::Array(values) => Self::Array(values),
             Op::Merge(values) => Self::Merge(values),
             Op::Project { base, field } => Self::Project(*base, field),
             Op::Tag { name, payload } => Self::Tag(name, *payload),
@@ -1852,6 +1874,7 @@ fn drain_lir_op(op: &mut Op, pending: &mut Vec<Block>) {
         | Op::Mul { .. }
         | Op::Div { .. }
         | Op::Struct(_)
+        | Op::Array(_)
         | Op::Merge(_)
         | Op::Project { .. }
         | Op::Tag { .. }
@@ -2129,6 +2152,7 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
         Row(&'a types::Row),
         Arrow,
         Package,
+        Array,
         Struct,
         Sum,
         Named {
@@ -2181,6 +2205,10 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
                     work.push(Work::Package);
                     work.push(Work::Ty(body));
                 }
+                types::Ty::Array(element) => {
+                    work.push(Work::Array);
+                    work.push(Work::Ty(element));
+                }
                 types::Ty::Struct(row) => {
                     work.push(Work::Struct);
                     work.push(Work::Row(row));
@@ -2231,6 +2259,10 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
             Work::Package => {
                 let body = tys.pop().expect("artifact package body");
                 tys.push(Type::Package(Box::new(body)));
+            }
+            Work::Array => {
+                let element = tys.pop().expect("artifact array element");
+                tys.push(Type::Array(Box::new(element)));
             }
             Work::Struct => {
                 let row = rows.pop().expect("artifact struct row");
@@ -2438,6 +2470,7 @@ fn op(mint: &Mint, value: &lir::Op) -> Op {
                 .map(|(field, temp)| (field_key(field), *temp))
                 .collect(),
         ),
+        Source::Array(values) => Op::Array(values.clone()),
         Source::Merge(values) => Op::Merge(values.clone()),
         Source::Project { base, field } => Op::Project {
             base: *base,
@@ -2560,6 +2593,7 @@ fn rep(value: lir::Rep) -> Rep {
         lir::Rep::Boolean => Rep::Boolean,
         lir::Rep::Unit => Rep::Unit,
         lir::Rep::Struct => Rep::Struct,
+        lir::Rep::Array => Rep::Array,
         lir::Rep::Sum => Rep::Sum,
         lir::Rep::Fn => Rep::Fn,
         lir::Rep::Any => Rep::Any,
@@ -2798,6 +2832,11 @@ pub mod text {
                             out.push_str("(package ");
                             work.push(Work::Text(")"));
                             work.push(Work::Ty(body));
+                        }
+                        Type::Array(element) => {
+                            out.push_str("(array ");
+                            work.push(Work::Text(")"));
+                            work.push(Work::Ty(element));
                         }
                         Type::Struct(row) | Type::Sum(row) => {
                             out.push('(');
@@ -3121,6 +3160,9 @@ pub mod text {
                         .map(|(field, value)| L(vec![field_key(field), A(value.to_string())])),
                 )
                 .collect()),
+            Op::Array(values) => L(std::iter::once(A("array".into()))
+                .chain(values.iter().map(|value| A(value.to_string())))
+                .collect()),
             Op::Merge(values) => L(std::iter::once(A("merge".into()))
                 .chain(values.iter().map(|value| A(value.to_string())))
                 .collect()),
@@ -3266,6 +3308,7 @@ pub mod text {
             Rep::Boolean => "boolean",
             Rep::Unit => "unit",
             Rep::Struct => "struct",
+            Rep::Array => "array",
             Rep::Sum => "sum",
             Rep::Fn => "fn",
             Rep::Any => "any",
@@ -3965,6 +4008,7 @@ pub mod text {
                 Field(S),
                 BuildArrow,
                 BuildPackage,
+                BuildArray,
                 BuildStruct,
                 BuildSum,
                 BuildNamed { name: String, count: usize },
@@ -4007,6 +4051,11 @@ pub mod text {
                                         let body = self.exact(values, 1, "package").remove(0);
                                         tasks.push(Task::BuildPackage);
                                         tasks.push(Task::Ty(body));
+                                    }
+                                    "array" => {
+                                        let element = self.exact(values, 1, "array").remove(0);
+                                        tasks.push(Task::BuildArray);
+                                        tasks.push(Task::Ty(element));
                                     }
                                     "struct" => {
                                         let row = self.exact(values, 1, "struct").remove(0);
@@ -4114,6 +4163,10 @@ pub mod text {
                     Task::BuildPackage => {
                         let body = tys.pop().expect("package body");
                         tys.push(Type::Package(Box::new(body)));
+                    }
+                    Task::BuildArray => {
+                        let element = tys.pop().expect("array element");
+                        tys.push(Type::Array(Box::new(element)));
                     }
                     Task::BuildStruct => {
                         let row = rows.pop().expect("struct row");
@@ -4574,6 +4627,7 @@ pub mod text {
                 "boolean" => Rep::Boolean,
                 "unit" => Rep::Unit,
                 "struct" => Rep::Struct,
+                "array" => Rep::Array,
                 "sum" => Rep::Sum,
                 "fn" => Rep::Fn,
                 "any" => Rep::Any,
@@ -4633,6 +4687,7 @@ pub mod text {
                         })
                         .collect(),
                 ),
+                "array" => Op::Array(values.into_iter().map(|value| self.number(value)).collect()),
                 "merge" => Op::Merge(values.into_iter().map(|value| self.number(value)).collect()),
                 "project" => {
                     let mut values = self.exact(values, 2, "project");

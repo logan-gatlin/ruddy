@@ -946,6 +946,31 @@ fn a_scheme_numbers_every_sort_in_one_space() {
     assert_eq!(scheme.formula().open(&fresh).to_string(), "?7");
 }
 
+#[test]
+fn existential_presence_ownership_descends_through_arrays() {
+    let element = Rc::new(Ty::Struct(Row {
+        labels: [(
+            "value".to_string(),
+            RowField {
+                presence: Presence::Bound(0),
+                ty: Rc::new(Ty::Nat),
+            },
+        )]
+        .into_iter()
+        .collect(),
+        rest: Rest::Closed,
+    }));
+    let scheme = Scheme::existential(
+        1,
+        1,
+        [0].into_iter().collect(),
+        Rc::new(Ty::Array(element)),
+        Formula::bound(0),
+    );
+    assert!(matches!(&**scheme.body(), Ty::Package(body) if matches!(&**body, Ty::Array(_))));
+    assert!(matches!(scheme.formula(), Formula::Owned(0, _)));
+}
+
 /// Every position of a scheme is opened at the sort the scheme reserved it for,
 /// so a value of another sort never reaches one. Rather than a rule for what
 /// cannot happen there is a value that says nothing, which absorbs the way

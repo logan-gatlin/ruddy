@@ -62,7 +62,10 @@ fn project(
     }
     if let Some(interface) = interface {
         node = node
-            .field("imported values", interface.header().values.len().to_string())
+            .field(
+                "imported values",
+                interface.header().values.len().to_string(),
+            )
             .field("imported types", interface.header().types.len().to_string())
             .field(
                 "imported effects",

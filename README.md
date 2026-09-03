@@ -17,6 +17,10 @@ ruddy run
 
 Use `ruddy --help` to see all CLI commands. The standard library is installed under `$RUDDY_HOME/std`, or `~/.ruddy/std` when `RUDDY_HOME` is unset.
 
+Immutable homogeneous arrays use `[value, ...]` literals and `[Type]` types.
+The `std::array` module provides `len`, safe `get` and `set`, and persistent
+`push`; updates return new arrays without changing their inputs.
+
 ## Development
 
 ```sh

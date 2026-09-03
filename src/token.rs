@@ -89,6 +89,8 @@ pub enum Kind {
     PipeForward,
     LeftBrace,
     RightBrace,
+    LeftBracket,
+    RightBracket,
     LeftParen,
     RightParen,
     Identifier(String),
@@ -200,6 +202,7 @@ pub struct Output {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Delimiter {
     Brace,
+    Bracket,
     Paren,
 }
 
@@ -367,6 +370,18 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
             '}' => {
                 tokens.push(file_id.span(start, c.len_utf8()).track(Kind::RightBrace));
                 if delimiters.last() == Some(&Delimiter::Brace) {
+                    delimiters.pop();
+                }
+                chars.next();
+            }
+            '[' => {
+                tokens.push(file_id.span(start, c.len_utf8()).track(Kind::LeftBracket));
+                delimiters.push(Delimiter::Bracket);
+                chars.next();
+            }
+            ']' => {
+                tokens.push(file_id.span(start, c.len_utf8()).track(Kind::RightBracket));
+                if delimiters.last() == Some(&Delimiter::Bracket) {
                     delimiters.pop();
                 }
                 chars.next();

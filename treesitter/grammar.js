@@ -409,6 +409,7 @@ module.exports = grammar({
       $.boolean,
       $.unit,
       $.struct_expression,
+      $.array_expression,
       $.tuple_expression,
       $.tag_expression,
       $.operation,
@@ -560,6 +561,17 @@ module.exports = grammar({
         optional(','),
       )),
       ')',
+    ),
+
+    /** `[a, b]` — an immutable homogeneous array, with an optional trailing comma. */
+    array_expression: $ => seq(
+      '[',
+      optional(seq(
+        field('element', $._expression),
+        repeat(seq(',', field('element', $._expression))),
+        optional(','),
+      )),
+      ']',
     ),
 
     parenthesized_expression: $ => seq('(', $._expression, ')'),
@@ -740,6 +752,7 @@ module.exports = grammar({
       $.hole,
       $.unit,
       $.struct_type,
+      $.array_type,
       $.tuple_type,
       $.parenthesized_type,
     ),
@@ -790,6 +803,9 @@ module.exports = grammar({
       )),
       ')',
     ),
+
+    /** `[T]` — the type of immutable homogeneous arrays of `T`. */
+    array_type: $ => seq('[', field('element', $._type), ']'),
 
     parenthesized_type: $ => seq('(', $._type, ')'),
 

@@ -592,6 +592,14 @@ fn assert_round_trip(value: &Artifact) -> String {
 }
 
 #[test]
+fn array_types_representations_and_constructors_round_trip() {
+    let artifact = built("let values : [Nat] = [1n, 2n]");
+    let printed = assert_round_trip(&artifact);
+    assert!(printed.contains("(ty (array nat))"), "{printed}");
+    assert!(printed.contains("(array 0 1)"), "{printed}");
+}
+
+#[test]
 fn tolerant_recovery_reports_each_repair_it_applies() {
     let mut unchecked = built("let kept = 1n\nlet discarded = 2n").to_unchecked();
     unchecked.header.identity.name.clear();

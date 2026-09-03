@@ -86,6 +86,55 @@ fn parses_expression_pattern_and_type_tuples() {
 }
 
 #[test]
+fn parses_homogeneous_array_literals_and_types() {
+    let out = parse(
+        lex(
+            "let empty : [Real] = []\nlet one = [1]\nlet many = [1, 2, 3,]",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    assert!(out.errors.is_empty(), "errors: {:#?}", out.errors);
+    assert_eq!(out.stmts.len(), 3);
+
+    let StmtKind::Let {
+        ty: Some(ty), body, ..
+    } = &out.stmts[0].tracked
+    else {
+        panic!("expected an ascribed array: {:#?}", out.stmts[0]);
+    };
+    assert!(
+        matches!(&ty.ty.tracked, TypeKind::Array(element) if matches!(element.tracked, TypeKind::Ident { .. }))
+    );
+    assert!(matches!(&body.tracked.tracked, ExprKind::Array(items) if items.is_empty()));
+
+    let StmtKind::Let { body, .. } = &out.stmts[1].tracked else {
+        unreachable!()
+    };
+    assert!(matches!(&body.tracked.tracked, ExprKind::Array(items) if items.len() == 1));
+
+    let StmtKind::Let { body, .. } = &out.stmts[2].tracked else {
+        unreachable!()
+    };
+    assert!(matches!(&body.tracked.tracked, ExprKind::Array(items) if items.len() == 3));
+
+    assert_eq!(
+        parse_one("let values : [Real] = [1, 2, 3,]"),
+        "let values : [Real] = [1, 2, 3]"
+    );
+}
+
+#[test]
+fn array_patterns_get_a_focused_diagnostic() {
+    let out = parse(lex("let [first] = values", FileID::GENERATED).tokens);
+    let [error] = out.errors.as_slice() else {
+        panic!("expected one focused error: {:#?}", out.errors);
+    };
+    assert_eq!(error.kind, ErrorKind::ArrayPattern);
+    assert_eq!(error.span.start, 4);
+}
+
+#[test]
 fn parses_numeric_projection_canonically() {
     let out = parse(lex("let value = pair.001", FileID::GENERATED).tokens);
     assert!(out.errors.is_empty(), "errors: {:#?}", out.errors);

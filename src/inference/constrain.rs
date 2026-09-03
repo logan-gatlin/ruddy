@@ -783,6 +783,13 @@ impl Constrain<'_> {
                     rest: Rest::Closed,
                 }))
             }
+            TermKind::Array(elements) => {
+                let element = self.table.fresh_type_for(Subject::Term);
+                for value in elements {
+                    self.check_term(value, &element, Subject::Context, None);
+                }
+                Rc::new(Ty::Array(element))
+            }
             // A tag is one case of a sum, and which sum is not for the literal
             // to say — so the type it gets names that case and leaves the tail
             // open. That is the whole of what makes a sum row-polymorphic, and
@@ -1494,6 +1501,12 @@ impl Constrain<'_> {
                 let provenance = super::EffectProvenance::from_fields(provenance_fields);
                 if provenance != super::EffectProvenance::default() {
                     self.term_effect_provenance.insert(term.span, provenance);
+                }
+                term.ty = expected.clone();
+            }
+            (TermKind::Array(elements), Ty::Array(element)) => {
+                for value in elements {
+                    self.check_term(value, element, expected_subject, expected_span);
                 }
                 term.ty = expected.clone();
             }

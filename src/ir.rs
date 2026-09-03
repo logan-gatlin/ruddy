@@ -203,6 +203,10 @@ pub struct Param {
 #[derive(Debug, Clone)]
 pub struct Extern {
     pub target: TrackedString,
+    /// This declaration matched one exact compiler-reserved array intrinsic
+    /// signature during lowering. Source-controlled names and targets alone
+    /// are not authority to bypass ordinary host-boundary checks.
+    pub array_intrinsic: bool,
     /// The resolved foreign boundary spelling. This is kept separately from
     /// the annotation's ordinary curried type so lowering can distinguish one
     /// n-ary host call from a chain of Ruddy calls without resolving names (or
@@ -339,6 +343,8 @@ pub enum TermKind {
         body: Box<Term>,
     },
     Struct(IndexMap<String, Field<Term>>),
+    /// An immutable homogeneous array literal.
+    Array(Vec<Term>),
     /// `#Some 1` — one case of a sum, with what it carries.
     ///
     /// The name stays a string for the reason [`Field`]'s keys do: it is a
@@ -569,6 +575,8 @@ pub type Type = Tracked<TypeKind>;
 
 #[derive(Debug, Clone)]
 pub enum TypeKind {
+    /// The type of an immutable homogeneous array.
+    Array(Box<Type>),
     Struct {
         fields: IndexMap<String, TypeField>,
         /// The `..` tail, when the struct type was written open. Inside a
@@ -855,6 +863,7 @@ fn presence_polarities(
                         work.push(Work::Ty(to, positive, result_owner));
                         work.push(Work::Ty(from, !positive, owner));
                     }
+                    TypeKind::Array(element) => work.push(Work::Ty(element, positive, owner)),
                     TypeKind::Struct { fields, .. } => {
                         for field in fields.values().rev() {
                             if let TypeField::Written { when, value, .. } = field {
@@ -951,6 +960,7 @@ fn declaration_variances(
                             *out.entry((*owner, *index)).or_default() |= bit;
                         }
                     }
+                    TypeKind::Array(element) => work.push((element, positive)),
                     TypeKind::Struct { fields, tail } => {
                         work.extend(fields.values().filter_map(|field| match field {
                             TypeField::Written { value, .. } => Some((value, positive)),
@@ -1035,6 +1045,7 @@ fn declaration_variances(
                                 work.push(Semantic::Row(effects, positive));
                             }
                             Ty::Package(body) => work.push(Semantic::Ty(body, positive)),
+                            Ty::Array(element) => work.push(Semantic::Ty(element, positive)),
                             Ty::Struct(row) | Ty::Sum(row) => {
                                 work.push(Semantic::Row(row, positive))
                             }
@@ -1210,6 +1221,9 @@ pub struct Error {
 
 #[derive(Debug, Clone)]
 pub enum ErrorKind {
+    /// Arrays have a private persistent representation and cannot cross a
+    /// user-authored host boundary in this release.
+    ArrayInExtern,
     /// A dependency alias cannot be written as a source path component.
     InvalidDependencyAlias {
         alias: String,
@@ -2692,6 +2706,16 @@ fn build_with_dependency_imports_inner(
                 let (module, name, annotation, abi, target) = flat.externs[at].clone();
                 b.module = module;
                 let annotation = b.written(annotation, Place::Annotation);
+                let runtime_array_primitive = array_intrinsic_signature(
+                    target.tracked.as_str(),
+                    &annotation.ty,
+                    &program.types,
+                );
+                if !runtime_array_primitive
+                    && type_contains_array(&annotation.ty, &program.types, &program.external_types)
+                {
+                    b.error(annotation.ty.span, ErrorKind::ArrayInExtern);
+                }
                 // Resolve the ABI against the annotation we just lowered. Its
                 // leaves are clones of the same parsed types, so lowering them
                 // independently would duplicate diagnostics and, more subtly,
@@ -2704,7 +2728,11 @@ fn build_with_dependency_imports_inner(
                             name_span: name.span,
                             annotation: Some(annotation),
                             params: Vec::new(),
-                            value: Extern { target, abi },
+                            value: Extern {
+                                target,
+                                abi,
+                                array_intrinsic: runtime_array_primitive,
+                            },
                         },
                     );
                 }
@@ -2906,10 +2934,227 @@ fn build_with_dependency_imports_inner(
     }
 }
 
+/// The only array-bearing host signatures accepted by lowering. This runs
+/// after name resolution, so primitive and structural identities—not
+/// shadowable source spellings—decide whether the declaration is intrinsic.
+fn array_intrinsic_signature(
+    target: &str,
+    root: &Type,
+    declarations: &IndexMap<Symbol, Decl<Type>>,
+) -> bool {
+    fn arrow(ty: &Type) -> Option<(&Type, &Type)> {
+        match &ty.tracked {
+            TypeKind::Arrow { from, to, effects }
+                if effects.effects.is_empty() && effects.tail.is_none() =>
+            {
+                Some((from, to))
+            }
+            _ => None,
+        }
+    }
+
+    fn variable(ty: &Type) -> Option<&str> {
+        match &ty.tracked {
+            TypeKind::Var(name) => Some(name.as_str()),
+            _ => None,
+        }
+    }
+
+    fn array_variable(ty: &Type) -> Option<&str> {
+        match &ty.tracked {
+            TypeKind::Array(element) => variable(element),
+            _ => None,
+        }
+    }
+
+    fn natural(ty: &Type) -> bool {
+        matches!(ty.tracked, TypeKind::Prim(crate::types::Prim::Nat))
+    }
+
+    fn option<'a>(ty: &'a Type, declarations: &IndexMap<Symbol, Decl<Type>>) -> Option<&'a Type> {
+        let TypeKind::Apply { head, args, .. } = &ty.tracked else {
+            return None;
+        };
+        let declaration = declarations.get(head)?;
+        let TypeKind::Sum { cases, tail: None } = &declaration.value.tracked else {
+            return None;
+        };
+        let some = cases.get("Some")?;
+        let none = cases.get("None")?;
+        let option_shape = declaration.params.len() == 1
+            && cases.len() == 2
+            && matches!(
+                some,
+                SumCase::Written {
+                    when: None,
+                    payload: Some(payload),
+                    ..
+                } if matches!(payload.tracked, TypeKind::Param { index: 0, .. })
+            )
+            && matches!(
+                none,
+                SumCase::Written {
+                    when: None,
+                    payload: None,
+                    ..
+                }
+            );
+        (args.len() == 1 && option_shape).then(|| &args[0])
+    }
+
+    let Some((array, rest)) = arrow(root) else {
+        return false;
+    };
+    let Some(element) = array_variable(array) else {
+        return false;
+    };
+    match target {
+        "$arrayLen" => natural(rest),
+        "$arrayGet" => {
+            let Some((index, result)) = arrow(rest) else {
+                return false;
+            };
+            natural(index) && option(result, declarations).and_then(variable) == Some(element)
+        }
+        "$arraySet" => {
+            let Some((index, rest)) = arrow(rest) else {
+                return false;
+            };
+            let Some((value, result)) = arrow(rest) else {
+                return false;
+            };
+            natural(index)
+                && variable(value) == Some(element)
+                && option(result, declarations).and_then(array_variable) == Some(element)
+        }
+        "$arrayPush" => {
+            let Some((value, result)) = arrow(rest) else {
+                return false;
+            };
+            variable(value) == Some(element) && array_variable(result) == Some(element)
+        }
+        _ => false,
+    }
+}
+
+fn type_contains_array(
+    root: &Type,
+    declarations: &IndexMap<Symbol, Decl<Type>>,
+    external: &IndexMap<Symbol, ExternalType>,
+) -> bool {
+    enum Work<'a> {
+        Ir(&'a Type),
+        Semantic(Rc<Ty>),
+        SemanticRow(Rc<crate::types::Row>),
+    }
+
+    fn push_alias<'a>(
+        symbol: Symbol,
+        declarations: &'a IndexMap<Symbol, Decl<Type>>,
+        external: &IndexMap<Symbol, ExternalType>,
+        expanded: &mut HashSet<Symbol>,
+        work: &mut Vec<Work<'a>>,
+    ) {
+        if !expanded.insert(symbol) {
+            return;
+        }
+        if let Some(declaration) = declarations.get(&symbol) {
+            work.push(Work::Ir(&declaration.value));
+        } else if let Some(declaration) = external.get(&symbol) {
+            work.push(Work::Semantic(declaration.scheme.body().clone()));
+        }
+    }
+
+    let mut work = vec![Work::Ir(root)];
+    let mut expanded = HashSet::new();
+    let mut expanded_rows = HashSet::new();
+    // Rows cloned out of by-value semantic constructors need to stay alive:
+    // otherwise the allocator may reuse an address and make the cycle guard
+    // mistake a later sibling for a row it has already visited.
+    let mut visited_rows = Vec::new();
+    while let Some(part) = work.pop() {
+        match part {
+            Work::Ir(ty) => match &ty.tracked {
+                TypeKind::Array(_) => return true,
+                TypeKind::Arrow { from, to, .. } => {
+                    work.push(Work::Ir(to));
+                    work.push(Work::Ir(from));
+                }
+                TypeKind::Apply { head, args, .. } => {
+                    work.extend(args.iter().map(Work::Ir));
+                    push_alias(*head, declarations, external, &mut expanded, &mut work);
+                }
+                TypeKind::Ident(symbol) => {
+                    push_alias(*symbol, declarations, external, &mut expanded, &mut work);
+                }
+                TypeKind::Struct { fields, .. } => {
+                    work.extend(fields.values().filter_map(|field| match field {
+                        TypeField::Written { value, .. } => Some(Work::Ir(value)),
+                        TypeField::Absent { .. } => None,
+                    }));
+                }
+                TypeKind::Sum { cases, .. } => {
+                    work.extend(cases.values().filter_map(|case| match case {
+                        SumCase::Written { payload, .. } => payload.as_ref().map(Work::Ir),
+                        SumCase::Absent { .. } => None,
+                    }));
+                }
+                TypeKind::Param { .. }
+                | TypeKind::Prim(_)
+                | TypeKind::Effects(_)
+                | TypeKind::Var(_)
+                | TypeKind::Hole
+                | TypeKind::Error => {}
+            },
+            Work::Semantic(ty) => match &*ty {
+                Ty::Array(_) => return true,
+                Ty::Arrow(from, to, effects) => {
+                    work.push(Work::SemanticRow(Rc::new(effects.clone())));
+                    work.push(Work::Semantic(to.clone()));
+                    work.push(Work::Semantic(from.clone()));
+                }
+                Ty::Package(body) => work.push(Work::Semantic(body.clone())),
+                Ty::Struct(row) | Ty::Sum(row) => {
+                    work.push(Work::SemanticRow(Rc::new(row.clone())))
+                }
+                Ty::Named { symbol, args, .. } => {
+                    work.extend(args.iter().cloned().map(Work::Semantic));
+                    push_alias(*symbol, declarations, external, &mut expanded, &mut work);
+                }
+                Ty::Nat
+                | Ty::Int
+                | Ty::Real
+                | Ty::String
+                | Ty::Boolean
+                | Ty::Var(_)
+                | Ty::Bound(_)
+                | Ty::Rigid { .. }
+                | Ty::Undecided => {}
+            },
+            Work::SemanticRow(row) => {
+                if !expanded_rows.insert(Rc::as_ptr(&row) as usize) {
+                    continue;
+                }
+                visited_rows.push(row.clone());
+                work.extend(
+                    row.labels
+                        .values()
+                        .map(|field| Work::Semantic(field.ty.clone())),
+                );
+                if let Rest::More(more) = &row.rest {
+                    work.push(Work::SemanticRow(more.clone()));
+                }
+            }
+        }
+    }
+    false
+}
+
 fn dependency_path(dependency: &artifact::Artifact, qualified: &str) -> Option<Vec<String>> {
     let prefix = format!(
         "{}@{}::",
-        dependency.header().identity.name, dependency.header().identity.version
+        dependency.header().identity.name,
+        dependency.header().identity.version
     );
     let path = qualified.strip_prefix(&prefix)?;
     let parts: Vec<String> = path.split("::").map(str::to_owned).collect();
@@ -2980,6 +3225,7 @@ fn clamp_bounds(ty: Rc<Ty>, count: usize, presences: usize) -> Rc<Ty> {
         Row(&'a crate::types::Row),
         Arrow,
         Package,
+        Array,
         Struct,
         Sum,
         Named {
@@ -3020,6 +3266,10 @@ fn clamp_bounds(ty: Rc<Ty>, count: usize, presences: usize) -> Rc<Ty> {
                 Ty::Package(body) => {
                     work.push(Work::Package);
                     work.push(Work::Ty(body));
+                }
+                Ty::Array(element) => {
+                    work.push(Work::Array);
+                    work.push(Work::Ty(element));
                 }
                 Ty::Struct(fields) => {
                     work.push(Work::Struct);
@@ -3080,6 +3330,10 @@ fn clamp_bounds(ty: Rc<Ty>, count: usize, presences: usize) -> Rc<Ty> {
             Work::Package => {
                 let body = types.pop().expect("package postorder stays balanced");
                 types.push(Rc::new(Ty::Package(body)));
+            }
+            Work::Array => {
+                let element = types.pop().expect("array postorder stays balanced");
+                types.push(Rc::new(Ty::Array(element)));
             }
             Work::Struct => {
                 let fields = rows.pop().expect("row postorder stays balanced");
@@ -3168,6 +3422,7 @@ fn drop_type_iterative(root: Rc<Ty>) {
                         row(effects, &mut work);
                     }
                     Ty::Package(body) => work.push(Work::Ty(body.clone())),
+                    Ty::Array(element) => work.push(Work::Ty(element.clone())),
                     Ty::Struct(fields) | Ty::Sum(fields) => row(fields, &mut work),
                     Ty::Named { args, .. } => {
                         work.extend(args.iter().cloned().map(Work::Ty));
@@ -3313,6 +3568,7 @@ fn import_type(
         Row(&'a artifact::Row, bool),
         Arrow,
         Package,
+        Array,
         Struct,
         Sum,
         Named {
@@ -3347,6 +3603,10 @@ fn import_type(
                 artifact::Type::Package(body) => {
                     work.push(Work::Package);
                     work.push(Work::Ty(body, is_effect_row));
+                }
+                artifact::Type::Array(element) => {
+                    work.push(Work::Array);
+                    work.push(Work::Ty(element, false));
                 }
                 artifact::Type::Struct(fields) => {
                     work.push(Work::Struct);
@@ -3387,6 +3647,10 @@ fn import_type(
             Work::Package => {
                 let body = types.pop().expect("package postorder stays balanced");
                 types.push(Rc::new(Ty::Package(body)));
+            }
+            Work::Array => {
+                let element = types.pop().expect("array postorder stays balanced");
+                types.push(Rc::new(Ty::Array(element)));
             }
             Work::Struct => {
                 let fields = rows.pop().expect("row postorder stays balanced");
@@ -3975,6 +4239,10 @@ impl RegularType<'_> {
                     values.push(self.with_fields(core, fields));
                 }
                 Work::Type(ty, args) => match &ty.tracked {
+                    TypeKind::Array(element) => {
+                        work.push(Work::Make("array".into(), vec!["element".into()]));
+                        work.push(Work::Type(element, args));
+                    }
                     TypeKind::Struct { fields, tail } => {
                         let labels = fields
                             .iter()
@@ -4238,6 +4506,15 @@ impl RegularType<'_> {
                     Ty::Var(_) | Ty::Rigid { .. } | Ty::Undecided => values.push(self.atom("?")),
                     Ty::Package(body) => {
                         work.push(Work::Type(body, args, supplied_as_effects, instantiation));
+                    }
+                    Ty::Array(element) => {
+                        work.push(Work::Make("array".into(), vec!["element".into()]));
+                        work.push(Work::Type(
+                            element,
+                            args,
+                            supplied_as_effects,
+                            instantiation,
+                        ));
                     }
                     Ty::Arrow(from, to, effects) => {
                         work.push(Work::Make(
@@ -4751,6 +5028,7 @@ fn type_effect_dependencies<'a>(
     let mut dependencies = Vec::new();
     while let Some(ty) = pending.pop() {
         match &ty.tracked {
+            TypeKind::Array(element) => pending.push(element),
             TypeKind::Struct { fields, .. } => {
                 pending.extend(fields.values().rev().filter_map(|field| match field {
                     TypeField::Written { value, .. } => Some(value),
@@ -5086,6 +5364,7 @@ fn rekey_type(ty: &mut Type, ids: &IndexMap<Symbol, EffectId>, errors: &mut Vec<
                 rekey_type(arg, ids, errors);
             }
         }
+        TypeKind::Array(element) => rekey_type(element, ids, errors),
         TypeKind::Effects(effects) => rekey_row(effects, ids, errors),
         TypeKind::Ident(_)
         | TypeKind::Param { .. }
@@ -5130,6 +5409,11 @@ fn rekey_term(
         TermKind::Struct(fields) => {
             for field in fields.values_mut() {
                 rekey_term(&mut field.value, ids, operations, errors);
+            }
+        }
+        TermKind::Array(elements) => {
+            for element in elements {
+                rekey_term(element, ids, operations, errors);
             }
         }
         TermKind::Tag {
@@ -5421,6 +5705,7 @@ impl<'a> Follow<'a> {
                         });
                     }
                     TypeKind::Struct { .. }
+                    | TypeKind::Array(_)
                     | TypeKind::Sum { .. }
                     | TypeKind::Arrow { .. }
                     | TypeKind::Effects(_)
@@ -5494,6 +5779,7 @@ impl<'a> Follow<'a> {
                     | Ty::String
                     | Ty::Boolean
                     | Ty::Arrow(..)
+                    | Ty::Array(_)
                     | Ty::Sum(_)
                     | Ty::Var(_)
                     | Ty::Rigid { .. }
@@ -5631,6 +5917,11 @@ fn erase_circular(term: &mut Term, looping: &IndexSet<Symbol>, out: &mut Vec<Spa
                 erase_circular(&mut field.value, looping, out);
             }
         }
+        TermKind::Array(elements) => {
+            for element in elements {
+                erase_circular(element, looping, out);
+            }
+        }
         TermKind::Tag { payload, .. } => {
             if let Some(payload) = payload {
                 erase_circular(payload, looping, out);
@@ -5690,6 +5981,11 @@ fn nested<'a>(term: &'a Term, out: &mut HashMap<Symbol, &'a Term>) {
         TermKind::Struct(fields) => {
             for field in fields.values() {
                 nested(&field.value, out);
+            }
+        }
+        TermKind::Array(elements) => {
+            for element in elements {
+                nested(element, out);
             }
         }
         TermKind::Tag { payload, .. } => {
@@ -5779,6 +6075,7 @@ impl Chain<'_> {
             | TermKind::Apply { .. }
             | TermKind::Fn { .. }
             | TermKind::Struct(_)
+            | TermKind::Array(_)
             | TermKind::Tag { .. }
             | TermKind::Project { .. }
             | TermKind::Match { .. }
@@ -6407,6 +6704,11 @@ fn references(term: &Term, out: &mut Vec<Symbol>) {
                 references(&field.value, out);
             }
         }
+        TermKind::Array(elements) => {
+            for element in elements {
+                references(element, out);
+            }
+        }
         TermKind::Tag { payload, .. } => {
             if let Some(payload) = payload {
                 references(payload, out);
@@ -6664,6 +6966,7 @@ fn constrain(
                 lacks: IndexSet::new(),
             },
         )),
+        TypeKind::Array(element) => constrain(element, summaries, out),
         TypeKind::Struct { fields, tail } => {
             for field in fields.values() {
                 if let Some(value) = field.value() {
@@ -6860,6 +7163,7 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
                 walk(from, kinds, carries, rows, out);
                 walk(to, kinds, carries, rows, out);
             }
+            TypeKind::Array(element) => walk(element, kinds, carries, rows, out),
             // A row holds labels and a tail, and neither is a type: there is
             // nothing inside one for an argument to be written at.
             TypeKind::Effects(_) => {}
@@ -7005,6 +7309,11 @@ fn annotations(term: &mut Term, out: &mut impl FnMut(&mut Type)) {
                 annotations(&mut field.value, out);
             }
         }
+        TermKind::Array(elements) => {
+            for element in elements {
+                annotations(element, out);
+            }
+        }
         TermKind::Tag { payload, .. } => {
             if let Some(payload) = payload {
                 annotations(payload, out);
@@ -7078,7 +7387,11 @@ fn row_shaped(
                             .is_some_and(|argument| outer(argument, rows, shape, summaries))
                     })
             }
-            TypeKind::Arrow { .. } | TypeKind::Prim(_) | TypeKind::Var(_) | TypeKind::Hole => false,
+            TypeKind::Array(_)
+            | TypeKind::Arrow { .. }
+            | TypeKind::Prim(_)
+            | TypeKind::Var(_)
+            | TypeKind::Hole => false,
         }
     }
 
@@ -7265,6 +7578,7 @@ fn row_summaries(
                     | Ty::String
                     | Ty::Boolean
                     | Ty::Arrow(..)
+                    | Ty::Array(_)
                     | Ty::Struct(_)
                     | Ty::Sum(_)
                     | Ty::Var(_)
@@ -7302,6 +7616,7 @@ fn row_summaries(
                         work.push(Work::Named(*head));
                     }
                     TypeKind::Struct { .. }
+                    | TypeKind::Array(_)
                     | TypeKind::Sum { .. }
                     | TypeKind::Arrow { .. }
                     | TypeKind::Effects(_)
@@ -7461,6 +7776,7 @@ fn row_summary(ty: &Type, decls: &HashMap<Symbol, RowSummary>, shape: Shape) -> 
             out
         }
         TypeKind::Struct { .. }
+        | TypeKind::Array(_)
         | TypeKind::Sum { .. }
         | TypeKind::Arrow { .. }
         | TypeKind::Effects(_)
@@ -7592,6 +7908,7 @@ fn relevance(types: &IndexMap<Symbol, Decl<Type>>) -> HashSet<Slot> {
     fn occurrences(ty: &Type, under: &mut Vec<Slot>, out: &mut impl FnMut(u32, &[Slot])) {
         match &ty.tracked {
             TypeKind::Param { index, .. } => out(*index, under),
+            TypeKind::Array(element) => occurrences(element, under, out),
             TypeKind::Struct { fields, tail } => {
                 for field in fields.values() {
                     if let Some(value) = field.value() {
@@ -7699,6 +8016,7 @@ fn relevance(types: &IndexMap<Symbol, Decl<Type>>) -> HashSet<Slot> {
 fn mentioned(ty: &Type, out: &mut Vec<Symbol>) {
     match &ty.tracked {
         TypeKind::Ident(symbol) => out.push(*symbol),
+        TypeKind::Array(element) => mentioned(element, out),
         TypeKind::Apply { head, args, .. } => {
             out.push(*head);
             for arg in args {
@@ -7762,6 +8080,7 @@ fn grows(ty: &Type, group: &[Symbol], report: &mut impl FnMut(Span)) {
         // something, the arity check has already spoken and this would be a
         // second complaint about one mistake.
         TypeKind::Ident(_) => {}
+        TypeKind::Array(element) => grows(element, group, report),
         TypeKind::Apply {
             head,
             head_span,
@@ -7817,6 +8136,7 @@ fn grows(ty: &Type, group: &[Symbol], report: &mut impl FnMut(Span)) {
 fn mentions_a_parameter(ty: &Type) -> bool {
     match &ty.tracked {
         TypeKind::Param { .. } => true,
+        TypeKind::Array(element) => mentions_a_parameter(element),
         TypeKind::Apply { args, .. } => args.iter().any(mentions_a_parameter),
         TypeKind::Arrow { from, to, effects } => {
             tails_a_parameter(&effects.tail)
@@ -9438,6 +9758,13 @@ impl Builder<'_> {
             ExprKind::Struct(fields) => {
                 TermKind::Struct(self.fields(fields, |b, value| b.term(value))).with_span(span)
             }
+            ExprKind::Array(elements) => TermKind::Array(
+                elements
+                    .into_iter()
+                    .map(|element| self.term(element))
+                    .collect(),
+            )
+            .with_span(span),
             // Tuples are positional structs at the IR boundary. Decimal keys
             // are canonical and zero-based; the element's own span stands in
             // for the generated field name, since no label was written.
@@ -9788,6 +10115,10 @@ impl Builder<'_> {
                 }
             },
             parse::TypeKind::Apply { head, args } => self.apply(span, *head, args, place),
+            parse::TypeKind::Array(element) => {
+                let element = self.ty(*element, place);
+                span.track(TypeKind::Array(Box::new(element)))
+            }
             // A tuple type is a closed struct with unconditional, zero-based
             // decimal fields. As with tuple terms, an element's span is the
             // best source location for its generated label.

@@ -63,6 +63,40 @@ fn built(src: &str) -> (Mint, Output) {
     (mint, out)
 }
 
+#[test]
+fn arrays_are_rejected_at_user_extern_boundaries_even_through_aliases() {
+    let (_, direct) = build_src("extern values : [Nat] = \"host.values\"");
+    assert!(
+        matches!(direct.errors.as_slice(), [error] if matches!(error.kind, ErrorKind::ArrayInExtern))
+    );
+
+    let (_, aliased) = build_src("type Numbers = [Nat]\nextern values : Numbers = \"host.values\"");
+    assert!(
+        matches!(aliased.errors.as_slice(), [error] if matches!(error.kind, ErrorKind::ArrayInExtern))
+    );
+
+    let parsed = parse::parse(
+        lex(
+            "extern fake : [Nat] -> Nat = \"$arrayLen\"",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    let mut mint = Mint::new(Bundle::new("std", Version::new(0, 0, 0)).unwrap());
+    let malformed_intrinsic = build(&mut mint, parsed.stmts);
+    assert!(matches!(
+        malformed_intrinsic.errors.as_slice(),
+        [error] if matches!(error.kind, ErrorKind::ArrayInExtern)
+    ));
+
+    let (_, shadowed) =
+        build_src("type Option 'a = Nat\nextern fake : ['a] -> Nat -> Option 'a = \"$arrayGet\"");
+    assert!(matches!(
+        shadowed.errors.as_slice(),
+        [error] if matches!(error.kind, ErrorKind::ArrayInExtern)
+    ));
+}
+
 /// Surface conditionals deliberately disappear at the IR boundary. The
 /// existing match node receives true and false arms in source order, and an
 /// else-if is another match in the outer false body.
@@ -3081,6 +3115,11 @@ fn references_of(term: &Term, out: &mut Vec<Symbol>) {
         TermKind::Struct(fields) => {
             for field in fields.values() {
                 references_of(&field.value, out);
+            }
+        }
+        TermKind::Array(elements) => {
+            for element in elements {
+                references_of(element, out);
             }
         }
         TermKind::Tag { payload, .. } => {

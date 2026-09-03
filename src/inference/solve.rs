@@ -809,6 +809,7 @@ impl Solve<'_> {
             Type(Rc<Ty>),
             Arrow(*const Ty, Rc<Ty>),
             Package(*const Ty, Rc<Ty>),
+            Array(*const Ty, Rc<Ty>),
             Struct(*const Ty, Rc<Ty>),
             Sum(*const Ty, Rc<Ty>),
             Named(*const Ty, Rc<Ty>, Symbol, usize),
@@ -896,6 +897,11 @@ impl Solve<'_> {
                                     work.push(FingerprintWork::Type(body.clone()));
                                     continue;
                                 }
+                                Ty::Array(element) => {
+                                    work.push(FingerprintWork::Array(key, ty.clone()));
+                                    work.push(FingerprintWork::Type(element.clone()));
+                                    continue;
+                                }
                                 Ty::Struct(row) => {
                                     work.push(FingerprintWork::Struct(key, ty.clone()));
                                     work.push(FingerprintWork::Row(row.clone()));
@@ -933,6 +939,12 @@ impl Solve<'_> {
                         FingerprintWork::Package(key, ty) => {
                             let body = values.pop().expect("family package fingerprint body");
                             let hash = tagged(12, [body]);
+                            self.types.insert(key, (ty, hash));
+                            values.push(hash);
+                        }
+                        FingerprintWork::Array(key, ty) => {
+                            let element = values.pop().expect("family array fingerprint element");
+                            let hash = tagged(14, [element]);
                             self.types.insert(key, (ty, hash));
                             values.push(hash);
                         }
@@ -1804,6 +1816,10 @@ impl Solve<'_> {
                             work.push(SolveWork::Ty(to.clone(), result.clone(), depth + 1));
                             work.push(SolveWork::Ty(from.clone(), other.clone(), depth + 1));
                         }
+                        (Ty::Array(element), Ty::Array(other)) => {
+                            self.step(span, Rule::Array, goal, Effect::Decomposed);
+                            work.push(SolveWork::Ty(element.clone(), other.clone(), depth + 1));
+                        }
                         (Ty::Struct(fields), Ty::Struct(others))
                             if fields.labels.is_empty()
                                 && others.labels.is_empty()
@@ -2089,6 +2105,7 @@ impl Solve<'_> {
                             work.push(Work::Ty(from.clone()));
                         }
                         Ty::Package(body) => work.push(Work::Ty(body.clone())),
+                        Ty::Array(element) => work.push(Work::Ty(element.clone())),
                         Ty::Struct(row) | Ty::Sum(row) => {
                             work.push(Work::Row(row.clone()));
                         }
@@ -3334,6 +3351,7 @@ impl Solve<'_> {
                         work.push(Work::Type(from.clone()));
                     }
                     Ty::Package(body) => work.push(Work::Type(body.clone())),
+                    Ty::Array(element) => work.push(Work::Type(element.clone())),
                     Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(Rc::new(row.clone()))),
                     Ty::Named { args, .. } => {
                         work.extend(args.iter().rev().cloned().map(Work::Type));

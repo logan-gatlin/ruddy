@@ -37,6 +37,7 @@ impl Grouped for Ast<'_, TypeKind> {
             TypeKind::Apply { .. } => Prec::Apply,
             TypeKind::Struct { .. }
             | TypeKind::Tuple(_)
+            | TypeKind::Array(_)
             | TypeKind::Ident { .. }
             | TypeKind::Variable { .. }
             | TypeKind::Hole
@@ -97,6 +98,7 @@ impl Grouped for Ast<'_, ExprKind> {
             | ExprKind::Operation { .. }
             | ExprKind::Struct(_)
             | ExprKind::Tuple(_)
+            | ExprKind::Array(_)
             | ExprKind::Ident { .. }
             | ExprKind::Natural(_)
             | ExprKind::Integer(_)
@@ -401,6 +403,16 @@ impl fmt::Display for Ast<'_, ExprKind> {
             ExprKind::Tuple(elements) => {
                 write_tuple(f, elements.iter().map(|element| Ast(&element.tracked)))
             }
+            ExprKind::Array(elements) => {
+                f.write_str("[")?;
+                for (index, element) in elements.iter().enumerate() {
+                    if index != 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{}", Ast(&element.tracked))?;
+                }
+                f.write_str("]")
+            }
             ExprKind::Project { base, field } => {
                 write_project(f, &Ast(&base.tracked), &field.tracked)
             }
@@ -608,6 +620,7 @@ impl fmt::Display for Ast<'_, TypeKind> {
             TypeKind::Tuple(elements) => {
                 write_tuple(f, elements.iter().map(|element| Ast(&element.tracked)))
             }
+            TypeKind::Array(element) => write!(f, "[{}]", Ast(&element.tracked)),
             TypeKind::Apply { head, args } => write_applied(
                 f,
                 Ast(&head.tracked),

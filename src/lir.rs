@@ -185,6 +185,8 @@ pub enum Op {
     },
     /// A struct literal. Empty is the unit value.
     Struct(IndexMap<FieldKey, Temp>),
+    /// An immutable persistent array literal.
+    Array(Vec<Temp>),
     /// One record carrying every field of each of these, laid over one another
     /// in order: a later one wins wherever two of them name the same field.
     ///
@@ -339,6 +341,7 @@ pub enum Rep {
     /// The value with nothing in it: the empty struct.
     Unit,
     Struct,
+    Array,
     Sum,
     /// A closure: a function paired with its captures.
     Fn,
@@ -1762,6 +1765,7 @@ impl Lower<'_> {
             Ty::String => Rep::String,
             Ty::Boolean => Rep::Boolean,
             Ty::Arrow(..) => Rep::Fn,
+            Ty::Array(_) => Rep::Array,
             Ty::Sum(_) => Rep::Sum,
             Ty::Struct(row) => {
                 let row = flat(row);
@@ -1834,6 +1838,14 @@ impl Lower<'_> {
             _ => None,
         };
         member.filter(|member| self.rep(member) != Rep::Any)
+    }
+
+    fn array_element(&self, ty: &Rc<Ty>) -> Option<Rc<Ty>> {
+        let ty = self.erased(ty);
+        match &*ty {
+            Ty::Array(element) => Some(element.clone()),
+            _ => None,
+        }
     }
 
     /// Whether a value whose evidence was built for `have` can be called where
@@ -2741,6 +2753,19 @@ impl Lower<'_> {
                     entries.insert(FieldKey::named(name.clone()), temp);
                 }
                 let temp = self.emit(body, span, rep, Op::Struct(entries));
+                self.contain(temp, &term.ty);
+                temp
+            }
+            TermKind::Array(elements) => {
+                let want = self.array_element(&term.ty);
+                let mut values = Vec::with_capacity(elements.len());
+                for element in elements {
+                    let temp = self.term(element, body);
+                    let target = want.clone().unwrap_or_else(|| element.ty.clone());
+                    let have = self.holding(temp, &element.ty);
+                    values.push(self.fitted(&target, &have, temp, body));
+                }
+                let temp = self.emit(body, span, Rep::Array, Op::Array(values));
                 self.contain(temp, &term.ty);
                 temp
             }
