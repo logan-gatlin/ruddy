@@ -32,7 +32,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     let (Some(program), Some(mint)) = (cx.program, cx.mint) else {
         return crate::stage::skipped(spec, "lowering did not run");
     };
-    let Some(output) = cx.inference else {
+    let Some(output) = cx.inference.map(|output| output.semantics()) else {
         return crate::stage::skipped(spec, "inference did not run");
     };
 
@@ -46,7 +46,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     //
     // Aliases first, then schemes: the order the program prints in, and the
     // order inference solved them in.
-    let aliases = output.aliases.iter().map(|(symbol, ty)| {
+    let aliases = output.aliases().iter().map(|(symbol, ty)| {
         (
             "type",
             *symbol,
@@ -54,7 +54,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             program.types.get(symbol).map(|decl| decl.name_span),
         )
     });
-    let externs = output.externs.iter().map(|(symbol, scheme)| {
+    let externs = output.externs().iter().map(|(symbol, scheme)| {
         (
             "extern",
             *symbol,
@@ -62,7 +62,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             program.externs.get(symbol).map(|decl| decl.name_span),
         )
     });
-    let schemes = output.schemes.iter().map(|(symbol, scheme)| {
+    let schemes = output.schemes().iter().map(|(symbol, scheme)| {
         (
             "let",
             *symbol,
@@ -70,7 +70,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             program.terms.get(symbol).map(|decl| decl.name_span),
         )
     });
-    let relevant = relevant_parameters(&output.aliases);
+    let relevant = relevant_parameters(output.aliases());
 
     let nodes: Vec<Node> = aliases
         .chain(externs)
@@ -103,7 +103,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             // it cannot show is whether the name it came back through leads
             // anywhere, which for a pair declared in terms of each other is
             // the whole question.
-            if let Some(loop_names) = loop_through(&output.aliases, &relevant, symbol) {
+            if let Some(loop_names) = loop_through(output.aliases(), &relevant, symbol) {
                 node = node.child(named_row(&mut ids, mint, loop_names));
             }
             // And a recursive definition says the same thing, off the groups
@@ -125,7 +125,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             // knows whose it is.
             if let Some(decl) = program.terms.get(&symbol) {
                 for local in locals(&decl.value) {
-                    let scheme = match output.locals.get(&local.tracked) {
+                    let scheme = match output.locals().get(&local.tracked) {
                         Some(scheme) => scheme.to_string(),
                         // Nothing was published for it, which means inference
                         // never reached it: the definition failed to lower, and
@@ -157,12 +157,12 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         debug: raw_types(output),
         ..spec.stage(
             cx.status(),
-            match output.externs.is_empty() {
-                true => plural(output.schemes.len(), "scheme"),
+            match output.externs().is_empty() {
+                true => plural(output.schemes().len(), "scheme"),
                 false => format!(
                     "{} · {}",
-                    plural(output.externs.len(), "extern"),
-                    plural(output.schemes.len(), "scheme")
+                    plural(output.externs().len(), "extern"),
+                    plural(output.schemes().len(), "scheme")
                 ),
             },
         )
@@ -172,12 +172,12 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
 /// The Types tab's raw view without derived `Debug` walking semantic trees on
 /// the native stack. Surface rendering is the useful part of a scheme here,
 /// and its formatter is iterative even for malformed, deeply nested imports.
-fn raw_types(output: &ruddy::inference::Output) -> String {
+fn raw_types(output: &ruddy::inference::Semantics) -> String {
     let mut out = String::new();
     for (title, schemes) in [
-        ("aliases", &output.aliases),
-        ("externs", &output.externs),
-        ("schemes", &output.schemes),
+        ("aliases", output.aliases()),
+        ("externs", output.externs()),
+        ("schemes", output.schemes()),
     ] {
         let _ = writeln!(out, "{title}:");
         for (symbol, scheme) in schemes {
@@ -570,7 +570,7 @@ pub fn annotate(spec: &Spec, cx: &Cx, trace: &Trace) -> Stage {
     let Some(program) = cx.program else {
         return crate::stage::skipped(spec, "lowering did not run");
     };
-    let Some(output) = cx.inference else {
+    let Some(output) = cx.inference.map(|output| output.semantics()) else {
         return crate::stage::skipped(spec, "inference did not run");
     };
 
@@ -579,15 +579,19 @@ pub fn annotate(spec: &Spec, cx: &Cx, trace: &Trace) -> Stage {
     let aliases = program
         .types
         .keys()
-        .map(|symbol| output.aliases.get(symbol).map(|ty| ty.to_string()));
-    let externs = program
-        .externs
-        .keys()
-        .map(|symbol| output.externs.get(symbol).map(|scheme| scheme.to_string()));
-    let schemes = program
-        .terms
-        .keys()
-        .map(|symbol| output.schemes.get(symbol).map(|scheme| scheme.to_string()));
+        .map(|symbol| output.aliases().get(symbol).map(|ty| ty.to_string()));
+    let externs = program.externs.keys().map(|symbol| {
+        output
+            .externs()
+            .get(symbol)
+            .map(|scheme| scheme.to_string())
+    });
+    let schemes = program.terms.keys().map(|symbol| {
+        output
+            .schemes()
+            .get(symbol)
+            .map(|scheme| scheme.to_string())
+    });
     let mut nodes: Vec<Node> = trace
         .decls
         .iter()

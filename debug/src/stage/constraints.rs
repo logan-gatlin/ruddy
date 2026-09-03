@@ -21,7 +21,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     let (Some(program), Some(mint)) = (cx.program, cx.mint) else {
         return crate::stage::skipped(spec, "lowering did not run");
     };
-    let Some(output) = cx.inference else {
+    let Some(output) = cx.inference.map(|output| output.diagnostics()) else {
         return crate::stage::skipped(spec, "inference did not run");
     };
 
@@ -32,7 +32,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     // One row per definition, in the order inference solved them, so a
     // definition that constrains nothing is still visible as the empty group
     // it is rather than missing from the tab.
-    for (symbol, constraints) in &output.constraints {
+    for (symbol, constraints) in output.constraints() {
         let asked = counted(constraints);
         total += asked;
         let mut node = Node::new(
@@ -53,7 +53,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     // chip would be the same microseconds counted twice.
     Stage {
         nodes,
-        debug: format!("{:#?}", output.constraints),
+        debug: format!("{:#?}", output.constraints()),
         ..spec.stage(cx.status(), plural(total, "constraint"))
     }
 }

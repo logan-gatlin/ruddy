@@ -318,7 +318,7 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     let inferred = built.as_mut().and_then(|built| {
         let started = Instant::now();
         let out = guard("types", &mut panicked, || {
-            inference::infer(&mint, &mut built.program)
+            inference::infer(&mint, &mut built.program, inference::Trace::Complete)
         });
         micros.infer = started.elapsed().as_micros() as u64;
         out
@@ -373,7 +373,7 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
         );
     }
     if let Some(inferred) = &inferred {
-        diagnostics.extend(inferred.errors.iter().map(|error| {
+        diagnostics.extend(inferred.errors().iter().map(|error| {
             let mut diagnostic = source_error("types", error.diagnostic(), &index);
             diagnostic.inference_error_id = Some(error.id.get());
             diagnostic.inference_cause = Some(match error.cause {
@@ -414,7 +414,7 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
         (Some(built), Some(inferred), Some(_), true) => {
             let started = Instant::now();
             let out = guard("lir", &mut panicked, || {
-                lir::lower(&mint, &built.program, inferred)
+                lir::lower(&mint, &built.program, inferred.semantics())
             });
             micros.lir = started.elapsed().as_micros() as u64;
             out
@@ -433,7 +433,7 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
                 artifact::build_with_dependencies(
                     &mint,
                     &built.program,
-                    inferred,
+                    inferred.semantics(),
                     lowered,
                     dependencies,
                 )

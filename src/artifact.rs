@@ -1588,7 +1588,7 @@ impl Drop for Op {
 pub fn build(
     mint: &Mint,
     program: &ir::Program,
-    inference: &inference::Output,
+    inference: &inference::Semantics,
     lir: &lir::Output,
 ) -> Artifact {
     build_with_dependencies(mint, program, inference, lir, Vec::new())
@@ -1598,7 +1598,7 @@ pub fn build(
 pub fn build_with_dependencies(
     mint: &Mint,
     program: &ir::Program,
-    inference: &inference::Output,
+    inference: &inference::Semantics,
     lir: &lir::Output,
     dependencies: Vec<Dependency>,
 ) -> Artifact {
@@ -1613,7 +1613,7 @@ pub fn build_with_dependencies(
             .keys()
             .map(|symbol| Value {
                 name: qualified(mint, *symbol),
-                scheme: scheme(mint, &inference.externs[symbol]),
+                scheme: scheme(mint, &inference.externs()[symbol]),
             })
             .chain(
                 program
@@ -1625,7 +1625,7 @@ pub fn build_with_dependencies(
                     .filter(|symbol| !mint.is_local(**symbol))
                     .map(|symbol| Value {
                         name: qualified(mint, *symbol),
-                        scheme: scheme(mint, &inference.schemes[symbol]),
+                        scheme: scheme(mint, &inference.schemes()[symbol]),
                     }),
             )
             .collect(),
@@ -1648,7 +1648,7 @@ pub fn build_with_dependencies(
                         relevant: param.relevant,
                     })
                     .collect(),
-                scheme: scheme(mint, &inference.aliases[symbol]),
+                scheme: scheme(mint, &inference.aliases()[symbol]),
             })
             .collect(),
         effects: program
@@ -1662,7 +1662,7 @@ pub fn build_with_dependencies(
                         operations
                             .iter()
                             .map(|(name, _)| {
-                                let (from, to) = &inference.operations[&(*symbol, name.clone())];
+                                let (from, to) = &inference.operations()[&(*symbol, name.clone())];
                                 Operation {
                                     selector: match name {
                                         ir::OperationSelector::Unnamed => {
@@ -1699,7 +1699,7 @@ impl Artifact {
     pub fn build(
         mint: &Mint,
         program: &ir::Program,
-        inference: &inference::Output,
+        inference: &inference::Semantics,
         lir: &lir::Output,
     ) -> Self {
         build(mint, program, inference, lir)
@@ -1774,6 +1774,13 @@ fn effect_id(id: &types::EffectId) -> EffectIdentity {
             panic!("artifact building requires structural effect identities")
         }
     }
+}
+
+/// Export one semantic scheme as portable artifact data, naming every declared
+/// type by its qualified name in `mint`. The same translation
+/// [`build_with_dependencies`] uses for every exported value.
+pub fn export_scheme(mint: &Mint, value: &types::Scheme) -> Scheme {
+    scheme(mint, value)
 }
 
 fn scheme(mint: &Mint, value: &types::Scheme) -> Scheme {

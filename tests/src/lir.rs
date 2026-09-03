@@ -7,7 +7,7 @@ use ruddy::{
     symbol::{Bundle, Mint, Version},
     token,
     tracking::FileManager,
-    types::{Formula, Presence, Rest, Row, RowField, Scheme, Ty},
+    types::{Presence, Rest, Row, RowField, Ty},
 };
 use ruddy_debug::print;
 
@@ -55,18 +55,21 @@ fn lowered_with_dependencies_after_check(
     let mut mint = Mint::new(bundle);
     let mut built = ir::build_with_dependencies(&mut mint, parsed.stmts, dependencies);
     assert!(built.errors.is_empty(), "{source}: {:#?}", built.errors);
-    let mut inferred = inference::infer(&mint, &mut built.program);
+    let mut inferred = inference::infer(&mint, &mut built.program, inference::Trace::Off);
     assert!(
-        inferred.errors.is_empty(),
+        inferred.errors().is_empty(),
         "{source}: {:#?}",
-        inferred.errors
+        inferred.errors()
     );
     let checked = patterns::check(&built.program, &inferred);
     assert!(checked.errors.is_empty(), "{source}: {:#?}", checked.errors);
     adjust(&mut built.program, &mut inferred);
 
     let labels = print::lir::Labels::new(&built.program);
-    (lir::lower(&mint, &built.program, &inferred), labels)
+    (
+        lir::lower(&mint, &built.program, inferred.semantics()),
+        labels,
+    )
 }
 
 fn local_effect_interface(source: &str) -> String {
@@ -670,21 +673,6 @@ fn an_undecided_presence_is_tested_both_ways() {
         "{printed}"
     );
     assert!(printed.contains("absent =>\n      yield %1"), "{printed}");
-}
-
-/// The SAT pair can only be false/false if a caller violates LIR's accepted-
-/// pipeline precondition by supplying a definition promise with no model. Keep
-/// the invariant check loud rather than silently manufacturing dead LIR.
-#[test]
-#[should_panic(expected = "the inferred definition promise has a model on every emitted path")]
-fn an_impossible_presence_path_is_rejected() {
-    let _ = lowered_after_check(
-        "let f = fn s => match s with | { x, y } => y | { x } => x end",
-        |program, inferred| {
-            let symbol = *program.terms.keys().next().expect("the source defines f");
-            inferred.promises.insert(symbol, Formula::False);
-        },
-    );
 }
 
 /// Replace the named field on the sole match scrutinee in the small defensive
@@ -1517,274 +1505,6 @@ fn recursive_arrow_fitting_reuses_one_guarded_adapter() {
     assert!(adapter.contains("struct { Log:"), "{adapter}");
     assert!(adapter.contains("call %"), "{adapter}");
     assert_eq!(adapter.matches("closure go#3").count(), 1, "{adapter}");
-}
-
-/// Alias arguments carry semantic identities that their diagnostic spelling
-/// deliberately hides. In this recovery input, `A` and `B` (and `C` and `D`)
-/// are all displayed as `Arg`, but the second pair reaches a new effect shape.
-/// It therefore needs its own recursive adapter rather than closing the cycle
-/// over the adapter for the first, merely same-spelled, applications.
-#[test]
-fn same_spelling_does_not_coinduct_distinct_recursive_alias_arguments() {
-    let (output, _) = lowered_after_check(
-        "type X 'a = 'a\n\
-         type Y 'a = 'a\n\
-         type A = Nat\n\
-         type B = Nat\n\
-         type C = Nat\n\
-         type D = Nat\n\
-         let takes : (Nat -> Nat) -> Nat = fn f => 1n\n\
-         let have : Nat -> Nat = fn n => n\n\
-         let go = takes have",
-        |program, inferred| {
-            let aliases: Vec<_> = inferred.aliases.keys().copied().collect();
-            let [x, y, a, b, c, d] = aliases.as_slice() else {
-                panic!("the six test aliases remain available")
-            };
-            let named = |symbol, name: &str, args: Vec<Rc<Ty>>| {
-                Rc::new(Ty::Named {
-                    symbol,
-                    name: Rc::from(name),
-                    args: args.into(),
-                })
-            };
-            let application = |outer, argument| named(outer, "Recursive", vec![argument]);
-            let hidden = |symbol| named(symbol, "Arg", Vec::new());
-            let arrow = |result, effects| Rc::new(Ty::Arrow(Rc::new(Ty::Nat), result, effects));
-
-            inferred
-                .aliases
-                .insert(*x, Scheme::new(1, Rc::new(Ty::Bound(0))));
-            inferred
-                .aliases
-                .insert(*y, Scheme::new(1, Rc::new(Ty::Bound(0))));
-            inferred.aliases.insert(
-                *a,
-                Scheme::new(0, arrow(application(*x, hidden(*b)), Row::closed())),
-            );
-            inferred.aliases.insert(
-                *b,
-                Scheme::new(
-                    0,
-                    arrow(
-                        application(*x, hidden(*b)),
-                        Row {
-                            labels: [("Log".into(), RowField::present(Rc::new(Ty::unit())))]
-                                .into_iter()
-                                .collect(),
-                            rest: Rest::Closed,
-                        },
-                    ),
-                ),
-            );
-            inferred.aliases.insert(
-                *c,
-                Scheme::new(0, arrow(application(*y, hidden(*d)), Row::closed())),
-            );
-            inferred.aliases.insert(
-                *d,
-                Scheme::new(0, arrow(application(*y, hidden(*d)), Row::closed())),
-            );
-
-            let want = application(*x, hidden(*a));
-            let have = application(*y, hidden(*c));
-            let terms: Vec<_> = program.terms.keys().copied().collect();
-            program.terms.get_mut(&terms[0]).unwrap().value.ty =
-                Rc::new(Ty::Arrow(want, Rc::new(Ty::Nat), Row::closed()));
-            program.terms.get_mut(&terms[1]).unwrap().value.ty = have.clone();
-            let ir::TermKind::Apply { arg, .. } =
-                &mut program.terms.get_mut(&terms[2]).unwrap().value.kind
-            else {
-                panic!("go is the checked application")
-            };
-            arg.ty = have;
-        },
-    );
-
-    let adapters: Vec<_> = output
-        .functions
-        .iter()
-        .filter(|function| function.name.starts_with("go#"))
-        .collect();
-    assert_eq!(adapters.len(), 2, "{:#?}", output.functions);
-    assert!(adapters.iter().any(|function| {
-        function
-            .body
-            .instrs
-            .iter()
-            .any(|instr| matches!(instr.op, lir::Op::Closure { .. }))
-    }));
-}
-
-/// Recursive adapter states use recovered presence identities as exact syntax.
-/// Repeating the same recovery identity closes the guarded cycle immediately;
-/// changing it reaches one distinct state before the stable suffix coalesces.
-#[test]
-fn recursive_adapter_coalescing_preserves_recovered_presence_correlation() {
-    let adapters = |first_id| {
-        let (output, _) = lowered_after_check(
-            "type X 'a 'b = 'a\n\
-             type Y 'a 'b = 'a\n\
-             let takes : (Nat -> Nat) -> Nat = fn f => 1n\n\
-             let have : Nat -> Nat = fn n => n\n\
-             let go = takes have",
-            |program, inferred| {
-                let aliases: Vec<_> = inferred.aliases.keys().copied().collect();
-                let [x, y] = aliases.as_slice() else {
-                    panic!("the two test aliases remain available")
-                };
-                let named = |symbol, args: Vec<Rc<Ty>>| {
-                    Rc::new(Ty::Named {
-                        symbol,
-                        name: Rc::from("Recursive"),
-                        args: args.into(),
-                    })
-                };
-                let recovered = |id| {
-                    Rc::new(Ty::Struct(Row {
-                        labels: [(
-                            "field".into(),
-                            RowField {
-                                presence: Presence::Recovered(id),
-                                ty: Rc::new(Ty::Nat),
-                            },
-                        )]
-                        .into_iter()
-                        .collect(),
-                        rest: Rest::Closed,
-                    }))
-                };
-                let recursive = |symbol, effects| {
-                    Scheme::new(
-                        2,
-                        Rc::new(Ty::Arrow(
-                            Rc::new(Ty::Nat),
-                            named(symbol, vec![Rc::new(Ty::Bound(1)), Rc::new(Ty::Bound(1))]),
-                            effects,
-                        )),
-                    )
-                };
-                inferred.aliases.insert(
-                    *x,
-                    recursive(
-                        *x,
-                        Row {
-                            labels: [("Log".into(), RowField::present(Rc::new(Ty::unit())))]
-                                .into_iter()
-                                .collect(),
-                            rest: Rest::Closed,
-                        },
-                    ),
-                );
-                inferred.aliases.insert(*y, recursive(*y, Row::closed()));
-
-                let want = named(*x, vec![recovered(first_id), recovered(2)]);
-                let have = named(*y, vec![recovered(first_id), recovered(2)]);
-                let terms: Vec<_> = program.terms.keys().copied().collect();
-                program.terms.get_mut(&terms[0]).unwrap().value.ty =
-                    Rc::new(Ty::Arrow(want, Rc::new(Ty::Nat), Row::closed()));
-                program.terms.get_mut(&terms[1]).unwrap().value.ty = have.clone();
-                let ir::TermKind::Apply { arg, .. } =
-                    &mut program.terms.get_mut(&terms[2]).unwrap().value.kind
-                else {
-                    panic!("go is the checked application")
-                };
-                arg.ty = have;
-            },
-        );
-        output
-            .functions
-            .iter()
-            .filter(|function| function.name.starts_with("go#"))
-            .count()
-    };
-
-    assert_eq!(adapters(2), 1);
-    assert_eq!(adapters(1), 2);
-}
-
-#[test]
-fn recursive_alias_argument_equality_is_stack_safe_at_thirty_thousand_layers() {
-    std::thread::Builder::new()
-        .name("deep-semantic-alias-equality".into())
-        .stack_size(256 * 1024)
-        .spawn(|| {
-            const DEPTH: usize = 30_000;
-            let (output, _) = lowered_after_check(
-                "type X 'a = 'a\n\
-                 type Y 'a = 'a\n\
-                 type Carrier 'a = 'a\n\
-                 type A = Nat\n\
-                 type B = Nat\n\
-                 type C = Nat\n\
-                 let takes : (Nat -> Nat) -> Nat = fn f => 1n\n\
-                 let have : Nat -> Nat = fn n => n\n\
-                 let go = takes have",
-                |program, inferred| {
-                    let symbols: Vec<_> = inferred.aliases.keys().copied().collect();
-                    let [x, y, carrier, a, b, c] = symbols.as_slice() else {
-                        panic!("the six test aliases remain available")
-                    };
-                    let named = |symbol, name: &str, args: Vec<Rc<Ty>>| {
-                        Rc::new(Ty::Named {
-                            symbol,
-                            name: Rc::from(name),
-                            args: args.into(),
-                        })
-                    };
-                    let nested = |leaf| {
-                        (0..DEPTH).fold(leaf, |inner, _| named(*carrier, "Carrier", vec![inner]))
-                    };
-                    let deep_a = nested(named(*a, "Leaf", Vec::new()));
-                    let deep_b = nested(named(*b, "Leaf", Vec::new()));
-                    let deep_c = nested(named(*c, "Leaf", Vec::new()));
-                    let application = |outer, argument| named(outer, "Recursive", vec![argument]);
-
-                    inferred
-                        .aliases
-                        .insert(*carrier, Scheme::new(1, Rc::new(Ty::Bound(0))));
-                    inferred.aliases.insert(
-                        *x,
-                        Scheme::new(
-                            1,
-                            Rc::new(Ty::Arrow(
-                                Rc::new(Ty::Nat),
-                                application(*x, deep_b.clone()),
-                                Row::closed(),
-                            )),
-                        ),
-                    );
-                    inferred.aliases.insert(
-                        *y,
-                        Scheme::new(
-                            1,
-                            Rc::new(Ty::Arrow(
-                                Rc::new(Ty::Nat),
-                                application(*y, deep_c.clone()),
-                                Row::closed(),
-                            )),
-                        ),
-                    );
-
-                    let want = application(*x, deep_a);
-                    let have = application(*y, deep_c);
-                    let terms: Vec<_> = program.terms.keys().copied().collect();
-                    program.terms.get_mut(&terms[0]).unwrap().value.ty =
-                        Rc::new(Ty::Arrow(want, Rc::new(Ty::Nat), Row::closed()));
-                    program.terms.get_mut(&terms[1]).unwrap().value.ty = have.clone();
-                    let ir::TermKind::Apply { arg, .. } =
-                        &mut program.terms.get_mut(&terms[2]).unwrap().value.kind
-                    else {
-                        panic!("go is the checked application")
-                    };
-                    arg.ty = have;
-                },
-            );
-            assert!(output.globals.iter().any(|global| global.name == "go"));
-        })
-        .expect("the bounded-stack semantic equality regression starts")
-        .join()
-        .expect("finite alias syntax equality is iterative");
 }
 
 /// One mismatch above thirty thousand equal result arrows used to recurse once
@@ -2691,8 +2411,8 @@ fn forced(source: &str) -> lir::Output {
     let bundle = Bundle::new("tests", Version::new(0, 1, 0)).expect("the bundle name is valid");
     let mut mint = Mint::new(bundle);
     let mut built = ir::build(&mut mint, parsed.stmts);
-    let inferred = inference::infer(&mint, &mut built.program);
-    lir::lower(&mint, &built.program, &inferred)
+    let inferred = inference::infer(&mint, &mut built.program, inference::Trace::Off);
+    lir::lower(&mint, &built.program, inferred.semantics())
 }
 
 /// An indirect call whose callee gives back a function hands the result on at

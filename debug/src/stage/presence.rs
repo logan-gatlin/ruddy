@@ -85,6 +85,8 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     let Some(output) = cx.inference else {
         return crate::stage::skipped(spec, "inference did not run");
     };
+    let semantics = output.semantics();
+    let diagnostics = output.diagnostics();
 
     let mut ids = Ids::default();
     let mut nodes: Vec<Node> = Vec::new();
@@ -99,7 +101,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     // is printed beside would blame each of them in turn for the one thing only
     // the first of them did.
     let mut flipped: Option<usize> = None;
-    for (at, batch) in output.store.batches.iter().enumerate() {
+    for (at, batch) in semantics.store().batches.iter().enumerate() {
         accumulated = accumulated.and(batch.formula.clone());
         if batch.flipped {
             flipped = Some(at);
@@ -156,7 +158,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     // conjoined) assumption, the boundary SAT verdict, entailed named facts,
     // and every implication structural solving emitted.
     let mut groups: Vec<(Span, Vec<&ruddy::inference::Refinement>)> = Vec::new();
-    for refinement in &output.refinements {
+    for refinement in diagnostics.refinements() {
         match groups
             .iter_mut()
             .find(|(span, _)| *span == refinement.match_span)
@@ -240,7 +242,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     // presence is the place to be able to see that a definition's presences are
     // independent, and a row saying so is a shorter answer than a reader
     // scanning the list for a name that is not there.
-    for (symbol, scheme) in &output.schemes {
+    for (symbol, scheme) in semantics.schemes() {
         let clause = match scheme.formula().is_true() {
             true => "unconstrained".to_string(),
             false => format!("where {}", scheme.formula()),
@@ -255,7 +257,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         // own: the scheme quantifies only what its own type mentions, and a
         // reader who saw only that could not explain a reachability verdict
         // that turned on a nested `let`'s constraint.
-        let promise = match output.promises.get(symbol) {
+        let promise = match semantics.promises().get(symbol) {
             Some(promise) if !promise.is_true() => promise.to_string(),
             _ => "unconstrained".to_string(),
         };
@@ -268,11 +270,12 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         nodes,
         debug: format!(
             "store: {:#?}\nrefinements: {:#?}",
-            output.store, output.refinements
+            semantics.store(),
+            diagnostics.refinements()
         ),
         ..spec.stage(
             cx.status(),
-            plural(output.store.batches.len(), "constraint"),
+            plural(semantics.store().batches.len(), "constraint"),
         )
     }
 }

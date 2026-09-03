@@ -1999,10 +1999,10 @@ fn compile_one(
         .map(|(alias, artifact)| ir::DependencyImport { alias, artifact })
         .collect();
     let mut built = ir::build_with_dependency_imports(&mut mint, loaded.stmts, &imports, &linked);
-    let inferred = inference::infer(&mint, &mut built.program);
+    let inferred = inference::infer(&mint, &mut built.program, inference::Trace::Off);
     let checked = patterns::check(&built.program, &inferred);
 
-    let errors = built.errors.len() + inferred.errors.len() + checked.errors.len();
+    let errors = built.errors.len() + inferred.errors().len() + checked.errors.len();
     if errors != 0 {
         let mut diagnostics = Vec::with_capacity(errors);
         for error in &built.errors {
@@ -2013,7 +2013,7 @@ fn compile_one(
                 source_directory,
             ));
         }
-        for error in &inferred.errors {
+        for error in inferred.errors() {
             diagnostics.push(source_diagnostic(
                 &mut files,
                 "types",
@@ -2034,7 +2034,7 @@ fn compile_one(
         return Err(CompileError::from_diagnostics(diagnostics));
     }
 
-    let lowered = lir::lower(&mint, &built.program, &inferred);
+    let lowered = lir::lower(&mint, &built.program, inferred.semantics());
     let identities = dependencies
         .iter()
         .map(|(_, artifact)| Dependency {
@@ -2045,7 +2045,7 @@ fn compile_one(
     Ok(ruddy::artifact::build_with_dependencies(
         &mint,
         &built.program,
-        &inferred,
+        inferred.semantics(),
         &lowered,
         identities,
     ))

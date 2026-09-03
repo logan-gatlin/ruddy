@@ -471,12 +471,12 @@ fn compiled(source: &str) -> a::Artifact {
     let bundle = Bundle::new("app", Version::new(1, 0, 0)).unwrap();
     let mut mint = Mint::new(bundle);
     let mut program = ir::build(&mut mint, parsed.stmts).program;
-    let inferred = inference::infer(&mint, &mut program);
-    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    let inferred = inference::infer(&mint, &mut program, inference::Trace::Off);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     let checked = patterns::check(&program, &inferred);
     assert!(checked.errors.is_empty(), "{:#?}", checked.errors);
-    let lowered = lir::lower(&mint, &program, &inferred);
-    a::Artifact::build(&mint, &program, &inferred, &lowered)
+    let lowered = lir::lower(&mint, &program, inferred.semantics());
+    a::Artifact::build(&mint, &program, inferred.semantics(), &lowered)
 }
 
 #[test]

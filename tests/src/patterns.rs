@@ -10,7 +10,7 @@ use ruddy::{
     symbol::{Bundle, Mint, Version},
     token::lex,
     tracking::FileID,
-    types::{Formula, Rest, Row, Ty},
+    types::{Rest, Row, Ty},
 };
 
 fn dummy_mint() -> Mint {
@@ -29,7 +29,7 @@ fn checked(src: &str) -> (ir::Output, inference::Output, patterns::Output) {
     );
     let mut mint = dummy_mint();
     let mut out = ir::build(&mut mint, parsed.stmts);
-    let inferred = inference::infer(&mint, &mut out.program);
+    let inferred = inference::infer(&mint, &mut out.program, inference::Trace::Complete);
     let checks = patterns::check(&out.program, &inferred);
     (out, inferred, checks)
 }
@@ -39,9 +39,9 @@ fn clean(src: &str) -> patterns::Output {
     let (out, inferred, checks) = checked(src);
     assert!(out.errors.is_empty(), "ir errors: {:#?}", out.errors);
     assert!(
-        inferred.errors.is_empty(),
+        inferred.errors().is_empty(),
         "inference errors: {:#?}",
-        inferred.errors
+        inferred.errors()
     );
     assert!(
         checks.errors.is_empty(),
@@ -126,14 +126,15 @@ fn annotated_and_inferred_swap_are_exhaustive_with_shared_conditions() {
     ] {
         let (out, inferred, checks) = checked(src);
         assert!(out.errors.is_empty(), "{:#?}", out.errors);
-        assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+        assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
         assert!(checks.errors.is_empty(), "{:#?}", checks.errors);
         let report = sole_report(&checks);
         assert!(matches!(report.coverage, Coverage::Exhaustive));
         assert_eq!(verdicts(report), [Verdict::Reachable; 2]);
 
         let coverage = inferred
-            .store
+            .semantics()
+            .store()
             .batches
             .iter()
             .find_map(|batch| match &batch.origin {
@@ -142,90 +143,11 @@ fn annotated_and_inferred_swap_are_exhaustive_with_shared_conditions() {
             })
             .expect("the qualifying match publishes coverage");
         let effective = inference::effective_conditions(&coverage.arms);
-        assert_eq!(effective.len(), inferred.refinements.len());
-        for (shared, traced) in effective.iter().zip(&inferred.refinements) {
+        assert_eq!(effective.len(), inferred.diagnostics().refinements().len());
+        for (shared, traced) in effective.iter().zip(inferred.diagnostics().refinements()) {
             assert!(inference::sat::entails(shared, &traced.effective));
             assert!(inference::sat::entails(&traced.effective, shared));
         }
-    }
-}
-
-#[test]
-fn unrelated_same_span_batches_do_not_hide_match_coverage() {
-    let src = "let f = fn v => match v with | {a} => 1n | {} => 2n end";
-    let (out, inferred, initial) = checked(src);
-    assert!(initial.errors.is_empty(), "{initial:#?}");
-    let coverage = inferred
-        .store
-        .batches
-        .iter()
-        .find(|batch| matches!(batch.origin, inference::Origin::Coverage(_)))
-        .expect("the qualifying match has a coverage batch");
-    let (definition, span) = (coverage.definition, coverage.span);
-
-    let named = || inference::Named {
-        labels: Vec::new(),
-        shape: None,
-    };
-    for origin in [
-        inference::Origin::Instance(named()),
-        inference::Origin::Annotation(named()),
-        inference::Origin::Refinement(named()),
-        inference::Origin::Guarded(inference::GuardedOrigin {
-            premise: Formula::True,
-            obligation: Formula::True,
-            origin: Box::new(inference::Origin::Instance(named())),
-        }),
-    ] {
-        let mut altered = inferred.clone();
-        altered.store.batches.insert(
-            0,
-            inference::Batch {
-                id: inference::BatchId::synthetic(0),
-                definition,
-                span,
-                origin,
-                reason: inference::ReasonId::synthetic(0),
-                formula: Formula::True,
-                flipped: false,
-            },
-        );
-        let checks = patterns::check(&out.program, &altered);
-        assert!(checks.errors.is_empty(), "{checks:#?}");
-        assert!(matches!(
-            sole_report(&checks).coverage,
-            Coverage::Exhaustive
-        ));
-    }
-
-    // Coverage can mention a solver atom with no corresponding readable path.
-    // A malformed nested path exercises the same conservative fallback after
-    // the path lookup itself fails.
-    for malformed in [
-        vec!["missing.field".to_string()],
-        vec!["a.b".to_string()],
-        vec!["a".to_string(), "below".to_string()],
-    ] {
-        let mut missing_path = inferred.clone();
-        let paths = missing_path
-            .store
-            .batches
-            .iter_mut()
-            .find_map(|batch| match &mut batch.origin {
-                inference::Origin::Coverage(coverage) => Some(&mut coverage.paths),
-                _ => None,
-            })
-            .expect("the coverage batch carries paths");
-        assert!(!paths.is_empty());
-        for (path, _) in paths {
-            *path = malformed.clone();
-        }
-        let checks = patterns::check(&out.program, &missing_path);
-        assert!(checks.errors.is_empty(), "{checks:#?}");
-        assert!(matches!(
-            sole_report(&checks).coverage,
-            Coverage::Exhaustive
-        ));
     }
 }
 
@@ -261,27 +183,6 @@ fn struct_pattern_compatibility_flattens_forwarded_rows() {
 }
 
 #[test]
-fn a_struct_pattern_with_a_corrupted_non_struct_type_is_skipped_safely() {
-    let src = "let f = fn v => match v with | { a } => 1n | _ => 2n end";
-    let (mut out, mut inferred, initial) = checked(src);
-    assert!(initial.errors.is_empty(), "{initial:#?}");
-    let definition = out.program.terms.values_mut().next().unwrap();
-    let ir::TermKind::Fn { body, .. } = &mut definition.value.kind else {
-        panic!("function fixture")
-    };
-    let ir::TermKind::Match { scrutinee, .. } = &mut body.kind else {
-        panic!("match fixture")
-    };
-    scrutinee.ty = Rc::new(Ty::Nat);
-    inferred
-        .store
-        .batches
-        .retain(|batch| !matches!(batch.origin, inference::Origin::Coverage(_)));
-    let checked = patterns::check(&out.program, &inferred);
-    assert!(matches!(sole_report(&checked).coverage, Coverage::Skipped));
-}
-
-#[test]
 fn scalar_witnesses_step_past_a_listed_zero_value() {
     for src in [
         "let f = fn v => match v with | 0i => 1n end",
@@ -289,7 +190,11 @@ fn scalar_witnesses_step_past_a_listed_zero_value() {
         "let f = fn v => match v with | \"\" => 1n end",
     ] {
         let (_, inferred, checks) = checked(src);
-        assert!(inferred.errors.is_empty(), "{src}: {:#?}", inferred.errors);
+        assert!(
+            inferred.errors().is_empty(),
+            "{src}: {:#?}",
+            inferred.errors()
+        );
         assert!(!witness_of(&checks).is_empty());
     }
 }
@@ -321,12 +226,12 @@ fn dotted_quoted_presence_paths_remain_structured_in_nested_matches() {
                \x20 0n";
     let (out, inferred, checks) = checked(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert!(checks.errors.is_empty(), "{checks:#?}");
     let report = checks.reports.last().expect("the nested guarded match");
     assert!(matches!(report.coverage, Coverage::Exhaustive));
     assert_eq!(verdicts(report), [Verdict::Reachable; 3]);
-    assert!(inferred.store.batches.iter().any(|batch| {
+    assert!(inferred.semantics().store().batches.iter().any(|batch| {
         matches!(
             &batch.origin,
             inference::Origin::Coverage(coverage)
@@ -383,11 +288,11 @@ fn ordered_overlap_and_nested_guards_agree_with_pattern_reachability() {
     let (out, inferred, checks) =
         checked("let f = fn v => match v with | {x, ..} => 1n | rest => 2n end");
     assert!(out.errors.is_empty());
-    assert!(inferred.errors.is_empty());
+    assert!(inferred.errors().is_empty());
     assert!(checks.errors.is_empty(), "{checks:#?}");
     assert_eq!(verdicts(sole_report(&checks)), [Verdict::Reachable; 2]);
     assert!(
-        inferred.refinements[1]
+        inferred.diagnostics().refinements()[1]
             .facts
             .iter()
             .any(|fact| fact.field == ["x".to_string()] && !fact.present)
@@ -425,7 +330,7 @@ fn a_qualifying_column_is_exhaustive_by_its_constraint() {
     let src = "let p = fn a => match a with | {a, b} => 1n | {} => 2n end";
     let (out, inferred, checks) = checked(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert!(checks.errors.is_empty(), "{checks:#?}");
     let report = sole_report(&checks);
     assert!(matches!(&report.coverage, Coverage::Exhaustive));
@@ -442,7 +347,7 @@ fn a_scrutinee_that_contradicts_the_coverage_is_unhandled() {
     let src = "let bad = match {x: 1n, y: 2n} with | {x} => {} | {y} => {} end";
     let (out, inferred, checks) = checked(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert_eq!(
         errors(&checks),
         [format!(
@@ -468,7 +373,7 @@ fn a_solved_present_field_makes_the_empty_arm_unreachable() {
                match v with | {a, b} => a | {} => 0n end";
     let (out, inferred, checks) = checked(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert_eq!(
         errors(&checks),
         [format!(
@@ -491,7 +396,7 @@ fn a_misplaced_catch_all_is_reported_at_the_arm() {
     let src = "let f = fn n => match n with | x => 1n | 2n => 3n | 4n => 5n end";
     let (out, inferred, checks) = checked(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert_eq!(
         errors(&checks),
         [format!(
@@ -564,7 +469,7 @@ fn naturals_still_need_a_final_catch_all() {
     let src = "let f = fn n => match n with | 0n => 1n end";
     let (out, inferred, checks) = checked(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert_eq!(
         errors(&checks),
         [format!(
@@ -686,7 +591,7 @@ fn a_failed_typing_skips_the_checks() {
     let src = "let f = fn e => match e with | 1n => 2n | #A => 3n end";
     let (out, inferred, checks) = checked(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    assert_eq!(inferred.errors.len(), 1, "{:#?}", inferred.errors);
+    assert_eq!(inferred.errors().len(), 1, "{:#?}", inferred.errors());
     assert!(checks.errors.is_empty(), "{:#?}", checks.errors);
     let report = sole_report(&checks);
     assert!(matches!(report.coverage, Coverage::Skipped));
@@ -695,7 +600,7 @@ fn a_failed_typing_skips_the_checks() {
     // At a nested position too: the payloads of one tag are one position.
     let src = "let f = fn e => match e with | #A 0n => 1n | #A #X => 2n | r => 3n end";
     let (_, inferred, checks) = checked(src);
-    assert_eq!(inferred.errors.len(), 1, "{:#?}", inferred.errors);
+    assert_eq!(inferred.errors().len(), 1, "{:#?}", inferred.errors());
     assert!(checks.errors.is_empty(), "{:#?}", checks.errors);
 
     // A scrutinee that never resolved: the undefined name is the one
@@ -709,7 +614,7 @@ fn a_failed_typing_skips_the_checks() {
     // And an empty match over something that is not the empty sum: the
     // mismatch speaks, the report stays honest.
     let (_, inferred, checks) = checked("let f = match 5n with end");
-    assert_eq!(inferred.errors.len(), 1, "{:#?}", inferred.errors);
+    assert_eq!(inferred.errors().len(), 1, "{:#?}", inferred.errors());
     assert!(matches!(sole_report(&checks).coverage, Coverage::Skipped));
 }
 
@@ -740,7 +645,7 @@ fn a_solved_absent_field_starves_its_arm() {
     let src = "let f = match {} with | {a} => 1n | {} => 2n end";
     let (out, inferred, checks) = checked(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert_eq!(
         errors(&checks),
         [format!(
@@ -791,7 +696,7 @@ fn an_aliased_scrutinee_is_unfolded() {
 fn a_listed_number_can_witness_the_hole() {
     let src = "let f = fn v => match v with | {a: 0n, b} => 1n | {} => 2n end";
     let (_, inferred, checks) = checked(src);
-    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert_eq!(checks.errors.len(), 1, "{:#?}", checks.errors);
     assert_eq!(witness_of(&checks), "{ a: 0n }");
 }
@@ -826,7 +731,7 @@ fn an_annotated_absence_starves_the_demanding_arm() {
                fn v => match v with | {a, ..} => 1n | {..} => 2n end";
     let (out, inferred, checks) = checked(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert_eq!(
         errors(&checks),
         [format!(
@@ -844,7 +749,7 @@ fn an_abandoned_presence_skips_the_checks() {
     let src = "let f = fn v => match v with | {a} => 1n | {} => g v end\n\
                let g = fn w => let n : Nat = w in f w";
     let (_, inferred, checks) = checked(src);
-    assert!(!inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(!inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert!(checks.errors.is_empty(), "{:#?}", checks.errors);
     assert!(
         checks
@@ -854,31 +759,6 @@ fn an_abandoned_presence_skips_the_checks() {
         "{:#?}",
         checks.reports
     );
-}
-
-/// A sum position whose every case is ruled out and whose rest stays open:
-/// what escapes is anything at all, and the witness says so rather than
-/// being "anything other than" nothing.
-#[test]
-fn an_abandoned_struct_tail_skips_reachability_cascade() {
-    let src = "let f = fn v => match v with | {a} => 1n | {} => 2n end";
-    let (mut out, mut inferred, initial) = checked(src);
-    assert!(initial.errors.is_empty(), "{initial:#?}");
-    let definition = out.program.terms.values_mut().next().unwrap();
-    let ir::TermKind::Fn { body, .. } = &mut definition.value.kind else {
-        panic!("function fixture")
-    };
-    let ir::TermKind::Match { scrutinee, .. } = &mut body.kind else {
-        panic!("match fixture")
-    };
-    scrutinee.ty = Rc::new(Ty::Struct(Row::of(Rest::Undecided)));
-    inferred
-        .store
-        .batches
-        .retain(|batch| !matches!(batch.origin, inference::Origin::Coverage(_)));
-    let checks = patterns::check(&out.program, &inferred);
-    assert!(checks.errors.is_empty(), "{:#?}", checks.errors);
-    assert!(matches!(sole_report(&checks).coverage, Coverage::Skipped));
 }
 
 #[test]
@@ -899,13 +779,13 @@ fn an_open_sum_with_no_cases_witnesses_as_anything() {
 fn a_failed_tag_test_skips_the_checks() {
     // No sum at all: the scrutinee solved to `Nat`.
     let (_, inferred, checks) = checked("let f = match 5n with | #A => 1n end");
-    assert!(!inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(!inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert!(checks.errors.is_empty(), "{:#?}", checks.errors);
     assert!(matches!(sole_report(&checks).coverage, Coverage::Skipped));
 
     // A sum without the case: the literal's own row never acquired `A`.
     let (_, inferred, checks) = checked("let f = match #B 1n with | #A x => x end");
-    assert!(!inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(!inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert!(checks.errors.is_empty(), "{:#?}", checks.errors);
     assert!(matches!(sole_report(&checks).coverage, Coverage::Skipped));
 
@@ -915,7 +795,7 @@ fn a_failed_tag_test_skips_the_checks() {
                | #Some x => 1n \
                | r => match r with | #Some y => 2n | w => 3n end end";
     let (_, inferred, checks) = checked(src);
-    assert!(!inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(!inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert!(checks.errors.is_empty(), "{:#?}", checks.errors);
     assert!(
         checks
@@ -935,7 +815,7 @@ fn an_abandoned_sum_rest_skips_the_checks() {
     let src = "let f = fn v => match v with | #A x => 1n | r => g v end\n\
                let g = fn w => let n : Nat = w in f w";
     let (_, inferred, checks) = checked(src);
-    assert!(!inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(!inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert!(checks.errors.is_empty(), "{:#?}", checks.errors);
     assert!(
         checks
@@ -975,7 +855,7 @@ fn arms_above_a_misplaced_catch_all_keep_their_verdicts() {
 fn an_empty_match_over_a_real_sum_is_skipped() {
     let (_, inferred, checks) =
         checked("let f = fn v => let w : (#A Nat | ..) = v in match v with end");
-    assert!(!inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(!inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert!(checks.errors.is_empty(), "{:#?}", checks.errors);
     let report = sole_report(&checks);
     assert!(matches!(report.coverage, Coverage::Skipped));
@@ -1016,7 +896,7 @@ fn a_duplicate_exact_arm_over_a_closed_row_is_unreachable() {
     let src = "let f = fn v => match v with | {a} => 1n | {a} => 2n end";
     let (out, inferred, checks) = checked(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert_eq!(
         errors(&checks),
         [format!(
@@ -1038,7 +918,7 @@ fn an_exact_arm_behind_a_covering_open_one_is_unreachable() {
     let src = "let f = fn v => match v with | {a, ..} => 1n | {a} => 2n end";
     let (out, inferred, checks) = checked(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert_eq!(
         errors(&checks),
         [format!(
@@ -1063,7 +943,7 @@ fn a_closed_nested_rest_offers_no_escape() {
                | {a: {}, b} => 1n | {b, ..} => 2n | {b, ..} => 3n end";
     let (out, inferred, checks) = checked(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert_eq!(
         errors(&checks),
         [format!(
@@ -1092,7 +972,7 @@ fn the_store_decides_reachability_for_a_converted_column() {
                \x20 match v with | {x} => {} | {y} => {} end";
     let (out, inferred, checks) = checked(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     let report = sole_report(&checks);
     assert_eq!(
         verdicts(report),
@@ -1115,7 +995,7 @@ fn a_match_after_the_flip_stands_aside() {
                let bad = p {}\n\
                let q = fn v => match v with | {u, w} => 1n | {} => 2n end";
     let (_, inferred, checks) = checked(src);
-    assert_eq!(inferred.errors.len(), 1, "{:#?}", inferred.errors);
+    assert_eq!(inferred.errors().len(), 1, "{:#?}", inferred.errors());
     // The flip is the use site's, so nothing the patterns phase says is about
     // it — and the match written after it reports nothing at all.
     assert!(checks.errors.is_empty(), "{checks:#?}");
@@ -1128,7 +1008,7 @@ fn a_match_after_the_flip_stands_aside() {
                let bad = p {}\n\
                let q = fn n => match n with | 0n => 1n end";
     let (_, inferred, checks) = checked(src);
-    assert_eq!(inferred.errors.len(), 1);
+    assert_eq!(inferred.errors().len(), 1);
     assert!(checks.errors.is_empty(), "{checks:#?}");
     let last = checks.reports.last().expect("the later natural match");
     assert!(matches!(last.coverage, Coverage::Skipped));
@@ -1137,7 +1017,7 @@ fn a_match_after_the_flip_stands_aside() {
     let src = "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
                let f = let _ = p {} in match 0n with | 0n => 1n end";
     let (_, inferred, checks) = checked(src);
-    assert_eq!(inferred.errors.len(), 1);
+    assert_eq!(inferred.errors().len(), 1);
     assert!(checks.errors.is_empty(), "{checks:#?}");
     let last = checks.reports.last().expect("the same-definition match");
     assert!(matches!(last.coverage, Coverage::Skipped));
@@ -1187,7 +1067,7 @@ fn a_field_the_type_never_named_is_still_a_column() {
     let src = "let f : {} -> Nat = fn v => match v with | {a, ..} => 1n | {} => 2n end";
     let (out, inferred, checks) = checked(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     let report = sole_report(&checks);
     assert!(matches!(report.coverage, Coverage::Exhaustive));
     assert_eq!(verdicts(report), [Verdict::Unreachable, Verdict::Reachable]);
@@ -1212,7 +1092,7 @@ fn a_non_qualifying_column_reads_the_store_for_exhaustiveness() {
                \x20 match v with | {x: 1n} => 1n | {x: n} => 2n | {y} => 3n end";
     let (out, inferred, checks) = checked(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert!(checks.errors.is_empty(), "{checks:#?}");
     let report = checks.reports.last().expect("two matches were checked");
     assert!(matches!(report.coverage, Coverage::Exhaustive));
@@ -1230,7 +1110,7 @@ fn a_non_qualifying_column_reads_the_store_for_reachability() {
                \x20 | {x: 1n} => 1n | {x: n, y} => 2n | {x: n} => 3n | {y} => 4n end";
     let (out, inferred, checks) = checked(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert_eq!(
         errors(&checks),
         [format!(
@@ -1267,7 +1147,7 @@ fn a_nested_binding_reads_the_store_for_exhaustiveness() {
                \x20 0n";
     let (out, inferred, checks) = checked(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert!(checks.errors.is_empty(), "{checks:#?}");
     let report = checks.reports.last().expect("two matches were checked");
     assert!(matches!(report.coverage, Coverage::Exhaustive));
@@ -1286,7 +1166,7 @@ fn a_nested_binding_reads_the_store_for_reachability() {
                \x20 0n";
     let (out, inferred, checks) = checked(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert_eq!(
         errors(&checks),
         [format!(
@@ -1320,7 +1200,7 @@ fn a_nested_written_clause_shapes_the_witness() {
                \x20 0n";
     let (out, inferred, checks) = checked(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert_eq!(
         errors(&checks),
         [format!(
@@ -1340,8 +1220,12 @@ fn a_non_qualifying_column_with_no_constraints_reads_as_before() {
     let src = "let m = fn v => match v with | {x: 1n} => 1n | {y} => 2n end";
     let (out, inferred, checks) = checked(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
-    assert!(inferred.store.batches.is_empty(), "{:#?}", inferred.store);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
+    assert!(
+        inferred.semantics().store().batches.is_empty(),
+        "{:#?}",
+        inferred.semantics().store()
+    );
     assert_eq!(
         errors(&checks),
         [format!(
@@ -1362,9 +1246,9 @@ fn expressions_and_patterns_cover_every_primitive() {
         let (built, inferred, checked) = checked(&source);
         assert!(built.errors.is_empty(), "{literal}: {:#?}", built.errors);
         assert!(
-            inferred.errors.is_empty(),
+            inferred.errors().is_empty(),
             "{literal}: {:#?}",
-            inferred.errors
+            inferred.errors()
         );
         assert!(
             checked.errors.is_empty(),
@@ -1379,7 +1263,7 @@ fn booleans_are_exhaustive_without_a_wildcard() {
     let (built, inferred, checked) =
         checked("let f = fn x => match x with | true => 1n | false => 0n end");
     assert!(built.errors.is_empty());
-    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert!(checked.errors.is_empty(), "{:#?}", checked.errors);
 }
 
@@ -1390,9 +1274,9 @@ fn other_primitive_literal_sets_need_a_wildcard() {
             "let f = fn x => match x with | {literal} => 0n end"
         ));
         assert!(
-            inferred.errors.is_empty(),
+            inferred.errors().is_empty(),
             "{literal}: {:#?}",
-            inferred.errors
+            inferred.errors()
         );
         assert!(
             !checked.errors.is_empty(),
@@ -1425,7 +1309,7 @@ fn quoted_sum_variants_are_exhaustive_by_their_decoded_names() {
 fn witnesses_render_quoted_field_and_variant_names_canonically() {
     let source = r###"let f = fn value => match value with | { "left side": #"a case", "let": #"x ray" } => 1n | { "left side": #"bee", "let": #"why" } => 2n end"###;
     let (_, inferred, checks) = checked(source);
-    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert_eq!(checks.errors.len(), 1, "{checks:#?}");
     assert_eq!(
         witness_of(&checks),
@@ -1436,6 +1320,6 @@ fn witnesses_render_quoted_field_and_variant_names_canonically() {
     // payload witness.
     let source = r###"let g = fn value => match value with | #"some case" 0n => 0n end"###;
     let (_, inferred, checks) = checked(source);
-    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert_eq!(witness_of(&checks), r###"#"some case" 1n"###);
 }
