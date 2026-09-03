@@ -6060,6 +6060,7 @@ pub fn infer(mint: &Mint, program: &mut Program, trace: Trace) -> Output {
                 annotated: Vec::new(),
                 operations: &operations,
                 effect_ids: &program.effect_ids,
+                effect_params: &program.effect_params,
                 effect_declaration_spans: &effect_declaration_spans,
                 term_effect_provenance: HashMap::new(),
                 local_effect_provenance: HashMap::new(),
@@ -11261,7 +11262,7 @@ fn lower_scoped(
         TypeKind::Arrow { from, to, effects } => Ty::Arrow(
             lower_scoped(mint, table, tails, from, boundaries),
             lower_scoped(mint, table, tails, to, boundaries),
-            effect_row(table, tails, effects),
+            effect_row(mint, table, tails, effects, boundaries),
         ),
         // A row handed to a declaration as an argument, which is the one place
         // a row arrives without an arrow around it. It lowers to the row it is
@@ -11269,7 +11270,7 @@ fn lower_scoped(
         // effects is too — and the position it is spliced into is what says
         // which of the three it is being read as. See
         // [`types::Shape`](crate::types::Shape).
-        TypeKind::Effects(effects) => Ty::Sum(effect_row(table, tails, effects)),
+        TypeKind::Effects(effects) => Ty::Sum(effect_row(mint, table, tails, effects, boundaries)),
         // A written struct is unit carrying the fields that were written: the
         // fields are what the type says, and there is nothing else to it. A
         // field written `\name` is [`Presence::Absent`] in the position it was
@@ -11406,19 +11407,34 @@ fn row(
 /// decide ([`Table::close_effects`]). A tail the reader *named* is out of R23's
 /// reach by construction — `..'e` lowers to a rigid, which is no solver variable
 /// and is never counted.
-fn effect_row(table: &mut Table, tails: &mut Tails, effects: &ir::EffectRow) -> Row {
+///
+/// Each label's arguments are lowered in the scope of the type around it and
+/// become the label's payload, as the positional struct a tuple is; a label
+/// written absent carries them too, so a printed row can still say which
+/// application is not performed.
+fn effect_row(
+    mint: &Mint,
+    table: &mut Table,
+    tails: &mut Tails,
+    effects: &ir::EffectRow,
+    boundaries: Option<&HashSet<Span>>,
+) -> Row {
     let mut labels = IndexMap::new();
     for (name, label) in &effects.effects {
+        let args: Vec<Assigned> = label
+            .args()
+            .iter()
+            .map(|arg| Assigned::Ty(lower_scoped(mint, table, tails, arg, boundaries)))
+            .collect();
+        let ty = constrain::effect_arguments(&args);
         let lowered = match label {
             ir::EffectLabel::Written { when, .. } => RowField {
                 presence: presence(table, tails, when),
-                ty: Rc::new(Ty::unit()),
+                ty,
             },
-            // The struct's absent field again: an effect that is definitely
-            // not performed carries nothing worth constraining.
             ir::EffectLabel::Absent { .. } => RowField {
                 presence: Presence::Absent,
-                ty: Rc::new(Ty::default()),
+                ty,
             },
         };
         labels.insert(name.row_key(), lowered);

@@ -28,6 +28,11 @@ pub struct Program {
     pub external_schemes: IndexMap<Symbol, Scheme>,
     pub external_types: IndexMap<Symbol, ExternalType>,
     pub external_operations: IndexMap<(Symbol, OperationSelector), (Rc<Ty>, Rc<Ty>)>,
+    /// What each effect's parameters stand for, local and imported alike, in
+    /// the order they are applied. An operation reference or a handler mints
+    /// one fresh argument per entry; an effect declared without parameters
+    /// has an empty list.
+    pub effect_params: IndexMap<Symbol, Vec<ParamKind>>,
     /// The effects declared, in the order they were written, each with the
     /// operations it declares or the effects it stands for.
     pub effects: IndexMap<Symbol, Decl<Effect>>,
@@ -2556,6 +2561,7 @@ fn build_with_dependency_imports_inner(
         external_schemes: IndexMap::new(),
         external_types: IndexMap::new(),
         external_operations: IndexMap::new(),
+        effect_params: IndexMap::new(),
         effects: IndexMap::new(),
         effect_ids: IndexMap::new(),
         groups: Vec::new(),
@@ -2808,6 +2814,18 @@ fn build_with_dependency_imports_inner(
             decl.value = span.track(TypeKind::Error);
         }
         kinds.remove(symbol);
+    }
+    // What each effect's parameters stand for, for inference to mint fresh
+    // arguments from. Imported effects declare their kinds in their headers;
+    // until they carry any, they take none.
+    for (symbol, decl) in &program.effects {
+        program.effect_params.insert(
+            *symbol,
+            decl.params.iter().map(|param| param.kind.clone()).collect(),
+        );
+    }
+    for symbol in program.effect_ids.keys() {
+        program.effect_params.entry(*symbol).or_default();
     }
     // Imported constructors impose exactly the same row-shape and lacks
     // conditions at a use site as local constructors. Their kinds came from

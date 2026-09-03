@@ -8,7 +8,7 @@ use crate::{
     ir::{self, Term, TermKind},
     symbol::{Mint, Symbol},
     tracking::{Span, Tracked},
-    types::{Formula, Presence, Rest, Row, RowField, Scheme, Shape, Ty},
+    types::{Assigned, Formula, ParamKind, Presence, Rest, Row, RowField, Scheme, Shape, Ty},
 };
 
 use super::{
@@ -51,6 +51,10 @@ pub struct Constrain<'a> {
     /// Structural row identity for each source-resolved effect declaration.
     /// Symbols remain the operation-table keys; rows use this map instead.
     pub effect_ids: &'a IndexMap<Symbol, crate::types::EffectId>,
+    /// What each effect's parameters stand for, in order: one fresh argument
+    /// per entry is minted wherever an operation is referred to or an effect
+    /// is handled, and the operation signatures are opened over them.
+    pub effect_params: &'a IndexMap<Symbol, Vec<ParamKind>>,
     /// Declaration spans keyed by the source-resolved identity. Kept apart
     /// from structural row keys because equivalent same-named interfaces are
     /// allowed to coalesce semantically.
@@ -713,11 +717,22 @@ impl Constrain<'_> {
                 // operation reference it cannot resolve, and a signature that
                 // failed to lower is still a signature — the two sides absorb
                 // as the undecided type rather than going missing.
-                let (from, to) = &self.operations[&(effect.tracked, selector.tracked.clone())];
+                //
+                // The effect's parameters are instantiated afresh for this
+                // reference: the signature is opened over new variables, and
+                // the label the reference carries holds them, so what the
+                // operation is applied to and what its result is used as
+                // decide the application the surrounding row carries.
+                let (from, to) =
+                    self.operations[&(effect.tracked, selector.tracked.clone())].clone();
+                let fresh = self.fresh_effect_arguments(effect.tracked);
+                let (from, to) = (from.open(&fresh), to.open(&fresh));
+                self.table.note_lacks(&from);
+                self.table.note_lacks(&to);
                 let does = Row {
                     labels: [(
                         self.effect_ids[&effect.tracked].row_key(),
-                        RowField::present(Rc::new(Ty::unit())),
+                        RowField::present(effect_arguments(&fresh)),
                     )]
                     .into_iter()
                     .collect(),
@@ -736,7 +751,7 @@ impl Constrain<'_> {
                     self.term_effect_provenance
                         .insert(span, super::EffectProvenance::origin(origin));
                 }
-                Rc::new(Ty::plain(Ty::Arrow(from.clone(), to.clone(), does)))
+                Rc::new(Ty::plain(Ty::Arrow(from, to, does)))
             }
             TermKind::Handle { body, handler } => self.handle(body, handler),
             // `raise` does not return, so its own type is a fresh variable
@@ -1017,15 +1032,22 @@ impl Constrain<'_> {
     /// none was written, and it is what the whole expression comes to.
     fn handle(&mut self, body: &mut Term, handler: &mut ir::Handler) -> Rc<Ty> {
         let answer = self.table.fresh_type_for(Subject::HandlerAnswer);
-        let discharged: IndexMap<String, RowField> = handler
+        // One instantiation of each handled effect's parameters, shared by
+        // the label the body is handled under and every arm of that effect:
+        // the computation and the arms together decide one application.
+        let instances: IndexMap<String, Vec<Assigned>> = handler
             .discharges
             .iter()
             .map(|effect| {
                 (
                     self.effect_ids[&effect.tracked].row_key(),
-                    RowField::present(Rc::new(Ty::unit())),
+                    self.fresh_effect_arguments(effect.tracked),
                 )
             })
+            .collect();
+        let discharged: IndexMap<String, RowField> = instances
+            .iter()
+            .map(|(key, fresh)| (key.clone(), RowField::present(effect_arguments(fresh))))
             .collect();
         let extended = Row {
             labels: discharged,
@@ -1071,6 +1093,11 @@ impl Constrain<'_> {
             // resolve.
             let (from, to) =
                 self.operations[&(arm.effect.tracked, arm.selector.tracked.clone())].clone();
+            let key = self.effect_ids[&arm.effect.tracked].row_key();
+            let fresh = instances.get(&key).cloned().unwrap_or_default();
+            let (from, to) = (from.open(&fresh), to.open(&fresh));
+            self.table.note_lacks(&from);
+            self.table.note_lacks(&to);
             self.env.insert(arm.binder.tracked, Binding::Mono(from));
             self.infer_term(&mut arm.body);
             let actual = arm.body.ty.clone();
@@ -1621,4 +1648,44 @@ impl Constrain<'_> {
             }
         }
     }
+}
+
+impl Constrain<'_> {
+    /// One fresh argument per parameter the effect declares, of the sort the
+    /// parameter stands for: a type variable for a type, and for a row a fresh
+    /// row wrapped as the type a row argument is written as — a struct for
+    /// fields, a sum for cases and effects — forbidden the labels the
+    /// declaration names beside it.
+    fn fresh_effect_arguments(&mut self, effect: Symbol) -> Vec<Assigned> {
+        let kinds = self.effect_params.get(&effect).cloned().unwrap_or_default();
+        kinds
+            .iter()
+            .map(|kind| match kind.row() {
+                None => Assigned::Ty(self.table.fresh_type_for(Subject::Instance)),
+                Some((shape, lacks)) => {
+                    let rest = self.table.fresh_row_for(Subject::Instance);
+                    let row = Row::of(rest);
+                    self.table.forbid(&row, shape, lacks);
+                    Assigned::Ty(Rc::new(match shape {
+                        Shape::Struct => Ty::Struct(row),
+                        Shape::Sum | Shape::Effect => Ty::Sum(row),
+                    }))
+                }
+            })
+            .collect()
+    }
+}
+
+/// The payload an effect label carries: its arguments, in order, as the
+/// positional struct a tuple is. An effect without parameters carries the
+/// unit tuple, as every label once did.
+pub(crate) fn effect_arguments(args: &[Assigned]) -> Rc<Ty> {
+    Rc::new(Ty::Struct(Row {
+        labels: args
+            .iter()
+            .enumerate()
+            .map(|(at, arg)| (at.to_string(), RowField::present(arg.as_ty())))
+            .collect(),
+        rest: Rest::Closed,
+    }))
 }

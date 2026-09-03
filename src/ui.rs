@@ -1850,7 +1850,8 @@ enum SemanticJob<'a> {
     Field(&'a str, &'a RowField),
     TupleField(&'a RowField),
     Case(&'a str, &'a RowField, bool),
-    Effect(&'a str, &'a Presence),
+    Effect(&'a str, &'a RowField),
+    Mark(&'a Presence),
     Text(&'static str),
 }
 
@@ -2020,7 +2021,7 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                     }
                 }
                 for (at, (name, field)) in effects.into_iter().enumerate().rev() {
-                    work.push(SemanticJob::Effect(name, &field.presence));
+                    work.push(SemanticJob::Effect(name, field));
                     if at != 0 {
                         work.push(SemanticJob::Text(" + "));
                     }
@@ -2050,10 +2051,22 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                     work.push(SemanticJob::Ty(&field.ty, field.ty.prec() < Prec::Atom));
                 }
             }
-            SemanticJob::Effect(name, presence) => {
+            // An applied effect: the label, its arguments as a type
+            // application writes them, and the mark it wears after those.
+            SemanticJob::Effect(name, field) => {
                 f.write_str(&label(Shape::Effect, name))?;
-                write_semantic_mark(f, presence, true)?;
+                work.push(SemanticJob::Mark(&field.presence));
+                if let Ty::Struct(row) = unpackaged(&field.ty)
+                    && matches!(row.rest, Rest::Closed)
+                    && let Some(order) = tuple_field_order(row.labels.keys().map(String::as_str))
+                {
+                    for insertion in order.into_iter().rev() {
+                        work.push(SemanticJob::Applied(&row.labels[insertion].ty));
+                        work.push(SemanticJob::Text(" "));
+                    }
+                }
             }
+            SemanticJob::Mark(presence) => write_semantic_mark(f, presence, true)?,
         }
     }
     Ok(())

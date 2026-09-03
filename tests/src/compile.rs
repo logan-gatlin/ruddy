@@ -105,3 +105,95 @@ fn compilation_trace_retention_does_not_change_causal_errors() {
     assert!(!diagnostics.variables().is_empty());
     assert!(!diagnostics.refinements().is_empty());
 }
+
+/// Compile one source that every phase accepts.
+fn accepted(source: &str) -> compile::AcceptedProgram {
+    let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty(), "{source}: {:#?}", parsed.errors);
+    compile::compile(
+        Mint::new(Bundle::new("tests", Version::new(0, 1, 0)).unwrap()),
+        parsed.stmts,
+        inference::Trace::Off,
+    )
+    .unwrap_or_else(|partial| panic!("{source}: {:#?}", partial.errors))
+}
+
+/// Compile one source some phase refuses, for the errors it publishes.
+fn rejected(source: &str) -> compile::PartialCompilation {
+    let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty(), "{source}: {:#?}", parsed.errors);
+    compile::compile(
+        Mint::new(Bundle::new("tests", Version::new(0, 1, 0)).unwrap()),
+        parsed.stmts,
+        inference::Trace::Off,
+    )
+    .expect_err("the source is refused")
+}
+
+/// The published scheme of one top-level definition, printed.
+fn scheme(accepted: &compile::AcceptedProgram, name: &str) -> String {
+    accepted
+        .semantics()
+        .schemes()
+        .iter()
+        .find(|(symbol, _)| accepted.mint().name(**symbol) == name)
+        .map(|(_, scheme)| scheme.to_string())
+        .unwrap_or_else(|| panic!("no definition named {name}"))
+}
+
+/// The codes of every error a refused compilation published, in order.
+fn codes(partial: &compile::PartialCompilation) -> Vec<&'static str> {
+    partial
+        .errors
+        .iter()
+        .map(|error| match error {
+            Error::Ir(error) => error.kind.code(),
+            Error::Inference(error) => error.kind.code(),
+            Error::Patterns(error) => error.kind.code(),
+        })
+        .collect()
+}
+
+/// Referring to an operation instantiates its effect's parameters afresh:
+/// what the operation is applied to, and what its result is used as,
+/// constrain the application the surrounding row carries; independent
+/// occurrences of one effect coalesce when their arguments agree; and a
+/// reusable operation value stays polymorphic.
+#[test]
+fn an_operation_reference_instantiates_its_effects_parameters() {
+    let source = "effect Ask 'a = { get: () -> 'a }\n\
+                  let num : () -> Nat + !Ask Nat = fn _ => !Ask.get ()\n\
+                  let any = fn _ => !Ask.get ()\n\
+                  let twice = fn _ => let n = !Ask.get () in let m = !Ask.get () in n + m\n\
+                  let get = !Ask.get\n\
+                  let run = fn _ => handle !Ask.get () with | !Ask.get _ => 1n end\n\
+                  let text = fn _ => handle !Ask.get () with | !Ask.get _ => \"s\" end";
+    let accepted = accepted(source);
+    assert_eq!(scheme(&accepted, "num"), "() -> Nat + !Ask Nat");
+    assert_eq!(scheme(&accepted, "any"), "'a -> 'b + !Ask 'b");
+    assert_eq!(scheme(&accepted, "twice"), "'a -> Real + !Ask Real");
+    assert_eq!(scheme(&accepted, "get"), "() -> 'a + !Ask 'a");
+    assert_eq!(scheme(&accepted, "run"), "'a -> Nat");
+    assert_eq!(scheme(&accepted, "text"), "'a -> String");
+
+    // Two occurrences whose arguments cannot agree are one computation using
+    // incompatible versions of one effect, whichever branch each is on.
+    for source in [
+        "effect Ask 'a = { get: () -> 'a }\n\
+         let bad = fn _ => let n : Nat = !Ask.get () in let s : String = !Ask.get () in ()",
+        "effect Ask 'a = { get: () -> 'a }\n\
+         let bad = fn b => if b then let n : Nat = !Ask.get () in () else let s : String = !Ask.get () in () end",
+        "effect Ask 'a = { get: () -> 'a }\n\
+         let bad : () -> Nat + !Ask String = fn _ => !Ask.get ()",
+    ] {
+        let partial = rejected(source);
+        assert!(
+            partial
+                .errors
+                .iter()
+                .any(|error| matches!(error, Error::Inference(_))),
+            "{source}: {:#?}",
+            codes(&partial)
+        );
+    }
+}
