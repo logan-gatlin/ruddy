@@ -25,6 +25,7 @@ use std::{collections::HashMap, rc::Rc};
 use indexmap::IndexMap;
 
 use crate::{
+    compile::AcceptedProgram,
     inference::{self, unfold},
     ir::{Handler, HandlerArm, Literal, Pattern, PatternKind, Program, Term, TermKind},
     symbol::{Mint, Symbol},
@@ -656,7 +657,7 @@ enum FittedStage {
 struct Lower<'a> {
     mint: &'a Mint,
     program: &'a Program,
-    inference: &'a inference::Output,
+    inference: &'a inference::Semantics,
     temps: u32,
     /// How each temp is held, indexed by the temp. A capture has to be given the
     /// representation of what it captures, and the only place that is written
@@ -702,7 +703,21 @@ struct Lower<'a> {
 ///
 /// Runs only when lexing, parsing, building, inference and the pattern checks
 /// have all reported nothing; see the module docs for what that buys.
-pub fn lower(mint: &Mint, program: &Program, inference: &inference::Output) -> Output {
+pub fn lower(accepted: &AcceptedProgram) -> Output {
+    lower_parts(
+        accepted.mint(),
+        accepted.ir(),
+        accepted.semantics(),
+        accepted.externs(),
+    )
+}
+
+fn lower_parts(
+    mint: &Mint,
+    program: &Program,
+    inference: &inference::Semantics,
+    extern_plan: &crate::externs::ExternPlan,
+) -> Output {
     let mut low = Lower {
         mint,
         program,
@@ -722,7 +737,7 @@ pub fn lower(mint: &Mint, program: &Program, inference: &inference::Output) -> O
         definition: None,
         assumed: Formula::True,
     };
-    let externs = low.lower_externs();
+    let externs = low.lower_externs(extern_plan);
     let order = low.order();
     low.reserve(&order);
     for symbol in &order {
@@ -1043,22 +1058,18 @@ impl Lower<'_> {
     /// internal evidence parameters but raw calls contain visible arguments
     /// only. Marked ABI functions accumulate their whole host argument group;
     /// ordinary arrows retain the legacy unary host-curried convention.
-    fn lower_externs(&mut self) -> Vec<Extern> {
-        let declarations: Vec<_> = self
-            .program
-            .externs
-            .iter()
-            .map(|(symbol, decl)| (*symbol, decl.clone()))
-            .collect();
-        let mut externs = Vec::with_capacity(declarations.len());
-        for (symbol, decl) in declarations {
+    fn lower_externs(&mut self, plan: &crate::externs::ExternPlan) -> Vec<Extern> {
+        let entries: Vec<_> = plan.iter().cloned().collect();
+        let mut externs = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let symbol = entry.symbol;
             let name = self.mint.name(symbol).to_string();
-            let ty = self.inference.externs[&symbol].body().clone();
+            let ty = entry.ty.clone();
             externs.push(Extern {
                 symbol,
                 name: name.clone(),
-                target: decl.value.target.tracked.clone(),
-                span: decl.value.target.span,
+                target: entry.target,
+                span: entry.target_span,
                 rep: self.rep(&ty),
             });
 
@@ -1071,22 +1082,22 @@ impl Lower<'_> {
                 let mut body = Body::default();
                 let raw = self.emit(
                     &mut body,
-                    decl.value.target.span,
+                    entry.target_span,
                     self.rep(&ty),
                     Op::Extern {
                         symbol,
                         name: name.clone(),
                     },
                 );
-                let value = self.host_to_ruddy(&decl.value.abi, &ty, raw, &mut body);
+                let value = self.host_to_ruddy(&entry.conversion, &ty, raw, &mut body);
                 self.globals.push(Global {
                     symbol,
                     name,
                     body: body.seal(Terminator {
-                        span: decl.value.target.span,
+                        span: entry.target_span,
                         kind: End::Ret(value),
                     }),
-                    span: decl.name_span,
+                    span: entry.declaration_span,
                 });
             }
         }
@@ -1095,16 +1106,16 @@ impl Lower<'_> {
 
     fn host_to_ruddy(
         &mut self,
-        abi: &crate::ir::ExternType,
+        conversion: &crate::externs::Conversion,
         ty: &Rc<Ty>,
         raw: Temp,
         body: &mut Body,
     ) -> Temp {
-        use crate::ir::ExternTypeKind;
-        match &abi.tracked {
-            ExternTypeKind::Group(inner) => self.host_to_ruddy(inner, ty, raw, body),
-            ExternTypeKind::Function {
-                parameters, result, ..
+        match conversion {
+            crate::externs::Conversion::MarkedFunction {
+                parameters,
+                result,
+                nullary,
             } => {
                 let arity = parameters.len().max(1);
                 let id = self.marked_extern_level(
@@ -1113,14 +1124,14 @@ impl Lower<'_> {
                     Vec::new(),
                     ty.clone(),
                     arity,
-                    parameters.is_empty(),
+                    *nullary,
                     parameters.clone(),
-                    result.as_ref().clone(),
+                    *result.clone(),
                     0,
                 );
                 self.emit(
                     body,
-                    abi.span,
+                    Span::default(),
                     Rep::Fn,
                     Op::Closure {
                         func: id,
@@ -1128,11 +1139,11 @@ impl Lower<'_> {
                     },
                 )
             }
-            ExternTypeKind::Ordinary(_) if self.rep(ty) == Rep::Fn => {
+            crate::externs::Conversion::OrdinaryFunction if self.rep(ty) == Rep::Fn => {
                 let id = self.ordinary_extern_level(ty.clone());
                 self.emit(
                     body,
-                    abi.span,
+                    Span::default(),
                     Rep::Fn,
                     Op::Closure {
                         func: id,
@@ -1140,7 +1151,7 @@ impl Lower<'_> {
                     },
                 )
             }
-            ExternTypeKind::Ordinary(_) => raw,
+            crate::externs::Conversion::Value | crate::externs::Conversion::OrdinaryFunction => raw,
         }
     }
 
@@ -1177,10 +1188,13 @@ impl Lower<'_> {
             rep: self.rep(&from),
         });
         let mut body = Body::default();
-        let ordinary = Span::default().track(crate::ir::ExternTypeKind::Ordinary(
-            Span::default().track(crate::ir::TypeKind::Error),
-        ));
-        let argument = self.ruddy_to_host(&ordinary, &from, argument, &row, &mut body);
+        let argument = self.ruddy_to_host(
+            &crate::externs::Conversion::OrdinaryFunction,
+            &from,
+            argument,
+            &row,
+            &mut body,
+        );
         let result = self.emit(
             &mut body,
             Span::default(),
@@ -1190,7 +1204,12 @@ impl Lower<'_> {
                 args: vec![argument],
             },
         );
-        let result = self.host_to_ruddy(&ordinary, &to, result, &mut body);
+        let result = self.host_to_ruddy(
+            &crate::externs::Conversion::OrdinaryFunction,
+            &to,
+            result,
+            &mut body,
+        );
         self.frames.pop().expect("the extern frame just pushed");
         self.fill(
             id,
@@ -1232,9 +1251,9 @@ impl Lower<'_> {
             // reveal a package whose body is another alias (including an
             // imported or recursive one), and either operation alone would
             // stop before the callback arrow.
-            let mut exposed = unfold(&self.inference.aliases, &cursor);
+            let mut exposed = unfold(self.inference.aliases(), &cursor);
             while let Ty::Package(body) = &*exposed {
-                exposed = unfold(&self.inference.aliases, body);
+                exposed = unfold(self.inference.aliases(), body);
             }
             let Ty::Arrow(_, to, row) = &*exposed else {
                 break;
@@ -1283,16 +1302,14 @@ impl Lower<'_> {
     /// their parameter list deliberately has no Ruddy evidence slots.
     fn ruddy_to_host(
         &mut self,
-        abi: &crate::ir::ExternType,
+        conversion: &crate::externs::Conversion,
         ty: &Rc<Ty>,
         value: Temp,
         available: &Row,
         body: &mut Body,
     ) -> Temp {
-        use crate::ir::ExternTypeKind;
-        match &abi.tracked {
-            ExternTypeKind::Group(inner) => self.ruddy_to_host(inner, ty, value, available, body),
-            ExternTypeKind::Function {
+        match conversion {
+            crate::externs::Conversion::MarkedFunction {
                 parameters, result, ..
             } => {
                 let required = self.callback_evidence(ty, available);
@@ -1301,17 +1318,29 @@ impl Lower<'_> {
                     self.marked_callback(ty.clone(), parameters.clone(), *result.clone(), required);
                 let mut captures = vec![value];
                 captures.extend(evidence);
-                self.emit(body, abi.span, Rep::Fn, Op::Closure { func: id, captures })
+                self.emit(
+                    body,
+                    Span::default(),
+                    Rep::Fn,
+                    Op::Closure { func: id, captures },
+                )
             }
-            ExternTypeKind::Ordinary(_) if self.rep(ty) == Rep::Fn => {
+            crate::externs::Conversion::OrdinaryFunction if self.rep(ty) == Rep::Fn => {
                 let required = self.callback_evidence(ty, available);
                 let evidence = self.evidence_args(&required, available, body);
                 let id = self.ordinary_callback(ty.clone(), required);
                 let mut captures = vec![value];
                 captures.extend(evidence);
-                self.emit(body, abi.span, Rep::Fn, Op::Closure { func: id, captures })
+                self.emit(
+                    body,
+                    Span::default(),
+                    Rep::Fn,
+                    Op::Closure { func: id, captures },
+                )
             }
-            ExternTypeKind::Ordinary(_) => value,
+            crate::externs::Conversion::Value | crate::externs::Conversion::OrdinaryFunction => {
+                value
+            }
         }
     }
 
@@ -1347,11 +1376,13 @@ impl Lower<'_> {
             temp: raw_argument,
             rep: self.rep(&from),
         });
-        let ordinary = Span::default().track(crate::ir::ExternTypeKind::Ordinary(
-            Span::default().track(crate::ir::TypeKind::Error),
-        ));
         let mut body = Body::default();
-        let argument = self.host_to_ruddy(&ordinary, &from, raw_argument, &mut body);
+        let argument = self.host_to_ruddy(
+            &crate::externs::Conversion::OrdinaryFunction,
+            &from,
+            raw_argument,
+            &mut body,
+        );
         let mut args = self.evidence_args(&row, &row, &mut body);
         args.push(argument);
         let result = self.emit(
@@ -1363,7 +1394,13 @@ impl Lower<'_> {
                 args,
             },
         );
-        let result = self.ruddy_to_host(&ordinary, &to, result, &available, &mut body);
+        let result = self.ruddy_to_host(
+            &crate::externs::Conversion::OrdinaryFunction,
+            &to,
+            result,
+            &available,
+            &mut body,
+        );
         self.frames.pop().expect("the callback frame just pushed");
         self.fill(
             id,
@@ -1388,8 +1425,8 @@ impl Lower<'_> {
     fn marked_callback(
         &mut self,
         ty: Rc<Ty>,
-        parameter_abis: Vec<crate::ir::ExternType>,
-        result_abi: crate::ir::ExternType,
+        parameter_conversions: Vec<crate::externs::Conversion>,
+        result_conversion: crate::externs::Conversion,
         available: Row,
     ) -> FuncId {
         let id = self.slot(format!("{}#callback#{}", self.stem, self.serial));
@@ -1404,9 +1441,9 @@ impl Lower<'_> {
         let mut raw_parameters = Vec::new();
         let mut arrows = Vec::new();
         let mut cursor = ty;
-        for _ in 0..parameter_abis.len().max(1) {
+        for _ in 0..parameter_conversions.len().max(1) {
             let (from, to, row) = self.arrow(&cursor);
-            if !parameter_abis.is_empty() {
+            if !parameter_conversions.is_empty() {
                 let temp = self.fresh(self.rep(&from));
                 params.push(Param {
                     temp,
@@ -1420,7 +1457,7 @@ impl Lower<'_> {
 
         let mut body = Body::default();
         let mut current = closure;
-        if parameter_abis.is_empty() {
+        if parameter_conversions.is_empty() {
             let unit = self.emit(
                 &mut body,
                 Span::default(),
@@ -1439,8 +1476,10 @@ impl Lower<'_> {
                 },
             );
         } else {
-            for ((abi, raw), (from, to, row)) in
-                parameter_abis.iter().zip(raw_parameters).zip(arrows.iter())
+            for ((abi, raw), (from, to, row)) in parameter_conversions
+                .iter()
+                .zip(raw_parameters)
+                .zip(arrows.iter())
             {
                 let argument = self.host_to_ruddy(abi, from, raw, &mut body);
                 let mut args = self.evidence_args(row, row, &mut body);
@@ -1456,7 +1495,8 @@ impl Lower<'_> {
                 );
             }
         }
-        let result = self.ruddy_to_host(&result_abi, &cursor, current, &available, &mut body);
+        let result =
+            self.ruddy_to_host(&result_conversion, &cursor, current, &available, &mut body);
         self.frames.pop().expect("the callback frame just pushed");
         self.fill(
             id,
@@ -1482,8 +1522,8 @@ impl Lower<'_> {
         ty: Rc<Ty>,
         arity: usize,
         nullary: bool,
-        parameter_abis: Vec<crate::ir::ExternType>,
-        result_abi: crate::ir::ExternType,
+        parameter_conversions: Vec<crate::externs::Conversion>,
+        result_conversion: crate::externs::Conversion,
         step: usize,
     ) -> FuncId {
         let id = self.slot(format!("{}#{}", self.stem, self.serial));
@@ -1517,7 +1557,7 @@ impl Lower<'_> {
             let gathered = gathered
                 .into_iter()
                 .zip(carried_types.iter().chain(std::iter::once(&from)))
-                .zip(parameter_abis.iter())
+                .zip(parameter_conversions.iter())
                 .map(|((argument, ty), abi)| self.ruddy_to_host(abi, ty, argument, &row, &mut body))
                 .collect();
             let result = self.emit(
@@ -1529,7 +1569,7 @@ impl Lower<'_> {
                     args: gathered,
                 },
             );
-            self.host_to_ruddy(&result_abi, &to, result, &mut body)
+            self.host_to_ruddy(&result_conversion, &to, result, &mut body)
         } else {
             let mut next_carried = carried;
             next_carried.push(argument_rep);
@@ -1542,8 +1582,8 @@ impl Lower<'_> {
                 to.clone(),
                 arity,
                 false,
-                parameter_abis,
-                result_abi,
+                parameter_conversions,
+                result_conversion,
                 step + 1,
             );
             let mut captures = vec![raw];
@@ -1746,9 +1786,9 @@ impl Lower<'_> {
     /// Opening aliases again after each package also handles a package whose
     /// body starts with a declared name.
     fn erased(&self, ty: &Rc<Ty>) -> Rc<Ty> {
-        let mut ty = unfold(&self.inference.aliases, ty);
+        let mut ty = unfold(self.inference.aliases(), ty);
         while let Ty::Package(body) = &*ty {
-            ty = unfold(&self.inference.aliases, body);
+            ty = unfold(self.inference.aliases(), body);
         }
         ty
     }
@@ -3334,7 +3374,7 @@ impl Lower<'_> {
         }
         let allowed = self
             .definition
-            .and_then(|symbol| self.inference.promises.get(&symbol).cloned())
+            .and_then(|symbol| self.inference.promises().get(&symbol).cloned())
             .unwrap_or(Formula::True);
         let tree = Tree {
             arms,
@@ -3831,5 +3871,328 @@ impl Lower<'_> {
                 some: Box::new(some),
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Defensive cases that corrupt an accepted program's semantic facts to
+    //! reach branches no coherent publication can. The corruption is
+    //! crate-private, so they live here rather than in the workspace's test
+    //! crate, which lowers accepted programs only.
+
+    use std::rc::Rc;
+
+    use super::*;
+    use crate::{
+        ir, test_support,
+        types::{Formula, Presence, Rest, Row, RowField, Scheme, Ty},
+    };
+
+    /// One accepted pipeline whose checked inputs a test may adjust before LIR.
+    fn lowered_after_check(
+        source: &str,
+        adjust: impl FnOnce(&mut Program, &mut inference::Output),
+    ) -> Output {
+        let (mint, mut out, mut inferred, _) = test_support::accepted(source);
+        adjust(&mut out.program, &mut inferred);
+        let plan = crate::externs::plan(inferred.semantics());
+        lower_parts(&mint, &out.program, inferred.semantics(), &plan)
+    }
+
+    /// The SAT pair can only be false/false if a caller violates LIR's accepted-
+    /// pipeline precondition by supplying a definition promise with no model. Keep
+    /// the invariant check loud rather than silently manufacturing dead LIR.
+    #[test]
+    #[should_panic(expected = "the inferred definition promise has a model on every emitted path")]
+    fn an_impossible_presence_path_is_rejected() {
+        let _ = lowered_after_check(
+            "let f = fn s => match s with | { x, y } => y | { x } => x end",
+            |program, inferred| {
+                let symbol = *program.terms.keys().next().expect("the source defines f");
+                inferred
+                    .semantics_mut()
+                    .promises
+                    .insert(symbol, Formula::False);
+            },
+        );
+    }
+
+    /// Alias arguments carry semantic identities that their diagnostic spelling
+    /// deliberately hides. In this recovery input, `A` and `B` (and `C` and `D`)
+    /// are all displayed as `Arg`, but the second pair reaches a new effect shape.
+    /// It therefore needs its own recursive adapter rather than closing the cycle
+    /// over the adapter for the first, merely same-spelled, applications.
+    #[test]
+    fn same_spelling_does_not_coinduct_distinct_recursive_alias_arguments() {
+        let output = lowered_after_check(
+            "type X 'a = 'a\n\
+             type Y 'a = 'a\n\
+             type A = Nat\n\
+             type B = Nat\n\
+             type C = Nat\n\
+             type D = Nat\n\
+             let takes : (Nat -> Nat) -> Nat = fn f => 1n\n\
+             let have : Nat -> Nat = fn n => n\n\
+             let go = takes have",
+            |program, inferred| {
+                let aliases: Vec<_> = inferred.semantics_mut().aliases.keys().copied().collect();
+                let [x, y, a, b, c, d] = aliases.as_slice() else {
+                    panic!("the six test aliases remain available")
+                };
+                let named = |symbol, name: &str, args: Vec<Rc<Ty>>| {
+                    Rc::new(Ty::Named {
+                        symbol,
+                        name: Rc::from(name),
+                        args: args.into(),
+                    })
+                };
+                let application = |outer, argument| named(outer, "Recursive", vec![argument]);
+                let hidden = |symbol| named(symbol, "Arg", Vec::new());
+                let arrow = |result, effects| Rc::new(Ty::Arrow(Rc::new(Ty::Nat), result, effects));
+
+                inferred
+                    .semantics_mut()
+                    .aliases
+                    .insert(*x, Scheme::new(1, Rc::new(Ty::Bound(0))));
+                inferred
+                    .semantics_mut()
+                    .aliases
+                    .insert(*y, Scheme::new(1, Rc::new(Ty::Bound(0))));
+                inferred.semantics_mut().aliases.insert(
+                    *a,
+                    Scheme::new(0, arrow(application(*x, hidden(*b)), Row::closed())),
+                );
+                inferred.semantics_mut().aliases.insert(
+                    *b,
+                    Scheme::new(
+                        0,
+                        arrow(
+                            application(*x, hidden(*b)),
+                            Row {
+                                labels: [("Log".into(), RowField::present(Rc::new(Ty::unit())))]
+                                    .into_iter()
+                                    .collect(),
+                                rest: Rest::Closed,
+                            },
+                        ),
+                    ),
+                );
+                inferred.semantics_mut().aliases.insert(
+                    *c,
+                    Scheme::new(0, arrow(application(*y, hidden(*d)), Row::closed())),
+                );
+                inferred.semantics_mut().aliases.insert(
+                    *d,
+                    Scheme::new(0, arrow(application(*y, hidden(*d)), Row::closed())),
+                );
+
+                let want = application(*x, hidden(*a));
+                let have = application(*y, hidden(*c));
+                let terms: Vec<_> = program.terms.keys().copied().collect();
+                program.terms.get_mut(&terms[0]).unwrap().value.ty =
+                    Rc::new(Ty::Arrow(want, Rc::new(Ty::Nat), Row::closed()));
+                program.terms.get_mut(&terms[1]).unwrap().value.ty = have.clone();
+                let ir::TermKind::Apply { arg, .. } =
+                    &mut program.terms.get_mut(&terms[2]).unwrap().value.kind
+                else {
+                    panic!("go is the checked application")
+                };
+                arg.ty = have;
+            },
+        );
+
+        let adapters: Vec<_> = output
+            .functions
+            .iter()
+            .filter(|function| function.name.starts_with("go#"))
+            .collect();
+        assert_eq!(adapters.len(), 2, "{:#?}", output.functions);
+        assert!(adapters.iter().any(|function| {
+            function
+                .body
+                .instrs
+                .iter()
+                .any(|instr| matches!(instr.op, Op::Closure { .. }))
+        }));
+    }
+
+    /// Recursive adapter states use recovered presence identities as exact syntax.
+    /// Repeating the same recovery identity closes the guarded cycle immediately;
+    /// changing it reaches one distinct state before the stable suffix coalesces.
+    #[test]
+    fn recursive_adapter_coalescing_preserves_recovered_presence_correlation() {
+        let adapters = |first_id| {
+            let output = lowered_after_check(
+                "type X 'a 'b = 'a\n\
+                 type Y 'a 'b = 'a\n\
+                 let takes : (Nat -> Nat) -> Nat = fn f => 1n\n\
+                 let have : Nat -> Nat = fn n => n\n\
+                 let go = takes have",
+                |program, inferred| {
+                    let aliases: Vec<_> =
+                        inferred.semantics_mut().aliases.keys().copied().collect();
+                    let [x, y] = aliases.as_slice() else {
+                        panic!("the two test aliases remain available")
+                    };
+                    let named = |symbol, args: Vec<Rc<Ty>>| {
+                        Rc::new(Ty::Named {
+                            symbol,
+                            name: Rc::from("Recursive"),
+                            args: args.into(),
+                        })
+                    };
+                    let recovered = |id| {
+                        Rc::new(Ty::Struct(Row {
+                            labels: [(
+                                "field".into(),
+                                RowField {
+                                    presence: Presence::Recovered(id),
+                                    ty: Rc::new(Ty::Nat),
+                                },
+                            )]
+                            .into_iter()
+                            .collect(),
+                            rest: Rest::Closed,
+                        }))
+                    };
+                    let recursive = |symbol, effects| {
+                        Scheme::new(
+                            2,
+                            Rc::new(Ty::Arrow(
+                                Rc::new(Ty::Nat),
+                                named(symbol, vec![Rc::new(Ty::Bound(1)), Rc::new(Ty::Bound(1))]),
+                                effects,
+                            )),
+                        )
+                    };
+                    inferred.semantics_mut().aliases.insert(
+                        *x,
+                        recursive(
+                            *x,
+                            Row {
+                                labels: [("Log".into(), RowField::present(Rc::new(Ty::unit())))]
+                                    .into_iter()
+                                    .collect(),
+                                rest: Rest::Closed,
+                            },
+                        ),
+                    );
+                    inferred
+                        .semantics_mut()
+                        .aliases
+                        .insert(*y, recursive(*y, Row::closed()));
+
+                    let want = named(*x, vec![recovered(first_id), recovered(2)]);
+                    let have = named(*y, vec![recovered(first_id), recovered(2)]);
+                    let terms: Vec<_> = program.terms.keys().copied().collect();
+                    program.terms.get_mut(&terms[0]).unwrap().value.ty =
+                        Rc::new(Ty::Arrow(want, Rc::new(Ty::Nat), Row::closed()));
+                    program.terms.get_mut(&terms[1]).unwrap().value.ty = have.clone();
+                    let ir::TermKind::Apply { arg, .. } =
+                        &mut program.terms.get_mut(&terms[2]).unwrap().value.kind
+                    else {
+                        panic!("go is the checked application")
+                    };
+                    arg.ty = have;
+                },
+            );
+            output
+                .functions
+                .iter()
+                .filter(|function| function.name.starts_with("go#"))
+                .count()
+        };
+
+        assert_eq!(adapters(2), 1);
+        assert_eq!(adapters(1), 2);
+    }
+
+    #[test]
+    fn recursive_alias_argument_equality_is_stack_safe_at_thirty_thousand_layers() {
+        std::thread::Builder::new()
+            .name("deep-semantic-alias-equality".into())
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                const DEPTH: usize = 30_000;
+                let output = lowered_after_check(
+                    "type X 'a = 'a\n\
+                     type Y 'a = 'a\n\
+                     type Carrier 'a = 'a\n\
+                     type A = Nat\n\
+                     type B = Nat\n\
+                     type C = Nat\n\
+                     let takes : (Nat -> Nat) -> Nat = fn f => 1n\n\
+                     let have : Nat -> Nat = fn n => n\n\
+                     let go = takes have",
+                    |program, inferred| {
+                        let symbols: Vec<_> =
+                            inferred.semantics_mut().aliases.keys().copied().collect();
+                        let [x, y, carrier, a, b, c] = symbols.as_slice() else {
+                            panic!("the six test aliases remain available")
+                        };
+                        let named = |symbol, name: &str, args: Vec<Rc<Ty>>| {
+                            Rc::new(Ty::Named {
+                                symbol,
+                                name: Rc::from(name),
+                                args: args.into(),
+                            })
+                        };
+                        let nested = |leaf| {
+                            (0..DEPTH)
+                                .fold(leaf, |inner, _| named(*carrier, "Carrier", vec![inner]))
+                        };
+                        let deep_a = nested(named(*a, "Leaf", Vec::new()));
+                        let deep_b = nested(named(*b, "Leaf", Vec::new()));
+                        let deep_c = nested(named(*c, "Leaf", Vec::new()));
+                        let application =
+                            |outer, argument| named(outer, "Recursive", vec![argument]);
+
+                        inferred
+                            .semantics_mut()
+                            .aliases
+                            .insert(*carrier, Scheme::new(1, Rc::new(Ty::Bound(0))));
+                        inferred.semantics_mut().aliases.insert(
+                            *x,
+                            Scheme::new(
+                                1,
+                                Rc::new(Ty::Arrow(
+                                    Rc::new(Ty::Nat),
+                                    application(*x, deep_b.clone()),
+                                    Row::closed(),
+                                )),
+                            ),
+                        );
+                        inferred.semantics_mut().aliases.insert(
+                            *y,
+                            Scheme::new(
+                                1,
+                                Rc::new(Ty::Arrow(
+                                    Rc::new(Ty::Nat),
+                                    application(*y, deep_c.clone()),
+                                    Row::closed(),
+                                )),
+                            ),
+                        );
+
+                        let want = application(*x, deep_a);
+                        let have = application(*y, deep_c);
+                        let terms: Vec<_> = program.terms.keys().copied().collect();
+                        program.terms.get_mut(&terms[0]).unwrap().value.ty =
+                            Rc::new(Ty::Arrow(want, Rc::new(Ty::Nat), Row::closed()));
+                        program.terms.get_mut(&terms[1]).unwrap().value.ty = have.clone();
+                        let ir::TermKind::Apply { arg, .. } =
+                            &mut program.terms.get_mut(&terms[2]).unwrap().value.kind
+                        else {
+                            panic!("go is the checked application")
+                        };
+                        arg.ty = have;
+                    },
+                );
+                assert!(output.globals.iter().any(|global| global.name == "go"));
+            })
+            .expect("the bounded-stack semantic equality regression starts")
+            .join()
+            .expect("finite alias syntax equality is iterative");
     }
 }

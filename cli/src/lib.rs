@@ -17,7 +17,7 @@ use indexmap::IndexMap;
 use ruddy::{
     artifact::{Artifact, Dependency},
     bundle::{self, Disk, Files},
-    inference, ir, lir, patterns,
+    inference,
     symbol::{Bundle, Mint, Version},
     tracking::{FileManager, Span},
     ui,
@@ -366,7 +366,7 @@ fn install_project(directory: &Path) -> Result<InstalledBuild, CliError> {
         })?;
         let artifact_path = build.join(format!(
             "{}.artifact",
-            project.artifact.header.identity.name
+            project.artifact.header().identity.name
         ));
         let artifact = if Some(index) == last {
             &linked
@@ -379,7 +379,7 @@ fn install_project(directory: &Path) -> Result<InstalledBuild, CliError> {
                 // The generated `.js` is always ESM, independent of any
                 // ancestor package scope in which the project happens to live.
                 replace_file(&build.join("package.json"), NODE_PACKAGE)?;
-                let path = build.join(format!("{}.js", project.artifact.header.identity.name));
+                let path = build.join(format!("{}.js", project.artifact.header().identity.name));
                 replace_file(&path, javascript.as_bytes())?;
                 root_javascript = Some(path);
             }
@@ -1449,8 +1449,8 @@ where
             .map_err(&contextualize)?;
         let artifact = &compiler.projects[index].artifact;
         direct.push(Dependency {
-            name: artifact.header.identity.name.clone(),
-            version: artifact.header.identity.version.clone(),
+            name: artifact.header().identity.name.clone(),
+            version: artifact.header().identity.version.clone(),
         });
         paths.push(directory);
     }
@@ -1533,8 +1533,8 @@ where
             .map_err(&contextualize)?;
         let artifact = &compiler.projects[index].artifact;
         direct.push(Dependency {
-            name: artifact.header.identity.name.clone(),
-            version: artifact.header.identity.version.clone(),
+            name: artifact.header().identity.name.clone(),
+            version: artifact.header().identity.version.clone(),
         });
     }
     Ok((
@@ -1993,62 +1993,77 @@ fn compile_one(
         return Err(CompileError::from_diagnostics(diagnostics));
     }
 
-    let mut mint = Mint::new(identity);
-    let imports: Vec<_> = dependencies
-        .iter()
-        .map(|(alias, artifact)| ir::DependencyImport { alias, artifact })
-        .collect();
-    let mut built = ir::build_with_dependency_imports(&mut mint, loaded.stmts, &imports, &linked);
-    let inferred = inference::infer(&mint, &mut built.program);
-    let checked = patterns::check(&built.program, &inferred);
-
-    let errors = built.errors.len() + inferred.errors.len() + checked.errors.len();
-    if errors != 0 {
-        let mut diagnostics = Vec::with_capacity(errors);
-        for error in &built.errors {
-            diagnostics.push(source_diagnostic(
-                &mut files,
-                "ir",
-                &error.diagnostic(),
-                source_directory,
-            ));
+    let mint = Mint::new(identity);
+    // The core seam receives one dependency graph. Direct interfaces select
+    // their aliases from this linked collection rather than arriving as an
+    // unrelated second slice.
+    let mut unchecked: Vec<_> = linked.iter().map(Artifact::to_unchecked).collect();
+    for (_, dependency) in &dependencies {
+        if !unchecked.iter().any(|artifact| {
+            artifact.header.identity.name == dependency.header().identity.name
+                && artifact.header.identity.version == dependency.header().identity.version
+        }) {
+            unchecked.push(dependency.to_unchecked());
         }
-        for error in &inferred.errors {
-            diagnostics.push(source_diagnostic(
-                &mut files,
-                "types",
-                &error.diagnostic(),
-                source_directory,
-            ));
-        }
-        for error in &checked.errors {
-            diagnostics.push(diagnostic(
-                &mut files,
-                "patterns",
-                error.kind.code(),
-                error.span,
-                &error.kind,
-                source_directory,
-            ));
-        }
-        return Err(CompileError::from_diagnostics(diagnostics));
     }
-
-    let lowered = lir::lower(&mint, &built.program, &inferred);
-    let identities = dependencies
+    let dependencies: Vec<_> = unchecked
         .iter()
-        .map(|(_, artifact)| Dependency {
-            name: artifact.header.identity.name.clone(),
-            version: artifact.header.identity.version.clone(),
+        .map(|artifact| ruddy::compile::Dependency {
+            alias: dependencies
+                .iter()
+                .find(|(_, dependency)| {
+                    artifact.header.identity.name == dependency.header().identity.name
+                        && artifact.header.identity.version == dependency.header().identity.version
+                })
+                .map(|(alias, _)| alias.as_str()),
+            artifact,
         })
         .collect();
-    Ok(ruddy::artifact::build_with_dependencies(
-        &mint,
-        &built.program,
-        &inferred,
-        &lowered,
-        identities,
-    ))
+    let accepted = ruddy::compile::compile_with_dependencies(
+        mint,
+        loaded.stmts,
+        &dependencies,
+        inference::Trace::Off,
+    );
+    let accepted = match accepted {
+        Ok(accepted) => accepted,
+        Err(partial) => {
+            let errors = partial.errors.len();
+            if errors != 0 {
+                let mut diagnostics = Vec::with_capacity(errors);
+                for error in &partial.ir.errors {
+                    diagnostics.push(source_diagnostic(
+                        &mut files,
+                        "ir",
+                        &error.diagnostic(),
+                        source_directory,
+                    ));
+                }
+                for error in partial.inference.errors() {
+                    diagnostics.push(source_diagnostic(
+                        &mut files,
+                        "types",
+                        &error.diagnostic(),
+                        source_directory,
+                    ));
+                }
+                for error in &partial.patterns.errors {
+                    diagnostics.push(diagnostic(
+                        &mut files,
+                        "patterns",
+                        error.kind.code(),
+                        error.span,
+                        &error.kind,
+                        source_directory,
+                    ));
+                }
+                return Err(CompileError::from_diagnostics(diagnostics));
+            }
+            unreachable!("partial compilation always has an error")
+        }
+    };
+
+    Ok(accepted.artifact().clone())
 }
 
 fn toml_error_note(source: &str, error: &toml::de::Error) -> String {

@@ -253,11 +253,11 @@ fn types_of(source: &str) -> (String, String) {
     let mut mint = Mint::new(bundle);
     let mut built = ir::build(&mut mint, parsed.stmts);
     assert!(built.errors.is_empty(), "{source}: {:#?}", built.errors);
-    let inferred = inference::infer(&mint, &mut built.program);
+    let inferred = inference::infer(&mint, &mut built.program, inference::Trace::Off);
     assert!(
-        inferred.errors.is_empty(),
+        inferred.errors().is_empty(),
         "{source}: {:#?}",
-        inferred.errors
+        inferred.errors()
     );
 
     let (symbol, decl) = built
@@ -268,7 +268,7 @@ fn types_of(source: &str) -> (String, String) {
     let annotation = decl.annotation.as_ref().expect("it is annotated");
     (
         print::ir::annotation(annotation, &mint).to_string(),
-        inferred.schemes[symbol].to_string(),
+        inferred.semantics().schemes()[symbol].to_string(),
     )
 }
 
@@ -650,10 +650,15 @@ fn a_scheme_prints_the_clause_it_requires() {
         let mut mint = Mint::new(bundle);
         let mut built = ir::build(&mut mint, parsed.stmts);
         assert!(built.errors.is_empty(), "{source}: {:#?}", built.errors);
-        let output = inference::infer(&mint, &mut built.program);
-        assert!(output.errors.is_empty(), "{source}: {:#?}", output.errors);
+        let output = inference::infer(&mint, &mut built.program, inference::Trace::Off);
+        assert!(
+            output.errors().is_empty(),
+            "{source}: {:#?}",
+            output.errors()
+        );
         let scheme = output
-            .schemes
+            .semantics()
+            .schemes()
             .values()
             .next()
             .expect("the source declares one term");
@@ -941,14 +946,14 @@ fn printed_scheme(source: &str) -> String {
     let mut mint = Mint::new(bundle);
     let mut built = ir::build(&mut mint, parsed.stmts);
     assert!(built.errors.is_empty(), "{source}: {:#?}", built.errors);
-    let inferred = inference::infer(&mint, &mut built.program);
+    let inferred = inference::infer(&mint, &mut built.program, inference::Trace::Off);
     assert!(
-        inferred.errors.is_empty(),
+        inferred.errors().is_empty(),
         "{source}: {:#?}",
-        inferred.errors
+        inferred.errors()
     );
     let (symbol, _) = built.program.terms.last().expect("a definition");
-    inferred.schemes[symbol].to_string()
+    inferred.semantics().schemes()[symbol].to_string()
 }
 
 /// Both module forms and a path, rendered back as the source they were parsed

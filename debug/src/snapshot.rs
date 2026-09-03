@@ -318,7 +318,7 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     let inferred = built.as_mut().and_then(|built| {
         let started = Instant::now();
         let out = guard("types", &mut panicked, || {
-            inference::infer(&mint, &mut built.program)
+            inference::infer(&mint, &mut built.program, inference::Trace::Complete)
         });
         micros.infer = started.elapsed().as_micros() as u64;
         out
@@ -373,7 +373,7 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
         );
     }
     if let Some(inferred) = &inferred {
-        diagnostics.extend(inferred.errors.iter().map(|error| {
+        diagnostics.extend(inferred.errors().iter().map(|error| {
             let mut diagnostic = source_error("types", error.diagnostic(), &index);
             diagnostic.inference_error_id = Some(error.id.get());
             diagnostic.inference_cause = Some(match error.cause {
@@ -410,12 +410,49 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     // the rule `main.rs` follows too — so it is gated on the whole diagnostic
     // list rather than on any one phase having produced a value. Its tab
     // reports `Skipped` the moment the reader types something wrong.
-    let lowered = match (&built, &inferred, &checked, diagnostics.is_empty()) {
-        (Some(built), Some(inferred), Some(_), true) => {
+    let accepted = loaded
+        .as_ref()
+        .filter(|_| diagnostics.is_empty())
+        .and_then(|loaded| {
+            let mut unchecked: Vec<_> = linked_interfaces
+                .iter()
+                .map(ruddy::artifact::Artifact::to_unchecked)
+                .collect();
+            for dependency in &dependency_interfaces {
+                if !unchecked.iter().any(|artifact| {
+                    artifact.header.identity.name == dependency.header().identity.name
+                        && artifact.header.identity.version == dependency.header().identity.version
+                }) {
+                    unchecked.push(dependency.to_unchecked());
+                }
+            }
+            let dependencies: Vec<_> = unchecked
+                .iter()
+                .map(|artifact| ruddy::compile::Dependency {
+                    alias: dependency_aliases
+                        .iter()
+                        .zip(&dependency_interfaces)
+                        .find(|(_, dependency)| {
+                            artifact.header.identity.name == dependency.header().identity.name
+                                && artifact.header.identity.version
+                                    == dependency.header().identity.version
+                        })
+                        .map(|(alias, _)| alias.as_str()),
+                    artifact,
+                })
+                .collect();
+            ruddy::compile::compile_with_dependencies(
+                Mint::new(mint.bundle().clone()),
+                loaded.stmts.clone(),
+                &dependencies,
+                inference::Trace::Complete,
+            )
+            .ok()
+        });
+    let lowered = match &accepted {
+        Some(accepted) => {
             let started = Instant::now();
-            let out = guard("lir", &mut panicked, || {
-                lir::lower(&mint, &built.program, inferred)
-            });
+            let out = guard("lir", &mut panicked, || lir::lower(accepted));
             micros.lir = started.elapsed().as_micros() as u64;
             out
         }
@@ -425,18 +462,12 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     // The artifact is the first disk-boundary representation. Like LIR, it
     // only exists for an accepted program, and retains no source spans.
     let mut artifact_panicked = false;
-    let artifact = match (&built, &inferred, &lowered) {
-        (Some(built), Some(inferred), Some(lowered)) => {
+    let artifact = match &accepted {
+        Some(accepted) => {
             let started = Instant::now();
             let dependencies = dependency_artifacts.clone();
             let out = guard("artifact", &mut panicked, || {
-                artifact::build_with_dependencies(
-                    &mint,
-                    &built.program,
-                    inferred,
-                    lowered,
-                    dependencies,
-                )
+                artifact::build_with_dependencies(accepted, dependencies)
             });
             artifact_panicked = out.is_none();
             micros.artifact = started.elapsed().as_micros() as u64;

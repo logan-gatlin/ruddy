@@ -285,7 +285,7 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
             // has an argument as surely as one checked against `Nat -> Nat`.
             let shape = cx
                 .inference
-                .map(|inferred| inference::unfold(&inferred.aliases, &term.ty));
+                .map(|inferred| inference::unfold(inferred.semantics().aliases(), &term.ty));
             if let Some(Ty::Arrow(from, _, _)) = shape.as_deref() {
                 trace.terms.push((bound.id, from.clone()));
             }

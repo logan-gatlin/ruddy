@@ -5,7 +5,7 @@ use std::{fs, process::Command};
 use ruddy::{
     artifact::{self, Artifact},
     backend::js::{self, Error},
-    inference, ir, lir, parse, patterns,
+    compile, inference, ir, lir, parse, patterns,
     symbol::{Bundle, Mint, Version},
     token,
     tracking::FileManager,
@@ -105,14 +105,10 @@ fn compiled(source: &str) -> Artifact {
     let parsed = parse::parse(lexed.tokens);
     assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
     let bundle = Bundle::new("app", Version::new(1, 0, 0)).unwrap();
-    let mut mint = Mint::new(bundle);
-    let mut program = ir::build(&mut mint, parsed.stmts).program;
-    let inferred = inference::infer(&mint, &mut program);
-    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
-    let checked = patterns::check(&program, &inferred);
-    assert!(checked.errors.is_empty(), "{:#?}", checked.errors);
-    let lowered = lir::lower(&mint, &program, &inferred);
-    Artifact::build(&mint, &program, &inferred, &lowered)
+    compile::compile(Mint::new(bundle), parsed.stmts, inference::Trace::Off)
+        .unwrap_or_else(|partial| panic!("{partial:#?}"))
+        .artifact()
+        .clone()
 }
 
 #[test]

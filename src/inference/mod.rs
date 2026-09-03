@@ -46,7 +46,7 @@
 //! Staging is what keeps that terminating, and it is the whole discipline:
 //! unification never consults the solver, matches emit only finite formulas,
 //! and SAT runs at generalization boundaries, at the use-site and annotation
-//! checks, and — through [`Output::store`] — in the patterns phase. A
+//! checks, and — through [`Semantics::store`] — in the patterns phase. A
 //! [`Scheme`] therefore carries a formula as well as a body, which is a
 //! constrained scheme in the HM(X) sense: it is what makes a principal type
 //! exist for the programs above.
@@ -96,8 +96,145 @@ use crate::{
 use constrain::Constrain;
 use solve::Solve;
 
+/// Whether inference keeps its complete solver replay data.
+///
+/// Structured errors and their causal explanations are always kept, so a
+/// reporter reads the same rich account in either mode. What the setting
+/// decides is whether the constraints, solver steps, reasons, variables and
+/// refinements the explanations were built from stay published afterwards —
+/// which only a debugger stepping the solve wants, and which ordinary
+/// compilation would otherwise carry for nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Trace {
+    /// Keep errors and their explanations only.
+    #[default]
+    Off,
+    /// Also keep every constraint, step, reason, variable and refinement.
+    Complete,
+}
+
+/// What inference publishes: the semantic facts every later phase reads, and
+/// the diagnostic account of how it reached them.
+///
+/// The two are published separately because they are consumed separately. A
+/// lowering reads schemes and never a solver step; a debugger reads steps and
+/// must not be able to rewrite a scheme on the way. Neither half is mutable
+/// from outside inference, so a program that came out of one `infer` call
+/// cannot be paired with facts that came out of another.
 #[derive(Debug, Clone)]
 pub struct Output {
+    semantics: Semantics,
+    diagnostics: Diagnostics,
+}
+
+/// The two sides of every declared operation, keyed by the effect that declares
+/// it and the operation's own name. See [`Semantics::operations`].
+pub type Operations = IndexMap<(Symbol, ir::OperationSelector), (Rc<Ty>, Rc<Ty>)>;
+
+/// The accepted semantic facts of one inference run, read-only.
+///
+/// Everything a later phase needs and nothing about how it was found: the
+/// meaning of each declaration, the scheme of each definition, and the presence
+/// store the pattern checks ask. Numbering, ordering, zonking and publication
+/// all happened before this was built, and none of them can be redone through
+/// it.
+#[derive(Debug, Clone)]
+pub struct Semantics {
+    pub(crate) aliases: IndexMap<Symbol, Scheme>,
+    pub(crate) operations: Operations,
+    pub(crate) externs: IndexMap<Symbol, Scheme>,
+    pub(crate) reviewed_externs: IndexMap<Symbol, ReviewedExtern>,
+    pub(crate) schemes: IndexMap<Symbol, Scheme>,
+    pub(crate) locals: IndexMap<Symbol, Scheme>,
+    pub(crate) store: Store,
+    pub(crate) promises: IndexMap<Symbol, Formula>,
+}
+
+/// Complete target-neutral facts inference accepted about an extern
+/// declaration.  This is the hand-off to extern planning: later phases do not
+/// reinterpret a raw IR declaration to rebuild facts inference already
+/// reviewed.
+#[derive(Debug, Clone)]
+pub(crate) struct ReviewedExtern {
+    pub(crate) scheme: Scheme,
+    pub(crate) abi: ir::ExternType,
+    pub(crate) target: String,
+    pub(crate) target_span: Span,
+    pub(crate) declaration_span: Span,
+}
+
+/// The diagnostic account of one inference run: its errors, and — when a
+/// complete [`Trace`] was asked for — everything the solver did to find them.
+#[derive(Debug, Clone)]
+pub(crate) struct Diagnostics {
+    pub(crate) trace: Trace,
+    pub(crate) errors: Vec<Error>,
+    pub(crate) constraints: IndexMap<Symbol, Vec<Constraint>>,
+    pub(crate) steps: Vec<Step>,
+    pub(crate) refinements: Vec<Refinement>,
+    pub(crate) variables: Vec<VarMeta>,
+    pub(crate) reasons: Vec<Reason>,
+    pub(crate) recovery_facts: Vec<crate::artifact::RecoveryFact>,
+}
+
+/// The supported read-only view of an inference run's diagnostics.
+///
+/// Every accessor returns what was published, and nothing here can change it.
+/// The replay data — constraints, steps, reasons, variables and refinements —
+/// is empty unless the run was asked for a complete [`Trace`]; the errors and
+/// their explanations are there in either mode.
+#[derive(Clone, Copy)]
+pub struct DiagnosticView<'a> {
+    inner: &'a Diagnostics,
+}
+
+impl Output {
+    /// The accepted semantic facts.
+    pub fn semantics(&self) -> &Semantics {
+        &self.semantics
+    }
+
+    /// The diagnostic account.
+    pub fn diagnostics(&self) -> DiagnosticView<'_> {
+        DiagnosticView {
+            inner: &self.diagnostics,
+        }
+    }
+
+    /// Every error, in source order. The same slice
+    /// [`DiagnosticView::errors`] returns, here because it is the one
+    /// diagnostic every caller reads.
+    pub fn errors(&self) -> &[Error] {
+        &self.diagnostics.errors
+    }
+
+    /// Publish non-fatal repairs made while admitting dependency artifacts.
+    /// Core compilation is the only caller: source inference does not invent
+    /// artifact recovery facts, but its diagnostic view is their supported
+    /// publication seam.
+    pub(crate) fn publish_recovery_facts(
+        &mut self,
+        facts: impl IntoIterator<Item = crate::artifact::RecoveryFact>,
+    ) {
+        self.diagnostics.recovery_facts.extend(facts);
+    }
+
+    /// Crate-private mutable access, for tests that deliberately corrupt an
+    /// otherwise coherent publication to reach a defensive branch.
+    #[cfg(test)]
+    pub(crate) fn semantics_mut(&mut self) -> &mut Semantics {
+        &mut self.semantics
+    }
+
+    /// Crate-private mutable access, for tests that synthesize diagnostic
+    /// records beyond what any real solve would publish.
+    #[cfg(test)]
+    pub(crate) fn diagnostics_mut(&mut self) -> &mut Diagnostics {
+        &mut self.diagnostics
+    }
+}
+
+impl Semantics {
     /// What each `type` declaration stands for: the semantic type its body
     /// denotes, one step deep. A name inside a body stays a [`Ty::Named`] and
     /// is looked up here again, which is how a declaration that names itself
@@ -109,52 +246,70 @@ pub struct Output {
     /// parameters — which is what instantiating a scheme already is, down to
     /// the same `open`. A declaration taking no parameters is a scheme binding
     /// nothing, and opening one returns its body unchanged.
-    pub aliases: IndexMap<Symbol, Scheme>,
+    pub fn aliases(&self) -> &IndexMap<Symbol, Scheme> {
+        &self.aliases
+    }
+
     /// The two sides of every declared operation, keyed by the effect that
     /// declares it and the operation's own name, in declaration order.
     ///
     /// A plain closed arrow, lowered once before any body is walked, because a
     /// signature mentions no variable. Published for the reason
-    /// [`Output::aliases`] is: a later phase reads it and has no table to lower
-    /// a written type with. [`lir`](crate::lir) is that phase — a handler arm's
-    /// binder is the operation's argument, and how a value of it is held is
-    /// nowhere else to be found, since the binder has no term of its own to
+    /// [`Semantics::aliases`] is: a later phase reads it and has no table to
+    /// lower a written type with. [`lir`](crate::lir) is that phase — a handler
+    /// arm's binder is the operation's argument, and how a value of it is held
+    /// is nowhere else to be found, since the binder has no term of its own to
     /// carry a solved type.
-    pub operations: IndexMap<(Symbol, ir::OperationSelector), (Rc<Ty>, Rc<Ty>)>,
+    pub fn operations(&self) -> &Operations {
+        &self.operations
+    }
+
     /// The scheme each target-provided top-level value declared. Externs have
-    /// no body and are therefore intentionally separate from `schemes`, whose
-    /// entries each correspond to a term initializer.
-    pub externs: IndexMap<Symbol, Scheme>,
+    /// no body and are therefore intentionally separate from
+    /// [`Semantics::schemes`], whose entries each correspond to a term
+    /// initializer.
+    pub fn externs(&self) -> &IndexMap<Symbol, Scheme> {
+        &self.externs
+    }
+
+    /// The complete reviewed target-neutral facts for each extern.
+    ///
+    /// This is the private hand-off to post-inference planning. Public callers
+    /// consume the resulting [`ExternPlan`](crate::externs::ExternPlan) from
+    /// an [`AcceptedProgram`](crate::compile::AcceptedProgram), rather than
+    /// reinterpreting the reviewed ABI facts themselves.
+    pub(crate) fn reviewed_externs(&self) -> &IndexMap<Symbol, ReviewedExtern> {
+        &self.reviewed_externs
+    }
+
     /// The scheme each top-level term was inferred, or checked, to have.
-    pub schemes: IndexMap<Symbol, Scheme>,
+    pub fn schemes(&self) -> &IndexMap<Symbol, Scheme> {
+        &self.schemes
+    }
+
     /// The scheme each nested `let` was inferred, in the order the lets were
     /// walked.
     ///
-    /// Beside [`Output::schemes`] rather than in it, so that a reader of that
-    /// map is still reading the definitions of the file: a local binding is not
-    /// a definition, and nothing that consumes the program's exports has any
-    /// business seeing one.
+    /// Beside [`Semantics::schemes`] rather than in it, so that a reader of
+    /// that map is still reading the definitions of the file: a local binding
+    /// is not a definition, and nothing that consumes the program's exports has
+    /// any business seeing one.
     ///
     /// Numbered on its own. A local's scheme may leave an enclosing binder's
     /// variables free, and those are spelled here as letters past its own
     /// quantifiers rather than as the `?3` the solver knew them by — see
     /// [`Table::published`] — so two rows of this map spelling `a` are two
     /// unrelated variables, exactly as two schemes are.
-    pub locals: IndexMap<Symbol, Scheme>,
-    /// What generation asked of each definition, in the order it asked, and
-    /// exactly as it was asked: these are the constraints *before* the solver
-    /// ran, so a variable in one prints as the variable it was. Solving is what
-    /// the schemes report. Kept so that the pass can be read rather than
-    /// inferred from its result — which is what the debugger's tab shows.
-    pub constraints: IndexMap<Symbol, Vec<Constraint>>,
-    /// Every act of the solver, over the whole program, in the order it
-    /// performed them. One flat list rather than one per definition: the
-    /// variable table is shared, so replaying the effects in this order — and
-    /// only in this order — reconstructs what the solver knew at any point.
-    pub steps: Vec<Step>,
+    pub fn locals(&self) -> &IndexMap<Symbol, Scheme> {
+        &self.locals
+    }
+
     /// What the program requires of its presence variables, in the order it
     /// required it. See [`Store`].
-    pub store: Store,
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
+
     /// What [`patterns`](crate::patterns) may assume while it walks each
     /// top-level definition: the store's word about *every* presence variable
     /// that definition's zonked terms can name, in the [`Ty::Bound`]
@@ -173,16 +328,97 @@ pub struct Output {
     /// — for a definition generalized once something had flipped the store: a
     /// store with no model entails everything, and asking it would call every
     /// arm of every match unreachable.
-    pub promises: IndexMap<Symbol, Formula>,
+    pub fn promises(&self) -> &IndexMap<Symbol, Formula> {
+        &self.promises
+    }
+}
+
+impl<'a> DiagnosticView<'a> {
+    /// Which [`Trace`] the run was asked for.
+    pub fn trace(self) -> Trace {
+        self.inner.trace
+    }
+
+    /// Every error, in source order, each carrying its causal explanation
+    /// where its family has one.
+    pub fn errors(self) -> &'a [Error] {
+        &self.inner.errors
+    }
+
+    /// Repairs made while accepting portable dependency data. These are facts
+    /// for tooling, never source compilation errors.
+    pub fn recovery_facts(self) -> &'a [crate::artifact::RecoveryFact] {
+        &self.inner.recovery_facts
+    }
+
+    /// What generation asked of each definition, in the order it asked, and
+    /// exactly as it was asked: these are the constraints *before* the solver
+    /// ran, so a variable in one prints as the variable it was. Solving is what
+    /// the schemes report. Kept so that the pass can be read rather than
+    /// inferred from its result — which is what the debugger's tab shows.
+    ///
+    /// Empty unless the trace is complete.
+    pub fn constraints(self) -> &'a IndexMap<Symbol, Vec<Constraint>> {
+        &self.inner.constraints
+    }
+
+    /// Every act of the solver, over the whole program, in the order it
+    /// performed them. One flat list rather than one per definition: the
+    /// variable table is shared, so replaying the effects in this order — and
+    /// only in this order — reconstructs what the solver knew at any point.
+    ///
+    /// Empty unless the trace is complete.
+    pub fn steps(self) -> &'a [Step] {
+        &self.inner.steps
+    }
+
     /// The branch-local presence assumptions inference used, one report per
     /// arm of every qualifying match, in solve order.
-    pub refinements: Vec<Refinement>,
+    ///
+    /// Empty unless the trace is complete.
+    pub fn refinements(self) -> &'a [Refinement] {
+        &self.inner.refinements
+    }
+
     /// Metadata indexed by `TyVar`, parallel to the solver's private slots.
-    pub variables: Vec<VarMeta>,
+    ///
+    /// Empty unless the trace is complete.
+    pub fn variables(self) -> &'a [VarMeta] {
+        &self.inner.variables
+    }
+
     /// Append-only reason arena. Speculative nodes remain retired but readable
     /// after rollback; no surviving link can be retargeted by identity reuse.
-    pub reasons: Vec<Reason>,
-    pub errors: Vec<Error>,
+    ///
+    /// Empty unless the trace is complete.
+    pub fn reasons(self) -> &'a [Reason] {
+        &self.inner.reasons
+    }
+
+    /// Reachable causal slice rooted at `seed`, walked iteratively so debugger
+    /// queries remain safe for arbitrarily deep chains of solved aliases.
+    pub fn reason_ancestors(self, seed: ReasonId) -> Vec<ReasonId> {
+        let arena: HashMap<_, _> = self
+            .inner
+            .reasons
+            .iter()
+            .map(|reason| (reason.id, reason))
+            .collect();
+        let mut seen = HashSet::new();
+        let mut work = vec![seed];
+        let mut out = Vec::new();
+        while let Some(id) = work.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(reason) = arena.get(&id).filter(|reason| reason.reachable) else {
+                continue;
+            };
+            out.push(id);
+            work.extend(reason.parents.iter().rev().copied());
+        }
+        out
+    }
 }
 
 /// The propositional constraint store: every formula the program emitted about
@@ -207,8 +443,10 @@ macro_rules! inference_id {
                 self.0
             }
 
-            #[doc(hidden)]
-            pub const fn synthetic(value: u64) -> Self {
+            /// A fabricated identity, for crate-private tests that build
+            /// diagnostic records no real solve would publish.
+            #[allow(dead_code)]
+            pub(crate) const fn synthetic(value: u64) -> Self {
                 Self(value)
             }
 
@@ -288,32 +526,6 @@ pub enum DefaultAssignment {
     EmptyRow,
 }
 
-impl Output {
-    /// Reachable causal slice rooted at `seed`, walked iteratively so debugger
-    /// queries remain safe for arbitrarily deep chains of solved aliases.
-    pub fn reason_ancestors(&self, seed: ReasonId) -> Vec<ReasonId> {
-        let arena: HashMap<_, _> = self
-            .reasons
-            .iter()
-            .map(|reason| (reason.id, reason))
-            .collect();
-        let mut seen = HashSet::new();
-        let mut work = vec![seed];
-        let mut out = Vec::new();
-        while let Some(id) = work.pop() {
-            if !seen.insert(id) {
-                continue;
-            }
-            let Some(reason) = arena.get(&id).filter(|reason| reason.reachable) else {
-                continue;
-            };
-            out.push(id);
-            work.extend(reason.parents.iter().rev().copied());
-        }
-        out
-    }
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct Store {
     pub batches: Vec<Batch>,
@@ -335,7 +547,7 @@ pub struct Batch {
     /// What it requires, over the presence variables that existed when it was
     /// emitted. Kept as it was emitted, not as the solve later resolved it —
     /// the debugger shows the pass being read rather than its result, exactly
-    /// as [`Output::constraints`] does.
+    /// as [`DiagnosticView::constraints`] does.
     pub formula: Formula,
     /// Whether conjoining this batch is what made the store unsatisfiable. At
     /// most one batch in a store is, which is the cascade rule: the first flip
@@ -2378,7 +2590,7 @@ struct Known {
 
 /// What one name in scope means. Private for the same reason as [`Slot`]: a
 /// binding exists only while a definition is being walked, and what survives
-/// the walk is the [`Scheme`] in [`Output::schemes`].
+/// the walk is the [`Scheme`] in [`Semantics::schemes`].
 #[derive(Debug, Clone)]
 enum Binding {
     Mono(Rc<Ty>),
@@ -2542,7 +2754,7 @@ struct Solved {
     /// contract, or what its body turned out to be.
     ty: Rc<Ty>,
     /// What generation asked of it, kept exactly as it was asked. See
-    /// [`Output::constraints`].
+    /// [`DiagnosticView::constraints`].
     generated: Vec<Constraint>,
     /// Every annotation written on a nested `let` inside it. See [`Annotated`].
     annotated: Vec<Annotated>,
@@ -2670,7 +2882,7 @@ struct Table {
     /// scheme's formula) and by lowering (an annotation's `where` clause), and
     /// consulted only where R8 allows: at a generalization boundary, at the
     /// use-site and annotation checks, and — through
-    /// [`Output::store`] — in the patterns phase. Never by unification.
+    /// [`Semantics::store`] — in the patterns phase. Never by unification.
     store: Store,
     /// Where each a variable variable in the program was declared, by the id
     /// its annotation gave it.
@@ -5319,7 +5531,7 @@ fn direct_callback_issue(
     })
 }
 
-pub fn infer(mint: &Mint, program: &mut Program) -> Output {
+pub fn infer(mint: &Mint, program: &mut Program, trace: Trace) -> Output {
     let mut table = Table::default();
     table.binding_names.extend(
         program
@@ -6083,7 +6295,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             // With every presence the body can name now numbered, the store's
             // word about all of them, for the patterns walk to assume. The
             // scheme's own clause is deliberately not this: see
-            // [`Output::promises`].
+            // [`Semantics::promises`].
             promises.insert(symbol, table.promised(&subst));
             // And the same for what it complained about, which is why this
             // waits until the group is solved rather than running where the
@@ -6130,7 +6342,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     // Both maps are keyed in source order, whatever order the groups were
     // solved in: a reader of either is reading the file, and which definition
     // had to be solved first is the solver's business rather than theirs.
-    // [`Output::steps`] is that business exactly, and stays in solve order.
+    // [`DiagnosticView::steps`] is that business exactly, and stays in solve order.
     let position: HashMap<Symbol, usize> = program
         .externs
         .keys()
@@ -6178,20 +6390,59 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
         )
     });
 
-    Output {
+    let reviewed_externs = program
+        .externs
+        .iter()
+        .map(|(symbol, declaration)| {
+            (
+                *symbol,
+                ReviewedExtern {
+                    scheme: externs[symbol].clone(),
+                    abi: declaration.value.abi.clone(),
+                    target: declaration.value.target.tracked.clone(),
+                    target_span: declaration.value.target.span,
+                    declaration_span: declaration.name_span,
+                },
+            )
+        })
+        .collect();
+    let semantics = Semantics {
         aliases,
         operations,
         externs,
+        reviewed_externs,
         schemes,
         locals,
-        constraints,
-        steps,
         store,
         promises,
-        refinements,
-        variables: table.var_meta.clone(),
-        reasons: table.reasons.clone(),
-        errors,
+    };
+    // The replay data was needed above to build every explanation; only a
+    // complete trace keeps it published past this point.
+    let diagnostics = match trace {
+        Trace::Complete => Diagnostics {
+            trace,
+            errors,
+            constraints,
+            steps,
+            refinements,
+            variables: table.var_meta.clone(),
+            reasons: table.reasons.clone(),
+            recovery_facts: Vec::new(),
+        },
+        Trace::Off => Diagnostics {
+            trace,
+            errors,
+            constraints: IndexMap::new(),
+            steps: Vec::new(),
+            refinements: Vec::new(),
+            variables: Vec::new(),
+            reasons: Vec::new(),
+            recovery_facts: Vec::new(),
+        },
+    };
+    Output {
+        semantics,
+        diagnostics,
     }
 }
 
@@ -9298,7 +9549,7 @@ impl Table {
 
     /// What the store says about every presence variable `subst` numbered, in
     /// that numbering: the formula [`patterns`](crate::patterns) walks a
-    /// definition under. See [`Output::promises`].
+    /// definition under. See [`Semantics::promises`].
     ///
     /// Beside [`required`](Self::required) rather than in it, and deliberately
     /// unlike it in two ways. The atoms are the substitution's rather than the
@@ -9334,7 +9585,7 @@ impl Table {
     /// is shown letters rather than the solver's `?3` and the scheme still says
     /// truthfully which of its positions are presences.
     ///
-    /// Only for [`Output::locals`], and only once the solve that could still
+    /// Only for [`Semantics::locals`], and only once the solve that could still
     /// bind those variables is over. The scheme the solver instantiates is the
     /// one [`generalize`](Self::generalize) produced, free variables and all;
     /// numbering them would hand each use a copy of a variable it is meant to
@@ -13210,5 +13461,35 @@ mod identity_tests {
             table.var_meta[surviving as usize].minted_by,
             abandoned_reason
         );
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    //! Tests that fabricate diagnostic records no real solve would publish.
+
+    use super::*;
+    use crate::test_support;
+
+    #[test]
+    fn deep_reason_slices_are_iterative() {
+        let (_, _, mut output) = test_support::inferred("let x = 1n", Trace::Complete);
+        let base = output.diagnostics().reasons().len() as u64 + 100;
+        let depth = 30_000u64;
+        for at in 0..depth {
+            output.diagnostics_mut().reasons.push(Reason {
+                id: ReasonId::synthetic(base + at),
+                parents: (at > 0)
+                    .then(|| ReasonId::synthetic(base + at - 1))
+                    .into_iter()
+                    .collect(),
+                origin: ReasonOrigin::Recovery,
+                reachable: true,
+            });
+        }
+        let slice = output
+            .diagnostics()
+            .reason_ancestors(ReasonId::synthetic(base + depth - 1));
+        assert_eq!(slice.len(), depth as usize);
     }
 }

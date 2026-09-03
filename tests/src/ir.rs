@@ -3334,8 +3334,8 @@ fn matrix_refinement_reads_every_nested_scalar_pattern() {
          | rest => 0n \
          end",
     );
-    let inferred = inference::infer(&mint, &mut out.program);
-    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    let inferred = inference::infer(&mint, &mut out.program, inference::Trace::Complete);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
 }
 
 /// The empty match survives as a match with no arms: the empty sum's
@@ -5960,7 +5960,10 @@ fn canonical_bundle_import_preserves_mixed_input_result_guarantee() {
     // universal atom remains in scope even though existential atoms determine
     // which result package owns the indivisible proposition.
     let text = dependency.print();
-    dependency = a::Artifact::try_parse(&text).expect("canonical dependency parses");
+    dependency = a::Artifact::try_parse(&text)
+        .expect("canonical dependency parses")
+        .validate()
+        .expect("canonical dependency validates");
     let parsed = parse::parse(lex("let value = dep::prelude::shared", FileID::GENERATED).tokens);
     let mut mint = dummy_mint();
     let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
@@ -6524,8 +6527,8 @@ fn imported_effect_row_keys_follow_canonical_identities_by_shape() {
     assert!(cases.labels.contains_key(raw));
     assert!(!cases.labels.contains_key(&canonical));
 
-    let inferred = inference::infer(&mint, &mut out.program);
-    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    let inferred = inference::infer(&mint, &mut out.program, inference::Trace::Complete);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
 }
 
 #[test]
@@ -6805,7 +6808,7 @@ fn a_direct_only_interface_with_a_transitive_type_recovers_without_panicking() {
     assert!(parsed.errors.is_empty());
     let mut mint = dummy_mint();
     let mut built = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
-    let _inferred = inference::infer(&mint, &mut built.program);
+    let _inferred = inference::infer(&mint, &mut built.program, inference::Trace::Complete);
     assert_eq!(built.program.external_types.len(), 2);
 }
 
@@ -6984,10 +6987,10 @@ fn direct_only_transitive_effects_keep_qualified_recovery_identity() {
     // Recovery identities must survive the full inference path too. In
     // particular, direct-only unresolved effects are semantic row labels, not
     // names which inference may discard or attempt to look up transitively.
-    let inferred = inference::infer(&mint, &mut out.program);
-    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
-    assert_eq!(inferred.schemes.len(), 3);
-    for scheme in inferred.schemes.values() {
+    let inferred = inference::infer(&mint, &mut out.program, inference::Trace::Complete);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
+    assert_eq!(inferred.semantics().schemes().len(), 3);
+    for scheme in inferred.semantics().schemes().values() {
         let ruddy::types::Ty::Arrow(_, _, effects) = &**scheme.body() else {
             panic!("expected inferred arrow")
         };
@@ -8125,9 +8128,14 @@ fn absent_imported_payloads_do_not_create_visible_quantifiers_or_effect_counts()
     let mut mint = dummy_mint();
     let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    let inferred = inference::infer(&mint, &mut out.program);
-    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
-    let scheme = inferred.schemes.values().next().expect("ghost scheme");
+    let inferred = inference::infer(&mint, &mut out.program, inference::Trace::Complete);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
+    let scheme = inferred
+        .semantics()
+        .schemes()
+        .values()
+        .next()
+        .expect("ghost scheme");
     assert_eq!(scheme.count(), 0);
     assert_eq!(scheme.presences(), 0);
 }
@@ -9786,22 +9794,24 @@ fn malformed_named_applications_of_unequal_arity_are_not_congruent() {
     let mut mint = dummy_mint();
     let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    let inferred = inference::infer(&mint, &mut out.program);
+    let inferred = inference::infer(&mint, &mut out.program, inference::Trace::Complete);
     assert!(
         inferred
-            .steps
+            .diagnostics()
+            .steps()
             .iter()
             .all(|step| !matches!(step.rule, inference::Rule::Congruent)),
         "{:#?}",
-        inferred.steps
+        inferred.diagnostics().steps()
     );
     assert!(
         inferred
-            .steps
+            .diagnostics()
+            .steps()
             .iter()
             .any(|step| matches!(step.rule, inference::Rule::Unfold)),
         "{:#?}",
-        inferred.steps
+        inferred.diagnostics().steps()
     );
 }
 
@@ -10891,11 +10901,12 @@ fn deeply_nested_imported_semantics_are_preserved_on_a_small_stack() {
             // Naming both values semantically instantiates the deep formula
             // and the deep arrow/name/field-payload type on this small stack.
             let mut program = out.program;
-            let inferred = inference::infer(&mint, &mut program);
-            assert_eq!(inferred.errors.len(), 1);
-            assert_eq!(inferred.errors[0].kind.code(), "type-mismatch");
+            let inferred = inference::infer(&mint, &mut program, inference::Trace::Complete);
+            assert_eq!(inferred.errors().len(), 1);
+            assert_eq!(inferred.errors()[0].kind.code(), "type-mismatch");
             let guarded_step = inferred
-                .steps
+                .diagnostics()
+                .steps()
                 .iter()
                 .any(|step| matches!(step.effect, inference::Effect::Guarded { .. }));
             assert!(guarded_step);
@@ -11177,9 +11188,9 @@ fn imported_interfaces_discard_foreign_solver_local_ids_before_inference() {
             .values()
             .all(|scheme| scheme.formula().is_true())
     );
-    let inferred = inference::infer(&mint, &mut out.program);
+    let inferred = inference::infer(&mint, &mut out.program, inference::Trace::Complete);
     assert!(matches!(
-        inferred.errors.as_slice(),
+        inferred.errors(),
         [error] if matches!(error.kind, inference::ErrorKind::Unhandled { .. })
     ));
 }
@@ -11275,8 +11286,8 @@ fn arrow_effect_more_rows_use_one_canonical_form_in_both_directions() {
     let mut mint = dummy_mint();
     let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    let inferred = inference::infer(&mint, &mut out.program);
-    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    let inferred = inference::infer(&mint, &mut out.program, inference::Trace::Complete);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
 }
 
 #[test]
@@ -11435,15 +11446,16 @@ fn deep_equal_imported_types_unify_on_a_bounded_stack() {
             let mut out =
                 build_with_dependencies(&mut mint, parsed.stmts, std::slice::from_ref(&dependency));
             assert!(out.errors.is_empty(), "{:#?}", out.errors);
-            let inferred = inference::infer(&mint, &mut out.program);
-            assert_eq!(inferred.errors.len(), 1, "{:#?}", inferred.errors);
+            let inferred = inference::infer(&mint, &mut out.program, inference::Trace::Complete);
+            assert_eq!(inferred.errors().len(), 1, "{:#?}", inferred.errors());
             assert!(matches!(
-                inferred.errors[0].kind,
+                inferred.errors()[0].kind,
                 inference::ErrorKind::Mismatch { .. }
             ));
             assert!(
                 inferred
-                    .steps
+                    .diagnostics()
+                    .steps()
                     .iter()
                     .any(|step| matches!(step.rule, inference::Rule::Arrow)),
                 "the deep bodies were decomposed"
@@ -11536,15 +11548,16 @@ fn deep_alias_reentry_shares_one_congruence_transaction() {
             let mut mint = dummy_mint();
             let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
             assert!(out.errors.is_empty(), "{:#?}", out.errors);
-            let inferred = inference::infer(&mint, &mut out.program);
-            assert_eq!(inferred.errors.len(), 1, "{:#?}", inferred.errors);
+            let inferred = inference::infer(&mint, &mut out.program, inference::Trace::Complete);
+            assert_eq!(inferred.errors().len(), 1, "{:#?}", inferred.errors());
             assert!(matches!(
-                inferred.errors[0].kind,
+                inferred.errors()[0].kind,
                 inference::ErrorKind::Mismatch { .. }
             ));
             assert!(
                 inferred
-                    .steps
+                    .diagnostics()
+                    .steps()
                     .iter()
                     .any(|step| matches!(step.rule, inference::Rule::Unfold))
             );
@@ -11631,11 +11644,12 @@ fn recursive_imported_alias_reentry_compares_malformed_arities() {
     let mut mint = dummy_mint();
     let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    let inferred = inference::infer(&mint, &mut out.program);
-    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    let inferred = inference::infer(&mint, &mut out.program, inference::Trace::Complete);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert!(
         inferred
-            .steps
+            .diagnostics()
+            .steps()
             .iter()
             .any(|step| matches!(step.rule, inference::Rule::Assume))
     );
@@ -11735,9 +11749,10 @@ fn deep_unequal_imported_struct_rows_unify_on_a_bounded_stack() {
                 let mut mint = dummy_mint();
                 let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
                 assert!(out.errors.is_empty(), "{:#?}", out.errors);
-                let inferred = inference::infer(&mint, &mut out.program);
+                let inferred =
+                    inference::infer(&mint, &mut out.program, inference::Trace::Complete);
                 let messages: Vec<String> = inferred
-                    .errors
+                    .errors()
                     .iter()
                     .map(|error| error.kind.to_string())
                     .collect();
@@ -11750,7 +11765,8 @@ fn deep_unequal_imported_struct_rows_unify_on_a_bounded_stack() {
                 );
                 assert!(
                     inferred
-                        .steps
+                        .diagnostics()
+                        .steps()
                         .iter()
                         .any(|step| matches!(step.rule, inference::Rule::Struct)),
                     "the deep rows did not use the struct decomposition path"

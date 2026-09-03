@@ -10,7 +10,8 @@
 use std::{collections::HashMap, error::Error, fmt};
 
 use crate::{
-    inference, ir, lir,
+    compile::AcceptedProgram,
+    ir, lir,
     symbol::{Mint, Symbol},
     types,
 };
@@ -59,11 +60,318 @@ impl fmt::Display for ParseError {
 
 impl Error for ParseError {}
 
+/// Portable artifact data before compiler invariants have been established.
+/// Parsers and hand-written producers return this type; consumers must choose
+/// strict validation or tolerant recovery explicitly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UncheckedArtifact {
+    pub header: Header,
+    pub lir: Lir,
+}
+
+/// A strict semantic-artifact validation failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationError {
+    message: String,
+}
+
+impl ValidationError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl Error for ValidationError {}
+
+/// A repair made while admitting foreign in-memory portable data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoveryFact {
+    /// The dependency did not provide a bundle name, so recovery supplied one.
+    IdentityNameReplaced { replacement: String },
+    /// The dependency did not provide a bundle version, so recovery supplied one.
+    IdentityVersionReplaced { replacement: String },
+    /// An exported value lacked a name, so recovery supplied one.
+    ValueNameReplaced { index: usize, replacement: String },
+    /// A type declaration could not join the validated artifact.
+    TypeDiscarded {
+        index: usize,
+        name: QualifiedName,
+        reason: String,
+    },
+    /// An effect declaration could not join the validated artifact.
+    EffectDiscarded {
+        index: usize,
+        name: QualifiedName,
+        reason: String,
+    },
+    /// A value declaration could not join the validated artifact.
+    ValueDiscarded {
+        index: usize,
+        name: QualifiedName,
+        reason: String,
+    },
+    /// Executable data referred outside its local function table and could not
+    /// safely be given a meaning during dependency recovery.
+    ExecutableDiscarded { reason: String },
+}
+
 /// A complete, serializable bundle artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Artifact {
-    pub header: Header,
-    pub lir: Lir,
+    pub(crate) header: Header,
+    pub(crate) lir: Lir,
+}
+
+/// An internal placeholder used only while core compilation establishes the
+/// accepted proof that artifact construction consumes. It is never published.
+pub(crate) fn empty() -> Artifact {
+    Artifact {
+        header: Header {
+            identity: Identity {
+                name: String::new(),
+                version: String::new(),
+            },
+            dependencies: Vec::new(),
+            values: Vec::new(),
+            types: Vec::new(),
+            effects: Vec::new(),
+        },
+        lir: Lir {
+            externs: Vec::new(),
+            functions: Vec::new(),
+            globals: Vec::new(),
+        },
+    }
+}
+
+impl UncheckedArtifact {
+    /// Strictly establish the portable artifact invariants.
+    pub fn validate(self) -> Result<Artifact, ValidationError> {
+        if self.header.identity.name.is_empty() || self.header.identity.version.is_empty() {
+            return Err(ValidationError::new(
+                "artifact identity must name a bundle and version",
+            ));
+        }
+        if self.header.values.iter().any(|value| value.name.is_empty()) {
+            return Err(ValidationError::new("artifact value name is empty"));
+        }
+        validate_executable_relationships(&self.lir)?;
+        // Text decoding is the single semantic translation implementation.
+        // Rendering this portable tree and decoding it again deliberately
+        // routes hand-built data through the same stack-safe checks as a disk
+        // artifact: bounds, formulas, package preorder ownership, rows and
+        // absent payloads cannot acquire a second, weaker validation policy.
+        let portable = Artifact {
+            header: self.header,
+            lir: self.lir,
+        };
+        let text = print(&portable);
+        text::try_parse(&text).map_err(|error| ValidationError::new(error.to_string()))
+    }
+
+    /// Admit a dependency artifact while recording that validation had to be
+    /// relaxed. Recovery facts are diagnostics, not source compilation errors.
+    pub fn recover(self) -> (Artifact, Vec<RecoveryFact>) {
+        let UncheckedArtifact { header, lir } = self;
+        match (UncheckedArtifact {
+            header: header.clone(),
+            lir: lir.clone(),
+        })
+        .validate()
+        {
+            Ok(artifact) => (artifact, Vec::new()),
+            Err(_) => {
+                // Recovery is deliberately local. One malformed spelling must
+                // not erase unaffected declarations or executable content.
+                let mut header = header;
+                let mut facts = Vec::new();
+                if header.identity.name.is_empty() {
+                    let replacement = String::from("<recovered>");
+                    header.identity.name = replacement.clone();
+                    facts.push(RecoveryFact::IdentityNameReplaced { replacement });
+                }
+                if header.identity.version.is_empty() {
+                    let replacement = String::from("0");
+                    header.identity.version = replacement.clone();
+                    facts.push(RecoveryFact::IdentityVersionReplaced { replacement });
+                }
+                for (index, value) in header.values.iter_mut().enumerate() {
+                    if value.name.is_empty() {
+                        let replacement = format!("<recovered>::value-{index}");
+                        value.name = replacement.clone();
+                        facts.push(RecoveryFact::ValueNameReplaced { index, replacement });
+                    }
+                }
+                let (lir, executable_facts) = recover_executable(lir);
+                facts.extend(executable_facts);
+                let (artifact, discarded) = recover_parts(header, lir);
+                facts.extend(discarded);
+                (artifact, facts)
+            }
+        }
+    }
+}
+
+/// Verify the executable relationships which later consumers rely on without
+/// rechecking a target adapter's own syntax or semantics. The traversal is
+/// iterative because portable blocks can be arbitrarily deeply nested.
+fn validate_executable_relationships(lir: &Lir) -> Result<(), ValidationError> {
+    let function_count = lir.functions.len() as u64;
+    let mut pending: Vec<&Block> = lir
+        .functions
+        .iter()
+        .map(|function| &function.body)
+        .chain(lir.globals.iter().map(|global| &global.body))
+        .collect();
+
+    while let Some(block) = pending.pop() {
+        for instruction in &block.instrs {
+            match &instruction.op {
+                Op::Closure { func, .. }
+                | Op::Call {
+                    callee: Callee::Direct(func),
+                    ..
+                } if *func >= function_count => {
+                    return Err(ValidationError::new(format!(
+                        "artifact function reference {func} is outside its function table"
+                    )));
+                }
+                Op::Catch { body, .. } => pending.push(body),
+                Op::SwitchTag {
+                    cases, fallback, ..
+                } => {
+                    pending.extend(cases.iter().map(|case| &case.block));
+                    pending.extend(fallback.as_deref());
+                }
+                Op::SwitchPrim {
+                    cases, fallback, ..
+                } => {
+                    pending.extend(cases.iter().map(|case| &case.block));
+                    pending.extend(fallback.as_deref());
+                }
+                Op::SwitchPresence {
+                    present, absent, ..
+                } => {
+                    pending.push(present);
+                    pending.push(absent);
+                }
+                Op::SwitchRest { none, some, .. } => {
+                    pending.push(none);
+                    pending.push(some);
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// An invalid local function reference has no target-neutral repair. Keep the
+/// recoverable semantic interface, but remove executable content rather than
+/// publishing an `Artifact` that could make a linker or backend dereference an
+/// invalid table entry.
+fn recover_executable(mut lir: Lir) -> (Lir, Vec<RecoveryFact>) {
+    match validate_executable_relationships(&lir) {
+        Ok(()) => (lir, Vec::new()),
+        Err(error) => {
+            lir.functions.clear();
+            lir.globals.clear();
+            (
+                lir,
+                vec![RecoveryFact::ExecutableDiscarded {
+                    reason: error.to_string(),
+                }],
+            )
+        }
+    }
+}
+
+/// Retain every independently valid declaration while excluding only portable
+/// semantic fragments that cannot establish the artifact invariant.  A valid
+/// LIR is carried through every candidate validation, so a bad interface tree
+/// never erases executable content that does not depend on it.
+fn recover_parts(header: Header, lir: Lir) -> (Artifact, Vec<RecoveryFact>) {
+    let mut recovered = Header {
+        identity: header.identity,
+        dependencies: header.dependencies,
+        values: Vec::new(),
+        types: Vec::new(),
+        effects: Vec::new(),
+    };
+
+    // Types precede values because an exported value may name a local type.
+    // Each candidate takes the same strict route as text input; recovery is
+    // selection, never a weaker semantic decoder.
+    let mut facts = Vec::new();
+    for (index, declaration) in header.types.into_iter().enumerate() {
+        let mut candidate = recovered.clone();
+        candidate.types.push(declaration.clone());
+        match (UncheckedArtifact {
+            header: candidate.clone(),
+            lir: lir.clone(),
+        })
+        .validate()
+        {
+            Ok(_) => recovered = candidate,
+            Err(error) => facts.push(RecoveryFact::TypeDiscarded {
+                index,
+                name: declaration.name,
+                reason: error.to_string(),
+            }),
+        }
+    }
+    for (index, declaration) in header.effects.into_iter().enumerate() {
+        let mut candidate = recovered.clone();
+        candidate.effects.push(declaration.clone());
+        match (UncheckedArtifact {
+            header: candidate.clone(),
+            lir: lir.clone(),
+        })
+        .validate()
+        {
+            Ok(_) => recovered = candidate,
+            Err(error) => facts.push(RecoveryFact::EffectDiscarded {
+                index,
+                name: declaration.name,
+                reason: error.to_string(),
+            }),
+        }
+    }
+    for (index, declaration) in header.values.into_iter().enumerate() {
+        let mut candidate = recovered.clone();
+        candidate.values.push(declaration.clone());
+        match (UncheckedArtifact {
+            header: candidate.clone(),
+            lir: lir.clone(),
+        })
+        .validate()
+        {
+            Ok(_) => recovered = candidate,
+            Err(error) => facts.push(RecoveryFact::ValueDiscarded {
+                index,
+                name: declaration.name,
+                reason: error.to_string(),
+            }),
+        }
+    }
+
+    let artifact = UncheckedArtifact {
+        header: recovered,
+        lir,
+    }
+    .validate()
+    .expect("a recovery candidate is admitted only after strict validation");
+    (artifact, facts)
 }
 
 impl Drop for Artifact {
@@ -1585,23 +1893,19 @@ impl Drop for Op {
 }
 
 /// Build an artifact after inference and LIR lowering succeeded.
-pub fn build(
-    mint: &Mint,
-    program: &ir::Program,
-    inference: &inference::Output,
-    lir: &lir::Output,
-) -> Artifact {
-    build_with_dependencies(mint, program, inference, lir, Vec::new())
+pub fn build(accepted: &AcceptedProgram) -> Artifact {
+    build_with_dependencies(accepted, Vec::new())
 }
 
 /// Build an artifact with the dependency identities supplied by its driver.
 pub fn build_with_dependencies(
-    mint: &Mint,
-    program: &ir::Program,
-    inference: &inference::Output,
-    lir: &lir::Output,
+    accepted: &AcceptedProgram,
     dependencies: Vec<Dependency>,
 ) -> Artifact {
+    let lir = accepted.lower();
+    let mint = accepted.mint();
+    let program = accepted.ir();
+    let inference = accepted.semantics();
     let header = Header {
         identity: Identity {
             name: mint.bundle().name().to_string(),
@@ -1613,7 +1917,7 @@ pub fn build_with_dependencies(
             .keys()
             .map(|symbol| Value {
                 name: qualified(mint, *symbol),
-                scheme: scheme(mint, &inference.externs[symbol]),
+                scheme: scheme(mint, &inference.externs()[symbol]),
             })
             .chain(
                 program
@@ -1625,7 +1929,7 @@ pub fn build_with_dependencies(
                     .filter(|symbol| !mint.is_local(**symbol))
                     .map(|symbol| Value {
                         name: qualified(mint, *symbol),
-                        scheme: scheme(mint, &inference.schemes[symbol]),
+                        scheme: scheme(mint, &inference.schemes()[symbol]),
                     }),
             )
             .collect(),
@@ -1648,7 +1952,7 @@ pub fn build_with_dependencies(
                         relevant: param.relevant,
                     })
                     .collect(),
-                scheme: scheme(mint, &inference.aliases[symbol]),
+                scheme: scheme(mint, &inference.aliases()[symbol]),
             })
             .collect(),
         effects: program
@@ -1662,7 +1966,7 @@ pub fn build_with_dependencies(
                         operations
                             .iter()
                             .map(|(name, _)| {
-                                let (from, to) = &inference.operations[&(*symbol, name.clone())];
+                                let (from, to) = &inference.operations()[&(*symbol, name.clone())];
                                 Operation {
                                     selector: match name {
                                         ir::OperationSelector::Unnamed => {
@@ -1690,19 +1994,36 @@ pub fn build_with_dependencies(
     };
     Artifact {
         header,
-        lir: lower_lir(mint, lir),
+        lir: lower_lir(mint, &lir),
     }
 }
 
 impl Artifact {
+    /// The validated public interface of this artifact.
+    pub fn header(&self) -> &Header {
+        &self.header
+    }
+
+    /// The validated executable representation of this artifact.
+    pub fn lir(&self) -> &Lir {
+        &self.lir
+    }
+
+    /// Copy this validated artifact back to portable data for a caller that
+    /// needs to pass it through a dependency-admission boundary.
+    pub fn to_unchecked(&self) -> UncheckedArtifact {
+        UncheckedArtifact {
+            header: self.header.clone(),
+            lir: self.lir.clone(),
+        }
+    }
+
+    pub(crate) fn from_validated_parts(header: Header, lir: Lir) -> Self {
+        Self { header, lir }
+    }
     /// Build an artifact after inference and LIR lowering succeeded.
-    pub fn build(
-        mint: &Mint,
-        program: &ir::Program,
-        inference: &inference::Output,
-        lir: &lir::Output,
-    ) -> Self {
-        build(mint, program, inference, lir)
+    pub fn build(accepted: &AcceptedProgram) -> Self {
+        build(accepted)
     }
 
     /// Canonical textual serialization.
@@ -1710,12 +2031,12 @@ impl Artifact {
         print(self)
     }
     /// Parse trusted internal artifact text. Malformed input panics.
-    pub fn parse(input: &str) -> Self {
+    pub fn parse(input: &str) -> UncheckedArtifact {
         parse(input)
     }
 
     /// Parse artifact text without panicking on malformed input.
-    pub fn try_parse(input: &str) -> Result<Self, ParseError> {
+    pub fn try_parse(input: &str) -> Result<UncheckedArtifact, ParseError> {
         try_parse(input)
     }
 }
@@ -1725,13 +2046,20 @@ pub fn print(artifact: &Artifact) -> String {
     text::print(artifact)
 }
 /// Parse trusted internal artifact text. Malformed input panics.
-pub fn parse(input: &str) -> Artifact {
-    text::parse(input)
+pub fn parse(input: &str) -> UncheckedArtifact {
+    let artifact = text::parse(input);
+    UncheckedArtifact {
+        header: artifact.header.clone(),
+        lir: artifact.lir.clone(),
+    }
 }
 
 /// Parse artifact text without panicking on malformed input.
-pub fn try_parse(input: &str) -> Result<Artifact, ParseError> {
-    text::try_parse(input)
+pub fn try_parse(input: &str) -> Result<UncheckedArtifact, ParseError> {
+    text::try_parse(input).map(|artifact| UncheckedArtifact {
+        header: artifact.header.clone(),
+        lir: artifact.lir.clone(),
+    })
 }
 
 fn qualified(mint: &Mint, symbol: Symbol) -> QualifiedName {
@@ -1774,6 +2102,13 @@ fn effect_id(id: &types::EffectId) -> EffectIdentity {
             panic!("artifact building requires structural effect identities")
         }
     }
+}
+
+/// Export one semantic scheme as portable artifact data, naming every declared
+/// type by its qualified name in `mint`. The same translation
+/// [`build_with_dependencies`] uses for every exported value.
+pub fn export_scheme(mint: &Mint, value: &types::Scheme) -> Scheme {
+    scheme(mint, value)
 }
 
 fn scheme(mint: &Mint, value: &types::Scheme) -> Scheme {
@@ -4459,7 +4794,7 @@ mod tests {
         ] {
             let artifact = artifact_with_target(target);
             let printed = print(&artifact);
-            assert_eq!(try_parse(&printed).unwrap(), artifact);
+            assert_eq!(try_parse(&printed).unwrap().validate().unwrap(), artifact);
             assert!(printed.contains(target_form), "{printed}");
         }
     }
@@ -4469,5 +4804,62 @@ mod tests {
         let printed = print(&artifact_with_target("console.log"));
         let old = printed.replace("(target \"console.log\")", "(target \"console\" \"log\")");
         assert_eq!(try_parse(&old).unwrap_err().message(), "bad `target` arity");
+    }
+
+    #[test]
+    fn validation_rejects_out_of_range_function_references() {
+        for op in [
+            Op::Closure {
+                func: 1,
+                captures: Vec::new(),
+            },
+            Op::Call {
+                callee: Callee::Direct(1),
+                args: Vec::new(),
+            },
+        ] {
+            let mut unchecked = artifact_with_target("host.value").to_unchecked();
+            unchecked.lir.globals.push(Global {
+                name: "test@1::value".into(),
+                body: Block {
+                    instrs: vec![Instr {
+                        temp: 0,
+                        rep: Rep::Any,
+                        op,
+                    }],
+                    end: End::Ret(0),
+                },
+            });
+            assert_eq!(
+                unchecked.validate().unwrap_err().message(),
+                "artifact function reference 1 is outside its function table"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_discards_unrepairable_executable_data() {
+        let mut unchecked = artifact_with_target("host.value").to_unchecked();
+        unchecked.lir.globals.push(Global {
+            name: "test@1::value".into(),
+            body: Block {
+                instrs: vec![Instr {
+                    temp: 0,
+                    rep: Rep::Any,
+                    op: Op::Closure {
+                        func: 1,
+                        captures: Vec::new(),
+                    },
+                }],
+                end: End::Ret(0),
+            },
+        });
+        let (recovered, facts) = unchecked.recover();
+        assert!(recovered.lir().functions.is_empty());
+        assert!(recovered.lir().globals.is_empty());
+        assert!(matches!(
+            facts.as_slice(),
+            [RecoveryFact::ExecutableDiscarded { .. }]
+        ));
     }
 }

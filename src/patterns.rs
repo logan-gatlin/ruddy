@@ -251,7 +251,7 @@ struct Check<'a> {
     flipped_definition_at: Option<usize>,
     /// What the definition being walked may assume about its presences: the
     /// store's word about every presence its terms can name, nested bindings
-    /// included. See [`inference::Output::promises`].
+    /// included. See [`inference::Semantics::promises`].
     ///
     /// The store itself is in the wrong alphabet to ask. Its batches are
     /// written about solver variables, and closing the definition numbered the
@@ -286,8 +286,9 @@ fn constrained_origin(origin: &Origin) -> Option<(Formula, &Covers)> {
 /// Run the checks over every match in the program. `inferred` is read for its
 /// aliases — the solved types themselves were written into the terms.
 pub fn check(program: &Program, inferred: &inference::Output) -> Output {
-    let flipped = inferred
-        .store
+    let semantics = inferred.semantics();
+    let flipped = semantics
+        .store()
         .batches
         .iter()
         .position(|batch| batch.flipped);
@@ -302,7 +303,7 @@ pub fn check(program: &Program, inferred: &inference::Output) -> Output {
         .map(|(at, symbol)| (*symbol, at))
         .collect();
     let flipped_definition_at = flipped.and_then(|at| {
-        inferred.store.batches[at]
+        semantics.store().batches[at]
             .definition
             .and_then(|symbol| definitions.get(&symbol).copied())
     });
@@ -312,14 +313,14 @@ pub fn check(program: &Program, inferred: &inference::Output) -> Output {
     // can use.
     for (definition_at, (symbol, decl)) in program.terms.iter().enumerate() {
         let check = Check {
-            aliases: &inferred.aliases,
-            errors: &inferred.errors,
-            store: &inferred.store,
+            aliases: semantics.aliases(),
+            errors: inferred.errors(),
+            store: semantics.store(),
             flipped,
             definition_at,
             flipped_definition_at,
-            promise: inferred
-                .promises
+            promise: semantics
+                .promises()
                 .get(symbol)
                 .cloned()
                 .unwrap_or(Formula::True),
@@ -1505,5 +1506,156 @@ impl Check<'_> {
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! A defensive case that plants store batches no real solve would emit.
+    //! Fabricating them is crate-private, so it lives here rather than in the
+    //! workspace's test crate.
+
+    use super::*;
+    use crate::{inference::Trace, test_support};
+
+    #[test]
+    fn unrelated_same_span_batches_do_not_hide_match_coverage() {
+        let src = "let f = fn v => match v with | {a} => 1n | {} => 2n end";
+        let (_, out, inferred) = test_support::inferred(src, Trace::Off);
+        let initial = check(&out.program, &inferred);
+        assert!(initial.errors.is_empty(), "{initial:#?}");
+        let sole_report = |checks: &Output| -> Report {
+            assert_eq!(checks.reports.len(), 1, "{:#?}", checks.reports);
+            checks.reports[0].clone()
+        };
+        let coverage = inferred
+            .semantics()
+            .store()
+            .batches
+            .iter()
+            .find(|batch| matches!(batch.origin, inference::Origin::Coverage(_)))
+            .expect("the qualifying match has a coverage batch");
+        let (definition, span) = (coverage.definition, coverage.span);
+
+        let named = || inference::Named {
+            labels: Vec::new(),
+            shape: None,
+        };
+        for origin in [
+            inference::Origin::Instance(named()),
+            inference::Origin::Annotation(named()),
+            inference::Origin::Refinement(named()),
+            inference::Origin::Guarded(inference::GuardedOrigin {
+                premise: Formula::True,
+                obligation: Formula::True,
+                origin: Box::new(inference::Origin::Instance(named())),
+            }),
+        ] {
+            let mut altered = inferred.clone();
+            altered.semantics_mut().store.batches.insert(
+                0,
+                inference::Batch {
+                    id: inference::BatchId::synthetic(0),
+                    definition,
+                    span,
+                    origin,
+                    reason: inference::ReasonId::synthetic(0),
+                    formula: Formula::True,
+                    flipped: false,
+                },
+            );
+            let checks = check(&out.program, &altered);
+            assert!(checks.errors.is_empty(), "{checks:#?}");
+            assert!(matches!(
+                sole_report(&checks).coverage,
+                Coverage::Exhaustive
+            ));
+        }
+
+        // Coverage can mention a solver atom with no corresponding readable path.
+        // A malformed nested path exercises the same conservative fallback after
+        // the path lookup itself fails.
+        for malformed in [
+            vec!["missing.field".to_string()],
+            vec!["a.b".to_string()],
+            vec!["a".to_string(), "below".to_string()],
+        ] {
+            let mut missing_path = inferred.clone();
+            let paths = missing_path
+                .semantics_mut()
+                .store
+                .batches
+                .iter_mut()
+                .find_map(|batch| match &mut batch.origin {
+                    inference::Origin::Coverage(coverage) => Some(&mut coverage.paths),
+                    _ => None,
+                })
+                .expect("the coverage batch carries paths");
+            assert!(!paths.is_empty());
+            for (path, _) in paths {
+                *path = malformed.clone();
+            }
+            let checks = check(&out.program, &missing_path);
+            assert!(checks.errors.is_empty(), "{checks:#?}");
+            assert!(matches!(
+                sole_report(&checks).coverage,
+                Coverage::Exhaustive
+            ));
+        }
+    }
+
+    /// The scrutinee's solved type is replaced after checking once, so the
+    /// checks meet a struct pattern over a type that is no struct at all.
+    #[test]
+    fn a_struct_pattern_with_a_corrupted_non_struct_type_is_skipped_safely() {
+        let src = "let f = fn v => match v with | { a } => 1n | _ => 2n end";
+        let (_, mut out, mut inferred) = test_support::inferred(src, Trace::Off);
+        let initial = check(&out.program, &inferred);
+        assert!(initial.errors.is_empty(), "{initial:#?}");
+        corrupt_scrutinee(&mut out.program, Rc::new(Ty::Nat));
+        inferred
+            .semantics_mut()
+            .store
+            .batches
+            .retain(|batch| !matches!(batch.origin, Origin::Coverage(_)));
+        let checked = check(&out.program, &inferred);
+        assert_eq!(checked.reports.len(), 1, "{:#?}", checked.reports);
+        assert!(matches!(checked.reports[0].coverage, Coverage::Skipped));
+    }
+
+    /// A struct position whose tail was abandoned: the typing never settled,
+    /// so the match is skipped rather than cascading into reachability.
+    #[test]
+    fn an_abandoned_struct_tail_skips_reachability_cascade() {
+        let src = "let f = fn v => match v with | {a} => 1n | {} => 2n end";
+        let (_, mut out, mut inferred) = test_support::inferred(src, Trace::Off);
+        let initial = check(&out.program, &inferred);
+        assert!(initial.errors.is_empty(), "{initial:#?}");
+        corrupt_scrutinee(
+            &mut out.program,
+            Rc::new(Ty::Struct(Row::of(Rest::Undecided))),
+        );
+        inferred
+            .semantics_mut()
+            .store
+            .batches
+            .retain(|batch| !matches!(batch.origin, Origin::Coverage(_)));
+        let checks = check(&out.program, &inferred);
+        assert!(checks.errors.is_empty(), "{:#?}", checks.errors);
+        assert_eq!(checks.reports.len(), 1, "{:#?}", checks.reports);
+        assert!(matches!(checks.reports[0].coverage, Coverage::Skipped));
+    }
+
+    /// Replace the solved type of the sole match scrutinee in the fixtures
+    /// above.
+    fn corrupt_scrutinee(program: &mut Program, ty: Rc<Ty>) {
+        let definition = program.terms.values_mut().next().unwrap();
+        let TermKind::Fn { body, .. } = &mut definition.value.kind else {
+            panic!("function fixture")
+        };
+        let TermKind::Match { scrutinee, .. } = &mut body.kind else {
+            panic!("match fixture")
+        };
+        scrutinee.ty = ty;
     }
 }

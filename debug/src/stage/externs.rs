@@ -30,7 +30,10 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                 mint,
                 *symbol,
             );
-            if let Some(inferred) = cx.inference.and_then(|output| output.externs.get(symbol)) {
+            if let Some(inferred) = cx
+                .inference
+                .and_then(|output| output.semantics().externs().get(symbol))
+            {
                 node = node.child(Node::new(ids.next(), "Declared", inferred.to_string()));
             }
             if let Some(external) = cx.lir.and_then(|output| {

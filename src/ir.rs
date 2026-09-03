@@ -2403,7 +2403,7 @@ pub fn build_with_dependency_graph(
     let imports: Vec<_> = dependencies
         .iter()
         .map(|artifact| DependencyImport {
-            alias: &artifact.header.identity.name,
+            alias: &artifact.header().identity.name,
             artifact,
         })
         .collect();
@@ -2909,7 +2909,7 @@ fn build_with_dependency_imports_inner(
 fn dependency_path(dependency: &artifact::Artifact, qualified: &str) -> Option<Vec<String>> {
     let prefix = format!(
         "{}@{}::",
-        dependency.header.identity.name, dependency.header.identity.version
+        dependency.header().identity.name, dependency.header().identity.version
     );
     let path = qualified.strip_prefix(&prefix)?;
     let parts: Vec<String> = path.split("::").map(str::to_owned).collect();
@@ -7961,8 +7961,8 @@ impl Builder<'_> {
         let mut valid = Vec::with_capacity(dependencies.len());
         for import in dependencies {
             let identity = (
-                import.artifact.header.identity.name.clone(),
-                import.artifact.header.identity.version.clone(),
+                import.artifact.header().identity.name.clone(),
+                import.artifact.header().identity.version.clone(),
             );
             if !source_identifier(import.alias) {
                 self.errors.push(Error {
@@ -7975,8 +7975,8 @@ impl Builder<'_> {
                 self.errors.push(Error {
                     span: Span::default(),
                     kind: ErrorKind::DuplicateDependency {
-                        name: import.artifact.header.identity.name.clone(),
-                        version: import.artifact.header.identity.version.clone(),
+                        name: import.artifact.header().identity.name.clone(),
+                        version: import.artifact.header().identity.version.clone(),
                     },
                 });
             } else if aliases.contains(import.alias) {
@@ -8002,7 +8002,7 @@ impl Builder<'_> {
             .iter()
             .chain(valid.iter().map(|import| import.artifact))
         {
-            for declaration in &dependency.header.effects {
+            for declaration in &dependency.header().effects {
                 if dependency_path(dependency, &declaration.name).is_none() {
                     continue;
                 }
@@ -8046,7 +8046,7 @@ impl Builder<'_> {
                 );
                 effect_rows.insert_identity(&declaration.name, identity);
             }
-            for declaration in &dependency.header.types {
+            for declaration in &dependency.header().types {
                 if dependency_path(dependency, &declaration.name).is_none() {
                     continue;
                 }
@@ -8170,7 +8170,7 @@ impl Builder<'_> {
             .iter()
             .chain(valid.iter().map(|import| import.artifact))
         {
-            for value in &dependency.header.values {
+            for value in &dependency.header().values {
                 let Some(&symbol) = symbols.get(&(Namespace::Terms, value.name.clone())) else {
                     continue;
                 };
@@ -8183,7 +8183,7 @@ impl Builder<'_> {
                 );
                 program.external_schemes.insert(symbol, scheme);
             }
-            for declaration in &dependency.header.types {
+            for declaration in &dependency.header().types {
                 let Some(&symbol) = symbols.get(&(Namespace::Types, declaration.name.clone()))
                 else {
                     continue;
@@ -8238,7 +8238,7 @@ impl Builder<'_> {
                     },
                 );
             }
-            for declaration in &dependency.header.effects {
+            for declaration in &dependency.header().effects {
                 let Some(&symbol) = symbols.get(&(Namespace::Effects, declaration.name.clone()))
                 else {
                     continue;

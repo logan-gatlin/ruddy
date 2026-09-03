@@ -15,14 +15,14 @@ use std::{
 use indexmap::IndexMap;
 use ruddy::{
     bundle::ErrorKind as BundleError,
-    inference::{self, Constraint, ConstraintKind, Effect, ErrorKind as TypeError, Goal, Rule},
+    inference::{self, ConstraintKind, ErrorKind as TypeError, Goal, Rule},
     ir::{self, ErrorKind as IrError},
     parse,
     patterns::ErrorKind as PatternError,
     symbol::{Bundle, Mint, Namespace, Version},
     token::{self, ErrorKind as LexError, Kind as TokenKind},
     tracking::{FileID, Span},
-    types::{Assigned, EffectId, Formula, Presence, Prim, Rest, Row, RowField, Sense, Shape, Ty},
+    types::{EffectId, Formula, Presence, Prim, Rest, Row, RowField, Sense, Shape, Ty},
     ui::{self, Entry, Mark},
 };
 use ruddy_debug::print;
@@ -592,63 +592,6 @@ fn a_loop_of_bare_names_is_worded_for_its_namespace() {
     assert_eq!(ty.to_string(), "type defined only as another name");
 }
 
-/// A constraint prints as what it demands, in the notation the Constraints tab
-/// shows it in. `~` is "must unify with".
-#[test]
-fn a_constraint_reads_as_what_it_demands() {
-    let nat = Rc::new(Ty::plain(Ty::Nat));
-    let span = Span::generated(0, 1);
-
-    let equal = Constraint {
-        id: inference::ConstraintId::synthetic(0),
-        reason: inference::ReasonId::synthetic(0),
-        span,
-        origin: inference::ConstraintOrigin::ContextualCheck,
-        subjects: inference::ConstraintSubjects::pair(
-            inference::Subject::Context,
-            inference::Subject::Term,
-        ),
-        kind: ConstraintKind::Equal {
-            expected: nat.clone(),
-            actual: Rc::new(Ty::plain(Ty::Var(0))),
-        },
-    };
-    assert_eq!(equal.to_string(), "Nat ~ ?0");
-    // The constraint prints as its kind, so the two cannot drift.
-    assert_eq!(equal.to_string(), equal.kind.to_string());
-}
-
-/// An effect is one line beside the rule that produced it. A failure says the
-/// error and nothing else, so the row reads as the complaint rather than as a
-/// wrapper around one.
-#[test]
-fn an_effect_reads_as_the_one_thing_that_changed() {
-    assert_eq!(Effect::None.to_string(), "no change");
-    assert_eq!(
-        Effect::Bound {
-            var: 3,
-            value: Assigned::Ty(Rc::new(Ty::plain(Ty::Nat))),
-            by: inference::ReasonId::synthetic(0),
-            because: None,
-        }
-        .to_string(),
-        "?3 := Nat"
-    );
-    let failure = TypeError::Recursive;
-    assert_eq!(
-        Effect::Failed(failure.clone()).to_string(),
-        failure.to_string()
-    );
-    assert_eq!(
-        Effect::Guarded {
-            premise: Formula::var(1),
-            obligation: Formula::var(2).not(),
-        }
-        .to_string(),
-        "requires not ?2 when ?1"
-    );
-}
-
 #[test]
 fn every_inference_error_exposes_a_complete_structured_diagnostic() {
     let use_span = Span::generated(4, 5);
@@ -826,7 +769,9 @@ fn inference_fixture_errors(source: &str) -> Vec<inference::Error> {
     let mut mint = Mint::new(bundle);
     let mut built = ir::build(&mut mint, parsed.stmts);
     assert!(built.errors.is_empty(), "IR errors: {:#?}", built.errors);
-    inference::infer(&mint, &mut built.program).errors
+    inference::infer(&mint, &mut built.program, inference::Trace::Off)
+        .errors()
+        .to_vec()
 }
 
 fn inference_fixture_diagnostics(source: &str) -> Vec<ui::Diagnostic> {
@@ -2224,15 +2169,15 @@ fn round_trip(prelude: &str, printed: &str) -> String {
     let mut mint = Mint::new(bundle);
     let mut built = ir::build(&mut mint, parsed.stmts);
     assert!(built.errors.is_empty(), "{source}: {:#?}", built.errors);
-    let inferred = inference::infer(&mint, &mut built.program);
+    let inferred = inference::infer(&mint, &mut built.program, inference::Trace::Off);
     assert!(
-        inferred.errors.is_empty(),
+        inferred.errors().is_empty(),
         "{source}: {:#?}",
-        inferred.errors
+        inferred.errors()
     );
 
     let (symbol, _) = built.program.terms.last().expect("the definition");
-    let scheme = inferred.schemes[symbol].to_string();
+    let scheme = inferred.semantics().schemes()[symbol].to_string();
     // The `where 'let` a scheme now declares its letters with is not part of the
     // row being read: what this reads back is the one field's type.
     let body = scheme.split(" where 'let ").next().unwrap_or(&scheme);
@@ -2600,14 +2545,14 @@ fn a_written_absence_is_not_printed() {
     let mut mint = Mint::new(bundle);
     let mut built = ir::build(&mut mint, parsed.stmts);
     assert!(built.errors.is_empty(), "{:#?}", built.errors);
-    let inferred = inference::infer(&mint, &mut built.program);
-    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    let inferred = inference::infer(&mint, &mut built.program, inference::Trace::Off);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
 
     let printed: Vec<String> = built
         .program
         .terms
         .keys()
-        .map(|symbol| inferred.schemes[symbol].to_string())
+        .map(|symbol| inferred.semantics().schemes()[symbol].to_string())
         .collect();
     assert_eq!(printed, ["{ x: Nat, ..'a } -> Nat", "#Ok Nat | ..'a"]);
 }
@@ -3275,79 +3220,6 @@ fn a_spliced_tail_prints_in_the_notation_of_the_row_it_ends() {
     );
 }
 
-/// The three sorts print on their own as well as inside a type, because the
-/// solver's own record shows them there: a step binding a row variable or a
-/// presence variable has nothing but the value to show.
-#[test]
-fn the_three_sorts_each_print_on_their_own() {
-    // A row prints as what it allows. One that names nothing prints as its
-    // rest alone, so closing a row reads as the nothing it closed to rather
-    // than as an empty pair of braces standing for the same thing.
-    assert_eq!(Row::closed().to_string(), "∅");
-    assert_eq!(
-        Row {
-            labels: Default::default(),
-            rest: Rest::Var(3),
-        }
-        .to_string(),
-        "?3"
-    );
-    assert_eq!(
-        Row {
-            labels: [(
-                "x".to_string(),
-                RowField::present(Rc::new(Ty::plain(Ty::Nat)))
-            )]
-            .into_iter()
-            .collect(),
-            rest: Rest::Var(9),
-        }
-        .to_string(),
-        "{ x: Nat, ..?9 }"
-    );
-
-    for (rest, printed) in [
-        (Rest::Closed, "∅"),
-        (Rest::Var(4), "?4"),
-        (Rest::Bound(0), "'a"),
-        (Rest::Undecided, "?"),
-        (Rest::More(Rc::new(Row::closed())), "∅"),
-    ] {
-        assert_eq!(rest.to_string(), printed);
-    }
-
-    for (presence, printed) in [
-        (Presence::Present, "present"),
-        (Presence::Absent, "absent"),
-        (Presence::Var(4), "?4"),
-        // A presence is a variable like the other two, and wears the sigil a
-        // `when` clause writes it with.
-        (Presence::Bound(1), "'b"),
-        (Presence::Undecided, "?"),
-    ] {
-        assert_eq!(presence.to_string(), printed);
-    }
-
-    // A binding prints as the value, whichever sort it is, so the Solve tab's
-    // one column serves all three.
-    for (value, printed) in [
-        (Assigned::Ty(Rc::new(Ty::plain(Ty::Nat))), "?2 := Nat"),
-        (Assigned::Row(Rc::new(Row::closed())), "?2 := ∅"),
-        (Assigned::Presence(Presence::Absent), "?2 := absent"),
-    ] {
-        assert_eq!(
-            Effect::Bound {
-                var: 2,
-                value,
-                by: inference::ReasonId::synthetic(0),
-                because: None,
-            }
-            .to_string(),
-            printed.to_string()
-        );
-    }
-}
-
 /// A goal is a constraint the solver may have taken apart, so it prints as one
 /// in whichever sort it ended up about. Generation only ever equates types; the
 /// other two are what taking a type apart reaches.
@@ -3548,18 +3420,15 @@ fn the_variable_complaints_read_as_what_went_wrong() {
         Rc::new(Ty::unit()),
         Row::closed(),
     )));
-    let closure = inference::Error {
-        id: inference::ErrorId::synthetic(0),
-        cause: inference::ErrorCause::Direct,
+    let closure = inference::Error::new(
         span,
-        kind: TypeError::RigidBroken {
+        TypeError::RigidBroken {
             found: closed_effects,
             name: "e".into(),
             sense: Sense::Effects,
             declared: span,
         },
-        explanation: None,
-    };
+    );
     assert_eq!(
         closure.kind.to_string(),
         "this closes the effects it may perform, but `'e` stands for whatever effects the caller allows"
@@ -3580,11 +3449,9 @@ fn the_variable_complaints_read_as_what_went_wrong() {
             ty: Rc::new(Ty::unit()),
         },
     );
-    let restriction = inference::Error {
-        id: inference::ErrorId::synthetic(1),
-        cause: inference::ErrorCause::Direct,
+    let restriction = inference::Error::new(
         span,
-        kind: TypeError::RigidBroken {
+        TypeError::RigidBroken {
             found: Rc::new(Ty::plain(Ty::Arrow(
                 Rc::new(Ty::unit()),
                 Rc::new(Ty::unit()),
@@ -3594,8 +3461,7 @@ fn the_variable_complaints_read_as_what_went_wrong() {
             sense: Sense::Effects,
             declared: span,
         },
-        explanation: None,
-    };
+    );
     assert_eq!(
         restriction.kind.to_string(),
         "this restricts which effect it may perform, but `'e` stands for whatever effects the caller allows"
@@ -3875,66 +3741,6 @@ fn no_two_kinds_of_constraint_are_coded_the_same() {
     for kind in &kinds {
         assert!(!kind.to_string().is_empty(), "{}", kind.code());
     }
-}
-
-/// The two kinds a nested `let` adds, read as what they say. A `let` carries
-/// two lists rather than a pair of types, so it prints as the header of the
-/// tree its children make; a use of the name it bound cannot spell the name at
-/// all, there being no mint here to spell one with, so it says what it is
-/// instead. An annotation's clause follows the header, because that is what the
-/// scheme the `let` publishes requires of its presences.
-#[test]
-fn the_scoping_constraints_read_as_what_they_do() {
-    let nat = Rc::new(Ty::plain(Ty::Nat));
-    let mut mint = Mint::new(Bundle::new("test", Version::new(0, 1, 0)).expect("valid bundle"));
-    let symbol = mint.local(None, Namespace::Terms, "x");
-
-    let bound = Constraint {
-        id: inference::ConstraintId::synthetic(0),
-        reason: inference::ReasonId::synthetic(0),
-        span: Span::generated(0, 1),
-        origin: inference::ConstraintOrigin::Binding,
-        subjects: inference::ConstraintSubjects::one(inference::Subject::Binding),
-        kind: ConstraintKind::Let {
-            symbol,
-            bound: nat.clone(),
-            level: 2,
-            promised: Formula::True,
-            rigids: Vec::new(),
-            effect_provenance: Default::default(),
-            value: Vec::new(),
-            body: Vec::new(),
-        },
-    };
-    assert_eq!(bound.kind.code(), "let");
-    assert_eq!(bound.to_string(), "Nat generalized at level 2");
-    assert_eq!(bound.to_string(), bound.kind.to_string());
-
-    let promised = ConstraintKind::Let {
-        symbol,
-        bound: nat.clone(),
-        level: 2,
-        promised: Formula::var(0).xor(Formula::var(1)),
-        rigids: Vec::new(),
-        effect_provenance: Default::default(),
-        value: Vec::new(),
-        body: Vec::new(),
-    };
-    assert_eq!(
-        promised.to_string(),
-        "Nat generalized at level 2 where ?0 != ?1"
-    );
-
-    let use_site = ConstraintKind::Instance {
-        symbol,
-        ty: Rc::new(Ty::plain(Ty::Var(4))),
-        requirement: 0,
-    };
-    assert_eq!(use_site.code(), "instance");
-    assert_eq!(
-        use_site.to_string(),
-        "?4 ~ a fresh copy of what this name was bound to"
-    );
 }
 
 /// The complaints pattern matching added, worded and coded. The wording quotes

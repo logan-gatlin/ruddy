@@ -72,18 +72,18 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     let Some(mint) = cx.mint else {
         return crate::stage::skipped(spec, "lowering did not run");
     };
-    let Some(output) = cx.inference else {
+    let Some(output) = cx.inference.map(|output| output.diagnostics()) else {
         return crate::stage::skipped(spec, "inference did not run");
     };
 
     let error_messages: HashMap<_, _> = output
-        .errors
+        .errors()
         .iter()
         .map(|error| (error.id, error.diagnostic().title))
         .collect();
     let mut ids = Ids::default();
     let mut nodes: Vec<Node> = output
-        .steps
+        .steps()
         .iter()
         .map(|step| {
             let effect = step.effect.to_string();
@@ -152,11 +152,11 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     // ride on one explicitly tagged metadata record, present even when there
     // are no steps and excluded from solve replay by wire consumers.
     let reason_by_id: HashMap<_, _> = output
-        .reasons
+        .reasons()
         .iter()
         .map(|reason| (reason.id, reason))
         .collect();
-    for (step, node) in output.steps.iter().zip(&mut nodes) {
+    for (step, node) in output.steps().iter().zip(&mut nodes) {
         let reason = reason_by_id
             .get(&step.reason)
             .expect("every published step has a reason");
@@ -172,7 +172,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             )
             .field("_reason_origin", "step");
         if let Effect::Bound { var, .. } = step.effect {
-            let meta = &output.variables[var as usize];
+            let meta = &output.variables()[var as usize];
             decorated = decorated
                 .field("_var_id", var.to_string())
                 .field("_var_sort", sort_code(meta.sort))
@@ -183,7 +183,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     }
     {
         let variables: Vec<_> = output
-            .variables
+            .variables()
             .iter()
             .enumerate()
             .map(|(var, meta)| {
@@ -196,7 +196,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             })
             .collect();
         let reasons: Vec<_> = output
-            .reasons
+            .reasons()
             .iter()
             .map(|reason| {
                 let (origin, origin_id, subject, sort) = reason_fields(reason.origin);
@@ -229,12 +229,14 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
 
     // No time of its own: the inference phase is timed once, on `Types`, which
     // is what leaving `micros` unset says.
-    let summary = plural(output.steps.len(), "step");
+    let summary = plural(output.steps().len(), "step");
     Stage {
         nodes,
         debug: format!(
             "steps = {:#?}\nvariables = {:#?}\nreasons = {:#?}",
-            output.steps, output.variables, output.reasons
+            output.steps(),
+            output.variables(),
+            output.reasons()
         ),
         ..spec.stage(cx.status(), summary)
     }

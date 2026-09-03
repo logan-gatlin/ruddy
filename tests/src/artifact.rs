@@ -9,9 +9,9 @@ use indexmap::{IndexMap, IndexSet};
 use ruddy::{
     artifact::{
         self, Artifact, Block, Callee, End, Formula, Global, Instr, Lir, Literal, Op, Param,
-        Presence, Rep, Rest, Row, RowField, Scheme, Type,
+        Presence, RecoveryFact, Rep, Rest, Row, RowField, Scheme, Type,
     },
-    inference, ir, lir, parse, patterns,
+    compile, inference, ir, lir, parse, patterns,
     symbol::{Bundle, Mint, Namespace, Version},
     token,
     tracking::{FileManager, Span},
@@ -26,19 +26,52 @@ fn compiled(source: &str) -> (Mint, ir::Program, inference::Output, lir::Output)
     let parsed = parse::parse(lexed.tokens);
     assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
     let bundle = Bundle::new("tests", Version::new(0, 1, 0)).unwrap();
-    let mut mint = Mint::new(bundle);
-    let mut program = ir::build(&mut mint, parsed.stmts).program;
-    let inferred = inference::infer(&mint, &mut program);
-    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
-    let checked = patterns::check(&program, &inferred);
-    assert!(checked.errors.is_empty(), "{:#?}", checked.errors);
-    let lowered = lir::lower(&mint, &program, &inferred);
-    (mint, program, inferred, lowered)
+    let accepted = compile::compile(Mint::new(bundle), parsed.stmts, inference::Trace::Off)
+        .unwrap_or_else(|partial| panic!("{partial:#?}"));
+    let lowered = accepted.lower();
+    let (mint, ir, inferred, _) = accepted.into_parts();
+    (mint, ir.program, inferred, lowered)
 }
 
 fn built(source: &str) -> Artifact {
-    let (mint, program, inferred, lowered) = compiled(source);
-    Artifact::build(&mint, &program, &inferred, &lowered)
+    let mut files = FileManager::new();
+    let file = files.register_new_file("<test>".to_string(), source.to_string());
+    let parsed = parse::parse(token::lex(source, file).tokens);
+    compile::compile(
+        Mint::new(Bundle::new("tests", Version::new(0, 1, 0)).unwrap()),
+        parsed.stmts,
+        inference::Trace::Off,
+    )
+    .unwrap_or_else(|partial| panic!("{partial:#?}"))
+    .artifact()
+    .clone()
+}
+
+/// An artifact exporting one hand-built semantic scheme as its only value, for
+/// semantic states no source program can conveniently reach.
+fn exporting(mint: &Mint, scheme: &types::Scheme) -> Artifact {
+    let name = mint.bundle().name().to_string();
+    let version = mint.bundle().version().to_string();
+    Artifact {
+        header: artifact::Header {
+            identity: artifact::Identity {
+                name: name.clone(),
+                version: version.clone(),
+            },
+            dependencies: Vec::new(),
+            values: vec![artifact::Value {
+                name: format!("{name}@{version}::value"),
+                scheme: artifact::export_scheme(mint, scheme),
+            }],
+            types: Vec::new(),
+            effects: Vec::new(),
+        },
+        lir: Lir {
+            externs: Vec::new(),
+            functions: Vec::new(),
+            globals: Vec::new(),
+        },
+    }
 }
 
 fn plain(ty: Type) -> Type {
@@ -506,13 +539,7 @@ fn broad_existential_package_validation_scales() {
 #[test]
 fn broad_semantic_scheme_converts_to_artifact_linearly() {
     const WIDTH: u32 = 4_096;
-    let (mint, program, mut inferred, lowered) = compiled("let target = {}\n");
-    let symbol = inferred
-        .schemes
-        .keys()
-        .copied()
-        .find(|symbol| mint.name(*symbol) == "target")
-        .expect("target scheme exists");
+    let mint = Mint::new(Bundle::new("tests", Version::new(0, 1, 0)).unwrap());
     let labels = (0..WIDTH)
         .map(|index| {
             (
@@ -529,24 +556,16 @@ fn broad_semantic_scheme_converts_to_artifact_linearly() {
         rest: types::Rest::Closed,
     }))));
     let formula = types::Formula::any((0..WIDTH).map(types::Formula::bound));
-    inferred.schemes.insert(
-        symbol,
-        types::Scheme::existential(
-            WIDTH,
-            WIDTH,
-            (0..WIDTH).collect::<IndexSet<_>>(),
-            body,
-            formula,
-        ),
+    let scheme = types::Scheme::existential(
+        WIDTH,
+        WIDTH,
+        (0..WIDTH).collect::<IndexSet<_>>(),
+        body,
+        formula,
     );
 
-    let artifact = Artifact::build(&mint, &program, &inferred, &lowered);
-    let value = artifact
-        .header
-        .values
-        .iter()
-        .find(|value| value.name.ends_with("::target"))
-        .expect("target is exported");
+    let artifact = exporting(&mint, &scheme);
+    let value = &artifact.header.values[0];
     assert_eq!(value.scheme.existentials.len(), WIDTH as usize);
     assert!(matches!(value.scheme.formula, Formula::Owned(0, _)));
     Artifact::try_parse(&artifact.print()).expect("broad semantic scheme round trips");
@@ -554,14 +573,52 @@ fn broad_semantic_scheme_converts_to_artifact_linearly() {
 
 fn assert_round_trip(value: &Artifact) -> String {
     let printed = value.print();
-    let parsed = Artifact::parse(&printed);
+    let parsed = Artifact::parse(&printed)
+        .validate()
+        .expect("printed artifact validates");
     assert_eq!(parsed, *value);
     assert_eq!(artifact::print(&parsed), printed);
-    assert_eq!(artifact::parse(&printed), parsed);
-    assert_eq!(Artifact::try_parse(&printed), Ok(parsed.clone()));
-    assert_eq!(artifact::try_parse(&printed), Ok(parsed.clone()));
+    assert_eq!(artifact::parse(&printed).validate().unwrap(), parsed);
+    assert_eq!(
+        Artifact::try_parse(&printed).map(|value| value.validate().unwrap()),
+        Ok(parsed.clone())
+    );
+    assert_eq!(
+        artifact::try_parse(&printed).map(|value| value.validate().unwrap()),
+        Ok(parsed.clone())
+    );
     assert_eq!(artifact::text::try_parse(&printed), Ok(parsed));
     printed
+}
+
+#[test]
+fn tolerant_recovery_reports_each_repair_it_applies() {
+    let mut unchecked = built("let kept = 1n\nlet discarded = 2n").to_unchecked();
+    unchecked.header.identity.name.clear();
+    unchecked.header.identity.version.clear();
+    unchecked.header.values[0].name.clear();
+    unchecked.header.values[1].scheme.body = Type::Bound(99);
+
+    let (recovered, facts) = unchecked.recover();
+    assert_eq!(recovered.header().values.len(), 1);
+    assert!(facts.iter().any(|fact| matches!(
+        fact,
+        RecoveryFact::IdentityNameReplaced { replacement } if replacement == "<recovered>"
+    )));
+    assert!(facts.iter().any(|fact| matches!(
+        fact,
+        RecoveryFact::IdentityVersionReplaced { replacement } if replacement == "0"
+    )));
+    assert!(facts.iter().any(|fact| matches!(
+        fact,
+        RecoveryFact::ValueNameReplaced { index: 0, replacement }
+            if replacement == "<recovered>::value-0"
+    )));
+    assert!(facts.iter().any(|fact| matches!(
+        fact,
+        RecoveryFact::ValueDiscarded { index: 1, name, reason }
+            if name.ends_with("::discarded") && !reason.is_empty()
+    )));
 }
 
 fn assert_parse_error(error: &artifact::ParseError) {
@@ -889,7 +946,11 @@ fn dependencies_round_trip_in_canonical_text() {
 
     assert!(printed.contains("(dependencies\n      (dependency \"base\" \"2.1.0\")"));
     assert_eq!(
-        Artifact::parse(&printed).header.dependencies,
+        Artifact::parse(&printed)
+            .validate()
+            .expect("printed artifact validates")
+            .header
+            .dependencies,
         artifact.header.dependencies
     );
 }
@@ -901,7 +962,7 @@ fn every_semantic_type_scheme_and_lir_variant_round_trips() {
 
 #[test]
 fn building_translates_every_compiler_semantic_and_lir_variant() {
-    let (mut mint, program, mut inferred, _) = compiled(
+    let (mut mint, program, inferred, _) = compiled(
         "type OpenCases 'r = #A | ..'r\n\
          type Runner 'e = Nat -> Nat + ..'e\n\
          let value = 0\n",
@@ -1021,9 +1082,7 @@ fn building_translates_every_compiler_semantic_and_lir_variant() {
             )),
         )),
     );
-    inferred
-        .schemes
-        .insert(symbol, types::Scheme::constrained(7, 3, body, formula));
+    let custom = types::Scheme::constrained(7, 3, body, formula);
 
     let span = Span::default();
     let nested = |kind| lir::Block {
@@ -1173,28 +1232,18 @@ fn building_translates_every_compiler_semantic_and_lir_variant() {
         ],
     };
 
-    let artifact = Artifact::build(&mint, &program, &inferred, &lowered);
+    let mut artifact = built("let value = 0n");
+    // The exported value wears the hand-built scheme: no source program reaches
+    // every semantic variant, and the export adapter is the same one building
+    // used for the scheme it replaces.
+    let value = artifact
+        .header
+        .values
+        .iter_mut()
+        .find(|value| value.name.ends_with("::value"))
+        .expect("the value is exported");
+    value.scheme = artifact::export_scheme(&mint, &custom);
     assert_round_trip(&artifact);
-}
-
-#[test]
-fn building_rejects_a_pending_effect_identity() {
-    let (mint, mut program, inferred, lowered) = compiled("effect Log = { write: Nat -> () }\n");
-    let symbol = *program
-        .effects
-        .keys()
-        .next()
-        .expect("source has one effect");
-    program
-        .effect_ids
-        .insert(symbol, types::EffectId::pending(symbol));
-
-    assert!(
-        catch_unwind(AssertUnwindSafe(|| {
-            Artifact::build(&mint, &program, &inferred, &lowered)
-        }))
-        .is_err()
-    );
 }
 
 #[test]
@@ -1473,8 +1522,7 @@ fn deep_formula_conversion_and_artifact_writing_are_stack_safe() {
         .stack_size(256 * 1024)
         .spawn(|| {
             const DEPTH: usize = 30_000;
-            let (mint, program, mut inferred, lowered) = compiled("let value = 1n");
-            let symbol = *program.terms.keys().next().expect("the value symbol");
+            let mint = Mint::new(Bundle::new("tests", Version::new(0, 1, 0)).unwrap());
             let mut formula = types::Formula::var(9)
                 .and(types::Formula::bound(0))
                 .or(types::Formula::True.iff(types::Formula::False))
@@ -1482,11 +1530,8 @@ fn deep_formula_conversion_and_artifact_writing_are_stack_safe() {
             for _ in 0..DEPTH {
                 formula = types::Formula::Not(Rc::new(formula));
             }
-            inferred.schemes.insert(
-                symbol,
-                types::Scheme::constrained(1, 1, Rc::new(types::Ty::Nat), formula),
-            );
-            let artifact = Artifact::build(&mint, &program, &inferred, &lowered);
+            let scheme = types::Scheme::constrained(1, 1, Rc::new(types::Ty::Nat), formula);
+            let artifact = exporting(&mint, &scheme);
             let printed = artifact.print();
             assert!(printed.contains("(not"));
             assert!(printed.contains("(bound 0)"));
@@ -1504,8 +1549,7 @@ fn deep_semantic_artifact_building_is_stack_safe_in_every_position() {
         .stack_size(256 * 1024)
         .spawn(|| {
             const DEPTH: usize = 30_000;
-            let (mut mint, program, mut inferred, lowered) = compiled("let value = 1n");
-            let symbol = *program.terms.keys().next().expect("the value symbol");
+            let mut mint = Mint::new(Bundle::new("tests", Version::new(0, 1, 0)).unwrap());
             let layer = mint
                 .global(None, Namespace::Types, "Layer")
                 .expect("a type symbol");
@@ -1551,15 +1595,10 @@ fn deep_semantic_artifact_building_is_stack_safe_in_every_position() {
                 .collect(),
                 rest: types::Rest::Closed,
             }));
-            inferred.schemes.insert(symbol, types::Scheme::new(0, body));
+            let scheme = types::Scheme::new(0, body);
 
-            let artifact = Artifact::build(&mint, &program, &inferred, &lowered);
-            let value = artifact
-                .header
-                .values
-                .iter()
-                .find(|value| value.name.ends_with("value"))
-                .expect("the built value");
+            let artifact = exporting(&mint, &scheme);
+            let value = &artifact.header.values[0];
             let Type::Struct(row) = &value.scheme.body else {
                 panic!("semantic root changed schema")
             };
@@ -1572,7 +1611,10 @@ fn deep_semantic_artifact_building_is_stack_safe_in_every_position() {
             );
             let printed = artifact.print();
             assert!(printed.contains("(more (row"));
-            let reparsed = Artifact::try_parse(&printed).expect("deep semantics print readably");
+            let reparsed = Artifact::try_parse(&printed)
+                .expect("deep semantics parse")
+                .validate()
+                .expect("deep semantics validate");
             assert_eq!(reparsed.print(), printed);
         })
         .expect("the bounded-stack regression thread starts")
