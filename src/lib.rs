@@ -1,6 +1,8 @@
 pub mod artifact;
 pub mod backend;
 pub mod bundle;
+pub mod compile;
+pub mod externs;
 pub mod inference;
 pub mod ir;
 pub mod link;

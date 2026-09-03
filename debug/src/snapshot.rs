@@ -410,12 +410,18 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     // the rule `main.rs` follows too — so it is gated on the whole diagnostic
     // list rather than on any one phase having produced a value. Its tab
     // reports `Skipped` the moment the reader types something wrong.
-    let lowered = match (&built, &inferred, &checked, diagnostics.is_empty()) {
-        (Some(built), Some(inferred), Some(_), true) => {
+    let accepted = loaded.as_ref().filter(|_| diagnostics.is_empty()).and_then(|loaded| {
+        let imports: Vec<_> = dependency_aliases.iter().zip(&dependency_interfaces)
+            .map(|(alias, artifact)| ir::DependencyImport { alias, artifact }).collect();
+        ruddy::compile::compile_with_dependency_imports(
+            Mint::new(mint.bundle().clone()), loaded.stmts.clone(), &imports,
+            &linked_interfaces, inference::Trace::Complete,
+        ).ok()
+    });
+    let lowered = match &accepted {
+        Some(accepted) => {
             let started = Instant::now();
-            let out = guard("lir", &mut panicked, || {
-                lir::lower(&mint, &built.program, inferred.semantics())
-            });
+            let out = guard("lir", &mut panicked, || lir::lower(accepted));
             micros.lir = started.elapsed().as_micros() as u64;
             out
         }
@@ -425,15 +431,13 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     // The artifact is the first disk-boundary representation. Like LIR, it
     // only exists for an accepted program, and retains no source spans.
     let mut artifact_panicked = false;
-    let artifact = match (&built, &inferred, &lowered) {
-        (Some(built), Some(inferred), Some(lowered)) => {
+    let artifact = match (&accepted, &lowered) {
+        (Some(accepted), Some(lowered)) => {
             let started = Instant::now();
             let dependencies = dependency_artifacts.clone();
             let out = guard("artifact", &mut panicked, || {
                 artifact::build_with_dependencies(
-                    &mint,
-                    &built.program,
-                    inferred.semantics(),
+                    accepted,
                     lowered,
                     dependencies,
                 )

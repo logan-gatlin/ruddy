@@ -25,6 +25,7 @@ use std::{collections::HashMap, rc::Rc};
 use indexmap::IndexMap;
 
 use crate::{
+    compile::AcceptedProgram,
     inference::{self, unfold},
     ir::{Handler, HandlerArm, Literal, Pattern, PatternKind, Program, Term, TermKind},
     symbol::{Mint, Symbol},
@@ -702,7 +703,21 @@ struct Lower<'a> {
 ///
 /// Runs only when lexing, parsing, building, inference and the pattern checks
 /// have all reported nothing; see the module docs for what that buys.
-pub fn lower(mint: &Mint, program: &Program, inference: &inference::Semantics) -> Output {
+pub fn lower(accepted: &AcceptedProgram) -> Output {
+    lower_parts(
+        accepted.mint(),
+        accepted.ir(),
+        accepted.semantics(),
+        accepted.externs(),
+    )
+}
+
+fn lower_parts(
+    mint: &Mint,
+    program: &Program,
+    inference: &inference::Semantics,
+    extern_plan: &crate::externs::ExternPlan,
+) -> Output {
     let mut low = Lower {
         mint,
         program,
@@ -722,7 +737,7 @@ pub fn lower(mint: &Mint, program: &Program, inference: &inference::Semantics) -
         definition: None,
         assumed: Formula::True,
     };
-    let externs = low.lower_externs();
+    let externs = low.lower_externs(extern_plan);
     let order = low.order();
     low.reserve(&order);
     for symbol in &order {
@@ -1043,22 +1058,18 @@ impl Lower<'_> {
     /// internal evidence parameters but raw calls contain visible arguments
     /// only. Marked ABI functions accumulate their whole host argument group;
     /// ordinary arrows retain the legacy unary host-curried convention.
-    fn lower_externs(&mut self) -> Vec<Extern> {
-        let declarations: Vec<_> = self
-            .program
-            .externs
-            .iter()
-            .map(|(symbol, decl)| (*symbol, decl.clone()))
-            .collect();
-        let mut externs = Vec::with_capacity(declarations.len());
-        for (symbol, decl) in declarations {
+    fn lower_externs(&mut self, plan: &crate::externs::ExternPlan) -> Vec<Extern> {
+        let entries: Vec<_> = plan.iter().cloned().collect();
+        let mut externs = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let symbol = entry.symbol;
             let name = self.mint.name(symbol).to_string();
-            let ty = self.inference.externs()[&symbol].body().clone();
+            let ty = entry.scheme.body().clone();
             externs.push(Extern {
                 symbol,
                 name: name.clone(),
-                target: decl.value.target.tracked.clone(),
-                span: decl.value.target.span,
+                target: entry.target,
+                span: entry.target_span,
                 rep: self.rep(&ty),
             });
 
@@ -1071,22 +1082,22 @@ impl Lower<'_> {
                 let mut body = Body::default();
                 let raw = self.emit(
                     &mut body,
-                    decl.value.target.span,
+                    entry.target_span,
                     self.rep(&ty),
                     Op::Extern {
                         symbol,
                         name: name.clone(),
                     },
                 );
-                let value = self.host_to_ruddy(&decl.value.abi, &ty, raw, &mut body);
+                let value = self.host_to_ruddy(&entry.abi, &ty, raw, &mut body);
                 self.globals.push(Global {
                     symbol,
                     name,
                     body: body.seal(Terminator {
-                        span: decl.value.target.span,
+                        span: entry.target_span,
                         kind: End::Ret(value),
                     }),
-                    span: decl.name_span,
+                    span: entry.declaration_span,
                 });
             }
         }
@@ -3856,7 +3867,8 @@ mod tests {
     ) -> Output {
         let (mint, mut out, mut inferred, _) = test_support::accepted(source);
         adjust(&mut out.program, &mut inferred);
-        lower(&mint, &out.program, inferred.semantics())
+        let plan = crate::externs::plan(&out.program, inferred.semantics());
+        lower_parts(&mint, &out.program, inferred.semantics(), &plan)
     }
 
     /// The SAT pair can only be false/false if a caller violates LIR's accepted-

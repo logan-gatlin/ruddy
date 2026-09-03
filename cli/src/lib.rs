@@ -17,7 +17,7 @@ use indexmap::IndexMap;
 use ruddy::{
     artifact::{Artifact, Dependency},
     bundle::{self, Disk, Files},
-    inference, ir, lir, patterns,
+    inference, ir, lir,
     symbol::{Bundle, Mint, Version},
     tracking::{FileManager, Span},
     ui,
@@ -1993,19 +1993,25 @@ fn compile_one(
         return Err(CompileError::from_diagnostics(diagnostics));
     }
 
-    let mut mint = Mint::new(identity);
+    let mint = Mint::new(identity);
     let imports: Vec<_> = dependencies
         .iter()
         .map(|(alias, artifact)| ir::DependencyImport { alias, artifact })
         .collect();
-    let mut built = ir::build_with_dependency_imports(&mut mint, loaded.stmts, &imports, &linked);
-    let inferred = inference::infer(&mint, &mut built.program, inference::Trace::Off);
-    let checked = patterns::check(&built.program, &inferred);
-
-    let errors = built.errors.len() + inferred.errors().len() + checked.errors.len();
+    let accepted = ruddy::compile::compile_with_dependency_imports(
+        mint,
+        loaded.stmts,
+        &imports,
+        &linked,
+        inference::Trace::Off,
+    );
+    let accepted = match accepted {
+        Ok(accepted) => accepted,
+        Err(partial) => {
+    let errors = partial.errors.len();
     if errors != 0 {
         let mut diagnostics = Vec::with_capacity(errors);
-        for error in &built.errors {
+        for error in &partial.ir.errors {
             diagnostics.push(source_diagnostic(
                 &mut files,
                 "ir",
@@ -2013,7 +2019,7 @@ fn compile_one(
                 source_directory,
             ));
         }
-        for error in inferred.errors() {
+        for error in partial.inference.errors() {
             diagnostics.push(source_diagnostic(
                 &mut files,
                 "types",
@@ -2021,7 +2027,7 @@ fn compile_one(
                 source_directory,
             ));
         }
-        for error in &checked.errors {
+        for error in &partial.patterns.errors {
             diagnostics.push(diagnostic(
                 &mut files,
                 "patterns",
@@ -2033,8 +2039,11 @@ fn compile_one(
         }
         return Err(CompileError::from_diagnostics(diagnostics));
     }
+        unreachable!("partial compilation always has an error")
+        }
+    };
 
-    let lowered = lir::lower(&mint, &built.program, inferred.semantics());
+    let lowered = lir::lower(&accepted);
     let identities = dependencies
         .iter()
         .map(|(_, artifact)| Dependency {
@@ -2043,9 +2052,7 @@ fn compile_one(
         })
         .collect();
     Ok(ruddy::artifact::build_with_dependencies(
-        &mint,
-        &built.program,
-        inferred.semantics(),
+        &accepted,
         &lowered,
         identities,
     ))

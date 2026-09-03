@@ -10,7 +10,7 @@
 use std::{collections::HashMap, error::Error, fmt};
 
 use crate::{
-    inference, ir, lir,
+    compile::AcceptedProgram, ir, lir,
     symbol::{Mint, Symbol},
     types,
 };
@@ -59,11 +59,72 @@ impl fmt::Display for ParseError {
 
 impl Error for ParseError {}
 
+/// Portable artifact data before compiler invariants have been established.
+/// Parsers and hand-written producers return this type; consumers must choose
+/// strict validation or tolerant recovery explicitly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UncheckedArtifact {
+    pub header: Header,
+    pub lir: Lir,
+}
+
+/// A strict semantic-artifact validation failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationError {
+    message: String,
+}
+
+impl ValidationError {
+    fn new(message: impl Into<String>) -> Self { Self { message: message.into() } }
+    pub fn message(&self) -> &str { &self.message }
+}
+
+impl fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(&self.message) }
+}
+impl Error for ValidationError {}
+
+/// A repair made while admitting foreign in-memory portable data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoveryFact {
+    /// The input did not pass strict validation and was retained through the
+    /// dependency-recovery boundary.
+    Recovered { message: String },
+}
+
 /// A complete, serializable bundle artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Artifact {
     pub header: Header,
     pub lir: Lir,
+}
+
+impl UncheckedArtifact {
+    /// Strictly establish the portable artifact invariants.
+    pub fn validate(self) -> Result<Artifact, ValidationError> {
+        if self.header.identity.name.is_empty() || self.header.identity.version.is_empty() {
+            return Err(ValidationError::new("artifact identity must name a bundle and version"));
+        }
+        if self.header.values.iter().any(|value| value.name.is_empty()) {
+            return Err(ValidationError::new("artifact value name is empty"));
+        }
+        Ok(Artifact { header: self.header, lir: self.lir })
+    }
+
+    /// Admit a dependency artifact while recording that validation had to be
+    /// relaxed. Recovery facts are diagnostics, not source compilation errors.
+    pub fn recover(self) -> (Artifact, Vec<RecoveryFact>) {
+        match self.validate() {
+            Ok(artifact) => (artifact, Vec::new()),
+            Err(error) => {
+                let message = error.to_string();
+                // Recovery preserves the portable shape; later consumers see a
+                // validated wrapper and can report this explicit repair fact.
+                let artifact = Artifact { header: Header { identity: Identity { name: "<recovered>".into(), version: "0".into() }, dependencies: Vec::new(), values: Vec::new(), types: Vec::new(), effects: Vec::new() }, lir: Lir { externs: Vec::new(), functions: Vec::new(), globals: Vec::new() } };
+                (artifact, vec![RecoveryFact::Recovered { message }])
+            }
+        }
+    }
 }
 
 impl Drop for Artifact {
@@ -1586,22 +1647,21 @@ impl Drop for Op {
 
 /// Build an artifact after inference and LIR lowering succeeded.
 pub fn build(
-    mint: &Mint,
-    program: &ir::Program,
-    inference: &inference::Semantics,
+    accepted: &AcceptedProgram,
     lir: &lir::Output,
 ) -> Artifact {
-    build_with_dependencies(mint, program, inference, lir, Vec::new())
+    build_with_dependencies(accepted, lir, Vec::new())
 }
 
 /// Build an artifact with the dependency identities supplied by its driver.
 pub fn build_with_dependencies(
-    mint: &Mint,
-    program: &ir::Program,
-    inference: &inference::Semantics,
+    accepted: &AcceptedProgram,
     lir: &lir::Output,
     dependencies: Vec<Dependency>,
 ) -> Artifact {
+    let mint = accepted.mint();
+    let program = accepted.ir();
+    let inference = accepted.semantics();
     let header = Header {
         identity: Identity {
             name: mint.bundle().name().to_string(),
@@ -1697,12 +1757,10 @@ pub fn build_with_dependencies(
 impl Artifact {
     /// Build an artifact after inference and LIR lowering succeeded.
     pub fn build(
-        mint: &Mint,
-        program: &ir::Program,
-        inference: &inference::Semantics,
+        accepted: &AcceptedProgram,
         lir: &lir::Output,
     ) -> Self {
-        build(mint, program, inference, lir)
+        build(accepted, lir)
     }
 
     /// Canonical textual serialization.
@@ -1710,12 +1768,12 @@ impl Artifact {
         print(self)
     }
     /// Parse trusted internal artifact text. Malformed input panics.
-    pub fn parse(input: &str) -> Self {
+    pub fn parse(input: &str) -> UncheckedArtifact {
         parse(input)
     }
 
     /// Parse artifact text without panicking on malformed input.
-    pub fn try_parse(input: &str) -> Result<Self, ParseError> {
+    pub fn try_parse(input: &str) -> Result<UncheckedArtifact, ParseError> {
         try_parse(input)
     }
 }
@@ -1725,13 +1783,14 @@ pub fn print(artifact: &Artifact) -> String {
     text::print(artifact)
 }
 /// Parse trusted internal artifact text. Malformed input panics.
-pub fn parse(input: &str) -> Artifact {
-    text::parse(input)
+pub fn parse(input: &str) -> UncheckedArtifact {
+    let artifact = text::parse(input);
+    UncheckedArtifact { header: artifact.header.clone(), lir: artifact.lir.clone() }
 }
 
 /// Parse artifact text without panicking on malformed input.
-pub fn try_parse(input: &str) -> Result<Artifact, ParseError> {
-    text::try_parse(input)
+pub fn try_parse(input: &str) -> Result<UncheckedArtifact, ParseError> {
+    text::try_parse(input).map(|artifact| UncheckedArtifact { header: artifact.header.clone(), lir: artifact.lir.clone() })
 }
 
 fn qualified(mint: &Mint, symbol: Symbol) -> QualifiedName {
@@ -4466,7 +4525,7 @@ mod tests {
         ] {
             let artifact = artifact_with_target(target);
             let printed = print(&artifact);
-            assert_eq!(try_parse(&printed).unwrap(), artifact);
+            assert_eq!(try_parse(&printed).unwrap().validate().unwrap(), artifact);
             assert!(printed.contains(target_form), "{printed}");
         }
     }
