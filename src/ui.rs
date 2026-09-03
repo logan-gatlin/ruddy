@@ -1026,6 +1026,7 @@ impl ir::ErrorKind {
                 "incompatible-presence-ownership"
             }
             ir::ErrorKind::Arity { .. } => "wrong-argument-count",
+            ir::ErrorKind::EffectArity { .. } => "effect-arity",
             ir::ErrorKind::NotAConstructor => "not-a-type-constructor",
             ir::ErrorKind::ParameterApplied { .. } => "applied-parameter",
             ir::ErrorKind::DuplicateParameter { .. } => "duplicate-parameter",
@@ -1215,6 +1216,29 @@ impl ir::Error {
                 "add the missing type arguments"
             } else {
                 "remove the extra type arguments"
+            }),
+            E::EffectArity {
+                name,
+                expected,
+                found,
+            } => Diagnostic::new(
+                code,
+                format!(
+                    "effect `!{name}` expects {}, but {} written",
+                    arguments(*expected),
+                    supplied(*found)
+                ),
+                span,
+            )
+            .label(if found < expected {
+                "not enough arguments are supplied"
+            } else {
+                "too many arguments are supplied"
+            })
+            .help(if found < expected {
+                "add the missing effect arguments"
+            } else {
+                "remove the extra effect arguments"
             }),
             E::NotAConstructor => Diagnostic::new(
                 code,

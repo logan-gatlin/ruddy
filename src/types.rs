@@ -117,6 +117,17 @@ impl EffectId {
             Self::Pending(_) => "<unresolved effect>",
         }
     }
+
+    /// The row key, or a provisional spelling for an effect whose identity is
+    /// still being computed. What the parameter-kind fixpoint labels a row's
+    /// lacks with: before identities exist it needs only to tell labels
+    /// apart, and after they do it is the row key itself.
+    pub fn label_key(&self) -> String {
+        match self {
+            Self::Structural { .. } => self.row_key(),
+            Self::Pending(symbol) => format!("\u{1e}p{symbol:?}"),
+        }
+    }
 }
 
 /// Which of the two sets of labels a rule is being read about.

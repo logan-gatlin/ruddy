@@ -4,9 +4,9 @@ use indexmap::IndexMap;
 use ruddy::{
     artifact as a, inference,
     ir::{
-        Annotation, ClauseKind, DependencyImport, Effect, ErrorKind, ExternTypeKind, Field,
-        OperationSelector, OperationTypeProblem, Output, PatternKind, PresenceOwnership, SumCase,
-        Term, TermKind, TypeField, TypeKind, build, build_with_dependencies,
+        Annotation, ClauseKind, DependencyImport, Effect, EffectLabel, ErrorKind, ExternTypeKind,
+        Field, OperationSelector, OperationTypeProblem, Output, PatternKind, PresenceOwnership,
+        SumCase, Term, TermKind, TypeField, TypeKind, build, build_with_dependencies,
         build_with_dependency_imports,
     },
     parse,
@@ -3858,6 +3858,341 @@ fn effect_of<'a>(mint: &Mint, out: &'a Output, name: &str) -> &'a Effect {
     &out.program.effects[&symbol].value
 }
 
+/// An effect binds parameters the way a type declaration does: its
+/// operations may mention them, a row applies it to exactly that many
+/// arguments, and a variable no parameter binds is still refused.
+#[test]
+fn an_effect_binds_parameters_its_operations_mention() {
+    let source = "effect Ask 'a = { get: () -> 'a }\n\
+                  let f : () -> Nat + !Ask Nat = fn _ => 0n";
+    let (mint, out) = built(source);
+    let symbol = *out
+        .program
+        .effects
+        .keys()
+        .find(|symbol| mint.name(**symbol) == "Ask")
+        .expect("the effect is declared");
+    let decl = &out.program.effects[&symbol];
+    assert_eq!(decl.params.len(), 1);
+    assert_eq!(mint.name(decl.params[0].symbol), "a");
+    assert_eq!(decl.params[0].kind, ParamKind::Type { lacks: [].into() });
+    let Effect::Operations(operations) = &decl.value else {
+        panic!("expected operations");
+    };
+    let get = &operations[&OperationSelector::Named("get".to_string())];
+    assert!(matches!(get.to.tracked, TypeKind::Param { index: 0, .. }));
+
+    let term = &out.program.terms[&term_symbol(&mint, &out, "f")];
+    let TypeKind::Arrow { effects, .. } = &term.annotation.as_ref().expect("annotated").ty.tracked
+    else {
+        panic!("expected an arrow");
+    };
+    let (id, label) = effects.effects.first().expect("the row names the effect");
+    assert_eq!(id.name(), "Ask");
+    let EffectLabel::Written { args, .. } = label else {
+        panic!("expected a written label");
+    };
+    assert!(matches!(args.as_slice(), [arg] if matches!(arg.tracked, TypeKind::Prim(Prim::Nat))));
+
+    // Too few or too many arguments is counted at the application, and the
+    // label is dropped rather than paired up by guesswork.
+    for row in ["!Ask", "!Ask Nat Nat", "\\!Ask + ..'e"] {
+        let src =
+            format!("effect Ask 'a = {{ get: () -> 'a }}\nlet f : () -> Nat + {row} = fn _ => 0n");
+        let (_, out) = build_src(&src);
+        let [error] = &out.errors[..] else {
+            panic!("{row}: {:#?}", out.errors);
+        };
+        assert_eq!(error.kind.code(), "effect-arity", "{row}");
+        assert!(
+            matches!(
+                &error.kind,
+                ErrorKind::EffectArity { name, expected: 1, .. } if name == "Ask"
+            ),
+            "{row}: {:#?}",
+            error.kind
+        );
+    }
+    let (_, out) =
+        build_src("effect Ask 'a = { get: () -> 'a }\nlet f : () -> Nat + !Ask = fn _ => 0n");
+    let diagnostic = out.errors[0].diagnostic();
+    assert_eq!(
+        diagnostic.title,
+        "effect `!Ask` expects one argument, but none was written"
+    );
+    assert_eq!(diagnostic.help, ["add the missing effect arguments"]);
+    // And an effect declared without parameters takes none, as before.
+    assert_eq!(
+        codes_of("effect Log = Nat -> ()\nlet f : () -> Nat + !Log Nat = fn _ => 0n"),
+        ["effect-arity"]
+    );
+    // A variable no parameter binds is the one an operation cannot have.
+    let (_, out) = build_src("effect Ask 'a = { get: () -> 'b }");
+    assert!(
+        matches!(
+            out.errors.as_slice(),
+            [error] if matches!(
+                error.kind,
+                ErrorKind::ImpureOperation { found: OperationTypeProblem::Variable(ref name) } if name == "b"
+            )
+        ),
+        "{:#?}",
+        out.errors
+    );
+}
+
+/// What an effect's parameter stands for is read off its operations the way a
+/// type's is read off its body — the same fixpoint, so a parameter handed on
+/// to an effect inherits that effect's reading, and one used two ways is
+/// refused at its declaration. An operation may carry effects on an arrow
+/// nested inside its signature; only its own outer arrow stays pure.
+#[test]
+fn an_effect_parameter_stands_for_what_its_operations_use_it_as() {
+    let source = "effect Log = { write: Nat -> () }\n\
+                  effect Ask 'a = { get: () -> 'a }\n\
+                  effect State 'r = { get: () -> { x: Nat, ..'r }, put: { x: Nat, ..'r } -> () }\n\
+                  effect Choose 'c = { pick: (#A | ..'c) -> () }\n\
+                  effect Run 'e = { run: (() -> () + !Log + ..'e) -> () }\n\
+                  effect Wrap 'f = { wrap: (() -> () + !Run 'f) -> () }\n\
+                  effect Nil 'u\n\
+                  type Runner 'g = () -> () + !Run 'g";
+    let (mint, out) = built(source);
+    let kind = |name: &str| {
+        let symbol = *out
+            .program
+            .effects
+            .keys()
+            .find(|symbol| mint.name(**symbol) == name)
+            .unwrap_or_else(|| panic!("no effect named {name}"));
+        out.program.effects[&symbol].params[0].kind.clone()
+    };
+    assert_eq!(kind("Ask"), ParamKind::Type { lacks: [].into() });
+    assert_eq!(
+        kind("State"),
+        ParamKind::Fields {
+            lacks: ["x".to_string()].into()
+        }
+    );
+    assert_eq!(
+        kind("Choose"),
+        ParamKind::Cases {
+            lacks: ["A".to_string()].into()
+        }
+    );
+    let log = out.program.effect_ids[&out
+        .program
+        .effects
+        .keys()
+        .copied()
+        .find(|symbol| mint.name(*symbol) == "Log")
+        .expect("Log is declared")]
+        .row_key();
+    assert_eq!(
+        kind("Run"),
+        ParamKind::Effects {
+            lacks: [log.clone()].into()
+        }
+    );
+    // Handed straight on to `Run`, `Wrap`'s parameter reads as `Run`'s does,
+    // and so does the type declaration's.
+    assert_eq!(
+        kind("Wrap"),
+        ParamKind::Effects {
+            lacks: [log].into()
+        }
+    );
+    let runner = &out.program.types[&type_symbol(&mint, &out, "Runner")];
+    assert_eq!(runner.params[0].kind.sense(), Sense::Effects);
+    // A parameter nothing uses stands for a type.
+    assert_eq!(kind("Nil"), ParamKind::Type { lacks: [].into() });
+
+    // Read as a type by one operation and as a sum's rest by another: the
+    // declaration is told, at the parameter.
+    let (_, out) = build_src("effect Bad 'a = { one: 'a -> (), two: (#A | ..'a) -> () }");
+    let [error] = &out.errors[..] else {
+        panic!("{:#?}", out.errors);
+    };
+    assert_eq!(error.kind.code(), "mixed-parameter");
+    assert!(matches!(
+        error.kind,
+        ErrorKind::MixedParameter {
+            first: Sense::Type,
+            second: Sense::Cases
+        }
+    ));
+
+    // The outer arrow of an operation is still the one place effects cannot
+    // be declared.
+    let (_, out) =
+        build_src("effect Log = { write: Nat -> () }\neffect Bad = { op: Nat -> () + !Log }");
+    assert!(
+        matches!(
+            out.errors.as_slice(),
+            [error] if matches!(error.kind, ErrorKind::ImpureOperation { found: OperationTypeProblem::Effects })
+        ),
+        "{:#?}",
+        out.errors
+    );
+    // And a nested row is held to an operation's rules: nothing anonymous.
+    for source in [
+        "effect Bad = { op: (() -> () + ..) -> () }",
+        "effect Log = { write: Nat -> () }\neffect Bad = { op: (() -> () + !Log (when 'p)) -> () }",
+        "effect Bad = { op: (() -> () + ..'e) -> () }",
+    ] {
+        let (_, out) = build_src(source);
+        assert!(
+            matches!(
+                out.errors.as_slice(),
+                [error] if matches!(error.kind, ErrorKind::ImpureOperation { .. })
+            ),
+            "{source}: {:#?}",
+            out.errors
+        );
+    }
+}
+
+/// An argument handed to an effect is held to the parameter's reading the way
+/// a type application's is: a row goes where a row is asked for, and it may
+/// not name what the declaration already names beside the parameter.
+#[test]
+fn an_effect_argument_is_held_to_its_parameters_reading() {
+    let base = "effect Log = { write: Nat -> () }\n\
+                effect Run 'e = { run: (() -> () + !Log + ..'e) -> () }\n\
+                effect State 'r = { get: () -> { x: Nat, ..'r } }\n\
+                effect Choose 'c = { pick: (#A | ..'c) -> () }\n";
+    for (row, sense) in [
+        ("!Run Nat", Sense::Effects),
+        ("!State Nat", Sense::Fields),
+        ("!Choose Nat", Sense::Cases),
+    ] {
+        let (_, out) = build_src(&format!("{base}let f : () -> Nat + {row} = fn _ => 0n"));
+        assert!(
+            matches!(
+                out.errors.as_slice(),
+                [error] if matches!(error.kind, ErrorKind::NotARow { sense: found } if found == sense)
+            ),
+            "{row}: {:#?}",
+            out.errors
+        );
+    }
+    let (mint, out) = built(base);
+    let log = out.program.effect_ids[&out
+        .program
+        .effects
+        .keys()
+        .copied()
+        .find(|symbol| mint.name(*symbol) == "Log")
+        .expect("Log is declared")]
+        .row_key();
+    for (row, shape, field) in [
+        ("!Run (!Log)", Shape::Effect, log.as_str()),
+        ("!State { x: Nat }", Shape::Struct, "x"),
+        ("!Choose (#A)", Shape::Sum, "A"),
+    ] {
+        let (_, out) = build_src(&format!("{base}let f : () -> Nat + {row} = fn _ => 0n"));
+        assert!(
+            matches!(
+                out.errors.as_slice(),
+                [error] if matches!(
+                    &error.kind,
+                    ErrorKind::RepeatedRowField { shape: found, field: name } if *found == shape && name == field
+                )
+            ),
+            "{row}: {:#?}",
+            out.errors
+        );
+    }
+    // Wherever a row is written: a declared type's body, an operation's
+    // nested arrow, and an extern's annotation are checked alike.
+    for source in [
+        format!("{base}type T = () -> () + !Run Nat"),
+        format!("{base}effect Nested = {{ op: (() -> () + !Run Nat) -> () }}"),
+        format!("{base}extern host : () -> Nat + !Run Nat = \"host\""),
+    ] {
+        assert_eq!(codes_of(&source), ["not-a-row"], "{source}");
+    }
+    // And an argument that keeps to the reading is taken as written.
+    let (mint, out) = built(&format!(
+        "{base}effect IO = {{ print: Nat -> () }}\nlet f : () -> Nat + !Run (!IO + ..'e) = fn _ => 0n"
+    ));
+    let term = &out.program.terms[&term_symbol(&mint, &out, "f")];
+    let TypeKind::Arrow { effects, .. } = &term.annotation.as_ref().expect("annotated").ty.tracked
+    else {
+        panic!("expected an arrow");
+    };
+    let label = effects.effects.values().next().expect("the row names Run");
+    assert!(matches!(label.args(), [arg] if matches!(arg.tracked, TypeKind::Effects(_))));
+}
+
+/// Structural identity belongs to the generic constructor: its leaf name, how
+/// many parameters it takes and what each stands for, and its operations with
+/// the parameters as positions. Names of parameters are not part of it; a
+/// parameter no operation mentions still is; and an effect applied inside an
+/// interface is told apart by its arguments.
+#[test]
+fn structural_identity_includes_parameters_and_their_positions() {
+    let source = "module Renamed = effect Ask 'a = { get: () -> 'a } end\n\
+                  module Same = effect Ask 'b = { get: () -> 'b } end\n\
+                  module Wider = effect Ask 'a 'b = { get: () -> 'a } end\n\
+                  module Other = effect Ask 'a 'b = { get: () -> 'b } end\n\
+                  module Fixed = effect Ask 'a = { get: () -> Nat } end\n\
+                  module Fields = effect Ask 'a = { get: () -> { x: Nat, ..'a } } end\n\
+                  module Bare = effect Ask = { get: () -> Nat } end\n\
+                  module Phantom = effect Ask 'a = { get: () -> Nat } end";
+    let (mint, out) = built(source);
+    let identity = |module: &str| {
+        let symbol = *out
+            .program
+            .effects
+            .keys()
+            .find(|symbol| {
+                mint.name(**symbol) == "Ask"
+                    && mint
+                        .parent(**symbol)
+                        .is_some_and(|parent| mint.name(parent.symbol()) == module)
+            })
+            .unwrap_or_else(|| panic!("no Ask in {module}"));
+        out.program.effect_ids[&symbol].clone()
+    };
+    assert_eq!(identity("Renamed"), identity("Same"));
+    assert_eq!(identity("Fixed"), identity("Phantom"));
+    let distinct = [
+        identity("Renamed"),
+        identity("Wider"),
+        identity("Other"),
+        identity("Fixed"),
+        identity("Fields"),
+        identity("Bare"),
+    ];
+    for (at, left) in distinct.iter().enumerate() {
+        for right in &distinct[at + 1..] {
+            assert_ne!(left, right);
+        }
+    }
+
+    // Applied inside an interface, an effect's arguments are part of what the
+    // interface says, so two interfaces differing only there are two.
+    let source = "effect Ask 'a = { get: () -> 'a }\n\
+                  module N = effect Probe = { run: (() -> () + !Ask Nat) -> () } end\n\
+                  module S = effect Probe = { run: (() -> () + !Ask String) -> () } end\n\
+                  module M = effect Probe = { run: (() -> () + !Ask Nat) -> () } end";
+    let (mint, out) = built(source);
+    let probes: Vec<_> = out
+        .program
+        .effect_ids
+        .iter()
+        .filter(|(symbol, _)| mint.name(**symbol) == "Probe")
+        .map(|(_, identity)| identity.clone())
+        .collect();
+    assert_eq!(probes.len(), 3);
+    assert_ne!(probes[0], probes[1]);
+    assert_eq!(probes[0], probes[2]);
+
+    // An interface may refer back to its own parameterized effect.
+    let (_, out) = built("effect Visit 'a = { run: (() -> 'a + !Visit 'a) -> 'a }");
+    assert_eq!(out.program.effect_ids.len(), 1);
+}
+
 /// An operation declaration keeps its operations in the order they were
 /// written, each as the two sides of the plain closed arrow performing it has —
 /// which is what a handler arm's binder and body type come off. The empty
@@ -7611,12 +7946,7 @@ fn recovery_row_tails_remain_unknown_in_every_canonical_shape() {
             .iter()
             .map(|error| error.kind.code())
             .collect::<Vec<_>>(),
-        [
-            "impure-operation",
-            "impure-operation",
-            "impure-operation",
-            "impure-operation"
-        ],
+        ["impure-operation", "impure-operation", "impure-operation"],
         "an unknown recovery tail must not collapse to a closed tail"
     );
     for name in ["Struct", "Cases", "Effects"] {
@@ -7641,14 +7971,9 @@ fn canonicalization_substitutes_struct_sum_and_effect_row_tails() {
                type Runs 'e = () -> () + ..'e\n\
                module Y =\n  effect RecordPick = { get: Record { y: Nat } -> () }\n  effect CasePick = { get: Cases (#Y) -> () }\n  effect RunPick = { get: Runs (!A) -> () }\nend\n\
                module Z =\n  effect RecordPick = { get: Record { z: Nat } -> () }\n  effect CasePick = { get: Cases (#Z) -> () }\n  effect RunPick = { get: Runs (!B) -> () }\nend";
-    let (mint, out) = build_src(src);
-    assert_eq!(
-        out.errors
-            .iter()
-            .map(|error| error.kind.code())
-            .collect::<Vec<_>>(),
-        ["impure-operation", "impure-operation"]
-    );
+    // An arrow nested in an operation's signature may carry effects; only the
+    // operation's own arrow may not.
+    let (mint, out) = built(src);
     for name in ["RecordPick", "CasePick", "RunPick"] {
         let identities: Vec<_> = out
             .program
@@ -7673,14 +7998,7 @@ fn local_row_applications_flatten_records_sums_and_effects_without_losing_labels
                module Flat =\n  effect Record = { get: { x: Nat, y: Nat } -> () }\n  effect Cases = { get: (#X | #Y) -> () }\n  effect Runs = { get: (() -> () + !A + !B) -> () }\nend\n\
                module Composed =\n  effect Record = { get: Record { y: Nat } -> () }\n  effect Cases = { get: Cases (#Y) -> () }\n  effect Runs = { get: Runs (!B) -> () }\nend\n\
                module Different =\n  effect Record = { get: Record { z: Nat } -> () }\n  effect Cases = { get: Cases (#Z) -> () }\n  effect Runs = { get: Runs (!C) -> () }\nend";
-    let (mint, out) = build_src(src);
-    assert_eq!(
-        out.errors
-            .iter()
-            .map(|error| error.kind.code())
-            .collect::<Vec<_>>(),
-        ["impure-operation", "impure-operation", "impure-operation"]
-    );
+    let (mint, out) = built(src);
     for name in ["Record", "Cases", "Runs"] {
         let ids: Vec<_> = out
             .program
@@ -8340,7 +8658,7 @@ fn imported_interfaces_keep_applied_types_effects_and_alias_overlap_structural()
             .iter()
             .map(|error| error.kind.code())
             .collect::<Vec<_>>(),
-        ["impure-operation", "impure-operation", "duplicate-case"]
+        ["duplicate-case"]
     );
     let identities = |name: &str| {
         out.program
@@ -8362,7 +8680,7 @@ fn imported_interfaces_keep_applied_types_effects_and_alias_overlap_structural()
         recovered[0], recovered[1],
         "imported effect ids stay distinct"
     );
-    assert_eq!(out.errors[2].span.start, src.rfind("dep::!B").unwrap());
+    assert_eq!(out.errors[0].span.start, src.rfind("dep::!B").unwrap());
 }
 
 #[test]

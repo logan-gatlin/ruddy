@@ -1131,15 +1131,18 @@ pub struct EffectRow {
 /// One effect a row names: performed — as its `when` clause says, where it
 /// wears one — or definitely not.
 ///
-/// [`SumCase`]'s twin minus the payload: an effect carries nothing, so a
-/// lowered label holds only what a complaint about it needs and the symbol the
-/// name resolved to.
+/// [`SumCase`]'s twin, whose payload is the arguments the effect is applied
+/// to: `!Ask Nat` hands `Ask`'s one parameter `Nat`, and a label holds those
+/// beside what a complaint about it needs and the symbol the name resolved
+/// to. An effect declared without parameters carries none.
 #[derive(Debug, Clone)]
 pub enum EffectLabel {
-    /// `!Log`, or `!Log (when a)`.
+    /// `!Log`, `!Ask Nat`, or `!Log (when a)`.
     Written {
         name_span: Span,
         symbol: Symbol,
+        /// The arguments, one per parameter the effect declares, in order.
+        args: Vec<Type>,
         /// Whether this label came out of an alias rather than being written.
         ///
         /// `!Console` stands for `!Log` and `!IO`, and neither of
@@ -1154,6 +1157,7 @@ pub enum EffectLabel {
     Absent {
         name_span: Span,
         symbol: Symbol,
+        args: Vec<Type>,
         expanded: bool,
     },
 }
@@ -1375,6 +1379,15 @@ pub enum ErrorKind {
     /// wherever it is written, so a name short of its arguments is the same
     /// complaint as one given too many.
     Arity {
+        name: String,
+        expected: usize,
+        found: usize,
+    },
+    /// An effect applied to the wrong number of arguments: `!Ask` or
+    /// `!Ask Nat Nat` where `effect Ask 'a` takes one. Counted at the label,
+    /// the way [`ErrorKind::Arity`] counts a type application, and the label
+    /// is dropped rather than paired up by guesswork.
+    EffectArity {
         name: String,
         expected: usize,
         found: usize,
@@ -2324,6 +2337,19 @@ impl EffectLabel {
         }
     }
 
+    /// The arguments the effect is applied to, one per parameter it declares.
+    pub fn args(&self) -> &[Type] {
+        match self {
+            EffectLabel::Written { args, .. } | EffectLabel::Absent { args, .. } => args,
+        }
+    }
+
+    pub fn args_mut(&mut self) -> &mut Vec<Type> {
+        match self {
+            EffectLabel::Written { args, .. } | EffectLabel::Absent { args, .. } => args,
+        }
+    }
+
     /// The `when` clause the label wears, when it wears one. An absent label
     /// never does: `\!Log` says the effect is not performed outright.
     pub fn when(&self) -> Option<&When> {
@@ -2498,15 +2524,25 @@ fn build_with_dependency_imports_inner(
     let named: Vec<_> = flat
         .effects
         .iter()
-        .map(|(module, name, _, _)| {
+        .map(|(module, name, params, _)| {
             b.module = *module;
-            b.declare(Scope::Effects, name)
+            let symbol = b.declare(Scope::Effects, name);
+            // The parameters are bound before any body is lowered, so that an
+            // application can be counted wherever it appears — in an
+            // operation's signature above the declaration it names included.
+            let params = b.declare_params(params);
+            if let Some(symbol) = symbol {
+                b.arities.insert(symbol, params.len());
+            }
+            (symbol, params)
         })
         .collect();
-    for (symbol, (module, name, params, cases)) in named.into_iter().zip(flat.effects) {
+    for ((symbol, params), (module, name, _, cases)) in named.into_iter().zip(flat.effects) {
         b.module = module;
-        let params = b.declare_params(&params);
+        // In scope for the length of the body, the way a type's are.
+        b.scope_params(&params);
         let value = b.effect(cases);
+        b.params.clear();
         if let Some(symbol) = symbol {
             program.effects.insert(
                 symbol,
@@ -2596,6 +2632,20 @@ fn build_with_dependency_imports_inner(
         decl.value = span.track(TypeKind::Error);
         b.error(at, ErrorKind::GrowingRecursion);
     }
+    // What each effect's parameters stand for is part of the effect's
+    // identity, and the lacks a parameter carries are spelled with identities:
+    // so the readings are taken once before identities exist, with rows keyed
+    // provisionally, and the whole fixpoint runs again below once they do.
+    // Only the senses are kept from this pass; its complaints are the second
+    // pass's to make.
+    let senses = kinds(&program.types, &program.effects, &program.external_types);
+    for (symbol, decl) in program.effects.iter_mut() {
+        if let Some(kinds) = senses.kinds.get(symbol) {
+            for (param, kind) in decl.params.iter_mut().zip(kinds) {
+                param.kind = kind.clone();
+            }
+        }
+    }
     // Type declarations are complete, so their effect rows can now be keyed
     // by normalized operation interfaces before parameter-kind analysis reads
     // their lacks sets. Terms are re-keyed after they are lowered below.
@@ -2612,10 +2662,14 @@ fn build_with_dependency_imports_inner(
         mut kinds,
         mixed,
         errors: clashes,
-    } = kinds(&program.types, &program.external_types);
+    } = kinds(&program.types, &program.effects, &program.external_types);
     b.errors.extend(clashes);
     for (symbol, kinds) in &kinds {
-        for (param, kind) in program.types[symbol].params.iter_mut().zip(kinds) {
+        let params = match program.types.get_mut(symbol) {
+            Some(decl) => &mut decl.params,
+            None => &mut program.effects[symbol].params,
+        };
+        for (param, kind) in params.iter_mut().zip(kinds) {
             param.kind = kind.clone();
         }
     }
@@ -2626,10 +2680,14 @@ fn build_with_dependency_imports_inner(
     // thing nothing downstream can recover from, and a slot left in the table
     // would complain at every ordinary type written at it — three complaints
     // about code the reader got right, for one mistake somewhere else.
+    // An effect read two ways keeps its operations — a handler still has to
+    // cover them — and is dropped from the table the same way, so its
+    // applications are not checked against a reading it never had.
     for symbol in &mixed {
-        let decl = &mut program.types[symbol];
-        let span = decl.value.span;
-        decl.value = span.track(TypeKind::Error);
+        if let Some(decl) = program.types.get_mut(symbol) {
+            let span = decl.value.span;
+            decl.value = span.track(TypeKind::Error);
+        }
         kinds.remove(symbol);
     }
     // Imported constructors impose exactly the same row-shape and lacks
@@ -3583,7 +3641,8 @@ fn structuralize_effects(
         operation_effects
             .into_iter()
             .map(|(symbol, operations)| {
-                let interface = canonical.canonical_interface(operations);
+                let interface =
+                    canonical.canonical_interface(&program.effects[&symbol].params, operations);
                 (
                     symbol,
                     EffectId::structural(mint.name(symbol).to_string(), interface),
@@ -3901,6 +3960,14 @@ impl RegularType<'_> {
         self.node(value, Vec::new())
     }
 
+    /// The nodes an effect's own parameters stand for in its operation types:
+    /// one position each, and nothing about the name.
+    fn parameters(&mut self, count: usize) -> Vec<usize> {
+        (0..count)
+            .map(|index| self.atom(format!("param:{index}")))
+            .collect()
+    }
+
     /// Select one applied parameter, recovering malformed imported arity with
     /// the ordinary unknown node. Source applications are already arity-checked;
     /// sharing this lookup keeps both presentations bounds-safe.
@@ -3944,7 +4011,7 @@ impl RegularType<'_> {
             FinishNamed(usize),
             Make(String, Vec<String>),
             Fields(Vec<(String, String)>),
-            EffectCase(String),
+            EffectCase(String, usize),
             Canonical(usize),
             Atom(String),
         }
@@ -3955,13 +4022,20 @@ impl RegularType<'_> {
             match part {
                 Work::Atom(label) => values.push(self.atom(label)),
                 Work::Canonical(node) => values.push(node),
-                Work::EffectCase(presence) => {
+                Work::EffectCase(presence, arity) => {
+                    let start = values.len() - arity;
+                    let args = values.split_off(start);
                     let payload = values.pop().expect("an effect case has a payload");
                     let identity = values.pop().expect("an effect case has an identity");
-                    values.push(self.node(
-                        format!("effect-case:{presence}"),
-                        vec![("identity".into(), identity), ("payload".into(), payload)],
-                    ));
+                    let edges = [("identity".into(), identity), ("payload".into(), payload)]
+                        .into_iter()
+                        .chain(
+                            args.into_iter()
+                                .enumerate()
+                                .map(|(at, arg)| (format!("arg:{at}"), arg)),
+                        )
+                        .collect();
+                    values.push(self.node(format!("effect-case:{presence}"), edges));
                 }
                 Work::Make(label, edge_labels) => {
                     let start = values.len() - edge_labels.len();
@@ -4086,7 +4160,7 @@ impl RegularType<'_> {
                         .chain(std::iter::once("tail".into()))
                         .collect();
                     work.push(Work::Make("effects".into(), labels));
-                    work.push(Work::RowTail(&row.tail, args));
+                    work.push(Work::RowTail(&row.tail, args.clone()));
                     for label in row.effects.values().rev() {
                         let presence = match label {
                             EffectLabel::Written { when, .. } => {
@@ -4094,7 +4168,16 @@ impl RegularType<'_> {
                             }
                             EffectLabel::Absent { .. } => "\\".into(),
                         };
-                        work.push(Work::EffectCase(presence));
+                        work.push(Work::EffectCase(presence, label.args().len()));
+                        // The arguments follow the identity and payload, in
+                        // order, each a type in the scope the row is in.
+                        work.extend(
+                            label
+                                .args()
+                                .iter()
+                                .rev()
+                                .map(|arg| Work::Type(arg, args.clone())),
+                        );
                         work.push(Work::Atom(
                             if matches!(label, EffectLabel::Absent { .. }) {
                                 "?"
@@ -4197,7 +4280,7 @@ impl RegularType<'_> {
             Apply(Symbol, usize, bool),
             FinishNamed(usize, Symbol),
             Make(String, Vec<String>),
-            EffectCase(String),
+            EffectCase(String, usize),
             Canonical(usize),
             Atom(String),
             Argument(Vec<usize>, u32),
@@ -4217,13 +4300,20 @@ impl RegularType<'_> {
                 Work::Atom(label) => values.push(self.atom(label)),
                 Work::Canonical(node) => values.push(node),
                 Work::Argument(args, index) => values.push(self.argument(&args, index)),
-                Work::EffectCase(presence) => {
+                Work::EffectCase(presence, arity) => {
+                    let start = values.len() - arity;
+                    let args = values.split_off(start);
                     let payload = values.pop().expect("an effect case has a payload");
                     let identity = values.pop().expect("an effect case has an identity");
-                    values.push(self.node(
-                        format!("effect-case:{presence}"),
-                        vec![("identity".into(), identity), ("payload".into(), payload)],
-                    ));
+                    let edges = [("identity".into(), identity), ("payload".into(), payload)]
+                        .into_iter()
+                        .chain(
+                            args.into_iter()
+                                .enumerate()
+                                .map(|(at, arg)| (format!("arg:{at}"), arg)),
+                        )
+                        .collect();
+                    values.push(self.node(format!("effect-case:{presence}"), edges));
                 }
                 Work::Make(label, edge_labels) => {
                     let mut children = Vec::with_capacity(edge_labels.len());
@@ -4429,7 +4519,7 @@ impl RegularType<'_> {
                                 presence_scope,
                             );
                             let identity = self.arena.effect_key(name);
-                            work.push(Work::EffectCase(presence));
+                            work.push(Work::EffectCase(presence, 0));
                             if matches!(field.presence, Presence::Absent) {
                                 work.push(Work::Atom("?".into()));
                             } else {
@@ -4773,6 +4863,12 @@ fn type_effect_dependencies<'a>(
             }
             TypeKind::Arrow { from, to, effects } => {
                 dependencies.extend(effects.effects.values().map(EffectLabel::symbol));
+                pending.extend(
+                    effects
+                        .effects
+                        .values()
+                        .flat_map(|label| label.args().iter().rev()),
+                );
                 pending.push(to);
                 pending.push(from);
             }
@@ -4797,6 +4893,12 @@ fn type_effect_dependencies<'a>(
             }
             TypeKind::Effects(effects) => {
                 dependencies.extend(effects.effects.values().map(EffectLabel::symbol));
+                pending.extend(
+                    effects
+                        .effects
+                        .values()
+                        .flat_map(|label| label.args().iter().rev()),
+                );
             }
             TypeKind::Param { .. }
             | TypeKind::Prim(_)
@@ -4860,10 +4962,28 @@ impl<'a> EffectCanonicalizer<'a> {
 
     fn canonical_interface(
         &mut self,
+        params: &'a [Param],
         operations: &'a IndexMap<OperationSelector, Operation>,
     ) -> String {
-        let root = self.run(CanonicalWork::Interface(operations)).node;
+        let root = self.run(CanonicalWork::Interface(params, operations)).node;
         self.arena.encode(root)
+    }
+
+    /// The edges an interface node carries for its parameters: how many, and
+    /// what each stands for. Names are nowhere in it; positions are, through
+    /// the `param:{index}` atoms the operation types are built over.
+    fn parameter_edges(&mut self, params: &[Param]) -> Vec<(String, usize)> {
+        std::iter::once((
+            "arity".to_string(),
+            self.arena.atom(params.len().to_string()),
+        ))
+        .chain(params.iter().enumerate().map(|(index, param)| {
+            (
+                format!("param:{index}"),
+                self.arena.atom(format!("{:?}", param.kind.sense())),
+            )
+        }))
+        .collect()
     }
 
     fn run(&mut self, root: CanonicalWork<'a>) -> CanonicalValue {
@@ -4871,23 +4991,29 @@ impl<'a> EffectCanonicalizer<'a> {
         let mut values: Vec<CanonicalValue> = Vec::new();
         while let Some(part) = work.pop() {
             match part {
-                CanonicalWork::Interface(operations) => {
+                CanonicalWork::Interface(params, operations) => {
                     let names = operations.keys().map(|name| name.canonical()).collect();
-                    work.push(CanonicalWork::FinishInterface(names));
-                    work.extend(operations.values().rev().map(CanonicalWork::Operation));
+                    let edges = self.parameter_edges(params);
+                    work.push(CanonicalWork::FinishInterface(edges, names));
+                    let count = params.len();
+                    work.extend(
+                        operations
+                            .values()
+                            .rev()
+                            .map(|operation| CanonicalWork::Operation(operation, count)),
+                    );
                 }
-                CanonicalWork::Operation(operation) => {
+                CanonicalWork::Operation(operation, count) => {
                     let scope = self.next_presence_scope;
                     self.next_presence_scope += 1;
                     self.presence_scopes
                         .insert(scope, CanonicalPresenceScope::default());
-                    work.push(CanonicalWork::Type(&operation.to, scope));
-                    work.push(CanonicalWork::Type(&operation.from, scope));
+                    work.push(CanonicalWork::Type(&operation.to, scope, count));
+                    work.push(CanonicalWork::Type(&operation.from, scope, count));
                 }
-                CanonicalWork::FinishInterface(names) => {
+                CanonicalWork::FinishInterface(mut edges, names) => {
                     let start = values.len() - names.len() * 2;
                     let mut types = values.split_off(start).into_iter();
-                    let mut edges = Vec::with_capacity(names.len() * 2);
                     for name in names {
                         let from = types.next().expect("an operation has an input");
                         let to = types.next().expect("an operation has an output");
@@ -4898,12 +5024,17 @@ impl<'a> EffectCanonicalizer<'a> {
                         node: self.arena.node("interface", edges),
                     });
                 }
-                CanonicalWork::Type(ty, scope) => {
+                CanonicalWork::Type(ty, scope, count) => {
                     let dependencies = type_effect_dependencies(ty, self.types);
-                    work.push(CanonicalWork::FinishType(ty, dependencies.clone(), scope));
+                    work.push(CanonicalWork::FinishType(
+                        ty,
+                        dependencies.clone(),
+                        scope,
+                        count,
+                    ));
                     work.extend(dependencies.into_iter().rev().map(CanonicalWork::Effect));
                 }
-                CanonicalWork::FinishType(ty, dependencies, scope) => {
+                CanonicalWork::FinishType(ty, dependencies, scope, count) => {
                     let start = values.len() - dependencies.len();
                     let resolved_values = values.split_off(start);
                     let resolved = dependencies
@@ -4920,9 +5051,10 @@ impl<'a> EffectCanonicalizer<'a> {
                         interned: HashMap::new(),
                         named: HashMap::new(),
                     };
+                    let params = graph.parameters(count);
                     let root = graph.source(
                         ty,
-                        &[],
+                        &params,
                         self.presence_scopes
                             .get_mut(&scope)
                             .expect("an operation presence scope remains live"),
@@ -4940,16 +5072,26 @@ impl<'a> EffectCanonicalizer<'a> {
                     } else {
                         let placeholder = self.arena.atom("pending-effect");
                         self.active.insert(symbol, placeholder);
-                        match self.effects.get(&symbol).map(|decl| &decl.value) {
-                            Some(Effect::Operations(operations)) => {
+                        match self
+                            .effects
+                            .get(&symbol)
+                            .map(|decl| (&decl.params, &decl.value))
+                        {
+                            Some((params, Effect::Operations(operations))) => {
                                 let names =
                                     operations.keys().map(|name| name.canonical()).collect();
-                                work.push(CanonicalWork::FinishOperations(symbol, name, names));
+                                let edges = self.parameter_edges(params);
+                                work.push(CanonicalWork::FinishOperations(
+                                    symbol, name, edges, names,
+                                ));
+                                let count = params.len();
                                 work.extend(
-                                    operations.values().rev().map(CanonicalWork::Operation),
+                                    operations.values().rev().map(|operation| {
+                                        CanonicalWork::Operation(operation, count)
+                                    }),
                                 );
                             }
-                            Some(Effect::Alias(named)) => {
+                            Some((_, Effect::Alias(named))) => {
                                 work.push(CanonicalWork::FinishAlias(symbol, name, named.len()));
                                 work.extend(
                                     named
@@ -4974,10 +5116,9 @@ impl<'a> EffectCanonicalizer<'a> {
                         }
                     }
                 }
-                CanonicalWork::FinishOperations(symbol, name, names) => {
+                CanonicalWork::FinishOperations(symbol, name, mut edges, names) => {
                     let start = values.len() - names.len() * 2;
                     let mut types = values.split_off(start).into_iter();
-                    let mut edges = Vec::with_capacity(names.len() * 2);
                     for name in names {
                         let from = types.next().expect("an operation has an input");
                         let to = types.next().expect("an operation has an output");
@@ -5030,19 +5171,24 @@ impl<'a> EffectCanonicalizer<'a> {
 }
 
 enum CanonicalWork<'a> {
-    Interface(&'a IndexMap<OperationSelector, Operation>),
-    FinishInterface(Vec<String>),
-    Operation(&'a Operation),
-    Type(&'a Type, usize),
+    Interface(&'a [Param], &'a IndexMap<OperationSelector, Operation>),
+    FinishInterface(Vec<(String, usize)>, Vec<String>),
+    /// An operation, with how many parameters its effect binds.
+    Operation(&'a Operation, usize),
+    Type(&'a Type, usize, usize),
     Effect(Symbol),
-    FinishType(&'a Type, Vec<Symbol>, usize),
-    FinishOperations(Symbol, String, Vec<String>),
+    FinishType(&'a Type, Vec<Symbol>, usize, usize),
+    FinishOperations(Symbol, String, Vec<(String, usize)>, Vec<String>),
     FinishAlias(Symbol, String, usize),
 }
 
 fn rekey_row(row: &mut EffectRow, ids: &IndexMap<Symbol, EffectId>, errors: &mut Vec<Error>) {
     let old = std::mem::take(&mut row.effects);
-    for (_, label) in old {
+    for (_, mut label) in old {
+        // An argument is a written type like any other, rows included.
+        for arg in label.args_mut() {
+            rekey_type(arg, ids, errors);
+        }
         let Some(id) = ids.get(&label.symbol()) else {
             continue;
         }; // aliases never survive expansion
@@ -6481,7 +6627,11 @@ fn references(term: &Term, out: &mut Vec<Symbol>) {
 /// on to may not name — so the set falls out of the same closure with union in
 /// place of a boolean or. It is finite because the labels in a program are, so
 /// no amount of handing on can make it grow forever.
-fn kinds(types: &IndexMap<Symbol, Decl<Type>>, external: &IndexMap<Symbol, ExternalType>) -> Kinds {
+fn kinds(
+    types: &IndexMap<Symbol, Decl<Type>>,
+    effects: &IndexMap<Symbol, Decl<Effect>>,
+    external: &IndexMap<Symbol, ExternalType>,
+) -> Kinds {
     // What each body says of its own parameters, which slots each one hands
     // itself on to, and which ones sit in the tail of a row handed on. All
     // gathered over the whole table before anything is resolved, so the walk
@@ -6508,18 +6658,38 @@ fn kinds(types: &IndexMap<Symbol, Decl<Type>>, external: &IndexMap<Symbol, Exter
             .into_iter()
             .map(|shape| (shape, row_summaries(types, external, shape)))
             .collect();
+    // Every body that binds parameters, with the types it reads them in: a
+    // type declaration's one body, and an effect's operation signatures. An
+    // effect is a declaration with parameters like any other, and its
+    // operations are where the parameters are used, so both feed one graph.
+    let declarations: Vec<(Symbol, &[Param], Vec<&Type>)> = types
+        .iter()
+        .map(|(symbol, decl)| (*symbol, decl.params.as_slice(), vec![&decl.value]))
+        .chain(effects.iter().map(|(symbol, decl)| {
+            let bodies = match &decl.value {
+                Effect::Operations(operations) => operations
+                    .values()
+                    .flat_map(|operation| [&operation.from, &operation.to])
+                    .collect(),
+                Effect::Alias(_) => Vec::new(),
+            };
+            (*symbol, decl.params.as_slice(), bodies)
+        }))
+        .collect();
     let mut handed: IndexMap<Slot, Vec<Slot>> = IndexMap::new();
     let mut tails: IndexMap<Slot, Vec<Slot>> = IndexMap::new();
-    for (symbol, decl) in types {
-        constrain(&decl.value, &summaries, &mut |fact| match fact {
-            Fact::Says(index, kind) => {
-                let entry = said.entry((*symbol, index)).or_default();
-                entry.senses.insert(kind.sense());
-                entry.lacks.extend(kind.lacks().iter().cloned());
-            }
-            Fact::Hands(index, to) => handed.entry((*symbol, index)).or_default().push(to),
-            Fact::Tails(index, to) => tails.entry((*symbol, index)).or_default().push(to),
-        });
+    for (symbol, _, bodies) in &declarations {
+        for body in bodies {
+            constrain(body, &summaries, &mut |fact| match fact {
+                Fact::Says(index, kind) => {
+                    let entry = said.entry((*symbol, index)).or_default();
+                    entry.senses.insert(kind.sense());
+                    entry.lacks.extend(kind.lacks().iter().cloned());
+                }
+                Fact::Hands(index, to) => handed.entry((*symbol, index)).or_default().push(to),
+                Fact::Tails(index, to) => tails.entry((*symbol, index)).or_default().push(to),
+            });
+        }
     }
     // Two closures over two edge sets, because the two questions travel
     // differently. Which reading a slot has travels only along a parameter
@@ -6538,10 +6708,11 @@ fn kinds(types: &IndexMap<Symbol, Decl<Type>>, external: &IndexMap<Symbol, Exter
     let mut out = HashMap::new();
     let mut mixed = IndexSet::new();
     let mut told = Vec::new();
-    for (symbol, decl) in types {
-        let mut kinds = Vec::with_capacity(decl.params.len());
-        for (index, param) in decl.params.iter().enumerate() {
-            let slot = (*symbol, index as u32);
+    for (symbol, params, _) in &declarations {
+        let symbol = *symbol;
+        let mut kinds = Vec::with_capacity(params.len());
+        for (index, param) in params.iter().enumerate() {
+            let slot = (symbol, index as u32);
             let read_as = senses(&reads, &said, slot);
             let mut lacks = IndexSet::new();
             for demand in reached(&carries, slot) {
@@ -6563,7 +6734,7 @@ fn kinds(types: &IndexMap<Symbol, Decl<Type>>, external: &IndexMap<Symbol, Exter
             // three ways has one mistake to point at like any other, and the
             // sentence that names two of them says enough to find it.
             if read_as.len() > 1 {
-                mixed.insert(*symbol);
+                mixed.insert(symbol);
                 let below = handed.get(&slot).into_iter().flatten().any(|to| {
                     senses(&reads, &said, *to).len() > 1
                         && !reached(&carries, *to).any(|at| at == slot)
@@ -6598,7 +6769,7 @@ fn kinds(types: &IndexMap<Symbol, Decl<Type>>, external: &IndexMap<Symbol, Exter
                 ParamKind::Type { lacks }
             });
         }
-        out.insert(*symbol, kinds);
+        out.insert(symbol, kinds);
     }
     Kinds {
         kinds: out,
@@ -6612,14 +6783,80 @@ fn kinds(types: &IndexMap<Symbol, Decl<Type>>, external: &IndexMap<Symbol, Exter
 ///
 /// One function because there are two rows now — an arrow's own, and the one an
 /// argument may be — and what each says of its tail is the same sentence.
-fn says_effects(effects: &EffectRow, out: &mut impl FnMut(Fact)) {
+fn says_effects(
+    effects: &EffectRow,
+    summaries: &HashMap<Shape, HashMap<Symbol, RowSummary>>,
+    out: &mut impl FnMut(Fact),
+) {
     if let Some(Tail {
         of: Row::Param { index, .. },
         ..
     }) = effects.tail
     {
-        let lacks = effects.effects.keys().map(EffectId::row_key).collect();
+        let lacks = effects.effects.keys().map(EffectId::label_key).collect();
         out(Fact::Says(index, ParamKind::Effects { lacks }));
+    }
+    // An applied effect is an application: what each argument says is what an
+    // argument of a type application says, about the effect's slot instead.
+    for label in effects.effects.values() {
+        arguments(label.symbol(), label.args(), summaries, out);
+    }
+}
+
+/// What the arguments of one application say, whichever declaration is
+/// applied: a parameter handed straight on stands for whatever the slot does,
+/// and any other argument's own tails land where the slot's tail sat.
+fn arguments(
+    head: Symbol,
+    args: &[Type],
+    summaries: &HashMap<Shape, HashMap<Symbol, RowSummary>>,
+    out: &mut impl FnMut(Fact),
+) {
+    for (at, arg) in args.iter().enumerate() {
+        let slot = (head, at as u32);
+        match &arg.tracked {
+            // A parameter handed straight on stands for whatever it is
+            // handed to. This is the statement that crosses
+            // declarations, and the only one that needs resolving
+            // rather than reading.
+            //
+            // Recorded here and *not* descended into: argument position
+            // is not type position, and walking in would say the
+            // parameter stands for a type — which is how a row handed
+            // straight on came to look like a parameter used both ways.
+            TypeKind::Param { index, .. } => out(Fact::Hands(*index, slot)),
+            // Anything else says nothing about what the head takes.
+            // Writing `WithX Nat` is a claim about `Nat`, not about
+            // `WithX` — the argument is checked against the kind the
+            // declaration was read to have, by [`row_arguments`], and
+            // letting a use site vote here is what made that kind
+            // depend on which declaration was written first. What is
+            // inside the argument still speaks for itself, so this
+            // descends.
+            //
+            // A row written out here is the one thing that carries
+            // something back across the same edge: its own tail ends up
+            // where the callee's tail sat, so it inherits what the
+            // callee may not name. That is an obligation and not a
+            // reading, which is why it is a [`Fact::Tails`] rather than
+            // a second [`Fact::Hands`].
+            _ => {
+                // Every parameter whose row reaches this argument's
+                // outer row lands where the callee's tail sat. Keep the
+                // three senses separate: a struct alias carries only
+                // field obligations, a sum alias only case obligations,
+                // and an effects row only effect obligations.
+                for shape in [Shape::Struct, Shape::Sum, Shape::Effect] {
+                    let declarations = summaries
+                        .get(&shape)
+                        .expect("every row sense has summaries");
+                    for index in row_summary(arg, declarations, shape).slots {
+                        out(Fact::Tails(index, slot));
+                    }
+                }
+                constrain(arg, summaries, out);
+            }
+        }
     }
 }
 
@@ -6719,60 +6956,13 @@ fn constrain(
         TypeKind::Arrow { from, to, effects } => {
             constrain(from, summaries, out);
             constrain(to, summaries, out);
-            says_effects(effects, out);
+            says_effects(effects, summaries, out);
         }
         // A row written as an argument says of its own tail exactly what an
         // arrow's row says: whatever the tail names is used as effects, and may
         // not name what the row already does.
-        TypeKind::Effects(effects) => says_effects(effects, out),
-        TypeKind::Apply { head, args, .. } => {
-            for (at, arg) in args.iter().enumerate() {
-                let slot = (*head, at as u32);
-                match &arg.tracked {
-                    // A parameter handed straight on stands for whatever it is
-                    // handed to. This is the statement that crosses
-                    // declarations, and the only one that needs resolving
-                    // rather than reading.
-                    //
-                    // Recorded here and *not* descended into: argument position
-                    // is not type position, and walking in would say the
-                    // parameter stands for a type — which is how a row handed
-                    // straight on came to look like a parameter used both ways.
-                    TypeKind::Param { index, .. } => out(Fact::Hands(*index, slot)),
-                    // Anything else says nothing about what the head takes.
-                    // Writing `WithX Nat` is a claim about `Nat`, not about
-                    // `WithX` — the argument is checked against the kind the
-                    // declaration was read to have, by [`row_arguments`], and
-                    // letting a use site vote here is what made that kind
-                    // depend on which declaration was written first. What is
-                    // inside the argument still speaks for itself, so this
-                    // descends.
-                    //
-                    // A row written out here is the one thing that carries
-                    // something back across the same edge: its own tail ends up
-                    // where the callee's tail sat, so it inherits what the
-                    // callee may not name. That is an obligation and not a
-                    // reading, which is why it is a [`Fact::Tails`] rather than
-                    // a second [`Fact::Hands`].
-                    _ => {
-                        // Every parameter whose row reaches this argument's
-                        // outer row lands where the callee's tail sat. Keep the
-                        // three senses separate: a struct alias carries only
-                        // field obligations, a sum alias only case obligations,
-                        // and an effects row only effect obligations.
-                        for shape in [Shape::Struct, Shape::Sum, Shape::Effect] {
-                            let declarations = summaries
-                                .get(&shape)
-                                .expect("every row sense has summaries");
-                            for index in row_summary(arg, declarations, shape).slots {
-                                out(Fact::Tails(index, slot));
-                            }
-                        }
-                        constrain(arg, summaries, out);
-                    }
-                }
-            }
-        }
+        TypeKind::Effects(effects) => says_effects(effects, summaries, out),
+        TypeKind::Apply { head, args, .. } => arguments(*head, args, summaries, out),
         TypeKind::Ident(_)
         | TypeKind::Prim(_)
         | TypeKind::Var(_)
@@ -6820,7 +7010,63 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
     ) {
         match &mut ty.tracked {
             TypeKind::Apply { head, args, .. } => {
-                let head = *head;
+                applied(*head, args, kinds, carries, rows, out);
+            }
+            // An effect row is a row of applications: each label's arguments
+            // are held to the effect's parameters exactly as a type
+            // application's are to the type's.
+            TypeKind::Arrow { from, to, effects } => {
+                walk(from, kinds, carries, rows, out);
+                walk(to, kinds, carries, rows, out);
+                for label in effects.effects.values_mut() {
+                    applied(label.symbol(), label.args_mut(), kinds, carries, rows, out);
+                }
+            }
+            TypeKind::Effects(effects) => {
+                for label in effects.effects.values_mut() {
+                    applied(label.symbol(), label.args_mut(), kinds, carries, rows, out);
+                }
+            }
+            TypeKind::Struct { fields, .. } => {
+                for field in fields.values_mut() {
+                    if let TypeField::Written { value, .. } = field {
+                        walk(value, kinds, carries, rows, out);
+                    }
+                }
+            }
+            TypeKind::Sum { cases, .. } => {
+                for case in cases.values_mut() {
+                    if let SumCase::Written {
+                        payload: Some(payload),
+                        ..
+                    } = case
+                    {
+                        walk(payload, kinds, carries, rows, out);
+                    }
+                }
+            }
+            TypeKind::Ident(_)
+            | TypeKind::Param { .. }
+            | TypeKind::Prim(_)
+            | TypeKind::Var(_)
+            | TypeKind::Hole
+            | TypeKind::Error => {}
+        }
+    }
+
+    /// The arguments of one application, whichever declaration is applied,
+    /// each checked against the parameter it lands at and erased where it
+    /// breaks the parameter's conditions.
+    fn applied(
+        head: Symbol,
+        args: &mut [Type],
+        kinds: &HashMap<Symbol, Vec<ParamKind>>,
+        carries: &HashMap<Shape, HashMap<Symbol, RowSummary>>,
+        rows: &HashMap<Symbol, Sense>,
+        out: &mut Vec<Error>,
+    ) {
+        {
+            {
                 for (at, arg) in args.iter_mut().enumerate() {
                     let kind = kinds.get(&head).and_then(|kinds| kinds.get(at));
                     let refused = match kind {
@@ -6858,40 +7104,6 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
                     walk(arg, kinds, carries, rows, out);
                 }
             }
-            // The effect row holds no argument to check: an effect is named,
-            // never applied, so there is nothing inside one for a parameter's
-            // conditions to be broken by.
-            TypeKind::Arrow { from, to, .. } => {
-                walk(from, kinds, carries, rows, out);
-                walk(to, kinds, carries, rows, out);
-            }
-            // A row holds labels and a tail, and neither is a type: there is
-            // nothing inside one for an argument to be written at.
-            TypeKind::Effects(_) => {}
-            TypeKind::Struct { fields, .. } => {
-                for field in fields.values_mut() {
-                    if let TypeField::Written { value, .. } = field {
-                        walk(value, kinds, carries, rows, out);
-                    }
-                }
-            }
-            TypeKind::Sum { cases, .. } => {
-                for case in cases.values_mut() {
-                    if let SumCase::Written {
-                        payload: Some(payload),
-                        ..
-                    } = case
-                    {
-                        walk(payload, kinds, carries, rows, out);
-                    }
-                }
-            }
-            TypeKind::Ident(_)
-            | TypeKind::Param { .. }
-            | TypeKind::Prim(_)
-            | TypeKind::Var(_)
-            | TypeKind::Hole
-            | TypeKind::Error => {}
         }
     }
 
@@ -6954,22 +7166,16 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
     // well-formedness check silently omit one of the language's type-bearing
     // positions.
     for decl in program.effects.values_mut() {
+        let rows: HashMap<Symbol, Sense> = decl
+            .params
+            .iter()
+            .filter(|param| param.kind.row().is_some())
+            .map(|param| (param.symbol, param.kind.sense()))
+            .collect();
         if let Effect::Operations(operations) = &mut decl.value {
             for operation in operations.values_mut() {
-                walk(
-                    &mut operation.from,
-                    kinds,
-                    &carries,
-                    &HashMap::new(),
-                    &mut out,
-                );
-                walk(
-                    &mut operation.to,
-                    kinds,
-                    &carries,
-                    &HashMap::new(),
-                    &mut out,
-                );
+                walk(&mut operation.from, kinds, &carries, &rows, &mut out);
+                walk(&mut operation.to, kinds, &carries, &rows, &mut out);
             }
         }
     }
@@ -7424,9 +7630,10 @@ fn row_summary(ty: &Type, decls: &HashMap<Symbol, RowSummary>, shape: Shape) -> 
         TypeKind::Sum { cases, tail } if shape == Shape::Sum => {
             written_summary(cases.keys().cloned(), tail)
         }
-        TypeKind::Effects(effects) if shape == Shape::Effect => {
-            written_summary(effects.effects.keys().map(EffectId::row_key), &effects.tail)
-        }
+        TypeKind::Effects(effects) if shape == Shape::Effect => written_summary(
+            effects.effects.keys().map(EffectId::label_key),
+            &effects.tail,
+        ),
         // The body is the parameter, as in `type Id 'a = 'a`: whatever is written
         // there is the whole of what the declaration stands for, fields
         // included.
@@ -8700,7 +8907,21 @@ impl Builder<'_> {
         let span = signature.span;
         let lowered = self.ty(signature, Place::Operation);
         let (from, to) = match lowered.tracked {
-            TypeKind::Arrow { from, to, .. } => (*from, *to),
+            TypeKind::Arrow { from, to, effects } => {
+                // The outer arrow is the one an operation performs through,
+                // and performing it introduces the declaring effect and
+                // nothing else. An arrow nested inside either side may carry
+                // effects like any other type written there.
+                if effects.written {
+                    self.error(
+                        effects.span,
+                        ErrorKind::ImpureOperation {
+                            found: OperationTypeProblem::Effects,
+                        },
+                    );
+                }
+                (*from, *to)
+            }
             written => {
                 // Only when the signature lowered to something in the first
                 // place: a type that was already refused is the error type, and
@@ -9981,18 +10202,6 @@ impl Builder<'_> {
                 ..EffectRow::default()
             });
         };
-        // Keep an impure operation signature intact for structural identity
-        // and recovery, even though the language still reports it. Its row
-        // distinguishes invalid interfaces in every later phase.
-        let impure_operation = place == Place::Operation;
-        if impure_operation {
-            self.error(
-                written.span,
-                ErrorKind::ImpureOperation {
-                    found: OperationTypeProblem::Effects,
-                },
-            );
-        }
         // Every label, expanded: a name declaring operations stands for itself,
         // and an alias for the effects it reaches. So no alias survives into
         // what a definition is checked against, and a printed type shows the
@@ -10006,10 +10215,30 @@ impl Builder<'_> {
             // The clause is lowered once, before the expansion, so that a name
             // a `where` beside it can use is bound exactly once however many
             // effects an alias stands for.
-            let when = match &label {
-                parse::EffectLabel::Written { when, .. } => self.when(when.clone(), place),
-                parse::EffectLabel::Absent { .. } => None,
+            let absent = matches!(label, parse::EffectLabel::Absent { .. });
+            let (written_args, when) = match label {
+                parse::EffectLabel::Written { args, when } => (args, self.when(when, place)),
+                parse::EffectLabel::Absent { args } => (args, None),
             };
+            // Counted at the label, the whole of it, as a type application
+            // is: a wrong count makes every position guesswork, so the label
+            // is dropped rather than paired up.
+            let expected = self.arity(symbol);
+            if written_args.len() != expected {
+                self.error(
+                    at,
+                    ErrorKind::EffectArity {
+                        name: self.mint.name(symbol).to_string(),
+                        expected,
+                        found: written_args.len(),
+                    },
+                );
+                continue;
+            }
+            let args: Vec<Type> = written_args
+                .into_iter()
+                .map(|arg| self.argument(arg, place))
+                .collect();
             let mut expanded: Vec<(String, Symbol)> = self
                 .expanded
                 .get(&symbol)
@@ -10029,16 +10258,18 @@ impl Builder<'_> {
                 // Whether the reader wrote *this* effect's name here, or an
                 // alias standing for it among others.
                 let expanded = label_symbol != symbol;
-                let lowered = match &label {
-                    parse::EffectLabel::Written { .. } => EffectLabel::Written {
+                let lowered = match absent {
+                    false => EffectLabel::Written {
                         name_span: at,
                         symbol: label_symbol,
+                        args: args.clone(),
                         expanded,
                         when: when.clone(),
                     },
-                    parse::EffectLabel::Absent { .. } => EffectLabel::Absent {
+                    true => EffectLabel::Absent {
                         name_span: at,
                         symbol: label_symbol,
+                        args: args.clone(),
                         expanded,
                     },
                 };
@@ -10061,14 +10292,6 @@ impl Builder<'_> {
             Ok(tail) => tail,
             Err(()) => return None,
         };
-        if impure_operation {
-            return Some(EffectRow {
-                span: written.span,
-                written: true,
-                effects,
-                tail,
-            });
-        }
         // The same two checks a struct and a sum make, in the effect reading:
         // a position that holds for every definition may leave nothing open,
         // and a `\` needs a `..` beside it to speak about.

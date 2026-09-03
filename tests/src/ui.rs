@@ -227,6 +227,11 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
             expected: 2,
             found: 1,
         },
+        IrError::EffectArity {
+            name: "Ask".to_string(),
+            expected: 1,
+            found: 0,
+        },
         IrError::NotAConstructor,
         IrError::ParameterApplied {
             name: "f".to_string(),
