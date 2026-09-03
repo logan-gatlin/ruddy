@@ -1944,21 +1944,6 @@ struct Builder<'a> {
 /// written in, depth-first through the modules, so a repeat is still reported
 /// against the first and the reports come in the order a reader would meet
 /// them.
-/// An alias declaration as written, waiting to be lowered on first use.
-struct PendingAlias {
-    module: Option<Module>,
-    params: Vec<Param>,
-    row: parse::EffectRow,
-}
-
-/// What an alias application comes to: the labels it stands for, each a
-/// concrete effect applied to substituted arguments, and the tail it ends in.
-#[derive(Default)]
-struct Expansion {
-    labels: Vec<EffectLabel>,
-    tail: Option<Tail>,
-}
-
 #[derive(Default)]
 struct Flat {
     types: Vec<(Option<Module>, TrackedString, Vec<TrackedString>, Annotated)>,
@@ -1972,6 +1957,21 @@ struct Flat {
     externs: Vec<External>,
     /// Shared term/extern source order, which preserves duplicate precedence.
     values: Vec<FlatValue>,
+}
+
+/// An alias declaration as written, waiting to be lowered on first use.
+struct PendingAlias {
+    module: Option<Module>,
+    params: Vec<Param>,
+    row: parse::EffectRow,
+}
+
+/// What an alias application comes to: the labels it stands for, each a
+/// concrete effect applied to substituted arguments, and the tail it ends in.
+#[derive(Default)]
+struct Expansion {
+    labels: Vec<EffectLabel>,
+    tail: Option<Tail>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2430,6 +2430,7 @@ impl EffectLabel {
         }
     }
 
+    /// [`args`](Self::args), to substitute into or re-key in place.
     pub fn args_mut(&mut self) -> &mut Vec<Type> {
         match self {
             EffectLabel::Written { args, .. } | EffectLabel::Absent { args, .. } => args,
@@ -3291,16 +3292,10 @@ fn imported_syntax(
                         .map(|(_, arg)| match &arg.ty {
                             // An effects argument: the row its arrow carries,
                             // read back as the row of effects it was.
-                            artifact::Type::Arrow(from, to, effects)
-                                if is_unit(from) && is_unit(to) =>
-                            {
+                            artifact::Type::Arrow(from, to, _) if is_unit(from) && is_unit(to) => {
                                 let arrow = imported_syntax(
                                     mint,
-                                    &artifact::Type::Arrow(
-                                        from.clone(),
-                                        to.clone(),
-                                        effects.clone(),
-                                    ),
+                                    &arg.ty,
                                     params,
                                     symbols,
                                     names,
@@ -7468,61 +7463,56 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
         rows: &HashMap<Symbol, Sense>,
         out: &mut Vec<Error>,
     ) {
-        {
+        for (at, arg) in args.iter_mut().enumerate() {
+            let kind = kinds.get(&head).and_then(|kinds| kinds.get(at));
+            // The empty row is written `|` whichever row it is, and
+            // the parser reads a bare `|` as the sum with no cases.
+            // Where a row of effects is asked for, that is the row of
+            // effects with none — which is what a printed pure
+            // effects argument reads back as.
+            if matches!(kind, Some(kind) if kind.row().is_some_and(|(shape, _)| shape == Shape::Effect))
+                && matches!(&arg.tracked, TypeKind::Sum { cases, tail: None } if cases.is_empty())
             {
-                for (at, arg) in args.iter_mut().enumerate() {
-                    let kind = kinds.get(&head).and_then(|kinds| kinds.get(at));
-                    // The empty row is written `|` whichever row it is, and
-                    // the parser reads a bare `|` as the sum with no cases.
-                    // Where a row of effects is asked for, that is the row of
-                    // effects with none — which is what a printed pure
-                    // effects argument reads back as.
-                    if matches!(kind, Some(kind) if kind.row().is_some_and(|(shape, _)| shape == Shape::Effect))
-                        && matches!(&arg.tracked, TypeKind::Sum { cases, tail: None } if cases.is_empty())
-                    {
-                        let span = arg.span;
-                        *arg = span.track(TypeKind::Effects(Box::new(EffectRow {
-                            span,
-                            written: true,
-                            effects: IndexMap::new(),
-                            tail: None,
-                        })));
-                    }
-                    let refused = match kind {
-                        // A sum's rest and an arrow's effects are both
-                        // spliced into a row, so only a row can go there —
-                        // and only one naming none of the labels the
-                        // declaration already names. The two conditions are
-                        // one condition; only the noun a complaint is
-                        // worded in differs.
-                        Some(kind) if kind.row().is_some() => {
-                            let (shape, lacks) = kind.row().expect("the arm just asked for one");
-                            let summaries =
-                                carries.get(&shape).expect("every row sense has summaries");
-                            match row_shaped(arg, rows, shape, summaries) {
-                                false => Some(ErrorKind::NotARow {
-                                    sense: kind.sense(),
-                                }),
-                                true => row_summary(arg, summaries, shape)
-                                    .labels
-                                    .into_iter()
-                                    .find(|name| lacks.contains(name))
-                                    .map(|field| ErrorKind::RepeatedRowField { shape, field }),
-                            }
-                        }
-                        _ => None,
-                    };
-                    if let Some(kind) = refused {
-                        let span = arg.span;
-                        out.push(Error { span, kind });
-                        // Nothing left inside to walk: what it was made of is no
-                        // longer part of the program.
-                        *arg = span.track(TypeKind::Error);
-                        continue;
-                    }
-                    walk(arg, kinds, carries, rows, out);
-                }
+                let span = arg.span;
+                *arg = span.track(TypeKind::Effects(Box::new(EffectRow {
+                    span,
+                    written: true,
+                    effects: IndexMap::new(),
+                    tail: None,
+                })));
             }
+            let refused = match kind {
+                // A sum's rest and an arrow's effects are both
+                // spliced into a row, so only a row can go there —
+                // and only one naming none of the labels the
+                // declaration already names. The two conditions are
+                // one condition; only the noun a complaint is
+                // worded in differs.
+                Some(kind) if kind.row().is_some() => {
+                    let (shape, lacks) = kind.row().expect("the arm just asked for one");
+                    let summaries = carries.get(&shape).expect("every row sense has summaries");
+                    match row_shaped(arg, rows, shape, summaries) {
+                        false => Some(ErrorKind::NotARow {
+                            sense: kind.sense(),
+                        }),
+                        true => row_summary(arg, summaries, shape)
+                            .labels
+                            .into_iter()
+                            .find(|name| lacks.contains(name))
+                            .map(|field| ErrorKind::RepeatedRowField { shape, field }),
+                    }
+                }
+                _ => None,
+            };
+            if let Some(kind) = refused {
+                let span = arg.span;
+                out.push(Error { span, kind });
+                // Nothing left inside to walk: what it was made of is no
+                // longer part of the program.
+                *arg = span.track(TypeKind::Error);
+                continue;
+            }
+            walk(arg, kinds, carries, rows, out);
         }
     }
 
@@ -9494,10 +9484,20 @@ impl Builder<'_> {
     /// stands for the effects its body names with the arguments substituted
     /// for its parameters, each expanded in turn, and for the row its tail's
     /// argument writes. An alias met again while it is being expanded is a
-    /// cycle: reported once, at its declaration, after which it stands for
-    /// nothing — the row that named it still stands for whatever else it
-    /// named.
+    /// cycle: reported once, at the application that closes the ring, after
+    /// which it stands for nothing — the row that named it still stands for
+    /// whatever else it named.
+    ///
+    /// The aliases being expanded are frames on a stack of this function's
+    /// own, since a chain of aliases is as long as a bundle cares to make it
+    /// and must not be a chain of native frames.
     fn expand_alias(&mut self, symbol: Symbol, args: &[Type], at: Span) -> Expansion {
+        struct Frame {
+            body: AliasBody,
+            args: Vec<Type>,
+            next: usize,
+            expansion: Expansion,
+        }
         if !self.is_alias(symbol) {
             return Expansion {
                 labels: vec![EffectLabel::Written {
@@ -9510,8 +9510,83 @@ impl Builder<'_> {
                 tail: None,
             };
         }
+        let mut frames: Vec<Frame> = Vec::new();
+        let open = |this: &mut Self,
+                    symbol: Symbol,
+                    args: Vec<Type>,
+                    at: Span,
+                    frames: &mut Vec<Frame>| {
+            if this.opened_alias(symbol, at) {
+                let body = this.alias_body(symbol);
+                frames.push(Frame {
+                    body,
+                    args,
+                    next: 0,
+                    expansion: Expansion::default(),
+                });
+            }
+        };
+        open(self, symbol, args.to_vec(), at, &mut frames);
+        loop {
+            let Some(frame) = frames.last_mut() else {
+                // The root was a ring or stands for nothing.
+                return Expansion::default();
+            };
+            if let Some(case) = frame.body.cases.get(frame.next).cloned() {
+                frame.next += 1;
+                let frame_args = frame.args.clone();
+                let case_args: Vec<Type> = case
+                    .args
+                    .iter()
+                    .map(|arg| self.substituted(arg, &frame_args))
+                    .collect();
+                if self.is_alias(case.symbol) {
+                    open(self, case.symbol, case_args, case.name_span, &mut frames);
+                } else {
+                    frames
+                        .last_mut()
+                        .expect("the frame is still open")
+                        .expansion
+                        .labels
+                        .push(EffectLabel::Written {
+                            name_span: case.name_span,
+                            symbol: case.symbol,
+                            args: case_args,
+                            expanded: true,
+                            when: None,
+                        });
+                }
+                continue;
+            }
+            // Every case is expanded: the tail, then what this alias stands
+            // for joins the alias that named it, or is the answer.
+            let mut frame = frames.pop().expect("the frame is still open");
+            self.splice_tail(&mut frame.expansion, &frame.body, &frame.args);
+            self.expanding.pop();
+            match frames.last_mut() {
+                Some(parent) => {
+                    for mut label in frame.expansion.labels {
+                        let (EffectLabel::Written { expanded, .. }
+                        | EffectLabel::Absent { expanded, .. }) = &mut label;
+                        *expanded = true;
+                        parent.expansion.labels.push(label);
+                    }
+                    if let Some(tail) = frame.expansion.tail {
+                        self.adopt_tail(&mut parent.expansion.tail, tail);
+                    }
+                }
+                None => return frame.expansion,
+            }
+        }
+    }
+
+    /// Begin expanding one alias: `true` when it may be, with the alias now
+    /// on the stack of those being expanded; `false` for one a ring was
+    /// already reported at, or one met again on the way down — which is the
+    /// ring, reported here at the application that closes it.
+    fn opened_alias(&mut self, symbol: Symbol, at: Span) -> bool {
         if self.cyclic.contains(&symbol) {
-            return Expansion::default();
+            return false;
         }
         if let Some(start) = self.expanding.iter().position(|open| *open == symbol) {
             // A ring is a forwarding one when every alias on it does nothing
@@ -9532,67 +9607,75 @@ impl Builder<'_> {
                 self.error(at, ErrorKind::AliasCycle { name, growing });
             }
             self.cyclic.insert(symbol);
-            return Expansion::default();
+            return false;
         }
         self.expanding.push(symbol);
-        let body = self.alias_body(symbol);
-        let mut expansion = Expansion::default();
-        for case in &body.cases {
-            let case_args: Vec<Type> = case
-                .args
-                .iter()
-                .map(|arg| self.substituted(arg, args))
-                .collect();
-            let inner = self.expand_alias(case.symbol, &case_args, at);
-            for mut label in inner.labels {
-                let (EffectLabel::Written { expanded, .. } | EffectLabel::Absent { expanded, .. }) =
-                    &mut label;
-                *expanded = true;
-                expansion.labels.push(label);
-            }
-            if let Some(tail) = inner.tail {
-                self.adopt_tail(&mut expansion.tail, tail);
-            }
-        }
-        if let Some(Tail {
+        true
+    }
+
+    /// Splice the row an alias's tail argument writes into its expansion:
+    /// the argument's labels, which may not name what the alias already
+    /// supplies, and its tail.
+    fn splice_tail(&mut self, expansion: &mut Expansion, body: &AliasBody, args: &[Type]) {
+        let Some(Tail {
             span,
             of: Row::Param { index, .. },
         }) = &body.tail
-        {
-            match args.get(*index as usize).map(|arg| &arg.tracked) {
-                Some(TypeKind::Effects(row)) => {
-                    expansion.labels.extend(row.effects.values().cloned());
-                    if let Some(tail) = row.tail.clone() {
-                        self.adopt_tail(&mut expansion.tail, tail);
+        else {
+            return;
+        };
+        match args.get(*index as usize).map(|arg| &arg.tracked) {
+            Some(TypeKind::Effects(row)) => {
+                // The row spliced in may not name what the alias already
+                // supplies: the parameter's lacks, said where the argument
+                // was written. Whichever arguments the two carry, one
+                // constructor stands once in a row.
+                let arg_span = args[*index as usize].span;
+                for label in row.effects.values() {
+                    let supplied = expansion
+                        .labels
+                        .iter()
+                        .any(|previous| previous.symbol() == label.symbol());
+                    if supplied {
+                        self.error(
+                            arg_span,
+                            ErrorKind::RepeatedRowField {
+                                shape: Shape::Effect,
+                                field: effect_key(self.mint, label.symbol()),
+                            },
+                        );
+                        continue;
                     }
+                    expansion.labels.push(label.clone());
                 }
-                Some(TypeKind::Param {
-                    symbol: param,
-                    index: outer,
-                }) => {
-                    let tail = Tail {
-                        span: *span,
-                        of: Row::Param {
-                            symbol: *param,
-                            index: *outer,
-                        },
-                    };
+                if let Some(tail) = row.tail.clone() {
                     self.adopt_tail(&mut expansion.tail, tail);
                 }
-                Some(TypeKind::Error) | None => {}
-                Some(_) => {
-                    let span = args[*index as usize].span;
-                    self.error(
-                        span,
-                        ErrorKind::NotARow {
-                            sense: Sense::Effects,
-                        },
-                    );
-                }
+            }
+            Some(TypeKind::Param {
+                symbol: param,
+                index: outer,
+            }) => {
+                let tail = Tail {
+                    span: *span,
+                    of: Row::Param {
+                        symbol: *param,
+                        index: *outer,
+                    },
+                };
+                self.adopt_tail(&mut expansion.tail, tail);
+            }
+            Some(TypeKind::Error) | None => {}
+            Some(_) => {
+                let span = args[*index as usize].span;
+                self.error(
+                    span,
+                    ErrorKind::NotARow {
+                        sense: Sense::Effects,
+                    },
+                );
             }
         }
-        self.expanding.pop();
-        expansion
     }
 
     /// Give a row the tail an expansion brought, or refuse the second one.
@@ -11133,9 +11216,13 @@ impl Builder<'_> {
         // what a definition is checked against, and a printed type shows the
         // effects rather than the name.
         let mut effects: IndexMap<EffectId, EffectLabel> = IndexMap::new();
+        // Which written label each effect came from, so an alias standing for
+        // one effect twice — refused at its declaration — is not refused
+        // again here, while two written labels reaching one effect are.
+        let mut origins: HashMap<Symbol, usize> = HashMap::new();
         // The tail an alias application brought with it, if one did.
         let mut brought: Option<Tail> = None;
-        for (name, label) in written.effects {
+        for (origin, (name, label)) in written.effects.into_iter().enumerate() {
             let at = name.span();
             let Some(symbol) = self.resolve(&name, Namespace::Effects) else {
                 continue;
@@ -11219,7 +11306,7 @@ impl Builder<'_> {
                 if let Some(previous) = effects.get(&label_key) {
                     // An alias standing for one effect twice was refused at
                     // its declaration; here it stands for the effect once.
-                    if expanded && previous.expanded() {
+                    if expanded && origins.get(&label_symbol) == Some(&origin) {
                         continue;
                     }
                     self.error(
@@ -11232,6 +11319,7 @@ impl Builder<'_> {
                     );
                     continue;
                 }
+                origins.insert(label_symbol, origin);
                 effects.insert(label_key, lowered);
             }
         }

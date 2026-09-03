@@ -509,6 +509,8 @@ impl AliasRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AliasCase {
     pub name: QualifiedName,
+    /// One argument per parameter the named effect declares, over the
+    /// alias's own parameters.
     pub args: Vec<Type>,
 }
 
@@ -4100,8 +4102,14 @@ pub mod text {
                 }
             }
             // Every alias, walked through the aliases it names; one met again
-            // on the way down is a ring.
+            // on the way down is a ring. An alias walked to the end once is
+            // done for good, so a diamond of aliases is walked once rather
+            // than once per path to it.
+            let mut done: std::collections::HashSet<&str> = std::collections::HashSet::new();
             for start in aliases.keys() {
+                if done.contains(start) {
+                    continue;
+                }
                 let mut stack = vec![(*start, 0usize)];
                 let mut path = vec![*start];
                 while let Some((name, at)) = stack.pop() {
@@ -4110,11 +4118,12 @@ pub mod text {
                     };
                     let Some(case) = row.cases.get(at) else {
                         path.pop();
+                        done.insert(name);
                         continue;
                     };
                     stack.push((name, at + 1));
                     let next = case.name.as_str();
-                    if !aliases.contains_key(next) {
+                    if !aliases.contains_key(next) || done.contains(next) {
                         continue;
                     }
                     if path.contains(&next) {

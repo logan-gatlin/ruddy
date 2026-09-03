@@ -728,12 +728,12 @@ impl Show<'_, TypeKind> {
         let effects = row
             .effects
             .iter()
-            .map(|(name, label)| {
+            .map(|(name, entry)| {
                 // The label applied to its arguments, spelled as a type
                 // application is: each argument an atom, anything larger
                 // parenthesized.
-                let mut applied = label_of(Shape::Effect, name.name());
-                for arg in label.args() {
+                let mut applied = label(Shape::Effect, name.name());
+                for arg in entry.args() {
                     let arg = self.show(arg);
                     applied.push(' ');
                     match arg.prec() < Prec::Atom {
@@ -741,7 +741,7 @@ impl Show<'_, TypeKind> {
                         false => applied.push_str(&arg.to_string()),
                     }
                 }
-                match label {
+                match entry {
                     EffectLabel::Written { when, .. } => Entry::Written {
                         name: applied,
                         mark: mark(when),
@@ -804,11 +804,6 @@ impl fmt::Display for Effects {
             None => Ok(()),
         }
     }
-}
-
-/// One effect label as the compiler spells it: `!Name`, or `Mod::!Name`.
-fn label_of(shape: Shape, name: &str) -> String {
-    label(shape, name)
 }
 
 /// The `when` clause a lowered label wears. `when _` is the anonymous presence,

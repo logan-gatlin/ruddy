@@ -732,7 +732,7 @@ impl Constrain<'_> {
                 let does = Row {
                     labels: [(
                         self.effect_ids[&effect.tracked].row_key(),
-                        RowField::present(effect_arguments(&fresh)),
+                        RowField::present(argument_tuple(&fresh)),
                     )]
                     .into_iter()
                     .collect(),
@@ -1047,7 +1047,7 @@ impl Constrain<'_> {
             .collect();
         let discharged: IndexMap<String, RowField> = instances
             .iter()
-            .map(|(key, fresh)| (key.clone(), RowField::present(effect_arguments(fresh))))
+            .map(|(key, fresh)| (key.clone(), RowField::present(argument_tuple(fresh))))
             .collect();
         let extended = Row {
             labels: discharged,
@@ -1680,7 +1680,7 @@ impl Constrain<'_> {
 /// The payload an effect label carries: its arguments, in order, as the
 /// positional struct a tuple is. An effect without parameters carries the
 /// unit tuple, as every label once did.
-pub(crate) fn effect_arguments(args: &[Assigned]) -> Rc<Ty> {
+pub(crate) fn argument_tuple(args: &[Assigned]) -> Rc<Ty> {
     Rc::new(Ty::Struct(Row {
         labels: args
             .iter()

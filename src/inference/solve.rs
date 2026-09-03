@@ -1528,12 +1528,9 @@ impl Solve<'_> {
                     .insert(ReasonId(id), (effect.clone(), position as u32));
             }
             for error in &mut self.errors[before..] {
-                let cause = Box::new(std::mem::replace(&mut error.kind, ErrorKind::Recursive));
-                error.kind = ErrorKind::EffectArgument {
-                    effect: effect.clone(),
-                    position: position as u32,
-                    cause,
-                };
+                error
+                    .kind
+                    .as_effect_argument(effect.clone(), position as u32);
             }
         }
     }
@@ -2609,6 +2606,12 @@ impl Solve<'_> {
                     &abandoned,
                 );
                 None
+            }
+            // Two applications of one effect both written absent still name
+            // one application: absence and presence cannot disagree about
+            // which, so their arguments agree as present ones do.
+            (Presence::Absent, Presence::Absent) if shape == Shape::Effect => {
+                Some((want.ty.clone(), have.ty.clone()))
             }
             // At least one side is still a variable or undecided: the
             // presences unify as anything else does, and the types follow

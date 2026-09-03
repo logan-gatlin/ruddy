@@ -1259,19 +1259,19 @@ impl ir::Error {
             .help("name the effects the alias stands for without going through itself"),
             E::ModifiedOpenAlias { name } => Diagnostic::new(
                 code,
-                format!("`!{name}` leaves its effects open here, so it cannot be marked"),
+                format!("`!{name}` leaves some effects unnamed here, so it cannot be marked"),
                 span,
             )
             .label("this mark would have to apply to effects that are not named yet")
-            .help("close the alias's tail with a row of effects, or mark each effect yourself"),
+            .help("give the alias every effect it stands for, or mark each effect yourself"),
             E::TwoTails { previous } => Diagnostic::new(
                 code,
-                "this row is given two tails",
+                "these effects are left open twice",
                 span,
             )
-            .label("this tail is the second")
-            .related(*previous, "the first tail is here")
-            .help("keep one tail: write the other's effects out, or drop one"),
+            .label("this `..` is the second")
+            .related(*previous, "the first `..` is here")
+            .help("keep one `..`: write the other's effects out, or drop one"),
             E::NotAConstructor => Diagnostic::new(
                 code,
                 "this type cannot take arguments",
@@ -1609,21 +1609,28 @@ impl fmt::Display for patterns::Verdict {
     }
 }
 
+/// `first`, `second`, `third` — the position of an argument, in the word a
+/// sentence wants; further along, the numeral with its ending, since an
+/// effect taking a dozen arguments is already past what a word helps with.
+fn ordinal(position: u32) -> String {
+    let nth = position + 1;
+    match nth {
+        1 => "first".to_string(),
+        2 => "second".to_string(),
+        3 => "third".to_string(),
+        n if (11..=13).contains(&(n % 100)) => format!("{n}th"),
+        n if n % 10 == 1 => format!("{n}st"),
+        n if n % 10 == 2 => format!("{n}nd"),
+        n if n % 10 == 3 => format!("{n}rd"),
+        n => format!("{n}th"),
+    }
+}
+
 /// `no arguments`, `one argument`, `two arguments` — small counts in words,
 /// because a message is a sentence and a sentence does not open with a numeral.
 ///
 /// Beyond what is worth spelling out, the numeral: a type taking thirteen
 /// arguments has a problem this message is not going to help with.
-/// `first`, `second`, … for the position of an argument, as far as words go.
-fn ordinal(position: u32) -> String {
-    match position {
-        0 => "first".to_string(),
-        1 => "second".to_string(),
-        2 => "third".to_string(),
-        n => format!("{}th", n + 1),
-    }
-}
-
 fn arguments(count: usize) -> String {
     match count {
         0 => "no arguments".to_string(),

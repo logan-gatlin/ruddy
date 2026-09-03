@@ -1600,7 +1600,7 @@ impl Parser {
                 return self.expected(Expected::Effect);
             };
             span = span.merge(name.span());
-            let args = self.effect_arguments(&mut span)?;
+            let args = self.label_arguments(&mut span)?;
             effects.insert(name, EffectLabel::Written { args, when: None });
             match self.eat_if(&Kind::Plus) {
                 Some(plus) => {
@@ -1627,7 +1627,7 @@ impl Parser {
     /// The arguments an effect label is applied to: the atoms after it, the
     /// way [`type_apply`](Self::type_apply) gathers a type's. A `(when` after
     /// the label is its presence clause and ends the arguments.
-    fn effect_arguments(&mut self, span: &mut Span) -> Option<Vec<Type>> {
+    fn label_arguments(&mut self, span: &mut Span) -> Option<Vec<Type>> {
         let mut args = Vec::new();
         while self.at_type_atom()
             && !(self.at_left_paren() && self.keyword_at(self.pos + 1, "when"))
@@ -3114,7 +3114,7 @@ impl Parser {
                     name: slash.span.merge(name.name.span).track(name.name.tracked),
                     modules: name.modules,
                 };
-                let args = self.effect_arguments(&mut span)?;
+                let args = self.label_arguments(&mut span)?;
                 effects.insert(key, EffectLabel::Absent { args });
             } else {
                 let Some(name) = self.effect() else {
@@ -3130,7 +3130,7 @@ impl Parser {
                     break;
                 };
                 span = span.merge(name.span());
-                let args = self.effect_arguments(&mut span)?;
+                let args = self.label_arguments(&mut span)?;
                 // A `when` takes parentheses here for the reason a sum case's
                 // does: an effect has no colon to end a bare clause.
                 let when = match self.at_left_paren() && self.keyword_at(self.pos + 1, "when") {

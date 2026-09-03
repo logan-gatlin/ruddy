@@ -90,8 +90,14 @@ follows so every phase agrees.
   parameters in scope, so an operation signature above an alias may apply it. Every alias is
   forced after the effect declarations and expanded over its own parameters into
   `Alias::expanded`, the row the parameter fixpoint and the argument checks read.
-- Cycles are detected on the expansion stack; the alias met again is reported (locally) or
-  silently emptied (imported) and stands for nothing from then on.
+- Expansion keeps its own frame stack (`Builder::expand_alias`), so a chain of aliases is data
+  rather than native recursion; cycles are detected on that stack and reported at the application
+  that closes the ring (locally) or silently emptied (imported), after which the alias stands for
+  nothing. A tail argument may not name a constructor the alias already supplies
+  (`RepeatedRowField` at the argument); two written labels reaching one constructor are a
+  written duplicate, while one alias standing for a constructor twice is refused only at its
+  declaration.
+- Two absent applications of one constructor still unify their arguments.
 
 ## Erasure
 

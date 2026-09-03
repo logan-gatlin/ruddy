@@ -2211,7 +2211,7 @@ fn parameterized_effects_and_generic_aliases_round_trip() {
          effect Ask 'a = { get: () -> 'a }\n\
          effect State 'r = { get: () -> { x: Nat, ..'r } }\n\
          effect Both 'a 'e = !Ask 'a + !Log + ..'e\n\
-         let f : () -> Nat + !Both Nat (!Log) = fn _ => 0n",
+         let f : () -> Nat + !Both Nat (..'e) = fn _ => 0n",
     );
     let effect = |name: &str| {
         artifact

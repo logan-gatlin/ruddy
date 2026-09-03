@@ -159,7 +159,9 @@ pub struct Semantics {
 /// parameter position it ends in.
 #[derive(Debug, Clone)]
 pub struct EffectAliasRow {
+    /// The effects the alias applies, each with its arguments in order.
     pub cases: Vec<(Symbol, Vec<Rc<Ty>>)>,
+    /// The parameter position the alias ends in, if it ends in one.
     pub tail: Option<u32>,
 }
 
@@ -273,12 +275,14 @@ impl Semantics {
     /// arm's binder is the operation's argument, and how a value of it is held
     /// is nowhere else to be found, since the binder has no term of its own to
     /// carry a solved type.
-    pub fn effect_aliases(&self) -> &IndexMap<Symbol, EffectAliasRow> {
-        &self.effect_aliases
-    }
-
     pub fn operations(&self) -> &Operations {
         &self.operations
+    }
+
+    /// Each effect alias's row over its own parameters, unexpanded. See
+    /// [`EffectAliasRow`].
+    pub fn effect_aliases(&self) -> &IndexMap<Symbol, EffectAliasRow> {
+        &self.effect_aliases
     }
 
     /// The scheme each target-provided top-level value declared. Externs have
@@ -2554,9 +2558,20 @@ impl ErrorKind {
     /// clash to the failure its arguments met with.
     pub fn cause(&self) -> &ErrorKind {
         match self {
-            ErrorKind::EffectArgument { cause, .. } => cause.cause(),
+            ErrorKind::EffectArgument { cause, .. } => cause,
             other => other,
         }
+    }
+
+    /// This failure, reported as a clash between two applications of
+    /// `effect` at argument `position` that it descends from.
+    pub(crate) fn as_effect_argument(&mut self, effect: String, position: u32) {
+        let cause = Box::new(std::mem::replace(self, ErrorKind::Recursive));
+        *self = ErrorKind::EffectArgument {
+            effect,
+            position,
+            cause,
+        };
     }
 }
 
@@ -5319,12 +5334,7 @@ fn attach_ordinary_explanations(
             },
         });
         if let Some((effect, position)) = clash {
-            let cause = Box::new(std::mem::replace(&mut error.kind, ErrorKind::Recursive));
-            error.kind = ErrorKind::EffectArgument {
-                effect,
-                position,
-                cause,
-            };
+            error.kind.as_effect_argument(effect, position);
         }
     }
 }
@@ -11544,7 +11554,7 @@ fn effect_row(
                 })
             })
             .collect();
-        let ty = constrain::effect_arguments(&args);
+        let ty = constrain::argument_tuple(&args);
         let lowered = match label {
             ir::EffectLabel::Written { when, .. } => RowField {
                 presence: presence(table, tails, when),

@@ -263,6 +263,41 @@ fn imported_effects_and_aliases_behave_like_local_declarations() {
     );
     assert_eq!(scheme(&accepted, "open"), "'a -> 'b + !Log + !Ask 'b");
     assert_eq!(scheme(&accepted, "run"), "'a -> Nat");
+    // An imported open alias splices the consumer's tail, and the effects
+    // the alias supplies may not be handed back through it.
+    let accepted = accepted_with(
+        "effect IO = { print: Nat -> () }\n\
+         let tail : () -> Nat + dep::!Both Nat (!IO + ..'e) = fn _ => dep::!Ask.get ()",
+        &dependency,
+    );
+    assert_eq!(
+        scheme(&accepted, "tail"),
+        "() -> Nat + !Ask Nat + !Log + !IO + ..'a"
+    );
+    let partial = {
+        let parsed = parse::parse(
+            token::lex(
+                "let clash : () -> Nat + dep::!Both Nat (dep::!Log) = fn _ => 0n\n\
+                 let bad = fn _ => let n : Nat = dep::!Ask.get () in let s : String = dep::!Ask.get () in ()",
+                FileID::GENERATED,
+            )
+            .tokens,
+        );
+        compile::compile_with_dependencies(
+            Mint::new(Bundle::new("app", Version::new(0, 1, 0)).unwrap()),
+            parsed.stmts,
+            &[compile::Dependency {
+                alias: Some("dep"),
+                artifact: &dependency,
+            }],
+            inference::Trace::Off,
+        )
+        .expect_err("the clashes are refused")
+    };
+    assert_eq!(
+        codes(&partial),
+        ["repeated-row-field", "effect-argument-mismatch"]
+    );
 
     // Diagnostics involving an imported application are the local ones.
     let partial = {
@@ -310,4 +345,168 @@ fn row_parameters_are_inferred_from_their_uses() {
     // row is.
     assert_eq!(scheme(&accepted, "run"), "'a -> () + !Run (!Log)");
     assert_eq!(scheme(&accepted, "pure"), "'a -> () + !Run (|)");
+}
+
+/// A written row names a constructor once, whatever its arguments: repeating
+/// one is a duplicate before any argument is compared, however the repeat is
+/// written — plainly, absent, under a condition, or through aliases that reach
+/// the same effect. An argument handed to an alias may not reintroduce what
+/// the alias supplies.
+#[test]
+fn written_duplicates_are_refused_before_arguments_are_compared() {
+    let base = "effect Log = { write: Nat -> () }\n\
+                effect Ask 'a = { get: () -> 'a }\n\
+                effect AskNat = !Ask Nat\n\
+                effect AskText = !Ask String\n\
+                effect Both 'a 'e = !Ask 'a + !Log + ..'e\n";
+    for row in [
+        "!Ask Nat + !Ask Nat",
+        "!Ask Nat + !Ask String",
+        "\\!Ask Nat + !Ask Nat + ..'e",
+        "!Ask Nat (when 'p) + !Ask String + ..'e",
+        "!AskNat + !AskText",
+        "!Ask Nat + !AskText",
+    ] {
+        let partial = rejected(&format!("{base}let f : () -> Nat + {row} = fn _ => 0n"));
+        assert_eq!(codes(&partial), ["duplicate-case"], "{row}");
+    }
+    for (row, code) in [
+        ("!Both Nat (!Log)", "repeated-row-field"),
+        ("!Both Nat (!Ask String)", "repeated-row-field"),
+        ("!Both Nat (!Log + ..'e)", "repeated-row-field"),
+    ] {
+        let partial = rejected(&format!("{base}let f : () -> Nat + {row} = fn _ => 0n"));
+        assert_eq!(codes(&partial), [code], "{row}");
+    }
+    // Two absent applications still name one application, so their
+    // arguments have to agree.
+    let partial = rejected(&format!(
+        "{base}let f : (() -> Nat + \\!Ask Nat + ..'e) -> () -> Nat + \\!Ask String + ..'e = fn g => g"
+    ));
+    assert_eq!(codes(&partial), ["effect-argument-mismatch"]);
+}
+
+/// A handler infers one application from its computation and every arm of
+/// the handled effect: arms that cannot agree are refused, the handled
+/// application is removed, and unrelated effects survive.
+#[test]
+fn a_handler_infers_one_application_across_its_arms() {
+    let base = "effect Log = { write: Nat -> () }\n\
+                effect State 's = { get: () -> 's, put: 's -> () }\n";
+    let accepted = accepted(&format!(
+        "{base}let counted = fn _ => handle (let n = !State.get () in let _ = !Log.write 1n in !State.put n) with\n\
+             | !State.get _ => 0n\n\
+             | !State.put _ => ()\n\
+         end\n\
+         let typed = fn _ => handle !State.put 1n with | !State.get _ => 2n | !State.put _ => () end"
+    ));
+    assert_eq!(scheme(&accepted, "counted"), "'a -> () + !Log");
+    assert_eq!(scheme(&accepted, "typed"), "'a -> ()");
+    // One arm decides the state is a natural number, the other a text: the
+    // handler cannot implement both.
+    let partial = rejected(&format!(
+        "{base}let bad = fn _ => handle !State.put 1n with | !State.get _ => \"s\" | !State.put _ => () end"
+    ));
+    assert_eq!(codes(&partial), ["effect-argument-mismatch"]);
+}
+
+/// An extern may declare an applied effect, which its callers then perform.
+#[test]
+fn an_extern_may_declare_an_applied_effect() {
+    let accepted = accepted(
+        "effect Ask 'a = { get: () -> 'a }\n\
+         extern host : () -> Nat + !Ask Nat = \"host\"\n\
+         let use = fn _ => host ()",
+    );
+    let host = accepted
+        .semantics()
+        .externs()
+        .iter()
+        .find(|(symbol, _)| accepted.mint().name(**symbol) == "host")
+        .map(|(_, scheme)| scheme.to_string())
+        .expect("the extern is published");
+    assert_eq!(host, "() -> Nat + !Ask Nat");
+    assert_eq!(scheme(&accepted, "use"), "'a -> Nat + !Ask Nat");
+}
+
+/// A chain of aliases as long as a bundle cares to write, and an interface as
+/// deep as an artifact cares to publish, are data rather than native frames:
+/// both go through on a small stack.
+#[test]
+fn deep_alias_chains_and_generic_interfaces_use_bounded_stack() {
+    std::thread::Builder::new()
+        .name("deep-effect-aliases".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            const LENGTH: usize = 2_000;
+            let mut source =
+                String::from("effect Log = { write: Nat -> () }\neffect A0 'e = ..'e\n");
+            for at in 1..LENGTH {
+                source.push_str(&format!("effect A{at} 'e = !A{} (..'e)\n", at - 1));
+            }
+            source.push_str(&format!(
+                "let f : () -> Nat + !A{} (!Log) = fn _ => 0n",
+                LENGTH - 1
+            ));
+            let accepted = accepted(&source);
+            assert_eq!(scheme(&accepted, "f"), "() -> Nat + !Log");
+
+            // And a published generic interface nested deeper than any
+            // native walk should follow, imported and applied.
+            const DEPTH: usize = 20_000;
+            let mut result = ruddy::artifact::Type::Bound(0);
+            for _ in 0..DEPTH {
+                result = ruddy::artifact::Type::Arrow(
+                    Box::new(ruddy::artifact::Type::Nat),
+                    Box::new(result),
+                    ruddy::artifact::Row {
+                        labels: Vec::new(),
+                        rest: ruddy::artifact::Rest::Closed,
+                    },
+                );
+            }
+            let dependency = ruddy::artifact::UncheckedArtifact {
+                header: ruddy::artifact::Header {
+                    identity: ruddy::artifact::Identity {
+                        name: "dep".into(),
+                        version: "1.0.0".into(),
+                    },
+                    dependencies: Vec::new(),
+                    values: Vec::new(),
+                    types: Vec::new(),
+                    effects: vec![ruddy::artifact::DeclaredEffect {
+                        name: "dep@1.0.0::Deep".into(),
+                        params: vec![ruddy::artifact::Parameter {
+                            sense: ruddy::artifact::Sense::Type,
+                            lacks: Vec::new(),
+                            relevant: true,
+                        }],
+                        identity: Some(ruddy::artifact::EffectIdentity {
+                            name: "Deep".into(),
+                            interface: "deep".into(),
+                        }),
+                        kind: ruddy::artifact::EffectKind::Operations(vec![
+                            ruddy::artifact::Operation {
+                                selector: ruddy::artifact::OperationSelector::Named("op".into()),
+                                from: ruddy::artifact::Type::Bound(0),
+                                to: result,
+                            },
+                        ]),
+                    }],
+                },
+                lir: ruddy::artifact::Lir {
+                    externs: Vec::new(),
+                    functions: Vec::new(),
+                    globals: Vec::new(),
+                },
+            };
+            let accepted = accepted_with(
+                "let g : () -> Nat + dep::!Deep Nat = fn _ => 0n",
+                &dependency,
+            );
+            assert_eq!(scheme(&accepted, "g"), "() -> Nat + !Deep Nat");
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("deep alias chains and generic interfaces use bounded stack");
 }
