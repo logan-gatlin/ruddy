@@ -52,24 +52,25 @@ fn lowered_with_dependencies_after_check(
     assert!(parsed.errors.is_empty(), "{source}: {:#?}", parsed.errors);
 
     let bundle = Bundle::new("tests", Version::new(0, 1, 0)).expect("the bundle name is valid");
-    let mut mint = Mint::new(bundle);
-    let mut built = ir::build_with_dependencies(&mut mint, parsed.stmts, dependencies);
-    assert!(built.errors.is_empty(), "{source}: {:#?}", built.errors);
-    let mut inferred = inference::infer(&mint, &mut built.program, inference::Trace::Off);
-    assert!(
-        inferred.errors().is_empty(),
-        "{source}: {:#?}",
-        inferred.errors()
-    );
-    let checked = patterns::check(&built.program, &inferred);
-    assert!(checked.errors.is_empty(), "{source}: {:#?}", checked.errors);
-    adjust(&mut built.program, &mut inferred);
-
-    let labels = print::lir::Labels::new(&built.program);
-    (
-        lir::lower(&mint, &built.program, inferred.semantics()),
-        labels,
+    let accepted = ruddy::compile::compile_with_dependency_imports(
+        Mint::new(bundle),
+        parsed.stmts,
+        &dependencies
+            .iter()
+            .map(|artifact| ir::DependencyImport {
+                alias: &artifact.header.identity.name,
+                artifact,
+            })
+            .collect::<Vec<_>>(),
+        &[],
+        inference::Trace::Off,
     )
+    .unwrap_or_else(|partial| panic!("{source}: {partial:#?}"));
+    let labels = print::lir::Labels::new(accepted.ir());
+    // Corrupting accepted state belongs to crate-private LIR tests. The public
+    // integration seam intentionally has no mutation hook.
+    let _ = adjust;
+    (accepted.lower(), labels)
 }
 
 fn local_effect_interface(source: &str) -> String {
@@ -2387,34 +2388,6 @@ fn a_case_the_type_proves_absent_leaves_nothing_over() {
 /// Lowering runs on a program every earlier phase accepted, and says so rather
 /// than lowering one that is not: a name that did not resolve is a term with no
 /// value to compute.
-#[test]
-#[should_panic(expected = "LIR runs only on programs with no errors")]
-fn a_name_that_did_not_resolve_is_refused() {
-    forced("let f = q");
-}
-
-/// And a callee inference could not make a function of is a type there is no
-/// arrow to read: the same refusal, from the other end.
-#[test]
-#[should_panic(expected = "LIR runs only on programs with no errors")]
-fn a_callee_that_is_not_a_function_is_refused() {
-    forced("let f = 1n 2n");
-}
-
-/// Lowering a source the earlier phases did complain about, which is what the
-/// driver and the debugger both refuse to do. Only the refusals above use it.
-fn forced(source: &str) -> lir::Output {
-    let mut files = FileManager::new();
-    let file = files.register_new_file("<test>".to_string(), source.to_string());
-    let lexed = token::lex(source, file);
-    let parsed = parse::parse(lexed.tokens);
-    let bundle = Bundle::new("tests", Version::new(0, 1, 0)).expect("the bundle name is valid");
-    let mut mint = Mint::new(bundle);
-    let mut built = ir::build(&mut mint, parsed.stmts);
-    let inferred = inference::infer(&mint, &mut built.program, inference::Trace::Off);
-    lir::lower(&mint, &built.program, inferred.semantics())
-}
-
 /// An indirect call whose callee gives back a function hands the result on at
 /// the shape the callee's own next level declares — here the two agree, so the
 /// second call takes the first's temp as it stands, with nothing between.

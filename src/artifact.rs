@@ -108,6 +108,28 @@ pub struct Artifact {
     pub lir: Lir,
 }
 
+/// An internal placeholder used only while core compilation establishes the
+/// accepted proof that artifact construction consumes. It is never published.
+pub(crate) fn empty() -> Artifact {
+    Artifact {
+        header: Header {
+            identity: Identity {
+                name: String::new(),
+                version: String::new(),
+            },
+            dependencies: Vec::new(),
+            values: Vec::new(),
+            types: Vec::new(),
+            effects: Vec::new(),
+        },
+        lir: Lir {
+            externs: Vec::new(),
+            functions: Vec::new(),
+            globals: Vec::new(),
+        },
+    }
+}
+
 impl UncheckedArtifact {
     /// Strictly establish the portable artifact invariants.
     pub fn validate(self) -> Result<Artifact, ValidationError> {

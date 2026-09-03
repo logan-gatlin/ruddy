@@ -2008,49 +2008,42 @@ fn compile_one(
     let accepted = match accepted {
         Ok(accepted) => accepted,
         Err(partial) => {
-    let errors = partial.errors.len();
-    if errors != 0 {
-        let mut diagnostics = Vec::with_capacity(errors);
-        for error in &partial.ir.errors {
-            diagnostics.push(source_diagnostic(
-                &mut files,
-                "ir",
-                &error.diagnostic(),
-                source_directory,
-            ));
-        }
-        for error in partial.inference.errors() {
-            diagnostics.push(source_diagnostic(
-                &mut files,
-                "types",
-                &error.diagnostic(),
-                source_directory,
-            ));
-        }
-        for error in &partial.patterns.errors {
-            diagnostics.push(diagnostic(
-                &mut files,
-                "patterns",
-                error.kind.code(),
-                error.span,
-                &error.kind,
-                source_directory,
-            ));
-        }
-        return Err(CompileError::from_diagnostics(diagnostics));
+            let errors = partial.errors.len();
+            if errors != 0 {
+                let mut diagnostics = Vec::with_capacity(errors);
+                for error in &partial.ir.errors {
+                    diagnostics.push(source_diagnostic(
+                        &mut files,
+                        "ir",
+                        &error.diagnostic(),
+                        source_directory,
+                    ));
+                }
+                for error in partial.inference.errors() {
+                    diagnostics.push(source_diagnostic(
+                        &mut files,
+                        "types",
+                        &error.diagnostic(),
+                        source_directory,
+                    ));
+                }
+                for error in &partial.patterns.errors {
+                    diagnostics.push(diagnostic(
+                        &mut files,
+                        "patterns",
+                        error.kind.code(),
+                        error.span,
+                        &error.kind,
+                        source_directory,
+                    ));
+                }
+                return Err(CompileError::from_diagnostics(diagnostics));
             }
-        unreachable!("partial compilation always has an error")
+            unreachable!("partial compilation always has an error")
         }
     };
 
-    let identities = dependencies
-        .iter()
-        .map(|(_, artifact)| Dependency {
-            name: artifact.header.identity.name.clone(),
-            version: artifact.header.identity.version.clone(),
-        })
-        .collect();
-    Ok(ruddy::artifact::build_with_dependencies(&accepted, identities))
+    Ok(accepted.artifact().clone())
 }
 
 fn toml_error_note(source: &str, error: &toml::de::Error) -> String {

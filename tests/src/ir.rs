@@ -5960,7 +5960,10 @@ fn canonical_bundle_import_preserves_mixed_input_result_guarantee() {
     // universal atom remains in scope even though existential atoms determine
     // which result package owns the indivisible proposition.
     let text = dependency.print();
-    dependency = a::Artifact::try_parse(&text).expect("canonical dependency parses");
+    dependency = a::Artifact::try_parse(&text)
+        .expect("canonical dependency parses")
+        .validate()
+        .expect("canonical dependency validates");
     let parsed = parse::parse(lex("let value = dep::prelude::shared", FileID::GENERATED).tokens);
     let mut mint = dummy_mint();
     let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);

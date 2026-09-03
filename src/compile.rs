@@ -38,6 +38,7 @@ pub struct AcceptedProgram {
     inference: inference::Output,
     patterns: patterns::Output,
     externs: externs::ExternPlan,
+    artifact: artifact::Artifact,
 }
 
 impl AcceptedProgram {
@@ -62,9 +63,9 @@ impl AcceptedProgram {
         lir::lower(self)
     }
 
-    /// Produce the validated target-neutral artifact for this accepted program.
-    pub fn artifact(&self) -> artifact::Artifact {
-        artifact::build(self)
+    /// The validated target-neutral artifact produced by core compilation.
+    pub fn artifact(&self) -> &artifact::Artifact {
+        &self.artifact
     }
 
     /// Consume accepted state for phase-specific debugger/test inspection.
@@ -80,7 +81,9 @@ pub fn compile(
     stmts: Vec<parse::Stmt>,
     trace: Trace,
 ) -> Result<AcceptedProgram, PartialCompilation> {
-    compile_with(mint, stmts, trace, |mint, stmts| ir::build(mint, stmts))
+    compile_with(mint, stmts, trace, Vec::new(), |mint, stmts| {
+        ir::build(mint, stmts)
+    })
 }
 
 /// Compile a parsed source bundle against dependency interfaces.
@@ -91,7 +94,14 @@ pub fn compile_with_dependency_imports(
     linked: &[artifact::Artifact],
     trace: Trace,
 ) -> Result<AcceptedProgram, PartialCompilation> {
-    compile_with(mint, stmts, trace, |mint, stmts| {
+    let artifact_dependencies = dependencies
+        .iter()
+        .map(|dependency| artifact::Dependency {
+            name: dependency.artifact.header.identity.name.clone(),
+            version: dependency.artifact.header.identity.version.clone(),
+        })
+        .collect();
+    compile_with(mint, stmts, trace, artifact_dependencies, |mint, stmts| {
         ir::build_with_dependency_imports(mint, stmts, dependencies, linked)
     })
 }
@@ -100,6 +110,7 @@ fn compile_with(
     mut mint: Mint,
     stmts: Vec<parse::Stmt>,
     trace: Trace,
+    artifact_dependencies: Vec<artifact::Dependency>,
     build: impl FnOnce(&mut Mint, Vec<parse::Stmt>) -> ir::Output,
 ) -> Result<AcceptedProgram, PartialCompilation> {
     let ir = build(&mut mint, stmts);
@@ -126,11 +137,18 @@ fn compile_with(
         });
     }
     let externs = externs::plan(inference.semantics());
-    Ok(AcceptedProgram {
+    // Construct the accepted proof before producing the artifact: lowering can
+    // only consume that proof. The artifact is then retained in the same
+    // coherent result, so the public compile seam runs all the way to the
+    // validated target-neutral persistence boundary.
+    let mut accepted = AcceptedProgram {
         mint,
         ir,
         inference,
         patterns,
         externs,
-    })
+        artifact: artifact::empty(),
+    };
+    accepted.artifact = artifact::build_with_dependencies(&accepted, artifact_dependencies);
+    Ok(accepted)
 }

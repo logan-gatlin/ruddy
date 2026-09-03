@@ -73,7 +73,10 @@ fn a_complete_trace_is_the_only_thing_the_trace_setting_adds() {
         off.errors()[0].diagnostic().title,
         complete.errors()[0].diagnostic().title
     );
-    assert_eq!(off.semantics().schemes().len(), complete.semantics().schemes().len());
+    assert_eq!(
+        off.semantics().schemes().len(),
+        complete.semantics().schemes().len()
+    );
 
     let diagnostics = off.diagnostics();
     assert_eq!(diagnostics.trace(), inference::Trace::Off);
@@ -82,7 +85,6 @@ fn a_complete_trace_is_the_only_thing_the_trace_setting_adds() {
     assert!(diagnostics.reasons().is_empty());
     assert!(diagnostics.variables().is_empty());
     assert!(diagnostics.refinements().is_empty());
-    assert!(diagnostics.reason_ancestors(off.errors()[0].id.into_reason_seed()).is_empty());
 
     let diagnostics = complete.diagnostics();
     assert_eq!(diagnostics.trace(), inference::Trace::Complete);

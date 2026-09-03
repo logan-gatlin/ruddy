@@ -1439,7 +1439,13 @@ fn the_configured_root_is_resolved_relative_to_the_manifest() {
 
     let built = compile(directory.path()).expect("compile the configured root");
     assert!(built.header.dependencies.is_empty());
-    assert_eq!(Artifact::try_parse(&built.print()).unwrap(), built);
+    assert_eq!(
+        Artifact::try_parse(&built.print())
+            .unwrap()
+            .validate()
+            .unwrap(),
+        built
+    );
 }
 
 #[test]
@@ -2634,7 +2640,14 @@ fn build_writes_and_replaces_the_named_canonical_artifact() {
     let path = build_project(&project).expect("build project");
     assert_eq!(path, project.join("build/sample.artifact"));
     let first = fs::read_to_string(&path).unwrap();
-    assert_eq!(Artifact::try_parse(&first).unwrap().print(), first);
+    assert_eq!(
+        Artifact::try_parse(&first)
+            .unwrap()
+            .validate()
+            .unwrap()
+            .print(),
+        first
+    );
 
     fs::write(&path, "old output").unwrap();
     assert_eq!(build_project(&project).unwrap(), path);
