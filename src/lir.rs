@@ -3900,6 +3900,262 @@ mod tests {
         lower_parts(&mint, &out.program, inferred.semantics(), &plan)
     }
 
+    /// A scrutinee whose checked type is not a struct at all cannot dispatch on
+    /// a field, so the match falls through to its wildcard arm outright.
+    #[test]
+    fn a_corrupted_non_struct_match_type_recovers_in_lir() {
+        let output = lowered_after_check(
+            "let f = fn s => match s with | { x } => 1n | _ => 2n end",
+            |program, _| {
+                let definition = &mut program.terms.values_mut().next().unwrap().value;
+                let ir::TermKind::Fn { body, .. } = &mut definition.kind else {
+                    panic!("function fixture")
+                };
+                let ir::TermKind::Match { scrutinee, .. } = &mut body.kind else {
+                    panic!("match fixture")
+                };
+                scrutinee.ty = Rc::new(Ty::Nat);
+            },
+        );
+        assert!(!projects_any_field(&output), "{output:#?}");
+        assert!(yields_constant(&output, 2), "{output:#?}");
+    }
+
+    /// A field absent from a closed solved row still receives an absent dispatch
+    /// column when a syntactically valid but unreachable arm asks for it.
+    #[test]
+    fn a_pattern_field_absent_from_the_solved_row_is_lowered_as_absent() {
+        let output = lowered_after_check(
+            "let f = fn s => match s with | { x } => 1n | _ => 2n end",
+            |program, _| {
+                let definition = &mut program.terms.values_mut().next().unwrap().value;
+                let ir::TermKind::Fn { body, .. } = &mut definition.kind else {
+                    panic!("function fixture")
+                };
+                let ir::TermKind::Match { scrutinee, .. } = &mut body.kind else {
+                    panic!("match fixture")
+                };
+                let Ty::Struct(row) = Rc::make_mut(&mut scrutinee.ty) else {
+                    panic!("struct fixture")
+                };
+                row.labels.clear();
+                row.rest = Rest::Closed;
+            },
+        );
+        assert!(!projects_any_field(&output), "{output:#?}");
+        assert!(yields_constant(&output, 2), "{output:#?}");
+    }
+
+    /// Every instruction of every function and global, nested blocks included.
+    fn instructions(output: &Output) -> Vec<&Instr> {
+        let mut blocks: Vec<&Block> = output
+            .functions
+            .iter()
+            .map(|function| &function.body)
+            .chain(output.globals.iter().map(|global| &global.body))
+            .collect();
+        let mut out = Vec::new();
+        while let Some(block) = blocks.pop() {
+            for instr in &block.instrs {
+                out.push(instr);
+                match &instr.op {
+                    Op::Catch { body, .. } => blocks.push(body),
+                    Op::SwitchTag {
+                        cases, fallback, ..
+                    } => {
+                        blocks.extend(cases.iter().map(|case| &case.block));
+                        blocks.extend(fallback.iter().map(|block| &**block));
+                    }
+                    Op::SwitchPrim {
+                        cases, fallback, ..
+                    } => {
+                        blocks.extend(cases.iter().map(|case| &case.block));
+                        blocks.extend(fallback.iter().map(|block| &**block));
+                    }
+                    Op::SwitchPresence {
+                        present, absent, ..
+                    } => blocks.extend([&**present, &**absent]),
+                    Op::SwitchRest { none, some, .. } => blocks.extend([&**none, &**some]),
+                    _ => {}
+                }
+            }
+        }
+        out
+    }
+
+    fn projects_any_field(output: &Output) -> bool {
+        instructions(output)
+            .iter()
+            .any(|instr| matches!(instr.op, Op::Project { .. }))
+    }
+
+    fn yields_constant(output: &Output, value: u64) -> bool {
+        instructions(output)
+            .iter()
+            .any(|instr| matches!(instr.op, Op::Const(Literal::Natural(found)) if found == value))
+    }
+
+    /// Thirty thousand arrow levels between a wanted and a had type stay off
+    /// the native stack while the effect-packing adapter between them is fitted.
+    #[test]
+    fn thirty_thousand_fitted_arrow_levels_use_bounded_stack() {
+        std::thread::Builder::new()
+            .name("deep-lir-fitting".into())
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                const DEPTH: usize = 30_000;
+                let output = lowered_after_check(
+                    "let takes : (Nat -> Nat) -> Nat = fn f => 1n\n\
+                     let have : Nat -> Nat = fn n => n\n\
+                     let go = takes have",
+                    |program, _| {
+                        let symbols: Vec<_> = program.terms.keys().copied().collect();
+                        let mut want_to = Rc::new(Ty::Nat);
+                        let mut have_to = Rc::new(Ty::Nat);
+                        for _ in 0..DEPTH {
+                            want_to = Rc::new(Ty::Arrow(
+                                Rc::new(Ty::Nat),
+                                want_to,
+                                Row::closed(),
+                            ));
+                            have_to = Rc::new(Ty::Arrow(
+                                Rc::new(Ty::Nat),
+                                have_to,
+                                Row::closed(),
+                            ));
+                        }
+                        let want = Rc::new(Ty::Arrow(
+                            Rc::new(Ty::Nat),
+                            want_to,
+                            Row {
+                                labels: [(
+                                    "Log".to_string(),
+                                    RowField {
+                                        presence: Presence::Present,
+                                        ty: Rc::new(Ty::Undecided),
+                                    },
+                                )]
+                                .into_iter()
+                                .collect(),
+                                rest: Rest::Closed,
+                            },
+                        ));
+                        let have = Rc::new(Ty::Arrow(
+                            Rc::new(Ty::Nat),
+                            have_to,
+                            Row::of(Rest::Bound(0)),
+                        ));
+
+                        program.terms.get_mut(&symbols[0]).unwrap().value.ty = Rc::new(Ty::Arrow(
+                            want,
+                            Rc::new(Ty::Nat),
+                            Row::closed(),
+                        ));
+                        program.terms.get_mut(&symbols[1]).unwrap().value.ty = have.clone();
+                        let ir::TermKind::Apply { arg, .. } =
+                            &mut program.terms.get_mut(&symbols[2]).unwrap().value.kind
+                        else {
+                            panic!("go is the checked application")
+                        };
+                        arg.ty = have;
+                    },
+                );
+                let adapter = output
+                    .functions
+                    .iter()
+                    .find(|function| {
+                        function.body.instrs.iter().any(|instr| {
+                            matches!(&instr.op, Op::Struct(fields) if fields.contains_key(&FieldKey::Named("Log".into())))
+                        })
+                    })
+                    .expect("the effect-packing adapter remains present");
+                assert!(adapter
+                    .body
+                    .instrs
+                    .iter()
+                    .any(|instr| matches!(instr.op, Op::Call { .. })));
+            })
+            .expect("the bounded-stack regression thread starts")
+            .join()
+            .expect("LIR fitting uses bounded stack");
+    }
+
+    /// An undecided presence only occurs after an earlier type failure, so an
+    /// accepted pipeline cannot carry one into LIR. Lowering still treats that
+    /// recovery value conservatively: both answers remain possible, without
+    /// adding a SAT assumption for a variable that does not exist.
+    #[test]
+    fn an_undecided_presence_is_tested_both_ways() {
+        let output = lowered_after_check(
+            "let f = fn s => match s with | { x, y } => y | { x } => x end",
+            |program, _| set_match_field_presence(program, "y", Presence::Undecided),
+        );
+        let switches: Vec<&Instr> = instructions(&output)
+            .into_iter()
+            .filter(|instr| matches!(instr.op, Op::SwitchPresence { .. }))
+            .collect();
+        let [switch] = switches.as_slice() else {
+            panic!("one presence switch: {output:#?}")
+        };
+        let Op::SwitchPresence {
+            field,
+            present,
+            absent,
+            ..
+        } = &switch.op
+        else {
+            unreachable!()
+        };
+        assert_eq!(field, "y");
+        assert!(
+            present.instrs.iter().any(|instr| {
+                matches!(&instr.op, Op::Project { field: FieldKey::Named(name), .. } if name == "y")
+            }),
+            "{output:#?}"
+        );
+        assert!(matches!(absent.end.kind, End::Yield(_)), "{output:#?}");
+    }
+
+    /// A container whose checked type was corrupted still lowers the members
+    /// it was written with.
+    #[test]
+    fn a_corrupted_container_type_uses_the_written_member_type() {
+        let output = lowered_after_check("let value = { x: 1n }", |program, _| {
+            program.terms.values_mut().next().unwrap().value.ty = Rc::new(Ty::Nat);
+        });
+        assert!(
+            instructions(&output).iter().any(|instr| {
+                matches!(&instr.op, Op::Struct(fields) if fields.contains_key(&FieldKey::Named("x".into())))
+            }),
+            "{output:#?}"
+        );
+    }
+
+    /// Replace the named field's presence on the sole match scrutinee of the
+    /// small defensive fixtures above. Pattern checking happens before this
+    /// adjustment.
+    fn set_match_field_presence(program: &mut Program, field: &str, presence: Presence) {
+        let definition = &mut program
+            .terms
+            .values_mut()
+            .next()
+            .expect("the fixture has one definition")
+            .value;
+        let ir::TermKind::Fn { body, .. } = &mut definition.kind else {
+            panic!("the fixture definition is a function")
+        };
+        let ir::TermKind::Match { scrutinee, .. } = &mut body.kind else {
+            panic!("the fixture function immediately matches")
+        };
+        let Ty::Struct(row) = Rc::make_mut(&mut scrutinee.ty) else {
+            panic!("struct scrutinee")
+        };
+        row.labels
+            .get_mut(field)
+            .expect("the scrutinee type names the tested field")
+            .presence = presence;
+    }
+
     /// The SAT pair can only be false/false if a caller violates LIR's accepted-
     /// pipeline precondition by supplying a definition promise with no model. Keep
     /// the invariant check loud rather than silently manufacturing dead LIR.

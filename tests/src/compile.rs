@@ -26,8 +26,8 @@ fn failed_compilation_preserves_completed_phases_and_aggregates_checking_errors(
     assert_eq!(partial.ir.program.terms.len(), 2);
     assert_eq!(partial.inference.semantics().schemes().len(), 2);
     assert_eq!(partial.patterns.reports.len(), 1);
-    assert!(partial.inference.errors().len() >= 1, "{partial:#?}");
-    assert!(partial.patterns.errors.len() >= 1, "{partial:#?}");
+    assert!(!partial.inference.errors().is_empty(), "{partial:#?}");
+    assert!(!partial.patterns.errors.is_empty(), "{partial:#?}");
 
     // Core compilation publishes the errors from every checking phase together
     // rather than making callers re-run a later phase to learn its failures.

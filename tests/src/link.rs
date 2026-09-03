@@ -1,11 +1,26 @@
 use ruddy::{
-    artifact as a, compile, inference, ir,
+    artifact as a, compile, inference,
     link::{self, LinkError},
-    lir, parse, patterns,
+    parse,
     symbol::{Bundle, Mint, Version},
     token,
     tracking::FileManager,
 };
+
+/// Hand-built link inputs cross the strict artifact boundary like a bundle
+/// read from disk. Rendering canonical text recurses, and the relocation
+/// regressions below nest thirty thousand blocks deep, so validation always
+/// runs on a generously sized thread of its own.
+fn validated(artifact: a::UncheckedArtifact) -> a::Artifact {
+    std::thread::Builder::new()
+        .name("artifact-validation".into())
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || artifact.validate())
+        .expect("the artifact validation thread starts")
+        .join()
+        .expect("artifact validation completes")
+        .expect("a hand-built artifact validates")
+}
 
 fn artifact(
     name: &str,
@@ -20,7 +35,7 @@ fn artifact(
             scheme: scheme(),
         })
         .collect();
-    a::Artifact {
+    validated(a::UncheckedArtifact {
         header: a::Header {
             identity: a::Identity {
                 name: name.into(),
@@ -46,7 +61,7 @@ fn artifact(
             functions,
             globals,
         },
-    }
+    })
 }
 
 fn scheme() -> a::Scheme {
@@ -165,28 +180,45 @@ fn links_every_item_and_recursively_relocates_function_indices() {
         &[("dep", "1.0.0")],
         vec![function("app-f", nested)],
         vec![global("app@1.0.0::main", local_references())],
-    );
-    root.header.values[0].scheme.count = 1;
-    root.header.values[0].scheme.presences = 1;
-    root.header.values[0].scheme.existentials = vec![0];
+    )
+    .to_unchecked();
+    // An existential witness is a presence the value's package owns, so the
+    // scheme quantifies one presence and its body packages a label wearing it.
+    root.header.values[0].scheme = a::Scheme {
+        count: 1,
+        presences: 1,
+        existentials: vec![0],
+        formula: a::Formula::True,
+        body: a::Type::Package(Box::new(a::Type::Struct(a::Row {
+            labels: vec![(
+                "choice".into(),
+                a::RowField {
+                    presence: a::Presence::Bound(0),
+                    ty: a::Type::Nat,
+                },
+            )],
+            rest: a::Rest::Closed,
+        }))),
+    };
     root.header.types.push(a::DeclaredType {
         name: "app@1.0.0::Public".into(),
         params: vec![],
         scheme: scheme(),
     });
 
+    let root = validated(root);
     let linked = link::link(&[dep, root.clone()]).unwrap();
-    assert_eq!(linked.header.identity, root.header.identity);
-    assert_eq!(linked.header.values, root.header.values);
-    assert_eq!(linked.header.values[0].scheme.existentials, vec![0]);
-    assert_eq!(linked.header.types, root.header.types);
-    assert!(linked.header.dependencies.is_empty());
-    assert_eq!(linked.lir.externs.len(), 2);
-    assert_eq!(linked.lir.externs[0].name, "dep@1.0.0::host");
-    assert_eq!(linked.lir.externs[1].name, "app@1.0.0::host");
-    assert_eq!(linked.lir.functions.len(), 2);
-    assert_eq!(linked.lir.globals.len(), 2);
-    assert_eq!(linked.lir.globals[0].name, "dep@1.0.0::value");
+    assert_eq!(linked.header().identity, root.header().identity);
+    assert_eq!(linked.header().values, root.header().values);
+    assert_eq!(linked.header().values[0].scheme.existentials, vec![0]);
+    assert_eq!(linked.header().types, root.header().types);
+    assert!(linked.header().dependencies.is_empty());
+    assert_eq!(linked.lir().externs.len(), 2);
+    assert_eq!(linked.lir().externs[0].name, "dep@1.0.0::host");
+    assert_eq!(linked.lir().externs[1].name, "app@1.0.0::host");
+    assert_eq!(linked.lir().functions.len(), 2);
+    assert_eq!(linked.lir().globals.len(), 2);
+    assert_eq!(linked.lir().globals[0].name, "dep@1.0.0::value");
 
     fn assert_relocated(block: &a::Block, expected: u64) {
         for instr in &block.instrs {
@@ -231,10 +263,10 @@ fn links_every_item_and_recursively_relocates_function_indices() {
             }
         }
     }
-    assert_relocated(&linked.lir.functions[0].body, 0);
-    assert_relocated(&linked.lir.globals[0].body, 0);
-    assert_relocated(&linked.lir.functions[1].body, 1);
-    assert_relocated(&linked.lir.globals[1].body, 1);
+    assert_relocated(&linked.lir().functions[0].body, 0);
+    assert_relocated(&linked.lir().globals[0].body, 0);
+    assert_relocated(&linked.lir().functions[1].body, 1);
+    assert_relocated(&linked.lir().globals[1].body, 1);
 }
 
 #[test]
@@ -320,7 +352,7 @@ fn relocates_thirty_thousand_nested_catches_and_switches_iteratively_in_order() 
         assert_eq!(*func, 1);
     }
 
-    let mut current = &linked.lir.functions[1].body;
+    let mut current = &linked.lir().functions[1].body;
     for depth in 0..DEPTH {
         assert_eq!(current.instrs.len(), 1);
         current = match (&current.instrs[0].op, depth % 5) {
@@ -421,7 +453,7 @@ fn copies_valid_dependency_first_transitive_diamond_graph_without_pruning() {
 
     let linked = link::link(&[base, left, right, root]).unwrap();
     let names: Vec<_> = linked
-        .lir
+        .lir()
         .functions
         .iter()
         .map(|function| function.name.as_str())
@@ -429,7 +461,7 @@ fn copies_valid_dependency_first_transitive_diamond_graph_without_pruning() {
     assert_eq!(names, ["base", "left", "right", "root"]);
     assert_eq!(
         linked
-            .lir
+            .lir()
             .externs
             .iter()
             .map(|external| external.name.as_str())
@@ -441,7 +473,7 @@ fn copies_valid_dependency_first_transitive_diamond_graph_without_pruning() {
             "app@1.0.0::host"
         ]
     );
-    for (index, function) in linked.lir.functions.iter().enumerate() {
+    for (index, function) in linked.lir().functions.iter().enumerate() {
         assert_references(&function.body, index as u64);
     }
 
@@ -478,11 +510,11 @@ fn compiled(source: &str) -> a::Artifact {
 #[test]
 fn links_unexported_wildcard_definitions_without_aliasing() {
     let artifact = compiled("let _ = 1n\nlet _ = 2n\nlet keep = 3n\nlet _ = keep");
-    assert_eq!(artifact.header.values.len(), 1);
-    assert_eq!(artifact.header.values[0].name, "app@1.0.0::keep");
+    assert_eq!(artifact.header().values.len(), 1);
+    assert_eq!(artifact.header().values[0].name, "app@1.0.0::keep");
 
     let names: std::collections::HashSet<_> = artifact
-        .lir
+        .lir()
         .globals
         .iter()
         .map(|global| global.name.as_str())
@@ -490,8 +522,8 @@ fn links_unexported_wildcard_definitions_without_aliasing() {
     assert_eq!(names.len(), 4);
 
     let linked = link::link(&[artifact]).unwrap();
-    assert_eq!(linked.header.values.len(), 1);
-    assert_eq!(linked.lir.globals.len(), 4);
+    assert_eq!(linked.header().values.len(), 1);
+    assert_eq!(linked.lir().globals.len(), 4);
 }
 
 #[test]

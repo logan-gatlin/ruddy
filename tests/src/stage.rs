@@ -6,7 +6,7 @@ use indexmap::IndexMap;
 
 use regex::Regex;
 use ruddy::{
-    artifact::{Artifact, Dependency, Header, Identity, Lir},
+    artifact::{Dependency, Header, Identity, Lir, UncheckedArtifact},
     types::Ty,
 };
 use ruddy_debug::{
@@ -919,7 +919,7 @@ fn the_lir_tab_skips_a_program_with_errors() {
 
 #[test]
 fn artifact_stage_renders_one_dependency() {
-    let artifact = Artifact {
+    let artifact = UncheckedArtifact {
         header: Header {
             identity: Identity {
                 name: "demo".to_string(),
@@ -942,7 +942,9 @@ fn artifact_stage_renders_one_dependency() {
             functions: Vec::new(),
             globals: Vec::new(),
         },
-    };
+    }
+    .validate()
+    .expect("a hand-built artifact validates");
     let symbols = HashMap::new();
     let declarations = IndexMap::from([
         ("base".to_string(), "../base".into()),
@@ -965,7 +967,7 @@ fn artifact_stage_renders_one_dependency() {
         standard_library: &ruddy_debug::wire::StdConfig::Disabled,
         dependency_declarations: &declarations,
         dependency_aliases: &["base".to_string()],
-        dependencies: &artifact.header.dependencies,
+        dependencies: &artifact.header().dependencies,
         dependency_interfaces: &[],
         dependencies_valid: false,
         artifact_panicked: false,

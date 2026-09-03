@@ -2909,7 +2909,8 @@ fn build_with_dependency_imports_inner(
 fn dependency_path(dependency: &artifact::Artifact, qualified: &str) -> Option<Vec<String>> {
     let prefix = format!(
         "{}@{}::",
-        dependency.header().identity.name, dependency.header().identity.version
+        dependency.header().identity.name,
+        dependency.header().identity.version
     );
     let path = qualified.strip_prefix(&prefix)?;
     let parts: Vec<String> = path.split("::").map(str::to_owned).collect();

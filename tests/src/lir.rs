@@ -1,13 +1,10 @@
 //! Tests for [`ruddy::lir`].
 
-use std::rc::Rc;
-
 use ruddy::{
-    artifact as a, inference, ir, lir, parse, patterns,
+    artifact as a, inference, ir, lir, parse,
     symbol::{Bundle, Mint, Version},
     token,
     tracking::FileManager,
-    types::{Presence, Rest, Row, RowField, Ty},
 };
 use ruddy_debug::print;
 
@@ -19,30 +16,15 @@ fn lowered(source: &str) -> lir::Output {
 }
 
 fn lowered_labelled(source: &str) -> (lir::Output, print::lir::Labels) {
-    lowered_after_check(source, |_, _| {})
+    lowered_with_dependencies(source, &[])
 }
 
-/// One accepted pipeline whose checked inputs a test may adjust before LIR.
-/// This is for defensive branches at LIR's public boundary: ordinary tests use
-/// [`lowered`] and therefore pass the accepted program through unchanged.
-fn lowered_after_check(
-    source: &str,
-    adjust: impl FnOnce(&mut ir::Program, &mut inference::Output),
-) -> (lir::Output, print::lir::Labels) {
-    lowered_with_dependencies_after_check(source, &[], adjust)
-}
-
+/// One accepted pipeline, dependencies included, taken to LIR through the
+/// public compilation seam. Tests that corrupt accepted state to reach LIR's
+/// defensive branches are crate-private and live beside the lowering.
 fn lowered_with_dependencies(
     source: &str,
     dependencies: &[a::Artifact],
-) -> (lir::Output, print::lir::Labels) {
-    lowered_with_dependencies_after_check(source, dependencies, |_, _| {})
-}
-
-fn lowered_with_dependencies_after_check(
-    source: &str,
-    dependencies: &[a::Artifact],
-    adjust: impl FnOnce(&mut ir::Program, &mut inference::Output),
 ) -> (lir::Output, print::lir::Labels) {
     let mut files = FileManager::new();
     let file = files.register_new_file("<test>".to_string(), source.to_string());
@@ -68,9 +50,6 @@ fn lowered_with_dependencies_after_check(
     )
     .unwrap_or_else(|partial| panic!("{source}: {partial:#?}"));
     let labels = print::lir::Labels::new(accepted.ir());
-    // Corrupting accepted state belongs to crate-private LIR tests. The public
-    // integration seam intentionally has no mutation hook.
-    let _ = adjust;
     (accepted.lower(), labels)
 }
 
@@ -306,7 +285,7 @@ fn imported_forwarding_cycles_recover_before_lir_representation() {
                 formula: a::Formula::True,
                 body,
             };
-            let dependency = a::Artifact {
+            let dependency = a::UncheckedArtifact {
                 header: a::Header {
                     identity: a::Identity {
                         name: "dep".into(),
@@ -346,7 +325,9 @@ fn imported_forwarding_cycles_recover_before_lir_representation() {
                     functions: Vec::new(),
                     globals: Vec::new(),
                 },
-            };
+            }
+            .validate()
+            .expect("a hand-built dependency validates");
 
             let source = "let id : dep::A -> dep::A = fn x => x";
             let (output, labels) = lowered_with_dependencies(source, &[dependency]);
@@ -658,77 +639,6 @@ fn an_optional_field_becomes_a_presence_test() {
     );
 }
 
-/// An undecided presence only occurs after an earlier type failure, so an
-/// accepted pipeline cannot carry one into LIR. Its public boundary still
-/// lowers that recovery value conservatively: both answers remain possible,
-/// without adding a SAT assumption for a variable that does not exist.
-#[test]
-fn an_undecided_presence_is_tested_both_ways() {
-    let (output, labels) = lowered_after_check(
-        "let f = fn s => match s with | { x, y } => y | { x } => x end",
-        |program, _| set_match_field_presence(program, "y", Presence::Undecided),
-    );
-    let printed = print::lir::program(&output, &labels);
-    assert_eq!(printed.matches("switch_presence").count(), 1, "{printed}");
-    assert!(
-        printed.contains("present =>\n      %2: any = project %0, \"y\""),
-        "{printed}"
-    );
-    assert!(printed.contains("absent =>\n      yield %1"), "{printed}");
-}
-
-/// Replace the named field on the sole match scrutinee in the small defensive
-/// fixtures above. Pattern checking happens before this adjustment.
-#[test]
-fn a_corrupted_container_type_uses_the_written_member_type() {
-    let (output, labels) = lowered_after_check("let value = { x: 1n }", |program, _| {
-        program.terms.values_mut().next().unwrap().value.ty = Rc::new(Ty::Nat);
-    });
-    let printed = print::lir::program(&output, &labels);
-    assert!(printed.contains("struct { x:"), "{printed}");
-}
-
-#[test]
-fn a_corrupted_non_struct_match_type_recovers_in_lir() {
-    let (output, labels) = lowered_after_check(
-        "let f = fn s => match s with | { x } => 1n | _ => 2n end",
-        |program, _| {
-            let definition = &mut program.terms.values_mut().next().unwrap().value;
-            let ir::TermKind::Fn { body, .. } = &mut definition.kind else {
-                panic!("function fixture")
-            };
-            let ir::TermKind::Match { scrutinee, .. } = &mut body.kind else {
-                panic!("match fixture")
-            };
-            scrutinee.ty = Rc::new(Ty::Nat);
-        },
-    );
-    let printed = print::lir::program(&output, &labels);
-    assert!(printed.contains("%1: nat = const 2n"), "{printed}");
-}
-
-fn set_match_field_presence(program: &mut ir::Program, field: &str, presence: Presence) {
-    let definition = &mut program
-        .terms
-        .values_mut()
-        .next()
-        .expect("the fixture has one definition")
-        .value;
-    let ir::TermKind::Fn { body, .. } = &mut definition.kind else {
-        panic!("the fixture definition is a function")
-    };
-    let ir::TermKind::Match { scrutinee, .. } = &mut body.kind else {
-        panic!("the fixture function immediately matches")
-    };
-    let Ty::Struct(row) = Rc::make_mut(&mut scrutinee.ty) else {
-        panic!("struct scrutinee")
-    };
-    row.labels
-        .get_mut(field)
-        .expect("the scrutinee type names the tested field")
-        .presence = presence;
-}
-
 #[test]
 fn a_refined_swap_uses_the_existing_presence_switch() {
     for source in [
@@ -939,7 +849,7 @@ fn imported_and_local_handler_arms_build_one_complete_evidence_record() {
             rest: a::Rest::Closed,
         })
     };
-    let dependency = a::Artifact {
+    let dependency = a::UncheckedArtifact {
         header: a::Header {
             identity: a::Identity {
                 name: "dep".into(),
@@ -973,7 +883,9 @@ fn imported_and_local_handler_arms_build_one_complete_evidence_record() {
             functions: Vec::new(),
             globals: Vec::new(),
         },
-    };
+    }
+    .validate()
+    .expect("a hand-built dependency validates");
     let source = format!(
         "{declaration}\n\
          let main = fn n => handle dep::!Log.write n with\n\
@@ -1319,34 +1231,6 @@ fn a_field_no_arm_asks_about_is_never_read() {
     );
 }
 
-/// A field absent from a closed solved row still receives an absent dispatch
-/// column when a syntactically valid but unreachable arm asks for it.
-#[test]
-fn a_pattern_field_absent_from_the_solved_row_is_lowered_as_absent() {
-    let (output, labels) = lowered_after_check(
-        "let f = fn s => match s with | { x } => 1n | _ => 2n end",
-        |program, _| {
-            let definition = &mut program.terms.values_mut().next().unwrap().value;
-            let ir::TermKind::Fn { body, .. } = &mut definition.kind else {
-                panic!("function fixture")
-            };
-            let ir::TermKind::Match { scrutinee, .. } = &mut body.kind else {
-                panic!("match fixture")
-            };
-            let Ty::Struct(row) = Rc::make_mut(&mut scrutinee.ty) else {
-                panic!("struct fixture")
-            };
-            row.labels.clear();
-            row.rest = ruddy::types::Rest::Closed;
-        },
-    );
-    let printed = print::lir::program(&output, &labels);
-    assert!(!printed.contains("project"), "{printed}");
-    assert!(printed.contains("const 2n"), "{printed}");
-}
-
-/// A field whose presence decides the arm but whose value nothing looks at is
-/// tested and not read — where a pun would have bound it, and so read it.
 #[test]
 fn a_field_every_arm_ignores_is_tested_but_not_read() {
     assert_eq!(
@@ -1507,93 +1391,6 @@ fn recursive_arrow_fitting_reuses_one_guarded_adapter() {
     assert!(adapter.contains("struct { Log:"), "{adapter}");
     assert!(adapter.contains("call %"), "{adapter}");
     assert_eq!(adapter.matches("closure go#3").count(), 1, "{adapter}");
-}
-
-/// One mismatch above thirty thousand equal result arrows used to recurse once
-/// in `fitted` and then once per suffix in `fits`. The adapter still packs the
-/// concrete record into the value's effect bundle, but both walks fit on a
-/// deliberately small native stack.
-#[test]
-fn thirty_thousand_fitted_arrow_levels_use_bounded_stack() {
-    std::thread::Builder::new()
-        .name("deep-lir-fitting".into())
-        .stack_size(256 * 1024)
-        .spawn(|| {
-            const DEPTH: usize = 30_000;
-            let (output, _) = lowered_after_check(
-                "let takes : (Nat -> Nat) -> Nat = fn f => 1n\n\
-                 let have : Nat -> Nat = fn n => n\n\
-                 let go = takes have",
-                |program, _| {
-                    let symbols: Vec<_> = program.terms.keys().copied().collect();
-                    let mut want_to = Rc::new(Ty::Nat);
-                    let mut have_to = Rc::new(Ty::Nat);
-                    for _ in 0..DEPTH {
-                        want_to = Rc::new(Ty::Arrow(
-                            Rc::new(Ty::Nat),
-                            want_to,
-                            Row::closed(),
-                        ));
-                        have_to = Rc::new(Ty::Arrow(
-                            Rc::new(Ty::Nat),
-                            have_to,
-                            Row::closed(),
-                        ));
-                    }
-                    let want = Rc::new(Ty::Arrow(
-                        Rc::new(Ty::Nat),
-                        want_to,
-                        Row {
-                            labels: [(
-                                "Log".to_string(),
-                                RowField {
-                                    presence: Presence::Present,
-                                    ty: Rc::new(Ty::Undecided),
-                                },
-                            )]
-                            .into_iter()
-                            .collect(),
-                            rest: Rest::Closed,
-                        },
-                    ));
-                    let have = Rc::new(Ty::Arrow(
-                        Rc::new(Ty::Nat),
-                        have_to,
-                        Row::of(Rest::Bound(0)),
-                    ));
-
-                    program.terms.get_mut(&symbols[0]).unwrap().value.ty = Rc::new(Ty::Arrow(
-                        want,
-                        Rc::new(Ty::Nat),
-                        Row::closed(),
-                    ));
-                    program.terms.get_mut(&symbols[1]).unwrap().value.ty = have.clone();
-                    let ir::TermKind::Apply { arg, .. } =
-                        &mut program.terms.get_mut(&symbols[2]).unwrap().value.kind
-                    else {
-                        panic!("go is the checked application")
-                    };
-                    arg.ty = have;
-                },
-            );
-            let adapter = output
-                .functions
-                .iter()
-                .find(|function| {
-                    function.body.instrs.iter().any(|instr| {
-                        matches!(&instr.op, lir::Op::Struct(fields) if fields.contains_key(&lir::FieldKey::Named("Log".into())))
-                    })
-                })
-                .expect("the effect-packing adapter remains present");
-            assert!(adapter
-                .body
-                .instrs
-                .iter()
-                .any(|instr| matches!(instr.op, lir::Op::Call { .. })));
-        })
-        .expect("the bounded-stack regression thread starts")
-        .join()
-        .expect("LIR fitting uses bounded stack");
 }
 
 #[test]

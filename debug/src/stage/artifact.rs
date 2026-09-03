@@ -83,7 +83,8 @@ pub fn render(spec: &Spec, cx: &Cx, artifact: &Artifact, micros: u64) -> Stage {
         "header",
         format!(
             "{}@{}",
-            artifact.header().identity.name, artifact.header().identity.version
+            artifact.header().identity.name,
+            artifact.header().identity.version
         ),
     )
     .children(interface);

@@ -5,13 +5,17 @@ use std::{fs, process::Command};
 use ruddy::{
     artifact::{self, Artifact},
     backend::js::{self, Error},
-    compile, inference, ir, lir, parse, patterns,
+    compile, inference, parse,
     symbol::{Bundle, Mint, Version},
     token,
     tracking::FileManager,
 };
 
-fn retag_numeric_global(artifact: &mut Artifact, name: &str, rep: artifact::Rep) {
+fn retag_numeric_global(
+    artifact: &mut artifact::UncheckedArtifact,
+    name: &str,
+    rep: artifact::Rep,
+) {
     let global = artifact
         .lir
         .globals
@@ -33,7 +37,7 @@ fn retag_numeric_global(artifact: &mut Artifact, name: &str, rep: artifact::Rep)
     }
 }
 
-fn split_record_into_merge(artifact: &mut Artifact, name: &str) {
+fn split_record_into_merge(artifact: &mut artifact::UncheckedArtifact, name: &str) {
     let global = artifact
         .lir
         .globals
@@ -67,7 +71,11 @@ fn split_record_into_merge(artifact: &mut Artifact, name: &str) {
     global.body.end = artifact::End::Ret(merged_temp);
 }
 
-fn retag_primitive_cases(artifact: &mut Artifact, name: &str, rep: artifact::Rep) {
+fn retag_primitive_cases(
+    artifact: &mut artifact::UncheckedArtifact,
+    name: &str,
+    rep: artifact::Rep,
+) {
     let function = artifact
         .lir
         .functions
@@ -273,13 +281,17 @@ fn generated_runtime_preserves_arithmetic_switch_record_effect_and_literal_seman
          effect Times = { apply: Real -> Real }\n\
          let calculate : Real -> Real + !Plus + !Times = fn n => let x = !Plus.apply n in !Times.apply x\n\
          let calculated = fn n => handle (handle calculate n with | !Plus.apply value => value + 1.0 end) with | !Times.apply value => value * 2.0 end\n",
-    );
+    )
+    .to_unchecked();
     retag_numeric_global(&mut artifact, "nat_sub", artifact::Rep::Nat);
     retag_numeric_global(&mut artifact, "int_div", artifact::Rep::Int);
     retag_numeric_global(&mut artifact, "int_negative_zero", artifact::Rep::Int);
     retag_primitive_cases(&mut artifact, "classify_nat", artifact::Rep::Nat);
     retag_primitive_cases(&mut artifact, "classify_int", artifact::Rep::Int);
     split_record_into_merge(&mut artifact, "merged");
+    let artifact = artifact
+        .validate()
+        .expect("the retagged artifact validates");
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("semantics.mjs");
     let module = js::generate(&artifact).unwrap();
@@ -309,19 +321,23 @@ fn generated_runtime_preserves_arithmetic_switch_record_effect_and_literal_seman
 
 #[test]
 fn generation_rejects_unlinked_and_internally_inconsistent_artifacts() {
-    let mut unlinked = compiled("let value = 1n");
+    let mut unlinked = compiled("let value = 1n").to_unchecked();
     unlinked.header.dependencies.push(artifact::Dependency {
         name: "dep".to_string(),
         version: "1.0.0".to_string(),
     });
+    let unlinked = unlinked.validate().expect("an unlinked artifact validates");
     assert_eq!(js::generate(&unlinked), Err(Error::Unlinked));
     assert_eq!(
         Error::Unlinked.to_string(),
         "the JavaScript backend requires a linked artifact"
     );
 
-    let mut missing_public = compiled("let value = 1n");
+    let mut missing_public = compiled("let value = 1n").to_unchecked();
     missing_public.header.values[0].name = "app@1.0.0::missing".to_string();
+    let missing_public = missing_public
+        .validate()
+        .expect("a missing public value validates");
     assert_eq!(
         js::generate(&missing_public),
         Err(Error::UnresolvedPublicValue(
@@ -329,10 +345,13 @@ fn generation_rejects_unlinked_and_internally_inconsistent_artifacts() {
         ))
     );
 
-    let mut bad_global = compiled("let value = 1n");
+    let mut bad_global = compiled("let value = 1n").to_unchecked();
     bad_global.lir.globals[0].body.instrs[0].op = artifact::Op::Global {
         target: "unknown@1.0.0::value".to_string(),
     };
+    let bad_global = bad_global
+        .validate()
+        .expect("an unknown global reference validates");
     assert_eq!(
         js::generate(&bad_global),
         Err(Error::InvalidGlobalReference(
@@ -340,7 +359,7 @@ fn generation_rejects_unlinked_and_internally_inconsistent_artifacts() {
         ))
     );
 
-    let mut bad_function = compiled("let identity = fn x => x");
+    let mut bad_function = compiled("let identity = fn x => x").to_unchecked();
     let closure = bad_function.lir.globals[0]
         .body
         .instrs
@@ -351,16 +370,37 @@ fn generation_rejects_unlinked_and_internally_inconsistent_artifacts() {
         func: u64::MAX,
         captures: Vec::new(),
     };
-    assert_eq!(
-        js::generate(&bad_function),
-        Err(Error::InvalidFunctionReference(u64::MAX))
+    // TODO: `Error::InvalidFunctionReference` is no longer reachable through
+    // the public API. A dangling function index never becomes an `Artifact`:
+    // `validate` rejects it and `recover` discards the executable content, so
+    // the backend cannot be handed one. The boundary is asserted instead.
+    let error = bad_function
+        .clone()
+        .validate()
+        .expect_err("a dangling function index is rejected");
+    assert!(
+        error.message().contains("outside its function table"),
+        "{error}"
     );
+    let (recovered, facts) = bad_function.recover();
+    assert!(
+        matches!(
+            facts.as_slice(),
+            [artifact::RecoveryFact::ExecutableDiscarded { .. }]
+        ),
+        "{facts:#?}"
+    );
+    assert!(recovered.lir().functions.is_empty());
+    assert!(recovered.lir().globals.is_empty());
 
-    let mut conflicting = compiled("let first = 1n\nlet second = 2n");
+    let mut conflicting = compiled("let first = 1n\nlet second = 2n").to_unchecked();
     conflicting.header.values[0].name = "app@1.0.0::path".to_string();
     conflicting.lir.globals[0].name = "app@1.0.0::path".to_string();
     conflicting.header.values[1].name = "app@1.0.0::path::child".to_string();
     conflicting.lir.globals[1].name = "app@1.0.0::path::child".to_string();
+    let conflicting = conflicting
+        .validate()
+        .expect("a conflicting export tree validates");
     assert_eq!(
         js::generate(&conflicting),
         Err(Error::ExportTreeConflict("path".to_string()))
@@ -409,7 +449,7 @@ fn generated_extern_expressions_execute_once_and_require_explicit_receiver_bindi
 
 #[test]
 fn boa_rejects_invalid_empty_and_structurally_breaking_extern_expressions() {
-    let mut artifact = compiled("extern host : Nat = \"0\"\n");
+    let mut artifact = compiled("extern host : Nat = \"0\"\n").to_unchecked();
     for target in [
         "(",
         "",
@@ -418,6 +458,10 @@ fn boa_rejects_invalid_empty_and_structurally_breaking_extern_expressions() {
         "0); globalThis.injected = true; (2",
     ] {
         artifact.lir.externs[0].target = target.to_string();
+        let artifact = artifact
+            .clone()
+            .validate()
+            .expect("an extern target string validates");
         let error = js::generate(&artifact).unwrap_err();
         assert!(
             matches!(error, Error::InvalidJavaScript(ref diagnostic) if !diagnostic.is_empty()),

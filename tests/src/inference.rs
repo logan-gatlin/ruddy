@@ -49,7 +49,7 @@ fn infer_src(src: &str) -> (Mint, ir::Output, inference::Output) {
 /// either way.
 #[test]
 fn a_complete_trace_is_the_only_thing_the_trace_setting_adds() {
-    let src = "let bad = 1n + \"text\"";
+    let src = "let bad = 1.0 + \"text\"";
     let publish = |trace| {
         let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
         let mut mint = dummy_mint();

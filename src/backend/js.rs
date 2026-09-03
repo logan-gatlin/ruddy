@@ -110,7 +110,8 @@ impl<'a> Generator<'a> {
 
         let prefix = format!(
             "{}@{}::",
-            artifact.header().identity.name, artifact.header().identity.version
+            artifact.header().identity.name,
+            artifact.header().identity.version
         );
         let mut exports = ExportNode::default();
         for value in &artifact.header().values {

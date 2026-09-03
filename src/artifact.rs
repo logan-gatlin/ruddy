@@ -171,12 +171,15 @@ impl UncheckedArtifact {
         // routes hand-built data through the same stack-safe checks as a disk
         // artifact: bounds, formulas, package preorder ownership, rows and
         // absent payloads cannot acquire a second, weaker validation policy.
+        // The tree is decoded without laying it out as text: a block nested
+        // thirty thousand deep is indented thirty thousand times per line, so
+        // the layout alone would be quadratic in the artifact, while the
+        // decoder's checks are the same either way.
         let portable = Artifact {
             header: self.header,
             lir: self.lir,
         };
-        let text = print(&portable);
-        text::try_parse(&text).map_err(|error| ValidationError::new(error.to_string()))
+        text::decode(&portable).map_err(|error| ValidationError::new(error.to_string()))
     }
 
     /// Admit a dependency artifact while recording that validation had to be
@@ -2622,6 +2625,50 @@ pub mod text {
         out.push(b'\n');
         String::from_utf8(out).expect("artifact text is UTF-8")
     }
+    /// Decode an artifact's own portable tree through the reader, which is
+    /// what parsing its canonical text would do minus the text.
+    pub(crate) fn decode(value: &Artifact) -> Result<Artifact, ParseError> {
+        Reader::new().artifact(expanded(artifact(value))?)
+    }
+    /// Replace every compact type spelling in a tree with the list it reads
+    /// as, so the tree is exactly what parsing its text would have produced.
+    /// Iterative, since the tree is as deep as the artifact.
+    fn expanded(root: S) -> Result<S, ParseError> {
+        enum Work {
+            Value(S),
+            Close(usize),
+        }
+        let mut work = vec![Work::Value(root)];
+        let mut out: Vec<S> = Vec::new();
+        while let Some(part) = work.pop() {
+            match part {
+                // Taken out rather than matched out: the tree has a drop of
+                // its own, so its parts are moved through `take`.
+                Work::Value(mut value) => match &mut value {
+                    Raw(text) => {
+                        let text = std::mem::take(text);
+                        let mut parser = Parser {
+                            input: &text,
+                            at: 0,
+                        };
+                        out.push(parser.value()?);
+                    }
+                    L(values) => {
+                        let values = std::mem::take(values);
+                        work.push(Work::Close(values.len()));
+                        work.extend(values.into_iter().rev().map(Work::Value));
+                    }
+                    A(_) | Q(_) => out.push(value),
+                },
+                Work::Close(count) => {
+                    let at = out.len() - count;
+                    let children = out.split_off(at);
+                    out.push(L(children));
+                }
+            }
+        }
+        Ok(out.pop().expect("a tree expands to one value"))
+    }
     /// Parse canonical trusted text; malformed text panics.
     pub fn parse(input: &str) -> Artifact {
         try_parse(input).unwrap_or_else(|error| panic!("{error}"))
@@ -3073,22 +3120,70 @@ pub mod text {
             block(&value.body),
         ])
     }
-    fn block(value: &Block) -> S {
-        L(vec![
-            A("block".into()),
-            L(std::iter::once(A("instrs".into()))
-                .chain(value.instrs.iter().map(instr))
-                .collect()),
-            end(&value.end),
-        ])
-    }
-    fn instr(value: &Instr) -> S {
-        L(vec![
-            A("instr".into()),
-            A(value.temp.to_string()),
-            A(rep_name(value.rep).into()),
-            op(&value.op),
-        ])
+    /// Render one block. Nested blocks are data, not control flow: a `catch`
+    /// or `switch` thirty thousand levels deep has to print on the same stack
+    /// the reader decodes it on, so the walk keeps its continuations on the
+    /// heap and every closure below assembles one node from children already
+    /// rendered.
+    fn block(root: &Block) -> S {
+        type Wrap<'a> = Box<dyn FnOnce(Vec<S>) -> S + 'a>;
+        enum Task<'a> {
+            Block(&'a Block),
+            Instr(&'a Instr),
+            Op(&'a Op),
+            /// Take the last `count` rendered values and combine them.
+            Wrap(usize, Wrap<'a>),
+        }
+        let mut work = vec![Task::Block(root)];
+        let mut out: Vec<S> = Vec::new();
+        while let Some(task) = work.pop() {
+            match task {
+                Task::Block(block) => {
+                    let count = block.instrs.len();
+                    let end = &block.end;
+                    work.push(Task::Wrap(
+                        count,
+                        Box::new(move |instrs| {
+                            L(vec![
+                                A("block".into()),
+                                L(std::iter::once(A("instrs".into())).chain(instrs).collect()),
+                                self::end(end),
+                            ])
+                        }),
+                    ));
+                    work.extend(block.instrs.iter().rev().map(Task::Instr));
+                }
+                Task::Instr(instr) => {
+                    let (temp, rep) = (instr.temp, instr.rep);
+                    work.push(Task::Wrap(
+                        1,
+                        Box::new(move |mut op| {
+                            L(vec![
+                                A("instr".into()),
+                                A(temp.to_string()),
+                                A(rep_name(rep).into()),
+                                op.pop().expect("an instruction renders one operation"),
+                            ])
+                        }),
+                    ));
+                    work.push(Task::Op(&instr.op));
+                }
+                Task::Op(op) => {
+                    let children = nested(op);
+                    work.push(Task::Wrap(
+                        children.len(),
+                        Box::new(move |rendered| self::op(op, rendered)),
+                    ));
+                    work.extend(children.into_iter().rev().map(Task::Block));
+                }
+                Task::Wrap(count, wrap) => {
+                    let at = out.len() - count;
+                    let children = out.split_off(at);
+                    out.push(wrap(children));
+                }
+            }
+        }
+        out.pop().expect("a block renders one value")
     }
     fn field_key(value: &FieldKey) -> S {
         match value {
@@ -3102,7 +3197,35 @@ pub mod text {
             }
         }
     }
-    fn op(value: &Op) -> S {
+    /// The blocks an operation holds, in the order [`op`] consumes them once
+    /// they are rendered.
+    fn nested(value: &Op) -> Vec<&Block> {
+        match value {
+            Op::Catch { body, .. } => vec![body],
+            Op::SwitchTag {
+                cases, fallback, ..
+            } => cases
+                .iter()
+                .map(|case| &case.block)
+                .chain(fallback.iter().map(|block| &**block))
+                .collect(),
+            Op::SwitchPrim {
+                cases, fallback, ..
+            } => cases
+                .iter()
+                .map(|case| &case.block)
+                .chain(fallback.iter().map(|block| &**block))
+                .collect(),
+            Op::SwitchPresence {
+                present, absent, ..
+            } => vec![present, absent],
+            Op::SwitchRest { none, some, .. } => vec![none, some],
+            _ => Vec::new(),
+        }
+    }
+    /// Render one operation, given its nested blocks already rendered by
+    /// [`block`] in the order [`nested`] lists them.
+    fn op(value: &Op, mut blocks: Vec<S>) -> S {
         match value {
             Op::Const(value) => L(vec![A("const".into()), literal(value)]),
             Op::Neg(value) => unary("neg", *value),
@@ -3161,65 +3284,71 @@ pub mod text {
             Op::Extern { target } => L(vec![A("extern".into()), Q(target.clone())]),
             Op::Global { target } => L(vec![A("global".into()), Q(target.clone())]),
             Op::NewTag => A("new-tag".into()),
-            Op::Catch { tag, body } => L(vec![A("catch".into()), A(tag.to_string()), block(body)]),
-            Op::SwitchTag {
-                on,
-                cases,
-                fallback,
-            } => L(vec![
-                A("switch-tag".into()),
-                A(on.to_string()),
-                L(std::iter::once(A("cases".into()))
-                    .chain(
-                        cases
-                            .iter()
-                            .map(|case| L(vec![Q(case.name.clone()), block(&case.block)])),
-                    )
-                    .collect()),
-                optional_block("fallback", fallback),
+            Op::Catch { tag, .. } => L(vec![
+                A("catch".into()),
+                A(tag.to_string()),
+                blocks.pop().expect("a catch renders one body"),
             ]),
-            Op::SwitchPrim {
-                on,
-                cases,
-                fallback,
-            } => L(vec![
-                A("switch-prim".into()),
-                A(on.to_string()),
-                L(std::iter::once(A("cases".into()))
-                    .chain(
-                        cases
-                            .iter()
-                            .map(|case| L(vec![literal(&case.value), block(&case.block)])),
-                    )
-                    .collect()),
-                optional_block("fallback", fallback),
-            ]),
-            Op::SwitchPresence {
-                on,
-                field,
-                present,
-                absent,
-            } => L(vec![
-                A("switch-presence".into()),
-                A(on.to_string()),
-                Q(field.clone()),
-                block(present),
-                block(absent),
-            ]),
-            Op::SwitchRest {
-                on,
-                fields,
-                none,
-                some,
-            } => L(vec![
-                A("switch-rest".into()),
-                A(on.to_string()),
-                L(std::iter::once(A("fields".into()))
-                    .chain(fields.iter().cloned().map(Q))
-                    .collect()),
-                block(none),
-                block(some),
-            ]),
+            Op::SwitchTag { on, cases, .. } => {
+                let fallback = blocks.split_off(cases.len());
+                L(vec![
+                    A("switch-tag".into()),
+                    A(on.to_string()),
+                    L(std::iter::once(A("cases".into()))
+                        .chain(
+                            cases
+                                .iter()
+                                .zip(blocks)
+                                .map(|(case, block)| L(vec![Q(case.name.clone()), block])),
+                        )
+                        .collect()),
+                    L(std::iter::once(A("fallback".into()))
+                        .chain(fallback)
+                        .collect()),
+                ])
+            }
+            Op::SwitchPrim { on, cases, .. } => {
+                let fallback = blocks.split_off(cases.len());
+                L(vec![
+                    A("switch-prim".into()),
+                    A(on.to_string()),
+                    L(std::iter::once(A("cases".into()))
+                        .chain(
+                            cases
+                                .iter()
+                                .zip(blocks)
+                                .map(|(case, block)| L(vec![literal(&case.value), block])),
+                        )
+                        .collect()),
+                    L(std::iter::once(A("fallback".into()))
+                        .chain(fallback)
+                        .collect()),
+                ])
+            }
+            Op::SwitchPresence { on, field, .. } => {
+                let absent = blocks.pop().expect("an absent branch renders");
+                let present = blocks.pop().expect("a present branch renders");
+                L(vec![
+                    A("switch-presence".into()),
+                    A(on.to_string()),
+                    Q(field.clone()),
+                    present,
+                    absent,
+                ])
+            }
+            Op::SwitchRest { on, fields, .. } => {
+                let some = blocks.pop().expect("a some branch renders");
+                let none = blocks.pop().expect("a none branch renders");
+                L(vec![
+                    A("switch-rest".into()),
+                    A(on.to_string()),
+                    L(std::iter::once(A("fields".into()))
+                        .chain(fields.iter().cloned().map(Q))
+                        .collect()),
+                    none,
+                    some,
+                ])
+            }
         }
     }
     fn unary(tag: &str, value: u32) -> S {
@@ -3231,11 +3360,6 @@ pub mod text {
             A(left.to_string()),
             A(right.to_string()),
         ])
-    }
-    fn optional_block(tag: &str, value: &Option<Box<Block>>) -> S {
-        L(std::iter::once(A(tag.into()))
-            .chain(value.iter().map(|value| block(value)))
-            .collect())
     }
     fn end(value: &End) -> S {
         match value {
