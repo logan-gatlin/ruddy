@@ -162,7 +162,7 @@ type Marked = { value: Nat }
 @tags ["core", "demo"]
 effect Noted = Nat -> ()
 
-@js { from: "host/math", "export as": "answer", 0: true }
+@js { from: "host/math", "export as": "answer", flags: { pure: true, arity: 0n } }
 extern answer : Nat = "host.answer"
 
 @owner "core"

@@ -255,6 +255,9 @@ pub type Data = Tracked<DataKind>;
 /// compiler writes is one the reader admits.
 pub const METADATA_DEPTH_LIMIT: usize = 32;
 
+/// The forms lowered data takes: the scalars, arrays, structs keyed by decoded
+/// label, and tags carrying something — with unit and tuples folded into the
+/// struct they are.
 #[derive(Debug, Clone)]
 pub enum DataKind {
     Natural(u64),
@@ -263,9 +266,10 @@ pub enum DataKind {
     String(String),
     Boolean(bool),
     Array(Vec<Data>),
-    /// Fields by decoded label, in written order. Unit and tuples are here
-    /// too: the empty struct, and the struct numbered `0`, `1`, ….
-    Struct(IndexMap<String, Data>),
+    /// Fields by decoded label, in written order, each with where its label
+    /// was written. Unit and tuples are here too: the empty struct, and the
+    /// struct numbered `0`, `1`, ….
+    Struct(IndexMap<String, Field<Data>>),
     /// A case, with what it carries — the empty struct when nothing was
     /// written after the name.
     Tag {
@@ -2094,10 +2098,10 @@ struct Flat {
     externs: Vec<External>,
     /// Shared term/extern source order, which preserves duplicate precedence.
     values: Vec<FlatValue>,
-    /// Every module minted, with where its name was written and its metadata,
-    /// in declaration order. A repeated module is reported where it is minted
-    /// and is not here: the first declaration is the one that stands.
-    modules: Vec<(Module, Span, Metadata)>,
+    /// Every module minted, with its declaration, in declaration order. A
+    /// repeated module is reported where it is minted and is not here: the
+    /// first declaration is the one that stands.
+    modules: Vec<(Module, ModuleDecl)>,
 }
 
 /// An alias declaration as written, waiting to be lowered on first use.
@@ -2756,14 +2760,8 @@ fn build_with_dependency_imports_inner(
     // named from above its own declaration and from another file.
     let mut flat = Flat::default();
     b.flatten(stmts, &mut flat);
-    for (module, name_span, metadata) in std::mem::take(&mut flat.modules) {
-        program.modules.insert(
-            module.symbol(),
-            ModuleDecl {
-                name_span,
-                metadata,
-            },
-        );
+    for (module, declaration) in std::mem::take(&mut flat.modules) {
+        program.modules.insert(module.symbol(), declaration);
     }
     // Every type's name is bound before any type's body is read, so a type can
     // name itself and two types can name each other. That is the whole of what
@@ -9206,7 +9204,11 @@ impl Builder<'_> {
                     // A repeat was reported by the minting and stands for the
                     // first declaration, whose metadata is the one that holds.
                     if self.modules.len() > known {
-                        flat.modules.push((module, name.span, metadata));
+                        let declaration = ModuleDecl {
+                            name_span: name.span,
+                            metadata,
+                        };
+                        flat.modules.push((module, declaration));
                     }
                     self.module = Some(module);
                     self.flatten(body.unwrap_or_default(), flat);
@@ -9269,7 +9271,11 @@ impl Builder<'_> {
                 elements
                     .into_iter()
                     .enumerate()
-                    .map(|(index, element)| (index.to_string(), self.data(element, depth + 1)))
+                    .map(|(index, element)| {
+                        let name_span = element.span;
+                        let value = self.data(element, depth + 1);
+                        (index.to_string(), Field { name_span, value })
+                    })
                     .collect(),
             ),
             parse::DataKind::Array(items) => DataKind::Array(
@@ -9278,27 +9284,11 @@ impl Builder<'_> {
                     .map(|item| self.data(item, depth + 1))
                     .collect(),
             ),
-            parse::DataKind::Struct(fields) => {
-                let mut lowered = IndexMap::new();
-                let mut written: HashMap<String, Span> = HashMap::new();
-                for (name, value) in fields {
-                    let value = self.data(value, depth + 1);
-                    match written.get(&name.tracked) {
-                        Some(&previous) => self.error(
-                            name.span,
-                            ErrorKind::DuplicateField {
-                                name: name.tracked,
-                                previous,
-                            },
-                        ),
-                        None => {
-                            written.insert(name.tracked.clone(), name.span);
-                            lowered.insert(name.tracked, value);
-                        }
-                    }
-                }
-                DataKind::Struct(lowered)
-            }
+            parse::DataKind::Struct(fields) => DataKind::Struct(self.labels(
+                fields,
+                |name, previous| ErrorKind::DuplicateField { name, previous },
+                |b, value| b.data(value, depth + 1),
+            )),
             parse::DataKind::Tag { name, payload } => DataKind::Tag {
                 payload: Box::new(match payload {
                     Some(payload) => self.data(*payload, depth + 1),

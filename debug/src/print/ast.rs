@@ -223,7 +223,7 @@ impl fmt::Display for Ast<'_, DataKind> {
                         f,
                         order
                             .into_iter()
-                            .map(|insertion| Ast(&fields[insertion].1.tracked)),
+                            .map(|insertion| Ast(&fields[insertion].tracked)),
                     )
                 } else {
                     write_struct(

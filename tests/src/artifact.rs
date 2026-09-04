@@ -2475,19 +2475,19 @@ fn metadata_round_trips_through_artifact_text() {
     );
     let printed = assert_round_trip(&artifact);
     for expected in [
-        "(k \"n\" (nat 1))",
-        "(k \"i\" (int 1))",
-        "(k \"r\" (real 1.5))",
-        "(k \"whole\" (real 1))",
-        "(k \"b\" (bool false))",
-        "(k \"s\" (string \"a\\\"b\\\\c\\nd\\te\"))",
-        "(k \"raw\" (string \" first line\\n second line\"))",
+        "(entry \"n\" (nat 1))",
+        "(entry \"i\" (int 1))",
+        "(entry \"r\" (real 1.5))",
+        "(entry \"whole\" (real 1))",
+        "(entry \"b\" (bool false))",
+        "(entry \"s\" (string \"a\\\"b\\\\c\\nd\\te\"))",
+        "(entry \"raw\" (string \" first line\\n second line\"))",
         "\"Tag\"",
         "(field \"0\" (nat 1))",
         "(field \"1\" (array (bool true) (bool false)))",
         "(field \"plain\" (struct))",
         "(field \"deep\" (tag \"A\" (struct)))",
-        "(module \"tests@0.1.0::M\" (metadata (k \"m\" (struct))))",
+        "(module \"tests@0.1.0::M\" (metadata (entry \"m\" (struct))))",
     ] {
         assert!(printed.contains(expected), "{expected}\n{printed}");
     }
@@ -2514,17 +2514,17 @@ fn malformed_metadata_text_is_refused() {
         ("(field \"a\"", "(fld \"a\""),
         ("(field \"a\" ", "(field "),
         ("(metadata", "(meta"),
-        ("(k \"k\"", "(k"),
-        ("(k \"k\"", "(key \"k\""),
+        ("(entry \"k\"", "(entry"),
+        ("(entry \"k\"", "(key \"k\""),
         ("(struct (field", "(struct field"),
-        ("(metadata (k \"k\"", "(metadata k (k \"k\""),
+        ("(metadata (entry \"k\"", "(metadata k (entry \"k\""),
         (
             "(struct (field \"a\" (tag \"T\" (nat 1))))",
             "(struct (field \"a\" (nat 1)) (field \"a\" (nat 2)))",
         ),
         (
-            "(metadata (k \"k\" (struct (field \"a\" (tag \"T\" (nat 1)))))",
-            "(metadata (k \"k\" (nat 1)) (k \"k\" (nat 2)))",
+            "(metadata (entry \"k\" (struct (field \"a\" (tag \"T\" (nat 1)))))",
+            "(metadata (entry \"k\" (nat 1)) (entry \"k\" (nat 2)))",
         ),
         ("(modules)", "(modules (module \"tests@0.1.0::M\"))"),
         ("(modules)", "(modules (mod \"tests@0.1.0::M\" (metadata)))"),

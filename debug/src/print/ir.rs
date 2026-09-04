@@ -326,14 +326,10 @@ impl fmt::Display for Show<'_, DataKind> {
                         f,
                         order
                             .into_iter()
-                            .map(|insertion| self.show(&fields[insertion])),
+                            .map(|insertion| self.show(&fields[insertion].value)),
                     )
                 } else {
-                    write_struct(
-                        f,
-                        fields.iter().map(|(name, value)| (name, self.show(value))),
-                        None,
-                    )
+                    write_struct(f, self.pairs(fields), None)
                 }
             }
             DataKind::Tag { name, payload } => write_tag(

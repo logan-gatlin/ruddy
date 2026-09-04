@@ -50,6 +50,8 @@ pub struct Attribute {
 /// lowering to LIR never see one.
 pub type Data = Tracked<DataKind>;
 
+/// The forms a metadata value takes, as written: every literal an expression
+/// has, and nothing an expression computes.
 #[derive(Debug, Clone)]
 pub enum DataKind {
     Natural(u64),
@@ -63,10 +65,10 @@ pub enum DataKind {
     /// numbers a tuple expression's fields.
     Tuple(Vec<Data>),
     Array(Vec<Data>),
-    /// `{ a: 1n, "b": 2n }` — fields in written order, with their labels as
-    /// written. Duplicates are recorded and refused in lowering, where struct
-    /// expressions' are.
-    Struct(Vec<(TrackedString, Data)>),
+    /// `{ a: 1n, "b": 2n }` — fields in written order, keyed by their labels
+    /// as written, spans included, so a label written twice is two entries.
+    /// The repeat is refused in lowering, where a struct expression's is.
+    Struct(IndexMap<TrackedString, Data>),
     /// `#Some 1n`, or `#None` carrying nothing, which is unit.
     Tag {
         name: TrackedString,
@@ -1626,13 +1628,11 @@ impl Parser {
     /// value computed from another, and this is data.
     fn data_struct(&mut self) -> Option<Data> {
         let open = self.eat(&Kind::LeftBrace).expect("the caller peeked `{`");
-        let mut fields = Vec::new();
+        let mut fields = IndexMap::new();
         while !self.at_expr_boundary() {
-            if let Some(dots) = self
-                .peek()
-                .filter(|tok| matches!(tok.tracked, Kind::DotDot))
-            {
-                self.error(dots.span, ErrorKind::MetadataNotLiteral);
+            if self.at(&Kind::DotDot) {
+                let span = self.peek().expect("the cursor is on `..`").span;
+                self.error(span, ErrorKind::MetadataNotLiteral);
                 return None;
             }
             if self.at_wildcard() {
@@ -1641,7 +1641,7 @@ impl Parser {
             let name = self.field_label()?;
             self.eat(&Kind::Colon)?;
             let value = self.data()?;
-            fields.push((name, value));
+            fields.insert(name, value);
             if self.eat_if(&Kind::Comma).is_none() {
                 break;
             }

@@ -2314,6 +2314,7 @@ fn metadata(value: &ir::Metadata) -> Metadata {
         .collect()
 }
 
+/// One lowered metadata value, with its spans left behind.
 fn data(value: &ir::Data) -> Data {
     match &value.tracked {
         ir::DataKind::Natural(value) => Data::Natural(*value),
@@ -2325,7 +2326,7 @@ fn data(value: &ir::Data) -> Data {
         ir::DataKind::Struct(fields) => Data::Struct(
             fields
                 .iter()
-                .map(|(name, value)| (name.clone(), data(value)))
+                .map(|(name, field)| (name.clone(), data(&field.value)))
                 .collect(),
         ),
         ir::DataKind::Tag { name, payload } => Data::Tag {
@@ -3094,14 +3095,14 @@ pub mod text {
             metadata(&value.metadata),
         ])
     }
-    /// `(metadata (k "key" <data>) ...)` — a declaration's metadata, in the
-    /// order it was written.
+    /// `(metadata (entry "key" <data>) ...)` — a declaration's metadata, in
+    /// the order it was written.
     fn metadata(value: &Metadata) -> S {
         L(std::iter::once(A("metadata".into()))
             .chain(
                 value
                     .iter()
-                    .map(|(key, value)| L(vec![A("k".into()), Q(key.clone()), data(value)])),
+                    .map(|(key, value)| L(vec![A("entry".into()), Q(key.clone()), data(value)])),
             )
             .collect())
     }
@@ -4297,7 +4298,7 @@ pub mod text {
         fn read_metadata(&self, value: S) -> Metadata {
             let mut metadata = Metadata::new();
             for entry in self.many(value, "metadata") {
-                let mut entry = self.exact(self.list(entry, "k"), 2, "k");
+                let mut entry = self.exact(self.list(entry, "entry"), 2, "entry");
                 let key = self.string(self.take(&mut entry));
                 let data = self.read_data(self.take(&mut entry), 1);
                 if metadata.insert(key, data).is_some() {
