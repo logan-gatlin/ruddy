@@ -14,4 +14,5 @@
   (tuple_type)
   (effect_definition)
   (module_definition)
+  (block_comment)
 ] @fold

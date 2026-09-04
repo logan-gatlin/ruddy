@@ -190,6 +190,9 @@ pub enum ErrorKind {
     UnknownStringEscape { escape: char },
     /// A string reached a line boundary or the end of input before its quote.
     MissingClosingQuote,
+    /// A block comment reached the end of input with a `(*` still unmatched
+    /// by any `*)` — its own or one nested inside it.
+    MissingClosingComment,
 }
 
 pub struct Output {
@@ -225,14 +228,22 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                     tokens.push(file_id.span(start, 1).track(Kind::Equal));
                 }
             }
-            // `->` wins over the standalone minus.
+            // `->` wins over the standalone minus, and `--` wins over both:
+            // the longer lexeme decides before the shorter one is assumed,
+            // the way `..` and `=>` already are. A line comment carries no
+            // token, the way whitespace does not.
             '-' => {
                 chars.next();
-                if let Some(&(_, '>')) = chars.peek() {
-                    chars.next();
-                    tokens.push(file_id.span(start, 2).track(Kind::Arrow));
-                } else {
-                    tokens.push(file_id.span(start, 1).track(Kind::Minus));
+                match chars.peek() {
+                    Some(&(_, '>')) => {
+                        chars.next();
+                        tokens.push(file_id.span(start, 2).track(Kind::Arrow));
+                    }
+                    Some(&(_, '-')) => {
+                        chars.next();
+                        line_comment(&mut chars);
+                    }
+                    _ => tokens.push(file_id.span(start, 1).track(Kind::Minus)),
                 }
             }
             // `::` separates a path's segments; a lone `:` ascribes. The longer
@@ -319,6 +330,14 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                     tokens.push(file_id.span(start, c.len_utf8()).track(Kind::Pipe));
                 }
             }
+            // `\\` opens a raw string line, and wins over two absence marks
+            // the way `--` wins over two minuses: nothing in the language
+            // writes one `\` directly after another. Decided by looking past
+            // the first `\` without consuming it, the way `(*` is.
+            '\\' if matches!(chars.clone().nth(1), Some((_, '\\'))) => {
+                let (value, width) = raw_string(&mut chars);
+                tokens.push(file_id.span(start, width).track(Kind::String(value)));
+            }
             // Never a lex error, unlike `-` and the `#`: what may follow a
             // `\` is the parser's business.
             '\\' => {
@@ -370,6 +389,16 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                     delimiters.pop();
                 }
                 chars.next();
+            }
+            // `(*` opens a block comment rather than a parenthesis — decided
+            // by looking past the `(` without consuming it, the way a `!`
+            // ahead of `=` is.
+            '(' if matches!(chars.clone().nth(1), Some((_, '*'))) => {
+                let (result, width) = block_comment(&mut chars);
+                if let Err(kind) = result {
+                    let span = file_id.span(start, width);
+                    invalid(span, kind, &mut tokens, &mut errors);
+                }
             }
             '(' => {
                 tokens.push(file_id.span(start, c.len_utf8()).track(Kind::LeftParen));
@@ -562,6 +591,105 @@ fn string(chars: &mut Peekable<CharIndices<'_>>) -> (Result<String, ErrorKind>, 
             _ => value.push(c),
         }
     }
+}
+
+/// Read a raw string: one or more `\\` lines, from the first `\\` onward.
+///
+/// Each line runs from the character after its `\\` to the end of that line,
+/// verbatim — no escapes, and no closing delimiter, so unlike [`string`] this
+/// cannot fail: the line is the only boundary it needs, and it always comes.
+/// Whitespace before a line's `\\` is the file's indentation and is not
+/// content; whitespace after it is.
+///
+/// Consecutive `\\` lines with nothing but whitespace between them are one
+/// string, joined by a newline between each pair and by none after the last,
+/// so a final empty `\\` line is how a trailing newline is written. Anything
+/// else between two lines — a comment included — ends the string at the
+/// first, and the second is a string of its own.
+fn raw_string(chars: &mut Peekable<CharIndices<'_>>) -> (String, usize) {
+    let mut value = String::new();
+    let mut width = 0;
+    loop {
+        for expected in ['\\', '\\'] {
+            let (_, opener) = chars.next().expect("the caller peeked both opening `\\`");
+            debug_assert_eq!(opener, expected);
+        }
+        width += 2;
+        while let Some(&(_, c)) = chars.peek() {
+            if matches!(c, '\n' | '\r') {
+                break;
+            }
+            chars.next();
+            width += c.len_utf8();
+            value.push(c);
+        }
+
+        // Look past the whitespace for the next line's `\\` without consuming
+        // anything: if it is not there, the whitespace is the main loop's.
+        let mut ahead = chars.clone();
+        while ahead.peek().is_some_and(|&(_, c)| c.is_whitespace()) {
+            ahead.next();
+        }
+        let continues = ahead.next().is_some_and(|(_, c)| c == '\\')
+            && ahead.next().is_some_and(|(_, c)| c == '\\');
+        if !continues {
+            return (value, width);
+        }
+        while let Some((_, c)) = chars.next_if(|&(_, c)| c.is_whitespace()) {
+            width += c.len_utf8();
+        }
+        value.push('\n');
+    }
+}
+
+/// Consume a `--` line comment's remaining text, up to but not including the
+/// newline that ends it, or the end of input. Carries no token, the way
+/// whitespace does not — the line itself is the only delimiter it needs.
+fn line_comment(chars: &mut Peekable<CharIndices<'_>>) {
+    while let Some(&(_, c)) = chars.peek() {
+        if c == '\n' {
+            break;
+        }
+        chars.next();
+    }
+}
+
+/// Consume a `(* ... *)` block comment, from its opening `(*` onward.
+///
+/// A `(*` inside the comment reopens the count, and only the `*)` that
+/// matches it closes that nesting rather than the outer one, so
+/// `(* (* *) *)` is one comment rather than a comment followed by stray text.
+/// Carries no token, the way [`string`]'s caller does carry one: a comment
+/// has no value to keep, only a width to have consumed.
+fn block_comment(chars: &mut Peekable<CharIndices<'_>>) -> (Result<(), ErrorKind>, usize) {
+    let (_, open) = chars.next().expect("the caller peeked the opening `(`");
+    debug_assert_eq!(open, '(');
+    let (_, star) = chars.next().expect("the caller peeked the opening `*`");
+    debug_assert_eq!(star, '*');
+    let mut depth = 1u32;
+    let mut width = 2;
+
+    while depth > 0 {
+        let Some(&(_, c)) = chars.peek() else {
+            return (Err(ErrorKind::MissingClosingComment), width);
+        };
+        chars.next();
+        width += c.len_utf8();
+        match c {
+            '(' if matches!(chars.peek(), Some(&(_, '*'))) => {
+                chars.next();
+                width += 1;
+                depth += 1;
+            }
+            '*' if matches!(chars.peek(), Some(&(_, ')'))) => {
+                chars.next();
+                width += 1;
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    (Ok(()), width)
 }
 
 fn word(chars: &mut Peekable<CharIndices<'_>>) -> String {

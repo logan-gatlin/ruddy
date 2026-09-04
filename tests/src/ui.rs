@@ -143,6 +143,7 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         LexError::NumericFieldTooLarge,
         LexError::UnknownStringEscape { escape: 'q' },
         LexError::MissingClosingQuote,
+        LexError::MissingClosingComment,
     ] {
         all.push(("lex", kind.code(), kind.to_string()));
     }

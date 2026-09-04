@@ -1,0 +1,39 @@
+================================================================================
+A line comment and a block comment sit beside the code they annotate
+================================================================================
+
+-- explains the next definition
+let x = 1 -- trailing remark
+
+(* a block comment
+   spanning several lines *) let y = (* inline *) 2
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (line_comment)
+  (let_definition
+    (identifier)
+    (natural))
+  (line_comment)
+  (block_comment)
+  (let_definition
+    (identifier)
+    (block_comment)
+    (natural)))
+
+================================================================================
+Block comments nest
+================================================================================
+
+(* outer (* inner *) still outer *)
+let z = 3
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (block_comment
+    (block_comment))
+  (let_definition
+    (identifier)
+    (natural)))

@@ -9,6 +9,11 @@
 ; Later patterns win over earlier ones, so the catch-all names come first and
 ; every position that knows better comes after.
 
+; ── comments ─────────────────────────────────────────────────────────────────
+
+(line_comment) @comment
+(block_comment) @comment
+
 ; ── names ────────────────────────────────────────────────────────────────────
 
 (identifier) @variable

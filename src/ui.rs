@@ -328,6 +328,7 @@ impl token::ErrorKind {
             token::ErrorKind::NumericFieldTooLarge => "field-number-too-large",
             token::ErrorKind::UnknownStringEscape { .. } => "unknown-string-escape",
             token::ErrorKind::MissingClosingQuote => "missing-closing-quote",
+            token::ErrorKind::MissingClosingComment => "missing-closing-comment",
         }
     }
 }
@@ -413,10 +414,27 @@ impl token::Error {
                     self.span.file_id.span(self.span.end(), 0),
                 )
                 .label("add `\"` here")
-                .help("strings must start and finish on the same line");
+                .help(
+                    "strings must start and finish on the same line; \
+                     for one that spans lines, begin each line with `\\\\`",
+                );
                 diagnostic.related.push(Annotation {
                     span: self.span.file_id.span(self.span.start, 1),
                     message: "the string starts here".into(),
+                });
+                diagnostic
+            }
+            E::MissingClosingComment => {
+                let mut diagnostic = Diagnostic::new(
+                    self.kind.code(),
+                    "this comment is missing its closing `*)`",
+                    self.span.file_id.span(self.span.end(), 0),
+                )
+                .label("add `*)` here")
+                .help("every `(*` needs a `*)` of its own, including ones nested inside it");
+                diagnostic.related.push(Annotation {
+                    span: self.span.file_id.span(self.span.start, 2),
+                    message: "the comment starts here".into(),
                 });
                 diagnostic
             }

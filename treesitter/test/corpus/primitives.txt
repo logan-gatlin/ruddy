@@ -34,3 +34,39 @@ let f = fn x => match x with
         (match_arm
           (wildcard)
           (boolean))))))
+
+================================================================================
+Raw string lines are one string, and a comment between them makes two
+================================================================================
+
+extern f : fn(Int) -> Int =
+  \\(x) => {
+  \\  return x -- not a comment
+  \\}
+
+let s = \\one line
+
+let t = \\a
+-- between
+let u = \\b
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (extern_definition
+    (identifier)
+    (extern_annotation
+      (extern_function_type
+        (identifier)
+        (identifier)))
+    (string))
+  (let_definition
+    (identifier)
+    (string))
+  (let_definition
+    (identifier)
+    (string))
+  (line_comment)
+  (let_definition
+    (identifier)
+    (string)))

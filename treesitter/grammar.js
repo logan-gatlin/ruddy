@@ -5,7 +5,7 @@
  * `src/parse.rs` is the source of truth: every rule below is named after the
  * production it stands for there.
  *
- * The language has no comments, so `extras` is whitespace and nothing else.
+ * `extras` is whitespace and the two comment forms `token::lex` recognizes.
  */
 
 /// <reference types="tree-sitter-cli/dsl" />
@@ -97,7 +97,7 @@ module.exports = grammar({
     ],
   },
 
-  extras: _ => [/\s/],
+  extras: $ => [/\s/, $.line_comment, $.block_comment],
 
   // This is a precedence-only choice, not a syntax node in the tree.
   inline: $ => [
@@ -903,10 +903,46 @@ module.exports = grammar({
       String.raw`[0-9]+(?:\.[0-9]+[\p{Alphabetic}\p{N}_]*|(?:[\p{Alphabetic}_]|[\p{N}&&[^0-9]])[\p{Alphabetic}\p{N}_]*)`,
     ),
 
-    /** A double-quoted UTF-8 string with the escapes token::lex accepts. */
-    string: _ => token(seq('"', repeat(choice(/[^"\\]/, /\\["\\nrt]/)), '"')),
+    /**
+     * A double-quoted UTF-8 string with the escapes token::lex accepts, or a
+     * raw string: one or more `\\` lines, each running to the end of its line
+     * with nothing escaped, joined by the whitespace between them alone.
+     * Mirrors `token::raw_string` — one token, because the lexer makes one:
+     * the whitespace between the lines is inside it, not an extra.
+     */
+    string: _ => token(choice(
+      seq('"', repeat(choice(/[^"\\]/, /\\["\\nrt]/)), '"'),
+      seq(/\\\\[^\n\r]*/, repeat(seq(/\s+/, /\\\\[^\n\r]*/))),
+    )),
 
     /** The two boolean literals, reserved by token::lex. */
     boolean: _ => choice('true', 'false'),
+
+    /**
+     * `--`, running to the end of its line. Mirrors `token::line_comment`.
+     */
+    line_comment: _ => token(seq('--', /[^\n]*/)),
+
+    /**
+     * `(* ... *)`. May span several lines, and nests: a `(*` written inside
+     * one reopens the count, and only the `*)` matching it closes that
+     * nesting rather than the outer comment. Mirrors `token::block_comment`,
+     * which is why this is a rule rather than a `token()` — the nesting is
+     * not a regular language.
+     *
+     * The body is "any one character", read one at a time rather than by a
+     * lookahead regex — this grammar's regex engine has none. That is enough:
+     * wherever `(*` or `*)` can instead be read as the longer two-character
+     * lexeme, the generated lexer's longest-match rule reads it that way, the
+     * same one character at a time `token::block_comment` decides with.
+     */
+    block_comment: $ => seq(
+      '(*',
+      repeat(choice(
+        $.block_comment,
+        /[\s\S]/,
+      )),
+      '*)',
+    ),
   },
 });

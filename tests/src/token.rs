@@ -635,6 +635,123 @@ fn lexes_the_backslash() {
     assert_eq!(slash.tracked.to_string(), "\\");
 }
 
+/// `\\` opens a raw string line: everything after it to the end of the line,
+/// verbatim. There is no closing delimiter and no escape, so nothing can go
+/// wrong inside one — the line ends it, and a line always ends.
+#[test]
+fn a_double_backslash_is_a_raw_string_line() {
+    assert!(matches!(&kinds("\\\\hello")[..], [Kind::String(value)] if value == "hello"));
+    assert!(matches!(&kinds("\\\\")[..], [Kind::String(value)] if value.is_empty()));
+    // Whitespace after the `\\` is content; the escapes an ordinary string
+    // decodes, and the quote that would close one, are content too.
+    assert!(matches!(
+        &kinds("\\\\  \"quoted\" and \\n and \\\\ and `tick`")[..],
+        [Kind::String(value)] if value == "  \"quoted\" and \\n and \\\\ and `tick`"
+    ));
+    // A comment marker inside the line is content, not a comment.
+    assert!(matches!(
+        &kinds("\\\\a -- not a comment (* nor this *)")[..],
+        [Kind::String(value)] if value == "a -- not a comment (* nor this *)"
+    ));
+    // It may sit mid-line, after other tokens, and takes the rest of the line.
+    assert!(matches!(
+        &kinds("let s = \\\\text)")[..],
+        [Kind::Let, Kind::Identifier(_), Kind::Equal, Kind::String(value)] if value == "text)"
+    ));
+    assert!(errors("\\\\ \\\\ \\\\").is_empty());
+}
+
+/// Consecutive `\\` lines with only whitespace between them are one string,
+/// joined by newlines: one between each pair, none after the last. The
+/// indentation before each `\\` is the file's, not the string's.
+#[test]
+fn consecutive_raw_string_lines_join_with_newlines() {
+    assert!(matches!(
+        &kinds("\\\\a\n\\\\b")[..],
+        [Kind::String(value)] if value == "a\nb"
+    ));
+    assert!(matches!(
+        &kinds("let s =\n    \\\\(x) => {\n    \\\\  return x\n    \\\\}\n")[..],
+        [Kind::Let, Kind::Identifier(_), Kind::Equal, Kind::String(value)]
+            if value == "(x) => {\n  return x\n}"
+    ));
+    // A final empty line is how a trailing newline is written.
+    assert!(matches!(
+        &kinds("\\\\a\n\\\\")[..],
+        [Kind::String(value)] if value == "a\n"
+    ));
+    // Blank lines between two `\\` lines are whitespace, so they join too;
+    // an empty `\\` line is how an empty line of content is written.
+    assert!(matches!(
+        &kinds("\\\\a\n\n\\\\b")[..],
+        [Kind::String(value)] if value == "a\nb"
+    ));
+    assert!(matches!(
+        &kinds("\\\\a\n\\\\\n\\\\b")[..],
+        [Kind::String(value)] if value == "a\n\nb"
+    ));
+    // A `\r\n` line end is a line end, and the `\r` is not content.
+    assert!(matches!(
+        &kinds("\\\\a\r\n\\\\b\r\n")[..],
+        [Kind::String(value)] if value == "a\nb"
+    ));
+    // Any whitespace, not only ASCII, is only indentation.
+    assert!(matches!(
+        &kinds("\\\\a\n\u{a0}\u{2003}\\\\b")[..],
+        [Kind::String(value)] if value == "a\nb"
+    ));
+
+    // The span runs from the first `\\` to the end of the last line's content,
+    // so the whole string is what a diagnostic underlines.
+    let src = "x\n  \\\\a\n  \\\\bc\nlet";
+    let out = lex(src, FileID::GENERATED);
+    let string = &out.tokens[1];
+    assert!(matches!(&string.tracked, Kind::String(value) if value == "a\nbc"));
+    assert_eq!(string.span.start, 4);
+    assert_eq!(string.span.width, "\\\\a\n  \\\\bc".len());
+    assert!(matches!(out.tokens[2].tracked, Kind::Let));
+}
+
+/// Anything that is not whitespace between two `\\` lines ends the string at
+/// the first — a comment included, since it is read after the line, not
+/// inside it. The second line is then a string of its own.
+#[test]
+fn anything_but_whitespace_between_raw_string_lines_keeps_them_apart() {
+    assert!(matches!(
+        &kinds("\\\\a\n-- between\n\\\\b")[..],
+        [Kind::String(a), Kind::String(b)] if a == "a" && b == "b"
+    ));
+    assert!(matches!(
+        &kinds("\\\\a\n(* between *) \\\\b")[..],
+        [Kind::String(a), Kind::String(b)] if a == "a" && b == "b"
+    ));
+    assert!(matches!(
+        &kinds("\\\\a\n, \\\\b")[..],
+        [Kind::String(a), Kind::Comma, Kind::String(b)] if a == "a" && b == "b"
+    ));
+    // A single `\` on the next line is still the absence mark, not a
+    // continuation — and never a lex error on its own.
+    assert!(matches!(
+        &kinds("\\\\a\n\\y")[..],
+        [Kind::String(a), Kind::Backslash, Kind::Identifier(y)] if a == "a" && y == "y"
+    ));
+    assert!(matches!(
+        &kinds("\\\\a\n\\")[..],
+        [Kind::String(a), Kind::Backslash] if a == "a"
+    ));
+}
+
+/// `\\` wins over two absence marks, the way `--` wins over two minuses: the
+/// longer lexeme decides first. Written apart, they are still two marks.
+#[test]
+fn two_backslashes_written_apart_stay_two_marks() {
+    assert!(matches!(
+        &kinds("\\ \\y")[..],
+        [Kind::Backslash, Kind::Backslash, Kind::Identifier(name)] if name == "y"
+    ));
+    assert!(matches!(&kinds("\\\\y")[..], [Kind::String(value)] if value == "y"));
+}
+
 #[test]
 fn lexes_the_pipeline_as_one_token() {
     assert!(matches!(
@@ -816,4 +933,132 @@ fn a_sigil_followed_by_a_non_identifier_word_is_rejected() {
     assert!(!out.errors.is_empty());
     let out = lex("1.a", FileID::GENERATED);
     assert!(out.errors.is_empty());
+}
+
+/// `--` opens a line comment. It carries no token, the way whitespace does
+/// not, and needs no newline to close it: the end of input closes it too.
+#[test]
+fn line_comments_swallow_to_the_end_of_the_line() {
+    assert!(matches!(kinds("-- a whole line")[..], []));
+    assert!(matches!(
+        kinds("let x = 1n -- trailing")[..],
+        [
+            Kind::Let,
+            Kind::Identifier(_),
+            Kind::Equal,
+            Kind::Natural(1)
+        ]
+    ));
+    assert!(matches!(
+        kinds("let x = 1n -- trailing\nlet y = 2n")[..],
+        [
+            Kind::Let,
+            Kind::Identifier(_),
+            Kind::Equal,
+            Kind::Natural(1),
+            Kind::Let,
+            Kind::Identifier(_),
+            Kind::Equal,
+            Kind::Natural(2),
+        ]
+    ));
+    assert!(errors("-- nothing else on this line").is_empty());
+}
+
+/// `->` still wins in front of one `-`, and `--` wins in front of a second:
+/// the longer lexeme decides before a shorter one is assumed, the way `..`
+/// beats two dots. So `-->` is a comment, never a minus before an arrow.
+#[test]
+fn a_double_minus_is_a_comment_not_two_minuses() {
+    assert!(matches!(kinds("-->")[..], []));
+    assert!(matches!(
+        kinds("A - B")[..],
+        [Kind::Identifier(_), Kind::Minus, Kind::Identifier(_)]
+    ));
+    assert!(matches!(
+        kinds("A -> B")[..],
+        [Kind::Identifier(_), Kind::Arrow, Kind::Identifier(_)]
+    ));
+}
+
+/// `(*` and `*)` delimit a block comment. Like a line comment it carries no
+/// token, but unlike one it may run across lines: only `*)` closes it.
+#[test]
+fn block_comments_swallow_everything_between_their_delimiters() {
+    assert!(matches!(kinds("(**)")[..], []));
+    assert!(matches!(kinds("(* a block comment *)")[..], []));
+    assert!(matches!(kinds("(*\nspans\nlines\n*)")[..], []));
+    assert!(matches!(
+        kinds("let x = (* inline *) 1n")[..],
+        [
+            Kind::Let,
+            Kind::Identifier(_),
+            Kind::Equal,
+            Kind::Natural(1)
+        ]
+    ));
+    // A lone `(` is still a parenthesis: only `(*` begins a comment.
+    assert!(matches!(
+        kinds("(1)")[..],
+        [Kind::LeftParen, Kind::Real(_), Kind::RightParen]
+    ));
+    // Parentheses that are only comment text play no part in delimiter
+    // tracking, so the numeric-field rule they would otherwise disturb still
+    // sees straight through the comment to the tuple around it.
+    assert!(matches!(
+        kinds("(1, (* (2, 3) *) 4)")[..],
+        [
+            Kind::LeftParen,
+            Kind::Real(_),
+            Kind::Comma,
+            Kind::Real(_),
+            Kind::RightParen,
+        ]
+    ));
+}
+
+/// Block comments nest: a `(*` written inside one reopens the count, and only
+/// the `*)` that matches it closes that nesting rather than the outer
+/// comment — so an inner close alone does not end the whole thing.
+#[test]
+fn block_comments_nest() {
+    assert!(matches!(kinds("(* (* *) *)")[..], []));
+    assert!(matches!(kinds("(* (* (* *) *) *)")[..], []));
+    assert!(matches!(
+        kinds("(* (* *) still inside *) let x = 1n")[..],
+        [
+            Kind::Let,
+            Kind::Identifier(_),
+            Kind::Equal,
+            Kind::Natural(1)
+        ]
+    ));
+}
+
+/// An unclosed block comment is one invalid lexeme spanning everything the
+/// lexer read looking for a `*)` that never came — the whole of what was
+/// consumed, the way an unterminated string's span is, except a comment has
+/// no line boundary to stop it early.
+#[test]
+fn an_unclosed_block_comment_is_one_invalid_lexeme() {
+    for src in [
+        "(* unterminated",
+        "(*",
+        "(* (* *)",
+        "(* (* nested still open *)",
+    ] {
+        let out = lex(src, FileID::GENERATED);
+        assert_eq!(out.errors.len(), 1, "{src:?}: {:#?}", out.errors);
+        assert_eq!(
+            out.errors[0].kind,
+            ErrorKind::MissingClosingComment,
+            "{src}"
+        );
+        assert_eq!(out.errors[0].span.start, 0, "{src}");
+        assert_eq!(out.errors[0].span.width, src.len(), "{src}");
+        assert!(
+            matches!(&out.tokens[..], [token] if matches!(token.tracked, Kind::Invalid)),
+            "{src:?}"
+        );
+    }
 }
