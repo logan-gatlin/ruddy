@@ -10,6 +10,8 @@
   (tuple_expression)
   (struct_pattern)
   (tuple_pattern)
+  (array_pattern)
+  (array_expression)
   (struct_type)
   (tuple_type)
   (effect_definition)

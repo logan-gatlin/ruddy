@@ -19,8 +19,8 @@ use ruddy::{
 
 use crate::print::{
     Entry, Grouped, Mark, Prec, Shape, label, string, tuple_field_order, write_applied,
-    write_apply, write_arrow, write_binary, write_let, write_match, write_project, write_row,
-    write_struct, write_sum, write_tag, write_tuple, write_unary,
+    write_apply, write_array_pattern, write_arrow, write_binary, write_let, write_match,
+    write_project, write_row, write_struct, write_sum, write_tag, write_tuple, write_unary,
 };
 
 /// Pairs a node with the mint that can name its symbols. Printing an IR node
@@ -300,7 +300,8 @@ impl Grouped for Show<'_, PatternKind> {
             | PatternKind::String(_)
             | PatternKind::Boolean(_)
             | PatternKind::Unit
-            | PatternKind::Struct { .. } => Prec::Atom,
+            | PatternKind::Struct { .. }
+            | PatternKind::Array { .. } => Prec::Atom,
         }
     }
 }
@@ -327,6 +328,17 @@ impl fmt::Display for Show<'_, PatternKind> {
                 &name.tracked,
                 None,
                 payload.as_deref().map(|payload| self.show(payload)),
+            ),
+            PatternKind::Array {
+                before,
+                rest,
+                after,
+            } => write_array_pattern(
+                f,
+                before.iter().map(|element| self.show(element)),
+                rest.as_ref()
+                    .map(|rest| rest.name.as_ref().map(|name| self.mint.name(name.tracked))),
+                after.iter().map(|element| self.show(element)),
             ),
             // Through `write_row` rather than `write_struct`, because a
             // pattern's field list can end in the `..` that makes it open —
@@ -455,13 +467,16 @@ impl fmt::Display for Show<'_, TermKind> {
                     write_struct(f, self.pairs(fields))
                 }
             }
-            TermKind::Array(elements) => {
+            TermKind::Array(items) => {
                 f.write_str("[")?;
-                for (index, element) in elements.iter().enumerate() {
+                for (index, item) in items.iter().enumerate() {
                     if index != 0 {
                         f.write_str(", ")?;
                     }
-                    write!(f, "{}", self.show(element))?;
+                    if item.spread.is_some() {
+                        f.write_str("..")?;
+                    }
+                    write!(f, "{}", self.show(&item.value))?;
                 }
                 f.write_str("]")
             }

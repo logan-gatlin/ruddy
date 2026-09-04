@@ -798,12 +798,20 @@ impl Constrain<'_> {
                     rest: Rest::Closed,
                 }))
             }
-            TermKind::Array(elements) => {
+            // A spread item is an array of the literal's own type, checked as
+            // such; a plain one is an element.
+            TermKind::Array(items) => {
                 let element = self.table.fresh_type_for(Subject::Term);
-                for value in elements {
-                    self.check_term(value, &element, Subject::Context, None);
+                let array = Rc::new(Ty::Array(element.clone()));
+                for item in items {
+                    match item.spread {
+                        Some(dots) => {
+                            self.check_term(&mut item.value, &array, Subject::Spread, Some(dots))
+                        }
+                        None => self.check_term(&mut item.value, &element, Subject::Context, None),
+                    }
                 }
-                Rc::new(Ty::Array(element))
+                array
             }
             // A tag is one case of a sum, and which sum is not for the literal
             // to say — so the type it gets names that case and leaves the tail
@@ -1216,6 +1224,11 @@ impl Constrain<'_> {
         let mut primitives: Vec<Ty> = Vec::new();
         let mut tags: IndexMap<&str, Vec<(usize, Col)>> = IndexMap::new();
         let mut fields: IndexMap<&str, Vec<(usize, Col)>> = IndexMap::new();
+        // Whether any array pattern tests the position, the element patterns
+        // of every one — from either end — and the names their rests bind.
+        let mut arrays = false;
+        let mut elements: Vec<(usize, Col)> = Vec::new();
+        let mut rests: Vec<Tracked<Symbol>> = Vec::new();
         // Whether the column qualifies for coverage-to-constraint conversion:
         // every entry a struct, unit, binder or wildcard, and the struct
         // entries not a mix of exact and `..`-open. A tag or a natural test is
@@ -1279,6 +1292,23 @@ impl Constrain<'_> {
                                 .push((*arm, Col::Pattern(&field.value)));
                         }
                     }
+                    // A length test is a gap no presence formula speaks of,
+                    // so the column keeps the matrix walk, as a tag's does.
+                    ir::PatternKind::Array {
+                        before,
+                        rest,
+                        after,
+                    } => {
+                        arrays = true;
+                        exact = false;
+                        qualifies = false;
+                        for element in before.iter().chain(after) {
+                            elements.push((*arm, Col::Pattern(element)));
+                        }
+                        if let Some(name) = rest.as_ref().and_then(|rest| rest.name) {
+                            rests.push(name);
+                        }
+                    }
                 },
             }
         }
@@ -1337,6 +1367,19 @@ impl Constrain<'_> {
             exact = false;
             qualifies = false;
             demands.extend(primitives.into_iter().map(|core| Rc::new(Ty::plain(core))));
+        }
+        // An array's elements are of one type, so every element pattern of
+        // every arm — wherever it sits among them — constrains the one element
+        // position, and a rest binds the array of them.
+        if arrays {
+            path.push(ir::Step::Element);
+            let (element, _) = self.position(columns, path, &elements);
+            path.pop();
+            let ty = Rc::new(Ty::Array(element));
+            for binder in rests {
+                self.env.insert(binder.tracked, Binding::Mono(ty.clone()));
+            }
+            demands.push(ty);
         }
         if structs {
             // The column-union rule for fields. A field is certainly there
@@ -1531,9 +1574,19 @@ impl Constrain<'_> {
                 }
                 term.ty = expected.clone();
             }
-            (TermKind::Array(elements), Ty::Array(element)) => {
-                for value in elements {
-                    self.check_term(value, element, expected_subject, expected_span);
+            (TermKind::Array(items), Ty::Array(element)) => {
+                for item in items {
+                    match item.spread {
+                        Some(dots) => {
+                            self.check_term(&mut item.value, expected, Subject::Spread, Some(dots))
+                        }
+                        None => self.check_term(
+                            &mut item.value,
+                            element,
+                            expected_subject,
+                            expected_span,
+                        ),
+                    }
                 }
                 term.ty = expected.clone();
             }

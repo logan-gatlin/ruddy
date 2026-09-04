@@ -1336,6 +1336,54 @@ fn fallible_parse_errors_distinguish_syntax_from_structure() {
     assert_eq!(structure.to_string(), "bad `artifact` arity");
 }
 
+/// The length dispatch, the element and slice reads, and the join a spread
+/// makes all print and parse back, and every misspelling or misshaping of
+/// them is refused as the malformed text it is.
+#[test]
+fn array_dispatch_and_reads_round_trip_and_reject_malformed_spellings() {
+    let artifact = built(
+        "let a = [1n]\nlet b = [..a, 2n, ..a]\n\
+         let pick = fn arr => match arr with \
+         | [1n, .., 2n] => [] | [first, ..middle, last] => middle | [..rest] => rest end",
+    );
+    let valid = compact(&assert_round_trip(&artifact));
+    // The first leaf list spelled with `prefix`, temps and all: the ops read
+    // out of an array carry no nested list, so the first `)` closes them.
+    let leaf = |prefix: &str| -> String {
+        let start = valid
+            .find(prefix)
+            .unwrap_or_else(|| panic!("{prefix} in {valid}"));
+        let end = valid[start..].find(')').expect("a closed leaf");
+        valid[start..start + end + 1].to_string()
+    };
+    let nth = leaf("(nth ");
+    let nth_back = leaf("(nth-back ");
+    let slice = leaf("(slice ");
+    assert!(valid.contains("(switch-len "), "{valid}");
+    assert!(valid.contains("(cases (0 "), "{valid}");
+    assert!(valid.contains("(concat "), "{valid}");
+    let dropped_last = |list: &str| list[..list.len() - 3].to_string() + ")";
+    let extended = |list: &str| list[..list.len() - 1].to_string() + " 0)";
+    for (from, to) in [
+        ("(switch-len ", "(length-switch "),
+        ("(switch-len ", "(switch-len 0 "),
+        ("(cases (0 ", "(cases 0 "),
+        ("(cases (0 ", "(cases (zero "),
+        ("(cases (0 ", "(cases (0 extra "),
+        ("(nth ", "(element "),
+        (nth.as_str(), dropped_last(&nth).as_str()),
+        ("(nth-back ", "(last-element "),
+        (nth_back.as_str(), extended(&nth_back).as_str()),
+        ("(slice ", "(between "),
+        (slice.as_str(), dropped_last(&slice).as_str()),
+        ("(concat ", "(join "),
+    ] {
+        assert_bad_replacement(&valid, from, to);
+    }
+    // A length case that is no list at all, the arity of the switch intact.
+    assert_malformed(&replace_balanced(&valid, "(0 (block", "0"));
+}
+
 #[test]
 fn malformed_text_returns_errors_while_trusted_api_panics() {
     let valid = compact(&assert_round_trip(&model_artifact()));

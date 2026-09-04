@@ -126,13 +126,150 @@ fn parses_homogeneous_array_literals_and_types() {
 }
 
 #[test]
-fn array_patterns_get_a_focused_diagnostic() {
-    let out = parse(lex("let [first] = values", FileID::GENERATED).tokens);
-    let [error] = out.errors.as_slice() else {
-        panic!("expected one focused error: {:#?}", out.errors);
+fn parses_array_patterns_with_one_rest_anywhere() {
+    let out = parse(
+        lex(
+            "let f = fn v => match v with\n\
+             | [] => 0\n\
+             | [x] => 1\n\
+             | [x, ..] => 2\n\
+             | [.., last] => 3\n\
+             | [first, ..middle, last,] => 4\n\
+             | [#Some x, [y, ..], ..] => 5\n\
+             end",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    assert!(out.errors.is_empty(), "errors: {:#?}", out.errors);
+    let StmtKind::Let { body, .. } = &out.stmts[0].tracked else {
+        panic!("expected a let: {:#?}", out.stmts[0]);
     };
-    assert_eq!(error.kind, ErrorKind::ArrayPattern);
-    assert_eq!(error.span.start, 4);
+    let ExprKind::Function { body, .. } = &body.tracked.tracked else {
+        panic!("expected a function: {:#?}", body);
+    };
+    let ExprKind::Match { arms, .. } = &body.tracked else {
+        panic!("expected a match: {:#?}", body);
+    };
+    let shapes: Vec<(usize, Option<Option<&str>>, usize)> = arms
+        .iter()
+        .map(|arm| match &arm.pattern.tracked {
+            PatternKind::Array {
+                before,
+                rest,
+                after,
+            } => (
+                before.len(),
+                rest.as_ref()
+                    .map(|rest| rest.name.as_ref().map(|name| name.tracked.as_str())),
+                after.len(),
+            ),
+            other => panic!("expected an array pattern: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        shapes,
+        [
+            (0, None, 0),
+            (1, None, 0),
+            (1, Some(None), 0),
+            (0, Some(None), 1),
+            (1, Some(Some("middle")), 1),
+            (2, Some(None), 0),
+        ]
+    );
+    let PatternKind::Array { before, .. } = &arms[5].pattern.tracked else {
+        unreachable!()
+    };
+    assert!(matches!(before[0].tracked, PatternKind::Tag { .. }));
+    assert!(matches!(
+        &before[1].tracked,
+        PatternKind::Array { before, rest: Some(rest), after }
+            if before.len() == 1 && rest.name.is_none() && after.is_empty()
+    ));
+
+    assert_eq!(
+        parse_one("let [first, ..middle, last,] = values"),
+        "let [first, ..middle, last] = values"
+    );
+    assert_eq!(parse_one("let [x, ..] = values"), "let [x, ..] = values");
+    assert_eq!(parse_one("let [.., x] = values"), "let [.., x] = values");
+    assert_eq!(parse_one("let [..] = values"), "let [..] = values");
+    assert_eq!(parse_one("let [] = values"), "let [] = values");
+    assert_eq!(
+        parse_one("let [#Some (a, b), [..inner]] = values"),
+        "let [#Some (a, b), [..inner]] = values"
+    );
+}
+
+#[test]
+fn an_array_pattern_allows_only_one_rest() {
+    let out = parse(lex("let [..a, ..b] = values", FileID::GENERATED).tokens);
+    let [error] = out.errors.as_slice() else {
+        panic!("expected one error: {:#?}", out.errors);
+    };
+    assert_eq!(error.span.start, 10);
+    assert!(matches!(
+        error.kind,
+        ErrorKind::SecondArrayRest { previous } if previous.start == 5
+    ));
+}
+
+#[test]
+fn an_unclosed_array_pattern_is_reported_at_its_opener() {
+    for src in ["let [..", "let [.. ", "let [..rest"] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        let [error] = out.errors.as_slice() else {
+            panic!("{src}: expected one error: {:#?}", out.errors);
+        };
+        assert!(
+            matches!(
+                error.kind,
+                ErrorKind::Expected {
+                    expected: Expected::Punctuation("]"),
+                    ..
+                }
+            ),
+            "{src}: {error:#?}"
+        );
+    }
+}
+
+#[test]
+fn an_array_rest_is_discarded_by_writing_it_bare() {
+    let out = parse(lex("let [x, .._] = values", FileID::GENERATED).tokens);
+    let [error] = out.errors.as_slice() else {
+        panic!("expected one error: {:#?}", out.errors);
+    };
+    assert_eq!(error.kind, ErrorKind::DiscardedArrayRest);
+    assert_eq!((error.span.start, error.span.end()), (8, 11));
+}
+
+#[test]
+fn parses_array_spreads_anywhere_in_a_literal() {
+    let out = parse(
+        lex(
+            "let joined = [..a, 1, ..b, ..f x,]\nlet copy = [..a]",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    assert!(out.errors.is_empty(), "errors: {:#?}", out.errors);
+    let StmtKind::Let { body, .. } = &out.stmts[0].tracked else {
+        unreachable!()
+    };
+    let ExprKind::Array(items) = &body.tracked.tracked else {
+        panic!("expected an array: {:#?}", body);
+    };
+    let spreads: Vec<bool> = items.iter().map(|item| item.spread.is_some()).collect();
+    assert_eq!(spreads, [true, false, true, true]);
+    assert!(matches!(items[3].value.tracked, ExprKind::Apply { .. }));
+
+    assert_eq!(
+        parse_one("let joined = [..a, 1, ..b, ..f x,]"),
+        "let joined = [..a, 1, ..b, ..f x]"
+    );
+    assert_eq!(parse_one("let copy = [..a]"), "let copy = [..a]");
 }
 
 #[test]

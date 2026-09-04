@@ -272,6 +272,10 @@ fn validate_executable_relationships(lir: &Lir) -> Result<(), ValidationError> {
                     pending.push(none);
                     pending.push(some);
                 }
+                Op::SwitchLen { cases, beyond, .. } => {
+                    pending.extend(cases.iter().map(|case| &case.block));
+                    pending.push(beyond);
+                }
                 _ => {}
             }
         }
@@ -1246,6 +1250,7 @@ pub enum Op {
     Struct(Vec<(FieldKey, u32)>),
     Array(Vec<u32>),
     Merge(Vec<u32>),
+    Concat(Vec<u32>),
     Project {
         base: u32,
         field: FieldKey,
@@ -1255,6 +1260,19 @@ pub enum Op {
         payload: Option<u32>,
     },
     Payload(u32),
+    Nth {
+        base: u32,
+        index: u64,
+    },
+    NthBack {
+        base: u32,
+        index: u64,
+    },
+    Slice {
+        base: u32,
+        start: u64,
+        drop: u64,
+    },
     Closure {
         /// Index into [`Lir::functions`], fixed-width on the artifact boundary.
         func: u64,
@@ -1302,6 +1320,18 @@ pub enum Op {
         none: Box<Block>,
         some: Box<Block>,
     },
+    SwitchLen {
+        on: u32,
+        cases: Vec<LenCase>,
+        beyond: Box<Block>,
+    },
+}
+
+/// One length-dispatch branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LenCase {
+    pub len: u64,
+    pub block: Block,
 }
 
 /// The target of an LIR call.
@@ -1390,6 +1420,10 @@ enum LirCloneWork<'a> {
         on: u32,
         fields: Vec<String>,
     },
+    FinishSwitchLen {
+        on: u32,
+        lens: Vec<u64>,
+    },
 }
 
 fn clone_lir_tree(root: LirCloneWork<'_>) -> (Vec<Block>, Vec<Op>) {
@@ -1450,6 +1484,7 @@ fn clone_lir_tree(root: LirCloneWork<'_>) -> (Vec<Block>, Vec<Op>) {
                 Op::Struct(fields) => ops.push(Op::Struct(fields.clone())),
                 Op::Array(values) => ops.push(Op::Array(values.clone())),
                 Op::Merge(values) => ops.push(Op::Merge(values.clone())),
+                Op::Concat(values) => ops.push(Op::Concat(values.clone())),
                 Op::Project { base, field } => ops.push(Op::Project {
                     base: *base,
                     field: field.clone(),
@@ -1459,6 +1494,19 @@ fn clone_lir_tree(root: LirCloneWork<'_>) -> (Vec<Block>, Vec<Op>) {
                     payload: *payload,
                 }),
                 Op::Payload(value) => ops.push(Op::Payload(*value)),
+                Op::Nth { base, index } => ops.push(Op::Nth {
+                    base: *base,
+                    index: *index,
+                }),
+                Op::NthBack { base, index } => ops.push(Op::NthBack {
+                    base: *base,
+                    index: *index,
+                }),
+                Op::Slice { base, start, drop } => ops.push(Op::Slice {
+                    base: *base,
+                    start: *start,
+                    drop: *drop,
+                }),
                 Op::Closure { func, captures } => ops.push(Op::Closure {
                     func: *func,
                     captures: captures.clone(),
@@ -1548,6 +1596,19 @@ fn clone_lir_tree(root: LirCloneWork<'_>) -> (Vec<Block>, Vec<Op>) {
                     work.push(LirCloneWork::Block(some));
                     work.push(LirCloneWork::Block(none));
                 }
+                Op::SwitchLen { on, cases, beyond } => {
+                    work.push(LirCloneWork::FinishSwitchLen {
+                        on: *on,
+                        lens: cases.iter().map(|case| case.len).collect(),
+                    });
+                    work.push(LirCloneWork::Block(beyond));
+                    work.extend(
+                        cases
+                            .iter()
+                            .rev()
+                            .map(|case| LirCloneWork::Block(&case.block)),
+                    );
+                }
             },
             LirCloneWork::FinishBlock { instrs, end } => {
                 let split = ops.len() - instrs.len();
@@ -1622,6 +1683,16 @@ fn clone_lir_tree(root: LirCloneWork<'_>) -> (Vec<Block>, Vec<Op>) {
                     some,
                 });
             }
+            LirCloneWork::FinishSwitchLen { on, lens } => {
+                let beyond = Box::new(blocks.pop().expect("cloned beyond-length branch"));
+                let split = blocks.len() - lens.len();
+                let cases = lens
+                    .into_iter()
+                    .zip(blocks.drain(split..))
+                    .map(|(len, block)| LenCase { len, block })
+                    .collect();
+                ops.push(Op::SwitchLen { on, cases, beyond });
+            }
         }
     }
     (blocks, ops)
@@ -1651,6 +1722,7 @@ enum OpHead<'a> {
     Struct(&'a [(FieldKey, u32)]),
     Array(&'a [u32]),
     Merge(&'a [u32]),
+    Concat(&'a [u32]),
     Project(u32, &'a FieldKey),
     Tag(&'a str, Option<u32>),
     Closure(u64, &'a [u32]),
@@ -1664,6 +1736,10 @@ enum OpHead<'a> {
     SwitchPrim(u32, Vec<&'a Literal>, bool),
     SwitchPresence(u32, &'a str),
     SwitchRest(u32, &'a [String]),
+    Nth(u32, u64),
+    NthBack(u32, u64),
+    Slice(u32, u64, u64),
+    SwitchLen(u32, Vec<u64>),
 }
 
 impl<'a> From<&'a Op> for OpHead<'a> {
@@ -1682,6 +1758,7 @@ impl<'a> From<&'a Op> for OpHead<'a> {
             Op::Struct(fields) => Self::Struct(fields),
             Op::Array(values) => Self::Array(values),
             Op::Merge(values) => Self::Merge(values),
+            Op::Concat(values) => Self::Concat(values),
             Op::Project { base, field } => Self::Project(*base, field),
             Op::Tag { name, payload } => Self::Tag(name, *payload),
             Op::Payload(value) => Self::Unary(2, *value),
@@ -1712,6 +1789,12 @@ impl<'a> From<&'a Op> for OpHead<'a> {
             ),
             Op::SwitchPresence { on, field, .. } => Self::SwitchPresence(*on, field),
             Op::SwitchRest { on, fields, .. } => Self::SwitchRest(*on, fields),
+            Op::Nth { base, index } => Self::Nth(*base, *index),
+            Op::NthBack { base, index } => Self::NthBack(*base, *index),
+            Op::Slice { base, start, drop } => Self::Slice(*base, *start, *drop),
+            Op::SwitchLen { on, cases, .. } => {
+                Self::SwitchLen(*on, cases.iter().map(|case| case.len).collect())
+            }
         }
     }
 }
@@ -1839,6 +1922,26 @@ fn lir_tree_eq(root: LirPair<'_>) -> bool {
                         work.push(LirPair::Block(left_some, right_some));
                         work.push(LirPair::Block(left_none, right_none));
                     }
+                    (
+                        Op::SwitchLen {
+                            cases: left_cases,
+                            beyond: left_beyond,
+                            ..
+                        },
+                        Op::SwitchLen {
+                            cases: right_cases,
+                            beyond: right_beyond,
+                            ..
+                        },
+                    ) => {
+                        work.extend(
+                            left_cases
+                                .iter()
+                                .zip(right_cases)
+                                .map(|(left, right)| LirPair::Block(&left.block, &right.block)),
+                        );
+                        work.push(LirPair::Block(left_beyond, right_beyond));
+                    }
                     _ => {}
                 }
             }
@@ -1907,6 +2010,14 @@ fn drain_lir_op(op: &mut Op, pending: &mut Vec<Block>) {
             pending.push(std::mem::replace(none.as_mut(), empty_block()));
             pending.push(std::mem::replace(some.as_mut(), empty_block()));
         }
+        Op::SwitchLen { cases, beyond, .. } => {
+            pending.extend(
+                cases
+                    .iter_mut()
+                    .map(|case| std::mem::replace(&mut case.block, empty_block())),
+            );
+            pending.push(std::mem::replace(beyond.as_mut(), empty_block()));
+        }
         Op::Const(_)
         | Op::Neg(_)
         | Op::Not(_)
@@ -1920,9 +2031,13 @@ fn drain_lir_op(op: &mut Op, pending: &mut Vec<Block>) {
         | Op::Struct(_)
         | Op::Array(_)
         | Op::Merge(_)
+        | Op::Concat(_)
         | Op::Project { .. }
         | Op::Tag { .. }
         | Op::Payload(_)
+        | Op::Nth { .. }
+        | Op::NthBack { .. }
+        | Op::Slice { .. }
         | Op::Closure { .. }
         | Op::Call { .. }
         | Op::RawCall { .. }
@@ -2540,6 +2655,7 @@ fn op(mint: &Mint, value: &lir::Op) -> Op {
         ),
         Source::Array(values) => Op::Array(values.clone()),
         Source::Merge(values) => Op::Merge(values.clone()),
+        Source::Concat(values) => Op::Concat(values.clone()),
         Source::Project { base, field } => Op::Project {
             base: *base,
             field: field_key(field),
@@ -2549,6 +2665,19 @@ fn op(mint: &Mint, value: &lir::Op) -> Op {
             payload: *payload,
         },
         Source::Payload(value) => Op::Payload(*value),
+        Source::Nth { base, index } => Op::Nth {
+            base: *base,
+            index: *index as u64,
+        },
+        Source::NthBack { base, index } => Op::NthBack {
+            base: *base,
+            index: *index as u64,
+        },
+        Source::Slice { base, start, drop } => Op::Slice {
+            base: *base,
+            start: *start as u64,
+            drop: *drop as u64,
+        },
         Source::Closure { func, captures } => Op::Closure {
             func: u64::try_from(*func).expect("LIR function index does not fit artifact format"),
             captures: captures.clone(),
@@ -2632,6 +2761,17 @@ fn op(mint: &Mint, value: &lir::Op) -> Op {
             fields: fields.clone(),
             none: Box::new(block(mint, none)),
             some: Box::new(block(mint, some)),
+        },
+        Source::SwitchLen { on, cases, beyond } => Op::SwitchLen {
+            on: *on,
+            cases: cases
+                .iter()
+                .map(|case| LenCase {
+                    len: case.len as u64,
+                    block: block(mint, &case.block),
+                })
+                .collect(),
+            beyond: Box::new(block(mint, beyond)),
         },
     }
 }
@@ -3342,6 +3482,11 @@ pub mod text {
                 present, absent, ..
             } => vec![present, absent],
             Op::SwitchRest { none, some, .. } => vec![none, some],
+            Op::SwitchLen { cases, beyond, .. } => cases
+                .iter()
+                .map(|case| &case.block)
+                .chain(std::iter::once(&**beyond))
+                .collect(),
             _ => Vec::new(),
         }
     }
@@ -3372,6 +3517,9 @@ pub mod text {
             Op::Merge(values) => L(std::iter::once(A("merge".into()))
                 .chain(values.iter().map(|value| A(value.to_string())))
                 .collect()),
+            Op::Concat(values) => L(std::iter::once(A("concat".into()))
+                .chain(values.iter().map(|value| A(value.to_string())))
+                .collect()),
             Op::Project { base, field } => L(vec![
                 A("project".into()),
                 A(base.to_string()),
@@ -3382,6 +3530,38 @@ pub mod text {
                 .chain(payload.iter().map(|value| A(value.to_string())))
                 .collect()),
             Op::Payload(value) => unary("payload", *value),
+            Op::Nth { base, index } => L(vec![
+                A("nth".into()),
+                A(base.to_string()),
+                A(index.to_string()),
+            ]),
+            Op::NthBack { base, index } => L(vec![
+                A("nth-back".into()),
+                A(base.to_string()),
+                A(index.to_string()),
+            ]),
+            Op::Slice { base, start, drop } => L(vec![
+                A("slice".into()),
+                A(base.to_string()),
+                A(start.to_string()),
+                A(drop.to_string()),
+            ]),
+            Op::SwitchLen { on, cases, .. } => {
+                let beyond = blocks.pop().expect("a beyond branch renders");
+                L(vec![
+                    A("switch-len".into()),
+                    A(on.to_string()),
+                    L(std::iter::once(A("cases".into()))
+                        .chain(
+                            cases
+                                .iter()
+                                .zip(blocks)
+                                .map(|(case, block)| L(vec![A(case.len.to_string()), block])),
+                        )
+                        .collect()),
+                    beyond,
+                ])
+            }
             Op::Closure { func, captures } => L(vec![
                 A("closure".into()),
                 A(func.to_string()),
@@ -4763,6 +4943,10 @@ pub mod text {
                     on: u32,
                     fields: Vec<String>,
                 },
+                SwitchLen {
+                    on: u32,
+                    lens: Vec<u64>,
+                },
             }
             #[derive(Clone, Copy)]
             enum Recursive {
@@ -4771,6 +4955,7 @@ pub mod text {
                 SwitchPrim,
                 SwitchPresence,
                 SwitchRest,
+                SwitchLen,
             }
             let mut tasks = vec![Task::Block(value)];
             // As in semantic type decoding, a task's result sort is fixed by
@@ -4810,6 +4995,7 @@ pub mod text {
                                     "switch-prim" => Some(Recursive::SwitchPrim),
                                     "switch-presence" => Some(Recursive::SwitchPresence),
                                     "switch-rest" => Some(Recursive::SwitchRest),
+                                    "switch-len" => Some(Recursive::SwitchLen),
                                     _ => None,
                                 },
                                 _ => None,
@@ -4888,6 +5074,27 @@ pub mod text {
                                 if let Some(block) = fallback {
                                     tasks.push(Task::Block(block));
                                 }
+                                for block in blocks.into_iter().rev() {
+                                    tasks.push(Task::Block(block));
+                                }
+                            }
+                            Recursive::SwitchLen => {
+                                let mut values = self.exact(values, 3, "switch-len");
+                                let on = self.number(self.take(&mut values));
+                                let cases = self.many(self.take(&mut values), "cases");
+                                let beyond = self.take(&mut values);
+                                let mut lens = Vec::with_capacity(cases.len());
+                                let mut blocks = Vec::with_capacity(cases.len());
+                                for case in cases {
+                                    let values = list_contents(case).unwrap_or_else(|| {
+                                        self.invalid("bad length case", Vec::new())
+                                    });
+                                    let mut values = self.exact(values, 2, "length case");
+                                    lens.push(self.number(self.take(&mut values)));
+                                    blocks.push(self.take(&mut values));
+                                }
+                                tasks.push(Task::SwitchLen { on, lens });
+                                tasks.push(Task::Block(beyond));
                                 for block in blocks.into_iter().rev() {
                                     tasks.push(Task::Block(block));
                                 }
@@ -4982,6 +5189,20 @@ pub mod text {
                             absent: Box::new(absent),
                         });
                     }
+                    Task::SwitchLen { on, lens } => {
+                        let beyond = Box::new(pop_block(&mut blocks_out));
+                        let split = blocks_out.len() - lens.len();
+                        let blocks = blocks_out.split_off(split);
+                        ops.push(Op::SwitchLen {
+                            on,
+                            cases: lens
+                                .into_iter()
+                                .zip(blocks)
+                                .map(|(len, block)| LenCase { len, block })
+                                .collect(),
+                            beyond,
+                        });
+                    }
                     Task::SwitchRest { on, fields } => {
                         let some = pop_block(&mut blocks_out);
                         let none = pop_block(&mut blocks_out);
@@ -5071,6 +5292,9 @@ pub mod text {
                 ),
                 "array" => Op::Array(values.into_iter().map(|value| self.number(value)).collect()),
                 "merge" => Op::Merge(values.into_iter().map(|value| self.number(value)).collect()),
+                "concat" => {
+                    Op::Concat(values.into_iter().map(|value| self.number(value)).collect())
+                }
                 "project" => {
                     let mut values = self.exact(values, 2, "project");
                     Op::Project {
@@ -5090,6 +5314,28 @@ pub mod text {
                     }
                 }
                 "payload" => Op::Payload(self.number(self.exact(values, 1, "payload").remove(0))),
+                "nth" => {
+                    let mut values = self.exact(values, 2, "nth");
+                    Op::Nth {
+                        base: self.number(self.take(&mut values)),
+                        index: self.number(self.take(&mut values)),
+                    }
+                }
+                "nth-back" => {
+                    let mut values = self.exact(values, 2, "nth-back");
+                    Op::NthBack {
+                        base: self.number(self.take(&mut values)),
+                        index: self.number(self.take(&mut values)),
+                    }
+                }
+                "slice" => {
+                    let mut values = self.exact(values, 3, "slice");
+                    Op::Slice {
+                        base: self.number(self.take(&mut values)),
+                        start: self.number(self.take(&mut values)),
+                        drop: self.number(self.take(&mut values)),
+                    }
+                }
                 "closure" => {
                     let mut values = self.exact(values, 2, "closure");
                     Op::Closure {

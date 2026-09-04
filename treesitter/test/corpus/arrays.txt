@@ -37,3 +37,29 @@ let nested : [[Nat]] = [[]]
           (identifier))))
     (array_expression
       (array_expression))))
+
+================================================================================
+Array literals spread other arrays in place
+================================================================================
+
+let joined = [..a, 1, ..f x,]
+let copy = [..a]
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (array_expression
+      (spread
+        (identifier))
+      (natural)
+      (spread
+        (application
+          (identifier)
+          (identifier)))))
+  (let_definition
+    (identifier)
+    (array_expression
+      (spread
+        (identifier)))))

@@ -1068,6 +1068,9 @@ pub enum Subject {
     CallbackRequired,
     CallbackAvailable,
     EffectDeclaration,
+    /// The `..` of an array literal: what it spreads has to be an array of
+    /// the literal's own type.
+    Spread,
 }
 
 impl Subject {
@@ -1102,6 +1105,7 @@ impl Subject {
             Self::CallbackRequired => "callback-required",
             Self::CallbackAvailable => "callback-available",
             Self::EffectDeclaration => "effect-declaration",
+            Self::Spread => "spread",
         }
     }
 }
@@ -10124,9 +10128,9 @@ impl Table {
                     self.zonk_term(&mut field.value, subst);
                 }
             }
-            TermKind::Array(elements) => {
-                for element in elements {
-                    self.zonk_term(element, subst);
+            TermKind::Array(items) => {
+                for item in items {
+                    self.zonk_term(&mut item.value, subst);
                 }
             }
             TermKind::Project { base, .. } => self.zonk_term(base, subst),

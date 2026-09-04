@@ -116,8 +116,9 @@ pub struct Error {
 
 #[derive(Debug, Clone)]
 pub enum ErrorKind {
-    /// A syntactically irrefutable arm — a bare name, a wildcard, or an open
-    /// `{..}` naming no fields — written before the last arm. The arms after
+    /// A syntactically irrefutable arm — a bare name, a wildcard, an open
+    /// `{..}` naming no fields, or a `[..]` naming no elements — written
+    /// before the last arm. The arms after
     /// it can never be reached, so the mistake is the placement, and it is
     /// reported at the arm that accepts everything rather than at each arm it
     /// starves.
@@ -165,6 +166,14 @@ enum Cell {
     /// column, no field beyond the ones the type names may be, which is what
     /// an exact pattern demands of the rest.
     Absent,
+    /// An array pattern: so many elements from the front, so many from the
+    /// back, and — with the rest — anything between. Without it the pattern
+    /// is exact, matching only arrays of exactly that many elements.
+    Array {
+        before: Vec<Cell>,
+        rest: bool,
+        after: Vec<Cell>,
+    },
 }
 
 /// One column of the typed matrix: a whole position with its solved type, or —
@@ -372,9 +381,9 @@ fn walk_under(check: &Check, term: &Term, assumed: &Formula, out: &mut Output) {
                 walk_under(check, &field.value, assumed, out);
             }
         }
-        TermKind::Array(elements) => {
-            for element in elements {
-                walk_under(check, element, assumed, out);
+        TermKind::Array(items) => {
+            for item in items {
+                walk_under(check, &item.value, assumed, out);
             }
         }
         TermKind::Tag { payload, .. } => {
@@ -407,8 +416,8 @@ fn walk_under(check: &Check, term: &Term, assumed: &Formula, out: &mut Output) {
     }
 }
 
-/// Whether an arm is irrefutable on its face: a bare name, a wildcard, or the
-/// open `{..}` naming no fields. Nothing typed enters into it — an exact
+/// Whether an arm is irrefutable on its face: a bare name, a wildcard, the
+/// open `{..}` naming no fields, or the `[..]` naming no elements. Nothing typed enters into it — an exact
 /// pattern the solved type happens to make total is not one, and neither is
 /// an open pattern naming a field, which a value could lack — so the
 /// misplaced-catch-all wording lands only where the arm accepts everything
@@ -420,6 +429,11 @@ fn catch_all(pattern: &Pattern) -> bool {
             fields,
             rest: Some(_),
         } => fields.is_empty(),
+        PatternKind::Array {
+            before,
+            rest: Some(_),
+            after,
+        } => before.is_empty() && after.is_empty(),
         _ => false,
     }
 }
@@ -453,6 +467,15 @@ fn cell(pattern: &Pattern) -> Cell {
                 fields: Vec::new(),
                 exact: true,
             })),
+        },
+        PatternKind::Array {
+            before,
+            rest,
+            after,
+        } => Cell::Array {
+            before: before.iter().map(cell).collect(),
+            rest: rest.is_some(),
+            after: after.iter().map(cell).collect(),
         },
     }
 }
@@ -982,6 +1005,16 @@ impl Check<'_> {
                     None => matches!(row.rest, Rest::Closed),
                 })
             }
+            // An array pattern lands only on an array: the demand put the
+            // array type on the column, or failed trying — and every element,
+            // from either end, is checked against the one element type.
+            Cell::Array { before, after, .. } => match &*ty {
+                Ty::Array(element) => before
+                    .iter()
+                    .chain(after)
+                    .all(|sub| self.compatible(element, sub)),
+                _ => false,
+            },
             // A wildcard tests nothing — and the presence cells the widening
             // makes never arrive here, since compatibility reads the arms as
             // written.
@@ -1034,7 +1067,101 @@ impl Check<'_> {
         if structs {
             return self.widened(rows, &ty, later, q, walk);
         }
+        let arrays = std::iter::once(&q[0])
+            .chain(rows.iter().map(|row| &row[0]))
+            .any(|cell| matches!(cell, Cell::Array { .. }));
+        if arrays {
+            return self.lengths(rows, &ty, later, q, walk);
+        }
         self.shape_column(rows, &ty, later, q, walk)
+    }
+
+    /// An array position: the universe is every length, asked one at a time —
+    /// each length up to the longest any cell names, and then every longer
+    /// one, which only the cells with a rest can take and which are one case,
+    /// since no cell tells two of them apart. Under one length the elements
+    /// are that many columns of the element type: an exact cell supplies its
+    /// elements, a cell with a rest its front and back elements around
+    /// wildcards for the middle, and a wildcard is wildcards throughout. The
+    /// witness folds the elements back into the array they came from, shortest
+    /// length first, and open past the longest.
+    fn lengths(
+        &self,
+        rows: &[Vec<Cell>],
+        ty: &Rc<Ty>,
+        later: &[Col],
+        q: &[Cell],
+        walk: &Walk,
+    ) -> Option<Vec<Option<Witness>>> {
+        let element = ty
+            .element()
+            .expect("array cells are created only for an array-compatible column")
+            .clone();
+        let named = |cell: &Cell| -> Option<usize> {
+            match cell {
+                Cell::Array { before, after, .. } => Some(before.len() + after.len()),
+                _ => None,
+            }
+        };
+        let longest = std::iter::once(&q[0])
+            .chain(rows.iter().map(|row| &row[0]))
+            .filter_map(named)
+            .max()
+            .unwrap_or(0);
+        // A cell's elements at length `n`, or `None` where the cell cannot
+        // take an array of that length.
+        let expand = |cell: &Cell, n: usize| -> Option<Vec<Cell>> {
+            match cell {
+                Cell::Array {
+                    before,
+                    rest,
+                    after,
+                } => {
+                    let fixed = before.len() + after.len();
+                    if fixed > n || (fixed < n && !rest) {
+                        return None;
+                    }
+                    Some(
+                        before
+                            .iter()
+                            .cloned()
+                            .chain(std::iter::repeat_n(Cell::Wild, n - fixed))
+                            .chain(after.iter().cloned())
+                            .collect(),
+                    )
+                }
+                _ => Some(vec![Cell::Wild; n]),
+            }
+        };
+        let ask = |n: usize, open: bool| -> Option<Vec<Option<Witness>>> {
+            let mut sub_q = expand(&q[0], n)?;
+            sub_q.extend(q[1..].iter().cloned());
+            let rows: Vec<Vec<Cell>> = rows
+                .iter()
+                .filter_map(|row| {
+                    let mut kept = expand(&row[0], n)?;
+                    kept.extend(row[1..].iter().cloned());
+                    Some(kept)
+                })
+                .collect();
+            let cols: Vec<Col> = std::iter::repeat_n(Col::Whole(element.clone()), n)
+                .chain(later.iter().cloned())
+                .collect();
+            let mut wits = self.useful(&rows, &cols, &sub_q, walk)?;
+            let after = wits.split_off(n);
+            let elements = wits
+                .into_iter()
+                .map(|wit| wit.unwrap_or(Witness::Any))
+                .collect();
+            Some(
+                std::iter::once(Some(Witness::Array { elements, open }))
+                    .chain(after)
+                    .collect(),
+            )
+        };
+        (0..=longest)
+            .find_map(|n| ask(n, false))
+            .or_else(|| ask(longest + 1, true))
     }
 
     /// The widening step: the fields the solved type names become one

@@ -229,3 +229,65 @@ let a = match v with | { 001: inner, 2: _ } => inner end
             (numeric_field)
             (wildcard)))
         (identifier)))))
+
+================================================================================
+Array patterns name elements from either end around one rest
+================================================================================
+
+let a = match v with
+  | [] => 0
+  | [x] => 1
+  | [x, ..] => 2
+  | [.., last] => 3
+  | [first, ..middle, last,] => 4
+  | [#Some x, [y, ..], ..] => 5
+  end
+
+let [..all] = v
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (match_expression
+      (identifier)
+      (match_arm
+        (array_pattern)
+        (natural))
+      (match_arm
+        (array_pattern
+          (identifier))
+        (natural))
+      (match_arm
+        (array_pattern
+          (identifier)
+          (rest_pattern))
+        (natural))
+      (match_arm
+        (array_pattern
+          (rest_pattern)
+          (identifier))
+        (natural))
+      (match_arm
+        (array_pattern
+          (identifier)
+          (rest_pattern
+            (identifier))
+          (identifier))
+        (natural))
+      (match_arm
+        (array_pattern
+          (tag_pattern
+            (tag)
+            (identifier))
+          (array_pattern
+            (identifier)
+            (rest_pattern))
+          (rest_pattern))
+        (natural))))
+  (let_definition
+    (array_pattern
+      (rest_pattern
+        (identifier)))
+    (identifier)))

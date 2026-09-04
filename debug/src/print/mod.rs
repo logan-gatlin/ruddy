@@ -25,8 +25,9 @@ pub use ruddy::{
     types::Shape,
     ui::{
         Entry, Grouped, Mark, Prec, label, tuple_field_order, write_applied, write_apply,
-        write_arrow, write_binary, write_effects, write_let, write_match, write_pipeline,
-        write_project, write_row, write_struct, write_sum, write_tag, write_tuple, write_unary,
+        write_array_pattern, write_arrow, write_binary, write_effects, write_let, write_match,
+        write_pipeline, write_project, write_row, write_struct, write_sum, write_tag, write_tuple,
+        write_unary,
     },
 };
 

@@ -153,9 +153,13 @@ pub fn opcode(op: &Op) -> &'static str {
         Op::Struct(_) => "struct",
         Op::Array(_) => "array",
         Op::Merge(_) => "merge",
+        Op::Concat(_) => "concat",
         Op::Project { .. } => "project",
         Op::Tag { .. } => "tag",
         Op::Payload(_) => "payload",
+        Op::Nth { .. } => "nth",
+        Op::NthBack { .. } => "nth_back",
+        Op::Slice { .. } => "slice",
         Op::Closure { .. } => "closure",
         Op::Call { .. } => "call",
         Op::RawCall { .. } => "raw_call",
@@ -165,6 +169,7 @@ pub fn opcode(op: &Op) -> &'static str {
         Op::Catch { .. } => "catch",
         Op::SwitchTag { .. } => "switch_tag",
         Op::SwitchPrim { .. } => "switch_prim",
+        Op::SwitchLen { .. } => "switch_len",
         Op::SwitchPresence { .. } => "switch_presence",
         Op::SwitchRest { .. } => "switch_rest",
     }
@@ -251,6 +256,11 @@ pub fn arms(op: &Op) -> Vec<(Option<String>, &Block)> {
             (Some("none".to_string()), &**none),
             (Some("some".to_string()), &**some),
         ],
+        Op::SwitchLen { cases, beyond, .. } => cases
+            .iter()
+            .map(|case| (Some(case.len.to_string()), &case.block))
+            .chain(std::iter::once((Some("else".to_string()), &**beyond)))
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -333,6 +343,10 @@ fn operation(output: &Output, labels: &Labels, generated: bool, op: &Op) -> Stri
             let laid: Vec<String> = records.iter().map(|temp| format!("%{temp}")).collect();
             format!("merge {}", laid.join(", "))
         }
+        Op::Concat(arrays) => {
+            let joined: Vec<String> = arrays.iter().map(|temp| format!("%{temp}")).collect();
+            format!("concat {}", joined.join(", "))
+        }
         Op::Project { base, field } => {
             format!("project %{base}, {:?}", labels.field(field, generated))
         }
@@ -345,6 +359,9 @@ fn operation(output: &Output, labels: &Labels, generated: bool, op: &Op) -> Stri
             payload: Some(temp),
         } => format!("tag {}, %{temp}", crate::print::label(Shape::Sum, name)),
         Op::Payload(temp) => format!("payload %{temp}"),
+        Op::Nth { base, index } => format!("nth %{base}, {index}"),
+        Op::NthBack { base, index } => format!("nth_back %{base}, {index}"),
+        Op::Slice { base, start, drop } => format!("slice %{base}, {start}, {drop}"),
         Op::Closure { func, captures } => {
             let held: Vec<String> = captures.iter().map(|temp| format!("%{temp}")).collect();
             format!(
@@ -373,6 +390,7 @@ fn operation(output: &Output, labels: &Labels, generated: bool, op: &Op) -> Stri
         Op::Catch { tag, .. } => format!("catch %{tag}:"),
         Op::SwitchTag { on, .. } => format!("switch_tag %{on}:"),
         Op::SwitchPrim { on, .. } => format!("switch_prim %{on}:"),
+        Op::SwitchLen { on, .. } => format!("switch_len %{on}:"),
         Op::SwitchPresence { on, field, .. } => {
             format!(
                 "switch_presence %{on}, {:?}:",

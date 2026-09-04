@@ -606,6 +606,10 @@
             "named": true
           },
           {
+            "type": "spread",
+            "named": true
+          },
+          {
             "type": "string",
             "named": true
           },
@@ -627,6 +631,66 @@
           },
           {
             "type": "unit",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "array_pattern",
+    "named": true,
+    "fields": {
+      "element": {
+        "multiple": true,
+        "required": false,
+        "types": [
+          {
+            "type": "array_pattern",
+            "named": true
+          },
+          {
+            "type": "boolean",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "natural",
+            "named": true
+          },
+          {
+            "type": "parenthesized_pattern",
+            "named": true
+          },
+          {
+            "type": "rest_pattern",
+            "named": true
+          },
+          {
+            "type": "string",
+            "named": true
+          },
+          {
+            "type": "struct_pattern",
+            "named": true
+          },
+          {
+            "type": "tag_pattern",
+            "named": true
+          },
+          {
+            "type": "tuple_pattern",
+            "named": true
+          },
+          {
+            "type": "unit",
+            "named": true
+          },
+          {
+            "type": "wildcard",
             "named": true
           }
         ]
@@ -3270,6 +3334,10 @@
         "required": true,
         "types": [
           {
+            "type": "array_pattern",
+            "named": true
+          },
+          {
             "type": "boolean",
             "named": true
           },
@@ -3445,6 +3513,10 @@
         "multiple": false,
         "required": true,
         "types": [
+          {
+            "type": "array_pattern",
+            "named": true
+          },
           {
             "type": "boolean",
             "named": true
@@ -3735,6 +3807,10 @@
         "multiple": false,
         "required": true,
         "types": [
+          {
+            "type": "array_pattern",
+            "named": true
+          },
           {
             "type": "boolean",
             "named": true
@@ -4391,6 +4467,10 @@
       "required": true,
       "types": [
         {
+          "type": "array_pattern",
+          "named": true
+        },
+        {
           "type": "boolean",
           "named": true
         },
@@ -4979,7 +5059,18 @@
   {
     "type": "rest_pattern",
     "named": true,
-    "fields": {}
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      }
+    }
   },
   {
     "type": "source_file",
@@ -5011,6 +5102,126 @@
           "named": true
         }
       ]
+    }
+  },
+  {
+    "type": "spread",
+    "named": true,
+    "fields": {
+      "value": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "addition",
+            "named": true
+          },
+          {
+            "type": "application",
+            "named": true
+          },
+          {
+            "type": "array_expression",
+            "named": true
+          },
+          {
+            "type": "boolean",
+            "named": true
+          },
+          {
+            "type": "boolean_and",
+            "named": true
+          },
+          {
+            "type": "boolean_or",
+            "named": true
+          },
+          {
+            "type": "boolean_xor",
+            "named": true
+          },
+          {
+            "type": "function",
+            "named": true
+          },
+          {
+            "type": "handle_expression",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "if_expression",
+            "named": true
+          },
+          {
+            "type": "let_expression",
+            "named": true
+          },
+          {
+            "type": "match_expression",
+            "named": true
+          },
+          {
+            "type": "multiplication",
+            "named": true
+          },
+          {
+            "type": "natural",
+            "named": true
+          },
+          {
+            "type": "operation",
+            "named": true
+          },
+          {
+            "type": "parenthesized_expression",
+            "named": true
+          },
+          {
+            "type": "path",
+            "named": true
+          },
+          {
+            "type": "pipeline",
+            "named": true
+          },
+          {
+            "type": "projection",
+            "named": true
+          },
+          {
+            "type": "raise_expression",
+            "named": true
+          },
+          {
+            "type": "string",
+            "named": true
+          },
+          {
+            "type": "struct_expression",
+            "named": true
+          },
+          {
+            "type": "tag_expression",
+            "named": true
+          },
+          {
+            "type": "tuple_expression",
+            "named": true
+          },
+          {
+            "type": "unary_expression",
+            "named": true
+          },
+          {
+            "type": "unit",
+            "named": true
+          }
+        ]
+      }
     }
   },
   {
@@ -5219,6 +5430,10 @@
         "multiple": false,
         "required": false,
         "types": [
+          {
+            "type": "array_pattern",
+            "named": true
+          },
           {
             "type": "boolean",
             "named": true
@@ -5575,6 +5790,10 @@
         "required": false,
         "types": [
           {
+            "type": "array_pattern",
+            "named": true
+          },
+          {
             "type": "boolean",
             "named": true
           },
@@ -5746,6 +5965,10 @@
         "multiple": true,
         "required": true,
         "types": [
+          {
+            "type": "array_pattern",
+            "named": true
+          },
           {
             "type": "boolean",
             "named": true

@@ -95,6 +95,41 @@ fn arrays_are_rejected_at_user_extern_boundaries_even_through_aliases() {
         shadowed.errors.as_slice(),
         [error] if matches!(error.kind, ErrorKind::ArrayInExtern)
     ));
+
+    // The joining, slicing, prepending and popping intrinsics are held to
+    // their exact signatures the same way, whichever part is off.
+    for src in [
+        "extern fake : ['a] -> Nat = \"$arrayConcat\"",
+        "extern fake : ['a] -> Nat -> ['a] = \"$arrayConcat\"",
+        "extern fake : ['a] -> Nat = \"$arraySlice\"",
+        "extern fake : ['a] -> Nat -> Nat = \"$arraySlice\"",
+        "extern fake : ['a] -> Nat -> Nat -> ['a] = \"$arraySlice\"",
+        "extern fake : ['a] -> Nat = \"$arrayPrepend\"",
+        "extern fake : ['a] -> Nat = \"$arrayPop\"",
+        "type Option 'a = #Some 'a | #None\nextern fake : ['a] -> Option Nat = \"$arrayPop\"",
+        "type Option 'a = #Some 'a | #None\nextern fake : ['a] -> Option ('a, ['a], Nat) = \"$arrayPop\"",
+        "type Option 'a = #Some 'a | #None\nextern fake : ['a] -> Option { first: 'a, rest: ['a] } = \"$arrayPop\"",
+        "type Option 'a = #Some 'a | #None\nextern fake : ['a] -> Option (Nat, ['a]) = \"$arrayPop\"",
+    ] {
+        let (_, malformed) = build_src(src);
+        assert!(
+            matches!(
+                malformed.errors.as_slice(),
+                [error] if matches!(error.kind, ErrorKind::ArrayInExtern)
+            ),
+            "{src}: {:#?}",
+            malformed.errors
+        );
+    }
+    for src in [
+        "extern fine : ['a] -> ['a] -> ['a] = \"$arrayConcat\"",
+        "extern fine : ['a] -> 'a -> ['a] = \"$arrayPrepend\"",
+        "type Option 'a = #Some 'a | #None\nextern fine : ['a] -> Nat -> Nat -> Option ['a] = \"$arraySlice\"",
+        "type Option 'a = #Some 'a | #None\nextern fine : ['a] -> Option ('a, ['a]) = \"$arrayPop\"",
+    ] {
+        let (_, accepted) = build_src(src);
+        assert!(accepted.errors.is_empty(), "{src}: {:#?}", accepted.errors);
+    }
 }
 
 /// Surface conditionals deliberately disappear at the IR boundary. The
@@ -2926,6 +2961,83 @@ fn lowered_with_errors(src: &str) -> (String, Vec<String>) {
     (printed, errors)
 }
 
+/// Array patterns on a `let`: the lone rest cannot fail, so it binds the
+/// whole value under the array demand it makes — named as written, or as
+/// nothing can name — while naming any element is a test a value can fail,
+/// length being no part of an array's type, and is refused pointing at the
+/// pattern, its names still bound to error values.
+#[test]
+fn array_lets_accept_a_lone_rest_and_refuse_any_element() {
+    assert_eq!(lowered("let [..all] = [1n]"), "let all : [_] = [1n]");
+    assert_eq!(lowered("let [..] = [1n]"), "let %array : [_] = [1n]");
+    assert_eq!(
+        lowered("let a = let [..r] = [1n] in r"),
+        "let a = let r : [_] = [1n] in r"
+    );
+    assert_eq!(
+        lowered("let a = let [..] = [1n] in 2n"),
+        "let a = let %array : [_] = [1n] in 2n"
+    );
+    // A written annotation is the contract on the whole value, and the
+    // pattern's demand goes on the rest's own binding, as a unit pattern's does.
+    assert_eq!(
+        lowered("let [..r] : [Nat] = [1n]"),
+        "let %value : [Nat] = [1n]\nlet r : [_] = %value"
+    );
+    assert_eq!(
+        lowered("let a = let [..r] : [Nat] = [1n] in r"),
+        "let a = let %value : [Nat] = [1n] in let r : [_] = %value in r"
+    );
+
+    let (printed, errors) = lowered_with_errors("let [x] = [1n]  let use = x");
+    assert_eq!(errors, ["binding-can-fail@4"], "{errors:#?}");
+    assert_eq!(printed, "let %value = [1n]\nlet x = <error>\nlet use = x");
+    for src in [
+        "let [x, ..r] = [1n]",
+        "let [..r, x] = [1n]",
+        "let [] = [1n]",
+        "let [.., _] = [1n]",
+        "let [[..], ..] = [[1n]]",
+    ] {
+        let (_, errors) = lowered_with_errors(src);
+        assert_eq!(errors, ["binding-can-fail@4"], "{src}: {errors:#?}");
+    }
+    let (printed, errors) = lowered_with_errors("let a = let [x, ..r] = [1n] in x");
+    assert_eq!(errors, ["binding-can-fail@12"], "{errors:#?}");
+    assert_eq!(
+        printed,
+        "let a = let %value = [1n] in let x = <error> in let r = <error> in x"
+    );
+}
+
+/// A match arm's array pattern survives normalization as written — the
+/// elements on either side of the rest in their order, and the rest with its
+/// name — and its binders go through the one duplicate check every pattern's
+/// do, the rest's name among them.
+#[test]
+fn array_patterns_normalize_as_written_and_check_their_binders_once() {
+    assert_eq!(
+        lowered(
+            "let f = fn v => match v with | [] => 0n | [a, ..b, c] => a | [.., z] => z | [#Some x, [y, ..], ..] => x end"
+        ),
+        "let f = fn v => match v with | [] => 0n | [a, ..b, c] => a | [.., z] => z | [#Some x, [y, ..], ..] => x end"
+    );
+    let (_, errors) = lowered_with_errors("let f = fn v => match v with | [x, ..x] => x end");
+    assert_eq!(errors, ["duplicate-binding@37"], "{errors:#?}");
+    let (_, errors) = lowered_with_errors("let f = fn v => match v with | [..x, x] => x end");
+    assert_eq!(errors, ["duplicate-binding@37"], "{errors:#?}");
+}
+
+/// A spread survives normalization as the item it is, in its place among the
+/// literal's values.
+#[test]
+fn array_spreads_normalize_in_place() {
+    assert_eq!(
+        lowered("let a = [1n]\nlet b = [..a, 2n, ..a]"),
+        "let a = [1n]\nlet b = [..a, 2n, ..a]"
+    );
+}
+
 /// [`lowered_with_errors`] for a program lowering should not complain about.
 fn lowered(src: &str) -> String {
     let (printed, errors) = lowered_with_errors(src);
@@ -3117,9 +3229,9 @@ fn references_of(term: &Term, out: &mut Vec<Symbol>) {
                 references_of(&field.value, out);
             }
         }
-        TermKind::Array(elements) => {
-            for element in elements {
-                references_of(element, out);
+        TermKind::Array(items) => {
+            for item in items {
+                references_of(&item.value, out);
             }
         }
         TermKind::Tag { payload, .. } => {

@@ -328,11 +328,24 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
             ..node
         }
         .children(elements.iter().map(|element| expr_node(ids, element))),
-        ExprKind::Array(elements) => Node {
+        // A spread item is shown as a row of its own around the value it
+        // spreads, the way a struct's `..` is shown beside its fields.
+        ExprKind::Array(items) => Node {
             label: "Array".into(),
             ..node
         }
-        .children(elements.iter().map(|element| expr_node(ids, element))),
+        .children(items.iter().map(|item| {
+            match item.spread {
+                Some(dots) => Node::new(
+                    ids.next(),
+                    "Spread",
+                    format!("..{}", print::ast::expr(&item.value.tracked)),
+                )
+                .at(dots.merge(item.value.span))
+                .child(expr_node(ids, &item.value)),
+                None => expr_node(ids, &item.value),
+            }
+        })),
         ExprKind::Struct(fields) => Node {
             label: "Struct".into(),
             ..node
@@ -556,6 +569,31 @@ fn pattern_node(ids: &mut Ids, pattern: &Pattern) -> Node {
             }
             Node {
                 label: "Struct".into(),
+                ..node
+            }
+            .children(kids)
+        }
+        // The rest sits among the elements where it was written, a row of
+        // its own: the dots, and the name they bind when one was given.
+        PatternKind::Array {
+            before,
+            rest,
+            after,
+        } => {
+            let mut kids: Vec<Node> = before
+                .iter()
+                .map(|element| pattern_node(ids, element))
+                .collect();
+            if let Some(rest) = rest {
+                let shown = match &rest.name {
+                    Some(name) => format!("..{}", name.tracked),
+                    None => "..".to_string(),
+                };
+                kids.push(Node::new(ids.next(), "Rest", shown).at(rest.span));
+            }
+            kids.extend(after.iter().map(|element| pattern_node(ids, element)));
+            Node {
+                label: "Array".into(),
                 ..node
             }
             .children(kids)
