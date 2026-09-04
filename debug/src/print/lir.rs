@@ -151,6 +151,7 @@ pub fn opcode(op: &Op) -> &'static str {
         Op::Mul { .. } => "mul",
         Op::Div { .. } => "div",
         Op::Struct(_) => "struct",
+        Op::Array(_) => "array",
         Op::Merge(_) => "merge",
         Op::Project { .. } => "project",
         Op::Tag { .. } => "tag",
@@ -179,6 +180,7 @@ pub fn rep(rep: Rep) -> &'static str {
         Rep::Boolean => "boolean",
         Rep::Unit => "unit",
         Rep::Struct => "struct",
+        Rep::Array => "array",
         Rep::Sum => "sum",
         Rep::Fn => "fn",
         Rep::Any => "any",
@@ -322,6 +324,10 @@ fn operation(output: &Output, labels: &Labels, generated: bool, op: &Op) -> Stri
                 })
                 .collect();
             format!("struct {{ {} }}", entries.join(", "))
+        }
+        Op::Array(values) => {
+            let values: Vec<String> = values.iter().map(|temp| format!("%{temp}")).collect();
+            format!("array [{}]", values.join(", "))
         }
         Op::Merge(records) => {
             let laid: Vec<String> = records.iter().map(|temp| format!("%{temp}")).collect();

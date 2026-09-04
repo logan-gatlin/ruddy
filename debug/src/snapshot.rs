@@ -705,6 +705,7 @@ fn wire_explanation(
             T::Function => "function",
             T::Struct => "struct",
             T::TaggedValue => "tagged-value",
+            T::Array => "array",
             T::DeclaredType => "declared-type",
             T::Undecided => "undecided",
         }

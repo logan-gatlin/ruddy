@@ -249,6 +249,10 @@ pub enum ExprKind {
     /// spelling can be reproduced. The empty tuple remains [`Unit`](Self::Unit)
     /// and a singleton requires its trailing comma.
     Tuple(Vec<Expr>),
+    /// `[a, b]` — an immutable homogeneous array literal. Homogeneity is a
+    /// semantic property established by inference; the surface tree preserves
+    /// every written element.
+    Array(Vec<Expr>),
     /// `#Some 1` — one case of a sum, with what it carries.
     ///
     /// The payload is optional because `#None` is how a case that carries
@@ -478,6 +482,8 @@ pub enum TypeKind {
     },
     /// `(A, B)` — a closed positional struct type with unconditional fields.
     Tuple(Vec<Type>),
+    /// `[T]` — the type of an immutable homogeneous array.
+    Array(Box<Type>),
     Ident {
         name: Path,
     },
@@ -746,6 +752,10 @@ pub enum ErrorKind {
     /// for a value being discarded, so it can never be *used* — with the
     /// position carried for the wording alone. See [`Place`].
     Wildcard { place: Place },
+    /// Array destructuring is deliberately not part of the first array
+    /// release. Keep this separate from a generic missing-pattern error so a
+    /// reader is not led to hunt for a different spelling of the same thing.
+    ArrayPattern,
 }
 
 /// What the parser needed at the primary error span.
@@ -1096,6 +1106,8 @@ impl Parser {
             Kind::PipeForward => Expected::Punctuation("|>"),
             Kind::LeftBrace => Expected::Punctuation("{"),
             Kind::RightBrace => Expected::Punctuation("}"),
+            Kind::LeftBracket => Expected::Punctuation("["),
+            Kind::RightBracket => Expected::Punctuation("]"),
             Kind::LeftParen => Expected::Punctuation("("),
             Kind::RightParen => Expected::Punctuation(")"),
             _ => Expected::Name,
@@ -1310,6 +1322,7 @@ impl Parser {
         let found = match self.peek().map(|token| &token.tracked) {
             Some(Kind::RightParen) => ")",
             Some(Kind::RightBrace) => "}",
+            Some(Kind::RightBracket) => "]",
             _ => return None,
         };
         // Resume the scan where the previous error left it. Recovery can move
@@ -1329,8 +1342,13 @@ impl Parser {
                     self.scan_open.push(("}", token.span));
                     continue;
                 }
+                Kind::LeftBracket => {
+                    self.scan_open.push(("]", token.span));
+                    continue;
+                }
                 Kind::RightParen => ")",
                 Kind::RightBrace => "}",
+                Kind::RightBracket => "]",
                 _ => continue,
             };
             if matches!(self.scan_open.last(), Some((needed, _)) if *needed == closer) {
@@ -1374,6 +1392,7 @@ impl Parser {
                     | Kind::Pipe
                     | Kind::RightParen
                     | Kind::RightBrace
+                    | Kind::RightBracket
             )
         )
     }
@@ -1384,7 +1403,13 @@ impl Parser {
     fn at_pattern_boundary(&self) -> bool {
         matches!(
             self.peek().map(|token| &token.tracked),
-            None | Some(Kind::Equal | Kind::FatArrow | Kind::RightParen | Kind::RightBrace)
+            None | Some(
+                Kind::Equal
+                    | Kind::FatArrow
+                    | Kind::RightParen
+                    | Kind::RightBrace
+                    | Kind::RightBracket,
+            )
         )
     }
 
@@ -1395,7 +1420,12 @@ impl Parser {
         matches!(
             self.peek().map(|token| &token.tracked),
             None | Some(
-                Kind::Equal | Kind::Arrow | Kind::Plus | Kind::RightParen | Kind::RightBrace
+                Kind::Equal
+                    | Kind::Arrow
+                    | Kind::Plus
+                    | Kind::RightParen
+                    | Kind::RightBrace
+                    | Kind::RightBracket
             )
         ) || self.at_keyword("where")
     }
@@ -1891,6 +1921,7 @@ impl Parser {
                     | Kind::EffectLabel(_)
                     | Kind::Fn
                     | Kind::LeftBrace
+                    | Kind::LeftBracket
                     | Kind::LeftParen
                     | Kind::Underscore
             )
@@ -2099,6 +2130,7 @@ impl Parser {
             // this is atom position and not an application argument.
             Kind::Raise => self.raise_expr(),
             Kind::LeftBrace => self.struct_expr(),
+            Kind::LeftBracket => self.array_expr(),
             Kind::LeftParen => self.paren_expr(),
             Kind::Tag(_) => self.tag_expr(),
             Kind::EffectLabel(_) => self.operation_expr(),
@@ -2242,6 +2274,24 @@ impl Parser {
         }
         let close = self.close_delimiter(open.span, &Kind::RightParen)?;
         Some(open.span.merge(close.span).track(ExprKind::Tuple(elements)))
+    }
+
+    /// `[<expr>, ...]`, including the empty literal and an optional trailing
+    /// comma. Unlike parentheses, brackets never group: one element is still
+    /// an array.
+    fn array_expr(&mut self) -> Option<Expr> {
+        let open = self
+            .eat(&Kind::LeftBracket)
+            .expect("the caller peeked `[` ");
+        let mut elements = Vec::new();
+        while !self.at(&Kind::RightBracket) && !self.at_expr_boundary() {
+            elements.push(self.expr()?);
+            if self.eat_if(&Kind::Comma).is_none() {
+                break;
+            }
+        }
+        let close = self.close_delimiter(open.span, &Kind::RightBracket)?;
+        Some(open.span.merge(close.span).track(ExprKind::Array(elements)))
     }
 
     /// `fn <arg>* => <expr>` — an anonymous function with zero or more
@@ -2505,6 +2555,7 @@ impl Parser {
                     | Kind::Boolean(_)
                     | Kind::Tag(_)
                     | Kind::LeftBrace
+                    | Kind::LeftBracket
                     | Kind::LeftParen
                     | Kind::Underscore
             )
@@ -2569,6 +2620,10 @@ impl Parser {
                 Some(span.track(PatternKind::Boolean(value)))
             }
             Kind::LeftBrace => self.struct_pattern(),
+            Kind::LeftBracket => {
+                self.error(span, ErrorKind::ArrayPattern);
+                None
+            }
             Kind::LeftParen => self.paren_pattern(),
             // Nothing here begins a pattern — an arm written `=> 1` is missing
             // one, and this is where it is told so.
@@ -3335,6 +3390,7 @@ impl Parser {
                 Kind::Identifier(_)
                     | Kind::Variable(_)
                     | Kind::LeftBrace
+                    | Kind::LeftBracket
                     | Kind::LeftParen
                     | Kind::Underscore
             )
@@ -3357,6 +3413,7 @@ impl Parser {
         let span = tok.span;
         match &tok.tracked {
             Kind::LeftBrace => self.struct_type(),
+            Kind::LeftBracket => self.array_type(),
             Kind::LeftParen => self.paren_type(),
             // A name, or a path ending in one: `Math::Pair` is as much a type
             // atom as `Pair` is, and may head an application like any other.
@@ -3461,6 +3518,23 @@ impl Parser {
         }
         let close = self.close_delimiter(open.span, &Kind::RightParen)?;
         Some(open.span.merge(close.span).track(TypeKind::Tuple(elements)))
+    }
+
+    /// `[T]`, the type of a homogeneous immutable array.
+    fn array_type(&mut self) -> Option<Type> {
+        let open = self
+            .eat(&Kind::LeftBracket)
+            .expect("the caller peeked `[` ");
+        if self.at(&Kind::RightBracket) || self.at_type_boundary() {
+            return self.expected(Expected::Type);
+        }
+        let element = self.type_expr()?;
+        let close = self.close_delimiter(open.span, &Kind::RightBracket)?;
+        Some(
+            open.span
+                .merge(close.span)
+                .track(TypeKind::Array(Box::new(element))),
+        )
     }
 
     /// Like [`eat`], but silent on mismatch: consume the token only if it

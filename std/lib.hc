@@ -23,6 +23,7 @@ module boolean
 module option
 module result
 module list
+module array
 module function
 module tuple
 module ordering

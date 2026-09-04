@@ -1,6 +1,64 @@
 use std::{fs, process::Command};
 
 #[test]
+fn immutable_arrays_run_end_to_end_across_trie_and_tail_boundaries() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the workspace root");
+    let project = tempfile::tempdir().expect("a temporary array project");
+    fs::write(
+        project.path().join("Ruddy.toml"),
+        format!(
+            "name = \"array-test\"\nversion = \"0.1.0\"\nroot = \"main.hc\"\ntarget = \"js\"\n\n[dependencies]\nstd = {:?}\n",
+            root.join("std")
+        ),
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("main.hc"),
+        r#"let original = [0n, 1n, 2n, 3n, 4n, 5n, 6n, 7n, 8n, 9n, 10n, 11n, 12n, 13n, 14n, 15n, 16n, 17n, 18n, 19n, 20n, 21n, 22n, 23n, 24n, 25n, 26n, 27n, 28n, 29n, 30n, 31n, 32n]
+let changed = match std::array::set original 0n 99n with | #Some values => values | #None => original end
+let original_first = match std::array::get original 0n with | #Some value => value | #None => 999n end
+let changed_first = match std::array::get changed 0n with | #Some value => value | #None => 999n end
+let boundary = match std::array::get original 32n with | #Some value => value | #None => 999n end
+let out_of_bounds = match std::array::get original 33n with | #Some _ => false | #None => true end
+let pushed = std::array::push original 33n
+let pushed_last = match std::array::get pushed 33n with | #Some value => value | #None => 999n end
+let original_len = std::array::len original
+let pushed_len = std::array::len pushed
+let words = std::array::push [] "array"
+let first_word = match std::array::get words 0n with | #Some value => value | #None => "none" end
+"#,
+    )
+    .unwrap();
+
+    let artifact = ruddy_cli::build_project(project.path()).expect("the array consumer builds");
+    let javascript = artifact.with_extension("js");
+    assert!(javascript.is_file());
+
+    if Command::new("node").arg("--version").output().is_err() {
+        return;
+    }
+    let probe = format!(
+        "import {{ pathToFileURL }} from 'node:url'; const x = await import(pathToFileURL({}).href); console.log(JSON.stringify([x.original_first,x.changed_first,x.boundary,x.out_of_bounds,x.pushed_last,x.original_len,x.pushed_len,x.first_word]));",
+        serde_json::to_string(javascript.to_str().unwrap()).unwrap()
+    );
+    let output = Command::new("node")
+        .args(["--input-type=module", "--eval", &probe])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        "[0,99,32,true,33,33,34,\"array\"]"
+    );
+}
+
+#[test]
 fn bundled_primitive_utilities_compile_and_run_through_the_javascript_boundary() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

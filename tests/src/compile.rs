@@ -323,6 +323,26 @@ fn imported_effects_and_aliases_behave_like_local_declarations() {
     assert_eq!(codes(&partial), ["effect-arity", "effect-arity"]);
 }
 
+/// An alias may apply an effect to an array of its own parameter. The array
+/// is substituted through like any other type, both when the alias is local
+/// and when its body is read back from a dependency's artifact.
+#[test]
+fn alias_arguments_substitute_through_arrays_locally_and_when_imported() {
+    let declarations = "effect Ask 'a = { get: () -> 'a }\n\
+                        effect Many 'a = !Ask ['a]\n";
+    let accepted = accepted(&format!(
+        "{declarations}let f : () -> [Nat] + !Many Nat = fn _ => !Ask.get ()"
+    ));
+    assert_eq!(scheme(&accepted, "f"), "() -> [Nat] + !Ask [Nat]");
+
+    let dependency = exported(declarations);
+    let accepted = accepted_with(
+        "let f : () -> [Nat] + dep::!Many Nat = fn _ => dep::!Ask.get ()",
+        &dependency,
+    );
+    assert_eq!(scheme(&accepted, "f"), "() -> [Nat] + !Ask [Nat]");
+}
+
 /// A parameter standing for a row is instantiated as a fresh row: a fields
 /// parameter from what an operation's struct carries beyond the fields the
 /// declaration names, and an effects parameter from what a callback may

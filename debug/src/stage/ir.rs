@@ -249,6 +249,15 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
             label: "Boolean".into(),
             ..node
         },
+        TermKind::Array(elements) => Node {
+            label: "Array".into(),
+            ..node
+        }
+        .children(
+            elements
+                .iter()
+                .map(|element| term_node(ids, cx, mint, element, trace)),
+        ),
         TermKind::Unary { op, value } => Node {
             label: match op {
                 ruddy::ir::UnaryOp::Neg => "Neg",
@@ -822,6 +831,11 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type, scope: &[Variable])
             label: "Prim".into(),
             ..node
         },
+        TypeKind::Array(element) => Node {
+            label: "Array".into(),
+            ..node
+        }
+        .child(type_node(ids, cx, mint, element, scope)),
         // The struct's row again about cases; see the arm below for what the
         // `Rest` child is.
         TypeKind::Sum { cases, tail } => {

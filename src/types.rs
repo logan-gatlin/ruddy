@@ -403,6 +403,8 @@ pub enum Ty {
     /// annotation result boundary at which hidden presence identities are
     /// opened; it is otherwise representation-transparent.
     Package(Rc<Ty>),
+    /// An immutable homogeneous array.
+    Array(Rc<Ty>),
     /// A structural record and its true field-row tail.
     Struct(Row),
     /// The cases a value may be: a row of labels, each with a presence, and a
@@ -773,6 +775,9 @@ fn take_ty_children(ty: &mut Ty, types: &mut Vec<Rc<Ty>>, rows: &mut Vec<Rc<Row>
         Ty::Package(body) => {
             types.push(std::mem::replace(body, Rc::new(Ty::Undecided)));
         }
+        Ty::Array(element) => {
+            types.push(std::mem::replace(element, Rc::new(Ty::Undecided)));
+        }
         Ty::Struct(row) | Ty::Sum(row) => take_row_children(row, types, rows),
         Ty::Named { args, .. } => {
             types.extend(std::mem::replace(args, Rc::from([])).iter().cloned());
@@ -926,6 +931,7 @@ pub(crate) fn same_finite_syntax_metered(
                         pending.push(Pair::Ty(left_from, right_from));
                     }
                     (Ty::Package(left), Ty::Package(right)) => pending.push(Pair::Ty(left, right)),
+                    (Ty::Array(left), Ty::Array(right)) => pending.push(Pair::Ty(left, right)),
                     (Ty::Struct(left), Ty::Struct(right)) | (Ty::Sum(left), Ty::Sum(right)) => {
                         pending.push(Pair::Row(left, right))
                     }
@@ -1250,6 +1256,7 @@ fn existential_outside_package(body: &Rc<Ty>, existentials: &IndexSet<u32>) -> b
         match part {
             Work::Ty(ty, packaged) => match &*ty {
                 Ty::Package(inner) => work.push(Work::Ty(inner.clone(), true)),
+                Ty::Array(element) => work.push(Work::Ty(element.clone(), packaged)),
                 Ty::Arrow(from, to, effects) => {
                     work.push(Work::Row(effects.clone(), packaged));
                     work.push(Work::Ty(to.clone(), packaged));
@@ -1302,6 +1309,7 @@ fn partition_package_formula(
                     package_count += 1;
                     work.push(Work::Ty(inner.clone(), Some(here)));
                 }
+                Ty::Array(element) => work.push(Work::Ty(element.clone(), owner)),
                 Ty::Arrow(from, to, effects) => {
                     work.push(Work::Row(effects.clone(), owner));
                     work.push(Work::Ty(to.clone(), owner));

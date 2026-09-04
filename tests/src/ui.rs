@@ -160,6 +160,7 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         parse::ErrorKind::Wildcard {
             place: parse::Place::Value,
         },
+        parse::ErrorKind::ArrayPattern,
     ] {
         let error = parse::Error { span, kind };
         all.push(("parse", error.code(), error.to_string()));

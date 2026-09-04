@@ -263,6 +263,7 @@ impl Grouped for Show<'_, TermKind> {
             TermKind::Project { .. }
             | TermKind::Operation { .. }
             | TermKind::Struct(_)
+            | TermKind::Array(_)
             | TermKind::Ident(_)
             | TermKind::Natural(_)
             | TermKind::Integer(_)
@@ -372,6 +373,7 @@ impl Grouped for Show<'_, TypeKind> {
             TypeKind::Sum { .. } | TypeKind::Effects(_) => Prec::Sum,
             TypeKind::Apply { .. } => Prec::Apply,
             TypeKind::Struct { .. }
+            | TypeKind::Array(_)
             | TypeKind::Ident(_)
             | TypeKind::Param { .. }
             | TypeKind::Prim(_)
@@ -452,6 +454,16 @@ impl fmt::Display for Show<'_, TermKind> {
                 } else {
                     write_struct(f, self.pairs(fields))
                 }
+            }
+            TermKind::Array(elements) => {
+                f.write_str("[")?;
+                for (index, element) in elements.iter().enumerate() {
+                    if index != 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{}", self.show(element))?;
+                }
+                f.write_str("]")
             }
             // A case carrying nothing prints as nothing, which is what it was
             // written as: lowering left the payload absent rather than filling
@@ -571,6 +583,7 @@ impl fmt::Display for Show<'_, TypeKind> {
                 )
             }
             TypeKind::Prim(prim) => f.write_str(prim.name()),
+            TypeKind::Array(element) => write!(f, "[{}]", self.show(&**element)),
             TypeKind::Arrow { from, to, effects } => {
                 let row = self.effect_row(effects);
                 write_arrow(

@@ -107,6 +107,62 @@ fn inferred(src: &str) -> (Mint, ir::Output, inference::Output) {
 }
 
 #[test]
+fn arrays_infer_one_element_type_and_generalize_empty_literals() {
+    let (mint, _, output) = inferred(
+        "type ArrayOf 'a = ['a]\n\
+         let numbers = [1, 2, 3]\n\
+         let empty = []\n\
+         let reals : ArrayOf Real = empty\n\
+         let strings : ArrayOf String = empty\n",
+    );
+    assert_eq!(scheme(&mint, &output, "numbers"), "[Real]");
+    assert_eq!(scheme(&mint, &output, "empty"), "['a]");
+    // An annotation naming an alias keeps the alias's name, as `Pair Nat Nat`
+    // does: `ArrayOf` is nominal within itself since its one parameter
+    // survives unfolding.
+    assert_eq!(scheme(&mint, &output, "reals"), "ArrayOf Real");
+    assert_eq!(scheme(&mint, &output, "strings"), "ArrayOf String");
+}
+
+#[test]
+fn heterogeneous_array_literals_report_a_type_mismatch() {
+    let (_, out, output) = infer_src("let mixed = [1, \"two\"]");
+    assert!(out.errors.is_empty(), "ir errors: {:#?}", out.errors);
+    let [error] = output.errors() else {
+        panic!("expected one mismatch: {:#?}", output.errors());
+    };
+    assert!(
+        error.kind.to_string().contains("type mismatch"),
+        "{:#?}",
+        error
+    );
+}
+
+#[test]
+fn array_alias_mismatches_point_to_the_element_types() {
+    let (_, out, output) =
+        infer_src("type ArrayOf 'a = ['a]\nlet bad : ArrayOf Nat = [\"not a natural\"]");
+    assert!(out.errors.is_empty(), "ir errors: {:#?}", out.errors);
+    let [error] = output.errors() else {
+        panic!("expected one mismatch: {:#?}", output.errors());
+    };
+    assert_eq!(
+        error.kind.to_string(),
+        "type mismatch: expected `Nat`, found `String`"
+    );
+}
+
+#[test]
+fn reserved_array_target_without_its_exact_signature_is_not_an_intrinsic() {
+    let (_, out, output) = infer_src("extern fake : 'a -> 'a = \"$arrayPush\"");
+    assert!(out.errors.is_empty(), "ir errors: {:#?}", out.errors);
+    assert!(matches!(
+        output.errors(),
+        [error] if matches!(error.kind, ErrorKind::PolymorphicExternBoundary { .. })
+    ));
+}
+
+#[test]
 fn positive_result_presences_can_forget_input_correlations() {
     let (mint, _, output) = inferred(
         "let forget:\n\
@@ -508,6 +564,11 @@ fn body_tys(term: &Term) -> Vec<Rc<Ty>> {
         TermKind::Struct(fields) => {
             for field in fields.values() {
                 out.extend(body_tys(&field.value));
+            }
+        }
+        TermKind::Array(elements) => {
+            for element in elements {
+                out.extend(body_tys(element));
             }
         }
         TermKind::Project { base, .. } => out.extend(body_tys(base)),
