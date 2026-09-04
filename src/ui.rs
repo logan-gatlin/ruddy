@@ -821,8 +821,8 @@ impl parse::Error {
                 "`return` can only end a `do` block",
                 self.span,
             )
-            .label("no `do` block ends here")
-            .help("wrap this in `do ... end`, or leave the `return` out"),
+            .label("this `return` is not at the end of a `do` block")
+            .help("write it as the last thing in a `do ... end` block, or leave the `return` out"),
             parse::ErrorKind::DeclarationInBlock { keyword } => Diagnostic::new(
                 "declaration-in-block",
                 "a `do` block can only hold `let` definitions",
@@ -4272,7 +4272,7 @@ pub fn write_let(
 pub fn write_do<S: fmt::Display>(
     f: &mut fmt::Formatter<'_>,
     stmts: impl IntoIterator<Item = S>,
-    result: Option<&dyn fmt::Display>,
+    result: Option<impl fmt::Display>,
 ) -> fmt::Result {
     f.write_str("do")?;
     for stmt in stmts {

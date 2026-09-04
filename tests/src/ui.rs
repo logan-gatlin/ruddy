@@ -4251,11 +4251,14 @@ fn block_errors_say_what_a_block_allows() {
     assert_eq!(outside.code, "return-outside-block");
     assert_eq!(outside.title, "`return` can only end a `do` block");
     assert_eq!(outside.primary.span, Span::generated(10, 6));
-    assert_eq!(outside.primary.message, "no `do` block ends here");
+    assert_eq!(
+        outside.primary.message,
+        "this `return` is not at the end of a `do` block"
+    );
     assert!(outside.related.is_empty());
     assert_eq!(
         outside.help,
-        ["wrap this in `do ... end`, or leave the `return` out"]
+        ["write it as the last thing in a `do ... end` block, or leave the `return` out"]
     );
 
     let declaration = parse::Error {

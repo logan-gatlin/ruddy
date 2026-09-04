@@ -347,8 +347,8 @@ pub enum ArmHead {
         selector: Tracked<OperationSelector>,
     },
     /// `return x => ...` — the value arm, which may appear at most once and in
-    /// any position. `return` is contextual: it heads an arm here and is an
-    /// ordinary name everywhere else. The span is the keyword's, which is where
+    /// any position. The `return` is the keyword a `do` block ends with, read
+    /// here for its other meaning. The span is the keyword's, which is where
     /// a complaint about a second one points.
     Return { span: Span },
 }
@@ -2424,70 +2424,59 @@ impl Parser {
     /// `do <stmt>* [return <expr>] end` — a run of bindings, each in scope
     /// for the rest of the block, and the value the block ends with.
     ///
-    /// The statements are read by [`stmt`](Self::stmt), the file's reader,
-    /// and every kind but `let` is refused at its keyword and dropped; the
-    /// block is still read through. A `let`'s value ends in front of the next
+    /// The statements are read by [`block_stmt`](Self::block_stmt) up to the
+    /// `return` or the `end`. A `let`'s value ends in front of the next
     /// `let`, the `return`, or the `end` of its own accord, since none of the
     /// three begins an atom. The `return`'s value is a full expression and
     /// extends as far right as it can, the way a `fn` body does, which is why
     /// the `return` is last: anything written after it would be read as part
-    /// of what it carries, and a statement that follows is refused where it
-    /// begins and read through so one mistake is one complaint.
+    /// of what it carries. A statement that follows one anyway is refused
+    /// where it begins, and the rest of the block is read through to its
+    /// `end` and dropped, so one mistake is one complaint. Anything else after
+    /// the value is the missing `end`, and is reported as that.
     fn do_expr(&mut self) -> Option<Expr> {
         let kw = self.advance().expect("the caller peeked `do`");
         let mut stmts = Vec::new();
-        let mut result: Option<Box<Expr>> = None;
-        let mut returned: Option<Span> = None;
-        let mut stray = false;
-        while let Some(tok) = self.peek()
-            && !matches!(tok.tracked, Kind::End)
+        while self
+            .peek()
+            .is_some_and(|tok| !matches!(tok.tracked, Kind::End | Kind::Return))
         {
-            let at = tok.span;
-            let is_return = matches!(tok.tracked, Kind::Return);
-            if let Some(returned) = returned
-                && !stray
+            if let Some(stmt) = self.block_stmt() {
+                stmts.push(stmt);
+            }
+        }
+        let mut result = None;
+        if let Some(ret) = self.eat_if(&Kind::Return) {
+            if self
+                .peek()
+                .is_none_or(|tok| matches!(tok.tracked, Kind::End))
             {
-                stray = true;
-                self.error(at, ErrorKind::StatementAfterReturn { returned });
-            }
-            if is_return {
-                self.advance();
-                if self
-                    .peek()
-                    .is_none_or(|tok| matches!(tok.tracked, Kind::End))
-                {
-                    self.error(at, ErrorKind::BareReturn);
-                } else {
-                    let value = self.expr()?;
-                    if returned.is_none() {
-                        result = Some(Box::new(value));
-                    }
+                self.error(ret.span, ErrorKind::BareReturn);
+            } else {
+                match self.expr() {
+                    Some(value) => result = Some(Box::new(value)),
+                    // The value is where the complaint is. The rest of the
+                    // block is read through so its `end` is found, and the
+                    // definition around it is kept.
+                    None => self.skip_block(),
                 }
-                returned.get_or_insert(at);
-                continue;
             }
-            let before = self.pos;
-            let stmt = self.stmt();
-            // Guarantee forward progress before recovering, as the file's
-            // reader does, so a token no statement begins with cannot spin.
-            if stmt.is_none() && self.pos == before {
-                self.advance();
-            }
-            let Some(stmt) = stmt else {
-                self.recover();
-                continue;
-            };
-            let keyword = match &stmt.tracked {
-                StmtKind::Let { .. } => None,
-                StmtKind::Type { .. } => Some("type"),
-                StmtKind::Effect { .. } => Some("effect"),
-                StmtKind::Module { .. } => Some("module"),
-                StmtKind::Extern { .. } => Some("extern"),
-            };
-            match keyword {
-                Some(keyword) => self.error(at, ErrorKind::DeclarationInBlock { keyword }),
-                None if returned.is_none() => stmts.push(stmt),
-                None => {}
+            if let Some(tok) = self.peek()
+                && matches!(
+                    tok.tracked,
+                    Kind::Let
+                        | Kind::Return
+                        | Kind::Type
+                        | Kind::Effect
+                        | Kind::Module
+                        | Kind::Extern
+                )
+            {
+                self.error(
+                    tok.span,
+                    ErrorKind::StatementAfterReturn { returned: ret.span },
+                );
+                self.skip_block();
             }
         }
         let anchor = result
@@ -2508,6 +2497,57 @@ impl Parser {
         )?;
         let span = kw.span.merge(close.span);
         Some(span.track(ExprKind::Do { stmts, result }))
+    }
+
+    /// One statement of a block, read by [`stmt`](Self::stmt), the file's
+    /// reader. Every kind but `let` is refused at its keyword and dropped,
+    /// and a statement that fails to parse is skipped to the next `let` or
+    /// the `end`, the way a broken definition is at file level; either way
+    /// the block goes on.
+    fn block_stmt(&mut self) -> Option<Stmt> {
+        let at = self.peek().expect("the caller peeked a token").span;
+        let before = self.pos;
+        let stmt = self.stmt();
+        // Guarantee forward progress before recovering, as the file's reader
+        // does, so a token no statement begins with cannot spin.
+        if stmt.is_none() && self.pos == before {
+            self.advance();
+        }
+        let Some(stmt) = stmt else {
+            self.recover();
+            return None;
+        };
+        let keyword = match &stmt.tracked {
+            StmtKind::Let { .. } => return Some(stmt),
+            StmtKind::Type { .. } => "type",
+            StmtKind::Effect { .. } => "effect",
+            StmtKind::Module { .. } => "module",
+            StmtKind::Extern { .. } => "extern",
+        };
+        self.error(at, ErrorKind::DeclarationInBlock { keyword });
+        None
+    }
+
+    /// The rest of a block whose complaint has already been made, read
+    /// through to its `end` and dropped. Read statement by statement rather
+    /// than skipped token by token, so an `end` inside a nested form is not
+    /// mistaken for the block's; and read with its complaints put back, since
+    /// nothing in it was going to be kept.
+    fn skip_block(&mut self) {
+        let mark = self.errors.len();
+        while self
+            .peek()
+            .is_some_and(|tok| !matches!(tok.tracked, Kind::End))
+        {
+            if self.eat_if(&Kind::Return).is_some() {
+                if self.expr().is_none() {
+                    self.recover();
+                }
+                continue;
+            }
+            self.block_stmt();
+        }
+        self.errors.truncate(mark);
     }
 
     /// `match <expr> with | <arm> (| <arm>)* end`, where an arm is

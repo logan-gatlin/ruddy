@@ -31,6 +31,16 @@ struct Show<'a, T> {
     mint: &'a Mint,
 }
 
+/// One statement of a printed `do` block: the binding a `Let` term is, with
+/// its body left to the block. Exists so that [`write_do`] can be handed the
+/// statements as a sequence of things that print, the way the parse tree's
+/// printer hands it statements.
+struct Binding<'a> {
+    name: &'a str,
+    annotation: Option<Show<'a, Annotation>>,
+    value: Show<'a, TermKind>,
+}
+
 /// An IR node the printer can reach the kind of.
 ///
 /// A term and a type wrap their kind in different bookkeeping — a type carries
@@ -70,16 +80,6 @@ impl<T> Node for Tracked<T> {
     }
 }
 
-/// One statement of a printed `do` block: the binding a `Let` term is, with
-/// its body left to the block. Exists so that [`write_do`] can be handed the
-/// statements as a sequence of things that print, the way the parse tree's
-/// printer hands it statements.
-struct Binding<'a> {
-    name: &'a str,
-    annotation: Option<Show<'a, Annotation>>,
-    value: Show<'a, TermKind>,
-}
-
 impl fmt::Display for Binding<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write_let(f, &self.name, self.annotation.as_ref(), &self.value)
@@ -92,15 +92,6 @@ impl<'a, T> Show<'a, T> {
     fn show<N: Node>(&self, node: &'a N) -> Show<'a, N::Kind> {
         Show {
             node: node.kind(),
-            mint: self.mint,
-        }
-    }
-
-    /// Point the printer at a kind already reached, for the one walk that
-    /// steps through nodes by kind rather than by node.
-    fn show_kind<K>(&self, kind: &'a K) -> Show<'a, K> {
-        Show {
-            node: kind,
             mint: self.mint,
         }
     }
@@ -489,13 +480,12 @@ impl fmt::Display for Show<'_, TermKind> {
                         fields,
                         spread: None,
                     } if fields.is_empty() => None,
-                    result => Some(self.show_kind(result)),
+                    result => Some(Show {
+                        node: result,
+                        mint: self.mint,
+                    }),
                 };
-                write_do(
-                    f,
-                    stmts,
-                    result.as_ref().map(|result| result as &dyn fmt::Display),
-                )
+                write_do(f, stmts, result)
             }
             // Braces whatever the fields are named, for the reason the parse
             // tree's printer gives: a spread says the fields written are not

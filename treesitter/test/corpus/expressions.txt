@@ -249,6 +249,105 @@ let a = do type T = Nat return 1 end
     (natural)))
 
 ================================================================================
+A block nests in a block
+================================================================================
+
+let a = do
+  let x = do let y = 1 return y end
+  return do let z = x return z end
+end
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (do_block
+      (let_definition
+        (identifier)
+        (do_block
+          (let_definition
+            (identifier)
+            (natural))
+          (identifier)))
+      (do_block
+        (let_definition
+          (identifier)
+          (identifier))
+        (identifier)))))
+
+================================================================================
+A return carries a value
+================================================================================
+
+let a = do let x = 1 return end
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (do_block
+      (let_definition
+        (identifier)
+        (natural))
+      (ERROR))))
+
+================================================================================
+A return belongs at the end of a block
+================================================================================
+
+let a = fn x => return x
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (function
+      (identifier)
+      (ERROR)
+      (identifier))))
+
+================================================================================
+No declaration but a let may be written in a block
+================================================================================
+
+let a = do effect E = () -> () return 1 end
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (do_block
+      (MISSING "end")))
+  (effect_definition
+    (identifier)
+    (function_type
+      (unit)
+      (unit)))
+  (ERROR
+    (natural)))
+
+================================================================================
+`do` and `return` are not names
+================================================================================
+
+let do = 1
+let return = 1
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (ERROR)
+    (natural)
+    (ERROR
+      (identifier))
+    (natural)))
+
+================================================================================
 `in` is an ordinary name
 ================================================================================
 

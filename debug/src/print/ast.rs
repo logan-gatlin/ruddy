@@ -369,14 +369,11 @@ impl fmt::Display for Ast<'_, ExprKind> {
             ExprKind::Function { args, body } => write_function(f, args, &Ast(&body.tracked)),
             // The statements print through the statement printer, so a
             // binding in a block is written as the definition it reads like.
-            ExprKind::Do { stmts, result } => {
-                let result = result.as_deref().map(|result| Ast(&result.tracked));
-                write_do(
-                    f,
-                    stmts.iter().map(|stmt| Ast(&stmt.tracked)),
-                    result.as_ref().map(|result| result as &dyn fmt::Display),
-                )
-            }
+            ExprKind::Do { stmts, result } => write_do(
+                f,
+                stmts.iter().map(|stmt| Ast(&stmt.tracked)),
+                result.as_deref().map(|result| Ast(&result.tracked)),
+            ),
             ExprKind::If {
                 predicate,
                 consequent,

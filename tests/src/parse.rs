@@ -501,8 +501,8 @@ fn a_label_may_be_called_when() {
     );
 }
 
-/// `when`, `where`, and `return` are contextual, but Boolean operators are
-/// reserved wherever an expression may appear.
+/// `when` and `where` are contextual, but Boolean operators are reserved
+/// wherever an expression may appear.
 #[test]
 fn only_non_operator_clause_keywords_are_contextual() {
     for src in [
@@ -1981,6 +1981,48 @@ fn a_statement_after_return_is_refused() {
         out.errors[0].span.start,
         src.rfind("return").expect("the second `return`")
     );
+
+    // What follows is read through and dropped, complaints included: a
+    // declaration after the `return` is one mistake, not two, and a nested
+    // `end` inside what is skipped is not taken for the block's.
+    for src in [
+        "let a = do return 1n type T = Nat end\nlet b = 3n",
+        "let a = do return 1n let x = match y with | _ => 1n end end\nlet b = 3n",
+    ] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        assert_eq!(out.errors.len(), 1, "{src:?}: {:#?}", out.errors);
+        assert!(
+            matches!(out.errors[0].kind, ErrorKind::StatementAfterReturn { .. }),
+            "{src:?}"
+        );
+        assert_eq!(out.stmts.len(), 2, "{src:?}: {:#?}", out.stmts);
+    }
+
+    // Something after the value that begins no statement is the block's
+    // missing `end`, and is reported as that rather than as a stray statement.
+    let src = "let a = do return x }";
+    let out = parse(lex(src, FileID::GENERATED).tokens);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert!(
+        matches!(
+            out.errors[0].kind,
+            ErrorKind::Expected {
+                expected: Expected::Keyword("end"),
+                ..
+            }
+        ),
+        "{:#?}",
+        out.errors
+    );
+    assert_eq!(out.errors[0].span.start, src.find('}').expect("the brace"));
+
+    // A `return` whose value is broken is one complaint at the value, and the
+    // block is still read through to its `end`, so the definition survives.
+    let src = "let a = do let x = 1n return } let y = 2n end\nlet b = 3n";
+    let out = parse(lex(src, FileID::GENERATED).tokens);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert_eq!(out.errors[0].span.start, src.find('}').expect("the brace"));
+    assert_eq!(out.stmts.len(), 2, "stmts: {:#?}", out.stmts);
 }
 
 /// A `return` carries a value: one written with nothing after it is refused

@@ -2497,8 +2497,8 @@ fn an_erased_argument_is_let_through_a_sum_tail() {
     assert_eq!(out.errors[0].kind.code(), "undefined-type");
 }
 
-/// The name a nested `let` binds is in scope for both halves — its own value,
-/// so a binding may name itself, and the body written after the `in`.
+/// The name a block's `let` binds is in scope for both halves — its own value,
+/// so a binding may name itself, and the rest of the block after it.
 #[test]
 fn a_nested_let_binds_its_name_for_the_value_and_the_body() {
     let (mint, out) = built("let a = do let f = fn n => f n return f end");

@@ -35,9 +35,9 @@ pub enum Kind {
     Handle,
     /// `raise`, aborting to the handler around it.
     ///
-    /// Reserved rather than contextual, unlike the `return` at a handler arm's
-    /// head: a `raise` may sit anywhere an expression may, so there is no one
-    /// position that could read it and leave the word a name everywhere else.
+    /// Reserved rather than contextual, unlike `when` and `where`: a `raise`
+    /// may sit anywhere an expression may, so there is no one position that
+    /// could read it and leave the word a name everywhere else.
     Raise,
     /// Boolean operators. Unlike the `where` clause's contextual words, these
     /// are reserved because they may appear wherever an expression does.

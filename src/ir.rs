@@ -6521,7 +6521,7 @@ impl<'a> Follow<'a> {
 /// through one still describes a value, and whether it can be typed is
 /// [`inference`](crate::inference)'s occurs check to answer.
 ///
-/// A nested `let` is followed too, and by the same rules: `let x = x in x`
+/// A block's binding is followed too, and by the same rules: `do let x = x return x end`
 /// says no more about what `x` is than `let x = x` at the top level does. What
 /// a `let` expression stands for is what its *body* stands for, since a body
 /// that is a bare name is a value given as that name.
@@ -6560,7 +6560,7 @@ fn circling(terms: &IndexMap<Symbol, Decl<Term>>) -> IndexSet<Symbol> {
 /// that `let x = x` gets at the top level.
 ///
 /// Innermost first, because a loop can close through a binding written inside
-/// another binding's value — `let x = let y = x in y in x` is two bindings on
+/// another binding's value — `do let x = do let y = x return y end return x end` is two bindings on
 /// one loop — and erasing the outer one takes the inner one's value out of the
 /// program with it. Every binding on the loop is told, which is what the
 /// top-level walk already does.
@@ -11899,10 +11899,6 @@ impl Builder<'_> {
         lowered
     }
 
-    /// A fresh symbol no source name can reach: minted like a local, never
-    /// bound into any scope, so nothing written can name or capture it. The
-    /// name starts with `%`, which no identifier can, so the debugger shows it
-    /// recognizably as the compiler's own.
     /// `do <stmt>* [return <expr>] end`, lowered to the nested `Let` terms it
     /// is a spelling of: the first statement's binding holds the rest of the
     /// block as its body, and the innermost body is the `return`'s value or,
@@ -12025,6 +12021,10 @@ impl Builder<'_> {
         }
     }
 
+    /// A fresh symbol no source name can reach: minted like a local, never
+    /// bound into any scope, so nothing written can name or capture it. The
+    /// name starts with `%`, which no identifier can, so the debugger shows it
+    /// recognizably as the compiler's own.
     fn fresh(&mut self, name: &str, span: Span) -> Tracked<Symbol> {
         span.track(self.mint.local(self.module, Namespace::Terms, name))
     }

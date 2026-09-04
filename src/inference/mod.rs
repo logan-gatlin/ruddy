@@ -2906,7 +2906,7 @@ struct Table {
     /// Rémy's levels, and the whole of what a nested `let` had to bring back
     /// with it. Where a definition could not nest there was nothing to decide:
     /// every variable still unsolved when a group ended was minted by that
-    /// group. Now `fn p => let q = p.x in q` mints the field's variable inside
+    /// group. Now `fn p => do let q = p.x return q end` mints the field's variable inside
     /// the let and must still not quantify it — see [`Table::demote`], which is
     /// what puts it back where it belongs, and why a range of minted variables
     /// is no substitute for this.
@@ -7577,7 +7577,7 @@ impl Table {
     /// The whole of why generalization at a level is right. A variable stands
     /// for a type the binder that minted `var` may see, so everything inside
     /// that type is as old as `var` is however recently it was written:
-    /// `fn p => let q = p.x in q` mints the field's variable inside the let and
+    /// `fn p => do let q = p.x return q end` mints the field's variable inside the let and
     /// then binds `p`'s — minted outside it — to a type carrying the field, at
     /// which point the field is the lambda's and not the let's. Generalizing
     /// the variables minted inside a let would quantify it; generalizing the
@@ -9280,7 +9280,7 @@ impl Table {
     /// A variable below the level is left where it stands, as a [`Ty::Var`]
     /// in the scheme's body: it belongs to an enclosing binder, so every use of
     /// this scheme is to share it rather than get a copy. That is the whole of
-    /// what makes `fn p => let q = p.x in q` one type rather than two — see
+    /// what makes `fn p => do let q = p.x return q end` one type rather than two — see
     /// [`Table::demote`] — and it is why a scheme published here may still
     /// mention the table. A definition's own scheme never does: its level is 0,
     /// and nothing is below that.
