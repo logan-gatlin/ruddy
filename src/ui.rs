@@ -771,7 +771,7 @@ impl parse::Error {
                 "an array pattern can only have one `..`",
                 self.span,
             )
-            .label("this second `..` has no end to count from")
+            .label("a second `..`")
             .related(previous, "the first `..`")
             .help("keep one `..` and name the elements on either side of it"),
             parse::ErrorKind::DiscardedArrayRest => Diagnostic::new(

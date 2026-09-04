@@ -2227,8 +2227,13 @@
       "type": "CHOICE",
       "members": [
         {
-          "type": "SYMBOL",
-          "name": "rest_pattern"
+          "type": "ALIAS",
+          "content": {
+            "type": "SYMBOL",
+            "name": "_struct_rest"
+          },
+          "named": true,
+          "value": "rest_pattern"
         },
         {
           "type": "SEQ",
@@ -2384,6 +2389,10 @@
           }
         ]
       }
+    },
+    "_struct_rest": {
+      "type": "STRING",
+      "value": ".."
     },
     "array_pattern": {
       "type": "SEQ",

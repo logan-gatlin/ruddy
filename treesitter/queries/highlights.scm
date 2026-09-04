@@ -195,7 +195,8 @@
   ".."
 ] @operator
 
-(rest_pattern) @operator
+(rest_pattern "..") @operator
+(rest_pattern name: (identifier) @variable)
 
 [
   ":"

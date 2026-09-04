@@ -139,6 +139,10 @@ test("array patterns take arrays apart from either end", () => {
   assert.deepEqual(contents(app.ends(values(5))), [0, 4]);
   assert.deepEqual(contents(app.ends(values(2))), [0, 1]);
   assert.deepEqual(contents(app.ends(values(1))), []);
+  assert.deepEqual(contents(app.init_of(values(5))), [0, 1, 2, 3]);
+  assert.deepEqual(contents(app.init_of(values(1))), []);
+  assert.deepEqual(contents(app.init_of(app.empty)), []);
+  assert.deepEqual(contents(app.init_of(values(40))), Array.from({ length: 39 }, (_, i) => i));
   assert.deepEqual(contents(app.middle(values(5))), [1, 2, 3]);
   assert.deepEqual(contents(app.middle(values(2))), []);
   assert.deepEqual(contents(app.middle(values(1))), []);

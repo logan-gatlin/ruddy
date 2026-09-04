@@ -79,9 +79,9 @@ the same runtime helpers the compiler uses.
 ## Checking
 
 - Irrefutability (rule R3 in `src/ir.rs`): an array pattern is irrefutable only when it consists of exactly one rest and no fixed elements, and the rest is `..` or a plain binding. Every other array pattern is refutable, because length is a runtime property.
-- Exhaustiveness and reachability treat an array column as a constructor with variable arity, keyed by exact length for rest-free patterns and minimum length for rest patterns. This is the standard Maranget list-constructor specialisation; both `src/patterns.rs` and the inference column rule in `src/ir.rs` (`Matrix::handled` / `Matrix::open`) must implement it, and `src/lir.rs` must agree.
+- Exhaustiveness and reachability treat an array column as a constructor with variable arity, keyed by exact length for rest-free patterns and minimum length for rest patterns. This is the standard Maranget list-constructor specialisation in `src/patterns.rs`, and `src/lir.rs` must agree. The syntactic matrix in `src/ir.rs` (`Matrix::handled` / `Matrix::open`) keeps one element position for every index and never counts an array pattern toward fully handling a case, which leaves a later binder's view unrefined: the sound side of a question it does not reason about.
 - Array columns do not participate in the presence SAT store. They qualify for the same path as tags and naturals.
-- Witnesses for unhandled cases print as array patterns: `[]`, `[_]`, `[_, _, ..]`. The checker reports the shortest missing length, adding `..` when every longer length is also missing.
+- Witnesses for unhandled cases print as array patterns: `[]`, `[_]`, `[_, _, ..]`. The checker reports the shortest missing length; the example is open (`..`) only when it stands for every length past the longest any arm names, since a shorter open example could claim lengths some arm handles.
 - Existing unreachable-arm reporting covers array arms with no new diagnostic kind.
 
 ## Lowering
@@ -157,7 +157,7 @@ All new messages are plain English per the project's diagnostic rule.
 - Pattern tests in `tests/src/patterns.rs`: exhaustive and non-exhaustive array matches, witness shapes `[]`, `[_]`, `[_, ..]`, `[_, _, ..]`, unreachable arms after `[..]`, nested array-in-array and tag-in-array cases, and mixed columns with tuples and structs.
 - Irrefutability tests: `let [..r]`, `let [..]`, and `let [[..], ..]` are rejected or accepted according to the rule; `let [x]` and `let [x, ..r]` are rejected.
 - Execution tests in `tests/bundles`: the `len` example, `[..init, last]`, `[first, .., last]`, spread literals with zero, one, and many spreads, and the four new standard functions.
-- Runtime differential test in `tests/bundles/runtime`: a seeded pseudo-random sequence of `push`, `set`, `get`, `slice`, `concat`, `prepend`, and `pop` checked against a plain JavaScript array, with sizes crossing the 32 and 1024 boundaries and repeated concatenation of unbalanced pieces to exercise rebalancing. The seed is fixed.
+- Runtime differential test in a `tests/bundles/arrays` fixture that depends on the standard library: a seeded pseudo-random sequence of `push`, `set`, `get`, `slice`, `concat`, `prepend`, and `pop` checked against a plain JavaScript array, with sizes crossing the 32 and 1024 boundaries and repeated concatenation of unbalanced pieces to exercise rebalancing. The seed is fixed. The same fixture runs the pattern and spread execution tests.
 - UI tests pin the new diagnostic prose and spans.
 - Tree-sitter corpus gains cases for every syntax form above.
 - 100% coverage per `just cov` for the compiler crate. All Rust tests run only through `just test`.

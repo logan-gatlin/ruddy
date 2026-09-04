@@ -2997,6 +2997,7 @@ fn array_lets_accept_a_lone_rest_and_refuse_any_element() {
         "let [..r, x] = [1n]",
         "let [] = [1n]",
         "let [.., _] = [1n]",
+        "let [[..], ..] = [[1n]]",
     ] {
         let (_, errors) = lowered_with_errors(src);
         assert_eq!(errors, ["binding-can-fail@4"], "{src}: {errors:#?}");

@@ -4140,10 +4140,7 @@ fn array_rest_mistakes_are_worded_plainly() {
     assert_eq!(second.code, "second-array-rest");
     assert_eq!(second.title, "an array pattern can only have one `..`");
     assert_eq!(second.primary.span, Span::generated(10, 2));
-    assert_eq!(
-        second.primary.message,
-        "this second `..` has no end to count from"
-    );
+    assert_eq!(second.primary.message, "a second `..`");
     assert_eq!(second.related.len(), 1);
     assert_eq!(second.related[0].span, Span::generated(5, 2));
     assert_eq!(second.related[0].message, "the first `..`");

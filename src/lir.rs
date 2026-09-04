@@ -3648,6 +3648,17 @@ impl Lower<'_> {
             })
             .max()
             .unwrap_or(0);
+        // No arm names an element, so every array cell is a lone rest and
+        // takes every length: there is nothing to dispatch on.
+        if longest == 0
+            && matrix
+                .lines
+                .iter()
+                .all(|line| !matches!(line.cells[0], Cell::Array { rest: None, .. }))
+        {
+            let all = Self::by_length(temp, ty, &element, &matrix, None);
+            return self.tree(all, tree, body);
+        }
         let cases: Vec<LenCase> = (0..=longest)
             .map(|len| {
                 let kept = Self::by_length(temp, ty, &element, &matrix, Some(len));

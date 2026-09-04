@@ -43,6 +43,10 @@ let ends = fn arr => match arr with
   | [first, .., last] => [first, last]
   | [..] => []
 end
+let init_of = fn arr => match arr with
+  | [..init, _] => init
+  | [] => []
+end
 let middle = fn arr => match arr with
   | [_, ..inner, _] => inner
   | [..] => []

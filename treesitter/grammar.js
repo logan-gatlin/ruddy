@@ -627,9 +627,11 @@ module.exports = grammar({
     struct_pattern: $ => seq('{', optional($._struct_pattern_body), '}'),
 
     // The `..` comes last and takes no comma after it: the fields it stands
-    // for have no order among the named ones to claim.
+    // for have no order among the named ones to claim. It takes no name
+    // either — a named struct rest is not part of the language yet — so the
+    // struct's rest is the bare dots, shown under the one `rest_pattern` name.
     _struct_pattern_body: $ => choice(
-      $.rest_pattern,
+      alias($._struct_rest, $.rest_pattern),
       seq(
         $.struct_pattern_field,
         optional(seq(',', optional($._struct_pattern_body))),
@@ -663,6 +665,8 @@ module.exports = grammar({
      * elements it stands for.
      */
     rest_pattern: $ => prec.right(seq('..', optional(field('name', $.identifier)))),
+
+    _struct_rest: _ => '..',
 
     /**
      * `[a, ..rest, b]` — the elements of an array, with at most one `..`

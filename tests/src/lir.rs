@@ -622,19 +622,15 @@ fn an_array_match_dispatches_on_length_once() {
          \x20     yield %5\n\
          \x20 ret %6"
     );
-    // A rest with nothing on either side is the array itself: no slice.
+    // A rest with nothing on either side is the array itself: no slice, and
+    // with no arm naming an element, no length to dispatch on either.
     assert_eq!(
         section(
             "let same = fn arr => match arr with | [..all] => all end",
             "fn same("
         ),
         "fn same(%0: array):\n\
-         \x20 %1: array = switch_len %0:\n\
-         \x20   0 =>\n\
-         \x20     yield %0\n\
-         \x20   else =>\n\
-         \x20     yield %0\n\
-         \x20 ret %1"
+         \x20 ret %0"
     );
 }
 
