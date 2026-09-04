@@ -190,6 +190,10 @@ impl<'a> Generator<'a> {
                         pending.push(none);
                         pending.push(some);
                     }
+                    Op::SwitchLen { cases, beyond, .. } => {
+                        pending.extend(cases.iter().map(|case| &case.block));
+                        pending.push(beyond);
+                    }
                     _ => {}
                 }
             }
@@ -352,6 +356,16 @@ impl<'a> Generator<'a> {
                 }
                 out.push_str("])");
             }
+            Op::Concat(values) => {
+                out.push_str("$arrayJoin([");
+                for (index, value) in values.iter().enumerate() {
+                    if index != 0 {
+                        out.push_str(", ");
+                    }
+                    out.push_str(&v(*value));
+                }
+                out.push_str("])");
+            }
             Op::Merge(values) => {
                 out.push_str("Object.assign(Object.create(null)");
                 for value in values {
@@ -380,6 +394,31 @@ impl<'a> Generator<'a> {
             Op::Payload(value) => {
                 out.push_str(&v(*value));
                 out.push_str("[$payload]");
+            }
+            Op::Nth { base, index } => {
+                out.push_str("$arrayNth(");
+                out.push_str(&v(*base));
+                out.push_str(", ");
+                out.push_str(&index.to_string());
+                out.push(')');
+            }
+            Op::NthBack { base, index } => {
+                out.push_str("$arrayNth(");
+                out.push_str(&v(*base));
+                out.push_str(", ");
+                out.push_str(&v(*base));
+                out.push_str(".size - ");
+                out.push_str(&(index + 1).to_string());
+                out.push(')');
+            }
+            Op::Slice { base, start, drop } => {
+                out.push_str("$arrayCut(");
+                out.push_str(&v(*base));
+                out.push_str(", ");
+                out.push_str(&start.to_string());
+                out.push_str(", ");
+                out.push_str(&drop.to_string());
+                out.push(')');
             }
             Op::Closure { func, captures } => {
                 out.push_str("(...$a) => $f[");
@@ -458,6 +497,21 @@ impl<'a> Generator<'a> {
                 out.push_str(" : ");
                 self.block(absent, out, depth)?;
                 out.push(')');
+            }
+            Op::SwitchLen { on, cases, beyond } => {
+                out.push_str("(function() { switch (");
+                out.push_str(&temp(*on));
+                out.push_str(".size) {");
+                for case in cases {
+                    out.push_str(" case ");
+                    out.push_str(&case.len.to_string());
+                    out.push_str(": return ");
+                    self.block(&case.block, out, depth + 1)?;
+                    out.push(';');
+                }
+                out.push_str(" default: return ");
+                self.block(beyond, out, depth + 1)?;
+                out.push_str("; } })()");
             }
             Op::SwitchRest {
                 on,
@@ -616,81 +670,243 @@ const $effect = Symbol("effect envelope");
 const $dv = new DataView(new ArrayBuffer(8));
 const $real = $bits => { $dv.setBigUint64(0, BigInt("0x" + $bits)); return $dv.getFloat64(0); };
 const $record = $entries => { const $o = Object.create(null); for (const [$k, $v] of $entries) $o[$k] = $v; return $o; };
+const $sum = ($name, $value) => { const $o = Object.create(null); $o[$tag] = $name; $o[$payload] = $value; return $o; };
+// ── Arrays ──────────────────────────────────────────────────────────────────
+// A relaxed-radix-balanced tree after Bagwell and Rompf (2011). A vector is
+// `{ size, shift, root, tail }`: `tail` holds the last one to thirty-two
+// elements as a plain frozen array, and `root` is a node at level `shift`
+// holding everything before them. A node is `{ items, sizes }`: `items` its
+// children — nodes, or at level five the leaves, which are frozen arrays of
+// values — and `sizes` the cumulative count of elements under each child, so
+// that a child need not be full for the one holding an index to be found.
+// Concatenation rebalances to at most two extra search steps per level, which
+// is what keeps every walk logarithmic.
+const $B = 32;
+const $BITS = 5;
+const $EXTRA = 2;
+const $node = ($items, $sizes) => Object.freeze({ items: Object.freeze($items), sizes: Object.freeze($sizes) });
+const $emptyNode = $node([], []);
+const $vector = ($size, $shift, $root, $tail) => Object.freeze({ size: $size, shift: $shift, root: $root, tail: Object.freeze($tail) });
+const $emptyArray = $vector(0, $BITS, $emptyNode, []);
+const $count = $n => $n.sizes.length === 0 ? 0 : $n.sizes[$n.sizes.length - 1];
+const $slots = ($child, $level) => $level === 0 ? $child.length : $child.items.length;
+const $below = ($child, $level) => $level === 0 ? $child.length : $count($child);
+// A node at `level` over these children, its size table computed.
+const $mk = ($items, $level) => {
+  const $sizes = [];
+  let $sum = 0;
+  for (const $child of $items) { $sum += $below($child, $level - $BITS); $sizes.push($sum); }
+  return $node($items, $sizes);
+};
+// Which child of a node at `level` holds relative index `i`, and how many
+// elements sit before that child. The radix guess is never past the answer,
+// since no child holds more than its full share.
+const $find = ($n, $level, $i) => {
+  let $idx = Math.floor($i / 2 ** $level);
+  while ($n.sizes[$idx] <= $i) $idx += 1;
+  return [$idx, $idx === 0 ? 0 : $n.sizes[$idx - 1]];
+};
+const $arrayNth = ($a, $i) => {
+  const $off = $a.size - $a.tail.length;
+  if ($i >= $off) return $a.tail[$i - $off];
+  let $n = $a.root;
+  for (let $level = $a.shift; $level > 0; $level -= $BITS) {
+    const [$idx, $before] = $find($n, $level, $i);
+    $n = $n.items[$idx];
+    $i -= $before;
+  }
+  return $n[$i];
+};
+const $assoc = ($n, $level, $i, $v) => {
+  if ($level === 0) { const $leaf = $n.slice(); $leaf[$i] = $v; return Object.freeze($leaf); }
+  const [$idx, $before] = $find($n, $level, $i);
+  const $items = $n.items.slice();
+  $items[$idx] = $assoc($n.items[$idx], $level - $BITS, $i - $before, $v);
+  return $node($items, $n.sizes);
+};
+const $path = ($level, $leaf) => $level === 0 ? $leaf : $mk([$path($level - $BITS, $leaf)], $level);
+// A leaf appended under a node at `level`, or null where there is no room.
+const $pushLeaf = ($n, $level, $leaf) => {
+  const $len = $n.items.length;
+  if ($level > $BITS && $len > 0) {
+    const $last = $pushLeaf($n.items[$len - 1], $level - $BITS, $leaf);
+    if ($last !== null) { const $items = $n.items.slice(); $items[$len - 1] = $last; return $mk($items, $level); }
+  }
+  if ($len >= $B) return null;
+  return $mk([...$n.items, $path($level - $BITS, $leaf)], $level);
+};
+// The tree with a leaf appended, grown a level where the root is full.
+const $withLeaf = ($root, $shift, $leaf) => {
+  const $grown = $pushLeaf($root, $shift, $leaf);
+  if ($grown !== null) return [$grown, $shift];
+  return [$mk([$root, $path($shift, $leaf)], $shift + $BITS), $shift + $BITS];
+};
+// The rightmost leaf taken out of a tree: the tree without it, and the leaf.
+const $popLeaf = ($n, $level) => {
+  const $len = $n.items.length;
+  if ($level === $BITS) return [$mk($n.items.slice(0, -1), $level), $n.items[$len - 1]];
+  const [$child, $leaf] = $popLeaf($n.items[$len - 1], $level - $BITS);
+  const $items = $child.items.length === 0 ? $n.items.slice(0, -1) : [...$n.items.slice(0, -1), $child];
+  return [$mk($items, $level), $leaf];
+};
+// A root with one child is that child, a level down; an empty one is empty.
+const $shrink = ($root, $shift) => {
+  while ($shift > $BITS && $root.items.length === 1) { $root = $root.items[0]; $shift -= $BITS; }
+  return $root.items.length === 0 ? [$emptyNode, $BITS] : [$root, $shift];
+};
+// The first `to` elements under a node, `to` being at least one.
+const $cut = ($n, $level, $to) => {
+  if ($level === 0) return Object.freeze($n.slice(0, $to));
+  const [$idx, $before] = $find($n, $level, $to - 1);
+  return $mk([...$n.items.slice(0, $idx), $cut($n.items[$idx], $level - $BITS, $to - $before)], $level);
+};
+// Everything after the first `from` elements under a node, `from` being less
+// than the count.
+const $chop = ($n, $level, $from) => {
+  if ($level === 0) return Object.freeze($n.slice($from));
+  const [$idx, $before] = $find($n, $level, $from);
+  const $child = $from === $before ? $n.items[$idx] : $chop($n.items[$idx], $level - $BITS, $from - $before);
+  return $mk([$child, ...$n.items.slice($idx + 1)], $level);
+};
+const $take = ($a, $to) => {
+  if ($to >= $a.size) return $a;
+  if ($to === 0) return $emptyArray;
+  const $off = $a.size - $a.tail.length;
+  if ($to > $off) return $vector($to, $a.shift, $a.root, $a.tail.slice(0, $to - $off));
+  const [$root, $leaf] = $popLeaf($cut($a.root, $a.shift, $to), $a.shift);
+  const [$shrunk, $shift] = $shrink($root, $a.shift);
+  return $vector($to, $shift, $shrunk, $leaf);
+};
+const $drop = ($a, $from) => {
+  if ($from === 0) return $a;
+  if ($from >= $a.size) return $emptyArray;
+  const $off = $a.size - $a.tail.length;
+  if ($from >= $off) return $vector($a.size - $from, $BITS, $emptyNode, $a.tail.slice($from - $off));
+  const [$root, $shift] = $shrink($chop($a.root, $a.shift, $from), $a.shift);
+  return $vector($a.size - $from, $shift, $root, $a.tail);
+};
+const $arrayCut = ($a, $from, $dropBack) => $drop($take($a, $a.size - $dropBack), $from);
+const $arrayValues = $a => {
+  const $out = [];
+  const $walk = ($n, $level) => {
+    if ($level === 0) { for (const $v of $n) $out.push($v); return; }
+    for (const $child of $n.items) $walk($child, $level - $BITS);
+  };
+  $walk($a.root, $a.shift);
+  for (const $v of $a.tail) $out.push($v);
+  return $out;
+};
+// The children of two nodes redistributed so that no more than `$EXTRA`
+// children beyond the fewest that could hold their contents remain — the
+// invariant that bounds the search steps at a level — returned as a node one
+// level up holding the one or two nodes they fill.
+const $rebalance = ($l, $mid, $r, $level) => {
+  const $all = [
+    ...($l === null ? [] : $mid === null ? $l.items : $l.items.slice(0, -1)),
+    ...($mid === null ? [] : $mid.items),
+    ...($r === null ? [] : $mid === null ? $r.items : $r.items.slice(1)),
+  ];
+  const $sub = $level - $BITS;
+  const $plan = $all.map($child => $slots($child, $sub));
+  let $n = $plan.length;
+  const $total = $plan.reduce(($x, $y) => $x + $y, 0);
+  const $optimal = Math.ceil($total / $B);
+  let $i = 0;
+  while ($n > $optimal + $EXTRA) {
+    while ($plan[$i] >= $B) $i += 1;
+    let $remaining = $plan[$i];
+    let $j = $i;
+    while ($remaining > 0) {
+      const $fill = Math.min($remaining + $plan[$j + 1], $B);
+      $plan[$j] = $fill;
+      $remaining = $remaining + $plan[$j + 1] - $fill;
+      $j += 1;
+    }
+    for (let $k = $j; $k < $n - 1; $k += 1) $plan[$k] = $plan[$k + 1];
+    $n -= 1;
+    $i = $j - 1;
+  }
+  const $merged = [];
+  let $src = 0;
+  let $off = 0;
+  for (let $k = 0; $k < $n; $k += 1) {
+    const $want = $plan[$k];
+    if ($off === 0 && $slots($all[$src], $sub) === $want) { $merged.push($all[$src]); $src += 1; continue; }
+    const $grand = [];
+    while ($grand.length < $want) {
+      const $from = $sub === 0 ? $all[$src] : $all[$src].items;
+      const $taken = Math.min($want - $grand.length, $from.length - $off);
+      for (let $t = 0; $t < $taken; $t += 1) $grand.push($from[$off + $t]);
+      $off += $taken;
+      if ($off === $from.length) { $src += 1; $off = 0; }
+    }
+    $merged.push($sub === 0 ? Object.freeze($grand) : $mk($grand, $sub));
+  }
+  const $nodes = $merged.length <= $B ? [$mk($merged, $level)] : [$mk($merged.slice(0, $B), $level), $mk($merged.slice($B), $level)];
+  return $mk($nodes, $level + $BITS);
+};
+// Two trees joined, as a node one level above the taller holding the one or
+// two nodes the join fills.
+const $mergeAt = ($l, $ls, $r, $rs) => {
+  if ($ls > $rs) return $rebalance($l, $mergeAt($l.items[$l.items.length - 1], $ls - $BITS, $r, $rs), null, $ls);
+  if ($ls < $rs) return $rebalance(null, $mergeAt($l, $ls, $r.items[0], $rs - $BITS), $r, $rs);
+  if ($ls === $BITS) return $rebalance($l, null, $r, $ls);
+  return $rebalance($l, $mergeAt($l.items[$l.items.length - 1], $ls - $BITS, $r.items[0], $rs - $BITS), $r, $ls);
+};
+const $join = ($a, $b) => {
+  if ($a.size === 0) return $b;
+  if ($b.size === 0) return $a;
+  if ($b.size <= $B) { let $out = $a; for (const $v of $arrayValues($b)) $out = $push($out, $v); return $out; }
+  const [$lroot, $lshift] = $withLeaf($a.root, $a.shift, $a.tail);
+  const [$rroot, $rshift] = $withLeaf($b.root, $b.shift, $b.tail);
+  const $top = $mergeAt($lroot, $lshift, $rroot, $rshift);
+  const $shift = Math.max($lshift, $rshift) + $BITS;
+  const [$root, $leaf] = $popLeaf($top, $shift);
+  const [$shrunk, $final] = $shrink($root, $shift);
+  return $vector($a.size + $b.size, $final, $shrunk, $leaf);
+};
+const $push = ($a, $v) => {
+  if ($a.tail.length < $B) return $vector($a.size + 1, $a.shift, $a.root, [...$a.tail, $v]);
+  const [$root, $shift] = $withLeaf($a.root, $a.shift, $a.tail);
+  return $vector($a.size + 1, $shift, $root, [$v]);
+};
 const $array = $values => {
   const $size = $values.length;
-  const $tailStart = $size === 0 ? 0 : Math.floor(($size - 1) / 32) * 32;
-  const $tail = Object.freeze($values.slice($tailStart));
+  if ($size === 0) return $emptyArray;
+  const $tailStart = Math.floor(($size - 1) / $B) * $B;
+  const $tail = $values.slice($tailStart);
   let $level = [];
-  for (let $i = 0; $i < $tailStart; $i += 32) $level.push(Object.freeze($values.slice($i, $i + 32)));
-  let $shift = 5;
-  while ($level.length > 32) {
+  for (let $i = 0; $i < $tailStart; $i += $B) $level.push(Object.freeze($values.slice($i, $i + $B)));
+  let $shift = $BITS;
+  if ($level.length === 0) return $vector($size, $shift, $emptyNode, $tail);
+  for (;;) {
     const $next = [];
-    for (let $i = 0; $i < $level.length; $i += 32) $next.push(Object.freeze($level.slice($i, $i + 32)));
+    for (let $i = 0; $i < $level.length; $i += $B) $next.push($mk($level.slice($i, $i + $B), $shift));
+    if ($next.length === 1) return $vector($size, $shift, $next[0], $tail);
     $level = $next;
-    $shift += 5;
+    $shift += $BITS;
   }
-  return Object.freeze({ size: $size, shift: $shift, root: Object.freeze($level), tail: $tail });
 };
-const $sum = ($name, $value) => { const $o = Object.create(null); $o[$tag] = $name; $o[$payload] = $value; return $o; };
-const $arrayTailOffset = $a => $a.size < 32 ? 0 : Math.floor(($a.size - 1) / 32) * 32;
-const $arrayNth = ($a, $i) => {
-  if ($i >= $arrayTailOffset($a)) return $a.tail[$i % 32];
-  let $node = $a.root;
-  for (let $level = $a.shift; $level > 0; $level -= 5) $node = $node[Math.floor($i / (2 ** $level)) % 32];
-  return $node[$i % 32];
-};
-const $arrayNewPath = ($level, $node) => {
-  while ($level > 0) { $node = Object.freeze([$node]); $level -= 5; }
-  return $node;
-};
-const $arrayPushTail = ($level, $parent, $tail, $index) => {
-  const $slot = Math.floor($index / (2 ** $level)) % 32;
-  const $copy = $parent.slice();
-  $copy[$slot] = $level === 5
-    ? $tail
-    : $parent[$slot] === undefined
-      ? $arrayNewPath($level - 5, $tail)
-      : $arrayPushTail($level - 5, $parent[$slot], $tail, $index);
-  return Object.freeze($copy);
-};
-const $arrayAssoc = ($level, $node, $index, $value) => {
-  const $copy = $node.slice();
-  if ($level === 0) $copy[$index % 32] = $value;
-  else {
-    const $slot = Math.floor($index / (2 ** $level)) % 32;
-    $copy[$slot] = $arrayAssoc($level - 5, $node[$slot], $index, $value);
-  }
-  return Object.freeze($copy);
-};
+const $arrayJoin = $pieces => $pieces.reduce($join, $emptyArray);
 const $arrayLen = $a => $a.size;
 const $arrayGet = $a => $i => $i < $a.size
   ? $sum("Some", $arrayNth($a, $i))
   : $sum("None", undefined);
-const $arraySet = $a => $i => $value => {
+const $arraySet = $a => $i => $v => {
   if ($i >= $a.size) return $sum("None", undefined);
-  if ($i >= $arrayTailOffset($a)) {
-    const $tail = $a.tail.slice();
-    $tail[$i % 32] = $value;
-    return $sum("Some", Object.freeze({ ...$a, tail: Object.freeze($tail) }));
-  }
-  return $sum("Some", Object.freeze({ ...$a, root: $arrayAssoc($a.shift, $a.root, $i, $value) }));
+  const $off = $a.size - $a.tail.length;
+  if ($i >= $off) { const $tail = $a.tail.slice(); $tail[$i - $off] = $v; return $sum("Some", $vector($a.size, $a.shift, $a.root, $tail)); }
+  return $sum("Some", $vector($a.size, $a.shift, $assoc($a.root, $a.shift, $i, $v), $a.tail));
 };
-const $arrayPush = $a => $value => {
-  if ($a.tail.length < 32) return Object.freeze({
-    ...$a,
-    size: $a.size + 1,
-    tail: Object.freeze([...$a.tail, $value]),
-  });
-  let $shift = $a.shift;
-  let $root;
-  if (Math.floor($a.size / 32) > 2 ** $a.shift) {
-    $root = Object.freeze([$a.root, $arrayNewPath($a.shift, $a.tail)]);
-    $shift += 5;
-  } else {
-    $root = $arrayPushTail($a.shift, $a.root, $a.tail, $a.size - 1);
-  }
-  return Object.freeze({ size: $a.size + 1, shift: $shift, root: $root, tail: Object.freeze([$value]) });
-};
+const $arrayPush = $a => $v => $push($a, $v);
+const $arrayConcat = $a => $b => $join($a, $b);
+const $arraySlice = $a => $from => $to => $from > $to || $to > $a.size
+  ? $sum("None", undefined)
+  : $sum("Some", $drop($take($a, $to), $from));
+const $arrayPrepend = $a => $v => $join($array([$v]), $a);
+const $arrayPop = $a => $a.size === 0
+  ? $sum("None", undefined)
+  : $sum("Some", $record([["0", $arrayNth($a, $a.size - 1)], ["1", $take($a, $a.size - 1)]]));
 const $namespace = $entries => Object.freeze($record($entries));
 const $own = ($o, $k) => Object.prototype.hasOwnProperty.call($o, $k);
 const $hasRest = ($o, $known) => Reflect.ownKeys($o).some($k => typeof $k !== "string" || !$known.includes($k));

@@ -34,6 +34,8 @@
   name: (identifier) @local.definition.var
   !pattern)
 (struct_pattern_field pattern: (identifier) @local.definition.var)
+(array_pattern element: (identifier) @local.definition.var)
+(rest_pattern name: (identifier) @local.definition.var)
 
 ; ── what a name may resolve to ───────────────────────────────────────────────
 

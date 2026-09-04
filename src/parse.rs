@@ -249,10 +249,11 @@ pub enum ExprKind {
     /// spelling can be reproduced. The empty tuple remains [`Unit`](Self::Unit)
     /// and a singleton requires its trailing comma.
     Tuple(Vec<Expr>),
-    /// `[a, b]` — an immutable homogeneous array literal. Homogeneity is a
-    /// semantic property established by inference; the surface tree preserves
-    /// every written element.
-    Array(Vec<Expr>),
+    /// `[a, ..b, c]` — an immutable homogeneous array literal, each item a
+    /// value of its own or a `..` spreading another array's values in place.
+    /// Homogeneity is a semantic property established by inference; the
+    /// surface tree preserves every written item.
+    Array(Vec<ArrayItem>),
     /// `#Some 1` — one case of a sum, with what it carries.
     ///
     /// The payload is optional because `#None` is how a case that carries
@@ -363,6 +364,24 @@ pub enum ArgKind {
     Wildcard,
 }
 
+/// One item of an array literal: a value, or — with the `..` — an array whose
+/// values are spread into the literal where the item sits. The span is the
+/// `..`'s own, for the debugger to point at.
+#[derive(Debug, Clone)]
+pub struct ArrayItem {
+    pub spread: Option<Span>,
+    pub value: Expr,
+}
+
+/// The `..` of an array pattern: everything the fixed elements around it do
+/// not claim, bound to `name` when one was written after the dots and thrown
+/// away otherwise. The span covers the dots and the name together.
+#[derive(Debug, Clone)]
+pub struct ArrayRest {
+    pub span: Span,
+    pub name: Option<TrackedString>,
+}
+
 pub type Pattern = Tracked<PatternKind>;
 
 /// What a value may be taken apart as, mirroring the expression grammar's
@@ -403,6 +422,16 @@ pub enum PatternKind {
     /// `(a, b)` — an exact positional struct pattern. The elements retain
     /// their tuple spelling until lowering assigns decimal field names.
     Tuple(Vec<Pattern>),
+    /// `[a, ..rest, b]` — reach into an array's elements. Without a rest the
+    /// pattern matches arrays of exactly as many elements as it names; with
+    /// one, arrays of at least that many, the elements before the `..`
+    /// counted from the front and the ones after it from the back, and the
+    /// rest — the middle — bound to the name after the dots, if any.
+    Array {
+        before: Vec<Pattern>,
+        rest: Option<ArrayRest>,
+        after: Vec<Pattern>,
+    },
     /// `#Name [<pattern>]` — one case of a sum. The payload pattern is
     /// taken greedily, exactly as [`Parser::tag_expr`] takes a payload, so
     /// `#A #B x` is `#A` carrying `(#B x)`. Written bare, the case
@@ -752,10 +781,13 @@ pub enum ErrorKind {
     /// for a value being discarded, so it can never be *used* — with the
     /// position carried for the wording alone. See [`Place`].
     Wildcard { place: Place },
-    /// Array destructuring is deliberately not part of the first array
-    /// release. Keep this separate from a generic missing-pattern error so a
-    /// reader is not led to hunt for a different spelling of the same thing.
-    ArrayPattern,
+    /// A second `..` in one array pattern. Two rests would leave the elements
+    /// between them nowhere definite to sit, so a pattern gets one, and the
+    /// complaint points back at the first.
+    SecondArrayRest { previous: Span },
+    /// `.._`: the rest of an array thrown away by name, which is what the bare
+    /// `..` already does. One spelling for one meaning, as with `{ x, .. }`.
+    DiscardedArrayRest,
 }
 
 /// What the parser needed at the primary error span.
@@ -2276,22 +2308,28 @@ impl Parser {
         Some(open.span.merge(close.span).track(ExprKind::Tuple(elements)))
     }
 
-    /// `[<expr>, ...]`, including the empty literal and an optional trailing
-    /// comma. Unlike parentheses, brackets never group: one element is still
-    /// an array.
+    /// `[<item>, ...]`, including the empty literal and an optional trailing
+    /// comma, where an item is an expression or a `..` spreading one. Unlike
+    /// parentheses, brackets never group: one element is still an array.
+    ///
+    /// The `..` is read here, before the expression it applies to, which is
+    /// the one place it has an expression reading: [`projection`]
+    /// (Self::projection) still refuses it after a value.
     fn array_expr(&mut self) -> Option<Expr> {
         let open = self
             .eat(&Kind::LeftBracket)
             .expect("the caller peeked `[` ");
-        let mut elements = Vec::new();
+        let mut items = Vec::new();
         while !self.at(&Kind::RightBracket) && !self.at_expr_boundary() {
-            elements.push(self.expr()?);
+            let spread = self.eat_if(&Kind::DotDot).map(|dots| dots.span);
+            let value = self.expr()?;
+            items.push(ArrayItem { spread, value });
             if self.eat_if(&Kind::Comma).is_none() {
                 break;
             }
         }
         let close = self.close_delimiter(open.span, &Kind::RightBracket)?;
-        Some(open.span.merge(close.span).track(ExprKind::Array(elements)))
+        Some(open.span.merge(close.span).track(ExprKind::Array(items)))
     }
 
     /// `fn <arg>* => <expr>` — an anonymous function with zero or more
@@ -2620,10 +2658,7 @@ impl Parser {
                 Some(span.track(PatternKind::Boolean(value)))
             }
             Kind::LeftBrace => self.struct_pattern(),
-            Kind::LeftBracket => {
-                self.error(span, ErrorKind::ArrayPattern);
-                None
-            }
+            Kind::LeftBracket => self.array_pattern(),
             Kind::LeftParen => self.paren_pattern(),
             // Nothing here begins a pattern — an arm written `=> 1` is missing
             // one, and this is where it is told so.
@@ -2690,6 +2725,69 @@ impl Parser {
         let close = self.close_delimiter(open.span, &Kind::RightBrace)?;
         let span = open.span.merge(close.span);
         Some(span.track(PatternKind::Struct { fields, rest }))
+    }
+
+    /// `[<pattern>, ..., ..[name], <pattern>, ...]` with an optional trailing
+    /// comma — the array literal's shape, with one `..` allowed anywhere among
+    /// the elements. The elements before it are counted from the front and
+    /// the ones after it from the back, which is what lets the rest sit
+    /// anywhere; a second `..` would leave the elements between the two with
+    /// no end to count from, and is refused at itself. The rest is discarded
+    /// by writing the dots alone: `.._` says the same thing twice, and is
+    /// refused so that there is one spelling.
+    fn array_pattern(&mut self) -> Option<Pattern> {
+        let open = self.eat(&Kind::LeftBracket).expect("the caller peeked `[`");
+        let mut before = Vec::new();
+        let mut rest: Option<ArrayRest> = None;
+        let mut after = Vec::new();
+        while !self.at(&Kind::RightBracket) && !self.at_pattern_boundary() {
+            if let Some(dots) = self.eat_if(&Kind::DotDot) {
+                if let Some(previous) = &rest {
+                    self.error(
+                        dots.span,
+                        ErrorKind::SecondArrayRest {
+                            previous: previous.span,
+                        },
+                    );
+                    return None;
+                }
+                if self.at_wildcard() {
+                    let under = self.advance().expect("the wildcard just peeked");
+                    self.error(dots.span.merge(under.span), ErrorKind::DiscardedArrayRest);
+                    return None;
+                }
+                let name = match self.peek() {
+                    Some(tok) => match &tok.tracked {
+                        Kind::Identifier(name) => {
+                            let name = tok.span.track(name.clone());
+                            self.advance();
+                            Some(name)
+                        }
+                        _ => None,
+                    },
+                    None => None,
+                };
+                let span = name
+                    .as_ref()
+                    .map_or(dots.span, |name| dots.span.merge(name.span));
+                rest = Some(ArrayRest { span, name });
+            } else {
+                let element = self.pattern()?;
+                match rest {
+                    Some(_) => after.push(element),
+                    None => before.push(element),
+                }
+            }
+            if self.eat_if(&Kind::Comma).is_none() {
+                break;
+            }
+        }
+        let close = self.close_delimiter(open.span, &Kind::RightBracket)?;
+        Some(open.span.merge(close.span).track(PatternKind::Array {
+            before,
+            rest,
+            after,
+        }))
     }
 
     /// A grouped pattern or exact tuple pattern, disambiguated by the comma

@@ -160,7 +160,8 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         parse::ErrorKind::Wildcard {
             place: parse::Place::Value,
         },
-        parse::ErrorKind::ArrayPattern,
+        parse::ErrorKind::SecondArrayRest { previous: span },
+        parse::ErrorKind::DiscardedArrayRest,
     ] {
         let error = parse::Error { span, kind };
         all.push(("parse", error.code(), error.to_string()));
@@ -3003,6 +3004,41 @@ fn a_printer_reports_a_writer_that_refuses_it() {
         every_failure_is_reported(what, &ty);
     }
 
+    // An array witness spells its elements as the arm for them would be
+    // written — `_` where any value serves — and the lengths beyond as `..`.
+    for (witness, printed) in [
+        (
+            ir::Witness::Array {
+                elements: vec![
+                    ir::Witness::Any,
+                    ir::Witness::Tag {
+                        name: "A".to_string(),
+                        payload: None,
+                    },
+                ],
+                open: true,
+            },
+            "[_, #A, ..]",
+        ),
+        (
+            ir::Witness::Array {
+                elements: Vec::new(),
+                open: true,
+            },
+            "[..]",
+        ),
+        (
+            ir::Witness::Array {
+                elements: vec![ir::Witness::Natural(3)],
+                open: false,
+            },
+            "[3n]",
+        ),
+    ] {
+        assert_eq!(witness.to_string(), printed);
+        every_failure_is_reported("an array witness", &witness);
+    }
+
     // Compound displays of their own, including every recursive formula form
     // and every piece of a witness, report a refusal at any depth.
     let witness = ir::Witness::Struct(
@@ -3817,6 +3853,17 @@ fn the_pattern_complaints_say_what_was_written() {
         "a value here might not equal `\"x\"`"
     );
 
+    // An array pattern naming an element fails on length, which the label
+    // says in as many words.
+    let length = diagnose(IrError::RefutableBinding {
+        found: ir::Refuter::Length,
+    });
+    assert_eq!(length.code, number.code);
+    assert_eq!(
+        length.primary.message,
+        "a value here might have a different number of elements"
+    );
+
     assert_eq!(PatternError::UnreachableArm.code(), "unreachable-arm");
     assert_eq!(
         PatternError::UnreachableArm.to_string(),
@@ -4077,6 +4124,47 @@ fn parse_expectations_are_worded_for_their_source_context() {
             }]
         );
     }
+}
+
+/// The two ways an array pattern's rest can be miswritten are told apart by
+/// code and by wording, the second `..` pointing back at the first.
+#[test]
+fn array_rest_mistakes_are_worded_plainly() {
+    let second = parse::Error {
+        span: Span::generated(10, 2),
+        kind: parse::ErrorKind::SecondArrayRest {
+            previous: Span::generated(5, 2),
+        },
+    }
+    .diagnostic();
+    assert_eq!(second.code, "second-array-rest");
+    assert_eq!(second.title, "an array pattern can only have one `..`");
+    assert_eq!(second.primary.span, Span::generated(10, 2));
+    assert_eq!(
+        second.primary.message,
+        "this second `..` has no end to count from"
+    );
+    assert_eq!(second.related.len(), 1);
+    assert_eq!(second.related[0].span, Span::generated(5, 2));
+    assert_eq!(second.related[0].message, "the first `..`");
+    assert_eq!(
+        second.help,
+        ["keep one `..` and name the elements on either side of it"]
+    );
+
+    let discarded = parse::Error {
+        span: Span::generated(8, 3),
+        kind: parse::ErrorKind::DiscardedArrayRest,
+    }
+    .diagnostic();
+    assert_eq!(discarded.code, "discarded-array-rest");
+    assert_eq!(discarded.title, "write `..` on its own to skip the rest");
+    assert_eq!(discarded.primary.span, Span::generated(8, 3));
+    assert_eq!(
+        discarded.primary.message,
+        "`..` already skips the rest; the `_` adds nothing"
+    );
+    assert!(discarded.related.is_empty());
 }
 
 /// The misplaced discard is one meaning worded five ways. Every wording is

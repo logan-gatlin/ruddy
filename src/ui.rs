@@ -657,7 +657,8 @@ impl parse::Error {
         match self.kind {
             parse::ErrorKind::Expected { expected, .. } => expected.code(),
             parse::ErrorKind::Wildcard { .. } => "misplaced-discard",
-            parse::ErrorKind::ArrayPattern => "unsupported-array-pattern",
+            parse::ErrorKind::SecondArrayRest { .. } => "second-array-rest",
+            parse::ErrorKind::DiscardedArrayRest => "discarded-array-rest",
         }
     }
 
@@ -765,12 +766,20 @@ impl parse::Error {
                 Diagnostic::new("misplaced-discard", title, self.span)
                     .label("`_` does not provide a name here")
             }
-            parse::ErrorKind::ArrayPattern => Diagnostic::new(
-                "unsupported-array-pattern",
-                "array patterns are not supported",
+            parse::ErrorKind::SecondArrayRest { previous } => Diagnostic::new(
+                "second-array-rest",
+                "an array pattern can only have one `..`",
                 self.span,
             )
-            .label("match the array as a value and use functions from `array`"),
+            .label("this second `..` has no end to count from")
+            .related(previous, "the first `..`")
+            .help("keep one `..` and name the elements on either side of it"),
+            parse::ErrorKind::DiscardedArrayRest => Diagnostic::new(
+                "discarded-array-rest",
+                "write `..` on its own to skip the rest",
+                self.span,
+            )
+            .label("`..` already skips the rest; the `_` adds nothing"),
         }
     }
 }
@@ -801,7 +810,8 @@ impl Grouped for parse::PatternKind {
             | parse::PatternKind::Boolean(_)
             | parse::PatternKind::Unit
             | parse::PatternKind::Struct { .. }
-            | parse::PatternKind::Tuple(_) => Prec::Atom,
+            | parse::PatternKind::Tuple(_)
+            | parse::PatternKind::Array { .. } => Prec::Atom,
         }
     }
 }
@@ -875,6 +885,17 @@ impl fmt::Display for parse::PatternKind {
                 }
                 f.write_str(" }")
             }
+            parse::PatternKind::Array {
+                before,
+                rest,
+                after,
+            } => write_array_pattern(
+                f,
+                before.iter().map(|element| &element.tracked),
+                rest.as_ref()
+                    .map(|rest| rest.name.as_ref().map(|name| name.tracked.as_str())),
+                after.iter().map(|element| &element.tracked),
+            ),
         }
     }
 }
@@ -891,9 +912,10 @@ impl Grouped for ir::Witness {
                 payload: Some(_), ..
             } => Prec::Apply,
             ir::Witness::Tag { payload: None, .. } => Prec::Tag,
-            ir::Witness::Natural(_) | ir::Witness::Literal(_) | ir::Witness::Struct(_) => {
-                Prec::Atom
-            }
+            ir::Witness::Natural(_)
+            | ir::Witness::Literal(_)
+            | ir::Witness::Struct(_)
+            | ir::Witness::Array { .. } => Prec::Atom,
             ir::Witness::Any | ir::Witness::Other(_) => Prec::Lambda,
         }
     }
@@ -945,6 +967,28 @@ impl fmt::Display for ir::Witness {
                     write_tag_label(f, case)?;
                 }
                 Ok(())
+            }
+            // An element any value serves for prints as the `_` an arm for it
+            // would be written with, and the lengths past the named ones as
+            // the `..` that would take them.
+            ir::Witness::Array { elements, open } => {
+                f.write_str("[")?;
+                for (at, element) in elements.iter().enumerate() {
+                    if at > 0 {
+                        f.write_str(", ")?;
+                    }
+                    match element {
+                        ir::Witness::Any => f.write_str("_")?,
+                        element => write!(f, "{element}")?,
+                    }
+                }
+                if *open {
+                    if !elements.is_empty() {
+                        f.write_str(", ")?;
+                    }
+                    f.write_str("..")?;
+                }
+                f.write_str("]")
             }
         }
     }
@@ -1378,6 +1422,9 @@ impl ir::Error {
                     }
                     ir::Refuter::Literal(value) => {
                         format!("a value here might not equal `{}`", SourceLiteral(value))
+                    }
+                    ir::Refuter::Length => {
+                        "a value here might have a different number of elements".to_string()
                     }
                 };
                 Diagnostic::new(code, "this pattern can fail, but a binding must accept every value", span)
@@ -2850,6 +2897,7 @@ fn explanation_fact(
             inference::Subject::Argument => "this argument has to fit the call".into(),
             inference::Subject::Parameter => "the function requires one parameter type".into(),
             inference::Subject::Term => "this expression supplies its type here".into(),
+            inference::Subject::Spread => "only an array can be spread into an array".into(),
             _ => "this use contributes one of the conflicting type requirements".into(),
         },
     }
@@ -3866,6 +3914,44 @@ pub fn write_tuple<V: fmt::Display>(
         f.write_str(",")?;
     }
     f.write_str(")")
+}
+
+/// Render an array pattern in canonical surface syntax: the elements before
+/// the rest, the rest as `..` with its name when it has one, and the elements
+/// after it, comma-separated inside brackets. `rest` is `None` for an exact
+/// pattern, `Some(None)` for a bare `..`, and `Some(Some(name))` for a named
+/// one.
+pub fn write_array_pattern<V: fmt::Display>(
+    f: &mut fmt::Formatter<'_>,
+    before: impl IntoIterator<Item = V>,
+    rest: Option<Option<&str>>,
+    after: impl IntoIterator<Item = V>,
+) -> fmt::Result {
+    f.write_str("[")?;
+    let mut count = 0;
+    let mut separate = |f: &mut fmt::Formatter<'_>| -> fmt::Result {
+        if count > 0 {
+            f.write_str(", ")?;
+        }
+        count += 1;
+        Ok(())
+    };
+    for element in before {
+        separate(f)?;
+        write!(f, "{element}")?;
+    }
+    if let Some(name) = rest {
+        separate(f)?;
+        f.write_str("..")?;
+        if let Some(name) = name {
+            f.write_str(name)?;
+        }
+    }
+    for element in after {
+        separate(f)?;
+        write!(f, "{element}")?;
+    }
+    f.write_str("]")
 }
 
 // These pieces do not depend on `K` or `V`. Keeping them outside `write_row`

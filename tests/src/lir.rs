@@ -596,6 +596,176 @@ fn a_match_tests_each_position_once() {
     );
 }
 
+/// An array position dispatches on length once: one case per length up to the
+/// longest an arm names and an `else` for the lengths beyond, each element
+/// read out once where an arm tests or binds it, and a rest read out as the
+/// slice between the fixed elements only where an arm binds it.
+#[test]
+fn an_array_match_dispatches_on_length_once() {
+    assert_eq!(
+        section(
+            "let len = fn arr => match arr with | [] => 0n | [_, ..rest] => 1n end",
+            "fn len("
+        ),
+        "fn len(%0: array):\n\
+         \x20 %6: nat = switch_len %0:\n\
+         \x20   0 =>\n\
+         \x20     %1: nat = const 0n\n\
+         \x20     yield %1\n\
+         \x20   1 =>\n\
+         \x20     %2: array = slice %0, 1, 0\n\
+         \x20     %3: nat = const 1n\n\
+         \x20     yield %3\n\
+         \x20   else =>\n\
+         \x20     %4: array = slice %0, 1, 0\n\
+         \x20     %5: nat = const 1n\n\
+         \x20     yield %5\n\
+         \x20 ret %6"
+    );
+    // A rest with nothing on either side is the array itself: no slice.
+    assert_eq!(
+        section(
+            "let same = fn arr => match arr with | [..all] => all end",
+            "fn same("
+        ),
+        "fn same(%0: array):\n\
+         \x20 %1: array = switch_len %0:\n\
+         \x20   0 =>\n\
+         \x20     yield %0\n\
+         \x20   else =>\n\
+         \x20     yield %0\n\
+         \x20 ret %1"
+    );
+}
+
+/// Under an exact length every element is counted from the front, the ones
+/// after a rest included; beyond the named lengths the ones after a rest are
+/// counted from the back, and the rest is the slice between.
+#[test]
+fn array_elements_are_read_from_whichever_end_the_length_fixes() {
+    assert_eq!(
+        section(
+            "let ends = fn arr => match arr with | [first, ..middle, last] => middle | [..rest] => rest end",
+            "fn ends("
+        ),
+        "fn ends(%0: array):\n\
+         \x20 %7: array = switch_len %0:\n\
+         \x20   0 =>\n\
+         \x20     yield %0\n\
+         \x20   1 =>\n\
+         \x20     yield %0\n\
+         \x20   2 =>\n\
+         \x20     %1: any = nth %0, 0\n\
+         \x20     %2: any = nth %0, 1\n\
+         \x20     %3: array = slice %0, 1, 1\n\
+         \x20     yield %3\n\
+         \x20   else =>\n\
+         \x20     %4: any = nth %0, 0\n\
+         \x20     %5: any = nth_back %0, 0\n\
+         \x20     %6: array = slice %0, 1, 1\n\
+         \x20     yield %6\n\
+         \x20 ret %7"
+    );
+    assert_eq!(
+        section(
+            "let pick = fn arr => match arr with | [1n, .., 2n] => 3n | [.., last] => last | [] => 0n end",
+            "fn pick("
+        ),
+        "fn pick(%0: array):\n\
+         \x20 %15: nat = switch_len %0:\n\
+         \x20   0 =>\n\
+         \x20     %1: nat = const 0n\n\
+         \x20     yield %1\n\
+         \x20   1 =>\n\
+         \x20     %2: nat = nth %0, 0\n\
+         \x20     yield %2\n\
+         \x20   2 =>\n\
+         \x20     %3: nat = nth %0, 0\n\
+         \x20     %8: nat = switch_prim %3:\n\
+         \x20       1n =>\n\
+         \x20         %4: nat = nth %0, 1\n\
+         \x20         %6: nat = switch_prim %4:\n\
+         \x20           2n =>\n\
+         \x20             %5: nat = const 3n\n\
+         \x20             yield %5\n\
+         \x20           else =>\n\
+         \x20             yield %4\n\
+         \x20         yield %6\n\
+         \x20       else =>\n\
+         \x20         %7: nat = nth %0, 1\n\
+         \x20         yield %7\n\
+         \x20     yield %8\n\
+         \x20   else =>\n\
+         \x20     %9: nat = nth %0, 0\n\
+         \x20     %14: nat = switch_prim %9:\n\
+         \x20       1n =>\n\
+         \x20         %10: nat = nth_back %0, 0\n\
+         \x20         %12: nat = switch_prim %10:\n\
+         \x20           2n =>\n\
+         \x20             %11: nat = const 3n\n\
+         \x20             yield %11\n\
+         \x20           else =>\n\
+         \x20             yield %10\n\
+         \x20         yield %12\n\
+         \x20       else =>\n\
+         \x20         %13: nat = nth_back %0, 0\n\
+         \x20         yield %13\n\
+         \x20     yield %14\n\
+         \x20 ret %15"
+    );
+}
+
+/// An arm accepting the whole array sits beside the length cases as the row
+/// that takes every length: it binds the array itself under each case, and
+/// reads no element.
+#[test]
+fn an_arm_binding_the_whole_array_takes_every_length() {
+    assert_eq!(
+        section(
+            "let f = fn arr => match arr with | [] => 0n | other => 1n end",
+            "fn f("
+        ),
+        "fn f(%0: array):\n\
+         \x20 %3: nat = switch_len %0:\n\
+         \x20   0 =>\n\
+         \x20     %1: nat = const 0n\n\
+         \x20     yield %1\n\
+         \x20   else =>\n\
+         \x20     %2: nat = const 1n\n\
+         \x20     yield %2\n\
+         \x20 ret %3"
+    );
+    assert_eq!(
+        section(
+            "let g = fn arr => match arr with | [x, ..] => x | _ => 0n end",
+            "fn g("
+        ),
+        "fn g(%0: array):\n\
+         \x20 %4: nat = switch_len %0:\n\
+         \x20   0 =>\n\
+         \x20     %1: nat = const 0n\n\
+         \x20     yield %1\n\
+         \x20   1 =>\n\
+         \x20     %2: nat = nth %0, 0\n\
+         \x20     yield %2\n\
+         \x20   else =>\n\
+         \x20     %3: nat = nth %0, 0\n\
+         \x20     yield %3\n\
+         \x20 ret %4"
+    );
+}
+
+/// A spread literal is the runs of plain items, each one literal, joined with
+/// the arrays it spreads, in order; a literal with no spread is one array.
+#[test]
+fn a_spread_literal_joins_its_pieces_in_order() {
+    let listing = listing("let a = [1n]\nlet b = [..a, 2n, 3n, ..a]\nlet c = [..a]");
+    assert!(listing.contains("concat %"), "{listing}");
+    let joined = section("let a = [1n]\nlet b = [..a, 2n, 3n, ..a]", "global b");
+    assert!(joined.contains("array [%"), "{joined}");
+    assert_eq!(joined.matches("concat").count(), 1, "{joined}");
+}
+
 /// A case no listed one covers needs somewhere 'to go: an arm that accepts
 /// anything gives the dispatch its `else`. With every case of a closed row
 /// listed there is nothing left over, and no `else` is written.

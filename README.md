@@ -18,8 +18,13 @@ ruddy run
 Use `ruddy --help` to see all CLI commands. The standard library is installed under `$RUDDY_HOME/std`, or `~/.ruddy/std` when `RUDDY_HOME` is unset.
 
 Immutable homogeneous arrays use `[value, ...]` literals and `[Type]` types.
-The `std::array` module provides `len`, safe `get` and `set`, and persistent
-`push`; updates return new arrays without changing their inputs.
+A literal may spread other arrays into place with `..`, as in `[..a, x, ..b]`,
+and a `match` may take an array apart by length with patterns such as `[]`,
+`[first, ..rest]`, and `[first, .., last]`, where the one `..` binds the
+elements between the named ones. The `std::array` module provides `len`,
+safe `get`, `set`, `slice`, and `pop`, and persistent `push`, `prepend`, and
+`concat`; every update returns a new array without changing its inputs, and
+slicing and concatenation take logarithmic time.
 
 ## Development
 

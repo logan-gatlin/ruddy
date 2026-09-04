@@ -124,6 +124,123 @@ fn arrays_infer_one_element_type_and_generalize_empty_literals() {
     assert_eq!(scheme(&mint, &output, "strings"), "ArrayOf String");
 }
 
+/// An array pattern demands an array of the column, every element pattern —
+/// from either end, at any depth — constrains the one element type, and a
+/// rest binds the array of them.
+#[test]
+fn array_patterns_type_their_elements_and_bind_rests_to_arrays() {
+    let (mint, _, output) = inferred(
+        "let head = fn arr => match arr with | [] => 0n | [x, ..] => x end\n\
+         let tail = fn arr => match arr with | [_, ..rest] => rest | [..] => [] end\n\
+         let last = fn arr => match arr with | [.., z] => z | [..] => 0n end\n\
+         let ends = fn arr => match arr with | [a, ..middle, b] => a + b | [..] => 0 end\n\
+         let nested = fn arr => match arr with | [[x, ..], ..] => x | [..] => 0n end\n\
+         let tagged = fn arr => match arr with | [#Some x, ..] => x | [..] => 0n end\n\
+         let [..all] = [1n]\n\
+         let whole = fn arr => match arr with | [..r] => r end\n",
+    );
+    assert_eq!(scheme(&mint, &output, "head"), "[Nat] -> Nat");
+    assert_eq!(scheme(&mint, &output, "tail"), "['a] -> ['a]");
+    assert_eq!(scheme(&mint, &output, "last"), "[Nat] -> Nat");
+    assert_eq!(scheme(&mint, &output, "ends"), "[Real] -> Real");
+    assert_eq!(scheme(&mint, &output, "nested"), "[[Nat]] -> Nat");
+    // The catch-all arm leaves the element sum open, as it leaves any sum.
+    assert_eq!(
+        scheme(&mint, &output, "tagged"),
+        "[#Some Nat | ..'a] -> Nat"
+    );
+    assert_eq!(scheme(&mint, &output, "all"), "[Nat]");
+    assert_eq!(scheme(&mint, &output, "whole"), "['a] -> ['a]");
+}
+
+/// A spread is checked against the literal's own array type, so it joins
+/// the element type the plain items decide — and anything but an array in
+/// that position is a mismatch worded as the spread it is.
+#[test]
+fn array_spreads_are_arrays_of_the_literal_and_nothing_else() {
+    let (mint, _, output) = inferred(
+        "let a = [1n]\n\
+         let b = [..a, 2n]\n\
+         let c = [..a, ..[]]\n\
+         let d = [..[]]\n\
+         let e = [..b, ..[3n], 4n, ..a]\n",
+    );
+    assert_eq!(scheme(&mint, &output, "b"), "[Nat]");
+    assert_eq!(scheme(&mint, &output, "c"), "[Nat]");
+    assert_eq!(scheme(&mint, &output, "d"), "['a]");
+    assert_eq!(scheme(&mint, &output, "e"), "[Nat]");
+
+    let (_, out, output) = infer_src("let bad = [..1n]");
+    assert!(out.errors.is_empty(), "ir errors: {:#?}", out.errors);
+    let [error] = output.errors() else {
+        panic!("expected one mismatch: {:#?}", output.errors());
+    };
+    let diagnostic = error.diagnostic();
+    assert_eq!(
+        diagnostic.title,
+        "an array and a natural number cannot be the same type"
+    );
+    let labels: Vec<&str> = std::iter::once(diagnostic.primary.message.as_str())
+        .chain(
+            diagnostic
+                .related
+                .iter()
+                .map(|related| related.message.as_str()),
+        )
+        .collect();
+    assert!(
+        labels
+            .iter()
+            .any(|label| label.contains("only an array can be spread into an array")),
+        "{labels:#?}"
+    );
+
+    let (_, _, output) = infer_src("let mixed = [\"one\", ..[2n]]");
+    assert_eq!(output.errors().len(), 1, "{:#?}", output.errors());
+
+    // Under an annotation the spread is checked against the written array
+    // type, with the same wording when it is not one.
+    let (mint, _, output) = inferred("let a = [1n]\nlet b : [Nat] = [..a, 2n]");
+    assert_eq!(scheme(&mint, &output, "b"), "[Nat]");
+    let (_, _, output) = infer_src("let bad : [Nat] = [..1n]");
+    let [error] = output.errors() else {
+        panic!("expected one mismatch: {:#?}", output.errors());
+    };
+    let diagnostic = error.diagnostic();
+    let labels: Vec<&str> = std::iter::once(diagnostic.primary.message.as_str())
+        .chain(
+            diagnostic
+                .related
+                .iter()
+                .map(|related| related.message.as_str()),
+        )
+        .collect();
+    assert!(
+        labels
+            .iter()
+            .any(|label| label.contains("only an array can be spread into an array")),
+        "{labels:#?}"
+    );
+}
+
+/// An array pattern inside a case's payload, or a case inside an array's
+/// elements, never counts toward fully handling a case: a later binder keeps
+/// the case in its view, which is the sound side of a question the syntactic
+/// matrix does not reason about.
+#[test]
+fn array_patterns_never_refine_a_later_binder_out_of_a_case() {
+    let (mint, _, output) = inferred(
+        "let f = fn v => match v with | #A [x] => x | y => 0n end\n\
+         let g = fn v => match v with | #A [..r] => 0n | y => 1n end\n\
+         let h = fn v => match v with | [#A] => 1n | [x] => 2n | [..] => 3n end\n\
+         let k = fn v => match v with | #A [x] => x | #A y => 0n | #B => 1n end\n",
+    );
+    assert_eq!(scheme(&mint, &output, "f"), "#A [Nat] | ..'a -> Nat");
+    assert_eq!(scheme(&mint, &output, "g"), "#A ['a] | ..'b -> Nat");
+    assert_eq!(scheme(&mint, &output, "h"), "[#A | ..'a] -> Nat");
+    assert_eq!(scheme(&mint, &output, "k"), "#A [Nat] | #B -> Nat");
+}
+
 #[test]
 fn heterogeneous_array_literals_report_a_type_mismatch() {
     let (_, out, output) = infer_src("let mixed = [1, \"two\"]");
@@ -566,9 +683,9 @@ fn body_tys(term: &Term) -> Vec<Rc<Ty>> {
                 out.extend(body_tys(&field.value));
             }
         }
-        TermKind::Array(elements) => {
-            for element in elements {
-                out.extend(body_tys(element));
+        TermKind::Array(items) => {
+            for item in items {
+                out.extend(body_tys(&item.value));
             }
         }
         TermKind::Project { base, .. } => out.extend(body_tys(base)),

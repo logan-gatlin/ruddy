@@ -19,8 +19,9 @@ use ruddy::{
 
 use crate::print::{
     Entry, Grouped, Mark, Prec, Shape, label, string, tuple_field_order, write_applied,
-    write_apply, write_arrow, write_binary, write_let, write_match, write_pipeline, write_project,
-    write_row, write_struct, write_sum, write_tag, write_tuple, write_unary,
+    write_apply, write_array_pattern, write_arrow, write_binary, write_let, write_match,
+    write_pipeline, write_project, write_row, write_struct, write_sum, write_tag, write_tuple,
+    write_unary,
 };
 
 /// A parse node, ready to print. A newtype rather than a bare impl because both
@@ -413,13 +414,16 @@ impl fmt::Display for Ast<'_, ExprKind> {
             ExprKind::Tuple(elements) => {
                 write_tuple(f, elements.iter().map(|element| Ast(&element.tracked)))
             }
-            ExprKind::Array(elements) => {
+            ExprKind::Array(items) => {
                 f.write_str("[")?;
-                for (index, element) in elements.iter().enumerate() {
+                for (index, item) in items.iter().enumerate() {
                     if index != 0 {
                         f.write_str(", ")?;
                     }
-                    write!(f, "{}", Ast(&element.tracked))?;
+                    if item.spread.is_some() {
+                        f.write_str("..")?;
+                    }
+                    write!(f, "{}", Ast(&item.value.tracked))?;
                 }
                 f.write_str("]")
             }
@@ -478,7 +482,8 @@ impl Grouped for Ast<'_, PatternKind> {
             | PatternKind::Boolean(_)
             | PatternKind::Unit
             | PatternKind::Struct { .. }
-            | PatternKind::Tuple(_) => Prec::Atom,
+            | PatternKind::Tuple(_)
+            | PatternKind::Array { .. } => Prec::Atom,
         }
     }
 }
@@ -503,6 +508,17 @@ impl fmt::Display for Ast<'_, PatternKind> {
             PatternKind::Tuple(elements) => {
                 write_tuple(f, elements.iter().map(|element| Ast(&element.tracked)))
             }
+            PatternKind::Array {
+                before,
+                rest,
+                after,
+            } => write_array_pattern(
+                f,
+                before.iter().map(|element| Ast(&element.tracked)),
+                rest.as_ref()
+                    .map(|rest| rest.name.as_ref().map(|name| name.tracked.as_str())),
+                after.iter().map(|element| Ast(&element.tracked)),
+            ),
             PatternKind::Struct { fields, rest } => {
                 if rest.is_none() && fields.is_empty() {
                     return f.write_str("()");

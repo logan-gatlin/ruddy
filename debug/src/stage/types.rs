@@ -283,9 +283,9 @@ fn walk_locals(term: &Term, out: &mut Vec<Tracked<Symbol>>) {
                 walk_locals(&field.value, out);
             }
         }
-        TermKind::Array(elements) => {
-            for element in elements {
-                walk_locals(element, out);
+        TermKind::Array(items) => {
+            for item in items {
+                walk_locals(&item.value, out);
             }
         }
         TermKind::Tag { payload, .. } => {

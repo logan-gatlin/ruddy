@@ -946,6 +946,19 @@ fn a_scheme_numbers_every_sort_in_one_space() {
     assert_eq!(scheme.formula().open(&fresh).to_string(), "?7");
 }
 
+/// The element accessor looks through a package to the array inside, and
+/// answers nothing for anything that is not one.
+#[test]
+fn the_element_accessor_looks_through_packages() {
+    let nat = Rc::new(Ty::Nat);
+    let array = Rc::new(Ty::Array(nat.clone()));
+    assert!(matches!(array.element(), Some(element) if matches!(**element, Ty::Nat)));
+    let packaged = Ty::Package(array.clone());
+    assert!(matches!(packaged.element(), Some(element) if matches!(**element, Ty::Nat)));
+    assert!(nat.element().is_none());
+    assert!(Ty::Package(nat.clone()).element().is_none());
+}
+
 #[test]
 fn existential_presence_ownership_descends_through_arrays() {
     let element = Rc::new(Ty::Struct(Row {

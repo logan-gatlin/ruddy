@@ -187,6 +187,10 @@ pub enum Op {
     Struct(IndexMap<FieldKey, Temp>),
     /// An immutable persistent array literal.
     Array(Vec<Temp>),
+    /// The arrays these temps hold, joined in order into one. Never fewer
+    /// than one operand: the value of a spread literal, which is what puts
+    /// arrays end to end.
+    Concat(Vec<Temp>),
     /// One record carrying every field of each of these, laid over one another
     /// in order: a later one wins wherever two of them name the same field.
     ///
@@ -206,6 +210,25 @@ pub enum Op {
     },
     /// Extract a sum case's payload. Emitted by match lowering alone.
     Payload(Temp),
+    /// One element of an array, counted from the front. Emitted by match
+    /// lowering alone, under a length test that proved the index in range.
+    Nth {
+        base: Temp,
+        index: usize,
+    },
+    /// One element of an array, counted from the back: index nought is the
+    /// last. Emitted by match lowering alone, under a length test.
+    NthBack {
+        base: Temp,
+        index: usize,
+    },
+    /// The elements of an array from the first `start` to the last `drop`,
+    /// as an array. Emitted by match lowering alone, for a rest binder.
+    Slice {
+        base: Temp,
+        start: usize,
+        drop: usize,
+    },
     /// Pair a function with the current values of its captures.
     Closure {
         func: FuncId,
@@ -278,6 +301,14 @@ pub enum Op {
         none: Box<Block>,
         some: Box<Block>,
     },
+    /// Dispatch on an array's length: one case per length from nought up to
+    /// the longest any arm names, and `beyond` for every longer one — which
+    /// only the arms with a rest can take, and which no arm tells apart.
+    SwitchLen {
+        on: Temp,
+        cases: Vec<LenCase>,
+        beyond: Box<Block>,
+    },
 }
 
 /// What an [`Op::Call`] calls: a function whose identity is known here, or
@@ -292,6 +323,13 @@ pub enum Callee {
 #[derive(Debug, Clone)]
 pub struct TagCase {
     pub name: String,
+    pub block: Block,
+}
+
+/// One case of a [`Op::SwitchLen`].
+#[derive(Debug, Clone)]
+pub struct LenCase {
+    pub len: usize,
     pub block: Block,
 }
 
@@ -506,6 +544,14 @@ enum Cell {
     /// The field must not be there — or, in a rest column, no field beyond the
     /// listed ones may be, which is what an exact pattern demands.
     Absent,
+    /// An array pattern: the elements before the rest, whether there is a rest
+    /// and what it binds, and the elements after it. Without a rest the
+    /// pattern matches arrays of exactly the named length.
+    Array {
+        before: Vec<Cell>,
+        rest: Option<Option<Symbol>>,
+        after: Vec<Cell>,
+    },
 }
 
 /// One column of the decision matrix: a whole value at a temp, one field's
@@ -519,6 +565,36 @@ enum Col {
     Value(Value),
     Field(Field),
     Beyond(Beyond),
+    Element(Element),
+    Between(Between),
+}
+
+/// Which element of an array: so many from the front, or so many from the
+/// back, nought being the last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Index {
+    Front(usize),
+    Back(usize),
+}
+
+/// One element of an array, at the temp holding the array.
+#[derive(Debug, Clone)]
+struct Element {
+    base: Temp,
+    base_ty: Rc<Ty>,
+    at: Index,
+    ty: Rc<Ty>,
+}
+
+/// The elements of an array between its first `start` and its last `drop`:
+/// what a rest binds. Only ever bound, never tested.
+#[derive(Debug, Clone)]
+struct Between {
+    base: Temp,
+    base_ty: Rc<Ty>,
+    start: usize,
+    drop: usize,
+    ty: Rc<Ty>,
 }
 
 /// A whole value, at the temp holding it.
@@ -880,6 +956,17 @@ fn cell(pattern: &Pattern) -> Cell {
         PatternKind::Tag { name, payload } => Cell::Tag {
             name: name.tracked.clone(),
             payload: Box::new(payload.as_deref().map(cell).unwrap_or(Cell::Wild(None))),
+        },
+        PatternKind::Array {
+            before,
+            rest,
+            after,
+        } => Cell::Array {
+            before: before.iter().map(cell).collect(),
+            rest: rest
+                .as_ref()
+                .map(|rest| rest.name.as_ref().map(|name| name.tracked)),
+            after: after.iter().map(cell).collect(),
         },
     }
 }
@@ -2756,16 +2843,42 @@ impl Lower<'_> {
                 self.contain(temp, &term.ty);
                 temp
             }
-            TermKind::Array(elements) => {
+            // Runs of plain items become one literal apiece, and a spread
+            // stands as the array it is; with any spread among the items the
+            // pieces are joined, and without one the single literal is the
+            // value.
+            TermKind::Array(items) => {
                 let want = self.array_element(&term.ty);
-                let mut values = Vec::with_capacity(elements.len());
-                for element in elements {
-                    let temp = self.term(element, body);
-                    let target = want.clone().unwrap_or_else(|| element.ty.clone());
-                    let have = self.holding(temp, &element.ty);
-                    values.push(self.fitted(&target, &have, temp, body));
+                let mut pieces: Vec<Temp> = Vec::new();
+                let mut values: Vec<Temp> = Vec::new();
+                let mut spread = false;
+                for item in items {
+                    let temp = self.term(&item.value, body);
+                    let have = self.holding(temp, &item.value.ty);
+                    match item.spread {
+                        Some(_) => {
+                            spread = true;
+                            if !values.is_empty() {
+                                let run = std::mem::take(&mut values);
+                                pieces.push(self.emit(body, span, Rep::Array, Op::Array(run)));
+                            }
+                            pieces.push(self.fitted(&term.ty, &have, temp, body));
+                        }
+                        None => {
+                            let target = want.clone().unwrap_or_else(|| item.value.ty.clone());
+                            values.push(self.fitted(&target, &have, temp, body));
+                        }
+                    }
                 }
-                let temp = self.emit(body, span, Rep::Array, Op::Array(values));
+                let temp = match spread {
+                    false => self.emit(body, span, Rep::Array, Op::Array(values)),
+                    true => {
+                        if !values.is_empty() {
+                            pieces.push(self.emit(body, span, Rep::Array, Op::Array(values)));
+                        }
+                        self.emit(body, span, Rep::Array, Op::Concat(pieces))
+                    }
+                };
                 self.contain(temp, &term.ty);
                 temp
             }
@@ -3442,6 +3555,8 @@ impl Lower<'_> {
             Col::Value(col) => self.column(&col, matrix, tree, body),
             Col::Field(col) => self.presence(&col, matrix, tree, body),
             Col::Beyond(col) => self.remainder(&col, matrix, tree, body),
+            Col::Element(col) => self.element(&col, matrix, tree, body),
+            Col::Between(col) => self.between(&col, matrix, tree, body),
         }
     }
 
@@ -3478,6 +3593,13 @@ impl Lower<'_> {
         {
             return self.widen(col.temp, &ty, matrix, tree, body);
         }
+        if matrix
+            .lines
+            .iter()
+            .any(|line| matches!(line.cells[0], Cell::Array { .. }))
+        {
+            return self.switch_len(col.temp, &ty, matrix, tree, body);
+        }
         let primitives = matrix
             .lines
             .iter()
@@ -3499,6 +3621,182 @@ impl Lower<'_> {
             // at it binds the value itself.
             _ => self.tree(matrix.consumed(col.temp), tree, body),
         }
+    }
+
+    /// An array position: one case per length from nought to the longest any
+    /// arm names, and the lengths beyond, which only the arms with a rest can
+    /// take. Under an exact length every element is counted from the front —
+    /// the ones an arm wrote after its rest included, since the length says
+    /// where they are — and beyond the named lengths the elements after a rest
+    /// are counted from the back. A rest binds the slice between, one column
+    /// per distinct span the surviving arms ask for.
+    fn switch_len(
+        &mut self,
+        temp: Temp,
+        ty: &Rc<Ty>,
+        matrix: Matrix,
+        tree: &Tree,
+        body: &mut Body,
+    ) -> Temp {
+        let element = self.array_element(ty).unwrap_or_default();
+        let longest = matrix
+            .lines
+            .iter()
+            .filter_map(|line| match &line.cells[0] {
+                Cell::Array { before, after, .. } => Some(before.len() + after.len()),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let cases: Vec<LenCase> = (0..=longest)
+            .map(|len| {
+                let kept = Self::by_length(temp, ty, &element, &matrix, Some(len));
+                LenCase {
+                    len,
+                    block: self.child(tree.span, |low, inner| low.tree(kept, tree, inner)),
+                }
+            })
+            .collect();
+        let beyond = Self::by_length(temp, ty, &element, &matrix, None);
+        let beyond = self.child(tree.span, |low, inner| low.tree(beyond, tree, inner));
+        self.emit(
+            body,
+            tree.span,
+            tree.rep,
+            Op::SwitchLen {
+                on: temp,
+                cases,
+                beyond: Box::new(beyond),
+            },
+        )
+    }
+
+    /// The matrix under one length — an exact one, or `None` for every length
+    /// past the longest named: the rows that can take an array of that length,
+    /// their array cell opened into one cell per element column and one per
+    /// slice column, and whatever bound the whole array bound to it.
+    fn by_length(
+        temp: Temp,
+        ty: &Rc<Ty>,
+        element: &Rc<Ty>,
+        matrix: &Matrix,
+        len: Option<usize>,
+    ) -> Matrix {
+        let takes = |before: &[Cell], rest: &Option<Option<Symbol>>, after: &[Cell]| -> bool {
+            let fixed = before.len() + after.len();
+            match len {
+                Some(n) => fixed == n || (fixed < n && rest.is_some()),
+                None => rest.is_some(),
+            }
+        };
+        // The spans the surviving rests bind, and — for the lengths beyond —
+        // how far in from either end any surviving arm reaches.
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        let (mut front, mut back) = (0, 0);
+        for line in &matrix.lines {
+            if let Cell::Array {
+                before,
+                rest: Some(_),
+                after,
+            } = &line.cells[0]
+                && takes(before, &Some(None), after)
+            {
+                let span = (before.len(), after.len());
+                if !spans.contains(&span) {
+                    spans.push(span);
+                }
+                front = front.max(before.len());
+                back = back.max(after.len());
+            }
+        }
+        let positions: Vec<Index> = match len {
+            Some(n) => (0..n).map(Index::Front).collect(),
+            None => (0..front)
+                .map(Index::Front)
+                .chain((0..back).map(Index::Back))
+                .collect(),
+        };
+        let cols: Vec<Col> = positions
+            .iter()
+            .map(|at| {
+                Col::Element(Element {
+                    base: temp,
+                    base_ty: ty.clone(),
+                    at: *at,
+                    ty: element.clone(),
+                })
+            })
+            .chain(spans.iter().map(|(start, drop)| {
+                Col::Between(Between {
+                    base: temp,
+                    base_ty: ty.clone(),
+                    start: *start,
+                    drop: *drop,
+                    ty: ty.clone(),
+                })
+            }))
+            .collect();
+        let lines: Vec<Line> = matrix
+            .lines
+            .iter()
+            .filter_map(|line| {
+                let mut line = line.clone();
+                let head = line.cells.remove(0);
+                let mut cells: Vec<Cell> = Vec::with_capacity(cols.len() + line.cells.len());
+                match head {
+                    Cell::Array {
+                        before,
+                        rest,
+                        after,
+                    } => {
+                        if !takes(&before, &rest, &after) {
+                            return None;
+                        }
+                        for at in &positions {
+                            cells.push(match *at {
+                                Index::Front(i) if i < before.len() => before[i].clone(),
+                                // Under an exact length the elements after
+                                // the rest have a place from the front too.
+                                Index::Front(i) => match len {
+                                    Some(n) if i >= n - after.len() => {
+                                        after[i - (n - after.len())].clone()
+                                    }
+                                    _ => Cell::Wild(None),
+                                },
+                                Index::Back(j) if j < after.len() => {
+                                    after[after.len() - 1 - j].clone()
+                                }
+                                Index::Back(_) => Cell::Wild(None),
+                            });
+                        }
+                        for (start, drop) in &spans {
+                            cells.push(match rest {
+                                Some(bound) if (*start, *drop) == (before.len(), after.len()) => {
+                                    Cell::Wild(bound)
+                                }
+                                _ => Cell::Wild(None),
+                            });
+                        }
+                    }
+                    // A row that accepts the whole array: it binds the array
+                    // itself and asks nothing of any element or slice.
+                    other => {
+                        if let Cell::Wild(Some(symbol)) = other {
+                            line.binds.push((symbol, temp));
+                        }
+                        cells.extend(std::iter::repeat_n(Cell::Wild(None), cols.len()));
+                    }
+                }
+                cells.append(&mut line.cells);
+                Some(Line { cells, ..line })
+            })
+            .collect();
+        Matrix {
+            cols: matrix.cols.clone(),
+            lines,
+            assumed: matrix.assumed.clone(),
+        }
+        .under(cols)
     }
 
     /// A primitive position: one case per literal written, and the rest. Only
@@ -3834,6 +4132,65 @@ impl Lower<'_> {
                 }
             }
         }
+    }
+
+    /// Read one element out and go on into what the arms ask of it. The
+    /// container's production type says what the elements hold, as it says
+    /// what a field holds; the read is fitted from that to the pattern's own
+    /// element type.
+    fn element(&mut self, col: &Element, matrix: Matrix, tree: &Tree, body: &mut Body) -> Temp {
+        if matrix.untested() {
+            return self.tree(matrix.dropped(), tree, body);
+        }
+        let authority = self.holding(col.base, &col.base_ty);
+        let have = self
+            .array_element(&authority)
+            .unwrap_or_else(|| col.ty.clone());
+        let op = match col.at {
+            Index::Front(index) => Op::Nth {
+                base: col.base,
+                index,
+            },
+            Index::Back(index) => Op::NthBack {
+                base: col.base,
+                index,
+            },
+        };
+        let temp = self.emit(body, tree.span, self.rep(&have), op);
+        self.contain(temp, &have);
+        let temp = self.fitted(&col.ty, &have, temp, body);
+        let read = vec![Col::Value(Value {
+            temp,
+            ty: col.ty.clone(),
+        })];
+        self.tree(matrix.under(read), tree, body)
+    }
+
+    /// The slice a rest binds, read out only where some arm binds it: nothing
+    /// tests a slice, so an unbound one is an instruction with no reader. A
+    /// rest with no element on either side of it is the whole array, and
+    /// binds the array itself.
+    fn between(&mut self, col: &Between, matrix: Matrix, tree: &Tree, body: &mut Body) -> Temp {
+        if matrix.untested() {
+            return self.tree(matrix.dropped(), tree, body);
+        }
+        if col.start == 0 && col.drop == 0 {
+            return self.tree(matrix.consumed(col.base), tree, body);
+        }
+        let authority = self.holding(col.base, &col.base_ty);
+        let temp = self.emit(
+            body,
+            tree.span,
+            Rep::Array,
+            Op::Slice {
+                base: col.base,
+                start: col.start,
+                drop: col.drop,
+            },
+        );
+        self.contain(temp, &authority);
+        let temp = self.fitted(&col.ty, &authority, temp, body);
+        self.tree(matrix.consumed(temp), tree, body)
     }
 
     /// Read one field out and go on into what the arms ask of it.

@@ -249,15 +249,22 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
             label: "Boolean".into(),
             ..node
         },
-        TermKind::Array(elements) => Node {
+        TermKind::Array(items) => Node {
             label: "Array".into(),
             ..node
         }
-        .children(
-            elements
-                .iter()
-                .map(|element| term_node(ids, cx, mint, element, trace)),
-        ),
+        .children(items.iter().map(|item| {
+            match item.spread {
+                Some(dots) => Node::new(
+                    ids.next(),
+                    "Spread",
+                    format!("..{}", print::ir::term(&item.value.kind, mint)),
+                )
+                .at(dots.merge(item.value.span))
+                .child(term_node(ids, cx, mint, &item.value, trace)),
+                None => term_node(ids, cx, mint, &item.value, trace),
+            }
+        })),
         TermKind::Unary { op, value } => Node {
             label: match op {
                 ruddy::ir::UnaryOp::Neg => "Neg",
@@ -633,6 +640,40 @@ fn pattern_node(ids: &mut Ids, cx: &Cx, mint: &Mint, pattern: &Pattern) -> Node 
             }
             Node {
                 label: "Struct".into(),
+                ..node
+            }
+            .children(kids)
+        }
+        // The rest's name survives normalization as the symbol it binds, so
+        // its row cross-highlights the way a binder's does.
+        PatternKind::Array {
+            before,
+            rest,
+            after,
+        } => {
+            let mut kids: Vec<Node> = before
+                .iter()
+                .map(|element| pattern_node(ids, cx, mint, element))
+                .collect();
+            if let Some(rest) = rest {
+                let row = match &rest.name {
+                    Some(name) => with_symbol(
+                        Node::new(ids.next(), "Rest", format!("..{}", mint.name(name.tracked))),
+                        cx,
+                        mint,
+                        name.tracked,
+                    ),
+                    None => Node::new(ids.next(), "Rest", ".."),
+                };
+                kids.push(row.at(rest.span));
+            }
+            kids.extend(
+                after
+                    .iter()
+                    .map(|element| pattern_node(ids, cx, mint, element)),
+            );
+            Node {
+                label: "Array".into(),
                 ..node
             }
             .children(kids)

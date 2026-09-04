@@ -1069,6 +1069,18 @@ impl Ty {
         }
     }
 
+    /// The element type inside an array, if this is one.
+    pub fn element(&self) -> Option<&Rc<Ty>> {
+        let mut ty = self;
+        while let Ty::Package(body) = ty {
+            ty = body;
+        }
+        match ty {
+            Ty::Array(element) => Some(element),
+            _ => None,
+        }
+    }
+
     /// The field row inside a struct, if this is one.
     pub fn fields(&self) -> Option<&Row> {
         let mut ty = self;

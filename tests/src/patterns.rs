@@ -151,6 +151,186 @@ fn annotated_and_inferred_swap_are_exhaustive_with_shared_conditions() {
     }
 }
 
+/// An array position's universe is every length. Arms naming lengths exactly
+/// and arms with a rest — from either end — together cover it, and the
+/// elements under each length are checked as the typed columns they are.
+#[test]
+fn array_patterns_are_exhaustive_over_every_length() {
+    for (src, arms) in [
+        (
+            "let len = fn arr => match arr with | [] => 0n | [_, ..rest] => 1n end",
+            2,
+        ),
+        (
+            "let f = fn arr => match arr with | [] => 0n | [_] => 1n | [_, _, ..] => 2n end",
+            3,
+        ),
+        (
+            "let f = fn arr => match arr with | [..init, _] => 1n | [] => 0n end",
+            2,
+        ),
+        (
+            "let f = fn arr => match arr with | [_, .., _] => 2n | [_] => 1n | [] => 0n end",
+            3,
+        ),
+        (
+            "let f = fn arr => match arr with | [[], ..] => 1n | [[_, ..], ..] => 2n | [] => 0n end",
+            3,
+        ),
+        (
+            "let f = fn arr => match arr with | [#A, ..] => 1n | [#B, ..] => 2n | [] => 0n end",
+            3,
+        ),
+        (
+            "let f = fn arr => match arr with | [true, ..] => 1n | [false, ..] => 2n | [] => 0n end",
+            3,
+        ),
+        ("let f = fn arr => match arr with | [..all] => all end", 1),
+    ] {
+        let checks = clean(src);
+        let report = sole_report(&checks);
+        assert!(
+            matches!(report.coverage, Coverage::Exhaustive),
+            "{src}: {:#?}",
+            report.coverage
+        );
+        assert_eq!(verdicts(report), vec![Verdict::Reachable; arms], "{src}");
+    }
+}
+
+/// A length no arm accepts is reported with the shortest such length as the
+/// example — with a `..` when it stands for every longer length too — and the
+/// elements filled in from the typed walk beneath.
+#[test]
+fn array_patterns_report_the_shortest_unhandled_length() {
+    for (src, witness) in [
+        ("let f = fn arr => match arr with | [] => 0n end", "[_, ..]"),
+        (
+            "let f = fn arr => match arr with | [] => 0n | [_, _, ..] => 2n end",
+            "[_]",
+        ),
+        (
+            "let f = fn arr => match arr with | [] => 0n | [_] => 1n end",
+            "[_, _, ..]",
+        ),
+        ("let f = fn arr => match arr with | [_, ..] => 1n end", "[]"),
+        ("let f = fn arr => match arr with | [.., _] => 1n end", "[]"),
+        (
+            "let f = fn arr => match arr with | [] => 0n | [#A, ..] => 1n | [#B, _, ..] => 2n end",
+            "[#B]",
+        ),
+        // The shortest unhandled length is one, whatever its element: the
+        // example is exact, and the element's own example is open.
+        (
+            "let f = fn arr => match arr with | [] => 0n | [[], ..] => 1n end",
+            "[[_, ..]]",
+        ),
+        (
+            "let f = fn arr => match arr with | [] => 0n | [1n, ..] => 1n end",
+            "[0n]",
+        ),
+    ] {
+        let (out, inferred, checks) = checked(src);
+        assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
+        assert!(
+            inferred.errors().is_empty(),
+            "{src}: {:#?}",
+            inferred.errors()
+        );
+        assert_eq!(
+            errors(&checks),
+            [format!(
+                "unhandled-values@{}",
+                src.find("match").expect("the match")
+            )],
+            "{src}: {checks:#?}"
+        );
+        assert_eq!(witness_of(&checks), witness, "{src}");
+        let report = sole_report(&checks);
+        assert!(matches!(report.coverage, Coverage::Unhandled(_)), "{src}");
+    }
+}
+
+/// An arm no length can reach past the arms above it is unreachable, and a
+/// lone rest accepts everything on its face, so it is a catch-all like `_`
+/// and `{..}`.
+#[test]
+fn array_arms_no_length_can_reach_are_unreachable() {
+    let src = "let f = fn arr => match arr with | [..] => 0n | [] => 1n end";
+    let (_, _, checks) = checked(src);
+    assert_eq!(
+        errors(&checks),
+        [format!(
+            "misplaced-catch-all@{}",
+            src.find("[..] => 0n").expect("the catch-all")
+        )],
+        "{checks:#?}"
+    );
+    assert_eq!(
+        verdicts(sole_report(&checks)),
+        [Verdict::Reachable, Verdict::Starved]
+    );
+
+    for (src, dead) in [
+        (
+            "let f = fn arr => match arr with | [_, ..] => 1n | [] => 0n | [_, _] => 2n end",
+            "[_, _] => 2n",
+        ),
+        (
+            "let f = fn arr => match arr with | [] => 0n | [] => 1n | [_, ..] => 2n end",
+            "[] => 1n",
+        ),
+        (
+            "let f = fn arr => match arr with | [x, ..] => 1n | [.., y] => 2n | [] => 0n end",
+            "[.., y] => 2n",
+        ),
+        (
+            "let f = fn arr => match arr with | [#A, ..] => 1n | [#A] => 2n | [] => 0n end",
+            "[#A] => 2n",
+        ),
+    ] {
+        let (out, inferred, checks) = checked(src);
+        assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
+        assert!(
+            inferred.errors().is_empty(),
+            "{src}: {:#?}",
+            inferred.errors()
+        );
+        assert_eq!(
+            errors(&checks),
+            [format!(
+                "unreachable-arm@{}",
+                src.find(dead).expect("the dead arm")
+            )],
+            "{src}: {checks:#?}"
+        );
+        assert!(
+            matches!(sole_report(&checks).coverage, Coverage::Exhaustive),
+            "{src}"
+        );
+    }
+}
+
+/// An array pattern beside a pattern of another shape is the solver's
+/// mismatch, and the checks stand aside, as they do for every mixed column.
+#[test]
+fn an_array_pattern_over_another_shape_is_skipped() {
+    for src in [
+        "let f = fn v => match v with | [] => 0n | {} => 1n end",
+        "let f = fn v => match v with | [] => 0n | #A => 1n end",
+        "let f = fn v => match v with | [1n, ..] => 0n | [\"one\", ..] => 1n | [..] => 2n end",
+    ] {
+        let (out, inferred, checks) = checked(src);
+        assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
+        assert!(!inferred.errors().is_empty(), "{src}");
+        assert!(checks.errors.is_empty(), "{src}: {:#?}", checks.errors);
+        assert!(
+            matches!(sole_report(&checks).coverage, Coverage::Skipped),
+            "{src}"
+        );
+    }
+}
+
 #[test]
 fn tuple_patterns_are_exact_and_split_nested_fields_exhaustively() {
     let checks = clean(

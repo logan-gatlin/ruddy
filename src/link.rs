@@ -168,6 +168,24 @@ fn relocate_block(block: &mut artifact::Block, offset: u64) {
                         .map(|instruction| &mut instruction.op),
                 );
             }
+            Op::SwitchLen { cases, beyond, .. } => {
+                pending.extend(
+                    beyond
+                        .instrs
+                        .iter_mut()
+                        .rev()
+                        .map(|instruction| &mut instruction.op),
+                );
+                for case in cases.iter_mut().rev() {
+                    pending.extend(
+                        case.block
+                            .instrs
+                            .iter_mut()
+                            .rev()
+                            .map(|instruction| &mut instruction.op),
+                    );
+                }
+            }
             _ => {}
         }
     }

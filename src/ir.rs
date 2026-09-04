@@ -376,8 +376,9 @@ pub enum TermKind {
         body: Box<Term>,
     },
     Struct(IndexMap<String, Field<Term>>),
-    /// An immutable homogeneous array literal.
-    Array(Vec<Term>),
+    /// An immutable homogeneous array literal, item by item: a value of its
+    /// own, or — with the `..` — an array spread into the literal in place.
+    Array(Vec<ArrayItem>),
     /// `#Some 1` — one case of a sum, with what it carries.
     ///
     /// The name stays a string for the reason [`Field`]'s keys do: it is a
@@ -602,6 +603,15 @@ pub enum PatternKind {
     String(String),
     Boolean(bool),
     Unit,
+    /// `[a, ..rest, b]`: the elements before the rest counted from the front,
+    /// the ones after it from the back, and the rest — when written — the
+    /// array of everything between. Without a rest the pattern is exact: it
+    /// matches arrays of exactly as many elements as it names.
+    Array {
+        before: Vec<Pattern>,
+        rest: Option<ArrayRest>,
+        after: Vec<Pattern>,
+    },
 }
 
 pub type Type = Tracked<TypeKind>;
@@ -1250,6 +1260,22 @@ pub struct Field<T> {
     pub value: T,
 }
 
+/// One item of an array literal, the `..` kept as the span it was written at
+/// when the item spreads an array rather than supplying one value.
+#[derive(Debug, Clone)]
+pub struct ArrayItem {
+    pub spread: Option<Span>,
+    pub value: Term,
+}
+
+/// The `..` of an array pattern, normalized: the same dots-and-name the
+/// surface carries, the name resolved to the symbol it binds.
+#[derive(Debug, Clone)]
+pub struct ArrayRest {
+    pub span: Span,
+    pub name: Option<Tracked<Symbol>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Error {
     pub span: Span,
@@ -1764,6 +1790,9 @@ pub enum Refuter {
     /// A primitive literal: a value here might be a different value of this
     /// primitive type.
     Literal(Literal),
+    /// An array pattern naming elements: a value here might have a different
+    /// number of them, length being no part of an array's type.
+    Length,
 }
 
 /// A concrete example of a value a match leaves unhandled, in the shape of the
@@ -1792,6 +1821,9 @@ pub enum Witness {
     /// A value that is none of the listed cases — what an open position's
     /// "anything else" is written as.
     Other(Vec<String>),
+    /// An array of these elements — and, when `open`, of any number more:
+    /// the example stands for every length past the ones the arms name.
+    Array { elements: Vec<Witness>, open: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -2271,6 +2303,13 @@ enum Calm {
         fields: Vec<(TrackedString, Calm)>,
         rest: Option<Span>,
     },
+    /// `[..r]` or `[..]`: constrains the value to an array and binds the whole
+    /// of it to the name, when one was written. The one array pattern that
+    /// cannot fail, since it names no element for a length to fall short of.
+    ArrayRest {
+        span: Span,
+        name: Option<Tracked<Symbol>>,
+    },
 }
 
 /// One step from a position of the scrutinee to a position inside it: into a
@@ -2283,6 +2322,12 @@ enum Calm {
 pub(crate) enum Step {
     Field(String),
     Payload(String),
+    /// Into an array's elements — every one of them at once. One position
+    /// rather than one per index, because an array's elements are of one
+    /// type, and a pattern's third element from the front and another's
+    /// second from the back may be the same element of some array: nothing
+    /// syntactic tells them apart, so nothing here pretends to.
+    Element,
 }
 
 /// What one match's written arms say, position by position: the tags and
@@ -2342,6 +2387,12 @@ enum Mat {
     /// arrives as [`Mat::Wild`] instead, so a struct cell always has a field
     /// for the widening step to find.
     Struct(Vec<(String, Mat)>),
+    /// An array pattern naming an element: a test of the value's length that
+    /// this syntactic walk does not reason about. The cell matches no
+    /// specialization and so never counts toward handling a case, which errs
+    /// toward leaving a binder's view unrefined — the sound side. `[..r]`
+    /// tests nothing and arrives as [`Mat::Wild`].
+    Array,
 }
 
 /// Where a lowered pattern's binder symbols come from.
@@ -3177,6 +3228,30 @@ fn array_intrinsic_signature(
         matches!(ty.tracked, TypeKind::Prim(crate::types::Prim::Nat))
     }
 
+    /// The two halves of a written pair `(A, B)`: the closed positional
+    /// struct a tuple type lowers to, with no `when` on either field.
+    fn pair(ty: &Type) -> Option<(&Type, &Type)> {
+        let TypeKind::Struct { fields, tail: None } = &ty.tracked else {
+            return None;
+        };
+        match (fields.len(), fields.get("0"), fields.get("1")) {
+            (
+                2,
+                Some(TypeField::Written {
+                    when: None,
+                    value: first,
+                    ..
+                }),
+                Some(TypeField::Written {
+                    when: None,
+                    value: second,
+                    ..
+                }),
+            ) => Some((first, second)),
+            _ => None,
+        }
+    }
+
     fn option<'a>(ty: &'a Type, declarations: &IndexMap<Symbol, Decl<Type>>) -> Option<&'a Type> {
         let TypeKind::Apply { head, args, .. } = &ty.tracked else {
             return None;
@@ -3233,11 +3308,35 @@ fn array_intrinsic_signature(
                 && variable(value) == Some(element)
                 && option(result, declarations).and_then(array_variable) == Some(element)
         }
-        "$arrayPush" => {
+        "$arrayPush" | "$arrayPrepend" => {
             let Some((value, result)) = arrow(rest) else {
                 return false;
             };
             variable(value) == Some(element) && array_variable(result) == Some(element)
+        }
+        "$arrayConcat" => {
+            let Some((other, result)) = arrow(rest) else {
+                return false;
+            };
+            array_variable(other) == Some(element) && array_variable(result) == Some(element)
+        }
+        "$arraySlice" => {
+            let Some((from, rest)) = arrow(rest) else {
+                return false;
+            };
+            let Some((to, result)) = arrow(rest) else {
+                return false;
+            };
+            natural(from)
+                && natural(to)
+                && option(result, declarations).and_then(array_variable) == Some(element)
+        }
+        "$arrayPop" => {
+            option(rest, declarations)
+                .and_then(pair)
+                .is_some_and(|(last, remaining)| {
+                    variable(last) == Some(element) && array_variable(remaining) == Some(element)
+                })
         }
         _ => false,
     }
@@ -5963,9 +6062,9 @@ fn rekey_term(
                 rekey_term(&mut field.value, ids, operations, errors);
             }
         }
-        TermKind::Array(elements) => {
-            for element in elements {
-                rekey_term(element, ids, operations, errors);
+        TermKind::Array(items) => {
+            for item in items {
+                rekey_term(&mut item.value, ids, operations, errors);
             }
         }
         TermKind::Tag {
@@ -6474,9 +6573,9 @@ fn erase_circular(term: &mut Term, looping: &IndexSet<Symbol>, out: &mut Vec<Spa
                 erase_circular(&mut field.value, looping, out);
             }
         }
-        TermKind::Array(elements) => {
-            for element in elements {
-                erase_circular(element, looping, out);
+        TermKind::Array(items) => {
+            for item in items {
+                erase_circular(&mut item.value, looping, out);
             }
         }
         TermKind::Tag { payload, .. } => {
@@ -6540,9 +6639,9 @@ fn nested<'a>(term: &'a Term, out: &mut HashMap<Symbol, &'a Term>) {
                 nested(&field.value, out);
             }
         }
-        TermKind::Array(elements) => {
-            for element in elements {
-                nested(element, out);
+        TermKind::Array(items) => {
+            for item in items {
+                nested(&item.value, out);
             }
         }
         TermKind::Tag { payload, .. } => {
@@ -6666,6 +6765,16 @@ fn refuter(pattern: &Pattern) -> Option<(Span, Refuter)> {
         PatternKind::Real(value) => literal(Literal::Real(*value)),
         PatternKind::String(value) => literal(Literal::String(value.clone())),
         PatternKind::Boolean(value) => literal(Literal::Boolean(*value)),
+        // Length is no part of an array's type, so naming any element is a
+        // test a value can fail; the lone rest names none and cannot.
+        PatternKind::Array {
+            before,
+            rest,
+            after,
+        } => match before.is_empty() && after.is_empty() && rest.is_some() {
+            true => None,
+            false => Some((pattern.span, Refuter::Length)),
+        },
     }
 }
 
@@ -6694,7 +6803,16 @@ fn calm(pattern: &Pattern) -> Option<Calm> {
                 rest: *rest,
             })
         }
+        PatternKind::Array {
+            before,
+            rest: Some(rest),
+            after,
+        } if before.is_empty() && after.is_empty() => Some(Calm::ArrayRest {
+            span: pattern.span,
+            name: rest.name,
+        }),
         PatternKind::Tag { .. }
+        | PatternKind::Array { .. }
         | PatternKind::Natural(_)
         | PatternKind::Integer(_)
         | PatternKind::Real(_)
@@ -6724,6 +6842,21 @@ fn pattern_binders(pattern: &Pattern, out: &mut Vec<Tracked<Symbol>>) {
         PatternKind::Struct { fields, .. } => {
             for field in fields.values() {
                 pattern_binders(&field.value, out);
+            }
+        }
+        PatternKind::Array {
+            before,
+            rest,
+            after,
+        } => {
+            for element in before {
+                pattern_binders(element, out);
+            }
+            if let Some(name) = rest.as_ref().and_then(|rest| rest.name) {
+                out.push(name);
+            }
+            for element in after {
+                pattern_binders(element, out);
             }
         }
     }
@@ -6777,6 +6910,13 @@ fn exact_demand(span: Span, fields: &[(TrackedString, Calm)]) -> Annotation {
     demand(span.track(TypeKind::Struct { fields, tail: None }))
 }
 
+/// The demand a lone-rest array pattern makes of the value a `let` binds it
+/// to: an array, of elements the pattern says nothing about — a hole, as an
+/// exact struct pattern's fields are.
+fn array_demand(span: Span) -> Annotation {
+    demand(span.track(TypeKind::Array(Box::new(span.track(TypeKind::Hole)))))
+}
+
 /// A type the compiler wrote itself, as the annotation it travels in.
 ///
 /// Never a `where` clause and never a declared variable: a demand is about
@@ -6814,6 +6954,14 @@ fn mat(pattern: &Pattern) -> Mat {
         PatternKind::Real(value) => Mat::Literal(Literal::Real(*value)),
         PatternKind::String(value) => Mat::Literal(Literal::String(value.clone())),
         PatternKind::Boolean(value) => Mat::Literal(Literal::Boolean(*value)),
+        PatternKind::Array {
+            before,
+            rest,
+            after,
+        } => match before.is_empty() && after.is_empty() && rest.is_some() {
+            true => Mat::Wild,
+            false => Mat::Array,
+        },
     }
 }
 
@@ -6874,6 +7022,16 @@ impl Matrix {
                 self.collect_literal(path, Literal::String(value.clone()))
             }
             PatternKind::Boolean(value) => self.collect_literal(path, Literal::Boolean(*value)),
+            // Every element, from either end, is the one element position;
+            // see [`Step::Element`]. The rest binds the array between the
+            // elements rather than any element, so it opens nothing here.
+            PatternKind::Array { before, after, .. } => {
+                path.push(Step::Element);
+                for element in before.iter().chain(after) {
+                    self.collect(element, path);
+                }
+                path.pop();
+            }
         }
     }
 
@@ -6902,6 +7060,10 @@ impl Matrix {
                     name: name.clone(),
                     payload: Box::new(forced),
                 },
+                // The element position stands for every index at once, and
+                // an arm testing the third element says nothing about the
+                // fourth: no arm handles a case there, whatever it wrote.
+                Step::Element => return false,
             };
         }
         !self.useful(&rows, &[Vec::new()], &[forced])
@@ -7132,6 +7294,23 @@ fn pattern_names(pattern: &parse::Pattern, out: &mut Vec<TrackedString>) {
                 pattern_names(element, out);
             }
         }
+        // The rest's name binds between the elements, in the order it was
+        // written among them, which is the order the lowering walk keeps.
+        parse::PatternKind::Array {
+            before,
+            rest,
+            after,
+        } => {
+            for element in before {
+                pattern_names(element, out);
+            }
+            if let Some(name) = rest.as_ref().and_then(|rest| rest.name.as_ref()) {
+                out.push(name.clone());
+            }
+            for element in after {
+                pattern_names(element, out);
+            }
+        }
     }
 }
 
@@ -7261,9 +7440,9 @@ fn references(term: &Term, out: &mut Vec<Symbol>) {
                 references(&field.value, out);
             }
         }
-        TermKind::Array(elements) => {
-            for element in elements {
-                references(element, out);
+        TermKind::Array(items) => {
+            for item in items {
+                references(&item.value, out);
             }
         }
         TermKind::Tag { payload, .. } => {
@@ -7940,9 +8119,9 @@ fn annotations(term: &mut Term, out: &mut impl FnMut(&mut Type)) {
                 annotations(&mut field.value, out);
             }
         }
-        TermKind::Array(elements) => {
-            for element in elements {
-                annotations(element, out);
+        TermKind::Array(items) => {
+            for item in items {
+                annotations(&mut item.value, out);
             }
         }
         TermKind::Tag { payload, .. } => {
@@ -11004,10 +11183,13 @@ impl Builder<'_> {
             ExprKind::Struct(fields) => {
                 TermKind::Struct(self.fields(fields, |b, value| b.term(value))).with_span(span)
             }
-            ExprKind::Array(elements) => TermKind::Array(
-                elements
+            ExprKind::Array(items) => TermKind::Array(
+                items
                     .into_iter()
-                    .map(|element| self.term(element))
+                    .map(|item| ArrayItem {
+                        spread: item.spread,
+                        value: self.term(item.value),
+                    })
                     .collect(),
             )
             .with_span(span),
@@ -11919,6 +12101,29 @@ impl Builder<'_> {
                 }
                 span.track(PatternKind::Struct { fields, rest })
             }
+            parse::PatternKind::Array {
+                before,
+                rest,
+                after,
+            } => {
+                let before = before
+                    .into_iter()
+                    .map(|element| self.pattern(element, seen, binders, dropped))
+                    .collect();
+                let rest = rest.map(|rest| ArrayRest {
+                    span: rest.span,
+                    name: rest.name.map(|name| self.bound(name, seen, binders)),
+                });
+                let after = after
+                    .into_iter()
+                    .map(|element| self.pattern(element, seen, binders, dropped))
+                    .collect();
+                span.track(PatternKind::Array {
+                    before,
+                    rest,
+                    after,
+                })
+            }
         }
     }
 
@@ -11986,6 +12191,37 @@ impl Builder<'_> {
                     TermKind::Let {
                         name,
                         annotation: Some(Box::new(unit)),
+                        value: Box::new(value),
+                        body: Box::new(inner),
+                    }
+                    .with_span(at)
+                }
+            },
+            // The unit pattern's split again: a written annotation holds the
+            // whole value on a binding of its own, and the pattern's demand —
+            // an array, see [`array_demand`] — goes on the binding the rest
+            // makes, named as written or as nothing can name.
+            Calm::ArrayRest { span, name } => match annotation {
+                Some(annotation) => {
+                    let held = self.fresh("%value", span);
+                    let again = TermKind::Ident(held.tracked).with_span(span);
+                    let constrained =
+                        self.destructure(Calm::ArrayRest { span, name }, again, None, inner);
+                    let at = span.merge(constrained.span);
+                    TermKind::Let {
+                        name: held,
+                        annotation: Some(annotation),
+                        value: Box::new(value),
+                        body: Box::new(constrained),
+                    }
+                    .with_span(at)
+                }
+                None => {
+                    let name = name.unwrap_or_else(|| self.fresh("%array", span));
+                    let at = span.merge(inner.span);
+                    TermKind::Let {
+                        name,
+                        annotation: Some(Box::new(array_demand(span))),
                         value: Box::new(value),
                         body: Box::new(inner),
                     }
@@ -12108,6 +12344,34 @@ impl Builder<'_> {
                         Decl {
                             name_span: span,
                             annotation: Some(unit),
+                            params: Vec::new(),
+                            value,
+                        },
+                    );
+                }
+            },
+            Calm::ArrayRest { span, name } => match annotation {
+                Some(annotation) => {
+                    let held = self.fresh("%value", span);
+                    out.insert(
+                        held.tracked,
+                        Decl {
+                            name_span: span,
+                            annotation: Some(annotation),
+                            params: Vec::new(),
+                            value,
+                        },
+                    );
+                    let again = TermKind::Ident(held.tracked).with_span(span);
+                    self.destructure_stmt(Calm::ArrayRest { span, name }, None, again, out);
+                }
+                None => {
+                    let name = name.unwrap_or_else(|| self.fresh("%array", span));
+                    out.insert(
+                        name.tracked,
+                        Decl {
+                            name_span: span,
+                            annotation: Some(array_demand(span)),
                             params: Vec::new(),
                             value,
                         },
