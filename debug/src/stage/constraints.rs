@@ -113,6 +113,7 @@ fn rows(ids: &mut Ids, constraints: &[Constraint]) -> Vec<Node> {
                         .collect::<Vec<_>>(),
                 ),
                 ConstraintKind::Project { .. }
+                | ConstraintKind::Spread { .. }
                 | ConstraintKind::Equal { .. }
                 | ConstraintKind::Instance { .. }
                 | ConstraintKind::Performs { .. }
@@ -137,6 +138,7 @@ fn counted(constraints: &[Constraint]) -> usize {
                     .sum::<usize>()
             }
             ConstraintKind::Project { .. }
+            | ConstraintKind::Spread { .. }
             | ConstraintKind::Equal { .. }
             | ConstraintKind::Instance { .. }
             | ConstraintKind::Performs { .. }

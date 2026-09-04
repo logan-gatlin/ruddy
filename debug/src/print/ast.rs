@@ -97,7 +97,7 @@ impl Grouped for Ast<'_, ExprKind> {
             // same way.
             ExprKind::Project { .. }
             | ExprKind::Operation { .. }
-            | ExprKind::Struct(_)
+            | ExprKind::Struct { .. }
             | ExprKind::Tuple(_)
             | ExprKind::Array(_)
             | ExprKind::Ident { .. }
@@ -391,7 +391,18 @@ impl fmt::Display for Ast<'_, ExprKind> {
                 arms.iter()
                     .map(|arm| (&arm.pattern.tracked, Ast(&arm.body.tracked))),
             ),
-            ExprKind::Struct(fields) => {
+            // A literal that spreads a value is written with its braces
+            // whatever its fields are named: the tuple and unit spellings say
+            // the fields written are all the fields there are, and a spread
+            // says the opposite.
+            ExprKind::Struct {
+                fields,
+                spread: Some(spread),
+            } => write_struct(f, pairs(fields), Some(&Ast(&spread.value.tracked))),
+            ExprKind::Struct {
+                fields,
+                spread: None,
+            } => {
                 if fields.is_empty() {
                     f.write_str("()")
                 } else if let Some(order) =
@@ -408,7 +419,7 @@ impl fmt::Display for Ast<'_, ExprKind> {
                         }),
                     )
                 } else {
-                    write_struct(f, pairs(fields))
+                    write_struct(f, pairs(fields), None)
                 }
             }
             ExprKind::Tuple(elements) => {

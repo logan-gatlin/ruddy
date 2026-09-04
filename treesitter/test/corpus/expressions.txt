@@ -250,6 +250,82 @@ let c = {}
     (struct_expression)))
 
 ================================================================================
+A struct spreads one value after its fields
+================================================================================
+
+let a = { x: 1, ..c }
+let b = { ..f x, }
+let c = { ..c }
+let d = { 0: 1, "q": 2, ..{ y: 2, ..d } }
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (struct_expression
+      (struct_field
+        (identifier)
+        (natural))
+      (spread
+        (identifier))))
+  (let_definition
+    (identifier)
+    (struct_expression
+      (spread
+        (application
+          (identifier)
+          (identifier)))))
+  (let_definition
+    (identifier)
+    (struct_expression
+      (spread
+        (identifier))))
+  (let_definition
+    (identifier)
+    (struct_expression
+      (struct_field
+        (numeric_field)
+        (natural))
+      (struct_field
+        (string)
+        (natural))
+      (spread
+        (struct_expression
+          (struct_field
+            (identifier)
+            (natural))
+          (spread
+            (identifier)))))))
+
+================================================================================
+A struct's spread comes once, and last
+================================================================================
+
+let a = { ..a, ..b }
+let b = { ..a, x: 1 }
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (struct_expression
+      (spread
+        (identifier))
+      (ERROR
+        (identifier))))
+  (let_definition
+    (identifier)
+    (struct_expression
+      (ERROR
+        (spread
+          (identifier)))
+      (struct_field
+        (identifier)
+        (natural)))))
+
+================================================================================
 Tuples are distinguished from grouping by their comma
 ================================================================================
 

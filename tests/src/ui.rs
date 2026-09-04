@@ -33,7 +33,10 @@ use ruddy_debug::print;
 fn inference_error_kinds(span: Span) -> Vec<TypeError> {
     let nat = Rc::new(Ty::plain(Ty::Nat));
     vec![
-        TypeError::NotAStruct { base: nat.clone() },
+        TypeError::NotAStruct {
+            base: nat.clone(),
+            demand: inference::StructDemand::Projection,
+        },
         TypeError::Mismatch {
             expected: nat.clone(),
             actual: Rc::new(Ty::default()),
@@ -162,6 +165,8 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         },
         parse::ErrorKind::SecondArrayRest { previous: span },
         parse::ErrorKind::DiscardedArrayRest,
+        parse::ErrorKind::SecondStructSpread { previous: span },
+        parse::ErrorKind::FieldAfterSpread { spread: span },
     ] {
         let error = parse::Error { span, kind };
         all.push(("parse", error.code(), error.to_string()));
@@ -2020,6 +2025,10 @@ fn inference_source_corpus_matches_abridged_structured_goldens() {
             include_str!("../diagnostics/inference/not-a-struct.hc"),
         ),
         (
+            "spread-not-a-struct",
+            include_str!("../diagnostics/inference/spread-not-a-struct.hc"),
+        ),
+        (
             "type-mismatch",
             include_str!("../diagnostics/inference/type-mismatch.hc"),
         ),
@@ -3375,6 +3384,30 @@ fn a_label_complaint_reads_the_shape_it_was_handed() {
     );
 }
 
+/// Spreading a known non-struct is the complaint projecting from one is,
+/// under the same code, worded for what was written: the value has no fields
+/// to spread, and what to remove is the spread.
+#[test]
+fn spreading_a_non_struct_is_worded_as_the_spread_it_is() {
+    let span = Span::generated(3, 2);
+    let kind = TypeError::NotAStruct {
+        base: Rc::new(Ty::plain(Ty::Nat)),
+        demand: inference::StructDemand::Spread,
+    };
+    assert_eq!(
+        kind.to_string(),
+        "`Nat` is not a struct, so it has no fields to spread"
+    );
+    let diagnostic = inference::Error::new(span, kind).diagnostic();
+    assert_eq!(diagnostic.code, "not-a-struct");
+    assert_eq!(diagnostic.primary.span, span);
+    assert_eq!(diagnostic.primary.message, "this spread requires a struct");
+    assert_eq!(
+        diagnostic.help,
+        ["change this value to a struct, or remove the spread"]
+    );
+}
+
 /// Projection from a known non-struct has its own stable diagnostic.
 #[test]
 fn not_a_struct_is_coded_and_worded() {
@@ -4124,6 +4157,46 @@ fn parse_expectations_are_worded_for_their_source_context() {
             }]
         );
     }
+}
+
+/// The two ways a struct literal's spread can be miswritten are told apart by
+/// code and by wording, each pointing back at the `..` it conflicts with.
+#[test]
+fn struct_spread_mistakes_are_worded_plainly() {
+    let second = parse::Error {
+        span: Span::generated(10, 2),
+        kind: parse::ErrorKind::SecondStructSpread {
+            previous: Span::generated(5, 2),
+        },
+    }
+    .diagnostic();
+    assert_eq!(second.code, "second-struct-spread");
+    assert_eq!(second.title, "a struct can only spread one value");
+    assert_eq!(second.primary.span, Span::generated(10, 2));
+    assert_eq!(second.primary.message, "a second `..`");
+    assert_eq!(second.related.len(), 1);
+    assert_eq!(second.related[0].span, Span::generated(5, 2));
+    assert_eq!(second.related[0].message, "the first `..`");
+    assert_eq!(
+        second.help,
+        ["keep one `..` and write the other value's fields by name"]
+    );
+
+    let after = parse::Error {
+        span: Span::generated(10, 1),
+        kind: parse::ErrorKind::FieldAfterSpread {
+            spread: Span::generated(5, 2),
+        },
+    }
+    .diagnostic();
+    assert_eq!(after.code, "field-after-spread");
+    assert_eq!(after.title, "a struct's `..` comes after its last field");
+    assert_eq!(after.primary.span, Span::generated(10, 1));
+    assert_eq!(after.primary.message, "this field comes after the `..`");
+    assert_eq!(after.related.len(), 1);
+    assert_eq!(after.related[0].span, Span::generated(5, 2));
+    assert_eq!(after.related[0].message, "the `..`");
+    assert_eq!(after.help, ["move the `..` after the last field"]);
 }
 
 /// The two ways an array pattern's rest can be miswritten are told apart by

@@ -542,12 +542,17 @@ module.exports = grammar({
     /** `raise <expr>` — the body runs as far right as a `fn`'s does. */
     raise_expression: $ => prec.right(seq('raise', $._expression)),
 
-    /** `{ x: 1, y: 2 }`, with an optional trailing comma. */
-    struct_expression: $ => seq('{', optional($._struct_fields), '}'),
+    /**
+     * `{ x: 1, y: 2, ..c }`, with an optional trailing comma: the fields it
+     * names, then — at most once, and last — a `..` spreading every field of
+     * one more value in. The same `spread` node an array literal has, since
+     * it is the same `..` and the same whole-expression operand.
+     */
+    struct_expression: $ => seq('{', optional($._struct_items), '}'),
 
-    _struct_fields: $ => seq(
-      $.struct_field,
-      optional(seq(',', optional($._struct_fields))),
+    _struct_items: $ => choice(
+      seq($.spread, optional(',')),
+      seq($.struct_field, optional(seq(',', optional($._struct_items)))),
     ),
 
     struct_field: $ => seq(

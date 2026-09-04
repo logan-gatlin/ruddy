@@ -376,9 +376,12 @@ fn walk_under(check: &Check, term: &Term, assumed: &Formula, out: &mut Output) {
             walk_under(check, value, assumed, out);
             walk_under(check, body, assumed, out);
         }
-        TermKind::Struct(fields) => {
+        TermKind::Struct { fields, spread } => {
             for field in fields.values() {
                 walk_under(check, &field.value, assumed, out);
+            }
+            if let Some(spread) = spread {
+                walk_under(check, &spread.value, assumed, out);
             }
         }
         TermKind::Array(items) => {

@@ -394,6 +394,12 @@ impl Solve<'_> {
                     result,
                     base_span,
                 } => self.project(span, *base_span, base, field, result),
+                ConstraintKind::Spread {
+                    operand,
+                    demand,
+                    result,
+                    operand_span,
+                } => self.spread(span, *operand_span, operand, demand, result),
                 ConstraintKind::Equal { expected, actual } => self.unify(span, expected, actual),
                 ConstraintKind::Let {
                     symbol,
@@ -600,7 +606,13 @@ impl Solve<'_> {
                     expected: Rc::new(Ty::unit()),
                     actual: exposed.clone(),
                 };
-                let error = Error::new(base_span, ErrorKind::NotAStruct { base: exposed });
+                let error = Error::new(
+                    base_span,
+                    ErrorKind::NotAStruct {
+                        base: exposed,
+                        demand: super::StructDemand::Projection,
+                    },
+                );
                 self.fail(
                     base_span,
                     Rule::Mismatch,
@@ -646,6 +658,66 @@ impl Solve<'_> {
                 self.table
                     .with_lacks_origin(origin, |table| table.note_lacks(&want));
                 self.unify(field_span, &want, &base);
+            }
+        }
+    }
+
+    /// Solve a struct spread after exposing only the operand's outer
+    /// constructor: a value that is known to be no struct has no fields to
+    /// spread, and is told so at the operand rather than as a mismatch
+    /// against the row the literal asked for. Anything else — a struct, a
+    /// variable, a rigid — meets that row by unification, which decides the
+    /// rest: the fields the literal names may be there or not in the operand
+    /// and hold anything, and the fields it does not name go past them into
+    /// the rest the result keeps, which is noted here as lacking the named
+    /// ones so nothing can put one of them back.
+    fn spread(
+        &mut self,
+        span: Span,
+        operand_span: Span,
+        operand: &Rc<Ty>,
+        demand: &Rc<Ty>,
+        result: &Rc<Ty>,
+    ) {
+        let operand = self.table.resolve(operand);
+        let exposed = super::unfold(self.aliases, &operand);
+        match &*exposed {
+            Ty::Nat
+            | Ty::Int
+            | Ty::Real
+            | Ty::String
+            | Ty::Boolean
+            | Ty::Arrow(..)
+            | Ty::Array(_)
+            | Ty::Sum(_) => {
+                let goal = Goal::Type {
+                    expected: Rc::new(Ty::unit()),
+                    actual: exposed.clone(),
+                };
+                let error = Error::new(
+                    operand_span,
+                    ErrorKind::NotAStruct {
+                        base: exposed,
+                        demand: super::StructDemand::Spread,
+                    },
+                );
+                self.fail(
+                    operand_span,
+                    Rule::Mismatch,
+                    goal,
+                    error,
+                    &[Assigned::Ty(result.clone())],
+                );
+            }
+            _ => {
+                let origin = self.table.active_lacks_origin.clone().map(|mut origin| {
+                    origin.subject = super::Subject::StructSpread;
+                    origin.span = span;
+                    origin
+                });
+                self.table
+                    .with_lacks_origin(origin, |table| table.note_lacks(demand));
+                self.unify(span, demand, &operand);
             }
         }
     }

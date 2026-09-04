@@ -459,10 +459,10 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
             mint,
             effect.tracked,
         ),
-        TermKind::Struct(fields) => {
+        TermKind::Struct { fields, spread } => {
             // Built eagerly rather than through `children`: the closure a lazy
             // iterator would need borrows the trace for as long as it lives.
-            let wrappers: Vec<Node> = fields
+            let mut wrappers: Vec<Node> = fields
                 .iter()
                 .map(|(name, field)| {
                     Node::new(
@@ -474,6 +474,19 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
                     .child(term_node(ids, cx, mint, &field.value, trace))
                 })
                 .collect();
+            // The spread last, where it was written, as the same row the
+            // array's spread is: the `..` and what it spreads.
+            if let Some(spread) = spread {
+                wrappers.push(
+                    Node::new(
+                        ids.next(),
+                        "Spread",
+                        format!("..{}", print::ir::term(&spread.value.kind, mint)),
+                    )
+                    .at(spread.span.merge(spread.value.span))
+                    .child(term_node(ids, cx, mint, &spread.value, trace)),
+                );
+            }
             Node {
                 label: "Struct".into(),
                 ..node

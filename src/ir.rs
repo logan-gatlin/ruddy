@@ -375,7 +375,15 @@ pub enum TermKind {
         value: Box<Term>,
         body: Box<Term>,
     },
-    Struct(IndexMap<String, Field<Term>>),
+    /// A struct literal: the fields it names, and — with the `..` — one more
+    /// value every field of which it takes on, less the ones it names itself.
+    /// The spread stays a node of its own rather than being expanded: which
+    /// fields it brings is inference's to find out, and the tree is what was
+    /// written.
+    Struct {
+        fields: IndexMap<String, Field<Term>>,
+        spread: Option<Spread>,
+    },
     /// An immutable homogeneous array literal, item by item: a value of its
     /// own, or — with the `..` — an array spread into the literal in place.
     Array(Vec<ArrayItem>),
@@ -1258,6 +1266,14 @@ pub enum Row {
 pub struct Field<T> {
     pub name_span: Span,
     pub value: T,
+}
+
+/// The `..` of a struct literal, normalized: the same dots-and-value the
+/// surface carries, the value lowered.
+#[derive(Debug, Clone)]
+pub struct Spread {
+    pub span: Span,
+    pub value: Box<Term>,
 }
 
 /// One item of an array literal, the `..` kept as the span it was written at
@@ -6057,9 +6073,12 @@ fn rekey_term(
             rekey_term(value, ids, operations, errors);
             rekey_term(body, ids, operations, errors);
         }
-        TermKind::Struct(fields) => {
+        TermKind::Struct { fields, spread } => {
             for field in fields.values_mut() {
                 rekey_term(&mut field.value, ids, operations, errors);
+            }
+            if let Some(spread) = spread {
+                rekey_term(&mut spread.value, ids, operations, errors);
             }
         }
         TermKind::Array(items) => {
@@ -6568,9 +6587,12 @@ fn erase_circular(term: &mut Term, looping: &IndexSet<Symbol>, out: &mut Vec<Spa
             erase_circular(arg, looping, out);
         }
         TermKind::Fn { body, .. } => erase_circular(body, looping, out),
-        TermKind::Struct(fields) => {
+        TermKind::Struct { fields, spread } => {
             for field in fields.values_mut() {
                 erase_circular(&mut field.value, looping, out);
+            }
+            if let Some(spread) = spread {
+                erase_circular(&mut spread.value, looping, out);
             }
         }
         TermKind::Array(items) => {
@@ -6634,9 +6656,12 @@ fn nested<'a>(term: &'a Term, out: &mut HashMap<Symbol, &'a Term>) {
             nested(arg, out);
         }
         TermKind::Fn { body, .. } => nested(body, out),
-        TermKind::Struct(fields) => {
+        TermKind::Struct { fields, spread } => {
             for field in fields.values() {
                 nested(&field.value, out);
+            }
+            if let Some(spread) = spread {
+                nested(&spread.value, out);
             }
         }
         TermKind::Array(items) => {
@@ -6730,7 +6755,7 @@ impl Chain<'_> {
             | TermKind::Binary { .. }
             | TermKind::Apply { .. }
             | TermKind::Fn { .. }
-            | TermKind::Struct(_)
+            | TermKind::Struct { .. }
             | TermKind::Array(_)
             | TermKind::Tag { .. }
             | TermKind::Project { .. }
@@ -7435,9 +7460,12 @@ fn references(term: &Term, out: &mut Vec<Symbol>) {
             references(value, out);
             references(body, out);
         }
-        TermKind::Struct(fields) => {
+        TermKind::Struct { fields, spread } => {
             for field in fields.values() {
                 references(&field.value, out);
+            }
+            if let Some(spread) = spread {
+                references(&spread.value, out);
             }
         }
         TermKind::Array(items) => {
@@ -8114,9 +8142,12 @@ fn annotations(term: &mut Term, out: &mut impl FnMut(&mut Type)) {
             annotations(arg, out);
         }
         TermKind::Fn { body, .. } => annotations(body, out),
-        TermKind::Struct(fields) => {
+        TermKind::Struct { fields, spread } => {
             for field in fields.values_mut() {
                 annotations(&mut field.value, out);
+            }
+            if let Some(spread) = spread {
+                annotations(&mut spread.value, out);
             }
         }
         TermKind::Array(items) => {
@@ -10989,7 +11020,11 @@ impl Builder<'_> {
             // `()` is the empty struct rather than a form of its own, so it is
             // erased here instead of surviving into the IR; semantic unit is
             // the explicit closed struct row with no labels.
-            ExprKind::Unit => TermKind::Struct(Default::default()).with_span(span),
+            ExprKind::Unit => TermKind::Struct {
+                fields: Default::default(),
+                spread: None,
+            }
+            .with_span(span),
             ExprKind::Ident { name } => match self.resolve(&name, Namespace::Terms) {
                 Some(symbol) => TermKind::Ident(symbol).with_span(span),
                 None => TermKind::Error.with_span(span),
@@ -11180,8 +11215,18 @@ impl Builder<'_> {
                 ];
                 self.match_term(span, *predicate, arms)
             }
-            ExprKind::Struct(fields) => {
-                TermKind::Struct(self.fields(fields, |b, value| b.term(value))).with_span(span)
+            // The fields first and the spread after them, which is the order
+            // they were written in and the order they will run in; a repeat
+            // among the fields is the complaint it always was, and a field
+            // the spread also carries is not one — that is what a spread is
+            // for, and which value wins is inference's to say.
+            ExprKind::Struct { fields, spread } => {
+                let fields = self.fields(fields, |b, value| b.term(value));
+                let spread = spread.map(|spread| Spread {
+                    span: spread.span,
+                    value: Box::new(self.term(*spread.value)),
+                });
+                TermKind::Struct { fields, spread }.with_span(span)
             }
             ExprKind::Array(items) => TermKind::Array(
                 items
@@ -11211,7 +11256,11 @@ impl Builder<'_> {
                         )
                     })
                     .collect();
-                TermKind::Struct(fields).with_span(span)
+                TermKind::Struct {
+                    fields,
+                    spread: None,
+                }
+                .with_span(span)
             }
             ExprKind::Tag { name, payload } => {
                 let payload = payload.map(|payload| Box::new(self.term(*payload)));

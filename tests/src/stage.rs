@@ -612,6 +612,36 @@ fn the_ast_tab_renders_the_where_statement_list() {
     );
 }
 
+/// A struct's spread is a row of its own on both tree tabs, after the fields
+/// and spanned from the `..` to the end of what it spreads, holding the
+/// value's own tree — and neither tab expands it into the fields inference
+/// found it to carry.
+#[test]
+fn the_tree_tabs_show_a_struct_spread_as_written() {
+    let source = "let c = { y: 2n }\nlet a = { x: 1n, ..c }";
+    for id in ["ast", "ir"] {
+        let tree = tab(id, source);
+        let rows = flatten(&tree);
+        let spread = rows
+            .iter()
+            .find(|node| node.label == "Spread")
+            .unwrap_or_else(|| panic!("{id}: the spread is a row: {rows:#?}"));
+        assert_eq!(spread.text, "..c", "{id}");
+        assert_eq!(
+            spread.at.map(|span| (span.start, span.end())),
+            Some((35, 38)),
+            "{id}"
+        );
+        assert_eq!(spread.children.len(), 1, "{id}");
+        let literal = rows
+            .iter()
+            .find(|node| node.label == "Struct" && node.text.contains(".."))
+            .unwrap_or_else(|| panic!("{id}: the literal keeps its `..`: {rows:#?}"));
+        assert_eq!(literal.text, "{ x: 1n, ..c }", "{id}");
+        assert!(!literal.text.contains("y"), "{id}: {}", literal.text);
+    }
+}
+
 /// The IR tab says what each variable turned out to stand for, which is the
 /// whole of what it adds over the AST's: the name is written as its uses spell
 /// it, and which of the three sorts it has follows from where the type uses it.

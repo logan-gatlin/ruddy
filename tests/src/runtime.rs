@@ -59,3 +59,35 @@ fn the_array_runtime_agrees_with_a_plain_array() {
     let generated = run_project(project.path()).expect("the array differential suite passes");
     assert!(generated.is_file());
 }
+
+/// Struct spreads compiled through the CLI's own path and read back by Node:
+/// every accepted form, the fields each keeps, and the order the pieces run
+/// in. The fixture owns the program and the assertions, as the array one
+/// does; the manifest is written here for the same reason.
+#[test]
+fn struct_spreads_build_the_fields_they_promise() {
+    if Command::new("node").arg("--version").output().is_err() {
+        return;
+    }
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the workspace root");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("bundles/struct-spreads");
+    let project = tempfile::tempdir().expect("a temporary struct-spread project");
+    for name in ["main.hc", "spreads.test.mjs"] {
+        fs::copy(fixture.join(name), project.path().join(name))
+            .unwrap_or_else(|error| panic!("could not copy struct-spread fixture {name}: {error}"));
+    }
+    fs::write(
+        project.path().join("Ruddy.toml"),
+        format!(
+            "name = \"struct-spread-tests\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\ntarget = \"js\"\n\n[run]\njs = \"node spreads.test.mjs\"\n\n[dependencies]\nstd = {:?}\n",
+            root.join("std")
+        ),
+    )
+    .unwrap();
+
+    let generated = run_project(project.path()).expect("the struct spread suite passes");
+    assert!(generated.is_file());
+}

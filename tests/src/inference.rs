@@ -223,6 +223,168 @@ fn array_spreads_are_arrays_of_the_literal_and_nothing_else() {
     );
 }
 
+/// A spread struct has the fields it names and every other field of the
+/// value it spreads. A closed value's fields come through as they are, less
+/// the named ones, which the literal's own values replace at whatever type
+/// those have; unit, the empty struct and a tuple spread like any struct,
+/// since they are structs; and a result whose fields make a tuple shape
+/// prints as the tuple it is.
+#[test]
+fn struct_spreads_keep_every_field_they_do_not_name() {
+    let (mint, _, output) = inferred(
+        "let c = { a: 1n, b: \"s\" }\n\
+         let copy = { ..c }\n\
+         let ext = { d: true, ..c }\n\
+         let upd = { a: 2n, ..c }\n\
+         let retyped = { a: true, ..c }\n\
+         let several = { a: 1.0, b: 2n, ..c }\n\
+         let computed = { ..(fn v => v) c }\n\
+         let unit = { x: 1n, ..() }\n\
+         let empty = { ..{} }\n\
+         let pair = (1n, 2n)\n\
+         let swapped = { 1: \"s\", ..pair }\n\
+         let gapped = { 3: true, ..pair }\n\
+         let exact : { a: Nat, b: String } = { a: 2n, ..c }\n",
+    );
+    assert_eq!(scheme(&mint, &output, "copy"), "{ a: Nat, b: String }");
+    assert_eq!(
+        scheme(&mint, &output, "ext"),
+        "{ d: Boolean, a: Nat, b: String }"
+    );
+    assert_eq!(scheme(&mint, &output, "upd"), "{ a: Nat, b: String }");
+    assert_eq!(
+        scheme(&mint, &output, "retyped"),
+        "{ a: Boolean, b: String }"
+    );
+    assert_eq!(scheme(&mint, &output, "several"), "{ a: Real, b: Nat }");
+    assert_eq!(scheme(&mint, &output, "computed"), "{ a: Nat, b: String }");
+    assert_eq!(scheme(&mint, &output, "unit"), "{ x: Nat }");
+    assert_eq!(scheme(&mint, &output, "empty"), "()");
+    assert_eq!(scheme(&mint, &output, "swapped"), "(Nat, String)");
+    assert_eq!(
+        scheme(&mint, &output, "gapped"),
+        "{ 3: Boolean, 0: Nat, 1: Nat }"
+    );
+    assert_eq!(scheme(&mint, &output, "exact"), "{ a: Nat, b: String }");
+}
+
+/// Spreading a value nothing else constrains makes it a struct, and an open
+/// one: the fields the literal names may be there or not — holding anything,
+/// since the literal replaces them — and every other field the caller
+/// chooses comes through into the result. So one updater serves a value that
+/// has the field, at any type, and one that lacks it.
+#[test]
+fn a_struct_spread_of_an_open_value_keeps_its_rest_and_replaces_by_name() {
+    let (mint, _, output) = inferred(
+        "let set_a = fn c => { a: 1n, ..c }\n\
+         let copy = fn c => { ..c }\n\
+         let added = set_a { b: \"s\" }\n\
+         let replaced = set_a { a: \"s\", b: true }\n\
+         let kept = fn c => (set_a c).b\n",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "set_a"),
+        "{ a when 'a: 'b, ..'c } -> { a: Nat, ..'c }"
+    );
+    assert_eq!(scheme(&mint, &output, "copy"), "{ ..'a } -> { ..'a }");
+    assert_eq!(scheme(&mint, &output, "added"), "{ a: Nat, b: String }");
+    assert_eq!(scheme(&mint, &output, "replaced"), "{ a: Nat, b: Boolean }");
+    assert_eq!(
+        scheme(&mint, &output, "kept"),
+        "{ a when 'a: 'b, b: 'c, ..'d } -> 'c"
+    );
+    // The demand is one constraint of its own, shown as the value against
+    // what the literal asks of it and then what the literal is.
+    let emitted = constraints(&mint, &output, "set_a");
+    assert!(
+        emitted.iter().any(|line| line.starts_with("spread: ..")),
+        "{emitted:#?}"
+    );
+}
+
+/// An annotation's row tail is the caller's, and a spread keeps it as it is:
+/// the result's rest is the operand's, whether or not the field the literal
+/// names is among the fields the tail stands for — so the same body meets an
+/// annotation that promises the field of its argument and one that does not.
+#[test]
+fn a_struct_spread_keeps_an_annotated_rest_whether_or_not_it_named_the_field() {
+    let (mint, _, output) = inferred(
+        "let keep : { x: Nat, ..'r } -> { x: Nat, ..'r } = fn v => { x: 2n, ..v }\n\
+         let add : { ..'r } -> { x: Nat, ..'r } = fn v => { x: 2n, ..v }\n\
+         let used = (keep { x: 1n, y: true }, add { y: true })\n",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "keep"),
+        "{ x: Nat, ..'a } -> { x: Nat, ..'a }"
+    );
+    assert_eq!(
+        scheme(&mint, &output, "add"),
+        "{ ..'a } -> { x: Nat, ..'a }"
+    );
+    assert_eq!(
+        scheme(&mint, &output, "used"),
+        "({ x: Nat, y: Boolean }, { x: Nat, y: Boolean })"
+    );
+}
+
+/// A value known to be no struct has no fields to spread, and is told so at
+/// the value — the complaint a projection off it makes, worded for the
+/// spread — rather than as a mismatch against the row the literal asked for.
+#[test]
+fn a_struct_spread_of_a_known_non_struct_is_refused_at_the_value() {
+    for (src, title, start) in [
+        (
+            "let bad = { ..1n }",
+            "`Nat` is not a struct, so it has no fields to spread",
+            14,
+        ),
+        (
+            "let bad = { x: 1n, ..[1n] }",
+            "`[Nat]` is not a struct, so it has no fields to spread",
+            21,
+        ),
+        (
+            "let f = fn x => x\nlet bad = { ..f }",
+            "`'a -> 'a` is not a struct, so it has no fields to spread",
+            32,
+        ),
+    ] {
+        let (_, out, output) = infer_src(src);
+        assert!(out.errors.is_empty(), "ir errors: {:#?}", out.errors);
+        let [error] = output.errors() else {
+            panic!("{src}: expected one error: {:#?}", output.errors());
+        };
+        assert_eq!(error.kind.code(), "not-a-struct", "{src}");
+        let diagnostic = error.diagnostic();
+        assert_eq!(diagnostic.title, title, "{src}");
+        assert_eq!(diagnostic.primary.span.start, start, "{src}");
+    }
+}
+
+/// Checking a spread struct against an expected type never drops a field to
+/// fit: a closed expected type that omits a field the spread carries is the
+/// extra-field complaint, whether or not the literal names other fields.
+#[test]
+fn a_struct_spread_never_drops_a_field_to_fit_an_expected_type() {
+    for src in [
+        "let c = { a: 1n, b: 2n }\nlet bad : { a: Nat } = { ..c }",
+        "let c = { a: 1n, b: 2n }\nlet bad : { a: Nat } = { a: 2n, ..c }",
+        "let c = { a: 1n, b: 2n }\nlet f : { a: Nat } -> Nat = fn v => v.a\nlet bad = f { a: 2n, ..c }",
+    ] {
+        let (_, out, output) = infer_src(src);
+        assert!(out.errors.is_empty(), "ir errors: {:#?}", out.errors);
+        let [error] = output.errors() else {
+            panic!("{src}: expected one error: {:#?}", output.errors());
+        };
+        assert_eq!(error.kind.code(), "extra-field", "{src}");
+        assert!(
+            error.kind.to_string().contains("`b`"),
+            "{src}: {}",
+            error.kind
+        );
+    }
+}
+
 /// An array pattern inside a case's payload, or a case inside an array's
 /// elements, never counts toward fully handling a case: a later binder keeps
 /// the case in its view, which is the sound side of a question the syntactic
@@ -678,9 +840,12 @@ fn body_tys(term: &Term) -> Vec<Rc<Ty>> {
             out.extend(body_tys(value));
             out.extend(body_tys(body));
         }
-        TermKind::Struct(fields) => {
+        TermKind::Struct { fields, spread } => {
             for field in fields.values() {
                 out.extend(body_tys(&field.value));
+            }
+            if let Some(spread) = spread {
+                out.extend(body_tys(&spread.value));
             }
         }
         TermKind::Array(items) => {

@@ -3,6 +3,11 @@
 primary: this field access requires a struct
 help: change this value to a struct, or change/remove the field access
 
+## spread-not-a-struct
+[not-a-struct] `Nat` is not a struct, so it has no fields to spread
+primary: this spread requires a struct
+help: change this value to a struct, or remove the spread
+
 ## type-mismatch
 [type-mismatch] a natural number and a struct cannot be the same type
 primary: Let’s call this shared value `Value` — the annotation fixes the type here

@@ -659,6 +659,8 @@ impl parse::Error {
             parse::ErrorKind::Wildcard { .. } => "misplaced-discard",
             parse::ErrorKind::SecondArrayRest { .. } => "second-array-rest",
             parse::ErrorKind::DiscardedArrayRest => "discarded-array-rest",
+            parse::ErrorKind::SecondStructSpread { .. } => "second-struct-spread",
+            parse::ErrorKind::FieldAfterSpread { .. } => "field-after-spread",
         }
     }
 
@@ -780,6 +782,22 @@ impl parse::Error {
                 self.span,
             )
             .label("`..` already skips the rest; the `_` adds nothing"),
+            parse::ErrorKind::SecondStructSpread { previous } => Diagnostic::new(
+                "second-struct-spread",
+                "a struct can only spread one value",
+                self.span,
+            )
+            .label("a second `..`")
+            .related(previous, "the first `..`")
+            .help("keep one `..` and write the other value's fields by name"),
+            parse::ErrorKind::FieldAfterSpread { spread } => Diagnostic::new(
+                "field-after-spread",
+                "a struct's `..` comes after its last field",
+                self.span,
+            )
+            .label("this field comes after the `..`")
+            .related(spread, "the `..`")
+            .help("move the `..` after the last field"),
         }
     }
 }
@@ -2632,6 +2650,7 @@ impl ConstraintKind {
     pub fn code(&self) -> &'static str {
         match self {
             ConstraintKind::Project { .. } => "project",
+            ConstraintKind::Spread { .. } => "spread",
             ConstraintKind::Equal { .. } => "equal",
             ConstraintKind::Let { .. } => "let",
             ConstraintKind::Instance { .. } => "instance",
@@ -2661,6 +2680,15 @@ impl fmt::Display for ConstraintKind {
             } => {
                 write!(f, "{base}.{field} -> {result}")
             }
+            // The operand against what the literal asks of it, and then what
+            // the literal is: the two rows share their tail, which is what
+            // the reader is being shown.
+            ConstraintKind::Spread {
+                operand,
+                demand,
+                result,
+                ..
+            } => write!(f, "..{operand} ~ {demand} -> {result}"),
             ConstraintKind::Equal { expected, actual } => write!(f, "{expected} ~ {actual}"),
             // A header rather than a line, because a `let` carries two lists of
             // constraints and a list is not a line: what it says of itself is
@@ -2898,6 +2926,9 @@ fn explanation_fact(
             inference::Subject::Parameter => "the function requires one parameter type".into(),
             inference::Subject::Term => "this expression supplies its type here".into(),
             inference::Subject::Spread => "only an array can be spread into an array".into(),
+            inference::Subject::StructSpread => {
+                "the struct keeps every field of the value it spreads".into()
+            }
             _ => "this use contributes one of the conflicting type requirements".into(),
         },
     }
@@ -3129,15 +3160,21 @@ impl inference::Error {
 
         let mut diagnostic = Diagnostic::new(self.kind.code(), self.kind.to_string(), self.span);
         match &self.kind {
-            E::NotAStruct { .. } => {
+            E::NotAStruct { demand, .. } => {
+                let (asked, undo) = match demand {
+                    inference::StructDemand::Projection => {
+                        ("field access", "change/remove the field access")
+                    }
+                    inference::StructDemand::Spread => ("spread", "remove the spread"),
+                };
                 if let Some(explanation) = &self.explanation {
                     diagnostic = causal_diagnostic(diagnostic, explanation)
                         .help("change the value to a struct")
-                        .help("or change/remove the field access");
+                        .help(format!("or {undo}"));
                 } else {
                     diagnostic = diagnostic
-                        .label("this field access requires a struct")
-                        .help("change this value to a struct, or change/remove the field access");
+                        .label(format!("this {asked} requires a struct"))
+                        .help(format!("change this value to a struct, or {undo}"));
                 }
             }
             E::EffectArgument {
@@ -3494,8 +3531,15 @@ impl inference::ErrorKind {
 impl fmt::Display for inference::ErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            inference::ErrorKind::NotAStruct { base } => {
-                write!(f, "`{base}` is not a struct, so it has no fields to read")
+            inference::ErrorKind::NotAStruct { base, demand } => {
+                let asked = match demand {
+                    inference::StructDemand::Projection => "read",
+                    inference::StructDemand::Spread => "spread",
+                };
+                write!(
+                    f,
+                    "`{base}` is not a struct, so it has no fields to {asked}"
+                )
             }
             inference::ErrorKind::Mismatch { expected, actual } => {
                 write!(f, "type mismatch: expected `{expected}`, found `{actual}`")
@@ -3842,16 +3886,25 @@ pub fn write_arrow(
 ///
 /// The wrapper over [`write_row`] for the positions that have no presence and
 /// no tail: struct expressions, whose fields are simply there.
+/// Render a `{ name: value, ..spread }` struct literal: the fields it names,
+/// and then, after the `..`, the value it spreads — which is written where a
+/// type writes its tail, and by the same rule, so the two cannot drift apart.
+/// `None` is a literal with no spread, which writes no `..` at all.
+///
+/// The spread value is never grouped: it is a whole expression, read as far
+/// as the `,` or `}` that ends the literal, and nothing an expression can
+/// contain reads as either of those.
 pub fn write_struct<K: fmt::Display, V: fmt::Display>(
     f: &mut fmt::Formatter<'_>,
     fields: impl IntoIterator<Item = (K, V)>,
+    spread: Option<&dyn fmt::Display>,
 ) -> fmt::Result {
     let fields = fields.into_iter().map(|(name, value)| Entry::Written {
         name,
         mark: None,
         holds: value,
     });
-    write_row(f, fields, None)
+    write_row(f, fields, spread)
 }
 
 /// Return the insertion indices that put canonical tuple field names in
