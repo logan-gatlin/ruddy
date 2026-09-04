@@ -315,6 +315,7 @@ module.exports = grammar({
     // ── Expressions ───────────────────────────────────────────────────────
 
     _expression: $ => choice(
+      $.match_function,
       $.function,
       $.raise_expression,
       $.pipeline,
@@ -406,6 +407,7 @@ module.exports = grammar({
     _argument: $ => choice(
       $._atom,
       alias($._atom_projection, $.projection),
+      $.match_function,
       $.function,
     ),
 
@@ -464,6 +466,13 @@ module.exports = grammar({
       repeat1(field('parameter', choice($.identifier, $.wildcard))),
       '=>',
       field('body', $._expression),
+    )),
+
+    /** `fn | <pattern> => <expr> (| <pattern> => <expr>)*`. */
+    match_function: $ => prec.right(seq(
+      'fn',
+      '|',
+      sepBy1('|', $.match_arm),
     )),
 
     /**

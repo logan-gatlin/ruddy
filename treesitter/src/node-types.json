@@ -404,6 +404,10 @@
             "named": true
           },
           {
+            "type": "match_function",
+            "named": true
+          },
+          {
             "type": "natural",
             "named": true
           },
@@ -583,6 +587,10 @@
           },
           {
             "type": "match_expression",
+            "named": true
+          },
+          {
+            "type": "match_function",
             "named": true
           },
           {
@@ -1612,6 +1620,10 @@
             "named": true
           },
           {
+            "type": "match_function",
+            "named": true
+          },
+          {
             "type": "multiplication",
             "named": true
           },
@@ -2035,6 +2047,10 @@
             "named": true
           },
           {
+            "type": "match_function",
+            "named": true
+          },
+          {
             "type": "multiplication",
             "named": true
           },
@@ -2146,6 +2162,10 @@
           },
           {
             "type": "match_expression",
+            "named": true
+          },
+          {
+            "type": "match_function",
             "named": true
           },
           {
@@ -2535,6 +2555,10 @@
             "named": true
           },
           {
+            "type": "match_function",
+            "named": true
+          },
+          {
             "type": "multiplication",
             "named": true
           },
@@ -2797,6 +2821,10 @@
             "named": true
           },
           {
+            "type": "match_function",
+            "named": true
+          },
+          {
             "type": "multiplication",
             "named": true
           },
@@ -2941,6 +2969,10 @@
             "named": true
           },
           {
+            "type": "match_function",
+            "named": true
+          },
+          {
             "type": "multiplication",
             "named": true
           },
@@ -3080,6 +3112,10 @@
             "named": true
           },
           {
+            "type": "match_function",
+            "named": true
+          },
+          {
             "type": "multiplication",
             "named": true
           },
@@ -3194,6 +3230,10 @@
             "named": true
           },
           {
+            "type": "match_function",
+            "named": true
+          },
+          {
             "type": "multiplication",
             "named": true
           },
@@ -3305,6 +3345,10 @@
           },
           {
             "type": "match_expression",
+            "named": true
+          },
+          {
+            "type": "match_function",
             "named": true
           },
           {
@@ -3435,6 +3479,10 @@
           },
           {
             "type": "match_expression",
+            "named": true
+          },
+          {
+            "type": "match_function",
             "named": true
           },
           {
@@ -3618,6 +3666,10 @@
             "named": true
           },
           {
+            "type": "match_function",
+            "named": true
+          },
+          {
             "type": "multiplication",
             "named": true
           },
@@ -3788,6 +3840,10 @@
             "named": true
           },
           {
+            "type": "match_function",
+            "named": true
+          },
+          {
             "type": "multiplication",
             "named": true
           },
@@ -3849,6 +3905,21 @@
     "children": {
       "multiple": true,
       "required": false,
+      "types": [
+        {
+          "type": "match_arm",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "match_function",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
       "types": [
         {
           "type": "match_arm",
@@ -4257,6 +4328,10 @@
         },
         {
           "type": "match_expression",
+          "named": true
+        },
+        {
+          "type": "match_function",
           "named": true
         },
         {
@@ -4874,6 +4949,10 @@
           "named": true
         },
         {
+          "type": "match_function",
+          "named": true
+        },
+        {
           "type": "multiplication",
           "named": true
         },
@@ -5057,6 +5136,10 @@
             "named": true
           },
           {
+            "type": "match_function",
+            "named": true
+          },
+          {
             "type": "multiplication",
             "named": true
           },
@@ -5215,6 +5298,10 @@
           },
           {
             "type": "match_expression",
+            "named": true
+          },
+          {
+            "type": "match_function",
             "named": true
           },
           {
@@ -5624,6 +5711,10 @@
             "named": true
           },
           {
+            "type": "match_function",
+            "named": true
+          },
+          {
             "type": "natural",
             "named": true
           },
@@ -5791,6 +5882,10 @@
           },
           {
             "type": "match_expression",
+            "named": true
+          },
+          {
+            "type": "match_function",
             "named": true
           },
           {

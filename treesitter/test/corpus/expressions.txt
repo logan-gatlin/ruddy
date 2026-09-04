@@ -402,6 +402,47 @@ let absurd = fn v => match v with end
         (identifier)))))
 
 ================================================================================
+A function matching its implicit argument
+================================================================================
+
+let unwrap = fn
+  | #Some x => x
+  | #None => 0n
+
+let nested = fn | #Outer => fn | #Inner => 1n | #Other => 2n
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (match_function
+      (match_arm
+        (tag_pattern
+          (tag)
+          (identifier))
+        (identifier))
+      (match_arm
+        (tag_pattern
+          (tag))
+        (natural))))
+  (let_definition
+    (identifier)
+    (match_function
+      (match_arm
+        (tag_pattern
+          (tag))
+        (match_function
+          (match_arm
+            (tag_pattern
+              (tag))
+            (natural))
+          (match_arm
+            (tag_pattern
+              (tag))
+            (natural)))))))
+
+================================================================================
 A handler, with a value arm
 ================================================================================
 

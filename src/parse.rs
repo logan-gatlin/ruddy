@@ -201,6 +201,18 @@ pub enum ExprKind {
         args: Vec<Arg>,
         body: Box<Expr>,
     },
+    /// `fn | <pattern> => <expr> (| <pattern> => <expr>)*` — a unary
+    /// function whose implicit argument is matched by its body.
+    ///
+    /// The leading bar distinguishes it from an ordinary function. There is
+    /// no closing delimiter: each body ends in front of the next `|`, and the
+    /// final body extends as far right as an ordinary function body.
+    MatchFunction {
+        /// Kept separately so lowering can locate the implicit argument at
+        /// the keyword rather than across the whole function expression.
+        fn_span: Span,
+        arms: Vec<Arm>,
+    },
     /// `do <stmt>* [return <expr>] end` — names given values for the length
     /// of one expression, one after another.
     ///
@@ -2412,6 +2424,16 @@ impl Parser {
     /// can, ML-style.
     fn function_expr(&mut self) -> Option<Expr> {
         let kw = self.advance().expect("the caller peeked `fn`");
+        if self.eat_if(&Kind::Pipe).is_some() {
+            let arms = self.match_arms()?;
+            let span = kw
+                .span
+                .merge(arms.last().expect("one arm was parsed").body.span);
+            return Some(span.track(ExprKind::MatchFunction {
+                fn_span: kw.span,
+                arms,
+            }));
+        }
         let args = self.function_args()?;
         let body = self.expr()?;
         let span = kw.span.merge(body.span);
@@ -2574,15 +2596,7 @@ impl Parser {
                     kind: RelatedKind::Construct("match"),
                 }),
             )?;
-            loop {
-                let pattern = self.pattern()?;
-                self.eat(&Kind::FatArrow)?;
-                let body = self.expr()?;
-                arms.push(Arm { pattern, body });
-                if self.eat_if(&Kind::Pipe).is_none() {
-                    break;
-                }
-            }
+            arms = self.match_arms()?;
         }
         let anchor = arms.last().map_or(with.span, |arm| arm.body.span);
         let close = self.eat_with_context(
@@ -2601,6 +2615,22 @@ impl Parser {
             scrutinee: Box::new(scrutinee),
             arms,
         }))
+    }
+
+    /// Read one or more match arms after their first `|` has been consumed.
+    /// The ordinary match and the function shorthand share this exact tail;
+    /// only what introduces its first bar differs.
+    fn match_arms(&mut self) -> Option<Vec<Arm>> {
+        let mut arms = Vec::new();
+        loop {
+            let pattern = self.pattern()?;
+            self.eat(&Kind::FatArrow)?;
+            let body = self.expr()?;
+            arms.push(Arm { pattern, body });
+            if self.eat_if(&Kind::Pipe).is_none() {
+                return Some(arms);
+            }
+        }
     }
 
     /// `if <predicate> then <consequent> else <alternative> end`.

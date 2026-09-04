@@ -104,12 +104,12 @@
 
 (let_definition
   pattern: (identifier) @function
-  body: (function))
+  body: [(function) (match_function)])
 
 (do_block
   statement: (let_definition
     pattern: (identifier) @function
-    body: (function)))
+    body: [(function) (match_function)]))
 
 (function parameter: (identifier) @variable.parameter)
 (handler_arm binder: (identifier) @variable.parameter)
