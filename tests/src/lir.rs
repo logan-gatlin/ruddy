@@ -138,7 +138,7 @@ fn boolean_operators_lower_to_native_instructions() {
 #[test]
 fn a_nested_expression_flattens_in_source_order() {
     let printed = section(
-        "let f = let p : { a: Nat } = { a: 1n } in #Some { b: p.a, c: 2n }",
+        "let f = do let p : { a: Nat } = { a: 1n } return #Some { b: p.a, c: 2n } end",
         "global f",
     );
     assert_eq!(
@@ -160,7 +160,7 @@ fn a_nested_expression_flattens_in_source_order() {
 #[test]
 fn a_binding_emits_no_instruction_of_its_own() {
     assert_eq!(
-        section("let f = let p : Nat = 1n in p", "global f"),
+        section("let f = do let p : Nat = 1n return p end", "global f"),
         "global f:\n  %0: nat = const 1n\n  ret %0"
     );
 }
@@ -170,7 +170,7 @@ fn a_binding_emits_no_instruction_of_its_own() {
 fn a_shadowed_name_is_put_back_afterwards() {
     assert_eq!(
         section(
-            "let f = let p = 1n in { one: let p = 2n in p, two: p }",
+            "let f = do let p = 1n return { one: do let p = 2n return p end, two: p } end",
             "global f"
         ),
         "global f:\n\
@@ -386,7 +386,8 @@ fn a_lambda_that_closes_over_nothing_captures_nothing() {
 /// body. Its name is therefore a local closure read, never a bogus global.
 #[test]
 fn a_local_recursive_function_reconstructs_its_closure() {
-    let source = "let main = let loop = fn n => let again = loop n in loop n in loop";
+    let source =
+        "let main = do let loop = fn n => do let again = loop n return loop n end return loop end";
     assert_eq!(
         section(source, "fn main#1"),
         "fn main#1(%0: any):\n\
@@ -405,7 +406,7 @@ fn a_local_recursive_function_reconstructs_its_closure() {
 /// parameters, corresponding exactly to the outer values captured at the site.
 #[test]
 fn a_local_recursive_function_keeps_its_outer_captures() {
-    let source = "let make = fn seed => let loop = fn n => seed + loop n in loop";
+    let source = "let make = fn seed => do let loop = fn n => seed + loop n return loop end";
     let outer = section(source, "fn make(");
     assert!(outer.contains("closure make#2, [%0]"), "{outer}");
     let recursive = section(source, "fn make#2");
@@ -424,7 +425,7 @@ fn a_local_recursive_function_keeps_its_outer_captures() {
 /// capture the reconstructed closure of the whole recursively bound function.
 #[test]
 fn a_curried_local_recursive_function_captures_its_outer_self() {
-    let source = "let main = let loop = fn a b => loop a b in loop";
+    let source = "let main = do let loop = fn a b => loop a b return loop end";
     let outer = section(source, "fn main#2");
     assert!(outer.contains("%4: fn = closure main#2, []"), "{outer}");
     assert!(outer.contains("closure main#1, [%4, %1]"), "{outer}");
@@ -1215,7 +1216,7 @@ fn a_bundle_is_built_where_none_can_be_forwarded() {
 fn a_function_receives_the_evidence_it_projects() {
     let source = "effect Log = { write: Nat -> () }\n\
          let piped : (Nat -> Nat + ..'e) -> Nat -> Nat + ..'e = fn g => fn n => g n\n\
-         let logger : Nat -> Nat + !Log = fn n => let z = !Log.write n in n\n\
+         let logger : Nat -> Nat + !Log = fn n => do let z = !Log.write n return n end\n\
          let use = fn w => handle piped logger 1n with | !Log.write s => {} end";
     // The record `logger` reads is its first parameter, and the wrapper that
     // stands for `logger` as a value passes its own first parameter straight on.
@@ -1276,7 +1277,7 @@ fn a_definite_effect_and_an_open_rest_are_both_passed() {
     assert_eq!(
         section(
             "effect Log = { write: Nat -> () }\n\
-             let both = fn g => let z = !Log.write 1n in g 2n",
+             let both = fn g => do let z = !Log.write 1n return g 2n end",
             "fn both("
         ),
         "fn both(%0: struct, %1: struct, %2: fn):\n\
@@ -1464,7 +1465,7 @@ fn an_operation_returning_a_function_keeps_applying() {
 fn a_nested_binding_takes_a_bundle_of_its_own() {
     assert_eq!(
         section(
-            "let outer = fn z => let g = fn h => h z in 0n",
+            "let outer = fn z => do let g = fn h => h z return 0n end",
             "fn outer#2"
         ),
         "fn outer#2(%3: any, %1: struct, %2: fn):\n  %4: any = call %2, %1, %3\n  ret %4"
@@ -1485,7 +1486,7 @@ fn every_temp_is_defined_once_in_the_whole_listing() {
          let go = fn w => handle shout 1n with | !Log.write n => {} end",
         "effect Log = { write: Nat -> () }\n\
          let piped : (Nat -> Nat + ..'e) -> Nat -> Nat + ..'e = fn g => fn n => g n\n\
-         let logger : Nat -> Nat + !Log = fn n => let z = !Log.write n in n\n\
+         let logger : Nat -> Nat + !Log = fn n => do let z = !Log.write n return n end\n\
          let use = fn w => handle piped logger 1n with | !Log.write s => {} end",
     ] {
         let printed = listing(source);
@@ -1536,7 +1537,7 @@ fn definitions(printed: &str) -> Vec<String> {
 fn evidence_of_the_same_shape_is_handed_straight_over() {
     let source = "effect Log = { write: Nat -> () }\n\
          let takes : (Nat -> Nat + !Log) -> Nat + !Log = fn f => f 1n\n\
-         let noisy = fn n => let z = !Log.write n in n\n\
+         let noisy = fn n => do let z = !Log.write n return n end\n\
          let same = fn w => handle takes noisy with | !Log.write s => {} end";
     let printed = section(source, "fn same(");
     assert!(printed.contains("%22: fn = global noisy"), "{printed}");
@@ -1590,7 +1591,7 @@ fn recursive_arrow_fitting_reuses_one_guarded_adapter() {
 fn an_adapter_packs_a_record_into_the_bundle_a_value_expects() {
     let source = "effect Log = { write: Nat -> () }\n\
          let takes : (Nat -> Nat + !Log) -> Nat + !Log = fn f => f 1n\n\
-         let openish : Nat -> Nat + !Log + ..'r = fn n => let z = !Log.write n in n\n\
+         let openish : Nat -> Nat + !Log + ..'r = fn n => do let z = !Log.write n return n end\n\
          let packed = fn w => handle takes openish with | !Log.write s => {} end";
     assert_eq!(
         section(source, "fn openish("),
@@ -1635,7 +1636,7 @@ fn an_adapter_forwards_the_bundle_it_was_handed() {
          let hof2 : ((Nat -> Nat + ..'r) -> Nat + ..'r) -> Nat + ..'r =\n\
            fn k => k (fn m => m)\n\
          let both : (Nat -> Nat + !Log + ..'s) -> Nat + !Log + ..'s =\n\
-           fn g => let z = !Log.write 1n in g 2n\n\
+           fn g => do let z = !Log.write 1n return g 2n end\n\
          let fwd : {} -> Nat + !Log + ..'t = fn w => hof2 both";
     assert!(
         section(source, "fn both(").starts_with("fn both(%10: struct, %11: struct, %12: fn):"),
@@ -1673,7 +1674,7 @@ fn an_adapter_forwards_the_bundle_it_was_handed() {
 fn a_partial_application_is_fitted_to_the_shape_its_wrapper_takes() {
     let source = "effect Log = { write: Nat -> () }\n\
          let two : Nat -> Nat -> Nat + !Log + ..'s =\n\
-           fn a => fn b => let z = !Log.write a in b\n\
+           fn a => fn b => do let z = !Log.write a return b end\n\
          let takes : (Nat -> Nat + !Log) -> Nat + !Log = fn f => f 1n\n\
          let go = fn w => handle takes (two 1n) with | !Log.write s => {} end";
     // The wrapper the partial application becomes takes a record and a bundle.
@@ -1705,7 +1706,7 @@ fn a_partial_application_is_fitted_to_the_shape_its_wrapper_takes() {
 #[test]
 fn a_full_application_stands_for_what_it_came_to() {
     let source = "effect Log = { write: Nat -> () }\n\
-         let noisy : Nat -> Nat + !Log = fn n => let z = !Log.write n in n\n\
+         let noisy : Nat -> Nat + !Log = fn n => do let z = !Log.write n return n end\n\
          let pick : Nat -> Nat -> (Nat -> Nat + !Log) = fn a => fn b => noisy\n\
          let takes : (Nat -> Nat + !Log) -> Nat + !Log = fn f => f 1n\n\
          let go = fn w => handle takes (pick 1n 2n) with | !Log.write s => {} end";
@@ -1736,7 +1737,7 @@ fn a_definition_read_through_a_binding_arrives_callable() {
          let poly : Nat -> Nat + ..'e = fn n => n\n\
          let run : (Nat -> Nat + !A + !B) -> Nat + !A + !B = fn f => f 1n\n\
          let go = fn w => handle handle\n\
-           (let h : Nat -> Nat + !A + !B = poly in run h)\n\
+           (do let h : Nat -> Nat + !A + !B = poly return run h end)\n\
            with | !A.a s => {} end with | !B.b s => {} end";
     // `poly` was compiled with one tail bundle before its argument, and `run`
     // calls what it is given with two records before it — so the adapter packs
@@ -1818,11 +1819,11 @@ fn a_definition_returned_from_a_function_arrives_callable() {
 fn a_polymorphic_value_bound_by_a_let_is_called_at_the_shape_it_holds() {
     let source = "effect A = { a: Nat -> () }\n\
          effect B = { b: Nat -> () }\n\
-         let both : Nat -> Nat + !A + !B = fn n => let x = !A.a n in let y = !B.b n in n\n\
+         let both : Nat -> Nat + !A + !B = fn n => do let x = !A.a n let y = !B.b n return n end\n\
          let app = fn g => g 1n\n\
          let direct = fn w => handle handle app both\n\
            with | !A.a s => {} end with | !B.b s => {} end\n\
-         let bound = fn w => handle handle (let h = app in h both)\n\
+         let bound = fn w => handle handle (do let h = app return h both end)\n\
            with | !A.a s => {} end with | !B.b s => {} end";
     // The lifted `app` and its wrapper take a bundle and the argument: two
     // parameters, which is what every call of the value has to supply.
@@ -1876,9 +1877,9 @@ fn a_polymorphic_value_bound_by_a_let_is_called_at_the_shape_it_holds() {
 #[test]
 fn a_parameter_is_called_at_one_shape_however_the_uses_instantiate_it() {
     let source = "effect Log = { write: Nat -> () }\n\
-         let noisy : Nat -> Nat + !Log = fn n => let z = !Log.write n in n\n\
+         let noisy : Nat -> Nat + !Log = fn n => do let z = !Log.write n return n end\n\
          let pure = fn n => n\n\
-         let go = fn w => handle (let h = fn g => g 1n in { a: h noisy, b: h pure })\n\
+         let go = fn w => handle (do let h = fn g => g 1n return { a: h noisy, b: h pure } end)\n\
            with | !Log.write s => {} end";
     // The lifted `h` takes a bundle and its argument: two parameters.
     assert_eq!(
@@ -1923,7 +1924,7 @@ fn a_parameter_is_called_at_one_shape_however_the_uses_instantiate_it() {
 fn a_value_returned_from_a_call_is_called_at_the_shape_it_holds() {
     let source = "effect A = { a: Nat -> () }\n\
          effect B = { b: Nat -> () }\n\
-         let both : Nat -> Nat + !A + !B = fn n => let x = !A.a n in let y = !B.b n in n\n\
+         let both : Nat -> Nat + !A + !B = fn n => do let x = !A.a n let y = !B.b n return n end\n\
          let app = fn g => g 1n\n\
          let pick = fn u => app\n\
          let late = fn w => handle handle (pick {}) both\n\
@@ -1960,7 +1961,7 @@ fn a_function_read_out_of_a_struct_field_is_called_at_the_shape_the_field_holds(
          effect Fail = { oops: Nat -> () }\n\
          let s = { f: fn g => fn n => g n }\n\
          let both : Nat -> Nat + !Log + !Fail = fn n =>\n\
-           let a = !Log.write n in let b = !Fail.oops n in n\n\
+           do let a = !Log.write n let b = !Fail.oops n return n end\n\
          let go = fn w => handle handle s.f both 1n\n\
            with | !Log.write x => {} end with | !Fail.oops y => {} end";
     // The function lifted out of the field takes a bundle and its argument,
@@ -2012,10 +2013,10 @@ fn call_results_keep_container_production_metadata_for_projection() {
          let direct = fn u => stored\n\
          let indirect = fn k => k {}\n\
          let both : Nat -> Nat + !Log + !Fail = fn n =>\n\
-           let a = !Log.write n in let b = !Fail.oops n in n\n\
+           do let a = !Log.write n let b = !Fail.oops n return n end\n\
          let go = fn w => handle handle\n\
-           let a = (direct {}).f both 1n in\n\
-           (indirect direct).f both a\n\
+           do let a = (direct {}).f both 1n\n\
+           return (indirect direct).f both a end\n\
            with | !Log.write x => {} end with | !Fail.oops y => {} end";
     let go = section(source, "fn go(");
     assert_eq!(go.matches("project ").count(), 2, "{go}");
@@ -2035,7 +2036,7 @@ fn a_function_bound_by_a_struct_pattern_keeps_the_stored_effect_abi() {
          effect Fail = { oops: Nat -> () }\n\
          let s = { f: fn g => fn n => g n }\n\
          let both : Nat -> Nat + !Log + !Fail = fn n =>\n\
-           let a = !Log.write n in let b = !Fail.oops n in n\n\
+           do let a = !Log.write n let b = !Fail.oops n return n end\n\
          let go = fn w => handle handle\n\
            (match s with | { f } => f both 1n end)\n\
            with | !Log.write x => {} end with | !Fail.oops y => {} end";
@@ -2066,7 +2067,7 @@ fn a_function_carried_as_a_sum_payload_is_called_at_the_shape_the_case_holds() {
          effect Fail = { oops: Nat -> () }\n\
          let wrap = #F (fn g => fn n => g n)\n\
          let both : Nat -> Nat + !Log + !Fail = fn n =>\n\
-           let a = !Log.write n in let b = !Fail.oops n in n\n\
+           do let a = !Log.write n let b = !Fail.oops n return n end\n\
          let go = fn w => handle handle\n\
            (match wrap with | #F h => h both 1n | _ => 0n end)\n\
            with | !Log.write x => {} end with | !Fail.oops y => {} end";
@@ -2095,7 +2096,7 @@ fn a_function_carried_as_a_sum_payload_is_called_at_the_shape_the_case_holds() {
 fn a_match_arm_yields_a_function_fitted_to_what_the_match_stands_for() {
     let source = "effect A = { a: Nat -> () }\n\
          effect B = { b: Nat -> () }\n\
-         let both : Nat -> Nat + !A + !B = fn n => let x = !A.a n in let y = !B.b n in n\n\
+         let both : Nat -> Nat + !A + !B = fn n => do let x = !A.a n let y = !B.b n return n end\n\
          let app = fn g => g 1n\n\
          let pick = fn u => app\n\
          let go = fn c => handle handle\n\
@@ -2124,7 +2125,7 @@ fn a_match_arm_yields_a_function_fitted_to_what_the_match_stands_for() {
 #[test]
 fn a_value_already_at_the_containers_shape_goes_in_and_out_untouched() {
     let source = "effect Log = { write: Nat -> () }\n\
-         let s : { f: Nat -> Nat + !Log } = { f: fn n => let z = !Log.write n in n }\n\
+         let s : { f: Nat -> Nat + !Log } = { f: fn n => do let z = !Log.write n return n end }\n\
          let go = fn w => handle s.f 1n with | !Log.write x => {} end";
     assert_eq!(
         section(source, "global s"),
@@ -2203,7 +2204,7 @@ fn a_bundle_names_an_effect_once_however_many_frames_hold_it() {
          let piped : (Nat -> Nat + ..'e) -> Nat -> Nat + ..'e = fn g => fn n => g n\n\
          let idn = fn n => n\n\
          let outer : Nat -> Nat + !Log = fn n =>\n\
-           let inner : Nat -> Nat + !Log = fn q => piped idn q in inner n";
+           do let inner : Nat -> Nat + !Log = fn q => piped idn q return inner n end";
     // Both `outer` and the `inner` lifted out of it take `Log`'s record, and
     // the bundle built inside `inner` names the effect once — as the record
     // `inner` itself was handed, which is the innermost one.
@@ -2262,7 +2263,7 @@ fn a_bundle_with_no_identity_hands_over_what_it_holds() {
 fn a_bundle_is_forwarded_only_where_the_use_shares_the_variable() {
     let source = "effect Log = { write: Nat -> () }\n\
          let piped : (Nat -> Nat + ..'e) -> Nat -> Nat + ..'e = fn g => fn n => g n\n\
-         let noisy : Nat -> Nat + !Log = fn n => let z = !Log.write n in n\n\
+         let noisy : Nat -> Nat + !Log = fn n => do let z = !Log.write n return n end\n\
          let caller : (Nat -> Nat + ..'r) -> Nat -> Nat + ..'r =\n\
            fn k => fn n => handle piped noisy n with | !Log.write s => {} end\n\
          let twice : (Nat -> Nat + ..'f) -> Nat -> Nat + ..'f =\n\
@@ -2300,7 +2301,7 @@ fn nothing_after_a_raise_is_emitted() {
             "effect Fail = { oops: () -> Nat }\n\
              let recover = fn w =>\n\
                handle !Fail.oops () with\n\
-               | !Fail.oops z => let q = raise 0n in raise 1n\n\
+               | !Fail.oops z => do let q = raise 0n return raise 1n end\n\
                | return r => r end",
             "fn recover#2"
         ),
@@ -2548,7 +2549,7 @@ fn conditional_named_evidence_overlays_the_same_shared_open_tail() {
     let source = "effect Needed = { get: () -> Nat }\n\
          effect Spare = { get: () -> Nat }\n\
          extern install : fn(fn(()) -> () + !Needed (when 'needed) + ..'effects) -> () + !Needed + ..'effects = \"host.install\"\n\
-         let call : () -> () + !Spare = fn _ => handle install (fn _ => let n = !Needed.get () in {}) with | !Needed.get _ => 0n end";
+         let call : () -> () + !Spare = fn _ => handle install (fn _ => do let n = !Needed.get () return {} end) with | !Needed.get _ => 0n end";
     let printed = listing(source);
     let marked = printed
         .split("\n\n")
@@ -2620,7 +2621,7 @@ fn restricted_callback_bundles_drop_unrelated_conditional_tail_effects() {
 
 #[test]
 fn struct_and_project_instructions_preserve_quoted_field_names() {
-    let source = r###"let pick = fn ignored => let record = { "field name": 1n, "let": 2n, "line\n\"quote\"\\tail": 3n } in record."line\n\"quote\"\\tail""###;
+    let source = r###"let pick = fn ignored => do let record = { "field name": 1n, "let": 2n, "line\n\"quote\"\\tail": 3n } return record."line\n\"quote\"\\tail" end"###;
     let printed = section(source, "fn pick(");
     assert!(
         printed.contains(r###"struct { "field name": %"###),

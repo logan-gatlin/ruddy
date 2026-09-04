@@ -2617,7 +2617,7 @@ fn inference_stage_rows_serialize_compiler_identities() {
                   type Callback = () -> () + !Fail\n\
                   extern install : fn(Callback) -> () + !Fail = \"host.install\"\n\
                   let choose : { x when 'a: Nat, y when 'b: Nat } -> Nat where 'a != 'b = fn v => match v with | {x} => x | {y} => y end\n\
-                  let local = fn tag => match tag with | {a} => let g = fn w => choose w in g {} | {b} => 0n end\n\
+                  let local = fn tag => match tag with | {a} => do let g = fn w => choose w return g {} end | {b} => 0n end\n\
                   let bad = (1n).missing\n";
     let snapshot = snapshot(source);
     let stage = |id| snapshot.stages.iter().find(|stage| stage.id == id).unwrap();
@@ -3095,7 +3095,7 @@ fn sums_reach_every_stage() {
 /// binds was generalized to.
 #[test]
 fn a_nested_let_reaches_every_stage() {
-    let source = "let a = let id : Nat -> Nat = fn x => x in id 1n\n";
+    let source = "let a = do let id : Nat -> Nat = fn x => x return id 1n end\n";
     let snapshot = snapshot(source);
     assert!(
         snapshot.diagnostics.is_empty(),
@@ -3111,30 +3111,50 @@ fn a_nested_let_reaches_every_stage() {
             .unwrap_or_else(|| panic!("{id} is registered"))
     };
 
-    // Both trees label the node with the name it binds, and both print it back
-    // as the source it stands for.
-    // The two trees name a lambda differently — one has the surface form and
-    // the other the curried one — and a binder differently too: the parse
-    // tree's is a pattern, which a bare name is the simplest of, and the IR's
-    // is the resolved name. They agree about everything else.
-    for (id, lambda, binder) in [("ast", "Function", "Bind"), ("ir", "Fn", "Name")] {
-        let node = nodes(stage(id))
-            .into_iter()
-            .find(|node| node.label == "Let id")
-            .unwrap_or_else(|| panic!("{id} renders no nested let"));
-        assert_eq!(
-            node.text, "let id : Nat -> Nat = fn x => x in id 1n",
-            "{id}"
-        );
-        // The written type is a child, between the name and the value where it
-        // was written.
-        let labels: Vec<&str> = node
-            .children
-            .iter()
-            .map(|child| child.label.as_str())
-            .collect();
-        assert_eq!(labels, [binder, "Ascribed Arrow", lambda, "Apply"], "{id}");
-    }
+    // The parse tree has the block: its row prints the whole of it, and under
+    // it sit the statement's row — the same row a definition gets, with the
+    // written type between the name and the value where it was written — and
+    // the returned expression under its role.
+    let block = nodes(stage("ast"))
+        .into_iter()
+        .find(|node| node.label == "Do")
+        .expect("the ast renders the block");
+    assert_eq!(
+        block.text,
+        "do let id : Nat -> Nat = fn x => x return id 1n end"
+    );
+    let labels: Vec<&str> = block
+        .children
+        .iter()
+        .map(|child| child.label.as_str())
+        .collect();
+    assert_eq!(labels, ["Let", "Return"]);
+    let binding = &block.children[0];
+    assert_eq!(binding.text, "let id : Nat -> Nat = fn x => x");
+    let labels: Vec<&str> = binding
+        .children
+        .iter()
+        .map(|child| child.label.as_str())
+        .collect();
+    assert_eq!(labels, ["Bind", "Ascribed Arrow", "Function"]);
+
+    // The IR has the binding the block lowered to, labelled with the name it
+    // binds and printed back as the block it stands for: the resolved name,
+    // the written type, the curried lambda, and the body it is in scope for.
+    let node = nodes(stage("ir"))
+        .into_iter()
+        .find(|node| node.label == "Let id")
+        .expect("the ir renders the binding");
+    assert_eq!(
+        node.text,
+        "do let id : Nat -> Nat = fn x => x return id 1n end"
+    );
+    let labels: Vec<&str> = node
+        .children
+        .iter()
+        .map(|child| child.label.as_str())
+        .collect();
+    assert_eq!(labels, ["Name", "Ascribed Arrow", "Fn", "Apply"]);
 
     // The Constraints tab is a tree: the `let` is a row, and what its value and
     // its body require are rows beneath it, in the order the solver runs them.
@@ -3333,7 +3353,7 @@ fn a_match_and_a_pattern_let_reach_every_stage() {
 fn a_wildcard_reaches_every_stage() {
     let source = "let _ = 1n\n\
                   let const = fn x _ => x\n\
-                  let use_y = fn p => let { x: _, y } = p in y\n\
+                  let use_y = fn p => do let { x: _, y } = p return y end\n\
                   let f = fn e => match e with | #Some _ => 1n | _ => 0n end\n";
     let snapshot = snapshot(source);
     assert!(snapshot.panic.is_none());
@@ -3454,7 +3474,7 @@ fn every_stage_reports_on_a_source_using_effects() {
                   effect Console = !Log + !IO\n\
                   type Logger = Nat -> Nat + !Log\n\
                   type Runner 'e = (Nat -> Nat + ..'e) -> Nat + ..'e\n\
-                  let greet : () -> Nat + !Log = fn _ => let _ = !Log.write 1n in 0n\n\
+                  let greet : () -> Nat + !Log = fn _ => do let _ = !Log.write 1n return 0n end\n\
                   let quiet : () -> Nat = fn _ =>\n\
                     handle greet () with | !Log.write s => () | return x => x end\n\
                   let loud : () -> Nat + !IO = fn _ =>\n\

@@ -501,8 +501,8 @@ fn a_label_may_be_called_when() {
     );
 }
 
-/// `when`, `where`, and `return` are contextual, but Boolean operators are
-/// reserved wherever an expression may appear.
+/// `when` and `where` are contextual, but Boolean operators are reserved
+/// wherever an expression may appear.
 #[test]
 fn only_non_operator_clause_keywords_are_contextual() {
     for src in [
@@ -1019,8 +1019,18 @@ fn a_delimiter_boundary_asks_for_the_matching_closer() {
         ("let value : { = source", "}", '{', "="),
         ("let ( = value", ")", '(', "="),
         ("let { = value", "}", '{', "="),
-        ("let value = let inner = ( in inner", ")", '(', "in inner"),
-        ("let value = let inner = { in inner", "}", '{', "in inner"),
+        (
+            "let value = do let inner = ( return inner end",
+            ")",
+            '(',
+            "return inner end",
+        ),
+        (
+            "let value = do let inner = { return inner end",
+            "}",
+            '{',
+            "return inner end",
+        ),
         ("extern f : fn( -> Nat = \"host.f\"", ")", '(', "->"),
         // A trailing comma is legal; at the boundary it is the closer, not
         // another tuple element or field, which is absent.
@@ -1776,135 +1786,307 @@ fn paths_propagate_formatter_failures() {
     assert!(write!(&mut FailsAfter(0), "{qualified}").is_err());
 }
 
-/// `let <name> [: <type>] = <value> in <body>` is an expression, and it prints
-/// back as what it was written as. The ascription is the same grammar the
-/// statement has, so a definition and a binding inside one read alike.
+/// `do <let>* [return <expr>] end` is an expression, and it prints back as
+/// what it was written as. Each `let` is the statement grammar, so a
+/// definition and a binding inside a block read alike.
 #[test]
-fn a_let_is_an_expression() {
+fn a_do_block_is_an_expression() {
+    for src in [
+        "let a = do let x = 1n return x end",
+        "let a = do let x : Nat = 1n return x end",
+        "let a = do let f : { x: Nat } -> Nat = fn p => p.x return f end",
+        "let a = do let x = 1n let y = { v: x } return y end",
+        "let a = do let x = 1n end",
+        "let a = do end",
+        "let a = do return 1n end",
+        "let a = do let (x, y) = p return x end",
+    ] {
+        assert_eq!(parse_one(src), src);
+    }
+}
+
+/// A `return`'s value extends as far right as it can, ML-style, exactly as
+/// a `fn` body does — so the application is inside the `return` and the block
+/// ends at the `end`. A `let`'s value stops in front of the next `let` or
+/// `return`, since neither begins an atom.
+#[test]
+fn a_blocks_values_run_as_far_right_as_they_can() {
     assert_eq!(
-        parse_one("let a = let x = 1n in x"),
-        "let a = let x = 1n in x"
+        parse_one("let a = do let f = g return f x y end"),
+        "let a = do let f = g return f x y end"
     );
     assert_eq!(
-        parse_one("let a = let x : Nat = 1n in x"),
-        "let a = let x : Nat = 1n in x"
+        parse_one("let a = do let f = g x let h = f y return h end"),
+        "let a = do let f = g x let h = f y return h end"
     );
     assert_eq!(
-        parse_one("let a = let f : { x: Nat } -> Nat = fn p => p.x in f"),
-        "let a = let f : { x: Nat } -> Nat = fn p => p.x in f"
+        parse_one("let a = do let f = g x return f end"),
+        "let a = do let f = g x return f end"
     );
 }
 
-/// The body extends as far right as it can, ML-style, exactly as a `fn` body
-/// does — so the application is inside the `let` rather than the `let` inside
-/// the application.
+/// A block may start an expression anywhere an atom may, and, like a `match`,
+/// it may head an application or be projected from.
 #[test]
-fn a_lets_body_runs_as_far_right_as_it_can() {
-    assert_eq!(
-        parse_one("let a = let f = g in f x y"),
-        "let a = let f = g in f x y"
-    );
-    // And the value stops at the `in`, which is what makes that unambiguous:
-    // `in` begins no atom, so the application gathering `g`'s arguments ends
-    // in front of it.
-    assert_eq!(
-        parse_one("let a = let f = g x in f"),
-        "let a = let f = g x in f"
-    );
-}
-
-/// A `let` may start an expression anywhere 'an atom may.
-#[test]
-fn a_let_starts_an_expression_wherever_an_atom_does() {
+fn a_do_block_starts_an_expression_wherever_an_atom_does() {
     for (src, printed) in [
         // A `fn` body.
         (
-            "let a = fn p => let x = p in x",
-            "let a = fn p => let x = p in x",
+            "let a = fn p => do let x = p return x end",
+            "let a = fn p => do let x = p return x end",
         ),
         // A struct field's value.
         (
-            "let a = { v: let n = 1n in n }",
-            "let a = { v: let n = 1n in n }",
+            "let a = { v: do let n = 1n return n end }",
+            "let a = { v: do let n = 1n return n end }",
         ),
         // A parenthesized expression.
-        ("let a = (let n = 1n in n)", "let a = let n = 1n in n"),
-        // Another let's value, and another let's body.
         (
-            "let a = let x = let y = 1n in y in x",
-            "let a = let x = let y = 1n in y in x",
+            "let a = (do let n = 1n return n end)",
+            "let a = do let n = 1n return n end",
+        ),
+        // Another block's value, and another block's return.
+        (
+            "let a = do let x = do let y = 1n return y end return x end",
+            "let a = do let x = do let y = 1n return y end return x end",
         ),
         (
-            "let a = let x = 1n in let y = x in y",
-            "let a = let x = 1n in let y = x in y",
+            "let a = do let x = 1n return do let y = x return y end end",
+            "let a = do let x = 1n return do let y = x return y end end",
+        ),
+        // Heading an application, and projected from.
+        (
+            "let a = do let f = g return f end 1n",
+            "let a = do let f = g return f end 1n",
+        ),
+        (
+            "let a = do let p = q return p end.x",
+            "let a = (do let p = q return p end).x",
         ),
     ] {
         assert_eq!(parse_one(src), printed, "{src}");
     }
 }
 
-/// A `let` is not an application argument: the loop that gathers arguments
-/// stops in front of one. Which is what keeps two definitions written one after
-/// the other from reading as an application, and what makes the parentheses in
-/// `f (let x = 1 in x)` the way to pass one.
+/// A block is not an application argument: the loop that gathers arguments
+/// stops in front of one, so the parentheses in `f (do ... end)` are the way
+/// to pass one — and the printer writes them back.
 #[test]
-fn a_let_is_not_an_application_argument() {
-    let out = parse(lex("let a = 1 let b = 2n", FileID::GENERATED).tokens);
-    assert!(out.errors.is_empty(), "errors: {:#?}", out.errors);
-    assert_eq!(out.stmts.len(), 2, "stmts: {:#?}", out.stmts);
-
+fn a_do_block_is_not_an_application_argument() {
     assert_eq!(
-        parse_one("let a = f (let x = 1n in x)"),
-        "let a = f (let x = 1n in x)"
+        parse_one("let a = f (do let x = 1n return x end)"),
+        "let a = f (do let x = 1n return x end)"
     );
 
-    // Without them the application ends at `f`, the `let` is read as a new
-    // definition, and its `in` is the token nothing can use.
-    let src = "let a = f let x = 1n in x";
+    // Without them the application ends at `f`, and the `do` is the token
+    // nothing can use.
+    let src = "let a = f do let x = 1n return x end";
     let out = parse(lex(src, FileID::GENERATED).tokens);
-    assert_eq!(out.stmts.len(), 2, "stmts: {:#?}", out.stmts);
-    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
+    assert!(!out.errors.is_empty(), "{src:?} parsed without complaint");
     assert_eq!(
         out.errors[0].span.start,
-        src.find(" in ").expect("the `in`") + 1
+        src.find(" do ").expect("the `do`") + 1
     );
 }
 
-/// Every position a nested `let` can fail at, reported where it is — and the
-/// statement dropped, so recovery resumes at the next `let` or `type` the way
-/// it does for any other malformed statement.
+/// `in` is a name like any other now that no form reads it.
 #[test]
-fn a_let_expression_reports_where_it_fails() {
+fn in_is_an_ordinary_name() {
+    assert_eq!(parse_one("let in = 1n"), "let in = 1n");
+    assert_eq!(parse_one("let a = f in"), "let a = f in");
+}
+
+/// `do` and `return` are reserved: neither is a name anywhere.
+#[test]
+fn do_and_return_are_not_names() {
+    for src in ["let do = 1n", "let return = 1n", "let a = fn do => 1n"] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        assert!(!out.errors.is_empty(), "{src:?} parsed without complaint");
+    }
+}
+
+/// Every position a block can fail at, reported where it is. A broken
+/// statement inside the block is skipped to the next `let` or the `end`, the
+/// way a broken definition is at file level, so the block is still read
+/// through to its `end` and the definitions after it are untouched.
+#[test]
+fn a_do_block_reports_where_it_fails() {
     // Each case is the source and the tail of it the complaint should land on,
     // which is the token the position had no reading for.
     for (src, from) in [
-        // The name, the ascribed type, and the `=`.
-        ("let a = let = 1n in x", "= 1n in x"),
-        ("let a = let x : = 1n in x", "= 1n in x"),
-        ("let a = let x 1n in x", "1n in x"),
-        // The value, the `in` the body follows, and the body itself.
-        ("let a = let x = in x", "in x"),
-        ("let a = let x = 1n } x", "} x"),
-        ("let a = let x = 1n in }", "}"),
+        // A `let`'s name, ascribed type, and `=`.
+        ("let a = do let = 1n return x end", "= 1n return x end"),
+        ("let a = do let x : = 1n return x end", "= 1n return x end"),
+        ("let a = do let x 1n return x end", "1n return x end"),
+        // A `let`'s value, and the returned value.
+        ("let a = do let x = return x end", "return x end"),
+        ("let a = do let x = 1n return } end", "} end"),
+        // A block that closes with something other than `end`.
+        ("let a = do let x = 1n return x }", "}"),
     ] {
         let out = parse(lex(src, FileID::GENERATED).tokens);
         assert!(!out.errors.is_empty(), "{src:?} parsed without complaint");
-        assert!(out.stmts.is_empty(), "{src:?} kept: {:#?}", out.stmts);
         let at = src.len() - from.len();
         assert_eq!(out.errors[0].span.start, at, "{src:?}");
     }
 
-    // A `let` with no `in` at all runs out of input, and is reported there.
-    let src = "let a = let x = 1n";
+    // A broken statement is skipped and the block read through: one complaint,
+    // and the definitions on either side of it survive.
+    let src = "let a = do let = 1n let x = 2n return x end\nlet b = 3n";
+    let out = parse(lex(src, FileID::GENERATED).tokens);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert_eq!(out.stmts.len(), 2, "stmts: {:#?}", out.stmts);
+
+    // A block with no `end` at all runs out of input, and is reported there.
+    let src = "let a = do let x = 1n return x";
     let out = parse(lex(src, FileID::GENERATED).tokens);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(out.errors[0].span.start, src.len());
     assert_eq!(out.errors[0].span.width, 0);
+}
 
-    // And recovery resumes at the next statement rather than swallowing it.
-    let out = parse(lex("let a = let x = 1n  let b = 2n", FileID::GENERATED).tokens);
+/// A `return` is the last thing in its block: a statement written after one
+/// is refused where it begins, pointing back at the `return`, and the block
+/// is read through to its `end` so the rest of the file is untouched.
+#[test]
+fn a_statement_after_return_is_refused() {
+    let src = "let a = do return 1n let x = 2n end\nlet b = 3n";
+    let out = parse(lex(src, FileID::GENERATED).tokens);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
-    assert_eq!(out.stmts.len(), 1, "stmts: {:#?}", out.stmts);
+    let error = &out.errors[0];
+    assert_eq!(
+        error.span.start,
+        src.find("let x").expect("the stray `let`")
+    );
+    assert!(
+        matches!(error.kind, ErrorKind::StatementAfterReturn { .. }),
+        "{error:?}"
+    );
+    let ErrorKind::StatementAfterReturn { returned } = error.kind else {
+        unreachable!()
+    };
+    assert_eq!(returned.start, src.find("return").expect("the `return`"));
+    assert_eq!(out.stmts.len(), 2, "stmts: {:#?}", out.stmts);
+
+    // A second `return` is a statement after the first, and the same
+    // complaint.
+    let src = "let a = do return 1n return 2n end";
+    let out = parse(lex(src, FileID::GENERATED).tokens);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert!(matches!(
+        out.errors[0].kind,
+        ErrorKind::StatementAfterReturn { .. }
+    ));
+    assert_eq!(
+        out.errors[0].span.start,
+        src.rfind("return").expect("the second `return`")
+    );
+
+    // What follows is read through and dropped, complaints included: a
+    // declaration after the `return` is one mistake, not two, and a nested
+    // `end` inside what is skipped is not taken for the block's.
+    for src in [
+        "let a = do return 1n type T = Nat end\nlet b = 3n",
+        "let a = do return 1n let x = match y with | _ => 1n end end\nlet b = 3n",
+    ] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        assert_eq!(out.errors.len(), 1, "{src:?}: {:#?}", out.errors);
+        assert!(
+            matches!(out.errors[0].kind, ErrorKind::StatementAfterReturn { .. }),
+            "{src:?}"
+        );
+        assert_eq!(out.stmts.len(), 2, "{src:?}: {:#?}", out.stmts);
+    }
+
+    // Something after the value that begins no statement is the block's
+    // missing `end`, and is reported as that rather than as a stray statement.
+    let src = "let a = do return x }";
+    let out = parse(lex(src, FileID::GENERATED).tokens);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert!(
+        matches!(
+            out.errors[0].kind,
+            ErrorKind::Expected {
+                expected: Expected::Keyword("end"),
+                ..
+            }
+        ),
+        "{:#?}",
+        out.errors
+    );
+    assert_eq!(out.errors[0].span.start, src.find('}').expect("the brace"));
+
+    // A `return` whose value is broken is one complaint at the value, and the
+    // block is still read through to its `end`, so the definition survives.
+    let src = "let a = do let x = 1n return } let y = 2n end\nlet b = 3n";
+    let out = parse(lex(src, FileID::GENERATED).tokens);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert_eq!(out.errors[0].span.start, src.find('}').expect("the brace"));
+    assert_eq!(out.stmts.len(), 2, "stmts: {:#?}", out.stmts);
+}
+
+/// A `return` carries a value: one written with nothing after it is refused
+/// at the `return`, since leaving it out is how a block evaluates to `()`.
+#[test]
+fn a_bare_return_is_refused() {
+    let src = "let a = do let x = 1n return end";
+    let out = parse(lex(src, FileID::GENERATED).tokens);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert!(matches!(out.errors[0].kind, ErrorKind::BareReturn));
+    assert_eq!(
+        out.errors[0].span.start,
+        src.find("return").expect("the `return`")
+    );
+}
+
+/// A `return` outside any block is refused where it is, and what it carries
+/// is still read so the rest of the definition is checked.
+#[test]
+fn a_return_outside_a_block_is_refused() {
+    for src in [
+        "let a = fn x => return x",
+        "let a = return 1n",
+        "let a = do let x = return 1n end",
+    ] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        assert_eq!(out.errors.len(), 1, "{src:?}: {:#?}", out.errors);
+        assert!(
+            matches!(out.errors[0].kind, ErrorKind::ReturnOutsideBlock),
+            "{src:?}"
+        );
+        assert_eq!(
+            out.errors[0].span.start,
+            src.find("return").expect("the `return`"),
+            "{src:?}"
+        );
+        assert_eq!(out.stmts.len(), 1, "{src:?}: {:#?}", out.stmts);
+    }
+}
+
+/// Only a `let` may be written in a block. Any other definition is refused
+/// at its keyword and dropped, and the block is still read through.
+#[test]
+fn a_declaration_in_a_block_is_refused() {
+    for (src, keyword) in [
+        ("let a = do type T = Nat let x = 1n return x end", "type"),
+        ("let a = do effect E = () -> () return 1n end", "effect"),
+        ("let a = do module M = end return 1n end", "module"),
+        ("let a = do extern f : Nat = \"f\" return 1n end", "extern"),
+    ] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        assert_eq!(out.errors.len(), 1, "{src:?}: {:#?}", out.errors);
+        assert_eq!(
+            out.errors[0].kind,
+            ErrorKind::DeclarationInBlock { keyword },
+            "{src:?}"
+        );
+        assert_eq!(
+            out.errors[0].span.start,
+            src.find(keyword).expect("the keyword"),
+            "{src:?}"
+        );
+        assert_eq!(out.stmts.len(), 1, "{src:?}: {:#?}", out.stmts);
+    }
 }
 
 /// A conditional is a self-delimiting expression whose three positions each
@@ -1914,7 +2096,7 @@ fn a_let_expression_reports_where_it_fails() {
 fn parses_if_expressions_and_full_branches() {
     for src in [
         "let a = if true then 1n else 2n end",
-        "let a = if not false and true then f 1n else let x = 2n in x end",
+        "let a = if not false and true then f 1n else do let x = 2n return x end end",
         "let a = if p then fn x => x else fn y => y end",
         "let a = { value: if p then a else b end }",
     ] {
@@ -2146,8 +2328,8 @@ fn parses_pattern_lets() {
     );
     assert_eq!(parse_one("let () = p"), "let () = p");
     assert_eq!(
-        parse_one("let f = fn p => let {pos: {x, y}} = p in x"),
-        "let f = fn p => let { pos: { x, y } } = p in x"
+        parse_one("let f = fn p => do let {pos: {x, y}} = p return x end"),
+        "let f = fn p => do let { pos: { x, y } } = p return x end"
     );
     // The parser records what was written and judges nothing: a refutable
     // pattern on a `let` parses, and refusing it is lowering's rule.
@@ -2266,7 +2448,10 @@ fn a_wildcard_parses_in_every_pattern_position() {
         // The pattern of a `let`, statement and expression.
         ("let _ = f 1n", "let _ = f 1n"),
         ("let _ : Nat = g 3n", "let _ : Nat = g 3n"),
-        ("let a = let _ = f 1n in 2n", "let a = let _ = f 1n in 2n"),
+        (
+            "let a = do let _ = f 1n return 2n end",
+            "let a = do let _ = f 1n return 2n end",
+        ),
         // Nested, and repeated: two `_` in one pattern parse — whether that
         // binds anything twice is not a question, since it binds nothing.
         (
@@ -2358,8 +2543,8 @@ fn a_struct_pattern_may_end_with_a_rest() {
     // On a `let`, in both forms, and beside a renamed field.
     assert_eq!(parse_one("let {x, ..} = p"), "let { x, .. } = p");
     assert_eq!(
-        parse_one("let a = let {x: y, ..} = p in y"),
-        "let a = let { x: y, .. } = p in y"
+        parse_one("let a = do let {x: y, ..} = p return y end"),
+        "let a = do let { x: y, .. } = p return y end"
     );
 
     let src = "let { a, .. } = p";

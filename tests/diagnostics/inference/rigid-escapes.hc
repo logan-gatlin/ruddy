@@ -1,3 +1,4 @@
-let bad = fn captured =>
-  let identity : 'a -> 'a = captured in
-  0n
+let bad = fn captured => do
+  let identity : 'a -> 'a = captured
+  return 0n
+end

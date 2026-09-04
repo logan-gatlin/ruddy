@@ -69,9 +69,9 @@ pub enum StmtKind {
         /// apart. Which names it binds is [`ir`](crate::ir)'s to work out; the
         /// parser records what was written.
         ///
-        /// Boxed for the reason [`ExprKind::Let`] boxes its ascription: a
-        /// pattern is a tree of its own, and inlining one here would grow
-        /// every statement to the size of the largest thing a binding can be.
+        /// Boxed because a pattern is a tree of its own, and inlining one here
+        /// would grow every statement to the size of the largest thing a
+        /// binding can be.
         pattern: Box<Pattern>,
         /// The written type, when the definition was ascribed one, with the
         /// `where` clause that may follow it.
@@ -201,27 +201,24 @@ pub enum ExprKind {
         args: Vec<Arg>,
         body: Box<Expr>,
     },
-    /// `let <name> [: <type>] = <value> in <body>` — a name given a value for
-    /// the length of one expression.
+    /// `do <stmt>* [return <expr>] end` — names given values for the length
+    /// of one expression, one after another.
     ///
-    /// The same shape as [`StmtKind::Let`] and nothing else: a statement binds
-    /// a name for the whole file and this one binds it for the body written
-    /// after the `in`, so the two share their grammar and not a line of their
-    /// meaning.
-    Let {
-        /// What the binding binds — a bare name, or a pattern taking the value
-        /// apart — exactly as [`StmtKind::Let`] records it.
-        pattern: Pattern,
-        /// The written type, when the binding was ascribed one.
-        ///
-        /// Boxed, where [`StmtKind::Let`]'s is not, because this node nests
-        /// inside another expression and that one does not. An ascription is
-        /// the largest thing either can carry, so inlining it here would make
-        /// every expression in the tree the size of the one construct that has
-        /// one.
-        ty: Option<Box<Annotation>>,
-        value: Box<Expr>,
-        body: Box<Expr>,
+    /// The statements are [`StmtKind::Let`]s and nothing else: the parser
+    /// refuses every other kind at its keyword and drops it — see
+    /// [`ErrorKind::DeclarationInBlock`] — so what reaches lowering is a run
+    /// of bindings. A statement here binds its name for the rest of the block
+    /// rather than for the file, so the two share their grammar and not a line
+    /// of their meaning.
+    ///
+    /// The block's value is what its `return` carries, and `()` when there is
+    /// no `return`. Nothing records which of the two was written when the
+    /// value is unit: `do let x = 1 end` and `do let x = 1 return () end` are
+    /// the same block, and the tree keeps the spelling only so the printer can
+    /// reproduce it.
+    Do {
+        stmts: Vec<Stmt>,
+        result: Option<Box<Expr>>,
     },
     /// `match <expr> with | <pattern> => <expr> (| <pattern> => <expr>)* end`
     /// — dispatch on what a value is.
@@ -298,8 +295,8 @@ pub enum ExprKind {
     ///
     /// Always qualified, which is what tells it from a projection: the `!Log`
     /// in front is a value of nothing, so there is no record here to read a
-    /// field off. There is no `do` and no perform form — an operation is a
-    /// value, and performing one is applying it.
+    /// field off. There is no perform form — an operation is a value, and
+    /// performing one is applying it.
     Operation {
         /// The effect, path and all: `Sys::!Log.write` names the `Log` declared
         /// in `Sys`. The path qualifies the whole sigilled label, so the
@@ -350,8 +347,8 @@ pub enum ArmHead {
         selector: Tracked<OperationSelector>,
     },
     /// `return x => ...` — the value arm, which may appear at most once and in
-    /// any position. `return` is contextual: it heads an arm here and is an
-    /// ordinary name everywhere else. The span is the keyword's, which is where
+    /// any position. The `return` is the keyword a `do` block ends with, read
+    /// here for its other meaning. The span is the keyword's, which is where
     /// a complaint about a second one points.
     Return { span: Span },
 }
@@ -566,9 +563,9 @@ pub enum TypeKind {
     /// it. That is the one form with no effect in it at all, and it is how a
     /// rest is handed on by itself.
     ///
-    /// Boxed for the reason [`ExprKind::Let`] boxes its ascription: a row is
-    /// among the largest things this enum can hold and the rarest, so inlining
-    /// one would grow every written type to the size of the few that are one.
+    /// Boxed because a row is among the largest things this enum can hold and
+    /// the rarest, so inlining one would grow every written type to the size
+    /// of the few that are one.
     Effects(Box<EffectRow>),
     /// `_` — a type position left for inference to decide.
     ///
@@ -674,10 +671,9 @@ pub enum EffectLabel {
 /// The span covers the whole clause — the `when` and the name after it — which
 /// is what a complaint about the label's openness underlines.
 ///
-/// Boxed where a label holds one, for the reason [`ExprKind::Let`] boxes its
-/// ascription: a clause is the rarest thing a label can carry and among the
-/// largest, so inlining one would grow every field of every written type to the
-/// size of the few that have one.
+/// Boxed where a label holds one, because a clause is the rarest thing a label
+/// can carry and among the largest, so inlining one would grow every field of
+/// every written type to the size of the few that have one.
 #[derive(Debug, Clone)]
 pub struct When {
     pub span: Span,
@@ -813,6 +809,23 @@ pub enum ErrorKind {
     /// so the literal has one reading and evaluates in the order it is
     /// written; the complaint points back at the `..` the field follows.
     FieldAfterSpread { spread: Span },
+    /// A statement — or a second `return` — written after a `do` block's
+    /// `return`. The `return` is the last thing in its block, since it is
+    /// what the block evaluates to and nothing after it could run; the
+    /// complaint points back at the `return` the statement follows.
+    StatementAfterReturn { returned: Span },
+    /// A `return` with nothing after it. Leaving the `return` out is how a
+    /// block evaluates to `()`, so one written bare is a value forgotten
+    /// rather than a second spelling of that.
+    BareReturn,
+    /// A `return` read where an expression begins rather than at the end of a
+    /// `do` block — `fn a => return a`, or inside a block's `let`. What it
+    /// carries is still read, so the definition around it is checked.
+    ReturnOutsideBlock,
+    /// A `type`, `effect`, `module`, or `extern` written inside a `do` block,
+    /// which holds `let`s alone. Carried with the keyword so the complaint
+    /// can say which one; the declaration itself is read and dropped.
+    DeclarationInBlock { keyword: &'static str },
 }
 
 /// What the parser needed at the primary error span.
@@ -1127,7 +1140,8 @@ impl Parser {
         match kind {
             Kind::Let => Expected::Keyword("let"),
             Kind::Extern => Expected::Keyword("extern"),
-            Kind::In => Expected::Keyword("in"),
+            Kind::Do => Expected::Keyword("do"),
+            Kind::Return => Expected::Keyword("return"),
             Kind::Type => Expected::Keyword("type"),
             Kind::End => Expected::Keyword("end"),
             Kind::With => Expected::Keyword("with"),
@@ -1441,7 +1455,7 @@ impl Parser {
         matches!(
             self.peek().map(|token| &token.tracked),
             None | Some(
-                Kind::In
+                Kind::Return
                     | Kind::With
                     | Kind::Then
                     | Kind::Else
@@ -2169,12 +2183,21 @@ impl Parser {
         let span = tok.span;
         match &tok.tracked {
             Kind::Fn => self.function_expr(),
-            Kind::Let => self.let_expr(),
-            // Reachable from atom position, like a nested `let` — and, like
-            // one, deliberately absent from `at_expr_atom`, so `f match ... end`
-            // is not `f` applied to a match. Projection off the `end` works
-            // because the projection loop sits above this call.
+            // Reachable from atom position, and deliberately absent from
+            // `at_expr_atom`, so `f match ... end` is not `f` applied to a
+            // match. Projection off the `end` works because the projection
+            // loop sits above this call.
             Kind::Match => self.match_expr(),
+            // A block is self-delimiting like `match`, and placed like one.
+            Kind::Do => self.do_expr(),
+            // A `return` belongs at the end of a block and nowhere else. One
+            // read here is refused, and what it carries is read anyway so the
+            // definition around it is checked as far as it can be.
+            Kind::Return => {
+                self.advance();
+                self.error(span, ErrorKind::ReturnOutsideBlock);
+                self.expr()
+            }
             // A conditional is self-delimiting like `match`: it can head an
             // application or projection, but must be parenthesized as an
             // application argument because it is absent from `at_expr_atom`.
@@ -2398,33 +2421,133 @@ impl Parser {
         }))
     }
 
-    /// `let <name> [: <type>] = <value> in <body>` — the expression form of
-    /// [`let_stmt`](Self::let_stmt), which the two share their shape with and
-    /// nothing else.
+    /// `do <stmt>* [return <expr>] end` — a run of bindings, each in scope
+    /// for the rest of the block, and the value the block ends with.
     ///
-    /// The body is a full expression and extends as far right as it can, the
-    /// way a `fn` body does. Nothing has to be done to stop it running past
-    /// the end of the enclosing form: `in` begins no atom, so an application
-    /// ends in front of one and a nested `let` reaches its own `in` and no
-    /// other.
-    fn let_expr(&mut self) -> Option<Expr> {
-        let kw = self.advance().expect("the caller peeked `let`");
-        let pattern = self.pattern()?;
-        let ty = match self.eat_if(&Kind::Colon) {
-            Some(_) => Some(Box::new(self.annotation(true)?)),
-            None => None,
+    /// The statements are read by [`block_stmt`](Self::block_stmt) up to the
+    /// `return` or the `end`. A `let`'s value ends in front of the next
+    /// `let`, the `return`, or the `end` of its own accord, since none of the
+    /// three begins an atom. The `return`'s value is a full expression and
+    /// extends as far right as it can, the way a `fn` body does, which is why
+    /// the `return` is last: anything written after it would be read as part
+    /// of what it carries. A statement that follows one anyway is refused
+    /// where it begins, and the rest of the block is read through to its
+    /// `end` and dropped, so one mistake is one complaint. Anything else after
+    /// the value is the missing `end`, and is reported as that.
+    fn do_expr(&mut self) -> Option<Expr> {
+        let kw = self.advance().expect("the caller peeked `do`");
+        let mut stmts = Vec::new();
+        while self
+            .peek()
+            .is_some_and(|tok| !matches!(tok.tracked, Kind::End | Kind::Return))
+        {
+            if let Some(stmt) = self.block_stmt() {
+                stmts.push(stmt);
+            }
+        }
+        let mut result = None;
+        if let Some(ret) = self.eat_if(&Kind::Return) {
+            if self
+                .peek()
+                .is_none_or(|tok| matches!(tok.tracked, Kind::End))
+            {
+                self.error(ret.span, ErrorKind::BareReturn);
+            } else {
+                match self.expr() {
+                    Some(value) => result = Some(Box::new(value)),
+                    // The value is where the complaint is. The rest of the
+                    // block is read through so its `end` is found, and the
+                    // definition around it is kept.
+                    None => self.skip_block(),
+                }
+            }
+            if let Some(tok) = self.peek()
+                && matches!(
+                    tok.tracked,
+                    Kind::Let
+                        | Kind::Return
+                        | Kind::Type
+                        | Kind::Effect
+                        | Kind::Module
+                        | Kind::Extern
+                )
+            {
+                self.error(
+                    tok.span,
+                    ErrorKind::StatementAfterReturn { returned: ret.span },
+                );
+                self.skip_block();
+            }
+        }
+        let anchor = result
+            .as_ref()
+            .map(|result| result.span)
+            .or_else(|| stmts.last().map(|stmt| stmt.span))
+            .unwrap_or(kw.span);
+        let close = self.eat_with_context(
+            &Kind::End,
+            Some(Related {
+                span: anchor,
+                kind: RelatedKind::Anchor,
+            }),
+            Some(Related {
+                span: kw.span,
+                kind: RelatedKind::Construct("block"),
+            }),
+        )?;
+        let span = kw.span.merge(close.span);
+        Some(span.track(ExprKind::Do { stmts, result }))
+    }
+
+    /// One statement of a block, read by [`stmt`](Self::stmt), the file's
+    /// reader. Every kind but `let` is refused at its keyword and dropped,
+    /// and a statement that fails to parse is skipped to the next `let` or
+    /// the `end`, the way a broken definition is at file level; either way
+    /// the block goes on.
+    fn block_stmt(&mut self) -> Option<Stmt> {
+        let at = self.peek().expect("the caller peeked a token").span;
+        let before = self.pos;
+        let stmt = self.stmt();
+        // Guarantee forward progress before recovering, as the file's reader
+        // does, so a token no statement begins with cannot spin.
+        if stmt.is_none() && self.pos == before {
+            self.advance();
+        }
+        let Some(stmt) = stmt else {
+            self.recover();
+            return None;
         };
-        self.eat(&Kind::Equal)?;
-        let value = self.expr()?;
-        self.eat(&Kind::In)?;
-        let body = self.expr()?;
-        let span = kw.span.merge(body.span);
-        Some(span.track(ExprKind::Let {
-            pattern,
-            ty,
-            value: Box::new(value),
-            body: Box::new(body),
-        }))
+        let keyword = match &stmt.tracked {
+            StmtKind::Let { .. } => return Some(stmt),
+            StmtKind::Type { .. } => "type",
+            StmtKind::Effect { .. } => "effect",
+            StmtKind::Module { .. } => "module",
+            StmtKind::Extern { .. } => "extern",
+        };
+        self.error(at, ErrorKind::DeclarationInBlock { keyword });
+        None
+    }
+
+    /// The rest of a block whose complaint has already been made, read
+    /// through to its `end` and dropped. Read statement by statement rather
+    /// than skipped token by token, so an `end` inside a nested form is not
+    /// mistaken for the block's; and read with its complaints put back, since
+    /// nothing in it was going to be kept.
+    fn skip_block(&mut self) {
+        let mark = self.errors.len();
+        while self
+            .peek()
+            .is_some_and(|tok| !matches!(tok.tracked, Kind::End))
+        {
+            if self.eat_if(&Kind::Return).is_some() {
+                if self.expr().is_none() {
+                    self.recover();
+                }
+                continue;
+            }
+            self.block_stmt();
+        }
+        self.errors.truncate(mark);
     }
 
     /// `match <expr> with | <arm> (| <arm>)* end`, where an arm is
@@ -2569,12 +2692,11 @@ impl Parser {
 
     /// One handler arm: what it answers, the name it binds, and its body.
     ///
-    /// `return` is read by spelling and only here, which is the whole of what
-    /// makes it contextual: an arm head is either it or the name of an effect,
-    /// so one token of lookahead settles the question and the word stays a
-    /// perfectly good name everywhere else.
+    /// An arm head is either `return` or the name of an effect, so one token
+    /// of lookahead settles the question. The `return` is the reserved word a
+    /// `do` block ends with, read here for its other meaning.
     fn handler_arm(&mut self) -> Option<HandlerArm> {
-        let head = match self.at_keyword("return") {
+        let head = match self.at(&Kind::Return) {
             true => {
                 let kw = self.advance().expect("just peeked `return`");
                 ArmHead::Return { span: kw.span }

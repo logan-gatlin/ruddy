@@ -16,7 +16,7 @@ effect Needed = () -> Nat
 effect Spare = Nat -> Nat
 extern invoke_conditional_shared : fn(fn(()) -> Nat + !Needed (when 'needed) + ..'effects) -> Nat + !Needed + ..'effects = "host.invokeConditionalShared"
 let run_conditional_shared : () -> Nat + !Needed + ..'effects =
-  fn _ => let needed = !Needed () in invoke_conditional_shared (fn _ => needed)
+  fn _ => do let needed = !Needed () return invoke_conditional_shared (fn _ => needed) end
 
 type Loop = () -> Loop
 extern host_loop : Loop = "host.loop.bind(host)"

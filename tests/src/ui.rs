@@ -885,7 +885,7 @@ fn annotated_row_rigid_reopens_as_a_row_and_keeps_contract_provenance() {
 
 #[test]
 fn authoritative_provenance_uses_the_owning_annotation() {
-    let source = "let outer : Nat -> Nat = fn value => let inner : Boolean -> Boolean = fn flag => flag in value\nlet bad = outer false";
+    let source = "let outer : Nat -> Nat = fn value => do let inner : Boolean -> Boolean = fn flag => flag return value end\nlet bad = outer false";
     let facts = explained_facts(source);
     let outer = source.find("Nat -> Nat").unwrap();
     let inner = source.find("Boolean -> Boolean").unwrap();
@@ -1175,7 +1175,7 @@ fn recursive_types_have_grounded_structured_cycle_explanations() {
         // The field-containing sibling must not override the first exact
         // self-call route when choosing repair advice.
         (
-            "let bad = fn f => let keep = f in { call: keep f, value: { self: f } }",
+            "let bad = fn f => do let keep = f return { call: keep f, value: { self: f } } end",
             inference::RecursiveCycleShape::CallInput,
         ),
         // One shared row tail cannot absorb the extra field on one side. The
@@ -1479,7 +1479,7 @@ fn same_label_performs_facts_do_not_invent_repeated_endpoints() {
         "effect Log = { write: Nat -> () }\n",
         "effect Tick = { tick: () -> () }\n",
         "let bad = fn _ => handle !Log.write 1n with | !Log.write n =>\n",
-        "  (fn action => action ()) (fn _ => let _ = !Tick.tick () in !Log.write n)\n",
+        "  (fn action => action ()) (fn _ => do let _ = !Tick.tick () return !Log.write n end)\n",
         "end\n",
     );
     let errors = inference_fixture_errors(source);
@@ -1494,7 +1494,7 @@ fn same_label_performs_facts_do_not_invent_repeated_endpoints() {
     else {
         panic!("same-label intermediate must retain its exact origin: {error:#?}");
     };
-    assert_eq!(introduction.span.start..introduction.span.end(), 190..202);
+    assert_eq!(introduction.span.start..introduction.span.end(), 197..209);
     assert!(forbidden.is_none());
     assert!(
         error.explanation.is_none(),
@@ -1615,8 +1615,8 @@ fn effect_boundaries_keep_source_causal_paths_and_repairs() {
         (
             concat!(
                 "effect Log = { write: Nat -> () }\n",
-                "let bad = fn _ => let inner : () -> () = ",
-                "fn _ => !Log.write 0n in inner\n",
+                "let bad = fn _ => do let inner : () -> () = ",
+                "fn _ => !Log.write 0n return inner end\n",
             ),
             K::EffectNotAllowed,
         ),
@@ -1626,7 +1626,7 @@ fn effect_boundaries_keep_source_causal_paths_and_repairs() {
                 "effect Tick = { tick: () -> () }\n",
                 "effect Both = !Log + !Tick\n",
                 "let action : () -> () + !Both = fn _ => ",
-                "let _ = !Log.write 0n in !Tick.tick ()\n",
+                "do let _ = !Log.write 0n return !Tick.tick () end\n",
                 "let bad : () -> () = fn _ => action ()\n",
             ),
             K::EffectNotAllowed,
@@ -1739,9 +1739,9 @@ fn bare_operation_values_keep_exact_origins_through_value_flow() {
         "let invoke = fn holder => holder.run 0n\nlet bad = invoke { run: C::!Log.write }\n",
         "let invoke = fn holder => holder.run 0n\nlet forward = fn holder => invoke holder\nlet bad = forward { run: C::!Log.write }\n",
         "let invoke : { run: Nat -> () + C::!Log } -> () + C::!Log = fn holder => holder.run 0n\nlet bad = invoke { run: C::!Log.write }\n",
-        "let bad = let invoke = fn holder => holder.run 0n in invoke { run: C::!Log.write }\n",
-        "let bad = let invoke : { run: Nat -> () + C::!Log } -> () + C::!Log = fn holder => holder.run 0n in invoke { run: C::!Log.write }\n",
-        "let return = fn holder => fn _ => holder.run 0n\nlet callback = return { run: C::!Log.write }\nlet bad = callback ()\n",
+        "let bad = do let invoke = fn holder => holder.run 0n return invoke { run: C::!Log.write } end\n",
+        "let bad = do let invoke : { run: Nat -> () + C::!Log } -> () + C::!Log = fn holder => holder.run 0n return invoke { run: C::!Log.write } end\n",
+        "let defer = fn holder => fn _ => holder.run 0n\nlet callback = defer { run: C::!Log.write }\nlet bad = callback ()\n",
         "let produce = fn _ => { run: C::!Log.write }\nlet invoke = fn maker => (maker ()).run 0n\nlet bad = invoke produce\n",
         "let produce = fn _ => { next: fn _ => { run: C::!Log.write } }\nlet invoke = fn maker => ((maker ()).next ()).run 0n\nlet bad = invoke produce\n",
     ] {
@@ -1771,7 +1771,7 @@ fn bare_operation_values_keep_exact_origins_through_value_flow() {
 #[test]
 fn returning_an_effectful_callback_does_not_perform_its_body() {
     for source in [
-        "module A = effect Log = { write: Nat -> () } end\nmodule C = effect Log = { write: Nat -> () } end\nlet return = fn holder => fn _ => holder.run 0n\nlet callback = return { run: C::!Log.write }\n",
+        "module A = effect Log = { write: Nat -> () } end\nmodule C = effect Log = { write: Nat -> () } end\nlet defer = fn holder => fn _ => holder.run 0n\nlet callback = defer { run: C::!Log.write }\n",
         "module A = effect Log = { write: Nat -> () } end\nmodule C = effect Log = { write: Nat -> () } end\nlet produce = fn _ => { run: C::!Log.write }\nlet saved = produce ()\n",
     ] {
         let errors = inference_fixture_errors(source);
@@ -1900,7 +1900,7 @@ fn deep_and_multiple_effect_boundaries_remain_bounded_and_counted() {
         "effect Log = { write: Nat -> () }\n",
         "effect Tick = { tick: () -> () }\n",
         "effect Both = !Log + !Tick\n",
-        "let bad : () -> () = fn _ => let _ = !Log.write 0n in !Tick.tick ()\n",
+        "let bad : () -> () = fn _ => do let _ = !Log.write 0n return !Tick.tick () end\n",
     );
     let errors = inference_fixture_errors(multiple);
     assert_eq!(errors.len(), 2, "one diagnostic per refused source effect");
@@ -2625,7 +2625,8 @@ fn every_fixed_token_prints_as_the_spelling_it_lexes_from() {
     let fixed = [
         TokenKind::Let,
         TokenKind::Extern,
-        TokenKind::In,
+        TokenKind::Do,
+        TokenKind::Return,
         TokenKind::If,
         TokenKind::Then,
         TokenKind::Else,
@@ -3151,7 +3152,7 @@ fn a_printer_reports_a_writer_that_refuses_it() {
     // the printers write for one comes back too.
     let source = "type Pair 'a 'b = { first: 'a, second: 'b }\n\
                   let f = fn g => fn p => g p.first\n\
-                  let h = let n : Nat = 1n in n\n\
+                  let h = do let n : Nat = 1n return n end\n\
                   let arithmetic = -1i + 2i\n\
                   let v : { first: Nat, second: Nat } = { first: 1n, second: 2n }\n\
                   type Gap 'r = { first: Nat, \\hole, ..'r }\n\
@@ -4197,6 +4198,89 @@ fn struct_spread_mistakes_are_worded_plainly() {
     assert_eq!(after.related[0].span, Span::generated(5, 2));
     assert_eq!(after.related[0].message, "the `..`");
     assert_eq!(after.help, ["move the `..` after the last field"]);
+}
+
+/// The four ways a `do` block can be miswritten each get a complaint of their
+/// own, in the block's own words: a statement after the `return`, a `return`
+/// with nothing after it, a `return` outside any block, and a declaration
+/// other than `let` inside one.
+#[test]
+fn block_errors_say_what_a_block_allows() {
+    let after = parse::Error {
+        span: Span::generated(20, 3),
+        kind: parse::ErrorKind::StatementAfterReturn {
+            returned: Span::generated(10, 6),
+        },
+    }
+    .diagnostic();
+    assert_eq!(after.code, "statement-after-return");
+    assert_eq!(
+        after.title,
+        "`return` must be the last thing in its `do` block"
+    );
+    assert_eq!(after.primary.span, Span::generated(20, 3));
+    assert_eq!(after.primary.message, "this comes after the `return`");
+    assert_eq!(after.related.len(), 1);
+    assert_eq!(after.related[0].span, Span::generated(10, 6));
+    assert_eq!(after.related[0].message, "the `return`");
+    assert_eq!(
+        after.help,
+        ["move this above the `return`, or take it out of the block"]
+    );
+
+    let bare = parse::Error {
+        span: Span::generated(10, 6),
+        kind: parse::ErrorKind::BareReturn,
+    }
+    .diagnostic();
+    assert_eq!(bare.code, "bare-return");
+    assert_eq!(bare.title, "`return` needs a value after it");
+    assert_eq!(bare.primary.span, Span::generated(10, 6));
+    assert_eq!(bare.primary.message, "nothing follows this `return`");
+    assert!(bare.related.is_empty());
+    assert_eq!(
+        bare.help,
+        ["write the value to return, or leave the `return` out to return `()`"]
+    );
+
+    let outside = parse::Error {
+        span: Span::generated(10, 6),
+        kind: parse::ErrorKind::ReturnOutsideBlock,
+    }
+    .diagnostic();
+    assert_eq!(outside.code, "return-outside-block");
+    assert_eq!(outside.title, "`return` can only end a `do` block");
+    assert_eq!(outside.primary.span, Span::generated(10, 6));
+    assert_eq!(
+        outside.primary.message,
+        "this `return` is not at the end of a `do` block"
+    );
+    assert!(outside.related.is_empty());
+    assert_eq!(
+        outside.help,
+        ["write it as the last thing in a `do ... end` block, or leave the `return` out"]
+    );
+
+    let declaration = parse::Error {
+        span: Span::generated(3, 4),
+        kind: parse::ErrorKind::DeclarationInBlock { keyword: "type" },
+    }
+    .diagnostic();
+    assert_eq!(declaration.code, "declaration-in-block");
+    assert_eq!(
+        declaration.title,
+        "a `do` block can only hold `let` definitions"
+    );
+    assert_eq!(declaration.primary.span, Span::generated(3, 4));
+    assert_eq!(
+        declaration.primary.message,
+        "a `type` cannot be written inside a block"
+    );
+    assert!(declaration.related.is_empty());
+    assert_eq!(
+        declaration.help,
+        ["move this `type` out to the file or module"]
+    );
 }
 
 /// The two ways an array pattern's rest can be miswritten are told apart by

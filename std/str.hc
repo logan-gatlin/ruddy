@@ -45,9 +45,10 @@ let is_blank : String -> Boolean = fn value => is_empty (trim value)
 let char_at_option : String -> Nat -> Option String = fn value index =>
   if nat::less_than index (len value) then #Some (char_at value index) else #None end
 
-let index_of_option : String -> String -> Option Nat = fn value search =>
-  let index = index_of value search in
-  if int::less_than index 0i then #None else #Some (nat::from_int index) end
+let index_of_option : String -> String -> Option Nat = fn value search => do
+  let index = index_of value search
+  return if int::less_than index 0i then #None else #Some (nat::from_int index) end
+end
 
 let take : String -> Nat -> String = fn value count => slice value 0n count
 let drop : String -> Nat -> String = fn value count => slice value count (len value)

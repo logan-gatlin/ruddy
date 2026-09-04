@@ -110,7 +110,7 @@ fn both_trees_render_a_struct_spread_the_same_way() {
         "let c = { y: 2n }\nlet a = { x: 1n, ..c.y }",
         "let c = { y: 2n }\nlet a = { x: 1n, ..c.y + 1n }",
         "let a = { x: 1n, ..fn v => v }",
-        "let a = { x: 1n, ..let c = { y: 2n } in c }",
+        "let a = { x: 1n, ..do let c = { y: 2n } return c end }",
     ] {
         let (ast, ir) = printed(source);
         assert_eq!(ast, source);
@@ -539,29 +539,59 @@ fn a_match_and_its_patterns_round_trip() {
     assert_eq!(again, ir);
 }
 
-/// A nested `let` prints back as the surface syntax it was written as, in both
+/// A `do` block prints back as the surface syntax it was written as, in both
 /// trees, and the printed form re-parses and re-lowers to the same thing.
 ///
-/// The `in` is what makes this need no parentheses anywhere: it begins no atom,
-/// so a value that would otherwise run rightward stops in front of it, and the
-/// body is the last thing on the line. A `let` written where something may
-/// follow it is a different question, and the two below are that question — an
-/// argument, and the head of an application.
+/// The `end` is what makes this need no parentheses anywhere but the two
+/// positions below that ask for them: a block closes itself, so it may be a
+/// value, a `fn` body, a field, or the head of an application as it stands —
+/// and it is grouped as an argument, as a `match` is.
 #[test]
-fn a_nested_let_round_trips() {
+fn a_do_block_round_trips() {
     for source in [
-        "let a = let x = 1n in x",
-        "let a = let x : Nat = 1n in x",
-        "let a = let x = 1n in let y = { v: x } in y",
-        "let a = let x = let y = 1n in y in x",
-        "let a = fn p => let x = p.v in x",
-        "let a = { v: let n = 1n in n }",
-        "let f = fn x => x\nlet a = f (let n = 1n in n)",
-        "let a = (let f = fn x => x in f) 1n",
+        "let a = do let x = 1n return x end",
+        "let a = do let x : Nat = 1n return x end",
+        "let a = do let x = 1n let y = { v: x } return y end",
+        "let a = do let x = do let y = 1n return y end return x end",
+        "let a = do let x = 1n end",
+        "let a = fn p => do let x = p.v return x end",
+        "let a = { v: do let n = 1n return n end }",
+        "let f = fn x => x\nlet a = f (do let n = 1n return n end)",
+        "let a = do let f = fn x => x return f end 1n",
+        "let a = (do let p = { x: 1n } return p end).x",
     ] {
         let (ast, ir) = printed(source);
         assert_eq!(ast, source, "{source}");
         assert_eq!(ir, source, "{source}");
+
+        let (_, again) = printed(&ir);
+        assert_eq!(again, ir, "{source} did not round-trip");
+    }
+}
+
+/// The IR has no block, only the nested bindings a block is a spelling of, so
+/// its printer folds a chain of them back into one block: a block returned
+/// from a block is one block, a `return ()` is no `return` at all, and a block
+/// with no bindings is just its value. Either way the printed IR re-lowers to
+/// the same IR.
+#[test]
+fn the_ir_prints_nested_bindings_as_one_block() {
+    for (source, folded) in [
+        (
+            "let a = do let x = 1n return do let y = x return y end end",
+            "let a = do let x = 1n let y = x return y end",
+        ),
+        (
+            "let a = do let x = 1n return () end",
+            "let a = do let x = 1n end",
+        ),
+        ("let a = do return () end", "let a = ()"),
+        ("let a = do end", "let a = ()"),
+        ("let a = do return 1n end", "let a = 1n"),
+    ] {
+        let (ast, ir) = printed(source);
+        assert_eq!(ast, source, "{source}");
+        assert_eq!(ir, folded, "{source}");
 
         let (_, again) = printed(&ir);
         assert_eq!(again, ir, "{source} did not round-trip");
@@ -588,13 +618,13 @@ fn a_wildcard_pattern_round_trips() {
     // page; the IR shows the hidden projection it became, and the exact
     // pattern's demand — its named fields, each type a hole — as the
     // annotation on the temporary.
-    let source = "let f = fn p => let { x: _, y } = p in y";
+    let source = "let f = fn p => do let { x: _, y } = p return y end";
     let (ast, ir) = printed(source);
     assert_eq!(ast, source);
     assert_eq!(
         ir,
-        "let f = fn p => let %struct : { x: _, y: _ } = p in \
-         let %discard = %struct.x in let y = %struct.y in y"
+        "let f = fn p => do let %struct : { x: _, y: _ } = p \
+         let %discard = %struct.x let y = %struct.y return y end"
     );
 }
 

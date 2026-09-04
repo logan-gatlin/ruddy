@@ -399,11 +399,13 @@ fn an_outer_presence_guard_applies_to_a_nested_literal_match() {
 
 #[test]
 fn dotted_quoted_presence_paths_remain_structured_in_nested_matches() {
-    let src = "let outer = fn z =>\n\
-               \x20 let g = fn v =>\n\
-               \x20   let w = match v with | {\"a.b\": x} => 0n | {y} => 0n end in\n\
-               \x20   match v with | {\"a.b\": 1n} => 1n | {\"a.b\": n} => 2n | {y} => 3n end in\n\
-               \x20 0n";
+    let src = "let outer = fn z => do\n\
+               \x20 let g = fn v => do\n\
+               \x20   let w = match v with | {\"a.b\": x} => 0n | {y} => 0n end\n\
+               \x20   return match v with | {\"a.b\": 1n} => 1n | {\"a.b\": n} => 2n | {y} => 3n end\n\
+               \x20 end\n\
+               \x20 return 0n\n\
+               end";
     let (out, inferred, checks) = checked(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
@@ -549,8 +551,8 @@ fn a_scrutinee_that_contradicts_the_coverage_is_unhandled() {
 /// is exhaustive without it.
 #[test]
 fn a_solved_present_field_makes_the_empty_arm_unreachable() {
-    let src = "let h = fn v => let {a, b} = v in \
-               match v with | {a, b} => a | {} => 0n end";
+    let src = "let h = fn v => do let {a, b} = v \
+               return match v with | {a, b} => a | {} => 0n end end";
     let (out, inferred, checks) = checked(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
@@ -927,7 +929,7 @@ fn an_annotated_absence_starves_the_demanding_arm() {
 #[test]
 fn an_abandoned_presence_skips_the_checks() {
     let src = "let f = fn v => match v with | {a} => 1n | {} => g v end\n\
-               let g = fn w => let n : Nat = w in f w";
+               let g = fn w => do let n : Nat = w return f w end";
     let (_, inferred, checks) = checked(src);
     assert!(!inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert!(checks.errors.is_empty(), "{:#?}", checks.errors);
@@ -993,7 +995,7 @@ fn a_failed_tag_test_skips_the_checks() {
 #[test]
 fn an_abandoned_sum_rest_skips_the_checks() {
     let src = "let f = fn v => match v with | #A x => 1n | r => g v end\n\
-               let g = fn w => let n : Nat = w in f w";
+               let g = fn w => do let n : Nat = w return f w end";
     let (_, inferred, checks) = checked(src);
     assert!(!inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert!(checks.errors.is_empty(), "{:#?}", checks.errors);
@@ -1034,7 +1036,7 @@ fn arms_above_a_misplaced_catch_all_keep_their_verdicts() {
 #[test]
 fn an_empty_match_over_a_real_sum_is_skipped() {
     let (_, inferred, checks) =
-        checked("let f = fn v => let w : (#A Nat | ..) = v in match v with end");
+        checked("let f = fn v => do let w : (#A Nat | ..) = v return match v with end end");
     assert!(!inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert!(checks.errors.is_empty(), "{:#?}", checks.errors);
     let report = sole_report(&checks);
@@ -1147,9 +1149,10 @@ fn a_closed_nested_rest_offers_no_escape() {
 /// no walk over the written matrix alone could reach.
 #[test]
 fn the_store_decides_reachability_for_a_converted_column() {
-    let src = "let h = fn v =>\n\
-               \x20 let {x, ..} = v in\n\
-               \x20 match v with | {x} => {} | {y} => {} end";
+    let src = "let h = fn v => do\n\
+               \x20 let {x, ..} = v\n\
+               \x20 return match v with | {x} => {} | {y} => {} end\n\
+               end";
     let (out, inferred, checks) = checked(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
@@ -1195,7 +1198,7 @@ fn a_match_after_the_flip_stands_aside() {
     assert_eq!(verdicts(last), [Verdict::Skipped]);
 
     let src = "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
-               let f = let _ = p {} in match 0n with | 0n => 1n end";
+               let f = do let _ = p {} return match 0n with | 0n => 1n end end";
     let (_, inferred, checks) = checked(src);
     assert_eq!(inferred.errors().len(), 1);
     assert!(checks.errors.is_empty(), "{checks:#?}");
@@ -1267,9 +1270,10 @@ fn a_field_the_type_never_named_is_still_a_column() {
 /// the column out of the conversion.
 #[test]
 fn a_non_qualifying_column_reads_the_store_for_exhaustiveness() {
-    let src = "let g = fn v =>\n\
-               \x20 let w = match v with | {x} => 0n | {y} => 0n end in\n\
-               \x20 match v with | {x: 1n} => 1n | {x: n} => 2n | {y} => 3n end";
+    let src = "let g = fn v => do\n\
+               \x20 let w = match v with | {x} => 0n | {y} => 0n end\n\
+               \x20 return match v with | {x: 1n} => 1n | {x: n} => 2n | {y} => 3n end\n\
+               end";
     let (out, inferred, checks) = checked(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
@@ -1284,10 +1288,11 @@ fn a_non_qualifying_column_reads_the_store_for_exhaustiveness() {
 /// reaches it. Nothing about the arms above it says so — it is the store alone.
 #[test]
 fn a_non_qualifying_column_reads_the_store_for_reachability() {
-    let src = "let g = fn v =>\n\
-               \x20 let w = match v with | {x} => 0n | {y} => 0n end in\n\
-               \x20 match v with\n\
-               \x20 | {x: 1n} => 1n | {x: n, y} => 2n | {x: n} => 3n | {y} => 4n end";
+    let src = "let g = fn v => do\n\
+               \x20 let w = match v with | {x} => 0n | {y} => 0n end\n\
+               \x20 return match v with\n\
+               \x20 | {x: 1n} => 1n | {x: n, y} => 2n | {x: n} => 3n | {y} => 4n end\n\
+               end";
     let (out, inferred, checks) = checked(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
@@ -1320,11 +1325,13 @@ fn a_non_qualifying_column_reads_the_store_for_reachability() {
 /// nested match is exhaustive exactly as it is at the top level.
 #[test]
 fn a_nested_binding_reads_the_store_for_exhaustiveness() {
-    let src = "let outer = fn z =>\n\
-               \x20 let g = fn v =>\n\
-               \x20   let w = match v with | {x} => 0n | {y} => 0n end in\n\
-               \x20   match v with | {x: 1n} => 1n | {x: n} => 2n | {y} => 3n end in\n\
-               \x20 0n";
+    let src = "let outer = fn z => do\n\
+               \x20 let g = fn v => do\n\
+               \x20   let w = match v with | {x} => 0n | {y} => 0n end\n\
+               \x20   return match v with | {x: 1n} => 1n | {x: n} => 2n | {y} => 3n end\n\
+               \x20 end\n\
+               \x20 return 0n\n\
+               end";
     let (out, inferred, checks) = checked(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
@@ -1338,12 +1345,14 @@ fn a_nested_binding_reads_the_store_for_exhaustiveness() {
 /// store forbids is unreachable wherever the binding that constrains it sits.
 #[test]
 fn a_nested_binding_reads_the_store_for_reachability() {
-    let src = "let outer = fn z =>\n\
-               \x20 let g = fn v =>\n\
-               \x20   let w = match v with | {x} => 0n | {y} => 0n end in\n\
-               \x20   match v with\n\
-               \x20   | {x: 1n} => 1n | {x: n, y} => 2n | {x: n} => 3n | {y} => 4n end in\n\
-               \x20 0n";
+    let src = "let outer = fn z => do\n\
+               \x20 let g = fn v => do\n\
+               \x20   let w = match v with | {x} => 0n | {y} => 0n end\n\
+               \x20   return match v with\n\
+               \x20   | {x: 1n} => 1n | {x: n, y} => 2n | {x: n} => 3n | {y} => 4n end\n\
+               \x20 end\n\
+               \x20 return 0n\n\
+               end";
     let (out, inferred, checks) = checked(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
@@ -1374,10 +1383,11 @@ fn a_nested_binding_reads_the_store_for_reachability() {
 /// the value with neither rather than the one with both.
 #[test]
 fn a_nested_written_clause_shapes_the_witness() {
-    let src = "let solo = fn v =>\n\
+    let src = "let solo = fn v => do\n\
                \x20 let inner : {p when 'c: Nat, q when 'd: Nat} -> Nat where 'c != 'd =\n\
-               \x20   fn w => match w with | {p: 1n} => 0n | {q} => 0n end in\n\
-               \x20 0n";
+               \x20   fn w => match w with | {p: 1n} => 0n | {q} => 0n end\n\
+               \x20 return 0n\n\
+               end";
     let (out, inferred, checks) = checked(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());

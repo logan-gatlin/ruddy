@@ -19,7 +19,7 @@ use ruddy::{
 
 use crate::print::{
     Entry, Grouped, Mark, Prec, Shape, label, string, tuple_field_order, write_applied,
-    write_apply, write_array_pattern, write_arrow, write_binary, write_let, write_match,
+    write_apply, write_array_pattern, write_arrow, write_binary, write_do, write_let, write_match,
     write_pipeline, write_project, write_row, write_struct, write_sum, write_tag, write_tuple,
     write_unary,
 };
@@ -51,14 +51,16 @@ impl Grouped for Ast<'_, ExprKind> {
     fn prec(&self) -> Prec {
         match self.0 {
             // The body runs as far right as it can, so anything appended after
-            // a bare lambda would be read as part of it. A nested `let`'s body
-            // runs the same way, so it groups the same way.
-            ExprKind::Function { .. } | ExprKind::Let { .. } => Prec::Lambda,
+            // a bare lambda would be read as part of it.
+            ExprKind::Function { .. } => Prec::Lambda,
             // Self-delimiting on the right — the `end` closes it — so it may
             // head an application and be projected from; but it is not an
             // application *argument* by grammar, so an argument position
             // brackets it. Below `Atom` is exactly that split.
-            ExprKind::If { .. } | ExprKind::Match { .. } | ExprKind::Handle { .. } => Prec::Apply,
+            ExprKind::If { .. }
+            | ExprKind::Match { .. }
+            | ExprKind::Handle { .. }
+            | ExprKind::Do { .. } => Prec::Apply,
             // The body runs as far right as it can, so anything appended after
             // a `raise` would be read as part of what it carries.
             ExprKind::Raise(_) => Prec::Lambda,
@@ -129,13 +131,12 @@ impl fmt::Display for Ast<'_, StmtKind> {
             }
             // `body` is a `Tracked<Expr>` and `Expr` is itself `Tracked`, hence
             // the doubled `.tracked` to reach the `ExprKind`.
-            StmtKind::Let { pattern, ty, body } => {
-                write!(f, "let {}", pattern.tracked)?;
-                if let Some(ty) = ty {
-                    write!(f, " : {}", annotation(ty))?;
-                }
-                write!(f, " = {}", Ast(&body.tracked.tracked))
-            }
+            StmtKind::Let { pattern, ty, body } => write_let(
+                f,
+                &pattern.tracked,
+                ty.as_ref().map(annotation),
+                &Ast(&body.tracked.tracked),
+            ),
             // A module written inline, with its own statements between the `=`
             // and the `end`; one whose body is another file has nothing after
             // the name, which is exactly how it was written.
@@ -366,17 +367,12 @@ impl fmt::Display for Ast<'_, ExprKind> {
                 write_apply(f, &Ast(&func.tracked), &Ast(&arg.tracked))
             }
             ExprKind::Function { args, body } => write_function(f, args, &Ast(&body.tracked)),
-            ExprKind::Let {
-                pattern,
-                ty,
-                value,
-                body,
-            } => write_let(
+            // The statements print through the statement printer, so a
+            // binding in a block is written as the definition it reads like.
+            ExprKind::Do { stmts, result } => write_do(
                 f,
-                &pattern.tracked,
-                ty.as_ref().map(|ty| annotation(ty)),
-                &Ast(&value.tracked),
-                &Ast(&body.tracked),
+                stmts.iter().map(|stmt| Ast(&stmt.tracked)),
+                result.as_deref().map(|result| Ast(&result.tracked)),
             ),
             ExprKind::If {
                 predicate,

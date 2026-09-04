@@ -156,7 +156,7 @@ fn file_modules_share_structural_effects() {
     let out = load(&[
         (
             "main.hc",
-            "module Foo\nmodule Bar\nlet cross : Nat -> {} + Foo::!Log = fn n => let _ = Bar::!Log.write n in {}\n",
+            "module Foo\nmodule Bar\nlet cross : Nat -> {} + Foo::!Log = fn n => do let _ = Bar::!Log.write n return {} end\n",
         ),
         ("Foo.hc", "effect Log = { write: Nat -> () }\n"),
         ("Bar.hc", "effect Log = { write: Nat -> () }\n"),

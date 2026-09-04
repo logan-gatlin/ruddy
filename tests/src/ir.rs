@@ -2497,11 +2497,11 @@ fn an_erased_argument_is_let_through_a_sum_tail() {
     assert_eq!(out.errors[0].kind.code(), "undefined-type");
 }
 
-/// The name a nested `let` binds is in scope for both halves — its own value,
-/// so a binding may name itself, and the body written after the `in`.
+/// The name a block's `let` binds is in scope for both halves — its own value,
+/// so a binding may name itself, and the rest of the block after it.
 #[test]
 fn a_nested_let_binds_its_name_for_the_value_and_the_body() {
-    let (mint, out) = built("let a = let f = fn n => f n in f");
+    let (mint, out) = built("let a = do let f = fn n => f n return f end");
     let TermKind::Let {
         name, value, body, ..
     } = term_value(&mint, &out, "a")
@@ -2530,7 +2530,7 @@ fn a_nested_let_binds_its_name_for_the_value_and_the_body() {
 /// visible after the expression it was written in.
 #[test]
 fn a_nested_let_releases_its_name_after_the_body() {
-    let src = "let leaked = let n = 1n in n\nlet after = n";
+    let src = "let leaked = do let n = 1n return n end\nlet after = n";
     let (mint, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
     assert!(matches!(
@@ -2550,7 +2550,7 @@ fn a_nested_let_releases_its_name_after_the_body() {
 /// second definition.
 #[test]
 fn a_nested_let_shadows_without_complaint() {
-    let (mint, out) = built("let n = 1n\nlet a = let n = { v: 2n } in n");
+    let (mint, out) = built("let n = 1n\nlet a = do let n = { v: 2n } return n end");
     let TermKind::Let { name, body, .. } = term_value(&mint, &out, "a") else {
         panic!("expected a let");
     };
@@ -2563,12 +2563,12 @@ fn a_nested_let_shadows_without_complaint() {
     assert!(matches!(out.errors[0].kind, ErrorKind::Duplicate { .. }));
 }
 
-/// Two nested lets cannot name each other. There is no block form to bind a
-/// group of them together, so `b` is simply not in scope where `a`'s value is
-/// written, and naming it is an unresolved name like any other.
+/// Two bindings in a block cannot name each other. A block binds one name at
+/// a time, each for the rest of the block, so `b` is simply not in scope where
+/// `a`'s value is written, and naming it is an unresolved name like any other.
 #[test]
 fn two_nested_lets_cannot_name_each_other() {
-    let src = "let e = let a = b in let b = 1n in a";
+    let src = "let e = do let a = b let b = 1n return a end";
     let (_, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
     assert!(matches!(
@@ -2578,7 +2578,10 @@ fn two_nested_lets_cannot_name_each_other() {
             namespace: Namespace::Terms,
         } if name == "b"
     ));
-    assert_eq!(out.errors[0].span.start, src.find("b in").expect("the use"));
+    assert_eq!(
+        out.errors[0].span.start,
+        src.find("b let").expect("the use")
+    );
 }
 
 /// A nested binding given as itself is the same complaint, in the same words,
@@ -2586,13 +2589,13 @@ fn two_nested_lets_cannot_name_each_other() {
 /// the value erased so that inference is never handed the loop.
 #[test]
 fn a_nested_let_given_as_itself_is_circular() {
-    let src = "let e = let x = x in x";
+    let src = "let e = do let x = x return x end";
     let (mint, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
     assert_eq!(out.errors[0].kind.code(), "circular-term");
     assert_eq!(
         out.errors[0].span.start,
-        src.find("x in").expect("the value")
+        src.find("x return").expect("the value")
     );
 
     let TermKind::Let { value, .. } = term_value(&mint, &out, "e") else {
@@ -2603,25 +2606,25 @@ fn a_nested_let_given_as_itself_is_circular() {
     // Including one written under a `fn`, which no definition's own chain
     // reaches: the walk stops at a lambda, so every nested binding is followed
     // from itself as well.
-    let src = "let g = fn p => let q = q in q";
+    let src = "let g = fn p => do let q = q return q end";
     let (_, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
     assert_eq!(out.errors[0].kind.code(), "circular-term");
     assert_eq!(
         out.errors[0].span.start,
-        src.find("q in").expect("the value")
+        src.find("q return").expect("the value")
     );
 }
 
 /// A loop closed through two nested bindings tells both of them.
 ///
-/// Two lets written side by side cannot reach each other — `b` is not in scope
-/// where `a`'s value is written — so the way two of them close a loop is by
-/// nesting: `x` is in scope inside its own value, so `y` written there can name
-/// it, and `x` is given as the `let` that stands for `y`.
+/// Two bindings written side by side cannot reach each other — `b` is not in
+/// scope where `a`'s value is written — so the way two of them close a loop is
+/// by nesting: `x` is in scope inside its own value, so `y` written there can
+/// name it, and `x` is given as the block that stands for `y`.
 #[test]
 fn a_loop_through_two_nested_lets_reports_both() {
-    let src = "let e = let x = let y = x in y in x";
+    let src = "let e = do let x = do let y = x return y end return x end";
     let (_, out) = build_src(src);
     let spans: Vec<usize> = out
         .errors
@@ -2633,7 +2636,7 @@ fn a_loop_through_two_nested_lets_reports_both() {
         spans,
         [
             src.find("let y").expect("x's value"),
-            src.find("x in y").expect("y's value"),
+            src.find("x return y").expect("y's value"),
         ],
         "errors: {:#?}",
         out.errors
@@ -2645,10 +2648,10 @@ fn a_loop_through_two_nested_lets_reports_both() {
 #[test]
 fn a_nested_let_reaching_a_shape_is_not_circular() {
     for src in [
-        "let e = let f = fn n => f n in f",
-        "let e = let x = 1n in let y = x in y",
-        "let e = fn p => let q = p in q",
-        "let a = let x = 1n in x  let b = a",
+        "let e = do let f = fn n => f n return f end",
+        "let e = do let x = 1n let y = x return y end",
+        "let e = fn p => do let q = p return q end",
+        "let a = do let x = 1n return x end  let b = a",
     ] {
         let (_, out) = build_src(src);
         assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
@@ -2660,7 +2663,8 @@ fn a_nested_let_reaching_a_shape_is_not_circular() {
 /// would be a `RepeatedRowField` never reported.
 #[test]
 fn a_nested_annotation_reaches_the_row_argument_check() {
-    let src = "type WithX 'r = { x: Nat, ..'r }\nlet e = let n : WithX { x: Nat } = 1n in n";
+    let src =
+        "type WithX 'r = { x: Nat, ..'r }\nlet e = do let n : WithX { x: Nat } = 1n return n end";
     let (_, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
     assert!(matches!(
@@ -2681,12 +2685,13 @@ fn a_nested_annotation_reaches_the_row_argument_check() {
 /// `let` binds is not a definition for a group to be about.
 #[test]
 fn grouping_sees_through_a_nested_let() {
-    let (mint, out) = built("let a = let x = b in { v: x }  let b = let y = a in { w: y }");
+    let (mint, out) =
+        built("let a = do let x = b return { v: x } end  let b = do let y = a return { w: y } end");
     assert_eq!(groups(&mint, &out), [vec!["a", "b"]]);
     assert!(out.program.groups[0].recursive);
 
     // And a definition whose nested binding names nobody is a group of one.
-    let (mint, out) = built("let a = let x = 1n in x");
+    let (mint, out) = built("let a = do let x = 1n return x end");
     assert_eq!(groups(&mint, &out), [vec!["a"]]);
     assert!(!out.program.groups[0].recursive);
 }
@@ -2696,17 +2701,17 @@ fn grouping_sees_through_a_nested_let() {
 #[test]
 fn displays_nested_lets() {
     assert_eq!(
-        display_program("let a = let x = 1n in x"),
-        "let a = let x = 1n in x"
+        display_program("let a = do let x = 1n return x end"),
+        "let a = do let x = 1n return x end"
     );
     assert_eq!(
-        display_program("let a = let x : Nat = 1n in x"),
-        "let a = let x : Nat = 1n in x"
+        display_program("let a = do let x : Nat = 1n return x end"),
+        "let a = do let x : Nat = 1n return x end"
     );
     // A `let` in argument position wears the parentheses that make it one.
     assert_eq!(
-        display_program("let f = fn x => x  let a = f (let x = 1n in x)"),
-        "let f = fn x => x\nlet a = f (let x = 1n in x)"
+        display_program("let f = fn x => x  let a = f (do let x = 1n return x end)"),
+        "let f = fn x => x\nlet a = f (do let x = 1n return x end)"
     );
 }
 
@@ -2971,12 +2976,12 @@ fn array_lets_accept_a_lone_rest_and_refuse_any_element() {
     assert_eq!(lowered("let [..all] = [1n]"), "let all : [_] = [1n]");
     assert_eq!(lowered("let [..] = [1n]"), "let %array : [_] = [1n]");
     assert_eq!(
-        lowered("let a = let [..r] = [1n] in r"),
-        "let a = let r : [_] = [1n] in r"
+        lowered("let a = do let [..r] = [1n] return r end"),
+        "let a = do let r : [_] = [1n] return r end"
     );
     assert_eq!(
-        lowered("let a = let [..] = [1n] in 2n"),
-        "let a = let %array : [_] = [1n] in 2n"
+        lowered("let a = do let [..] = [1n] return 2n end"),
+        "let a = do let %array : [_] = [1n] return 2n end"
     );
     // A written annotation is the contract on the whole value, and the
     // pattern's demand goes on the rest's own binding, as a unit pattern's does.
@@ -2985,8 +2990,8 @@ fn array_lets_accept_a_lone_rest_and_refuse_any_element() {
         "let %value : [Nat] = [1n]\nlet r : [_] = %value"
     );
     assert_eq!(
-        lowered("let a = let [..r] : [Nat] = [1n] in r"),
-        "let a = let %value : [Nat] = [1n] in let r : [_] = %value in r"
+        lowered("let a = do let [..r] : [Nat] = [1n] return r end"),
+        "let a = do let %value : [Nat] = [1n] let r : [_] = %value return r end"
     );
 
     let (printed, errors) = lowered_with_errors("let [x] = [1n]  let use = x");
@@ -3002,11 +3007,11 @@ fn array_lets_accept_a_lone_rest_and_refuse_any_element() {
         let (_, errors) = lowered_with_errors(src);
         assert_eq!(errors, ["binding-can-fail@4"], "{src}: {errors:#?}");
     }
-    let (printed, errors) = lowered_with_errors("let a = let [x, ..r] = [1n] in x");
-    assert_eq!(errors, ["binding-can-fail@12"], "{errors:#?}");
+    let (printed, errors) = lowered_with_errors("let a = do let [x, ..r] = [1n] return x end");
+    assert_eq!(errors, ["binding-can-fail@15"], "{errors:#?}");
     assert_eq!(
         printed,
-        "let a = let %value = [1n] in let x = <error> in let r = <error> in x"
+        "let a = do let %value = [1n] let x = <error> let r = <error> return x end"
     );
 }
 
@@ -3081,8 +3086,8 @@ fn an_identifier_let_lowers_unchanged() {
     assert_eq!(lowered("let x = 1n"), "let x = 1n");
     assert_eq!(lowered("let f = fn n => f n"), "let f = fn n => f n");
     assert_eq!(
-        lowered("let a = let x = 1n in x"),
-        "let a = let x = 1n in x"
+        lowered("let a = do let x = 1n return x end"),
+        "let a = do let x = 1n return x end"
     );
 }
 
@@ -3125,41 +3130,43 @@ fn a_struct_let_statement_makes_a_definition_per_field() {
     );
 }
 
-/// R6's expression half: `let {x, y: a} = e in b` is a fresh temporary and one
+/// R6's expression half: `do let {x, y: a} = e return b end` is a fresh temporary and one
 /// nested `let` per field.
 #[test]
 fn a_struct_let_expression_chains_through_a_temporary() {
     assert_eq!(
-        lowered("let d = fn e => let {x, y: a} = e in x"),
-        "let d = fn e => let %struct : { x: _, y: _ } = e in \
-         let x = %struct.x in let a = %struct.y in x"
+        lowered("let d = fn e => do let {x, y: a} = e return x end"),
+        "let d = fn e => do let %struct : { x: _, y: _ } = e \
+         let x = %struct.x let a = %struct.y return x end"
     );
     // Open, the pattern demands only what the projections do, so the
     // temporary is bare.
     assert_eq!(
-        lowered("let d = fn e => let {x, ..} = e in x"),
-        "let d = fn e => let %struct = e in let x = %struct.x in x"
+        lowered("let d = fn e => do let {x, ..} = e return x end"),
+        "let d = fn e => do let %struct = e let x = %struct.x return x end"
     );
     // A written annotation holds the whole value on a binding of its own, and
     // the exact demand rides on the temporary the projections read.
     assert_eq!(
-        lowered("let a = let {x} : { x: Nat } = { x: 1n } in x"),
-        "let a = let %value : { x: Nat } = { x: 1n } in \
-         let %struct : { x: _ } = %value in let x = %struct.x in x"
+        lowered("let a = do let {x} : { x: Nat } = { x: 1n } return x end"),
+        "let a = do let %value : { x: Nat } = { x: 1n } \
+         let %struct : { x: _ } = %value let x = %struct.x return x end"
     );
     // The spec's own nested example.
     assert_eq!(
-        lowered("let dist = fn p => let {pos: {x, y}} = p in add x y  let add = fn a b => a"),
+        lowered(
+            "let dist = fn p => do let {pos: {x, y}} = p return add x y end  let add = fn a b => a"
+        ),
         "let dist = fn p => \
-         let %struct : { pos: _ } = p in \
-         let %struct : { x: _, y: _ } = %struct.pos in \
-         let x = %struct.x in let y = %struct.y in add x y\n\
+         do let %struct : { pos: _ } = p \
+         let %struct : { x: _, y: _ } = %struct.pos \
+         let x = %struct.x let y = %struct.y return add x y end\n\
          let add = fn a => fn b => a"
     );
     // `()` constrains the value to unit through an annotated fresh binding.
     assert_eq!(
-        lowered("let u = let () = {} in 1n"),
-        "let u = let %unit : () = () in 1n"
+        lowered("let u = do let () = {} return 1n end"),
+        "let u = do let %unit : () = () return 1n end"
     );
 }
 
@@ -3196,24 +3203,24 @@ fn a_wildcard_let_statement_defines_a_hidden_fresh_name() {
     assert_ne!(discards[0], discards[1]);
 }
 
-/// R5's expression half: `let _ = e in b` is a `Let` through a fresh symbol —
+/// R5's expression half: `do let _ = e return b end` is a `Let` through a fresh symbol —
 /// the value still on the page, typechecked, and nothing in `b` able to name
 /// it, because there is no name.
 #[test]
 fn a_wildcard_let_expression_binds_a_hidden_fresh_name() {
     assert_eq!(
-        lowered("let a = let _ = f 1n in 2n  let f = fn x => x"),
-        "let a = let %discard = f 1n in 2n\nlet f = fn x => x"
+        lowered("let a = do let _ = f 1n return 2n end  let f = fn x => x"),
+        "let a = do let %discard = f 1n return 2n end\nlet f = fn x => x"
     );
     // The annotation stays the contract on the value.
     assert_eq!(
-        lowered("let a = let _ : Nat = 1n in 2n"),
-        "let a = let %discard : Nat = 1n in 2n"
+        lowered("let a = do let _ : Nat = 1n return 2n end"),
+        "let a = do let %discard : Nat = 1n return 2n end"
     );
 
     // The fresh symbol is bound into no scope: the body's `2` aside, nothing
     // references it, and the tree says so.
-    let (mint, out) = built("let a = let _ = 1n in 2n");
+    let (mint, out) = built("let a = do let _ = 1n return 2n end");
     let TermKind::Let { name, body, .. } = term_value(&mint, &out, "a") else {
         panic!("a lowers to a let");
     };
@@ -3297,9 +3304,9 @@ fn a_wildcard_struct_leaf_keeps_the_projection() {
          let %discard = %struct.x\nlet y = %struct.y"
     );
     assert_eq!(
-        lowered("let use_y = fn p => let {x: _, y} = p in y"),
-        "let use_y = fn p => let %struct : { x: _, y: _ } = p in \
-         let %discard = %struct.x in let y = %struct.y in y"
+        lowered("let use_y = fn p => do let {x: _, y} = p return y end"),
+        "let use_y = fn p => do let %struct : { x: _, y: _ } = p \
+         let %discard = %struct.x let y = %struct.y return y end"
     );
 }
 
@@ -3370,7 +3377,7 @@ fn a_wildcard_does_not_make_a_refutable_binding_calm() {
         format!("binding-can-fail@{}", src.find("#Some").expect("the tag"))
     );
 
-    let src = "let a = let #Some _ = opt in 1n  let opt = #Some 1n";
+    let src = "let a = do let #Some _ = opt return 1n end  let opt = #Some 1n";
     let (_, errors) = lowered_with_errors(src);
     assert_eq!(errors.len(), 1, "{errors:#?}");
     assert!(errors[0].starts_with("binding-can-fail@"), "{errors:#?}");
@@ -3478,7 +3485,7 @@ fn nested_arms_stay_written() {
 }
 
 /// The sole irrefutable arm is legal and stays a match: one arm, binding the
-/// whole value — `match e with | x => b end` means `let x = e in b`, and the
+/// whole value — `match e with | x => b end` means `do let x = e return b end`, and the
 /// meaning is typing's to give.
 #[test]
 fn a_sole_catch_all_keeps_its_shape() {
@@ -3559,8 +3566,9 @@ fn a_match_is_a_shape_for_the_circularity_walk() {
         lowered("let x = match x with | #A y => y | r => r end"),
         "let x = match x with | #A y => y | r => r end"
     );
-    let (_, errors) =
-        lowered_with_errors("let a = let x = match x with | #A y => y | r => r end in x");
+    let (_, errors) = lowered_with_errors(
+        "let a = do let x = match x with | #A y => y | r => r end return x end",
+    );
     assert!(errors.is_empty(), "{errors:#?}");
     let (_, errors) = lowered_with_errors("let x = match x with | w => w end");
     assert!(errors.is_empty(), "{errors:#?}");
@@ -3595,14 +3603,14 @@ fn a_refutable_let_is_refused_and_its_names_still_bind() {
 
     // The expression form, and the number as the refuter: the complaint
     // points at the `0`.
-    let (printed, errors) = lowered_with_errors("let a = let {a: 0n} = { a: 1n } in 2n");
-    assert_eq!(errors, ["binding-can-fail@16"], "{errors:#?}");
-    assert_eq!(printed, "let a = let %value = { a: 1n } in 2n");
-    let (printed, errors) = lowered_with_errors("let a = let #Some x = #Some 1n in x");
-    assert_eq!(errors, ["binding-can-fail@12"], "{errors:#?}");
+    let (printed, errors) = lowered_with_errors("let a = do let {a: 0n} = { a: 1n } return 2n end");
+    assert_eq!(errors, ["binding-can-fail@19"], "{errors:#?}");
+    assert_eq!(printed, "let a = do let %value = { a: 1n } return 2n end");
+    let (printed, errors) = lowered_with_errors("let a = do let #Some x = #Some 1n return x end");
+    assert_eq!(errors, ["binding-can-fail@15"], "{errors:#?}");
     assert_eq!(
         printed,
-        "let a = let %value = #Some 1n in let x = <error> in x"
+        "let a = do let %value = #Some 1n let x = <error> return x end"
     );
 }
 
@@ -3829,7 +3837,7 @@ fn a_struct_pattern_naming_a_field_twice_is_refused() {
     assert_eq!(errors, ["duplicate-field@38"], "{errors:#?}");
     assert_eq!(
         printed,
-        "let f = fn e => match e with | { x: a } => let b = <error> in b end"
+        "let f = fn e => match e with | { x: a } => do let b = <error> return b end end"
     );
 
     // A pun beside a rename of the same field is still the field named twice,
@@ -3854,8 +3862,8 @@ fn pattern_let_corners() {
         "let %value : () = ()\nlet %unit : () = %value"
     );
     assert_eq!(
-        lowered("let u = let () : {} = {} in 1n"),
-        "let u = let %value : () = () in let %unit : () = %value in 1n"
+        lowered("let u = do let () : {} = {} return 1n end"),
+        "let u = do let %value : () = () let %unit : () = %value return 1n end"
     );
 
     // A statement pattern repeating a name: the repeat is the pattern's own
@@ -3880,9 +3888,13 @@ fn pattern_let_corners() {
 
     // A refused binding still binds the names inside its calm corners — the
     // nested struct's — and points at the tag past a field that is fine.
-    let (printed, errors) = lowered_with_errors("let a = let {p: {q}, r: #Bad} = {} in q");
-    assert_eq!(errors, ["binding-can-fail@24"], "{errors:#?}");
-    assert_eq!(printed, "let a = let %value = () in let q = <error> in q");
+    let (printed, errors) =
+        lowered_with_errors("let a = do let {p: {q}, r: #Bad} = {} return q end");
+    assert_eq!(errors, ["binding-can-fail@27"], "{errors:#?}");
+    assert_eq!(
+        printed,
+        "let a = do let %value = () let q = <error> return q end"
+    );
 }
 
 /// A `where` clause survives lowering as the formula it was written as, over
@@ -4920,7 +4932,7 @@ fn raise_belongs_to_the_arm_around_it() {
     // And every position an expression may sit in, none of which needs a rule.
     for body in [
         "raise 0n",
-        "let a = raise 0n in ()",
+        "do let a = raise 0n end",
         "f (raise 0n)",
         "{ g: raise 0n }",
         "match s with | 0n => raise 0n | _ => () end",
@@ -5354,20 +5366,15 @@ fn an_effect_tail_makes_an_argument_grow() {
     assert_eq!(codes, ["growing-recursion"]);
 }
 
-/// `return` is contextual: it heads a handler arm and is an ordinary name
-/// everywhere 'else, so a definition may still be called one.
+/// `return` is reserved: it ends a `do` block and heads a handler arm, and
+/// the handler arm reads the same keyword the block does.
 #[test]
-fn return_is_a_name_everywhere_but_an_arms_head() {
+fn return_heads_a_handler_arm() {
     let (mint, out) = built(
         "effect Log = { write: Nat -> () }\n\
-         let return = 1n\n\
-         let p : () -> Nat + !Log = fn _ => return\n\
+         let p : () -> Nat + !Log = fn _ => do let _ = !Log.write 1n return 1n end\n\
          let h = fn _ => handle p () with | !Log.write s => () | return x => x end",
     );
-    assert!(matches!(
-        term_value(&mint, &out, "return"),
-        TermKind::Natural(1)
-    ));
     let mut node = term_value(&mint, &out, "h");
     while let TermKind::Fn { body, .. } = node {
         node = &body.kind;
@@ -6438,7 +6445,7 @@ fn paths_resolve_in_every_position() {
     let src = "module Math =\n  type Pair 'a 'b = { first: 'a, second: 'b }\nend\n\
                module Sys =\n  effect Log = { write: Nat -> () }\nend\n\
                let p : Math::Pair Nat Nat = { first: 1n, second: 2n }\n\
-               let greet : () -> Nat + Sys::!Log = fn _ => let _ = Sys::!Log.write 1n in 0n\n\
+               let greet : () -> Nat + Sys::!Log = fn _ => do let _ = Sys::!Log.write 1n return 0n end\n\
                let quiet : () -> Nat = fn _ =>\n\
                  handle greet () with | Sys::!Log.write s => () | return x => x end";
     let (mint, out) = built(src);

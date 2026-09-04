@@ -73,7 +73,8 @@ pub fn label(kind: &Kind) -> &'static str {
     match kind {
         Kind::Let => "Let",
         Kind::Extern => "Extern",
-        Kind::In => "In",
+        Kind::Do => "Do",
+        Kind::Return => "Return",
         Kind::If => "If",
         Kind::Then => "Then",
         Kind::Else => "Else",

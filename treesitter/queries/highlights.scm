@@ -106,9 +106,10 @@
   pattern: (identifier) @function
   body: (function))
 
-(let_expression
-  pattern: (identifier) @function
-  value: (function))
+(do_block
+  statement: (let_definition
+    pattern: (identifier) @function
+    body: (function)))
 
 (function parameter: (identifier) @variable.parameter)
 (handler_arm binder: (identifier) @variable.parameter)
@@ -145,7 +146,7 @@
 [
   "let"
   "extern"
-  "in"
+  "do"
   "if"
   "then"
   "else"
@@ -159,7 +160,10 @@
   "module"
 ] @keyword
 
-"raise" @keyword.return
+[
+  "raise"
+  "return"
+] @keyword.return
 
 ; Contextual: each of these is an ordinary name everywhere but the position
 ; that reads it, and the anonymous node only exists where it was read as one.
@@ -172,7 +176,6 @@
 (clause_or "or" @keyword.operator)
 (clause_and "and" @keyword.operator)
 (clause_not "not" @keyword.operator)
-(handler_arm "return" @keyword.return)
 
 ; ── the wildcard and the hole ────────────────────────────────────────────────
 
