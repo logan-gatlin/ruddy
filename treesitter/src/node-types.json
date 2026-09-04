@@ -5233,6 +5233,10 @@
       "required": false,
       "types": [
         {
+          "type": "spread",
+          "named": true
+        },
+        {
           "type": "struct_field",
           "named": true
         }

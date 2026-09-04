@@ -244,7 +244,14 @@ pub enum ExprKind {
         consequent: Box<Expr>,
         alternative: Box<Expr>,
     },
-    Struct(IndexMap<TrackedString, Expr>),
+    /// `{ a: 1, ..c }` — a struct built from the fields it names and, with
+    /// the `..`, every field of one more value. The spread is written last
+    /// and at most once; the parser refuses anything else, so the tree holds
+    /// exactly one optional spread rather than a list of items.
+    Struct {
+        fields: IndexMap<TrackedString, Expr>,
+        spread: Option<Spread>,
+    },
     /// `(a, b)` — a positional struct, retained in the surface tree so the
     /// spelling can be reproduced. The empty tuple remains [`Unit`](Self::Unit)
     /// and a singleton requires its trailing comma.
@@ -371,6 +378,16 @@ pub enum ArgKind {
 pub struct ArrayItem {
     pub spread: Option<Span>,
     pub value: Expr,
+}
+
+/// The `..` of a struct literal: a value whose fields the literal takes on,
+/// after the ones it names itself. The span is the `..`'s own, for the
+/// debugger to point at and for a complaint about a second one to point back
+/// at; the value is a full expression, as an [`ArrayItem`]'s is.
+#[derive(Debug, Clone)]
+pub struct Spread {
+    pub span: Span,
+    pub value: Box<Expr>,
 }
 
 /// The `..` of an array pattern: everything the fixed elements around it do
@@ -788,6 +805,14 @@ pub enum ErrorKind {
     /// `.._`: the rest of an array thrown away by name, which is what the bare
     /// `..` already does. One spelling for one meaning, as with `{ x, .. }`.
     DiscardedArrayRest,
+    /// A second `..` in one struct literal. Two spreads would leave inference
+    /// to decide which of them a shared field comes from, so a literal gets
+    /// one, and the complaint points back at the first.
+    SecondStructSpread { previous: Span },
+    /// A field written after a struct literal's `..`. The spread comes last,
+    /// so the literal has one reading and evaluates in the order it is
+    /// written; the complaint points back at the `..` the field follows.
+    FieldAfterSpread { spread: Span },
 }
 
 /// What the parser needed at the primary error span.
@@ -2204,24 +2229,51 @@ impl Parser {
         }
     }
 
-    /// `{ <field>: <expr>, <field>: <expr>, ... }` with an optional trailing
-    /// comma — the same shape as a struct type, but with expression values.
+    /// `{ <field>: <expr>, <field>: <expr>, ..., [..<expr>] }` with an
+    /// optional trailing comma — the same shape as a struct type, but with
+    /// expression values, and a `..` spreading one more value's fields in
+    /// where the type's tail would be. The spread comes last, as the tail
+    /// does: anything written after it is refused where it begins, and the
+    /// complaint says which rule it broke.
     fn struct_expr(&mut self) -> Option<Expr> {
         let open = self.eat(&Kind::LeftBrace).expect("the caller peeked `{`");
         let mut fields = IndexMap::new();
+        let mut spread: Option<Spread> = None;
 
         while !self.at_expr_boundary() {
-            // `{ _: 1 }` names a field nothing: the complaint is the
-            // wildcard's, worded for the field name it fails to be.
-            if self.at_wildcard() {
-                return self.wildcard(Place::Field);
+            if let Some(previous) = &spread {
+                let token = self.peek().expect("not at an expression boundary");
+                let span = token.span;
+                let kind = match token.tracked {
+                    Kind::DotDot => ErrorKind::SecondStructSpread {
+                        previous: previous.span,
+                    },
+                    _ => ErrorKind::FieldAfterSpread {
+                        spread: previous.span,
+                    },
+                };
+                self.error(span, kind);
+                return None;
             }
-            let name = self.field_label()?;
-            self.eat(&Kind::Colon)?;
-            let value = self.expr()?;
-            fields.insert(name, value);
+            if let Some(dots) = self.eat_if(&Kind::DotDot) {
+                let value = self.expr()?;
+                spread = Some(Spread {
+                    span: dots.span,
+                    value: Box::new(value),
+                });
+            } else {
+                // `{ _: 1 }` names a field nothing: the complaint is the
+                // wildcard's, worded for the field name it fails to be.
+                if self.at_wildcard() {
+                    return self.wildcard(Place::Field);
+                }
+                let name = self.field_label()?;
+                self.eat(&Kind::Colon)?;
+                let value = self.expr()?;
+                fields.insert(name, value);
+            }
 
-            // A comma separates fields; its absence ends the field list.
+            // A comma separates items; its absence ends the list.
             if self.eat_if(&Kind::Comma).is_none() {
                 break;
             }
@@ -2229,7 +2281,7 @@ impl Parser {
 
         let close = self.close_delimiter(open.span, &Kind::RightBrace)?;
         let span = open.span.merge(close.span);
-        Some(span.track(ExprKind::Struct(fields)))
+        Some(span.track(ExprKind::Struct { fields, spread }))
     }
 
     /// `#Some <atom>` — one case of a sum, with what it carries.

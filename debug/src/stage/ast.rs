@@ -346,7 +346,9 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
                 None => expr_node(ids, &item.value),
             }
         })),
-        ExprKind::Struct(fields) => Node {
+        // The spread, when there is one, is a row after the fields, the way
+        // an array's is among its items: the `..` and what it spreads.
+        ExprKind::Struct { fields, spread } => Node {
             label: "Struct".into(),
             ..node
         }
@@ -358,6 +360,15 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
             )
             .at(name.span)
             .child(expr_node(ids, value))
+        }))
+        .children(spread.iter().map(|spread| {
+            Node::new(
+                ids.next(),
+                "Spread",
+                format!("..{}", print::ast::expr(&spread.value.tracked)),
+            )
+            .at(spread.span.merge(spread.value.span))
+            .child(expr_node(ids, &spread.value))
         })),
         // The case is a label rather than a name, so the node carries the span
         // it was written at and no symbol — the same as a field, and for the

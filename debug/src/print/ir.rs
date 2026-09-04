@@ -262,7 +262,7 @@ impl Grouped for Show<'_, TermKind> {
             TermKind::Apply { .. } => Prec::Apply,
             TermKind::Project { .. }
             | TermKind::Operation { .. }
-            | TermKind::Struct(_)
+            | TermKind::Struct { .. }
             | TermKind::Array(_)
             | TermKind::Ident(_)
             | TermKind::Natural(_)
@@ -452,7 +452,17 @@ impl fmt::Display for Show<'_, TermKind> {
                 &self.show(&**value),
                 &self.show(&**body),
             ),
-            TermKind::Struct(fields) => {
+            // Braces whatever the fields are named, for the reason the parse
+            // tree's printer gives: a spread says the fields written are not
+            // all there are, and the tuple and unit spellings say they are.
+            TermKind::Struct {
+                fields,
+                spread: Some(spread),
+            } => write_struct(f, self.pairs(fields), Some(&self.show(&*spread.value))),
+            TermKind::Struct {
+                fields,
+                spread: None,
+            } => {
                 if fields.is_empty() {
                     f.write_str("()")
                 } else if let Some(order) = tuple_field_order(fields.keys().map(String::as_str)) {
@@ -464,7 +474,7 @@ impl fmt::Display for Show<'_, TermKind> {
                         }),
                     )
                 } else {
-                    write_struct(f, self.pairs(fields))
+                    write_struct(f, self.pairs(fields), None)
                 }
             }
             TermKind::Array(items) => {

@@ -91,6 +91,34 @@ fn both_trees_render_a_struct_the_same_way() {
     }
 }
 
+/// A spread prints after the fields, as the `..` it was written as, in both
+/// trees — never expanded into the fields inference found it to carry — and
+/// with braces whatever the fields are named, since the tuple and unit
+/// spellings would say the written fields are all there are. The value it
+/// spreads is a whole expression and is never grouped: nothing an expression
+/// can contain reads as the `,` or `}` that ends the literal.
+#[test]
+fn both_trees_render_a_struct_spread_the_same_way() {
+    for source in [
+        "let c = { y: 2n }\nlet a = { x: 1n, ..c }",
+        "let c = { y: 2n }\nlet a = { ..c }",
+        "let c = { y: 2n }\nlet a = { 0: 1n, 1: 2n, ..c }",
+        "let a = { ..() }",
+        "let f = fn v => v\nlet c = { y: 2n }\nlet a = { x: 1n, ..f c }",
+        "let c = { y: 2n }\nlet a = { x: { ..c }, ..{ z: 3n, ..c } }",
+        "let c = { y: 2n }\nlet a = { x: 1n, ..match c with | v => v end }",
+        "let c = { y: 2n }\nlet a = { x: 1n, ..c.y }",
+        "let c = { y: 2n }\nlet a = { x: 1n, ..c.y + 1n }",
+        "let a = { x: 1n, ..fn v => v }",
+        "let a = { x: 1n, ..let c = { y: 2n } in c }",
+    ] {
+        let (ast, ir) = printed(source);
+        assert_eq!(ast, source);
+        assert_eq!(ir, source);
+        assert_eq!(ast_of(&ast), ast, "spread printing is a fixed point");
+    }
+}
+
 #[test]
 fn tuples_print_canonically_in_both_trees() {
     for source in [

@@ -28,12 +28,11 @@ fn generated_javascript_passes_the_node_runtime_suite() {
     assert!(generated.is_file());
 }
 
-/// The array runtime, checked against a plain JavaScript array by a seeded
-/// sequence of every operation the standard library exposes. The fixture
-/// owns the program and the assertions; the manifest is written here because
-/// it has to name the standard library by an absolute path.
-#[test]
-fn the_array_runtime_agrees_with_a_plain_array() {
+/// Build and run one checked-in bundle whose program and assertions live in
+/// `bundles/<fixture>`, from a temporary project so no output lands in the
+/// fixture. The manifest is written here because it has to name the standard
+/// library by an absolute path. Skipped where there is no Node to run it.
+fn run_bundle(fixture: &str, script: &str) {
     if Command::new("node").arg("--version").output().is_err() {
         return;
     }
@@ -41,21 +40,39 @@ fn the_array_runtime_agrees_with_a_plain_array() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("the workspace root");
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("bundles/arrays");
-    let project = tempfile::tempdir().expect("a temporary array-test project");
-    for name in ["main.hc", "arrays.test.mjs"] {
-        fs::copy(fixture.join(name), project.path().join(name))
-            .unwrap_or_else(|error| panic!("could not copy array fixture {name}: {error}"));
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("bundles")
+        .join(fixture);
+    let project = tempfile::tempdir().expect("a temporary bundle project");
+    for name in ["main.hc", script] {
+        fs::copy(source.join(name), project.path().join(name))
+            .unwrap_or_else(|error| panic!("could not copy {fixture} fixture {name}: {error}"));
     }
     fs::write(
         project.path().join("Ruddy.toml"),
         format!(
-            "name = \"array-tests\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\ntarget = \"js\"\n\n[run]\njs = \"node arrays.test.mjs\"\n\n[dependencies]\nstd = {:?}\n",
+            "name = \"{fixture}\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\ntarget = \"js\"\n\n[run]\njs = \"node {script}\"\n\n[dependencies]\nstd = {:?}\n",
             root.join("std")
         ),
     )
     .unwrap();
 
-    let generated = run_project(project.path()).expect("the array differential suite passes");
+    let generated =
+        run_project(project.path()).unwrap_or_else(|error| panic!("{fixture}: {error}"));
     assert!(generated.is_file());
+}
+
+/// The array runtime, checked against a plain JavaScript array by a seeded
+/// sequence of every operation the standard library exposes.
+#[test]
+fn the_array_runtime_agrees_with_a_plain_array() {
+    run_bundle("arrays", "arrays.test.mjs");
+}
+
+/// Struct spreads compiled through the CLI's own path and read back by Node:
+/// every accepted form, the fields each keeps, and the order the pieces run
+/// in.
+#[test]
+fn struct_spreads_build_the_fields_they_promise() {
+    run_bundle("struct-spreads", "spreads.test.mjs");
 }

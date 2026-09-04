@@ -762,6 +762,32 @@ fn a_spread_literal_joins_its_pieces_in_order() {
     assert_eq!(joined.matches("concat").count(), 1, "{joined}");
 }
 
+/// A spread struct is the value it spreads under a record of the fields it
+/// names, laid over it so the named ones win wherever the two share a field.
+/// The value it spreads runs after every named field, which is where it was
+/// written — and once, whatever the fields do with it.
+#[test]
+fn a_struct_spread_lays_the_named_fields_over_the_value() {
+    assert_eq!(
+        section("let c = { y: 2n }\nlet a = { x: 1n, ..c }", "global a"),
+        "global a:\n\
+         \x20 %2: nat = const 1n\n\
+         \x20 %3: struct = global c\n\
+         \x20 %4: struct = struct { x: %2 }\n\
+         \x20 %5: struct = merge %3, %4\n\
+         \x20 ret %5"
+    );
+    let ordered = section(
+        "let f = fn n => { y: n }\nlet a = { x: f 1n, ..f 2n }",
+        "global a",
+    );
+    let first = ordered.find("call").expect("the field's call");
+    let second = ordered.rfind("call").expect("the spread's call");
+    let merged = ordered.find("merge").expect("the merge");
+    assert!(first < second && second < merged, "{ordered}");
+    assert_eq!(ordered.matches("call").count(), 2, "{ordered}");
+}
+
 /// A case no listed one covers needs somewhere 'to go: an arm that accepts
 /// anything gives the dispatch its `else`. With every case of a closed row
 /// listed there is nothing left over, and no `else` is written.

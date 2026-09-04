@@ -194,9 +194,10 @@ pub enum Op {
     /// One record carrying every field of each of these, laid over one another
     /// in order: a later one wins wherever two of them name the same field.
     ///
-    /// Evidence plumbing alone, and the only way to build a record out of one
-    /// whose fields are not known here — which is what a tail bundle is. Never
-    /// fewer than two operands: laying one record over nothing is that record.
+    /// The only way to build a record out of one whose fields are not known
+    /// here — which is what a tail bundle is, and what the value a struct
+    /// literal spreads is. Never fewer than two operands: laying one record
+    /// over nothing is that record.
     Merge(Vec<Temp>),
     /// Read one field of a struct.
     Project {
@@ -2828,7 +2829,14 @@ impl Lower<'_> {
             // each member is fitted from the shape it holds to the shape the
             // container's type gives it going in, and the container records
             // that type so a read coming out can trust it.
-            TermKind::Struct(fields) => {
+            //
+            // A spread runs after every named field, which is where it was
+            // written, and the value it produces goes under the literal's own
+            // fields: the named ones win wherever the two have a field in
+            // common, and the rest of the spread value's fields come through
+            // as they are — which is all a spread value's fields can do, since
+            // which fields it has is not known here.
+            TermKind::Struct { fields, spread } => {
                 let mut entries = IndexMap::new();
                 for (name, field) in fields {
                     let temp = self.term(&field.value, body);
@@ -2839,7 +2847,14 @@ impl Lower<'_> {
                     let temp = self.fitted(&want, &have, temp, body);
                     entries.insert(FieldKey::named(name.clone()), temp);
                 }
-                let temp = self.emit(body, span, rep, Op::Struct(entries));
+                let temp = match spread {
+                    None => self.emit(body, span, rep, Op::Struct(entries)),
+                    Some(spread) => {
+                        let under = self.term(&spread.value, body);
+                        let over = self.emit(body, span, rep, Op::Struct(entries));
+                        self.emit(body, span, rep, Op::Merge(vec![under, over]))
+                    }
+                };
                 self.contain(temp, &term.ty);
                 temp
             }

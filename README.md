@@ -17,6 +17,12 @@ ruddy run
 
 Use `ruddy --help` to see all CLI commands. The standard library is installed under `$RUDDY_HOME/std`, or `~/.ruddy/std` when `RUDDY_HOME` is unset.
 
+A struct literal may spread one value's fields into itself with `..`, written
+last, as in `{ x: 1, ..base }`: the result has every field of `base` and the
+fields named before the `..`, which replace fields of the same name at
+whatever type they have, so `fn v => { x: 1, ..v }` updates or extends
+whatever struct it is given while keeping the rest of its fields.
+
 Immutable homogeneous arrays use `[value, ...]` literals and `[Type]` types.
 A literal may spread other arrays into place with `..`, as in `[..a, x, ..b]`,
 and a `match` may take an array apart by length with patterns such as `[]`,

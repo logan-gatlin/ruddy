@@ -946,6 +946,7 @@ pub enum ConstraintOrigin {
     ApplicationEffects,
     Raise,
     Projection,
+    StructSpread,
     Match,
     MatchScrutinee,
     MatchArm,
@@ -967,6 +968,7 @@ impl ConstraintOrigin {
             Self::ApplicationEffects => "application-effects",
             Self::Raise => "raise",
             Self::Projection => "projection",
+            Self::StructSpread => "struct-spread",
             Self::Match => "match",
             Self::MatchScrutinee => "match-scrutinee",
             Self::MatchArm => "match-arm",
@@ -1071,6 +1073,9 @@ pub enum Subject {
     /// The `..` of an array literal: what it spreads has to be an array of
     /// the literal's own type.
     Spread,
+    /// The `..` of a struct literal: what it spreads has to be a struct, and
+    /// the literal keeps every field of it that it does not name itself.
+    StructSpread,
 }
 
 impl Subject {
@@ -1106,6 +1111,7 @@ impl Subject {
             Self::CallbackAvailable => "callback-available",
             Self::EffectDeclaration => "effect-declaration",
             Self::Spread => "spread",
+            Self::StructSpread => "struct-spread",
         }
     }
 }
@@ -1119,6 +1125,23 @@ pub enum ConstraintKind {
         field: String,
         result: Rc<Ty>,
         base_span: Span,
+    },
+    /// Spread one value's fields into a struct literal. Distinct from
+    /// ordinary equality for the reason a projection is: a known non-struct
+    /// is diagnosed at the operand, as the value that has no fields to
+    /// spread, rather than as a mismatch against the row it was asked for.
+    Spread {
+        /// What was written after the `..`.
+        operand: Rc<Ty>,
+        /// What the literal asks of it: a struct that may or may not have
+        /// each field the literal names — holding anything where it does,
+        /// since the literal's own value replaces it — and past those, the
+        /// rest the result keeps.
+        demand: Rc<Ty>,
+        /// The literal's own type — its named fields, certainly there, over
+        /// the same rest — abandoned when the operand is no struct.
+        result: Rc<Ty>,
+        operand_span: Span,
     },
     /// Two types the program requires to be the same. `expected` is the side
     /// the context demanded — an annotation, a function's parameter, or the
@@ -2340,10 +2363,22 @@ impl Error {
     }
 }
 
+/// What asked a value to be a struct, for the wording of
+/// [`ErrorKind::NotAStruct`]: the complaint is the same, and what the reader
+/// wrote — and so what they might change — is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructDemand {
+    /// `v.x` — a field read off the value.
+    Projection,
+    /// `{ ..v }` — the value's fields spread into a struct literal.
+    Spread,
+}
+
 #[derive(Debug, Clone)]
 pub enum ErrorKind {
-    /// A field was read from a value whose outer type is known not to be a struct.
-    NotAStruct { base: Rc<Ty> },
+    /// A value whose outer type is known not to be a struct was asked for its
+    /// fields — read one at a time, or spread all at once.
+    NotAStruct { base: Rc<Ty>, demand: StructDemand },
     /// Two types that had to be equal are not. `expected` is the side the
     /// context demanded — an annotation, a function's parameter, or the arrow
     /// shape a call site needs — and `actual` is what the term turned out to
@@ -4662,7 +4697,7 @@ fn attach_ordinary_explanations(
             ErrorKind::Mismatch { expected, actual } => {
                 (describe_type(expected), describe_type(actual), None, None)
             }
-            ErrorKind::NotAStruct { base } => (
+            ErrorKind::NotAStruct { base, .. } => (
                 describe_type(base),
                 TypeDescription::Struct,
                 Some(ContradictionKind::ProjectionOnNonStruct),
@@ -6726,6 +6761,9 @@ impl Table {
     fn constraint_reason_for(&mut self, id: ConstraintId, kind: &ConstraintKind) -> ReasonId {
         let roots: Vec<&Rc<Ty>> = match kind {
             ConstraintKind::Project { base, result, .. } => vec![base, result],
+            ConstraintKind::Spread {
+                operand, result, ..
+            } => vec![operand, result],
             ConstraintKind::Equal { expected, actual } => vec![expected, actual],
             ConstraintKind::Let { bound, .. } => vec![bound],
             ConstraintKind::Instance { ty, .. } => vec![ty],
@@ -10123,9 +10161,12 @@ impl Table {
                 self.zonk_term(value, subst);
                 self.zonk_term(body, subst);
             }
-            TermKind::Struct(fields) => {
+            TermKind::Struct { fields, spread } => {
                 for field in fields.values_mut() {
                     self.zonk_term(&mut field.value, subst);
+                }
+                if let Some(spread) = spread {
+                    self.zonk_term(&mut spread.value, subst);
                 }
             }
             TermKind::Array(items) => {
@@ -10181,8 +10222,9 @@ impl Table {
     /// it spells `a`.
     fn zonk_error(&self, kind: &ErrorKind, subst: &mut Subst) -> ErrorKind {
         match kind {
-            ErrorKind::NotAStruct { base } => ErrorKind::NotAStruct {
+            ErrorKind::NotAStruct { base, demand } => ErrorKind::NotAStruct {
                 base: self.close(base, subst),
+                demand: *demand,
             },
             ErrorKind::Mismatch { expected, actual } => ErrorKind::Mismatch {
                 expected: self.close(expected, subst),

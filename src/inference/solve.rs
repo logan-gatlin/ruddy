@@ -394,6 +394,12 @@ impl Solve<'_> {
                     result,
                     base_span,
                 } => self.project(span, *base_span, base, field, result),
+                ConstraintKind::Spread {
+                    operand,
+                    demand,
+                    result,
+                    operand_span,
+                } => self.spread(span, *operand_span, operand, demand, result),
                 ConstraintKind::Equal { expected, actual } => self.unify(span, expected, actual),
                 ConstraintKind::Let {
                     symbol,
@@ -596,18 +602,7 @@ impl Solve<'_> {
             | Ty::Boolean
             | Ty::Arrow(..)
             | Ty::Sum(_) => {
-                let goal = Goal::Type {
-                    expected: Rc::new(Ty::unit()),
-                    actual: exposed.clone(),
-                };
-                let error = Error::new(base_span, ErrorKind::NotAStruct { base: exposed });
-                self.fail(
-                    base_span,
-                    Rule::Mismatch,
-                    goal,
-                    error,
-                    &[Assigned::Ty(result.clone())],
-                );
+                self.not_a_struct(base_span, exposed, super::StructDemand::Projection, result)
             }
             Ty::Rigid { id, name } => {
                 let error = Error::new(
@@ -648,6 +643,79 @@ impl Solve<'_> {
                 self.unify(field_span, &want, &base);
             }
         }
+    }
+
+    /// Solve a struct spread after exposing only the operand's outer
+    /// constructor: a value that is known to be no struct has no fields to
+    /// spread, and is told so at the operand rather than as a mismatch
+    /// against the row the literal asked for. Anything else — a struct, a
+    /// variable, a rigid — meets that row by unification, which decides the
+    /// rest: the fields the literal names may be there or not in the operand
+    /// and hold anything, and the fields it does not name go past them into
+    /// the rest the result keeps, which is noted here as lacking the named
+    /// ones so nothing can put one of them back.
+    fn spread(
+        &mut self,
+        span: Span,
+        operand_span: Span,
+        operand: &Rc<Ty>,
+        demand: &Rc<Ty>,
+        result: &Rc<Ty>,
+    ) {
+        let operand = self.table.resolve(operand);
+        let exposed = super::unfold(self.aliases, &operand);
+        match &*exposed {
+            Ty::Nat
+            | Ty::Int
+            | Ty::Real
+            | Ty::String
+            | Ty::Boolean
+            | Ty::Arrow(..)
+            | Ty::Array(_)
+            | Ty::Sum(_) => {
+                self.not_a_struct(operand_span, exposed, super::StructDemand::Spread, result)
+            }
+            _ => {
+                let origin = self.table.active_lacks_origin.clone().map(|mut origin| {
+                    origin.subject = super::Subject::StructSpread;
+                    origin.span = span;
+                    origin
+                });
+                self.table
+                    .with_lacks_origin(origin, |table| table.note_lacks(demand));
+                self.unify(span, demand, &operand);
+            }
+        }
+    }
+
+    /// Refuse a value whose outer constructor is known to be no struct where
+    /// one was asked for — read off, or spread — abandoning the type that
+    /// would have come of it.
+    fn not_a_struct(
+        &mut self,
+        span: Span,
+        exposed: Rc<Ty>,
+        demand: super::StructDemand,
+        result: &Rc<Ty>,
+    ) {
+        let goal = Goal::Type {
+            expected: Rc::new(Ty::unit()),
+            actual: exposed.clone(),
+        };
+        let error = Error::new(
+            span,
+            ErrorKind::NotAStruct {
+                base: exposed,
+                demand,
+            },
+        );
+        self.fail(
+            span,
+            Rule::Mismatch,
+            goal,
+            error,
+            &[Assigned::Ty(result.clone())],
+        );
     }
 
     /// Solve one qualifying match as a finite tree of arm-local constraints.

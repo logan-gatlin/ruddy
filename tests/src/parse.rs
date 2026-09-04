@@ -272,6 +272,116 @@ fn parses_array_spreads_anywhere_in_a_literal() {
     assert_eq!(parse_one("let copy = [..a]"), "let copy = [..a]");
 }
 
+/// A struct literal spreads one value after the fields it names: on its own,
+/// after any number of fields — quoted and numeric labels included — as a
+/// whole expression, nested, and with or without the trailing comma the
+/// field list has always allowed. It prints back as the `..` it was written
+/// as, with braces whatever the fields are named: the tuple and unit
+/// spellings would say the fields written are all there are.
+#[test]
+fn parses_a_struct_spread_after_its_fields() {
+    let out = parse(
+        lex(
+            "let ext = { a: 1, \"b c\": 2, 0: 3, ..f x, }\nlet copy = { ..c }",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    assert!(out.errors.is_empty(), "errors: {:#?}", out.errors);
+    let StmtKind::Let { body, .. } = &out.stmts[0].tracked else {
+        unreachable!()
+    };
+    let ExprKind::Struct {
+        fields,
+        spread: Some(spread),
+    } = &body.tracked.tracked
+    else {
+        panic!("expected a spread struct: {:#?}", body);
+    };
+    let names: Vec<&str> = fields.keys().map(|name| name.tracked.as_str()).collect();
+    assert_eq!(names, ["a", "b c", "0"]);
+    assert!(matches!(spread.value.tracked, ExprKind::Apply { .. }));
+    assert_eq!((spread.span.start, spread.span.end()), (34, 36));
+    let StmtKind::Let { body, .. } = &out.stmts[1].tracked else {
+        unreachable!()
+    };
+    let ExprKind::Struct {
+        fields,
+        spread: Some(spread),
+    } = &body.tracked.tracked
+    else {
+        panic!("expected a spread struct: {:#?}", body);
+    };
+    assert!(fields.is_empty());
+    assert!(matches!(spread.value.tracked, ExprKind::Ident { .. }));
+
+    assert_eq!(
+        parse_one("let ext = { a: 1, \"b c\": 2, 0: 3, ..f x, }"),
+        "let ext = { a: 1, \"b c\": 2, 0: 3, ..f x }"
+    );
+    assert_eq!(parse_one("let copy = { ..c, }"), "let copy = { ..c }");
+    assert_eq!(
+        parse_one("let nested = { inner: { x: 1, ..c }, ..{ y: 2, ..d } }"),
+        "let nested = { inner: { x: 1, ..c }, ..{ y: 2, ..d } }"
+    );
+    assert_eq!(
+        parse_one("let pair = { 0: 1, 1: 2, ..c }"),
+        "let pair = { 0: 1, 1: 2, ..c }"
+    );
+    assert_eq!(parse_one("let unit = { ..() }"), "let unit = { ..() }");
+    assert_eq!(
+        parse_one("let chosen = { x: 1, ..match c with | v => v end }"),
+        "let chosen = { x: 1, ..match c with | v => v end }"
+    );
+}
+
+/// A struct literal gets one spread, and it comes last: a second `..` and a
+/// field after the `..` are each refused where they begin, pointing back at
+/// the `..` they conflict with, and told apart so the reader knows which of
+/// the two rules they broke.
+#[test]
+fn a_struct_literal_spreads_one_value_and_spreads_it_last() {
+    let out = parse(lex("let bad = { ..a, ..b }", FileID::GENERATED).tokens);
+    let [error] = out.errors.as_slice() else {
+        panic!("expected one error: {:#?}", out.errors);
+    };
+    assert_eq!((error.span.start, error.span.end()), (17, 19));
+    assert!(matches!(
+        error.kind,
+        ErrorKind::SecondStructSpread { previous } if previous.start == 12
+    ));
+
+    let out = parse(lex("let bad = { x: 1, ..a, y: 2 }", FileID::GENERATED).tokens);
+    let [error] = out.errors.as_slice() else {
+        panic!("expected one error: {:#?}", out.errors);
+    };
+    assert_eq!((error.span.start, error.span.end()), (23, 24));
+    assert!(matches!(
+        error.kind,
+        ErrorKind::FieldAfterSpread { spread } if spread.start == 18
+    ));
+
+    // A quoted or numeric label after the `..` is the same complaint, at the
+    // label; so is a `_`, which is refused as a field after the spread
+    // before it can be refused as a field named nothing.
+    for src in [
+        "let bad = { ..a, \"q\": 1 }",
+        "let bad = { ..a, 0: 1 }",
+        "let bad = { ..a, _: 1 }",
+    ] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        let [error] = out.errors.as_slice() else {
+            panic!("{src}: expected one error: {:#?}", out.errors);
+        };
+        assert_eq!(error.span.start, 17, "{src}");
+        assert!(
+            matches!(error.kind, ErrorKind::FieldAfterSpread { spread } if spread.start == 12),
+            "{src}: {:?}",
+            error.kind
+        );
+    }
+}
+
 #[test]
 fn parses_numeric_projection_canonically() {
     let out = parse(lex("let value = pair.001", FileID::GENERATED).tokens);

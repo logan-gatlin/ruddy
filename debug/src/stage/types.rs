@@ -278,9 +278,12 @@ fn walk_locals(term: &Term, out: &mut Vec<Tracked<Symbol>>) {
             walk_locals(arg, out);
         }
         TermKind::Fn { body, .. } => walk_locals(body, out),
-        TermKind::Struct(fields) => {
+        TermKind::Struct { fields, spread } => {
             for field in fields.values() {
                 walk_locals(&field.value, out);
+            }
+            if let Some(spread) = spread {
+                walk_locals(&spread.value, out);
             }
         }
         TermKind::Array(items) => {

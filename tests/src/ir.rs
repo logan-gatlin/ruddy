@@ -199,7 +199,7 @@ fn term_fields<'a>(mint: &Mint, out: &'a Output, name: &str) -> &'a IndexMap<Str
         node = &body.kind;
     }
     match node {
-        TermKind::Struct(fields) => fields,
+        TermKind::Struct { fields, .. } => fields,
         other => panic!("expected a struct term, got {other:?}"),
     }
 }
@@ -610,7 +610,7 @@ fn unit_is_the_empty_struct() {
     let (mint, out) = built("let u = ()");
     assert!(matches!(
         term_value(&mint, &out, "u"),
-        TermKind::Struct(fields) if fields.is_empty()
+        TermKind::Struct { fields, spread: None } if fields.is_empty()
     ));
 }
 
@@ -713,7 +713,7 @@ fn duplicate_definitions_keep_the_first() {
     assert_eq!(out.program.terms.len(), 1);
     assert!(matches!(
         term_value(&mint, &out, "x"),
-        TermKind::Struct(fields) if fields.is_empty()
+        TermKind::Struct { fields, spread: None } if fields.is_empty()
     ));
 
     // The repeat's body is lowered all the same, though nothing keeps it: a
@@ -3038,6 +3038,34 @@ fn array_spreads_normalize_in_place() {
     );
 }
 
+/// A struct's spread survives normalization as the node it is, after the
+/// fields it was written after, and the literal's own duplicate-field rule
+/// is unchanged by it: a field written twice is still refused, and a field
+/// the spread value also has is not — choosing between those two is what a
+/// spread is for.
+#[test]
+fn struct_spreads_normalize_in_place() {
+    let source = "let c = { y: 2n }\nlet a = { x: 1n, ..c }\nlet b = { ..{ x: 3n, ..c } }";
+    assert_eq!(lowered(source), source);
+
+    let (mint, out) = built("let c = { y: 2n }\nlet a = { x: 1n, ..c }");
+    let TermKind::Struct {
+        fields,
+        spread: Some(spread),
+    } = term_value(&mint, &out, "a")
+    else {
+        panic!("a spread struct lowers to a struct with a spread");
+    };
+    assert_eq!(fields.keys().map(String::as_str).collect::<Vec<_>>(), ["x"]);
+    assert!(matches!(spread.value.kind, TermKind::Ident(_)));
+    assert_eq!((spread.span.start, spread.span.end()), (35, 37));
+
+    let (_, errors) = lowered_with_errors("let c = { y: 2n }\nlet a = { x: 1n, x: 2n, ..c }");
+    assert_eq!(errors, ["duplicate-field@35"], "{errors:#?}");
+    let (_, errors) = lowered_with_errors("let a = { x: 1n, ..{ x: 2n } }");
+    assert!(errors.is_empty(), "{errors:#?}");
+}
+
 /// [`lowered_with_errors`] for a program lowering should not complain about.
 fn lowered(src: &str) -> String {
     let (printed, errors) = lowered_with_errors(src);
@@ -3224,9 +3252,12 @@ fn references_of(term: &Term, out: &mut Vec<Symbol>) {
             references_of(value, out);
             references_of(body, out);
         }
-        TermKind::Struct(fields) => {
+        TermKind::Struct { fields, spread } => {
             for field in fields.values() {
                 references_of(&field.value, out);
+            }
+            if let Some(spread) = spread {
+                references_of(&spread.value, out);
             }
         }
         TermKind::Array(items) => {
@@ -3662,7 +3693,7 @@ fn a_rest_marker_survives_normalization() {
 fn tuples_lower_to_canonical_structs() {
     let (mint, out) = built("let value : (Nat, String) = (1n, \"x\")");
     let symbol = term_symbol(&mint, &out, "value");
-    let TermKind::Struct(fields) = &out.program.terms[&symbol].value.kind else {
+    let TermKind::Struct { fields, .. } = &out.program.terms[&symbol].value.kind else {
         panic!("a tuple expression lowers to a struct");
     };
     assert_eq!(

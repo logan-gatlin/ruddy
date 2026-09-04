@@ -774,7 +774,7 @@ impl Constrain<'_> {
                 }
                 self.table.fresh_type_for(Subject::RaiseResult)
             }
-            TermKind::Struct(fields) => {
+            TermKind::Struct { fields, spread } => {
                 let mut tys = IndexMap::new();
                 let mut provenance_fields = IndexMap::new();
                 for (name, field) in fields.iter_mut() {
@@ -789,14 +789,62 @@ impl Constrain<'_> {
                 if provenance != super::EffectProvenance::default() {
                     self.term_effect_provenance.insert(span, provenance);
                 }
-                // A literal's fields are all there, and are all it has: the
-                // tail is closed. Openness belongs to demands, not to values.
-                // Nothing of its own beside them, which is what makes a struct
-                // a struct rather than a shape of its own.
-                Rc::new(Ty::Struct(Row {
-                    labels: tys,
-                    rest: Rest::Closed,
-                }))
+                match spread {
+                    // A literal's fields are all there, and are all it has:
+                    // the tail is closed. Openness belongs to demands, not to
+                    // values. Nothing of its own beside them, which is what
+                    // makes a struct a struct rather than a shape of its own.
+                    None => Rc::new(Ty::Struct(Row {
+                        labels: tys,
+                        rest: Rest::Closed,
+                    })),
+                    // With a spread the literal has its own fields and then
+                    // whatever the spread value has past them, and that is
+                    // what the walk says: one rest, shared between what the
+                    // value is asked to be and what the literal is. The
+                    // named fields are the literal's own — certainly there,
+                    // holding the written value — whether or not the value
+                    // spread has them, and whatever it holds where it does;
+                    // so the demand on it names them too, each with a
+                    // presence and a type of its own that nothing else
+                    // mentions. Which value is spread is not for the walk to
+                    // know, so the demand is emitted as the constraint it is
+                    // and left to the solver — see [`Solve::spread`]
+                    // (super::solve::Solve::spread).
+                    Some(spread) => {
+                        self.infer_term(&mut spread.value);
+                        let rest = self.table.fresh_row_for(Subject::StructSpread);
+                        let shadowed = tys
+                            .keys()
+                            .map(|name| {
+                                let presence = self.table.fresh_presence_for(Subject::StructSpread);
+                                let ty = self.table.fresh_type_for(Subject::StructSpread);
+                                (name.clone(), RowField { presence, ty })
+                            })
+                            .collect();
+                        let demand = Rc::new(Ty::Struct(Row {
+                            labels: shadowed,
+                            rest: rest.clone(),
+                        }));
+                        let result = Rc::new(Ty::Struct(Row { labels: tys, rest }));
+                        // One subject, because one side of this ever reaches
+                        // a reader: the demand is fresh variables and cannot
+                        // conflict with anything, so a complaint is always
+                        // about what the value spread brought in.
+                        self.emit(
+                            spread.span.merge(spread.value.span),
+                            ConstraintOrigin::StructSpread,
+                            ConstraintSubjects::one(Subject::StructSpread),
+                            ConstraintKind::Spread {
+                                operand: spread.value.ty.clone(),
+                                demand,
+                                result: result.clone(),
+                                operand_span: spread.value.span,
+                            },
+                        );
+                        result
+                    }
+                }
             }
             // A spread item is an array of the literal's own type, checked as
             // such; a plain one is an element.
@@ -1550,14 +1598,21 @@ impl Constrain<'_> {
             // letting row unification line the two up — which decides the
             // same things, just without the better spans pushing gives. The
             // gate reads the written type's own syntax, never the table, so
-            // generation stays a description of the term.
-            (TermKind::Struct(fields), Ty::Struct(row))
-                if matches!(row.rest, Rest::Closed)
-                    && row
-                        .labels
-                        .values()
-                        .all(|field| matches!(field.presence, Presence::Present))
-                    && same_field_set(fields, &row.labels) =>
+            // generation stays a description of the term. A literal with a
+            // spread falls through too: what fields it has is the spread
+            // value's to say, and only the solver finds out.
+            (
+                TermKind::Struct {
+                    fields,
+                    spread: None,
+                },
+                Ty::Struct(row),
+            ) if matches!(row.rest, Rest::Closed)
+                && row
+                    .labels
+                    .values()
+                    .all(|field| matches!(field.presence, Presence::Present))
+                && same_field_set(fields, &row.labels) =>
             {
                 let mut provenance_fields = IndexMap::new();
                 for (name, field) in fields.iter_mut() {
