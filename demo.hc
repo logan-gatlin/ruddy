@@ -121,25 +121,31 @@ let forwarded = identity 7
 
 let identity = fn x => x
 
-let named =
-  let half = { v: 21 } in
-  { doubled: half.v, original: half }
+let named = do
+  let half = { v: 21 }
+  return { doubled: half.v, original: half }
+end
 
-let twice =
-  let same = fn x => x in
-  { a: same 1, b: same {} }
+let twice = do
+  let same = fn x => x
+  return { a: same 1, b: same {} }
+end
 
-let selfnaming =
-  let step = fn n => step n in
-  step
+let selfnaming = do
+  let step = fn n => step n
+  return step
+end
 
-let ascribed =
-  let total : Nat = 4 in
-  total
+let ascribed = do
+  let total : Nat = 4
+  return total
+end
 
-let shadowing =
-  let count = { v: 1 } in
-  count
+let shadowing = do
+  let count = { v: 1 }
+  let count = { v: 2 }
+  return count
+end
 
 let _ = id 7
 
@@ -156,9 +162,10 @@ effect IO = { print: Nat -> () }
 
 effect Console = !Log + !IO
 
-let greet : () -> Nat + !Log = fn _ =>
-  let _ = !Log 1 in
-  0
+let greet : () -> Nat + !Log = fn _ => do
+  let _ = !Log 1
+  return 0
+end
 
 let quiet : () -> Nat = fn _ =>
   handle greet () with

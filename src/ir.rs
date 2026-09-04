@@ -366,11 +366,9 @@ pub enum TermKind {
         name: Tracked<Symbol>,
         /// The written type, lowered, when the binding was ascribed one.
         ///
-        /// Boxed for the reason
-        /// [`parse::ExprKind::Let`](crate::parse::ExprKind::Let) boxes its
-        /// ascription: an annotation is the largest thing a term can carry and
-        /// the rarest, so inlining one would grow every node of every tree to
-        /// the size of the few that have one.
+        /// Boxed because an annotation is the largest thing a term can carry
+        /// and the rarest, so inlining one would grow every node of every
+        /// tree to the size of the few that have one.
         annotation: Option<Box<Annotation>>,
         value: Box<Term>,
         body: Box<Term>,
@@ -6177,7 +6175,8 @@ fn source_identifier(name: &str) -> bool {
         && !matches!(
             name,
             "_" | "let"
-                | "in"
+                | "do"
+                | "return"
                 | "type"
                 | "end"
                 | "with"
@@ -11113,85 +11112,9 @@ impl Builder<'_> {
                     .with_span(span)
                 })
             }
-            // A bare name is bound before the value is lowered, so a nested
-            // `let` may name itself the way a definition may; and released
-            // after the body, so nothing written past the expression can see
-            // it. Bound rather than declared, which is what makes it shadow
-            // silently: two definitions of one name are a repeat, and a scope
-            // inside one is not.
-            //
-            // A pattern is the other way round: the value is lowered first —
-            // the temporary is bound before any of the pattern's names, so
-            // none of them is in scope in it — and then the binding desugars
-            // to that temporary and a projection per name. A pattern that
-            // could fail is refused; see [`ErrorKind::RefutableBinding`].
-            ExprKind::Let {
-                pattern,
-                ty,
-                value,
-                body,
-            } => match pattern.tracked {
-                parse::PatternKind::Ident { name } => {
-                    let annotation = ty.map(|ty| Box::new(self.written(*ty, Place::Annotation)));
-                    let mark = self.terms.mark();
-                    let symbol = self
-                        .mint
-                        .local(self.module, Namespace::Terms, &name.tracked);
-                    self.terms.bind(name.tracked, symbol);
-                    let value = self.term(*value);
-                    let body = self.term(*body);
-                    self.terms.release(mark);
-                    TermKind::Let {
-                        name: name.span.track(symbol),
-                        annotation,
-                        value: Box::new(value),
-                        body: Box::new(body),
-                    }
-                    .with_span(span)
-                }
-                tracked => {
-                    let pspan = pattern.span;
-                    let pattern = pspan.track(tracked);
-                    let annotation = ty.map(|ty| Box::new(self.written(*ty, Place::Annotation)));
-                    let value = self.term(*value);
-                    let mark = self.terms.mark();
-                    let mut seen = Vec::new();
-                    let mut dropped = Vec::new();
-                    let pattern =
-                        self.pattern(pattern, &mut seen, &mut Binders::Local, &mut dropped);
-                    let body = self.term(*body);
-                    self.terms.release(mark);
-                    let body = bound_to_errors(dropped, body);
-                    match calm(&pattern) {
-                        Some(calm) => {
-                            let mut term = self.destructure(calm, value, annotation, body);
-                            term.span = span;
-                            term
-                        }
-                        // The binding has to accept every value, and this
-                        // pattern would not. Every name it would have bound is
-                        // still bound — to error values, which absorb — and
-                        // the value keeps its place, so its own mistakes are
-                        // still its own complaints.
-                        None => {
-                            let (at, found) = refuter(&pattern)
-                                .expect("a pattern that is not calm names what refutes it");
-                            self.error(at, ErrorKind::RefutableBinding { found });
-                            let mut names = Vec::new();
-                            pattern_binders(&pattern, &mut names);
-                            let inner = bound_to_errors(names, body);
-                            let held = self.fresh("%value", pspan);
-                            TermKind::Let {
-                                name: held,
-                                annotation,
-                                value: Box::new(value),
-                                body: Box::new(inner),
-                            }
-                            .with_span(span)
-                        }
-                    }
-                }
-            },
+            // A block is a spelling of the nested bindings it holds, one term
+            // per `let`; see [`Builder::block`].
+            ExprKind::Do { stmts, result } => self.block(span, stmts.into_iter(), result),
             ExprKind::Match { scrutinee, arms } => self.match_term(span, *scrutinee, arms),
             // A conditional is surface syntax for the ordinary exhaustive
             // Boolean match. Keeping the desugaring here means inference,
@@ -11980,6 +11903,128 @@ impl Builder<'_> {
     /// bound into any scope, so nothing written can name or capture it. The
     /// name starts with `%`, which no identifier can, so the debugger shows it
     /// recognizably as the compiler's own.
+    /// `do <stmt>* [return <expr>] end`, lowered to the nested `Let` terms it
+    /// is a spelling of: the first statement's binding holds the rest of the
+    /// block as its body, and the innermost body is the `return`'s value or,
+    /// when there is none, a unit literal spanning the block. Each term keeps
+    /// the span of its own statement, so a complaint about a binding points
+    /// at the line that wrote it.
+    ///
+    /// Written recursively because scope runs outward-in while the tree is
+    /// built inside-out: a statement's name has to be bound before the rest
+    /// of the block is lowered, and released after.
+    fn block(
+        &mut self,
+        span: Span,
+        mut stmts: std::vec::IntoIter<Stmt>,
+        result: Option<Box<Expr>>,
+    ) -> Term {
+        let Some(stmt) = stmts.next() else {
+            return match result {
+                Some(result) => self.term(*result),
+                None => TermKind::Struct {
+                    fields: Default::default(),
+                    spread: None,
+                }
+                .with_span(span),
+            };
+        };
+        let StmtKind::Let { pattern, ty, body } = stmt.tracked else {
+            // The parser refuses every other kind at its keyword and drops
+            // it. One that got through binds nothing, so the block goes on
+            // without it.
+            return self.block(span, stmts, result);
+        };
+        self.binding(stmt.span, *pattern, ty, body.tracked, |b| {
+            b.block(span, stmts, result)
+        })
+    }
+
+    /// One binding of a block: the name or pattern, what it is bound to, and
+    /// the term it is in scope for, lowered by `body` once the name is bound.
+    ///
+    /// A bare name is bound before the value is lowered, so a binding may
+    /// name itself the way a definition may; and released after the body, so
+    /// nothing written past the block can see it. Bound rather than declared,
+    /// which is what makes it shadow silently: two definitions of one name
+    /// are a repeat, and a scope inside one is not.
+    ///
+    /// A pattern is the other way round: the value is lowered first — the
+    /// temporary is bound before any of the pattern's names, so none of them
+    /// is in scope in it — and then the binding desugars to that temporary
+    /// and a projection per name. A pattern that could fail is refused; see
+    /// [`ErrorKind::RefutableBinding`].
+    fn binding(
+        &mut self,
+        span: Span,
+        pattern: parse::Pattern,
+        ty: Option<parse::Annotation>,
+        value: Expr,
+        body: impl FnOnce(&mut Self) -> Term,
+    ) -> Term {
+        match pattern.tracked {
+            parse::PatternKind::Ident { name } => {
+                let annotation = ty.map(|ty| Box::new(self.written(ty, Place::Annotation)));
+                let mark = self.terms.mark();
+                let symbol = self
+                    .mint
+                    .local(self.module, Namespace::Terms, &name.tracked);
+                self.terms.bind(name.tracked, symbol);
+                let value = self.term(value);
+                let body = body(self);
+                self.terms.release(mark);
+                TermKind::Let {
+                    name: name.span.track(symbol),
+                    annotation,
+                    value: Box::new(value),
+                    body: Box::new(body),
+                }
+                .with_span(span)
+            }
+            tracked => {
+                let pspan = pattern.span;
+                let pattern = pspan.track(tracked);
+                let annotation = ty.map(|ty| Box::new(self.written(ty, Place::Annotation)));
+                let value = self.term(value);
+                let mark = self.terms.mark();
+                let mut seen = Vec::new();
+                let mut dropped = Vec::new();
+                let pattern = self.pattern(pattern, &mut seen, &mut Binders::Local, &mut dropped);
+                let body = body(self);
+                self.terms.release(mark);
+                let body = bound_to_errors(dropped, body);
+                match calm(&pattern) {
+                    Some(calm) => {
+                        let mut term = self.destructure(calm, value, annotation, body);
+                        term.span = span;
+                        term
+                    }
+                    // The binding has to accept every value, and this
+                    // pattern would not. Every name it would have bound is
+                    // still bound — to error values, which absorb — and
+                    // the value keeps its place, so its own mistakes are
+                    // still its own complaints.
+                    None => {
+                        let (at, found) = refuter(&pattern)
+                            .expect("a pattern that is not calm names what refutes it");
+                        self.error(at, ErrorKind::RefutableBinding { found });
+                        let mut names = Vec::new();
+                        pattern_binders(&pattern, &mut names);
+                        let inner = bound_to_errors(names, body);
+                        let held = self.fresh("%value", pspan);
+                        TermKind::Let {
+                            name: held,
+                            annotation,
+                            value: Box::new(value),
+                            body: Box::new(inner),
+                        }
+                        .with_span(span)
+                    }
+                }
+            }
+        }
+    }
+
     fn fresh(&mut self, name: &str, span: Span) -> Tracked<Symbol> {
         span.track(self.mint.local(self.module, Namespace::Terms, name))
     }

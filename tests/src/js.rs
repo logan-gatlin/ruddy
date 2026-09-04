@@ -279,10 +279,10 @@ fn generated_runtime_preserves_arithmetic_switch_record_effect_and_literal_seman
          let read = fn _ => handle !Read.get () with | !Read.get _ => 42n end\n\
          effect Plus = { apply: Real -> Real }\n\
          effect Times = { apply: Real -> Real }\n\
-         let calculate : Real -> Real + !Plus + !Times = fn n => let x = !Plus.apply n in !Times.apply x\n\
+         let calculate : Real -> Real + !Plus + !Times = fn n => do let x = !Plus.apply n return !Times.apply x end\n\
          let calculated = fn n => handle (handle calculate n with | !Plus.apply value => value + 1.0 end) with | !Times.apply value => value * 2.0 end\n\
          effect Ask 'a = { get: () -> 'a }\n\
-         let asked = fn n => handle (let x = !Ask.get () in x + n) with | !Ask.get _ => 1.0 end\n",
+         let asked = fn n => handle do let x = !Ask.get () return x + n end with | !Ask.get _ => 1.0 end\n",
     )
     .to_unchecked();
     retag_numeric_global(&mut artifact, "nat_sub", artifact::Rep::Nat);

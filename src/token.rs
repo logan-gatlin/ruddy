@@ -9,7 +9,13 @@ pub enum Kind {
     Let,
     /// `extern`, declaring a target-provided top-level value.
     Extern,
-    In,
+    /// `do`, opening a `do <stmts> [return <expr>] end` block. The `end`
+    /// that closes it is the one every other delimited form ends with.
+    Do,
+    /// `return`, giving a `do` block its value. Reserved everywhere rather
+    /// than read by spelling: a handler arm's `return` reads the same token,
+    /// so the word means one thing at both positions and is a name at neither.
+    Return,
     Type,
     End,
     With,
@@ -437,7 +443,8 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                 let kind = match ident.as_str() {
                     "let" => Kind::Let,
                     "extern" => Kind::Extern,
-                    "in" => Kind::In,
+                    "do" => Kind::Do,
+                    "return" => Kind::Return,
                     "type" => Kind::Type,
                     "end" => Kind::End,
                     "with" => Kind::With,

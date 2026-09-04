@@ -462,7 +462,8 @@ fn bare_identifier(name: &str) -> bool {
             name,
             "_" | "let"
                 | "extern"
-                | "in"
+                | "do"
+                | "return"
                 | "if"
                 | "then"
                 | "else"
@@ -540,7 +541,8 @@ impl fmt::Display for Kind {
         match self {
             Kind::Let => f.write_str("let"),
             Kind::Extern => f.write_str("extern"),
-            Kind::In => f.write_str("in"),
+            Kind::Do => f.write_str("do"),
+            Kind::Return => f.write_str("return"),
             Kind::Type => f.write_str("type"),
             Kind::End => f.write_str("end"),
             Kind::With => f.write_str("with"),
@@ -642,7 +644,6 @@ impl parse::Expected {
             Self::Keyword("with") => "expected-with",
             Self::Keyword("then") => "expected-then",
             Self::Keyword("else") => "expected-else",
-            Self::Keyword("in") => "expected-in",
             Self::Keyword(_) => "expected-word",
             Self::Punctuation(")") => "expected-closing-parenthesis",
             Self::Punctuation("}") => "expected-closing-brace",
@@ -661,6 +662,10 @@ impl parse::Error {
             parse::ErrorKind::DiscardedArrayRest => "discarded-array-rest",
             parse::ErrorKind::SecondStructSpread { .. } => "second-struct-spread",
             parse::ErrorKind::FieldAfterSpread { .. } => "field-after-spread",
+            parse::ErrorKind::StatementAfterReturn { .. } => "statement-after-return",
+            parse::ErrorKind::BareReturn => "bare-return",
+            parse::ErrorKind::ReturnOutsideBlock => "return-outside-block",
+            parse::ErrorKind::DeclarationInBlock { .. } => "declaration-in-block",
         }
     }
 
@@ -798,6 +803,33 @@ impl parse::Error {
             .label("this field comes after the `..`")
             .related(spread, "the `..`")
             .help("move the `..` after the last field"),
+            parse::ErrorKind::StatementAfterReturn { returned } => Diagnostic::new(
+                "statement-after-return",
+                "`return` must be the last thing in its `do` block",
+                self.span,
+            )
+            .label("this comes after the `return`")
+            .related(returned, "the `return`")
+            .help("move this above the `return`, or take it out of the block"),
+            parse::ErrorKind::BareReturn => {
+                Diagnostic::new("bare-return", "`return` needs a value after it", self.span)
+                    .label("nothing follows this `return`")
+                    .help("write the value to return, or leave the `return` out to return `()`")
+            }
+            parse::ErrorKind::ReturnOutsideBlock => Diagnostic::new(
+                "return-outside-block",
+                "`return` can only end a `do` block",
+                self.span,
+            )
+            .label("no `do` block ends here")
+            .help("wrap this in `do ... end`, or leave the `return` out"),
+            parse::ErrorKind::DeclarationInBlock { keyword } => Diagnostic::new(
+                "declaration-in-block",
+                "a `do` block can only hold `let` definitions",
+                self.span,
+            )
+            .label(format!("a `{keyword}` cannot be written inside a block"))
+            .help(format!("move this `{keyword}` out to the file or module")),
         }
     }
 }
@@ -4212,27 +4244,44 @@ pub fn write_tag<V: Grouped>(
     }
 }
 
-/// Render `let <name> [: <type>] = <value> in <body>` — a name given a value
-/// for the length of one expression, in whichever tree it is being read from.
-///
-/// Nothing is grouped, and nothing here has to be. `in` begins no atom, so an
-/// expression written as the value ends in front of the `in` of its own accord,
-/// however far right it would otherwise run; and the body is the last thing on
-/// the line, so there is nothing after it to be drawn into. A `let` that needs
-/// parentheses needs them from whatever it was written inside, which is what
-/// [`Prec::Lambda`] says of it.
+/// Render `let <binder> [: <type>] = <value>` — one binding of a block, in
+/// whichever tree it is being read from. The value is not grouped: it ends in
+/// front of the next `let`, the `return`, or the `end` of its own accord,
+/// since none of the three begins an atom.
 pub fn write_let(
     f: &mut fmt::Formatter<'_>,
     binder: &impl fmt::Display,
     ty: Option<impl fmt::Display>,
     value: &impl fmt::Display,
-    body: &impl fmt::Display,
 ) -> fmt::Result {
     write!(f, "let {binder}")?;
     if let Some(ty) = ty {
         write!(f, " : {ty}")?;
     }
-    write!(f, " = {value} in {body}")
+    write!(f, " = {value}")
+}
+
+/// Render `do <stmt>* [return <value>] end` — one writer for both trees, so
+/// the punctuation of a block is one rule.
+///
+/// Nothing here needs grouping. Each statement ends in front of the next of
+/// its own accord, the `return`'s value is the last thing before the `end`,
+/// and the `end` closes the whole form. A block that needs parentheses needs
+/// them from whatever it was written inside, which is what [`Prec::Apply`]
+/// says of it.
+pub fn write_do<S: fmt::Display>(
+    f: &mut fmt::Formatter<'_>,
+    stmts: impl IntoIterator<Item = S>,
+    result: Option<&dyn fmt::Display>,
+) -> fmt::Result {
+    f.write_str("do")?;
+    for stmt in stmts {
+        write!(f, " {stmt}")?;
+    }
+    if let Some(result) = result {
+        write!(f, " return {result}")?;
+    }
+    f.write_str(" end")
 }
 
 /// Render `match <scrutinee> with | <pattern> => <body> ... end` — one

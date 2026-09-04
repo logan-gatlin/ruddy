@@ -19,7 +19,7 @@ use ruddy::{
 
 use crate::print::{
     Entry, Grouped, Mark, Prec, Shape, label, string, tuple_field_order, write_applied,
-    write_apply, write_array_pattern, write_arrow, write_binary, write_let, write_match,
+    write_apply, write_array_pattern, write_arrow, write_binary, write_do, write_let, write_match,
     write_project, write_row, write_struct, write_sum, write_tag, write_tuple, write_unary,
 };
 
@@ -70,12 +70,37 @@ impl<T> Node for Tracked<T> {
     }
 }
 
+/// One statement of a printed `do` block: the binding a `Let` term is, with
+/// its body left to the block. Exists so that [`write_do`] can be handed the
+/// statements as a sequence of things that print, the way the parse tree's
+/// printer hands it statements.
+struct Binding<'a> {
+    name: &'a str,
+    annotation: Option<Show<'a, Annotation>>,
+    value: Show<'a, TermKind>,
+}
+
+impl fmt::Display for Binding<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_let(f, &self.name, self.annotation.as_ref(), &self.value)
+    }
+}
+
 impl<'a, T> Show<'a, T> {
     /// Point the printer at a child node, keeping the mint. Takes the node
     /// rather than its kind so that a call site reads the same either way.
     fn show<N: Node>(&self, node: &'a N) -> Show<'a, N::Kind> {
         Show {
             node: node.kind(),
+            mint: self.mint,
+        }
+    }
+
+    /// Point the printer at a kind already reached, for the one walk that
+    /// steps through nodes by kind rather than by node.
+    fn show_kind<K>(&self, kind: &'a K) -> Show<'a, K> {
+        Show {
+            node: kind,
             mint: self.mint,
         }
     }
@@ -224,14 +249,12 @@ impl fmt::Display for Show<'_, Program> {
 impl Grouped for Show<'_, TermKind> {
     fn prec(&self) -> Prec {
         match self.node {
-            // A `let`'s body runs as far right as a lambda's does, so the two
-            // group alike. The parse tree's printer says the same, because it
-            // is the same syntax.
-            TermKind::Fn { .. } | TermKind::Let { .. } => Prec::Lambda,
+            TermKind::Fn { .. } => Prec::Lambda,
             // Self-delimiting on the right but not an application argument by
             // grammar; the parse tree's printer says the same, because it is
-            // the same syntax.
-            TermKind::Match { .. } | TermKind::Handle { .. } => Prec::Apply,
+            // the same syntax. A `let` prints as the `do` block it was written
+            // in, which closes with an `end` like the others.
+            TermKind::Match { .. } | TermKind::Handle { .. } | TermKind::Let { .. } => Prec::Apply,
             TermKind::Raise(_) => Prec::Lambda,
             TermKind::Binary {
                 op: ruddy::ir::BinaryOp::Or,
@@ -437,21 +460,43 @@ impl fmt::Display for Show<'_, TermKind> {
                 self.mint.name(arg.tracked),
                 self.show(&**body)
             ),
-            // The name comes off the mint, the way every other IR node's does,
-            // so what is printed is the name that was written even though the
-            // tree holds a symbol.
-            TermKind::Let {
-                name,
-                annotation,
-                value,
-                body,
-            } => write_let(
-                f,
-                &self.mint.name(name.tracked),
-                annotation.as_deref().map(|ty| self.show(ty)),
-                &self.show(&**value),
-                &self.show(&**body),
-            ),
+            // A `let` is one statement of the `do` block that wrote it, and a
+            // chain of them is the block's statements in order: each body that
+            // is itself a `let` folds into the same block, and the innermost
+            // body is what the block returns — or nothing, when it is the unit
+            // literal a block without a `return` lowers to. The names come off
+            // the mint, the way every other IR node's do, so what is printed is
+            // the name that was written even though the tree holds a symbol.
+            TermKind::Let { .. } => {
+                let mut stmts = Vec::new();
+                let mut term = self.node;
+                while let TermKind::Let {
+                    name,
+                    annotation,
+                    value,
+                    body,
+                } = term
+                {
+                    stmts.push(Binding {
+                        name: self.mint.name(name.tracked),
+                        annotation: annotation.as_deref().map(|ty| self.show(ty)),
+                        value: self.show(&**value),
+                    });
+                    term = body.kind();
+                }
+                let result = match term {
+                    TermKind::Struct {
+                        fields,
+                        spread: None,
+                    } if fields.is_empty() => None,
+                    result => Some(self.show_kind(result)),
+                };
+                write_do(
+                    f,
+                    stmts,
+                    result.as_ref().map(|result| result as &dyn fmt::Display),
+                )
+            }
             // Braces whatever the fields are named, for the reason the parse
             // tree's printer gives: a spread says the fields written are not
             // all there are, and the tuple and unit spellings say they are.

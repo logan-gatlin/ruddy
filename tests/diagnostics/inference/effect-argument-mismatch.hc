@@ -1,2 +1,2 @@
 effect Ask 'a = { get: () -> 'a }
-let bad = fn _ => let n : Nat = !Ask.get () in let s : String = !Ask.get () in ()
+let bad = fn _ => do let n : Nat = !Ask.get () let s : String = !Ask.get () end

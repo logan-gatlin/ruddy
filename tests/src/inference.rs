@@ -603,9 +603,10 @@ fn captured_presence_activates_nested_closure_result_guarantee() {
         "extern follows: { input when 'u: Nat } -> { output when 'e: Nat }\n\
          where (not 'u) or 'e = \"host.follows\"\n\
          let needs_output: { output: Nat } -> Nat = fn value => value.output\n\
-         let make = fn captured =>\n\
+         let make = fn captured => do\n\
            let nested = fn _ => follows captured\n\
-           in nested\n\
+           return nested\n\
+         end\n\
          let good = needs_output ((make { input: 1n }) {})",
     );
 }
@@ -5157,7 +5158,8 @@ fn an_assumption_compares_a_sum_argument_as_a_sum() {
 /// lambda applied to its value, where the two uses would have to agree.
 #[test]
 fn a_nested_let_is_generalized() {
-    let (mint, _, output) = inferred("let pair = let id = fn x => x in { a: id 1n, b: id {} }");
+    let (mint, _, output) =
+        inferred("let pair = do let id = fn x => x return { a: id 1n, b: id {} } end");
     assert_eq!(scheme(&mint, &output, "pair"), "{ a: Nat, b: () }");
 }
 
@@ -5166,8 +5168,9 @@ fn a_nested_let_is_generalized() {
 /// restriction to protect.
 #[test]
 fn a_nested_let_generalizes_whatever_its_value_is() {
-    let (mint, _, output) =
-        inferred("let e = let box = { it: fn x => x } in { a: box.it 1n, b: box.it {} }");
+    let (mint, _, output) = inferred(
+        "let e = do let box = { it: fn x => x } return { a: box.it 1n, b: box.it {} } end",
+    );
     assert_eq!(scheme(&mint, &output, "e"), "{ a: Nat, b: () }");
 }
 
@@ -5180,17 +5183,17 @@ fn a_nested_let_quantifies_only_what_it_owns() {
     // The field's variable is minted inside the let, by the projection, and
     // then dropped out of the let's range when `p`'s own variable is bound to a
     // type carrying it. So the argument and the result are one type.
-    let (mint, _, output) = inferred("let projected = fn p => let q = p.x in q");
+    let (mint, _, output) = inferred("let projected = fn p => do let q = p.x return q end");
     assert_eq!(scheme(&mint, &output, "projected"), "{ x: 'a, ..'b } -> 'a");
 
     // The same, without the projection in the way.
-    let (mint, _, output) = inferred("let held = fn p => let q = p in q");
+    let (mint, _, output) = inferred("let held = fn p => do let q = p return q end");
     assert_eq!(scheme(&mint, &output, "held"), "'a -> 'a");
 
     // And both halves at once: `dup` generalizes, so it is used at two types,
     // while `p` — the lambda's — does not, so the two uses share it.
     let (mint, _, output) =
-        inferred("let shared = fn p => let dup = fn x => x in { a: dup p, b: dup 1n }");
+        inferred("let shared = fn p => do let dup = fn x => x return { a: dup p, b: dup 1n } end");
     assert_eq!(scheme(&mint, &output, "shared"), "'a -> { a: 'a, b: Nat }");
 }
 
@@ -5200,7 +5203,7 @@ fn a_nested_let_quantifies_only_what_it_owns() {
 /// polymorphically recursive.
 #[test]
 fn a_nested_let_names_itself_monomorphically() {
-    let (mint, _, output) = inferred("let looping = let f = fn n => f n in f");
+    let (mint, _, output) = inferred("let looping = do let f = fn n => f n return f end");
     assert_eq!(scheme(&mint, &output, "looping"), "'a -> 'b");
 }
 
@@ -5210,27 +5213,27 @@ fn a_nested_let_names_itself_monomorphically() {
 fn nested_lets_nest_and_sit_wherever_an_expression_does() {
     for (src, name, printed) in [
         (
-            "let chained = let one = 1n in let two = { v: one } in two",
+            "let chained = do let one = 1n let two = { v: one } return two end",
             "chained",
             "{ v: Nat }",
         ),
         (
-            "let inside = fn p => let x = p.x in { first: x, second: x }",
+            "let inside = fn p => do let x = p.x return { first: x, second: x } end",
             "inside",
             "{ x: 'a, ..'b } -> { first: 'a, second: 'a }",
         ),
         (
-            "let in_field = { v: let n = 1n in n }",
+            "let in_field = { v: do let n = 1n return n end }",
             "in_field",
             "{ v: Nat }",
         ),
         (
-            "let id = fn x => x\nlet applied = id (let n = 1n in n)",
+            "let id = fn x => x\nlet applied = id (do let n = 1n return n end)",
             "applied",
             "Nat",
         ),
         (
-            "let n = 1n\nlet shadowed = let n = { v: 2n } in n",
+            "let n = 1n\nlet shadowed = do let n = { v: 2n } return n end",
             "shadowed",
             "{ v: Nat }",
         ),
@@ -5245,12 +5248,12 @@ fn nested_lets_nest_and_sit_wherever_an_expression_does() {
 /// scheme published is the annotation's.
 #[test]
 fn an_annotated_nested_let_is_checked_against_its_annotation() {
-    let (mint, _, output) = inferred("let annotated = let n : Nat = 1n in n");
+    let (mint, _, output) = inferred("let annotated = do let n : Nat = 1n return n end");
     assert_eq!(scheme(&mint, &output, "annotated"), "Nat");
 
     // A value that does not match is refused at the value, which is the term
     // the reader can change.
-    let src = "let e = let n : Nat = {} in n";
+    let src = "let e = do let n : Nat = {} return n end";
     let (_, _, output) = infer_src(src);
     assert_eq!(output.errors().len(), 1, "{:#?}", output.errors());
     assert_eq!(
@@ -5264,7 +5267,7 @@ fn an_annotated_nested_let_is_checked_against_its_annotation() {
 
     // And the annotation is what the name means inside its own value, so a
     // recursive use is checked against it.
-    let (mint, _, output) = inferred("let e = let f : Nat -> Nat = fn n => f n in f 1n");
+    let (mint, _, output) = inferred("let e = do let f : Nat -> Nat = fn n => f n return f 1n end");
     assert_eq!(scheme(&mint, &output, "e"), "Nat");
 }
 
@@ -5275,17 +5278,19 @@ fn an_annotated_nested_let_is_checked_against_its_annotation() {
 #[test]
 fn a_nested_annotation_promises_what_it_declares() {
     // A hole the value decides is no complaint.
-    let (mint, _, output) = infer_src("let e = let n : { a when _: Nat } = { a: 1n } in n");
+    let (mint, _, output) =
+        infer_src("let e = do let n : { a when _: Nat } = { a: 1n } return n end");
     assert!(output.errors().is_empty(), "{:#?}", output.errors());
     assert_eq!(scheme(&mint, &output, "e"), "{ a: Nat }");
 
     // An annotation the value keeps open is no complaint either.
-    let (_, _, output) = infer_src("let e = let f : { x: Nat, .. } -> Nat = fn p => p.x in f");
+    let (_, _, output) =
+        infer_src("let e = do let f : { x: Nat, .. } -> Nat = fn p => p.x return f end");
     assert!(output.errors().is_empty(), "{:#?}", output.errors());
 
     // And a declared variable the value decides is refused at the expression
     // that decided it, exactly as a definition's own is.
-    let src = "let e = let f : 'a -> 'a = fn x => 0n in f";
+    let src = "let e = do let f : 'a -> 'a = fn x => 0n return f end";
     let (_, _, output) = infer_src(src);
     assert_eq!(output.errors().len(), 1, "{:#?}", output.errors());
     assert_eq!(output.errors()[0].kind.code(), "rigid-broken");
@@ -5301,8 +5306,8 @@ fn a_nested_annotation_promises_what_it_declares() {
 #[test]
 fn every_nested_let_publishes_a_scheme() {
     let (mint, _, output) = inferred(
-        "let a = let id = fn x => x in { one: id 1n, two: id {} }\n\
-         let b = fn p => let q = p.x in q\n",
+        "let a = do let id = fn x => x return { one: id 1n, two: id {} } end\n\
+         let b = fn p => do let q = p.x return q end\n",
     );
     let locals: Vec<(&str, String)> = output
         .semantics()
@@ -5332,7 +5337,7 @@ fn every_nested_let_publishes_a_scheme() {
 /// its body's, which is what the expression evaluates to.
 #[test]
 fn every_term_inside_a_nested_let_is_typed() {
-    let (mint, out, _) = inferred("let a = let n = 1n in { v: n }");
+    let (mint, out, _) = inferred("let a = do let n = 1n return { v: n } end");
     assert_eq!(
         body_types(&term_decl(&mint, &out, "a").value),
         [
@@ -5347,7 +5352,8 @@ fn every_term_inside_a_nested_let_is_typed() {
 
     // And no solver variable survives anywhere 'in one, including the parts
     // generalization never numbered.
-    let (_, out, _) = infer_src("let a = fn p => let q = fn z => z in { held: p, made: q }");
+    let (_, out, _) =
+        infer_src("let a = fn p => do let q = fn z => z return { held: p, made: q } end");
     for decl in out.program.terms.values() {
         for ty in body_tys(&decl.value) {
             assert!(!mentions_a_variable(&ty), "{ty}");
@@ -5360,7 +5366,7 @@ fn every_term_inside_a_nested_let_is_typed() {
 /// what order is written down as a constraint that carries its two lists.
 #[test]
 fn a_nested_let_is_said_as_two_constraint_kinds() {
-    let (mint, _, output) = inferred("let a = let id = fn x => x in id 1n");
+    let (mint, _, output) = inferred("let a = do let id = fn x => x return id 1n end");
     // One `let` carrying everything the expression asked for, and then the
     // definition's own equation tying it to what `a` is.
     let generated = constraints(&mint, &output, "a");
@@ -5404,11 +5410,11 @@ fn a_nested_let_is_said_as_two_constraint_kinds() {
 fn a_local_leaves_every_sort_of_outer_variable_alone() {
     for (src, printed) in [
         (
-            "let f : (#A | ..) -> Nat = fn s => let q = s in 1n",
+            "let f : (#A | ..) -> Nat = fn s => do let q = s return 1n end",
             "#A | ..'a",
         ),
         (
-            "let f : { a when _: Nat } -> Nat = fn r => let q = r in 1n",
+            "let f : { a when _: Nat } -> Nat = fn r => do let q = r return 1n end",
             "{ a when 'a: Nat }",
         ),
     ] {
@@ -5432,11 +5438,11 @@ fn a_local_leaves_every_sort_of_outer_variable_alone() {
 fn a_published_scheme_keeps_its_presences_below_its_types() {
     let (mint, _, output) = inferred(
         "let outer = fn r =>\n\
-         \x20 let inner = fn s => r in\n\
-         \x20 match r with\n\
+         \x20 do let inner = fn s => r\n\
+         \x20 return match r with\n\
          \x20   | {x} => inner\n\
          \x20   | {} => inner\n\
-         \x20 end",
+         \x20 end end",
     );
     let symbol = symbol_named(&mint, output.semantics().locals().keys().copied(), "inner");
     let scheme = &output.semantics().locals()[&symbol];
@@ -5457,12 +5463,12 @@ fn a_published_scheme_keeps_its_presences_below_its_types() {
     // argument are positions like the core of an arrow.
     for (src, printed) in [
         (
-            "let k = let g : (#A Nat | ..'r) -> Nat = fn v => 1n in g",
+            "let k = do let g : (#A Nat | ..'r) -> Nat = fn v => 1n return g end",
             "#A Nat | ..'a -> Nat",
         ),
         (
             "type Box 'A = { it: 'A }\n\
-             let k = let f : Box 'b -> 'b = fn x => x.it in f",
+             let k = do let f : Box 'b -> 'b = fn x => x.it return f end",
             "Box 'a -> 'a",
         ),
     ] {
@@ -5984,7 +5990,7 @@ fn a_wildcard_fn_argument_still_has_a_domain() {
 #[test]
 fn a_discarded_value_is_still_typechecked() {
     // The assertion holding, statement and expression.
-    let (_, _, output) = inferred("let _ : Nat = 3n  let a = let _ : Nat = 4n in 5n");
+    let (_, _, output) = inferred("let _ : Nat = 3n  let a = do let _ : Nat = 4n return 5n end");
     assert!(output.errors().is_empty());
 
     // And failing: a lambda is not a Nat, discarded or not.
@@ -6003,7 +6009,7 @@ fn a_discarded_value_is_still_typechecked() {
         output.errors()[0].kind,
         ErrorKind::Mismatch { .. }
     ));
-    let (_, _, output) = infer_src("let a = let _ = 1n 2n in 3n");
+    let (_, _, output) = infer_src("let a = do let _ = 1n 2n return 3n end");
     assert_eq!(output.errors().len(), 1, "{:#?}", output.errors());
     assert!(matches!(
         output.errors()[0].kind,
@@ -6016,7 +6022,7 @@ fn a_discarded_value_is_still_typechecked() {
 /// `y`'s returned — exactly the demand the equivalent match makes.
 #[test]
 fn a_wildcard_struct_leaf_still_demands_its_field() {
-    let (mint, _, output) = inferred("let use_y = fn p => let {x: _, y} = p in y");
+    let (mint, _, output) = inferred("let use_y = fn p => do let {x: _, y} = p return y end");
     assert_eq!(scheme(&mint, &output, "use_y"), "{ x: 'a, y: 'b } -> 'b");
 
     let (mint, _, output) = inferred("let use_y = fn p => match p with | {x: _, y} => y end");
@@ -6143,9 +6149,9 @@ fn an_exact_let_pattern_is_exact() {
     assert_eq!(scheme(&mint, &output, "x"), "Nat");
 
     // The expression form makes the same two demands.
-    let (_, _, output) = infer_src("let a = let {x} = {x: 1n, y: 2n} in x");
+    let (_, _, output) = infer_src("let a = do let {x} = {x: 1n, y: 2n} return x end");
     assert_eq!(output.errors().len(), 1, "{:#?}", output.errors());
-    let (mint, _, output) = inferred("let a = let {x, ..} = {x: 1n, y: 2n} in x");
+    let (mint, _, output) = inferred("let a = do let {x, ..} = {x: 1n, y: 2n} return x end");
     assert_eq!(scheme(&mint, &output, "a"), "Nat");
 }
 
@@ -6438,8 +6444,8 @@ fn nested_presence_guards_conjoin_and_name_nested_paths() {
 #[test]
 fn refinement_reports_are_published_in_source_definition_order() {
     let (mint, _, output) = inferred(
-        "let first = fn v => let _ = second v in\n\
-         match v with | {x} => 1n | {y} => 2n end\n\
+        "let first = fn v => do let _ = second v\n\
+         return match v with | {x} => 1n | {y} => 2n end end\n\
          let second = fn v => match v with | {x} => {} | {y} => {} end",
     );
     let mut definitions: Vec<&str> = output
@@ -6467,8 +6473,8 @@ fn overlap_uses_exclusion_and_arm_assumptions_do_not_leak() {
 
     let (mint, _, output) = inferred(
         "let one : { x when 'a: Nat, y when 'b: Nat, .. } -> {} where 'a != 'b = fn v => {}\n\
-         let f = fn v => let _ = match v with\n\
-         | {x, ..} => {} | {y, ..} => one v | _ => {} end in one v",
+         let f = fn v => do let _ = match v with\n\
+         | {x, ..} => {} | {y, ..} => one v | _ => {} end return one v end",
     );
     assert_eq!(
         scheme(&mint, &output, "f"),
@@ -6824,7 +6830,7 @@ fn failed_nominal_congruence_rolls_back_active_refinement_state() {
 fn guarded_assignments_leave_absent_payloads_irrelevant() {
     let (mint, _, output) = inferred(
         "let f = fn v => match v with\n\
-         | {x} => let q : { \\gone, .. } = x in 1n\n\
+         | {x} => do let q : { \\gone, .. } = x return 1n end\n\
          | {y} => 2n end",
     );
     let printed = scheme(&mint, &output, "f");
@@ -6851,8 +6857,8 @@ fn guarded_assignments_leave_absent_payloads_irrelevant() {
 fn an_undecided_presence_survives_guarded_local_instantiation() {
     let (_, out, output) = infer_src(
         "let f =\n\
-         let bad : { y when 'a: Nat } = nope in\n\
-         fn v => match v with | {x} => bad | {z} => {} end",
+         do let bad : { y when 'a: Nat } = nope\n\
+         return fn v => match v with | {x} => bad | {z} => {} end end",
     );
 
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
@@ -6925,8 +6931,8 @@ fn tautological_guarded_relations_and_unreachable_requirements_are_recorded_safe
 fn a_guarded_local_annotation_is_checked_under_its_arm_premise() {
     let src = "let need : { x when 'x: Nat, y when 'y: Nat } -> {} where 'x != 'y = fn v => {}\n\
                let f = fn tag => match tag with\n\
-               | {a} => let g : { x when 'x: Nat, y when 'y: Nat } -> {} where 'x or 'y =\n\
-               fn v => need v in g { x: 1n, y: 2n }\n\
+               | {a} => do let g : { x when 'x: Nat, y when 'y: Nat } -> {} where 'x or 'y =\n\
+               fn v => need v return g { x: 1n, y: 2n } end\n\
                | {b} => {} end";
     let (_, _, output) = infer_src(src);
     let annotation = src.find("{ x when 'x").expect("need's annotation");
@@ -6948,7 +6954,7 @@ fn an_inferred_local_keeps_the_requirement_of_its_arm() {
     let src = "let choose : { x when 'a: Nat, y when 'b: Nat } -> Nat where 'a != 'b =\n\
                fn v => match v with | {x} => x | {y} => y end\n\
                let f = fn tag => match tag with\n\
-               | {a} => let g = fn w => choose w in g {}\n\
+               | {a} => do let g = fn w => choose w return g {} end\n\
                | {b} => 0n end\n\
                let bad = f { a: 1n }";
     let (_, _, output) = infer_src(src);
@@ -6963,8 +6969,8 @@ fn an_inferred_local_keeps_the_requirement_of_its_arm() {
 #[test]
 fn local_instance_requirements_keep_their_reserved_source_slot() {
     let src = "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
-               let f = let g = fn a => match a with | {x} => {} | {y} => {} end in\n\
-               let _ = g {} in p {}";
+               let f = do let g = fn a => match a with | {x} => {} | {y} => {} end\n\
+               let _ = g {} return p {} end";
     let (_, _, output) = infer_src(src);
     let flipped = output
         .semantics()
@@ -7001,7 +7007,7 @@ fn local_instance_requirements_keep_their_reserved_source_slot() {
 fn captured_arm_requirements_keep_their_source_order() {
     let src = "let equal : { x when 'a: Nat, y when 'b: Nat, .. } -> {} where 'a = 'b = fn v => {}\n\
                let different : { x when 'a: Nat, y when 'b: Nat, .. } -> {} where 'a != 'b = fn v => {}\n\
-               let f = fn v => let _ = match v with | _ => equal v end in different v";
+               let f = fn v => do let _ = match v with | _ => equal v end return different v end";
     let (_, _, output) = infer_src(src);
     let flipped = output
         .semantics()
@@ -7035,8 +7041,8 @@ fn a_guarded_batch_can_own_the_single_store_flip() {
 
     let src = "let f : { x when 'a: Nat, .. } -> {} where 'a = fn v =>\n\
                match v with\n\
-               | {x, ..} => let g : { z when 'p: Nat, .. } where 'p and not 'p =\n\
-               { z: 1n } in {}\n\
+               | {x, ..} => do let g : { z when 'p: Nat, .. } where 'p and not 'p =\n\
+               { z: 1n } return {} end\n\
                | rest => {} end";
     let (_, _, output) = infer_src(src);
     assert!(
@@ -7050,8 +7056,8 @@ fn a_guarded_batch_can_own_the_single_store_flip() {
 #[test]
 fn a_prior_store_flip_does_not_turn_later_arms_into_a_cascade() {
     let src = "let one = fn a => match a with | {x} => {} | {y} => {} end\n\
-               let f = fn v => let _ = one {} in\n\
-               match v with | {x} => 1n | {y} => 2n end";
+               let f = fn v => do let _ = one {}\n\
+               return match v with | {x} => 1n | {y} => 2n end end";
     let (_, _, output) = infer_src(src);
     assert_eq!(output.errors().len(), 1, "{:#?}", output.errors());
     assert!(
@@ -7106,8 +7112,8 @@ fn a_shared_presence_prints_one_name() {
 fn an_entailed_presence_folds_back_at_generalization() {
     let (mint, _, output) = infer_src(
         "let h = fn v =>\n\
-         \x20 let {x, ..} = v in\n\
-         \x20 match v with | {x} => {} | {y} => {} end",
+         \x20 do let {x, ..} = v\n\
+         \x20 return match v with | {x} => {} | {y} => {} end end",
     );
     assert_eq!(scheme(&mint, &output, "h"), "{ x: 'a } -> ()");
 }
@@ -7303,9 +7309,9 @@ fn a_clause_covers_what_its_whole_group_needs() {
 #[test]
 fn a_nested_annotation_is_the_contract_for_its_presences() {
     let src = "let k =\n\
-               \x20 let g : { x when 'a: Nat, y when 'b: Nat } -> {} where 'a or 'b = fn v =>\n\
-               \x20   match v with | {x} => {} | {y} => {} end in\n\
-               \x20 g { x: 1n, y: 2n }";
+               \x20 do let g : { x when 'a: Nat, y when 'b: Nat } -> {} where 'a or 'b = fn v =>\n\
+               \x20   match v with | {x} => {} | {y} => {} end\n\
+               \x20 return g { x: 1n, y: 2n } end";
     let (_, _, output) = infer_src(src);
     let [error] = output.errors() else {
         panic!("expected one error: {:#?}", output.errors());
@@ -7316,15 +7322,18 @@ fn a_nested_annotation_is_the_contract_for_its_presences() {
         "the annotation allows `'a or 'b`, but the definition requires `'a != 'b`"
     );
     // The use satisfies `a or b`, so it is not what is wrong here.
-    assert_eq!(error.span.start, 18);
+    assert_eq!(
+        error.span.start,
+        src.find("{ x when").expect("the annotation")
+    );
 
     // A clause the value keeps is accepted, and it — not the `a or b` the open
     // arms needed — is what the body of the `let` sees. So a use that violates
     // it is refused where it is written.
     let src = "let k =\n\
-               \x20 let g : { x when 'a: Nat, y when 'b: Nat, .. } -> {} where 'a != 'b = fn v =>\n\
-               \x20   match v with | {x, ..} => {} | {y, ..} => {} end in\n\
-               \x20 g { x: 1n, y: 2n }";
+               \x20 do let g : { x when 'a: Nat, y when 'b: Nat, .. } -> {} where 'a != 'b = fn v =>\n\
+               \x20   match v with | {x, ..} => {} | {y, ..} => {} end\n\
+               \x20 return g { x: 1n, y: 2n } end";
     let (mint, _, output) = infer_src(src);
     let [error] = output.errors() else {
         panic!("expected one error: {:#?}", output.errors());
@@ -7353,7 +7362,7 @@ fn a_nested_annotation_is_the_contract_for_its_presences() {
 fn a_flipped_store_silences_a_nested_clause() {
     let src = "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
                let bad = p {}\n\
-               let k = let g : { x when 'a: Nat } -> {} where 'a = fn v => {} in g";
+               let k = do let g : { x when 'a: Nat } -> {} where 'a = fn v => {} return g end";
     let (mint, _, output) = infer_src(src);
     let [error] = output.errors() else {
         panic!("expected one error: {:#?}", output.errors());
@@ -7447,7 +7456,7 @@ fn the_first_flipping_batch_owns_the_error() {
 #[test]
 fn a_nested_annotation_carries_its_clause_too() {
     let (mint, _, output) =
-        inferred("let g = fn v => let h : { x when 'a: Nat } where 'a = v in h");
+        inferred("let g = fn v => do let h : { x when 'a: Nat } where 'a = v return h end");
     assert_eq!(scheme(&mint, &output, "g"), "{ x: Nat } -> { x: Nat }");
     assert!(
         store(&output)
@@ -7697,8 +7706,8 @@ fn an_effect_variable_that_links_nothing_is_closed() {
 
     let (mint, _, output) = inferred(&format!(
         "{EFFECTS}let greet : () -> Nat + !Log = fn _ =>\n\
-         let _ = !Log.write 1n in\n\
-         0n"
+         do let _ = !Log.write 1n\n\
+         return 0n end"
     ));
     assert_eq!(scheme(&mint, &output, "greet"), "() -> Nat + !Log");
 }
@@ -7709,7 +7718,7 @@ fn an_effect_variable_that_links_nothing_is_closed() {
 #[test]
 fn a_handler_discharges_what_its_arms_cover() {
     let (mint, _, output) = inferred(&format!(
-        "{EFFECTS}let greet : () -> Nat + !Log = fn _ => let _ = !Log.write 1n in 0n\n\
+        "{EFFECTS}let greet : () -> Nat + !Log = fn _ => do let _ = !Log.write 1n return 0n end\n\
          let quiet : () -> Nat = fn _ =>\n\
            handle greet () with | !Log.write s => () | return x => x end\n\
          let loud : () -> Nat + !IO = fn _ =>\n\
@@ -7734,9 +7743,9 @@ fn a_handler_discharges_what_its_arms_cover() {
 fn same_interface_effects_are_interchangeable_across_modules() {
     let src = "module Foo =\n  effect Log = { write: Nat -> () }\nend\n\
                module Bar =\n  effect Log = { write: Nat -> () }\nend\n\
-               let foo : Nat -> {} + Foo::!Log = fn n => let _ = Foo::!Log.write n in {}\n\
-               let bar : Nat -> {} + Bar::!Log = fn n => let _ = Bar::!Log.write n in {}\n\
-               let cross : Nat -> {} + Foo::!Log = fn n => let _ = Bar::!Log.write n in {}\n\
+               let foo : Nat -> {} + Foo::!Log = fn n => do let _ = Foo::!Log.write n return {} end\n\
+               let bar : Nat -> {} + Bar::!Log = fn n => do let _ = Bar::!Log.write n return {} end\n\
+               let cross : Nat -> {} + Foo::!Log = fn n => do let _ = Bar::!Log.write n return {} end\n\
                let quiet = fn n => handle Foo::!Log.write n with | Bar::!Log.write _ => {} end";
     let (mint, _ir, output) = inferred(src);
     assert_eq!(scheme(&mint, &output, "foo"), "Nat -> () + !Log");
@@ -7841,11 +7850,11 @@ fn a_row_of_effects_may_be_handed_to_a_declaration() {
 #[test]
 fn an_application_opens_the_callees_row() {
     let (mint, _, output) = inferred(&format!(
-        "{EFFECTS}let greet : () -> Nat + !Log = fn _ => let _ = !Log.write 1n in 0n\n\
+        "{EFFECTS}let greet : () -> Nat + !Log = fn _ => do let _ = !Log.write 1n return 0n end\n\
          let both : () -> Nat + !Log + !IO = fn _ =>\n\
-           let n = greet () in\n\
-           let _ = !IO.print n in\n\
-           n\n\
+           do let n = greet ()\n\
+           let _ = !IO.print n\n\
+           return n end\n\
          let just : () -> Nat + !Log = fn _ => greet ()"
     ));
     assert_eq!(scheme(&mint, &output, "both"), "() -> Nat + !Log + !IO");
@@ -7877,7 +7886,7 @@ fn an_annotation_is_not_opened() {
 #[test]
 fn a_performed_effect_has_to_be_allowed_where_it_is_written() {
     let (_, _, output) = infer_src(&format!(
-        "{EFFECTS}let greet : () -> Nat + !Log = fn _ => let _ = !Log.write 1n in 0n\n\
+        "{EFFECTS}let greet : () -> Nat + !Log = fn _ => do let _ = !Log.write 1n return 0n end\n\
          let n = greet ()"
     ));
     let [error] = output.errors() else {
@@ -7890,7 +7899,7 @@ fn a_performed_effect_has_to_be_allowed_where_it_is_written() {
     );
 
     let (_, _, output) = infer_src(&format!(
-        "{EFFECTS}let greet : () -> Nat + !Log = fn _ => let _ = !Log.write 1n in 0n\n\
+        "{EFFECTS}let greet : () -> Nat + !Log = fn _ => do let _ = !Log.write 1n return 0n end\n\
          let f : () -> Nat = fn _ => greet ()"
     ));
     let [error] = output.errors() else {
@@ -7950,7 +7959,7 @@ fn an_annotations_effect_tail_is_the_readers() {
     assert_eq!(scheme(&mint, &output, "f"), "Nat -> Nat + ..'a");
 
     let (_, _, output) = infer_src(&format!(
-        "{EFFECTS}let greet : () -> Nat + !Log = fn _ => let _ = !Log.write 1n in 0n\n\
+        "{EFFECTS}let greet : () -> Nat + !Log = fn _ => do let _ = !Log.write 1n return 0n end\n\
          let f : () -> Nat + ..'e = fn _ => greet ()"
     ));
     let [error] = output.errors() else {
@@ -7966,7 +7975,7 @@ fn an_annotations_effect_tail_is_the_readers() {
 #[test]
 fn a_handler_runs_under_a_declared_tail() {
     let (mint, _, output) = inferred(&format!(
-        "{EFFECTS}let greet : () -> Nat + !Log = fn _ => let _ = !Log.write 1n in 0n\n\
+        "{EFFECTS}let greet : () -> Nat + !Log = fn _ => do let _ = !Log.write 1n return 0n end\n\
          let f : () -> Nat + ..'e = fn _ =>\n\
          \x20 handle greet () with | !Log.write s => () | return x => x end"
     ));
@@ -8166,7 +8175,7 @@ fn a_nested_let_leaves_an_outer_binders_effects_alone() {
     // `p`'s own row is minted outside the `let` and pushed below it when the
     // application ties the two together, so `q` may not close it — and the
     // definition's scheme is where it is finally quantified.
-    let (mint, _, output) = inferred("let a = fn p => let q = fn z => p z in q");
+    let (mint, _, output) = inferred("let a = fn p => do let q = fn z => p z return q end");
     assert_eq!(
         scheme(&mint, &output, "a"),
         "('a -> 'b + ..'c) -> 'a -> 'b + ..'c"
@@ -8364,8 +8373,8 @@ fn the_written_examples_are_refused_where_they_go_wrong() {
 
     // And a declared variable reaching a type outside its own annotation.
     let src = "let bad = fn x =>\n\
-               \x20 let g : 'a -> 'a = x in\n\
-               \x20 0n";
+               \x20 do let g : 'a -> 'a = x\n\
+               \x20 return 0n end";
     let (_, _, output) = infer_src(src);
     let [error] = output.errors() else {
         panic!("expected one error: {:#?}", output.errors());
@@ -8383,9 +8392,9 @@ fn the_written_examples_are_refused_where_they_go_wrong() {
     // twice learns nothing the second time.
     let (_, _, output) = infer_src(
         "let bad = fn x =>\n\
-         \x20 let g : 'a -> 'a = x in\n\
-         \x20 let h = x in\n\
-         \x20 0n",
+         \x20 do let g : 'a -> 'a = x\n\
+         \x20 let h = x\n\
+         \x20 return 0n end",
     );
     assert_eq!(output.errors().len(), 1, "{:#?}", output.errors());
     assert_eq!(output.errors()[0].kind.code(), "rigid-escapes");
@@ -8401,7 +8410,7 @@ fn caller_choices_have_shape_specific_causal_paths() {
         "let f : (#A Nat | ..'r) -> Nat = fn p => match p with | #A x => 1n | #B y => 0n end"
             .to_string(),
         format!(
-            "{EFFECTS}let greet : () -> Nat + !Log = fn _ => let _ = !Log.write 1n in 0n\n\
+            "{EFFECTS}let greet : () -> Nat + !Log = fn _ => do let _ = !Log.write 1n return 0n end\n\
              let f : () -> Nat + ..'e = fn _ => greet ()"
         ),
     ];
@@ -8437,8 +8446,8 @@ fn caller_choices_have_shape_specific_causal_paths() {
 #[test]
 fn caller_choice_escape_names_its_destination_and_deep_type_path() {
     let source = "let bad = fn outer =>\n\
-                  \x20 let source : 'a -> 'a = outer in\n\
-                  \x20 { nested: { value: outer } }";
+                  \x20 do let source : 'a -> 'a = outer\n\
+                  \x20 return { nested: { value: outer } } end";
     let (_, _, output) = infer_src(source);
     let escape = output
         .errors()
@@ -8666,7 +8675,7 @@ fn a_recursive_use_instantiates_what_was_declared() {
 #[test]
 fn a_nested_annotation_declares_its_own_variables() {
     // Accepted, and published as what it declared.
-    let (mint, _, output) = inferred("let e = let id : 'a -> 'a = fn x => x in id 1n");
+    let (mint, _, output) = inferred("let e = do let id : 'a -> 'a = fn x => x return id 1n end");
     assert_eq!(scheme(&mint, &output, "e"), "Nat");
     let local = output
         .semantics()
@@ -8677,7 +8686,7 @@ fn a_nested_annotation_declares_its_own_variables() {
     assert_eq!(local.to_string(), "'a -> 'a");
 
     // Refused where the value decides one.
-    let src = "let e = let f : 'a -> Nat = fn x => x.y in 0n";
+    let src = "let e = do let f : 'a -> Nat = fn x => x.y return 0n end";
     let (_, _, output) = infer_src(src);
     let [error] = output.errors() else {
         panic!("expected one error: {:#?}", output.errors());
@@ -8689,8 +8698,8 @@ fn a_nested_annotation_declares_its_own_variables() {
     let (mint, _, output) = inferred(
         "type Nest = { kids: Nest }\n\
          let e = fn v =>\n\
-         \x20 let depth : { kids: Nest, ..'r } -> Nat = fn n => depth n.kids in\n\
-         \x20 depth v",
+         \x20 do let depth : { kids: Nest, ..'r } -> Nat = fn n => depth n.kids\n\
+         \x20 return depth v end",
     );
     assert_eq!(scheme(&mint, &output, "e"), "{ kids: Nest, ..'a } -> Nat");
 }
@@ -9727,8 +9736,8 @@ fn inference_records_have_unique_direct_identities_across_nested_constraints() {
     use std::collections::HashSet;
 
     let (_, _, output) = infer_src(
-        "let f = fn v => let read = fn x => x.field in match v with\n\
-         | {a} => read { field: 1n } | {b} => read { field: true } end",
+        "let f = fn v => do let read = fn x => x.field return match v with\n\
+         | {a} => read { field: 1n } | {b} => read { field: true } end end",
     );
     let mut constraints = Vec::new();
     for generated in output.diagnostics().constraints().values() {
@@ -9810,7 +9819,7 @@ fn contextual_checks_retain_exact_spans_and_expected_side_provenance() {
                let call = 3n {}\n\
                let inferred = 4n\n\
                let annotated : Nat = 5n\n\
-               let nested = let local = 6n in let noted : Nat = 7n in noted";
+               let nested = do let local = 6n let noted : Nat = 7n return noted end";
     let (_, _, output) = infer_src(src);
     let mut constraints = Vec::new();
     for generated in output.diagnostics().constraints().values() {
@@ -10249,7 +10258,7 @@ fn constraints_keep_reason_roots_for_raise_pattern_and_instance_origins() {
         "effect Fail = { oops: () -> () }\n\
          let run = fn v => handle !Fail.oops () with\n\
            | !Fail.oops _ => match v with\n\
-             | {x} => let local = fn y => y in local (raise 0n)\n\
+             | {x} => do let local = fn y => y return local (raise 0n) end\n\
              | 0n => 1n end\n\
            end",
     );
@@ -10305,8 +10314,8 @@ fn sat_and_effect_defaults_are_first_class_binding_reasons() {
     let (_, _, output) = infer_src(
         "let pure = fn x => x\n\
          let folded = fn v =>\n\
-         \x20 let {x, ..} = v in\n\
-         \x20 match v with | {x} => {} | {y} => {} end",
+         \x20 do let {x, ..} = v\n\
+         \x20 return match v with | {x} => {} | {y} => {} end end",
     );
     assert!(output.diagnostics().reasons().iter().any(|reason| matches!(
         reason.origin,
@@ -10359,8 +10368,8 @@ fn sat_and_effect_defaults_are_first_class_binding_reasons() {
 fn replaced_and_guarded_batches_keep_referentially_integral_reason_roots() {
     let (_, _, local) = infer_src(
         "let outer =\n\
-         \x20 let choice : { x when 'a: Nat, y when 'b: Nat } where 'a != 'b = { x: 1n } in\n\
-         \x20 choice",
+         \x20 do let choice : { x when 'a: Nat, y when 'b: Nat } where 'a != 'b = { x: 1n }\n\
+         \x20 return choice end",
     );
     let reasons: std::collections::HashMap<_, _> = local
         .diagnostics()
@@ -10423,7 +10432,7 @@ fn replaced_and_guarded_batches_keep_referentially_integral_reason_roots() {
 
 #[test]
 fn zero_step_rules_and_recovery_components_do_not_contaminate_later_steps() {
-    let (_, _, output) = infer_src("let bad : {} -> Boolean = fn x => let {} = x in 1n");
+    let (_, _, output) = infer_src("let bad : {} -> Boolean = fn x => do let {} = x return 1n end");
     let failure = output
         .diagnostics()
         .steps()
@@ -10583,7 +10592,7 @@ fn published_reason_links_never_reach_rolled_back_origins() {
     let (_, _, output) = infer_src(
         "type Box 'a = { value: 'a, next: Box 'a }\n\
          let bad : Box Nat -> Nat = fn x =>\n\
-         \x20 let wrong : Box Boolean = x in 1n",
+         \x20 do let wrong : Box Boolean = x return 1n end",
     );
     assert!(
         output

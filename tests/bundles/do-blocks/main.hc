@@ -1,0 +1,52 @@
+extern mark : fn(Nat) -> Nat = "host.mark"
+
+effect Log = Nat -> ()
+
+let several = do
+  let a = 1n
+  let b = { of: a }
+  let c = (a, b)
+  return { first: c.0, second: c.1.of }
+end
+let empty = do end
+let only = do return 7n end
+let nested = do
+  let inner = do
+    let x = 2n
+    return { x: x }
+  end
+  return inner.x
+end
+let self_recursive = do
+  let descend = fn n => match n with | 0n => "done" | _ => descend 0n end
+  return descend 5n
+end
+let taken_apart = do
+  let (x, y) = (1n, 2n)
+  let { v } = { v: 3n }
+  return { x: x, y: y, v: v }
+end
+let shadowed = do
+  let s = 1n
+  let earlier = s
+  let s = { was: earlier }
+  return s
+end
+let unit_block = fn seed => do
+  let _ = mark seed
+end
+let ordered = fn seed => do
+  let _ = mark 1n
+  let _ = mark 2n
+  let last = mark 3n
+  return last
+end
+let logged : () -> Nat + !Log = fn _ => do
+  let _ = !Log 10n
+  let _ = !Log 20n
+  return 30n
+end
+let handled = fn seed => handle logged () with
+  | !Log n => do let _ = mark n end
+  | return v => v
+end

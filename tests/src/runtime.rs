@@ -76,3 +76,11 @@ fn the_array_runtime_agrees_with_a_plain_array() {
 fn struct_spreads_build_the_fields_they_promise() {
     run_bundle("struct-spreads", "spreads.test.mjs");
 }
+
+/// `do` blocks compiled through the CLI's own path and read back by Node:
+/// what each form evaluates to, which names a binding sees, and the order
+/// the statements run in.
+#[test]
+fn do_blocks_evaluate_in_order_to_what_they_return() {
+    run_bundle("do-blocks", "blocks.test.mjs");
+}

@@ -1,7 +1,7 @@
 ; Scopes, definitions and references for ruddy.
 ;
 ; A `let` statement binds for the whole file, so the file is a scope; a `fn`,
-; a `let ... in`, a match arm and a handler arm each bind for their own body,
+; a `do` block, a match arm and a handler arm each bind for their own body,
 ; so each of those is one too.
 
 ; A `type` declaration's parameters bind for its body and nowhere else, which
@@ -9,7 +9,7 @@
 (source_file) @local.scope
 (type_definition) @local.scope
 (function) @local.scope
-(let_expression) @local.scope
+(do_block) @local.scope
 (match_arm) @local.scope
 (handler_arm) @local.scope
 
@@ -17,7 +17,6 @@
 
 (let_definition pattern: (identifier) @local.definition.var)
 (extern_definition name: (identifier) @local.definition.var)
-(let_expression pattern: (identifier) @local.definition.var)
 
 (function parameter: (identifier) @local.definition.parameter)
 (handler_arm binder: (identifier) @local.definition.parameter)

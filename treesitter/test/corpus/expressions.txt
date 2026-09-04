@@ -86,33 +86,186 @@ let a = f fn x => g x
           (identifier))))))
 
 ================================================================================
-A binding for the length of one expression
+A block binds names for the length of one expression
 ================================================================================
 
-let named =
-  let half = { v: 21 } in
-  { doubled: half.v, original: half }
+let named = do
+  let half = { v: 21 }
+  let whole : Nat = half.v
+  return { doubled: whole, original: half }
+end
 
 --------------------------------------------------------------------------------
 
 (source_file
   (let_definition
     (identifier)
-    (let_expression
-      (identifier)
-      (struct_expression
-        (struct_field
-          (identifier)
-          (natural)))
-      (struct_expression
-        (struct_field
-          (identifier)
-          (projection
+    (do_block
+      (let_definition
+        (identifier)
+        (struct_expression
+          (struct_field
             (identifier)
-            (identifier)))
+            (natural))))
+      (let_definition
+        (identifier)
+        (annotation
+          (identifier))
+        (projection
+          (identifier)
+          (identifier)))
+      (struct_expression
+        (struct_field
+          (identifier)
+          (identifier))
         (struct_field
           (identifier)
           (identifier))))))
+
+================================================================================
+A block without a return, and the empty block
+================================================================================
+
+let effects = do
+  let _ = !Log 1
+end
+let nothing = do end
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (do_block
+      (let_definition
+        (wildcard)
+        (application
+          (operation
+            (effect_label))
+          (natural)))))
+  (let_definition
+    (identifier)
+    (do_block)))
+
+================================================================================
+A block with only a return
+================================================================================
+
+let value = do return 1 end
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (do_block
+      (natural))))
+
+================================================================================
+A block heads an application and is projected from
+================================================================================
+
+let applied = do let f = g return f end 1
+let field = do let p = q return p end.x
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (application
+      (do_block
+        (let_definition
+          (identifier)
+          (identifier))
+        (identifier))
+      (natural)))
+  (let_definition
+    (identifier)
+    (projection
+      (do_block
+        (let_definition
+          (identifier)
+          (identifier))
+        (identifier))
+      (identifier))))
+
+================================================================================
+A block is not an application argument
+================================================================================
+
+let a = f (do let x = 1 return x end)
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (application
+      (identifier)
+      (parenthesized_expression
+        (do_block
+          (let_definition
+            (identifier)
+            (natural))
+          (identifier))))))
+
+================================================================================
+A return must be the last thing in its block
+================================================================================
+
+let a = do return 1 let x = 2 end
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (do_block
+      (ERROR
+        (natural))
+      (let_definition
+        (identifier)
+        (natural)))))
+
+================================================================================
+Only a let may be written in a block
+================================================================================
+
+let a = do type T = Nat return 1 end
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (do_block
+      (MISSING "end")))
+  (type_definition
+    (identifier)
+    (annotation
+      (identifier)))
+  (ERROR
+    (natural)))
+
+================================================================================
+`in` is an ordinary name
+================================================================================
+
+let in = 1
+let a = f in
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (natural))
+  (let_definition
+    (identifier)
+    (application
+      (identifier)
+      (identifier))))
 
 ================================================================================
 A match, and the empty one

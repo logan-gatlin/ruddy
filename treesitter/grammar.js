@@ -68,14 +68,15 @@ module.exports = grammar({
   word: $ => $.identifier,
 
   // The words `token::lex` reserves: no position reads one of these as a name.
-  // `when`, `where`, and `return` are deliberately absent — they are contextual,
-  // read by spelling at the few positions that want them and ordinary identifiers
+  // `when` and `where` are deliberately absent — they are contextual, read by
+  // spelling at the few positions that want them and ordinary identifiers
   // everywhere else.
   reserved: {
     global: _ => [
       'let',
       'extern',
-      'in',
+      'do',
+      'return',
       'if',
       'then',
       'else',
@@ -315,7 +316,6 @@ module.exports = grammar({
 
     _expression: $ => choice(
       $.function,
-      $.let_expression,
       $.raise_expression,
       $.pipeline,
       $._boolean_or,
@@ -378,10 +378,10 @@ module.exports = grammar({
     ),
 
     /**
-     * The expressions an application may be built from. An `if`, `match`, or
-     * `handle` reaches here — each may be applied and projected off — but none
-     * begins an argument, which is what keeps `f match ... end` from being an
-     * application of `f`.
+     * The expressions an application may be built from. An `if`, `match`,
+     * `handle`, or `do` reaches here — each may be applied and projected off —
+     * but none begins an argument, which is what keeps `f match ... end` from
+     * being an application of `f`.
      */
     _head_expression: $ => choice(
       $._atom,
@@ -389,6 +389,7 @@ module.exports = grammar({
       $.if_expression,
       $.match_expression,
       $.handle_expression,
+      $.do_block,
     ),
 
     /** `f x y` — application, left-associative and ML-style. */
@@ -446,6 +447,7 @@ module.exports = grammar({
         $.if_expression,
         $.match_expression,
         $.handle_expression,
+        $.do_block,
       )),
       '.',
       field('field', choice(
@@ -464,16 +466,18 @@ module.exports = grammar({
       field('body', $._expression),
     )),
 
-    /** `let <pattern> [: <annotation>] = <value> in <body>` */
-    let_expression: $ => prec.right(seq(
-      'let',
-      field('pattern', $._pattern),
-      optional(seq(':', field('type', $.annotation))),
-      '=',
-      field('value', $._expression),
-      'in',
-      field('body', $._expression),
-    )),
+    /**
+     * `do <let>* [return <expr>] end` — bindings, each in scope for the rest
+     * of the block, and the value the block ends with. Only a `let` may be
+     * written in a block: `parse.rs` refuses every other definition at its
+     * keyword, and so does this.
+     */
+    do_block: $ => seq(
+      'do',
+      repeat(field('statement', $.let_definition)),
+      optional(seq('return', field('value', $._expression))),
+      'end',
+    ),
 
     /**
      * `if <condition> then <expr> (else if <condition> then <expr>)*

@@ -286,28 +286,21 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
             Node::new(ids.next(), "Arg", text).at(arg.span)
         }))
         .child(expr_node(ids, body)),
-        // The statement's row again, about the expression: the name it binds,
-        // the type it was ascribed, the value and the body. Labelled with the
-        // name, since that is what a reader scanning the tree is looking for.
-        ExprKind::Let {
-            pattern,
-            ty,
-            value,
-            body,
-        } => {
-            let mut let_node = Node {
-                label: format!("Let {}", pattern.tracked),
+        // A block's row holds a statement row per binding — the same row a
+        // definition gets, since a binding is written as one — and, when the
+        // block returns something, the returned expression under its role.
+        ExprKind::Do { stmts, result } => {
+            let mut block = Node {
+                label: "Do".into(),
                 ..node
+            };
+            for stmt in stmts {
+                block = block.child(stmt_node(ids, stmt));
             }
-            .child(pattern_node(ids, pattern));
-            if let Some(ty) = ty {
-                let mut ascribed = annotation_node(ids, ty);
-                ascribed.label = format!("Ascribed {}", ascribed.label);
-                let_node = let_node.child(ascribed);
+            match result {
+                Some(result) => block.child(expr_role_node(ids, "Return", result)),
+                None => block,
             }
-            let_node
-                .child(expr_node(ids, value))
-                .child(expr_node(ids, body))
         }
         // Keep the three roles explicit: unlike a match's arms, all three are
         // expressions, and their position alone should not be needed to tell

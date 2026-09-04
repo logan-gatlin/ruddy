@@ -434,11 +434,13 @@ fn the_presence_tab_renders_the_store_and_the_clauses() {
     // under everything the store says about them.
     let nodes = tab(
         "presence",
-        "let outer = fn z =>\n  \
-           let g = fn v =>\n    \
-             let w = match v with | {x} => 0n | {y} => 0n end in\n    \
-             match v with | {x: 1n} => 1n | {x: n} => 2n | {y} => 3n end in\n  \
-           0n",
+        "let outer = fn z => do\n  \
+           let g = fn v => do\n    \
+             let w = match v with | {x} => 0n | {y} => 0n end\n    \
+             return match v with | {x: 1n} => 1n | {x: n} => 2n | {y} => 3n end\n  \
+           end\n  \
+           return 0n\n\
+         end",
     );
     let outer = nodes
         .iter()
@@ -878,7 +880,7 @@ fn the_lir_tab_marks_the_evidence_it_plumbs_as_generated() {
         "lir",
         "effect Log = { write: Nat -> () }\n\
          let piped : (Nat -> Nat + ..'e) -> Nat -> Nat + ..'e = fn g => fn n => g n\n\
-         let logger : Nat -> Nat + !Log = fn n => let z = !Log.write n in n\n\
+         let logger : Nat -> Nat + !Log = fn n => do let z = !Log.write n return n end\n\
          let use = fn w => handle piped logger 1n with | !Log.write s => {} end\n",
     );
     let rows = flatten(&nodes);

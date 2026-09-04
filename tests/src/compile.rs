@@ -164,7 +164,7 @@ fn an_operation_reference_instantiates_its_effects_parameters() {
     let source = "effect Ask 'a = { get: () -> 'a }\n\
                   let num : () -> Nat + !Ask Nat = fn _ => !Ask.get ()\n\
                   let any = fn _ => !Ask.get ()\n\
-                  let twice = fn _ => let n = !Ask.get () in let m = !Ask.get () in n + m\n\
+                  let twice = fn _ => do let n = !Ask.get () let m = !Ask.get () return n + m end\n\
                   let get = !Ask.get\n\
                   let run = fn _ => handle !Ask.get () with | !Ask.get _ => 1n end\n\
                   let text = fn _ => handle !Ask.get () with | !Ask.get _ => \"s\" end";
@@ -180,9 +180,9 @@ fn an_operation_reference_instantiates_its_effects_parameters() {
     // incompatible versions of one effect, whichever branch each is on.
     for source in [
         "effect Ask 'a = { get: () -> 'a }\n\
-         let bad = fn _ => let n : Nat = !Ask.get () in let s : String = !Ask.get () in ()",
+         let bad = fn _ => do let n : Nat = !Ask.get () let s : String = !Ask.get () end",
         "effect Ask 'a = { get: () -> 'a }\n\
-         let bad = fn b => if b then let n : Nat = !Ask.get () in () else let s : String = !Ask.get () in () end",
+         let bad = fn b => if b then do let n : Nat = !Ask.get () end else do let s : String = !Ask.get () end end",
         "effect Ask 'a = { get: () -> 'a }\n\
          let bad : () -> Nat + !Ask String = fn _ => !Ask.get ()",
     ] {
@@ -205,6 +205,36 @@ fn an_operation_reference_instantiates_its_effects_parameters() {
             "{source}: the clash keeps its causal detail"
         );
     }
+}
+
+/// A block is typed as what its `return` carries, or as unit when it has
+/// none, and it carries the effects of every statement in it: what a binding
+/// performs is performed by the block, whether or not the value is kept.
+#[test]
+fn a_block_is_typed_by_its_return_and_carries_every_statements_effects() {
+    let source = "effect Log = { write: Nat -> () }\n\
+                  effect Tick = { tick: () -> () }\n\
+                  let valued = fn _ => do let x = 1n let y = { v: x } return y end\n\
+                  let unit = fn _ => do let x = 1n end\n\
+                  let empty = do end\n\
+                  let only = do return 1n end\n\
+                  let ascribed = do let n : Nat = 1n return n end\n\
+                  let effectful : () -> Nat + !Log + !Tick = fn _ => do let _ = !Log.write 1n let _ = !Tick.tick () return 2n end\n\
+                  let inferred = fn _ => do let _ = !Log.write 1n let _ = !Tick.tick () return 2n end\n\
+                  let quiet = fn _ => do let _ = !Log.write 1n end";
+    let accepted = accepted(source);
+    assert_eq!(scheme(&accepted, "valued"), "'a -> { v: Nat }");
+    assert_eq!(scheme(&accepted, "unit"), "'a -> ()");
+    assert_eq!(scheme(&accepted, "empty"), "()");
+    assert_eq!(scheme(&accepted, "only"), "Nat");
+    assert_eq!(scheme(&accepted, "ascribed"), "Nat");
+    assert_eq!(scheme(&accepted, "effectful"), "() -> Nat + !Log + !Tick");
+    assert_eq!(scheme(&accepted, "inferred"), "'a -> Nat + !Log + !Tick");
+    assert_eq!(scheme(&accepted, "quiet"), "'a -> () + !Log");
+
+    // An ascription inside a block is held to, the way a definition's is.
+    let partial = rejected("let bad = do let n : Nat = \"s\" return n end");
+    assert_eq!(codes(&partial), ["type-mismatch"]);
 }
 
 /// Compile one source to the artifact another compilation may depend on.
@@ -249,8 +279,8 @@ fn imported_effects_and_aliases_behave_like_local_declarations() {
          let num : () -> Nat + dep::!Ask Nat = fn _ => dep::!Ask.get ()\n\
          let any = fn _ => dep::!Ask.get ()\n\
          let same : () -> Nat + !Ask Nat = fn _ => dep::!Ask.get ()\n\
-         let both : () -> Nat + dep::!Both Nat (!IO) = fn _ => let _ = !IO.print 1n in dep::!Ask.get ()\n\
-         let open = fn _ => let _ = dep::!Log.write 1n in dep::!Ask.get ()\n\
+         let both : () -> Nat + dep::!Both Nat (!IO) = fn _ => do let _ = !IO.print 1n return dep::!Ask.get () end\n\
+         let open = fn _ => do let _ = dep::!Log.write 1n return dep::!Ask.get () end\n\
          let run = fn _ => handle dep::!Ask.get () with | dep::!Ask.get _ => 1n end",
         &dependency,
     );
@@ -278,7 +308,7 @@ fn imported_effects_and_aliases_behave_like_local_declarations() {
         let parsed = parse::parse(
             token::lex(
                 "let clash : () -> Nat + dep::!Both Nat (dep::!Log) = fn _ => 0n\n\
-                 let bad = fn _ => let n : Nat = dep::!Ask.get () in let s : String = dep::!Ask.get () in ()",
+                 let bad = fn _ => do let n : Nat = dep::!Ask.get () let s : String = dep::!Ask.get () end",
                 FileID::GENERATED,
             )
             .tokens,
@@ -354,7 +384,7 @@ fn row_parameters_are_inferred_from_their_uses() {
                   effect Run 'e = { run: (() -> () + ..'e) -> () }\n\
                   let read = fn _ => (!State.get ()).x\n\
                   let write = fn _ => !State.put { x: 1n, y: 2n }\n\
-                  let both = fn _ => let s = !State.get () in !State.put s\n\
+                  let both = fn _ => do let s = !State.get () return !State.put s end\n\
                   let run = fn _ => !Run.run (fn _ => !Log.write 1n)\n\
                   let pure = fn _ => !Run.run (fn _ => ())";
     let accepted = accepted(source);
@@ -414,7 +444,7 @@ fn a_handler_infers_one_application_across_its_arms() {
     let base = "effect Log = { write: Nat -> () }\n\
                 effect State 's = { get: () -> 's, put: 's -> () }\n";
     let accepted = accepted(&format!(
-        "{base}let counted = fn _ => handle (let n = !State.get () in let _ = !Log.write 1n in !State.put n) with\n\
+        "{base}let counted = fn _ => handle do let n = !State.get () let _ = !Log.write 1n return !State.put n end with\n\
              | !State.get _ => 0n\n\
              | !State.put _ => ()\n\
          end\n\

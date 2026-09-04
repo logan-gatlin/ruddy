@@ -847,13 +847,14 @@ fn the_effect_keywords_are_reserved() {
     assert!(matches!(kinds("raised")[..], [Kind::Identifier(_)]));
 }
 
-/// `return` is not one of them. It heads a handler arm and is an ordinary name
-/// everywhere 'else, so the lexer hands it over as the identifier it is and the
-/// one position that reads it recognizes it by spelling — the rule `when` and
-/// `where` already keep.
+/// `do` and `return` are reserved: a block is read by them, and a handler
+/// arm's `return` is the same keyword. `in` is not — nothing reads it since
+/// `let ... in` went, so it is the ordinary name it looks like.
 #[test]
-fn return_is_an_ordinary_identifier() {
-    assert!(matches!(&kinds("return")[..], [Kind::Identifier(name)] if name == "return"));
+fn do_and_return_are_keywords_and_in_is_a_name() {
+    assert!(matches!(&kinds("do")[..], [Kind::Do]));
+    assert!(matches!(&kinds("return")[..], [Kind::Return]));
+    assert!(matches!(&kinds("in")[..], [Kind::Identifier(name)] if name == "in"));
 }
 
 /// `::` is one token, the way `..` and `=>` are: the longer lexeme wins, so a
