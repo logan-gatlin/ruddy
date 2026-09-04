@@ -167,6 +167,31 @@ fn if_expressions_lower_to_boolean_matches() {
     assert!(matches!(nested[1].0.tracked, PatternKind::Boolean(false)));
 }
 
+#[test]
+fn match_function_shorthand_lowers_to_a_function_over_a_match() {
+    let src = "let unwrap = fn | #Some x => x | #None => 0n";
+    let (mint, out) = built(src);
+    let value = &out.program.terms[&term_symbol(&mint, &out, "unwrap")].value;
+    let TermKind::Fn { arg, body } = &value.kind else {
+        panic!("the shorthand lowers to a function");
+    };
+    assert_eq!(mint.name(arg.tracked), "%match");
+    assert_eq!(arg.span.start, src.find("fn").expect("the keyword"));
+    assert_eq!(arg.span.width, 2);
+    assert_eq!(value.span.start, arg.span.start);
+    assert_eq!(value.span.end(), src.len());
+
+    let TermKind::Match { scrutinee, arms } = &body.kind else {
+        panic!("the shorthand function body lowers to a match");
+    };
+    assert_eq!(body.span, value.span);
+    assert!(matches!(scrutinee.kind, TermKind::Ident(symbol) if symbol == arg.tracked));
+    assert_eq!(scrutinee.span, arg.span);
+    assert_eq!(arms.len(), 2);
+    assert!(matches!(arms[0].0.tracked, PatternKind::Tag { .. }));
+    assert!(matches!(arms[1].0.tracked, PatternKind::Tag { .. }));
+}
+
 /// The lowered annotation of a top-level definition, which is where the
 /// variables a `where 'let` declared and the sorts lowering read them at live.
 fn annotation_of<'a>(mint: &Mint, out: &'a Output, name: &str) -> &'a Annotation {
@@ -4926,6 +4951,14 @@ fn raise_belongs_to_the_arm_around_it() {
     );
     assert_eq!(
         codes_of(&arm("(fn _ => raise 0n) 1n")),
+        ["raise-in-function"]
+    );
+    assert_eq!(
+        codes_of(&arm("{ g: fn | _ => raise 0n }")),
+        ["raise-in-function"]
+    );
+    assert_eq!(
+        codes_of(&arm("{ g: fn | _ => fn | _ => raise 0n }")),
         ["raise-in-function"]
     );
 

@@ -803,6 +803,81 @@ fn functions() {
 }
 
 #[test]
+fn match_function_shorthand_parses_and_prints() {
+    assert_eq!(
+        parse_one(
+            "let unwrap = fn\n\
+             | #Some x => x\n\
+             | #None => 0n"
+        ),
+        "let unwrap = fn | #Some x => x | #None => 0n"
+    );
+
+    let src = "let identity = fn | value => value";
+    let out = parse(lex(src, FileID::GENERATED).tokens);
+    assert!(out.errors.is_empty(), "errors: {:#?}", out.errors);
+    let StmtKind::Let { body, .. } = &out.stmts[0].tracked else {
+        panic!("expected a let");
+    };
+    let ExprKind::MatchFunction { fn_span, arms } = &body.tracked.tracked else {
+        panic!("expected a match function");
+    };
+    assert_eq!(fn_span.start, src.find("fn").expect("the keyword"));
+    assert_eq!(fn_span.width, 2);
+    assert_eq!(arms.len(), 1);
+}
+
+#[test]
+fn match_function_shorthand_has_function_precedence_and_greedy_arms() {
+    assert_eq!(
+        parse_one("let mapped = map fn | #Some x => x | #None => 0n"),
+        "let mapped = map (fn | #Some x => x | #None => 0n)"
+    );
+    assert_eq!(
+        parse_one("let identity = (fn | x => x) 1n"),
+        "let identity = (fn | x => x) 1n"
+    );
+    assert_eq!(
+        parse_one(
+            "let nested = fn\n\
+             | #Outer x => (fn | #InnerA => 1n | #InnerB => 2n)\n\
+             | #Other => 3n"
+        ),
+        "let nested = fn | #Outer x => (fn | #InnerA => 1n | #InnerB => 2n) | #Other => 3n"
+    );
+    assert_eq!(
+        parse_one(
+            "let nested = fn\n\
+             | #Outer => (fn x => fn | #Inner => 1n)\n\
+             | #Other => 2n"
+        ),
+        "let nested = fn | #Outer => (fn x => fn | #Inner => 1n) | #Other => 2n"
+    );
+}
+
+#[test]
+fn malformed_match_function_shorthand_uses_existing_parse_errors() {
+    for (src, expected) in [
+        ("let f = fn |", Expected::Pattern),
+        ("let f = fn | value", Expected::Punctuation("=>")),
+        ("let f = fn | value =>", Expected::Value),
+        ("let f = fn value | _ => 0n", Expected::Punctuation("=>")),
+    ] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        let [error] = out.errors.as_slice() else {
+            panic!("{src}: expected one error: {:#?}", out.errors);
+        };
+        let ErrorKind::Expected {
+            expected: actual, ..
+        } = error.kind
+        else {
+            panic!("{src}: wrong error: {error:#?}");
+        };
+        assert_eq!(actual, expected, "{src}");
+    }
+}
+
+#[test]
 fn zero_arg_functions_are_rejected() {
     // A function binding nothing is an error, reported at the arrow.
     let out = parse(lex("let z = fn => y", FileID::GENERATED).tokens);

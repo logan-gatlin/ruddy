@@ -11112,6 +11112,22 @@ impl Builder<'_> {
                     .with_span(span)
                 })
             }
+            ExprKind::MatchFunction { fn_span, arms } => {
+                let arg = self.fresh("%match", fn_span);
+                let scrutinee = TermKind::Ident(arg.tracked).with_span(fn_span);
+                let inner = match self.answering {
+                    Answering::Nowhere => Answering::Nowhere,
+                    Answering::Arm | Answering::UnderFn(_) => Answering::UnderFn(span),
+                };
+                let outer = std::mem::replace(&mut self.answering, inner);
+                let body = self.match_term_with_scrutinee(span, scrutinee, arms);
+                self.answering = outer;
+                TermKind::Fn {
+                    arg,
+                    body: Box::new(body),
+                }
+                .with_span(span)
+            }
             // A block is a spelling of the nested bindings it holds, one term
             // per `let`; see [`Builder::block`].
             ExprKind::Do { stmts, result } => self.block(span, stmts.into_iter(), result),
@@ -12532,6 +12548,15 @@ impl Builder<'_> {
     /// twice — reported by the pattern walk itself.
     fn match_term(&mut self, span: Span, scrutinee: Expr, arms: Vec<parse::Arm>) -> Term {
         let scrutinee = self.term(scrutinee);
+        self.match_term_with_scrutinee(span, scrutinee, arms)
+    }
+
+    fn match_term_with_scrutinee(
+        &mut self,
+        span: Span,
+        scrutinee: Term,
+        arms: Vec<parse::Arm>,
+    ) -> Term {
         let mut lowered: Vec<(Pattern, Term)> = Vec::new();
         for arm in arms {
             let mark = self.terms.mark();

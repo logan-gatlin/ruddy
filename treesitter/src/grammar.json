@@ -710,6 +710,10 @@
       "members": [
         {
           "type": "SYMBOL",
+          "name": "match_function"
+        },
+        {
+          "type": "SYMBOL",
           "name": "function"
         },
         {
@@ -1110,6 +1114,10 @@
         },
         {
           "type": "SYMBOL",
+          "name": "match_function"
+        },
+        {
+          "type": "SYMBOL",
           "name": "function"
         }
       ]
@@ -1349,6 +1357,48 @@
               "type": "SYMBOL",
               "name": "_expression"
             }
+          }
+        ]
+      }
+    },
+    "match_function": {
+      "type": "PREC_RIGHT",
+      "value": 0,
+      "content": {
+        "type": "SEQ",
+        "members": [
+          {
+            "type": "STRING",
+            "value": "fn"
+          },
+          {
+            "type": "STRING",
+            "value": "|"
+          },
+          {
+            "type": "SEQ",
+            "members": [
+              {
+                "type": "SYMBOL",
+                "name": "match_arm"
+              },
+              {
+                "type": "REPEAT",
+                "content": {
+                  "type": "SEQ",
+                  "members": [
+                    {
+                      "type": "STRING",
+                      "value": "|"
+                    },
+                    {
+                      "type": "SYMBOL",
+                      "name": "match_arm"
+                    }
+                  ]
+                }
+              }
+            ]
           }
         ]
       }

@@ -7,9 +7,9 @@ use std::fmt;
 
 use ruddy::{
     parse::{
-        Annotation, ArgKind, ArmHead, Clause, ClauseKind, EffectBody, EffectLabel, EffectRow, Expr,
-        ExprKind, Pattern, PatternKind, Rest, Stmt, StmtKind, SumCase, Type, TypeField, TypeKind,
-        When,
+        Annotation, ArgKind, Arm, ArmHead, Clause, ClauseKind, EffectBody, EffectLabel, EffectRow,
+        Expr, ExprKind, Pattern, PatternKind, Rest, Stmt, StmtKind, SumCase, Type, TypeField,
+        TypeKind, When,
     },
     tracking::FileID,
 };
@@ -286,6 +286,14 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
             Node::new(ids.next(), "Arg", text).at(arg.span)
         }))
         .child(expr_node(ids, body)),
+        ExprKind::MatchFunction { arms, .. } => pattern_arms(
+            ids,
+            Node {
+                label: "Match Function".into(),
+                ..node
+            },
+            arms,
+        ),
         // A block's row holds a statement row per binding — the same row a
         // definition gets, since a binding is written as one — and, when the
         // block returns something, the returned expression under its role.
@@ -395,20 +403,12 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
         // The scrutinee first, then one wrapper per arm holding the arm's
         // pattern and body — the shape the reader wrote, before flattening.
         ExprKind::Match { scrutinee, arms } => {
-            let mut match_node = Node {
+            let node = Node {
                 label: "Match".into(),
                 ..node
             }
             .child(expr_node(ids, scrutinee));
-            for arm in &arms[..] {
-                let span = arm.pattern.span.merge(arm.body.span);
-                let arm_node = Node::new(ids.next(), "Arm", format!("{}", arm.pattern.tracked))
-                    .at(span)
-                    .child(pattern_node(ids, &arm.pattern))
-                    .child(expr_node(ids, &arm.body));
-                match_node = match_node.child(arm_node);
-            }
-            match_node
+            pattern_arms(ids, node, arms)
         }
         // The handled expression first, then one wrapper per arm holding what
         // it answers, the name it binds and its body — the match's shape,
@@ -482,6 +482,18 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
             ..node
         },
     }
+}
+
+fn pattern_arms(ids: &mut Ids, mut node: Node, arms: &[Arm]) -> Node {
+    for arm in arms {
+        let span = arm.pattern.span.merge(arm.body.span);
+        let arm_node = Node::new(ids.next(), "Arm", format!("{}", arm.pattern.tracked))
+            .at(span)
+            .child(pattern_node(ids, &arm.pattern))
+            .child(expr_node(ids, &arm.body));
+        node = node.child(arm_node);
+    }
+    node
 }
 
 /// One written pattern, as a tree: each node's text is the pattern's own

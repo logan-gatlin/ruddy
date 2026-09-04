@@ -52,7 +52,7 @@ impl Grouped for Ast<'_, ExprKind> {
         match self.0 {
             // The body runs as far right as it can, so anything appended after
             // a bare lambda would be read as part of it.
-            ExprKind::Function { .. } => Prec::Lambda,
+            ExprKind::Function { .. } | ExprKind::MatchFunction { .. } => Prec::Lambda,
             // Self-delimiting on the right — the `end` closes it — so it may
             // head an application and be projected from; but it is not an
             // application *argument* by grammar, so an argument position
@@ -118,6 +118,18 @@ impl Grouped for Ast<'_, ExprKind> {
             ExprKind::Project { field, .. }
                 if ruddy::ui::canonical_tuple_index(&field.tracked).is_some()
         )
+    }
+}
+
+/// Whether a following `|` would be claimed by a shorthand nested at the
+/// right edge of this expression. Parentheses are the only way to hand that
+/// bar back to an enclosing shorthand.
+fn ends_in_match_function(expr: &ExprKind) -> bool {
+    match expr {
+        ExprKind::MatchFunction { .. } => true,
+        ExprKind::Function { body, .. } => ends_in_match_function(&body.tracked),
+        ExprKind::Raise(value) => ends_in_match_function(&value.tracked),
+        _ => false,
     }
 }
 
@@ -367,6 +379,19 @@ impl fmt::Display for Ast<'_, ExprKind> {
                 write_apply(f, &Ast(&func.tracked), &Ast(&arg.tracked))
             }
             ExprKind::Function { args, body } => write_function(f, args, &Ast(&body.tracked)),
+            ExprKind::MatchFunction { arms, .. } => {
+                f.write_str("fn")?;
+                for (at, arm) in arms.iter().enumerate() {
+                    write!(f, " | {} => ", arm.pattern.tracked)?;
+                    let body = Ast(&arm.body.tracked);
+                    if at + 1 < arms.len() && ends_in_match_function(&arm.body.tracked) {
+                        write!(f, "({body})")?;
+                    } else {
+                        write!(f, "{body}")?;
+                    }
+                }
+                Ok(())
+            }
             // The statements print through the statement printer, so a
             // binding in a block is written as the definition it reads like.
             ExprKind::Do { stmts, result } => write_do(
