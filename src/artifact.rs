@@ -9,6 +9,8 @@
 
 use std::{collections::HashMap, error::Error, fmt};
 
+use indexmap::IndexMap;
+
 use crate::{
     compile::AcceptedProgram,
     ir, lir,
@@ -120,6 +122,12 @@ pub enum RecoveryFact {
         name: QualifiedName,
         reason: String,
     },
+    /// A module declaration could not join the validated artifact.
+    ModuleDiscarded {
+        index: usize,
+        name: QualifiedName,
+        reason: String,
+    },
     /// Executable data referred outside its local function table and could not
     /// safely be given a meaning during dependency recovery.
     ExecutableDiscarded { reason: String },
@@ -145,6 +153,7 @@ pub(crate) fn empty() -> Artifact {
             values: Vec::new(),
             types: Vec::new(),
             effects: Vec::new(),
+            modules: Vec::new(),
         },
         lir: Lir {
             externs: Vec::new(),
@@ -314,6 +323,7 @@ fn recover_parts(header: Header, lir: Lir) -> (Artifact, Vec<RecoveryFact>) {
         values: Vec::new(),
         types: Vec::new(),
         effects: Vec::new(),
+        modules: Vec::new(),
     };
 
     // Types precede values because an exported value may name a local type.
@@ -371,6 +381,25 @@ fn recover_parts(header: Header, lir: Lir) -> (Artifact, Vec<RecoveryFact>) {
             }),
         }
     }
+    // A module carries nothing but its metadata, and nothing else names it,
+    // so it is the last thing admitted and its loss costs no other entry.
+    for (index, declaration) in header.modules.into_iter().enumerate() {
+        let mut candidate = recovered.clone();
+        candidate.modules.push(declaration.clone());
+        match (UncheckedArtifact {
+            header: candidate.clone(),
+            lir: lir.clone(),
+        })
+        .validate()
+        {
+            Ok(_) => recovered = candidate,
+            Err(error) => facts.push(RecoveryFact::ModuleDiscarded {
+                index,
+                name: declaration.name,
+                reason: error.to_string(),
+            }),
+        }
+    }
 
     let artifact = UncheckedArtifact {
         header: recovered,
@@ -401,6 +430,9 @@ pub struct Header {
     pub types: Vec<DeclaredType>,
     /// Every declared effect, in source declaration order.
     pub effects: Vec<DeclaredEffect>,
+    /// Every declared module, in source declaration order, with its metadata.
+    /// A module is otherwise visible only as a segment of the names under it.
+    pub modules: Vec<DeclaredModule>,
 }
 
 /// The identity that owns an artifact.
@@ -426,6 +458,7 @@ pub type QualifiedName = String;
 pub struct Value {
     pub name: QualifiedName,
     pub scheme: Scheme,
+    pub metadata: Metadata,
 }
 
 /// A declared type and the semantics of its parameters.
@@ -434,7 +467,63 @@ pub struct DeclaredType {
     pub name: QualifiedName,
     pub params: Vec<Parameter>,
     pub scheme: Scheme,
+    pub metadata: Metadata,
 }
+
+/// A declared module: its qualified name and the metadata in front of its
+/// declaration. The one entry of the header that says nothing semantic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredModule {
+    pub name: QualifiedName,
+    pub metadata: Metadata,
+}
+
+/// A declaration's metadata: literal data by key, in written order, and empty
+/// when no attribute was written. Tools read it; the compiler never does.
+pub type Metadata = IndexMap<String, Data>;
+
+/// A metadata value, span-free: the lowered [`ir::DataKind`] with nothing
+/// about where it was written. Unit is the empty struct and a tuple is the
+/// struct numbered `0`, `1`, …, as they are after lowering.
+///
+/// Compared by representation — a real by its bits, so signed zero is told
+/// apart — so that two artifacts are equal exactly when they print the same.
+/// Nested at most [`ir::METADATA_DEPTH_LIMIT`] deep, which the reader
+/// enforces before building one, so the derived traits may recurse.
+#[derive(Debug, Clone)]
+pub enum Data {
+    Natural(u64),
+    Integer(i64),
+    Real(f64),
+    String(String),
+    Boolean(bool),
+    Array(Vec<Data>),
+    Struct(IndexMap<String, Data>),
+    Tag { name: String, payload: Box<Data> },
+}
+
+impl PartialEq for Data {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Natural(a), Self::Natural(b)) => a == b,
+            (Self::Integer(a), Self::Integer(b)) => a == b,
+            (Self::Real(a), Self::Real(b)) => a.to_bits() == b.to_bits(),
+            (Self::String(a), Self::String(b)) => a == b,
+            (Self::Boolean(a), Self::Boolean(b)) => a == b,
+            (Self::Array(a), Self::Array(b)) => a == b,
+            (Self::Struct(a), Self::Struct(b)) => a == b,
+            (
+                Self::Tag { name, payload },
+                Self::Tag {
+                    name: other_name,
+                    payload: other_payload,
+                },
+            ) => name == other_name && payload == other_payload,
+            _ => false,
+        }
+    }
+}
+impl Eq for Data {}
 
 /// The semantic role of a declared type parameter.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -465,6 +554,7 @@ pub struct DeclaredEffect {
     /// row label of their own.
     pub identity: Option<EffectIdentity>,
     pub kind: EffectKind,
+    pub metadata: Metadata,
 }
 
 /// The structural identity used by semantic effect rows.
@@ -2096,22 +2186,24 @@ pub fn build_with_dependencies(
         dependencies,
         values: program
             .externs
-            .keys()
-            .map(|symbol| Value {
+            .iter()
+            .map(|(symbol, declaration)| Value {
                 name: qualified(mint, *symbol),
                 scheme: scheme(mint, &inference.externs()[symbol]),
+                metadata: metadata(&declaration.metadata),
             })
             .chain(
                 program
                     .terms
-                    .keys()
+                    .iter()
                     // Fresh top-level definitions implement patterns such as
                     // `let _`; they must be initialized, but have no source
                     // name through which another bundle could import them.
-                    .filter(|symbol| !mint.is_local(**symbol))
-                    .map(|symbol| Value {
+                    .filter(|(symbol, _)| !mint.is_local(**symbol))
+                    .map(|(symbol, declaration)| Value {
                         name: qualified(mint, *symbol),
                         scheme: scheme(mint, &inference.schemes()[symbol]),
+                        metadata: metadata(&declaration.metadata),
                     }),
             )
             .collect(),
@@ -2135,6 +2227,7 @@ pub fn build_with_dependencies(
                     })
                     .collect(),
                 scheme: scheme(mint, &inference.aliases()[symbol]),
+                metadata: metadata(&declaration.metadata),
             })
             .collect(),
         effects: program
@@ -2195,12 +2288,50 @@ pub fn build_with_dependencies(
                         })
                     }
                 },
+                metadata: metadata(&declaration.metadata),
+            })
+            .collect(),
+        modules: program
+            .modules
+            .iter()
+            .map(|(symbol, declaration)| DeclaredModule {
+                name: qualified(mint, *symbol),
+                metadata: metadata(&declaration.metadata),
             })
             .collect(),
     };
     Artifact {
         header,
         lir: lower_lir(mint, &lir),
+    }
+}
+
+/// A declaration's lowered metadata, with its spans left behind.
+fn metadata(value: &ir::Metadata) -> Metadata {
+    value
+        .iter()
+        .map(|(key, attribute)| (key.clone(), data(&attribute.value)))
+        .collect()
+}
+
+fn data(value: &ir::Data) -> Data {
+    match &value.tracked {
+        ir::DataKind::Natural(value) => Data::Natural(*value),
+        ir::DataKind::Integer(value) => Data::Integer(*value),
+        ir::DataKind::Real(value) => Data::Real(*value),
+        ir::DataKind::String(value) => Data::String(value.clone()),
+        ir::DataKind::Boolean(value) => Data::Boolean(*value),
+        ir::DataKind::Array(items) => Data::Array(items.iter().map(data).collect()),
+        ir::DataKind::Struct(fields) => Data::Struct(
+            fields
+                .iter()
+                .map(|(name, value)| (name.clone(), data(value)))
+                .collect(),
+        ),
+        ir::DataKind::Tag { name, payload } => Data::Tag {
+            name: name.clone(),
+            payload: Box::new(data(payload)),
+        },
     }
 }
 
@@ -2951,7 +3082,50 @@ pub mod text {
             L(std::iter::once(A("effects".into()))
                 .chain(value.effects.iter().map(effect))
                 .collect()),
+            L(std::iter::once(A("modules".into()))
+                .chain(value.modules.iter().map(module))
+                .collect()),
         ])
+    }
+    fn module(value: &DeclaredModule) -> S {
+        L(vec![
+            A("module".into()),
+            Q(value.name.clone()),
+            metadata(&value.metadata),
+        ])
+    }
+    /// `(metadata (k "key" <data>) ...)` — a declaration's metadata, in the
+    /// order it was written.
+    fn metadata(value: &Metadata) -> S {
+        L(std::iter::once(A("metadata".into()))
+            .chain(
+                value
+                    .iter()
+                    .map(|(key, value)| L(vec![A("k".into()), Q(key.clone()), data(value)])),
+            )
+            .collect())
+    }
+    /// One metadata value. Recursive, since the reader bounds the depth
+    /// before any tree this deep can exist.
+    fn data(value: &Data) -> S {
+        match value {
+            Data::Natural(value) => L(vec![A("nat".into()), A(value.to_string())]),
+            Data::Integer(value) => L(vec![A("int".into()), A(value.to_string())]),
+            Data::Real(value) => L(vec![A("real".into()), A(value.to_string())]),
+            Data::String(value) => L(vec![A("string".into()), Q(value.clone())]),
+            Data::Boolean(value) => L(vec![A("bool".into()), A(value.to_string())]),
+            Data::Array(items) => L(std::iter::once(A("array".into()))
+                .chain(items.iter().map(data))
+                .collect()),
+            Data::Struct(fields) => {
+                L(std::iter::once(A("struct".into()))
+                    .chain(fields.iter().map(|(name, value)| {
+                        L(vec![A("field".into()), Q(name.clone()), data(value)])
+                    }))
+                    .collect())
+            }
+            Data::Tag { name, payload } => L(vec![A("tag".into()), Q(name.clone()), data(payload)]),
+        }
     }
     fn dependency(value: &Dependency) -> S {
         L(vec![
@@ -2965,6 +3139,7 @@ pub mod text {
             A("value".into()),
             Q(value.name.clone()),
             scheme(&value.scheme),
+            metadata(&value.metadata),
         ])
     }
     fn declared_type(value: &DeclaredType) -> S {
@@ -2975,6 +3150,7 @@ pub mod text {
                 .chain(value.params.iter().map(parameter))
                 .collect()),
             scheme(&value.scheme),
+            metadata(&value.metadata),
         ])
     }
     fn parameter(value: &Parameter) -> S {
@@ -3031,6 +3207,7 @@ pub mod text {
                     ]),
                 ]),
             },
+            metadata(&value.metadata),
         ])
     }
     fn operation(value: &Operation) -> S {
@@ -4068,7 +4245,7 @@ pub mod text {
             }
         }
         fn read_header(&self, value: S) -> Header {
-            let mut values = self.exact(self.list(value, "header"), 5, "header");
+            let mut values = self.exact(self.list(value, "header"), 6, "header");
             let identity = {
                 let mut value =
                     self.exact(self.list(self.take(&mut values), "identity"), 2, "identity");
@@ -4103,6 +4280,74 @@ pub mod text {
                     self.check_effects(&effects);
                     effects
                 },
+                modules: self
+                    .many(self.take(&mut values), "modules")
+                    .into_iter()
+                    .map(|value| self.read_module(value))
+                    .collect(),
+            }
+        }
+        fn read_module(&self, value: S) -> DeclaredModule {
+            let mut value = self.exact(self.list(value, "module"), 2, "module");
+            DeclaredModule {
+                name: self.string(self.take(&mut value)),
+                metadata: self.read_metadata(self.take(&mut value)),
+            }
+        }
+        fn read_metadata(&self, value: S) -> Metadata {
+            let mut metadata = Metadata::new();
+            for entry in self.many(value, "metadata") {
+                let mut entry = self.exact(self.list(entry, "k"), 2, "k");
+                let key = self.string(self.take(&mut entry));
+                let data = self.read_data(self.take(&mut entry), 1);
+                if metadata.insert(key, data).is_some() {
+                    self.fail("repeated metadata key");
+                }
+            }
+            metadata
+        }
+        /// One metadata value, `depth` values down from the top of its entry.
+        /// Recursive, and safe to be: nothing below the depth limit is read,
+        /// so the stack this uses is bounded by the limit and not by the file.
+        fn read_data(&self, value: S, depth: usize) -> Data {
+            if depth > ir::METADATA_DEPTH_LIMIT {
+                return self.invalid("metadata nested too deeply", Data::Struct(IndexMap::new()));
+            }
+            let mut values = list_contents(value)
+                .unwrap_or_else(|| self.invalid("invalid metadata value", Vec::new()));
+            let tag = self.atom(self.take(&mut values));
+            match tag.as_str() {
+                "nat" => Data::Natural(self.number(self.exact(values, 1, "nat").remove(0))),
+                "int" => Data::Integer(self.number(self.exact(values, 1, "int").remove(0))),
+                "real" => Data::Real(self.number(self.exact(values, 1, "real").remove(0))),
+                "string" => Data::String(self.string(self.exact(values, 1, "string").remove(0))),
+                "bool" => Data::Boolean(self.boolean(self.exact(values, 1, "bool").remove(0))),
+                "array" => Data::Array(
+                    values
+                        .into_iter()
+                        .map(|item| self.read_data(item, depth + 1))
+                        .collect(),
+                ),
+                "struct" => {
+                    let mut fields = IndexMap::new();
+                    for field in values {
+                        let mut field = self.exact(self.list(field, "field"), 2, "field");
+                        let name = self.string(self.take(&mut field));
+                        let value = self.read_data(self.take(&mut field), depth + 1);
+                        if fields.insert(name, value).is_some() {
+                            self.fail("repeated metadata field");
+                        }
+                    }
+                    Data::Struct(fields)
+                }
+                "tag" => {
+                    let mut values = self.exact(values, 2, "tag");
+                    Data::Tag {
+                        name: self.string(self.take(&mut values)),
+                        payload: Box::new(self.read_data(self.take(&mut values), depth + 1)),
+                    }
+                }
+                _ => self.invalid("invalid metadata value", Data::Struct(IndexMap::new())),
             }
         }
         fn read_dependency(&self, value: S) -> Dependency {
@@ -4113,14 +4358,15 @@ pub mod text {
             }
         }
         fn read_value(&self, value: S) -> Value {
-            let mut value = self.exact(self.list(value, "value"), 2, "value");
+            let mut value = self.exact(self.list(value, "value"), 3, "value");
             Value {
                 name: self.string(self.take(&mut value)),
                 scheme: self.read_scheme(self.take(&mut value)),
+                metadata: self.read_metadata(self.take(&mut value)),
             }
         }
         fn read_declared_type(&self, value: S) -> DeclaredType {
-            let mut value = self.exact(self.list(value, "type"), 3, "type");
+            let mut value = self.exact(self.list(value, "type"), 4, "type");
             DeclaredType {
                 name: self.string(self.take(&mut value)),
                 params: self
@@ -4129,6 +4375,7 @@ pub mod text {
                     .map(|value| self.read_parameter(value))
                     .collect(),
                 scheme: self.read_scheme(self.take(&mut value)),
+                metadata: self.read_metadata(self.take(&mut value)),
             }
         }
         fn read_parameter(&self, value: S) -> Parameter {
@@ -4150,7 +4397,7 @@ pub mod text {
             }
         }
         fn read_effect(&self, value: S) -> DeclaredEffect {
-            let mut value = self.exact(self.list(value, "effect"), 4, "effect");
+            let mut value = self.exact(self.list(value, "effect"), 5, "effect");
             let name = self.string(self.take(&mut value));
             let params: Vec<Parameter> = self
                 .many(self.take(&mut value), "params")
@@ -4239,11 +4486,13 @@ pub mod text {
                     EffectKind::Alias(AliasRow::naming(Vec::new())),
                 ),
             };
+            let metadata = self.read_metadata(self.take(&mut value));
             DeclaredEffect {
                 name,
                 params,
                 identity,
                 kind,
+                metadata,
             }
         }
 
@@ -5451,6 +5700,7 @@ mod tests {
                 values: Vec::new(),
                 types: Vec::new(),
                 effects: Vec::new(),
+                modules: Vec::new(),
             },
             lir: Lir {
                 externs: vec![Extern {

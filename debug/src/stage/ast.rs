@@ -39,7 +39,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         .map(|file| {
             let stmts = written_in(&loaded.stmts, file.id);
             for stmt in &stmts {
-                counts.add(&stmt.tracked);
+                counts.add(&stmt.kind);
             }
             Node::new(ids.next(), "File", file.path.clone())
                 .children(stmts.iter().map(|stmt| stmt_node(&mut ids, stmt)))
@@ -104,7 +104,7 @@ fn written_in(stmts: &[Stmt], file: FileID) -> Vec<&Stmt> {
             }
             if let StmtKind::Module {
                 body: Some(body), ..
-            } = &stmt.tracked
+            } = &stmt.kind
             {
                 walk(body, file, out);
             }
@@ -116,8 +116,22 @@ fn written_in(stmts: &[Stmt], file: FileID) -> Vec<&Stmt> {
 }
 
 fn stmt_node(ids: &mut Ids, stmt: &Stmt) -> Node {
-    let node = Node::new(ids.next(), "", print::ast::stmt(&stmt.tracked).to_string()).at(stmt.span);
-    match &stmt.tracked {
+    // The attributes come first, as they were written, each a row of its own
+    // spanning the key and its value.
+    let attributes: Vec<Node> = stmt
+        .attributes
+        .iter()
+        .map(|attribute| {
+            Node::new(
+                ids.next(),
+                "Attribute",
+                print::ast::attribute(attribute).to_string(),
+            )
+            .at(attribute.span)
+        })
+        .collect();
+    let node = Node::new(ids.next(), "", print::ast::stmt(stmt).to_string()).at(stmt.span);
+    let mut built = match &stmt.kind {
         // A module's own row is its name and, when the body was written inline,
         // the statements in it. A body that came from another file is left to
         // that file's own row; see [`written_in`].
@@ -220,7 +234,9 @@ fn stmt_node(ids: &mut Ids, stmt: &Stmt) -> Node {
             }
             effect_node
         }
-    }
+    };
+    built.children.splice(0..0, attributes);
+    built
 }
 
 fn expr_role_node(ids: &mut Ids, role: &'static str, expr: &Expr) -> Node {

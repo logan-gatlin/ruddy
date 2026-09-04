@@ -10,9 +10,9 @@ use std::fmt;
 use indexmap::IndexMap;
 use ruddy::{
     parse::{
-        Annotation, Arg, ArgKind, ArmHead, ClauseKind, EffectBody, EffectLabel, EffectRow, Expr,
-        ExprKind, HandlerArm, Path, PatternKind, Rest, StmtKind, SumCase, TypeField, TypeKind,
-        When, Where,
+        Annotation, Arg, ArgKind, ArmHead, Attribute, ClauseKind, DataKind, EffectBody,
+        EffectLabel, EffectRow, Expr, ExprKind, HandlerArm, Path, PatternKind, Rest, Stmt,
+        StmtKind, SumCase, TypeField, TypeKind, When, Where,
     },
     tracking::Tracked,
 };
@@ -133,6 +133,118 @@ fn ends_in_match_function(expr: &ExprKind) -> bool {
     }
 }
 
+/// A statement prints as its attributes, one apiece and each in front of the
+/// next, and then the definition — the order it was written in, and the order
+/// the parser reads it back in.
+impl fmt::Display for Ast<'_, Stmt> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for attribute in &self.0.attributes {
+            write!(f, "{} ", Ast(attribute))?;
+        }
+        write!(f, "{}", Ast(&self.0.kind))
+    }
+}
+
+/// `@key`, and its value after a space when it carries one. A written `()` is
+/// the same value as none, so it prints as the bare key — the rule the
+/// lowered tree's printer follows too, which is what keeps the two agreeing.
+impl fmt::Display for Ast<'_, Attribute> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "@{}", self.0.key.tracked)?;
+        match &self.0.value {
+            Some(value) if !unit_data(&value.tracked) => write!(f, " {}", Ast(&value.tracked)),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Whether a written value is unit: `()`, or the `{}` lowering makes the same.
+fn unit_data(data: &DataKind) -> bool {
+    match data {
+        DataKind::Unit => true,
+        DataKind::Struct(fields) => fields.is_empty(),
+        _ => false,
+    }
+}
+
+/// Data groups as the expression it looks like: a tag carrying something is
+/// the one form that reads as an application, and everything else closes
+/// itself. A tag carrying a written unit is bare, as it prints.
+impl Grouped for Ast<'_, DataKind> {
+    fn prec(&self) -> Prec {
+        match self.0 {
+            DataKind::Tag { payload, .. } => match carried(payload.as_deref()) {
+                Some(_) => Prec::Apply,
+                None => Prec::Tag,
+            },
+            _ => Prec::Atom,
+        }
+    }
+}
+
+/// A tag's payload, when it carries anything: a written `()` or `{}` is the
+/// unit a bare tag already carries, so it is not written back.
+fn carried(payload: Option<&ruddy::parse::Data>) -> Option<&ruddy::parse::Data> {
+    payload.filter(|payload| !unit_data(&payload.tracked))
+}
+
+/// A metadata value prints as the expression it would be, by the expression
+/// printer's rules: unit and the empty struct as `()`, numbered fields as a
+/// tuple, and the rest as written.
+impl fmt::Display for Ast<'_, DataKind> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            DataKind::Natural(value) => write!(f, "{value}n"),
+            DataKind::Integer(value) => write!(f, "{value}i"),
+            DataKind::Real(value) => write!(f, "{value}"),
+            DataKind::String(value) => f.write_str(&string(value)),
+            DataKind::Boolean(value) => write!(f, "{value}"),
+            DataKind::Unit => f.write_str("()"),
+            DataKind::Tuple(elements) => {
+                write_tuple(f, elements.iter().map(|element| Ast(&element.tracked)))
+            }
+            DataKind::Array(items) => {
+                f.write_str("[")?;
+                for (index, item) in items.iter().enumerate() {
+                    if index != 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{}", Ast(&item.tracked))?;
+                }
+                f.write_str("]")
+            }
+            DataKind::Struct(fields) => {
+                if fields.is_empty() {
+                    f.write_str("()")
+                } else if let Some(order) =
+                    tuple_field_order(fields.iter().map(|(name, _)| name.tracked.as_str()))
+                {
+                    write_tuple(
+                        f,
+                        order
+                            .into_iter()
+                            .map(|insertion| Ast(&fields[insertion].1.tracked)),
+                    )
+                } else {
+                    write_struct(
+                        f,
+                        fields
+                            .iter()
+                            .map(|(name, value)| (&name.tracked, Ast(&value.tracked))),
+                        None,
+                    )
+                }
+            }
+            DataKind::Tag { name, payload } => write_tag(
+                f,
+                &name.tracked,
+                None,
+                carried(payload.as_deref()).map(|payload| Ast(&payload.tracked)),
+            ),
+        }
+    }
+}
+
 impl fmt::Display for Ast<'_, StmtKind> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
@@ -159,7 +271,7 @@ impl fmt::Display for Ast<'_, StmtKind> {
                 };
                 f.write_str(" =")?;
                 for stmt in body {
-                    write!(f, " {}", Ast(&stmt.tracked))?;
+                    write!(f, " {}", Ast(stmt))?;
                 }
                 f.write_str(" end")
             }
@@ -396,7 +508,7 @@ impl fmt::Display for Ast<'_, ExprKind> {
             // binding in a block is written as the definition it reads like.
             ExprKind::Do { stmts, result } => write_do(
                 f,
-                stmts.iter().map(|stmt| Ast(&stmt.tracked)),
+                stmts.iter().map(Ast),
                 result.as_deref().map(|result| Ast(&result.tracked)),
             ),
             ExprKind::If {
@@ -848,9 +960,16 @@ impl fmt::Display for Effects {
     }
 }
 
-/// Render one statement, `let` or `type`, as it was written.
-pub fn stmt(kind: &StmtKind) -> impl fmt::Display + '_ {
-    Ast(kind)
+/// Render one statement as it was written: its attributes, then the
+/// definition.
+pub fn stmt(stmt: &Stmt) -> impl fmt::Display + '_ {
+    Ast(stmt)
+}
+
+/// Render one attribute as it was written, `@key` or `@key value`, for the
+/// row the AST tab gives each one.
+pub fn attribute(attribute: &Attribute) -> impl fmt::Display + '_ {
+    Ast(attribute)
 }
 
 /// Render one expression, for the tree view, which labels a node with the source

@@ -23,6 +23,15 @@ fields named before the `..`, which replace fields of the same name at
 whatever type they have, so `fn v => { x: 1, ..v }` updates or extends
 whatever struct it is given while keeping the rest of its fields.
 
+Any top-level definition may carry metadata: attributes written in front of
+it as `@key` or `@key <literal>`, where the literal is a string, number,
+boolean, tag, or a tuple, array, or struct of those, as in
+`@deprecated "use nat::add" @since 2n let add = ...`. The compiler gives no key
+a meaning: it refuses a repeated key, carries the metadata through unchanged,
+shows it in the debugger, and publishes it in the bundle's artifact for every
+value, type, effect, and module, where tools and dependents can read it.
+Metadata never changes a definition's type or its generated code.
+
 Immutable homogeneous arrays use `[value, ...]` literals and `[Type]` types.
 A literal may spread other arrays into place with `..`, as in `[..a, x, ..b]`,
 and a `match` may take an array apart by length with patterns such as `[]`,

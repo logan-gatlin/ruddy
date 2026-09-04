@@ -222,7 +222,7 @@ impl Loader<'_> {
     /// never at `B.hc`.
     fn splice(&mut self, stmts: &mut [Stmt], at: &mut Vec<String>) {
         for stmt in stmts {
-            let StmtKind::Module { name, body } = &mut stmt.tracked else {
+            let StmtKind::Module { name, body } = &mut stmt.kind else {
                 continue;
             };
             at.push(name.tracked.clone());

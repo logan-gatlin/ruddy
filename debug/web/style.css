@@ -30,6 +30,9 @@
   /* An effect. A name that does resolve, unlike a tag, so it is told apart
      from one — the same distinction the `!` draws in the source. */
   --effect: #6cc7f7;
+  /* An attribute's key: metadata about a definition, dimmer than the program
+     it annotates so the notes read as notes. */
+  --attribute: #9aa5b8;
   --unlexed: #ff6b6b;
 
   --row: 20px;
@@ -61,6 +64,7 @@
     --number: #b4531a;
     --tag: #8a6216;
     --effect: #15607f;
+    --attribute: #6b7a90;
     --unlexed: #c92a2a;
   }
 }
@@ -419,6 +423,9 @@ input {
 }
 .hl .effect {
   color: var(--effect);
+}
+.hl .attribute {
+  color: var(--attribute);
 }
 .hl .unlexed {
   color: var(--unlexed);

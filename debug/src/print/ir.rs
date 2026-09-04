@@ -10,8 +10,9 @@ use std::fmt;
 use indexmap::IndexMap;
 use ruddy::{
     ir::{
-        Annotation, ClauseKind, Effect, EffectLabel, EffectRow, Field, Handler, PatternKind,
-        Program, Row, SumCase, Term, TermKind, TypeField, TypeKind, When,
+        Annotation, Attribute, ClauseKind, DataKind, Effect, EffectLabel, EffectRow, Field,
+        Handler, Metadata, PatternKind, Program, Row, SumCase, Term, TermKind, TypeField, TypeKind,
+        When,
     },
     symbol::Mint,
     tracking::Tracked,
@@ -133,6 +134,7 @@ impl fmt::Display for Show<'_, Program> {
                 f.write_str("\n")?;
             }
             first = false;
+            self.write_metadata(f, &decl.metadata)?;
             write!(f, "effect {}", self.mint.name(*symbol))?;
             for param in &decl.params {
                 write!(f, " '{}", self.mint.name(param.symbol))?;
@@ -203,6 +205,7 @@ impl fmt::Display for Show<'_, Program> {
                 f.write_str("\n")?;
             }
             first = false;
+            self.write_metadata(f, &decl.metadata)?;
             write!(f, "type {}", self.mint.name(*symbol))?;
             for param in &decl.params {
                 write!(f, " '{}", self.mint.name(param.symbol))?;
@@ -214,6 +217,7 @@ impl fmt::Display for Show<'_, Program> {
                 f.write_str("\n")?;
             }
             first = false;
+            self.write_metadata(f, &decl.metadata)?;
             write!(f, "extern {} : ", self.mint.name(*symbol))?;
             if let Some(annotation) = &decl.annotation {
                 write!(f, "{}", self.show(annotation))?;
@@ -225,6 +229,7 @@ impl fmt::Display for Show<'_, Program> {
                 f.write_str("\n")?;
             }
             first = false;
+            self.write_metadata(f, &decl.metadata)?;
             write!(f, "let {}", self.mint.name(*symbol))?;
             if let Some(annotation) = &decl.annotation {
                 write!(f, " : {}", self.show(annotation))?;
@@ -232,6 +237,112 @@ impl fmt::Display for Show<'_, Program> {
             write!(f, " = {}", self.show(&decl.value))?;
         }
         Ok(())
+    }
+}
+
+impl<T> Show<'_, T> {
+    /// A declaration's metadata, one `@key value` apiece and a space after
+    /// each, in front of the declaration it belongs to.
+    fn write_metadata(&self, f: &mut fmt::Formatter<'_>, metadata: &Metadata) -> fmt::Result {
+        for (key, attribute) in metadata {
+            write!(
+                f,
+                "{} ",
+                Shown {
+                    key,
+                    attribute,
+                    mint: self.mint
+                }
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// One lowered attribute, ready to print: `@key`, and its value after a space
+/// when it is anything but unit. Unit — the empty struct — prints as the bare
+/// key, which is what the parse tree's printer writes for it too, so the two
+/// printers agree.
+struct Shown<'a> {
+    key: &'a str,
+    attribute: &'a Attribute,
+    mint: &'a Mint,
+}
+
+impl fmt::Display for Shown<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "@{}", self.key)?;
+        match unit_data(&self.attribute.value.tracked) {
+            true => Ok(()),
+            false => write!(f, " {}", data(&self.attribute.value.tracked, self.mint)),
+        }
+    }
+}
+
+/// Whether lowered data is unit: the empty struct, which `()`, `{}`, and a
+/// bare attribute all became.
+fn unit_data(data: &DataKind) -> bool {
+    matches!(data, DataKind::Struct(fields) if fields.is_empty())
+}
+
+/// Data groups as the expression it reads as: a tag carrying something is an
+/// application, and everything else closes itself.
+impl Grouped for Show<'_, DataKind> {
+    fn prec(&self) -> Prec {
+        match self.node {
+            DataKind::Tag { payload, .. } if !unit_data(&payload.tracked) => Prec::Apply,
+            DataKind::Tag { .. } => Prec::Tag,
+            _ => Prec::Atom,
+        }
+    }
+}
+
+/// Lowered data prints as the expression printer prints the value it stands
+/// for: the empty struct as `()`, numbered fields as a tuple, a tag carrying
+/// unit as the bare tag.
+impl fmt::Display for Show<'_, DataKind> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.node {
+            DataKind::Natural(value) => write!(f, "{value}n"),
+            DataKind::Integer(value) => write!(f, "{value}i"),
+            DataKind::Real(value) => write!(f, "{value}"),
+            DataKind::String(value) => f.write_str(&string(value)),
+            DataKind::Boolean(value) => write!(f, "{value}"),
+            DataKind::Array(items) => {
+                f.write_str("[")?;
+                for (index, item) in items.iter().enumerate() {
+                    if index != 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{}", self.show(item))?;
+                }
+                f.write_str("]")
+            }
+            DataKind::Struct(fields) => {
+                if fields.is_empty() {
+                    f.write_str("()")
+                } else if let Some(order) = tuple_field_order(fields.keys().map(String::as_str)) {
+                    write_tuple(
+                        f,
+                        order
+                            .into_iter()
+                            .map(|insertion| self.show(&fields[insertion])),
+                    )
+                } else {
+                    write_struct(
+                        f,
+                        fields.iter().map(|(name, value)| (name, self.show(value))),
+                        None,
+                    )
+                }
+            }
+            DataKind::Tag { name, payload } => write_tag(
+                f,
+                name,
+                None,
+                (!unit_data(&payload.tracked)).then(|| self.show(payload.as_ref())),
+            ),
+        }
     }
 }
 
@@ -928,4 +1039,25 @@ pub fn clause<'a>(kind: &'a ClauseKind, mint: &'a Mint) -> impl fmt::Display + '
 /// match.
 pub fn pattern<'a>(kind: &'a PatternKind, mint: &'a Mint) -> impl fmt::Display + 'a {
     Show { node: kind, mint }
+}
+
+/// Render one lowered metadata value, the way [`program`] writes it after a
+/// definition's `@key`. Data names no symbols, but it prints by the same
+/// grouping rules as everything else here, so it takes the mint the rest do.
+pub fn data<'a>(kind: &'a DataKind, mint: &'a Mint) -> impl fmt::Display + 'a {
+    Show { node: kind, mint }
+}
+
+/// Render one lowered attribute, `@key value`, for the row the IR tab gives
+/// each one.
+pub fn attribute<'a>(
+    key: &'a str,
+    attribute: &'a Attribute,
+    mint: &'a Mint,
+) -> impl fmt::Display + 'a {
+    Shown {
+        key,
+        attribute,
+        mint,
+    }
 }

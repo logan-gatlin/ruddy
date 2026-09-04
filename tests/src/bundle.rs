@@ -58,7 +58,7 @@ fn paths(out: &Output) -> Vec<&str> {
 fn names(stmts: &[ruddy::parse::Stmt]) -> Vec<String> {
     stmts
         .iter()
-        .map(|stmt| match &stmt.tracked {
+        .map(|stmt| match &stmt.kind {
             StmtKind::Let { pattern, .. } => format!("let {}", pattern.tracked),
             StmtKind::Extern { name, .. } => format!("extern {}", name.tracked),
             StmtKind::Type { name, .. } => format!("type {}", name.tracked),
@@ -72,7 +72,7 @@ fn names(stmts: &[ruddy::parse::Stmt]) -> Vec<String> {
 fn body<'a>(stmts: &'a [ruddy::parse::Stmt], name: &str) -> &'a [ruddy::parse::Stmt] {
     stmts
         .iter()
-        .find_map(|stmt| match &stmt.tracked {
+        .find_map(|stmt| match &stmt.kind {
             StmtKind::Module { name: at, body } if at.tracked == name => body.as_deref(),
             _ => None,
         })

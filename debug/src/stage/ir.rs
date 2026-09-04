@@ -126,6 +126,19 @@ fn decl_node<T>(
         ascribed.label = format!("Ascribed {}", ascribed.label);
         node = node.child(ascribed);
     }
+    // The metadata, one row per attribute, spanning the key and its value:
+    // what the declaration carries about itself, shown where the AST panel
+    // shows the same thing.
+    for (key, attribute) in &decl.metadata {
+        node = node.child(
+            Node::new(
+                ids.next(),
+                "Attribute",
+                print::ir::attribute(key, attribute, mint).to_string(),
+            )
+            .at(attribute.key_span.merge(attribute.value.span)),
+        );
+    }
     // The binders, before the body that uses them, which is where they are
     // written and how the AST panel already shows them. A parameter is a local
     // symbol like a lambda's argument, so it cross-highlights with every

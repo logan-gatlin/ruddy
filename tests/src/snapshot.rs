@@ -1019,7 +1019,7 @@ fn diagnostics_are_reported_in_source_order() {
     assert_eq!(
         codes,
         [
-            "character-not-used",
+            "attribute-needs-name",
             "number-joined-to-name",
             "expected-name"
         ]

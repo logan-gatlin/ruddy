@@ -147,6 +147,30 @@ let shadowing = do
   return count
 end
 
+@test
+let flagged = 1n
+
+@doc "Adds two naturals, saturating nowhere."
+@since 2n
+let described = fn a => a
+
+@stability #Experimental
+@retired #Removed 3n
+type Marked = { value: Nat }
+
+@shape (1n, "two")
+@tags ["core", "demo"]
+effect Noted = Nat -> ()
+
+@js { from: "host/math", "export as": "answer", 0: true }
+extern answer : Nat = "host.answer"
+
+@owner "core"
+module Annotated =
+  @inner ()
+  let within = 2n
+end
+
 let _ = id 7
 
 let konst = fn x _ => x
