@@ -582,6 +582,8 @@ impl fmt::Display for Kind {
             Kind::Variable(name) => write!(f, "'{name}"),
             Kind::LeftBrace => f.write_str("{"),
             Kind::RightBrace => f.write_str("}"),
+            Kind::LeftBracket => f.write_str("["),
+            Kind::RightBracket => f.write_str("]"),
             Kind::LeftParen => f.write_str("("),
             Kind::RightParen => f.write_str(")"),
             Kind::Identifier(name) => f.write_str(name),
@@ -655,6 +657,7 @@ impl parse::Error {
         match self.kind {
             parse::ErrorKind::Expected { expected, .. } => expected.code(),
             parse::ErrorKind::Wildcard { .. } => "misplaced-discard",
+            parse::ErrorKind::ArrayPattern => "unsupported-array-pattern",
         }
     }
 
@@ -762,6 +765,12 @@ impl parse::Error {
                 Diagnostic::new("misplaced-discard", title, self.span)
                     .label("`_` does not provide a name here")
             }
+            parse::ErrorKind::ArrayPattern => Diagnostic::new(
+                "unsupported-array-pattern",
+                "array patterns are not supported",
+                self.span,
+            )
+            .label("match the array as a value and use functions from `array`"),
         }
     }
 }
@@ -1003,6 +1012,7 @@ impl ir::ErrorKind {
     /// have to re-inspect the variant to tell them apart.
     pub fn code(&self) -> &'static str {
         match self {
+            ir::ErrorKind::ArrayInExtern => "array-in-extern",
             ir::ErrorKind::InvalidDependencyAlias { .. } => "invalid-dependency-alias",
             ir::ErrorKind::DuplicateDependencyAlias { .. } => "duplicate-dependency-alias",
             ir::ErrorKind::DuplicateDependency { .. } => "duplicate-dependency",
@@ -1093,6 +1103,13 @@ impl ir::Error {
         let code = self.kind.code();
         let span = self.span;
         match &self.kind {
+            E::ArrayInExtern => Diagnostic::new(
+                code,
+                "arrays cannot cross an extern boundary yet",
+                span,
+            )
+            .label("this array uses Ruddy's private persistent representation")
+            .help("convert the value at a Ruddy boundary, or keep this function in Ruddy code"),
             E::InvalidDependencyAlias { alias } => Diagnostic::new(
                 code,
                 format!("`{alias}` cannot be used as a module name"),
@@ -1908,6 +1925,11 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                 }
                 match ty {
                     Ty::Package(body) => work.push(SemanticJob::Ty(body, false)),
+                    Ty::Array(element) => {
+                        f.write_str("[")?;
+                        work.push(SemanticJob::Text("]"));
+                        work.push(SemanticJob::Ty(element, false));
+                    }
                     Ty::Nat => f.write_str(Prim::Nat.name())?,
                     Ty::Int => f.write_str(Prim::Int.name())?,
                     Ty::Real => f.write_str(Prim::Real.name())?,
@@ -2438,6 +2460,7 @@ impl Rule {
             Rule::Same => "same",
             Rule::Congruent => "congruent",
             Rule::Bind => "bind",
+            Rule::Array => "array",
             Rule::Occurs => "occurs",
             // The shape is not part of these two codes, only of their wording,
             // for the reason a row error's is not part of its code: a reader
@@ -2473,6 +2496,7 @@ impl fmt::Display for Rule {
                 "the same declared type on both sides, and it keeps what it takes: argument against argument",
             ),
             Rule::Bind => f.write_str("a variable takes the type it is against"),
+            Rule::Array => f.write_str("two arrays: element type against element type"),
             Rule::Occurs => {
                 f.write_str("the variable is inside the type it is against, so no finite type fits")
             }
@@ -2691,6 +2715,7 @@ fn type_description(description: inference::TypeDescription) -> &'static str {
         T::Function => "a function",
         T::Struct => "a struct",
         T::TaggedValue => "a tagged value",
+        T::Array => "an array",
         T::DeclaredType => "a declared type",
         T::Undecided => "another type",
     }

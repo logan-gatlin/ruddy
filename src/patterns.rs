@@ -372,6 +372,11 @@ fn walk_under(check: &Check, term: &Term, assumed: &Formula, out: &mut Output) {
                 walk_under(check, &field.value, assumed, out);
             }
         }
+        TermKind::Array(elements) => {
+            for element in elements {
+                walk_under(check, element, assumed, out);
+            }
+        }
         TermKind::Tag { payload, .. } => {
             if let Some(payload) = payload {
                 walk_under(check, payload, assumed, out);

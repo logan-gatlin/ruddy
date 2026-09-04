@@ -112,6 +112,8 @@ pub fn label(kind: &Kind) -> &'static str {
         Kind::Variable(_) => "Variable",
         Kind::LeftBrace => "LeftBrace",
         Kind::RightBrace => "RightBrace",
+        Kind::LeftBracket => "LeftBracket",
+        Kind::RightBracket => "RightBracket",
         Kind::LeftParen => "LeftParen",
         Kind::RightParen => "RightParen",
         Kind::Identifier(_) => "Identifier",
@@ -158,6 +160,8 @@ pub fn class(kind: &Kind) -> &'static str {
         | Kind::Pipe
         | Kind::LeftBrace
         | Kind::RightBrace
+        | Kind::LeftBracket
+        | Kind::RightBracket
         | Kind::LeftParen
         | Kind::RightParen => "punct",
         _ => "keyword",

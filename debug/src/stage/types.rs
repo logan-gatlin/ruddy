@@ -210,6 +210,7 @@ fn ownership_metadata(scheme: &Scheme) -> (u32, Vec<u32>) {
                     packages += 1;
                     parts.push(Part::Ty(body));
                 }
+                Ty::Array(element) => parts.push(Part::Ty(element)),
                 Ty::Arrow(from, to, effects) => {
                     parts.push(Part::Row(effects));
                     parts.push(Part::Ty(to));
@@ -280,6 +281,11 @@ fn walk_locals(term: &Term, out: &mut Vec<Tracked<Symbol>>) {
         TermKind::Struct(fields) => {
             for field in fields.values() {
                 walk_locals(&field.value, out);
+            }
+        }
+        TermKind::Array(elements) => {
+            for element in elements {
+                walk_locals(element, out);
             }
         }
         TermKind::Tag { payload, .. } => {
@@ -461,6 +467,7 @@ fn relevant_parameters(aliases: &IndexMap<Symbol, Scheme>) -> HashMap<Symbol, Ha
                         work.push(Work::Ty(from));
                     }
                     Ty::Package(body) => work.push(Work::Ty(body)),
+                    Ty::Array(element) => work.push(Work::Ty(element)),
                     Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(row)),
                     Ty::Nat
                     | Ty::Int
@@ -536,6 +543,7 @@ fn names_in(ty: &Ty, relevant: &HashMap<Symbol, HashSet<usize>>, out: &mut Vec<S
                     work.push(Work::Ty(from));
                 }
                 Ty::Package(body) => work.push(Work::Ty(body)),
+                Ty::Array(element) => work.push(Work::Ty(element)),
                 Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(row)),
                 Ty::Nat
                 | Ty::Int

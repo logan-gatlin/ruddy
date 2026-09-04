@@ -1,0 +1,39 @@
+================================================================================
+Array literals are atoms and allow a trailing comma
+================================================================================
+
+let empty = []
+let values = [1, f x, true,]
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (array_expression))
+  (let_definition
+    (identifier)
+    (array_expression
+      (natural)
+      (application
+        (identifier)
+        (identifier))
+      (boolean))))
+
+================================================================================
+Array types contain exactly one element type
+================================================================================
+
+let nested : [[Nat]] = [[]]
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (annotation
+      (array_type
+        (array_type
+          (identifier))))
+    (array_expression
+      (array_expression))))

@@ -3295,6 +3295,41 @@ fn check_compiles_without_build_output_and_reports_failures() {
 }
 
 #[test]
+fn imported_array_aliases_cannot_cross_extern_boundaries() {
+    let directory = tempfile::tempdir().unwrap();
+    let dependency = directory.path().join("dep");
+    let app = directory.path().join("app");
+    fs::create_dir(&dependency).unwrap();
+    fs::create_dir(&app).unwrap();
+    fs::write(
+        dependency.join("Ruddy.toml"),
+        "name = \"dep\"\nversion = \"1.0.0\"\nroot = \"lib.hc\"\n[dependencies]\nstd = false\n",
+    )
+    .unwrap();
+    fs::write(
+        dependency.join("lib.hc"),
+        "type Carrier 'r = { name: String, ..'r }\ntype Numbers = Carrier { values: [Nat] }\n",
+    )
+    .unwrap();
+    fs::write(
+        app.join("Ruddy.toml"),
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\ndep = \"../dep\"\n",
+    )
+    .unwrap();
+    fs::write(
+        app.join("main.hc"),
+        "extern values : dep::Numbers = \"host.values\"\n",
+    )
+    .unwrap();
+
+    let error = check_project(&app).expect_err("the private array representation must not leak");
+    assert!(
+        error.to_string().contains("[array-in-extern] Error"),
+        "{error}"
+    );
+}
+
+#[test]
 fn clean_removes_build_directories_and_other_stale_entries_idempotently() {
     let directory = tempfile::tempdir().unwrap();
     let app = directory.path().join("app");

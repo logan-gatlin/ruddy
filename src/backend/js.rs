@@ -342,6 +342,16 @@ impl<'a> Generator<'a> {
                 }
                 out.push_str("])");
             }
+            Op::Array(values) => {
+                out.push_str("$array([");
+                for (index, value) in values.iter().enumerate() {
+                    if index != 0 {
+                        out.push_str(", ");
+                    }
+                    out.push_str(&v(*value));
+                }
+                out.push_str("])");
+            }
             Op::Merge(values) => {
                 out.push_str("Object.assign(Object.create(null)");
                 for value in values {
@@ -606,7 +616,81 @@ const $effect = Symbol("effect envelope");
 const $dv = new DataView(new ArrayBuffer(8));
 const $real = $bits => { $dv.setBigUint64(0, BigInt("0x" + $bits)); return $dv.getFloat64(0); };
 const $record = $entries => { const $o = Object.create(null); for (const [$k, $v] of $entries) $o[$k] = $v; return $o; };
+const $array = $values => {
+  const $size = $values.length;
+  const $tailStart = $size === 0 ? 0 : Math.floor(($size - 1) / 32) * 32;
+  const $tail = Object.freeze($values.slice($tailStart));
+  let $level = [];
+  for (let $i = 0; $i < $tailStart; $i += 32) $level.push(Object.freeze($values.slice($i, $i + 32)));
+  let $shift = 5;
+  while ($level.length > 32) {
+    const $next = [];
+    for (let $i = 0; $i < $level.length; $i += 32) $next.push(Object.freeze($level.slice($i, $i + 32)));
+    $level = $next;
+    $shift += 5;
+  }
+  return Object.freeze({ size: $size, shift: $shift, root: Object.freeze($level), tail: $tail });
+};
 const $sum = ($name, $value) => { const $o = Object.create(null); $o[$tag] = $name; $o[$payload] = $value; return $o; };
+const $arrayTailOffset = $a => $a.size < 32 ? 0 : Math.floor(($a.size - 1) / 32) * 32;
+const $arrayNth = ($a, $i) => {
+  if ($i >= $arrayTailOffset($a)) return $a.tail[$i % 32];
+  let $node = $a.root;
+  for (let $level = $a.shift; $level > 0; $level -= 5) $node = $node[Math.floor($i / (2 ** $level)) % 32];
+  return $node[$i % 32];
+};
+const $arrayNewPath = ($level, $node) => {
+  while ($level > 0) { $node = Object.freeze([$node]); $level -= 5; }
+  return $node;
+};
+const $arrayPushTail = ($level, $parent, $tail, $index) => {
+  const $slot = Math.floor($index / (2 ** $level)) % 32;
+  const $copy = $parent.slice();
+  $copy[$slot] = $level === 5
+    ? $tail
+    : $parent[$slot] === undefined
+      ? $arrayNewPath($level - 5, $tail)
+      : $arrayPushTail($level - 5, $parent[$slot], $tail, $index);
+  return Object.freeze($copy);
+};
+const $arrayAssoc = ($level, $node, $index, $value) => {
+  const $copy = $node.slice();
+  if ($level === 0) $copy[$index % 32] = $value;
+  else {
+    const $slot = Math.floor($index / (2 ** $level)) % 32;
+    $copy[$slot] = $arrayAssoc($level - 5, $node[$slot], $index, $value);
+  }
+  return Object.freeze($copy);
+};
+const $arrayLen = $a => $a.size;
+const $arrayGet = $a => $i => $i < $a.size
+  ? $sum("Some", $arrayNth($a, $i))
+  : $sum("None", undefined);
+const $arraySet = $a => $i => $value => {
+  if ($i >= $a.size) return $sum("None", undefined);
+  if ($i >= $arrayTailOffset($a)) {
+    const $tail = $a.tail.slice();
+    $tail[$i % 32] = $value;
+    return $sum("Some", Object.freeze({ ...$a, tail: Object.freeze($tail) }));
+  }
+  return $sum("Some", Object.freeze({ ...$a, root: $arrayAssoc($a.shift, $a.root, $i, $value) }));
+};
+const $arrayPush = $a => $value => {
+  if ($a.tail.length < 32) return Object.freeze({
+    ...$a,
+    size: $a.size + 1,
+    tail: Object.freeze([...$a.tail, $value]),
+  });
+  let $shift = $a.shift;
+  let $root;
+  if (Math.floor($a.size / 32) > 2 ** $a.shift) {
+    $root = Object.freeze([$a.root, $arrayNewPath($a.shift, $a.tail)]);
+    $shift += 5;
+  } else {
+    $root = $arrayPushTail($a.shift, $a.root, $a.tail, $a.size - 1);
+  }
+  return Object.freeze({ size: $a.size + 1, shift: $shift, root: $root, tail: Object.freeze([$value]) });
+};
 const $namespace = $entries => Object.freeze($record($entries));
 const $own = ($o, $k) => Object.prototype.hasOwnProperty.call($o, $k);
 const $hasRest = ($o, $known) => Reflect.ownKeys($o).some($k => typeof $k !== "string" || !$known.includes($k));

@@ -328,6 +328,11 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
             ..node
         }
         .children(elements.iter().map(|element| expr_node(ids, element))),
+        ExprKind::Array(elements) => Node {
+            label: "Array".into(),
+            ..node
+        }
+        .children(elements.iter().map(|element| expr_node(ids, element))),
         ExprKind::Struct(fields) => Node {
             label: "Struct".into(),
             ..node
@@ -781,6 +786,11 @@ fn type_node(ids: &mut Ids, ty: &Type) -> Node {
             ..node
         }
         .children(elements.iter().map(|element| type_node(ids, element))),
+        TypeKind::Array(element) => Node {
+            label: "Array".into(),
+            ..node
+        }
+        .child(type_node(ids, element)),
         TypeKind::Apply { head, args } => Node {
             label: "Apply".into(),
             ..node

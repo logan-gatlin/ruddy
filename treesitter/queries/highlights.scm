@@ -208,6 +208,8 @@
 [
   "("
   ")"
+  "["
+  "]"
   "{"
   "}"
 ] @punctuation.bracket
