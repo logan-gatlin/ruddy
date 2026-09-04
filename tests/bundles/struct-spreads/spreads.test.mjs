@@ -55,6 +55,10 @@ test("one updater serves a value with the field and one without it", () => {
 test("every retained field reads back", () => {
   assert.deepEqual(fields(app.read_back(app.several)), { 0: 3, 1: "b", 2: false });
   assert.deepEqual(fields(app.read_back(app.computed)), { 0: 1, 1: "b", 2: true });
+  assert.deepEqual(fields(app.read_added({ ...app.several, ...app.computed })), { 0: 4, 1: 9 });
+  assert.equal(app.several.e, 9);
+  assert.equal(app.computed.d, 4);
+  assert.equal(app.extended.d, 2);
 });
 
 test("fields run left to right, the spread last and once, and still lose to the fields", () => {

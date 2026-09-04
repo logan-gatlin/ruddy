@@ -2926,9 +2926,6 @@ fn explanation_fact(
             inference::Subject::Parameter => "the function requires one parameter type".into(),
             inference::Subject::Term => "this expression supplies its type here".into(),
             inference::Subject::Spread => "only an array can be spread into an array".into(),
-            inference::Subject::StructSpread => {
-                "the struct keeps every field of the value it spreads".into()
-            }
             _ => "this use contributes one of the conflicting type requirements".into(),
         },
     }
@@ -3878,17 +3875,13 @@ pub fn write_arrow(
     }
 }
 
-/// Render a `{ name: value, ... }` literal, shared by every position one can
-/// appear in: struct expressions and struct types, in either tree, and the
-/// semantic type as well. The trees reach the name and the value differently —
-/// one off a spanned key, another off the map's key and a field — so the pairs
-/// arrive already rendered.
-///
-/// The wrapper over [`write_row`] for the positions that have no presence and
-/// no tail: struct expressions, whose fields are simply there.
-/// Render a `{ name: value, ..spread }` struct literal: the fields it names,
-/// and then, after the `..`, the value it spreads — which is written where a
-/// type writes its tail, and by the same rule, so the two cannot drift apart.
+/// Render a `{ name: value, ..spread }` struct literal, shared by both trees:
+/// they reach the name and the value differently — one off a spanned key,
+/// another off the map's key and a field — so the pairs arrive already
+/// rendered. The wrapper over [`write_row`] for the one position whose
+/// fields have no presence: they are simply there. After them, past the
+/// `..`, comes the value the literal spreads — written where a type writes
+/// its tail, and by the same rule, so the two cannot drift apart — and
 /// `None` is a literal with no spread, which writes no `..` at all.
 ///
 /// The spread value is never grouped: it is a whole expression, read as far

@@ -602,24 +602,7 @@ impl Solve<'_> {
             | Ty::Boolean
             | Ty::Arrow(..)
             | Ty::Sum(_) => {
-                let goal = Goal::Type {
-                    expected: Rc::new(Ty::unit()),
-                    actual: exposed.clone(),
-                };
-                let error = Error::new(
-                    base_span,
-                    ErrorKind::NotAStruct {
-                        base: exposed,
-                        demand: super::StructDemand::Projection,
-                    },
-                );
-                self.fail(
-                    base_span,
-                    Rule::Mismatch,
-                    goal,
-                    error,
-                    &[Assigned::Ty(result.clone())],
-                );
+                self.not_a_struct(base_span, exposed, super::StructDemand::Projection, result)
             }
             Ty::Rigid { id, name } => {
                 let error = Error::new(
@@ -690,24 +673,7 @@ impl Solve<'_> {
             | Ty::Arrow(..)
             | Ty::Array(_)
             | Ty::Sum(_) => {
-                let goal = Goal::Type {
-                    expected: Rc::new(Ty::unit()),
-                    actual: exposed.clone(),
-                };
-                let error = Error::new(
-                    operand_span,
-                    ErrorKind::NotAStruct {
-                        base: exposed,
-                        demand: super::StructDemand::Spread,
-                    },
-                );
-                self.fail(
-                    operand_span,
-                    Rule::Mismatch,
-                    goal,
-                    error,
-                    &[Assigned::Ty(result.clone())],
-                );
+                self.not_a_struct(operand_span, exposed, super::StructDemand::Spread, result)
             }
             _ => {
                 let origin = self.table.active_lacks_origin.clone().map(|mut origin| {
@@ -720,6 +686,36 @@ impl Solve<'_> {
                 self.unify(span, demand, &operand);
             }
         }
+    }
+
+    /// Refuse a value whose outer constructor is known to be no struct where
+    /// one was asked for — read off, or spread — abandoning the type that
+    /// would have come of it.
+    fn not_a_struct(
+        &mut self,
+        span: Span,
+        exposed: Rc<Ty>,
+        demand: super::StructDemand,
+        result: &Rc<Ty>,
+    ) {
+        let goal = Goal::Type {
+            expected: Rc::new(Ty::unit()),
+            actual: exposed.clone(),
+        };
+        let error = Error::new(
+            span,
+            ErrorKind::NotAStruct {
+                base: exposed,
+                demand,
+            },
+        );
+        self.fail(
+            span,
+            Rule::Mismatch,
+            goal,
+            error,
+            &[Assigned::Ty(result.clone())],
+        );
     }
 
     /// Solve one qualifying match as a finite tree of arm-local constraints.

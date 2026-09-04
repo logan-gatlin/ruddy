@@ -257,6 +257,8 @@ let a = { x: 1, ..c }
 let b = { ..f x, }
 let c = { ..c }
 let d = { 0: 1, "q": 2, ..{ y: 2, ..d } }
+let e = { ..() }
+let f = { 1: x, ..(1, 2) }
 
 --------------------------------------------------------------------------------
 
@@ -296,7 +298,22 @@ let d = { 0: 1, "q": 2, ..{ y: 2, ..d } }
             (identifier)
             (natural))
           (spread
-            (identifier)))))))
+            (identifier))))))
+  (let_definition
+    (identifier)
+    (struct_expression
+      (spread
+        (unit))))
+  (let_definition
+    (identifier)
+    (struct_expression
+      (struct_field
+        (numeric_field)
+        (identifier))
+      (spread
+        (tuple_expression
+          (natural)
+          (natural))))))
 
 ================================================================================
 A struct's spread comes once, and last

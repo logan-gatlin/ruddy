@@ -108,6 +108,9 @@ fn both_trees_render_a_struct_spread_the_same_way() {
         "let c = { y: 2n }\nlet a = { x: { ..c }, ..{ z: 3n, ..c } }",
         "let c = { y: 2n }\nlet a = { x: 1n, ..match c with | v => v end }",
         "let c = { y: 2n }\nlet a = { x: 1n, ..c.y }",
+        "let c = { y: 2n }\nlet a = { x: 1n, ..c.y + 1n }",
+        "let a = { x: 1n, ..fn v => v }",
+        "let a = { x: 1n, ..let c = { y: 2n } in c }",
     ] {
         let (ast, ir) = printed(source);
         assert_eq!(ast, source);

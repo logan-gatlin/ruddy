@@ -827,10 +827,14 @@ impl Constrain<'_> {
                             rest: rest.clone(),
                         }));
                         let result = Rc::new(Ty::Struct(Row { labels: tys, rest }));
+                        // One subject, because one side of this ever reaches
+                        // a reader: the demand is fresh variables and cannot
+                        // conflict with anything, so a complaint is always
+                        // about what the value spread brought in.
                         self.emit(
                             spread.span.merge(spread.value.span),
-                            ConstraintOrigin::Spread,
-                            ConstraintSubjects::pair(Subject::StructSpread, Subject::Term),
+                            ConstraintOrigin::StructSpread,
+                            ConstraintSubjects::one(Subject::StructSpread),
                             ConstraintKind::Spread {
                                 operand: spread.value.ty.clone(),
                                 demand,

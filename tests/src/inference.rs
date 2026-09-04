@@ -361,6 +361,20 @@ fn a_struct_spread_of_a_known_non_struct_is_refused_at_the_value() {
     }
 }
 
+/// A rigid operand is the caller's to choose, so a spread cannot assume it is
+/// a struct: the complaint is the one every other use of a rigid makes when
+/// it fixes what the caller was to decide, not the non-struct one — the
+/// caller might well choose a struct.
+#[test]
+fn a_struct_spread_of_a_rigid_is_refused_as_fixing_the_callers_choice() {
+    let (_, out, output) = infer_src("let f : 'a -> { x: Nat } = fn v => { x: 1n, ..v }");
+    assert!(out.errors.is_empty(), "ir errors: {:#?}", out.errors);
+    let [error] = output.errors() else {
+        panic!("expected one error: {:#?}", output.errors());
+    };
+    assert_eq!(error.kind.code(), "rigid-broken");
+}
+
 /// Checking a spread struct against an expected type never drops a field to
 /// fit: a closed expected type that omits a field the spread carries is the
 /// extra-field complaint, whether or not the literal names other fields.

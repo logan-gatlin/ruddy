@@ -17,4 +17,5 @@ let set_a = fn v => { a: 7n, ..v }
 let added = set_a { b: 1n }
 let overwritten = set_a { a: "old", b: 2n }
 let read_back = fn v => (v.a, v.b, v.c)
+let read_added = fn v => (v.d, v.e)
 let traced = fn v => { a: mark 10n, c: mark 30n, ..mark_base v }
