@@ -226,13 +226,9 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
                         PathBuf::from("invalid-document")
                     }
                 };
-                let specifications = req
-                    .dependencies
-                    .iter()
-                    .map(|(alias, specification)| (alias.clone(), specification.clone()));
-                match ruddy_cli::compile_sandboxed_project_dependencies(
+                match crate::dependency_cache::compile(
                     &req.std,
-                    specifications,
+                    &req.dependencies,
                     &project,
                     scratch,
                 ) {

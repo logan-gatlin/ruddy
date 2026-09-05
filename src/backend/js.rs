@@ -6,14 +6,10 @@
 use crate::artifact::{
     Artifact, Block, Callee, End, FieldKey, Instr, Literal, Op, PrimCase, Rep, TagCase,
 };
-use boa_ast::{ModuleItem, scope::Scope};
-use boa_interner::Interner;
-use boa_parser::{Parser, Source};
+use esparse::Item;
 use std::{
     collections::{BTreeMap, HashSet},
     error, fmt,
-    panic::resume_unwind,
-    thread,
 };
 
 /// A JavaScript generation failure.
@@ -916,58 +912,25 @@ const $catch = ($identity, $body) => { try { return $body(); } catch ($e) { if (
 const $unreachable = () => { throw new Error("unreachable Ruddy LIR branch"); };
 "#;
 
-const JAVASCRIPT_PARSER_STACK: usize = 8 * 1024 * 1024;
-
-fn with_javascript_parser_stack(
-    parse: impl FnOnce() -> Result<(), Error> + Send,
-) -> Result<(), Error> {
-    // Boa's parser uses the native stack in proportion to expression nesting.
-    // Rust test and worker threads commonly have only a 2 MiB stack, while the
-    // generated runtime suite needs more than that. Give validation the same
-    // stack budget as a typical main thread instead of making success depend on
-    // which thread called the backend.
-    thread::scope(|scope| {
-        let parser = thread::Builder::new()
-            .name("ruddy-javascript-validator".to_string())
-            .stack_size(JAVASCRIPT_PARSER_STACK)
-            .spawn_scoped(scope, parse)
-            .map_err(|error| {
-                Error::InvalidJavaScript(format!("could not start validator: {error}"))
-            })?;
-        match parser.join() {
-            Ok(result) => result,
-            Err(panic) => resume_unwind(panic),
-        }
-    })
-}
-
 fn validate_extern_target(target: &str) -> Result<(), Error> {
     // Parsing the target in its own module prevents it from closing the generated
     // initializer and introducing statements or module declarations. The newlines
     // keep a trailing line comment from consuming either closing delimiter.
     let source = format!("export default (\n{target}\n);\n");
-    with_javascript_parser_stack(move || {
-        let mut interner = Interner::default();
-        let module = Parser::new(Source::from_bytes(&source))
-            .parse_module(&Scope::new_global(), &mut interner)
-            .map_err(|error| Error::InvalidJavaScript(error.to_string()))?;
-        if !matches!(module.items().items(), [ModuleItem::ExportDeclaration(_)]) {
-            return Err(Error::InvalidJavaScript(
-                "an extern target must be exactly one expression".to_string(),
-            ));
-        }
-        Ok(())
-    })
+    let module = validate_module(&source)?;
+    if !matches!(module.items(), [Item::ExportDefault]) {
+        return Err(Error::InvalidJavaScript(
+            "an extern target must be exactly one expression".to_string(),
+        ));
+    }
+    Ok(())
 }
 
-fn validate_module(source: &str) -> Result<(), Error> {
-    with_javascript_parser_stack(|| {
-        let mut interner = Interner::default();
-        Parser::new(Source::from_bytes(source))
-            .parse_module(&Scope::new_global(), &mut interner)
-            .map(|_| ())
-            .map_err(|error| Error::InvalidJavaScript(error.to_string()))
-    })
+/// `source` as an ECMAScript module, or its first syntax error. The parser
+/// keeps its nesting off the native stack, so this runs on whichever thread
+/// called the backend, however deep the generated program is.
+fn validate_module(source: &str) -> Result<esparse::Module, Error> {
+    esparse::parse_module(source).map_err(|error| Error::InvalidJavaScript(error.to_string()))
 }
 
 fn temp(value: u32) -> String {
@@ -1082,7 +1045,7 @@ mod tests {
     }
 
     #[test]
-    fn reports_boa_diagnostics_for_invalid_modules() {
+    fn reports_parser_diagnostics_for_invalid_modules() {
         let error = validate_module("const value = (); export { value };").unwrap_err();
         assert!(
             matches!(error, Error::InvalidJavaScript(ref diagnostic) if !diagnostic.is_empty())

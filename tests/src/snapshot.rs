@@ -238,6 +238,63 @@ fn custom_standard_library_is_source_visible_rendered_and_sandboxed() {
     }));
 }
 
+/// The debugger remembers a compiled dependency graph between requests, and
+/// forgets it the moment a file the graph was read from changes: a standard
+/// library edited on disk is what the very next compile sees.
+#[test]
+fn a_remembered_dependency_graph_follows_edits_to_its_sources() {
+    let outer = tempfile::tempdir().unwrap();
+    let scratch = outer.path().join("scratch");
+    let app = scratch.join("app");
+    let standard = scratch.join("std-next");
+    fs::create_dir_all(&app).unwrap();
+    fs::create_dir_all(&standard).unwrap();
+    fs::write(standard.join("main.hc"), "let answer = 42n\n").unwrap();
+    fs::write(
+        standard.join("Ruddy.toml"),
+        "name = \"std\"\nversion = \"2.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
+    )
+    .unwrap();
+    let request = CompileRequest {
+        name: "app".into(),
+        version: "1.0.0".into(),
+        root: ROOT.into(),
+        document: "app".into(),
+        files: vec![FileSpec {
+            path: ROOT.into(),
+            source: "let main = std::answer\n".into(),
+        }],
+        std: StdConfig::Dependency(DependencySpec::from("../std-next")),
+        dependencies: IndexMap::new(),
+        revision: 1,
+    };
+    for revision in 1..=2 {
+        let built = compile_at(&request, revision, &scratch);
+        assert!(built.diagnostics.is_empty(), "{:#?}", built.diagnostics);
+    }
+
+    fs::write(standard.join("main.hc"), "let renamed = 42n\n").unwrap();
+    let stale = compile_at(&request, 3, &scratch);
+    assert!(
+        stale
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "ir"),
+        "{:#?}",
+        stale.diagnostics
+    );
+
+    let repointed = CompileRequest {
+        files: vec![FileSpec {
+            path: ROOT.into(),
+            source: "let main = std::renamed\n".into(),
+        }],
+        ..request
+    };
+    let built = compile_at(&repointed, 4, &scratch);
+    assert!(built.diagnostics.is_empty(), "{:#?}", built.diagnostics);
+}
+
 #[test]
 fn installed_standard_library_is_the_only_trusted_external_local_root() {
     let outer = tempfile::tempdir().unwrap();

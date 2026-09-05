@@ -54,6 +54,43 @@ fn the_solver_answers_the_three_questions() {
     assert!(sat::model(&Formula::False).is_none());
 }
 
+/// A formula that is one literal or one constant is answered without the
+/// solver, and answers exactly as the solver would: the literal's atom set the
+/// way the literal says, nothing else named, and ownership looked through.
+#[test]
+fn a_literal_is_read_off_without_the_solver() {
+    let model = sat::model(&var(3)).expect("a model");
+    assert_eq!(model.len(), 1);
+    assert!(model[&Atom::Var(3)]);
+
+    let model = sat::model(&var(3).not()).expect("a model");
+    assert_eq!(model.len(), 1);
+    assert!(!model[&Atom::Var(3)]);
+
+    let model = sat::model(&Formula::owned(0, var(3).not())).expect("a model");
+    assert!(!model[&Atom::Var(3)]);
+    let model = sat::model(&Formula::owned(0, var(3)).not()).expect("a model");
+    assert!(!model[&Atom::Var(3)]);
+
+    assert!(sat::model(&Formula::True).expect("a model").is_empty());
+    assert!(
+        sat::model(&Formula::owned(1, Formula::True))
+            .expect("a model")
+            .is_empty()
+    );
+    assert!(sat::model(&Formula::owned(1, Formula::False)).is_none());
+    assert!(sat::model(&Formula::owned(1, Formula::True).not()).is_none());
+    assert!(
+        sat::model(&Formula::owned(1, Formula::False).not())
+            .expect("a model")
+            .is_empty()
+    );
+
+    assert!(!sat::entails(&Formula::True, &var(0)));
+    assert!(sat::entails(&var(0), &var(0)));
+    assert!(!sat::entails(&var(0), &var(0).not()));
+}
+
 /// Every connective the surface grammar has, encoded and decided: each one is
 /// a Tseitin definition of its own, and a formula that agreed with the wrong
 /// one would answer some of these backwards.

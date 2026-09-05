@@ -4,6 +4,7 @@
 //! [`server::serve`]; everything worth testing is here, where the test crate
 //! can reach it.
 
+pub mod dependency_cache;
 pub mod docs;
 pub mod print;
 pub mod server;

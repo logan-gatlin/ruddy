@@ -450,7 +450,7 @@ fn generated_extern_expressions_execute_once_and_require_explicit_receiver_bindi
 }
 
 #[test]
-fn boa_rejects_invalid_empty_and_structurally_breaking_extern_expressions() {
+fn invalid_empty_and_structurally_breaking_extern_expressions_are_rejected() {
     let mut artifact = compiled("extern host : Nat = \"0\"\n").to_unchecked();
     for target in [
         "(",

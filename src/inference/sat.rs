@@ -93,6 +93,9 @@ pub fn entails(premise: &Formula, conclusion: &Formula) -> bool {
 /// built from this should say nothing about a label the formula says nothing
 /// about.
 pub fn model(formula: &Formula) -> Option<HashMap<Atom, bool>> {
+    if let Some(answer) = literal_model(formula) {
+        return answer;
+    }
     let mut encoding = Encoding {
         solver: Solver::new(),
         atoms: HashMap::new(),
@@ -124,6 +127,38 @@ pub fn model(formula: &Formula) -> Option<HashMap<Atom, bool>> {
             .map(|(atom, var)| (atom, positive.contains(&var)))
             .collect(),
     )
+}
+
+/// The model of a formula that is one literal or one constant, read off
+/// without a solver: `Some(None)` for the unsatisfiable constant, the one-entry
+/// or empty assignment otherwise, and `None` when the formula is anything
+/// larger and the solver has to be asked.
+///
+/// Three calls in four during a compile of the standard library are of this
+/// shape — the store a definition without row constraints generalizes under,
+/// the fold-back of a single presence literal — and building a solver to
+/// answer each of them cost more than the rest of inference's propositional
+/// work put together.
+fn literal_model(formula: &Formula) -> Option<Option<HashMap<Atom, bool>>> {
+    let (formula, holds) = match unowned(formula) {
+        Formula::Not(inner) => (unowned(inner), false),
+        formula => (formula, true),
+    };
+    match formula {
+        Formula::True => Some(holds.then(HashMap::new)),
+        Formula::False => Some((!holds).then(HashMap::new)),
+        Formula::Atom(atom) => Some(Some(HashMap::from([(*atom, holds)]))),
+        _ => None,
+    }
+}
+
+/// `formula` without its ownership wrappers. Ownership is metadata; the
+/// encoder looks through it and so does the literal reading above.
+fn unowned(mut formula: &Formula) -> &Formula {
+    while let Formula::Owned(_, inner) = formula {
+        formula = inner;
+    }
+    formula
 }
 
 /// `formula` with every atom it names but `keep` does not existentially
