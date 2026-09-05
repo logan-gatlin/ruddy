@@ -488,3 +488,58 @@ fn trailing_line_comments_in_extern_expressions_do_not_consume_the_initializer()
         "{module}"
     );
 }
+
+/// Metadata is inert: two sources that differ only in the attributes in front
+/// of their definitions have the same schemes and compile to byte-identical
+/// JavaScript. The artifact differs only in what it publishes about them.
+#[test]
+fn metadata_changes_neither_schemes_nor_generated_javascript() {
+    let plain = compiled(
+        "module Math =\n  let answer = 42n\nend\n\
+         type Pair 'a = { first: 'a, second: 'a }\n\
+         effect Log = Nat -> ()\n\
+         extern sqrt : Real -> Real = \"Math.sqrt\"\n\
+         let pair = fn x => { first: x, second: x }\n\
+         let (a, b) = (1n, 2n)\n",
+    );
+    let annotated = compiled(
+        "@owner \"core\" module Math =\n  @answer @doc \"forty-two\" let answer = 42n\nend\n\
+         @shape (1n, 2n) type Pair 'a = { first: 'a, second: 'a }\n\
+         @level #Debug effect Log = Nat -> ()\n\
+         @host { from: \"math\" } extern sqrt : Real -> Real = \"Math.sqrt\"\n\
+         @test @tags [\"a\", \"b\"] let pair = fn x => { first: x, second: x }\n\
+         @k let (a, b) = (1n, 2n)\n",
+    );
+    assert_eq!(
+        js::generate(&plain).unwrap(),
+        js::generate(&annotated).unwrap()
+    );
+    assert_eq!(plain.lir(), annotated.lir());
+
+    let (plain, annotated) = (plain.header(), annotated.header());
+    assert_eq!(plain.values.len(), annotated.values.len());
+    for (before, after) in plain.values.iter().zip(&annotated.values) {
+        assert_eq!(before.name, after.name);
+        assert_eq!(before.scheme, after.scheme, "{}", before.name);
+    }
+    for (before, after) in plain.types.iter().zip(&annotated.types) {
+        assert_eq!(
+            (&before.name, &before.params, &before.scheme),
+            (&after.name, &after.params, &after.scheme)
+        );
+    }
+    for (before, after) in plain.effects.iter().zip(&annotated.effects) {
+        assert_eq!(
+            (&before.name, &before.identity, &before.kind),
+            (&after.name, &after.identity, &after.kind)
+        );
+    }
+    assert!(plain.values.iter().all(|value| value.metadata.is_empty()));
+    assert!(
+        annotated
+            .values
+            .iter()
+            .any(|value| !value.metadata.is_empty())
+    );
+    assert_eq!(plain.modules[0].name, annotated.modules[0].name);
+}

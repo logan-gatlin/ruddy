@@ -472,9 +472,49 @@ fn a_lone_minus_is_a_token() {
 
 #[test]
 fn an_unrecognized_character_is_still_its_own_error() {
-    let out = errors("@");
+    let out = errors("$");
     assert_eq!(out.len(), 1, "errors: {out:#?}");
-    assert_eq!(out[0].kind, ErrorKind::InvalidCharacter { character: '@' });
+    assert_eq!(out[0].kind, ErrorKind::InvalidCharacter { character: '$' });
+    assert!(matches!(
+        tokens_of("$;")[..],
+        [Kind::Invalid, Kind::Semicolon]
+    ));
+}
+
+/// `@key` is the fourth sigilled token, and it keeps the tag's two rules: the
+/// sigil and the name are one lexeme, and the name is carried without it.
+#[test]
+fn an_attribute_is_one_token_carrying_its_key() {
+    let out = lex("@deprecated let x = 1n", FileID::GENERATED);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let attribute = &out.tokens[0];
+    assert!(matches!(&attribute.tracked, Kind::Attribute(key) if key == "deprecated"));
+    assert_eq!(attribute.span.start, 0);
+    assert_eq!(attribute.span.width, 11);
+    assert_eq!(attribute.tracked.to_string(), "@deprecated");
+    assert!(matches!(
+        kinds("@_x @a1 @since 2n")[..],
+        [
+            Kind::Attribute(_),
+            Kind::Attribute(_),
+            Kind::Attribute(_),
+            Kind::Natural(2)
+        ]
+    ));
+}
+
+/// `@` alone begins nothing, so — like `#` and `!` — the whole lexeme it ran
+/// over is one malformed attribute rather than a character the language does
+/// not know.
+#[test]
+fn an_attribute_sigil_that_begins_no_name_is_malformed() {
+    for (src, width) in [("@", 1), ("@ ", 1), ("@(", 1), ("@1", 2), ("@1abc", 5)] {
+        let out = errors(src);
+        assert_eq!(out.len(), 1, "{src}: {out:#?}");
+        assert_eq!(out[0].kind, ErrorKind::MalformedAttribute, "{src}");
+        assert_eq!(out[0].span.start, 0, "{src}");
+        assert_eq!(out[0].span.width, width, "{src}");
+    }
     assert!(matches!(
         tokens_of("@;")[..],
         [Kind::Invalid, Kind::Semicolon]

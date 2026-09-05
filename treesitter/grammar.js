@@ -22,6 +22,9 @@ const IDENT = /[\p{Alphabetic}][\p{Alphabetic}\p{N}_]*|_[\p{Alphabetic}\p{N}_]+/
 const TAG = /#[\p{Alphabetic}_][\p{Alphabetic}\p{N}_]*/;
 const EFFECT = /![\p{Alphabetic}_][\p{Alphabetic}\p{N}_]*/;
 const VARIABLE = /'[\p{Alphabetic}_][\p{Alphabetic}\p{N}_]*/;
+// The fourth: an attribute's key, `@deprecated`, which keeps the tag's rules —
+// sigil and name are one token, and the name starts the way an identifier does.
+const ATTRIBUTE = /@[\p{Alphabetic}_][\p{Alphabetic}\p{N}_]*/;
 
 const PREC = {
   // `f x y` groups to the left, and stops in front of anything that begins no
@@ -123,13 +126,94 @@ module.exports = grammar({
 
     // ── Statements ────────────────────────────────────────────────────────
 
-    _statement: $ => choice(
-      $.extern_definition,
-      $.let_definition,
-      $.type_definition,
-      $.effect_definition,
-      $.module_definition,
+    /**
+     * `<attribute>* <definition>`. The attributes belong to the definition
+     * after them, and appear as its preceding siblings: every kind of
+     * definition may carry them, so they are read here, once, rather than
+     * inside each of the five. A block's `let` is read by `do_block` directly
+     * and so takes none, the way `parse.rs` refuses them there.
+     */
+    _statement: $ => seq(
+      repeat($.attribute),
+      choice(
+        $.extern_definition,
+        $.let_definition,
+        $.type_definition,
+        $.effect_definition,
+        $.module_definition,
+      ),
     ),
+
+    /**
+     * `@key` or `@key <literal>` — one entry of a definition's metadata. The
+     * value is literal data: nothing that begins a definition begins a
+     * literal, so whether one follows the key is never in doubt.
+     */
+    attribute: $ => prec.right(seq(
+      field('key', $.attribute_key),
+      optional(field('value', $._data)),
+    )),
+
+    /**
+     * Literal data, and only that: the scalars, a tag with an optional literal
+     * payload, and tuples, arrays, and structs of these. Mirrors
+     * `Parser::data` — no name, no application, no operator, no spread.
+     */
+    _data: $ => choice(
+      $.natural,
+      $.string,
+      $.boolean,
+      $.unit,
+      $.data_tuple,
+      $.data_array,
+      $.data_struct,
+      $.data_tag,
+      $.parenthesized_data,
+    ),
+
+    parenthesized_data: $ => seq('(', $._data, ')'),
+
+    /** `(a, b)`, or `(a,)` — a comma is what makes a tuple of one. */
+    data_tuple: $ => seq(
+      '(',
+      field('element', $._data),
+      ',',
+      optional(seq(
+        sepBy1(',', field('element', $._data)),
+        optional(','),
+      )),
+      ')',
+    ),
+
+    data_array: $ => seq(
+      '[',
+      optional(seq(
+        sepBy1(',', field('element', $._data)),
+        optional(','),
+      )),
+      ']',
+    ),
+
+    data_struct: $ => seq(
+      '{',
+      optional(seq(
+        sepBy1(',', $.data_field),
+        optional(','),
+      )),
+      '}',
+    ),
+
+    data_field: $ => seq(
+      field('name', fieldLabel($)),
+      ':',
+      field('value', $._data),
+    ),
+
+    /** `#Some 1n`, or a bare `#None` — greedy, as an expression's tag is. */
+    data_tag: $ => prec.right(seq(
+      field('name', $.tag),
+      optional(field('payload', $._data)),
+    )),
 
     /**
      * `module A = <stmts> end`, or `module A` for a module whose body is
@@ -943,6 +1027,9 @@ module.exports = grammar({
 
     /** `!Log` — an effect, named. The `!` is not part of the name. */
     effect_label: _ => new RegExp(EFFECT.source, 'u'),
+
+    /** `@deprecated` — an attribute's key. The `@` is not part of the name. */
+    attribute_key: _ => new RegExp(ATTRIBUTE.source, 'u'),
 
     /**
      * `'a` — a variable: the parameter of the declaration it is written in, or

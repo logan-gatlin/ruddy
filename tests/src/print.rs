@@ -25,7 +25,7 @@ fn printed(source: &str) -> (String, String) {
     let ast = parsed
         .stmts
         .iter()
-        .map(|stmt| print::ast::stmt(&stmt.tracked).to_string())
+        .map(|stmt| print::ast::stmt(stmt).to_string())
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -240,7 +240,7 @@ fn ast_of(source: &str) -> String {
     parsed
         .stmts
         .iter()
-        .map(|stmt| print::ast::stmt(&stmt.tracked).to_string())
+        .map(|stmt| print::ast::stmt(stmt).to_string())
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1097,7 +1097,7 @@ fn printed_ast(source: &str) -> String {
     parsed
         .stmts
         .iter()
-        .map(|stmt| print::ast::stmt(&stmt.tracked).to_string())
+        .map(|stmt| print::ast::stmt(stmt).to_string())
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1161,5 +1161,54 @@ fn a_printed_applied_effect_re_lowers_to_itself() {
         assert_eq!(scheme, annotation, "{annotation}");
         let again = format!("{effects}let f : {scheme} = fn x => x");
         assert_eq!(types_of(&again).1, annotation, "{annotation}");
+    }
+}
+
+/// Both printers write a definition's metadata in front of it, and agree on
+/// every literal form: unit spellings collapse to the bare key, a tuple
+/// prints as one, and grouping follows the expression printer's rules.
+#[test]
+fn both_trees_render_metadata_the_same_way() {
+    for (source, expected) in [
+        ("@k let x = 1n", "@k let x = 1n"),
+        ("@k () let x = 1n", "@k let x = 1n"),
+        ("@k {} let x = 1n", "@k let x = 1n"),
+        (
+            "@a 1n @b 2i @c 1.5 @d \"s\" @e true let x = 1n",
+            "@a 1n @b 2i @c 1.5 @d \"s\" @e true let x = 1n",
+        ),
+        ("@k (1n, 2n) let x = 1n", "@k (1n, 2n) let x = 1n"),
+        ("@k { 0: 1n, 1: 2n } let x = 1n", "@k (1n, 2n) let x = 1n"),
+        ("@k (1n,) let x = 1n", "@k (1n,) let x = 1n"),
+        ("@k [1n, 2n] let x = 1n", "@k [1n, 2n] let x = 1n"),
+        (
+            "@k { a: 1n, \"b c\": [true] } let x = 1n",
+            "@k { a: 1n, \"b c\": [true] } let x = 1n",
+        ),
+        ("@k #Tag let x = 1n", "@k #Tag let x = 1n"),
+        ("@k #Tag () let x = 1n", "@k #Tag let x = 1n"),
+        ("@k #Tag 1n let x = 1n", "@k #Tag 1n let x = 1n"),
+        (
+            "@k #Tag #Inner 1n let x = 1n",
+            "@k #Tag (#Inner 1n) let x = 1n",
+        ),
+        (
+            "@k #\"two words\" let x = 1n",
+            "@k #\"two words\" let x = 1n",
+        ),
+        (
+            "@k \\\\ line one\n   \\\\ line two\nlet x = 1n",
+            "@k \" line one\\n line two\" let x = 1n",
+        ),
+        ("@t type T = Nat", "@t type T = Nat"),
+        ("@e #On effect E = Nat -> ()", "@e #On effect E = Nat -> ()"),
+        (
+            "@h \"host\" extern f : Nat = \"f\"",
+            "@h \"host\" extern f : Nat = \"f\"",
+        ),
+    ] {
+        let (ast, ir) = printed(source);
+        assert_eq!(ast, expected, "surface: {source:?}");
+        assert_eq!(ir, expected, "lowered: {source:?}");
     }
 }

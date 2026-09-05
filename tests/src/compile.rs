@@ -517,6 +517,7 @@ fn deep_alias_chains_and_generic_interfaces_use_bounded_stack() {
             }
             let dependency = ruddy::artifact::UncheckedArtifact {
                 header: ruddy::artifact::Header {
+                    modules: Vec::new(),
                     identity: ruddy::artifact::Identity {
                         name: "dep".into(),
                         version: "1.0.0".into(),
@@ -525,6 +526,7 @@ fn deep_alias_chains_and_generic_interfaces_use_bounded_stack() {
                     values: Vec::new(),
                     types: Vec::new(),
                     effects: vec![ruddy::artifact::DeclaredEffect {
+                        metadata: Default::default(),
                         name: "dep@1.0.0::Deep".into(),
                         params: vec![ruddy::artifact::Parameter {
                             sense: ruddy::artifact::Sense::Type,

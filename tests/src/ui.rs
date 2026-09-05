@@ -133,10 +133,11 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
 
     let mut all: Vec<(&str, &str, String)> = Vec::new();
     for kind in [
-        LexError::InvalidCharacter { character: '@' },
+        LexError::InvalidCharacter { character: '$' },
         LexError::MalformedTag,
         LexError::MalformedEffectLabel,
         LexError::MalformedVariable,
+        LexError::MalformedAttribute,
         LexError::NumberFollowedByName,
         LexError::DecimalWithWholeSuffix { suffix: 'n' },
         LexError::MalformedNumericField,
@@ -167,6 +168,10 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         parse::ErrorKind::DiscardedArrayRest,
         parse::ErrorKind::SecondStructSpread { previous: span },
         parse::ErrorKind::FieldAfterSpread { spread: span },
+        parse::ErrorKind::AttributeWithoutDefinition,
+        parse::ErrorKind::MetadataNotLiteral,
+        parse::ErrorKind::AttributeInBlock,
+        parse::ErrorKind::AttributeInExpression,
     ] {
         let error = parse::Error { span, kind };
         all.push(("parse", error.code(), error.to_string()));
@@ -231,6 +236,11 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
             name: "x".to_string(),
             previous: span,
         },
+        IrError::DuplicateAttribute {
+            name: "k".to_string(),
+            previous: span,
+        },
+        IrError::MetadataTooDeep,
         IrError::AbsentInClosed {
             shape: Shape::Struct,
             label: "x".to_string(),
@@ -3180,7 +3190,7 @@ fn a_printer_reports_a_writer_that_refuses_it() {
     let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
     for stmt in &parsed.stmts {
-        every_failure_is_reported("a parsed statement", &print::ast::stmt(&stmt.tracked));
+        every_failure_is_reported("a parsed statement", &print::ast::stmt(stmt));
     }
 }
 
@@ -4444,7 +4454,7 @@ fn a_printed_formula_reads_back_as_itself() {
             format!("type T = {{ a when 'a: Nat, b when 'b: Nat, c when 'c: Nat }} where {clause}");
         let out = parse::parse(token::lex(&src, FileID::GENERATED).tokens);
         assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
-        let parse::StmtKind::Type { body, .. } = &out.stmts[0].tracked else {
+        let parse::StmtKind::Type { body, .. } = &out.stmts[0].kind else {
             panic!("expected a declaration");
         };
         let written = body.clause.as_ref().expect("the clause");
@@ -5190,5 +5200,136 @@ fn an_argument_clash_renders_the_applications_and_its_cause() {
     assert_eq!(
         error.kind.to_string(),
         "effect `!Ask` is used with incompatible first arguments: type mismatch: expected `String`, found `Nat`"
+    );
+}
+
+/// Every complaint metadata can raise, pinned: the code a reporter keys on,
+/// the span it points at, and the words it says, which stay plain English.
+#[test]
+fn metadata_diagnostics_are_pinned() {
+    let malformed = token::Error {
+        span: Span::generated(0, 1),
+        kind: LexError::MalformedAttribute,
+    }
+    .diagnostic();
+    assert_eq!(malformed.code, "attribute-needs-name");
+    assert_eq!(malformed.title, "`@` must be followed by a name");
+    assert_eq!(malformed.primary.span, Span::generated(0, 1));
+    assert_eq!(malformed.primary.message, "the name cannot start here");
+    assert_eq!(
+        malformed.help,
+        ["metadata is written `@key` or `@key value` in front of a definition"]
+    );
+
+    let dangling = parse::Error {
+        span: Span::generated(4, 8),
+        kind: parse::ErrorKind::AttributeWithoutDefinition,
+    }
+    .diagnostic();
+    assert_eq!(dangling.code, "metadata-without-definition");
+    assert_eq!(
+        dangling.title,
+        "this metadata has no definition to describe"
+    );
+    assert_eq!(dangling.primary.span, Span::generated(4, 8));
+    assert_eq!(
+        dangling.primary.message,
+        "nothing that this could describe follows it"
+    );
+    assert!(dangling.related.is_empty());
+    assert_eq!(
+        dangling.help,
+        ["write a `let`, `extern`, `type`, `effect`, or `module` after it, or remove it"]
+    );
+
+    let computed = parse::Error {
+        span: Span::generated(7, 3),
+        kind: parse::ErrorKind::MetadataNotLiteral,
+    }
+    .diagnostic();
+    assert_eq!(computed.code, "metadata-not-literal");
+    assert_eq!(computed.title, "a metadata value must be a literal");
+    assert_eq!(computed.primary.span, Span::generated(7, 3));
+    assert_eq!(computed.primary.message, "this is not a literal");
+    assert_eq!(
+        computed.help,
+        [
+            "write a string, number, boolean, or tag, or a tuple, array, or struct of those; \
+             metadata is data and cannot be computed"
+        ]
+    );
+
+    let in_block = parse::Error {
+        span: Span::generated(11, 2),
+        kind: parse::ErrorKind::AttributeInBlock,
+    }
+    .diagnostic();
+    assert_eq!(in_block.code, "metadata-in-block");
+    assert_eq!(in_block.title, "metadata belongs to a top-level definition");
+    assert_eq!(in_block.primary.span, Span::generated(11, 2));
+    assert_eq!(
+        in_block.primary.message,
+        "a `let` inside a `do` block cannot carry metadata"
+    );
+    assert_eq!(
+        in_block.help,
+        ["remove this, or move the definition out to the file or module"]
+    );
+
+    let in_expression = parse::Error {
+        span: Span::generated(8, 2),
+        kind: parse::ErrorKind::AttributeInExpression,
+    }
+    .diagnostic();
+    assert_eq!(in_expression.code, "metadata-in-expression");
+    assert_eq!(
+        in_expression.title,
+        "metadata goes in front of a definition"
+    );
+    assert_eq!(in_expression.primary.span, Span::generated(8, 2));
+    assert_eq!(
+        in_expression.primary.message,
+        "this is written where a value goes"
+    );
+    assert_eq!(
+        in_expression.help,
+        ["move it in front of the `let`, `extern`, `type`, `effect`, or `module` it describes"]
+    );
+
+    let repeated = ir::Error {
+        span: Span::generated(6, 2),
+        kind: IrError::DuplicateAttribute {
+            name: "k".to_string(),
+            previous: Span::generated(0, 2),
+        },
+    }
+    .diagnostic();
+    assert_eq!(repeated.code, "duplicate-metadata-key");
+    assert_eq!(repeated.title, "metadata key `k` is written more than once");
+    assert_eq!(repeated.primary.span, Span::generated(6, 2));
+    assert_eq!(repeated.primary.message, "written again here");
+    assert_eq!(repeated.related.len(), 1);
+    assert_eq!(repeated.related[0].span, Span::generated(0, 2));
+    assert_eq!(repeated.related[0].message, ui::FIRST_WRITTEN);
+    assert_eq!(
+        repeated.help,
+        ["a definition's metadata has one value per key; keep one `@k`"]
+    );
+
+    let deep = ir::Error {
+        span: Span::generated(40, 2),
+        kind: IrError::MetadataTooDeep,
+    }
+    .diagnostic();
+    assert_eq!(deep.code, "metadata-too-deep");
+    assert_eq!(deep.title, "this metadata value is nested too deeply");
+    assert_eq!(deep.primary.span, Span::generated(40, 2));
+    assert_eq!(
+        deep.primary.message,
+        "this sits below the deepest level allowed"
+    );
+    assert_eq!(
+        deep.help,
+        ["metadata may nest at most 32 levels of arrays, structs, and tag payloads"]
     );
 }

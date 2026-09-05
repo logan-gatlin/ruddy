@@ -52,6 +52,7 @@ pub(crate) fn string(value: &str) -> String {
     written
 }
 
+pub mod artifact;
 pub mod ast;
 pub mod ir;
 pub mod lir;
