@@ -419,7 +419,7 @@ impl Drop for Artifact {
     }
 }
 
-/// The public interface of one bundle.
+/// A bundle's exports and the semantic declarations needed to interpret them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Header {
     /// Whether this bundle is importable or provides a program entry point.
@@ -431,13 +431,16 @@ pub struct Header {
     pub dependencies: Vec<Dependency>,
     /// Every source-addressable top-level value exported by the bundle. Externs
     /// precede `let`s; each kind retains its source declaration order. Hidden
-    /// definitions generated for patterns such as `let _` are not exported.
+    /// definitions generated for patterns such as `let _`, private definitions,
+    /// and descendants of private modules are not exported.
     pub values: Vec<Value>,
-    /// Every declared type, in source declaration order.
+    /// Every declared type, including private semantic support for public
+    /// signatures. Only entries marked `exported` are source-addressable.
     pub types: Vec<DeclaredType>,
-    /// Every declared effect, in source declaration order.
+    /// Every declared effect, including private semantic support for public
+    /// signatures. Only entries marked `exported` are source-addressable.
     pub effects: Vec<DeclaredEffect>,
-    /// Every declared module, in source declaration order, with its metadata.
+    /// Every exported module, in source declaration order, with its metadata.
     /// A module is otherwise visible only as a segment of the names under it.
     pub modules: Vec<DeclaredModule>,
 }
@@ -524,6 +527,9 @@ pub struct Value {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclaredType {
     pub name: QualifiedName,
+    /// Whether dependent source may name this declaration. Private entries
+    /// remain available solely to interpret structural types and effects.
+    pub exported: bool,
     pub params: Vec<Parameter>,
     pub scheme: Scheme,
     pub metadata: Metadata,
@@ -538,7 +544,8 @@ pub struct DeclaredModule {
 }
 
 /// A declaration's metadata: literal data by key, in written order, and empty
-/// when no attribute was written. Tools read it; the compiler never does.
+/// when no attribute was written. `private` controls source export visibility;
+/// other keys are uninterpreted data for tools.
 pub type Metadata = IndexMap<String, Data>;
 
 /// A metadata value, span-free: the lowered [`ir::DataKind`] with nothing
@@ -605,6 +612,9 @@ pub enum Sense {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclaredEffect {
     pub name: QualifiedName,
+    /// Whether dependent source may name this declaration. Private entries
+    /// remain available solely to interpret structural types and effects.
+    pub exported: bool,
     /// The parameters the effect binds, in the order it is applied to them.
     /// Operation signatures refer to them by position through
     /// [`Type::Bound`] and [`Rest::Bound`]; an alias row does the same.
@@ -2248,6 +2258,9 @@ pub fn build_with_dependencies(
         values: program
             .externs
             .iter()
+            .filter(|(symbol, declaration)| {
+                is_exported(mint, program, **symbol, &declaration.metadata)
+            })
             .map(|(symbol, declaration)| Value {
                 name: qualified(mint, *symbol),
                 scheme: scheme(mint, &inference.externs()[symbol]),
@@ -2260,7 +2273,9 @@ pub fn build_with_dependencies(
                     // Fresh top-level definitions implement patterns such as
                     // `let _`; they must be initialized, but have no source
                     // name through which another bundle could import them.
-                    .filter(|(symbol, _)| !mint.is_local(**symbol))
+                    .filter(|(symbol, declaration)| {
+                        is_exported(mint, program, **symbol, &declaration.metadata)
+                    })
                     .map(|(symbol, declaration)| Value {
                         name: qualified(mint, *symbol),
                         scheme: scheme(mint, &inference.schemes()[symbol]),
@@ -2273,6 +2288,7 @@ pub fn build_with_dependencies(
             .iter()
             .map(|(symbol, declaration)| DeclaredType {
                 name: qualified(mint, *symbol),
+                exported: is_exported(mint, program, *symbol, &declaration.metadata),
                 params: declaration
                     .params
                     .iter()
@@ -2296,6 +2312,7 @@ pub fn build_with_dependencies(
             .iter()
             .map(|(symbol, declaration)| DeclaredEffect {
                 name: qualified(mint, *symbol),
+                exported: is_exported(mint, program, *symbol, &declaration.metadata),
                 params: declaration
                     .params
                     .iter()
@@ -2355,6 +2372,9 @@ pub fn build_with_dependencies(
         modules: program
             .modules
             .iter()
+            .filter(|(symbol, declaration)| {
+                is_exported(mint, program, **symbol, &declaration.metadata)
+            })
             .map(|(symbol, declaration)| DeclaredModule {
                 name: qualified(mint, *symbol),
                 metadata: metadata(&declaration.metadata),
@@ -2365,6 +2385,31 @@ pub fn build_with_dependencies(
         header,
         lir: lower_lir(mint, &lir),
     }
+}
+
+/// A source name is exported only when it and every enclosing module are public.
+/// This does not affect resolution or initialization inside the declaring bundle.
+fn is_exported(
+    mint: &Mint,
+    program: &ir::Program,
+    symbol: Symbol,
+    metadata: &ir::Metadata,
+) -> bool {
+    if mint.is_local(symbol) || metadata.contains_key("private") {
+        return false;
+    }
+    let mut parent = mint.parent(symbol);
+    while let Some(module) = parent {
+        if program
+            .modules
+            .get(&module.symbol())
+            .is_some_and(|declaration| declaration.metadata.contains_key("private"))
+        {
+            return false;
+        }
+        parent = mint.parent(module.symbol());
+    }
+    true
 }
 
 /// A declaration's lowered metadata, with its spans left behind.
@@ -3214,6 +3259,7 @@ pub mod text {
         L(vec![
             A("type".into()),
             Q(value.name.clone()),
+            A(value.exported.to_string()),
             L(std::iter::once(A("params".into()))
                 .chain(value.params.iter().map(parameter))
                 .collect()),
@@ -3241,6 +3287,7 @@ pub mod text {
         L(vec![
             A("effect".into()),
             Q(value.name.clone()),
+            A(value.exported.to_string()),
             L(std::iter::once(A("params".into()))
                 .chain(value.params.iter().map(parameter))
                 .collect()),
@@ -4538,9 +4585,10 @@ pub mod text {
             }
         }
         fn read_declared_type(&self, value: S) -> DeclaredType {
-            let mut value = self.exact(self.list(value, "type"), 4, "type");
+            let mut value = self.exact(self.list(value, "type"), 5, "type");
             DeclaredType {
                 name: self.string(self.take(&mut value)),
+                exported: self.boolean(self.take(&mut value)),
                 params: self
                     .many(self.take(&mut value), "params")
                     .into_iter()
@@ -4569,8 +4617,9 @@ pub mod text {
             }
         }
         fn read_effect(&self, value: S) -> DeclaredEffect {
-            let mut value = self.exact(self.list(value, "effect"), 5, "effect");
+            let mut value = self.exact(self.list(value, "effect"), 6, "effect");
             let name = self.string(self.take(&mut value));
+            let exported = self.boolean(self.take(&mut value));
             let params: Vec<Parameter> = self
                 .many(self.take(&mut value), "params")
                 .into_iter()
@@ -4661,6 +4710,7 @@ pub mod text {
             let metadata = self.read_metadata(self.take(&mut value));
             DeclaredEffect {
                 name,
+                exported,
                 params,
                 identity,
                 kind,

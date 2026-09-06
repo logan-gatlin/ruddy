@@ -205,6 +205,7 @@ fn links_every_item_and_recursively_relocates_function_indices() {
         }))),
     };
     root.header.types.push(a::DeclaredType {
+        exported: true,
         metadata: Default::default(),
         name: "app@1.0.0::Public".into(),
         params: vec![],

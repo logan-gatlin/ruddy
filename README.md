@@ -75,11 +75,22 @@ whatever struct it is given while keeping the rest of its fields.
 Any top-level definition may carry metadata: attributes written in front of
 it as `@key` or `@key <literal>`, where the literal is a string, number,
 boolean, tag, or a tuple, array, or struct of those, as in
-`@deprecated "use nat::add" @since 2n let add = ...`. The compiler gives no key
-a meaning: it refuses a repeated key, carries the metadata through unchanged,
-shows it in the debugger, and publishes it in the bundle's artifact for every
-value, type, effect, and module, where tools and dependents can read it.
-Metadata never changes a definition's type or its generated code.
+`@deprecated "use nat::add" @since 2n let add = ...`. The compiler refuses a
+repeated key, carries metadata through compilation, and shows it in the debugger
+and bundle artifact.
+
+`@private` makes a definition accessible only within its declaring bundle.
+It accepts only unit (`@private`, `@private ()`, or `@private {}`). It applies
+to values, externs, types, effects, and modules; a private module hides every
+definition beneath it, including in module files. A pattern binding marks every
+name it binds private. Unmarked definitions are public unless enclosed by a
+private module. An executable's root `main` must be public.
+
+Public definitions may alias private definitions, and public signatures may
+mention private types or effects, explicitly or through inference: their
+structural meaning remains available to callers. Private names are absent from
+dependent bundles' source lookup and JavaScript exports; private implementation
+code still runs when needed. All other metadata keys remain uninterpreted.
 
 Immutable homogeneous arrays use `[value, ...]` literals and `[Type]` types.
 A literal may spread other arrays into place with `..`, as in `[..a, x, ..b]`,

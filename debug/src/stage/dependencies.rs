@@ -66,10 +66,25 @@ fn project(
                 "imported values",
                 interface.header().values.len().to_string(),
             )
-            .field("imported types", interface.header().types.len().to_string())
+            .field(
+                "imported types",
+                interface
+                    .header()
+                    .types
+                    .iter()
+                    .filter(|ty| ty.exported)
+                    .count()
+                    .to_string(),
+            )
             .field(
                 "imported effects",
-                interface.header().effects.len().to_string(),
+                interface
+                    .header()
+                    .effects
+                    .iter()
+                    .filter(|effect| effect.exported)
+                    .count()
+                    .to_string(),
             );
     }
     node

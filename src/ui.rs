@@ -1170,6 +1170,7 @@ impl ir::ErrorKind {
             ir::ErrorKind::DuplicateField { .. } => "duplicate-field",
             ir::ErrorKind::DuplicateAttribute { .. } => "duplicate-metadata-key",
             ir::ErrorKind::MetadataTooDeep => "metadata-too-deep",
+            ir::ErrorKind::InvalidPrivateValue => "invalid-private-value",
             // The shape is not part of the code, for the reason a repeated row
             // field's is not: the wording quotes the label the way it was
             // written, and that already says which kind of row it sits in.
@@ -1308,6 +1309,9 @@ impl ir::Error {
             .help(format!(
                 "a definition's metadata has one value per key; keep one `@{name}`"
             )),
+            E::InvalidPrivateValue => Diagnostic::new(code, "`@private` requires unit", span)
+                .label("this value is not unit")
+                .help("write `@private` or `@private ()`"),
             E::MetadataTooDeep => Diagnostic::new(
                 code,
                 "this metadata value is nested too deeply",
