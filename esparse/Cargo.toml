@@ -1,0 +1,13 @@
+[package]
+name = "esparse"
+version = "0.1.0"
+edition = "2024"
+description = "A stack-safe ECMAScript module recognizer for validating generated JavaScript"
+
+[dependencies]
+unicode-id-start = "1"
+
+[dev-dependencies]
+oxc_allocator = "0.148"
+oxc_parser = "0.148"
+oxc_span = "0.148"

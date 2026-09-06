@@ -49,7 +49,7 @@ use crate::{
     ir, parse, patterns,
     symbol::{Bundle, LOCAL_SEGMENT, Mint, Namespace, Symbol},
     token::{self, Kind},
-    tracking::Span,
+    tracking::{Anchor, SourceMap, Span},
     types::{
         Assigned, Atom, EffectId, Formula, Presence, Prim, Rest, Row, RowField, Scheme, Sense,
         Shape, Ty,
@@ -1236,12 +1236,13 @@ impl ir::ErrorKind {
 }
 
 impl ir::Error {
-    /// Turn a lowering failure into reporter-independent words and annotations.
-    pub fn diagnostic(&self) -> Diagnostic {
+    /// Turn a lowering failure into reporter-independent words and annotations,
+    /// with `source` saying where its anchors point.
+    pub fn diagnostic(&self, source: &SourceMap) -> Diagnostic {
         use ir::ErrorKind as E;
 
         let code = self.kind.code();
-        let span = self.span;
+        let span = source.span(self.at);
         match &self.kind {
             E::ArrayInExtern => Diagnostic::new(
                 code,
@@ -1284,12 +1285,12 @@ impl ir::Error {
                 let kind = namespace_name(*namespace);
                 Diagnostic::new(code, format!("`{name}` is defined more than once"), span)
                     .label(format!("this {kind} is defined again"))
-                    .related(*previous, FIRST_DEFINITION)
+                    .related(source.span(*previous), FIRST_DEFINITION)
             }
             E::DuplicateField { name, previous } => {
                 Diagnostic::new(code, format!("field `{name}` is written more than once"), span)
                     .label("written again here")
-                    .related(*previous, FIRST_WRITTEN)
+                    .related(source.span(*previous), FIRST_WRITTEN)
             }
             E::DuplicateAttribute { name, previous } => Diagnostic::new(
                 code,
@@ -1297,7 +1298,7 @@ impl ir::Error {
                 span,
             )
             .label("written again here")
-            .related(*previous, FIRST_WRITTEN)
+            .related(source.span(*previous), FIRST_WRITTEN)
             .help(format!(
                 "a definition's metadata has one value per key; keep one `@{name}`"
             )),
@@ -1323,7 +1324,7 @@ impl ir::Error {
                     span,
                 )
                 .label("included again here")
-                .related(*previous, FIRST_WRITTEN)
+                .related(source.span(*previous), FIRST_WRITTEN)
             }
             E::AbsentInClosed { shape, label: name } => Diagnostic::new(
                 code,
@@ -1391,7 +1392,7 @@ impl ir::Error {
                 span,
             )
             .label("this result makes its own choice")
-            .related(*previous, FIRST_PRODUCTION_LIFETIME)
+            .related(source.span(*previous), FIRST_PRODUCTION_LIFETIME)
             .help("use a different name for each result's choice"),
             E::Arity {
                 name,
@@ -1465,7 +1466,7 @@ impl ir::Error {
                 span,
             )
             .label("this `..` is the second")
-            .related(*previous, "the first `..` is here")
+            .related(source.span(*previous), "the first `..` is here")
             .help("keep one `..`: write the other's effects out, or drop one"),
             E::NotAConstructor => Diagnostic::new(
                 code,
@@ -1484,7 +1485,7 @@ impl ir::Error {
             E::DuplicateParameter { name, previous } => {
                 Diagnostic::new(code, format!("parameter `'{name}` is declared more than once"), span)
                     .label("declared again here")
-                    .related(*previous, FIRST_DECLARATION)
+                    .related(source.span(*previous), FIRST_DECLARATION)
             }
             E::GrowingRecursion => {
                 Diagnostic::new(code, "recursive type arguments grow without bound", span)
@@ -1501,7 +1502,7 @@ impl ir::Error {
                 span,
             )
             .label(format!("used as {second} here"))
-            .related(*previous, format!("first used as {first} here"))
+            .related(source.span(*previous), format!("first used as {first} here"))
             .help("use a different name for each purpose"),
             E::MixedParameter { first, second } => Diagnostic::new(
                 code,
@@ -1550,13 +1551,13 @@ impl ir::Error {
             E::DuplicateBinding { name, previous } => {
                 Diagnostic::new(code, format!("this pattern binds `{name}` more than once"), span)
                     .label("bound again here")
-                    .related(*previous, FIRST_BINDING)
+                    .related(source.span(*previous), FIRST_BINDING)
                     .help("rename one binding or replace it with `_`")
             }
             E::DuplicateOperation { name, previous } => {
                 Diagnostic::new(code, format!("effect function `{name}` is declared more than once"), span)
                     .label("declared again here")
-                    .related(*previous, FIRST_DECLARATION)
+                    .related(source.span(*previous), FIRST_DECLARATION)
             }
             E::NotAnOperation { name } => {
                 Diagnostic::new(code, format!("`{name}` is not a function"), span)
@@ -1665,14 +1666,14 @@ impl ir::Error {
                 span,
             )
             .label("handled again here")
-            .related(*previous, FIRST_ARM),
+            .related(source.span(*previous), FIRST_ARM),
             E::DuplicateReturn { previous } => Diagnostic::new(
                 code,
                 "this handler has more than one `return` arm",
                 span,
             )
             .label("second return arm")
-            .related(*previous, FIRST_ARM),
+            .related(source.span(*previous), FIRST_ARM),
             E::RaiseOutsideArm => Diagnostic::new(
                 code,
                 "`raise` can be used only directly inside a handler arm",
@@ -1686,7 +1687,7 @@ impl ir::Error {
                 span,
             )
             .label("this `raise` is separated from its handler arm")
-            .related(*function, "the intervening function starts here")
+            .related(source.span(*function), "the intervening function starts here")
             .help("move `raise` directly into the handler arm, or return a value from the function"),
         }
     }
@@ -1696,10 +1697,10 @@ impl ir::Error {
 impl fmt::Display for ir::ErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let error = ir::Error {
-            span: Span::default(),
+            at: Anchor::GENERATED,
             kind: self.clone(),
         };
-        f.write_str(&error.diagnostic().title)
+        f.write_str(&error.diagnostic(&SourceMap::default()).title)
     }
 }
 
@@ -3144,6 +3145,7 @@ fn effect_row_has_specific_operation(ty: &Ty) -> bool {
 }
 
 fn causal_diagnostic(
+    source: &SourceMap,
     mut diagnostic: Diagnostic,
     explanation: &inference::InferenceExplanation,
 ) -> Diagnostic {
@@ -3154,14 +3156,16 @@ fn causal_diagnostic(
         .copied()
         .filter_map(|at| explanation.full_facts.get(at).map(|fact| (at, fact)));
     if let Some((at, primary)) = selected.next() {
-        diagnostic.primary.span = primary.span;
+        diagnostic.primary.span = source.span(primary.at);
         diagnostic.primary.message = displayed_explanation_fact(primary, at, explanation);
     } else {
         diagnostic.primary.message = "these uses contribute conflicting requirements".into();
     }
     for (at, fact) in selected {
-        diagnostic =
-            diagnostic.related(fact.span, displayed_explanation_fact(fact, at, explanation));
+        diagnostic = diagnostic.related(
+            source.span(fact.at),
+            displayed_explanation_fact(fact, at, explanation),
+        );
     }
     add_abridgement_note(diagnostic, explanation)
 }
@@ -3250,10 +3254,14 @@ impl inference::Error {
     /// annotations. This is deliberately the only presentation boundary for
     /// type errors: terminals and the debugger must not reconstruct evidence
     /// from the error kind themselves.
-    pub fn diagnostic(&self) -> Diagnostic {
+    pub fn diagnostic(&self, source: &SourceMap) -> Diagnostic {
         use inference::ErrorKind as E;
 
-        let mut diagnostic = Diagnostic::new(self.kind.code(), self.kind.to_string(), self.span);
+        let mut diagnostic = Diagnostic::new(
+            self.kind.code(),
+            self.kind.to_string(),
+            source.span(self.at),
+        );
         match &self.kind {
             E::NotAStruct { demand, .. } => {
                 let (asked, undo) = match demand {
@@ -3263,7 +3271,7 @@ impl inference::Error {
                     inference::StructDemand::Spread => ("spread", "remove the spread"),
                 };
                 if let Some(explanation) = &self.explanation {
-                    diagnostic = causal_diagnostic(diagnostic, explanation)
+                    diagnostic = causal_diagnostic(source, diagnostic, explanation)
                         .help("change the value to a struct")
                         .help(format!("or {undo}"));
                 } else {
@@ -3287,7 +3295,7 @@ impl inference::Error {
                         .copied()
                         .filter_map(|at| explanation.full_facts.get(at).map(|fact| (at, fact)));
                     if let Some((at, primary)) = selected.next() {
-                        diagnostic.primary.span = primary.span;
+                        diagnostic.primary.span = source.span(primary.at);
                         diagnostic.primary.message =
                             displayed_explanation_fact(primary, at, explanation);
                     } else {
@@ -3295,8 +3303,10 @@ impl inference::Error {
                             "these uses of the effect disagree about this argument".into();
                     }
                     for (at, fact) in selected {
-                        diagnostic = diagnostic
-                            .related(fact.span, displayed_explanation_fact(fact, at, explanation));
+                        diagnostic = diagnostic.related(
+                            source.span(fact.at),
+                            displayed_explanation_fact(fact, at, explanation),
+                        );
                     }
                     diagnostic = add_abridgement_note(diagnostic, explanation)
                         .note(format!(
@@ -3306,7 +3316,7 @@ impl inference::Error {
                         .help("use the effect with one argument throughout this computation")
                         .help("or handle one of the uses separately");
                 } else {
-                    diagnostic = Diagnostic::new(self.kind.code(), title, self.span)
+                    diagnostic = Diagnostic::new(self.kind.code(), title, source.span(self.at))
                         .label("these uses of the effect disagree about this argument")
                         .note(format!("the arguments cannot agree: {}", self.kind.cause()))
                         .help("use the effect with one argument throughout this computation")
@@ -3322,7 +3332,7 @@ impl inference::Error {
                         .copied()
                         .filter_map(|at| explanation.full_facts.get(at).map(|fact| (at, fact)));
                     if let Some((at, primary)) = selected.next() {
-                        diagnostic.primary.span = primary.span;
+                        diagnostic.primary.span = source.span(primary.at);
                         diagnostic.primary.message =
                             displayed_explanation_fact(primary, at, explanation);
                     } else {
@@ -3330,8 +3340,10 @@ impl inference::Error {
                             "these uses contribute incompatible type requirements".into();
                     }
                     for (at, fact) in selected {
-                        diagnostic = diagnostic
-                            .related(fact.span, displayed_explanation_fact(fact, at, explanation));
+                        diagnostic = diagnostic.related(
+                            source.span(fact.at),
+                            displayed_explanation_fact(fact, at, explanation),
+                        );
                     }
                     diagnostic = add_abridgement_note(diagnostic, explanation)
                         .help("change the first use so it agrees with the other one")
@@ -3344,7 +3356,7 @@ impl inference::Error {
             }
             E::Recursive => {
                 if let Some(explanation) = &self.explanation {
-                    diagnostic = causal_diagnostic(diagnostic, explanation);
+                    diagnostic = causal_diagnostic(source, diagnostic, explanation);
                     diagnostic = match explanation.contradiction.recursive {
                         Some(inference::RecursiveCycleShape::CallInput) => diagnostic
                             .help("change the call so a value is not passed to itself")
@@ -3365,7 +3377,7 @@ impl inference::Error {
             E::MissingField { shape, field, .. } | E::ExtraField { shape, field, .. } => {
                 let (noun, field) = about(*shape, field);
                 if let Some(explanation) = &self.explanation {
-                    diagnostic = causal_diagnostic(diagnostic, explanation)
+                    diagnostic = causal_diagnostic(source, diagnostic, explanation)
                         .help(format!("allow {noun} `{field}` in the limiting use"))
                         .help(format!("or change the use that requires {noun} `{field}`"));
                 } else {
@@ -3383,11 +3395,11 @@ impl inference::Error {
                 ..
             } => {
                 if let Some(explanation) = &self.explanation {
-                    diagnostic = causal_diagnostic(diagnostic, explanation);
+                    diagnostic = causal_diagnostic(source, diagnostic, explanation);
                 } else {
                     diagnostic = diagnostic
                         .label("this use narrows a choice that belongs to the caller")
-                        .related(*declared, DECLARED_HERE);
+                        .related(source.span(*declared), DECLARED_HERE);
                 }
                 diagnostic = match sense {
                     Sense::Type => diagnostic
@@ -3419,14 +3431,14 @@ impl inference::Error {
                     Shape::Effect => "effects",
                 };
                 if let Some(explanation) = &self.explanation {
-                    diagnostic = causal_diagnostic(diagnostic, explanation);
+                    diagnostic = causal_diagnostic(source, diagnostic, explanation);
                 } else {
                     diagnostic = diagnostic
                         .label(format!(
                             "this assumes one of the {choices} chosen by the caller"
                         ))
                         .related(
-                            *declared,
+                            source.span(*declared),
                             format!("the caller's choice of {choices} starts here"),
                         );
                 }
@@ -3449,20 +3461,20 @@ impl inference::Error {
                 ..
             } => {
                 if let Some(explanation) = &self.explanation {
-                    diagnostic = causal_diagnostic(diagnostic, explanation);
+                    diagnostic = causal_diagnostic(source, diagnostic, explanation);
                     // The synthetic escape explanation already contributes a
                     // destination fact. Replace it rather than appending a
                     // second label for the same binding and span.
                     diagnostic
                         .related
-                        .retain(|annotation| annotation.span != *destination_span);
+                        .retain(|annotation| annotation.span != source.span(*destination_span));
                 } else {
                     diagnostic = diagnostic
                         .label("this type carries a caller choice outside its annotation");
                 }
                 diagnostic = diagnostic
                     .related(
-                        *destination_span,
+                        source.span(*destination_span),
                         format!(
                             "binding `{destination_name}` has inferred type `{destination}`, which would carry this choice outside its annotation"
                         ),
@@ -3475,7 +3487,7 @@ impl inference::Error {
             E::RepeatedField { shape, field, .. } => {
                 let (noun, field) = about(*shape, field);
                 if let Some(explanation) = &self.explanation {
-                    diagnostic = causal_diagnostic(diagnostic, explanation)
+                    diagnostic = causal_diagnostic(source, diagnostic, explanation)
                         .help(format!("remove {noun} `{field}` from the named side"))
                         .help("or keep it out of the `..` remainder");
                 } else {
@@ -3508,7 +3520,7 @@ impl inference::Error {
             }
             E::Unhandled { effect } => {
                 if let Some(explanation) = &self.explanation {
-                    diagnostic = causal_diagnostic(diagnostic, explanation);
+                    diagnostic = causal_diagnostic(source, diagnostic, explanation);
                 } else {
                     diagnostic = diagnostic.label(format!(
                         "effect `{}` has no enclosing handler",
@@ -3519,7 +3531,7 @@ impl inference::Error {
             }
             E::NotAllowed { effect } => {
                 if let Some(explanation) = &self.explanation {
-                    diagnostic = causal_diagnostic(diagnostic, explanation);
+                    diagnostic = causal_diagnostic(source, diagnostic, explanation);
                 } else {
                     diagnostic = diagnostic.label(format!(
                         "effect `{}` is not listed by this function",
@@ -3535,7 +3547,7 @@ impl inference::Error {
                 ..
             } => {
                 if let Some(explanation) = &self.explanation {
-                    diagnostic = causal_diagnostic(diagnostic, explanation);
+                    diagnostic = causal_diagnostic(source, diagnostic, explanation);
                 } else {
                     let effects = if missing_effects.is_empty() {
                         "callback evidence not carried by this extern".into()
@@ -3568,7 +3580,7 @@ impl inference::Error {
                 callback_issues, ..
             } => {
                 if let Some(explanation) = &self.explanation {
-                    diagnostic = causal_diagnostic(diagnostic, explanation);
+                    diagnostic = causal_diagnostic(source, diagnostic, explanation);
                 } else {
                     diagnostic = diagnostic
                         .label("host code needs one fixed kind of value at this position");
@@ -4403,12 +4415,13 @@ mod tests {
     //! is crate-private, so they live here rather than in the workspace's
     //! test crate.
 
+    use crate::tracking::Anchor;
+
     use std::rc::Rc;
 
     use crate::{
         inference::{self, Constraint, ConstraintKind, Effect, ErrorKind as TypeError},
         symbol::{Bundle, Mint, Namespace, Version},
-        tracking::Span,
         types::{Assigned, Formula, Presence, Rest, Row, RowField, Ty},
     };
 
@@ -4417,12 +4430,12 @@ mod tests {
     #[test]
     fn a_constraint_reads_as_what_it_demands() {
         let nat = Rc::new(Ty::plain(Ty::Nat));
-        let span = Span::generated(0, 1);
+        let span = Anchor::GENERATED;
 
         let equal = Constraint {
             id: inference::ConstraintId::synthetic(0),
             reason: inference::ReasonId::synthetic(0),
-            span,
+            at: span,
             origin: inference::ConstraintOrigin::ContextualCheck,
             subjects: inference::ConstraintSubjects::pair(
                 inference::Subject::Context,
@@ -4557,7 +4570,7 @@ mod tests {
         let bound = Constraint {
             id: inference::ConstraintId::synthetic(0),
             reason: inference::ReasonId::synthetic(0),
-            span: Span::generated(0, 1),
+            at: Anchor::GENERATED,
             origin: inference::ConstraintOrigin::Binding,
             subjects: inference::ConstraintSubjects::one(inference::Subject::Binding),
             kind: ConstraintKind::Let {

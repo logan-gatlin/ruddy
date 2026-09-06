@@ -38,6 +38,7 @@ fn artifact(
         .collect();
     validated(a::UncheckedArtifact {
         header: a::Header {
+            compiler: ruddy::artifact::Stamp::current(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: name.into(),

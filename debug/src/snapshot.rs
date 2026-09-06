@@ -226,13 +226,9 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
                         PathBuf::from("invalid-document")
                     }
                 };
-                let specifications = req
-                    .dependencies
-                    .iter()
-                    .map(|(alias, specification)| (alias.clone(), specification.clone()));
-                match ruddy_cli::compile_sandboxed_project_dependencies(
+                match crate::dependency_cache::compile(
                     &req.std,
-                    specifications,
+                    &req.dependencies,
                     &project,
                     scratch,
                 ) {
@@ -302,27 +298,31 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
                     .zip(&dependency_interfaces)
                     .map(|(alias, artifact)| ir::DependencyImport { alias, artifact })
                     .collect();
+                let linked: Vec<&artifact::Artifact> = linked_interfaces.iter().collect();
                 ir::build_with_dependency_imports(
                     &mut mint,
                     loaded.stmts.clone(),
                     &imports,
-                    &linked_interfaces,
+                    &linked,
                 )
             });
             micros.build = started.elapsed().as_micros() as u64;
             out
         });
 
-    // Inference mutates the program it types, so it borrows `built` mutably
-    // and finishes before any stage looks at either.
-    let inferred = built.as_mut().and_then(|built| {
+    let inferred = built.as_ref().and_then(|built| {
         let started = Instant::now();
         let out = guard("types", &mut panicked, || {
-            inference::infer(&mint, &mut built.program, inference::Trace::Complete)
+            inference::infer(&mint, &built.program, inference::Trace::Complete)
         });
         micros.infer = started.elapsed().as_micros() as u64;
         out
     });
+    // Inference answers with typed copies of the declarations; the program
+    // every later stage reads is the one with those written in.
+    if let (Some(built), Some(inferred)) = (&mut built, &inferred) {
+        inferred.apply_types(&mut built.program);
+    }
 
     // The pattern checks read the program inference just finished writing
     // solved types into, and run only when both phases did.
@@ -337,6 +337,12 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
         }
         _ => None,
     };
+
+    // Where every anchor the phases produced was written, or nothing when
+    // nothing was lowered: the one place positions come back into the
+    // picture, for the diagnostics and the panels the page shows.
+    let empty_source = ruddy::tracking::SourceMap::default();
+    let source_map = built.as_ref().map_or(&empty_source, |built| &built.source);
 
     // Every phase words and codes its own errors in `ruddy::ui`, so the strip
     // and the CLI driver cannot describe the same program differently, and a
@@ -369,22 +375,26 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
             built
                 .errors
                 .iter()
-                .map(|error| source_error("ir", error.diagnostic(), &index)),
+                .map(|error| source_error("ir", error.diagnostic(&built.source), &index)),
         );
     }
-    if let Some(inferred) = &inferred {
+    if let (Some(inferred), Some(built)) = (&inferred, &built) {
         diagnostics.extend(inferred.errors().iter().map(|error| {
-            let mut diagnostic = source_error("types", error.diagnostic(), &index);
-            diagnostic.inference_error_id = Some(error.id.get());
+            let mut diagnostic = source_error("types", error.diagnostic(&built.source), &index);
+            diagnostic.inference_error_id = Some(error.id.to_string());
             diagnostic.inference_cause = Some(match error.cause {
-                inference::ErrorCause::Step(id) => InferenceCause::Step { step_id: id.get() },
-                inference::ErrorCause::Batch(id) => InferenceCause::Batch { batch_id: id.get() },
+                inference::ErrorCause::Step(id) => InferenceCause::Step {
+                    step_id: id.to_string(),
+                },
+                inference::ErrorCause::Batch(id) => InferenceCause::Batch {
+                    batch_id: id.to_string(),
+                },
                 inference::ErrorCause::Direct => InferenceCause::Direct,
             });
             diagnostic.inference_explanation = error
                 .explanation
                 .as_ref()
-                .map(|explanation| wire_explanation(explanation, &index));
+                .map(|explanation| wire_explanation(explanation, source_map, &index));
             diagnostic
         }));
     }
@@ -394,7 +404,7 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
                 "patterns",
                 error.kind.code(),
                 error.kind.to_string(),
-                loc(error.span, &index),
+                loc(source_map.span(error.at), &index),
             )
         }));
     }
@@ -414,31 +424,28 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
         .as_ref()
         .filter(|_| diagnostics.is_empty())
         .and_then(|loaded| {
-            let mut unchecked: Vec<_> = linked_interfaces
-                .iter()
-                .map(ruddy::artifact::Artifact::to_unchecked)
-                .collect();
+            // Every graph artifact was validated when it was compiled, so it
+            // crosses the seam as the proof it already is.
+            let mut checked: Vec<&artifact::Artifact> = linked_interfaces.iter().collect();
             for dependency in &dependency_interfaces {
-                if !unchecked.iter().any(|artifact| {
-                    artifact.header.identity.name == dependency.header().identity.name
-                        && artifact.header.identity.version == dependency.header().identity.version
-                }) {
-                    unchecked.push(dependency.to_unchecked());
+                if !checked
+                    .iter()
+                    .any(|artifact| artifact.header().identity == dependency.header().identity)
+                {
+                    checked.push(dependency);
                 }
             }
-            let dependencies: Vec<_> = unchecked
+            let dependencies: Vec<_> = checked
                 .iter()
                 .map(|artifact| ruddy::compile::Dependency {
                     alias: dependency_aliases
                         .iter()
                         .zip(&dependency_interfaces)
                         .find(|(_, dependency)| {
-                            artifact.header.identity.name == dependency.header().identity.name
-                                && artifact.header.identity.version
-                                    == dependency.header().identity.version
+                            artifact.header().identity == dependency.header().identity
                         })
                         .map(|(alias, _)| alias.as_str()),
-                    artifact,
+                    artifact: ruddy::compile::DependencyArtifact::Checked(artifact),
                 })
                 .collect();
             ruddy::compile::compile_with_dependencies(
@@ -559,6 +566,7 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
         diagnostics: &diagnostics,
         bundle: loaded.as_ref(),
         program: built.as_ref().map(|built| &built.program),
+        source: source_map,
         inference: inferred.as_ref(),
         patterns: checked.as_ref(),
         lir: lowered.as_ref(),
@@ -692,6 +700,7 @@ pub fn install_hook() {
 
 fn wire_explanation(
     explanation: &inference::InferenceExplanation,
+    source: &ruddy::tracking::SourceMap,
     files: &HashMap<FileID, u32>,
 ) -> crate::wire::InferenceExplanation {
     fn description(value: inference::TypeDescription) -> &'static str {
@@ -712,6 +721,7 @@ fn wire_explanation(
     }
     fn fact(
         fact: &inference::ExplanationFact,
+        source: &ruddy::tracking::SourceMap,
         files: &HashMap<FileID, u32>,
     ) -> crate::wire::ExplanationFact {
         let payload = match fact.payload {
@@ -740,8 +750,8 @@ fn wire_explanation(
             inference::ExplanationFactPayload::ExternPosition => "extern-position",
         };
         crate::wire::ExplanationFact {
-            span: loc(fact.span, files),
-            constraint_id: (!fact.direct).then(|| fact.constraint.get()),
+            span: loc(source.span(fact.at), files),
+            constraint_id: (!fact.direct).then(|| fact.constraint.to_string()),
             direct: fact.direct,
             origin: fact.origin.code(),
             subject: fact.subject.code(),
@@ -751,7 +761,7 @@ fn wire_explanation(
     let full: Vec<_> = explanation
         .full_facts
         .iter()
-        .map(|item| fact(item, files))
+        .map(|item| fact(item, source, files))
         .collect();
     let abridged = explanation
         .abridged
@@ -817,19 +827,19 @@ fn wire_explanation(
             }),
         },
         cause: crate::wire::ExplanationCause {
-            error_id: explanation.cause.error.get(),
-            seed_reason_id: explanation.cause.seed.map(|id| id.get()),
+            error_id: explanation.cause.error.to_string(),
+            seed_reason_id: explanation.cause.seed.map(|id| id.to_string()),
             constraint_ids: explanation
                 .cause
                 .constraints
                 .iter()
-                .map(|id| id.get())
+                .map(|id| id.to_string())
                 .collect(),
             reason_ids: explanation
                 .cause
                 .reasons
                 .iter()
-                .map(|id| id.get())
+                .map(|id| id.to_string())
                 .collect(),
             omitted_reasons: explanation.cause.omitted_reasons,
         },

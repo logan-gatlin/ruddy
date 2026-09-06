@@ -394,15 +394,14 @@ fn the_presence_tab_renders_the_store_and_the_clauses() {
         "{nodes:#?}"
     );
 
-    // The store never recovers, so every batch past the flip renders an
-    // unsatisfiable verdict too — and each of them names the batch that did the
-    // flipping rather than itself, which would blame each in turn for the one
-    // thing only the first of them did.
+    // A group's store never recovers, so every batch of the group past the
+    // flip renders an unsatisfiable verdict too — and each of them names the
+    // batch that did the flipping rather than itself, which would blame each
+    // in turn for the one thing only the first of them did.
     let nodes = tab(
         "presence",
         "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
-         let bad = p {}\n\
-         let q = fn a => match a with | {x} => {} | {y} => {} end",
+         let bad = fn b => do let _ = p {} return match b with | {x} => {} | {y} => {} end end",
     );
     let unsatisfiable: Vec<&str> = nodes
         .iter()
@@ -953,6 +952,7 @@ fn the_lir_tab_skips_a_program_with_errors() {
 fn artifact_stage_renders_one_dependency() {
     let artifact = UncheckedArtifact {
         header: Header {
+            compiler: ruddy::artifact::Stamp::current(),
             modules: Vec::new(),
             identity: Identity {
                 name: "demo".to_string(),
@@ -987,6 +987,7 @@ fn artifact_stage_renders_one_dependency() {
         files: &[],
         sources: &[],
         diagnostics: &[],
+        source: &ruddy::tracking::SourceMap::default(),
         bundle: None,
         program: None,
         inference: None,

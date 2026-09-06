@@ -238,6 +238,63 @@ fn custom_standard_library_is_source_visible_rendered_and_sandboxed() {
     }));
 }
 
+/// The debugger remembers a compiled dependency graph between requests, and
+/// forgets it the moment a file the graph was read from changes: a standard
+/// library edited on disk is what the very next compile sees.
+#[test]
+fn a_remembered_dependency_graph_follows_edits_to_its_sources() {
+    let outer = tempfile::tempdir().unwrap();
+    let scratch = outer.path().join("scratch");
+    let app = scratch.join("app");
+    let standard = scratch.join("std-next");
+    fs::create_dir_all(&app).unwrap();
+    fs::create_dir_all(&standard).unwrap();
+    fs::write(standard.join("main.hc"), "let answer = 42n\n").unwrap();
+    fs::write(
+        standard.join("Ruddy.toml"),
+        "name = \"std\"\nversion = \"2.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
+    )
+    .unwrap();
+    let request = CompileRequest {
+        name: "app".into(),
+        version: "1.0.0".into(),
+        root: ROOT.into(),
+        document: "app".into(),
+        files: vec![FileSpec {
+            path: ROOT.into(),
+            source: "let main = std::answer\n".into(),
+        }],
+        std: StdConfig::Dependency(DependencySpec::from("../std-next")),
+        dependencies: IndexMap::new(),
+        revision: 1,
+    };
+    for revision in 1..=2 {
+        let built = compile_at(&request, revision, &scratch);
+        assert!(built.diagnostics.is_empty(), "{:#?}", built.diagnostics);
+    }
+
+    fs::write(standard.join("main.hc"), "let renamed = 42n\n").unwrap();
+    let stale = compile_at(&request, 3, &scratch);
+    assert!(
+        stale
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "ir"),
+        "{:#?}",
+        stale.diagnostics
+    );
+
+    let repointed = CompileRequest {
+        files: vec![FileSpec {
+            path: ROOT.into(),
+            source: "let main = std::renamed\n".into(),
+        }],
+        ..request
+    };
+    let built = compile_at(&repointed, 4, &scratch);
+    assert!(built.diagnostics.is_empty(), "{:#?}", built.diagnostics);
+}
+
 #[test]
 fn installed_standard_library_is_the_only_trusted_external_local_root() {
     let outer = tempfile::tempdir().unwrap();
@@ -2011,10 +2068,10 @@ fn symbols_round_trip_through_the_mangler() {
         .collect();
     // In mint order, which is the row order: types are lowered first, and every
     // definition's name is minted before any body is lowered — so `f` comes
-    // before the `x` its own lambda binds.
+    // before the `x` its own lambda binds, and `x` is shown inside `f`.
     assert_eq!(
         paths,
-        [("T", "demo::T"), ("f", "demo::f"), ("x", "demo::_::x")]
+        [("T", "demo::T"), ("f", "demo::f"), ("x", "demo::f::_::x")]
     );
 }
 
@@ -2754,6 +2811,7 @@ fn inference_stage_rows_serialize_compiler_identities() {
         .expect("a solve-caused inference diagnostic");
     let error_id = diagnostic
         .inference_error_id
+        .clone()
         .expect("stable inference error identity");
     let Some(InferenceCause::Step { step_id }) = diagnostic.inference_cause.as_ref() else {
         panic!("ordinary inference error should carry its step cause");
@@ -2769,7 +2827,7 @@ fn inference_stage_rows_serialize_compiler_identities() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|item| item["inference_error_id"] == error_id)
+        .find(|item| item["inference_error_id"] == error_id.as_str())
         .expect("stable inference metadata reaches the wire");
     assert!(serialized.get("id").is_some(), "display id remains present");
     assert_eq!(serialized["inference_cause"]["kind"], "step");

@@ -51,6 +51,9 @@ pub struct Cx<'a> {
     /// the spliced statement tree.
     pub bundle: Option<&'a ruddy::bundle::Output>,
     pub program: Option<&'a ruddy::ir::Program>,
+    /// Where every anchor in `program` was written. Empty when there is no
+    /// program, so a stage can always resolve an anchor it is handed.
+    pub source: &'a ruddy::tracking::SourceMap,
     pub inference: Option<&'a ruddy::inference::Output>,
     pub patterns: Option<&'a ruddy::patterns::Output>,
     /// `None` whenever an earlier phase reported anything: LIR runs on accepted

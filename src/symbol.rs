@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fmt::Write as _};
 
-use indexmap::IndexSet;
+use indexmap::{IndexMap, IndexSet};
 use semver::Prerelease;
 use twox_hash::XxHash3_64;
 
@@ -15,10 +15,10 @@ pub const PREFIX: &str = "_R";
 /// The path segment standing in for the scope a local lives in.
 ///
 /// A local has no canonical path — the lambda or `let` body it belongs to is
-/// not a module and has no name to spell — so every local of a given parent is
-/// shown under one anonymous segment rather than directly beside the globals it
-/// is not addressable alongside. Display only: the mangling distinguishes
-/// locals by disambiguator, and never emits a component for this.
+/// not a module and has no name to spell — so every local of a given owner is
+/// shown under one anonymous segment inside it, rather than directly beside
+/// the globals it is not addressable alongside. Display only: the mangling
+/// distinguishes locals by disambiguator, and never emits a component for this.
 pub const LOCAL_SEGMENT: &str = "_";
 
 /// Tags introducing the parts of a mangled name that come before the path.
@@ -52,14 +52,21 @@ pub struct BundleHash(u64);
 
 /// A globally unique name for one variable, type, or module.
 ///
-/// A symbol is an identity, not a name: equality is identity, and everything
-/// else about it — its name, namespace, and containing module — is held by the
-/// [`Mint`] that made it. Symbols carry the bundle they were minted in so that
-/// two bundles' symbols can never compare equal by accident.
+/// A symbol is a value of its path, not a ticket from a counter: the fingerprint
+/// of the mangled components that name it, so the same declaration is the same
+/// symbol in every run and whatever else was minted before it. Adding a local
+/// to one definition renumbers nothing in another, which is what lets the
+/// lowered form of a definition nobody edited compare equal to what it was.
+/// Everything else about it — its name, namespace, containing module and owner
+/// — is held by the [`Mint`] that made it. Symbols carry the bundle they were
+/// minted in so that two bundles' symbols can never compare equal by accident.
+///
+/// Ordered, so that it can key an ordered collection, but the order is the
+/// fingerprint's and means nothing; what wants source order asks the program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Symbol {
     bundle: BundleHash,
-    index: u32,
+    path: u64,
 }
 
 /// A symbol already known to live in the module namespace. Newtyped so that a
@@ -89,13 +96,17 @@ struct Name(u32);
 /// Everything the mint knows about one symbol. Spans are deliberately absent;
 /// callers keep a [`Tracked<Symbol>`](crate::tracking::Tracked) instead, since
 /// one symbol can be written at many places.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Data {
     name: Name,
     namespace: Namespace,
     /// `None` places the symbol directly at the top level of the bundle, which
     /// is a real position in the tree rather than a missing one.
     parent: Option<Module>,
+    /// The definition a local was written inside, when it was written inside
+    /// one. A local's path runs through its owner, so that its number counts
+    /// only the locals of that definition.
+    owner: Option<Symbol>,
     /// Present when the symbol is local.
     disambiguator: Option<u32>,
 }
@@ -103,21 +114,19 @@ struct Data {
 /// Builder for unique symbols.
 ///
 /// One mint per bundle: the mint *is* the bundle, which is what lets a bundle
-/// mangle its whole tree while knowing nothing about its dependencies. Never
-/// clone a mint — the copy would hand out indices that collide with the
-/// original's while meaning something else.
+/// mangle its whole tree while knowing nothing about its dependencies. Symbols
+/// are fingerprints of their paths, so two mints of one bundle minting the same
+/// declarations hand out the same symbols; what a mint holds beyond that is
+/// the names behind them and the count of locals at each path.
 #[derive(Debug)]
 pub struct Mint {
     bundle: Bundle,
     names: IndexSet<String>,
-    symbols: Vec<Data>,
-    /// The one symbol at each global path. Not a symbol table for callers to
-    /// resolve names against — deciding what a name means belongs to whoever
-    /// owns the scopes. This is the guard that keeps two global symbols from
-    /// sharing a path, and so keeps their manglings distinct.
-    globals: HashMap<(Option<Module>, Namespace, Name), Symbol>,
-    /// The next disambiguator for each local path.
-    locals: HashMap<(Option<Module>, Namespace, Name), u32>,
+    /// Every symbol minted, in the order it was minted, and what it names.
+    symbols: IndexMap<Symbol, Data>,
+    /// The next disambiguator for each local path: the owner, or the module
+    /// for a local that no definition wrote, then the namespace and name.
+    locals: HashMap<(Option<Symbol>, Option<Module>, Namespace, Name), u32>,
     /// Portable artifact spelling for dependency-interface symbols represented
     /// inside this mint. These symbols participate in checking but retain the
     /// bundle that actually owns them at the artifact boundary.
@@ -214,8 +223,31 @@ impl BundleHash {
 }
 
 impl Symbol {
+    /// The symbol an [`Anchor`](crate::tracking::Anchor) names when what it
+    /// anchors was written by no definition: what the compiler generated, or
+    /// a dependency's declaration. No mint ever hands this out, so nothing a
+    /// program declares can collide with it.
+    pub const GENERATED: Symbol = Symbol {
+        bundle: BundleHash(0),
+        path: u64::MAX,
+    };
+
     pub const fn bundle(self) -> BundleHash {
         self.bundle
+    }
+
+    /// The fingerprint of the symbol's path within its bundle. Readable but
+    /// not constructible, like [`BundleHash::bits`].
+    pub const fn bits(self) -> u64 {
+        self.path
+    }
+}
+
+/// What a symbol is before anything is named: the generated one, so that a
+/// record with a symbol in it can be built empty and filled in.
+impl Default for Symbol {
+    fn default() -> Self {
+        Self::GENERATED
     }
 }
 
@@ -257,8 +289,7 @@ impl Mint {
         Self {
             bundle,
             names: IndexSet::new(),
-            symbols: Vec::new(),
-            globals: HashMap::new(),
+            symbols: IndexMap::new(),
             locals: HashMap::new(),
             external: HashMap::new(),
         }
@@ -279,18 +310,13 @@ impl Mint {
     ) -> Result<Symbol, Symbol> {
         self.check_parent(parent);
         let name = self.intern(name);
-        let key = (parent, namespace, name);
-        if let Some(&existing) = self.globals.get(&key) {
-            return Err(existing);
-        }
-        let symbol = self.push(Data {
+        self.push(Data {
             name,
             namespace,
             parent,
+            owner: None,
             disambiguator: None,
-        });
-        self.globals.insert(key, symbol);
-        Ok(symbol)
+        })
     }
 
     /// [`global`](Self::global) in the module namespace.
@@ -301,16 +327,39 @@ impl Mint {
         }
     }
 
-    /// Mint a fresh local symbol. Two calls with identical arguments return
-    /// unequal symbols; that is the whole point of a local.
+    /// Mint a fresh local symbol that no definition wrote: an imported
+    /// declaration's stand-in, or a test's. Two calls with identical arguments
+    /// return unequal symbols; that is the whole point of a local.
+    ///
+    /// A local written inside a definition wants [`local_in`](Self::local_in),
+    /// which counts it against that definition alone.
     pub fn local(&mut self, parent: Option<Module>, namespace: Namespace, name: &str) -> Symbol {
         self.check_parent(parent);
+        self.fresh(parent, None, namespace, name)
+    }
+
+    /// Mint a fresh local symbol of the definition `owner`, in the module the
+    /// owner is in. Counted per owner, name and namespace, so that a local
+    /// added to one definition renumbers no local of another, and its symbol
+    /// — a fingerprint of its path — says nothing about what else was minted.
+    pub fn local_in(&mut self, owner: Symbol, namespace: Namespace, name: &str) -> Symbol {
+        let parent = self.data(owner).parent;
+        self.fresh(parent, Some(owner), namespace, name)
+    }
+
+    fn fresh(
+        &mut self,
+        parent: Option<Module>,
+        owner: Option<Symbol>,
+        namespace: Namespace,
+        name: &str,
+    ) -> Symbol {
         let name = self.intern(name);
-        // Counted per path rather than per mint, so that adding a local in one
-        // module does not renumber every local after it in the bundle — and so
-        // that a mangling never depends on the order symbols were minted in.
         let disambiguator = {
-            let next = self.locals.entry((parent, namespace, name)).or_insert(0);
+            let next = self
+                .locals
+                .entry((owner, parent, namespace, name))
+                .or_insert(0);
             let current = *next;
             *next += 1;
             current
@@ -319,8 +368,10 @@ impl Mint {
             name,
             namespace,
             parent,
+            owner,
             disambiguator: Some(disambiguator),
         })
+        .unwrap_or_else(|_| unreachable!("a local's disambiguator is fresh"))
     }
 
     /// Associate an imported semantic symbol with its portable qualified name.
@@ -352,6 +403,12 @@ impl Mint {
         self.data(symbol).parent
     }
 
+    /// The definition a local was written inside, or `None` for a global and
+    /// for a local no definition wrote.
+    pub fn owner(&self, symbol: Symbol) -> Option<Symbol> {
+        self.data(symbol).owner
+    }
+
     pub fn is_local(&self, symbol: Symbol) -> bool {
         self.data(symbol).disambiguator.is_some()
     }
@@ -362,10 +419,7 @@ impl Mint {
 
     /// Every symbol this mint has made, in the order they were made.
     pub fn symbols(&self) -> impl Iterator<Item = Symbol> + '_ {
-        (0..self.symbols.len() as u32).map(|index| Symbol {
-            bundle: self.bundle.hash,
-            index,
-        })
+        self.symbols.keys().copied()
     }
 
     /// `bundle::module::name`, for diagnostics, with every local one segment
@@ -384,16 +438,25 @@ impl Mint {
     pub fn mangle(&self, symbol: Symbol) -> String {
         let mut out = String::from(PREFIX);
         write_bundle(&mut out, &self.bundle);
-        for symbol in self.chain(symbol) {
-            let data = self.data(symbol);
-            write_component(
-                &mut out,
-                data.namespace.tag(),
-                self.name(symbol),
-                data.disambiguator,
-            );
-        }
+        self.write_path(&mut out, self.data(symbol));
         out
+    }
+
+    /// The mangled components of `data`'s path, outermost first, with no
+    /// bundle in front: what a symbol is the fingerprint of.
+    fn write_path(&self, out: &mut String, data: &Data) {
+        for symbol in self.above(data) {
+            self.write_data(out, self.data(symbol));
+        }
+        self.write_data(out, data);
+    }
+
+    fn write_data(&self, out: &mut String, data: &Data) {
+        let name = self
+            .names
+            .get_index(data.name.0 as usize)
+            .expect("interned name was dropped");
+        write_component(out, data.namespace.tag(), name, data.disambiguator);
     }
 
     fn intern(&mut self, name: &str) -> Name {
@@ -404,12 +467,33 @@ impl Mint {
         Name(index as u32)
     }
 
-    fn push(&mut self, data: Data) -> Symbol {
-        let index = self.symbols.len() as u32;
-        self.symbols.push(data);
-        Symbol {
+    /// The symbol at `data`'s path, minted if it was not already. The `Err`
+    /// carries the symbol already there, which is the same declaration named
+    /// twice: a redeclaration for a global, and impossible for a local, whose
+    /// disambiguator is fresh.
+    ///
+    /// The path is sixty-four bits of fingerprint, so two paths that agree on
+    /// it would be miscompiled as one symbol. That is ruled out here rather
+    /// than trusted: a program cannot be written to produce it, and a check
+    /// nothing can reach is one nobody can confirm still means what it says.
+    fn push(&mut self, data: Data) -> Result<Symbol, Symbol> {
+        let mut path = String::new();
+        self.write_path(&mut path, &data);
+        let symbol = Symbol {
             bundle: self.bundle.hash,
-            index,
+            path: XxHash3_64::oneshot(path.as_bytes()),
+        };
+        match self.symbols.get(&symbol) {
+            Some(existing) if *existing == data => Err(symbol),
+            Some(existing) => {
+                let mut other = String::new();
+                self.write_path(&mut other, existing);
+                panic!("symbol paths {path} and {other} fingerprint the same")
+            }
+            None => {
+                self.symbols.insert(symbol, data);
+                Ok(symbol)
+            }
         }
     }
 
@@ -418,7 +502,9 @@ impl Mint {
             symbol.bundle, self.bundle.hash,
             "symbol belongs to another bundle"
         );
-        &self.symbols[symbol.index as usize]
+        self.symbols
+            .get(&symbol)
+            .expect("symbol was minted by another mint")
     }
 
     fn check_parent(&self, parent: Option<Module>) {
@@ -427,19 +513,29 @@ impl Mint {
         }
     }
 
-    /// The symbols from the outermost containing module down to `symbol`.
-    /// Crate-visible so that [`Path`] can walk it; a caller outside wants
-    /// [`path`](Self::path) or [`mangle`](Self::mangle), which are the two
-    /// things a chain is ever walked for.
+    /// The symbols from the outermost containing module down to `symbol`,
+    /// through the definition that owns it when one does. Crate-visible so
+    /// that [`Path`] can walk it; a caller outside wants [`path`](Self::path)
+    /// or [`mangle`](Self::mangle), which are the two things a chain is ever
+    /// walked for.
     pub(crate) fn chain(&self, symbol: Symbol) -> Vec<Symbol> {
-        let mut chain = vec![symbol];
-        let mut parent = self.data(symbol).parent;
-        while let Some(module) = parent {
-            chain.push(module.0);
-            parent = self.data(module.0).parent;
-        }
-        chain.reverse();
+        let mut chain = self.above(self.data(symbol));
+        chain.push(symbol);
         chain
+    }
+
+    /// Everything on the path above `data`, outermost first: its owner if it
+    /// has one, and the modules from there out.
+    fn above(&self, data: &Data) -> Vec<Symbol> {
+        let mut above = Vec::new();
+        let mut at = data.owner.or(data.parent.map(Module::symbol));
+        while let Some(symbol) = at {
+            above.push(symbol);
+            let data = self.data(symbol);
+            at = data.owner.or(data.parent.map(Module::symbol));
+        }
+        above.reverse();
+        above
     }
 }
 

@@ -12,7 +12,7 @@ use ruddy::{
     parse,
     symbol::{Bundle, Mint, Namespace, Symbol, Version},
     token::lex,
-    tracking::FileID,
+    tracking::{FileID, FileManager},
     types::{ParamKind, Presence, Prim, Rest, Sense, Shape, Ty},
 };
 use ruddy_debug::print;
@@ -55,6 +55,17 @@ fn build_src(src: &str) -> (Mint, Output) {
     let mut mint = dummy_mint();
     let out = build(&mut mint, parsed.stmts);
     (mint, out)
+}
+
+/// Lowered from a registered file, as a bundle's files are: a generated span
+/// is the compiler's own and is numbered absolutely on purpose, so a test
+/// about anchors staying put has to lex under a real file id.
+fn build_file(src: &str) -> Output {
+    let mut files = FileManager::new();
+    let id = files.register_new_file("test.hc".into(), src.into());
+    let parsed = parse::parse(lex(src, id).tokens);
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    build(&mut dummy_mint(), parsed.stmts)
 }
 
 fn built(src: &str) -> (Mint, Output) {
@@ -143,11 +154,11 @@ fn if_expressions_lower_to_boolean_matches() {
     };
     assert!(matches!(scrutinee.kind, TermKind::Boolean(true)));
     assert_eq!(arms.len(), 2);
-    assert!(matches!(arms[0].0.tracked, PatternKind::Boolean(true)));
-    assert_eq!(arms[0].0.span, scrutinee.span);
+    assert!(matches!(arms[0].0.anchored, PatternKind::Boolean(true)));
+    assert_eq!(arms[0].0.at, scrutinee.at);
     assert!(matches!(arms[0].1.kind, TermKind::Natural(1)));
-    assert!(matches!(arms[1].0.tracked, PatternKind::Boolean(false)));
-    assert_eq!(arms[1].0.span, scrutinee.span);
+    assert!(matches!(arms[1].0.anchored, PatternKind::Boolean(false)));
+    assert_eq!(arms[1].0.at, scrutinee.at);
     assert!(matches!(arms[1].1.kind, TermKind::Natural(2)));
 
     let (mint, out) = built("let choose = if true then 1n else if false then 2n else 3n end");
@@ -163,33 +174,34 @@ fn if_expressions_lower_to_boolean_matches() {
     };
     assert!(matches!(scrutinee.kind, TermKind::Boolean(false)));
     assert_eq!(nested.len(), 2);
-    assert!(matches!(nested[0].0.tracked, PatternKind::Boolean(true)));
-    assert!(matches!(nested[1].0.tracked, PatternKind::Boolean(false)));
+    assert!(matches!(nested[0].0.anchored, PatternKind::Boolean(true)));
+    assert!(matches!(nested[1].0.anchored, PatternKind::Boolean(false)));
 }
 
 #[test]
 fn match_function_shorthand_lowers_to_a_function_over_a_match() {
     let src = "let unwrap = fn | #Some x => x | #None => 0n";
     let (mint, out) = built(src);
+    let map = &out.source;
     let value = &out.program.terms[&term_symbol(&mint, &out, "unwrap")].value;
     let TermKind::Fn { arg, body } = &value.kind else {
         panic!("the shorthand lowers to a function");
     };
-    assert_eq!(mint.name(arg.tracked), "%match");
-    assert_eq!(arg.span.start, src.find("fn").expect("the keyword"));
-    assert_eq!(arg.span.width, 2);
-    assert_eq!(value.span.start, arg.span.start);
-    assert_eq!(value.span.end(), src.len());
+    assert_eq!(mint.name(arg.anchored), "%match");
+    assert_eq!(map.span(arg.at).start, src.find("fn").expect("the keyword"));
+    assert_eq!(map.span(arg.at).width, 2);
+    assert_eq!(map.span(value.at).start, map.span(arg.at).start);
+    assert_eq!(map.span(value.at).end(), src.len());
 
     let TermKind::Match { scrutinee, arms } = &body.kind else {
         panic!("the shorthand function body lowers to a match");
     };
-    assert_eq!(body.span, value.span);
-    assert!(matches!(scrutinee.kind, TermKind::Ident(symbol) if symbol == arg.tracked));
-    assert_eq!(scrutinee.span, arg.span);
+    assert_eq!(body.at, value.at);
+    assert!(matches!(scrutinee.kind, TermKind::Ident(symbol) if symbol == arg.anchored));
+    assert_eq!(scrutinee.at, arg.at);
     assert_eq!(arms.len(), 2);
-    assert!(matches!(arms[0].0.tracked, PatternKind::Tag { .. }));
-    assert!(matches!(arms[1].0.tracked, PatternKind::Tag { .. }));
+    assert!(matches!(arms[0].0.anchored, PatternKind::Tag { .. }));
+    assert!(matches!(arms[1].0.anchored, PatternKind::Tag { .. }));
 }
 
 /// The lowered annotation of a top-level definition, which is where the
@@ -256,9 +268,9 @@ fn circular<'a>(mint: &'a Mint, out: &'a Output) -> Vec<&'a str> {
             out.program
                 .terms
                 .iter()
-                .find(|(_, decl)| decl.value.span == error.span)
+                .find(|(_, decl)| decl.value.at == error.at)
                 .map(|(symbol, _)| mint.name(*symbol))
-                .unwrap_or_else(|| panic!("no definition at {:?}", error.span))
+                .unwrap_or_else(|| panic!("no definition at {:?}", error.at))
         })
         .collect()
 }
@@ -274,7 +286,7 @@ fn type_symbol(mint: &Mint, out: &Output, name: &str) -> Symbol {
 fn type_fields<'a>(mint: &Mint, out: &'a Output, name: &str) -> &'a IndexMap<String, TypeField> {
     let node = &out.program.types[&type_symbol(mint, out, name)]
         .value
-        .tracked;
+        .anchored;
     match node {
         TypeKind::Struct { fields, .. } => fields,
         other => panic!("expected a struct type, got {other:?}"),
@@ -361,9 +373,9 @@ fn a_natural_lowers_to_its_value_and_span() {
     };
     assert_eq!(*value, 4096);
 
-    let span = out.program.terms[&term_symbol(&mint, &out, "n")].value.span;
-    assert_eq!(span.start, 8);
-    assert_eq!(span.width, 5);
+    let span = out.program.terms[&term_symbol(&mint, &out, "n")].value.at;
+    assert_eq!(out.source.span(span).start, 8);
+    assert_eq!(out.source.span(span).width, 5);
 }
 
 #[test]
@@ -447,17 +459,17 @@ fn a_projected_field_is_a_label_and_not_a_name() {
     let TermKind::Project { base, field } = node else {
         panic!("expected a projection, got {node:?}");
     };
-    assert_eq!(field.tracked, "x");
+    assert_eq!(field.anchored, "x");
     // Written where it was written, so a diagnostic can point at the label
     // rather than at the whole projection.
-    assert_eq!(field.span.start, 18);
-    assert_eq!(field.span.width, 1);
+    assert_eq!(out.source.span(field.at).start, 18);
+    assert_eq!(out.source.span(field.at).width, 1);
     assert!(matches!(base.kind, TermKind::Ident(s) if mint.name(s) == "p"));
 
     // A field name never has to resolve; only the base does.
     let (_, out) = build_src("let b = q.x");
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
-    assert_eq!(out.errors[0].span.start, 8);
+    assert_eq!(out.source.span(out.errors[0].at).start, 8);
 }
 
 /// Lowering keeps the decoded projection key and the complete quoted label
@@ -473,9 +485,12 @@ fn a_quoted_projection_lowers_to_its_decoded_label() {
     let TermKind::Project { base, field } = &body.kind else {
         panic!("expected a projection, got {:?}", body.kind);
     };
-    assert_eq!(field.tracked, "field name");
-    assert_eq!(field.span.start, src.find('"').expect("the quote"));
-    assert_eq!(field.span.width, r###""field name""###.len());
+    assert_eq!(field.anchored, "field name");
+    assert_eq!(
+        out.source.span(field.at).start,
+        src.find('"').expect("the quote")
+    );
+    assert_eq!(out.source.span(field.at).width, r###""field name""###.len());
     assert!(matches!(base.kind, TermKind::Ident(s) if mint.name(s) == "p"));
 
     // Only the base is a name lookup.
@@ -540,7 +555,7 @@ fn an_ascription_resolves_in_the_type_namespace() {
         .annotation
         .as_ref()
         .expect("the ascription was lowered");
-    assert!(matches!(annotation.ty.tracked, TypeKind::Ident(s) if mint.name(s) == "T"));
+    assert!(matches!(annotation.ty.anchored, TypeKind::Ident(s) if mint.name(s) == "T"));
 }
 
 #[test]
@@ -550,7 +565,7 @@ fn primitives_are_resolved_from_their_spelling() {
     assert!(matches!(
         out.program.types[&type_symbol(&mint, &out, "T")]
             .value
-            .tracked,
+            .anchored,
         TypeKind::Prim(Prim::Nat)
     ));
     assert_eq!(mint.symbols().count(), 1);
@@ -564,7 +579,7 @@ fn primitives_are_resolved_from_their_spelling() {
     assert!(matches!(
         out.program.types[&type_symbol(&mint, &out, "T")]
             .value
-            .tracked,
+            .anchored,
         TypeKind::Ident(_)
     ));
 }
@@ -580,7 +595,7 @@ fn types_are_hoisted_above_terms_and_above_each_other() {
     assert!(matches!(
         out.program.types[&type_symbol(&mint, &out, "T")]
             .value
-            .tracked,
+            .anchored,
         TypeKind::Ident(_)
     ));
 
@@ -590,7 +605,7 @@ fn types_are_hoisted_above_terms_and_above_each_other() {
         .annotation
         .as_ref()
         .expect("the ascription was lowered");
-    assert!(matches!(annotation.ty.tracked, TypeKind::Ident(_)));
+    assert!(matches!(annotation.ty.anchored, TypeKind::Ident(_)));
 
     // Which holds for a name of the program's own just the same.
     let (mint, out) = built("let u : T = ()  type T = ()");
@@ -598,7 +613,7 @@ fn types_are_hoisted_above_terms_and_above_each_other() {
         .annotation
         .as_ref()
         .expect("the ascription was lowered");
-    assert!(matches!(annotation.ty.tracked, TypeKind::Ident(s) if mint.name(s) == "T"));
+    assert!(matches!(annotation.ty.anchored, TypeKind::Ident(s) if mint.name(s) == "T"));
 }
 
 #[test]
@@ -610,7 +625,7 @@ fn unit_is_the_empty_struct() {
     assert!(matches!(
         out.program.types[&type_symbol(&mint, &out, "T")]
             .value
-            .tracked,
+            .anchored,
         TypeKind::Struct { ref fields, tail: None } if fields.is_empty()
     ));
     assert_eq!(mint.symbols().count(), 1);
@@ -625,7 +640,7 @@ fn unit_is_the_empty_struct() {
     assert!(matches!(
         out.program.types[&type_symbol(&mint, &out, "T")]
             .value
-            .tracked,
+            .anchored,
         TypeKind::Struct { ref fields, tail: None } if fields.is_empty()
     ));
 
@@ -671,7 +686,7 @@ fn a_name_defined_nowhere_is_still_undefined() {
     let (_, out) = build_src("let a = nope");
 
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
-    assert_eq!(out.errors[0].span.start, 8);
+    assert_eq!(out.source.span(out.errors[0].at).start, 8);
     assert!(matches!(
         out.errors[0].kind,
         ErrorKind::Undefined {
@@ -724,14 +739,14 @@ fn duplicate_definitions_keep_the_first() {
 
     // Reported at the repeat, pointing back at what it repeats.
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
-    assert_eq!(out.errors[0].span.start, 16);
+    assert_eq!(out.source.span(out.errors[0].at).start, 16);
     assert!(matches!(
         out.errors[0].kind,
         ErrorKind::Duplicate {
             ref name,
             namespace: Namespace::Terms,
             previous,
-        } if name == "x" && previous.start == 4
+        } if name == "x" && out.source.span(previous).start == 4
     ));
 
     // One symbol, and it still holds the first definition's body.
@@ -794,8 +809,8 @@ fn arguments_shadow_definitions_and_release() {
         panic!("expected a function");
     };
     // The argument hides the definition for the length of the body...
-    assert_ne!(arg.tracked, global);
-    assert!(matches!(body.kind, TermKind::Ident(s) if s == arg.tracked));
+    assert_ne!(arg.anchored, global);
+    assert!(matches!(body.kind, TermKind::Ident(s) if s == arg.anchored));
     // ...and the definition is back in scope afterwards.
     assert!(matches!(term_value(&mint, &out, "g"), TermKind::Ident(s) if *s == global));
 }
@@ -805,7 +820,7 @@ fn sibling_lambdas_bind_distinct_symbols() {
     let (mint, out) = built("let f = fn x => x  let g = fn x => x");
 
     let arg_of = |name| match term_value(&mint, &out, name) {
-        TermKind::Fn { arg, .. } => arg.tracked,
+        TermKind::Fn { arg, .. } => arg.anchored,
         other => panic!("expected a function, got {other:?}"),
     };
     assert_ne!(arg_of("f"), arg_of("g"));
@@ -822,9 +837,9 @@ fn fields_are_keyed_by_name_in_source_order() {
         ["x", "y"]
     );
     // The name is the key, but the span it was written at is still kept.
-    assert_eq!(fields["x"].name_span.start, 10);
-    assert_eq!(fields["x"].name_span.width, 1);
-    assert_eq!(fields["y"].name_span.start, 17);
+    assert_eq!(out.source.span(fields["x"].name_at).start, 10);
+    assert_eq!(out.source.span(fields["x"].name_at).width, 1);
+    assert_eq!(out.source.span(fields["y"].name_at).start, 17);
 }
 
 /// Quoted struct labels become the same decoded map keys as bare fields. Their
@@ -840,11 +855,11 @@ fn quoted_fields_lower_to_decoded_keys_and_render_canonically() {
         ["field name", "plain", "line\nname"]
     );
     assert_eq!(
-        fields["field name"].name_span.start,
+        out.source.span(fields["field name"].name_at).start,
         src.find(r###""field name""###).expect("the field")
     );
     assert_eq!(
-        fields["field name"].name_span.width,
+        out.source.span(fields["field name"].name_at).width,
         r###""field name""###.len()
     );
     assert_eq!(
@@ -865,17 +880,17 @@ fn duplicate_term_fields_are_rejected() {
 
     // Reported at the offending repeat, not at the first occurrence.
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
-    assert_eq!(out.errors[0].span.start, 26);
+    assert_eq!(out.source.span(out.errors[0].at).start, 26);
     assert!(matches!(
         &out.errors[0].kind,
         ErrorKind::DuplicateField { name, previous }
-            if name == "x" && previous.start == src.find("x: a").expect("the first")
+            if name == "x" && out.source.span(*previous).start == src.find("x: a").expect("the first")
     ));
 
     // The first occurrence is the one that survives.
     let fields = term_fields(&mint, &out, "p");
     assert_eq!(fields.len(), 1);
-    assert_eq!(fields["x"].name_span.start, 20);
+    assert_eq!(out.source.span(fields["x"].name_at).start, 20);
     assert!(matches!(fields["x"].value.kind, TermKind::Ident(s) if mint.name(s) == "a"));
 }
 
@@ -890,10 +905,10 @@ fn bare_numeric_and_quoted_canonical_labels_are_duplicates() {
         assert!(matches!(
             &out.errors[0].kind,
             ErrorKind::DuplicateField { name, previous }
-                if name == "1" && previous.start == src.find("001").expect("the first")
+                if name == "1" && out.source.span(*previous).start == src.find("001").expect("the first")
         ));
         assert_eq!(
-            out.errors[0].span.start,
+            out.source.span(out.errors[0].at).start,
             src.rfind("\"1\"").expect("the duplicate")
         );
     }
@@ -913,10 +928,10 @@ fn duplicate_type_fields_are_rejected() {
     assert!(matches!(
         &out.errors[0].kind,
         ErrorKind::DuplicateField { name, previous }
-            if name == "a" && previous.start == src.find("a: A").expect("the first")
+            if name == "a" && out.source.span(*previous).start == src.find("a: A").expect("the first")
     ));
     assert_eq!(
-        out.errors[0].span.start,
+        out.source.span(out.errors[0].at).start,
         src.rfind("a: B").expect("the repeat")
     );
 
@@ -924,11 +939,11 @@ fn duplicate_type_fields_are_rejected() {
     let fields = type_fields(&mint, &out, "T");
     assert_eq!(fields.len(), 1);
     assert_eq!(
-        fields["a"].name_span().start,
+        out.source.span(fields["a"].name_at()).start,
         src.find("a: A").expect("the first")
     );
     assert!(matches!(
-        fields["a"].value().map(|value| &value.tracked),
+        fields["a"].value().map(|value| &value.anchored),
         Some(&TypeKind::Ident(s)) if mint.name(s) == "A"
     ));
 
@@ -940,10 +955,10 @@ fn duplicate_type_fields_are_rejected() {
     assert!(matches!(
         &out.errors[0].kind,
         ErrorKind::DuplicateField { name, previous }
-            if name == "a" && previous.start == src.find("a when").expect("the first")
+            if name == "a" && out.source.span(*previous).start == src.find("a when").expect("the first")
     ));
     assert_eq!(
-        out.errors[0].span.start,
+        out.source.span(out.errors[0].at).start,
         src.rfind("a: Nat").expect("the repeat")
     );
 
@@ -951,10 +966,10 @@ fn duplicate_type_fields_are_rejected() {
         .annotation
         .clone()
         .expect("the annotation");
-    let TypeKind::Arrow { from, .. } = annotation.ty.tracked else {
-        panic!("expected an arrow, got {:?}", annotation.ty.tracked);
+    let TypeKind::Arrow { from, .. } = annotation.ty.anchored else {
+        panic!("expected an arrow, got {:?}", annotation.ty.anchored);
     };
-    let TypeKind::Struct { fields, .. } = from.tracked else {
+    let TypeKind::Struct { fields, .. } = from.anchored else {
         panic!("expected a struct parameter");
     };
     assert_eq!(fields.len(), 1);
@@ -1019,7 +1034,7 @@ fn duplicate_fields_are_rejected_when_nested() {
     assert!(matches!(
         &out.errors[0].kind,
         ErrorKind::DuplicateField { name, previous }
-            if name == "y" && previous.start == src.find("y: a").expect("the first")
+            if name == "y" && out.source.span(*previous).start == src.find("y: a").expect("the first")
     ));
 }
 
@@ -1039,12 +1054,12 @@ fn a_declaration_binds_its_parameters() {
     let decl = out.program.types.values().next().expect("one declaration");
     assert_eq!(decl.params.len(), 2);
 
-    let TypeKind::Struct { fields, .. } = &decl.value.tracked else {
+    let TypeKind::Struct { fields, .. } = &decl.value.anchored else {
         panic!("expected a struct: {:#?}", decl.value);
     };
     let indices: Vec<u32> = fields
         .values()
-        .map(|field| match field.value().map(|value| &value.tracked) {
+        .map(|field| match field.value().map(|value| &value.anchored) {
             Some(&TypeKind::Param { index, .. }) => index,
             other => panic!("expected a parameter: {other:#?}"),
         })
@@ -1085,11 +1100,11 @@ fn a_parameter_shadows_a_declared_type() {
         .values()
         .find(|decl| decl.params.len() == 1)
         .expect("the parameterized declaration");
-    let TypeKind::Struct { fields, .. } = &boxed.value.tracked else {
+    let TypeKind::Struct { fields, .. } = &boxed.value.anchored else {
         panic!("expected a struct: {:#?}", boxed.value);
     };
     assert!(matches!(
-        fields["it"].value().map(|value| &value.tracked),
+        fields["it"].value().map(|value| &value.anchored),
         Some(TypeKind::Param { index: 0, .. })
     ));
 }
@@ -1167,7 +1182,11 @@ fn errors_are_reported_in_source_order() {
         "type L 'a = { next: L { x: 'a } }\nlet d = missing",
     ] {
         let (_, out) = build_src(src);
-        let offsets: Vec<usize> = out.errors.iter().map(|error| error.span.start).collect();
+        let offsets: Vec<usize> = out
+            .errors
+            .iter()
+            .map(|error| out.source.span(error.at).start)
+            .collect();
         assert!(
             offsets.windows(2).all(|pair| pair[0] <= pair[1]),
             "{src}: {offsets:?}"
@@ -1221,8 +1240,8 @@ fn a_wrong_argument_count_underlines_the_whole_application() {
 
     let written = "Pair Nat Nat Nat";
     let at = src.rfind(written).expect("the application");
-    assert_eq!(out.errors[0].span.start, at);
-    assert_eq!(out.errors[0].span.width, written.len());
+    assert_eq!(out.source.span(out.errors[0].at).start, at);
+    assert_eq!(out.source.span(out.errors[0].at).width, written.len());
 }
 
 /// Two declarations are in one group when each leads to the other, and only a
@@ -1243,7 +1262,7 @@ fn separate_recursive_groups_do_not_restrict_each_other() {
         .errors
         .iter()
         .filter(|error| matches!(error.kind, ErrorKind::GrowingRecursion))
-        .map(|error| error.span.start)
+        .map(|error| out.source.span(error.at).start)
         .collect();
     // Only `C`, and only where it hands `D` a type built out of what it takes.
     assert_eq!(offenders.len(), 1, "{:#?}", out.errors);
@@ -1351,8 +1370,8 @@ fn a_loop_can_close_through_a_parameter() {
     // has nothing to fix.
     let (mint, out) = build_src("type A 'a = 'a  type B = A B  type P = B");
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
-    let b = out.program.types[&type_symbol(&mint, &out, "B")].name_span;
-    assert!(out.errors[0].span.start >= b.start);
+    let b = out.program.types[&type_symbol(&mint, &out, "B")].name_at;
+    assert!(out.source.span(out.errors[0].at).start >= out.source.span(b).start);
 }
 
 /// A type that leads back to itself may not hand on an argument built out of
@@ -1547,13 +1566,13 @@ fn a_mixed_parameter_names_the_declaration_that_mixed_it() {
         );
 
         let v = &out.program.types[&type_symbol(&mint, &out, "V")];
-        assert_eq!(out.errors[0].span, v.params[0].span, "{src}: at `a` in `V`");
+        assert_eq!(out.errors[0].at, v.params[0].at, "{src}: at `a` in `V`");
         // A mixed parameter is still shown as a sum's rest, since that is what
         // the body said of it — but the body itself is gone, which is what keeps
         // the one mistake to one complaint. See the erasure test below.
         assert_eq!(v.params[0].kind, cases(&["X"]), "{src}");
         assert!(
-            matches!(v.value.tracked, TypeKind::Error),
+            matches!(v.value.anchored, TypeKind::Error),
             "{src}: the body absorbs: {:#?}",
             v.value
         );
@@ -1561,7 +1580,7 @@ fn a_mixed_parameter_names_the_declaration_that_mixed_it() {
         let w = &out.program.types[&type_symbol(&mint, &out, "W")];
         assert_eq!(w.params[0].kind, cases(&["X"]), "{src}: `W` is right");
         assert!(
-            !matches!(w.value.tracked, TypeKind::Error),
+            !matches!(w.value.anchored, TypeKind::Error),
             "{src}: `W` keeps its body"
         );
     }
@@ -1587,7 +1606,7 @@ fn a_mixed_parameter_absorbs_its_own_use_sites() {
 
     let bad = &out.program.types[&type_symbol(&mint, &out, "Bad")];
     assert!(
-        matches!(bad.value.tracked, TypeKind::Error),
+        matches!(bad.value.anchored, TypeKind::Error),
         "{:#?}",
         bad.value
     );
@@ -1612,14 +1631,14 @@ fn a_mixed_parameter_is_reported_once_along_a_chain() {
 
     // At `t` in `U`, which is where the field and the hand-off meet.
     let u = &out.program.types[&type_symbol(&mint, &out, "U")];
-    assert_eq!(out.errors[0].span, u.params[0].span);
+    assert_eq!(out.errors[0].at, u.params[0].at);
 
     // Everything the clash reaches still absorbs, told or not: a body left
     // standing would put whatever a use site handed it into a row.
     for name in ["U", "V", "Q"] {
         let decl = &out.program.types[&type_symbol(&mint, &out, name)];
         assert!(
-            matches!(decl.value.tracked, TypeKind::Error),
+            matches!(decl.value.anchored, TypeKind::Error),
             "{name}: {:#?}",
             decl.value
         );
@@ -1683,7 +1702,7 @@ fn a_row_argument_may_not_name_what_the_declaration_names() {
     );
     // At the argument, which is the whole of what the reader can change.
     assert_eq!(
-        out.errors[0].span.start,
+        out.source.span(out.errors[0].at).start,
         src.find("{ x: Nat }").expect("the argument")
     );
 
@@ -1724,7 +1743,7 @@ fn a_declaration_is_open_only_through_a_parameter() {
             .next()
             .expect("one declaration")
             .value
-            .tracked,
+            .anchored,
         TypeKind::Struct { tail: Some(_), .. }
     ));
 
@@ -1767,12 +1786,12 @@ fn a_parameter_cannot_hide_a_primitive() {
     let (_, out) = built("type Box 'Nat = { it: 'Nat }  let b : Box Nat -> Nat = fn p => p.it");
 
     let boxed = out.program.types.values().next().expect("the declaration");
-    let TypeKind::Struct { fields, .. } = &boxed.value.tracked else {
+    let TypeKind::Struct { fields, .. } = &boxed.value.anchored else {
         panic!("expected a struct: {:#?}", boxed.value);
     };
     assert!(
         matches!(
-            fields["it"].value().map(|value| &value.tracked),
+            fields["it"].value().map(|value| &value.anchored),
             Some(TypeKind::Param { index: 0, .. })
         ),
         "inside the body the sigil names the parameter: {:#?}",
@@ -1786,14 +1805,14 @@ fn a_parameter_cannot_hide_a_primitive() {
         .next()
         .and_then(|decl| decl.annotation.as_ref())
         .expect("the annotation");
-    let TypeKind::Arrow { from, .. } = &annotation.ty.tracked else {
+    let TypeKind::Arrow { from, .. } = &annotation.ty.anchored else {
         panic!("expected an arrow: {annotation:#?}");
     };
-    let TypeKind::Apply { args, .. } = &from.tracked else {
+    let TypeKind::Apply { args, .. } = &from.anchored else {
         panic!("expected an application: {from:#?}");
     };
     assert!(
-        matches!(args[0].tracked, TypeKind::Prim(Prim::Nat)),
+        matches!(args[0].anchored, TypeKind::Prim(Prim::Nat)),
         "and the bare name is the primitive: {:#?}",
         args[0]
     );
@@ -1807,18 +1826,18 @@ fn lowers_a_sum_type() {
     let src = "type Option 'T = #Some 'T | #None";
     let (mint, out) = built(src);
     let decl = &out.program.types[&type_symbol(&mint, &out, "Option")];
-    let TypeKind::Sum { cases, tail } = &decl.value.tracked else {
-        panic!("expected a sum, got {:#?}", decl.value.tracked);
+    let TypeKind::Sum { cases, tail } = &decl.value.anchored else {
+        panic!("expected a sum, got {:#?}", decl.value.anchored);
     };
     assert_eq!(cases.keys().collect::<Vec<_>>(), vec!["Some", "None"]);
     // The case's own span is the name it was written at, `#` included.
     assert_eq!(
-        cases["Some"].name_span().start,
+        out.source.span(cases["Some"].name_at()).start,
         src.find("#Some").expect("the case")
     );
-    assert_eq!(cases["Some"].name_span().width, 5);
+    assert_eq!(out.source.span(cases["Some"].name_at()).width, 5);
     assert!(matches!(
-        cases["Some"].payload().map(|ty| &ty.tracked),
+        cases["Some"].payload().map(|ty| &ty.anchored),
         Some(TypeKind::Param { index: 0, .. })
     ));
     assert!(cases["None"].payload().is_none());
@@ -1836,7 +1855,7 @@ fn lowers_a_tag() {
     let TermKind::Tag { name, payload } = term_value(&mint, &out, "v") else {
         panic!("expected a tag");
     };
-    assert_eq!(name.tracked, "Some");
+    assert_eq!(name.anchored, "Some");
     assert!(matches!(
         payload.as_ref().map(|term| &term.kind),
         Some(TermKind::Natural(1))
@@ -1845,7 +1864,7 @@ fn lowers_a_tag() {
     let TermKind::Tag { name, payload } = term_value(&mint, &out, "n") else {
         panic!("expected a tag");
     };
-    assert_eq!(name.tracked, "None");
+    assert_eq!(name.anchored, "None");
     assert!(payload.is_none());
 }
 
@@ -1859,11 +1878,11 @@ fn a_repeated_case_is_reported_once() {
     assert!(matches!(
         &out.errors[0].kind,
         ErrorKind::DuplicateCase { name, previous, .. }
-            if name == "A" && previous.start == src.find("#A").expect("the first")
+            if name == "A" && out.source.span(*previous).start == src.find("#A").expect("the first")
     ));
     // The first occurrence is the one that stands.
     let decl = &out.program.types[&type_symbol(&mint, &out, "T")];
-    let TypeKind::Sum { cases, .. } = &decl.value.tracked else {
+    let TypeKind::Sum { cases, .. } = &decl.value.anchored else {
         panic!("expected a sum");
     };
     assert_eq!(cases.len(), 1);
@@ -1878,9 +1897,12 @@ fn quoted_tags_lower_to_decoded_labels_everywhere() {
     let TermKind::Tag { name, payload } = term_value(&mint, &out, "v") else {
         panic!("expected a tag");
     };
-    assert_eq!(name.tracked, "case name");
-    assert_eq!(name.span.start, src.find('#').expect("the tag"));
-    assert_eq!(name.span.width, r###"#"case name""###.len());
+    assert_eq!(name.anchored, "case name");
+    assert_eq!(
+        out.source.span(name.at).start,
+        src.find('#').expect("the tag")
+    );
+    assert_eq!(out.source.span(name.at).width, r###"#"case name""###.len());
     assert!(matches!(
         payload.as_deref().map(|term| &term.kind),
         Some(TermKind::Natural(1))
@@ -1894,16 +1916,16 @@ fn quoted_tags_lower_to_decoded_labels_everywhere() {
     let TermKind::Match { arms, .. } = &body.kind else {
         panic!("expected a match");
     };
-    let PatternKind::Tag { name, payload } = &arms[0].0.tracked else {
+    let PatternKind::Tag { name, payload } = &arms[0].0.anchored else {
         panic!("expected a tag pattern");
     };
-    assert_eq!(name.tracked, "case name");
+    assert_eq!(name.anchored, "case name");
     assert!(payload.is_some());
 
     let (mint, out) = built(r###"type T 'r = #"case name" Nat | \#"gone case" | ..'r"###);
     let TypeKind::Sum { cases, .. } = &out.program.types[&type_symbol(&mint, &out, "T")]
         .value
-        .tracked
+        .anchored
     else {
         panic!("expected a sum");
     };
@@ -1924,10 +1946,10 @@ fn bare_and_quoted_labels_are_duplicates() {
         assert!(matches!(
             &out.errors[0].kind,
             ErrorKind::DuplicateField { name, previous }
-                if name == "same" && previous.start == src.find("same").expect("the first")
+                if name == "same" && out.source.span(*previous).start == src.find("same").expect("the first")
         ));
         assert_eq!(
-            out.errors[0].span.start,
+            out.source.span(out.errors[0].at).start,
             src.rfind(r###""same""###).unwrap()
         );
     }
@@ -1938,10 +1960,10 @@ fn bare_and_quoted_labels_are_duplicates() {
     assert!(matches!(
         &out.errors[0].kind,
         ErrorKind::DuplicateCase { name, previous, .. }
-            if name == "Same" && previous.start == src.find("#Same").expect("the first")
+            if name == "Same" && out.source.span(*previous).start == src.find("#Same").expect("the first")
     ));
     assert_eq!(
-        out.errors[0].span.start,
+        out.source.span(out.errors[0].at).start,
         src.rfind(r###"#"Same""###).unwrap()
     );
 }
@@ -2061,7 +2083,7 @@ fn a_sum_argument_may_not_repeat_a_case() {
     // At the argument, parentheses and all: they are what the reader wrote
     // around it, and the span is the text they can change.
     assert_eq!(
-        out.errors[0].span.start,
+        out.source.span(out.errors[0].at).start,
         src.find("(#A Nat)").expect("the argument")
     );
 
@@ -2079,7 +2101,7 @@ fn a_sum_argument_may_not_repeat_a_case() {
 fn a_sum_makes_a_type_recursive_rather_than_circular() {
     let (mint, out) = built("type List 'a = #Nil | #Cons { head: 'a, tail: List 'a }");
     let decl = &out.program.types[&type_symbol(&mint, &out, "List")];
-    assert!(matches!(decl.value.tracked, TypeKind::Sum { .. }));
+    assert!(matches!(decl.value.anchored, TypeKind::Sum { .. }));
     // And the parameter reaches a position of what the declaration stands
     // for, through the case's payload, so congruence may be taken on it.
     assert!(decl.params[0].relevant);
@@ -2123,14 +2145,14 @@ fn one_tail_name_is_one_shape_of_rest() {
     // — and pointing back at the first, which is the other half of what went
     // wrong and is somewhere else on the page.
     assert_eq!(
-        out.errors[0].span.start,
+        out.source.span(out.errors[0].at).start,
         src.rfind("..'r").expect("the tail") + 2
     );
     let ErrorKind::MixedTail { previous, .. } = out.errors[0].kind else {
         panic!("the clash was just matched");
     };
     assert_eq!(
-        previous.start,
+        out.source.span(previous).start,
         src.find("..'r").expect("the first tail") + 2
     );
 
@@ -2182,7 +2204,7 @@ fn duplicate_type_declarations_keep_the_first() {
                 ref name,
                 namespace: Namespace::Types,
                 previous,
-            } if name == "T" && previous.start == 5
+            } if name == "T" && out.source.span(previous).start == 5
         ),
         "{:#?}",
         out.errors
@@ -2192,7 +2214,7 @@ fn duplicate_type_declarations_keep_the_first() {
     assert_eq!(out.program.types.len(), 1);
     let symbol = type_symbol(&mint, &out, "T");
     assert!(matches!(
-        out.program.types[&symbol].value.tracked,
+        out.program.types[&symbol].value.anchored,
         TypeKind::Prim(Prim::Nat)
     ));
 }
@@ -2218,7 +2240,10 @@ fn applying_an_undeclared_name_is_an_undefined_type() {
         "{:#?}",
         out.errors
     );
-    assert_eq!(out.errors[0].span.start, src.find("Missing").expect("head"));
+    assert_eq!(
+        out.source.span(out.errors[0].at).start,
+        src.find("Missing").expect("head")
+    );
 
     // The primitive beside it says how many it takes, at the whole application.
     let (_, out) = build_src("type P = Nat Nat");
@@ -2285,7 +2310,7 @@ fn a_definition_given_only_as_a_name_is_circular() {
     let (mint, out) = build_src("let x = x");
 
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
-    assert_eq!(out.errors[0].span.start, 8);
+    assert_eq!(out.source.span(out.errors[0].at).start, 8);
     assert!(matches!(
         out.errors[0].kind,
         ErrorKind::Circular {
@@ -2449,12 +2474,16 @@ fn a_declaration_that_adds_fields_to_itself_is_refused() {
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(out.errors[0].kind.code(), "endless-fields");
     let t = &out.program.types[&type_symbol(&mint, &out, "T")];
-    assert!(matches!(t.value.tracked, TypeKind::Error), "{:#?}", t.value);
+    assert!(
+        matches!(t.value.anchored, TypeKind::Error),
+        "{:#?}",
+        t.value
+    );
     // And the declaration it goes through is not on the loop, so it keeps its
     // body: only what leads back to itself has anything to fix.
     let with_x = &out.program.types[&type_symbol(&mint, &out, "WithX")];
     assert!(
-        !matches!(with_x.value.tracked, TypeKind::Error),
+        !matches!(with_x.value.anchored, TypeKind::Error),
         "{:#?}",
         with_x.value
     );
@@ -2473,7 +2502,7 @@ fn a_declaration_that_adds_fields_to_itself_is_refused() {
     for name in ["A", "B"] {
         let decl = &out.program.types[&type_symbol(&mint, &out, name)];
         assert!(
-            matches!(decl.value.tracked, TypeKind::Error),
+            matches!(decl.value.anchored, TypeKind::Error),
             "{name}: {:#?}",
             decl.value
         );
@@ -2535,20 +2564,20 @@ fn a_nested_let_binds_its_name_for_the_value_and_the_body() {
     };
     // The body is the name, and the recursive use inside the value is the same
     // symbol — one binding, seen from both sides.
-    assert!(matches!(body.kind, TermKind::Ident(symbol) if symbol == name.tracked));
+    assert!(matches!(body.kind, TermKind::Ident(symbol) if symbol == name.anchored));
     let TermKind::Fn { body: inner, .. } = &value.kind else {
         panic!("expected a lambda: {:#?}", value.kind);
     };
     let TermKind::Apply { func, .. } = &inner.kind else {
         panic!("expected an application: {:#?}", inner.kind);
     };
-    assert!(matches!(func.kind, TermKind::Ident(symbol) if symbol == name.tracked));
+    assert!(matches!(func.kind, TermKind::Ident(symbol) if symbol == name.anchored));
 
     // And the name is a local, minted beside the module the way a lambda's
     // argument is rather than declared as a definition.
-    assert_eq!(mint.name(name.tracked), "f");
-    assert!(mint.is_local(name.tracked));
-    assert!(!out.program.terms.contains_key(&name.tracked));
+    assert_eq!(mint.name(name.anchored), "f");
+    assert!(mint.is_local(name.anchored));
+    assert!(!out.program.terms.contains_key(&name.anchored));
 }
 
 /// And released at the end of the body: a name bound by a nested `let` is not
@@ -2565,7 +2594,10 @@ fn a_nested_let_releases_its_name_after_the_body() {
             namespace: Namespace::Terms,
         } if name == "n"
     ));
-    assert_eq!(out.errors[0].span.start, src.rfind('n').expect("the use"));
+    assert_eq!(
+        out.source.span(out.errors[0].at).start,
+        src.rfind('n').expect("the use")
+    );
     assert!(matches!(term_value(&mint, &out, "after"), TermKind::Error));
 }
 
@@ -2580,8 +2612,8 @@ fn a_nested_let_shadows_without_complaint() {
         panic!("expected a let");
     };
     // The use in the body is the inner binding, not the definition above it.
-    assert!(matches!(body.kind, TermKind::Ident(symbol) if symbol == name.tracked));
-    assert_ne!(name.tracked, term_symbol(&mint, &out, "n"));
+    assert!(matches!(body.kind, TermKind::Ident(symbol) if symbol == name.anchored));
+    assert_ne!(name.anchored, term_symbol(&mint, &out, "n"));
 
     let (_, out) = build_src("let n = 1n  let n = 2n");
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
@@ -2604,7 +2636,7 @@ fn two_nested_lets_cannot_name_each_other() {
         } if name == "b"
     ));
     assert_eq!(
-        out.errors[0].span.start,
+        out.source.span(out.errors[0].at).start,
         src.find("b let").expect("the use")
     );
 }
@@ -2619,7 +2651,7 @@ fn a_nested_let_given_as_itself_is_circular() {
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
     assert_eq!(out.errors[0].kind.code(), "circular-term");
     assert_eq!(
-        out.errors[0].span.start,
+        out.source.span(out.errors[0].at).start,
         src.find("x return").expect("the value")
     );
 
@@ -2636,7 +2668,7 @@ fn a_nested_let_given_as_itself_is_circular() {
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
     assert_eq!(out.errors[0].kind.code(), "circular-term");
     assert_eq!(
-        out.errors[0].span.start,
+        out.source.span(out.errors[0].at).start,
         src.find("q return").expect("the value")
     );
 }
@@ -2655,7 +2687,7 @@ fn a_loop_through_two_nested_lets_reports_both() {
         .errors
         .iter()
         .filter(|error| error.kind.code() == "circular-term")
-        .map(|error| error.span.start)
+        .map(|error| out.source.span(error.at).start)
         .collect();
     assert_eq!(
         spans,
@@ -2700,7 +2732,7 @@ fn a_nested_annotation_reaches_the_row_argument_check() {
         }
     ));
     assert_eq!(
-        out.errors[0].span.start,
+        out.source.span(out.errors[0].at).start,
         src.find("{ x: Nat }").expect("the argument")
     );
 }
@@ -2750,19 +2782,19 @@ fn lowers_absent_labels_in_written_position() {
         .annotation
         .clone()
         .expect("the annotation");
-    let TypeKind::Arrow { from, .. } = annotation.ty.tracked else {
-        panic!("expected an arrow, got {:?}", annotation.ty.tracked);
+    let TypeKind::Arrow { from, .. } = annotation.ty.anchored else {
+        panic!("expected an arrow, got {:?}", annotation.ty.anchored);
     };
-    let TypeKind::Struct { fields, .. } = from.tracked else {
+    let TypeKind::Struct { fields, .. } = from.anchored else {
         panic!("expected a struct parameter");
     };
     assert_eq!(fields.keys().collect::<Vec<_>>(), vec!["x", "y", "z"]);
     assert!(matches!(fields["y"], TypeField::Absent { .. }));
     assert_eq!(
-        fields["y"].name_span().start,
+        out.source.span(fields["y"].name_at()).start,
         src.find("\\y").expect("the mark")
     );
-    assert_eq!(fields["y"].name_span().width, 2);
+    assert_eq!(out.source.span(fields["y"].name_at()).width, 2);
 
     // The sum counterpart: the case keeps its `#`, and the span keeps
     // the `\` in front of it.
@@ -2772,16 +2804,16 @@ fn lowers_absent_labels_in_written_position() {
         .annotation
         .clone()
         .expect("the annotation");
-    let TypeKind::Sum { cases, .. } = annotation.ty.tracked else {
-        panic!("expected a sum, got {:?}", annotation.ty.tracked);
+    let TypeKind::Sum { cases, .. } = annotation.ty.anchored else {
+        panic!("expected a sum, got {:?}", annotation.ty.anchored);
     };
     assert_eq!(cases.keys().collect::<Vec<_>>(), vec!["Ok", "Err"]);
     assert!(matches!(cases["Err"], SumCase::Absent { .. }));
     assert_eq!(
-        cases["Err"].name_span().start,
+        out.source.span(cases["Err"].name_at()).start,
         src.find("\\#Err").expect("the mark")
     );
-    assert_eq!(cases["Err"].name_span().width, 5);
+    assert_eq!(out.source.span(cases["Err"].name_at()).width, 5);
 }
 
 /// An explicitly absent label in a closed composite is refused: the `\` says
@@ -2799,14 +2831,17 @@ fn an_absent_label_needs_a_tail() {
             label,
         } if label == "y"
     ));
-    assert_eq!(out.errors[0].span.start, src.find("\\y").expect("the mark"));
-    assert_eq!(out.errors[0].span.width, 2);
+    assert_eq!(
+        out.source.span(out.errors[0].at).start,
+        src.find("\\y").expect("the mark")
+    );
+    assert_eq!(out.source.span(out.errors[0].at).width, 2);
     let annotation = out.program.terms[&term_symbol(&mint, &out, "x")]
         .annotation
         .clone()
         .expect("the annotation");
     assert!(
-        matches!(annotation.ty.tracked, TypeKind::Error),
+        matches!(annotation.ty.anchored, TypeKind::Error),
         "the struct absorbs: {annotation:#?}"
     );
 
@@ -2821,10 +2856,10 @@ fn an_absent_label_needs_a_tail() {
         } if label == "B"
     ));
     assert_eq!(
-        out.errors[0].span.start,
+        out.source.span(out.errors[0].at).start,
         src.find("\\#B").expect("the mark")
     );
-    assert_eq!(out.errors[0].span.width, 3);
+    assert_eq!(out.source.span(out.errors[0].at).width, 3);
 
     // Every absence in the row is its own report, the way every `when` in a
     // declared type is: each is a mark the reader can act on.
@@ -2866,13 +2901,13 @@ fn a_label_named_present_and_absent_is_a_duplicate() {
             matches!(
                 &out.errors[0].kind,
                 ErrorKind::DuplicateField { name, previous }
-                    if name == "x" && previous.start == src.find(first).expect("the first mention")
+                    if name == "x" && out.source.span(*previous).start == src.find(first).expect("the first mention")
             ),
             "{src}: {:#?}",
             out.errors
         );
         assert_eq!(
-            out.errors[0].span.start,
+            out.source.span(out.errors[0].at).start,
             src.rfind(second).expect("the second mention"),
             "{src}"
         );
@@ -2884,10 +2919,10 @@ fn a_label_named_present_and_absent_is_a_duplicate() {
     assert!(matches!(
         &out.errors[0].kind,
         ErrorKind::DuplicateCase { name, previous, .. }
-            if name == "A" && previous.start == src.find("#A").expect("the first mention")
+            if name == "A" && out.source.span(*previous).start == src.find("#A").expect("the first mention")
     ));
     assert_eq!(
-        out.errors[0].span.start,
+        out.source.span(out.errors[0].at).start,
         src.find("\\#A").expect("the second mention")
     );
 }
@@ -2923,7 +2958,7 @@ fn an_argument_may_not_name_an_absent_label() {
         } if field == "y"
     ));
     assert_eq!(
-        out.errors[0].span.start,
+        out.source.span(out.errors[0].at).start,
         src.find("{ y: Nat }").expect("the argument")
     );
 
@@ -2986,7 +3021,7 @@ fn lowered_with_errors(src: &str) -> (String, Vec<String>) {
     let errors = out
         .errors
         .iter()
-        .map(|error| format!("{}@{}", error.kind.code(), error.span.start))
+        .map(|error| format!("{}@{}", error.kind.code(), out.source.span(error.at).start))
         .collect();
     (printed, errors)
 }
@@ -3088,7 +3123,13 @@ fn struct_spreads_normalize_in_place() {
     };
     assert_eq!(fields.keys().map(String::as_str).collect::<Vec<_>>(), ["x"]);
     assert!(matches!(spread.value.kind, TermKind::Ident(_)));
-    assert_eq!((spread.span.start, spread.span.end()), (35, 37));
+    assert_eq!(
+        (
+            out.source.span(spread.at).start,
+            out.source.span(spread.at).end()
+        ),
+        (35, 37)
+    );
 
     let (_, errors) = lowered_with_errors("let c = { y: 2n }\nlet a = { x: 1n, x: 2n, ..c }");
     assert_eq!(errors, ["duplicate-field@35"], "{errors:#?}");
@@ -3251,7 +3292,10 @@ fn a_wildcard_let_expression_binds_a_hidden_fresh_name() {
     };
     let mut names = Vec::new();
     references_of(body, &mut names);
-    assert!(!names.contains(&name.tracked), "the body names the discard");
+    assert!(
+        !names.contains(&name.anchored),
+        "the body names the discard"
+    );
 }
 
 /// Every symbol a term mentions, for the wildcard tests to assert nothing
@@ -3364,10 +3408,10 @@ fn a_wildcard_fn_argument_binds_a_symbol_nothing_references() {
     let TermKind::Fn { arg, body } = term_value(&mint, &out, "f") else {
         panic!("f is a function");
     };
-    assert_eq!(mint.name(arg.tracked), "%discard");
+    assert_eq!(mint.name(arg.anchored), "%discard");
     let mut names = Vec::new();
     references_of(body, &mut names);
-    assert!(!names.contains(&arg.tracked));
+    assert!(!names.contains(&arg.anchored));
 
     // Mixing works, and the middle name still resolves to its own argument.
     assert_eq!(
@@ -3385,8 +3429,8 @@ fn a_wildcard_fn_argument_binds_a_symbol_nothing_references() {
         panic!("a third argument");
     };
     // Two discards, two symbols.
-    assert_ne!(first.tracked, second.tracked);
-    assert!(matches!(&body.kind, TermKind::Ident(symbol) if *symbol == x.tracked));
+    assert_ne!(first.anchored, second.anchored);
+    assert!(matches!(&body.kind, TermKind::Ident(symbol) if *symbol == x.anchored));
 }
 
 /// R8: a wildcard does not launder the refutability of what surrounds it —
@@ -3494,17 +3538,17 @@ fn nested_arms_stay_written() {
         let PatternKind::Tag {
             payload: Some(payload),
             ..
-        } = &pattern.tracked
+        } = &pattern.anchored
         else {
             panic!("a Cons arm");
         };
-        let PatternKind::Struct { fields, .. } = &payload.tracked else {
+        let PatternKind::Struct { fields, .. } = &payload.anchored else {
             panic!("a struct payload");
         };
-        let PatternKind::Bind(name) = &fields["tail"].value.tracked else {
+        let PatternKind::Bind(name) = &fields["tail"].value.anchored else {
             panic!("tail binds");
         };
-        name.tracked
+        name.anchored
     };
     assert_ne!(tail_binder(&arms[0].0), tail_binder(&arms[1].0));
 }
@@ -3539,7 +3583,7 @@ fn a_sole_catch_all_keeps_its_shape() {
 /// while the matrix asks which cases remain possible.
 #[test]
 fn matrix_refinement_reads_every_nested_scalar_pattern() {
-    let (mint, mut out) = built(
+    let (mint, out) = built(
         "let f = fn value => match value with \
          | #Integer 1i => 0n \
          | #Real 1.5 => 0n \
@@ -3548,7 +3592,7 @@ fn matrix_refinement_reads_every_nested_scalar_pattern() {
          | rest => 0n \
          end",
     );
-    let inferred = inference::infer(&mint, &mut out.program, inference::Trace::Complete);
+    let inferred = inference::infer(&mint, &out.program, inference::Trace::Complete);
     assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
 }
 
@@ -3712,7 +3756,7 @@ fn a_rest_marker_survives_normalization() {
     let TermKind::Match { arms, .. } = &body.kind else {
         panic!("the body is a match");
     };
-    let PatternKind::Struct { fields, rest } = &arms[0].0.tracked else {
+    let PatternKind::Struct { fields, rest } = &arms[0].0.anchored else {
         panic!("a struct pattern");
     };
     assert!(rest.is_some());
@@ -3735,14 +3779,14 @@ fn tuples_lower_to_canonical_structs() {
     );
     assert!(matches!(fields["0"].value.kind, TermKind::Natural(1)));
     assert!(matches!(fields["1"].value.kind, TermKind::String(ref value) if value == "x"));
-    assert_eq!(fields["0"].name_span, fields["0"].value.span);
-    assert_eq!(fields["1"].name_span, fields["1"].value.span);
+    assert_eq!(fields["0"].name_at, fields["0"].value.at);
+    assert_eq!(fields["1"].name_at, fields["1"].value.at);
 
     let annotation = out.program.terms[&symbol]
         .annotation
         .as_ref()
         .expect("the tuple type annotation");
-    let TypeKind::Struct { fields, tail } = &annotation.ty.tracked else {
+    let TypeKind::Struct { fields, tail } = &annotation.ty.anchored else {
         panic!("a tuple type lowers to a struct type");
     };
     assert!(tail.is_none());
@@ -3752,7 +3796,7 @@ fn tuples_lower_to_canonical_structs() {
     );
     for field in fields.values() {
         let TypeField::Written {
-            name_span,
+            name_at: name_span,
             when,
             value,
         } = field
@@ -3760,7 +3804,7 @@ fn tuples_lower_to_canonical_structs() {
             panic!("tuple fields are present");
         };
         assert!(when.is_none());
-        assert_eq!(*name_span, value.span);
+        assert_eq!(*name_span, value.at);
     }
 
     let (mint, out) =
@@ -3771,7 +3815,7 @@ fn tuples_lower_to_canonical_structs() {
     let TermKind::Match { arms, .. } = &body.kind else {
         panic!("pick matches its argument");
     };
-    let PatternKind::Struct { fields, rest } = &arms[0].0.tracked else {
+    let PatternKind::Struct { fields, rest } = &arms[0].0.anchored else {
         panic!("a tuple pattern lowers to a struct pattern");
     };
     assert!(rest.is_none());
@@ -3782,7 +3826,7 @@ fn tuples_lower_to_canonical_structs() {
     let PatternKind::Struct {
         fields: nested,
         rest: nested_rest,
-    } = &fields["1"].value.tracked
+    } = &fields["1"].value.anchored
     else {
         panic!("a nested tuple remains a nested canonical struct");
     };
@@ -3791,11 +3835,11 @@ fn tuples_lower_to_canonical_structs() {
         nested.keys().map(String::as_str).collect::<Vec<_>>(),
         ["0", "1"]
     );
-    assert!(matches!(nested["0"].value.tracked, PatternKind::Wildcard));
-    let PatternKind::Bind(second) = nested["1"].value.tracked else {
+    assert!(matches!(nested["0"].value.anchored, PatternKind::Wildcard));
+    let PatternKind::Bind(second) = nested["1"].value.anchored else {
         panic!("the second element binds second");
     };
-    assert!(matches!(arms[0].1.kind, TermKind::Ident(symbol) if symbol == second.tracked));
+    assert!(matches!(arms[0].1.kind, TermKind::Ident(symbol) if symbol == second.anchored));
 }
 
 /// Both surface-pattern walks recurse through tuple elements: top-level tuple
@@ -3935,15 +3979,15 @@ fn an_annotation_keeps_its_clause() {
         .as_ref()
         .expect("the annotation");
     let clause = annotation.clause.as_ref().expect("the clause");
-    assert!(matches!(clause.tracked, ClauseKind::NotEqual(..)));
+    assert!(matches!(clause.anchored, ClauseKind::NotEqual(..)));
     assert_eq!(
-        print::ir::clause(&clause.tracked, &mint).to_string(),
+        print::ir::clause(&clause.anchored, &mint).to_string(),
         "'a != 'b"
     );
 
     // And the labels keep the names they were written with, which is what the
     // clause resolves against.
-    let TypeKind::Struct { fields, .. } = &annotation.ty.tracked else {
+    let TypeKind::Struct { fields, .. } = &annotation.ty.anchored else {
         panic!("expected a struct annotation");
     };
     let names: Vec<Option<&str>> = fields
@@ -3965,7 +4009,7 @@ fn the_anonymous_presence_binds_no_name() {
         .annotation
         .as_ref()
         .expect("the annotation");
-    let TypeKind::Struct { fields, .. } = &annotation.ty.tracked else {
+    let TypeKind::Struct { fields, .. } = &annotation.ty.anchored else {
         panic!("expected a struct annotation");
     };
     let TypeField::Written {
@@ -4000,7 +4044,10 @@ fn a_clause_may_not_name_what_the_type_does_not_bind() {
         &error.kind,
         ErrorKind::UnboundPresence { name } if name == "c"
     ));
-    assert_eq!(error.span.start, src.rfind("'c").expect("the name"));
+    assert_eq!(
+        out.source.span(error.at).start,
+        src.rfind("'c").expect("the name")
+    );
 
     // The clause absorbs rather than keeping the half that resolved: half a
     // contract is a contract nobody wrote.
@@ -4045,7 +4092,10 @@ fn a_declaration_may_not_carry_a_clause() {
         panic!("expected one error: {:#?}", out.errors);
     };
     assert!(matches!(error.kind, ErrorKind::ClauseInDeclaration));
-    assert_eq!(error.span.start, src.rfind("'a").expect("the clause"));
+    assert_eq!(
+        out.source.span(error.at).start,
+        src.rfind("'a").expect("the clause")
+    );
 
     // A `when` inside one is the same refusal about a label, and it is the one
     // `..` already gets: the declaration's body lowers to the error type.
@@ -4099,10 +4149,10 @@ fn an_effect_binds_parameters_its_operations_mention() {
         panic!("expected operations");
     };
     let get = &operations[&OperationSelector::Named("get".to_string())];
-    assert!(matches!(get.to.tracked, TypeKind::Param { index: 0, .. }));
+    assert!(matches!(get.to.anchored, TypeKind::Param { index: 0, .. }));
 
     let term = &out.program.terms[&term_symbol(&mint, &out, "f")];
-    let TypeKind::Arrow { effects, .. } = &term.annotation.as_ref().expect("annotated").ty.tracked
+    let TypeKind::Arrow { effects, .. } = &term.annotation.as_ref().expect("annotated").ty.anchored
     else {
         panic!("expected an arrow");
     };
@@ -4111,7 +4161,7 @@ fn an_effect_binds_parameters_its_operations_mention() {
     let EffectLabel::Written { args, .. } = label else {
         panic!("expected a written label");
     };
-    assert!(matches!(args.as_slice(), [arg] if matches!(arg.tracked, TypeKind::Prim(Prim::Nat))));
+    assert!(matches!(args.as_slice(), [arg] if matches!(arg.anchored, TypeKind::Prim(Prim::Nat))));
 
     // Too few or too many arguments is counted at the application, and the
     // label is dropped rather than paired up by guesswork.
@@ -4134,7 +4184,7 @@ fn an_effect_binds_parameters_its_operations_mention() {
     }
     let (_, out) =
         build_src("effect Ask 'a = { get: () -> 'a }\nlet f : () -> Nat + !Ask = fn _ => 0n");
-    let diagnostic = out.errors[0].diagnostic();
+    let diagnostic = out.errors[0].diagnostic(&out.source);
     assert_eq!(
         diagnostic.title,
         "effect `!Ask` expects one argument, but none was written"
@@ -4335,12 +4385,12 @@ fn an_effect_argument_is_held_to_its_parameters_reading() {
         "{base}effect IO = {{ print: Nat -> () }}\nlet f : () -> Nat + !Run (!IO + ..'e) = fn _ => 0n"
     ));
     let term = &out.program.terms[&term_symbol(&mint, &out, "f")];
-    let TypeKind::Arrow { effects, .. } = &term.annotation.as_ref().expect("annotated").ty.tracked
+    let TypeKind::Arrow { effects, .. } = &term.annotation.as_ref().expect("annotated").ty.anchored
     else {
         panic!("expected an arrow");
     };
     let label = effects.effects.values().next().expect("the row names Run");
-    assert!(matches!(label.args(), [arg] if matches!(arg.tracked, TypeKind::Effects(_))));
+    assert!(matches!(label.args(), [arg] if matches!(arg.anchored, TypeKind::Effects(_))));
 }
 
 /// Structural identity belongs to the generic constructor: its leaf name, how
@@ -4432,7 +4482,7 @@ fn a_parameterized_alias_expands_to_the_row_it_writes() {
     let row = |name: &str| {
         let term = &out.program.terms[&term_symbol(&mint, &out, name)];
         let TypeKind::Arrow { effects, .. } =
-            &term.annotation.as_ref().expect("annotated").ty.tracked
+            &term.annotation.as_ref().expect("annotated").ty.anchored
         else {
             panic!("expected an arrow");
         };
@@ -4442,7 +4492,7 @@ fn a_parameterized_alias_expands_to_the_row_it_writes() {
     let names: Vec<_> = f.effects.keys().map(|id| id.name().to_string()).collect();
     assert_eq!(names, ["Ask", "Log", "IO"]);
     let ask = f.effects.values().next().expect("Ask");
-    assert!(matches!(ask.args(), [arg] if matches!(arg.tracked, TypeKind::Prim(Prim::Nat))));
+    assert!(matches!(ask.args(), [arg] if matches!(arg.anchored, TypeKind::Prim(Prim::Nat))));
     assert!(ask.expanded());
     assert!(matches!(&f.tail, Some(Tail { of: Row::Named(name), .. }) if name == "r"));
     let g = row("g");
@@ -4544,9 +4594,9 @@ fn an_effect_declares_its_operations() {
         ]
     );
     let write = &operations[&OperationSelector::Named("write".to_string())];
-    assert!(matches!(write.from.tracked, TypeKind::Prim(Prim::Nat)));
+    assert!(matches!(write.from.anchored, TypeKind::Prim(Prim::Nat)));
     assert!(matches!(
-        write.to.tracked,
+        write.to.anchored,
         TypeKind::Struct { ref fields, tail: None } if fields.is_empty()
     ));
 
@@ -4605,7 +4655,7 @@ fn annotation_effects(mint: &Mint, out: &Output, name: &str) -> Vec<String> {
         .as_ref()
         .expect("the definition is annotated")
         .ty
-        .tracked
+        .anchored
     else {
         panic!("expected an arrow");
     };
@@ -4623,7 +4673,7 @@ fn annotation_effects(mint: &Mint, out: &Output, name: &str) -> Vec<String> {
 fn a_bare_arrow_is_pure() {
     let (mint, out) = built("let f : Nat -> Nat = fn x => x");
     let decl = &out.program.terms[&term_symbol(&mint, &out, "f")];
-    let TypeKind::Arrow { effects, .. } = &decl.annotation.as_ref().expect("annotated").ty.tracked
+    let TypeKind::Arrow { effects, .. } = &decl.annotation.as_ref().expect("annotated").ty.anchored
     else {
         panic!("expected an arrow");
     };
@@ -4632,7 +4682,7 @@ fn a_bare_arrow_is_pure() {
 
     let (mint, out) = built("let f : Nat -> Nat + | = fn x => x");
     let decl = &out.program.terms[&term_symbol(&mint, &out, "f")];
-    let TypeKind::Arrow { effects, .. } = &decl.annotation.as_ref().expect("annotated").ty.tracked
+    let TypeKind::Arrow { effects, .. } = &decl.annotation.as_ref().expect("annotated").ty.anchored
     else {
         panic!("expected an arrow");
     };
@@ -4747,9 +4797,9 @@ fn an_operation_reference_resolves_through_its_effect() {
     let TermKind::Operation { effect, selector } = &func.kind else {
         panic!("expected an operation, got {:?}", func.kind);
     };
-    assert_eq!(mint.name(effect.tracked), "Log");
+    assert_eq!(mint.name(effect.anchored), "Log");
     assert_eq!(
-        selector.tracked,
+        selector.anchored,
         OperationSelector::Named("write".to_string())
     );
 
@@ -4785,7 +4835,7 @@ fn an_operation_reference_resolves_through_its_effect() {
     let TermKind::Operation { selector, .. } = term_value(&mint, &out, "g") else {
         panic!("expected qualified bare operation")
     };
-    assert_eq!(selector.tracked, OperationSelector::Unnamed);
+    assert_eq!(selector.anchored, OperationSelector::Unnamed);
     assert_eq!(
         codes_of(
             "effect Log = Nat -> ()\n\
@@ -4817,7 +4867,7 @@ fn a_handler_must_cover_every_effect_it_names() {
     let discharged: Vec<&str> = handler
         .discharges
         .iter()
-        .map(|effect| mint.name(effect.tracked))
+        .map(|effect| mint.name(effect.anchored))
         .collect();
     assert_eq!(discharged, ["Log"]);
 
@@ -4829,7 +4879,7 @@ fn a_handler_must_cover_every_effect_it_names() {
         panic!("{:#?}", out.errors);
     };
     assert_eq!(error.kind.code(), "partial-handler");
-    let diagnostic = error.diagnostic();
+    let diagnostic = error.diagnostic(&out.source);
     assert_eq!(
         diagnostic.title,
         "this handler does not cover effect `!Log`"
@@ -4858,11 +4908,11 @@ fn a_handler_must_cover_every_effect_it_names() {
     };
     assert_eq!(handler.arms.len(), 2);
     assert_ne!(
-        handler.arms[0].effect.tracked,
-        handler.arms[1].effect.tracked
+        handler.arms[0].effect.anchored,
+        handler.arms[1].effect.anchored
     );
     assert_eq!(handler.discharges.len(), 1);
-    assert_eq!(mint.name(handler.discharges[0].tracked), "Log");
+    assert_eq!(mint.name(handler.discharges[0].anchored), "Log");
 }
 
 /// A duplicate arm and a second `return` arm are refused where a duplicate
@@ -4917,7 +4967,7 @@ fn a_handler_takes_each_arm_once() {
         panic!("expected a handler");
     };
     let ret = handler.ret.as_ref().expect("a return arm");
-    assert_eq!(mint.name(ret.binder.tracked), "a");
+    assert_eq!(mint.name(ret.binder.anchored), "a");
 }
 
 /// R17: a `raise` answers the innermost arm that lexically encloses it, and a
@@ -5007,7 +5057,7 @@ fn a_declaration_may_write_and_take_effects() {
     );
     let TypeKind::Arrow { effects, .. } = &out.program.types[&type_symbol(&mint, &out, "Logger")]
         .value
-        .tracked
+        .anchored
     else {
         panic!("expected an arrow");
     };
@@ -5058,7 +5108,7 @@ fn a_declared_effect_row_must_be_closed() {
         );
     }
     let out = build_src(&format!("{base}type T = Nat -> Nat + ..")).1;
-    let diagnostic = out.errors[0].diagnostic();
+    let diagnostic = out.errors[0].diagnostic(&out.source);
     assert_eq!(
         diagnostic.title,
         "a declared type must list its effects exactly"
@@ -5094,7 +5144,7 @@ fn a_parameter_read_two_ways_names_both() {
             second: Sense::Effects
         }
     ));
-    let diagnostic = error.diagnostic();
+    let diagnostic = error.diagnostic(&out.source);
     assert_eq!(
         diagnostic.title,
         "this parameter is used as a whole type and as the rest of an arrow's effects"
@@ -5216,7 +5266,10 @@ fn transitive_alias_overlap_is_rejected_at_the_overlapping_case() {
                effect Both = !A + !B";
     let (_, out) = build_src(src);
     assert_eq!(codes_of(src), ["duplicate-case"]);
-    assert_eq!(out.errors[0].span.start, src.rfind("!B").unwrap());
+    assert_eq!(
+        out.source.span(out.errors[0].at).start,
+        src.rfind("!B").unwrap()
+    );
 }
 
 /// Effect rows inside an operation's input/output signature participate in
@@ -5378,7 +5431,7 @@ fn a_signature_that_did_not_lower_is_not_told_twice() {
 fn a_row_that_is_only_a_tail_says_something() {
     let (mint, out) = built("let f : Nat -> Nat + ..'e = fn x => x");
     let decl = &out.program.terms[&term_symbol(&mint, &out, "f")];
-    let TypeKind::Arrow { effects, .. } = &decl.annotation.as_ref().expect("annotated").ty.tracked
+    let TypeKind::Arrow { effects, .. } = &decl.annotation.as_ref().expect("annotated").ty.anchored
     else {
         panic!("expected an arrow");
     };
@@ -5438,7 +5491,7 @@ fn an_argument_at_an_effect_parameter_has_to_be_a_row() {
             sense: Sense::Effects
         }
     ));
-    let diagnostic = error.diagnostic();
+    let diagnostic = error.diagnostic(&out.source);
     assert_eq!(
         diagnostic.title,
         "this argument must provide the rest of an arrow's effects"
@@ -5455,7 +5508,7 @@ fn an_argument_at_an_effect_parameter_has_to_be_a_row() {
         panic!("{:#?}", out.errors);
     };
     assert_eq!(error.kind.code(), "repeated-row-field");
-    let diagnostic = error.diagnostic();
+    let diagnostic = error.diagnostic(&out.source);
     assert_eq!(
         diagnostic.title,
         "`!Log` would appear twice in this function"
@@ -5624,41 +5677,41 @@ fn a_bare_name_resolves_in_one_order() {
     // A declared type, which is what a bare name has always been.
     let (mint, out) = built("type T = Nat  let f : T -> Nat = fn x => 0n");
     let annotation = annotation_of(&mint, &out, "f");
-    let TypeKind::Arrow { from, .. } = &annotation.ty.tracked else {
+    let TypeKind::Arrow { from, .. } = &annotation.ty.anchored else {
         panic!("expected an arrow");
     };
-    assert!(matches!(from.tracked, TypeKind::Ident(_)));
+    assert!(matches!(from.anchored, TypeKind::Ident(_)));
 
     // The same spelling with a sigil is a variable, and the two sit side by
     // side: nothing a variable is spelled like can shadow it or be shadowed.
     let (mint, out) = built("type T = Nat  let f : 'T -> T = fn x => 0n");
     let annotation = annotation_of(&mint, &out, "f");
-    let TypeKind::Arrow { from, to, .. } = &annotation.ty.tracked else {
+    let TypeKind::Arrow { from, to, .. } = &annotation.ty.anchored else {
         panic!("expected an arrow");
     };
-    assert!(matches!(&from.tracked, TypeKind::Var(name) if name == "T"));
-    assert!(matches!(to.tracked, TypeKind::Ident(_)));
+    assert!(matches!(&from.anchored, TypeKind::Var(name) if name == "T"));
+    assert!(matches!(to.anchored, TypeKind::Ident(_)));
 
     // And the built-in goes the same way.
     let (mint, out) = built("let f : 'Nat -> Nat = fn x => 0n");
     let annotation = annotation_of(&mint, &out, "f");
-    let TypeKind::Arrow { from, to, .. } = &annotation.ty.tracked else {
+    let TypeKind::Arrow { from, to, .. } = &annotation.ty.anchored else {
         panic!("expected an arrow");
     };
-    assert!(matches!(&from.tracked, TypeKind::Var(name) if name == "Nat"));
-    assert!(matches!(to.tracked, TypeKind::Prim(_)));
+    assert!(matches!(&from.anchored, TypeKind::Var(name) if name == "Nat"));
+    assert!(matches!(to.anchored, TypeKind::Prim(_)));
 
     // A declaration's parameter still comes first, and a declaration has no
     // variables at all for it to be shadowed by.
     let (mint, out) = built("type Box 'a = { it: 'a }");
     let symbol = type_symbol(&mint, &out, "Box");
-    let TypeKind::Struct { fields, .. } = &out.program.types[&symbol].value.tracked else {
+    let TypeKind::Struct { fields, .. } = &out.program.types[&symbol].value.anchored else {
         panic!("expected a struct");
     };
     let TypeField::Written { value, .. } = &fields["it"] else {
         panic!("expected a written field");
     };
-    assert!(matches!(value.tracked, TypeKind::Param { .. }));
+    assert!(matches!(value.anchored, TypeKind::Param { .. }));
 }
 
 /// A bare name in a type position resolves to something declared elsewhere —
@@ -5723,7 +5776,10 @@ fn a_declared_variable_takes_its_sort_from_its_uses() {
         };
         assert_eq!(variable.name, "a", "{src}");
         assert_eq!(variable.sense, sense, "{src}");
-        assert_eq!(variable.span.start, src.find("'a").expect("the first use"));
+        assert_eq!(
+            out.source.span(variable.at).start,
+            src.find("'a").expect("the first use")
+        );
     }
 
     // Several of them, in the order they were declared, each with the sort its
@@ -5851,7 +5907,7 @@ fn a_variable_is_minted_by_its_first_use() {
     // Spanned at the first use, which is where a complaint about what the rest
     // of the annotation did with it points back to.
     assert_eq!(
-        annotation.variables[0].span.start,
+        out.source.span(annotation.variables[0].at).start,
         "let f : ".len(),
         "{:#?}",
         annotation.variables[0]
@@ -5910,7 +5966,7 @@ fn presence_ownership_is_inferred_from_polarity_and_result_boundaries() {
     };
     // The package starts at the final struct result, not at either arrow.
     assert_eq!(
-        &source[boundary.start..boundary.end()],
+        &source[out.source.span(boundary).start..out.source.span(boundary).end()],
         "{ x when 'p: Nat }"
     );
 }
@@ -6002,9 +6058,15 @@ fn presence_ownership_rejects_incompatible_production_lifetimes_deterministicall
         let ErrorKind::IncompatiblePresenceOwnership { previous, .. } = out.errors[0].kind else {
             unreachable!()
         };
-        assert_ne!(previous, out.errors[0].span);
-        assert!(source[out.errors[0].span.start..out.errors[0].span.end()].contains('{'));
-        assert!(source[previous.start..previous.end()].contains('{'));
+        assert_ne!(previous, out.errors[0].at);
+        assert!(
+            source
+                [out.source.span(out.errors[0].at).start..out.source.span(out.errors[0].at).end()]
+                .contains('{')
+        );
+        assert!(
+            source[out.source.span(previous).start..out.source.span(previous).end()].contains('{')
+        );
     }
 
     // Repetition within one exact package remains one producer-owned witness.
@@ -6042,7 +6104,7 @@ fn nested_callback_results_keep_their_own_existential_boundary() {
         panic!("a twice-reversed callback result should be producer-owned");
     };
     assert_eq!(
-        &source[boundary.start..boundary.end()],
+        &source[out.source.span(boundary).start..out.source.span(boundary).end()],
         "{ x when 'p: Nat }"
     );
 }
@@ -6100,12 +6162,15 @@ fn a_declaration_may_declare_nothing_in_its_where() {
         error.kind,
         ErrorKind::VariableInDeclaration { ref name } if name == "r"
     ));
-    assert_eq!(error.span.start, src.rfind("'r").expect("the variable"));
+    assert_eq!(
+        out.source.span(error.at).start,
+        src.rfind("'r").expect("the variable")
+    );
     // The body absorbs, the way one left open through anything but a parameter
     // does: what the declaration would stand for is exactly what was refused.
     let symbol = type_symbol(&mint, &out, "Bad");
     assert!(matches!(
-        out.program.types[&symbol].value.tracked,
+        out.program.types[&symbol].value.anchored,
         TypeKind::Error
     ));
 
@@ -6151,7 +6216,7 @@ fn several_constraint_statements_are_conjoined() {
     let annotation = annotation_of(&mint, &out, "f");
     let clause = annotation.clause.as_ref().expect("the clause");
     assert_eq!(
-        print::ir::clause(&clause.tracked, &mint).to_string(),
+        print::ir::clause(&clause.anchored, &mint).to_string(),
         "'a and 'b"
     );
 }
@@ -6171,7 +6236,10 @@ fn a_declared_variable_may_not_be_applied() {
         error.kind,
         ErrorKind::ParameterApplied { ref name } if name == "a"
     ));
-    assert_eq!(error.span.start, src.find("'a").expect("the head"));
+    assert_eq!(
+        out.source.span(error.at).start,
+        src.find("'a").expect("the head")
+    );
 }
 
 /// A declaration says the same thing wherever it is used, so there is nothing
@@ -6185,23 +6253,26 @@ fn a_declaration_may_not_hold_a_hole() {
         panic!("expected one error: {:#?}", out.errors);
     };
     assert!(matches!(error.kind, ErrorKind::HoleInDeclaration));
-    assert_eq!(error.span.start, src.find('_').expect("the hole"));
+    assert_eq!(
+        out.source.span(error.at).start,
+        src.find('_').expect("the hole")
+    );
     let symbol = type_symbol(&mint, &out, "Bad");
-    let TypeKind::Struct { fields, .. } = &out.program.types[&symbol].value.tracked else {
+    let TypeKind::Struct { fields, .. } = &out.program.types[&symbol].value.anchored else {
         panic!("expected a struct");
     };
     let TypeField::Written { value, .. } = &fields["x"] else {
         panic!("expected a written field");
     };
-    assert!(matches!(value.tracked, TypeKind::Error));
+    assert!(matches!(value.anchored, TypeKind::Error));
 
     // An annotation is where a hole belongs, and it lowers to one.
     let (mint, out) = built("let k : _ -> Nat = fn x => 0n");
     let annotation = annotation_of(&mint, &out, "k");
-    let TypeKind::Arrow { from, .. } = &annotation.ty.tracked else {
+    let TypeKind::Arrow { from, .. } = &annotation.ty.anchored else {
         panic!("expected an arrow");
     };
-    assert!(matches!(from.tracked, TypeKind::Hole));
+    assert!(matches!(from.anchored, TypeKind::Hole));
 }
 
 /// A symbol declared in a module is minted with that module as its parent, so
@@ -6325,10 +6396,13 @@ fn a_repeated_module_is_a_duplicate() {
     assert_eq!(name, "A");
     assert_eq!(namespace, Namespace::Modules);
     assert_eq!(
-        out.errors[0].span.start,
+        out.source.span(out.errors[0].at).start,
         src.rfind('A').expect("the second")
     );
-    assert_eq!(previous.start, src.find('A').expect("the first"));
+    assert_eq!(
+        out.source.span(previous).start,
+        src.find('A').expect("the first")
+    );
 
     // The same name in two different scopes is not a repeat: a module inside a
     // module is somewhere else.
@@ -6352,10 +6426,10 @@ fn an_undefined_first_segment_is_reported_at_the_segment() {
         } if name == "Nope"
     ));
     assert_eq!(
-        out.errors[0].span.start,
+        out.source.span(out.errors[0].at).start,
         src.find("Nope").expect("the segment")
     );
-    assert_eq!(out.errors[0].span.width, "Nope".len());
+    assert_eq!(out.source.span(out.errors[0].at).width, "Nope".len());
 }
 
 /// Every segment after the first resolves strictly inside the module the
@@ -6374,7 +6448,7 @@ fn a_later_segment_does_not_walk_outward() {
         } if name == "Outer"
     ));
     assert_eq!(
-        out.errors[0].span.start,
+        out.source.span(out.errors[0].at).start,
         src.rfind("Outer").expect("the middle segment")
     );
 }
@@ -6399,7 +6473,7 @@ fn an_undefined_segment_in_a_type_is_reported_once() {
             out.errors[0].kind
         );
         assert_eq!(
-            out.errors[0].span.start,
+            out.source.span(out.errors[0].at).start,
             src.find("Nope").expect("the segment"),
             "{src:?}"
         );
@@ -6450,7 +6524,7 @@ fn an_undefined_final_name_is_reported_in_its_own_namespace() {
             undefined[0].kind
         );
         assert_eq!(
-            undefined[0].span.start,
+            out.source.span(undefined[0].at).start,
             src.rfind(at).expect("the name"),
             "{src:?}"
         );
@@ -6465,7 +6539,7 @@ fn a_middle_segment_naming_no_module_is_reported_once() {
     let (_, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(
-        out.errors[0].span.start,
+        out.source.span(out.errors[0].at).start,
         src.rfind("Nope").expect("the segment")
     );
 }
@@ -6697,6 +6771,7 @@ fn prelude_artifact(bundle: &str) -> a::UncheckedArtifact {
     let qualified = |name: &str| format!("{bundle}@1.0.0::prelude::{name}");
     a::UncheckedArtifact {
         header: a::Header {
+            compiler: ruddy::artifact::Stamp::current(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: bundle.into(),
@@ -6783,7 +6858,7 @@ fn configured_std_prelude_opens_only_direct_members_in_every_namespace() {
     assert_eq!(bare, qualified);
     assert_eq!(external(*bare), Some("foundation@1.0.0::prelude::shared"));
     assert!(matches!(
-        out.program.types[&type_symbol(&mint, &out, "Alias")].value.tracked,
+        out.program.types[&type_symbol(&mint, &out, "Alias")].value.anchored,
         TypeKind::Ident(symbol)
             if external(symbol) == Some("foundation@1.0.0::prelude::Shared")
     ));
@@ -6917,7 +6992,7 @@ fn user_and_lexical_declarations_shadow_std_prelude_without_duplicates() {
     let TermKind::Fn { arg, body } = term_value(&mint, &out, "lexical") else {
         panic!("lexical test is a lambda")
     };
-    assert!(matches!(body.kind, TermKind::Ident(symbol) if symbol == arg.tracked));
+    assert!(matches!(body.kind, TermKind::Ident(symbol) if symbol == arg.anchored));
 }
 
 #[test]
@@ -6936,7 +7011,7 @@ fn user_types_effects_and_child_modules_shadow_prelude_names_independently() {
 
     let local_type = type_symbol(&mint, &out, "Shared");
     assert!(matches!(
-        out.program.types[&type_symbol(&mint, &out, "Alias")].value.tracked,
+        out.program.types[&type_symbol(&mint, &out, "Alias")].value.anchored,
         TypeKind::Ident(symbol) if symbol == local_type
     ));
 
@@ -6979,7 +7054,7 @@ fn std_prelude_type_precedes_primitives_but_user_types_precede_the_prelude() {
     let (mint, out) = build_imported("type Alias = Nat", "std", &dependency);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert!(matches!(
-        out.program.types[&type_symbol(&mint, &out, "Alias")].value.tracked,
+        out.program.types[&type_symbol(&mint, &out, "Alias")].value.anchored,
         TypeKind::Ident(symbol)
             if out.program.external_names.get(&symbol).map(String::as_str)
                 == Some("foundation@1.0.0::prelude::Nat")
@@ -6989,7 +7064,7 @@ fn std_prelude_type_precedes_primitives_but_user_types_precede_the_prelude() {
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     let local = type_symbol(&mint, &out, "Nat");
     assert!(matches!(
-        out.program.types[&type_symbol(&mint, &out, "Alias")].value.tracked,
+        out.program.types[&type_symbol(&mint, &out, "Alias")].value.anchored,
         TypeKind::Ident(symbol) if symbol == local
     ));
 }
@@ -6997,6 +7072,7 @@ fn std_prelude_type_precedes_primitives_but_user_types_precede_the_prelude() {
 fn effect_artifact(bundle: &str, interface: &str) -> a::UncheckedArtifact {
     a::UncheckedArtifact {
         header: a::Header {
+            compiler: ruddy::artifact::Stamp::current(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: bundle.into(),
@@ -7196,7 +7272,7 @@ fn imported_effect_row_keys_follow_canonical_identities_by_shape() {
     );
     assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
     let mut mint = dummy_mint();
-    let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
 
     let imported_value = |name: &str| {
@@ -7256,7 +7332,7 @@ fn imported_effect_row_keys_follow_canonical_identities_by_shape() {
     assert!(cases.labels.contains_key(raw));
     assert!(!cases.labels.contains_key(&canonical));
 
-    let inferred = inference::infer(&mint, &mut out.program, inference::Trace::Complete);
+    let inferred = inference::infer(&mint, &out.program, inference::Trace::Complete);
     assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
 }
 
@@ -7447,8 +7523,8 @@ fn dependency_and_local_structural_handlers_share_one_discharge() {
         panic!("expected structural dependency handler")
     };
     assert_ne!(
-        handler.arms[0].effect.tracked,
-        handler.arms[1].effect.tracked
+        handler.arms[0].effect.anchored,
+        handler.arms[1].effect.anchored
     );
     assert_eq!(handler.discharges, [handler.arms[0].effect]);
 }
@@ -7485,8 +7561,8 @@ fn structurally_equivalent_dependencies_share_coverage_and_duplicates() {
         panic!("expected dependency handler")
     };
     assert_ne!(
-        handler.arms[0].effect.tracked,
-        handler.arms[1].effect.tracked
+        handler.arms[0].effect.anchored,
+        handler.arms[1].effect.anchored
     );
     assert_eq!(handler.discharges, [handler.arms[0].effect]);
 
@@ -7512,6 +7588,7 @@ fn structurally_equivalent_dependencies_share_coverage_and_duplicates() {
 fn a_direct_only_interface_with_a_transitive_type_recovers_without_panicking() {
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            compiler: ruddy::artifact::Stamp::current(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".to_string(),
@@ -7543,7 +7620,8 @@ fn a_direct_only_interface_with_a_transitive_type_recovers_without_panicking() {
     assert!(parsed.errors.is_empty());
     let mut mint = dummy_mint();
     let mut built = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
-    let _inferred = inference::infer(&mint, &mut built.program, inference::Trace::Complete);
+    let inferred = inference::infer(&mint, &built.program, inference::Trace::Complete);
+    inferred.apply_types(&mut built.program);
     assert_eq!(built.program.external_types.len(), 2);
 }
 
@@ -7560,6 +7638,7 @@ fn missing_transitive_type_applications_keep_distinct_effect_identities() {
     };
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            compiler: ruddy::artifact::Stamp::current(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
@@ -7645,6 +7724,7 @@ fn fixed_argument_recursive_types_terminate_during_effect_canonicalization() {
 fn direct_only_transitive_effects_keep_qualified_recovery_identity() {
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            compiler: ruddy::artifact::Stamp::current(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
@@ -7699,7 +7779,7 @@ fn direct_only_transitive_effects_keep_qualified_recovery_identity() {
         alias: "dep",
         artifact: &dependency,
     }];
-    let mut out = build_with_dependency_imports(&mut mint, parsed.stmts, &imports, &[]);
+    let out = build_with_dependency_imports(&mut mint, parsed.stmts, &imports, &[]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     let recovered: Vec<_> = out
         .program
@@ -7717,7 +7797,7 @@ fn direct_only_transitive_effects_keep_qualified_recovery_identity() {
     assert_ne!(recovered[0], recovered[1]);
     for declaration in out.program.terms.values() {
         let annotation = declaration.annotation.as_ref().unwrap();
-        let TypeKind::Arrow { effects, .. } = &annotation.ty.tracked else {
+        let TypeKind::Arrow { effects, .. } = &annotation.ty.anchored else {
             panic!("expected arrow annotation")
         };
         assert_eq!(
@@ -7730,7 +7810,7 @@ fn direct_only_transitive_effects_keep_qualified_recovery_identity() {
     // Recovery identities must survive the full inference path too. In
     // particular, direct-only unresolved effects are semantic row labels, not
     // names which inference may discard or attempt to look up transitively.
-    let inferred = inference::infer(&mint, &mut out.program, inference::Trace::Complete);
+    let inferred = inference::infer(&mint, &out.program, inference::Trace::Complete);
     assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert_eq!(inferred.semantics().schemes().len(), 3);
     for scheme in inferred.semantics().schemes().values() {
@@ -7797,7 +7877,7 @@ fn recovery_signatures_keep_every_normalized_source_form_structural() {
 
     let TypeKind::Arrow { effects, .. } = &out.program.types[&type_symbol(&mint, &out, "Runner")]
         .value
-        .tracked
+        .anchored
     else {
         panic!("Runner is an arrow");
     };
@@ -7807,15 +7887,15 @@ fn recovery_signatures_keep_every_normalized_source_form_structural() {
         .next()
         .expect("the absent IO label");
     assert!(!absent.expanded());
-    assert!(absent.name_span().width > 0);
+    assert!(out.source.span(absent.name_at()).width > 0);
 
-    let TypeKind::Arrow { effects, .. } = &annotation_of(&mint, &out, "uses_alias").ty.tracked
+    let TypeKind::Arrow { effects, .. } = &annotation_of(&mint, &out, "uses_alias").ty.anchored
     else {
         panic!("uses_alias is an arrow");
     };
     let expanded = effects.effects.values().next().expect("expanded IO label");
     assert!(expanded.expanded());
-    assert!(expanded.name_span().width > 0);
+    assert!(out.source.span(expanded.name_at()).width > 0);
 }
 
 #[test]
@@ -8536,6 +8616,7 @@ fn row_composition_is_flattened_across_local_and_imported_types() {
     };
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            compiler: ruddy::artifact::Stamp::current(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
@@ -8638,6 +8719,7 @@ fn structural_rows_mask_inner_duplicates_and_preserve_ordinary_separator_labels(
     };
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            compiler: ruddy::artifact::Stamp::current(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
@@ -8751,6 +8833,7 @@ fn absent_semantic_payloads_do_not_affect_structural_identity() {
         .collect();
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            compiler: ruddy::artifact::Stamp::current(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
@@ -8872,9 +8955,9 @@ fn absent_imported_payloads_do_not_create_visible_quantifiers_or_effect_counts()
         .tokens,
     );
     let mut mint = dummy_mint();
-    let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    let inferred = inference::infer(&mint, &mut out.program, inference::Trace::Complete);
+    let inferred = inference::infer(&mint, &out.program, inference::Trace::Complete);
     assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     let scheme = inferred
         .semantics()
@@ -8906,6 +8989,7 @@ fn local_and_imported_structural_types_share_one_canonical_encoding() {
     };
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            compiler: ruddy::artifact::Stamp::current(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
@@ -8977,6 +9061,7 @@ fn local_and_imported_structural_types_share_one_canonical_encoding() {
 fn imported_interfaces_keep_applied_types_effects_and_alias_overlap_structural() {
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            compiler: ruddy::artifact::Stamp::current(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
@@ -9067,7 +9152,10 @@ fn imported_interfaces_keep_applied_types_effects_and_alias_overlap_structural()
         recovered[0], recovered[1],
         "imported effect ids stay distinct"
     );
-    assert_eq!(out.errors[0].span.start, src.rfind("dep::!B").unwrap());
+    assert_eq!(
+        out.source.span(out.errors[0].at).start,
+        src.rfind("dep::!B").unwrap()
+    );
 }
 
 #[test]
@@ -9231,6 +9319,7 @@ fn imported_declared_types_exercise_every_semantic_identity_form() {
     ));
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            compiler: ruddy::artifact::Stamp::current(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
@@ -9319,6 +9408,7 @@ fn malformed_dependency_declarations_are_ignored_without_shadow_symbols() {
 fn imported_alias_cycles_recover_without_a_spurious_structural_identity() {
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            compiler: ruddy::artifact::Stamp::current(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
@@ -9588,6 +9678,7 @@ fn dependency_interfaces_import_every_semantic_form() {
 
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            compiler: ruddy::artifact::Stamp::current(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".to_string(),
@@ -9978,7 +10069,7 @@ fn externs_bind_terms_without_becoming_initializer_groups() {
         .first()
         .expect("the extern is lowered");
     assert_eq!(mint.name(*symbol), "log");
-    assert_eq!(external.value.target.tracked, "console.log");
+    assert_eq!(external.value.target.anchored, "console.log");
     assert_eq!(
         display_program(source),
         "extern log : String -> () = \"console.log\"\nlet written = log \"hello\""
@@ -10009,19 +10100,19 @@ fn extern_abi_retains_resolved_arity_callback_nesting_and_effects() {
     let external = &output.program.externs.first().unwrap().1.value;
     let ExternTypeKind::Function {
         parameters, result, ..
-    } = &external.abi.tracked
+    } = &external.abi.anchored
     else {
         panic!("outer ABI function was not retained: {:#?}", external.abi);
     };
     assert_eq!(parameters.len(), 2);
-    let ExternTypeKind::Group(callback) = &parameters[0].tracked else {
+    let ExternTypeKind::Group(callback) = &parameters[0].anchored else {
         panic!("callback grouping was not retained");
     };
     let ExternTypeKind::Function {
         parameters: callback_parameters,
         effects,
         ..
-    } = &callback.tracked
+    } = &callback.anchored
     else {
         panic!("marked callback was not retained");
     };
@@ -10032,20 +10123,20 @@ fn extern_abi_retains_resolved_arity_callback_nesting_and_effects() {
         "callback effects were not resolved"
     );
     assert!(matches!(
-        callback_parameters[0].tracked,
-        ExternTypeKind::Ordinary(ruddy::tracking::Tracked {
-            tracked: TypeKind::Prim(Prim::Nat),
+        callback_parameters[0].anchored,
+        ExternTypeKind::Ordinary(ruddy::tracking::Anchored {
+            anchored: TypeKind::Prim(Prim::Nat),
             ..
         })
     ));
-    let ExternTypeKind::Group(result) = &result.tracked else {
+    let ExternTypeKind::Group(result) = &result.anchored else {
         panic!("marked result grouping was not retained");
     };
     let ExternTypeKind::Function {
         parameters: result_parameters,
         result: callback_result,
         ..
-    } = &result.tracked
+    } = &result.anchored
     else {
         panic!("marked result function was not retained");
     };
@@ -10054,9 +10145,9 @@ fn extern_abi_retains_resolved_arity_callback_nesting_and_effects() {
         "nullary ABI gained a host argument"
     );
     assert!(matches!(
-        callback_result.tracked,
-        ExternTypeKind::Ordinary(ruddy::tracking::Tracked {
-            tracked: TypeKind::Prim(Prim::String),
+        callback_result.anchored,
+        ExternTypeKind::Ordinary(ruddy::tracking::Anchored {
+            anchored: TypeKind::Prim(Prim::String),
             ..
         })
     ));
@@ -10068,10 +10159,10 @@ fn invalid_names_inside_an_extern_abi_are_diagnosed_once_and_shape_is_retained()
         build_src("extern broken : fn(Missing) -> fn() -> Other + !Absent = \"host.broken\"");
     assert_eq!(output.errors.len(), 3, "{:#?}", output.errors);
     let abi = &output.program.externs.first().unwrap().1.value.abi;
-    let ExternTypeKind::Function { result, .. } = &abi.tracked else {
+    let ExternTypeKind::Function { result, .. } = &abi.anchored else {
         panic!("outer ABI shape was lost after an error");
     };
-    assert!(matches!(result.tracked, ExternTypeKind::Function { .. }));
+    assert!(matches!(result.anchored, ExternTypeKind::Function { .. }));
 }
 
 #[test]
@@ -10681,9 +10772,9 @@ fn malformed_named_applications_of_unequal_arity_are_not_congruent() {
     });
     let parsed = parse::parse(lex("let use : dep::Box Nat = dep::short", FileID::GENERATED).tokens);
     let mut mint = dummy_mint();
-    let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    let inferred = inference::infer(&mint, &mut out.program, inference::Trace::Complete);
+    let inferred = inference::infer(&mint, &out.program, inference::Trace::Complete);
     assert!(
         inferred
             .diagnostics()
@@ -11816,8 +11907,9 @@ fn deeply_nested_imported_semantics_are_preserved_on_a_small_stack() {
 
             // Naming both values semantically instantiates the deep formula
             // and the deep arrow/name/field-payload type on this small stack.
-            let mut program = out.program;
-            let inferred = inference::infer(&mint, &mut program, inference::Trace::Complete);
+            let source_map = out.source;
+            let program = out.program;
+            let inferred = inference::infer(&mint, &program, inference::Trace::Complete);
             assert_eq!(inferred.errors().len(), 1);
             assert_eq!(inferred.errors()[0].kind.code(), "type-mismatch");
             let guarded_step = inferred
@@ -11836,6 +11928,7 @@ fn deeply_nested_imported_semantics_are_preserved_on_a_small_stack() {
                 files: &[],
                 sources: &[],
                 diagnostics: &[],
+                source: &source_map,
                 bundle: None,
                 program: Some(&program),
                 inference: Some(&inferred),
@@ -12124,7 +12217,7 @@ fn imported_interfaces_discard_foreign_solver_local_ids_before_inference() {
     );
     assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
     let mut mint = dummy_mint();
-    let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert!(
         out.program
@@ -12132,7 +12225,7 @@ fn imported_interfaces_discard_foreign_solver_local_ids_before_inference() {
             .values()
             .all(|scheme| scheme.formula().is_true())
     );
-    let inferred = inference::infer(&mint, &mut out.program, inference::Trace::Complete);
+    let inferred = inference::infer(&mint, &out.program, inference::Trace::Complete);
     assert!(matches!(
         inferred.errors(),
         [error] if matches!(error.kind, inference::ErrorKind::Unhandled { .. })
@@ -12233,9 +12326,9 @@ fn arrow_effect_more_rows_use_one_canonical_form_in_both_directions() {
         .tokens,
     );
     let mut mint = dummy_mint();
-    let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    let inferred = inference::infer(&mint, &mut out.program, inference::Trace::Complete);
+    let inferred = inference::infer(&mint, &out.program, inference::Trace::Complete);
     assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
 }
 
@@ -12400,10 +12493,10 @@ fn deep_equal_imported_types_unify_on_a_bounded_stack() {
             );
             assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
             let mut mint = dummy_mint();
-            let mut out =
+            let out =
                 build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency.clone())]);
             assert!(out.errors.is_empty(), "{:#?}", out.errors);
-            let inferred = inference::infer(&mint, &mut out.program, inference::Trace::Complete);
+            let inferred = inference::infer(&mint, &out.program, inference::Trace::Complete);
             assert_eq!(inferred.errors().len(), 1, "{:#?}", inferred.errors());
             assert!(matches!(
                 inferred.errors()[0].kind,
@@ -12417,6 +12510,25 @@ fn deep_equal_imported_types_unify_on_a_bounded_stack() {
                     .any(|step| matches!(step.rule, inference::Rule::Arrow)),
                 "the deep bodies were decomposed"
             );
+
+            // A memo fingerprints what each group reads, the deep imported
+            // schemes included, and has to do so on the same stack.
+            let mut memo = inference::GroupMemo::default();
+            inference::infer_with_memo(&mint, &out.program, inference::Trace::Complete, &mut memo);
+            let again = inference::infer_with_memo(
+                &mint,
+                &out.program,
+                inference::Trace::Complete,
+                &mut memo,
+            );
+            assert_eq!((memo.hits(), memo.misses()), (3, 3));
+            // Compared without printing: the mismatch names the deep types.
+            assert_eq!(again.errors().len(), 1);
+            assert!(matches!(
+                again.errors()[0].kind,
+                inference::ErrorKind::Mismatch { .. }
+            ));
+            assert_eq!(again.errors()[0].id, inferred.errors()[0].id);
         })
         .expect("the bounded-stack regression thread starts")
         .join()
@@ -12508,9 +12620,9 @@ fn deep_alias_reentry_shares_one_congruence_transaction() {
                 .tokens,
             );
             let mut mint = dummy_mint();
-            let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
+            let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
             assert!(out.errors.is_empty(), "{:#?}", out.errors);
-            let inferred = inference::infer(&mint, &mut out.program, inference::Trace::Complete);
+            let inferred = inference::infer(&mint, &out.program, inference::Trace::Complete);
             assert_eq!(inferred.errors().len(), 1, "{:#?}", inferred.errors());
             assert!(matches!(
                 inferred.errors()[0].kind,
@@ -12608,9 +12720,9 @@ fn recursive_imported_alias_reentry_compares_malformed_arities() {
     let parsed =
         parse::parse(lex("let compared = dep::accept dep::value", FileID::GENERATED).tokens);
     let mut mint = dummy_mint();
-    let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    let inferred = inference::infer(&mint, &mut out.program, inference::Trace::Complete);
+    let inferred = inference::infer(&mint, &out.program, inference::Trace::Complete);
     assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert!(
         inferred
@@ -12717,11 +12829,9 @@ fn deep_unequal_imported_struct_rows_unify_on_a_bounded_stack() {
                     lex("let mismatch = dep::accept dep::bad", FileID::GENERATED).tokens,
                 );
                 let mut mint = dummy_mint();
-                let mut out =
-                    build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
+                let out = build_with_dependencies(&mut mint, parsed.stmts, &[checked(dependency)]);
                 assert!(out.errors.is_empty(), "{:#?}", out.errors);
-                let inferred =
-                    inference::infer(&mint, &mut out.program, inference::Trace::Complete);
+                let inferred = inference::infer(&mint, &out.program, inference::Trace::Complete);
                 let messages: Vec<String> = inferred
                     .errors()
                     .iter()
@@ -13193,6 +13303,68 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
     );
 }
 
+/// A symbol is a value of its path, so a local added to one definition is
+/// that definition's business alone: every other definition lowers to the
+/// same value it did, symbol for symbol and anchor for anchor. Together with
+/// [`whitespace_changes_leave_the_lowered_program_unchanged`] this is what a
+/// per-definition cache would be keyed on.
+#[test]
+fn a_local_added_to_one_definition_leaves_the_others_unchanged() {
+    let before = "let first = fn a => a\n\
+                  let second = fn b => { value: b }\n";
+    let after = "let first = fn a => do let extra = a return extra end\n\
+                 let second = fn b => { value: b }\n";
+    let one = build_file(before);
+    let two = build_file(after);
+    assert!(one.errors.is_empty() && two.errors.is_empty());
+    let second = |out: &Output| {
+        let symbol = out.program.terms.keys().nth(1).copied().expect("second");
+        (symbol, format!("{:?}", out.program.terms[&symbol]))
+    };
+    assert_eq!(second(&one), second(&two));
+    assert_eq!(
+        format!("{:?}", one.program.groups[1]),
+        format!("{:?}", two.program.groups[1])
+    );
+    // While `first` did change, in the one place it was edited.
+    let first = |out: &Output| {
+        let symbol = out.program.terms.keys().next().copied().expect("first");
+        format!("{:?}", out.program.terms[&symbol])
+    };
+    assert_ne!(first(&one), first(&two));
+}
+
+/// Whitespace between definitions is the file's business, not the program's:
+/// two spellings of one program that differ only in the blank lines and
+/// indentation around its definitions lower to the same value, anchor for
+/// anchor, and only the source map that turns anchors back into spans tells
+/// them apart. This is what lets a definition nobody edited keep its lowered
+/// form when the text above it moves; an edit inside a definition renumbers
+/// that definition, which is the one being edited anyway.
+#[test]
+fn whitespace_changes_leave_the_lowered_program_unchanged() {
+    let tight = "type Pair 'a = { first: 'a, second: 'a }\n\
+                 let swap = fn p => { first: p.second, second: p.first }\n\
+                 let use = swap { first: 1n, second: 2n }\n";
+    let loose = "\n\n   type Pair 'a = { first: 'a, second: 'a }\n\n\n\
+                 \t let swap = fn p => { first: p.second, second: p.first }\n\n\
+                 let use = swap { first: 1n, second: 2n }\n\n";
+    let one = build_file(tight);
+    let two = build_file(loose);
+    assert!(one.errors.is_empty() && two.errors.is_empty());
+    assert_eq!(format!("{:?}", one.program), format!("{:?}", two.program));
+    assert_ne!(one.source, two.source);
+    let swap = one.program.terms.keys().next().copied().expect("swap");
+    assert_eq!(
+        one.source.span(one.program.terms[&swap].name_at).start,
+        tight.find("swap").unwrap()
+    );
+    assert_eq!(
+        two.source.span(two.program.terms[&swap].name_at).start,
+        loose.find("swap").unwrap()
+    );
+}
+
 /// The metadata a definition carries, as `key: printed value` pairs, so a
 /// test can read one declaration's metadata at a glance.
 fn metadata_of(mint: &Mint, metadata: &ruddy::ir::Metadata) -> Vec<(String, String)> {
@@ -13201,7 +13373,7 @@ fn metadata_of(mint: &Mint, metadata: &ruddy::ir::Metadata) -> Vec<(String, Stri
         .map(|(key, attribute)| {
             (
                 key.clone(),
-                print::ir::data(&attribute.value.tracked, mint).to_string(),
+                print::ir::data(&attribute.value.anchored, mint).to_string(),
             )
         })
         .collect()
@@ -13267,7 +13439,7 @@ fn metadata_rides_on_every_declaration() {
     );
     // A tuple is the struct its numbering makes, and nothing else remembers
     // it was written with parentheses.
-    let ruddy::ir::DataKind::Struct(fields) = &pair.metadata["shape"].value.tracked else {
+    let ruddy::ir::DataKind::Struct(fields) = &pair.metadata["shape"].value.anchored else {
         panic!("a tuple lowers to a struct: {:#?}", pair.metadata["shape"]);
     };
     assert_eq!(fields.keys().collect::<Vec<_>>(), ["0", "1"]);
@@ -13282,11 +13454,11 @@ fn metadata_rides_on_every_declaration() {
         metadata_of(&mint, &log.metadata),
         pairs(&[("level", "#Debug"), ("kind", "#Removed 3n")])
     );
-    let ruddy::ir::DataKind::Tag { name, payload } = &log.metadata["level"].value.tracked else {
+    let ruddy::ir::DataKind::Tag { name, payload } = &log.metadata["level"].value.anchored else {
         panic!("a tag: {:#?}", log.metadata["level"]);
     };
     assert_eq!(name, "Debug");
-    assert!(matches!(&payload.tracked, ruddy::ir::DataKind::Struct(fields) if fields.is_empty()));
+    assert!(matches!(&payload.anchored, ruddy::ir::DataKind::Struct(fields) if fields.is_empty()));
 
     let (_, module) = out
         .program
@@ -13299,13 +13471,13 @@ fn metadata_rides_on_every_declaration() {
         pairs(&[("owner", "{ team: \"core\", \"since when\": 1.5, 0: true }")])
     );
     assert_eq!(
-        module.name_span.start,
+        out.source.span(module.name_at).start,
         src.find("M =").expect("the module name")
     );
     // Each attribute keeps where its key was written.
     assert_eq!(
-        out.program.terms[&term_symbol(&mint, &out, "add")].metadata["since"]
-            .key_span
+        out.source
+            .span(out.program.terms[&term_symbol(&mint, &out, "add")].metadata["since"].key_at)
             .start,
         src.find("@since").expect("the key")
     );
@@ -13358,11 +13530,11 @@ fn duplicate_metadata_keys_and_fields_are_refused() {
     let (mint, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     let second = src.rfind("@k").expect("the second key");
-    assert_eq!(out.errors[0].span.start, second);
-    assert_eq!(out.errors[0].span.width, 2);
+    assert_eq!(out.source.span(out.errors[0].at).start, second);
+    assert_eq!(out.source.span(out.errors[0].at).width, 2);
     assert!(matches!(
         &out.errors[0].kind,
-        ErrorKind::DuplicateAttribute { name, previous } if name == "k" && previous.start == 0
+        ErrorKind::DuplicateAttribute { name, previous } if name == "k" && out.source.span(*previous).start == 0
     ));
     assert_eq!(
         metadata_of(
@@ -13376,12 +13548,12 @@ fn duplicate_metadata_keys_and_fields_are_refused() {
     let (mint, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(
-        out.errors[0].span.start,
+        out.source.span(out.errors[0].at).start,
         src.find("\"a\"").expect("the repeat")
     );
     assert!(matches!(
         &out.errors[0].kind,
-        ErrorKind::DuplicateField { name, previous } if name == "a" && previous.start == src.find("a:").expect("the first")
+        ErrorKind::DuplicateField { name, previous } if name == "a" && out.source.span(*previous).start == src.find("a:").expect("the first")
     ));
     assert_eq!(
         metadata_of(
@@ -13424,7 +13596,7 @@ fn metadata_nesting_is_bounded() {
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert!(matches!(out.errors[0].kind, ErrorKind::MetadataTooDeep));
     assert_eq!(
-        out.errors[0].span.start,
+        out.source.span(out.errors[0].at).start,
         too_deep.find("1n").expect("the innermost value")
     );
     let printed = metadata_of(

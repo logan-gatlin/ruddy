@@ -41,10 +41,10 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             plural(asked, "constraint"),
         );
         if let Some(decl) = program.terms.get(symbol) {
-            node = node.at(decl.name_span);
+            node = node.at(cx.source.span(decl.name_at));
         }
         node = with_symbol(node, cx, mint, *symbol);
-        node = node.children(rows(&mut ids, constraints));
+        node = node.children(rows(&mut ids, cx, constraints));
         nodes.push(node);
     }
 
@@ -65,25 +65,25 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
 /// different levels, so its two lists sit beneath it rather than in line with
 /// it. That nesting *is* the solve order, which is the whole reason the tab
 /// shows it.
-fn rows(ids: &mut Ids, constraints: &[Constraint]) -> Vec<Node> {
+fn rows(ids: &mut Ids, cx: &Cx, constraints: &[Constraint]) -> Vec<Node> {
     constraints
         .iter()
         .map(|constraint| {
             // Each constraint wears the span the program said it at, which is
             // what lets clicking one highlight the term that demanded it.
             let mut node = Node::new(ids.next(), constraint.kind.code(), constraint.to_string())
-                .at(constraint.span)
-                .field("_constraint_id", constraint.id.get().to_string())
-                .field("_reason_id", constraint.reason.get().to_string())
+                .at(cx.source.span(constraint.at))
+                .field("_constraint_id", constraint.id.to_string())
+                .field("_reason_id", constraint.reason.to_string())
                 .field("_origin", constraint.origin.code())
                 .field("_primary_subject", constraint.subjects.primary.code());
             if let Some(subject) = constraint.subjects.secondary {
                 node = node.field("_secondary_subject", subject.code());
             }
             match &constraint.kind {
-                ConstraintKind::Let { value, body, .. } => {
-                    node.children(rows(ids, value)).children(rows(ids, body))
-                }
+                ConstraintKind::Let { value, body, .. } => node
+                    .children(rows(ids, cx, value))
+                    .children(rows(ids, cx, body)),
                 ConstraintKind::Match { arms, .. } => node.children(
                     arms.iter()
                         .enumerate()
@@ -93,7 +93,7 @@ fn rows(ids: &mut Ids, constraints: &[Constraint]) -> Vec<Node> {
                                 format!("arm {at}"),
                                 format!("{} -> {}", arm.raw, arm.effective),
                             )
-                            .at(arm.span);
+                            .at(cx.source.span(arm.at));
                             let arm_node =
                                 arm.requirements.iter().fold(arm_node, |node, requirement| {
                                     node.child(
@@ -102,13 +102,13 @@ fn rows(ids: &mut Ids, constraints: &[Constraint]) -> Vec<Node> {
                                             requirement.batch.origin.code(),
                                             requirement.batch.formula.to_string(),
                                         )
-                                        .at(requirement.batch.span)
-                                        .field("_batch_id", requirement.batch.id.get().to_string()),
+                                        .at(cx.source.span(requirement.batch.at))
+                                        .field("_batch_id", requirement.batch.id.to_string()),
                                     )
                                 });
                             arm_node
-                                .children(rows(ids, &arm.constraints))
-                                .children(rows(ids, std::slice::from_ref(&arm.result)))
+                                .children(rows(ids, cx, &arm.constraints))
+                                .children(rows(ids, cx, std::slice::from_ref(&arm.result)))
                         })
                         .collect::<Vec<_>>(),
                 ),

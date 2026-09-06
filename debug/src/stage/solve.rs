@@ -38,7 +38,7 @@ fn reason_fields(
     origin: ReasonOrigin,
 ) -> (
     &'static str,
-    Option<u64>,
+    Option<String>,
     Option<&'static str>,
     Option<&'static str>,
 ) {
@@ -49,17 +49,17 @@ fn reason_fields(
             Some(subject.code()),
             Some(sort_code(sort)),
         ),
-        ReasonOrigin::Constraint(id) => ("constraint", Some(id.get()), None, None),
-        ReasonOrigin::Contract(id) => ("contract", Some(id.get()), None, None),
-        ReasonOrigin::Batch(id) => ("batch", Some(id.get()), None, None),
-        ReasonOrigin::Step(id) => ("step", Some(id.get()), None, None),
+        ReasonOrigin::Constraint(id) => ("constraint", Some(id.to_string()), None, None),
+        ReasonOrigin::Contract(id) => ("contract", Some(id.to_string()), None, None),
+        ReasonOrigin::Batch(id) => ("batch", Some(id.to_string()), None, None),
+        ReasonOrigin::Step(id) => ("step", Some(id.to_string()), None, None),
         ReasonOrigin::Recovery => ("recovery", None, None, None),
         ReasonOrigin::DefaultBinding { var, kind, .. } => (
             match kind {
                 DefaultBinding::Sat => "sat-binding",
                 DefaultBinding::CloseEffects => "close-effects-binding",
             },
-            Some(var as u64),
+            Some(var.to_string()),
             None,
             None,
         ),
@@ -79,7 +79,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     let error_messages: HashMap<_, _> = output
         .errors()
         .iter()
-        .map(|error| (error.id, error.diagnostic().title))
+        .map(|error| (error.id, error.diagnostic(cx.source).title))
         .collect();
     let mut ids = Ids::default();
     let mut nodes: Vec<Node> = output
@@ -88,25 +88,21 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         .map(|step| {
             let effect = step.effect.to_string();
             let mut node = Node::new(ids.next(), step.rule.code(), step.goal.to_string())
-                .at(step.span)
+                .at(cx.source.span(step.at))
                 // What the rule does, in the compiler's own words rather than
                 // the page's: one wording, wherever it is read.
                 .field("_rule", step.rule.to_string())
                 .field("_effect", effect.clone())
                 .field("_depth", step.depth.to_string())
-                .field("_step_id", step.id.get().to_string())
-                .field("_reason_id", step.reason.get().to_string())
+                .field("_step_id", step.id.to_string())
+                .field("_reason_id", step.reason.to_string())
                 .field(
                     "_constraint_id",
-                    step.constraint
-                        .map(|id| id.get().to_string())
-                        .unwrap_or_default(),
+                    step.constraint.map(|id| id.to_string()).unwrap_or_default(),
                 )
                 .field(
                     "_error_id",
-                    step.error
-                        .map(|id| id.get().to_string())
-                        .unwrap_or_default(),
+                    step.error.map(|id| id.to_string()).unwrap_or_default(),
                 )
                 .field("_def", mint.name(step.definition).to_string());
 
@@ -121,9 +117,9 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                 Effect::Bound { by, because, .. } => {
                     node = node
                         .field("_bind", effect)
-                        .field("_bind_by", by.get().to_string());
+                        .field("_bind_by", by.to_string());
                     if let Some(because) = because {
-                        node = node.field("_recovery_because", because.get().to_string());
+                        node = node.field("_recovery_because", because.to_string());
                     }
                 }
                 Effect::Failed(kind) => {
@@ -166,32 +162,37 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                 reason
                     .parents
                     .iter()
-                    .map(|id| id.get().to_string())
+                    .map(|id| id.to_string())
                     .collect::<Vec<_>>()
                     .join(","),
             )
             .field("_reason_origin", "step");
         if let Effect::Bound { var, .. } = step.effect {
-            let meta = &output.variables()[var as usize];
+            let meta = output
+                .variable(step.id.scope(), var)
+                .expect("every bound variable was minted in the step's scope");
             decorated = decorated
                 .field("_var_id", var.to_string())
                 .field("_var_sort", sort_code(meta.sort))
                 .field("_var_subject", meta.subject.code())
-                .field("_var_minted_by", meta.minted_by.get().to_string());
+                .field("_var_minted_by", meta.minted_by.to_string());
         }
         *node = decorated;
     }
     {
+        // A variable's number is its table's; the scope says which table.
         let variables: Vec<_> = output
             .variables()
             .iter()
-            .enumerate()
-            .map(|(var, meta)| {
-                serde_json::json!({
-                    "id": var,
-                    "sort": sort_code(meta.sort),
-                    "subject": meta.subject.code(),
-                    "minted_by": meta.minted_by.get(),
+            .flat_map(|(scope, variables)| {
+                variables.iter().enumerate().map(|(var, meta)| {
+                    serde_json::json!({
+                        "id": var,
+                        "scope": format!("{:x}", scope.bits()),
+                        "sort": sort_code(meta.sort),
+                        "subject": meta.subject.code(),
+                        "minted_by": meta.minted_by.to_string(),
+                    })
                 })
             })
             .collect();
@@ -209,8 +210,8 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                     _ => None,
                 };
                 serde_json::json!({
-                    "id": reason.id.get(),
-                    "parents": reason.parents.iter().map(|id| id.get()).collect::<Vec<_>>(),
+                    "id": reason.id.to_string(),
+                    "parents": reason.parents.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
                     "origin": origin,
                     "origin_id": origin_id,
                     "sort": sort,

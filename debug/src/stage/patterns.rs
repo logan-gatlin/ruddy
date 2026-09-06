@@ -30,18 +30,18 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         .iter()
         .map(|report| {
             let mut node = Node::new(ids.next(), "match", report.scrutinee.to_string())
-                .at(report.span)
+                .at(cx.source.span(report.at))
                 .child(
                     Node::new(ids.next(), "scrutinee", report.scrutinee.to_string())
-                        .at(report.scrutinee_span),
+                        .at(cx.source.span(report.scrutinee_at)),
                 );
             for arm in &report.arms {
                 let row = Node::new(
                     ids.next(),
                     arm.verdict.to_string(),
-                    print::ir::pattern(&arm.pattern.tracked, mint).to_string(),
+                    print::ir::pattern(&arm.pattern.anchored, mint).to_string(),
                 )
-                .at(arm.span);
+                .at(cx.source.span(arm.at));
                 let row = match arm.verdict {
                     Verdict::Unreachable => row.error(),
                     _ => row,
@@ -55,7 +55,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                 }
                 Coverage::Skipped => Node::new(ids.next(), "coverage", "skipped"),
             };
-            node.child(coverage.at(report.span))
+            node.child(coverage.at(cx.source.span(report.at)))
         })
         .collect();
 

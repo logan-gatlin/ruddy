@@ -29,7 +29,7 @@ use crate::{
     inference::{self, unfold},
     ir::{Handler, HandlerArm, Literal, Pattern, PatternKind, Program, Term, TermKind},
     symbol::{Mint, Symbol},
-    tracking::Span,
+    tracking::{Anchor, SourceMap, Span},
     types::{Formula, Presence, Rest, Row, Ty, same_finite_syntax},
 };
 
@@ -735,6 +735,9 @@ enum FittedStage {
 /// The lowering itself: the program being read, everything emitted so far, and
 /// the stack of functions currently being built.
 struct Lower<'a> {
+    /// Where the program's anchors were written: the LIR keeps spans, for
+    /// the backend and the debugger, and this is what it reads them from.
+    source: &'a SourceMap,
     mint: &'a Mint,
     program: &'a Program,
     inference: &'a inference::Semantics,
@@ -787,6 +790,7 @@ pub fn lower(accepted: &AcceptedProgram) -> Output {
     lower_parts(
         accepted.mint(),
         accepted.ir(),
+        accepted.source(),
         accepted.semantics(),
         accepted.externs(),
     )
@@ -795,10 +799,12 @@ pub fn lower(accepted: &AcceptedProgram) -> Output {
 fn lower_parts(
     mint: &Mint,
     program: &Program,
+    source: &SourceMap,
     inference: &inference::Semantics,
     extern_plan: &crate::externs::ExternPlan,
 ) -> Output {
     let mut low = Lower {
+        source,
         mint,
         program,
         inference,
@@ -909,7 +915,7 @@ fn nest(term: &Term) -> (Vec<(&Term, Symbol)>, &Term) {
     let mut fns = Vec::new();
     let mut cur = term;
     while let TermKind::Fn { arg, body } = &cur.kind {
-        fns.push((cur, arg.tracked));
+        fns.push((cur, arg.anchored));
         cur = body;
     }
     (fns, cur)
@@ -935,8 +941,8 @@ fn spine(term: &Term) -> (&Term, Vec<Apply<'_>>) {
 /// unit, so there is nothing left here to test and extracting the payload at all
 /// would be an instruction with no reader.
 fn cell(pattern: &Pattern) -> Cell {
-    match &pattern.tracked {
-        PatternKind::Bind(name) => Cell::Wild(Some(name.tracked)),
+    match &pattern.anchored {
+        PatternKind::Bind(name) => Cell::Wild(Some(name.anchored)),
         PatternKind::Wildcard => Cell::Wild(None),
         PatternKind::Natural(value) => Cell::Prim(Literal::Natural(*value)),
         PatternKind::Integer(value) => Cell::Prim(Literal::Integer(*value)),
@@ -955,7 +961,7 @@ fn cell(pattern: &Pattern) -> Cell {
             exact: rest.is_none(),
         },
         PatternKind::Tag { name, payload } => Cell::Tag {
-            name: name.tracked.clone(),
+            name: name.anchored.clone(),
             payload: Box::new(payload.as_deref().map(cell).unwrap_or(Cell::Wild(None))),
         },
         PatternKind::Array {
@@ -966,7 +972,7 @@ fn cell(pattern: &Pattern) -> Cell {
             before: before.iter().map(cell).collect(),
             rest: rest
                 .as_ref()
-                .map(|rest| rest.name.as_ref().map(|name| name.tracked)),
+                .map(|rest| rest.name.as_ref().map(|name| name.anchored)),
             after: after.iter().map(cell).collect(),
         },
     }
@@ -1144,6 +1150,11 @@ impl Body {
 }
 
 impl Lower<'_> {
+    /// Where `at` was written, for the LIR that keeps positions.
+    fn span(&self, at: Anchor) -> Span {
+        self.source.span(at)
+    }
+
     /// Import raw target values and install Ruddy-facing globals in front of
     /// ordinary definitions. Function imports are always adapters: they accept
     /// internal evidence parameters but raw calls contain visible arguments
@@ -1160,7 +1171,7 @@ impl Lower<'_> {
                 symbol,
                 name: name.clone(),
                 target: entry.target,
-                span: entry.target_span,
+                span: self.span(entry.target_at),
                 rep: self.rep(&ty),
             });
 
@@ -1173,7 +1184,7 @@ impl Lower<'_> {
                 let mut body = Body::default();
                 let raw = self.emit(
                     &mut body,
-                    entry.target_span,
+                    self.span(entry.target_at),
                     self.rep(&ty),
                     Op::Extern {
                         symbol,
@@ -1185,10 +1196,10 @@ impl Lower<'_> {
                     symbol,
                     name,
                     body: body.seal(Terminator {
-                        span: entry.target_span,
+                        span: self.span(entry.target_at),
                         kind: End::Ret(value),
                     }),
-                    span: entry.declaration_span,
+                    span: self.span(entry.declaration_at),
                 });
             }
         }
@@ -2025,7 +2036,7 @@ impl Lower<'_> {
                 let mut body = Body::default();
                 let temp = self.emit(
                     &mut body,
-                    decl.value.span,
+                    self.span(decl.value.at),
                     Rep::Fn,
                     Op::Closure {
                         func: known.wrappers[0],
@@ -2033,7 +2044,7 @@ impl Lower<'_> {
                     },
                 );
                 body.seal(Terminator {
-                    span: decl.value.span,
+                    span: self.span(decl.value.at),
                     kind: End::Ret(temp),
                 })
             }
@@ -2043,7 +2054,7 @@ impl Lower<'_> {
                 let temp = self.term(&decl.value, &mut body);
                 self.frames.pop();
                 body.seal(Terminator {
-                    span: decl.value.span,
+                    span: self.span(decl.value.at),
                     kind: End::Ret(temp),
                 })
             }
@@ -2052,7 +2063,7 @@ impl Lower<'_> {
             symbol,
             name,
             body,
-            span: decl.name_span,
+            span: self.span(decl.name_at),
         });
     }
 
@@ -2075,7 +2086,7 @@ impl Lower<'_> {
         let temp = self.term(inner, &mut body);
         let frame = self.frames.pop().expect("the frame just pushed");
         let body = body.seal(Terminator {
-            span: inner.span,
+            span: self.span(inner.at),
             kind: End::Ret(temp),
         });
         // A top-level `fn` closes over nothing but top-level definitions, which
@@ -2088,7 +2099,7 @@ impl Lower<'_> {
                 name: self.labels[known.lifted].clone(),
                 params,
                 body,
-                span: value.span,
+                span: self.span(value.at),
             },
         );
     }
@@ -2787,29 +2798,43 @@ impl Lower<'_> {
     /// Lower one term into the block being built, and hand back the temp its
     /// value lands in.
     fn term(&mut self, term: &Term, body: &mut Body) -> Temp {
-        let span = term.span;
+        let span = term.at;
         let rep = self.rep(&term.ty);
         match &term.kind {
-            TermKind::Natural(value) => {
-                self.emit(body, span, rep, Op::Const(Literal::Natural(*value)))
+            TermKind::Natural(value) => self.emit(
+                body,
+                self.span(span),
+                rep,
+                Op::Const(Literal::Natural(*value)),
+            ),
+            TermKind::Integer(value) => self.emit(
+                body,
+                self.span(span),
+                rep,
+                Op::Const(Literal::Integer(*value)),
+            ),
+            TermKind::Real(value) => {
+                self.emit(body, self.span(span), rep, Op::Const(Literal::Real(*value)))
             }
-            TermKind::Integer(value) => {
-                self.emit(body, span, rep, Op::Const(Literal::Integer(*value)))
-            }
-            TermKind::Real(value) => self.emit(body, span, rep, Op::Const(Literal::Real(*value))),
-            TermKind::String(value) => {
-                self.emit(body, span, rep, Op::Const(Literal::String(value.clone())))
-            }
-            TermKind::Boolean(value) => {
-                self.emit(body, span, rep, Op::Const(Literal::Boolean(*value)))
-            }
+            TermKind::String(value) => self.emit(
+                body,
+                self.span(span),
+                rep,
+                Op::Const(Literal::String(value.clone())),
+            ),
+            TermKind::Boolean(value) => self.emit(
+                body,
+                self.span(span),
+                rep,
+                Op::Const(Literal::Boolean(*value)),
+            ),
             TermKind::Unary { op, value } => {
                 let value = self.term(value, body);
                 let op = match op {
                     crate::ir::UnaryOp::Neg => Op::Neg(value),
                     crate::ir::UnaryOp::Not => Op::Not(value),
                 };
-                self.emit(body, span, rep, op)
+                self.emit(body, self.span(span), rep, op)
             }
             TermKind::Binary { op, left, right } => {
                 let left = self.term(left, body);
@@ -2823,7 +2848,7 @@ impl Lower<'_> {
                     crate::ir::BinaryOp::Or => Op::Or { left, right },
                     crate::ir::BinaryOp::Xor => Op::Xor { left, right },
                 };
-                self.emit(body, span, rep, op)
+                self.emit(body, self.span(span), rep, op)
             }
             // A container honestly contains values shaped by its own type:
             // each member is fitted from the shape it holds to the shape the
@@ -2848,11 +2873,11 @@ impl Lower<'_> {
                     entries.insert(FieldKey::named(name.clone()), temp);
                 }
                 let temp = match spread {
-                    None => self.emit(body, span, rep, Op::Struct(entries)),
+                    None => self.emit(body, self.span(span), rep, Op::Struct(entries)),
                     Some(spread) => {
                         let under = self.term(&spread.value, body);
-                        let over = self.emit(body, span, rep, Op::Struct(entries));
-                        self.emit(body, span, rep, Op::Merge(vec![under, over]))
+                        let over = self.emit(body, self.span(span), rep, Op::Struct(entries));
+                        self.emit(body, self.span(span), rep, Op::Merge(vec![under, over]))
                     }
                 };
                 self.contain(temp, &term.ty);
@@ -2875,7 +2900,12 @@ impl Lower<'_> {
                             spread = true;
                             if !values.is_empty() {
                                 let run = std::mem::take(&mut values);
-                                pieces.push(self.emit(body, span, Rep::Array, Op::Array(run)));
+                                pieces.push(self.emit(
+                                    body,
+                                    self.span(span),
+                                    Rep::Array,
+                                    Op::Array(run),
+                                ));
                             }
                             pieces.push(self.fitted(&term.ty, &have, temp, body));
                         }
@@ -2886,12 +2916,17 @@ impl Lower<'_> {
                     }
                 }
                 let temp = match spread {
-                    false => self.emit(body, span, Rep::Array, Op::Array(values)),
+                    false => self.emit(body, self.span(span), Rep::Array, Op::Array(values)),
                     true => {
                         if !values.is_empty() {
-                            pieces.push(self.emit(body, span, Rep::Array, Op::Array(values)));
+                            pieces.push(self.emit(
+                                body,
+                                self.span(span),
+                                Rep::Array,
+                                Op::Array(values),
+                            ));
                         }
-                        self.emit(body, span, Rep::Array, Op::Concat(pieces))
+                        self.emit(body, self.span(span), Rep::Array, Op::Concat(pieces))
                     }
                 };
                 self.contain(temp, &term.ty);
@@ -2905,15 +2940,15 @@ impl Lower<'_> {
                 let temp = self.term(base, body);
                 let authority = self.holding(temp, &base.ty);
                 let have = self
-                    .member_of(&authority, &field.tracked)
+                    .member_of(&authority, &field.anchored)
                     .unwrap_or_else(|| term.ty.clone());
                 let read = self.emit(
                     body,
-                    span,
+                    self.span(span),
                     self.rep(&have),
                     Op::Project {
                         base: temp,
-                        field: FieldKey::named(field.tracked.clone()),
+                        field: FieldKey::named(field.anchored.clone()),
                     },
                 );
                 self.contain(read, &have);
@@ -2923,17 +2958,17 @@ impl Lower<'_> {
                 let payload = payload.as_ref().map(|written| {
                     let temp = self.term(written, body);
                     let want = self
-                        .member_of(&term.ty, &name.tracked)
+                        .member_of(&term.ty, &name.anchored)
                         .unwrap_or_else(|| written.ty.clone());
                     let have = self.holding(temp, &written.ty);
                     self.fitted(&want, &have, temp, body)
                 });
                 let temp = self.emit(
                     body,
-                    span,
+                    self.span(span),
                     rep,
                     Op::Tag {
-                        name: name.tracked.clone(),
+                        name: name.anchored.clone(),
                         payload,
                     },
                 );
@@ -2955,11 +2990,11 @@ impl Lower<'_> {
                 // name fall through to a bogus global read.
                 let temp = match &value.kind {
                     TermKind::Fn { arg, body: inner } => {
-                        self.lambda(value, arg.tracked, inner, body, Some(name.tracked))
+                        self.lambda(value, arg.anchored, inner, body, Some(name.anchored))
                     }
                     _ => self.term(value, body),
                 };
-                self.top().locals.insert(name.tracked, temp);
+                self.top().locals.insert(name.anchored, temp);
                 self.term(rest, body)
             }
             // A definition is compiled once, against the row it was written
@@ -2976,7 +3011,7 @@ impl Lower<'_> {
                 None => {
                     let temp = self.emit(
                         body,
-                        span,
+                        self.span(span),
                         rep,
                         Op::Global {
                             symbol: *symbol,
@@ -3006,10 +3041,10 @@ impl Lower<'_> {
                     self.fitted(&term.ty, &have, temp, body)
                 }
             },
-            TermKind::Fn { arg, body: inner } => self.lambda(term, arg.tracked, inner, body, None),
+            TermKind::Fn { arg, body: inner } => self.lambda(term, arg.anchored, inner, body, None),
             TermKind::Apply { .. } => self.apply(term, body),
             TermKind::Operation { selector, .. } => {
-                self.operation_value(term, Self::operation_slot(&selector.tracked), body)
+                self.operation_value(term, Self::operation_slot(&selector.anchored), body)
             }
             TermKind::Match { scrutinee, arms } => self.matched(term, scrutinee, arms, body),
             TermKind::Handle {
@@ -3020,7 +3055,7 @@ impl Lower<'_> {
                 let temp = self.term(value, body);
                 let tag = self.raise_tag();
                 body.stop(Terminator {
-                    span,
+                    span: self.span(span),
                     kind: End::Throw { tag, value: temp },
                 });
                 temp
@@ -3086,7 +3121,7 @@ impl Lower<'_> {
         frame.prologue.append(&mut lifted.instrs);
         lifted.instrs = std::mem::take(&mut frame.prologue);
         let lifted = lifted.seal(Terminator {
-            span: inner.span,
+            span: self.span(inner.at),
             kind: End::Ret(value),
         });
         let captures: Vec<Temp> = frame.captures.iter().map(|capture| capture.outer).collect();
@@ -3097,10 +3132,15 @@ impl Lower<'_> {
                 name,
                 params,
                 body: lifted,
-                span: term.span,
+                span: self.span(term.at),
             },
         );
-        let closure = self.emit(body, term.span, Rep::Fn, Op::Closure { func: id, captures });
+        let closure = self.emit(
+            body,
+            self.span(term.at),
+            Rep::Fn,
+            Op::Closure { func: id, captures },
+        );
         // The closure holds the shape of the very type the `fn` was compiled
         // against, wherever a binding or a return carries it from here.
         self.hold(closure, &term.ty);
@@ -3166,7 +3206,7 @@ impl Lower<'_> {
         );
         self.emit(
             body,
-            term.span,
+            self.span(term.at),
             Rep::Fn,
             Op::Closure {
                 func: id,
@@ -3189,7 +3229,7 @@ impl Lower<'_> {
             return self.perform(
                 head,
                 *effect,
-                Self::operation_slot(&selector.tracked),
+                Self::operation_slot(&selector.anchored),
                 &applies,
                 body,
             );
@@ -3255,7 +3295,7 @@ impl Lower<'_> {
         let rep = self.rep(&apply.node.ty);
         let value = self.emit(
             body,
-            apply.node.span,
+            self.span(apply.node.at),
             rep,
             Op::Call {
                 callee: Callee::Indirect(callee),
@@ -3281,16 +3321,16 @@ impl Lower<'_> {
     fn perform(
         &mut self,
         head: &Term,
-        effect: crate::tracking::Tracked<Symbol>,
+        effect: crate::tracking::Anchored<Symbol>,
         op: FieldKey,
         applies: &[Apply],
         body: &mut Body,
     ) -> Temp {
-        let name = self.program.effect_ids[&effect.tracked].row_key();
+        let name = self.program.effect_ids[&effect.anchored].row_key();
         let record = self.evidence_of(&name);
         let held = self.emit(
             body,
-            head.span,
+            self.span(head.at),
             Rep::Fn,
             Op::Project {
                 base: record,
@@ -3304,7 +3344,7 @@ impl Lower<'_> {
         // operation's declared arrow, so no evidence goes with the call.
         let value = self.emit(
             body,
-            first.node.span,
+            self.span(first.node.at),
             rep,
             Op::Call {
                 callee: Callee::Indirect(held),
@@ -3334,7 +3374,7 @@ impl Lower<'_> {
         }
         // The visible arguments are evaluated where they were written; the
         // evidence around them is this pass's own, and goes in afterwards.
-        let span = applies[0].node.span;
+        let span = applies[0].node.at;
         let mut full: Vec<Temp> = Vec::new();
         let mut here = used.clone();
         for ((level, apply), arg) in known.levels.iter().zip(applies).zip(&args) {
@@ -3350,7 +3390,7 @@ impl Lower<'_> {
                 let rep = self.rep(&node.ty);
                 let temp = self.emit(
                     body,
-                    node.span,
+                    self.span(node.at),
                     rep,
                     Op::Call {
                         callee: Callee::Direct(known.lifted),
@@ -3376,7 +3416,7 @@ impl Lower<'_> {
                 let rep = self.rep(&node.ty);
                 let temp = self.emit(
                     body,
-                    span,
+                    self.span(span),
                     rep,
                     Op::Closure {
                         func: known.wrappers[taken],
@@ -3394,22 +3434,22 @@ impl Lower<'_> {
     /// identity, one evidence record per discharged effect, and a `catch` over
     /// the body.
     fn handle(&mut self, term: &Term, handled: &Term, handler: &Handler, body: &mut Body) -> Temp {
-        let span = term.span;
+        let span = term.at;
         let tag = self.emit(body, Span::default(), Rep::Any, Op::NewTag);
         let held_tag = self.top().raise_tag.replace(tag);
         let mut records: Vec<(String, Temp)> = Vec::new();
         for effect in &handler.discharges {
-            let name = self.program.effect_ids[&effect.tracked].row_key();
+            let name = self.program.effect_ids[&effect.anchored].row_key();
             let mut entries: IndexMap<FieldKey, Temp> = IndexMap::new();
-            let identity = &self.program.effect_ids[&effect.tracked];
+            let identity = &self.program.effect_ids[&effect.anchored];
             let arms: Vec<&HandlerArm> = handler
                 .arms
                 .iter()
-                .filter(|arm| self.program.effect_ids[&arm.effect.tracked] == *identity)
+                .filter(|arm| self.program.effect_ids[&arm.effect.anchored] == *identity)
                 .collect();
             for arm in arms {
                 let closure = self.arm(arm, body);
-                entries.insert(Self::operation_slot(&arm.selector.tracked), closure);
+                entries.insert(Self::operation_slot(&arm.selector.anchored), closure);
             }
             // The record itself is evidence plumbing: the arms in it are the
             // reader's, the record holding them is this pass's own.
@@ -3426,11 +3466,11 @@ impl Lower<'_> {
             })
             .collect();
         let ret = handler.ret.as_ref();
-        let block = self.child(handled.span, |low, inner| {
+        let block = self.child(self.span(handled.at), |low, inner| {
             let value = low.term(handled, inner);
             match ret {
                 Some(ret) => {
-                    low.top().locals.insert(ret.binder.tracked, value);
+                    low.top().locals.insert(ret.binder.anchored, value);
                     low.term(&ret.body, inner)
                 }
                 None => value,
@@ -3450,7 +3490,7 @@ impl Lower<'_> {
         let rep = self.rep(&term.ty);
         self.emit(
             body,
-            span,
+            self.span(span),
             rep,
             Op::Catch {
                 tag,
@@ -3466,18 +3506,18 @@ impl Lower<'_> {
         let payload = self
             .inference
             .operations
-            .get(&(arm.effect.tracked, arm.selector.tracked.clone()))
+            .get(&(arm.effect.anchored, arm.selector.anchored.clone()))
             .map(|(from, _)| from.clone())
             .unwrap_or_default();
         self.frames.push(Frame::default());
         let rep = self.rep(&payload);
         let temp = self.fresh(rep);
-        self.top().locals.insert(arm.binder.tracked, temp);
+        self.top().locals.insert(arm.binder.anchored, temp);
         let mut lifted = Body::default();
         let value = self.term(&arm.body, &mut lifted);
         let frame = self.frames.pop().expect("the frame just pushed");
         let lifted = lifted.seal(Terminator {
-            span: arm.body.span,
+            span: self.span(arm.body.at),
             kind: End::Ret(value),
         });
         let name = self.lifted_name();
@@ -3490,12 +3530,12 @@ impl Lower<'_> {
                 name,
                 params,
                 body: lifted,
-                span: arm.body.span,
+                span: self.span(arm.body.at),
             },
         );
         self.emit(
             body,
-            arm.selector.span,
+            self.span(arm.selector.at),
             Rep::Fn,
             Op::Closure { func: id, captures },
         )
@@ -3516,7 +3556,7 @@ impl Lower<'_> {
         if arms.is_empty() {
             return self.emit(
                 body,
-                term.span,
+                self.span(term.at),
                 rep,
                 Op::SwitchTag {
                     on: temp,
@@ -3533,7 +3573,7 @@ impl Lower<'_> {
             arms,
             rep,
             ty: term.ty.clone(),
-            span: term.span,
+            span: self.span(term.at),
             allowed,
         };
         let matrix = Matrix {
@@ -4305,7 +4345,13 @@ mod tests {
         let (mint, mut out, mut inferred, _) = test_support::accepted(source);
         adjust(&mut out.program, &mut inferred);
         let plan = crate::externs::plan(inferred.semantics());
-        lower_parts(&mint, &out.program, inferred.semantics(), &plan)
+        lower_parts(
+            &mint,
+            &out.program,
+            &out.source,
+            inferred.semantics(),
+            &plan,
+        )
     }
 
     /// A scrutinee whose checked type is not a struct at all cannot dispatch on

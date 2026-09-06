@@ -245,7 +245,7 @@ pub struct Diagnostic {
     /// Stable inference identity, when this came from inference. Unlike `id`,
     /// this survives debugger-wide sorting and never changes with other phases.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub inference_error_id: Option<u64>,
+    pub inference_error_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inference_cause: Option<InferenceCause>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -277,8 +277,8 @@ pub struct Diagnostic {
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum InferenceCause {
-    Step { step_id: u64 },
-    Batch { batch_id: u64 },
+    Step { step_id: String },
+    Batch { batch_id: String },
     Direct,
 }
 
@@ -306,7 +306,7 @@ pub struct ExplanationFact {
     pub span: Option<Loc>,
     /// Absent for an explicit direct source fact, rather than a solver fact.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub constraint_id: Option<u64>,
+    pub constraint_id: Option<String>,
     pub direct: bool,
     pub origin: &'static str,
     pub subject: &'static str,
@@ -331,10 +331,10 @@ pub struct ExplanationRow {
 
 #[derive(Debug, Serialize)]
 pub struct ExplanationCause {
-    pub error_id: u64,
-    pub seed_reason_id: Option<u64>,
-    pub constraint_ids: Vec<u64>,
-    pub reason_ids: Vec<u64>,
+    pub error_id: String,
+    pub seed_reason_id: Option<String>,
+    pub constraint_ids: Vec<String>,
+    pub reason_ids: Vec<String>,
     #[serde(skip_serializing_if = "is_zero")]
     pub omitted_reasons: usize,
 }

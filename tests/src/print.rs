@@ -281,7 +281,8 @@ fn types_of(source: &str) -> (String, String) {
     let mut mint = Mint::new(bundle);
     let mut built = ir::build(&mut mint, parsed.stmts);
     assert!(built.errors.is_empty(), "{source}: {:#?}", built.errors);
-    let inferred = inference::infer(&mint, &mut built.program, inference::Trace::Off);
+    let inferred = inference::infer(&mint, &built.program, inference::Trace::Off);
+    inferred.apply_types(&mut built.program);
     assert!(
         inferred.errors().is_empty(),
         "{source}: {:#?}",
@@ -708,7 +709,8 @@ fn a_scheme_prints_the_clause_it_requires() {
         let mut mint = Mint::new(bundle);
         let mut built = ir::build(&mut mint, parsed.stmts);
         assert!(built.errors.is_empty(), "{source}: {:#?}", built.errors);
-        let output = inference::infer(&mint, &mut built.program, inference::Trace::Off);
+        let output = inference::infer(&mint, &built.program, inference::Trace::Off);
+        output.apply_types(&mut built.program);
         assert!(
             output.errors().is_empty(),
             "{source}: {:#?}",
@@ -1004,7 +1006,8 @@ fn printed_scheme(source: &str) -> String {
     let mut mint = Mint::new(bundle);
     let mut built = ir::build(&mut mint, parsed.stmts);
     assert!(built.errors.is_empty(), "{source}: {:#?}", built.errors);
-    let inferred = inference::infer(&mint, &mut built.program, inference::Trace::Off);
+    let inferred = inference::infer(&mint, &built.program, inference::Trace::Off);
+    inferred.apply_types(&mut built.program);
     assert!(
         inferred.errors().is_empty(),
         "{source}: {:#?}",

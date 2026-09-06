@@ -3404,3 +3404,98 @@ fn clean_unlinks_build_symlinks_without_touching_their_targets() {
         "must remain"
     );
 }
+
+/// Dependency artifacts are kept under Ruddy home between builds, keyed by the
+/// compiler's stamp and the sources they came from, so the second build of a
+/// project reads its dependencies rather than compiling them.
+#[test]
+fn dependency_artifacts_are_cached_between_builds() {
+    let outer = tempfile::tempdir().unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "cli::dependency_artifacts_cache_child",
+        ])
+        .env("RUDDY_HOME", outer.path().join("home"))
+        .env("RUDDY_TEST_CACHE_ROOT", outer.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "run in isolation with a dedicated Ruddy home"]
+fn dependency_artifacts_cache_child() {
+    let home = PathBuf::from(std::env::var_os("RUDDY_HOME").unwrap());
+    let root = PathBuf::from(std::env::var_os("RUDDY_TEST_CACHE_ROOT").unwrap());
+    let dep = root.join("dep");
+    let app = root.join("app");
+    write_project(&dep, "dep", "1.0.0", &[]);
+    write_project(&app, "app", "0.1.0", &[("dep", "../dep")]);
+    fs::write(app.join("main.hc"), "let main = dep::value\n").unwrap();
+    build_project(&app).unwrap();
+
+    // One entry, for the dependency and under this compiler's stamp; the
+    // root is what the build is for and is not kept.
+    let cache = home.join("cache/artifacts");
+    let compilers: Vec<_> = fs::read_dir(&cache).unwrap().flatten().collect();
+    assert_eq!(compilers.len(), 1);
+    assert_eq!(
+        compilers[0].file_name().to_string_lossy(),
+        ruddy::artifact::COMPILER_HASH
+    );
+    let entries: Vec<_> = fs::read_dir(compilers[0].path())
+        .unwrap()
+        .flatten()
+        .collect();
+    assert_eq!(entries.len(), 1);
+    let entry = entries[0].path();
+    let cached = ruddy::artifact::text::parse(&fs::read_to_string(&entry).unwrap());
+    assert_eq!(cached.header().identity.name, "dep");
+    assert!(cached.header().compiler.is_current());
+
+    // What the cache holds is what the next build sees: an artifact for the
+    // same key that exports a different name is believed over the source.
+    let other = root.join("other");
+    write_project(&other, "dep", "1.0.0", &[]);
+    fs::write(other.join("main.hc"), "let renamed = 0n\n").unwrap();
+    let planted = compile(&other).unwrap().print();
+    fs::write(&entry, &planted).unwrap();
+    fs::write(app.join("main.hc"), "let main = dep::renamed\n").unwrap();
+    build_project(&app).unwrap();
+
+    // Another compiler's directory is removed the moment this one stores
+    // something, and an entry stamped by another compiler is not read.
+    let stale = cache.join("0000000000000000");
+    fs::create_dir_all(&stale).unwrap();
+    fs::write(stale.join("x.artifact"), "stale").unwrap();
+    fs::write(
+        &entry,
+        planted.replace(ruddy::artifact::COMPILER_HASH, "0000000000000000"),
+    )
+    .unwrap();
+    let error = build_project(&app).unwrap_err().to_string();
+    assert!(error.contains("renamed"), "{error}");
+    assert!(!stale.exists());
+    assert!(
+        ruddy::artifact::text::parse(&fs::read_to_string(&entry).unwrap())
+            .header()
+            .compiler
+            .is_current()
+    );
+
+    // A change to the dependency's sources changes the key, so the planted
+    // entry is left behind and the real dependency is compiled.
+    fs::write(&entry, &planted).unwrap();
+    fs::write(dep.join("main.hc"), "let value = 1n\nlet more = 2n\n").unwrap();
+    let error = build_project(&app).unwrap_err().to_string();
+    assert!(error.contains("renamed"), "{error}");
+    fs::write(app.join("main.hc"), "let main = dep::more\n").unwrap();
+    build_project(&app).unwrap();
+}

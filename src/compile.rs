@@ -4,14 +4,21 @@
 //! and pattern checking.  Individual phases remain public for tooling, but a
 //! caller cannot accidentally hand LIR facts from different runs.
 
+use std::borrow::Cow;
+
 use crate::{
     artifact, externs,
     inference::{self, Trace},
     ir, lir, parse, patterns,
     symbol::Mint,
+    tracking::SourceMap,
 };
 
 /// Every checking error produced by a completed compiler phase.
+///
+/// An inference error is far larger than the others, and boxing it would
+/// touch every reader of one for a value that is only ever built on failure.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Error {
     Ir(ir::Error),
@@ -21,6 +28,9 @@ pub enum Error {
 
 /// A compilation which has not established the all-phases-accepted invariant.
 /// Completed phases stay available for diagnostics and tooling.
+///
+/// Returned whole in the `Err` of the compile entry points: it is built once
+/// per failed compile, so its size is no cost worth a box.
 #[derive(Debug)]
 pub struct PartialCompilation {
     pub mint: Mint,
@@ -34,12 +44,26 @@ pub struct PartialCompilation {
 ///
 /// An alias makes this artifact directly source-visible. An absent alias keeps
 /// it available solely to resolve the interfaces named by direct dependencies.
-/// Both roles point at the same portable artifact collection, so source
-/// interfaces and linked implementations cannot drift into separate inputs.
+/// Both roles point at the same artifact collection, so source interfaces and
+/// linked implementations cannot drift into separate inputs.
 #[derive(Debug, Clone, Copy)]
 pub struct Dependency<'a> {
     pub alias: Option<&'a str>,
-    pub artifact: &'a artifact::UncheckedArtifact,
+    pub artifact: DependencyArtifact<'a>,
+}
+
+/// How a dependency arrives at the seam: as an artifact that has already been
+/// validated, admitted as it is, or as portable data, admitted through
+/// recovery with any repairs published as diagnostics.
+///
+/// A driver that compiled or parsed a dependency itself holds the validated
+/// form, and handing it over unchecked would only have it copied three times
+/// and decoded once more for a proof it already has. The unchecked form is
+/// for data whose provenance is not this compiler's own output.
+#[derive(Debug, Clone, Copy)]
+pub enum DependencyArtifact<'a> {
+    Checked(&'a artifact::Artifact),
+    Unchecked(&'a artifact::UncheckedArtifact),
 }
 
 /// The coherent program that has passed every checking phase.
@@ -59,6 +83,10 @@ impl AcceptedProgram {
     }
     pub fn ir(&self) -> &ir::Program {
         &self.ir.program
+    }
+    /// Where every anchor in the program was written.
+    pub fn source(&self) -> &SourceMap {
+        &self.ir.source
     }
     pub fn semantics(&self) -> &inference::Semantics {
         self.inference.semantics()
@@ -88,6 +116,7 @@ impl AcceptedProgram {
 }
 
 /// Compile a parsed source bundle with no dependency interfaces.
+#[allow(clippy::result_large_err)]
 pub fn compile(
     mint: Mint,
     stmts: Vec<parse::Stmt>,
@@ -104,15 +133,22 @@ pub fn compile(
 /// transitive dependencies are represented by entries without one. This keeps
 /// the source-visible interface and the linked implementation set together at
 /// the public compilation seam.
+#[allow(clippy::result_large_err)]
 pub fn compile_with_dependencies(
     mint: Mint,
     stmts: Vec<parse::Stmt>,
     dependencies: &[Dependency<'_>],
     trace: Trace,
 ) -> Result<AcceptedProgram, PartialCompilation> {
-    let recovered: Vec<_> = dependencies
+    let recovered: Vec<(Cow<'_, artifact::Artifact>, Vec<artifact::RecoveryFact>)> = dependencies
         .iter()
-        .map(|dependency| dependency.artifact.clone().recover())
+        .map(|dependency| match dependency.artifact {
+            DependencyArtifact::Checked(artifact) => (Cow::Borrowed(artifact), Vec::new()),
+            DependencyArtifact::Unchecked(artifact) => {
+                let (artifact, facts) = artifact.clone().recover();
+                (Cow::Owned(artifact), facts)
+            }
+        })
         .collect();
     let facts: Vec<_> = recovered
         .iter()
@@ -122,9 +158,10 @@ pub fn compile_with_dependencies(
         .iter()
         .zip(&recovered)
         .filter_map(|(dependency, (artifact, _))| {
-            dependency
-                .alias
-                .map(|alias| ir::DependencyImport { alias, artifact })
+            dependency.alias.map(|alias| ir::DependencyImport {
+                alias,
+                artifact: artifact.as_ref(),
+            })
         })
         .collect();
     let artifact_dependencies = recovered
@@ -136,9 +173,9 @@ pub fn compile_with_dependencies(
             version: artifact.header().identity.version.clone(),
         })
         .collect();
-    let linked: Vec<_> = recovered
+    let linked: Vec<&artifact::Artifact> = recovered
         .iter()
-        .map(|(artifact, _)| artifact.clone())
+        .map(|(artifact, _)| artifact.as_ref())
         .collect();
     let mut result = compile_with(mint, stmts, trace, artifact_dependencies, |mint, stmts| {
         ir::build_with_dependency_imports(mint, stmts, &imports, &linked)
@@ -150,6 +187,7 @@ pub fn compile_with_dependencies(
     result
 }
 
+#[allow(clippy::result_large_err)]
 fn compile_with(
     mut mint: Mint,
     stmts: Vec<parse::Stmt>,
@@ -157,15 +195,12 @@ fn compile_with(
     artifact_dependencies: Vec<artifact::Dependency>,
     build: impl FnOnce(&mut Mint, Vec<parse::Stmt>) -> ir::Output,
 ) -> Result<AcceptedProgram, PartialCompilation> {
-    let ir = build(&mut mint, stmts);
-    let mut program = ir.program.clone();
-    let inference = inference::infer(&mint, &mut program, trace);
-    // Inference writes solved types into the program, so publish that coherent
-    // program rather than the pre-inference IR output.
-    let ir = ir::Output {
-        program,
-        errors: ir.errors,
-    };
+    let mut ir = build(&mut mint, stmts);
+    let inference = inference::infer(&mint, &ir.program, trace);
+    // Inference reads the program and answers with typed copies of its
+    // declarations; the program every later phase reads is the one with
+    // those written in.
+    inference.apply_types(&mut ir.program);
     let patterns = patterns::check(&ir.program, &inference);
     let mut errors = Vec::new();
     errors.extend(ir.errors.iter().cloned().map(Error::Ir));

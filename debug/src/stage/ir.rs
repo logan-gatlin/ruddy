@@ -112,7 +112,7 @@ fn decl_node<T>(
             format!("{keyword} {}", mint.name(symbol)),
             mint.path(symbol).to_string(),
         )
-        .at(decl.name_span),
+        .at(cx.source.span(decl.name_at)),
         cx,
         mint,
         symbol,
@@ -136,7 +136,10 @@ fn decl_node<T>(
                 "Attribute",
                 print::ir::attribute(key, attribute, mint).to_string(),
             )
-            .at(attribute.key_span.merge(attribute.value.span)),
+            .at(cx
+                .source
+                .span(attribute.key_at)
+                .merge(cx.source.span(attribute.value.at))),
         );
     }
     // The binders, before the body that uses them, which is where they are
@@ -148,7 +151,7 @@ fn decl_node<T>(
     // binder in the language that stands for anything but a type.
     for param in &decl.params {
         node = node.child(with_symbol(
-            Node::new(ids.next(), "Param", stands_for(mint, param)).at(param.span),
+            Node::new(ids.next(), "Param", stands_for(mint, param)).at(cx.source.span(param.at)),
             cx,
             mint,
             param.symbol,
@@ -158,8 +161,9 @@ fn decl_node<T>(
 }
 
 /// One target-provided declaration: the target remains data, never a term.
-fn extern_node(ids: &mut Ids, _: &Cx, _: &Mint, external: &Extern) -> Node {
-    Node::new(ids.next(), "Target", external.target.to_string()).at(external.target.span)
+fn extern_node(ids: &mut Ids, cx: &Cx, _: &Mint, external: &Extern) -> Node {
+    Node::new(ids.next(), "Target", external.target.to_string())
+        .at(cx.source.span(external.target.at))
 }
 
 /// One `effect` declaration's cases: an operation with its two sides under it,
@@ -180,11 +184,11 @@ fn effect_node(ids: &mut Ids, cx: &Cx, mint: &Mint, effect: &Effect) -> Node {
                         },
                         format!(
                             "{} -> {}",
-                            print::ir::ty(&operation.from.tracked, mint),
-                            print::ir::ty(&operation.to.tracked, mint),
+                            print::ir::ty(&operation.from.anchored, mint),
+                            print::ir::ty(&operation.to.anchored, mint),
                         ),
                     )
-                    .at(operation.name_span)
+                    .at(cx.source.span(operation.name_at))
                     .child(type_node(ids, cx, mint, &operation.from, &[]))
                     .child(type_node(ids, cx, mint, &operation.to, &[]))
                 })
@@ -199,7 +203,7 @@ fn effect_node(ids: &mut Ids, cx: &Cx, mint: &Mint, effect: &Effect) -> Node {
                     let name = mint.name(case.symbol);
                     let mut case_node = with_symbol(
                         Node::new(ids.next(), "Names", print::label(Shape::Effect, name))
-                            .at(named(case.name_span, name)),
+                            .at(named(cx.source.span(case.name_at), name)),
                         cx,
                         mint,
                         case.symbol,
@@ -223,7 +227,7 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
         "",
         print::ir::term(&term.kind, mint).to_string(),
     )
-    .at(term.span);
+    .at(cx.source.span(term.at));
     trace.terms.push((node.id, term.ty.clone()));
     match &term.kind {
         TermKind::Error => Node {
@@ -273,7 +277,7 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
                     "Spread",
                     format!("..{}", print::ir::term(&item.value.kind, mint)),
                 )
-                .at(dots.merge(item.value.span))
+                .at(cx.source.span(dots).merge(cx.source.span(item.value.at)))
                 .child(term_node(ids, cx, mint, &item.value, trace)),
                 None => term_node(ids, cx, mint, &item.value, trace),
             }
@@ -310,10 +314,10 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
         .child(term_node(ids, cx, mint, arg, trace)),
         TermKind::Fn { arg, body } => {
             let bound = with_symbol(
-                Node::new(ids.next(), "Arg", mint.name(arg.tracked)).at(arg.span),
+                Node::new(ids.next(), "Arg", mint.name(arg.anchored)).at(cx.source.span(arg.at)),
                 cx,
                 mint,
-                arg.tracked,
+                arg.anchored,
             );
             // The bound name has no term of its own to carry a type, but the
             // lambda's arrow knows it — through a declared type if that is
@@ -343,14 +347,14 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
             body,
         } => {
             let mut node = Node {
-                label: format!("Let {}", mint.name(name.tracked)),
+                label: format!("Let {}", mint.name(name.anchored)),
                 ..node
             }
             .child(with_symbol(
-                Node::new(ids.next(), "Name", mint.name(name.tracked)).at(name.span),
+                Node::new(ids.next(), "Name", mint.name(name.anchored)).at(cx.source.span(name.at)),
                 cx,
                 mint,
-                name.tracked,
+                name.anchored,
             ));
             if let Some(annotation) = annotation {
                 let mut ascribed = annotation_node(ids, cx, mint, annotation);
@@ -368,7 +372,7 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
                 label: "Tag".into(),
                 ..node
             }
-            .at(name.span);
+            .at(cx.source.span(name.at));
             match payload {
                 Some(payload) => node.child(term_node(ids, cx, mint, payload, trace)),
                 None => node,
@@ -385,9 +389,9 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
             Node::new(
                 ids.next(),
                 "Field",
-                print::label(Shape::Struct, &field.tracked),
+                print::label(Shape::Struct, &field.anchored),
             )
-            .at(field.span),
+            .at(cx.source.span(field.at)),
         ),
         // The scrutinee, then each written arm: its normalized pattern — the
         // binders symbols like a lambda's argument, so they cross-highlight
@@ -423,28 +427,35 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
                 let head = Node::new(
                     ids.next(),
                     "Arm",
-                    format!("!{}{}", mint.name(arm.effect.tracked), arm.selector.tracked),
+                    format!(
+                        "!{}{}",
+                        mint.name(arm.effect.anchored),
+                        arm.selector.anchored
+                    ),
                 )
-                .at(named(arm.effect.span, mint.name(arm.effect.tracked)))
+                .at(named(
+                    cx.source.span(arm.effect.at),
+                    mint.name(arm.effect.anchored),
+                ))
                 .child(with_symbol(
-                    Node::new(ids.next(), "Binder", mint.name(arm.binder.tracked))
-                        .at(arm.binder.span),
+                    Node::new(ids.next(), "Binder", mint.name(arm.binder.anchored))
+                        .at(cx.source.span(arm.binder.at)),
                     cx,
                     mint,
-                    arm.binder.tracked,
+                    arm.binder.anchored,
                 ))
                 .child(term_node(ids, cx, mint, &arm.body, trace));
-                handle_node = handle_node.child(with_symbol(head, cx, mint, arm.effect.tracked));
+                handle_node = handle_node.child(with_symbol(head, cx, mint, arm.effect.anchored));
             }
             if let Some(ret) = &handler.ret {
                 let head = Node::new(ids.next(), "Return", String::new())
-                    .at(ret.span)
+                    .at(cx.source.span(ret.at))
                     .child(with_symbol(
-                        Node::new(ids.next(), "Binder", mint.name(ret.binder.tracked))
-                            .at(ret.binder.span),
+                        Node::new(ids.next(), "Binder", mint.name(ret.binder.anchored))
+                            .at(cx.source.span(ret.binder.at)),
                         cx,
                         mint,
-                        ret.binder.tracked,
+                        ret.binder.anchored,
                     ))
                     .child(term_node(ids, cx, mint, &ret.body, trace));
                 handle_node = handle_node.child(head);
@@ -467,10 +478,10 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
             // `!Eff.op`, and inside the `!` at that: the row claims the effect,
             // and a claim has to be spanned where the name it claims was
             // written.
-            .at(named(effect.span, mint.name(effect.tracked))),
+            .at(named(cx.source.span(effect.at), mint.name(effect.anchored))),
             cx,
             mint,
-            effect.tracked,
+            effect.anchored,
         ),
         TermKind::Struct { fields, spread } => {
             // Built eagerly rather than through `children`: the closure a lazy
@@ -483,7 +494,7 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
                         format!("{}:", print::label(Shape::Struct, name)),
                         print::ir::term(&field.value.kind, mint).to_string(),
                     )
-                    .at(field.name_span)
+                    .at(cx.source.span(field.name_at))
                     .child(term_node(ids, cx, mint, &field.value, trace))
                 })
                 .collect();
@@ -496,7 +507,10 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
                         "Spread",
                         format!("..{}", print::ir::term(&spread.value.kind, mint)),
                     )
-                    .at(spread.span.merge(spread.value.span))
+                    .at(cx
+                        .source
+                        .span(spread.at)
+                        .merge(cx.source.span(spread.value.at)))
                     .child(term_node(ids, cx, mint, &spread.value, trace)),
                 );
             }
@@ -515,7 +529,7 @@ fn discharges_node(ids: &mut Ids, cx: &Cx, mint: &Mint, handler: &Handler) -> No
     let labels: Vec<String> = handler
         .discharges
         .iter()
-        .map(|effect| format!("!{}", mint.name(effect.tracked)))
+        .map(|effect| format!("!{}", mint.name(effect.anchored)))
         .collect();
     let node = Node::new(ids.next(), "Discharges", labels.join(" | "));
     node.children(
@@ -524,11 +538,11 @@ fn discharges_node(ids: &mut Ids, cx: &Cx, mint: &Mint, handler: &Handler) -> No
             .iter()
             .map(|effect| {
                 with_symbol(
-                    Node::new(ids.next(), "", format!("!{}", mint.name(effect.tracked)))
-                        .at(named(effect.span, mint.name(effect.tracked))),
+                    Node::new(ids.next(), "", format!("!{}", mint.name(effect.anchored)))
+                        .at(named(cx.source.span(effect.at), mint.name(effect.anchored))),
                     cx,
                     mint,
-                    effect.tracked,
+                    effect.anchored,
                 )
             })
             .collect::<Vec<_>>(),
@@ -562,7 +576,7 @@ fn effects_node(
                 }
             };
             let row = Node::new(ids.next(), text, String::new())
-                .at(named(label.name_span(), name.name()));
+                .at(named(cx.source.span(label.name_at()), name.name()));
             // A label an alias put here is *about* the effect without being an
             // occurrence of its name — the name on the page is the alias's —
             // so it takes the association without the span claim.
@@ -576,10 +590,10 @@ fn effects_node(
         })
         .collect();
     if let Some(tail) = &effects.tail {
-        kids.push(rest_node(ids, mint, tail, scope));
+        kids.push(rest_node(ids, cx, mint, tail, scope));
     }
     Node::new(ids.next(), "Effects", String::new())
-        .at(effects.span)
+        .at(cx.source.span(effects.at))
         .children(kids)
 }
 
@@ -590,10 +604,10 @@ fn pattern_node(ids: &mut Ids, cx: &Cx, mint: &Mint, pattern: &Pattern) -> Node 
     let node = Node::new(
         ids.next(),
         "",
-        print::ir::pattern(&pattern.tracked, mint).to_string(),
+        print::ir::pattern(&pattern.anchored, mint).to_string(),
     )
-    .at(pattern.span);
-    match &pattern.tracked {
+    .at(cx.source.span(pattern.at));
+    match &pattern.anchored {
         PatternKind::Bind(name) => with_symbol(
             Node {
                 label: "Bind".into(),
@@ -601,7 +615,7 @@ fn pattern_node(ids: &mut Ids, cx: &Cx, mint: &Mint, pattern: &Pattern) -> Node 
             },
             cx,
             mint,
-            name.tracked,
+            name.anchored,
         ),
         // The AST tab's wildcard leaf again, surviving normalization as the
         // `_` it is: no symbol, since nothing can use it.
@@ -652,9 +666,9 @@ fn pattern_node(ids: &mut Ids, cx: &Cx, mint: &Mint, pattern: &Pattern) -> Node 
                     Node::new(
                         ids.next(),
                         format!("{}:", print::label(Shape::Struct, name)),
-                        print::ir::pattern(&field.value.tracked, mint).to_string(),
+                        print::ir::pattern(&field.value.anchored, mint).to_string(),
                     )
-                    .at(field.name_span)
+                    .at(cx.source.span(field.name_at))
                     .child(pattern_node(ids, cx, mint, &field.value))
                 })
                 .collect();
@@ -662,7 +676,7 @@ fn pattern_node(ids: &mut Ids, cx: &Cx, mint: &Mint, pattern: &Pattern) -> Node 
             // the AST tab shows it: a row of its own, beside the fields it
             // stands apart from.
             if let Some(rest) = rest {
-                kids.push(Node::new(ids.next(), "Rest", "..").at(*rest));
+                kids.push(Node::new(ids.next(), "Rest", "..").at(cx.source.span(*rest)));
             }
             Node {
                 label: "Struct".into(),
@@ -684,14 +698,18 @@ fn pattern_node(ids: &mut Ids, cx: &Cx, mint: &Mint, pattern: &Pattern) -> Node 
             if let Some(rest) = rest {
                 let row = match &rest.name {
                     Some(name) => with_symbol(
-                        Node::new(ids.next(), "Rest", format!("..{}", mint.name(name.tracked))),
+                        Node::new(
+                            ids.next(),
+                            "Rest",
+                            format!("..{}", mint.name(name.anchored)),
+                        ),
                         cx,
                         mint,
-                        name.tracked,
+                        name.anchored,
                     ),
                     None => Node::new(ids.next(), "Rest", ".."),
                 };
-                kids.push(row.at(rest.span));
+                kids.push(row.at(cx.source.span(rest.at)));
             }
             kids.extend(
                 after
@@ -732,14 +750,15 @@ fn annotation_node(ids: &mut Ids, cx: &Cx, mint: &Mint, annotation: &Annotation)
             format!("Variable {}", variable.name),
             stands_for_variable(variable),
         )
-        .at(variable.span)
+        .at(cx.source.span(variable.at))
         .link(variable.id);
         node = node.child(row);
     }
     match &annotation.clause {
         Some(clause) => {
-            let row = Node::new(ids.next(), "Where", clause_text(mint, clause)).at(clause.span);
-            node.child(row.children(clause_kids(ids, mint, clause)))
+            let row = Node::new(ids.next(), "Where", clause_text(mint, clause))
+                .at(cx.source.span(clause.at));
+            node.child(row.children(clause_kids(ids, cx, mint, clause)))
         }
         None => node,
     }
@@ -764,13 +783,13 @@ fn stands_for_variable(variable: &Variable) -> String {
 /// One clause as the source it was lowered from — through the shared printer,
 /// so this row and the type's own text cannot spell one clause two ways.
 fn clause_text(mint: &Mint, clause: &Clause) -> String {
-    print::ir::clause(&clause.tracked, mint).to_string()
+    print::ir::clause(&clause.anchored, mint).to_string()
 }
 
 /// The parts of a clause, each a row of its own, so a reader can cross-
 /// highlight the name a formula uses against the `when` that bound it.
-fn clause_kids(ids: &mut Ids, mint: &Mint, clause: &Clause) -> Vec<Node> {
-    let parts: Vec<&Clause> = match &clause.tracked {
+fn clause_kids(ids: &mut Ids, cx: &Cx, mint: &Mint, clause: &Clause) -> Vec<Node> {
+    let parts: Vec<&Clause> = match &clause.anchored {
         ClauseKind::Name(_) => Vec::new(),
         ClauseKind::Not(inner) => vec![inner],
         ClauseKind::And(left, right)
@@ -781,8 +800,9 @@ fn clause_kids(ids: &mut Ids, mint: &Mint, clause: &Clause) -> Vec<Node> {
     parts
         .into_iter()
         .map(|part| {
-            let row = Node::new(ids.next(), "", clause_text(mint, part)).at(part.span);
-            row.children(clause_kids(ids, mint, part))
+            let row =
+                Node::new(ids.next(), "", clause_text(mint, part)).at(cx.source.span(part.at));
+            row.children(clause_kids(ids, cx, mint, part))
         })
         .collect()
 }
@@ -822,8 +842,13 @@ fn linked(node: Node, link: Option<u32>) -> Node {
 /// — empty inside a declaration body, which declares none — and is what a use in
 /// the type is grouped against.
 fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type, scope: &[Variable]) -> Node {
-    let node = Node::new(ids.next(), "", print::ir::ty(&ty.tracked, mint).to_string()).at(ty.span);
-    match &ty.tracked {
+    let node = Node::new(
+        ids.next(),
+        "",
+        print::ir::ty(&ty.anchored, mint).to_string(),
+    )
+    .at(cx.source.span(ty.at));
+    match &ty.anchored {
         TypeKind::Error => Node {
             label: "Error".into(),
             ..node
@@ -872,11 +897,12 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type, scope: &[Variable])
         ),
         TypeKind::Apply {
             head,
-            head_span,
+            head_at: head_span,
             args,
         } => {
             let head = with_symbol(
-                Node::new(ids.next(), "Head", mint.name(*head).to_string()).at(*head_span),
+                Node::new(ids.next(), "Head", mint.name(*head).to_string())
+                    .at(cx.source.span(*head_span)),
                 cx,
                 mint,
                 *head,
@@ -910,20 +936,20 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type, scope: &[Variable])
                 .iter()
                 .map(|(name, case)| match case {
                     SumCase::Written {
-                        name_span,
+                        name_at: name_span,
                         when,
                         payload,
                     } => {
                         let mark = when_text(when);
                         let text = payload.as_ref().map_or(String::new(), |ty| {
-                            print::ir::ty(&ty.tracked, mint).to_string()
+                            print::ir::ty(&ty.anchored, mint).to_string()
                         });
                         let node = Node::new(
                             ids.next(),
                             format!("{}{mark}", print::label(Shape::Sum, name)),
                             text,
                         )
-                        .at(*name_span);
+                        .at(cx.source.span(*name_span));
                         match payload {
                             Some(payload) => node.child(type_node(ids, cx, mint, payload, scope)),
                             None => node,
@@ -931,16 +957,16 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type, scope: &[Variable])
                     }
                     // An absent case is a leaf wearing the `\`, spanning the
                     // whole `\#Name` for cross-highlighting.
-                    SumCase::Absent { name_span } => Node::new(
+                    SumCase::Absent { name_at: name_span } => Node::new(
                         ids.next(),
                         format!("\\{}", print::label(Shape::Sum, name)),
                         String::new(),
                     )
-                    .at(*name_span),
+                    .at(cx.source.span(*name_span)),
                 })
                 .collect();
             if let Some(tail) = tail {
-                kids.push(rest_node(ids, mint, tail, scope));
+                kids.push(rest_node(ids, cx, mint, tail, scope));
             }
             Node {
                 label: "Sum".into(),
@@ -968,7 +994,7 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type, scope: &[Variable])
                 .iter()
                 .map(|(name, field)| match field {
                     TypeField::Written {
-                        name_span,
+                        name_at: name_span,
                         when,
                         value,
                     } => {
@@ -976,25 +1002,25 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type, scope: &[Variable])
                         Node::new(
                             ids.next(),
                             format!("{}{mark}:", print::label(Shape::Struct, name)),
-                            print::ir::ty(&value.tracked, mint).to_string(),
+                            print::ir::ty(&value.anchored, mint).to_string(),
                         )
-                        .at(*name_span)
+                        .at(cx.source.span(*name_span))
                         .child(type_node(ids, cx, mint, value, scope))
                     }
                     // An absent field is a leaf: there is no type under it,
                     // and the span covers the whole `\name`.
-                    TypeField::Absent { name_span } => Node::new(
+                    TypeField::Absent { name_at: name_span } => Node::new(
                         ids.next(),
                         format!("\\{}", print::label(Shape::Struct, name)),
                         String::new(),
                     )
-                    .at(*name_span),
+                    .at(cx.source.span(*name_span)),
                 })
                 .collect();
             // The tail is a row of its own: it stands for the labels not
             // named, so it is shown beside them rather than folded into one.
             if let Some(tail) = tail {
-                kids.push(rest_node(ids, mint, tail, scope));
+                kids.push(rest_node(ids, cx, mint, tail, scope));
             }
             Node {
                 label: "Struct".into(),
@@ -1024,14 +1050,14 @@ fn named(span: Span, name: &str) -> Span {
 /// A named tail is a use of a declared variable, so it is grouped with the
 /// declaration the same way a bare name in a type position is; a bare `..`
 /// names nothing and a parameter is a symbol, and neither needs the group.
-fn rest_node(ids: &mut Ids, mint: &Mint, tail: &Tail, scope: &[Variable]) -> Node {
+fn rest_node(ids: &mut Ids, cx: &Cx, mint: &Mint, tail: &Tail, scope: &[Variable]) -> Node {
     let (name, link) = match &tail.of {
         Row::Anything => (String::new(), None),
         Row::Named(name) => (format!("'{name}"), link_of(scope, name)),
         Row::Param { symbol, .. } => (format!("'{}", mint.name(*symbol)), None),
     };
     linked(
-        Node::new(ids.next(), "Rest", format!("..{name}")).at(tail.span),
+        Node::new(ids.next(), "Rest", format!("..{name}")).at(cx.source.span(tail.at)),
         link,
     )
 }
