@@ -33,6 +33,11 @@ pub enum Prim {
 
 pub type TyVar = u32;
 
+/// Compiler-owned mutation identity, independent of source declarations.
+pub fn mutation_effect() -> EffectId {
+    EffectId::structural("mut".into(), "0#13:<builtin:mut>;".into())
+}
+
 /// The semantic identity of an effect label.
 ///
 /// Effect names resolve nominally, but effect rows do not: two declarations
@@ -174,6 +179,7 @@ pub enum Shape {
 /// whole type. Presence is the additional annotation-only sort.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Sense {
+    Region,
     Type,
     /// The rest of a struct's fields.
     Fields,
@@ -214,11 +220,18 @@ pub enum Sense {
 /// about an argument breaking the rule twice always names the same label first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParamKind {
+    Region {
+        lacks: IndexSet<String>,
+    },
     /// Stands for a whole type. `'A` in `type Pair 'A 'B`.
-    Type { lacks: IndexSet<String> },
+    Type {
+        lacks: IndexSet<String>,
+    },
     /// Stands for fields a struct does not name. `'r` in
     /// `type WithX 'r = { x: Nat, ..'r }`.
-    Fields { lacks: IndexSet<String> },
+    Fields {
+        lacks: IndexSet<String>,
+    },
     /// Stands for the cases a sum does not name — and, with them, the cases it
     /// may therefore not name itself. `'r` in `type Or 'r = #A | ..'r`.
     ///
@@ -226,7 +239,9 @@ pub enum ParamKind {
     /// than substituted: a sum's rest is spliced into [`Ty::Sum`]'s row, so
     /// anything else written there would leave a row holding what no row can
     /// hold. See [`ir::ErrorKind::NotARow`](crate::ir::ErrorKind).
-    Cases { lacks: IndexSet<String> },
+    Cases {
+        lacks: IndexSet<String>,
+    },
     /// Stands for the effects an arrow does not name — and, with them, the
     /// effects it may therefore not name itself. `'e` in
     /// `type Runner 'e = (Nat -> Nat + ..'e) -> Nat + ..'e`.
@@ -234,7 +249,9 @@ pub enum ParamKind {
     /// [`ParamKind::Cases`]'s twin, and enforced for the same reason: an effect
     /// row's rest is spliced into the row [`Ty::Arrow`] carries, so anything
     /// else written there would leave a row holding what no row can hold.
-    Effects { lacks: IndexSet<String> },
+    Effects {
+        lacks: IndexSet<String>,
+    },
 }
 
 /// One variable a [`Formula`] names: one the solver still owns, or one a
@@ -405,6 +422,8 @@ pub enum Ty {
     Package(Rc<Ty>),
     /// An immutable homogeneous array.
     Array(Rc<Ty>),
+    /// A cell with a fixed region and invariant element type.
+    Mut(Rc<Ty>, Rc<Ty>),
     /// A structural record and its true field-row tail.
     Struct(Row),
     /// The cases a value may be: a row of labels, each with a presence, and a
@@ -636,7 +655,8 @@ impl ParamKind {
     /// of them: `'A` in `type Pair 'A 'B` sits in no row and forbids nothing.
     pub fn lacks(&self) -> &IndexSet<String> {
         match self {
-            ParamKind::Type { lacks }
+            ParamKind::Region { lacks }
+            | ParamKind::Type { lacks }
             | ParamKind::Fields { lacks }
             | ParamKind::Cases { lacks }
             | ParamKind::Effects { lacks } => lacks,
@@ -646,6 +666,7 @@ impl ParamKind {
     /// What this parameter stands for, with the labels dropped. See [`Sense`].
     pub fn sense(&self) -> Sense {
         match self {
+            ParamKind::Region { .. } => Sense::Region,
             ParamKind::Type { .. } => Sense::Type,
             ParamKind::Fields { .. } => Sense::Fields,
             ParamKind::Cases { .. } => Sense::Cases,
@@ -659,7 +680,7 @@ impl ParamKind {
     /// arrow's effects are both spliced into a row, so only a row can go there.
     pub fn row(&self) -> Option<(Shape, &IndexSet<String>)> {
         match self {
-            ParamKind::Type { .. } => None,
+            ParamKind::Region { .. } | ParamKind::Type { .. } => None,
             ParamKind::Fields { lacks } => Some((Shape::Struct, lacks)),
             ParamKind::Cases { lacks } => Some((Shape::Sum, lacks)),
             ParamKind::Effects { lacks } => Some((Shape::Effect, lacks)),
@@ -774,6 +795,10 @@ fn take_ty_children(ty: &mut Ty, types: &mut Vec<Rc<Ty>>, rows: &mut Vec<Rc<Row>
         }
         Ty::Package(body) => {
             types.push(std::mem::replace(body, Rc::new(Ty::Undecided)));
+        }
+        Ty::Mut(region, element) => {
+            types.push(std::mem::replace(region, Rc::new(Ty::Undecided)));
+            types.push(std::mem::replace(element, Rc::new(Ty::Undecided)));
         }
         Ty::Array(element) => {
             types.push(std::mem::replace(element, Rc::new(Ty::Undecided)));
@@ -931,6 +956,10 @@ pub(crate) fn same_finite_syntax_metered(
                         pending.push(Pair::Ty(left_from, right_from));
                     }
                     (Ty::Package(left), Ty::Package(right)) => pending.push(Pair::Ty(left, right)),
+                    (Ty::Mut(a, b), Ty::Mut(c, d)) => {
+                        pending.push(Pair::Ty(a, c));
+                        pending.push(Pair::Ty(b, d));
+                    }
                     (Ty::Array(left), Ty::Array(right)) => pending.push(Pair::Ty(left, right)),
                     (Ty::Struct(left), Ty::Struct(right)) | (Ty::Sum(left), Ty::Sum(right)) => {
                         pending.push(Pair::Row(left, right))
@@ -1269,6 +1298,10 @@ fn existential_outside_package(body: &Rc<Ty>, existentials: &IndexSet<u32>) -> b
             Work::Ty(ty, packaged) => match &*ty {
                 Ty::Package(inner) => work.push(Work::Ty(inner.clone(), true)),
                 Ty::Array(element) => work.push(Work::Ty(element.clone(), packaged)),
+                Ty::Mut(region, element) => {
+                    work.push(Work::Ty(element.clone(), packaged));
+                    work.push(Work::Ty(region.clone(), packaged));
+                }
                 Ty::Arrow(from, to, effects) => {
                     work.push(Work::Row(effects.clone(), packaged));
                     work.push(Work::Ty(to.clone(), packaged));
@@ -1322,6 +1355,10 @@ fn partition_package_formula(
                     work.push(Work::Ty(inner.clone(), Some(here)));
                 }
                 Ty::Array(element) => work.push(Work::Ty(element.clone(), owner)),
+                Ty::Mut(region, element) => {
+                    work.push(Work::Ty(element.clone(), owner));
+                    work.push(Work::Ty(region.clone(), owner));
+                }
                 Ty::Arrow(from, to, effects) => {
                     work.push(Work::Row(effects.clone(), owner));
                     work.push(Work::Ty(to.clone(), owner));

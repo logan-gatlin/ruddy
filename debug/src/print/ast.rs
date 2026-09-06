@@ -35,7 +35,7 @@ impl Grouped for Ast<'_, TypeKind> {
             // A row of effects binds as a sum does: it is written with the same
             // labels and the same tail, and needs the same brackets around it.
             TypeKind::Sum { .. } | TypeKind::Effects(_) => Prec::Sum,
-            TypeKind::Apply { .. } => Prec::Apply,
+            TypeKind::Apply { .. } | TypeKind::Mut(..) => Prec::Apply,
             TypeKind::Struct { .. }
             | TypeKind::Tuple(_)
             | TypeKind::Array(_)
@@ -65,6 +65,10 @@ impl Grouped for Ast<'_, ExprKind> {
             // a `raise` would be read as part of what it carries.
             ExprKind::Raise(_) => Prec::Lambda,
             ExprKind::Pipe { .. } => Prec::Pipeline,
+            ExprKind::Binary {
+                op: ruddy::parse::BinaryOp::Write,
+                ..
+            } => Prec::Assignment,
             ExprKind::Binary {
                 op: ruddy::parse::BinaryOp::Or,
                 ..
@@ -516,11 +520,14 @@ impl fmt::Display for Ast<'_, ExprKind> {
                 match op {
                     ruddy::parse::UnaryOp::Neg => "-",
                     ruddy::parse::UnaryOp::Not => "not ",
+                    ruddy::parse::UnaryOp::Allocate => "mut ",
+                    ruddy::parse::UnaryOp::Read => "~",
                 },
                 &Ast(&value.tracked),
             ),
             ExprKind::Binary { op, left, right } => {
                 let (symbol, prec) = match op {
+                    ruddy::parse::BinaryOp::Write => (":=", Prec::Assignment),
                     ruddy::parse::BinaryOp::Add => ("+", Prec::Addition),
                     ruddy::parse::BinaryOp::Sub => ("-", Prec::Addition),
                     ruddy::parse::BinaryOp::Mul => ("*", Prec::Multiplication),
@@ -834,6 +841,12 @@ impl fmt::Display for Ast<'_, TypeKind> {
             TypeKind::Tuple(elements) => {
                 write_tuple(f, elements.iter().map(|element| Ast(&element.tracked)))
             }
+            TypeKind::Mut(region, element) => write!(
+                f,
+                "mut {} ({})",
+                Ast(&region.tracked),
+                Ast(&element.tracked)
+            ),
             TypeKind::Array(element) => write!(f, "[{}]", Ast(&element.tracked)),
             TypeKind::Apply { head, args } => write_applied(
                 f,

@@ -2681,7 +2681,7 @@ fn a_solver_step_declares_what_it_added_to_the_state() {
             // it. The two had been written out separately, identically, which
             // is two places for one notation to drift from.
             assert_eq!(field(node, "_effect"), Some(bind.clone()), "{}", node.label);
-            bound.push(bind);
+            bound.push((field(node, "_def").unwrap(), bind));
         }
         if let Some(error) = field(node, "_error") {
             failed.push(error);

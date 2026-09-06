@@ -1,0 +1,51 @@
+================================================================================
+Mutation assignment is right associative
+================================================================================
+
+let update = a := b := ~c
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (assignment
+      (identifier)
+      (assignment
+        (identifier)
+        (unary_expression
+          (identifier))))))
+
+================================================================================
+Cell allocation and reading bind below application
+================================================================================
+
+let a = mut f x
+let b = ~record.cell
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (unary_expression
+      (application (identifier) (identifier))))
+  (let_definition
+    (identifier)
+    (unary_expression
+      (projection (identifier) (identifier)))))
+
+================================================================================
+Cell types have explicit region and element arguments
+================================================================================
+
+let a : mut 'r Nat = cell
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (annotation
+      (mut_type (type_variable) (identifier)))
+    (identifier)))

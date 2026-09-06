@@ -28,6 +28,7 @@ use crate::{
 
 fn sort_code(sort: VarSort) -> &'static str {
     match sort {
+        VarSort::Region => "region",
         VarSort::Type => "type",
         VarSort::Row => "row",
         VarSort::Presence => "presence",

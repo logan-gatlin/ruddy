@@ -29,19 +29,20 @@ const ATTRIBUTE = /@[\p{Alphabetic}_][\p{Alphabetic}\p{N}_]*/;
 const PREC = {
   // `f x y` groups to the left, and stops in front of anything that begins no
   // argument.
-  pipeline: 1,
-  booleanOr: 2,
-  booleanXor: 3,
-  booleanAnd: 4,
-  addition: 5,
-  multiplication: 6,
-  unary: 7,
-  application: 8,
+  assignment: 1,
+  pipeline: 2,
+  booleanOr: 3,
+  booleanXor: 4,
+  booleanAnd: 5,
+  addition: 6,
+  multiplication: 7,
+  unary: 8,
+  application: 9,
   // A tag takes its payload before an application takes another argument, so
   // `f #A 1` is `f` applied to `#A 1`.
-  tag: 6,
+  tag: 7,
   // `f p.x` reaches into the record before passing it along.
-  projection: 7,
+  projection: 8,
 };
 
 /**
@@ -95,6 +96,7 @@ module.exports = grammar({
       'or',
       'xor',
       'not',
+      'mut',
       'module',
       'true',
       'false',
@@ -413,9 +415,16 @@ module.exports = grammar({
       $.match_function,
       $.function,
       $.raise_expression,
+      $.assignment,
       $.pipeline,
       $._boolean_or,
     ),
+
+    assignment: $ => prec.right(PREC.assignment, seq(
+      field('target', choice($.pipeline, $._boolean_or)),
+      ':=',
+      field('value', $._expression),
+    )),
 
     pipeline: $ => prec.left(PREC.pipeline, seq(
       field('value', choice($.pipeline, $._boolean_or)),
@@ -464,7 +473,7 @@ module.exports = grammar({
     )),
 
     unary_expression: $ => prec(PREC.unary, seq(
-      choice('-', 'not'),
+      choice('-', 'not', 'mut', '~'),
       field('value', $.binary_expression),
     )),
 
@@ -929,6 +938,7 @@ module.exports = grammar({
       $.unit,
       $.struct_type,
       $.array_type,
+      $.mut_type,
       $.tuple_type,
       $.parenthesized_type,
     ),
@@ -981,6 +991,8 @@ module.exports = grammar({
     ),
 
     /** `[T]` — the type of immutable homogeneous arrays of `T`. */
+    mut_type: $ => seq('mut', field('region', $._type_atom), field('element', $._type_atom)),
+
     array_type: $ => seq('[', field('element', $._type), ']'),
 
     parenthesized_type: $ => seq('(', $._type, ')'),

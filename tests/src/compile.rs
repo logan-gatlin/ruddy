@@ -880,3 +880,181 @@ fn imported_callable_summaries_control_sync_export_eligibility_before_linking() 
     .expect_err("missing imported proof is potentially suspending");
     assert!(codes(&partial).contains(&"foreign-protocol"));
 }
+
+#[test]
+fn local_mutation_is_isolated_at_a_function_body() {
+    let program = accepted(
+        "let counter = fn _ => do let cell = mut 0n let alias = cell let _ = alias := 2n return ~cell end",
+    );
+    assert_eq!(scheme(&program, "counter"), "'a -> Nat");
+    let _ = program.artifact();
+}
+
+#[test]
+fn mutation_signatures_forward_region_kinds_through_aliases() {
+    let program = accepted(
+        "type cell 'r = mut 'r Nat
+        effect state 'r = !mut 'r
+        let make: Nat -> cell 'r + !state 'r = fn x => mut x
+        let read: cell 'r -> Nat + !state 'r = fn cell => ~cell",
+    );
+    assert!(scheme(&program, "make").contains("!mut"));
+    assert!(scheme(&program, "read").contains("!mut"));
+    let artifact = program.artifact().to_unchecked();
+    let consumer = accepted_with("let run = fn _ => dep::read (dep::make 3n)", &artifact);
+    assert_eq!(scheme(&consumer, "run"), "'a -> Nat");
+}
+
+#[test]
+fn mutation_rejects_wrong_region_kinds_and_incompatible_writes() {
+    for source in [
+        "type cell 'r = mut 'r Nat type bad = cell Nat",
+        "type bad 'r = (mut 'r Nat, 'r)",
+        "type bad = mut Nat Nat",
+        "let bad = fn _ => do let cell = mut (fn x => x) let alias = cell let _ = (~cell) 1n return (~alias) true end",
+        "let bad = fn _ => do let cell = mut [] let alias = cell let _ = cell := [1n] return alias := [true] end",
+        "let bad: mut 'r Nat -> Nat = fn cell => ~cell",
+        "let bad: (mut 'r Nat, mut 's Nat) -> Nat + !mut 'r = fn pair => pair.0 := ~pair.1",
+    ] {
+        let partial = rejected(source);
+        assert!(!partial.errors.is_empty(), "{source}");
+    }
+}
+
+#[test]
+fn mutation_isolation_respects_pure_annotations_and_other_effects() {
+    let program = accepted("effect Log = { write: Nat -> () }
+        let local: () -> Nat = fn _ => do let cell = mut 1n return cell := 2n end
+        let logged: () -> Nat + !Log = fn _ => do let cell = mut 1n let _ = !Log.write (~cell) return ~cell end
+        let factory = fn x => mut x
+        let uses = fn _ => do let a = factory 1n let b = factory true return (~a, ~b) end");
+    assert_eq!(scheme(&program, "local"), "() -> Nat");
+    assert_eq!(scheme(&program, "logged"), "() -> Nat + !Log");
+    assert_eq!(scheme(&program, "uses"), "'a -> (Nat, Boolean)");
+}
+
+#[test]
+fn mutation_value_restriction_preserves_pure_factories_and_shared_unknowns() {
+    let program = accepted(
+        "let factory = fn x => mut x
+      let run = fn _ => do
+        let number = factory 1n
+        let truth = factory true
+        let pure = (fn _ => fn x => x) ()
+        return (pure (~number), pure (~truth))
+      end",
+    );
+    assert_eq!(scheme(&program, "run"), "'a -> (Nat, Boolean)");
+    for source in [
+        "let bad = fn _ => do let box = { cell: mut (fn x => x) } let { cell: alias } = box let _ = (~box.cell) 1n return (~alias) true end",
+        "let bad = fn _ => do let cell = mut (fn x => x) let use = fn x => (~cell) x let _ = use 1n return use true end",
+        "effect Get 'a = { get: () -> ('a -> 'a) } let bad = fn _ => do let id = !Get.get () let alias = id let _ = id 1n return alias true end",
+        "let global = mut 0n",
+    ] {
+        assert!(!rejected(source).errors.is_empty(), "{source}");
+    }
+}
+
+#[test]
+fn mutation_regions_remain_visible_through_residual_effects_and_captures() {
+    let program = accepted(
+        "effect Export 'r = { send: mut 'r Nat -> () }
+      let export_cell = fn _ => do let cell = mut 0n return !Export.send cell end
+      let capture = fn cell => fn _ => ~cell
+      let copy = fn target => fn source => target := ~source
+      let local = fn _ => do let cell = mut 2n return ~cell end
+      let use = fn cell => cell := local ()",
+    );
+    assert!(scheme(&program, "export_cell").contains("!mut"));
+    assert!(scheme(&program, "export_cell").contains("!Export"));
+    assert!(scheme(&program, "capture").contains("!mut"));
+    assert!(scheme(&program, "copy").contains("!mut"));
+    assert!(scheme(&program, "use").contains("!mut"));
+}
+
+#[test]
+fn mutation_syntax_rejects_incomplete_forms_and_user_handlers() {
+    for source in [
+        "let x = mut",
+        "let x = ~",
+        "let x = fn cell => cell :=",
+        "type Cell = mut Nat",
+        "effect State = !mut",
+        "effect State 'r = !mut 'r Nat",
+        "let bad = fn _ => do let cell = mut 0n cell := 1n return ~cell end",
+        "effect mut 'r = Nat -> Nat",
+        "let bad = fn cell => handle ~cell with | !mut value => value end",
+    ] {
+        let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
+        if parsed.errors.is_empty() {
+            rejected(source);
+        }
+    }
+}
+
+#[test]
+fn mutation_identity_cannot_be_forged_by_an_imported_handler() {
+    let mut dependency = exported("effect Evil 'r = { fake: mut 'r Nat -> Nat }");
+    let builtin = dependency
+        .header
+        .effects
+        .iter()
+        .find(|effect| effect.name.ends_with("::mut"))
+        .unwrap()
+        .identity
+        .clone();
+    dependency
+        .header
+        .effects
+        .iter_mut()
+        .find(|effect| effect.name.ends_with("::Evil"))
+        .unwrap()
+        .identity = builtin;
+    assert!(dependency.clone().validate().is_err());
+    let parsed = parse::parse(token::lex(
+        "let bad: mut 'r Nat -> Nat = fn cell => handle ~cell with | dep::!Evil.fake _ => 0n end",
+        FileID::GENERATED,
+    ).tokens);
+    assert!(parsed.errors.is_empty());
+    assert!(
+        compile::compile_with_dependencies(
+            Mint::new(Bundle::new("app", Version::new(0, 1, 0)).unwrap()),
+            parsed.stmts,
+            &[compile::Dependency {
+                alias: Some("dep"),
+                artifact: compile::DependencyArtifact::Unchecked(&dependency)
+            }],
+            inference::Trace::Off,
+        )
+        .is_err(),
+        "recovery cannot expose a handler for builtin mutation"
+    );
+}
+
+#[test]
+fn mutation_region_kinds_forward_from_imported_effects() {
+    let dependency = exported("effect Access 'r = { read: mut 'r Nat -> Nat }");
+    let direct = accepted_with(
+        "let run: mut 'r Nat -> Nat + dep::!Access 'r = fn cell => dep::!Access.read cell",
+        &dependency,
+    );
+    direct.artifact().to_unchecked().validate().unwrap();
+    let program = accepted_with(
+        "effect Copy 'r = dep::!Access 'r
+        type Reader 'r = () -> Nat + dep::!Access 'r
+        let run: mut 'r Nat -> Nat + !Copy 'r = fn cell => dep::!Access.read cell",
+        &dependency,
+    );
+    let artifact = program.artifact();
+    for declaration in &artifact.header().types {
+        assert_eq!(declaration.params[0].sense, ruddy::artifact::Sense::Region);
+        assert!(declaration.params[0].relevant);
+    }
+    let copy = artifact
+        .header()
+        .effects
+        .iter()
+        .find(|effect| effect.name.ends_with("::Copy"))
+        .unwrap();
+    assert_eq!(copy.params[0].sense, ruddy::artifact::Sense::Region);
+}

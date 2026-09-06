@@ -159,6 +159,12 @@ pub enum Op {
     Const(Literal),
     Neg(Temp),
     Not(Temp),
+    Allocate(Temp),
+    Read(Temp),
+    Write {
+        left: Temp,
+        right: Temp,
+    },
     And {
         left: Temp,
         right: Temp,
@@ -882,11 +888,12 @@ fn possible(presence: &Presence) -> bool {
 /// performed is not known here, so its evidence has to travel in the bundle
 /// rather than in a parameter that may turn out to stand for nothing.
 fn tail_key(row: &Row) -> Option<RestKey> {
-    let wobbly = row.labels.values().any(|field| {
-        matches!(
-            field.presence,
-            Presence::Var(_) | Presence::Bound(_) | Presence::Undecided
-        )
+    let wobbly = row.labels.iter().any(|(name, field)| {
+        *name != crate::types::mutation_effect().row_key()
+            && matches!(
+                field.presence,
+                Presence::Var(_) | Presence::Bound(_) | Presence::Undecided
+            )
     });
     match &row.rest {
         Rest::Bound(index) => Some(RestKey::Bound(*index)),
@@ -908,7 +915,9 @@ fn shape(row: &Row) -> Shape {
         names: row
             .labels
             .iter()
-            .filter(|(_, field)| definite(&field.presence))
+            .filter(|(name, field)| {
+                **name != crate::types::mutation_effect().row_key() && definite(&field.presence)
+            })
             .map(|(name, _)| name.clone())
             .collect(),
         tail: tail_key(row).is_some(),
@@ -1932,6 +1941,7 @@ impl Lower<'_> {
             Ty::Boolean => Rep::Boolean,
             Ty::Arrow(..) => Rep::Fn,
             Ty::Array(_) => Rep::Array,
+            Ty::Mut(..) => Rep::Any,
             Ty::Sum(_) => Rep::Sum,
             Ty::Struct(row) => {
                 let row = flat(row);
@@ -2312,7 +2322,11 @@ impl Lower<'_> {
             let conditional: Vec<String> = declared
                 .labels
                 .iter()
-                .filter(|(_, field)| possible(&field.presence) && !definite(&field.presence))
+                .filter(|(name, field)| {
+                    **name != crate::types::mutation_effect().row_key()
+                        && possible(&field.presence)
+                        && !definite(&field.presence)
+                })
                 .map(|(name, _)| name.clone())
                 .collect();
             if conditional.is_empty() {
@@ -2900,6 +2914,8 @@ impl Lower<'_> {
                 let op = match op {
                     crate::ir::UnaryOp::Neg => Op::Neg(value),
                     crate::ir::UnaryOp::Not => Op::Not(value),
+                    crate::ir::UnaryOp::Allocate => Op::Allocate(value),
+                    crate::ir::UnaryOp::Read => Op::Read(value),
                 };
                 self.emit(body, self.span(span), rep, op)
             }
@@ -2907,6 +2923,7 @@ impl Lower<'_> {
                 let left = self.term(left, body);
                 let right = self.term(right, body);
                 let op = match op {
+                    crate::ir::BinaryOp::Write => Op::Write { left, right },
                     crate::ir::BinaryOp::Add => Op::Add { left, right },
                     crate::ir::BinaryOp::Sub => Op::Sub { left, right },
                     crate::ir::BinaryOp::Mul => Op::Mul { left, right },

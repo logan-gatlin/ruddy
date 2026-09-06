@@ -145,6 +145,12 @@ pub enum Op {
     Const(Literal),
     Neg(Temp),
     Not(Temp),
+    Allocate(Temp),
+    Read(Temp),
+    Write {
+        left: Temp,
+        right: Temp,
+    },
     And {
         left: Temp,
         right: Temp,
@@ -281,12 +287,18 @@ impl Op {
     pub fn uses(&self) -> Vec<Temp> {
         match self {
             Self::Const(_) | Self::Extern { .. } | Self::Global { .. } | Self::NewTag => vec![],
-            Self::Callback { value: v, .. } | Self::Neg(v) | Self::Not(v) | Self::Payload(v) => {
+            Self::Callback { value: v, .. }
+            | Self::Neg(v)
+            | Self::Not(v)
+            | Self::Allocate(v)
+            | Self::Read(v)
+            | Self::Payload(v) => {
                 vec![*v]
             }
             Self::And { left, right }
             | Self::Or { left, right }
             | Self::Xor { left, right }
+            | Self::Write { left, right }
             | Self::Add { left, right }
             | Self::Sub { left, right }
             | Self::Mul { left, right }

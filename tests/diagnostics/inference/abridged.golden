@@ -21,7 +21,7 @@ primary: Let’s call this shared value `Value` — the annotation fixes the typ
 related: this expression supplies its type here; this is another requirement on `Value`
 help: use the effect with one argument throughout this computation
 help: or handle one of the uses separately
-note: 3 intermediate uses are omitted from this short explanation
+note: 2 intermediate uses are omitted from this short explanation
 note: the arguments cannot agree: text and a natural number cannot be the same type
 
 ## recursive-type
@@ -151,6 +151,7 @@ primary: this enclosing function does not allow effect `!Log`
 related: this may perform effect `!Log`
 related: effect `!Log` is declared here
 help: add the effect to the function type, or handle it here
+note: 1 intermediate use is omitted from this short explanation
 
 ## callback-effects-not-covered
 [callback-effects-not-covered] a callback can perform effects not listed by the extern declaration

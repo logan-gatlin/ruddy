@@ -355,7 +355,49 @@ impl Constrain<'_> {
             TermKind::Real(_) => Rc::new(Ty::plain(Ty::Real)),
             TermKind::String(_) => Rc::new(Ty::plain(Ty::String)),
             TermKind::Boolean(_) => Rc::new(Ty::plain(Ty::Boolean)),
+            TermKind::Unary {
+                op: crate::ir::UnaryOp::Allocate,
+                value,
+            } => {
+                self.infer_term(value);
+                let region = self.table.fresh_region();
+                self.mutation(span, region.clone());
+                Rc::new(Ty::Mut(region, value.ty.clone()))
+            }
+            TermKind::Unary {
+                op: crate::ir::UnaryOp::Read,
+                value,
+            } => {
+                let region = self.table.fresh_region();
+                let element = self.table.fresh_type_for(Subject::Term);
+                self.check_term(
+                    value,
+                    &Rc::new(Ty::Mut(region.clone(), element.clone())),
+                    Subject::Context,
+                    None,
+                );
+                self.mutation(span, region);
+                element
+            }
+            TermKind::Binary {
+                op: crate::ir::BinaryOp::Write,
+                left,
+                right,
+            } => {
+                let region = self.table.fresh_region();
+                let element = self.table.fresh_type_for(Subject::Term);
+                self.check_term(
+                    left,
+                    &Rc::new(Ty::Mut(region.clone(), element.clone())),
+                    Subject::Context,
+                    None,
+                );
+                self.check_term(right, &element, Subject::Context, None);
+                self.mutation(span, region);
+                element
+            }
             TermKind::Unary { op, value } => match op {
+                crate::ir::UnaryOp::Allocate | crate::ir::UnaryOp::Read => unreachable!(),
                 crate::ir::UnaryOp::Neg => {
                     let real = Rc::new(Ty::plain(Ty::Real));
                     self.check_term(value, &real, Subject::Context, None);
@@ -369,6 +411,7 @@ impl Constrain<'_> {
             },
             TermKind::Binary { op, left, right } => {
                 let core = match op {
+                    crate::ir::BinaryOp::Write => unreachable!(),
                     crate::ir::BinaryOp::Add
                     | crate::ir::BinaryOp::Sub
                     | crate::ir::BinaryOp::Mul
@@ -461,7 +504,14 @@ impl Constrain<'_> {
                     }
                 };
                 let outer = std::mem::take(&mut self.out);
+                let initializer_effects =
+                    Row::of(self.table.fresh_row_for(Subject::AmbientEffects));
+                let enclosing = self.enter(Ambient {
+                    row: initializer_effects.clone(),
+                    ..self.ambient.clone()
+                });
                 self.check_term(value, &bound, expected_subject, expected_span);
+                self.leave(enclosing);
                 let required = std::mem::replace(&mut self.out, outer);
 
                 self.table.level -= 1;
@@ -500,6 +550,9 @@ impl Constrain<'_> {
                             .get(&name.anchored)
                             .cloned()
                             .unwrap_or_default(),
+                        initializer_effects,
+                        ambient: self.ambient.row.clone(),
+                        inside: self.ambient.inside,
                         value: required,
                         body: rest,
                     },
@@ -674,6 +727,8 @@ impl Constrain<'_> {
             // it, which is what makes "what this may do" a property of the
             // function rather than of wherever it was written.
             TermKind::Fn { arg, body } => {
+                self.table.level += 1;
+                let level = self.table.level;
                 let param = self.table.fresh_type_for(Subject::Parameter);
                 let does = Row::of(self.table.fresh_row_for(Subject::AmbientEffects));
                 self.env.insert(arg.anchored, Binding::Mono(param.clone()));
@@ -708,9 +763,24 @@ impl Constrain<'_> {
                     .unwrap_or_default();
                 self.term_effect_provenance.insert(
                     span,
-                    super::EffectProvenance::function(callable, arg.anchored, result),
+                    super::EffectProvenance::function(callable.clone(), arg.anchored, result),
                 );
-                Rc::new(Ty::plain(Ty::Arrow(param, body.ty.clone(), does)))
+                let external = Row::of(self.table.fresh_row_for(Subject::AmbientEffects));
+                self.emit(
+                    span,
+                    ConstraintOrigin::Binding,
+                    ConstraintSubjects::one(Subject::AmbientEffects),
+                    ConstraintKind::Isolate {
+                        effect_origins: callable,
+                        input: param.clone(),
+                        output: body.ty.clone(),
+                        internal: does,
+                        external: external.clone(),
+                        level,
+                    },
+                );
+                self.table.level -= 1;
+                Rc::new(Ty::Arrow(param, body.ty.clone(), external))
             }
             // An operation is an ordinary value of its declared signature, with
             // the effect's own label as the row of its outermost arrow, closed.
@@ -1559,20 +1629,22 @@ impl Constrain<'_> {
         // as it.
         let shape = self.table.unfolded(self.aliases, expected);
         match (&mut term.kind, &*shape) {
-            // The lambda's arrow *is* the annotation, so its effect row is the
-            // annotation's: the body is walked at what the reader wrote it may
-            // do, and a `fn` that mints its own row here would be checking
-            // against a promise nobody made.
+            // Inputs and results use the annotation immediately. Effects meet
+            // that same promise after fresh local state has been isolated;
+            // the final relation preserves all remaining row sharing.
             (TermKind::Fn { arg, body }, Ty::Arrow(from, to, does)) => {
                 let (from, to, does) = (from.clone(), to.clone(), does.clone());
-                self.env.insert(arg.anchored, Binding::Mono(from));
+                self.table.level += 1;
+                let level = self.table.level;
+                let internal = Row::of(self.table.fresh_row_for(Subject::AmbientEffects));
+                self.env.insert(arg.anchored, Binding::Mono(from.clone()));
                 self.binding_effect_provenance.insert(
                     arg.anchored,
                     super::EffectProvenance::parameter(arg.anchored),
                 );
                 self.callable_effect_scopes.push(Vec::new());
                 let outer = self.enter(Ambient {
-                    row: does,
+                    row: internal.clone(),
                     inside: true,
                     boundary_at: term.at,
                     label_spans: IndexMap::new(),
@@ -1592,8 +1664,22 @@ impl Constrain<'_> {
                     .unwrap_or_default();
                 self.term_effect_provenance.insert(
                     term.at,
-                    super::EffectProvenance::function(callable, arg.anchored, result),
+                    super::EffectProvenance::function(callable.clone(), arg.anchored, result),
                 );
+                self.emit(
+                    term.at,
+                    ConstraintOrigin::ApplicationEffects,
+                    ConstraintSubjects::one(Subject::AmbientEffects),
+                    ConstraintKind::Isolate {
+                        effect_origins: callable,
+                        input: from,
+                        output: to,
+                        internal,
+                        external: does,
+                        level,
+                    },
+                );
+                self.table.level -= 1;
                 term.ty = expected.clone();
             }
             // Only the exact closed shape a literal already has is pushed
@@ -1781,6 +1867,30 @@ impl Constrain<'_> {
 }
 
 impl Constrain<'_> {
+    /// Require access to the cell region at this expression.
+    fn mutation(&mut self, span: Anchor, region: Rc<Ty>) {
+        let performed = Row {
+            labels: [(
+                crate::types::mutation_effect().row_key(),
+                RowField::present(argument_tuple(&[Assigned::Ty(region)])),
+            )]
+            .into(),
+            rest: Rest::Closed,
+        };
+        self.emit(
+            span,
+            ConstraintOrigin::ApplicationEffects,
+            ConstraintSubjects::one(Subject::PerformedEffects),
+            ConstraintKind::Performs {
+                performed,
+                ambient: self.ambient.row.clone(),
+                effect_origins: Vec::new(),
+                ambient_label_spans: self.ambient.label_spans.clone(),
+                inside: self.ambient.inside,
+            },
+        );
+    }
+
     /// One fresh argument per parameter the effect declares, of the sort the
     /// parameter stands for: a type variable for a type, and for a row a fresh
     /// row wrapped as the type a row argument is written as — a struct for
@@ -1791,6 +1901,9 @@ impl Constrain<'_> {
         kinds
             .iter()
             .map(|kind| match kind.row() {
+                None if kind.sense() == crate::types::Sense::Region => {
+                    Assigned::Ty(self.table.fresh_region())
+                }
                 None => Assigned::Ty(self.table.fresh_type_for(Subject::Instance)),
                 Some((shape, lacks)) => {
                     let rest = self.table.fresh_row_for(Subject::Instance);

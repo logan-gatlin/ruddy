@@ -2649,3 +2649,25 @@ fn cps_artifacts_reject_synchronous_summaries_for_unknown_indirect_calls() {
         "an unknown higher-order call cannot certify itself synchronous"
     );
 }
+
+#[test]
+fn mutation_artifacts_validate_region_positions_and_preserve_round_trips() {
+    let original = built("type cell 'r = mut 'r Nat let make = fn x => mut x");
+    let text = original.print();
+    let round_trip = artifact::try_parse(&text).unwrap().validate().unwrap();
+    assert_eq!(round_trip.print(), text);
+    for bad_region in [Type::Nat, Type::Bound(99)] {
+        let mut corrupt = original.to_unchecked();
+        let Type::Mut(region, _) = &mut corrupt.header.types[0].scheme.body else {
+            panic!("cell alias")
+        };
+        **region = bad_region;
+        assert!(corrupt.validate().is_err());
+    }
+    let mut mixed = original.to_unchecked();
+    let Type::Mut(_, element) = &mut mixed.header.types[0].scheme.body else {
+        panic!("cell alias")
+    };
+    **element = Type::Bound(0);
+    assert!(mixed.validate().is_err());
+}

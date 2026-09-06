@@ -562,3 +562,179 @@ fn metadata_changes_neither_schemes_nor_generated_javascript() {
     );
     assert_eq!(plain.modules[0].name, annotated.modules[0].name);
 }
+
+#[test]
+fn mutation_factories_preserve_freshness_aliases_and_assignment_results() {
+    let artifact = compiled(
+        "let counter = fn _ => do let cell = mut 0 return fn _ => cell := ~cell + 1 end
+        let run = fn _ => do
+          let first = counter ()
+          let second = counter ()
+          let _ = first ()
+          let a = mut 0
+          let b = a
+          let stored = a := b := first ()
+          return { first: ~a, second: second (), stored: stored }
+        end",
+    );
+    let module = js::generate(&artifact).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("app.mjs");
+    fs::write(&path, module).unwrap();
+    let probe = format!(
+        "import * as app from {}; console.log(JSON.stringify(await app.run({{}})));",
+        serde_json::to_string(path.to_str().unwrap()).unwrap()
+    );
+    let output = Command::new("node")
+        .args(["--input-type=module", "--eval", &probe])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        "{\"first\":2,\"second\":1,\"stored\":2}"
+    );
+}
+
+#[test]
+fn mutation_operands_execute_once_in_target_then_value_order() {
+    let artifact = compiled(
+        "let run = fn _ => do
+        let order = mut 0
+        let a = mut 0
+        let b = mut 0
+        let target = fn pair => do let _ = order := ~order * 10 + pair.0 return pair.1 end
+        let value = fn _ => do let _ = order := ~order * 10 + 3 return 9 end
+        let result = target (1, a) := target (2, b) := value ()
+        return { order: ~order, a: ~a, b: ~b, result: result }
+      end",
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("app.mjs");
+    fs::write(&path, js::generate(&artifact).unwrap()).unwrap();
+    let probe = format!(
+        "import * as app from {}; console.log(JSON.stringify(await app.run({{}})));",
+        serde_json::to_string(path.to_str().unwrap()).unwrap()
+    );
+    let output = Command::new("node")
+        .args(["--input-type=module", "--eval", &probe])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        "{\"order\":123,\"a\":9,\"b\":9,\"result\":9}"
+    );
+}
+
+#[test]
+fn mutation_survives_foreign_aliases_callbacks_and_suspension() {
+    let artifact = compiled(
+        "extern alias: mut 'r Real -> mut 'r Real = \"host.alias\"
+        extern update: mut 'r Real -> () + !mut 'r = \"host.update\"
+        @async extern later: (() -> Real + !mut 'r) -> Real + !mut 'r = \"host.later\"
+        let run = fn _ => do
+          let cell = mut 1
+          let same = alias cell
+          let _ = update same
+          let result = later (fn _ => cell := ~cell + 1)
+          return { result: result, read: ~same }
+        end",
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("app.mjs");
+    fs::write(&path, js::generate(&artifact).unwrap()).unwrap();
+    let probe = format!(
+        "globalThis.host = {{ alias: c => c, update: c => {{ c.value = 4; return {{}}; }}, later: async cb => {{ await Promise.resolve(); return await cb({{}}); }} }}; const app = await import({}); console.log(JSON.stringify(await app.run({{}})));",
+        serde_json::to_string(path.to_str().unwrap()).unwrap()
+    );
+    let output = Command::new("node")
+        .args(["--input-type=module", "--eval", &probe])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        "{\"result\":5,\"read\":5}"
+    );
+}
+
+#[test]
+fn mutation_composes_with_effect_polymorphism_and_stack_safe_recursion() {
+    let artifact = compiled(
+        "let apply = fn f => fn x => f x
+        let loop = fn pair => match pair.1 with
+          | 0 => ~pair.0
+          | _ => do let _ = pair.0 := ~pair.0 + 1 return loop (pair.0, pair.1 - 1) end
+        end
+        let run = fn _ => do
+          let cell = mut 0
+          let _ = apply (fn _ => cell := 1) ()
+          return loop (cell, 20000)
+        end",
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("app.mjs");
+    fs::write(&path, js::generate(&artifact).unwrap()).unwrap();
+    let probe = format!(
+        "import * as app from {}; console.log(await app.run({{}}));",
+        serde_json::to_string(path.to_str().unwrap()).unwrap()
+    );
+    let output = Command::new("node")
+        .args(["--input-type=module", "--eval", &probe])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "20001");
+}
+
+#[test]
+fn mutation_keeps_arrays_persistent_and_conditional_effects_callable() {
+    let artifact = compiled(
+        "let invoke: (() -> Real + !mut 'r (when 'p)) -> Real + !mut 'r (when 'p) = fn f => f ()
+        let first = fn array => match array with | [x, ..] => x | [] => 0 end
+        let run = fn _ => do
+          let cell = mut [1, 2]
+          let original = ~cell
+          let _ = cell := [3, 4]
+          let changed = invoke (fn _ => first (~cell))
+          return { original: first original, changed: changed }
+        end",
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("app.mjs");
+    fs::write(&path, js::generate(&artifact).unwrap()).unwrap();
+    let probe = format!(
+        "import * as app from {}; console.log(JSON.stringify(await app.run({{}})));",
+        serde_json::to_string(path.to_str().unwrap()).unwrap()
+    );
+    let output = Command::new("node")
+        .args(["--input-type=module", "--eval", &probe])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        "{\"original\":1,\"changed\":3}"
+    );
+}

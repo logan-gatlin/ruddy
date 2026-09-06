@@ -350,6 +350,18 @@ impl<'a> Generator<'a> {
                 out.push_str(&v(*a));
                 out.push(')');
             }
+            Op::Allocate(a) => {
+                out.push_str("({ value: ");
+                out.push_str(&v(*a));
+                out.push_str(" })");
+            }
+            Op::Read(a) => {
+                out.push_str(&v(*a));
+                out.push_str(".value");
+            }
+            Op::Write { left, right } => {
+                binary(out, &format!("{}.value", v(*left)), "=", &v(*right));
+            }
             Op::Not(a) => {
                 out.push_str("(!");
                 out.push_str(&v(*a));

@@ -560,12 +560,15 @@ pub enum TermKind {
 
 #[derive(Debug, Clone, Copy)]
 pub enum UnaryOp {
+    Allocate,
+    Read,
     Neg,
     Not,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum BinaryOp {
+    Write,
     Add,
     Sub,
     Mul,
@@ -717,6 +720,7 @@ pub type Type = Anchored<TypeKind>;
 pub enum TypeKind {
     /// The type of an immutable homogeneous array.
     Array(Box<Type>),
+    Mut(Box<Type>, Box<Type>),
     Struct {
         fields: IndexMap<String, TypeField>,
         /// The `..` tail, when the struct type was written open. Inside a
@@ -1004,6 +1008,12 @@ fn presence_polarities(
                         work.push(Work::Ty(from, !positive, owner));
                     }
                     TypeKind::Array(element) => work.push(Work::Ty(element, positive, owner)),
+                    TypeKind::Mut(region, element) => {
+                        for polarity in [positive, !positive] {
+                            work.push(Work::Ty(region, polarity, owner));
+                            work.push(Work::Ty(element, polarity, owner));
+                        }
+                    }
                     TypeKind::Struct { fields, .. } => {
                         for field in fields.values().rev() {
                             if let TypeField::Written { when, value, .. } = field {
@@ -1101,6 +1111,12 @@ fn declaration_variances(
                         }
                     }
                     TypeKind::Array(element) => work.push((element, positive)),
+                    TypeKind::Mut(region, element) => {
+                        for polarity in [positive, !positive] {
+                            work.push((region, polarity));
+                            work.push((element, polarity));
+                        }
+                    }
                     TypeKind::Struct { fields, tail } => {
                         work.extend(fields.values().filter_map(|field| match field {
                             TypeField::Written { value, .. } => Some((value, positive)),
@@ -1186,6 +1202,12 @@ fn declaration_variances(
                             }
                             Ty::Package(body) => work.push(Semantic::Ty(body, positive)),
                             Ty::Array(element) => work.push(Semantic::Ty(element, positive)),
+                            Ty::Mut(region, element) => {
+                                work.push(Semantic::Ty(element, positive));
+                                work.push(Semantic::Ty(region, positive));
+                                work.push(Semantic::Ty(element, !positive));
+                                work.push(Semantic::Ty(region, !positive));
+                            }
                             Ty::Struct(row) | Ty::Sum(row) => {
                                 work.push(Semantic::Row(row, positive))
                             }
@@ -2001,6 +2023,8 @@ impl From<Scope> for Namespace {
 
 struct Builder<'a> {
     mint: &'a mut Mint,
+    builtin_mut: Option<(Symbol, Symbol)>,
+    parameter_kinds: HashMap<Symbol, Vec<ParamKind>>,
     /// The module being lowered into: `None` at the top level of the bundle,
     /// which is a real position in the tree rather than a missing one. Every
     /// symbol minted while it holds a module is minted under that module, and
@@ -2789,6 +2813,8 @@ fn build_with_dependency_imports_inner(
         terms: Names::default(),
         globals: HashMap::new(),
         source: SourceMap::default(),
+        builtin_mut: None,
+        parameter_kinds: HashMap::new(),
         current: Symbol::GENERATED,
         current_base: 0,
         bases: HashMap::new(),
@@ -3032,7 +3058,13 @@ fn build_with_dependency_imports_inner(
     // provisionally, and the whole fixpoint runs again below once they do.
     // Only the senses are kept from this pass; its complaints are the second
     // pass's to make.
-    let senses = kinds(&program.types, &program.effects, &program.external_types);
+    b.install_mutation(&mut program);
+    let senses = kinds(
+        &program.types,
+        &program.effects,
+        &program.external_types,
+        &b.imported_effect_params,
+    );
     for (symbol, decl) in program.effects.iter_mut() {
         if let Some(kinds) = senses.kinds.get(symbol) {
             for (param, kind) in decl.params.iter_mut().zip(kinds) {
@@ -3056,7 +3088,12 @@ fn build_with_dependency_imports_inner(
         mut kinds,
         mixed,
         errors: clashes,
-    } = kinds(&program.types, &program.effects, &program.external_types);
+    } = kinds(
+        &program.types,
+        &program.effects,
+        &program.external_types,
+        &b.imported_effect_params,
+    );
     b.errors.extend(clashes);
     for (symbol, kinds) in &kinds {
         let params = match program.types.get_mut(symbol) {
@@ -3108,6 +3145,8 @@ fn build_with_dependency_imports_inner(
             .iter()
             .map(|(symbol, declaration)| (*symbol, declaration.params.clone())),
     );
+    kinds.extend(b.imported_effect_params.clone());
+    b.parameter_kinds = kinds.clone();
     // Every definition's name is bound before any definition's body is read —
     // the hoist the `type` half above already gets, and for the same reason.
     // That is the whole of what makes a definition able to name itself and two
@@ -3328,6 +3367,7 @@ fn build_with_dependency_imports_inner(
             },
         );
     }
+    b.install_mutation(&mut program);
     // Terms were lowered after the type declarations above; give their rows
     // the identities already computed before inference sees them. Handler
     // coverage is finalized here too, now that nominal declarations can be
@@ -3393,7 +3433,8 @@ fn build_with_dependency_imports_inner(
     let relevant = relevance(&program.types);
     for (symbol, decl) in program.types.iter_mut() {
         for (index, param) in decl.params.iter_mut().enumerate() {
-            param.relevant = relevant.contains(&(*symbol, index as u32));
+            param.relevant =
+                param.kind.sense() == Sense::Region || relevant.contains(&(*symbol, index as u32));
         }
     }
     // Every complaint in the order the reader would meet it. The passes above
@@ -3608,6 +3649,10 @@ fn type_contains_array(
     while let Some(part) = work.pop() {
         match part {
             Work::Ir(ty) => match &ty.anchored {
+                TypeKind::Mut(region, element) => {
+                    work.push(Work::Ir(region));
+                    work.push(Work::Ir(element));
+                }
                 TypeKind::Array(_) => return true,
                 TypeKind::Arrow { from, to, .. } => {
                     work.push(Work::Ir(to));
@@ -3640,6 +3685,10 @@ fn type_contains_array(
                 | TypeKind::Error => {}
             },
             Work::Semantic(ty) => match &*ty {
+                Ty::Mut(region, element) => {
+                    work.push(Work::Semantic(region.clone()));
+                    work.push(Work::Semantic(element.clone()));
+                }
                 Ty::Array(_) => return true,
                 Ty::Arrow(from, to, effects) => {
                     work.push(Work::SemanticRow(Rc::new(effects.clone())));
@@ -3771,6 +3820,26 @@ fn imported_syntax(
         artifact::Type::Package(body) => {
             return imported_syntax(mint, body, params, symbols, names, effect_rows, depth + 1);
         }
+        artifact::Type::Mut(region, element) => TypeKind::Mut(
+            Box::new(imported_syntax(
+                mint,
+                region,
+                params,
+                symbols,
+                names,
+                effect_rows,
+                depth + 1,
+            )),
+            Box::new(imported_syntax(
+                mint,
+                element,
+                params,
+                symbols,
+                names,
+                effect_rows,
+                depth + 1,
+            )),
+        ),
         artifact::Type::Array(element) => TypeKind::Array(Box::new(imported_syntax(
             mint,
             element,
@@ -3997,6 +4066,7 @@ fn clamp_bounds(ty: Rc<Ty>, count: usize, presences: usize) -> Rc<Ty> {
         Arrow,
         Package,
         Array,
+        Mut,
         Struct,
         Sum,
         Named {
@@ -4041,6 +4111,11 @@ fn clamp_bounds(ty: Rc<Ty>, count: usize, presences: usize) -> Rc<Ty> {
                 Ty::Array(element) => {
                     work.push(Work::Array);
                     work.push(Work::Ty(element));
+                }
+                Ty::Mut(region, element) => {
+                    work.push(Work::Mut);
+                    work.push(Work::Ty(element));
+                    work.push(Work::Ty(region));
                 }
                 Ty::Struct(fields) => {
                     work.push(Work::Struct);
@@ -4105,6 +4180,11 @@ fn clamp_bounds(ty: Rc<Ty>, count: usize, presences: usize) -> Rc<Ty> {
             Work::Array => {
                 let element = types.pop().expect("array postorder stays balanced");
                 types.push(Rc::new(Ty::Array(element)));
+            }
+            Work::Mut => {
+                let element = types.pop().expect("cell element");
+                let region = types.pop().expect("cell region");
+                types.push(Rc::new(Ty::Mut(region, element)));
             }
             Work::Struct => {
                 let fields = rows.pop().expect("row postorder stays balanced");
@@ -4194,6 +4274,10 @@ fn drop_type_iterative(root: Rc<Ty>) {
                     }
                     Ty::Package(body) => work.push(Work::Ty(body.clone())),
                     Ty::Array(element) => work.push(Work::Ty(element.clone())),
+                    Ty::Mut(region, element) => {
+                        work.push(Work::Ty(element.clone()));
+                        work.push(Work::Ty(region.clone()));
+                    }
                     Ty::Struct(fields) | Ty::Sum(fields) => row(fields, &mut work),
                     Ty::Named { args, .. } => {
                         work.extend(args.iter().cloned().map(Work::Ty));
@@ -4350,6 +4434,7 @@ fn import_type(
         Arrow,
         Package,
         Array,
+        Mut,
         Struct,
         Sum,
         Named {
@@ -4388,6 +4473,11 @@ fn import_type(
                 artifact::Type::Array(element) => {
                     work.push(Work::Array);
                     work.push(Work::Ty(element, false));
+                }
+                artifact::Type::Mut(region, element) => {
+                    work.push(Work::Mut);
+                    work.push(Work::Ty(element, false));
+                    work.push(Work::Ty(region, false));
                 }
                 artifact::Type::Struct(fields) => {
                     work.push(Work::Struct);
@@ -4432,6 +4522,11 @@ fn import_type(
             Work::Array => {
                 let element = types.pop().expect("array postorder stays balanced");
                 types.push(Rc::new(Ty::Array(element)));
+            }
+            Work::Mut => {
+                let element = types.pop().expect("cell element");
+                let region = types.pop().expect("cell region");
+                types.push(Rc::new(Ty::Mut(region, element)));
             }
             Work::Struct => {
                 let fields = rows.pop().expect("row postorder stays balanced");
@@ -4623,6 +4718,9 @@ fn structuralize_effects(
         operation_effects
             .into_iter()
             .map(|(symbol, operations)| {
+                if mint.name(symbol) == "mut" {
+                    return (symbol, crate::types::mutation_effect());
+                }
                 let interface =
                     canonical.canonical_interface(&program.effects[&symbol].params, operations);
                 (
@@ -5045,6 +5143,14 @@ impl RegularType<'_> {
                     values.push(self.with_fields(core, fields));
                 }
                 Work::Type(ty, args) => match &ty.anchored {
+                    TypeKind::Mut(region, element) => {
+                        work.push(Work::Make(
+                            "mut".into(),
+                            vec!["region".into(), "element".into()],
+                        ));
+                        work.push(Work::Type(element, args.clone()));
+                        work.push(Work::Type(region, args));
+                    }
                     TypeKind::Array(element) => {
                         work.push(Work::Make("array".into(), vec!["element".into()]));
                         work.push(Work::Type(element, args));
@@ -5328,6 +5434,14 @@ impl RegularType<'_> {
                     Ty::Var(_) | Ty::Rigid { .. } | Ty::Undecided => values.push(self.atom("?")),
                     Ty::Package(body) => {
                         work.push(Work::Type(body, args, supplied_as_effects, instantiation));
+                    }
+                    Ty::Mut(region, element) => {
+                        work.push(Work::Make(
+                            "mut".into(),
+                            vec!["region".into(), "element".into()],
+                        ));
+                        work.push(Work::Type(element, args.clone(), false, instantiation));
+                        work.push(Work::Type(region, args, false, instantiation));
                     }
                     Ty::Array(element) => {
                         work.push(Work::Make("array".into(), vec!["element".into()]));
@@ -5851,6 +5965,10 @@ fn type_effect_dependencies<'a>(
     while let Some(ty) = pending.pop() {
         match &ty.anchored {
             TypeKind::Array(element) => pending.push(element),
+            TypeKind::Mut(region, element) => {
+                pending.push(region);
+                pending.push(element);
+            }
             TypeKind::Struct { fields, .. } => {
                 pending.extend(fields.values().rev().filter_map(|field| match field {
                     TypeField::Written { value, .. } => Some(value),
@@ -6244,6 +6362,10 @@ fn rekey_type(ty: &mut Type, ids: &IndexMap<Symbol, EffectId>, errors: &mut Vec<
             }
         }
         TypeKind::Array(element) => rekey_type(element, ids, errors),
+        TypeKind::Mut(region, element) => {
+            rekey_type(region, ids, errors);
+            rekey_type(element, ids, errors);
+        }
         TypeKind::Effects(effects) => rekey_row(effects, ids, errors),
         TypeKind::Ident(_)
         | TypeKind::Param { .. }
@@ -6593,6 +6715,7 @@ impl<'a> Follow<'a> {
                         });
                     }
                     TypeKind::Struct { .. }
+                    | TypeKind::Mut(..)
                     | TypeKind::Array(_)
                     | TypeKind::Sum { .. }
                     | TypeKind::Arrow { .. }
@@ -6667,6 +6790,7 @@ impl<'a> Follow<'a> {
                     | Ty::String
                     | Ty::Boolean
                     | Ty::Arrow(..)
+                    | Ty::Mut(..)
                     | Ty::Array(_)
                     | Ty::Sum(_)
                     | Ty::Var(_)
@@ -7759,6 +7883,7 @@ fn kinds(
     types: &IndexMap<Symbol, Decl<Type>>,
     effects: &IndexMap<Symbol, Decl<Effect>>,
     external: &IndexMap<Symbol, ExternalType>,
+    external_effects: &HashMap<Symbol, Vec<ParamKind>>,
 ) -> Kinds {
     // What each body says of its own parameters, which slots each one hands
     // itself on to, and which ones sit in the tail of a row handed on. All
@@ -7769,8 +7894,10 @@ fn kinds(
     // one must inherit its reading and lacks just as it does from a local slot.
     let mut said: HashMap<Slot, Reading> = external
         .iter()
-        .flat_map(|(symbol, declaration)| {
-            declaration.params.iter().enumerate().map(|(index, kind)| {
+        .map(|(symbol, declaration)| (symbol, &declaration.params))
+        .chain(external_effects.iter())
+        .flat_map(|(symbol, params)| {
+            params.iter().enumerate().map(|(index, kind)| {
                 (
                     (*symbol, index as u32),
                     Reading {
@@ -7806,7 +7933,15 @@ fn kinds(
         .collect();
     let mut handed: IndexMap<Slot, Vec<Slot>> = IndexMap::new();
     let mut tails: IndexMap<Slot, Vec<Slot>> = IndexMap::new();
-    for (symbol, _, bodies) in &declarations {
+    for (symbol, params, bodies) in &declarations {
+        for (index, param) in params.iter().enumerate() {
+            if param.kind.sense() == Sense::Region {
+                said.entry((*symbol, index as u32))
+                    .or_default()
+                    .senses
+                    .insert(Sense::Region);
+            }
+        }
         for body in bodies {
             constrain(body, &summaries, &mut |fact| match fact {
                 Fact::Says(index, kind) => {
@@ -7893,6 +8028,8 @@ fn kinds(
                 ParamKind::Cases { lacks }
             } else if read_as.contains(&Sense::Effects) {
                 ParamKind::Effects { lacks }
+            } else if read_as.contains(&Sense::Region) {
+                ParamKind::Region { lacks }
             } else {
                 ParamKind::Type { lacks }
             });
@@ -8035,6 +8172,17 @@ fn constrain(
             },
         )),
         TypeKind::Array(element) => constrain(element, summaries, out),
+        TypeKind::Mut(region, element) => {
+            if let TypeKind::Param { index, .. } = &region.anchored {
+                out(Fact::Says(
+                    *index,
+                    ParamKind::Region {
+                        lacks: IndexSet::new(),
+                    },
+                ));
+            }
+            constrain(element, summaries, out);
+        }
         TypeKind::Struct { fields, tail } => {
             for field in fields.values() {
                 if let Some(value) = field.value() {
@@ -8157,6 +8305,10 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
                 }
             }
             TypeKind::Array(element) => walk(element, kinds, carries, rows, out),
+            TypeKind::Mut(region, element) => {
+                walk(region, kinds, carries, rows, out);
+                walk(element, kinds, carries, rows, out);
+            }
             TypeKind::Struct { fields, .. } => {
                 for field in fields.values_mut() {
                     if let TypeField::Written { value, .. } = field {
@@ -8214,6 +8366,15 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
                 })));
             }
             let refused = match kind {
+                Some(kind) if kind.sense() == Sense::Region => match &arg.anchored {
+                    TypeKind::Param { symbol, .. } if rows.get(symbol) == Some(&Sense::Region) => {
+                        None
+                    }
+                    TypeKind::Var(_) | TypeKind::Error => None,
+                    _ => Some(ErrorKind::NotARow {
+                        sense: Sense::Region,
+                    }),
+                },
                 // A sum's rest and an arrow's effects are both
                 // spliced into a row, so only a row can go there —
                 // and only one naming none of the labels the
@@ -8275,7 +8436,7 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
         let rows: HashMap<Symbol, Sense> = decl
             .params
             .iter()
-            .filter(|param| param.kind.row().is_some())
+            .filter(|param| param.kind.row().is_some() || param.kind.sense() == Sense::Region)
             .map(|param| (param.symbol, param.kind.sense()))
             .collect();
         walk(&mut decl.value, kinds, &carries, &rows, &mut out);
@@ -8310,7 +8471,7 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
         let rows: HashMap<Symbol, Sense> = decl
             .params
             .iter()
-            .filter(|param| param.kind.row().is_some())
+            .filter(|param| param.kind.row().is_some() || param.kind.sense() == Sense::Region)
             .map(|param| (param.symbol, param.kind.sense()))
             .collect();
         match &mut decl.value {
@@ -8441,7 +8602,8 @@ fn row_shaped(
                             .is_some_and(|argument| outer(argument, rows, shape, summaries))
                     })
             }
-            TypeKind::Array(_)
+            TypeKind::Mut(..)
+            | TypeKind::Array(_)
             | TypeKind::Arrow { .. }
             | TypeKind::Prim(_)
             | TypeKind::Var(_)
@@ -8632,6 +8794,7 @@ fn row_summaries(
                     | Ty::String
                     | Ty::Boolean
                     | Ty::Arrow(..)
+                    | Ty::Mut(..)
                     | Ty::Array(_)
                     | Ty::Struct(_)
                     | Ty::Sum(_)
@@ -8670,6 +8833,7 @@ fn row_summaries(
                         work.push(Work::Named(*head));
                     }
                     TypeKind::Struct { .. }
+                    | TypeKind::Mut(..)
                     | TypeKind::Array(_)
                     | TypeKind::Sum { .. }
                     | TypeKind::Arrow { .. }
@@ -8831,6 +8995,7 @@ fn row_summary(ty: &Type, decls: &HashMap<Symbol, RowSummary>, shape: Shape) -> 
             out
         }
         TypeKind::Struct { .. }
+        | TypeKind::Mut(..)
         | TypeKind::Array(_)
         | TypeKind::Sum { .. }
         | TypeKind::Arrow { .. }
@@ -8964,6 +9129,10 @@ fn relevance(types: &IndexMap<Symbol, Decl<Type>>) -> HashSet<Slot> {
         match &ty.anchored {
             TypeKind::Param { index, .. } => out(*index, under),
             TypeKind::Array(element) => occurrences(element, under, out),
+            TypeKind::Mut(region, element) => {
+                occurrences(region, under, out);
+                occurrences(element, under, out);
+            }
             TypeKind::Struct { fields, tail } => {
                 for field in fields.values() {
                     if let Some(value) = field.value() {
@@ -9072,6 +9241,10 @@ fn mentioned(ty: &Type, out: &mut Vec<Symbol>) {
     match &ty.anchored {
         TypeKind::Ident(symbol) => out.push(*symbol),
         TypeKind::Array(element) => mentioned(element, out),
+        TypeKind::Mut(region, element) => {
+            mentioned(region, out);
+            mentioned(element, out);
+        }
         TypeKind::Apply { head, args, .. } => {
             out.push(*head);
             for arg in args {
@@ -9136,6 +9309,10 @@ fn grows(ty: &Type, group: &[Symbol], report: &mut impl FnMut(Anchor)) {
         // second complaint about one mistake.
         TypeKind::Ident(_) => {}
         TypeKind::Array(element) => grows(element, group, report),
+        TypeKind::Mut(region, element) => {
+            grows(region, group, report);
+            grows(element, group, report);
+        }
         TypeKind::Apply {
             head,
             head_at: head_span,
@@ -9192,6 +9369,9 @@ fn mentions_a_parameter(ty: &Type) -> bool {
     match &ty.anchored {
         TypeKind::Param { .. } => true,
         TypeKind::Array(element) => mentions_a_parameter(element),
+        TypeKind::Mut(region, element) => {
+            mentions_a_parameter(region) || mentions_a_parameter(element)
+        }
         TypeKind::Apply { args, .. } => args.iter().any(mentions_a_parameter),
         TypeKind::Arrow { from, to, effects } => {
             tails_a_parameter(&effects.tail)
@@ -9747,11 +9927,13 @@ impl Builder<'_> {
                                 .iter()
                                 .map(|label| effect_rows.label(label))
                                 .collect(),
-                            artifact::Sense::Type
+                            artifact::Sense::Region
+                            | artifact::Sense::Type
                             | artifact::Sense::Fields
                             | artifact::Sense::Cases => param.lacks.iter().cloned().collect(),
                         };
                         match param.sense {
+                            artifact::Sense::Region => ParamKind::Region { lacks },
                             artifact::Sense::Type => ParamKind::Type { lacks },
                             artifact::Sense::Fields => ParamKind::Fields { lacks },
                             artifact::Sense::Cases => ParamKind::Cases { lacks },
@@ -9811,6 +9993,7 @@ impl Builder<'_> {
                             })
                             .collect();
                         match param.sense {
+                            artifact::Sense::Region => ParamKind::Region { lacks },
                             artifact::Sense::Type => ParamKind::Type { lacks },
                             artifact::Sense::Fields => ParamKind::Fields { lacks },
                             artifact::Sense::Cases => ParamKind::Cases { lacks },
@@ -10167,10 +10350,57 @@ impl Builder<'_> {
         }
     }
 
+    /// Intern the builtin independently of the standard library.
+    fn mutation_symbol(&mut self) -> Symbol {
+        if let Some((symbol, _)) = self.builtin_mut {
+            return symbol;
+        }
+        let symbol = self
+            .mint
+            .global(None, Namespace::Effects, "mut")
+            .unwrap_or_else(|symbol| symbol);
+        let param = self.mint.local(None, Namespace::Types, "r");
+        self.arities.insert(symbol, 1);
+        self.operations.insert(symbol, IndexSet::new());
+        self.expanded
+            .insert(symbol, [("mut".into(), symbol)].into());
+        self.builtin_mut = Some((symbol, param));
+        symbol
+    }
+
+    fn install_mutation(&self, program: &mut Program) {
+        let Some((symbol, param)) = self.builtin_mut else {
+            return;
+        };
+        let kind = ParamKind::Region {
+            lacks: IndexSet::new(),
+        };
+        program.effects.entry(symbol).or_insert_with(|| Decl {
+            name_at: Anchor::GENERATED,
+            annotation: None,
+            params: vec![Param {
+                at: Anchor::GENERATED,
+                symbol: param,
+                kind: kind.clone(),
+                relevant: true,
+            }],
+            metadata: Metadata::new(),
+            value: Effect::Operations(IndexMap::new()),
+        });
+        program
+            .effect_ids
+            .insert(symbol, crate::types::mutation_effect());
+        program.effect_params.insert(symbol, vec![kind]);
+    }
+
     /// [`find`](Self::find) with the complaint attached: a name the path's
     /// module does not declare is reported at the name, in the namespace the
     /// position it was written at demands.
     fn resolve(&mut self, path: &parse::Path, namespace: Namespace) -> Option<Symbol> {
+        if namespace == Namespace::Effects && path.modules.is_empty() && path.name.tracked == "mut"
+        {
+            return Some(self.mutation_symbol());
+        }
         match self.find(path, namespace) {
             Ok(symbol) => Some(symbol),
             Err(Missing::Segment) => None,
@@ -10357,7 +10587,8 @@ impl Builder<'_> {
             }
             let args = args
                 .into_iter()
-                .map(|arg| self.argument(arg, Place::Declaration))
+                .enumerate()
+                .map(|(index, arg)| self.effect_argument(symbol, index, arg, Place::Declaration))
                 .collect();
             cases.push(AliasCase {
                 name_at: self.anchor(at),
@@ -10756,6 +10987,10 @@ impl Builder<'_> {
             TypeKind::Effects(effects) => {
                 TypeKind::Effects(Box::new(self.substituted_row(effects, args)))
             }
+            TypeKind::Mut(region, element) => TypeKind::Mut(
+                Box::new(self.substituted(region, args)),
+                Box::new(self.substituted(element, args)),
+            ),
             TypeKind::Array(element) => TypeKind::Array(Box::new(self.substituted(element, args))),
             TypeKind::Apply {
                 head,
@@ -11316,9 +11551,29 @@ impl Builder<'_> {
         place: Place,
     ) -> Type {
         let found = args.len();
+        let resolved = match &head.tracked {
+            parse::TypeKind::Ident { name } => Some(self.find(name, Namespace::Types)),
+            _ => None,
+        };
+        let parameter_kinds = resolved
+            .as_ref()
+            .and_then(|found| found.as_ref().ok())
+            .and_then(|symbol| self.parameter_kinds.get(symbol))
+            .cloned()
+            .unwrap_or_default();
         let args: Vec<Type> = args
             .into_iter()
-            .map(|arg| self.argument(arg, place))
+            .enumerate()
+            .map(|(index, arg)| {
+                if parameter_kinds
+                    .get(index)
+                    .is_some_and(|kind| kind.sense() == Sense::Region)
+                {
+                    self.region(arg, place)
+                } else {
+                    self.argument(arg, place)
+                }
+            })
             .collect();
         let head_span = head.span;
         let name = match head.tracked {
@@ -11348,7 +11603,7 @@ impl Builder<'_> {
                 return self.anchored(span.track(TypeKind::Error));
             }
         };
-        let symbol = match self.find(&name, Namespace::Types) {
+        let symbol = match resolved.expect("an applied identifier was resolved") {
             Ok(symbol) => symbol,
             // A segment named no module; the complaint is already at it.
             Err(Missing::Segment) => return self.anchored(span.track(TypeKind::Error)),
@@ -11434,12 +11689,24 @@ impl Builder<'_> {
                 op: match op {
                     parse::UnaryOp::Neg => UnaryOp::Neg,
                     parse::UnaryOp::Not => UnaryOp::Not,
+                    parse::UnaryOp::Allocate => {
+                        self.mutation_symbol();
+                        UnaryOp::Allocate
+                    }
+                    parse::UnaryOp::Read => {
+                        self.mutation_symbol();
+                        UnaryOp::Read
+                    }
                 },
                 value: Box::new(self.term(*value)),
             }
             .at(self.anchor(span)),
             ExprKind::Binary { op, left, right } => TermKind::Binary {
                 op: match op {
+                    parse::BinaryOp::Write => {
+                        self.mutation_symbol();
+                        BinaryOp::Write
+                    }
                     parse::BinaryOp::Add => BinaryOp::Add,
                     parse::BinaryOp::Sub => BinaryOp::Sub,
                     parse::BinaryOp::Mul => BinaryOp::Mul,
@@ -11797,20 +12064,52 @@ impl Builder<'_> {
         (at.track(symbol), body)
     }
 
-    /// Lower a surface type into an IR type, mirroring [`term`](Self::term).
-    ///
-    /// The scope this resolves against is pushed by the caller rather than
-    /// here, because a declaration's parameters are bound for the whole of its
-    /// body and this is called once per node in it. So every name reaching
-    /// here is a parameter of the declaration being lowered, a top-level
-    /// declaration, or a primitive — looked for in that order, since a
-    /// parameter is meant to hide a declaration of the same name.
-    ///
-    /// A tail's name may or may not be a binder, and which it is decides what
-    /// the tail means: naming a row parameter it is that parameter, and
-    /// anything else is scoped to its annotation and resolved by inference, so
-    /// it passes through here as the string it was written as. See
-    /// [`row`](Self::row).
+    /// Lower a written region identity, rejecting ordinary type expressions.
+    fn region(&mut self, ty: parse::Type, place: Place) -> Type {
+        let span = ty.span;
+        let at = self.anchor(span);
+        if let parse::TypeKind::Variable { name } = ty.tracked {
+            if let Some(&(symbol, index)) = self.params.get(&name.tracked) {
+                return at.anchor(TypeKind::Param { symbol, index });
+            }
+            if let Some(kind) = wherever(place, &name.tracked) {
+                self.error(span, kind);
+            } else if self.variable(&name, Sense::Region) {
+                return at.anchor(TypeKind::Var(name.tracked));
+            }
+        } else {
+            self.error(
+                span,
+                ErrorKind::NotARow {
+                    sense: Sense::Region,
+                },
+            );
+        }
+        at.anchor(TypeKind::Error)
+    }
+
+    fn effect_argument(
+        &mut self,
+        symbol: Symbol,
+        index: usize,
+        arg: parse::Type,
+        place: Place,
+    ) -> Type {
+        let builtin = self.builtin_mut.is_some_and(|(built, _)| built == symbol);
+        let region = builtin
+            || self
+                .parameter_kinds
+                .get(&symbol)
+                .or_else(|| self.imported_effect_params.get(&symbol))
+                .and_then(|kinds| kinds.get(index))
+                .is_some_and(|kind| kind.sense() == Sense::Region);
+        if region {
+            self.region(arg, place)
+        } else {
+            self.argument(arg, place)
+        }
+    }
+
     /// [`ty`](Self::ty) at the one position a row of effects may be written
     /// without an arrow to carry it: an argument.
     ///
@@ -11831,6 +12130,20 @@ impl Builder<'_> {
         }
     }
 
+    /// Lower a surface type into an IR type, mirroring [`term`](Self::term).
+    ///
+    /// The scope this resolves against is pushed by the caller rather than
+    /// here, because a declaration's parameters are bound for the whole of its
+    /// body and this is called once per node in it. So every name reaching
+    /// here is a parameter of the declaration being lowered, a top-level
+    /// declaration, or a primitive — looked for in that order, since a
+    /// parameter is meant to hide a declaration of the same name.
+    ///
+    /// A tail's name may or may not be a binder, and which it is decides what
+    /// the tail means: naming a row parameter it is that parameter, and
+    /// anything else is scoped to its annotation and resolved by inference, so
+    /// it passes through here as the string it was written as. See
+    /// [`row`](Self::row).
     fn ty(&mut self, ty: parse::Type, place: Place) -> Type {
         let span = ty.span;
         let here = self.anchor(span);
@@ -11939,6 +12252,12 @@ impl Builder<'_> {
                 }
             },
             parse::TypeKind::Apply { head, args } => self.apply(span, *head, args, place),
+            parse::TypeKind::Mut(region, element) => {
+                self.mutation_symbol();
+                let region = self.region(*region, place);
+                let element = self.ty(*element, place);
+                here.anchor(TypeKind::Mut(Box::new(region), Box::new(element)))
+            }
             parse::TypeKind::Array(element) => {
                 let element = self.ty(*element, place);
                 here.anchor(TypeKind::Array(Box::new(element)))
@@ -12170,7 +12489,8 @@ impl Builder<'_> {
             }
             let args: Vec<Type> = written_args
                 .into_iter()
-                .map(|arg| self.argument(arg, place))
+                .enumerate()
+                .map(|(index, arg)| self.effect_argument(symbol, index, arg, place))
                 .collect();
             let at = self.anchor(at);
             let expansion = self.expand_alias(symbol, &args, at);

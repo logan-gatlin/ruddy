@@ -218,6 +218,9 @@ struct Scoping<'a> {
     promised: &'a Formula,
     rigids: &'a [u32],
     effect_provenance: &'a super::EffectProvenance,
+    initializer_effects: &'a Row,
+    ambient: &'a Row,
+    inside: bool,
     value: &'a [Constraint],
     body: &'a [Constraint],
 }
@@ -388,6 +391,45 @@ impl Solve<'_> {
                         at: source.1,
                     });
             match &constraint.kind {
+                ConstraintKind::Isolate {
+                    input,
+                    output,
+                    internal,
+                    external,
+                    level,
+                    ..
+                } => {
+                    let mut remaining = self.table.canon(internal);
+                    let key = crate::types::mutation_effect().row_key();
+                    if let Some(field) = remaining.labels.get(&key)
+                        && let Ty::Struct(arguments) = &*field.ty
+                        && let Some(region) = arguments.labels.get("0")
+                        && let Ty::Var(var) = &*self.table.resolve(&region.ty)
+                    {
+                        let var = *var;
+                        let mut escaping = Vec::new();
+                        self.table.mentions_ty(input, &mut escaping);
+                        self.table.mentions_ty(output, &mut escaping);
+                        let mut residual = remaining.clone();
+                        residual.labels.shift_remove(&key);
+                        self.table.mentions_row(&residual, &mut escaping);
+                        if self.table.levels[var as usize] >= *level && !escaping.contains(&var) {
+                            remaining.labels.shift_remove(&key);
+                            let id = u32::MAX - var;
+                            self.table.rigids.insert(id, span);
+                            self.table.region_rigids.insert(id);
+                            self.unify(
+                                span,
+                                &Rc::new(Ty::Var(var)),
+                                &Rc::new(Ty::Rigid {
+                                    id,
+                                    name: "local region".into(),
+                                }),
+                            );
+                        }
+                    }
+                    self.relate_effects(span, &remaining, external, true, false);
+                }
                 ConstraintKind::Project {
                     base,
                     field,
@@ -408,6 +450,9 @@ impl Solve<'_> {
                     promised,
                     rigids,
                     effect_provenance,
+                    initializer_effects,
+                    ambient,
+                    inside,
                     value,
                     body,
                 } => self.bind_local(
@@ -419,6 +464,9 @@ impl Solve<'_> {
                         promised,
                         rigids,
                         effect_provenance,
+                        initializer_effects,
+                        ambient,
+                        inside: *inside,
                         value,
                         body,
                     },
@@ -601,6 +649,7 @@ impl Solve<'_> {
             | Ty::String
             | Ty::Boolean
             | Ty::Arrow(..)
+            | Ty::Mut(..)
             | Ty::Sum(_) => {
                 self.not_a_struct(base_span, exposed, super::StructDemand::Projection, result)
             }
@@ -672,6 +721,7 @@ impl Solve<'_> {
             | Ty::Boolean
             | Ty::Arrow(..)
             | Ty::Array(_)
+            | Ty::Mut(..)
             | Ty::Sum(_) => {
                 self.not_a_struct(operand_span, exposed, super::StructDemand::Spread, result)
             }
@@ -878,6 +928,7 @@ impl Solve<'_> {
             Arrow(*const Ty, Rc<Ty>),
             Package(*const Ty, Rc<Ty>),
             Array(*const Ty, Rc<Ty>),
+            Mut(*const Ty, Rc<Ty>),
             Struct(*const Ty, Rc<Ty>),
             Sum(*const Ty, Rc<Ty>),
             Named(*const Ty, Rc<Ty>, Symbol, usize),
@@ -965,6 +1016,12 @@ impl Solve<'_> {
                                     work.push(FingerprintWork::Type(body.clone()));
                                     continue;
                                 }
+                                Ty::Mut(region, element) => {
+                                    work.push(FingerprintWork::Mut(key, ty.clone()));
+                                    work.push(FingerprintWork::Type(element.clone()));
+                                    work.push(FingerprintWork::Type(region.clone()));
+                                    continue;
+                                }
                                 Ty::Array(element) => {
                                     work.push(FingerprintWork::Array(key, ty.clone()));
                                     work.push(FingerprintWork::Type(element.clone()));
@@ -1007,6 +1064,13 @@ impl Solve<'_> {
                         FingerprintWork::Package(key, ty) => {
                             let body = values.pop().expect("family package fingerprint body");
                             let hash = tagged(12, [body]);
+                            self.types.insert(key, (ty, hash));
+                            values.push(hash);
+                        }
+                        FingerprintWork::Mut(key, ty) => {
+                            let b = values.pop().expect("cell element hash");
+                            let a = values.pop().expect("cell region hash");
+                            let hash = tagged(15, [a, b]);
                             self.types.insert(key, (ty, hash));
                             values.push(hash);
                         }
@@ -1478,38 +1542,75 @@ impl Solve<'_> {
     /// effect nothing will handle is something the reader fixes by widening a
     /// signature or writing a handler. Both readings are R11's.
     fn performs(&mut self, span: Anchor, performed: &Row, ambient: &Row, inside: bool) {
+        self.relate_effects(span, performed, ambient, inside, true);
+    }
+
+    /// Isolation preserves row sharing exactly; an application can widen a
+    /// closed callee row to the effects available at its call site.
+    fn relate_effects(
+        &mut self,
+        span: Anchor,
+        performed: &Row,
+        ambient: &Row,
+        inside: bool,
+        widen: bool,
+    ) {
         let want = self.table.canon(performed);
         let have = self.table.canon(ambient);
         let goal = Goal::Row {
             expected: Rc::new(want.clone()),
             actual: Rc::new(have.clone()),
         };
-        let refused = want.labels.iter().find(|(name, field)| {
-            if !matches!(self.table.presence_of(&field.presence), Presence::Present) {
-                return false;
+        let refused: Vec<_> = want
+            .labels
+            .iter()
+            .filter(|(name, field)| {
+                if !matches!(self.table.presence_of(&field.presence), Presence::Present) {
+                    return false;
+                }
+                match have.labels.get(*name) {
+                    // Named and settled absent: the ambient says outright that
+                    // this effect is not performed here.
+                    Some(there) => {
+                        matches!(self.table.presence_of(&there.presence), Presence::Absent)
+                    }
+                    // Not named at all, and no room past the ones that are.
+                    None => matches!(have.rest, Rest::Closed | Rest::Bound(_)),
+                }
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        if !refused.is_empty() {
+            // An isolation boundary can collect several source operations.
+            // Report each refused effect before abandoning their shared row.
+            let parents = self.table.take_binding_reads();
+            for (index, effect) in refused.iter().enumerate() {
+                // Each diagnostic retains the normalization reads, including
+                // the internal row which an isolation boundary flattened.
+                for parent in &parents {
+                    self.table.note_binding_read(*parent);
+                }
+                let kind = match inside {
+                    true => ErrorKind::NotAllowed {
+                        effect: effect.clone(),
+                    },
+                    false => ErrorKind::Unhandled {
+                        effect: effect.clone(),
+                    },
+                };
+                let abandoned = [Assigned::Row(Rc::new(want.clone()))];
+                self.fail(
+                    span,
+                    Rule::Performs,
+                    goal.clone(),
+                    Error::new(span, kind),
+                    if index + 1 == refused.len() {
+                        &abandoned
+                    } else {
+                        &[]
+                    },
+                );
             }
-            match have.labels.get(*name) {
-                // Named and settled absent: the ambient says outright that
-                // this effect is not performed here.
-                Some(there) => matches!(self.table.presence_of(&there.presence), Presence::Absent),
-                // Not named at all, and no room past the ones that are.
-                None => matches!(have.rest, Rest::Closed | Rest::Bound(_)),
-            }
-        });
-        if let Some((effect, _)) = refused {
-            let effect = effect.clone();
-            let kind = match inside {
-                true => ErrorKind::NotAllowed { effect },
-                false => ErrorKind::Unhandled { effect },
-            };
-            let abandoned = [Assigned::Row(Rc::new(want.clone()))];
-            self.fail(
-                span,
-                Rule::Performs,
-                goal,
-                Error::new(span, kind),
-                &abandoned,
-            );
             return;
         }
         // A closed row is opened with a fresh tail, which is what makes the row
@@ -1517,7 +1618,7 @@ impl Solve<'_> {
         // past the callee's own labels lands there. A row still ending in a
         // variable is already open and unifies as it stands.
         let opened = match want.rest {
-            Rest::Closed | Rest::Bound(_) => Row {
+            Rest::Closed | Rest::Bound(_) if widen => Row {
                 labels: want.labels.clone(),
                 rest: self.table.fresh_row(),
             },
@@ -1642,6 +1743,9 @@ impl Solve<'_> {
             promised,
             rigids,
             effect_provenance,
+            initializer_effects,
+            ambient,
+            inside,
             value,
             body,
         } = scoping;
@@ -1651,7 +1755,26 @@ impl Solve<'_> {
         // R23's closing rule, said about a nested binding on the same terms: a
         // `let` in the middle of a body is generalized exactly as one at the
         // top of a file is.
-        self.table.close_effects(bound, level);
+        let initializer = Rc::new(Ty::Arrow(
+            Rc::new(Ty::unit()),
+            bound.clone(),
+            initializer_effects.clone(),
+        ));
+        self.table.close_effects(&initializer, level);
+        let immediate = self.table.canon(initializer_effects);
+        let pure = matches!(immediate.rest, Rest::Closed)
+            && immediate
+                .labels
+                .values()
+                .all(|field| matches!(self.table.presence_of(&field.presence), Presence::Absent));
+        if !pure {
+            let mut shared = Vec::new();
+            self.table.mentions_ty(bound, &mut shared);
+            for var in shared {
+                self.table.levels[var as usize] = self.table.levels[var as usize].min(level - 1);
+            }
+        }
+        self.performs(binding_span, &immediate, ambient, inside);
         // A nested binding's scheme carries what the store requires of the
         // presences it quantifies, exactly as a definition's does — a `let` in
         // the middle of a body is generalized on the same terms as one at the
@@ -1925,6 +2048,15 @@ impl Solve<'_> {
                             work.push(SolveWork::Labels(left, right, depth + 1));
                             work.push(SolveWork::Ty(to.clone(), result.clone(), depth + 1));
                             work.push(SolveWork::Ty(from.clone(), other.clone(), depth + 1));
+                        }
+                        (Ty::Mut(region, element), Ty::Mut(other_region, other)) => {
+                            self.step(span, Rule::Mut, goal, Effect::Decomposed);
+                            work.push(SolveWork::Ty(element.clone(), other.clone(), depth + 1));
+                            work.push(SolveWork::Ty(
+                                region.clone(),
+                                other_region.clone(),
+                                depth + 1,
+                            ));
                         }
                         (Ty::Array(element), Ty::Array(other)) => {
                             self.step(span, Rule::Array, goal, Effect::Decomposed);
@@ -2222,6 +2354,10 @@ impl Solve<'_> {
                         }
                         Ty::Package(body) => work.push(Work::Ty(body.clone())),
                         Ty::Array(element) => work.push(Work::Ty(element.clone())),
+                        Ty::Mut(region, element) => {
+                            work.push(Work::Ty(region.clone()));
+                            work.push(Work::Ty(element.clone()));
+                        }
                         Ty::Struct(row) | Ty::Sum(row) => {
                             work.push(Work::Row(row.clone()));
                         }
@@ -3474,6 +3610,10 @@ impl Solve<'_> {
                     }
                     Ty::Package(body) => work.push(Work::Type(body.clone())),
                     Ty::Array(element) => work.push(Work::Type(element.clone())),
+                    Ty::Mut(region, element) => {
+                        work.push(Work::Type(region.clone()));
+                        work.push(Work::Type(element.clone()));
+                    }
                     Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(Rc::new(row.clone()))),
                     Ty::Named { args, .. } => {
                         work.extend(args.iter().rev().cloned().map(Work::Type));

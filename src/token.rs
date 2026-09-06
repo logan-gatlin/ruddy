@@ -45,6 +45,9 @@ pub enum Kind {
     Or,
     Xor,
     Not,
+    Mut,
+    Tilde,
+    Assign,
     /// `module`, opening a module declaration — inline with an `=` and a body,
     /// or bare for a module whose body is another file.
     Module,
@@ -267,11 +270,18 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
             // `::` separates a path's segments; a lone `:` ascribes. The longer
             // lexeme wins, so `A::x` is a path rather than an ascription of an
             // ascription — the rule `..` and `=>` already keep.
+            '~' => {
+                chars.next();
+                tokens.push(file_id.span(start, 1).track(Kind::Tilde));
+            }
             ':' => {
                 chars.next();
                 if let Some(&(_, ':')) = chars.peek() {
                     chars.next();
                     tokens.push(file_id.span(start, 2).track(Kind::ColonColon));
+                } else if let Some(&(_, '=')) = chars.peek() {
+                    chars.next();
+                    tokens.push(file_id.span(start, 2).track(Kind::Assign));
                 } else {
                     tokens.push(file_id.span(start, 1).track(Kind::Colon));
                 }
@@ -481,6 +491,7 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                     "or" => Kind::Or,
                     "xor" => Kind::Xor,
                     "not" => Kind::Not,
+                    "mut" => Kind::Mut,
                     "module" => Kind::Module,
                     "true" => Kind::Boolean(true),
                     "false" => Kind::Boolean(false),
