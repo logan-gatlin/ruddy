@@ -5071,6 +5071,82 @@ fn the_bundle_phase_words_and_codes_its_refusals() {
     assert_eq!(diagnostic.notes.len(), 1);
 }
 
+/// The four ways an `@if` guard can be malformed, each worded at the part
+/// that is wrong and reminded of the guard's shape, since a reader who wrote
+/// one wrong may not have seen a right one.
+#[test]
+fn the_bundle_phase_words_and_codes_a_malformed_guard() {
+    let span = Span::generated(3, 2);
+    for (kind, code, title, label) in [
+        (
+            BundleError::ConditionMissing,
+            "condition-missing",
+            "`@if` needs a condition",
+            "nothing here says when the definition is compiled",
+        ),
+        (
+            BundleError::ConditionNotStruct,
+            "condition-not-struct",
+            "an `@if` condition is a struct",
+            "this value is not a struct",
+        ),
+        (
+            BundleError::ConditionUnknownField {
+                name: "taget".to_string(),
+                known: vec!["target".to_string(), "platform".to_string()],
+            },
+            "condition-unknown-field",
+            "this condition is not known",
+            "`taget` is not a fact of the build",
+        ),
+        (
+            BundleError::ConditionNotString {
+                name: "platform".to_string(),
+            },
+            "condition-not-string",
+            "a condition's value is a string",
+            "this value is not a string",
+        ),
+    ] {
+        let error = ruddy::bundle::Error { span, kind };
+        assert_eq!(error.kind.to_string(), title);
+        let diagnostic = error.diagnostic();
+        assert_eq!(diagnostic.code, code);
+        assert_eq!(diagnostic.title, title);
+        assert_eq!(diagnostic.primary.span, span);
+        assert_eq!(diagnostic.primary.message, label);
+        assert_eq!(diagnostic.help.len(), 1, "{code}");
+        assert_eq!(diagnostic.notes.len(), 1, "{code}");
+        assert!(
+            diagnostic.notes[0].contains("`@if {target: \"js\", platform: \"web\"}`"),
+            "{code}"
+        );
+    }
+    // The unknown-field help names every fact there is, so the fix is on the
+    // page; the not-a-string help names the field that was written.
+    let unknown = ruddy::bundle::Error {
+        span,
+        kind: BundleError::ConditionUnknownField {
+            name: "taget".to_string(),
+            known: vec!["target".to_string(), "platform".to_string()],
+        },
+    };
+    assert_eq!(
+        unknown.diagnostic().help,
+        ["the facts are `target`, `platform`"]
+    );
+    let not_string = ruddy::bundle::Error {
+        span,
+        kind: BundleError::ConditionNotString {
+            name: "platform".to_string(),
+        },
+    };
+    assert_eq!(
+        not_string.diagnostic().help,
+        ["write `platform` as a string, in quotes"]
+    );
+}
+
 /// The tokens the module grammar added print as the lexemes they were written
 /// with, so a printed stream re-lexes to the tokens it came from.
 #[test]

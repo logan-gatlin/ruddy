@@ -869,6 +869,63 @@ impl Target {
             Kind::Executable => Self::Js,
         }
     }
+
+    /// The target as `Ruddy.toml` spells it, which is also what an `@if`
+    /// guard in source names.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Artifact => "artifact",
+            Self::Js => "js",
+        }
+    }
+}
+
+/// Where a build's output is loaded and run. Distinct from [`Target`], which
+/// is what the compiler emits: the same JavaScript runs under Node or in a
+/// browser, and what differs is the host — which externs exist, which effects
+/// the runtime handles. The platform decides what `@if` guards see and which
+/// cache entry a dependency gets. A library builds for either; an executable
+/// is refused for the web until the backend has a web entry adapter, since
+/// today's adapter and epilogue are Node's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Platform {
+    /// Node.js, the platform every build has had until now.
+    #[default]
+    Node,
+    /// A browser.
+    Web,
+}
+
+impl Platform {
+    /// The platform as `Ruddy.toml` spells it, which is also what an `@if`
+    /// guard in source names.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Node => "node",
+            Self::Web => "web",
+        }
+    }
+}
+
+/// What a build is: the target it emits and the platform it runs on. Every
+/// project in a graph is compiled for the root's build, so a dependency's
+/// guards see the build its consumer is making.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Build {
+    pub target: Target,
+    pub platform: Platform,
+}
+
+impl Build {
+    /// The facts source may ask about this build, in the order a complaint
+    /// lists them.
+    pub fn environment(self) -> bundle::Environment {
+        bundle::Environment::new([
+            ("target", self.target.name()),
+            ("platform", self.platform.name()),
+        ])
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -895,6 +952,8 @@ struct Manifest {
     #[serde(default)]
     target: Option<Target>,
     #[serde(default)]
+    platform: Option<Platform>,
+    #[serde(default)]
     run: RunConfig,
     dependencies: ManifestDependencies,
 }
@@ -903,6 +962,18 @@ impl Manifest {
     fn target(&self) -> Target {
         self.target
             .unwrap_or_else(|| Target::default_for(self.kind))
+    }
+
+    fn platform(&self) -> Platform {
+        self.platform.unwrap_or_default()
+    }
+
+    /// The build this manifest asks for, when it is the root.
+    fn build(&self) -> Build {
+        Build {
+            target: self.target(),
+            platform: self.platform(),
+        }
     }
 }
 
@@ -1271,9 +1342,11 @@ pub fn compile(directory: impl AsRef<Path>) -> Result<Artifact, CompileError> {
 pub fn compile_graph(directory: impl AsRef<Path>) -> Result<CompiledGraph, CompileError> {
     let root = canonical_project(directory.as_ref())?;
     let resolver = git::Resolver::new(&root)?;
+    let build = load_manifest(&root, None)?.build();
     let mut compiler = GraphCompiler {
         root: Some(root.clone()),
         resolver: Some(resolver),
+        build: Some(build),
         // Beside the Git checkouts, under Ruddy home: one standard library
         // compiled once serves every project.
         cache: ruddy_home()
@@ -1338,6 +1411,7 @@ pub fn compile_sandboxed_dependency_specs<I, A>(
     dependencies: I,
     project: impl AsRef<Path>,
     sandbox: impl AsRef<Path>,
+    build: Build,
 ) -> Result<(CompiledGraph, Vec<Dependency>, Vec<PathBuf>), CompileError>
 where
     I: IntoIterator<Item = (A, DependencySpec)>,
@@ -1349,10 +1423,12 @@ where
             .map(|(alias, specification)| (alias.into(), specification, false)),
         project.as_ref(),
         sandbox.as_ref(),
+        build,
     )
 }
 
-/// Resolve a debugger project's implicit standard library and declarations.
+/// Resolve a debugger project's implicit standard library and declarations,
+/// compiling every one of them for `build`, the project's own.
 ///
 /// Custom local roots remain inside `sandbox`. The only extra trusted tree is
 /// the exact canonical `$RUDDY_HOME/std` root when `std` is defaulted; a custom
@@ -1362,6 +1438,7 @@ pub fn compile_sandboxed_project_dependencies<I, A>(
     dependencies: I,
     project: impl AsRef<Path>,
     sandbox: impl AsRef<Path>,
+    build: Build,
 ) -> Result<(CompiledGraph, Vec<Dependency>, Vec<PathBuf>), CompileError>
 where
     I: IntoIterator<Item = (A, DependencySpec)>,
@@ -1391,13 +1468,19 @@ where
         }
         specifications.push((alias, specification, false));
     }
-    compile_sandboxed_dependency_specs_inner(specifications, project.as_ref(), sandbox.as_ref())
+    compile_sandboxed_dependency_specs_inner(
+        specifications,
+        project.as_ref(),
+        sandbox.as_ref(),
+        build,
+    )
 }
 
 fn compile_sandboxed_dependency_specs_inner<I>(
     dependencies: I,
     project: &Path,
     sandbox: &Path,
+    build: Build,
 ) -> Result<(CompiledGraph, Vec<Dependency>, Vec<PathBuf>), CompileError>
 where
     I: IntoIterator<Item = (String, DependencySpec, bool)>,
@@ -1419,6 +1502,7 @@ where
         )),
         sandbox: Some(sandbox),
         resolver: Some(resolver),
+        build: Some(build),
         ..GraphCompiler::default()
     };
     let mut direct = Vec::new();
@@ -1610,6 +1694,11 @@ struct GraphCompiler {
     /// The cache key of each project in `projects` that has one: every
     /// dependency, since a root is what the run is for and never cached.
     keys: HashMap<usize, u64>,
+    /// The root's build, which every project in the graph is compiled for: a
+    /// dependency's `@if` guards are judged against it, not against the
+    /// dependency's own manifest. `None` when the graph has no single root,
+    /// in which case each root's own manifest decides.
+    build: Option<Build>,
 }
 
 impl Default for GraphCompiler {
@@ -1627,6 +1716,7 @@ impl Default for GraphCompiler {
             projects: Vec::new(),
             cache: None,
             keys: HashMap::new(),
+            build: None,
         }
     }
 }
@@ -1855,15 +1945,18 @@ impl GraphCompiler {
             .collect();
         let target = manifest.target();
         let run = manifest.run.clone();
+        // What this project is compiled for: the root's build when there is
+        // one root, and its own otherwise.
+        let build = self.build.unwrap_or_else(|| manifest.build());
         // A dependency is compiled only when the cache has no artifact for
-        // this compiler, these sources and these dependencies. The root is
-        // what the run is for, and always compiled.
+        // this compiler, these sources, these dependencies and this build.
+        // The root is what the run is for, and always compiled.
         let key = match &self.cache {
             Some(_) if edge.is_some() => dependency_indices
                 .iter()
                 .map(|index| self.keys.get(index).copied())
                 .collect::<Option<Vec<u64>>>()
-                .map(|children| cache::key(&directory, &children)),
+                .map(|children| cache::key(&directory, &children, build)),
             _ => None,
         };
         let cached = key.and_then(|key| self.cache.as_ref()?.load(key, &manifest.name));
@@ -1877,6 +1970,7 @@ impl GraphCompiler {
                     dependency_artifacts,
                     linked_artifacts,
                     boundary.as_deref(),
+                    build,
                 )?;
                 if let (Some(key), Some(cache)) = (key, &mut self.cache) {
                     cache.store(key, &artifact);
@@ -1986,6 +2080,8 @@ fn dependency_error(
     error.map_diagnostics(|diagnostic| diagnostic.with_note(context.clone()))
 }
 
+/// Compile one project for `build`, the root's, against the artifacts of its
+/// dependencies.
 fn compile_one(
     directory: &Path,
     manifest: Manifest,
@@ -1993,6 +2089,7 @@ fn compile_one(
     dependencies: Vec<(String, Artifact)>,
     linked: Vec<Artifact>,
     sandbox: Option<&Path>,
+    build: Build,
 ) -> Result<Artifact, CompileError> {
     if sandbox.is_some() && manifest.root.is_absolute() {
         return Err(CompileError::report(
@@ -2047,7 +2144,7 @@ fn compile_one(
     }
 
     let mut files = FileManager::new();
-    let loaded = bundle::load(&mut files, &disk, name);
+    let loaded = bundle::load(&mut files, &disk, name, &build.environment());
 
     // Parser recovery is useful for finding more syntax complaints, but its
     // placeholder statements are not an input to semantic phases. Apart from
@@ -2341,6 +2438,21 @@ fn load_manifest(directory: &Path, sandbox: Option<&Path>) -> Result<Manifest, C
         .with_note(toml_error_note(&source, &error))
         .with_help("fix the named field in `Ruddy.toml` and try again")
     })?;
+    // The JavaScript backend's entry adapter and epilogue are Node's: they
+    // write to `process.stdout` and call `process.exit`. Until there is a web
+    // adapter, an executable for the web would be a Node program with the
+    // wrong label, so it is refused here, where every build begins.
+    if manifest.kind == Kind::Executable && manifest.platform() == Platform::Web {
+        return Err(CompileError::report(
+            "platform-unsupported",
+            format!(
+                "`{}` asks for an executable on the `web` platform, which is not supported yet",
+                path.display()
+            ),
+        )
+        .with_note("executables run under Node's entry adapter; a web library builds as any other")
+        .with_help("set `platform = \"node\"`, or make the project a library"));
+    }
     Ok(manifest)
 }
 

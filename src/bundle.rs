@@ -12,6 +12,11 @@
 //! with the [`FileManager`] on the way, so every span in the program names the
 //! file it was written in.
 //!
+//! A definition guarded by `@if` is judged here too, against the
+//! [`Environment`] the driver supplies: one whose conditions do not hold is
+//! dropped before anything under it is read and before lowering mints a name,
+//! so two definitions of one name guarded for two builds never meet.
+//!
 //! Files are reached through the [`Files`] trait rather than through
 //! [`std::fs`], so the debugger compiles what is in its editor and a test
 //! compiles what is in its own map — and neither has to invent a directory to
@@ -19,8 +24,10 @@
 
 use std::{path::PathBuf, time::Instant};
 
+use indexmap::IndexMap;
+
 use crate::{
-    parse::{self, Stmt, StmtKind},
+    parse::{self, Attribute, DataKind, Stmt, StmtKind},
     token::{self, Token},
     tracking::{FileID, FileManager, Span},
 };
@@ -31,6 +38,9 @@ const EXTENSION: &str = "hc";
 /// The file a module's directory holds its own body in, when its body is not
 /// beside the directory instead.
 const DIRECTORY_FILE: &str = "module";
+
+/// The metadata key that guards a definition: `@if {target: "js"}`.
+const CONDITION_KEY: &str = "if";
 
 /// Where a bundle's files come from.
 ///
@@ -100,6 +110,58 @@ pub enum ErrorKind {
     /// A file module whose file is at *both* paths. Which one was meant is not
     /// the loader's to guess.
     ModuleFileAmbiguous { beside: String, inside: String },
+    /// `@if` with nothing to judge: no value, unit, or an empty struct. A guard
+    /// that guards nothing is far more likely a forgotten condition than a
+    /// deliberate truth.
+    ConditionMissing,
+    /// `@if` whose value is not a struct, such as `@if "js"`.
+    ConditionNotStruct,
+    /// A condition naming no fact of the build. Refused rather than ignored,
+    /// so that a fact added later cannot change what a guard written today
+    /// means, and so that a misspelling cannot drop a definition. The facts
+    /// there are ride along, because naming them is the whole of the fix.
+    ConditionUnknownField { name: String, known: Vec<String> },
+    /// A condition whose value is not a string, which every fact is.
+    ConditionNotString { name: String },
+}
+
+/// What a build is for, as far as source can ask: the facts a definition's
+/// `@if` is judged against, each a name and a string. Supplied by the driver
+/// from project configuration, as bundle identity is.
+///
+/// A guard names facts and the values it needs them to have; a fact it does
+/// not name may be anything. The facts are those of the root project being
+/// built — its `target` and `platform` — not of the bundle being loaded, so a
+/// library sees the build its consumer is making. A value no build ever has
+/// matches nothing, which lets a guard be written for a backend or platform
+/// before it exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Environment {
+    facts: IndexMap<String, String>,
+}
+
+impl Environment {
+    /// The facts, in the order a complaint lists them.
+    pub fn new<'a>(facts: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
+        Self {
+            facts: facts
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+        }
+    }
+
+    /// The value of the fact called `name`, if the build has one by that name.
+    pub fn fact(&self, name: &str) -> Option<&str> {
+        self.facts.get(name).map(String::as_str)
+    }
+
+    /// Every fact, in order: what a cache key digests.
+    pub fn facts(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.facts
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+    }
 }
 
 /// The whole load, in progress.
@@ -110,6 +172,7 @@ struct Loader<'a> {
     /// paths are relative to this point even when the caller names the root as
     /// `src/main.hc` rather than rooting its [`Files`] there first.
     directory: String,
+    environment: &'a Environment,
     out: Output,
 }
 
@@ -161,10 +224,16 @@ impl Files for Disk {
 /// parent's — so no file can be reached twice from below and no cycle is
 /// possible. There is nothing here that checks for one, and nothing that needs
 /// to be.
-pub fn load(files: &mut FileManager, fs: &dyn Files, root: &str) -> Output {
+pub fn load(
+    files: &mut FileManager,
+    fs: &dyn Files,
+    root: &str,
+    environment: &Environment,
+) -> Output {
     let mut loader = Loader {
         files,
         fs,
+        environment,
         directory: root
             .rsplit_once('/')
             .map_or_else(String::new, |(directory, _)| format!("{directory}/")),
@@ -212,15 +281,21 @@ impl Loader<'_> {
         parsed.stmts
     }
 
-    /// Fill in the body of every file module in `stmts`, and walk into every
-    /// module's body once it has one.
+    /// Drop every definition in `stmts` whose guard does not hold, fill in the
+    /// body of every file module left, and walk into every module's body once
+    /// it has one.
+    ///
+    /// Guards are judged before the walk, so a file module that is guarded
+    /// out is never looked for, and nothing under an excluded inline module
+    /// is judged at all.
     ///
     /// `at` is the logical module path of the statements being walked, which is
     /// also the file path a module under them is looked for at: an inline
     /// module contributes a directory component exactly as a file module does,
     /// so `module B` inside `module A = ... end` is looked for at `A/B.hc` and
     /// never at `B.hc`.
-    fn splice(&mut self, stmts: &mut [Stmt], at: &mut Vec<String>) {
+    fn splice(&mut self, stmts: &mut Vec<Stmt>, at: &mut Vec<String>) {
+        stmts.retain(|stmt| self.holds(stmt));
         for stmt in stmts {
             let StmtKind::Module { name, body } = &mut stmt.kind else {
                 continue;
@@ -282,6 +357,82 @@ impl Loader<'_> {
                 Vec::new()
             }
         }
+    }
+
+    /// Whether `stmt` is to be compiled: it carries no `@if`, or the
+    /// conditions of its one `@if` all hold.
+    ///
+    /// A second `@if` is the repeated key lowering refuses; the definition is
+    /// kept so that lowering sees it and says so, rather than the guard being
+    /// judged by one of two spellings and the definition dropped in silence.
+    fn holds(&mut self, stmt: &Stmt) -> bool {
+        let mut guards = stmt
+            .attributes
+            .iter()
+            .filter(|attribute| attribute.key.tracked == CONDITION_KEY);
+        match (guards.next(), guards.next()) {
+            (Some(guard), None) => self.guard_holds(guard),
+            _ => true,
+        }
+    }
+
+    /// Judge one `@if`. A malformed guard is reported and holds, so that the
+    /// one complaint is not followed by an unresolved name for everything that
+    /// used the definition it guards. A guard with a repeated field holds for
+    /// the same reason, and is not reported here: lowering refuses the repeat
+    /// on the definition kept, as it does in every metadata struct.
+    fn guard_holds(&mut self, guard: &Attribute) -> bool {
+        let Some(value) = &guard.value else {
+            self.error(guard.span, ErrorKind::ConditionMissing);
+            return true;
+        };
+        let fields = match &value.tracked {
+            DataKind::Struct(fields) if !fields.is_empty() => fields,
+            DataKind::Struct(_) | DataKind::Unit => {
+                self.error(value.span, ErrorKind::ConditionMissing);
+                return true;
+            }
+            _ => {
+                self.error(value.span, ErrorKind::ConditionNotStruct);
+                return true;
+            }
+        };
+        if fields.keys().enumerate().any(|(at, label)| {
+            fields
+                .keys()
+                .take(at)
+                .any(|seen| seen.tracked == label.tracked)
+        }) {
+            return true;
+        }
+        let mut holds = true;
+        for (label, field) in fields {
+            let Some(actual) = self.environment.fact(&label.tracked) else {
+                let known = self
+                    .environment
+                    .facts()
+                    .map(|(name, _)| name.to_string())
+                    .collect();
+                self.error(
+                    label.span,
+                    ErrorKind::ConditionUnknownField {
+                        name: label.tracked.clone(),
+                        known,
+                    },
+                );
+                continue;
+            };
+            match &field.tracked {
+                DataKind::String(wanted) => holds &= wanted == actual,
+                _ => self.error(
+                    field.span,
+                    ErrorKind::ConditionNotString {
+                        name: label.tracked.clone(),
+                    },
+                ),
+            }
+        }
+        holds
     }
 
     fn error(&mut self, span: Span, kind: ErrorKind) {

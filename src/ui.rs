@@ -95,6 +95,10 @@ pub const FIRST_DECLARATION: &str = "first declared here";
 /// [`inference::ErrorKind::RigidField`].
 pub const DECLARED_HERE: &str = "declared here";
 
+/// What every `@if` complaint reminds the reader of: the shape of a guard and
+/// the facts it can ask about.
+const CONDITIONS: &str = "`@if {target: \"js\", platform: \"web\"}` compiles a definition only when the root project is built with every fact named; a fact not named may be anything";
+
 /// A node a printer has to parenthesize by precedence. Implemented by every
 /// wrapper that prints as surface syntax, and by [`Ty`], which prints as one
 /// directly.
@@ -1095,6 +1099,10 @@ impl bundle::ErrorKind {
         match self {
             bundle::ErrorKind::ModuleFileMissing { .. } => "module-file-missing",
             bundle::ErrorKind::ModuleFileAmbiguous { .. } => "module-file-ambiguous",
+            bundle::ErrorKind::ConditionMissing => "condition-missing",
+            bundle::ErrorKind::ConditionNotStruct => "condition-not-struct",
+            bundle::ErrorKind::ConditionUnknownField { .. } => "condition-unknown-field",
+            bundle::ErrorKind::ConditionNotString { .. } => "condition-not-string",
         }
     }
 }
@@ -1130,6 +1138,41 @@ impl bundle::Error {
                 path(inside)
             ))
             .note(convention),
+            bundle::ErrorKind::ConditionMissing => {
+                Diagnostic::new(self.kind.code(), "`@if` needs a condition", self.span)
+                    .label("nothing here says when the definition is compiled")
+                    .help("write a struct of conditions, such as `@if {target: \"js\"}`")
+                    .note(CONDITIONS)
+            }
+            bundle::ErrorKind::ConditionNotStruct => Diagnostic::new(
+                self.kind.code(),
+                "an `@if` condition is a struct",
+                self.span,
+            )
+            .label("this value is not a struct")
+            .help("write the condition as a field, such as `@if {target: \"js\"}`")
+            .note(CONDITIONS),
+            bundle::ErrorKind::ConditionUnknownField { name, known } => {
+                Diagnostic::new(self.kind.code(), "this condition is not known", self.span)
+                    .label(format!("`{name}` is not a fact of the build"))
+                    .help(format!(
+                        "the facts are {}",
+                        known
+                            .iter()
+                            .map(|fact| format!("`{fact}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                    .note(CONDITIONS)
+            }
+            bundle::ErrorKind::ConditionNotString { name } => Diagnostic::new(
+                self.kind.code(),
+                "a condition's value is a string",
+                self.span,
+            )
+            .label("this value is not a string")
+            .help(format!("write `{name}` as a string, in quotes"))
+            .note(CONDITIONS),
         }
     }
 }
@@ -1139,6 +1182,10 @@ impl fmt::Display for bundle::ErrorKind {
         f.write_str(match self {
             bundle::ErrorKind::ModuleFileMissing { .. } => "this module needs a file",
             bundle::ErrorKind::ModuleFileAmbiguous { .. } => "this module has two possible files",
+            bundle::ErrorKind::ConditionMissing => "`@if` needs a condition",
+            bundle::ErrorKind::ConditionNotStruct => "an `@if` condition is a struct",
+            bundle::ErrorKind::ConditionUnknownField { .. } => "this condition is not known",
+            bundle::ErrorKind::ConditionNotString { .. } => "a condition's value is a string",
         })
     }
 }

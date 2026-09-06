@@ -33,6 +33,8 @@ pub struct CompileRequest {
     pub kind: ruddy::artifact::Kind,
     #[serde(default)]
     pub target: Option<ruddy_cli::Target>,
+    #[serde(default)]
+    pub platform: Option<ruddy_cli::Platform>,
     /// The bundle identity supplied by project configuration in a normal
     /// compilation. Defaults keep cached requests from older debugger pages
     /// usable after identity moved out of source files.
@@ -396,6 +398,7 @@ pub struct DocMeta {
 pub struct Doc {
     pub kind: ruddy::artifact::Kind,
     pub target: Option<ruddy_cli::Target>,
+    pub platform: Option<ruddy_cli::Platform>,
     pub name: String,
     pub bundle_name: String,
     pub version: String,
@@ -464,6 +467,8 @@ pub struct DocBody {
     pub kind: ruddy::artifact::Kind,
     #[serde(default)]
     pub target: Option<ruddy_cli::Target>,
+    #[serde(default)]
+    pub platform: Option<ruddy_cli::Platform>,
     /// Optional only for compatibility with saves from debugger pages opened
     /// before identity moved into document configuration.
     #[serde(default)]

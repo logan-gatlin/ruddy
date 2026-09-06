@@ -503,6 +503,24 @@ fn an_attribute_is_one_token_carrying_its_key() {
     ));
 }
 
+/// The sigil path reads a name with `word`, the same raw scan a bare
+/// identifier gets, but never sends it through the keyword table the way a
+/// bare identifier does. A keyword spelling after `@` is therefore an
+/// ordinary attribute name rather than the keyword's own token.
+#[test]
+fn a_keyword_spelling_is_an_ordinary_attribute_name() {
+    for keyword in ["if", "let", "match", "fn", "true", "and", "end"] {
+        let src = format!("@{keyword} let x = 1n");
+        let out = lex(&src, FileID::GENERATED);
+        assert!(out.errors.is_empty(), "{keyword}: {:#?}", out.errors);
+        assert!(
+            matches!(&out.tokens[0].tracked, Kind::Attribute(key) if key == keyword),
+            "{keyword}: {:#?}",
+            out.tokens[0]
+        );
+    }
+}
+
 /// `@` alone begins nothing, so — like `#` and `!` — the whole lexeme it ran
 /// over is one malformed attribute rather than a character the language does
 /// not know.

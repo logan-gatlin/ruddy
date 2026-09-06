@@ -1,11 +1,12 @@
 //! Compiled dependency artifacts kept between runs.
 //!
-//! A dependency's artifact is a function of three things: the compiler, the
-//! dependency's own sources, and the artifacts of its dependencies. Each is
-//! digested into the key an artifact is stored under, so a cached artifact is
-//! used only while all three are what they were — and there is no versioning
-//! to keep up with, because the compiler's part of the key is the
-//! [`Stamp`](ruddy::artifact::Stamp) its build script computed from its
+//! A dependency's artifact is a function of four things: the compiler, the
+//! dependency's own sources, the artifacts of its dependencies, and the build
+//! it was compiled for — target and platform — which its `@if` guards were
+//! judged against. Each is digested into the key an artifact is stored under, so a
+//! cached artifact is used only while all four are what they were — and there
+//! is no versioning to keep up with, because the compiler's part of the key is
+//! the [`Stamp`](ruddy::artifact::Stamp) its build script computed from its
 //! source.
 //!
 //! An artifact read back from the cache is trusted on its stamp: it was
@@ -26,6 +27,8 @@ use std::{
 
 use ruddy::artifact::{Artifact, COMPILER_HASH, text};
 use twox_hash::XxHash3_64;
+
+use crate::Build;
 
 /// One compiler's cache directory.
 pub(crate) struct ArtifactCache {
@@ -83,10 +86,17 @@ impl ArtifactCache {
 }
 
 /// The key of a project's artifact: this compiler, the project's manifest and
-/// sources, and the keys of the artifacts it was compiled against.
-pub(crate) fn key(directory: &Path, dependencies: &[u64]) -> u64 {
+/// sources, the keys of the artifacts it was compiled against, and every fact
+/// of the build it was compiled for.
+pub(crate) fn key(directory: &Path, dependencies: &[u64], build: Build) -> u64 {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(COMPILER_HASH.as_bytes());
+    for (fact, value) in build.environment().facts() {
+        bytes.extend_from_slice(fact.as_bytes());
+        bytes.push(b'=');
+        bytes.extend_from_slice(value.as_bytes());
+        bytes.push(0);
+    }
     bytes.extend_from_slice(
         &fingerprint(std::slice::from_ref(&directory.to_path_buf())).to_le_bytes(),
     );

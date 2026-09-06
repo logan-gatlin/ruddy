@@ -24,7 +24,11 @@ Only libraries can be dependencies. The optional `target` defaults to `js`
 for executables and `artifact` for libraries. `artifact` writes the portable
 compiler artifact without running a backend; `js` writes both the artifact
 and Node.js ESM. A library targeting JS exports its values without calling
-an entry point.
+an entry point. The optional `platform` names where the output runs, `node`
+(the default) or `web`. It decides what `@if` guards see and which cache entry
+a dependency gets. A library builds for either platform; an executable for the
+web is refused until the JavaScript backend has a web entry adapter, since
+today's entry adapter writes to Node's streams and exits its process.
 
 Executables define `main`, callable with `()` and returning a value compatible
 with `()` (including a function that never returns). Its effects must be
@@ -90,7 +94,27 @@ Public definitions may alias private definitions, and public signatures may
 mention private types or effects, explicitly or through inference: their
 structural meaning remains available to callers. Private names are absent from
 dependent bundles' source lookup and JavaScript exports; private implementation
-code still runs when needed. All other metadata keys remain uninterpreted.
+code still runs when needed.
+
+`@if` compiles a definition only for the builds its conditions name. Its value
+is a struct whose fields are facts of the root project's build, each a string:
+`target` (`"js"` or `"artifact"`) and `platform` (`"node"` or `"web"`). Every
+fact named must hold; a fact not named may be anything. The facts are the root
+project's, so a library's guard sees the build of the executable depending on
+it. A definition whose guard does not hold is dropped before names are
+resolved: a guarded `module` whose file is missing costs nothing, and two
+definitions of one name guarded for two builds do not collide. A value no
+build has holds for no build. An unknown fact, a missing condition, or a value
+that is not a string is refused.
+
+```text
+@if {target: "js"} module js
+@if {target: "js", platform: "node"} let now = js::node_now
+@if {target: "js", platform: "web"} let now = js::web_now
+@if {target: "artifact"} let now = fn _ => 0n
+```
+
+All other metadata keys remain uninterpreted.
 
 Immutable homogeneous arrays use `[value, ...]` literals and `[Type]` types.
 A literal may spread other arrays into place with `..`, as in `[..a, x, ..b]`,
