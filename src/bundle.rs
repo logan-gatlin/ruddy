@@ -12,6 +12,11 @@
 //! with the [`FileManager`] on the way, so every span in the program names the
 //! file it was written in.
 //!
+//! A definition guarded by `@if` is judged here too, against the
+//! [`Environment`] the driver supplies: one whose conditions do not hold is
+//! dropped before anything under it is read and before lowering mints a name,
+//! so two definitions of one name guarded for two targets never meet.
+//!
 //! Files are reached through the [`Files`] trait rather than through
 //! [`std::fs`], so the debugger compiles what is in its editor and a test
 //! compiles what is in its own map — and neither has to invent a directory to
@@ -20,7 +25,7 @@
 use std::{path::PathBuf, time::Instant};
 
 use crate::{
-    parse::{self, Stmt, StmtKind},
+    parse::{self, Attribute, DataKind, Stmt, StmtKind},
     token::{self, Token},
     tracking::{FileID, FileManager, Span},
 };
@@ -31,6 +36,12 @@ const EXTENSION: &str = "hc";
 /// The file a module's directory holds its own body in, when its body is not
 /// beside the directory instead.
 const DIRECTORY_FILE: &str = "module";
+
+/// The metadata key that guards a definition: `@if {target: "js"}`.
+const CONDITION_KEY: &str = "if";
+
+/// The one condition a guard may name today.
+const TARGET_FIELD: &str = "target";
 
 /// Where a bundle's files come from.
 ///
@@ -100,6 +111,31 @@ pub enum ErrorKind {
     /// A file module whose file is at *both* paths. Which one was meant is not
     /// the loader's to guess.
     ModuleFileAmbiguous { beside: String, inside: String },
+    /// `@if` with nothing to judge: no value, unit, or an empty struct. A guard
+    /// that guards nothing is far more likely a forgotten condition than a
+    /// deliberate truth.
+    ConditionMissing,
+    /// `@if` whose value is not a struct, such as `@if "js"`.
+    ConditionNotStruct,
+    /// A condition field the loader does not know. Refused rather than ignored,
+    /// so that a condition added later cannot change what a guard written
+    /// today means, and so that a misspelling cannot drop a definition.
+    ConditionUnknownField { name: String },
+    /// A `target` condition whose value is not a string.
+    ConditionTargetNotString,
+}
+
+/// What a build is for, as far as source can ask: the facts a definition's
+/// `@if` is judged against. Supplied by the driver from project configuration,
+/// as bundle identity is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Environment {
+    /// The target of the root project being built, spelled as its manifest
+    /// spells it — `js` or `artifact`. A dependency is judged against the
+    /// root's target, not its own manifest's, so a library sees the target its
+    /// consumer is built for. A name no backend answers to matches nothing,
+    /// which lets a guard be written for a backend before it exists.
+    pub target: String,
 }
 
 /// The whole load, in progress.
@@ -110,6 +146,7 @@ struct Loader<'a> {
     /// paths are relative to this point even when the caller names the root as
     /// `src/main.hc` rather than rooting its [`Files`] there first.
     directory: String,
+    environment: &'a Environment,
     out: Output,
 }
 
@@ -161,10 +198,16 @@ impl Files for Disk {
 /// parent's — so no file can be reached twice from below and no cycle is
 /// possible. There is nothing here that checks for one, and nothing that needs
 /// to be.
-pub fn load(files: &mut FileManager, fs: &dyn Files, root: &str) -> Output {
+pub fn load(
+    files: &mut FileManager,
+    fs: &dyn Files,
+    root: &str,
+    environment: &Environment,
+) -> Output {
     let mut loader = Loader {
         files,
         fs,
+        environment,
         directory: root
             .rsplit_once('/')
             .map_or_else(String::new, |(directory, _)| format!("{directory}/")),
@@ -212,15 +255,21 @@ impl Loader<'_> {
         parsed.stmts
     }
 
-    /// Fill in the body of every file module in `stmts`, and walk into every
-    /// module's body once it has one.
+    /// Drop every definition in `stmts` whose guard does not hold, fill in the
+    /// body of every file module left, and walk into every module's body once
+    /// it has one.
+    ///
+    /// Guards are judged before the walk, so a file module that is guarded
+    /// out is never looked for, and nothing under an excluded inline module
+    /// is judged at all.
     ///
     /// `at` is the logical module path of the statements being walked, which is
     /// also the file path a module under them is looked for at: an inline
     /// module contributes a directory component exactly as a file module does,
     /// so `module B` inside `module A = ... end` is looked for at `A/B.hc` and
     /// never at `B.hc`.
-    fn splice(&mut self, stmts: &mut [Stmt], at: &mut Vec<String>) {
+    fn splice(&mut self, stmts: &mut Vec<Stmt>, at: &mut Vec<String>) {
+        stmts.retain(|stmt| self.holds(stmt));
         for stmt in stmts {
             let StmtKind::Module { name, body } = &mut stmt.kind else {
                 continue;
@@ -282,6 +331,57 @@ impl Loader<'_> {
                 Vec::new()
             }
         }
+    }
+
+    /// Whether `stmt` is to be compiled: it carries no `@if`, or the
+    /// conditions of its first `@if` all hold. A second `@if` is the repeated
+    /// key lowering refuses, and is not judged here.
+    fn holds(&mut self, stmt: &Stmt) -> bool {
+        match stmt
+            .attributes
+            .iter()
+            .find(|attribute| attribute.key.tracked == CONDITION_KEY)
+        {
+            Some(guard) => self.condition(guard),
+            None => true,
+        }
+    }
+
+    /// Judge one `@if`. A malformed guard is reported and holds, so that the
+    /// one complaint is not followed by an unresolved name for everything that
+    /// used the definition it guards.
+    fn condition(&mut self, guard: &Attribute) -> bool {
+        let Some(value) = &guard.value else {
+            self.error(guard.span, ErrorKind::ConditionMissing);
+            return true;
+        };
+        let fields = match &value.tracked {
+            DataKind::Struct(fields) if !fields.is_empty() => fields,
+            DataKind::Struct(_) | DataKind::Unit => {
+                self.error(value.span, ErrorKind::ConditionMissing);
+                return true;
+            }
+            _ => {
+                self.error(value.span, ErrorKind::ConditionNotStruct);
+                return true;
+            }
+        };
+        let mut holds = true;
+        for (label, field) in fields {
+            match label.tracked.as_str() {
+                TARGET_FIELD => match &field.tracked {
+                    DataKind::String(target) => holds &= *target == self.environment.target,
+                    _ => self.error(field.span, ErrorKind::ConditionTargetNotString),
+                },
+                _ => self.error(
+                    label.span,
+                    ErrorKind::ConditionUnknownField {
+                        name: label.tracked.clone(),
+                    },
+                ),
+            }
+        }
+        holds
     }
 
     fn error(&mut self, span: Span, kind: ErrorKind) {

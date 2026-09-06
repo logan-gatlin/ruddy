@@ -90,7 +90,25 @@ Public definitions may alias private definitions, and public signatures may
 mention private types or effects, explicitly or through inference: their
 structural meaning remains available to callers. Private names are absent from
 dependent bundles' source lookup and JavaScript exports; private implementation
-code still runs when needed. All other metadata keys remain uninterpreted.
+code still runs when needed.
+
+`@if` compiles a definition only for the builds its conditions name. Its value
+is a struct; the one condition is `target`, a string compared with the target
+of the root project being built (`"js"` or `"artifact"`), so a library's guard
+sees the target of the executable depending on it. A definition whose guard
+does not hold is dropped before names are resolved: a guarded `module` whose
+file is missing costs nothing, and two definitions of one name guarded for two
+targets do not collide. A target name no backend answers to holds for no
+build. An unknown condition, a missing one, or a `target` that is not a string
+is refused.
+
+```text
+@if {target: "js"} module js
+@if {target: "js"} let now = js::now
+@if {target: "artifact"} let now = fn _ => 0n
+```
+
+All other metadata keys remain uninterpreted.
 
 Immutable homogeneous arrays use `[value, ...]` literals and `[Type]` types.
 A literal may spread other arrays into place with `..`, as in `[..a, x, ..b]`,

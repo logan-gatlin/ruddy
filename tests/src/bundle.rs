@@ -11,7 +11,7 @@
 use std::{collections::HashMap, path::PathBuf};
 
 use ruddy::{
-    bundle::{self, Disk, ErrorKind, Files, Output},
+    bundle::{self, Disk, Environment, ErrorKind, Files, Output},
     inference,
     ir::{self, TypeKind},
     parse::StmtKind,
@@ -29,9 +29,22 @@ impl Files for Memory {
     }
 }
 
-/// Load an in-memory bundle rooted at `main.hc`, with the file manager the spans
-/// name their files through.
+/// The build most tests load for: a JavaScript one. Only the guard tests care
+/// which, and they say so.
+fn js() -> Environment {
+    Environment {
+        target: "js".to_string(),
+    }
+}
+
+/// Load an in-memory bundle rooted at `main.hc` for a JavaScript build, with
+/// the file manager the spans name their files through.
 fn load(files: &[(&str, &str)]) -> (FileManager, Output) {
+    load_for("js", files)
+}
+
+/// [`load`], for a build of the named target.
+fn load_for(target: &str, files: &[(&str, &str)]) -> (FileManager, Output) {
     let fs = Memory(
         files
             .iter()
@@ -39,7 +52,10 @@ fn load(files: &[(&str, &str)]) -> (FileManager, Output) {
             .collect(),
     );
     let mut manager = FileManager::new();
-    let out = bundle::load(&mut manager, &fs, "main.hc");
+    let environment = Environment {
+        target: target.to_string(),
+    };
+    let out = bundle::load(&mut manager, &fs, "main.hc", &environment);
     (manager, out)
 }
 
@@ -312,7 +328,7 @@ fn a_root_name_collision_does_not_hide_ambiguous_module_files() {
         ),
     ]));
     let mut manager = FileManager::new();
-    let out = bundle::load(&mut manager, &fs, "Child.hc");
+    let out = bundle::load(&mut manager, &fs, "Child.hc", &js());
 
     assert_eq!(
         out.errors
@@ -352,6 +368,147 @@ fn each_file_carries_its_own_lex_and_parse_errors() {
     assert_eq!(out.loaded[2].parse_errors[0].span.file_id, out.loaded[2].id);
 }
 
+/// `@if {target: ...}` keeps a definition for the build it names and drops it
+/// for every other, whatever kind of definition it is. What survives keeps
+/// its `@if` as ordinary metadata; what is dropped leaves nothing behind.
+#[test]
+fn a_guard_keeps_a_definition_for_its_target_and_drops_it_for_others() {
+    let source = "@if {target: \"js\"} let a = 1n\n\
+                  @if {target: \"artifact\"} let b = 2n\n\
+                  let c = 3n\n\
+                  @if {target: \"js\"} type T = Nat\n\
+                  @if {target: \"artifact\"} effect E = () -> ()\n\
+                  @if {target: \"artifact\"} module M = let inner = 0n end\n\
+                  @if {target: \"js\"} extern f : Nat = \"1\"\n";
+
+    let out = load_for("js", &[("main.hc", source)]).1;
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert_eq!(names(&out.stmts), ["let a", "let c", "type T", "extern f"]);
+    assert_eq!(out.stmts[0].attributes[0].key.tracked, "if");
+    assert!(out.stmts[1].attributes.is_empty());
+
+    let out = load_for("artifact", &[("main.hc", source)]).1;
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert_eq!(
+        names(&out.stmts),
+        ["let b", "let c", "effect E", "module M"]
+    );
+}
+
+/// A file module guarded out is never looked for, so its file need not exist
+/// for the builds it is not part of. One that is guarded in is looked for
+/// exactly as an unguarded one would be, missing file and all.
+#[test]
+fn a_guarded_file_module_is_only_looked_for_when_its_guard_holds() {
+    let files = [
+        (
+            "main.hc",
+            "@if {target: \"js\"} module js\n@if {target: \"artifact\"} module native\nlet x = 1n\n",
+        ),
+        ("js.hc", "let now = 0n\n"),
+    ];
+
+    let out = load_for("js", &files).1;
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert_eq!(paths(&out), ["main.hc", "js.hc"]);
+    assert_eq!(names(&out.stmts), ["module js", "let x"]);
+    assert_eq!(names(body(&out.stmts, "js")), ["let now"]);
+
+    let out = load_for("artifact", &files).1;
+    assert_eq!(paths(&out), ["main.hc"]);
+    assert_eq!(names(&out.stmts), ["module native", "let x"]);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert!(matches!(
+        out.errors[0].kind,
+        ErrorKind::ModuleFileMissing { .. }
+    ));
+}
+
+/// Guards are judged wherever a definition can carry metadata: inside an
+/// inline module's body and in a module file alike, with nothing under an
+/// excluded module judged or read at all.
+#[test]
+fn guards_are_judged_inside_module_bodies() {
+    let out = load_for(
+        "js",
+        &[
+            (
+                "main.hc",
+                "module A\nmodule B = @if {target: \"artifact\"} let hidden = 0n let shown = 1n end\n@if {target: \"artifact\"} module C = module D end\n",
+            ),
+            (
+                "A.hc",
+                "@if {target: \"artifact\"} let gone = 0n\nlet kept = 1n\n@if {target: \"artifact\"} module Deep\n",
+            ),
+        ],
+    )
+    .1;
+
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert_eq!(paths(&out), ["main.hc", "A.hc"]);
+    assert_eq!(names(&out.stmts), ["module A", "module B"]);
+    assert_eq!(names(body(&out.stmts, "A")), ["let kept"]);
+    assert_eq!(names(body(&out.stmts, "B")), ["let shown"]);
+}
+
+/// The reason the guard is judged here and not in lowering: two definitions
+/// of one name, guarded for two targets, are one definition to everything
+/// after the load. A target no backend answers to holds for no build, so a
+/// guard can be written for a backend before it exists.
+#[test]
+fn definitions_guarded_for_different_targets_do_not_collide() {
+    let source = "@if {target: \"js\"} let f = 1n\n\
+                  @if {target: \"artifact\"} let f = 2n\n\
+                  @if {target: \"rust\"} let f = 3n\n";
+    for target in ["js", "artifact"] {
+        let out = load_for(target, &[("main.hc", source)]).1;
+        assert!(out.errors.is_empty(), "{target}: {:#?}", out.errors);
+        assert_eq!(names(&out.stmts), ["let f"], "{target}");
+        let mut mint = Mint::new(Bundle::new("demo", Version::new(0, 1, 0)).expect("valid bundle"));
+        let built = ruddy::ir::build(&mut mint, out.stmts);
+        assert!(built.errors.is_empty(), "{target}: {:#?}", built.errors);
+    }
+}
+
+/// A guard that cannot be judged is reported at the part that is wrong and
+/// keeps its definition, so that the one complaint is not followed by an
+/// unresolved name for everything that used it.
+#[test]
+fn a_malformed_guard_is_reported_and_keeps_its_definition() {
+    for (source, at, expected) in [
+        ("@if let a = 1n\n", "@if", ErrorKind::ConditionMissing),
+        ("@if () let a = 1n\n", "()", ErrorKind::ConditionMissing),
+        ("@if {} let a = 1n\n", "{}", ErrorKind::ConditionMissing),
+        (
+            "@if \"js\" let a = 1n\n",
+            "\"js\"",
+            ErrorKind::ConditionNotStruct,
+        ),
+        (
+            "@if {taget: \"js\"} let a = 1n\n",
+            "taget",
+            ErrorKind::ConditionUnknownField {
+                name: "taget".to_string(),
+            },
+        ),
+        (
+            "@if {target: 1n} let a = 1n\n",
+            "1n",
+            ErrorKind::ConditionTargetNotString,
+        ),
+    ] {
+        let out = one(source);
+        assert_eq!(out.errors.len(), 1, "{source:?}: {:#?}", out.errors);
+        assert_eq!(out.errors[0].kind, expected, "{source:?}");
+        assert_eq!(
+            out.errors[0].span.start,
+            source.find(at).expect("the offending part"),
+            "{source:?}"
+        );
+        assert_eq!(names(&out.stmts), ["let a"], "{source:?}");
+    }
+}
+
 /// [`Disk`] against a real directory, which is the one implementation an
 /// in-memory map cannot stand in for: the `/`-separated path a module names has
 /// to become the platform's own, and a fixture is the only way to know it did.
@@ -359,7 +516,7 @@ fn each_file_carries_its_own_lex_and_parse_errors() {
 fn disk_reads_a_checked_in_fixture() {
     let fs = fixture("nested");
     let mut manager = FileManager::new();
-    let out = bundle::load(&mut manager, &fs, "main.hc");
+    let out = bundle::load(&mut manager, &fs, "main.hc", &js());
 
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert_eq!(paths(&out), ["main.hc", "Math.hc", "Math/Vec.hc"]);
@@ -372,7 +529,7 @@ fn disk_reads_a_checked_in_fixture() {
 fn disk_reads_the_directory_spelling() {
     let fs = fixture("dir-form");
     let mut manager = FileManager::new();
-    let out = bundle::load(&mut manager, &fs, "main.hc");
+    let out = bundle::load(&mut manager, &fs, "main.hc", &js());
 
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert_eq!(paths(&out), ["main.hc", "Math/module.hc"]);
@@ -384,7 +541,7 @@ fn disk_reads_the_directory_spelling() {
 fn disk_reports_a_fixture_whose_module_file_is_missing() {
     let fs = fixture("broken");
     let mut manager = FileManager::new();
-    let out = bundle::load(&mut manager, &fs, "main.hc");
+    let out = bundle::load(&mut manager, &fs, "main.hc", &js());
 
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert!(matches!(

@@ -3452,6 +3452,22 @@ fn attributes_are_read_in_front_of_every_definition_kind() {
     }
 }
 
+/// An attribute's key is read from the sigilled token, not re-parsed as an
+/// identifier, so a keyword spelling like `if` names a tag the same way
+/// `test` or `doc` would.
+#[test]
+fn a_keyword_spelling_names_an_attribute_like_any_other() {
+    for (src, printed) in [
+        ("@if let x = 1n", "@if let x = 1n"),
+        ("@match \"m\" let x = 1n", "@match \"m\" let x = 1n"),
+    ] {
+        assert_eq!(parse_one(src), printed, "{src:?}");
+    }
+    let out = parse(lex("@if let x = 1n", FileID::GENERATED).tokens);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert_eq!(out.stmts[0].attributes[0].key.tracked, "if");
+}
+
 /// A value is literal data and nothing else: scalars, a tag with an optional
 /// literal payload, and tuples, arrays, and structs of those. A written `()`
 /// is the same as no value, so it prints as the bare attribute; grouping

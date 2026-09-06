@@ -101,6 +101,32 @@ fn executable_contract_is_checked_and_artifact_targets_defer_node_support() {
     );
 }
 
+/// The document's configured target is the one its `@if` guards are judged
+/// against, so the page shows what a build of that target would compile.
+#[test]
+fn guards_follow_the_documents_configured_target() {
+    let request = |target: &str| -> CompileRequest {
+        serde_json::from_value(serde_json::json!({
+            "name": "app", "version": "1.0.0", "kind": "library", "target": target,
+            "root": ROOT, "std": false,
+            "files": [{"path": ROOT, "source":
+                "@if {target: \"js\"} let only_js = 1n\nlet uses = only_js\n"}],
+        }))
+        .unwrap()
+    };
+    let js = compile(&request("js"), 0);
+    assert!(js.diagnostics.is_empty(), "{:?}", js.diagnostics);
+    let artifact = compile(&request("artifact"), 0);
+    assert!(
+        artifact
+            .diagnostics
+            .iter()
+            .any(|error| error.code == "undefined-term"),
+        "{:?}",
+        artifact.diagnostics
+    );
+}
+
 #[test]
 fn library_artifact_targets_including_the_default_skip_backend_validation() {
     for target in [None, Some("artifact"), Some("js")] {

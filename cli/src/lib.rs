@@ -869,6 +869,22 @@ impl Target {
             Kind::Executable => Self::Js,
         }
     }
+
+    /// The target as `Ruddy.toml` spells it, which is also what an `@if`
+    /// guard in source names.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Artifact => "artifact",
+            Self::Js => "js",
+        }
+    }
+
+    /// The facts source may ask about a build for this target.
+    pub fn environment(self) -> bundle::Environment {
+        bundle::Environment {
+            target: self.name().to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -1271,9 +1287,11 @@ pub fn compile(directory: impl AsRef<Path>) -> Result<Artifact, CompileError> {
 pub fn compile_graph(directory: impl AsRef<Path>) -> Result<CompiledGraph, CompileError> {
     let root = canonical_project(directory.as_ref())?;
     let resolver = git::Resolver::new(&root)?;
+    let target = load_manifest(&root, None)?.target();
     let mut compiler = GraphCompiler {
         root: Some(root.clone()),
         resolver: Some(resolver),
+        target: Some(target),
         // Beside the Git checkouts, under Ruddy home: one standard library
         // compiled once serves every project.
         cache: ruddy_home()
@@ -1338,6 +1356,7 @@ pub fn compile_sandboxed_dependency_specs<I, A>(
     dependencies: I,
     project: impl AsRef<Path>,
     sandbox: impl AsRef<Path>,
+    target: Target,
 ) -> Result<(CompiledGraph, Vec<Dependency>, Vec<PathBuf>), CompileError>
 where
     I: IntoIterator<Item = (A, DependencySpec)>,
@@ -1349,10 +1368,12 @@ where
             .map(|(alias, specification)| (alias.into(), specification, false)),
         project.as_ref(),
         sandbox.as_ref(),
+        target,
     )
 }
 
-/// Resolve a debugger project's implicit standard library and declarations.
+/// Resolve a debugger project's implicit standard library and declarations,
+/// compiling every one of them for `target`, the project's own.
 ///
 /// Custom local roots remain inside `sandbox`. The only extra trusted tree is
 /// the exact canonical `$RUDDY_HOME/std` root when `std` is defaulted; a custom
@@ -1362,6 +1383,7 @@ pub fn compile_sandboxed_project_dependencies<I, A>(
     dependencies: I,
     project: impl AsRef<Path>,
     sandbox: impl AsRef<Path>,
+    target: Target,
 ) -> Result<(CompiledGraph, Vec<Dependency>, Vec<PathBuf>), CompileError>
 where
     I: IntoIterator<Item = (A, DependencySpec)>,
@@ -1391,13 +1413,19 @@ where
         }
         specifications.push((alias, specification, false));
     }
-    compile_sandboxed_dependency_specs_inner(specifications, project.as_ref(), sandbox.as_ref())
+    compile_sandboxed_dependency_specs_inner(
+        specifications,
+        project.as_ref(),
+        sandbox.as_ref(),
+        target,
+    )
 }
 
 fn compile_sandboxed_dependency_specs_inner<I>(
     dependencies: I,
     project: &Path,
     sandbox: &Path,
+    target: Target,
 ) -> Result<(CompiledGraph, Vec<Dependency>, Vec<PathBuf>), CompileError>
 where
     I: IntoIterator<Item = (String, DependencySpec, bool)>,
@@ -1419,6 +1447,7 @@ where
         )),
         sandbox: Some(sandbox),
         resolver: Some(resolver),
+        target: Some(target),
         ..GraphCompiler::default()
     };
     let mut direct = Vec::new();
@@ -1610,6 +1639,11 @@ struct GraphCompiler {
     /// The cache key of each project in `projects` that has one: every
     /// dependency, since a root is what the run is for and never cached.
     keys: HashMap<usize, u64>,
+    /// The target of the root build, which every project in the graph is
+    /// compiled for: a dependency's `@if` guards are judged against it, not
+    /// against the dependency's own manifest. `None` when the graph has no
+    /// single root, in which case each root's own manifest decides.
+    target: Option<Target>,
 }
 
 impl Default for GraphCompiler {
@@ -1627,6 +1661,7 @@ impl Default for GraphCompiler {
             projects: Vec::new(),
             cache: None,
             keys: HashMap::new(),
+            target: None,
         }
     }
 }
@@ -1855,15 +1890,18 @@ impl GraphCompiler {
             .collect();
         let target = manifest.target();
         let run = manifest.run.clone();
+        // What this project is compiled for: the root build's target when
+        // there is one root, and its own otherwise.
+        let build = self.target.unwrap_or(target);
         // A dependency is compiled only when the cache has no artifact for
-        // this compiler, these sources and these dependencies. The root is
-        // what the run is for, and always compiled.
+        // this compiler, these sources, these dependencies and this target.
+        // The root is what the run is for, and always compiled.
         let key = match &self.cache {
             Some(_) if edge.is_some() => dependency_indices
                 .iter()
                 .map(|index| self.keys.get(index).copied())
                 .collect::<Option<Vec<u64>>>()
-                .map(|children| cache::key(&directory, &children)),
+                .map(|children| cache::key(&directory, &children, build)),
             _ => None,
         };
         let cached = key.and_then(|key| self.cache.as_ref()?.load(key, &manifest.name));
@@ -1877,6 +1915,7 @@ impl GraphCompiler {
                     dependency_artifacts,
                     linked_artifacts,
                     boundary.as_deref(),
+                    build,
                 )?;
                 if let (Some(key), Some(cache)) = (key, &mut self.cache) {
                     cache.store(key, &artifact);
@@ -1986,6 +2025,8 @@ fn dependency_error(
     error.map_diagnostics(|diagnostic| diagnostic.with_note(context.clone()))
 }
 
+/// Compile one project for `target`, the root build's, against the artifacts
+/// of its dependencies.
 fn compile_one(
     directory: &Path,
     manifest: Manifest,
@@ -1993,6 +2034,7 @@ fn compile_one(
     dependencies: Vec<(String, Artifact)>,
     linked: Vec<Artifact>,
     sandbox: Option<&Path>,
+    target: Target,
 ) -> Result<Artifact, CompileError> {
     if sandbox.is_some() && manifest.root.is_absolute() {
         return Err(CompileError::report(
@@ -2047,7 +2089,7 @@ fn compile_one(
     }
 
     let mut files = FileManager::new();
-    let loaded = bundle::load(&mut files, &disk, name);
+    let loaded = bundle::load(&mut files, &disk, name, &target.environment());
 
     // Parser recovery is useful for finding more syntax complaints, but its
     // placeholder statements are not an input to semantic phases. Apart from

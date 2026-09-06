@@ -3840,6 +3840,61 @@ fn dependency_artifacts_cache_child() {
     assert!(error.contains("renamed"), "{error}");
     fs::write(app.join("main.hc"), "let main = dep::more\n").unwrap();
     build_project(&app).unwrap();
+
+    // The target is part of the key: the same dependency built under a
+    // library root, for `artifact`, is a second entry rather than the JS
+    // build's artifact read back for a build its guards were not judged for.
+    let lib = root.join("lib");
+    write_project(&lib, "lib", "0.1.0", &[("dep", "../dep")]);
+    fs::write(lib.join("main.hc"), "let value = dep::more\n").unwrap();
+    build_project(&lib).unwrap();
+    let entries = fs::read_dir(compilers[0].path()).unwrap().flatten().count();
+    assert_eq!(entries, 2);
+}
+
+/// A dependency's guards are judged against the root build's target, not the
+/// library's own manifest, so a library can carry one definition per target
+/// and a JavaScript executable gets the JavaScript one.
+#[test]
+fn a_dependency_is_compiled_for_the_root_builds_target() {
+    let project = tempfile::tempdir().unwrap();
+    let dependency = project.path().join("dep");
+    write_project(&dependency, "dep", "1.0.0", &[]);
+    fs::write(
+        dependency.join("main.hc"),
+        "type Never = |\n\
+         effect Process = { exit: Nat -> Never }\n\
+         @if {target: \"js\"} module js\n\
+         @if {target: \"js\"} let stop : () -> Never + !Process = fn _ => !Process.exit js::code\n\
+         @if {target: \"artifact\"} let stop : () -> Never + !Process = fn _ => !Process.exit 3n\n",
+    )
+    .unwrap();
+    fs::write(dependency.join("js.hc"), "let code = 17n\n").unwrap();
+    // On its own the library is an artifact build: the `js` module is never
+    // looked for and the artifact arm is the one compiled.
+    let alone = compile(&dependency).unwrap();
+    assert!(alone.print().contains("stop"));
+    assert!(!alone.print().contains("code"));
+
+    let app = project.path().join("app");
+    executable_project(&app, "let main = dep::stop", None);
+    let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
+    fs::write(
+        app.join("Ruddy.toml"),
+        format!("{manifest}dep = \"../dep\"\n"),
+    )
+    .unwrap();
+    let artifact = build_project(&app).expect("the dependency compiles for the JS root");
+    let output = Command::new("node")
+        .arg(artifact.with_extension("js"))
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(17),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

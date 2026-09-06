@@ -1095,6 +1095,10 @@ impl bundle::ErrorKind {
         match self {
             bundle::ErrorKind::ModuleFileMissing { .. } => "module-file-missing",
             bundle::ErrorKind::ModuleFileAmbiguous { .. } => "module-file-ambiguous",
+            bundle::ErrorKind::ConditionMissing => "condition-missing",
+            bundle::ErrorKind::ConditionNotStruct => "condition-not-struct",
+            bundle::ErrorKind::ConditionUnknownField { .. } => "condition-unknown-field",
+            bundle::ErrorKind::ConditionTargetNotString => "condition-target-not-string",
         }
     }
 }
@@ -1130,15 +1134,51 @@ impl bundle::Error {
                 path(inside)
             ))
             .note(convention),
+            bundle::ErrorKind::ConditionMissing => {
+                Diagnostic::new(self.kind.code(), "`@if` needs a condition", self.span)
+                    .label("nothing here says when the definition is compiled")
+                    .help("write a struct of conditions, such as `@if {target: \"js\"}`")
+                    .note(CONDITIONS)
+            }
+            bundle::ErrorKind::ConditionNotStruct => Diagnostic::new(
+                self.kind.code(),
+                "an `@if` condition is a struct",
+                self.span,
+            )
+            .label("this value is not a struct")
+            .help("write the condition as a field, such as `@if {target: \"js\"}`")
+            .note(CONDITIONS),
+            bundle::ErrorKind::ConditionUnknownField { name } => {
+                Diagnostic::new(self.kind.code(), "this condition is not known", self.span)
+                    .label(format!("`{name}` is not a condition `@if` understands"))
+                    .help("the conditions are `target`")
+                    .note(CONDITIONS)
+            }
+            bundle::ErrorKind::ConditionTargetNotString => Diagnostic::new(
+                self.kind.code(),
+                "`target` names a target with a string",
+                self.span,
+            )
+            .label("this value is not a string")
+            .help("write the target's name, such as `\"js\"` or `\"artifact\"`")
+            .note(CONDITIONS),
         }
     }
 }
+
+/// What every `@if` complaint reminds the reader of: the shape of a guard and
+/// the one fact it can ask about.
+const CONDITIONS: &str = "`@if {target: \"js\"}` compiles a definition only when the root project is built for that target; every field written must hold";
 
 impl fmt::Display for bundle::ErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             bundle::ErrorKind::ModuleFileMissing { .. } => "this module needs a file",
             bundle::ErrorKind::ModuleFileAmbiguous { .. } => "this module has two possible files",
+            bundle::ErrorKind::ConditionMissing => "`@if` needs a condition",
+            bundle::ErrorKind::ConditionNotStruct => "an `@if` condition is a struct",
+            bundle::ErrorKind::ConditionUnknownField { .. } => "this condition is not known",
+            bundle::ErrorKind::ConditionTargetNotString => "`target` names a target with a string",
         })
     }
 }
