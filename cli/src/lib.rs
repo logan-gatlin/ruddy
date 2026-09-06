@@ -93,6 +93,15 @@ pub struct CliError {
 }
 
 impl CliError {
+    fn subprocess(message: impl Into<String>, status: std::process::ExitStatus) -> Self {
+        let mut error = Self::one(message);
+        error.exit_code = status
+            .code()
+            .and_then(|code| u8::try_from(code).ok())
+            .unwrap_or(1);
+        error
+    }
+
     fn one(message: impl Into<String>) -> Self {
         Self {
             rendered: format!("error: {}", message.into()),
@@ -457,12 +466,10 @@ fn execute_javascript_runner(runner: &str, path: &Path, directory: &Path) -> Res
     if status.success() {
         Ok(())
     } else {
-        let mut error = CliError::one(format!("JavaScript runner `{runner}` exited with {status}"));
-        error.exit_code = status
-            .code()
-            .and_then(|code| u8::try_from(code).ok())
-            .unwrap_or(1);
-        Err(error)
+        Err(CliError::subprocess(
+            format!("JavaScript runner `{runner}` exited with {status}"),
+            status,
+        ))
     }
 }
 
@@ -529,13 +536,10 @@ fn execute_node_module(program: &OsStr, path: &Path, directory: &Path) -> Result
     } else {
         format!("\n{diagnostics}")
     };
-    let mut error = CliError::one(format!("Node.js exited with {}{detail}", output.status));
-    error.exit_code = output
-        .status
-        .code()
-        .and_then(|code| u8::try_from(code).ok())
-        .unwrap_or(1);
-    Err(error)
+    Err(CliError::subprocess(
+        format!("Node.js exited with {}{detail}", output.status),
+        output.status,
+    ))
 }
 
 #[cfg(test)]
@@ -857,6 +861,16 @@ pub enum Target {
     Js,
 }
 
+impl Target {
+    /// The backend policy when a manifest omits its target.
+    pub fn default_for(kind: Kind) -> Self {
+        match kind {
+            Kind::Library => Self::Artifact,
+            Kind::Executable => Self::Js,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunConfig {
@@ -887,10 +901,8 @@ struct Manifest {
 
 impl Manifest {
     fn target(&self) -> Target {
-        self.target.unwrap_or(match self.kind {
-            Kind::Library => Target::Artifact,
-            Kind::Executable => Target::Js,
-        })
+        self.target
+            .unwrap_or_else(|| Target::default_for(self.kind))
     }
 }
 

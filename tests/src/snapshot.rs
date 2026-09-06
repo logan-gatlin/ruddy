@@ -57,8 +57,35 @@ fn executable_contract_is_checked_and_artifact_targets_defer_node_support() {
             .any(|error| error.code == "invalid-entry-point")
     );
     assert!(missing.panic.is_none());
+    assert_eq!(
+        missing
+            .stages
+            .iter()
+            .find(|s| s.id == "entry")
+            .unwrap()
+            .status,
+        Status::Error
+    );
+    assert_ne!(
+        missing
+            .stages
+            .iter()
+            .find(|s| s.id == "artifact")
+            .unwrap()
+            .status,
+        Status::Skipped
+    );
     let source = "effect Custom = () -> ()\nlet main = fn _ => !Custom ()";
     let artifact = compile(&request(source, "artifact"), 0);
+    assert_eq!(
+        artifact
+            .stages
+            .iter()
+            .find(|s| s.id == "entry")
+            .unwrap()
+            .status,
+        Status::Ok
+    );
     assert!(
         artifact.diagnostics.is_empty(),
         "{:?}",
@@ -74,13 +101,51 @@ fn executable_contract_is_checked_and_artifact_targets_defer_node_support() {
     );
 }
 
+#[test]
+fn library_artifact_targets_including_the_default_skip_backend_validation() {
+    for target in [None, Some("artifact"), Some("js")] {
+        let request: CompileRequest = serde_json::from_value(serde_json::json!({
+            "name": "lib", "version": "1.0.0", "kind": "library", "target": target,
+            "root": ROOT, "std": false,
+            "files": [{"path": ROOT, "source": "extern invalid : Nat = \"?\""}],
+        }))
+        .unwrap();
+        let snapshot = compile(&request, 0);
+        assert_eq!(
+            snapshot
+                .stages
+                .iter()
+                .find(|s| s.id == "entry")
+                .unwrap()
+                .status,
+            Status::Skipped
+        );
+        let js = snapshot.stages.iter().find(|s| s.id == "js").unwrap();
+        if target == Some("js") {
+            assert!(
+                snapshot
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.code == "javascript-generation")
+            );
+        } else {
+            assert!(
+                snapshot.diagnostics.is_empty(),
+                "{:?}",
+                snapshot.diagnostics
+            );
+            assert_eq!(js.status, Status::Skipped);
+        }
+    }
+}
+
 /// A whole bundle, each file exactly as written — the request the page posts,
 /// with nothing added to it.
 fn bundle(files: &[(&str, &str)]) -> Snapshot {
     compile(
         &CompileRequest {
             kind: ruddy::artifact::Kind::Library,
-            target: None,
+            target: Some(ruddy_cli::Target::Js),
             name: "demo".to_string(),
             version: "0.1.0".to_string(),
             root: ROOT.to_string(),
@@ -910,6 +975,7 @@ fn every_stage_reports_on_the_demo() {
             "patterns",
             "lir",
             "artifact",
+            "entry",
             "linked",
             "js",
             "symbols",
@@ -939,6 +1005,7 @@ fn every_stage_reports_on_the_demo() {
                 | "patterns"
                 | "lir"
                 | "artifact"
+                | "entry"
                 | "linked"
                 | "js"
                 | "symbols"
@@ -979,6 +1046,7 @@ fn every_stage_reports_on_the_demo() {
             "Patterns",
             "LIR",
             "Artifact",
+            "Entry",
             "Linked Artifact",
             "JS",
             "Symbols"
@@ -1465,6 +1533,7 @@ fn frontend_errors_keep_reader_advice_and_skip_semantic_debugger_stages() {
         "patterns",
         "lir",
         "artifact",
+        "entry",
         "linked",
         "js",
         "symbols",
@@ -2612,6 +2681,7 @@ fn only_the_stages_that_own_a_phase_report_a_time() {
             "solve",
             "lir",
             "artifact",
+            "entry",
             "linked",
             "js",
             "types-ir"
@@ -3313,6 +3383,10 @@ fn every_stage_reports_on_explicit_absence() {
         snapshot.diagnostics
     );
     for stage in &snapshot.stages {
+        if stage.id == "entry" {
+            assert_eq!(stage.status, Status::Skipped);
+            continue;
+        }
         // The Patterns tab has one section per match, and this program
         // matches nothing — an honest emptiness rather than a failure.
         if stage.id == "patterns" {
@@ -3594,6 +3668,10 @@ fn every_stage_reports_on_a_source_using_effects() {
     let snapshot = snapshot(source);
     assert!(snapshot.panic.is_none());
     for stage in &snapshot.stages {
+        if stage.id == "entry" {
+            assert_eq!(stage.status, Status::Skipped);
+            continue;
+        }
         assert!(
             !stage.nodes.is_empty() || stage.text.as_ref().is_some_and(|text| !text.is_empty()),
             "{} produced nothing",

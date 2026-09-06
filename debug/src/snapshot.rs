@@ -483,19 +483,27 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
         _ => None,
     };
 
-    let artifact = artifact.and_then(|artifact| {
+    let mut entry_panicked = false;
+    let entry = artifact.as_ref().and_then(|artifact| {
         if req.kind == ruddy::artifact::Kind::Library {
-            return Some(artifact);
+            return None;
         }
         let dependencies: Vec<_> = linked_interfaces.iter().collect();
-        match ruddy::entry::executable(&artifact, &dependencies) {
-            Ok(artifact) => Some(artifact),
-            Err(error) => {
-                diagnostics.push(raw("entry", "invalid-entry-point", error.to_string(), None));
-                None
-            }
+        let started = Instant::now();
+        let out = guard("entry", &mut panicked, || {
+            ruddy::entry::executable(artifact, &dependencies)
+        });
+        entry_panicked = out.is_none();
+        micros.entry = started.elapsed().as_micros() as u64;
+        if let Some(Err(error)) = &out {
+            diagnostics.push(raw("entry", "invalid-entry-point", error.to_string(), None));
         }
+        out
     });
+    let validated = match req.kind {
+        ruddy::artifact::Kind::Library => artifact.as_ref(),
+        ruddy::artifact::Kind::Executable => entry.as_ref().and_then(|result| result.as_ref().ok()),
+    };
 
     // Linking is a distinct final phase. Dependency artifacts remain separate
     // compilation boundaries above; this output copies their code into the
@@ -503,7 +511,7 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     let errored_before_link = !diagnostics.is_empty();
     let mut link_error = None;
     let mut link_panicked = false;
-    let linked = artifact.as_ref().and_then(|artifact| {
+    let linked = validated.and_then(|artifact| {
         let started = Instant::now();
         let mut graph = linked_interfaces.clone();
         graph.push(artifact.clone());
@@ -526,15 +534,16 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
         diagnostic.id = i as u32;
     }
 
-    // Code generation is always exposed by the debugger, independently of a
-    // project's manifest target. It consumes the same linked, in-memory root
+    // Code generation follows the manifest target and consumes the same linked root
     // artifact as the command-line backend and is guarded like every other
     // compiler phase.
     let mut js_error = None;
     let mut js_panicked = false;
     let js = linked.as_ref().and_then(|linked| {
-        if req.kind == ruddy::artifact::Kind::Executable
-            && req.target == Some(ruddy_cli::Target::Artifact)
+        if req
+            .target
+            .unwrap_or_else(|| ruddy_cli::Target::default_for(req.kind))
+            == ruddy_cli::Target::Artifact
         {
             return None;
         }
@@ -594,6 +603,8 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
         patterns: checked.as_ref(),
         lir: lowered.as_ref(),
         artifact: artifact.as_ref(),
+        entry: entry.as_ref(),
+        entry_panicked,
         linked: linked.as_ref(),
         js: js.as_deref(),
         js_error: js_error.as_deref(),

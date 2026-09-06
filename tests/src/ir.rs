@@ -11938,6 +11938,8 @@ fn deeply_nested_imported_semantics_are_preserved_on_a_small_stack() {
             let dependency_declarations = IndexMap::new();
             let symbols = std::collections::HashMap::new();
             let cx = ruddy_debug::stage::Cx {
+                entry: None,
+                entry_panicked: false,
                 files: &[],
                 sources: &[],
                 diagnostics: &[],
