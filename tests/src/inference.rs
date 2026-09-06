@@ -9325,6 +9325,32 @@ fn extern_boundary_reports_row_and_presence_kinds() {
 }
 
 #[test]
+fn async_boundary_metadata_preserves_alias_representation_checks() {
+    for signature in [
+        "@async Transform 'a",
+        "(@async Transform 'a)",
+        "fn(@async Transform 'a) -> Nat",
+    ] {
+        let (_, lowered, output) = infer_src(&format!(
+            "type Transform 'a = 'a -> 'a\nextern apply : {signature} = \"host.apply\""
+        ));
+        assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+        assert!(
+            output.errors().iter().any(|e| matches!(
+                e.kind,
+                ruddy::inference::ErrorKind::PolymorphicExternBoundary { .. }
+            )),
+            "{signature}: {:#?}",
+            output.errors()
+        );
+    }
+    let (_, lowered, output) =
+        infer_src("type Loop = () -> Loop\nextern loop : @async Loop = \"host.loop\"");
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    assert!(output.errors().is_empty(), "{:#?}", output.errors());
+}
+
+#[test]
 fn extern_boundary_alias_presence_and_multiple_variables_keep_exact_sources() {
     use ruddy::inference::{ErrorKind, ExternVariableKind};
 

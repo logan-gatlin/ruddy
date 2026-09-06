@@ -581,12 +581,6 @@ pub(super) fn validate(lir: &Lir) -> Result<(), String> {
         {
             return error("synchronous export has no non-suspension proof");
         }
-        if matches!(
-            g.adapter,
-            Some(crate::externs::Callback::Completion | crate::externs::Callback::Notification)
-        ) {
-            return error("invalid library export adapter");
-        }
         let Some(f) = usize::try_from(g.initializer)
             .ok()
             .and_then(|id| lir.functions.get(id))

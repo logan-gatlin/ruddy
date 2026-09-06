@@ -48,33 +48,14 @@ pub enum Conversion {
 pub enum Completion {
     Immediate,
     Promise,
-    Callback,
 }
 /// A fixed contract for results delivered to JavaScript.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Callback {
     Sync,
     Promise,
-    Completion,
-    Notification,
 }
 
-/// Reviewed metadata follows the written marked-function ABI tree.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct Protocol {
-    at: Anchor,
-    completion: Option<Completion>,
-    callback: Option<Callback>,
-    parameters: Option<Vec<Protocol>>,
-    result: Option<Box<Protocol>>,
-}
-
-pub(crate) fn protocol(metadata: &ir::Metadata) -> Result<Option<Protocol>, ir::Error> {
-    let Some(attribute) = metadata.get("ffi") else {
-        return Ok(None);
-    };
-    read_protocol(&attribute.value).map(Some)
-}
 /// A JS-facing export may request a fixed contract without changing its source type.
 pub(crate) fn export_request(metadata: &ir::Metadata) -> Result<Option<Callback>, ir::Error> {
     let Some(attribute) = metadata.get("export") else {
@@ -126,159 +107,14 @@ fn invalid(at: Anchor, message: impl Into<String>) -> ir::Error {
         },
     }
 }
-fn read_protocol(data: &ir::Data) -> Result<Protocol, ir::Error> {
-    let ir::DataKind::Struct(fields) = &data.anchored else {
-        return Err(invalid(
-            data.at,
-            "`@ffi` needs a record of boundary protocols",
-        ));
-    };
-    let mut protocol = Protocol {
-        at: data.at,
-        ..Protocol::default()
-    };
-    for (key, field) in fields {
-        let value = &field.value;
-        match key.as_str() {
-            "completion" => {
-                protocol.completion = Some(match &value.anchored {
-                    ir::DataKind::String(s) if s == "immediate" => Completion::Immediate,
-                    ir::DataKind::String(s) if s == "promise" => Completion::Promise,
-                    ir::DataKind::String(s) if s == "callback" => Completion::Callback,
-                    _ => {
-                        return Err(invalid(
-                            value.at,
-                            "completion must be \"immediate\", \"promise\", or \"callback\"",
-                        ));
-                    }
-                })
-            }
-            "callback" => {
-                protocol.callback = Some(match &value.anchored {
-                    ir::DataKind::String(s) if s == "sync" => Callback::Sync,
-                    ir::DataKind::String(s) if s == "promise" => Callback::Promise,
-                    ir::DataKind::String(s) if s == "completion" => Callback::Completion,
-                    ir::DataKind::String(s) if s == "notification" => Callback::Notification,
-                    _ => {
-                        return Err(invalid(
-                            value.at,
-                            "callback must be \"sync\", \"promise\", \"completion\", or \"notification\"",
-                        ));
-                    }
-                })
-            }
-            "parameters" => {
-                let ir::DataKind::Array(values) = &value.anchored else {
-                    return Err(invalid(
-                        value.at,
-                        "parameters must be an array of protocol records",
-                    ));
-                };
-                protocol.parameters =
-                    Some(values.iter().map(read_protocol).collect::<Result<_, _>>()?);
-            }
-            "result" => protocol.result = Some(Box::new(read_protocol(value)?)),
-            _ => {
-                return Err(invalid(
-                    value.at,
-                    format!("unknown foreign protocol field `{key}`"),
-                ));
-            }
-        }
-    }
-    Ok(protocol)
-}
 pub(crate) fn review(semantics: &inference::Semantics) -> Vec<ir::Error> {
     semantics
         .reviewed_externs()
         .values()
         .filter_map(|reviewed| {
-            let protocol = reviewed.protocol.as_ref()?;
-            let conversion = conversion(&reviewed.abi, reviewed.scheme.body(), semantics.aliases());
-            check_protocol(&conversion, protocol, false).err()
+            conversion(&reviewed.abi, reviewed.scheme.body(), semantics.aliases()).err()
         })
         .collect()
-}
-fn check_protocol(
-    conversion: &Conversion,
-    protocol: &Protocol,
-    callback: bool,
-) -> Result<(), ir::Error> {
-    if protocol.completion.is_some() && callback {
-        return Err(invalid(
-            protocol.at,
-            "use `callback` to choose how this callback delivers its result",
-        ));
-    }
-    if protocol.callback.is_some() && !callback {
-        return Err(invalid(
-            protocol.at,
-            "use `completion` to choose how this host function completes",
-        ));
-    }
-    match conversion {
-        Conversion::Value => {
-            if protocol.completion.is_some()
-                || protocol.callback.is_some()
-                || protocol.parameters.is_some()
-                || protocol.result.is_some()
-            {
-                return Err(invalid(protocol.at, "foreign protocols apply to functions"));
-            }
-        }
-        Conversion::MarkedFunction {
-            parameters, result, ..
-        } => {
-            if let Some(protocols) = &protocol.parameters {
-                if protocols.len() != parameters.len() {
-                    return Err(invalid(
-                        protocol.at,
-                        "protocol parameters must match the marked function's arity",
-                    ));
-                }
-                for (conversion, protocol) in parameters.iter().zip(protocols) {
-                    check_protocol(conversion, protocol, !callback)?;
-                }
-            }
-            if let Some(protocol) = &protocol.result {
-                check_protocol(result, protocol, callback)?;
-            }
-        }
-        Conversion::OrdinaryFunction => {
-            if protocol.parameters.is_some() || protocol.result.is_some() {
-                return Err(invalid(
-                    protocol.at,
-                    "write a marked `fn(...)` ABI to specify nested boundary protocols",
-                ));
-            }
-        }
-        Conversion::Protocol { .. } => unreachable!("protocol review precedes planning"),
-    }
-    Ok(())
-}
-
-fn apply_protocol(mut conversion: Conversion, protocol: &Protocol) -> Conversion {
-    if let Conversion::MarkedFunction {
-        parameters, result, ..
-    } = &mut conversion
-    {
-        if let Some(protocols) = &protocol.parameters {
-            for (parameter, protocol) in parameters.iter_mut().zip(protocols) {
-                *parameter = apply_protocol(parameter.clone(), protocol);
-            }
-        }
-        if let Some(protocol) = &protocol.result {
-            **result = apply_protocol(*result.clone(), protocol);
-        }
-    }
-    if protocol.completion.is_none() && protocol.callback.is_none() {
-        return conversion;
-    }
-    Conversion::Protocol {
-        inner: Box::new(conversion),
-        completion: protocol.completion.unwrap_or(Completion::Immediate),
-        callback: protocol.callback.unwrap_or(Callback::Sync),
-    }
 }
 
 impl ExternPlan {
@@ -303,17 +139,12 @@ pub(crate) fn plan(semantics: &inference::Semantics) -> ExternPlan {
                     Extern {
                         symbol: *symbol,
                         ty: reviewed.scheme.body().clone(),
-                        conversion: {
-                            let conversion = conversion(
-                                &reviewed.abi,
-                                reviewed.scheme.body(),
-                                semantics.aliases(),
-                            );
-                            match &reviewed.protocol {
-                                Some(protocol) => apply_protocol(conversion, protocol),
-                                None => conversion,
-                            }
-                        },
+                        conversion: conversion(
+                            &reviewed.abi,
+                            reviewed.scheme.body(),
+                            semantics.aliases(),
+                        )
+                        .expect("accepted extern boundary was reviewed"),
                         target: reviewed.target.clone(),
                         target_at: reviewed.target_span,
                         declaration_at: reviewed.declaration_span,
@@ -328,9 +159,44 @@ fn conversion(
     abi: &ir::ExternType,
     ty: &std::rc::Rc<Ty>,
     aliases: &indexmap::IndexMap<Symbol, crate::types::Scheme>,
-) -> Conversion {
-    match &abi.anchored {
-        ir::ExternTypeKind::Group(inner) => conversion(inner, ty, aliases),
+) -> Result<Conversion, ir::Error> {
+    Ok(match &abi.anchored {
+        ir::ExternTypeKind::Annotated { metadata, inner } => {
+            for (key, attribute) in metadata {
+                if key != "async" {
+                    return Err(invalid(
+                        attribute.key_at,
+                        format!(
+                            "unsupported extern type attribute `@{key}`; use `@async` on a function boundary"
+                        ),
+                    ));
+                }
+                if !matches!(&attribute.value.anchored, ir::DataKind::Struct(fields) if fields.is_empty())
+                {
+                    return Err(invalid(
+                        attribute.value.at,
+                        "`@async` is a tag; omit its value",
+                    ));
+                }
+                if !matches!(&*exposed(ty, aliases), Ty::Arrow(..)) {
+                    return Err(invalid(
+                        attribute.key_at,
+                        "`@async` applies to a function boundary, not its result value",
+                    ));
+                }
+            }
+            let inner = conversion(inner, ty, aliases)?;
+            if metadata.contains_key("async") && !matches!(inner, Conversion::Protocol { .. }) {
+                Conversion::Protocol {
+                    inner: Box::new(inner),
+                    completion: Completion::Promise,
+                    callback: Callback::Promise,
+                }
+            } else {
+                inner
+            }
+        }
+        ir::ExternTypeKind::Group(inner) => conversion(inner, ty, aliases)?,
         ir::ExternTypeKind::Ordinary(_) => match &*exposed(ty, aliases) {
             Ty::Arrow(..) => Conversion::OrdinaryFunction,
             _ => Conversion::Value,
@@ -346,7 +212,7 @@ fn conversion(
                     cursor = to;
                     conversion(parameter, &from, aliases)
                 })
-                .collect();
+                .collect::<Result<_, _>>()?;
             // A nullary host function still corresponds to the one unit arrow.
             if parameters.is_empty() {
                 let (_, to) = arrow(&cursor, aliases);
@@ -354,11 +220,11 @@ fn conversion(
             }
             Conversion::MarkedFunction {
                 parameters: parameter_conversions,
-                result: Box::new(conversion(result, &cursor, aliases)),
+                result: Box::new(conversion(result, &cursor, aliases)?),
                 nullary: parameters.is_empty(),
             }
         }
-    }
+    })
 }
 
 fn exposed(

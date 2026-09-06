@@ -1595,8 +1595,27 @@ fn metadata_is_shown_across_the_debugger_tabs() {
 }
 
 #[test]
+fn nested_async_boundary_metadata_is_visible_in_debugger_views() {
+    let source = "extern use : fn(@async fn(Nat) -> Nat) -> @async fn(Nat) -> Nat = \"host.use\"";
+    let ast = tab("ast", source);
+    assert!(
+        flatten(&ast)
+            .iter()
+            .any(|n| n.label == "Boundary" && n.text.matches("@async").count() == 2)
+    );
+    let externs = tab("externs", source);
+    assert_eq!(
+        flatten(&externs)
+            .iter()
+            .filter(|n| n.label == "Completion protocol" && n.span.is_some())
+            .count(),
+        2
+    );
+}
+
+#[test]
 fn cps_debugger_views_expose_suspension_saved_environments_and_protocols() {
-    let source = "@ffi { completion: \"promise\" } extern wait : Real -> Real = \"host.wait\"\nlet run = fn n => n + wait n";
+    let source = "@async extern wait : Real -> Real = \"host.wait\"\nlet run = fn n => n + wait n";
     let externs = tab("externs", source);
     assert!(
         flatten(&externs)

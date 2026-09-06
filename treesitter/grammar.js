@@ -248,10 +248,20 @@ module.exports = grammar({
     ),
 
     _extern_type: $ => choice(
+      $.annotated_extern_type,
       $.extern_function_type,
       $.parenthesized_extern_function_type,
       $._type,
     ),
+
+    annotated_extern_type: $ => prec.right(seq(
+      repeat1($.attribute),
+      field('type', choice(
+        $.extern_function_type,
+        $.parenthesized_extern_function_type,
+        $._type,
+      )),
+    )),
 
     /** `fn(A, B) -> R [+ effects]` — one n-ary foreign-call boundary. */
     extern_function_type: $ => prec.right(seq(
@@ -268,10 +278,11 @@ module.exports = grammar({
       optional(field('effects', $.effect_row)),
     )),
 
-    /** Transparent grouping is admitted only around a marked ABI function. */
+    /** Transparent grouping around marked or annotated boundary types. */
     parenthesized_extern_function_type: $ => seq(
       '(',
       field('type', choice(
+        $.annotated_extern_type,
         $.extern_function_type,
         $.parenthesized_extern_function_type,
       )),

@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 const pending = [];
 const completions = [];
-const reports = [];
-globalThis[Symbol.for('ruddy.runtime')] = { onUnhandledError: error => reports.push(error) };
 globalThis.observations = 0;
 globalThis.dataInspections = 0;
 globalThis.host = {
+  useNested: callback => {
+    globalThis.nestedCallback = callback;
+  },
   keepData: callback => { globalThis.dataCallback = callback; },
   keepFactory: callback => { globalThis.factoryCallback = callback; },
   keepSync: callback => { globalThis.syncCallback = callback; },
@@ -16,8 +16,6 @@ globalThis.host = {
   keepReader: callback => { globalThis.readerCallback = callback; },
   runExit: callback => callback(7),
   remember: callback => { globalThis.saved = callback; },
-  watch: callback => { globalThis.watched = callback; },
-  keepCompleted: callback => { globalThis.completedCallback = callback; },
   delayed: value => new Promise((resolve, reject) => {
     pending.push({ ok: () => resolve(value + 1), bad: reject });
     globalThis.onRegistration?.();
@@ -60,27 +58,22 @@ const rejection = assert.rejects(rejected, /delayed failure/);
 pending.pop().bad(new Error('delayed failure'));
 await rejection;
 
-const immediate = app.via_callback(0);
-assert.ok(immediate instanceof Promise, 'fixed Promise export even for immediate completion');
+// Callback-based host APIs use an explicit JS Promise wrapper at the extern.
+const immediate = app.via_wrapped_callback(0);
+assert.ok(immediate instanceof Promise, 'Promise export even for an already settled Promise');
 assert.equal(await immediate, 11);
-await assert.rejects(app.via_callback(-1), /first failure/);
-const later = app.via_callback(1);
+await assert.rejects(app.via_wrapped_callback(-1), /first failure/);
+const later = app.via_wrapped_callback(1);
 const delivery = completions.pop();
 delivery.ok(30); delivery.bad(new Error('late')); delivery.ok(40);
 assert.equal(await later, 31);
 
-app.notify(10);
-assert.equal(globalThis.watched(1), undefined);
-pending.pop().bad(new Error('notification failure'));
-// Observe the reporter explicitly, without arbitrary timer delays.
-await new Promise(resolve => {
-  globalThis[Symbol.for('ruddy.runtime')].onUnhandledError = error => { reports.push(error); resolve(); };
-});
-assert.equal(reports[0].message, 'notification failure');
-app.save_completed(20);
-const delivered = new Promise((resolve, reject) => globalThis.completedCallback(2, resolve, reject));
-pending.pop().ok();
-assert.equal(await delivered, 23);
+app.save(10);
+const failedCallback = globalThis.saved(1);
+assert.ok(failedCallback instanceof Promise);
+const callbackRejection = assert.rejects(failedCallback, /callback failure/);
+pending.pop().bad(new Error('callback failure'));
+await callbackRejection;
 
 assert.equal(await app.expired(null), 99);
 await assert.rejects(globalThis.exitCallback(7), /invalid handler exit/);
@@ -120,30 +113,15 @@ assert.throws(() => globalThis.syncCallback(9), /synchronous callback attempted 
 pending.pop().ok();
 await new Promise(resolve => queueMicrotask(() => queueMicrotask(resolve)));
 assert.equal(globalThis.observations, 0, 'late completion cannot restart a failed invocation');
-app.notify_failure(null);
-assert.equal(globalThis.watched(0), undefined);
-assert.equal(reports.at(-1).message, 'immediate failure');
+app.save_failure(null);
+const immediateFailure = globalThis.saved(0);
+assert.ok(immediateFailure instanceof Promise, 'synchronous failure still returns a Promise');
+await assert.rejects(immediateFailure, /immediate failure/);
 assert.equal(await app.translation(3), 13);
 assert.ok(app.fixed_promise(3) instanceof Promise);
 assert.equal(await app.fixed_promise(4), 4);
 assert.equal(typeof app.immediate_data(null), 'object', 'immediate data is never probed for then');
-assert.equal(await app.registrations(100_000), 0, 'synchronous registrations do not recursively reenter the driver');
-
-for (const delayed of [false, true]) {
-  const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
-    globalThis.host = {
-  keepData: callback => { globalThis.dataCallback = callback; },
-      delayed: () => Promise.reject(new Error('uncaught delayed notification')),
-      watch: callback => { globalThis.watched = callback; }
-    };
-    const app = await import(${JSON.stringify(pathToFileURL(process.argv[2]).href)});
-    app.${delayed ? 'notify' : 'notify_failure'}(0);
-    globalThis.watched(1);
-  `], { encoding: 'utf8', timeout: 10_000 });
-  assert.ifError(child.error);
-  assert.notEqual(child.status, 0, 'default notification reporter is an uncaught host failure');
-  assert.match(child.stderr, delayed ? /uncaught delayed notification/ : /immediate failure/);
-}
+assert.equal(await app.settled_promises(100_000), 0, 'already settled Promises do not grow the driver stack');
 
 const nestedHandlers = app.nested_handlers(2);
 const secondOperation = new Promise(resolve => { globalThis.onRegistration = resolve; });
@@ -153,11 +131,28 @@ globalThis.onRegistration = undefined;
 pending.pop().ok();
 assert.equal(await nestedHandlers, 14, 'resumption restores evidence across nested handlers');
 
-app.completion_data(null);
-const completedData = new Promise((resolve, reject) => globalThis.dataCallback(1,
-  value => resolve({ value }), reject));
-pending.pop().ok();
-const { value: ordinaryData } = await completedData;
+app.save_data(null);
+const ordinaryData = globalThis.dataCallback(1);
 assert.equal(typeof Object.getOwnPropertyDescriptor(ordinaryData, 'then').get, 'function',
-  'completion notification never assimilates ordinary returned data');
+  'synchronous callbacks never assimilate ordinary returned data');
 assert.equal(globalThis.dataInspections, 0, 'runtime must not inspect thenable data');
+
+const reader = app.returned_host(20);
+assert.equal(typeof reader, 'function', 'factory itself completes immediately');
+const readResult = reader(2);
+assert.ok(readResult instanceof Promise);
+assert.equal(await readResult, 22);
+
+app.nested_callbacks(10);
+const factoryResult = globalThis.nestedCallback(n => Promise.resolve(n * 2));
+assert.ok(factoryResult instanceof Promise);
+const nestedCallback = await factoryResult;
+const nestedResult = nestedCallback(3);
+assert.ok(nestedResult instanceof Promise);
+assert.equal(await nestedResult, 26, 'annotations follow each direction through nested callbacks');
+await assert.rejects((await globalThis.nestedCallback(() => Promise.reject(new Error('nested failure'))))(1), /nested failure/);
+
+const syncFactoryResult = app.returned_sync(30);
+assert.ok(syncFactoryResult instanceof Promise);
+const syncResult = await syncFactoryResult;
+assert.equal(syncResult(4), 34, 'async metadata does not propagate into returned functions');

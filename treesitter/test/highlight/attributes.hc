@@ -18,3 +18,8 @@
 --                                           ^ @property
 --                                              ^^^^ @boolean
 let add = fn a b => a
+
+extern register : fn(@async Callback) -> @async Result = "host.register"
+--                   ^^^^^^ @attribute
+--                          ^^^^^^^^ @type
+--                                              ^^^^^^ @type

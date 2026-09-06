@@ -34,6 +34,12 @@ assert.equal(operation.value, 30);
 operation.resolve(31);
 assert.equal(await call, 32);
 
+const reader = app.nested(40);
+assert.equal(typeof reader, 'function', 'imported factory stays synchronous');
+const nestedResult = reader(2);
+assert.ok(nestedResult instanceof Promise);
+assert.equal(await nestedResult, 42, 'nested boundary adapters survive artifact serialization and linking');
+
 // Initialization failure rejects readiness before later declarations run.
 events.length = 0;
 url.search = '?failure';

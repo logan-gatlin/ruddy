@@ -1078,8 +1078,6 @@ fn callback_protocol(mode: crate::externs::Callback) -> &'static str {
     match mode {
         Callback::Sync => "Sync",
         Callback::Promise => "Promise",
-        Callback::Completion => "Completion",
-        Callback::Notification => "Notification",
     }
 }
 fn completion_protocol(mode: crate::externs::Completion) -> &'static str {
@@ -1087,7 +1085,6 @@ fn completion_protocol(mode: crate::externs::Completion) -> &'static str {
     match mode {
         Completion::Immediate => "Immediate",
         Completion::Promise => "Promise",
-        Completion::Callback => "Callback",
     }
 }
 

@@ -98,3 +98,45 @@ extern record : { callback: fn(Nat) -> Nat } = "host.record"
               (identifier))
             to: (identifier)))))
     target: (string)))
+
+================================================================================
+Metadata decorates individual nested function boundaries
+================================================================================
+
+extern use : @async fn(@async fn(Nat) -> Nat) -> (@async fn() -> Nat) = "host.use"
+extern tagged : @format "utf8" fn(String) -> String = "host.tagged"
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (extern_definition
+    (identifier)
+    (extern_annotation
+      (annotated_extern_type
+        (attribute
+          (attribute_key))
+        (extern_function_type
+          (annotated_extern_type
+            (attribute
+              (attribute_key))
+            (extern_function_type
+              (identifier)
+              (identifier)))
+          (parenthesized_extern_function_type
+            (annotated_extern_type
+              (attribute
+                (attribute_key))
+              (extern_function_type
+                (identifier)))))))
+    (string))
+  (extern_definition
+    (identifier)
+    (extern_annotation
+      (annotated_extern_type
+        (attribute
+          (attribute_key)
+          (string))
+        (extern_function_type
+          (identifier)
+          (identifier))))
+    (string)))

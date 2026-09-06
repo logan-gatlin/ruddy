@@ -777,12 +777,8 @@ fn foreign_protocols_and_sync_export_eligibility_are_checked_during_compilation(
     );
     for source in [
         "@export \"sync\" let apply = fn f => f ()",
-        "@ffi { completion: \"promise\" } extern wait : Nat -> Nat = \"host.wait\"\n@export \"sync\" let run = fn n => wait n",
-        "@ffi { completion: \"maybe\" } extern wait : Nat -> Nat = \"host.wait\"",
-        "@ffi { completion: \"promise\" } extern value : Nat = \"host.value\"",
-        "@ffi { parameters: [] } extern apply : fn(Nat) -> Nat = \"host.apply\"",
-        "@ffi { parameters: [{ callback: \"promise\" }] } extern apply : fn(Nat) -> Nat = \"host.apply\"",
-        "@ffi { unknown: true } extern wait : Nat -> Nat = \"host.wait\"",
+        "@async extern wait : Nat -> Nat = \"host.wait\"\n@export \"sync\" let run = fn n => wait n",
+        "@async extern value : Nat = \"host.value\"",
         "@export \"sometimes\" let identity = fn n => n",
     ] {
         let partial = rejected(source);
@@ -798,6 +794,62 @@ fn foreign_protocols_and_sync_export_eligibility_are_checked_during_compilation(
         );
     }
     accepted("@export \"promise\" let identity = fn n => n");
+}
+
+#[test]
+fn async_boundary_annotations_are_local_and_preserve_outer_shorthand() {
+    for source in [
+        "@async extern wait : fn(Nat) -> Nat = \"host.wait\"",
+        "extern wait : @async fn(Nat) -> Nat = \"host.wait\"",
+        "extern wait : (@async fn(Nat) -> Nat) = \"host.wait\"",
+        "extern wait : @async (fn(Nat) -> Nat) = \"host.wait\"",
+        "@async extern wait : @async fn(Nat) -> Nat = \"host.wait\"",
+        "type Wait = Nat -> Nat\nextern wait : @async Wait = \"host.wait\"",
+    ] {
+        let program = accepted(&format!("{source}\nlet run = fn n => wait n"));
+        assert_eq!(
+            program.artifact().lir().globals[0].callable,
+            Some(ruddy::lir::Suspension::MaySuspend)
+        );
+    }
+    for source in [
+        "extern apply : fn(@async fn(Nat) -> Nat) -> Nat = \"host.apply\"",
+        "extern factory : fn() -> @async fn(Nat) -> Nat = \"host.factory\"",
+        "extern factory : fn(fn() -> @async fn(Nat) -> Nat) -> () = \"host.factory\"",
+    ] {
+        accepted(source);
+    }
+    // An async returned function does not make its factory async.
+    accepted(
+        "extern factory : fn() -> @async fn(Nat) -> Nat = \"host.factory\"\n@export \"sync\" let run = fn _ => factory ()",
+    );
+    accepted("extern call : Nat -> Nat = \"host.call\"\n@export \"sync\" let run = fn n => call n");
+}
+
+#[test]
+fn invalid_boundary_metadata_is_rejected() {
+    for source in [
+        "@async false extern call : Nat -> Nat = \"host.call\"",
+        "extern call : @async false fn(Nat) -> Nat = \"host.call\"",
+        "extern call : fn(@async Nat) -> Nat = \"host.call\"",
+        "extern call : fn(Nat) -> @async Nat = \"host.call\"",
+        "type Record = { value: Nat }\nextern call : @async Record = \"host.call\"",
+        "extern call : fn(@unknown fn(Nat) -> Nat) -> Nat = \"host.call\"",
+        "extern call : fn(Nat) -> @encoding \"utf8\" String = \"host.call\"",
+    ] {
+        assert!(
+            codes(&rejected(source)).contains(&"foreign-protocol"),
+            "{source}"
+        );
+    }
+    let duplicate = rejected("extern call : @async @async fn(Nat) -> Nat = \"host.call\"");
+    assert!(
+        duplicate
+            .ir
+            .errors
+            .iter()
+            .any(|e| matches!(e.kind, ruddy::ir::ErrorKind::DuplicateAttribute { .. }))
+    );
 }
 
 #[test]

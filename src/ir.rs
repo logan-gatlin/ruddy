@@ -330,6 +330,10 @@ pub type ExternType = Anchored<ExternTypeKind>;
 
 #[derive(Debug, Clone)]
 pub enum ExternTypeKind {
+    Annotated {
+        metadata: Metadata,
+        inner: Box<ExternType>,
+    },
     Ordinary(Type),
     Function {
         parameters: Vec<ExternType>,
@@ -345,14 +349,25 @@ pub enum ExternTypeKind {
 /// function corresponds to one arrow per parameter (or one unit arrow when it
 /// is nullary). Invalid annotation pieces are deliberately retained as error
 /// leaves rather than making ABI retention depend on successful resolution.
-fn resolved_extern_type(written: parse::ExternType, resolved: &Type) -> ExternType {
+fn resolved_extern_type(
+    builder: &mut Builder<'_>,
+    written: parse::ExternType,
+    resolved: &Type,
+) -> ExternType {
     // The ABI tree mirrors the annotation it was resolved against, so its
     // nodes are anchored where the annotation's are.
     let at = resolved.at;
     match written.tracked {
+        parse::ExternTypeKind::Annotated { attributes, inner } => {
+            let at = builder.anchor(written.span);
+            at.anchor(ExternTypeKind::Annotated {
+                metadata: builder.metadata(attributes),
+                inner: Box::new(resolved_extern_type(builder, *inner, resolved)),
+            })
+        }
         parse::ExternTypeKind::Ordinary(_) => at.anchor(ExternTypeKind::Ordinary(resolved.clone())),
         parse::ExternTypeKind::Group(inner) => at.anchor(ExternTypeKind::Group(Box::new(
-            resolved_extern_type(*inner, resolved),
+            resolved_extern_type(builder, *inner, resolved),
         ))),
         parse::ExternTypeKind::Function {
             parameters, result, ..
@@ -390,9 +405,9 @@ fn resolved_extern_type(written: parse::ExternType, resolved: &Type) -> ExternTy
             let parameters = parameters
                 .into_iter()
                 .zip(resolved_parameters.iter())
-                .map(|(parameter, resolved)| resolved_extern_type(parameter, resolved))
+                .map(|(parameter, resolved)| resolved_extern_type(builder, parameter, resolved))
                 .collect();
-            let result = Box::new(resolved_extern_type(*result, &cursor));
+            let result = Box::new(resolved_extern_type(builder, *result, &cursor));
             at.anchor(ExternTypeKind::Function {
                 parameters,
                 result,
@@ -3163,7 +3178,15 @@ fn build_with_dependency_imports_inner(
                 // leaves are clones of the same parsed types, so lowering them
                 // independently would duplicate diagnostics and, more subtly,
                 // mint different annotation-variable identities.
-                let abi = resolved_extern_type(abi, &annotation.ty);
+                let mut abi = resolved_extern_type(&mut b, abi, &annotation.ty);
+                // Declaration-level @async is shorthand for the same metadata
+                // on the outer boundary. Other declaration metadata stays put.
+                if let Some(attribute) = metadata.get("async") {
+                    abi = attribute.key_at.anchor(ExternTypeKind::Annotated {
+                        metadata: [("async".to_owned(), attribute.clone())].into(),
+                        inner: Box::new(abi),
+                    });
+                }
                 if let Some(symbol) = symbol {
                     program.externs.insert(
                         symbol,

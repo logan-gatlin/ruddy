@@ -1,9 +1,10 @@
 # CPS execution and foreign completion
 
 Ruddy functions use the same source types and calling convention whether they
-complete immediately or suspend. There is no `async` keyword, `await` expression,
-or `Async` effect. Evaluation within an invocation remains sequential. Domain
-effect rows describe capabilities, independently of foreign completion timing.
+complete immediately or suspend. The `@async` tag marks a foreign boundary;
+ordinary functions need no annotation, `await` expression, or `Async` effect.
+Evaluation within an invocation remains sequential. Domain effect rows describe
+capabilities, independently of foreign completion timing.
 
 ## Foreign declarations
 
@@ -12,45 +13,69 @@ contract: a returned Promise is data, and is not implicitly awaited. Mark a
 binding that completes through a Promise explicitly:
 
 ```text
-@ffi { completion: "promise" }
+@async
 extern fetch_count : String -> Nat = "host.fetchCount"
 ```
 
-`completion: "callback"` appends separate success and failure functions to the
-host argument list. For example, the target of a unary binding is called as
-`host.read(argument, resolve, reject)`. Registration may complete synchronously.
-The first success or failure wins, including an exception during registration;
-subsequent deliveries cannot resume the operation again. A handler exit remains
-a distinct control transfer, rather than an ordinary failure value.
-
-Use a marked `fn(...)` ABI when specifying nested function boundaries. Protocol
-records mirror its parameters and result:
+`@async` selects Promise completion; the return type describes the resolved
+value. Without the tag, completion is immediate. Declaration-level `@async`
+is shorthand for an annotation on the outermost function:
 
 ```text
-@ffi { parameters: [{ callback: "promise" }] }
-extern subscribe : fn(fn(Nat) -> Nat) -> () = "host.subscribe"
+extern fetch_count : @async fn(String) -> Nat = "host.fetchCount"
 ```
 
-`parameters` has one record per marked parameter; `{}` retains the defaults.
-`result` describes a returned function boundary. At host-function positions use
-`completion`; at Ruddy callback positions use `callback`. Parameter positions
-reverse direction, while results keep their enclosing direction. The compiler
-rejects unknown keys, invalid protocols, arity mismatches, and protocols on
-non-function values.
+Use `fn(...)` to describe nested function boundaries, and put metadata directly
+on the function it belongs to:
 
-A callback has one fixed result contract:
+```text
+-- JS receives a Ruddy callback that returns a Promise.
+extern subscribe : fn(@async fn(Nat) -> Nat) -> () = "host.subscribe"
 
-| `callback` | Host observation |
+-- The factory returns immediately; its returned JS function returns a Promise.
+extern make_reader : fn(String) -> @async fn(Nat) -> String = "host.makeReader"
+
+-- JS receives a synchronous factory whose returned Ruddy callback is async.
+extern use_factory : fn(fn() -> @async fn(Nat) -> String) -> () = "host.useFactory"
+```
+
+Annotations apply only to the function they decorate. Parameters reverse the
+direction of the boundary; results keep it. In either direction, `@async` means
+that a JS invocation returns a Promise. Ruddy awaits host Promises and supplies
+Promise-returning adapters for its own annotated callbacks. An outer annotation
+does not make any nested functions async. Parentheses can group an annotated
+function, as in `(@async fn(Nat) -> Nat)`.
+
+`@async` on an ordinary function type or a function alias selects its outermost
+call boundary. Use nested `fn(...)` signatures when individual inner boundaries
+need annotations. Metadata does not change the ordinary Ruddy type or effects.
+Annotations are supported throughout nested function signatures; annotations
+inside records, tuples, arrays, and ordinary type aliases are not supported.
+`fn(Nat) -> @async String` is invalid: annotate the function, not its scalar
+result. Unknown boundary attributes, non-tag `@async` values, and duplicate
+attributes on one type occurrence are rejected. The boundary tree retains
+metadata and source locations for future attributes.
+
+A Ruddy callback has one fixed JS-facing result contract:
+
+| Annotation | Host observation |
 | --- | --- |
-| `"sync"` (default) | Returns a value or throws. This binding promises that the callback completes synchronously. Suspension violates that contract and fails the invocation. |
-| `"promise"` | Always returns a Promise, including on immediate success or failure. |
-| `"completion"` | Accepts success and failure functions after the visible arguments, delivers once, and returns `undefined`. |
-| `"notification"` | Returns `undefined`; reports failures through the runtime reporter. |
+| None (default) | Returns a value or throws. Suspension violates this immediate contract and fails the invocation. |
+| `@async` | Always returns a Promise, including on immediate success or failure. |
+
+Extern completion also has only immediate and Promise modes. Adapt a
+callback-based host API with an explicit JS Promise wrapper:
+
+```text
+@async
+extern read : String -> String =
+  "key => new Promise((resolve, reject) => host.read(key, resolve, reject))"
+```
 
 Callbacks retain their closure, captures, evidence, and runtime as ordinary
 JavaScript-owned values. Each call starts an independent invocation; repeated
 and overlapping calls are supported. Captured values are shared according to
-ordinary closure semantics. Promise and notification callbacks begin executing
+ordinary closure semantics. Promise callbacks begin executing
 immediately and run until completion or a real suspension.
 
 Synchronous exceptions and asynchronous failures fail the invocation unless the
@@ -58,17 +83,8 @@ binding explicitly translates them. For example, a Promise target may use
 `.catch(...)` to produce a normal Ruddy result representation. Host failures do
 not implicitly become a Ruddy `raise`.
 
-Embedders can install a notification error reporter before loading a module:
-
-```js
-globalThis[Symbol.for("ruddy.runtime")] = {
-  onUnhandledError(error) { console.error(error); }
-};
-```
-
-The default reports an uncaught host error. Notification adapters handle their
-internal Promise failures; they do not depend on a caller observing a returned
-Promise.
+JavaScript callers handle failures by catching synchronous exceptions or
+observing returned Promise rejections. There is no runtime notification reporter.
 
 ## Library exports and initialization
 

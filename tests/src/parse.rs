@@ -3398,12 +3398,72 @@ fn extern_fn_abi_supports_nullary_nested_grouped_and_where_forms() {
 }
 
 #[test]
+fn extern_boundary_metadata_retains_nesting_values_and_round_trips() {
+    let source = "extern use : @outer { version: 1n } fn(@async fn(Nat) -> Nat) -> (@async fn(Nat) -> Nat) = \"host.use\"";
+    let output = parse(lex(source, FileID::GENERATED).tokens);
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+    let StmtKind::Extern { abi, .. } = &output.stmts[0].kind else {
+        panic!("extern")
+    };
+    let ExternTypeKind::Annotated { attributes, inner } = &abi.tracked else {
+        panic!("metadata")
+    };
+    assert_eq!(attributes[0].key.tracked, "outer");
+    assert!(matches!(
+        attributes[0].value.as_ref().unwrap().tracked,
+        DataKind::Struct(_)
+    ));
+    let ExternTypeKind::Function {
+        parameters, result, ..
+    } = &inner.tracked
+    else {
+        panic!("function")
+    };
+    assert!(matches!(
+        parameters[0].tracked,
+        ExternTypeKind::Annotated { .. }
+    ));
+    assert!(matches!(result.tracked, ExternTypeKind::Group(_)));
+    let printed = print::ast::stmt(&output.stmts[0]).to_string();
+    let reparsed = parse(lex(&printed, FileID::GENERATED).tokens);
+    assert!(
+        reparsed.errors.is_empty(),
+        "{printed}: {:#?}",
+        reparsed.errors
+    );
+    assert_eq!(printed, print::ast::stmt(&reparsed.stmts[0]).to_string());
+
+    // Metadata does not impose a separate nesting limit on boundary functions.
+    let mut signature = "Nat".to_owned();
+    for _ in 0..32 {
+        signature = format!("@async fn() -> {signature}");
+    }
+    let output = parse(
+        lex(
+            &format!("extern deep : {signature} = \"host.deep\""),
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+    assert_eq!(
+        print::ast::stmt(&output.stmts[0])
+            .to_string()
+            .matches("@async")
+            .count(),
+        32
+    );
+}
+
+#[test]
 fn fn_abi_syntax_is_extern_only_and_directly_nested() {
     for source in [
         "let f : fn(Nat) -> Nat = value",
         "type F = fn(Nat) -> Nat",
         "extern bad : { callback: fn(Nat) -> Nat } = \"host.bad\"",
         "extern bad : fn(Nat -> fn(String) -> Nat) -> Nat = \"host.bad\"",
+        "extern bad : { callback: @async fn(Nat) -> Nat } = \"host.bad\"",
+        "extern bad : fn(Nat, @async) -> Nat = \"host.bad\"",
     ] {
         let output = parse(lex(source, FileID::GENERATED).tokens);
         assert!(

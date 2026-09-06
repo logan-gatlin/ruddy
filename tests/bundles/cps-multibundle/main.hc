@@ -6,3 +6,4 @@ let ready = do
 end
 effect Ask = Real -> Real
 let read = fn n => handle (1.0 + !Ask n) with | !Ask value => dep::wait value end
+let nested = fn offset => dep::reader offset

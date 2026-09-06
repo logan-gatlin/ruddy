@@ -2585,9 +2585,7 @@ fn cps_artifacts_reject_invalid_destinations_environments_and_summaries() {
             [RecoveryFact::ExecutableDiscarded { .. }]
         ));
     }
-    let mut asynchronous =
-        built("@ffi { completion: \"promise\" } extern wait : Nat -> Nat = \"host.wait\"")
-            .to_unchecked();
+    let mut asynchronous = built("@async extern wait : Nat -> Nat = \"host.wait\"").to_unchecked();
     for f in &mut asynchronous.lir.functions {
         f.suspension = ruddy::lir::Suspension::Synchronous;
     }

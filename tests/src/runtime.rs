@@ -221,7 +221,7 @@ fn executable_main_waits_for_async_initialization_and_preserves_process_exit() {
     fs::write(project.path().join("main.hc"), r#"
         effect Console = { write: String -> (), write_error: String -> () }
         effect Process = { exit: Nat -> | }
-        @ffi { completion: "promise" }
+        @async
         extern wait : String -> String = "value => new Promise(resolve => queueMicrotask(() => { console.log(value); resolve(value); }))"
         let initialized = wait "initialized"
         let main = fn _ => do
@@ -248,7 +248,7 @@ fn async_initialization_does_not_assimilate_ordinary_thenable_data() {
     let project = tempfile::tempdir().unwrap();
     fs::write(project.path().join("Ruddy.toml"), "name = \"async-data\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\ntarget = \"js\"\n[dependencies]\nstd = false\n").unwrap();
     fs::write(project.path().join("main.hc"), r#"
-        @ffi { completion: "promise" }
+        @async
         extern wait : () -> () = "() => Promise.resolve(null)"
         extern data : () -> { "then": Nat } = "() => ({ get then() { globalThis.inspected++; return () => {}; } })"
         let value = do let _ = wait () return data () end

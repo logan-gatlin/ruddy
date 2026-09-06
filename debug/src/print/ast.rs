@@ -11,8 +11,8 @@ use indexmap::IndexMap;
 use ruddy::{
     parse::{
         Annotation, Arg, ArgKind, ArmHead, Attribute, ClauseKind, DataKind, EffectBody,
-        EffectLabel, EffectRow, Expr, ExprKind, HandlerArm, Path, PatternKind, Rest, Stmt,
-        StmtKind, SumCase, TypeField, TypeKind, When, Where,
+        EffectLabel, EffectRow, Expr, ExprKind, ExternTypeKind, HandlerArm, Path, PatternKind,
+        Rest, Stmt, StmtKind, SumCase, TypeField, TypeKind, When, Where,
     },
     tracking::Tracked,
 };
@@ -249,9 +249,16 @@ impl fmt::Display for Ast<'_, StmtKind> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
             StmtKind::Extern {
-                name, ty, target, ..
+                name,
+                ty,
+                abi,
+                target,
             } => {
-                write!(f, "extern {} : {} = {target}", name.tracked, annotation(ty))
+                write!(f, "extern {} : {}", name.tracked, Ast(&abi.tracked))?;
+                if let Some(clause) = &ty.clause {
+                    write!(f, " where {}", Ast(clause))?;
+                }
+                write!(f, " = {target}")
             }
             // `body` is a `Tracked<Expr>` and `Expr` is itself `Tracked`, hence
             // the doubled `.tracked` to reach the `ExprKind`.
@@ -307,6 +314,43 @@ impl fmt::Display for Ast<'_, StmtKind> {
             }
         }
     }
+}
+
+impl fmt::Display for Ast<'_, ExternTypeKind> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            ExternTypeKind::Annotated { attributes, inner } => {
+                for attribute in attributes {
+                    write!(f, "{} ", Ast(attribute))?;
+                }
+                write!(f, "{}", Ast(&inner.tracked))
+            }
+            ExternTypeKind::Group(inner) => write!(f, "({})", Ast(&inner.tracked)),
+            ExternTypeKind::Ordinary(ty) => write!(f, "{}", Ast(&ty.tracked)),
+            ExternTypeKind::Function {
+                parameters,
+                result,
+                effects,
+            } => {
+                f.write_str("fn(")?;
+                for (i, parameter) in parameters.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{}", Ast(&parameter.tracked))?;
+                }
+                write!(f, ") -> {}", Ast(&result.tracked))?;
+                if let Some(effects) = effects {
+                    write!(f, " + {}", effect_row(effects))?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+pub fn extern_type(kind: &ExternTypeKind) -> impl fmt::Display + '_ {
+    Ast(kind)
 }
 
 /// Render a written type and the `where` clause after it — an ascription as it

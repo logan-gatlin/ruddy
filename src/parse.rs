@@ -546,6 +546,10 @@ pub type ExternType = Tracked<ExternTypeKind>;
 
 #[derive(Debug, Clone)]
 pub enum ExternTypeKind {
+    Annotated {
+        attributes: Vec<Attribute>,
+        inner: Box<ExternType>,
+    },
     Ordinary(Type),
     Function {
         parameters: Vec<ExternType>,
@@ -1459,6 +1463,10 @@ impl Parser {
 
     /// `@key [<literal>]`, as many as are written. None is the ordinary case.
     fn attributes(&mut self) -> Option<Vec<Attribute>> {
+        self.attributes_before(false)
+    }
+
+    fn attributes_before(&mut self, boundary_type: bool) -> Option<Vec<Attribute>> {
         let mut attributes = Vec::new();
         while matches!(
             self.peek().map(|tok| &tok.tracked),
@@ -1469,7 +1477,14 @@ impl Parser {
                 unreachable!("the loop peeked an attribute")
             };
             let key = token.span.track(key);
-            let value = self.data_value()?;
+            // A type can start with `fn` or a name that would be a computation
+            // in definition metadata. Parenthesized marked functions are type
+            // groups, not tuple-valued metadata.
+            let value = if boundary_type && (!self.at_data() || self.at_grouped_extern_function()) {
+                None
+            } else {
+                self.data_value()?
+            };
             let span = value
                 .as_ref()
                 .map_or(key.span, |value| key.span.merge(value.span));
@@ -2115,6 +2130,21 @@ impl Parser {
     /// Ruddy type leaf. `ordinary_outermost` retains the ordinary annotation's
     /// useful error for a `+` with no arrow at the declaration's top level.
     fn extern_type(&mut self, ordinary_outermost: bool) -> Option<(Type, ExternType)> {
+        if matches!(
+            self.peek().map(|token| &token.tracked),
+            Some(Kind::Attribute(_))
+        ) {
+            let attributes = self.attributes_before(true)?;
+            let (ty, inner) = self.extern_type(ordinary_outermost)?;
+            let span = attributes[0].span.merge(inner.span);
+            return Some((
+                ty,
+                span.track(ExternTypeKind::Annotated {
+                    attributes,
+                    inner: Box::new(inner),
+                }),
+            ));
+        }
         if self.at(&Kind::Fn) {
             return self.extern_function_type();
         }
@@ -2137,7 +2167,7 @@ impl Parser {
         Some((ty, abi))
     }
 
-    /// Whether consecutive transparent parentheses lead directly to `fn`.
+    /// Whether transparent parentheses lead to `fn` or boundary metadata.
     /// Ordinary parenthesized and tuple types remain wholly ordinary leaves.
     fn at_grouped_extern_function(&self) -> bool {
         let mut at = self.pos;
@@ -2152,7 +2182,7 @@ impl Parser {
         opens > 0
             && matches!(
                 self.toks.get(at).map(|token| &token.tracked),
-                Some(Kind::Fn)
+                Some(Kind::Fn | Kind::Attribute(_))
             )
     }
 

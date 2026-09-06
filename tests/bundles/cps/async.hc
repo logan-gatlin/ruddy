@@ -1,12 +1,11 @@
-@ffi { completion: "promise" }
+@async
 extern delayed : Real -> Real = "globalThis.host.delayed"
 effect Ask = { get: Real -> Real }
 let read = fn n => handle (1.0 + !Ask.get n) with
   | !Ask.get value => delayed value
 end
 
-@ffi { parameters: [{ callback: "promise" }] }
-extern remember : fn(fn(Real) -> Real) -> () = "globalThis.host.remember"
+extern remember : fn(@async fn(Real) -> Real) -> () = "globalThis.host.remember"
 let save = fn offset => remember (fn n => delayed (n + offset))
 
 let abort = fn n => handle !Ask.get n with
@@ -18,21 +17,12 @@ let normal = fn n => handle !Ask.get n with
   | return value => value + 100.0
 end
 
-@ffi { completion: "callback" }
-extern completed : Real -> Real = "globalThis.host.completed"
-let via_callback = fn n => 1.0 + completed n
-
-@ffi { parameters: [{ callback: "notification" }] }
-extern watch : fn(fn(Real) -> Real) -> () = "globalThis.host.watch"
-let notify = fn offset => watch (fn n => delayed (n + offset))
-
-@ffi { parameters: [{ callback: "completion" }] }
-extern keep_completed : fn(fn(Real) -> Real) -> () = "globalThis.host.keepCompleted"
-let save_completed = fn offset => keep_completed (fn n => delayed (n + offset))
+@async
+extern completed : Real -> Real = "n => new Promise((resolve, reject) => globalThis.host.completed(n, resolve, reject))"
+let via_wrapped_callback = fn n => 1.0 + completed n
 
 effect Exit = { stop: Real -> Real }
-@ffi { parameters: [{ callback: "promise" }] }
-extern keep_exit : fn(fn(Real) -> Real + !Exit) -> () + !Exit = "globalThis.host.keepExit"
+extern keep_exit : fn(@async fn(Real) -> Real + !Exit) -> () + !Exit = "globalThis.host.keepExit"
 extern run_exit : fn(fn(Real) -> Real + !Exit) -> Real + !Exit = "globalThis.host.runExit"
 let expired = fn _ => handle do
   let _ = keep_exit (fn n => !Exit.stop n)
@@ -48,8 +38,7 @@ let inline_exit = fn _ => handle run_exit (fn n => !Exit.stop n) with
 end
 
 effect Reader = { get: Real -> Real }
-@ffi { parameters: [{ callback: "promise" }] }
-extern keep_reader : fn(fn(Real) -> Real + !Reader) -> () + !Reader = "globalThis.host.keepReader"
+extern keep_reader : fn(@async fn(Real) -> Real + !Reader) -> () + !Reader = "globalThis.host.keepReader"
 let ordinary_evidence = fn offset => handle keep_reader (fn n => !Reader.get n) with
   | !Reader.get n => n + offset
 end
@@ -61,8 +50,7 @@ let fresh = fn offset => remember (fn n => handle !Ask.get (n + offset) with
   | return value => value + 100.0
 end)
 
-@ffi { parameters: [{ callback: "sync", result: { callback: "promise" } }] }
-extern keep_factory : fn(fn(Real) -> fn(Real) -> Real) -> () = "globalThis.host.keepFactory"
+extern keep_factory : fn(fn(Real) -> @async fn(Real) -> Real) -> () = "globalThis.host.keepFactory"
 let factory = fn offset => keep_factory (fn n => fn m => delayed (offset + n + m))
 
 extern keep_sync : fn(fn(Real) -> Real) -> () = "globalThis.host.keepSync"
@@ -70,9 +58,9 @@ extern observed : Real -> Real = "globalThis.host.observed"
 let unsafe_sync = fn _ => keep_sync (fn n => observed (delayed n))
 
 extern failure : Real -> Real = "n => { throw new Error('immediate failure'); }"
-let notify_failure = fn _ => watch (fn n => failure n)
+let save_failure = fn _ => remember (fn n => failure n)
 
-@ffi { completion: "promise" }
+@async
 extern translated : Real -> Real = "n => Promise.reject(new Error('translated')).catch(() => n + 10)"
 let translation = fn n => translated n
 
@@ -82,9 +70,9 @@ let immediate_data = fn _ => data ()
 @export "promise"
 let fixed_promise = fn n => n
 
-let registrations = fn n => match n with | 0.0 => 0.0 | _ => do
+let settled_promises = fn n => match n with | 0.0 => 0.0 | _ => do
   let _ = completed 0.0
-  return registrations (n - 1.0)
+  return settled_promises (n - 1.0)
 end
 end
 
@@ -96,9 +84,18 @@ end with | !Ask.get value => delayed value end) with
   | !Other value => delayed (value + 10.0)
 end
 
-@ffi { parameters: [{ callback: "completion" }] }
 extern keep_data : fn(fn(Real) -> { "then": Real }) -> () = "globalThis.host.keepData"
-let completion_data = fn _ => keep_data (fn n => do
-  let _ = delayed n
-  return data ()
-end)
+let save_data = fn _ => keep_data (fn _ => data ())
+
+-- A returned host function has its own Promise contract.
+extern make_reader : fn(Real) -> @async fn(Real) -> Real = "offset => n => Promise.resolve(offset + n)"
+let returned_host = fn offset => make_reader offset
+
+-- Direction reverses at every parameter boundary. The host passes an async
+-- function to Ruddy's async callback, which returns another async callback.
+extern use_nested : fn(@async fn(@async fn(Real) -> Real) -> @async fn(Real) -> Real) -> () = "globalThis.host.useNested"
+let nested_callbacks = fn offset => use_nested (fn host => fn n => host (offset + n))
+
+-- The outer @async does not change the returned function's immediate contract.
+extern make_sync : @async fn(Real) -> fn(Real) -> Real = "offset => Promise.resolve(n => offset + n)"
+let returned_sync = fn offset => make_sync offset

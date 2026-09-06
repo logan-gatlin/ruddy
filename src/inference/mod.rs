@@ -178,7 +178,6 @@ pub struct EffectAliasRow {
 /// reviewed.
 #[derive(Debug, Clone)]
 pub(crate) struct ReviewedExtern {
-    pub(crate) protocol: Option<crate::externs::Protocol>,
     pub(crate) scheme: Scheme,
     pub(crate) abi: ir::ExternType,
     pub(crate) target: String,
@@ -3763,7 +3762,15 @@ fn extern_boundary_review(
         if !seen.insert((abi as *const ir::ExternType, Rc::as_ptr(&original))) {
             continue;
         }
-        if matches!(&*original, Ty::Named { .. }) {
+        // Transparent ABI wrappers have not traversed the alias yet. Recording
+        // it here would make the inner node look like a recursive occurrence
+        // and skip its representation and callback-effect checks.
+        if matches!(&*original, Ty::Named { .. })
+            && !matches!(
+                &abi.anchored,
+                ir::ExternTypeKind::Group(_) | ir::ExternTypeKind::Annotated { .. }
+            )
+        {
             if active_aliases
                 .iter()
                 .any(|prior| same_finite_syntax(prior, &original))
@@ -3774,7 +3781,7 @@ fn extern_boundary_review(
         }
 
         match &abi.anchored {
-            ir::ExternTypeKind::Group(inner) => {
+            ir::ExternTypeKind::Group(inner) | ir::ExternTypeKind::Annotated { inner, .. } => {
                 work.push((inner, ty, path, active_aliases, report_row_leaves))
             }
             ir::ExternTypeKind::Function {
@@ -7194,9 +7201,6 @@ fn assemble(
             (
                 *symbol,
                 ReviewedExtern {
-                    protocol: crate::externs::protocol(&declaration.metadata)
-                        .ok()
-                        .flatten(),
                     scheme: externs[symbol].clone(),
                     abi: declaration.value.abi.clone(),
                     target: declaration.value.target.anchored.clone(),

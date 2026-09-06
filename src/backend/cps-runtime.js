@@ -49,15 +49,15 @@ function $promise(state) {
   });
   return state.promise;
 }
-// Each foreign request has one settlement. A completion during registration is
-// consumed by the running driver; a later completion schedules a fresh turn.
+// Each foreign request has one settlement. A synchronous throw is consumed by
+// the running driver; Promise settlement schedules a fresh turn.
 function $foreign(state, s) {
   const args = s.a.map(value => value && value[$closureMark] ? $callback(value, "Sync") : value);
   if (s.completion === "Immediate") {
     state.next = $resume(s.k, $fromHost(s.c(...args)));
     return;
   }
-  const token = { settled: false, registering: true };
+  const token = { settled: false, calling: true };
   const apply = () => {
     if (state.done) return;
     state.pending = false;
@@ -67,19 +67,17 @@ function $foreign(state, s) {
   const deliver = (failed, value) => {
     if (token.settled || state.done) return;
     token.settled = true; token.failed = failed; token.value = value;
-    if (!token.registering) queueMicrotask(() => { apply(); if (!state.done) $drive(state); });
+    if (!token.calling) queueMicrotask(() => { apply(); if (!state.done) $drive(state); });
   };
   try {
     if (s.completion === "Promise") {
       Promise.resolve(s.c(...args)).then(value => deliver(false, value), error => deliver(true, error));
-    } else if (s.completion === "Callback") {
-      s.c(...args, value => deliver(false, value), error => deliver(true, error));
     } else throw new Error("invalid foreign completion protocol");
   } catch (error) {
     if (error && error[$abortMark]) throw error;
     deliver(true, error);
   }
-  token.registering = false;
+  token.calling = false;
   if (token.settled) apply();
   else if (!state.allowSuspend) $finish(state, true, new Error("synchronous callback attempted to suspend"));
   else state.pending = true;
@@ -160,14 +158,6 @@ function $start(c, args, parent, allowSuspend = true, foreign = false) {
   state.next = $call(c, args, { root: true }, parent);
   return $drive(state);
 }
-function $report(error) {
-  const configuration = globalThis[Symbol.for("ruddy.runtime")];
-  if (configuration && typeof configuration.onUnhandledError === "function") {
-    try { configuration.onUnhandledError(error); }
-    catch (failure) { queueMicrotask(() => { throw failure; }); }
-  }
-  else queueMicrotask(() => { throw error; });
-}
 function $callback(value, mode, foreign = true) {
   value = $fromHost(value);
   let modes = $exported.get(value);
@@ -184,19 +174,8 @@ function $invoke(value, mode, args, foreign = false) {
       if (state.failed) throw state.error;
       return $export(state.value);
     }
-    let success, failure;
-    if (mode === "Completion") {
-      failure = args.pop(); success = args.pop();
-      if (typeof success !== "function" || typeof failure !== "function") throw new TypeError("completion callback requires success and failure functions");
-    }
-    const state = $start(value, args, null, true, foreign);
-    if (mode === "Promise") return $promise(state);
-    const done = () => {
-      if (mode === "Completion") { if (state.failed) failure(state.error); else success($export(state.value)); }
-      else if (state.failed) $report(state.error);
-    };
-    if (state.done) done(); else $settled(state).then(done).catch($report);
-    return undefined;
+    if (mode === "Promise") return $promise($start(value, args, null, true, foreign));
+    throw new Error("invalid callback protocol");
 }
 function $export(value) { return value; }
 function $initialize(initializers) {

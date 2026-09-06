@@ -218,12 +218,6 @@ fn compile_with(
     let mut ir = build(&mut mint, stmts);
     ir.errors.extend(
         ir.program
-            .externs
-            .values()
-            .filter_map(|declaration| externs::protocol(&declaration.metadata).err()),
-    );
-    ir.errors.extend(
-        ir.program
             .terms
             .values()
             .filter_map(|declaration| externs::export_request(&declaration.metadata).err()),
