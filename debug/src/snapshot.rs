@@ -83,16 +83,19 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     let mut diagnostics = Vec::new();
     let mut micros = Phases::default();
 
-    // The target every phase follows: what the document is configured for,
-    // or the kind's default. `@if` guards are judged against it, dependencies
-    // are compiled for it, and generation runs a backend for it.
-    let target = req
-        .target
-        .unwrap_or_else(|| ruddy_cli::Target::default_for(req.kind));
+    // The build every phase follows: what the document is configured for, or
+    // the defaults. `@if` guards are judged against it, dependencies are
+    // compiled for it, and generation runs a backend for its target.
+    let output = ruddy_cli::Build {
+        target: req
+            .target
+            .unwrap_or_else(|| ruddy_cli::Target::default_for(req.kind)),
+        platform: req.platform.unwrap_or_default(),
+    };
     let fs = Requested(&req.files);
     let started = Instant::now();
     let loaded = guard("bundle", &mut panicked, || {
-        bundle::load(&mut files, &fs, &req.root, &target.environment())
+        bundle::load(&mut files, &fs, &req.root, &output.environment())
     });
     micros.load = started.elapsed().as_micros() as u64;
     // Lexing and parsing happen inside the load, once per file, so the two tabs
@@ -237,7 +240,7 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
                     &req.dependencies,
                     &project,
                     scratch,
-                    target,
+                    output,
                 ) {
                     Ok((graph, direct, direct_paths)) => {
                         dependency_aliases = if req.std.is_disabled() {
@@ -547,7 +550,7 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     let mut js_error = None;
     let mut js_panicked = false;
     let js = linked.as_ref().and_then(|linked| {
-        if target == ruddy_cli::Target::Artifact {
+        if output.target == ruddy_cli::Target::Artifact {
             return None;
         }
         let started = Instant::now();
@@ -969,6 +972,7 @@ mod tests {
         let request = CompileRequest {
             kind: ruddy::artifact::Kind::Library,
             target: None,
+            platform: None,
             name: "test".into(),
             version: "0.1.0".into(),
             root: ROOT.into(),

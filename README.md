@@ -24,7 +24,9 @@ Only libraries can be dependencies. The optional `target` defaults to `js`
 for executables and `artifact` for libraries. `artifact` writes the portable
 compiler artifact without running a backend; `js` writes both the artifact
 and Node.js ESM. A library targeting JS exports its values without calling
-an entry point.
+an entry point. The optional `platform` names where the output runs, `node`
+(the default) or `web`; today it decides only what `@if` guards see and which
+cache entry a dependency gets.
 
 Executables define `main`, callable with `()` and returning a value compatible
 with `()` (including a function that never returns). Its effects must be
@@ -93,18 +95,20 @@ dependent bundles' source lookup and JavaScript exports; private implementation
 code still runs when needed.
 
 `@if` compiles a definition only for the builds its conditions name. Its value
-is a struct; the one condition is `target`, a string compared with the target
-of the root project being built (`"js"` or `"artifact"`), so a library's guard
-sees the target of the executable depending on it. A definition whose guard
-does not hold is dropped before names are resolved: a guarded `module` whose
-file is missing costs nothing, and two definitions of one name guarded for two
-targets do not collide. A target name no backend answers to holds for no
-build. An unknown condition, a missing one, or a `target` that is not a string
-is refused.
+is a struct whose fields are facts of the root project's build, each a string:
+`target` (`"js"` or `"artifact"`) and `platform` (`"node"` or `"web"`). Every
+fact named must hold; a fact not named may be anything. The facts are the root
+project's, so a library's guard sees the build of the executable depending on
+it. A definition whose guard does not hold is dropped before names are
+resolved: a guarded `module` whose file is missing costs nothing, and two
+definitions of one name guarded for two builds do not collide. A value no
+build has holds for no build. An unknown fact, a missing condition, or a value
+that is not a string is refused.
 
 ```text
 @if {target: "js"} module js
-@if {target: "js"} let now = js::now
+@if {target: "js", platform: "node"} let now = js::node_now
+@if {target: "js", platform: "web"} let now = js::web_now
 @if {target: "artifact"} let now = fn _ => 0n
 ```
 

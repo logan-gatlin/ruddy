@@ -20,7 +20,7 @@ use std::{
 
 use indexmap::IndexMap;
 use ruddy::artifact::Dependency;
-use ruddy_cli::{CompileError, CompiledGraph, DependencySpec, StdConfig, Target, fingerprint};
+use ruddy_cli::{Build, CompileError, CompiledGraph, DependencySpec, StdConfig, fingerprint};
 
 /// The most requests remembered before the memo is emptied. A browser debugs
 /// one document at a time, so this is far more than one ever needs; the
@@ -52,9 +52,9 @@ pub fn compile(
     dependencies: &IndexMap<String, DependencySpec>,
     project: &Path,
     scratch: &Path,
-    target: Target,
+    build: Build,
 ) -> Result<(CompiledGraph, Vec<Dependency>, Vec<PathBuf>), CompileError> {
-    let key = key(std, dependencies, project, scratch, target);
+    let key = key(std, dependencies, project, scratch, build);
     if let Some(entry) = CACHE.lock().unwrap().get(&key)
         && fingerprint(&entry.inputs) == entry.fingerprint
     {
@@ -73,7 +73,7 @@ pub fn compile(
         specifications,
         project,
         scratch,
-        target,
+        build,
     )?;
 
     let mut inputs: Vec<PathBuf> = graph
@@ -98,7 +98,7 @@ pub fn compile(
 }
 
 /// Everything about a request that decides which graph it gets, before any
-/// file is read: the configuration, the target its dependencies are compiled
+/// file is read: the configuration, the build its dependencies are compiled
 /// for, where it is resolved from, and the environment that locates the
 /// installed standard library.
 fn key(
@@ -106,13 +106,12 @@ fn key(
     dependencies: &IndexMap<String, DependencySpec>,
     project: &Path,
     scratch: &Path,
-    target: Target,
+    build: Build,
 ) -> String {
     // `Debug` rather than the wire form: the default standard library has no
     // wire form of its own, being the field's absence.
     format!(
-        "{std:?}\n{dependencies:?}\n{}\n{}\n{}\n{:?}\n{:?}",
-        target.name(),
+        "{std:?}\n{dependencies:?}\n{build:?}\n{}\n{}\n{:?}\n{:?}",
         project.display(),
         scratch.display(),
         env::var_os("RUDDY_HOME"),

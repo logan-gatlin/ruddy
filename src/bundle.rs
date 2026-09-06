@@ -15,7 +15,7 @@
 //! A definition guarded by `@if` is judged here too, against the
 //! [`Environment`] the driver supplies: one whose conditions do not hold is
 //! dropped before anything under it is read and before lowering mints a name,
-//! so two definitions of one name guarded for two targets never meet.
+//! so two definitions of one name guarded for two builds never meet.
 //!
 //! Files are reached through the [`Files`] trait rather than through
 //! [`std::fs`], so the debugger compiles what is in its editor and a test
@@ -23,6 +23,8 @@
 //! do it. [`Disk`] is the implementation that reads a real one.
 
 use std::{path::PathBuf, time::Instant};
+
+use indexmap::IndexMap;
 
 use crate::{
     parse::{self, Attribute, DataKind, Stmt, StmtKind},
@@ -39,9 +41,6 @@ const DIRECTORY_FILE: &str = "module";
 
 /// The metadata key that guards a definition: `@if {target: "js"}`.
 const CONDITION_KEY: &str = "if";
-
-/// The one condition a guard may name today.
-const TARGET_FIELD: &str = "target";
 
 /// Where a bundle's files come from.
 ///
@@ -117,25 +116,52 @@ pub enum ErrorKind {
     ConditionMissing,
     /// `@if` whose value is not a struct, such as `@if "js"`.
     ConditionNotStruct,
-    /// A condition field the loader does not know. Refused rather than ignored,
-    /// so that a condition added later cannot change what a guard written
-    /// today means, and so that a misspelling cannot drop a definition.
-    ConditionUnknownField { name: String },
-    /// A `target` condition whose value is not a string.
-    ConditionTargetNotString,
+    /// A condition naming no fact of the build. Refused rather than ignored,
+    /// so that a fact added later cannot change what a guard written today
+    /// means, and so that a misspelling cannot drop a definition. The facts
+    /// there are ride along, because naming them is the whole of the fix.
+    ConditionUnknownField { name: String, known: Vec<String> },
+    /// A condition whose value is not a string, which every fact is.
+    ConditionNotString { name: String },
 }
 
 /// What a build is for, as far as source can ask: the facts a definition's
-/// `@if` is judged against. Supplied by the driver from project configuration,
-/// as bundle identity is.
+/// `@if` is judged against, each a name and a string. Supplied by the driver
+/// from project configuration, as bundle identity is.
+///
+/// A guard names facts and the values it needs them to have; a fact it does
+/// not name may be anything. The facts are those of the root project being
+/// built — its `target` and `platform` — not of the bundle being loaded, so a
+/// library sees the build its consumer is making. A value no build ever has
+/// matches nothing, which lets a guard be written for a backend or platform
+/// before it exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Environment {
-    /// The target of the root project being built, spelled as its manifest
-    /// spells it — `js` or `artifact`. A dependency is judged against the
-    /// root's target, not its own manifest's, so a library sees the target its
-    /// consumer is built for. A name no backend answers to matches nothing,
-    /// which lets a guard be written for a backend before it exists.
-    pub target: String,
+    facts: IndexMap<String, String>,
+}
+
+impl Environment {
+    /// The facts, in the order a complaint lists them.
+    pub fn new<'a>(facts: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
+        Self {
+            facts: facts
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+        }
+    }
+
+    /// The value of the fact called `name`, if the build has one by that name.
+    pub fn fact(&self, name: &str) -> Option<&str> {
+        self.facts.get(name).map(String::as_str)
+    }
+
+    /// Every fact, in order: what a cache key digests.
+    pub fn facts(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.facts
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+    }
 }
 
 /// The whole load, in progress.
@@ -381,14 +407,26 @@ impl Loader<'_> {
         }
         let mut holds = true;
         for (label, field) in fields {
-            match label.tracked.as_str() {
-                TARGET_FIELD => match &field.tracked {
-                    DataKind::String(target) => holds &= *target == self.environment.target,
-                    _ => self.error(field.span, ErrorKind::ConditionTargetNotString),
-                },
-                _ => self.error(
+            let Some(actual) = self.environment.fact(&label.tracked) else {
+                let known = self
+                    .environment
+                    .facts()
+                    .map(|(name, _)| name.to_string())
+                    .collect();
+                self.error(
                     label.span,
                     ErrorKind::ConditionUnknownField {
+                        name: label.tracked.clone(),
+                        known,
+                    },
+                );
+                continue;
+            };
+            match &field.tracked {
+                DataKind::String(wanted) => holds &= wanted == actual,
+                _ => self.error(
+                    field.span,
+                    ErrorKind::ConditionNotString {
                         name: label.tracked.clone(),
                     },
                 ),

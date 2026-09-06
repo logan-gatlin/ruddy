@@ -101,30 +101,38 @@ fn executable_contract_is_checked_and_artifact_targets_defer_node_support() {
     );
 }
 
-/// The document's configured target is the one its `@if` guards are judged
-/// against, so the page shows what a build of that target would compile.
+/// The document's configured target and platform are what its `@if` guards
+/// are judged against, so the page shows what a build of that kind would
+/// compile. A request with no platform is a Node one, as every request was
+/// before there was a choice.
 #[test]
-fn guards_follow_the_documents_configured_target() {
-    let request = |target: &str| -> CompileRequest {
-        serde_json::from_value(serde_json::json!({
+fn guards_follow_the_documents_configured_target_and_platform() {
+    let request = |target: &str, platform: Option<&str>| -> CompileRequest {
+        let mut request = serde_json::json!({
             "name": "app", "version": "1.0.0", "kind": "library", "target": target,
             "root": ROOT, "std": false,
             "files": [{"path": ROOT, "source":
-                "@if {target: \"js\"} let only_js = 1n\nlet uses = only_js\n"}],
-        }))
-        .unwrap()
+                "@if {target: \"js\", platform: \"node\"} let only_js = 1n\nlet uses = only_js\n"}],
+        });
+        if let Some(platform) = platform {
+            request["platform"] = serde_json::json!(platform);
+        }
+        serde_json::from_value(request).unwrap()
     };
-    let js = compile(&request("js"), 0);
-    assert!(js.diagnostics.is_empty(), "{:?}", js.diagnostics);
-    let artifact = compile(&request("artifact"), 0);
-    assert!(
-        artifact
+    let undefined = |snapshot: &Snapshot| {
+        snapshot
             .diagnostics
             .iter()
-            .any(|error| error.code == "undefined-term"),
-        "{:?}",
-        artifact.diagnostics
-    );
+            .any(|error| error.code == "undefined-term")
+    };
+    let js = compile(&request("js", None), 0);
+    assert!(js.diagnostics.is_empty(), "{:?}", js.diagnostics);
+    let node = compile(&request("js", Some("node")), 0);
+    assert!(node.diagnostics.is_empty(), "{:?}", node.diagnostics);
+    let web = compile(&request("js", Some("web")), 0);
+    assert!(undefined(&web), "{:?}", web.diagnostics);
+    let artifact = compile(&request("artifact", None), 0);
+    assert!(undefined(&artifact), "{:?}", artifact.diagnostics);
 }
 
 #[test]
@@ -172,6 +180,7 @@ fn bundle(files: &[(&str, &str)]) -> Snapshot {
         &CompileRequest {
             kind: ruddy::artifact::Kind::Library,
             target: Some(ruddy_cli::Target::Js),
+            platform: None,
             name: "demo".to_string(),
             version: "0.1.0".to_string(),
             root: ROOT.to_string(),
@@ -272,6 +281,7 @@ fn dependency_paths_without_a_scratch_root_are_recoverable() {
         &CompileRequest {
             kind: ruddy::artifact::Kind::Library,
             target: None,
+            platform: None,
             name: "debugger".to_string(),
             version: "1.2.3".to_string(),
             root: ROOT.to_string(),
@@ -329,6 +339,7 @@ fn custom_standard_library_is_source_visible_rendered_and_sandboxed() {
     let request = CompileRequest {
         kind: ruddy::artifact::Kind::Library,
         target: None,
+        platform: None,
         name: "app".into(),
         version: "1.0.0".into(),
         root: ROOT.into(),
@@ -389,6 +400,7 @@ fn a_remembered_dependency_graph_follows_edits_to_its_sources() {
     let request = CompileRequest {
         kind: ruddy::artifact::Kind::Library,
         target: None,
+        platform: None,
         name: "app".into(),
         version: "1.0.0".into(),
         root: ROOT.into(),
@@ -467,6 +479,7 @@ fn installed_standard_library_child() {
     let request = CompileRequest {
         kind: ruddy::artifact::Kind::Library,
         target: None,
+        platform: None,
         name: "app".into(),
         version: "1.0.0".into(),
         root: ROOT.into(),
@@ -524,6 +537,7 @@ fn saved_dependency_projects_supply_artifact_identity_and_gate_lir() {
     let request = CompileRequest {
         kind: ruddy::artifact::Kind::Library,
         target: None,
+        platform: None,
         name: "app".to_string(),
         version: "1.0.0".to_string(),
         root: ROOT.to_string(),
@@ -670,6 +684,7 @@ fn dependencies_tab_correlates_same_bundle_versions_by_request_alias() {
     let request = CompileRequest {
         kind: ruddy::artifact::Kind::Library,
         target: None,
+        platform: None,
         name: "app".into(),
         version: "1.0.0".into(),
         root: ROOT.into(),
@@ -967,6 +982,7 @@ fn dependency_request(dependencies: IndexMap<String, String>) -> CompileRequest 
     CompileRequest {
         kind: ruddy::artifact::Kind::Library,
         target: None,
+        platform: None,
         name: "app".to_string(),
         version: "1.0.0".to_string(),
         root: ROOT.to_string(),
@@ -2344,6 +2360,7 @@ fn a_bad_bundle_is_reported_rather_than_fatal() {
             &CompileRequest {
                 kind: ruddy::artifact::Kind::Library,
                 target: None,
+                platform: None,
                 name: name.to_string(),
                 version: version.to_string(),
                 root: ROOT.to_string(),
@@ -2381,6 +2398,7 @@ fn a_nested_debugger_root_resolves_module_files_beside_its_root() {
         &CompileRequest {
             kind: ruddy::artifact::Kind::Library,
             target: None,
+            platform: None,
             name: "demo".into(),
             version: "0.1.0".into(),
             root: "src/main.hc".into(),

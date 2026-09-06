@@ -5093,15 +5093,18 @@ fn the_bundle_phase_words_and_codes_a_malformed_guard() {
         (
             BundleError::ConditionUnknownField {
                 name: "taget".to_string(),
+                known: vec!["target".to_string(), "platform".to_string()],
             },
             "condition-unknown-field",
             "this condition is not known",
-            "`taget` is not a condition `@if` understands",
+            "`taget` is not a fact of the build",
         ),
         (
-            BundleError::ConditionTargetNotString,
-            "condition-target-not-string",
-            "`target` names a target with a string",
+            BundleError::ConditionNotString {
+                name: "platform".to_string(),
+            },
+            "condition-not-string",
+            "a condition's value is a string",
             "this value is not a string",
         ),
     ] {
@@ -5115,10 +5118,33 @@ fn the_bundle_phase_words_and_codes_a_malformed_guard() {
         assert_eq!(diagnostic.help.len(), 1, "{code}");
         assert_eq!(diagnostic.notes.len(), 1, "{code}");
         assert!(
-            diagnostic.notes[0].contains("`@if {target: \"js\"}`"),
+            diagnostic.notes[0].contains("`@if {target: \"js\", platform: \"web\"}`"),
             "{code}"
         );
     }
+    // The unknown-field help names every fact there is, so the fix is on the
+    // page; the not-a-string help names the field that was written.
+    let unknown = ruddy::bundle::Error {
+        span,
+        kind: BundleError::ConditionUnknownField {
+            name: "taget".to_string(),
+            known: vec!["target".to_string(), "platform".to_string()],
+        },
+    };
+    assert_eq!(
+        unknown.diagnostic().help,
+        ["the facts are `target`, `platform`"]
+    );
+    let not_string = ruddy::bundle::Error {
+        span,
+        kind: BundleError::ConditionNotString {
+            name: "platform".to_string(),
+        },
+    };
+    assert_eq!(
+        not_string.diagnostic().help,
+        ["write `platform` as a string, in quotes"]
+    );
 }
 
 /// The tokens the module grammar added print as the lexemes they were written

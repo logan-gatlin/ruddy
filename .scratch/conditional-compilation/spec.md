@@ -25,12 +25,16 @@ definition is dropped before name resolution, as if it had not been written.
 @if {target: "artifact"} let now = fn _ => 0n
 ```
 
-The one condition today is `target`, a string compared with the target of the
-root project being built: `js` or `artifact`, spelled as `Ruddy.toml` spells
-them. A dependency is judged against the *root's* target, not its own
-manifest's, so a library sees the target its consumer is built for. The
-struct form leaves room for further conditions; an unknown field is refused so
-that adding one later cannot silently change what an existing guard means.
+The conditions are the facts of the root project's build, each a string
+compared with what `Ruddy.toml` spells: `target` (`js` or `artifact`) and
+`platform` (`node`, the default, or `web`). Target is what the compiler
+emits; platform is where the output runs, since the same JavaScript runs
+under Node or in a browser and what differs is the host. A guard names only
+the facts it cares about; one it does not name may be anything, so
+`@if {platform: "web"}` spans both targets. A dependency is judged against
+the *root's* build, not its own manifest's, so a library sees the build its
+consumer is making. An unknown field is refused so that adding a fact later
+cannot silently change what an existing guard means.
 
 ## User Stories
 
@@ -47,7 +51,10 @@ that adding one later cannot silently change what an existing guard means.
 11. As a Ruddy programmer, I want a malformed guard to keep its definition, so that the one complaint is not followed by unresolved-name complaints for everything that used it.
 12. As a Ruddy programmer, I want a surviving `@if` carried as ordinary metadata, so that tools can see which target a definition was written for.
 13. As a debugger user, I want the document's configured target to decide its guards, so that the page shows what a build of that target would compile.
-14. As a compiler maintainer, I want a dependency's cached artifact keyed by the target it was compiled for, so that a JavaScript build and an artifact build of the same library never read each other's cache entry.
+14. As a compiler maintainer, I want a dependency's cached artifact keyed by every fact of the build it was compiled for, so that two builds that differ in target or platform never read each other's cache entry.
+15. As a Ruddy programmer, I want `platform = "web"` in `Ruddy.toml`, defaulting to `node`, so that a build can say where its output runs.
+16. As a Ruddy programmer, I want `@if {platform: "web"}` to guard a definition by platform alone, and `@if {target: "js", platform: "web"}` by both, so that a guard names only the facts it cares about.
+17. As a debugger user, I want a platform chip beside the target chip, saved with the document, so that the page shows what a build for that platform would compile.
 
 ## Semantics
 
@@ -69,23 +76,30 @@ All are bundle-stage errors, recoverable: the definition is kept.
 | --- | --- |
 | `condition-missing` | `@if` needs a condition |
 | `condition-not-struct` | an `@if` condition is a struct |
-| `condition-unknown-field` | this condition is not known |
-| `condition-target-not-string` | `target` names a target with a string |
+| `condition-unknown-field` | this condition is not known (help names every fact) |
+| `condition-not-string` | a condition's value is a string |
 
 ## Implementation Decisions
 
-- `bundle::Environment { target }` carries the facts a guard is judged
-  against; `bundle::load` takes one. The CLI derives it from the root
-  manifest's target (`Target::name`), the debugger from the request's.
-- `GraphCompiler` records the root build's target and passes it to every
-  project it compiles; the multi-root dependency-graph APIs, which have no
-  single root, let each root use its own manifest target.
-- `cache::key` digests the target alongside the sources and dependency keys.
-- The debugger's in-process dependency memo keys on the target too.
+- `bundle::Environment` is an ordered map of fact name to value; the loader
+  judges any field by looking its name up, so adding a fact touches the
+  driver only. `bundle::load` takes one.
+- The CLI's `Build { target, platform }` is derived from the root manifest
+  and produces the environment; the debugger builds one from its request.
+- `GraphCompiler` records the root's build and passes it to every project it
+  compiles; the multi-root dependency-graph APIs, which have no single root,
+  let each root use its own manifest.
+- `cache::key` digests every fact alongside the sources and dependency keys.
+- The debugger's in-process dependency memo keys on the build too.
+- The backend and the Node entry check do not read the platform yet; a web
+  build still emits the Node runtime handlers. Making them platform-aware is
+  separate work.
 
 ## Out of Scope
 
 - Negation, `else`, or any-of forms.
-- Conditions other than `target`.
+- Facts other than `target` and `platform`; `arch` waits for a backend that
+  cares.
+- Platform-specific code generation and entry checking.
 - Guards on local definitions or expressions; attributes are refused there
   already.

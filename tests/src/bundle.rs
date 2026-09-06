@@ -29,11 +29,10 @@ impl Files for Memory {
     }
 }
 
-/// A build for the named target, which is all an [`Environment`] says.
+/// A build for the named target on Node, the platform every build had until
+/// there was a choice. The platform tests spell theirs out.
 fn environment(target: &str) -> Environment {
-    Environment {
-        target: target.to_string(),
-    }
+    Environment::new([("target", target), ("platform", "node")])
 }
 
 /// The build most tests load for: a JavaScript one. Only the guard tests care
@@ -50,6 +49,11 @@ fn load(files: &[(&str, &str)]) -> (FileManager, Output) {
 
 /// [`load`], for a build of the named target.
 fn load_for(target: &str, files: &[(&str, &str)]) -> (FileManager, Output) {
+    load_in(&environment(target), files)
+}
+
+/// [`load`], for whatever build `environment` describes.
+fn load_in(environment: &Environment, files: &[(&str, &str)]) -> (FileManager, Output) {
     let fs = Memory(
         files
             .iter()
@@ -57,7 +61,7 @@ fn load_for(target: &str, files: &[(&str, &str)]) -> (FileManager, Output) {
             .collect(),
     );
     let mut manager = FileManager::new();
-    let out = bundle::load(&mut manager, &fs, "main.hc", &environment(target));
+    let out = bundle::load(&mut manager, &fs, "main.hc", environment);
     (manager, out)
 }
 
@@ -472,6 +476,33 @@ fn definitions_guarded_for_different_targets_do_not_collide() {
     }
 }
 
+/// Every fact of the build is a condition, and a guard holds only when every
+/// fact it names has the value it wants. A fact it does not name may be
+/// anything: `platform` alone spans both targets, and `target` alone both
+/// platforms.
+#[test]
+fn a_guard_holds_when_every_fact_it_names_holds() {
+    let source = "@if {platform: \"web\"} let w = 1n\n\
+                  @if {platform: \"node\"} let n = 2n\n\
+                  @if {target: \"js\", platform: \"web\"} let jw = 3n\n\
+                  @if {target: \"js\"} let j = 4n\n";
+    for (target, platform, expected) in [
+        ("js", "web", &["let w", "let jw", "let j"][..]),
+        ("js", "node", &["let n", "let j"]),
+        ("artifact", "web", &["let w"]),
+        ("artifact", "node", &["let n"]),
+    ] {
+        let environment = Environment::new([("target", target), ("platform", platform)]);
+        let out = load_in(&environment, &[("main.hc", source)]).1;
+        assert!(
+            out.errors.is_empty(),
+            "{target}/{platform}: {:#?}",
+            out.errors
+        );
+        assert_eq!(names(&out.stmts), expected, "{target}/{platform}");
+    }
+}
+
 /// A repeated `@if`, or a repeated field inside one, is the duplicate that
 /// lowering already refuses. The loader keeps the definition so that lowering
 /// sees it and says so, rather than judging one of two spellings and dropping
@@ -525,12 +556,22 @@ fn a_malformed_guard_is_reported_and_keeps_its_definition() {
             "taget",
             ErrorKind::ConditionUnknownField {
                 name: "taget".to_string(),
+                known: vec!["target".to_string(), "platform".to_string()],
             },
         ),
         (
             "@if {target: 1n} let a = 1n\n",
             "1n",
-            ErrorKind::ConditionTargetNotString,
+            ErrorKind::ConditionNotString {
+                name: "target".to_string(),
+            },
+        ),
+        (
+            "@if {platform: #Web} let a = 1n\n",
+            "#Web",
+            ErrorKind::ConditionNotString {
+                name: "platform".to_string(),
+            },
         ),
     ] {
         let out = one(source);

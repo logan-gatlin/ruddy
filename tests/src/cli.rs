@@ -394,6 +394,7 @@ fn inference_diagnostics_keep_structured_parity_across_real_consumers() {
         &CompileRequest {
             kind: ruddy::artifact::Kind::Library,
             target: None,
+            platform: None,
             name: "diagnostics".into(),
             version: "0.1.0".into(),
             root: DEBUG_ROOT.into(),
@@ -3850,6 +3851,39 @@ fn dependency_artifacts_cache_child() {
     build_project(&lib).unwrap();
     let entries = fs::read_dir(compilers[0].path()).unwrap().flatten().count();
     assert_eq!(entries, 2);
+}
+
+/// `platform` in the manifest is the other fact a guard can name. It defaults
+/// to Node, and a manifest that names a platform the compiler does not know
+/// is refused where it is read.
+#[test]
+fn a_manifests_platform_is_judged_by_guards_and_defaults_to_node() {
+    let directory = tempfile::tempdir().unwrap();
+    write_project(directory.path(), "hosted", "1.0.0", &[]);
+    fs::write(
+        directory.path().join("main.hc"),
+        "@if {platform: \"web\"} let value = 1n\nlet uses = value\n",
+    )
+    .unwrap();
+    let manifest = fs::read_to_string(directory.path().join("Ruddy.toml")).unwrap();
+
+    let error = compile(directory.path()).unwrap_err().to_string();
+    assert!(error.contains("undefined-term"), "{error}");
+
+    fs::write(
+        directory.path().join("Ruddy.toml"),
+        manifest.replace("root =", "platform = \"web\"\nroot ="),
+    )
+    .unwrap();
+    compile(directory.path()).expect("the web arm is compiled for a web build");
+
+    fs::write(
+        directory.path().join("Ruddy.toml"),
+        manifest.replace("root =", "platform = \"deno\"\nroot ="),
+    )
+    .unwrap();
+    let error = compile(directory.path()).unwrap_err().to_string();
+    assert!(error.contains("deno"), "{error}");
 }
 
 /// A dependency's guards are judged against the root build's target, not the

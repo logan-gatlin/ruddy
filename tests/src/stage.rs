@@ -1452,6 +1452,7 @@ fn bundle(files: &[(&str, &str)]) -> Snapshot {
         &CompileRequest {
             kind: ruddy::artifact::Kind::Library,
             target: Some(ruddy_cli::Target::Js),
+            platform: None,
             name: "demo".to_string(),
             version: "0.1.0".to_string(),
             root: ROOT.to_string(),

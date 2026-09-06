@@ -96,8 +96,8 @@ pub const FIRST_DECLARATION: &str = "first declared here";
 pub const DECLARED_HERE: &str = "declared here";
 
 /// What every `@if` complaint reminds the reader of: the shape of a guard and
-/// the one fact it can ask about.
-const CONDITIONS: &str = "`@if {target: \"js\"}` compiles a definition only when the root project is built for that target; every field written must hold";
+/// the facts it can ask about.
+const CONDITIONS: &str = "`@if {target: \"js\", platform: \"web\"}` compiles a definition only when the root project is built with every fact named; a fact not named may be anything";
 
 /// A node a printer has to parenthesize by precedence. Implemented by every
 /// wrapper that prints as surface syntax, and by [`Ty`], which prints as one
@@ -1102,7 +1102,7 @@ impl bundle::ErrorKind {
             bundle::ErrorKind::ConditionMissing => "condition-missing",
             bundle::ErrorKind::ConditionNotStruct => "condition-not-struct",
             bundle::ErrorKind::ConditionUnknownField { .. } => "condition-unknown-field",
-            bundle::ErrorKind::ConditionTargetNotString => "condition-target-not-string",
+            bundle::ErrorKind::ConditionNotString { .. } => "condition-not-string",
         }
     }
 }
@@ -1152,19 +1152,26 @@ impl bundle::Error {
             .label("this value is not a struct")
             .help("write the condition as a field, such as `@if {target: \"js\"}`")
             .note(CONDITIONS),
-            bundle::ErrorKind::ConditionUnknownField { name } => {
+            bundle::ErrorKind::ConditionUnknownField { name, known } => {
                 Diagnostic::new(self.kind.code(), "this condition is not known", self.span)
-                    .label(format!("`{name}` is not a condition `@if` understands"))
-                    .help("the conditions are `target`")
+                    .label(format!("`{name}` is not a fact of the build"))
+                    .help(format!(
+                        "the facts are {}",
+                        known
+                            .iter()
+                            .map(|fact| format!("`{fact}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
                     .note(CONDITIONS)
             }
-            bundle::ErrorKind::ConditionTargetNotString => Diagnostic::new(
+            bundle::ErrorKind::ConditionNotString { name } => Diagnostic::new(
                 self.kind.code(),
-                "`target` names a target with a string",
+                "a condition's value is a string",
                 self.span,
             )
             .label("this value is not a string")
-            .help("write the target's name, such as `\"js\"` or `\"artifact\"`")
+            .help(format!("write `{name}` as a string, in quotes"))
             .note(CONDITIONS),
         }
     }
@@ -1178,7 +1185,7 @@ impl fmt::Display for bundle::ErrorKind {
             bundle::ErrorKind::ConditionMissing => "`@if` needs a condition",
             bundle::ErrorKind::ConditionNotStruct => "an `@if` condition is a struct",
             bundle::ErrorKind::ConditionUnknownField { .. } => "this condition is not known",
-            bundle::ErrorKind::ConditionTargetNotString => "`target` names a target with a string",
+            bundle::ErrorKind::ConditionNotString { .. } => "a condition's value is a string",
         })
     }
 }

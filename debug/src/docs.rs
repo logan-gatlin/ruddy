@@ -31,6 +31,8 @@ struct Manifest {
     kind: ruddy::artifact::Kind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     target: Option<ruddy_cli::Target>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    platform: Option<ruddy_cli::Platform>,
     name: String,
     version: String,
     root: String,
@@ -174,6 +176,7 @@ pub fn read(root: &Path, name: &str) -> io::Result<Doc> {
     Ok(Doc {
         kind: manifest.kind,
         target: manifest.target,
+        platform: manifest.platform,
         name: name.to_string(),
         bundle_name: manifest.name,
         version: manifest.version,
@@ -215,6 +218,7 @@ pub fn write(
         configured_root,
         ruddy::artifact::Kind::Library,
         None,
+        None,
         run,
         std,
         dependencies,
@@ -222,7 +226,8 @@ pub fn write(
     )
 }
 
-/// Save a document with its executable/library and output-target contract.
+/// Save a document with its executable/library, output-target and platform
+/// contract.
 #[allow(clippy::too_many_arguments)]
 pub fn write_configured(
     root: &Path,
@@ -232,6 +237,7 @@ pub fn write_configured(
     configured_root: &str,
     kind: ruddy::artifact::Kind,
     target: Option<ruddy_cli::Target>,
+    platform: Option<ruddy_cli::Platform>,
     run: &RunConfig,
     std: &StdConfig,
     dependencies: &IndexMap<String, DependencySpec>,
@@ -243,6 +249,7 @@ pub fn write_configured(
     let manifest = Manifest {
         kind,
         target,
+        platform,
         name: bundle_name.to_string(),
         version: version.to_string(),
         root: configured_root.to_string(),
