@@ -953,6 +953,7 @@ fn artifact_stage_renders_one_dependency() {
     let artifact = UncheckedArtifact {
         header: Header {
             compiler: ruddy::artifact::Stamp::current(),
+            modules: Vec::new(),
             identity: Identity {
                 name: "demo".to_string(),
                 version: "1.0.0".to_string(),
@@ -1020,7 +1021,7 @@ fn artifact_stage_renders_one_dependency() {
 
     assert_eq!(
         stage.summary,
-        "1 dependency · 0 values · 0 types · 0 effects · 1 externs · 0 functions · 0 globals"
+        "1 dependency · 0 values · 0 types · 0 effects · 0 modules · 1 externs · 0 functions · 0 globals"
     );
     let dependencies = &stage.nodes[0].children[0];
     assert_eq!(dependencies.label, "dependencies");
@@ -1490,4 +1491,100 @@ fn flatten(nodes: &[Node]) -> Vec<&Node> {
         out.extend(flatten(&node.children));
     }
     out
+}
+
+/// A definition's metadata is visible in every tab that shows the definition:
+/// the token stream paints the key in its own class, the AST and IR trees give
+/// each attribute a row spanning what was written, and the artifact tab shows
+/// what was published — for the module too, which has no other row anywhere.
+#[test]
+fn metadata_is_shown_across_the_debugger_tabs() {
+    let source =
+        "@k 1n @flag let x = 1n\n@owner \"core\" module M = @inner #Tag [true] let y = 2n end\n";
+
+    let tokens = named(bundle(&[(ROOT, source)]), "tokens");
+    let keys: Vec<(&str, &str)> = tokens.nodes[0]
+        .children
+        .iter()
+        .filter(|token| token.label == "Attribute")
+        .map(|token| {
+            let class = token
+                .fields
+                .iter()
+                .find(|field| field.name == "_class")
+                .expect("every token has an editor class");
+            (token.text.as_str(), class.value.as_str())
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            ("@k", "attribute"),
+            ("@flag", "attribute"),
+            ("@owner", "attribute"),
+            ("@inner", "attribute"),
+        ]
+    );
+
+    for id in ["ast", "ir"] {
+        let tree = tab(id, source);
+        let rows = flatten(&tree);
+        let attributes: Vec<&str> = rows
+            .iter()
+            .filter(|node| node.label == "Attribute")
+            .map(|node| node.text.as_str())
+            .collect();
+        let expected: &[&str] = match id {
+            // The IR has no row for a module, so its metadata is the one
+            // thing this tab does not show; the artifact tab does.
+            "ast" => &["@k 1n", "@flag", "@owner \"core\"", "@inner #Tag [true]"],
+            _ => &["@k 1n", "@flag", "@inner #Tag [true]"],
+        };
+        assert_eq!(attributes, expected, "{id}: {rows:#?}");
+        let first = rows
+            .iter()
+            .find(|node| node.label == "Attribute")
+            .expect("an attribute row");
+        assert_eq!(
+            first.at.map(|span| (span.start, span.end())),
+            Some((0, 5)),
+            "{id}"
+        );
+    }
+
+    let artifact = tab("artifact", source);
+    let header = &artifact[0];
+    let published: Vec<(&str, &str, Vec<&str>)> = header
+        .children
+        .iter()
+        .filter(|node| node.label == "value" || node.label == "module")
+        .map(|node| {
+            (
+                node.label.as_str(),
+                node.text.as_str(),
+                node.children
+                    .iter()
+                    .map(|child| child.text.as_str())
+                    .collect(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        published,
+        [
+            ("value", "demo@0.1.0::x", vec!["@k 1n", "@flag"]),
+            ("value", "demo@0.1.0::M::y", vec!["@inner #Tag [true]"]),
+            ("module", "demo@0.1.0::M", vec!["@owner \"core\""]),
+        ],
+        "{header:#?}"
+    );
+    assert!(
+        header
+            .children
+            .iter()
+            .filter(|node| node.label == "metadata"
+                || node.children.iter().any(|c| c.label == "metadata"))
+            .all(|node| node.children.iter().all(|child| child.label == "metadata")),
+        "{header:#?}"
+    );
 }

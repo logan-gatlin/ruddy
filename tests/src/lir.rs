@@ -287,6 +287,7 @@ fn imported_forwarding_cycles_recover_before_lir_representation() {
             let dependency = a::UncheckedArtifact {
                 header: a::Header {
                     compiler: ruddy::artifact::Stamp::current(),
+                    modules: Vec::new(),
                     identity: a::Identity {
                         name: "dep".into(),
                         version: "1.0.0".into(),
@@ -295,6 +296,7 @@ fn imported_forwarding_cycles_recover_before_lir_representation() {
                     values: Vec::new(),
                     types: vec![
                         a::DeclaredType {
+                            metadata: Default::default(),
                             name: "dep@1.0.0::A".into(),
                             params: Vec::new(),
                             scheme: scheme(
@@ -309,6 +311,7 @@ fn imported_forwarding_cycles_recover_before_lir_representation() {
                             ),
                         },
                         a::DeclaredType {
+                            metadata: Default::default(),
                             name: "dep@1.0.0::Id".into(),
                             params: vec![a::Parameter {
                                 sense: a::Sense::Type,
@@ -1045,6 +1048,7 @@ fn imported_and_local_handler_arms_build_one_complete_evidence_record() {
     let dependency = a::UncheckedArtifact {
         header: a::Header {
             compiler: ruddy::artifact::Stamp::current(),
+            modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
                 version: "1.0.0".into(),
@@ -1053,6 +1057,7 @@ fn imported_and_local_handler_arms_build_one_complete_evidence_record() {
             values: Vec::new(),
             types: Vec::new(),
             effects: vec![a::DeclaredEffect {
+                metadata: Default::default(),
                 name: "dep@1.0.0::Log".into(),
                 params: Vec::new(),
                 identity: Some(a::EffectIdentity {

@@ -31,6 +31,7 @@ fn artifact(
     let values = globals
         .iter()
         .map(|global| a::Value {
+            metadata: Default::default(),
             name: global.name.clone(),
             scheme: scheme(),
         })
@@ -38,6 +39,7 @@ fn artifact(
     validated(a::UncheckedArtifact {
         header: a::Header {
             compiler: ruddy::artifact::Stamp::current(),
+            modules: Vec::new(),
             identity: a::Identity {
                 name: name.into(),
                 version: "1.0.0".into(),
@@ -202,6 +204,7 @@ fn links_every_item_and_recursively_relocates_function_indices() {
         }))),
     };
     root.header.types.push(a::DeclaredType {
+        metadata: Default::default(),
         name: "app@1.0.0::Public".into(),
         params: vec![],
         scheme: scheme(),

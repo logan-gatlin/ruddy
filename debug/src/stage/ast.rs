@@ -7,9 +7,9 @@ use std::fmt;
 
 use ruddy::{
     parse::{
-        Annotation, ArgKind, ArmHead, Clause, ClauseKind, EffectBody, EffectLabel, EffectRow, Expr,
-        ExprKind, Pattern, PatternKind, Rest, Stmt, StmtKind, SumCase, Type, TypeField, TypeKind,
-        When,
+        Annotation, ArgKind, Arm, ArmHead, Clause, ClauseKind, EffectBody, EffectLabel, EffectRow,
+        Expr, ExprKind, Pattern, PatternKind, Rest, Stmt, StmtKind, SumCase, Type, TypeField,
+        TypeKind, When,
     },
     tracking::FileID,
 };
@@ -39,7 +39,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         .map(|file| {
             let stmts = written_in(&loaded.stmts, file.id);
             for stmt in &stmts {
-                counts.add(&stmt.tracked);
+                counts.add(&stmt.kind);
             }
             Node::new(ids.next(), "File", file.path.clone())
                 .children(stmts.iter().map(|stmt| stmt_node(&mut ids, stmt)))
@@ -104,7 +104,7 @@ fn written_in(stmts: &[Stmt], file: FileID) -> Vec<&Stmt> {
             }
             if let StmtKind::Module {
                 body: Some(body), ..
-            } = &stmt.tracked
+            } = &stmt.kind
             {
                 walk(body, file, out);
             }
@@ -116,8 +116,22 @@ fn written_in(stmts: &[Stmt], file: FileID) -> Vec<&Stmt> {
 }
 
 fn stmt_node(ids: &mut Ids, stmt: &Stmt) -> Node {
-    let node = Node::new(ids.next(), "", print::ast::stmt(&stmt.tracked).to_string()).at(stmt.span);
-    match &stmt.tracked {
+    // The attributes come first, as they were written, each a row of its own
+    // spanning the key and its value.
+    let attributes: Vec<Node> = stmt
+        .attributes
+        .iter()
+        .map(|attribute| {
+            Node::new(
+                ids.next(),
+                "Attribute",
+                print::ast::attribute(attribute).to_string(),
+            )
+            .at(attribute.span)
+        })
+        .collect();
+    let node = Node::new(ids.next(), "", print::ast::stmt(stmt).to_string()).at(stmt.span);
+    let mut built = match &stmt.kind {
         // A module's own row is its name and, when the body was written inline,
         // the statements in it. A body that came from another file is left to
         // that file's own row; see [`written_in`].
@@ -220,7 +234,9 @@ fn stmt_node(ids: &mut Ids, stmt: &Stmt) -> Node {
             }
             effect_node
         }
-    }
+    };
+    built.children.splice(0..0, attributes);
+    built
 }
 
 fn expr_role_node(ids: &mut Ids, role: &'static str, expr: &Expr) -> Node {
@@ -286,6 +302,14 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
             Node::new(ids.next(), "Arg", text).at(arg.span)
         }))
         .child(expr_node(ids, body)),
+        ExprKind::MatchFunction { arms, .. } => pattern_arms(
+            ids,
+            Node {
+                label: "Match Function".into(),
+                ..node
+            },
+            arms,
+        ),
         // A block's row holds a statement row per binding — the same row a
         // definition gets, since a binding is written as one — and, when the
         // block returns something, the returned expression under its role.
@@ -395,20 +419,12 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
         // The scrutinee first, then one wrapper per arm holding the arm's
         // pattern and body — the shape the reader wrote, before flattening.
         ExprKind::Match { scrutinee, arms } => {
-            let mut match_node = Node {
+            let node = Node {
                 label: "Match".into(),
                 ..node
             }
             .child(expr_node(ids, scrutinee));
-            for arm in &arms[..] {
-                let span = arm.pattern.span.merge(arm.body.span);
-                let arm_node = Node::new(ids.next(), "Arm", format!("{}", arm.pattern.tracked))
-                    .at(span)
-                    .child(pattern_node(ids, &arm.pattern))
-                    .child(expr_node(ids, &arm.body));
-                match_node = match_node.child(arm_node);
-            }
-            match_node
+            pattern_arms(ids, node, arms)
         }
         // The handled expression first, then one wrapper per arm holding what
         // it answers, the name it binds and its body — the match's shape,
@@ -482,6 +498,18 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
             ..node
         },
     }
+}
+
+fn pattern_arms(ids: &mut Ids, mut node: Node, arms: &[Arm]) -> Node {
+    for arm in arms {
+        let span = arm.pattern.span.merge(arm.body.span);
+        let arm_node = Node::new(ids.next(), "Arm", format!("{}", arm.pattern.tracked))
+            .at(span)
+            .child(pattern_node(ids, &arm.pattern))
+            .child(expr_node(ids, &arm.body));
+        node = node.child(arm_node);
+    }
+    node
 }
 
 /// One written pattern, as a tree: each node's text is the pattern's own

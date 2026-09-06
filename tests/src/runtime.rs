@@ -30,8 +30,10 @@ fn generated_javascript_passes_the_node_runtime_suite() {
 
 /// Build and run one checked-in bundle whose program and assertions live in
 /// `bundles/<fixture>`, from a temporary project so no output lands in the
-/// fixture. The manifest is written here because it has to name the standard
-/// library by an absolute path. Skipped where there is no Node to run it.
+/// fixture. Every file of the fixture is copied, so a bundle may have module
+/// files beside its root. The manifest is written here because it has to name
+/// the standard library by an absolute path. Skipped where there is no Node
+/// to run it.
 fn run_bundle(fixture: &str, script: &str) {
     if Command::new("node").arg("--version").output().is_err() {
         return;
@@ -44,9 +46,15 @@ fn run_bundle(fixture: &str, script: &str) {
         .join("bundles")
         .join(fixture);
     let project = tempfile::tempdir().expect("a temporary bundle project");
-    for name in ["main.hc", script] {
-        fs::copy(source.join(name), project.path().join(name))
-            .unwrap_or_else(|error| panic!("could not copy {fixture} fixture {name}: {error}"));
+    for entry in fs::read_dir(&source).expect("the fixture directory") {
+        let entry = entry.expect("a fixture entry");
+        let name = entry.file_name();
+        fs::copy(entry.path(), project.path().join(&name)).unwrap_or_else(|error| {
+            panic!(
+                "could not copy {fixture} fixture {}: {error}",
+                name.display()
+            )
+        });
     }
     fs::write(
         project.path().join("Ruddy.toml"),
@@ -83,4 +91,13 @@ fn struct_spreads_build_the_fields_they_promise() {
 #[test]
 fn do_blocks_evaluate_in_order_to_what_they_return() {
     run_bundle("do-blocks", "blocks.test.mjs");
+}
+
+/// Definition metadata compiled through the CLI's own path and read back by
+/// Node: every attribute form on every kind of definition, including a
+/// module whose body is another file, and a program that computes exactly
+/// what it would without them.
+#[test]
+fn definition_metadata_leaves_the_program_unchanged() {
+    run_bundle("definition-metadata", "metadata.test.mjs");
 }

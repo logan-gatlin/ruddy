@@ -111,6 +111,7 @@ pub fn label(kind: &Kind) -> &'static str {
         Kind::Tag(_) => "Tag",
         Kind::EffectLabel(_) => "EffectLabel",
         Kind::Variable(_) => "Variable",
+        Kind::Attribute(_) => "Attribute",
         Kind::LeftBrace => "LeftBrace",
         Kind::RightBrace => "RightBrace",
         Kind::LeftBracket => "LeftBracket",
@@ -137,7 +138,9 @@ pub fn label(kind: &Kind) -> &'static str {
 /// a case rather than a definition, nothing ever resolves it, and a reader
 /// scanning a sum wants to see where the cases are. An effect has a third,
 /// because it is neither: it resolves to a declaration, like a name, and wears
-/// a sigil, like a tag.
+/// a sigil, like a tag. An attribute's key has a fourth: it is metadata about
+/// a definition rather than part of the program, and a reader wants to see
+/// where the program stops and the notes about it begin.
 pub fn class(kind: &Kind) -> &'static str {
     match kind {
         Kind::Identifier(_) => "ident",
@@ -147,6 +150,7 @@ pub fn class(kind: &Kind) -> &'static str {
         Kind::Tag(_) => "tag",
         Kind::EffectLabel(_) => "effect",
         Kind::Variable(_) => "variable",
+        Kind::Attribute(_) => "attribute",
         Kind::Equal
         | Kind::FatArrow
         | Kind::Arrow

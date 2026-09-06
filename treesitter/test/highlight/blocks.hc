@@ -18,3 +18,7 @@ let quiet = fn _ => handle greet () with
   | return x => x
 --  ^^^^^^ @keyword.return
 end
+
+let unwrap = fn | #Some value => value | #None => 0n
+--  ^^^^^^ @function
+--                ^^^^^ @constructor

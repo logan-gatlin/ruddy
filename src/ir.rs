@@ -40,6 +40,11 @@ pub struct Program {
     /// symbols remain on labels for resolution and navigation; this map is
     /// what gives rows their module-independent semantic identity.
     pub effect_ids: IndexMap<Symbol, EffectId>,
+    /// The modules declared, in the order they were written, each with the
+    /// metadata written in front of its declaration. A module is otherwise
+    /// only a symbol other symbols are minted under; this is the one thing a
+    /// declaration says about the module itself.
+    pub modules: IndexMap<Symbol, ModuleDecl>,
     /// The definitions split into the smallest sets that have to be typed
     /// together, earliest first. See [`Group`] and [`grouping`].
     pub groups: Vec<Group>,
@@ -199,7 +204,78 @@ pub struct Decl<T> {
     /// term, which binds none of its own — a lambda's argument is bound inside
     /// its body rather than by the definition.
     pub params: Vec<Param>,
+    /// What the attributes in front of the definition said. Empty for the
+    /// ordinary definition with none, and for the hidden definitions a
+    /// pattern makes: those have no name another bundle could read it under.
+    pub metadata: Metadata,
     pub value: T,
+}
+
+/// A module's declaration: where its name was written and the metadata in
+/// front of it. The symbol is the map key, as a [`Decl`]'s is.
+#[derive(Debug, Clone)]
+pub struct ModuleDecl {
+    pub name_at: Anchor,
+    pub metadata: Metadata,
+}
+
+/// A definition's metadata: one entry per attribute, by decoded key, in
+/// written order. A key appears once — the repeat is refused in lowering, as a
+/// struct's repeated field is — so this is the struct the attributes make.
+pub type Metadata = IndexMap<String, Attribute>;
+
+/// One entry of a definition's metadata: where its key was written, and the
+/// data it carries. A bare `@key` carries unit, which is the empty struct
+/// here as it is everywhere else in the lowered tree.
+#[derive(Debug, Clone)]
+pub struct Attribute {
+    pub key_at: Anchor,
+    pub value: Data,
+}
+
+/// A metadata value, lowered: the data a literal stands for, with the
+/// spellings that mean one thing made one thing. `()` and `{}` are the empty
+/// struct, a tuple is the struct its numbering makes, and a bare tag carries
+/// the empty struct — the same three identifications lowering makes for
+/// expressions, so metadata reads by the rules the rest of the language
+/// reads by.
+///
+/// Never a term. Nothing here is typed, checked, or lowered further; the
+/// artifact publishes it as it is.
+pub type Data = Anchored<DataKind>;
+
+/// How deep metadata may nest: a value at this depth is admitted and one
+/// below it is refused. The top of an attribute's value is depth 1, and each
+/// array, struct, or tag payload adds one.
+///
+/// A bound rather than a stack-safe reader, because metadata is small: nothing
+/// a person writes nests this far, and the bound is what lets the artifact
+/// reader hold a file's metadata in an ordinary recursive tree without
+/// trusting the file. Lowering refuses the same depth, so an artifact the
+/// compiler writes is one the reader admits.
+pub const METADATA_DEPTH_LIMIT: usize = 32;
+
+/// The forms lowered data takes: the scalars, arrays, structs keyed by decoded
+/// label, and tags carrying something — with unit and tuples folded into the
+/// struct they are.
+#[derive(Debug, Clone)]
+pub enum DataKind {
+    Natural(u64),
+    Integer(i64),
+    Real(f64),
+    String(String),
+    Boolean(bool),
+    Array(Vec<Data>),
+    /// Fields by decoded label, in written order, each with where its label
+    /// was written. Unit and tuples are here too: the empty struct, and the
+    /// struct numbered `0`, `1`, ….
+    Struct(IndexMap<String, Field<Data>>),
+    /// A case, with what it carries — the empty struct when nothing was
+    /// written after the name.
+    Tag {
+        name: String,
+        payload: Box<Data>,
+    },
 }
 
 /// One parameter of a `type` declaration.
@@ -1329,6 +1405,16 @@ pub enum ErrorKind {
         name: String,
         previous: Anchor,
     },
+    /// A key written twice in one definition's attributes. The metadata is a
+    /// struct — one value per key — and the first attribute is the one that
+    /// stands.
+    DuplicateAttribute {
+        name: String,
+        previous: Anchor,
+    },
+    /// A metadata value nested below [`METADATA_DEPTH_LIMIT`]. Reported at
+    /// the value that crossed the line, which stands in as unit.
+    MetadataTooDeep,
     /// A second case of a name in one sum, one effect row, or one alias — all
     /// three being a set of labels a name may appear in once.
     DuplicateCase {
@@ -2022,17 +2108,16 @@ struct Builder<'a> {
 /// them.
 #[derive(Default)]
 struct Flat {
-    types: Vec<(Option<Module>, TrackedString, Vec<TrackedString>, Annotated)>,
-    effects: Vec<(
-        Option<Module>,
-        TrackedString,
-        Vec<TrackedString>,
-        EffectBody,
-    )>,
+    types: Vec<Hoisted<Annotated>>,
+    effects: Vec<Hoisted<EffectBody>>,
     terms: Vec<Defined>,
     externs: Vec<External>,
     /// Shared term/extern source order, which preserves duplicate precedence.
     values: Vec<FlatValue>,
+    /// Every module minted, with its declaration, in declaration order. A
+    /// repeated module is reported where it is minted and is not here: the
+    /// first declaration is the one that stands.
+    modules: Vec<(Module, ModuleDecl)>,
 }
 
 /// An alias declaration as written, waiting to be lowered on first use.
@@ -2056,10 +2141,27 @@ enum FlatValue {
     Extern(usize),
 }
 
+/// One `type` or `effect` declaration, as the parser read it and with the
+/// module it was written in: its name, the parameters it binds, its body, and
+/// the metadata in front of it.
+type Hoisted<Body> = (
+    Option<Module>,
+    TrackedString,
+    Vec<TrackedString>,
+    Body,
+    Metadata,
+);
+
 /// One `let`, as the parser read it and with the module it was written in: the
 /// pattern it binds, the annotation it may wear, and its value. Named because
 /// the tuple is the widest of the three and reads as noise inline.
-type Defined = (Option<Module>, Box<parse::Pattern>, Option<Annotated>, Body);
+type Defined = (
+    Option<Module>,
+    Box<parse::Pattern>,
+    Option<Annotated>,
+    Body,
+    Metadata,
+);
 
 /// One extern declaration, paired with the module it belongs to.
 type External = (
@@ -2068,6 +2170,7 @@ type External = (
     Annotated,
     parse::ExternType,
     TrackedString,
+    Metadata,
 );
 
 enum DeclaredValue {
@@ -2692,6 +2795,7 @@ fn build_with_dependency_imports_inner(
         effect_params: IndexMap::new(),
         effects: IndexMap::new(),
         effect_ids: IndexMap::new(),
+        modules: IndexMap::new(),
         groups: Vec::new(),
     };
     b.import_dependencies(dependencies, linked, &mut program);
@@ -2701,6 +2805,9 @@ fn build_with_dependency_imports_inner(
     // named from above its own declaration and from another file.
     let mut flat = Flat::default();
     b.flatten(stmts, &mut flat);
+    for (module, declaration) in std::mem::take(&mut flat.modules) {
+        program.modules.insert(module.symbol(), declaration);
+    }
     // Every type's name is bound before any type's body is read, so a type can
     // name itself and two types can name each other. That is the whole of what
     // makes a recursive type writable: nothing downstream ties the knot, and
@@ -2710,7 +2817,7 @@ fn build_with_dependency_imports_inner(
     let declared: Vec<_> = flat
         .types
         .iter()
-        .map(|(module, name, _, _)| {
+        .map(|(module, name, ..)| {
             b.module = *module;
             b.declare(Scope::Types, name)
         })
@@ -2724,7 +2831,7 @@ fn build_with_dependency_imports_inner(
         .types
         .iter()
         .zip(&declared)
-        .map(|((module, name, params, _), symbol)| {
+        .map(|((module, name, params, ..), symbol)| {
             b.module = *module;
             b.define(*symbol, name.span.start);
             b.declare_params(params)
@@ -2744,7 +2851,7 @@ fn build_with_dependency_imports_inner(
     let named: Vec<_> = flat
         .effects
         .iter()
-        .map(|(module, name, params, _)| {
+        .map(|(module, name, params, ..)| {
             b.module = *module;
             let symbol = b.declare(Scope::Effects, name);
             b.define(symbol, name.span.start);
@@ -2759,7 +2866,9 @@ fn build_with_dependency_imports_inner(
         })
         .collect();
     let mut aliases = Vec::new();
-    for ((symbol, params), (module, name, _, cases)) in named.into_iter().zip(flat.effects) {
+    for ((symbol, params), (module, name, _, cases, metadata)) in
+        named.into_iter().zip(flat.effects)
+    {
         b.module = module;
         b.define(symbol, name.span.start);
         let value = match cases {
@@ -2799,6 +2908,7 @@ fn build_with_dependency_imports_inner(
                     name_at: b.anchor(name.span),
                     annotation: None,
                     params,
+                    metadata,
                     value,
                 },
             );
@@ -2827,7 +2937,7 @@ fn build_with_dependency_imports_inner(
                 Effect::Alias(_) => None,
             }),
     );
-    for ((symbol, (module, name, _, body)), params) in
+    for ((symbol, (module, name, _, body, metadata)), params) in
         declared.into_iter().zip(flat.types).zip(bound)
     {
         b.module = module;
@@ -2848,6 +2958,7 @@ fn build_with_dependency_imports_inner(
                     name_at: b.anchor(name.span),
                     annotation: None,
                     params,
+                    metadata,
                     value,
                 },
             );
@@ -2992,7 +3103,7 @@ fn build_with_dependency_imports_inner(
         .iter()
         .map(|value| match value {
             FlatValue::Term(at) => {
-                let (module, pattern, _, _) = &flat.terms[*at];
+                let (module, pattern, ..) = &flat.terms[*at];
                 b.module = *module;
                 let mut names = Vec::new();
                 pattern_names(pattern, &mut names);
@@ -3012,7 +3123,7 @@ fn build_with_dependency_imports_inner(
                 }
             }
             FlatValue::Extern(at) => {
-                let (module, name, _, _, _) = &flat.externs[*at];
+                let (module, name, ..) = &flat.externs[*at];
                 b.module = *module;
                 DeclaredValue::Extern {
                     at: *at,
@@ -3024,7 +3135,7 @@ fn build_with_dependency_imports_inner(
     for value in declared {
         match value {
             DeclaredValue::Extern { at, symbol } => {
-                let (module, name, annotation, abi, target) = flat.externs[at].clone();
+                let (module, name, annotation, abi, target, metadata) = flat.externs[at].clone();
                 b.module = module;
                 b.define(symbol, name.span.start);
                 let annotation = b.written(annotation, Place::Annotation);
@@ -3050,6 +3161,7 @@ fn build_with_dependency_imports_inner(
                             name_at: b.anchor(name.span),
                             annotation: Some(annotation),
                             params: Vec::new(),
+                            metadata,
                             value: Extern {
                                 target: b.anchored(target),
                                 abi,
@@ -3063,7 +3175,7 @@ fn build_with_dependency_imports_inner(
                 at,
                 symbols: declared,
             } => {
-                let (module, pattern, ty, body) = flat.terms[at].clone();
+                let (module, pattern, ty, body, metadata) = flat.terms[at].clone();
                 b.module = module;
                 match pattern.tracked {
                     parse::PatternKind::Ident { name } => {
@@ -3081,6 +3193,7 @@ fn build_with_dependency_imports_inner(
                                     name_at: b.anchor(name.span),
                                     annotation,
                                     params: Vec::new(),
+                                    metadata,
                                     value,
                                 },
                             );
@@ -3100,9 +3213,13 @@ fn build_with_dependency_imports_inner(
                         let mut dropped = Vec::new();
                         let pattern = b.pattern(pattern, &mut seen, &mut binders, &mut dropped);
                         match calm(&pattern) {
-                            Some(calm) => {
-                                b.destructure_stmt(calm, annotation, value, &mut program.terms)
-                            }
+                            Some(calm) => b.destructure_stmt(
+                                calm,
+                                annotation,
+                                value,
+                                &metadata,
+                                &mut program.terms,
+                            ),
                             None => {
                                 let (at, found) = refuter(&pattern)
                                     .expect("a pattern that is not calm names what refutes it");
@@ -3115,6 +3232,7 @@ fn build_with_dependency_imports_inner(
                                         name_at: b.anchor(pspan),
                                         annotation,
                                         params: Vec::new(),
+                                        metadata: Metadata::new(),
                                         value,
                                     },
                                 );
@@ -3130,6 +3248,7 @@ fn build_with_dependency_imports_inner(
                                     name_at: name.at,
                                     annotation: None,
                                     params: Vec::new(),
+                                    metadata: Metadata::new(),
                                     value: TermKind::Error.at(name.at),
                                 },
                             );
@@ -9091,6 +9210,12 @@ impl Names {
     }
 }
 
+/// Unit, as data: the empty struct, anchored at what stood for it — a bare
+/// `@key` or a bare tag's name.
+fn unit_data(at: Anchor) -> Data {
+    at.anchor(DataKind::Struct(IndexMap::new()))
+}
+
 impl Builder<'_> {
     /// The anchor of something written at `span` in the definition being
     /// lowered.
@@ -9160,16 +9285,19 @@ impl Builder<'_> {
     fn flatten(&mut self, stmts: Vec<Stmt>, flat: &mut Flat) {
         let outer = self.module;
         for stmt in stmts {
-            match stmt.tracked {
+            // Lowered here, on the way past, so a repeated key is reported in
+            // the order the reader wrote it and beside nothing else.
+            let metadata = self.metadata(stmt.attributes);
+            match stmt.kind {
                 StmtKind::Type { name, params, body } => {
-                    flat.types.push((outer, name, params, body))
+                    flat.types.push((outer, name, params, body, metadata))
                 }
                 StmtKind::Effect { name, params, body } => {
-                    flat.effects.push((outer, name, params, body))
+                    flat.effects.push((outer, name, params, body, metadata))
                 }
                 StmtKind::Let { pattern, ty, body } => {
                     let at = flat.terms.len();
-                    flat.terms.push((outer, pattern, ty, body));
+                    flat.terms.push((outer, pattern, ty, body, metadata));
                     flat.values.push(FlatValue::Term(at));
                 }
                 StmtKind::Extern {
@@ -9179,16 +9307,108 @@ impl Builder<'_> {
                     target,
                 } => {
                     let at = flat.externs.len();
-                    flat.externs.push((outer, name, ty, abi, target));
+                    flat.externs.push((outer, name, ty, abi, target, metadata));
                     flat.values.push(FlatValue::Extern(at));
                 }
                 StmtKind::Module { name, body } => {
-                    self.module = Some(self.declare_module(&name));
+                    let known = self.modules.len();
+                    let module = self.declare_module(&name);
+                    // A repeat was reported by the minting and stands for the
+                    // first declaration, whose metadata is the one that holds.
+                    if self.modules.len() > known {
+                        let declaration = ModuleDecl {
+                            name_at: self.anchor(name.span),
+                            metadata,
+                        };
+                        flat.modules.push((module, declaration));
+                    }
+                    self.module = Some(module);
                     self.flatten(body.unwrap_or_default(), flat);
                     self.module = outer;
                 }
             }
         }
+    }
+
+    /// The attributes in front of a definition, as the struct they make. A key
+    /// written twice is refused at the repeat, pointing back at the first,
+    /// and the first is the one kept.
+    fn metadata(&mut self, attributes: Vec<parse::Attribute>) -> Metadata {
+        let mut metadata = Metadata::new();
+        for attribute in attributes {
+            let key = attribute.key;
+            if let Some(previous) = metadata.get(&key.tracked) {
+                self.error(
+                    key.span,
+                    ErrorKind::DuplicateAttribute {
+                        name: key.tracked,
+                        previous: previous.key_at,
+                    },
+                );
+                continue;
+            }
+            let key_at = self.anchor(key.span);
+            let value = match attribute.value {
+                Some(data) => self.data(data, 1),
+                None => unit_data(key_at),
+            };
+            metadata.insert(key.tracked, Attribute { key_at, value });
+        }
+        metadata
+    }
+
+    /// A written metadata value, lowered: the three spellings of one value
+    /// made one, and a struct's repeated field refused as a term's is. `depth`
+    /// is how many values enclose this one, itself included; past the limit
+    /// the value is refused and unit stands in for it.
+    fn data(&mut self, data: parse::Data, depth: usize) -> Data {
+        let span = data.span;
+        let here = self.anchor(span);
+        if depth > METADATA_DEPTH_LIMIT {
+            self.error(span, ErrorKind::MetadataTooDeep);
+            return unit_data(here);
+        }
+        let kind = match data.tracked {
+            parse::DataKind::Natural(value) => DataKind::Natural(value),
+            parse::DataKind::Integer(value) => DataKind::Integer(value),
+            parse::DataKind::Real(value) => DataKind::Real(value),
+            parse::DataKind::String(value) => DataKind::String(value),
+            parse::DataKind::Boolean(value) => DataKind::Boolean(value),
+            parse::DataKind::Unit => DataKind::Struct(IndexMap::new()),
+            parse::DataKind::Tuple(elements) => DataKind::Struct(
+                elements
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, element)| {
+                        let name_at = self.anchor(element.span);
+                        let value = self.data(element, depth + 1);
+                        (index.to_string(), Field { name_at, value })
+                    })
+                    .collect(),
+            ),
+            parse::DataKind::Array(items) => DataKind::Array(
+                items
+                    .into_iter()
+                    .map(|item| self.data(item, depth + 1))
+                    .collect(),
+            ),
+            parse::DataKind::Struct(fields) => DataKind::Struct(self.labels(
+                fields,
+                |name, previous| ErrorKind::DuplicateField { name, previous },
+                |b, value| b.data(value, depth + 1),
+            )),
+            parse::DataKind::Tag { name, payload } => DataKind::Tag {
+                payload: Box::new(match payload {
+                    Some(payload) => self.data(*payload, depth + 1),
+                    None => {
+                        let at = self.anchor(name.span);
+                        unit_data(at)
+                    }
+                }),
+                name: name.tracked,
+            },
+        };
+        here.anchor(kind)
     }
 
     /// Declare a global in the module being lowered into. `None` when that
@@ -11243,6 +11463,24 @@ impl Builder<'_> {
                     .at(span)
                 })
             }
+            ExprKind::MatchFunction { fn_span, arms } => {
+                let fn_at = self.anchor(fn_span);
+                let arg = self.fresh("%match", fn_at);
+                let scrutinee = TermKind::Ident(arg.anchored).at(fn_at);
+                let inner = match self.answering {
+                    Answering::Nowhere => Answering::Nowhere,
+                    Answering::Arm | Answering::UnderFn(_) => Answering::UnderFn(self.anchor(span)),
+                };
+                let outer = std::mem::replace(&mut self.answering, inner);
+                let body = self.match_term_with_scrutinee(span, scrutinee, arms);
+                self.answering = outer;
+                let here = self.anchor(span);
+                TermKind::Fn {
+                    arg,
+                    body: Box::new(body),
+                }
+                .at(here)
+            }
             // A block is a spelling of the nested bindings it holds, one term
             // per `let`; see [`Builder::block`].
             ExprKind::Do { stmts, result } => self.block(span, stmts.into_iter(), result),
@@ -12068,7 +12306,7 @@ impl Builder<'_> {
                 .at(self.anchor(span)),
             };
         };
-        let StmtKind::Let { pattern, ty, body } = stmt.tracked else {
+        let StmtKind::Let { pattern, ty, body } = stmt.kind else {
             // The parser refuses every other kind at its keyword and drops
             // it. One that got through binds nothing, so the block goes on
             // without it.
@@ -12541,11 +12779,16 @@ impl Builder<'_> {
     /// R6's statement half: a calm pattern on a top-level `let` becomes
     /// ordinary top-level definitions — a fresh one holding the value, with
     /// the written annotation, then one per name, fields in written order.
+    ///
+    /// The statement's metadata goes to every name the pattern binds: it was
+    /// written about the definition, and the names are what a reader of the
+    /// artifact can find it under. The hidden definitions carry none.
     fn destructure_stmt(
         &mut self,
         calm: Calm,
         annotation: Option<Annotation>,
         value: Term,
+        metadata: &Metadata,
         out: &mut IndexMap<Symbol, Decl<Term>>,
     ) {
         match calm {
@@ -12556,6 +12799,7 @@ impl Builder<'_> {
                         name_at: name.at,
                         annotation,
                         params: Vec::new(),
+                        metadata: metadata.clone(),
                         value,
                     },
                 );
@@ -12573,6 +12817,7 @@ impl Builder<'_> {
                         name_at: span,
                         annotation,
                         params: Vec::new(),
+                        metadata: Metadata::new(),
                         value,
                     },
                 );
@@ -12586,11 +12831,12 @@ impl Builder<'_> {
                             name_at: span,
                             annotation: Some(annotation),
                             params: Vec::new(),
+                            metadata: Metadata::new(),
                             value,
                         },
                     );
                     let again = TermKind::Ident(held.anchored).at(span);
-                    self.destructure_stmt(Calm::Unit(span), None, again, out);
+                    self.destructure_stmt(Calm::Unit(span), None, again, metadata, out);
                 }
                 None => {
                     let unit = demand(span.anchor(TypeKind::Struct {
@@ -12604,6 +12850,7 @@ impl Builder<'_> {
                             name_at: span,
                             annotation: Some(unit),
                             params: Vec::new(),
+                            metadata: Metadata::new(),
                             value,
                         },
                     );
@@ -12618,13 +12865,26 @@ impl Builder<'_> {
                             name_at: span,
                             annotation: Some(annotation),
                             params: Vec::new(),
+                            metadata: Metadata::new(),
                             value,
                         },
                     );
                     let again = TermKind::Ident(held.anchored).at(span);
-                    self.destructure_stmt(Calm::ArrayRest { at: span, name }, None, again, out);
+                    self.destructure_stmt(
+                        Calm::ArrayRest { at: span, name },
+                        None,
+                        again,
+                        metadata,
+                        out,
+                    );
                 }
                 None => {
+                    // A named rest is a name the reader wrote, and carries the
+                    // metadata; the nameless one is hidden and carries none.
+                    let carried = match &name {
+                        Some(_) => metadata.clone(),
+                        None => Metadata::new(),
+                    };
                     let name = name.unwrap_or_else(|| self.fresh("%array", span));
                     out.insert(
                         name.anchored,
@@ -12632,6 +12892,7 @@ impl Builder<'_> {
                             name_at: span,
                             annotation: Some(array_demand(span)),
                             params: Vec::new(),
+                            metadata: carried,
                             value,
                         },
                     );
@@ -12654,6 +12915,7 @@ impl Builder<'_> {
                             name_at: span,
                             annotation: Some(annotation),
                             params: Vec::new(),
+                            metadata: Metadata::new(),
                             value,
                         },
                     );
@@ -12663,7 +12925,7 @@ impl Builder<'_> {
                         fields,
                         rest,
                     };
-                    self.destructure_stmt(calm, None, again, out);
+                    self.destructure_stmt(calm, None, again, metadata, out);
                 }
                 (annotation, rest) => {
                     let annotation = match rest {
@@ -12677,6 +12939,7 @@ impl Builder<'_> {
                             name_at: span,
                             annotation,
                             params: Vec::new(),
+                            metadata: Metadata::new(),
                             value,
                         },
                     );
@@ -12687,7 +12950,7 @@ impl Builder<'_> {
                             field: name.clone(),
                         }
                         .at(name.at);
-                        self.destructure_stmt(sub, None, field, out);
+                        self.destructure_stmt(sub, None, field, metadata, out);
                     }
                 }
             },
@@ -12705,6 +12968,15 @@ impl Builder<'_> {
     /// twice — reported by the pattern walk itself.
     fn match_term(&mut self, span: Span, scrutinee: Expr, arms: Vec<parse::Arm>) -> Term {
         let scrutinee = self.term(scrutinee);
+        self.match_term_with_scrutinee(span, scrutinee, arms)
+    }
+
+    fn match_term_with_scrutinee(
+        &mut self,
+        span: Span,
+        scrutinee: Term,
+        arms: Vec<parse::Arm>,
+    ) -> Term {
         let mut lowered: Vec<(Pattern, Term)> = Vec::new();
         for arm in arms {
             let mark = self.terms.mark();

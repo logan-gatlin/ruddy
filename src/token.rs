@@ -142,6 +142,13 @@ pub enum Kind {
     /// one declaration, which is what makes a declaration statement
     /// unnecessary.
     Variable(String),
+    /// `@deprecated` — an attribute's key: one entry of the metadata written
+    /// in front of a top-level definition. The fourth sigilled token, and it
+    /// keeps the tag's rules: sigil and name are one lexeme, so the whole key
+    /// can be selected in one go, and the `@` is not part of the name it
+    /// carries. What follows it — a literal value, or nothing — is the
+    /// parser's to read.
+    Attribute(String),
     /// An unsigned 64-bit natural literal, written with an `n` suffix.
     Natural(u64),
     /// A signed 64-bit integer literal, written with an `i` suffix.
@@ -180,6 +187,8 @@ pub enum ErrorKind {
     MalformedEffectLabel,
     /// `'` was not followed by an identifier-shaped variable name.
     MalformedVariable,
+    /// `@` was not followed by an identifier-shaped attribute key.
+    MalformedAttribute,
     /// A number ran directly into identifier characters, as in `1thing`.
     NumberFollowedByName,
     /// A whole-number suffix was attached to a decimal, as in `1.5n`.
@@ -304,6 +313,18 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                         Ok(kind) => tokens.push(span.track(kind)),
                         Err(kind) => invalid(span, kind, &mut tokens, &mut errors),
                     }
+                }
+            }
+            // An `@` heads an attribute's key and nothing else, so what
+            // follows it is a name or the lexeme is an error — the rule the
+            // `'` below keeps.
+            '@' => {
+                let (kind, width) =
+                    sigilled(&mut chars, Kind::Attribute, ErrorKind::MalformedAttribute);
+                let span = file_id.span(start, width);
+                match kind {
+                    Ok(kind) => tokens.push(span.track(kind)),
+                    Err(kind) => invalid(span, kind, &mut tokens, &mut errors),
                 }
             }
             // A `'` heads a variable and nothing else: there are no character

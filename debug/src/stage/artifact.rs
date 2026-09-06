@@ -53,13 +53,19 @@ pub fn render(spec: &Spec, cx: &Cx, artifact: &Artifact, micros: u64) -> Stage {
         .children(dependency_nodes),
     ];
     for value in &artifact.header().values {
-        interface.push(Node::new(ids.next(), "value", &value.name));
+        interface.push(
+            Node::new(ids.next(), "value", &value.name)
+                .children(metadata(&mut ids, &value.metadata)),
+        );
     }
     for ty in &artifact.header().types {
-        interface.push(Node::new(ids.next(), "type", &ty.name));
+        interface.push(
+            Node::new(ids.next(), "type", &ty.name).children(metadata(&mut ids, &ty.metadata)),
+        );
     }
     for effect in &artifact.header().effects {
-        let mut node = Node::new(ids.next(), "effect", &effect.name);
+        let mut node = Node::new(ids.next(), "effect", &effect.name)
+            .children(metadata(&mut ids, &effect.metadata));
         for param in &effect.params {
             node = node.child(Node::new(
                 ids.next(),
@@ -105,6 +111,12 @@ pub fn render(spec: &Spec, cx: &Cx, artifact: &Artifact, micros: u64) -> Stage {
             }
         }
         interface.push(node);
+    }
+    for module in &artifact.header().modules {
+        interface.push(
+            Node::new(ids.next(), "module", &module.name)
+                .children(metadata(&mut ids, &module.metadata)),
+        );
     }
     let header = Node::new(
         ids.next(),
@@ -161,15 +173,31 @@ pub fn render(spec: &Spec, cx: &Cx, artifact: &Artifact, micros: u64) -> Stage {
         ..spec.stage(
             cx.status(),
             format!(
-                "{} · {} values · {} types · {} effects · {} externs · {} functions · {} globals",
+                "{} · {} values · {} types · {} effects · {} modules · {} externs · {} functions · {} globals",
                 dependencies,
                 artifact.header().values.len(),
                 artifact.header().types.len(),
                 artifact.header().effects.len(),
+                artifact.header().modules.len(),
                 artifact.lir().externs.len(),
                 artifact.lir().functions.len(),
                 artifact.lir().globals.len(),
             ),
         )
     }
+}
+
+/// The published metadata of one declaration, one row per entry, written as
+/// the source it stands for rather than as the artifact's own text.
+fn metadata(ids: &mut Ids, metadata: &ruddy::artifact::Metadata) -> Vec<Node> {
+    metadata
+        .iter()
+        .map(|(key, value)| {
+            Node::new(
+                ids.next(),
+                "metadata",
+                crate::print::artifact::attribute(key, value).to_string(),
+            )
+        })
+        .collect()
 }

@@ -7,7 +7,74 @@ use crate::{
     tracking::{Span, Tracked, TrackedString},
 };
 
-pub type Stmt = Tracked<StmtKind>;
+/// One top-level definition as written: the attributes in front of it, the
+/// definition itself, and where the definition was written.
+///
+/// A struct rather than a `Tracked<StmtKind>` because the attributes belong to
+/// the statement and to no one variant of it: every kind of definition may
+/// carry metadata, and a field on each variant would be five spellings of one
+/// fact. The span is the definition's own, from its keyword — the attributes
+/// each carry theirs — so nothing that pointed at a definition moves when
+/// metadata is written in front of it.
+#[derive(Debug, Clone)]
+pub struct Stmt {
+    /// The metadata written in front of the definition, in written order.
+    /// Empty for the ordinary definition with none. Whether two of them share
+    /// a key is [`ir`](crate::ir)'s to say; the parser records what was
+    /// written.
+    pub attributes: Vec<Attribute>,
+    pub kind: StmtKind,
+    pub span: Span,
+}
+
+/// `@key` or `@key <literal>` — one entry of a definition's metadata.
+///
+/// The value, when there is one, is [`Data`]: literal data and never a term.
+/// A bare key carries unit, the way a bare `#Tag` does, and that is decided
+/// where `#None` and `#None ()` meet — in lowering — so this records whether a
+/// value was written.
+#[derive(Debug, Clone)]
+pub struct Attribute {
+    /// From the key through the value, when there is one.
+    pub span: Span,
+    /// The key, without its `@`.
+    pub key: TrackedString,
+    pub value: Option<Data>,
+}
+
+/// A metadata value as written. Literal data: what a scalar, tag, tuple, array,
+/// or struct literal would evaluate to, with nothing in it that computes.
+///
+/// Its own tree rather than a restricted [`Expr`], so that no later phase has to
+/// ask whether a metadata value might compute: inference, pattern checking, and
+/// lowering to LIR never see one.
+pub type Data = Tracked<DataKind>;
+
+/// The forms a metadata value takes, as written: every literal an expression
+/// has, and nothing an expression computes.
+#[derive(Debug, Clone)]
+pub enum DataKind {
+    Natural(u64),
+    Integer(i64),
+    Real(f64),
+    String(String),
+    Boolean(bool),
+    /// `()`. Lowering makes it the empty struct, as it does the expression.
+    Unit,
+    /// `(a, b)` — one or more values with a comma; lowering numbers them as it
+    /// numbers a tuple expression's fields.
+    Tuple(Vec<Data>),
+    Array(Vec<Data>),
+    /// `{ a: 1n, "b": 2n }` — fields in written order, keyed by their labels
+    /// as written, spans included, so a label written twice is two entries.
+    /// The repeat is refused in lowering, where a struct expression's is.
+    Struct(IndexMap<TrackedString, Data>),
+    /// `#Some 1n`, or `#None` carrying nothing, which is unit.
+    Tag {
+        name: TrackedString,
+        payload: Option<Box<Data>>,
+    },
+}
 
 /// A name, and the modules it is reached through: `Math::Vec::zero`.
 ///
@@ -200,6 +267,18 @@ pub enum ExprKind {
     Function {
         args: Vec<Arg>,
         body: Box<Expr>,
+    },
+    /// `fn | <pattern> => <expr> (| <pattern> => <expr>)*` — a unary
+    /// function whose implicit argument is matched by its body.
+    ///
+    /// The leading bar distinguishes it from an ordinary function. There is
+    /// no closing delimiter: each body ends in front of the next `|`, and the
+    /// final body extends as far right as an ordinary function body.
+    MatchFunction {
+        /// Kept separately so lowering can locate the implicit argument at
+        /// the keyword rather than across the whole function expression.
+        fn_span: Span,
+        arms: Vec<Arm>,
     },
     /// `do <stmt>* [return <expr>] end` — names given values for the length
     /// of one expression, one after another.
@@ -826,6 +905,22 @@ pub enum ErrorKind {
     /// which holds `let`s alone. Carried with the keyword so the complaint
     /// can say which one; the declaration itself is read and dropped.
     DeclarationInBlock { keyword: &'static str },
+    /// Attributes with no definition after them — at the end of a file, in
+    /// front of a module's `end`, or in front of a token that begins no
+    /// definition. Reported over the attributes themselves, which are what
+    /// was written, rather than at whatever stopped them.
+    AttributeWithoutDefinition,
+    /// Something that begins an expression but not a literal, written where a
+    /// metadata value goes: a name, an application, an operator, a `fn`. A
+    /// metadata value is data, and this is the token at which it stopped
+    /// being data.
+    MetadataNotLiteral,
+    /// Attributes in front of a `do` block's `let`. Metadata belongs to a
+    /// top-level definition; the `let` is kept, without them.
+    AttributeInBlock,
+    /// An attribute read where an expression begins — `let x = @key 1n`.
+    /// What follows it is still read, so the definition around it is checked.
+    AttributeInExpression,
 }
 
 /// What the parser needed at the primary error span.
@@ -1333,15 +1428,237 @@ impl Parser {
         stmts
     }
 
+    /// `<attribute>* <definition>`. The attributes are read first and belong
+    /// to whatever definition follows; when nothing does, they are the
+    /// complaint, reported over themselves.
     fn stmt(&mut self) -> Option<Stmt> {
-        match self.peek().map(|tok| &tok.tracked) {
+        let attributes = self.attributes()?;
+        let kind = match self.peek().map(|tok| &tok.tracked) {
             Some(Kind::Let) => self.let_stmt(),
             Some(Kind::Extern) => self.extern_stmt(),
             Some(Kind::Type) => self.type_stmt(),
             Some(Kind::Effect) => self.effect_stmt(),
             Some(Kind::Module) => self.module_stmt(),
-            _ => self.expected(Expected::Statement),
+            _ => match (attributes.first(), attributes.last()) {
+                (Some(first), Some(last)) => {
+                    self.error(
+                        first.span.merge(last.span),
+                        ErrorKind::AttributeWithoutDefinition,
+                    );
+                    None
+                }
+                _ => self.expected(Expected::Statement),
+            },
+        }?;
+        Some(Stmt {
+            attributes,
+            kind: kind.tracked,
+            span: kind.span,
+        })
+    }
+
+    /// `@key [<literal>]`, as many as are written. None is the ordinary case.
+    fn attributes(&mut self) -> Option<Vec<Attribute>> {
+        let mut attributes = Vec::new();
+        while matches!(
+            self.peek().map(|tok| &tok.tracked),
+            Some(Kind::Attribute(_))
+        ) {
+            let token = self.advance().expect("the loop peeked an attribute");
+            let Kind::Attribute(key) = token.tracked else {
+                unreachable!("the loop peeked an attribute")
+            };
+            let key = token.span.track(key);
+            let value = self.data_value()?;
+            let span = value
+                .as_ref()
+                .map_or(key.span, |value| key.span.merge(value.span));
+            attributes.push(Attribute { span, key, value });
         }
+        Some(attributes)
+    }
+
+    /// The literal after an attribute's key or a metadata tag's name, when
+    /// one begins here. `Some(None)` when nothing does — the next token is a
+    /// definition's keyword, another attribute, a closer, or the end — and
+    /// `None` when what begins here is an expression rather than a literal,
+    /// which is reported where it begins.
+    fn data_value(&mut self) -> Option<Option<Data>> {
+        if self.at_data() {
+            return self.data().map(Some);
+        }
+        if self.at_computation() {
+            let span = self.peek().expect("the cursor is on a token").span;
+            self.error(span, ErrorKind::MetadataNotLiteral);
+            return None;
+        }
+        Some(None)
+    }
+
+    /// Whether the next token begins a literal: a scalar, a tag, or the
+    /// opener of a tuple, array, or struct.
+    fn at_data(&self) -> bool {
+        matches!(
+            self.peek().map(|tok| &tok.tracked),
+            Some(
+                Kind::String(_)
+                    | Kind::Natural(_)
+                    | Kind::Integer(_)
+                    | Kind::Real(_)
+                    | Kind::Boolean(_)
+                    | Kind::LeftParen
+                    | Kind::LeftBracket
+                    | Kind::LeftBrace
+                    | Kind::Tag(_)
+            )
+        )
+    }
+
+    /// Whether the next token begins an expression that is not a literal —
+    /// the tokens a reader reaching for a computed value would write, and
+    /// the ones that get the literal-only complaint rather than a generic one.
+    /// `..` is here for the spread it would be in an array or struct.
+    fn at_computation(&self) -> bool {
+        matches!(
+            self.peek().map(|tok| &tok.tracked),
+            Some(
+                Kind::Identifier(_)
+                    | Kind::Underscore
+                    | Kind::Fn
+                    | Kind::If
+                    | Kind::Match
+                    | Kind::Do
+                    | Kind::Handle
+                    | Kind::Raise
+                    | Kind::Minus
+                    | Kind::Not
+                    | Kind::EffectLabel(_)
+                    | Kind::DotDot
+            )
+        )
+    }
+
+    /// One literal, where a metadata value is required: the value of an
+    /// attribute, an element, a field's value. Every caller has seen that a
+    /// token is here — a literal's opener, or an element position short of
+    /// its closer — so the end of input is not a case.
+    fn data(&mut self) -> Option<Data> {
+        let tok = self
+            .peek()
+            .expect("the caller saw a token where a metadata value goes");
+        let span = tok.span;
+        match &tok.tracked {
+            Kind::String(value) => {
+                let value = value.clone();
+                self.advance();
+                Some(span.track(DataKind::String(value)))
+            }
+            &Kind::Natural(value) => {
+                self.advance();
+                Some(span.track(DataKind::Natural(value)))
+            }
+            &Kind::Integer(value) => {
+                self.advance();
+                Some(span.track(DataKind::Integer(value)))
+            }
+            &Kind::Real(value) => {
+                self.advance();
+                Some(span.track(DataKind::Real(value)))
+            }
+            &Kind::Boolean(value) => {
+                self.advance();
+                Some(span.track(DataKind::Boolean(value)))
+            }
+            Kind::LeftParen => self.data_paren(),
+            Kind::LeftBracket => self.data_array(),
+            Kind::LeftBrace => self.data_struct(),
+            Kind::Tag(_) => self.data_tag(),
+            _ if self.at_computation() => {
+                self.error(span, ErrorKind::MetadataNotLiteral);
+                None
+            }
+            _ => self.expected(Expected::Value),
+        }
+    }
+
+    /// `()`, `(<data>)`, or `(<data>, ...)` — read as parentheses are in an
+    /// expression: unit, a grouping that is dropped, or a tuple, with a
+    /// trailing comma making one element a tuple.
+    fn data_paren(&mut self) -> Option<Data> {
+        let open = self.eat(&Kind::LeftParen).expect("the caller peeked `(`");
+        if let Some(close) = self.eat_if(&Kind::RightParen) {
+            return Some(open.span.merge(close.span).track(DataKind::Unit));
+        }
+        if self.at_expr_boundary() {
+            return self.expected_closer(open.span, &Kind::RightParen);
+        }
+        let first = self.data()?;
+        if self.eat_if(&Kind::Comma).is_none() {
+            let close = self.close_delimiter(open.span, &Kind::RightParen)?;
+            return Some(open.span.merge(close.span).track(first.tracked));
+        }
+        let mut elements = vec![first];
+        while !self.at(&Kind::RightParen) && !self.at_expr_boundary() {
+            elements.push(self.data()?);
+            if self.eat_if(&Kind::Comma).is_none() {
+                break;
+            }
+        }
+        let close = self.close_delimiter(open.span, &Kind::RightParen)?;
+        Some(open.span.merge(close.span).track(DataKind::Tuple(elements)))
+    }
+
+    /// `[<data>, ...]`, empty included, with an optional trailing comma. A
+    /// `..` is refused by [`data`](Self::data): nothing is spread into data.
+    fn data_array(&mut self) -> Option<Data> {
+        let open = self.eat(&Kind::LeftBracket).expect("the caller peeked `[`");
+        let mut items = Vec::new();
+        while !self.at(&Kind::RightBracket) && !self.at_expr_boundary() {
+            items.push(self.data()?);
+            if self.eat_if(&Kind::Comma).is_none() {
+                break;
+            }
+        }
+        let close = self.close_delimiter(open.span, &Kind::RightBracket)?;
+        Some(open.span.merge(close.span).track(DataKind::Array(items)))
+    }
+
+    /// `{ <field>: <data>, ... }` with an optional trailing comma — a struct
+    /// literal's shape with literal values, and no `..`: a spread would be a
+    /// value computed from another, and this is data.
+    fn data_struct(&mut self) -> Option<Data> {
+        let open = self.eat(&Kind::LeftBrace).expect("the caller peeked `{`");
+        let mut fields = IndexMap::new();
+        while !self.at_expr_boundary() {
+            if self.at(&Kind::DotDot) {
+                let span = self.peek().expect("the cursor is on `..`").span;
+                self.error(span, ErrorKind::MetadataNotLiteral);
+                return None;
+            }
+            if self.at_wildcard() {
+                return self.wildcard(Place::Field);
+            }
+            let name = self.field_label()?;
+            self.eat(&Kind::Colon)?;
+            let value = self.data()?;
+            fields.insert(name, value);
+            if self.eat_if(&Kind::Comma).is_none() {
+                break;
+            }
+        }
+        let close = self.close_delimiter(open.span, &Kind::RightBrace)?;
+        Some(open.span.merge(close.span).track(DataKind::Struct(fields)))
+    }
+
+    /// `#Some <data>` or a bare `#None` — one case, with what it carries,
+    /// read greedily the way an expression's tag takes its payload.
+    fn data_tag(&mut self) -> Option<Data> {
+        let name = self.tag().expect("the caller peeked a tag");
+        let payload = self.data_value()?.map(Box::new);
+        let span = payload
+            .as_ref()
+            .map_or(name.span, |payload| name.span.merge(payload.span));
+        Some(span.track(DataKind::Tag { name, payload }))
     }
 
     /// `module <Name> = <stmts> end`, or `module <Name>` for a module whose
@@ -1351,7 +1668,7 @@ impl Parser {
     /// one, so `module A::B` is the unexpected `::` it looks like. The body of
     /// the inline form is a statement list of any length, empty included —
     /// `module A = end` declares a module with nothing in it.
-    fn module_stmt(&mut self) -> Option<Stmt> {
+    fn module_stmt(&mut self) -> Option<Tracked<StmtKind>> {
         let kw = self.advance().expect("the caller peeked `module`");
         let name = self.ident()?;
         let mut span = kw.span.merge(name.span);
@@ -1585,7 +1902,7 @@ impl Parser {
 
     /// `effect E`, `effect E = !A + !B`, `effect E = A -> B`, or
     /// `effect E = { op: A -> B, ... }`.
-    fn effect_stmt(&mut self) -> Option<Stmt> {
+    fn effect_stmt(&mut self) -> Option<Tracked<StmtKind>> {
         let kw = self.advance().expect("the caller peeked `effect`");
         if self.at_wildcard() {
             return self.wildcard(Place::Type);
@@ -1766,7 +2083,7 @@ impl Parser {
     /// `extern <name> : <extern-annotation> = <target>` — a target-supplied
     /// value. `fn(A, B) -> R` is available only in this annotation and records
     /// an n-ary foreign ABI while desugaring to the curried type `A -> B -> R`.
-    fn extern_stmt(&mut self) -> Option<Stmt> {
+    fn extern_stmt(&mut self) -> Option<Tracked<StmtKind>> {
         let kw = self.advance().expect("the caller peeked `extern`");
         let name = self.ident()?;
         self.eat(&Kind::Colon)?;
@@ -1919,7 +2236,7 @@ impl Parser {
     /// it the definition's type is whatever is inferred for its body. What is
     /// bound is a pattern — a bare name being the ordinary case, and a struct
     /// pattern taking the value apart into several definitions at once.
-    fn let_stmt(&mut self) -> Option<Stmt> {
+    fn let_stmt(&mut self) -> Option<Tracked<StmtKind>> {
         let kw = self.advance().expect("the caller peeked `let`");
         let pattern = self.pattern()?;
         let ty = match self.eat_if(&Kind::Colon) {
@@ -1941,7 +2258,7 @@ impl Parser {
     /// list ends at the `=` — so an empty one is not the error an empty
     /// [`function_expr`](Self::function_expr) argument list is: a type taking
     /// no parameters is the ordinary case.
-    fn type_stmt(&mut self) -> Option<Stmt> {
+    fn type_stmt(&mut self) -> Option<Tracked<StmtKind>> {
         let kw = self.advance().expect("the caller peeked `type`");
         // A declaration's name and parameters are names: a `_` is not one, and
         // a type is nothing a value could be thrown away from, so it gets the
@@ -2198,6 +2515,14 @@ impl Parser {
                 self.error(span, ErrorKind::ReturnOutsideBlock);
                 self.expr()
             }
+            // Metadata goes in front of a definition. One read here is
+            // refused, and what follows it is read for the reason a stray
+            // `return`'s value is.
+            Kind::Attribute(_) => {
+                self.advance();
+                self.error(span, ErrorKind::AttributeInExpression);
+                self.expr()
+            }
             // A conditional is self-delimiting like `match`: it can head an
             // application or projection, but must be parenthesized as an
             // application argument because it is absent from `at_expr_atom`.
@@ -2412,6 +2737,16 @@ impl Parser {
     /// can, ML-style.
     fn function_expr(&mut self) -> Option<Expr> {
         let kw = self.advance().expect("the caller peeked `fn`");
+        if self.eat_if(&Kind::Pipe).is_some() {
+            let arms = self.match_arms()?;
+            let span = kw
+                .span
+                .merge(arms.last().expect("one arm was parsed").body.span);
+            return Some(span.track(ExprKind::MatchFunction {
+                fn_span: kw.span,
+                arms,
+            }));
+        }
         let args = self.function_args()?;
         let body = self.expr()?;
         let span = kw.span.merge(body.span);
@@ -2513,11 +2848,17 @@ impl Parser {
         if stmt.is_none() && self.pos == before {
             self.advance();
         }
-        let Some(stmt) = stmt else {
+        let Some(mut stmt) = stmt else {
             self.recover();
             return None;
         };
-        let keyword = match &stmt.tracked {
+        // Metadata belongs to a top-level definition. Refused over the
+        // attributes and dropped; the statement they were written on is kept.
+        if let (Some(first), Some(last)) = (stmt.attributes.first(), stmt.attributes.last()) {
+            self.error(first.span.merge(last.span), ErrorKind::AttributeInBlock);
+            stmt.attributes.clear();
+        }
+        let keyword = match &stmt.kind {
             StmtKind::Let { .. } => return Some(stmt),
             StmtKind::Type { .. } => "type",
             StmtKind::Effect { .. } => "effect",
@@ -2574,15 +2915,7 @@ impl Parser {
                     kind: RelatedKind::Construct("match"),
                 }),
             )?;
-            loop {
-                let pattern = self.pattern()?;
-                self.eat(&Kind::FatArrow)?;
-                let body = self.expr()?;
-                arms.push(Arm { pattern, body });
-                if self.eat_if(&Kind::Pipe).is_none() {
-                    break;
-                }
-            }
+            arms = self.match_arms()?;
         }
         let anchor = arms.last().map_or(with.span, |arm| arm.body.span);
         let close = self.eat_with_context(
@@ -2601,6 +2934,22 @@ impl Parser {
             scrutinee: Box::new(scrutinee),
             arms,
         }))
+    }
+
+    /// Read one or more match arms after their first `|` has been consumed.
+    /// The ordinary match and the function shorthand share this exact tail;
+    /// only what introduces its first bar differs.
+    fn match_arms(&mut self) -> Option<Vec<Arm>> {
+        let mut arms = Vec::new();
+        loop {
+            let pattern = self.pattern()?;
+            self.eat(&Kind::FatArrow)?;
+            let body = self.expr()?;
+            arms.push(Arm { pattern, body });
+            if self.eat_if(&Kind::Pipe).is_none() {
+                return Some(arms);
+            }
+        }
     }
 
     /// `if <predicate> then <consequent> else <alternative> end`.
@@ -3828,9 +4177,18 @@ impl Parser {
     /// would take the rest of the enclosing file with it.
     fn recover(&mut self) {
         while let Some(tok) = self.peek() {
+            // An attribute begins the next definition as surely as its
+            // keyword does, and skipping it would lose that definition's
+            // metadata without a word.
             if matches!(
                 tok.tracked,
-                Kind::Let | Kind::Extern | Kind::Type | Kind::Effect | Kind::Module | Kind::End
+                Kind::Let
+                    | Kind::Extern
+                    | Kind::Type
+                    | Kind::Effect
+                    | Kind::Module
+                    | Kind::End
+                    | Kind::Attribute(_)
             ) {
                 break;
             }
@@ -3859,7 +4217,7 @@ mod tests {
             "parse errors: {:?}",
             output.errors
         );
-        let StmtKind::Extern { target, .. } = &output.stmts[0].tracked else {
+        let StmtKind::Extern { target, .. } = &output.stmts[0].kind else {
             panic!("expected an extern declaration");
         };
         assert_eq!(target.tracked, r#"(s) => "ok""#);

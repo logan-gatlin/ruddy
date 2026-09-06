@@ -84,6 +84,9 @@
 ; Helix calls it `namespace`, and neither minds the name it does not know.
 (effect_label) @module @namespace
 
+; `@deprecated` — an attribute's key: metadata about the definition after it.
+(attribute_key) @attribute
+
 (effect_definition name: (identifier) @module @namespace)
 (effect_operation_field name: (identifier) @function)
 (operation name: (identifier) @function)
@@ -104,12 +107,12 @@
 
 (let_definition
   pattern: (identifier) @function
-  body: (function))
+  body: [(function) (match_function)])
 
 (do_block
   statement: (let_definition
     pattern: (identifier) @function
-    body: (function)))
+    body: [(function) (match_function)]))
 
 (function parameter: (identifier) @variable.parameter)
 (handler_arm binder: (identifier) @variable.parameter)
@@ -117,12 +120,14 @@
 ; ── fields ───────────────────────────────────────────────────────────────────
 
 (struct_field name: (identifier) @property)
+(data_field name: (identifier) @property)
 (struct_type_field name: (identifier) @property)
 (struct_pattern_field name: (identifier) @property)
 (absent_field name: (identifier) @property)
 (projection field: (identifier) @property)
 (projection field: (numeric_field) @property)
 (struct_field name: (numeric_field) @property)
+(data_field name: (numeric_field) @property)
 (struct_type_field name: (numeric_field) @property)
 (struct_pattern_field name: (numeric_field) @property)
 (absent_field name: (numeric_field) @property)
@@ -136,6 +141,7 @@
 ; A quoted field is lexically a string, but its syntactic role is a property.
 ; These come after the catch-all string capture so the contextual class wins.
 (struct_field name: (string) @property)
+(data_field name: (string) @property)
 (struct_type_field name: (string) @property)
 (struct_pattern_field name: (string) @property)
 (absent_field name: (string) @property)

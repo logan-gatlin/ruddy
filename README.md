@@ -23,6 +23,15 @@ fields named before the `..`, which replace fields of the same name at
 whatever type they have, so `fn v => { x: 1, ..v }` updates or extends
 whatever struct it is given while keeping the rest of its fields.
 
+Any top-level definition may carry metadata: attributes written in front of
+it as `@key` or `@key <literal>`, where the literal is a string, number,
+boolean, tag, or a tuple, array, or struct of those, as in
+`@deprecated "use nat::add" @since 2n let add = ...`. The compiler gives no key
+a meaning: it refuses a repeated key, carries the metadata through unchanged,
+shows it in the debugger, and publishes it in the bundle's artifact for every
+value, type, effect, and module, where tools and dependents can read it.
+Metadata never changes a definition's type or its generated code.
+
 Immutable homogeneous arrays use `[value, ...]` literals and `[Type]` types.
 A literal may spread other arrays into place with `..`, as in `[..a, x, ..b]`,
 and a `match` may take an array apart by length with patterns such as `[]`,
@@ -31,6 +40,12 @@ elements between the named ones. The `std::array` module provides `len`,
 safe `get`, `set`, `slice`, and `pop`, and persistent `push`, `prepend`, and
 `concat`; every update returns a new array without changing its inputs, and
 slicing and concatenation take logarithmic time.
+
+A function that immediately matches its sole argument may omit the argument
+and match wrapper: `fn | #Some value => value | #None => 0n` is shorthand for
+an ordinary unary function whose body matches that implicit argument. The
+leading `|` is required, and parentheses delimit a nested shorthand when an
+enclosing arm follows it.
 
 ## Development
 

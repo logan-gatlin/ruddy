@@ -319,6 +319,7 @@ impl token::ErrorKind {
             token::ErrorKind::MalformedTag => "tag-needs-name",
             token::ErrorKind::MalformedEffectLabel => "effect-needs-name",
             token::ErrorKind::MalformedVariable => "variable-needs-name",
+            token::ErrorKind::MalformedAttribute => "attribute-needs-name",
             token::ErrorKind::NumberFollowedByName => "number-joined-to-name",
             token::ErrorKind::DecimalWithWholeSuffix { .. } => "decimal-marked-whole",
             token::ErrorKind::MalformedNumericField => "invalid-field-number",
@@ -361,6 +362,13 @@ impl token::Error {
                 self.span,
             )
             .label("the name cannot start here"),
+            E::MalformedAttribute => Diagnostic::new(
+                self.kind.code(),
+                "`@` must be followed by a name",
+                self.span,
+            )
+            .label("the name cannot start here")
+            .help("metadata is written `@key` or `@key value` in front of a definition"),
             E::NumberFollowedByName => Diagnostic::new(
                 self.kind.code(),
                 "a number cannot run directly into a name",
@@ -582,6 +590,7 @@ impl fmt::Display for Kind {
             Kind::Tag(name) => write_tag_label(f, name),
             Kind::EffectLabel(name) => write!(f, "!{name}"),
             Kind::Variable(name) => write!(f, "'{name}"),
+            Kind::Attribute(name) => write!(f, "@{name}"),
             Kind::LeftBrace => f.write_str("{"),
             Kind::RightBrace => f.write_str("}"),
             Kind::LeftBracket => f.write_str("["),
@@ -666,6 +675,10 @@ impl parse::Error {
             parse::ErrorKind::BareReturn => "bare-return",
             parse::ErrorKind::ReturnOutsideBlock => "return-outside-block",
             parse::ErrorKind::DeclarationInBlock { .. } => "declaration-in-block",
+            parse::ErrorKind::AttributeWithoutDefinition => "metadata-without-definition",
+            parse::ErrorKind::MetadataNotLiteral => "metadata-not-literal",
+            parse::ErrorKind::AttributeInBlock => "metadata-in-block",
+            parse::ErrorKind::AttributeInExpression => "metadata-in-expression",
         }
     }
 
@@ -830,6 +843,37 @@ impl parse::Error {
             )
             .label(format!("a `{keyword}` cannot be written inside a block"))
             .help(format!("move this `{keyword}` out to the file or module")),
+            parse::ErrorKind::AttributeWithoutDefinition => Diagnostic::new(
+                "metadata-without-definition",
+                "this metadata has no definition to describe",
+                self.span,
+            )
+            .label("nothing that this could describe follows it")
+            .help("write a `let`, `extern`, `type`, `effect`, or `module` after it, or remove it"),
+            parse::ErrorKind::MetadataNotLiteral => Diagnostic::new(
+                "metadata-not-literal",
+                "a metadata value must be a literal",
+                self.span,
+            )
+            .label("this is not a literal")
+            .help(
+                "write a string, number, boolean, or tag, or a tuple, array, or struct of those; \
+                 metadata is data and cannot be computed",
+            ),
+            parse::ErrorKind::AttributeInBlock => Diagnostic::new(
+                "metadata-in-block",
+                "metadata belongs to a top-level definition",
+                self.span,
+            )
+            .label("a `let` inside a `do` block cannot carry metadata")
+            .help("remove this, or move the definition out to the file or module"),
+            parse::ErrorKind::AttributeInExpression => Diagnostic::new(
+                "metadata-in-expression",
+                "metadata goes in front of a definition",
+                self.span,
+            )
+            .label("this is written where a value goes")
+            .help("move it in front of the `let`, `extern`, `type`, `effect`, or `module` it describes"),
         }
     }
 }
@@ -1123,6 +1167,8 @@ impl ir::ErrorKind {
                 Namespace::Terms => "duplicate-term",
             },
             ir::ErrorKind::DuplicateField { .. } => "duplicate-field",
+            ir::ErrorKind::DuplicateAttribute { .. } => "duplicate-metadata-key",
+            ir::ErrorKind::MetadataTooDeep => "metadata-too-deep",
             // The shape is not part of the code, for the reason a repeated row
             // field's is not: the wording quotes the label the way it was
             // written, and that already says which kind of row it sits in.
@@ -1246,6 +1292,26 @@ impl ir::Error {
                     .label("written again here")
                     .related(source.span(*previous), FIRST_WRITTEN)
             }
+            E::DuplicateAttribute { name, previous } => Diagnostic::new(
+                code,
+                format!("metadata key `{name}` is written more than once"),
+                span,
+            )
+            .label("written again here")
+            .related(source.span(*previous), FIRST_WRITTEN)
+            .help(format!(
+                "a definition's metadata has one value per key; keep one `@{name}`"
+            )),
+            E::MetadataTooDeep => Diagnostic::new(
+                code,
+                "this metadata value is nested too deeply",
+                span,
+            )
+            .label("this sits below the deepest level allowed")
+            .help(format!(
+                "metadata may nest at most {} levels of arrays, structs, and tag payloads",
+                ir::METADATA_DEPTH_LIMIT
+            )),
             E::DuplicateCase {
                 shape,
                 name,

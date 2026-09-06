@@ -178,6 +178,32 @@ fn if_expressions_lower_to_boolean_matches() {
     assert!(matches!(nested[1].0.anchored, PatternKind::Boolean(false)));
 }
 
+#[test]
+fn match_function_shorthand_lowers_to_a_function_over_a_match() {
+    let src = "let unwrap = fn | #Some x => x | #None => 0n";
+    let (mint, out) = built(src);
+    let map = &out.source;
+    let value = &out.program.terms[&term_symbol(&mint, &out, "unwrap")].value;
+    let TermKind::Fn { arg, body } = &value.kind else {
+        panic!("the shorthand lowers to a function");
+    };
+    assert_eq!(mint.name(arg.anchored), "%match");
+    assert_eq!(map.span(arg.at).start, src.find("fn").expect("the keyword"));
+    assert_eq!(map.span(arg.at).width, 2);
+    assert_eq!(map.span(value.at).start, map.span(arg.at).start);
+    assert_eq!(map.span(value.at).end(), src.len());
+
+    let TermKind::Match { scrutinee, arms } = &body.kind else {
+        panic!("the shorthand function body lowers to a match");
+    };
+    assert_eq!(body.at, value.at);
+    assert!(matches!(scrutinee.kind, TermKind::Ident(symbol) if symbol == arg.anchored));
+    assert_eq!(scrutinee.at, arg.at);
+    assert_eq!(arms.len(), 2);
+    assert!(matches!(arms[0].0.anchored, PatternKind::Tag { .. }));
+    assert!(matches!(arms[1].0.anchored, PatternKind::Tag { .. }));
+}
+
 /// The lowered annotation of a top-level definition, which is where the
 /// variables a `where 'let` declared and the sorts lowering read them at live.
 fn annotation_of<'a>(mint: &Mint, out: &'a Output, name: &str) -> &'a Annotation {
@@ -4977,6 +5003,14 @@ fn raise_belongs_to_the_arm_around_it() {
         codes_of(&arm("(fn _ => raise 0n) 1n")),
         ["raise-in-function"]
     );
+    assert_eq!(
+        codes_of(&arm("{ g: fn | _ => raise 0n }")),
+        ["raise-in-function"]
+    );
+    assert_eq!(
+        codes_of(&arm("{ g: fn | _ => fn | _ => raise 0n }")),
+        ["raise-in-function"]
+    );
 
     // And every position an expression may sit in, none of which needs a rule.
     for body in [
@@ -6738,6 +6772,7 @@ fn prelude_artifact(bundle: &str) -> a::UncheckedArtifact {
     a::UncheckedArtifact {
         header: a::Header {
             compiler: ruddy::artifact::Stamp::current(),
+            modules: Vec::new(),
             identity: a::Identity {
                 name: bundle.into(),
                 version: "1.0.0".into(),
@@ -6745,27 +6780,32 @@ fn prelude_artifact(bundle: &str) -> a::UncheckedArtifact {
             dependencies: Vec::new(),
             values: vec![
                 a::Value {
+                    metadata: Default::default(),
                     name: qualified("shared"),
                     scheme: artifact_scheme(artifact_type(a::Type::Nat)),
                 },
                 a::Value {
+                    metadata: Default::default(),
                     name: qualified("Tools::inside"),
                     scheme: artifact_scheme(artifact_type(a::Type::Nat)),
                 },
             ],
             types: vec![
                 a::DeclaredType {
+                    metadata: Default::default(),
                     name: qualified("Shared"),
                     params: Vec::new(),
                     scheme: artifact_scheme(artifact_type(a::Type::String)),
                 },
                 a::DeclaredType {
+                    metadata: Default::default(),
                     name: qualified("Nat"),
                     params: Vec::new(),
                     scheme: artifact_scheme(artifact_type(a::Type::String)),
                 },
             ],
             effects: vec![a::DeclaredEffect {
+                metadata: Default::default(),
                 name: qualified("Shared"),
                 params: Vec::new(),
                 identity: Some(a::EffectIdentity {
@@ -7033,6 +7073,7 @@ fn effect_artifact(bundle: &str, interface: &str) -> a::UncheckedArtifact {
     a::UncheckedArtifact {
         header: a::Header {
             compiler: ruddy::artifact::Stamp::current(),
+            modules: Vec::new(),
             identity: a::Identity {
                 name: bundle.into(),
                 version: "1.0.0".into(),
@@ -7041,6 +7082,7 @@ fn effect_artifact(bundle: &str, interface: &str) -> a::UncheckedArtifact {
             values: Vec::new(),
             types: Vec::new(),
             effects: vec![a::DeclaredEffect {
+                metadata: Default::default(),
                 name: format!("{bundle}@1.0.0::IO"),
                 params: Vec::new(),
                 identity: Some(a::EffectIdentity {
@@ -7163,6 +7205,7 @@ fn imported_effect_row_keys_follow_canonical_identities_by_shape() {
     });
     dependency.header.values.extend([
         a::Value {
+            metadata: Default::default(),
             name: "dep@1.0.0::action".into(),
             scheme: artifact_scheme(artifact_type(a::Type::Arrow(
                 Box::new(artifact_type(artifact_unit())),
@@ -7171,12 +7214,14 @@ fn imported_effect_row_keys_follow_canonical_identities_by_shape() {
             ))),
         },
         a::Value {
+            metadata: Default::default(),
             name: "dep@1.0.0::nested".into(),
             scheme: artifact_scheme(nested_effect_argument()),
         },
         // Missing declarations have no published argument sense. Their sum is
         // recovery data, not an effect row, even when its label looks generated.
         a::Value {
+            metadata: Default::default(),
             name: "dep@1.0.0::unresolved".into(),
             scheme: artifact_scheme(artifact_type(a::Type::Named {
                 name: "missing@1.0.0::Unknown".into(),
@@ -7186,6 +7231,7 @@ fn imported_effect_row_keys_follow_canonical_identities_by_shape() {
     ]);
     dependency.header.types.extend([
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::Effects".into(),
             params: vec![a::Parameter {
                 sense: a::Sense::Effects,
@@ -7201,6 +7247,7 @@ fn imported_effect_row_keys_follow_canonical_identities_by_shape() {
             },
         },
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::Cases".into(),
             params: Vec::new(),
             scheme: artifact_scheme(artifact_type(a::Type::Sum(a::Row {
@@ -7313,6 +7360,7 @@ fn legacy_operation_effects_get_fallback_identity_before_row_normalization() {
         rest: a::Rest::Closed,
     };
     dependency.header.values.push(a::Value {
+        metadata: Default::default(),
         name: "dep@1.0.0::action".into(),
         scheme: artifact_scheme(a::Type::Arrow(
             Box::new(artifact_unit()),
@@ -7321,6 +7369,7 @@ fn legacy_operation_effects_get_fallback_identity_before_row_normalization() {
         )),
     });
     dependency.header.types.push(a::DeclaredType {
+        metadata: Default::default(),
         name: "dep@1.0.0::Effects".into(),
         params: vec![a::Parameter {
             sense: a::Sense::Effects,
@@ -7540,6 +7589,7 @@ fn a_direct_only_interface_with_a_transitive_type_recovers_without_panicking() {
     let dependency = a::UncheckedArtifact {
         header: a::Header {
             compiler: ruddy::artifact::Stamp::current(),
+            modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".to_string(),
                 version: "1.0.0".to_string(),
@@ -7550,6 +7600,7 @@ fn a_direct_only_interface_with_a_transitive_type_recovers_without_panicking() {
             }],
             values: Vec::new(),
             types: vec![a::DeclaredType {
+                metadata: Default::default(),
                 name: "dep@1.0.0::Wrapper".to_string(),
                 params: Vec::new(),
                 scheme: artifact_scheme(artifact_type(a::Type::Named {
@@ -7577,6 +7628,7 @@ fn a_direct_only_interface_with_a_transitive_type_recovers_without_panicking() {
 #[test]
 fn missing_transitive_type_applications_keep_distinct_effect_identities() {
     let alias = |name: &str, argument| a::DeclaredType {
+        metadata: Default::default(),
         name: format!("dep@1.0.0::{name}"),
         params: Vec::new(),
         scheme: artifact_scheme(artifact_type(a::Type::Named {
@@ -7587,6 +7639,7 @@ fn missing_transitive_type_applications_keep_distinct_effect_identities() {
     let dependency = a::UncheckedArtifact {
         header: a::Header {
             compiler: ruddy::artifact::Stamp::current(),
+            modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
                 version: "1.0.0".into(),
@@ -7672,6 +7725,7 @@ fn direct_only_transitive_effects_keep_qualified_recovery_identity() {
     let dependency = a::UncheckedArtifact {
         header: a::Header {
             compiler: ruddy::artifact::Stamp::current(),
+            modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
                 version: "1.0.0".into(),
@@ -7688,12 +7742,14 @@ fn direct_only_transitive_effects_keep_qualified_recovery_identity() {
             ]
             .into_iter()
             .map(|(name, target)| a::DeclaredEffect {
+                metadata: Default::default(),
                 name: format!("dep@1.0.0::{name}"),
                 params: Vec::new(),
                 identity: None,
                 kind: a::EffectKind::Alias(a::AliasRow::naming(vec![target.into()])),
             })
             .chain(std::iter::once(a::DeclaredEffect {
+                metadata: Default::default(),
                 name: "dep@1.0.0::Legacy".into(),
                 params: Vec::new(),
                 identity: None,
@@ -7926,6 +7982,7 @@ fn generated_and_malformed_imported_effect_keys_decode_exactly_and_totally() {
 
     let mut semantic = effect_artifact("semantic", &io);
     semantic.header.types.push(a::DeclaredType {
+        metadata: Default::default(),
         name: "semantic@1.0.0::Carrier".into(),
         params: Vec::new(),
         scheme: artifact_scheme(a::Type::Arrow(
@@ -7975,6 +8032,7 @@ fn imported_presence_variables_keep_alpha_correlation_in_effect_identity() {
     // Two quantified presences per declaration, so a bound position is in
     // range whether the two labels share one or take one each.
     let declaration = |name: &str, left, right| a::DeclaredType {
+        metadata: Default::default(),
         name: format!("dep@1.0.0::{name}"),
         params: Vec::new(),
         scheme: a::Scheme {
@@ -8100,6 +8158,7 @@ fn operation_inputs_and_outputs_share_one_presence_alpha_scope() {
 fn imported_bound_presences_are_local_to_each_scheme_instantiation() {
     let mut dependency = effect_artifact("dep", "bound-scopes");
     let declaration = |name: &str| a::DeclaredType {
+        metadata: Default::default(),
         name: format!("dep@1.0.0::{name}"),
         params: Vec::new(),
         scheme: a::Scheme {
@@ -8155,6 +8214,7 @@ fn imported_bound_presences_are_local_to_each_scheme_instantiation() {
 fn imported_presence_vars_use_a_disjoint_recovery_variant() {
     let mut dependency = effect_artifact("dep", "recovered-presence");
     dependency.header.types.push(a::DeclaredType {
+        metadata: Default::default(),
         name: "dep@1.0.0::Carrier".into(),
         params: Vec::new(),
         scheme: a::Scheme {
@@ -8266,6 +8326,7 @@ fn source_and_imported_absent_effect_payloads_have_one_identity() {
     let io = local_effect_interface(io_source, "IO");
     let mut dependency = effect_artifact("dep", &io);
     dependency.header.types.push(a::DeclaredType {
+        metadata: Default::default(),
         name: "dep@1.0.0::Carrier".into(),
         params: Vec::new(),
         scheme: artifact_scheme(a::Type::Arrow(
@@ -8423,6 +8484,7 @@ fn imported_structural_identity_respects_effect_and_case_parameter_senses() {
         relevant: true,
     };
     let declared = |name: &str, params, count, body| a::DeclaredType {
+        metadata: Default::default(),
         name: format!("dep@1.0.0::{name}"),
         params,
         scheme: a::Scheme {
@@ -8543,6 +8605,7 @@ fn row_composition_is_flattened_across_local_and_imported_types() {
         })
     };
     let declared = |name: &str, body| a::DeclaredType {
+        metadata: Default::default(),
         name: format!("dep@1.0.0::{name}"),
         params: Vec::new(),
         scheme: artifact_scheme(body),
@@ -8554,6 +8617,7 @@ fn row_composition_is_flattened_across_local_and_imported_types() {
     let dependency = a::UncheckedArtifact {
         header: a::Header {
             compiler: ruddy::artifact::Stamp::current(),
+            modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
                 version: "1.0.0".into(),
@@ -8638,6 +8702,7 @@ fn structural_rows_mask_inner_duplicates_and_preserve_ordinary_separator_labels(
         })
     };
     let declared = |name: &str, params, count, body| a::DeclaredType {
+        metadata: Default::default(),
         name: format!("dep@1.0.0::{name}"),
         params,
         scheme: a::Scheme {
@@ -8655,6 +8720,7 @@ fn structural_rows_mask_inner_duplicates_and_preserve_ordinary_separator_labels(
     let dependency = a::UncheckedArtifact {
         header: a::Header {
             compiler: ruddy::artifact::Stamp::current(),
+            modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
                 version: "1.0.0".into(),
@@ -8737,6 +8803,7 @@ fn absent_semantic_payloads_do_not_affect_structural_identity() {
         ty,
     };
     let declared = |name: &str, body| a::DeclaredType {
+        metadata: Default::default(),
         name: format!("dep@1.0.0::{name}"),
         params: Vec::new(),
         scheme: artifact_scheme(body),
@@ -8767,6 +8834,7 @@ fn absent_semantic_payloads_do_not_affect_structural_identity() {
     let dependency = a::UncheckedArtifact {
         header: a::Header {
             compiler: ruddy::artifact::Stamp::current(),
+            modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
                 version: "1.0.0".into(),
@@ -8806,6 +8874,7 @@ fn absent_semantic_payloads_do_not_affect_structural_identity() {
 fn absent_imported_payloads_do_not_create_visible_quantifiers_or_effect_counts() {
     let mut dependency = effect_artifact("dep", "absent-payload-walks");
     dependency.header.values.push(a::Value {
+        metadata: Default::default(),
         name: "dep@1.0.0::ghost".into(),
         scheme: a::Scheme {
             count: 1,
@@ -8832,6 +8901,7 @@ fn absent_imported_payloads_do_not_create_visible_quantifiers_or_effect_counts()
         },
     });
     dependency.header.values.push(a::Value {
+        metadata: Default::default(),
         name: "dep@1.0.0::nested".into(),
         scheme: a::Scheme {
             count: 1,
@@ -8912,6 +8982,7 @@ fn local_and_imported_structural_types_share_one_canonical_encoding() {
         rest: a::Rest::Closed,
     }));
     let declared = |name: &str, body| a::DeclaredType {
+        metadata: Default::default(),
         name: format!("dep@1.0.0::{name}"),
         params: Vec::new(),
         scheme: artifact_scheme(body),
@@ -8919,6 +8990,7 @@ fn local_and_imported_structural_types_share_one_canonical_encoding() {
     let dependency = a::UncheckedArtifact {
         header: a::Header {
             compiler: ruddy::artifact::Stamp::current(),
+            modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
                 version: "1.0.0".into(),
@@ -8990,6 +9062,7 @@ fn imported_interfaces_keep_applied_types_effects_and_alias_overlap_structural()
     let dependency = a::UncheckedArtifact {
         header: a::Header {
             compiler: ruddy::artifact::Stamp::current(),
+            modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
                 version: "1.0.0".into(),
@@ -8997,6 +9070,7 @@ fn imported_interfaces_keep_applied_types_effects_and_alias_overlap_structural()
             dependencies: Vec::new(),
             values: Vec::new(),
             types: vec![a::DeclaredType {
+                metadata: Default::default(),
                 name: "dep@1.0.0::Box".into(),
                 params: vec![a::Parameter {
                     sense: a::Sense::Type,
@@ -9018,6 +9092,7 @@ fn imported_interfaces_keep_applied_types_effects_and_alias_overlap_structural()
             ]
             .into_iter()
             .map(|(name, interface)| a::DeclaredEffect {
+                metadata: Default::default(),
                 name: format!("dep@1.0.0::{name}"),
                 params: Vec::new(),
                 identity: Some(a::EffectIdentity {
@@ -9027,6 +9102,7 @@ fn imported_interfaces_keep_applied_types_effects_and_alias_overlap_structural()
                 kind: a::EffectKind::Operations(Vec::new()),
             })
             .chain(["A", "B"].into_iter().map(|name| a::DeclaredEffect {
+                metadata: Default::default(),
                 name: format!("dep@1.0.0::{name}"),
                 params: Vec::new(),
                 identity: None,
@@ -9132,11 +9208,13 @@ fn imported_declared_types_exercise_every_semantic_identity_form() {
     let field = |presence, ty| a::RowField { presence, ty };
     let unit = || artifact_type(artifact_unit());
     let row_type = |name: &str, labels, rest| a::DeclaredType {
+        metadata: Default::default(),
         name: format!("dep@1.0.0::{name}"),
         params: Vec::new(),
         scheme: artifact_scheme(artifact_type(a::Type::Sum(a::Row { labels, rest }))),
     };
     let declared = |name: &str, body| a::DeclaredType {
+        metadata: Default::default(),
         name: format!("dep@1.0.0::{name}"),
         params: Vec::new(),
         scheme: artifact_scheme(body),
@@ -9144,6 +9222,7 @@ fn imported_declared_types_exercise_every_semantic_identity_form() {
     // A bound position has to sit inside its scheme's quantifier space, so
     // the forms that use one quantify enough positions to hold it.
     let quantified = |name: &str, count, presences, body| a::DeclaredType {
+        metadata: Default::default(),
         name: format!("dep@1.0.0::{name}"),
         params: Vec::new(),
         scheme: a::Scheme {
@@ -9241,6 +9320,7 @@ fn imported_declared_types_exercise_every_semantic_identity_form() {
     let dependency = a::UncheckedArtifact {
         header: a::Header {
             compiler: ruddy::artifact::Stamp::current(),
+            modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
                 version: "1.0.0".into(),
@@ -9283,21 +9363,25 @@ fn imported_declared_types_exercise_every_semantic_identity_form() {
 fn malformed_dependency_declarations_are_ignored_without_shadow_symbols() {
     let mut dependency = effect_artifact("dep", "read:{}->Nat");
     let value = a::Value {
+        metadata: Default::default(),
         name: "dep@1.0.0::answer".into(),
         scheme: artifact_scheme(artifact_type(a::Type::Nat)),
     };
     dependency.header.values = vec![value.clone(), value];
     dependency.header.types.push(a::DeclaredType {
+        metadata: Default::default(),
         name: "dep@1.0.0::".into(),
         params: Vec::new(),
         scheme: artifact_scheme(artifact_type(a::Type::Nat)),
     });
     dependency.header.types.push(a::DeclaredType {
+        metadata: Default::default(),
         name: "other@1.0.0::Ignored".into(),
         params: Vec::new(),
         scheme: artifact_scheme(artifact_type(a::Type::Nat)),
     });
     dependency.header.effects.push(a::DeclaredEffect {
+        metadata: Default::default(),
         name: "other@1.0.0::Ignored".into(),
         params: Vec::new(),
         identity: Some(a::EffectIdentity {
@@ -9325,6 +9409,7 @@ fn imported_alias_cycles_recover_without_a_spurious_structural_identity() {
     let dependency = a::UncheckedArtifact {
         header: a::Header {
             compiler: ruddy::artifact::Stamp::current(),
+            modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
                 version: "1.0.0".into(),
@@ -9335,6 +9420,7 @@ fn imported_alias_cycles_recover_without_a_spurious_structural_identity() {
             effects: [("A", "dep@1.0.0::B"), ("B", "dep@1.0.0::A")]
                 .into_iter()
                 .map(|(name, target)| a::DeclaredEffect {
+                    metadata: Default::default(),
                     name: format!("dep@1.0.0::{name}"),
                     params: Vec::new(),
                     identity: None,
@@ -9476,6 +9562,7 @@ fn dependency_interfaces_import_every_semantic_form() {
         )),
     );
     let mut values = vec![a::Value {
+        metadata: Default::default(),
         name: "dep@1.0.0::M::rich".to_string(),
         scheme: a::Scheme {
             count: 3,
@@ -9575,6 +9662,7 @@ fn dependency_interfaces_import_every_semantic_form() {
         // quantify nothing.
         let count = u32::from(name.contains("bound"));
         values.push(a::Value {
+            metadata: Default::default(),
             name: format!("dep@1.0.0::{name}"),
             scheme: a::Scheme {
                 count,
@@ -9583,6 +9671,7 @@ fn dependency_interfaces_import_every_semantic_form() {
         });
     }
     values.push(a::Value {
+        metadata: Default::default(),
         name: "wrong@1.0.0::ignored".to_string(),
         scheme: artifact_scheme(unit()),
     });
@@ -9590,6 +9679,7 @@ fn dependency_interfaces_import_every_semantic_form() {
     let dependency = a::UncheckedArtifact {
         header: a::Header {
             compiler: ruddy::artifact::Stamp::current(),
+            modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".to_string(),
                 version: "1.0.0".to_string(),
@@ -9598,6 +9688,7 @@ fn dependency_interfaces_import_every_semantic_form() {
             values,
             types: vec![
                 a::DeclaredType {
+                    metadata: Default::default(),
                     name: "dep@1.0.0::M::T".to_string(),
                     params: vec![
                         a::Parameter {
@@ -9622,6 +9713,7 @@ fn dependency_interfaces_import_every_semantic_form() {
                     })),
                 },
                 a::DeclaredType {
+                    metadata: Default::default(),
                     name: "dep@1.0.0::StructMore".into(),
                     params: Vec::new(),
                     scheme: a::Scheme {
@@ -9673,6 +9765,7 @@ fn dependency_interfaces_import_every_semantic_form() {
                     },
                 },
                 a::DeclaredType {
+                    metadata: Default::default(),
                     name: "dep@1.0.0::StructVar".into(),
                     params: Vec::new(),
                     scheme: artifact_scheme(artifact_type(a::Type::Struct(a::Row {
@@ -9681,6 +9774,7 @@ fn dependency_interfaces_import_every_semantic_form() {
                     }))),
                 },
                 a::DeclaredType {
+                    metadata: Default::default(),
                     name: "dep@1.0.0::StructBound".into(),
                     params: vec![a::Parameter {
                         sense: a::Sense::Fields,
@@ -9699,6 +9793,7 @@ fn dependency_interfaces_import_every_semantic_form() {
                     },
                 },
                 a::DeclaredType {
+                    metadata: Default::default(),
                     name: "dep@1.0.0::StructMissing".into(),
                     params: Vec::new(),
                     // A quantified tail no parameter of the declaration
@@ -9712,6 +9807,7 @@ fn dependency_interfaces_import_every_semantic_form() {
                     },
                 },
                 a::DeclaredType {
+                    metadata: Default::default(),
                     name: "dep@1.0.0::StructRigid".into(),
                     params: Vec::new(),
                     scheme: artifact_scheme(artifact_type(a::Type::Struct(a::Row {
@@ -9723,6 +9819,7 @@ fn dependency_interfaces_import_every_semantic_form() {
                     }))),
                 },
                 a::DeclaredType {
+                    metadata: Default::default(),
                     name: "dep@1.0.0::StructUnknown".into(),
                     params: Vec::new(),
                     scheme: artifact_scheme(artifact_type(a::Type::Struct(a::Row {
@@ -9731,6 +9828,7 @@ fn dependency_interfaces_import_every_semantic_form() {
                     }))),
                 },
                 a::DeclaredType {
+                    metadata: Default::default(),
                     name: "dep@1.0.0::RowLoop".into(),
                     params: vec![a::Parameter {
                         sense: a::Sense::Fields,
@@ -9749,6 +9847,7 @@ fn dependency_interfaces_import_every_semantic_form() {
                     },
                 },
                 a::DeclaredType {
+                    metadata: Default::default(),
                     name: "dep@1.0.0::RowCycle".into(),
                     params: Vec::new(),
                     scheme: artifact_scheme(artifact_type(a::Type::Named {
@@ -9762,6 +9861,7 @@ fn dependency_interfaces_import_every_semantic_form() {
             ],
             effects: vec![
                 a::DeclaredEffect {
+                    metadata: Default::default(),
                     name: "dep@1.0.0::M::Read".to_string(),
                     // One fields parameter, which the `bound` operation's row
                     // ends in.
@@ -9878,6 +9978,7 @@ fn dependency_interfaces_import_every_semantic_form() {
                     ]),
                 },
                 a::DeclaredEffect {
+                    metadata: Default::default(),
                     name: "dep@1.0.0::Alias".to_string(),
                     params: Vec::new(),
                     identity: None,
@@ -10190,6 +10291,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
     let mut dependency = effect_artifact("dep", "forwarding");
     dependency.header.types = vec![
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::Id".into(),
             params: vec![a::Parameter {
                 sense: a::Sense::Fields,
@@ -10208,6 +10310,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
             },
         },
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::Identity".into(),
             params: vec![a::Parameter {
                 sense: a::Sense::Type,
@@ -10223,6 +10326,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
             },
         },
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::First".into(),
             params: vec![
                 a::Parameter {
@@ -10245,6 +10349,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
             },
         },
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::MissingSelect".into(),
             params: Vec::new(),
             scheme: artifact_scheme(artifact_type(a::Type::Named {
@@ -10253,6 +10358,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
             })),
         },
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::GenericUnknown".into(),
             params: vec![a::Parameter {
                 sense: a::Sense::Fields,
@@ -10268,6 +10374,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
             },
         },
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::Twice".into(),
             params: vec![a::Parameter {
                 sense: a::Sense::Fields,
@@ -10289,6 +10396,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
             },
         },
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::Chain".into(),
             params: vec![a::Parameter {
                 sense: a::Sense::Fields,
@@ -10307,6 +10415,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
             },
         },
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::Second".into(),
             params: vec![
                 a::Parameter {
@@ -10332,6 +10441,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
             },
         },
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::WithX".into(),
             params: vec![a::Parameter {
                 sense: a::Sense::Fields,
@@ -10356,6 +10466,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
             },
         },
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::MaybeX".into(),
             params: vec![a::Parameter {
                 sense: a::Sense::Fields,
@@ -10380,6 +10491,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
             },
         },
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::AbsentX".into(),
             params: vec![a::Parameter {
                 sense: a::Sense::Fields,
@@ -10407,6 +10519,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
     if include_cycle {
         dependency.header.types.extend([
             a::DeclaredType {
+                metadata: Default::default(),
                 name: "dep@1.0.0::Cycle".into(),
                 params: Vec::new(),
                 scheme: artifact_scheme(artifact_type(a::Type::Named {
@@ -10415,6 +10528,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
                 })),
             },
             a::DeclaredType {
+                metadata: Default::default(),
                 name: "dep@1.0.0::BrokenSlot".into(),
                 params: vec![a::Parameter {
                     sense: a::Sense::Fields,
@@ -10441,6 +10555,7 @@ fn case_rows_artifact() -> a::UncheckedArtifact {
     let mut dependency = forwarding_rows_artifact(false);
     dependency.header.types.extend([
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::CaseAlias".into(),
             params: Vec::new(),
             scheme: artifact_scheme(artifact_type(a::Type::Sum(a::Row {
@@ -10460,6 +10575,7 @@ fn case_rows_artifact() -> a::UncheckedArtifact {
             }))),
         },
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::CaseTransitive".into(),
             params: Vec::new(),
             scheme: artifact_scheme(artifact_type(a::Type::Named {
@@ -10468,6 +10584,7 @@ fn case_rows_artifact() -> a::UncheckedArtifact {
             })),
         },
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::AddB".into(),
             params: vec![a::Parameter {
                 sense: a::Sense::Cases,
@@ -10492,6 +10609,7 @@ fn case_rows_artifact() -> a::UncheckedArtifact {
             },
         },
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::SelectSecond".into(),
             params: vec![
                 a::Parameter {
@@ -10519,6 +10637,7 @@ fn case_rows_artifact() -> a::UncheckedArtifact {
         // No parameters, despite the malformed semantic rest. The importer
         // must absorb slot zero rather than assigning it to a local parameter.
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::BrokenBare".into(),
             params: Vec::new(),
             scheme: a::Scheme {
@@ -10622,6 +10741,7 @@ fn imported_forwarding_aliases_classify_local_recursion() {
 fn malformed_named_applications_of_unequal_arity_are_not_congruent() {
     let mut dependency = effect_artifact("dep", "bad-arity");
     dependency.header.types = vec![a::DeclaredType {
+        metadata: Default::default(),
         name: "dep@1.0.0::Box".into(),
         params: vec![a::Parameter {
             sense: a::Sense::Type,
@@ -10643,6 +10763,7 @@ fn malformed_named_applications_of_unequal_arity_are_not_congruent() {
         },
     }];
     dependency.header.values.push(a::Value {
+        metadata: Default::default(),
         name: "dep@1.0.0::short".into(),
         scheme: artifact_scheme(a::Type::Named {
             name: "dep@1.0.0::Box".into(),
@@ -10679,6 +10800,7 @@ fn malformed_nested_imported_applications_recover_during_effect_identity() {
     let mut dependency = effect_artifact("dep", "bad-nested-arity");
     dependency.header.types = vec![
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::Box".into(),
             params: vec![a::Parameter {
                 sense: a::Sense::Type,
@@ -10694,6 +10816,7 @@ fn malformed_nested_imported_applications_recover_during_effect_identity() {
             },
         },
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::Broken".into(),
             params: Vec::new(),
             scheme: artifact_scheme(a::Type::Named {
@@ -10816,11 +10939,13 @@ fn imported_effect_identity_graph_is_stack_safe_and_absorbs_growing_types() {
             let mut dependency = effect_artifact("dep", "identity-graph");
             dependency.header.types = vec![
                 a::DeclaredType {
+                    metadata: Default::default(),
                     name: "dep@1.0.0::Deep".into(),
                     params: Vec::new(),
                     scheme: artifact_scheme(deep),
                 },
                 a::DeclaredType {
+                    metadata: Default::default(),
                     name: "dep@1.0.0::Grow".into(),
                     params: vec![a::Parameter {
                         sense: a::Sense::Type,
@@ -10892,6 +11017,7 @@ fn imported_recursive_instantiations_close_through_forwarding_aliases() {
     };
     dependency.header.types = vec![
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::Id".into(),
             params: vec![parameter()],
             scheme: a::Scheme {
@@ -10903,6 +11029,7 @@ fn imported_recursive_instantiations_close_through_forwarding_aliases() {
             },
         },
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::Loop".into(),
             params: vec![parameter()],
             scheme: a::Scheme {
@@ -10961,6 +11088,7 @@ fn a_finite_imported_rotation_longer_than_256_states_remains_exact() {
         .map(|index| a::Type::Bound(index as u32))
         .collect();
     let rotate = a::DeclaredType {
+        metadata: Default::default(),
         name: "dep@1.0.0::Rotate".into(),
         params: parameters,
         scheme: a::Scheme {
@@ -11008,6 +11136,7 @@ fn a_finite_imported_rotation_longer_than_256_states_remains_exact() {
                     ));
                 }
                 a::DeclaredType {
+                    metadata: Default::default(),
                     name: format!("dep@1.0.0::{prefix}{index}"),
                     params: Vec::new(),
                     scheme: artifact_scheme(artifact_struct(fields)),
@@ -11016,6 +11145,7 @@ fn a_finite_imported_rotation_longer_than_256_states_remains_exact() {
             .collect::<Vec<_>>()
     };
     let alias = |name: &str, prefix: &str| a::DeclaredType {
+        metadata: Default::default(),
         name: format!("dep@1.0.0::{name}"),
         params: Vec::new(),
         scheme: artifact_scheme(a::Type::Named {
@@ -11073,6 +11203,7 @@ fn structurally_growing_imported_rotation_recovers_without_a_depth_cap() {
     let mut dependency = effect_artifact("dep", "growing-rotation");
     dependency.header.types = vec![
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::Grow".into(),
             params: vec![
                 a::Parameter {
@@ -11107,6 +11238,7 @@ fn structurally_growing_imported_rotation_recovers_without_a_depth_cap() {
             },
         },
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::Loop".into(),
             params: Vec::new(),
             scheme: artifact_scheme(a::Type::Arrow(
@@ -11124,6 +11256,7 @@ fn structurally_growing_imported_rotation_recovers_without_a_depth_cap() {
         // A malformed changing arity is finite here and must not be mistaken
         // for constructor growth merely because its active vectors differ.
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::Odd".into(),
             params: vec![a::Parameter {
                 sense: a::Sense::Type,
@@ -11196,6 +11329,7 @@ fn sequential_imported_instantiations_do_not_exhaust_the_active_recursion_limit(
         .collect();
     dependency.header.types = vec![
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::Box".into(),
             params: vec![a::Parameter {
                 sense: a::Sense::Type,
@@ -11211,6 +11345,7 @@ fn sequential_imported_instantiations_do_not_exhaust_the_active_recursion_limit(
             },
         },
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::Wide".into(),
             params: Vec::new(),
             scheme: artifact_scheme(artifact_struct(fields)),
@@ -11395,6 +11530,7 @@ fn malformed_effect_keys_cannot_collide_with_encoded_unknown_atoms() {
     ]
     .into_iter()
     .map(|(name, key)| a::DeclaredType {
+        metadata: Default::default(),
         name: format!("dep@1.0.0::{name}"),
         params: Vec::new(),
         scheme: artifact_scheme(effectful(key)),
@@ -11439,6 +11575,7 @@ fn malformed_effect_keys_cannot_collide_with_encoded_unknown_atoms() {
 fn forwarded_field_addition_respects_outer_absent_shadowing() {
     let mut dependency = effect_artifact("dep", "shadow");
     dependency.header.types = vec![a::DeclaredType {
+        metadata: Default::default(),
         name: "dep@1.0.0::Shadow".into(),
         params: vec![a::Parameter {
             sense: a::Sense::Fields,
@@ -11555,6 +11692,7 @@ fn deep_field_summary_artifact(depth: usize, cycle: bool) -> a::UncheckedArtifac
                 }
             };
             a::DeclaredType {
+                metadata: Default::default(),
                 name,
                 params,
                 scheme: a::Scheme {
@@ -11599,6 +11737,7 @@ fn deeply_nested_imported_more_rows_are_imported_and_clamped_iteratively() {
             }
             let mut dependency = effect_artifact("dep", "deep-more");
             dependency.header.types = vec![a::DeclaredType {
+                metadata: Default::default(),
                 name: "dep@1.0.0::Deep".into(),
                 params: Vec::new(),
                 scheme: artifact_scheme(a::Type::Struct(row)),
@@ -11703,15 +11842,18 @@ fn deeply_nested_imported_semantics_are_preserved_on_a_small_stack() {
 
             let mut dependency = effect_artifact("dep", "deep-semantics");
             dependency.header.types.push(a::DeclaredType {
+                metadata: Default::default(),
                 name: "dep@1.0.0::Deep".into(),
                 params: Vec::new(),
                 scheme: artifact_scheme(a::Type::Nat),
             });
             dependency.header.values.push(a::Value {
+                metadata: Default::default(),
                 name: "dep@1.0.0::deep_type".into(),
                 scheme: artifact_scheme(body),
             });
             dependency.header.values.push(a::Value {
+                metadata: Default::default(),
                 name: "dep@1.0.0::deep_formula".into(),
                 scheme: a::Scheme {
                     count: 1,
@@ -11722,6 +11864,7 @@ fn deeply_nested_imported_semantics_are_preserved_on_a_small_stack() {
                 },
             });
             dependency.header.values.push(a::Value {
+                metadata: Default::default(),
                 name: "dep@1.0.0::malformed_formula".into(),
                 scheme: a::Scheme {
                     count: 0,
@@ -11844,6 +11987,7 @@ fn malformed_imported_scheme_bounds_recover_for_types_and_values() {
     };
     let mut dependency = effect_artifact("dep", "bad-bounds");
     dependency.header.values.push(a::Value {
+        metadata: Default::default(),
         name: "dep@1.0.0::bad".into(),
         scheme: malformed.clone(),
     });
@@ -11883,6 +12027,7 @@ fn malformed_imported_scheme_bounds_recover_for_types_and_values() {
         ),
     ] {
         dependency.header.values.push(a::Value {
+            metadata: Default::default(),
             name: format!("dep@1.0.0::{name}"),
             scheme: a::Scheme {
                 count: 2,
@@ -11894,6 +12039,7 @@ fn malformed_imported_scheme_bounds_recover_for_types_and_values() {
         });
     }
     dependency.header.values.push(a::Value {
+        metadata: Default::default(),
         name: "dep@1.0.0::presence_as_row".into(),
         scheme: a::Scheme {
             count: 2,
@@ -11907,6 +12053,7 @@ fn malformed_imported_scheme_bounds_recover_for_types_and_values() {
         },
     });
     dependency.header.types.push(a::DeclaredType {
+        metadata: Default::default(),
         name: "dep@1.0.0::Broken".into(),
         params: Vec::new(),
         scheme: malformed,
@@ -11993,6 +12140,7 @@ fn imported_interfaces_discard_foreign_solver_local_ids_before_inference() {
         ),
     ] {
         dependency.header.types.push(a::DeclaredType {
+            metadata: Default::default(),
             name: format!("dep@1.0.0::{name}"),
             params: Vec::new(),
             scheme: artifact_scheme(body),
@@ -12009,6 +12157,7 @@ fn imported_interfaces_discard_foreign_solver_local_ids_before_inference() {
         ),
     ] {
         dependency.header.values.push(a::Value {
+            metadata: Default::default(),
             name: format!("dep@1.0.0::{name}"),
             scheme: a::Scheme {
                 count: 0,
@@ -12113,6 +12262,7 @@ fn arrow_effect_more_rows_use_one_canonical_form_in_both_directions() {
     let mut dependency = effect_artifact("dep", "effect-more-equality");
     dependency.header.types = vec![
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::Effectful".into(),
             params: vec![a::Parameter {
                 sense: a::Sense::Effects,
@@ -12128,6 +12278,7 @@ fn arrow_effect_more_rows_use_one_canonical_form_in_both_directions() {
             },
         },
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::Composed".into(),
             params: Vec::new(),
             scheme: artifact_scheme(a::Type::Named {
@@ -12139,6 +12290,7 @@ fn arrow_effect_more_rows_use_one_canonical_form_in_both_directions() {
             }),
         },
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::Flat".into(),
             params: Vec::new(),
             scheme: artifact_scheme(arrow(
@@ -12149,6 +12301,7 @@ fn arrow_effect_more_rows_use_one_canonical_form_in_both_directions() {
     ];
     dependency.header.values.extend([
         a::Value {
+            metadata: Default::default(),
             name: "dep@1.0.0::composed".into(),
             scheme: artifact_scheme(a::Type::Named {
                 name: "dep@1.0.0::Composed".into(),
@@ -12156,6 +12309,7 @@ fn arrow_effect_more_rows_use_one_canonical_form_in_both_directions() {
             }),
         },
         a::Value {
+            metadata: Default::default(),
             name: "dep@1.0.0::flat".into(),
             scheme: artifact_scheme(a::Type::Named {
                 name: "dep@1.0.0::Flat".into(),
@@ -12247,6 +12401,7 @@ fn deep_equal_imported_types_unify_on_a_bounded_stack() {
             let mut dependency = effect_artifact("dep", "deep-equal");
             dependency.header.types = vec![
                 a::DeclaredType {
+                    metadata: Default::default(),
                     name: "dep@1.0.0::Wrap".into(),
                     params: vec![a::Parameter {
                         sense: a::Sense::Type,
@@ -12262,16 +12417,19 @@ fn deep_equal_imported_types_unify_on_a_bounded_stack() {
                     },
                 },
                 a::DeclaredType {
+                    metadata: Default::default(),
                     name: "dep@1.0.0::A".into(),
                     params: Vec::new(),
                     scheme: artifact_scheme(deep(a::Type::Nat, a::Type::Nat)),
                 },
                 a::DeclaredType {
+                    metadata: Default::default(),
                     name: "dep@1.0.0::B".into(),
                     params: Vec::new(),
                     scheme: artifact_scheme(deep(a::Type::String, a::Type::Nat)),
                 },
                 a::DeclaredType {
+                    metadata: Default::default(),
                     name: "dep@1.0.0::C".into(),
                     params: Vec::new(),
                     scheme: artifact_scheme(deep(a::Type::Nat, a::Type::String)),
@@ -12279,6 +12437,7 @@ fn deep_equal_imported_types_unify_on_a_bounded_stack() {
             ];
             dependency.header.values.extend([
                 a::Value {
+                    metadata: Default::default(),
                     name: "dep@1.0.0::value".into(),
                     scheme: artifact_scheme(a::Type::Named {
                         name: "dep@1.0.0::B".into(),
@@ -12286,6 +12445,7 @@ fn deep_equal_imported_types_unify_on_a_bounded_stack() {
                     }),
                 },
                 a::Value {
+                    metadata: Default::default(),
                     name: "dep@1.0.0::bad".into(),
                     scheme: artifact_scheme(a::Type::Named {
                         name: "dep@1.0.0::C".into(),
@@ -12293,6 +12453,7 @@ fn deep_equal_imported_types_unify_on_a_bounded_stack() {
                     }),
                 },
                 a::Value {
+                    metadata: Default::default(),
                     name: "dep@1.0.0::accept".into(),
                     scheme: artifact_scheme(a::Type::Arrow(
                         Box::new(a::Type::Named {
@@ -12310,6 +12471,7 @@ fn deep_equal_imported_types_unify_on_a_bounded_stack() {
                 // Per-depth snapshots would retain DEPTH × 5,000 slots; the
                 // single outer transaction remains O(DEPTH + variables).
                 a::Value {
+                    metadata: Default::default(),
                     name: "dep@1.0.0::padding".into(),
                     scheme: a::Scheme {
                         count: 5_000,
@@ -12390,6 +12552,7 @@ fn deep_alias_reentry_shares_one_congruence_transaction() {
             };
             let mut dependency = effect_artifact("dep", "deep-alias-transaction");
             dependency.header.types.push(a::DeclaredType {
+                metadata: Default::default(),
                 name: "dep@1.0.0::Wrap".into(),
                 params: vec![a::Parameter {
                     sense: a::Sense::Type,
@@ -12412,6 +12575,7 @@ fn deep_alias_reentry_shares_one_congruence_transaction() {
                         false => wrapped(format!("dep@1.0.0::{side}{}", index + 1)),
                     };
                     dependency.header.types.push(a::DeclaredType {
+                        metadata: Default::default(),
                         name: format!("dep@1.0.0::{side}{index}"),
                         params: Vec::new(),
                         scheme: artifact_scheme(body),
@@ -12420,10 +12584,12 @@ fn deep_alias_reentry_shares_one_congruence_transaction() {
             }
             dependency.header.values.extend([
                 a::Value {
+                    metadata: Default::default(),
                     name: "dep@1.0.0::value".into(),
                     scheme: artifact_scheme(named("dep@1.0.0::Y0".into())),
                 },
                 a::Value {
+                    metadata: Default::default(),
                     name: "dep@1.0.0::accept".into(),
                     scheme: artifact_scheme(a::Type::Arrow(
                         Box::new(named("dep@1.0.0::X0".into())),
@@ -12435,6 +12601,7 @@ fn deep_alias_reentry_shares_one_congruence_transaction() {
                     )),
                 },
                 a::Value {
+                    metadata: Default::default(),
                     name: "dep@1.0.0::padding".into(),
                     scheme: a::Scheme {
                         count: 5_000,
@@ -12503,6 +12670,7 @@ fn recursive_imported_alias_reentry_compares_malformed_arities() {
     let mut dependency = effect_artifact("dep", "malformed-recursive-arity");
     dependency.header.types = vec![
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::A".into(),
             params: vec![parameter()],
             scheme: a::Scheme {
@@ -12514,6 +12682,7 @@ fn recursive_imported_alias_reentry_compares_malformed_arities() {
             },
         },
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::B".into(),
             params: vec![parameter()],
             scheme: a::Scheme {
@@ -12531,10 +12700,12 @@ fn recursive_imported_alias_reentry_compares_malformed_arities() {
     };
     dependency.header.values.extend([
         a::Value {
+            metadata: Default::default(),
             name: "dep@1.0.0::value".into(),
             scheme: artifact_scheme(applied("dep@1.0.0::A")),
         },
         a::Value {
+            metadata: Default::default(),
             name: "dep@1.0.0::accept".into(),
             scheme: artifact_scheme(a::Type::Arrow(
                 Box::new(applied("dep@1.0.0::B")),
@@ -12613,11 +12784,13 @@ fn deep_unequal_imported_struct_rows_unify_on_a_bounded_stack() {
                 let mut dependency = effect_artifact("dep", "deep-unequal-rows");
                 dependency.header.types = vec![
                     a::DeclaredType {
+                        metadata: Default::default(),
                         name: "dep@1.0.0::Expected".into(),
                         params: Vec::new(),
                         scheme: artifact_scheme(nested("bottom", a::Presence::Present, false)),
                     },
                     a::DeclaredType {
+                        metadata: Default::default(),
                         name: "dep@1.0.0::Actual".into(),
                         params: Vec::new(),
                         scheme: artifact_scheme(nested(
@@ -12629,6 +12802,7 @@ fn deep_unequal_imported_struct_rows_unify_on_a_bounded_stack() {
                 ];
                 dependency.header.values.extend([
                     a::Value {
+                        metadata: Default::default(),
                         name: "dep@1.0.0::bad".into(),
                         scheme: artifact_scheme(a::Type::Named {
                             name: "dep@1.0.0::Actual".into(),
@@ -12636,6 +12810,7 @@ fn deep_unequal_imported_struct_rows_unify_on_a_bounded_stack() {
                         }),
                     },
                     a::Value {
+                        metadata: Default::default(),
                         name: "dep@1.0.0::accept".into(),
                         scheme: artifact_scheme(a::Type::Arrow(
                             Box::new(a::Type::Named {
@@ -12830,6 +13005,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
     let mut dependency = effect_artifact("dep", "empty");
     dependency.header.types = vec![
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::Record".into(),
             params: Vec::new(),
             scheme: artifact_scheme(artifact_struct(vec![(
@@ -12841,6 +13017,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
             )])),
         },
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::Fields".into(),
             params: vec![a::Parameter {
                 sense: a::Sense::Fields,
@@ -12859,6 +13036,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
             },
         },
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::IdentityRow".into(),
             params: vec![a::Parameter {
                 sense: a::Sense::Fields,
@@ -12874,6 +13052,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
             },
         },
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::ForwardRow".into(),
             params: vec![a::Parameter {
                 sense: a::Sense::Fields,
@@ -12892,6 +13071,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
             },
         },
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::Cases".into(),
             params: Vec::new(),
             scheme: artifact_scheme(artifact_type(a::Type::Sum(a::Row {
@@ -12900,6 +13080,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
             }))),
         },
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::MissingTail".into(),
             params: Vec::new(),
             scheme: artifact_scheme(artifact_type(a::Type::Struct(a::Row {
@@ -12908,11 +13089,13 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
             }))),
         },
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::Nat".into(),
             params: Vec::new(),
             scheme: artifact_scheme(artifact_type(a::Type::Nat)),
         },
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::More".into(),
             params: Vec::new(),
             scheme: artifact_scheme(artifact_type(a::Type::Struct(a::Row {
@@ -12930,6 +13113,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
             }))),
         },
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::Cycle".into(),
             params: Vec::new(),
             scheme: artifact_scheme(artifact_type(a::Type::Named {
@@ -12938,11 +13122,13 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
             })),
         },
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::Unknown".into(),
             params: Vec::new(),
             scheme: artifact_scheme(artifact_type(a::Type::Undecided)),
         },
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::Pass".into(),
             params: vec![a::Parameter {
                 sense: a::Sense::Fields,
@@ -12961,6 +13147,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
             },
         },
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::Box".into(),
             params: vec![a::Parameter {
                 sense: a::Sense::Type,
@@ -12982,6 +13169,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
             },
         },
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::Alias".into(),
             params: Vec::new(),
             scheme: artifact_scheme(artifact_type(a::Type::Named {
@@ -12996,6 +13184,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
             })),
         },
         a::DeclaredType {
+            metadata: Default::default(),
             name: "dep@1.0.0::Phantom".into(),
             params: vec![a::Parameter {
                 sense: a::Sense::Type,
@@ -13084,6 +13273,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
 
     let mut dependency = effect_artifact("dep", "empty");
     dependency.header.types = vec![a::DeclaredType {
+        metadata: Default::default(),
         name: "dep@1.0.0::Record".into(),
         params: Vec::new(),
         scheme: artifact_scheme(artifact_struct(vec![(
@@ -13172,5 +13362,249 @@ fn whitespace_changes_leave_the_lowered_program_unchanged() {
     assert_eq!(
         two.source.span(two.program.terms[&swap].name_at).start,
         loose.find("swap").unwrap()
+    );
+}
+
+/// The metadata a definition carries, as `key: printed value` pairs, so a
+/// test can read one declaration's metadata at a glance.
+fn metadata_of(mint: &Mint, metadata: &ruddy::ir::Metadata) -> Vec<(String, String)> {
+    metadata
+        .iter()
+        .map(|(key, attribute)| {
+            (
+                key.clone(),
+                print::ir::data(&attribute.value.anchored, mint).to_string(),
+            )
+        })
+        .collect()
+}
+
+fn pairs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+    entries
+        .iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
+
+/// Every declaration — term, extern, type, effect, and module — carries the
+/// metadata written in front of it, as a struct of literal data: a bare
+/// attribute, a written `()`, and `{}` are one value, a tuple is the struct
+/// its numbering makes, and a bare tag carries unit.
+#[test]
+fn metadata_rides_on_every_declaration() {
+    let src = "@doc \"Adds.\" @since 2n @flag @unit () @empty {}\n\
+               let add = fn a b => a\n\
+               @host \"math\" extern sqrt : Real -> Real = \"Math.sqrt\"\n\
+               @shape (1n, \"two\") type Pair = { first: Nat, second: String }\n\
+               @level #Debug @kind #Removed 3n effect Log = Nat -> ()\n\
+               @owner { team: \"core\", \"since when\": 1.5, 0: true } module M = @inner [1i, 2i] let y = 1n end\n\
+               let plain = 0n";
+    let (mint, out) = build_src(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+
+    let term = |name: &str| {
+        metadata_of(
+            &mint,
+            &out.program.terms[&term_symbol(&mint, &out, name)].metadata,
+        )
+    };
+    assert_eq!(
+        term("add"),
+        pairs(&[
+            ("doc", "\"Adds.\""),
+            ("since", "2n"),
+            ("flag", "()"),
+            ("unit", "()"),
+            ("empty", "()"),
+        ])
+    );
+    assert_eq!(term("plain"), pairs(&[]));
+    assert_eq!(term("y"), pairs(&[("inner", "[1i, 2i]")]));
+
+    let (_, sqrt) = out
+        .program
+        .externs
+        .iter()
+        .find(|(symbol, _)| mint.name(**symbol) == "sqrt")
+        .expect("the extern");
+    assert_eq!(
+        metadata_of(&mint, &sqrt.metadata),
+        pairs(&[("host", "\"math\"")])
+    );
+
+    let pair = &out.program.types[&type_symbol(&mint, &out, "Pair")];
+    assert_eq!(
+        metadata_of(&mint, &pair.metadata),
+        pairs(&[("shape", "(1n, \"two\")")])
+    );
+    // A tuple is the struct its numbering makes, and nothing else remembers
+    // it was written with parentheses.
+    let ruddy::ir::DataKind::Struct(fields) = &pair.metadata["shape"].value.anchored else {
+        panic!("a tuple lowers to a struct: {:#?}", pair.metadata["shape"]);
+    };
+    assert_eq!(fields.keys().collect::<Vec<_>>(), ["0", "1"]);
+
+    let (_, log) = out
+        .program
+        .effects
+        .iter()
+        .find(|(symbol, _)| mint.name(**symbol) == "Log")
+        .expect("the effect");
+    assert_eq!(
+        metadata_of(&mint, &log.metadata),
+        pairs(&[("level", "#Debug"), ("kind", "#Removed 3n")])
+    );
+    let ruddy::ir::DataKind::Tag { name, payload } = &log.metadata["level"].value.anchored else {
+        panic!("a tag: {:#?}", log.metadata["level"]);
+    };
+    assert_eq!(name, "Debug");
+    assert!(matches!(&payload.anchored, ruddy::ir::DataKind::Struct(fields) if fields.is_empty()));
+
+    let (_, module) = out
+        .program
+        .modules
+        .iter()
+        .find(|(symbol, _)| mint.name(**symbol) == "M")
+        .expect("the module");
+    assert_eq!(
+        metadata_of(&mint, &module.metadata),
+        pairs(&[("owner", "{ team: \"core\", \"since when\": 1.5, 0: true }")])
+    );
+    assert_eq!(
+        out.source.span(module.name_at).start,
+        src.find("M =").expect("the module name")
+    );
+    // Each attribute keeps where its key was written.
+    assert_eq!(
+        out.source
+            .span(out.program.terms[&term_symbol(&mint, &out, "add")].metadata["since"].key_at)
+            .start,
+        src.find("@since").expect("the key")
+    );
+}
+
+/// A pattern `let` hands its metadata to every name it binds, and the hidden
+/// definitions that implement the pattern — and a `let _` — carry none.
+#[test]
+fn a_pattern_let_gives_its_metadata_to_every_name_it_binds() {
+    let src = "@k 1n let (a, b) = (1n, 2n)\n@k 2n let { c, d } = { c: 3n, d: 4n }\n@k 3n let _ = 5n\n@k 4n let [..rest] = [1n]";
+    let (mint, out) = build_src(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    for (name, value) in [
+        ("a", "1n"),
+        ("b", "1n"),
+        ("c", "2n"),
+        ("d", "2n"),
+        ("rest", "4n"),
+    ] {
+        let decl = &out.program.terms[&term_symbol(&mint, &out, name)];
+        assert_eq!(
+            metadata_of(&mint, &decl.metadata),
+            pairs(&[("k", value)]),
+            "{name}"
+        );
+    }
+    let hidden: Vec<_> = out
+        .program
+        .terms
+        .iter()
+        .filter(|(symbol, _)| mint.is_local(**symbol))
+        .collect();
+    assert!(!hidden.is_empty(), "the patterns make hidden definitions");
+    for (symbol, decl) in hidden {
+        assert!(
+            decl.metadata.is_empty(),
+            "{}: {:#?}",
+            mint.name(*symbol),
+            decl.metadata
+        );
+    }
+}
+
+/// A key written twice on one definition is refused at the second, pointing
+/// back at the first, and the first is the one that stands. A field written
+/// twice inside a metadata struct is the duplicate field it would be anywhere.
+#[test]
+fn duplicate_metadata_keys_and_fields_are_refused() {
+    let src = "@k 1n @j @k 2n let x = 1n";
+    let (mint, out) = build_src(src);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    let second = src.rfind("@k").expect("the second key");
+    assert_eq!(out.source.span(out.errors[0].at).start, second);
+    assert_eq!(out.source.span(out.errors[0].at).width, 2);
+    assert!(matches!(
+        &out.errors[0].kind,
+        ErrorKind::DuplicateAttribute { name, previous } if name == "k" && out.source.span(*previous).start == 0
+    ));
+    assert_eq!(
+        metadata_of(
+            &mint,
+            &out.program.terms[&term_symbol(&mint, &out, "x")].metadata
+        ),
+        pairs(&[("k", "1n"), ("j", "()")])
+    );
+
+    let src = "@k { a: 1n, \"a\": 2n } let x = 1n";
+    let (mint, out) = build_src(src);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert_eq!(
+        out.source.span(out.errors[0].at).start,
+        src.find("\"a\"").expect("the repeat")
+    );
+    assert!(matches!(
+        &out.errors[0].kind,
+        ErrorKind::DuplicateField { name, previous } if name == "a" && out.source.span(*previous).start == src.find("a:").expect("the first")
+    ));
+    assert_eq!(
+        metadata_of(
+            &mint,
+            &out.program.terms[&term_symbol(&mint, &out, "x")].metadata
+        ),
+        pairs(&[("k", "{ a: 1n }")])
+    );
+}
+
+/// The lowered tree prints its metadata in front of each declaration the way
+/// the parse tree does, so a printed program re-lowers to the one it was
+/// printed from with its metadata intact.
+#[test]
+fn displays_metadata_in_front_of_declarations() {
+    assert_eq!(
+        display_program(
+            "@k @v (1n, 2n) let x = 1n\n@t \"T\" type T = Nat\n@e #On effect E = Nat -> ()\n@h { a: [true] } extern f : Nat = \"f\""
+        ),
+        "@e #On effect E = Nat -> ()\n@t \"T\" type T = Nat\n@h { a: [true] } extern f : Nat = \"f\"\n@k @v (1n, 2n) let x = 1n"
+    );
+}
+
+/// Metadata may nest only so deep, so that an artifact reader can hold it in
+/// memory and on its stack without trusting the file. A value past the limit
+/// is refused where it sits and stands in as unit; one at the limit is kept.
+#[test]
+fn metadata_nesting_is_bounded() {
+    let limit = ruddy::ir::METADATA_DEPTH_LIMIT;
+    let fits = format!(
+        "@k {}1n{} let x = 1n",
+        "[".repeat(limit - 1),
+        "]".repeat(limit - 1)
+    );
+    let (_, out) = build_src(&fits);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+
+    let too_deep = format!("@k {}1n{} let x = 1n", "[".repeat(limit), "]".repeat(limit));
+    let (mint, out) = build_src(&too_deep);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert!(matches!(out.errors[0].kind, ErrorKind::MetadataTooDeep));
+    assert_eq!(
+        out.source.span(out.errors[0].at).start,
+        too_deep.find("1n").expect("the innermost value")
+    );
+    let printed = metadata_of(
+        &mint,
+        &out.program.terms[&term_symbol(&mint, &out, "x")].metadata,
+    );
+    assert_eq!(
+        printed[0].1,
+        format!("{}(){}", "[".repeat(limit), "]".repeat(limit))
     );
 }

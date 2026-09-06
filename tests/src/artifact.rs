@@ -55,12 +55,14 @@ fn exporting(mint: &Mint, scheme: &types::Scheme) -> Artifact {
     UncheckedArtifact {
         header: artifact::Header {
             compiler: ruddy::artifact::Stamp::current(),
+            modules: Vec::new(),
             identity: artifact::Identity {
                 name: name.clone(),
                 version: version.clone(),
             },
             dependencies: Vec::new(),
             values: vec![artifact::Value {
+                metadata: Default::default(),
                 name: format!("{name}@{version}::value"),
                 scheme: artifact::export_scheme(mint, scheme),
             }],
@@ -173,6 +175,7 @@ fn model_artifact() -> Artifact {
         .into_iter()
         .enumerate()
         .map(|(index, body)| artifact::Value {
+            metadata: Default::default(),
             name: format!("bundle@1.0.0::value-{index}"),
             scheme: Scheme {
                 count: 15,
@@ -289,6 +292,7 @@ fn model_artifact() -> Artifact {
     UncheckedArtifact {
         header: artifact::Header {
             compiler: ruddy::artifact::Stamp::current(),
+            modules: Vec::new(),
             identity: artifact::Identity {
                 name: "bundle".to_string(),
                 version: "1.0.0".to_string(),
@@ -306,6 +310,7 @@ fn model_artifact() -> Artifact {
             values,
             types: vec![
                 artifact::DeclaredType {
+                    metadata: Default::default(),
                     name: "bundle@1.0.0::Type".to_string(),
                     params: vec![artifact::Parameter {
                         sense: artifact::Sense::Type,
@@ -321,6 +326,7 @@ fn model_artifact() -> Artifact {
                     },
                 },
                 artifact::DeclaredType {
+                    metadata: Default::default(),
                     name: "bundle@1.0.0::Fields".to_string(),
                     params: vec![artifact::Parameter {
                         sense: artifact::Sense::Fields,
@@ -336,6 +342,7 @@ fn model_artifact() -> Artifact {
                     },
                 },
                 artifact::DeclaredType {
+                    metadata: Default::default(),
                     name: "bundle@1.0.0::Cases".to_string(),
                     params: vec![artifact::Parameter {
                         sense: artifact::Sense::Cases,
@@ -351,6 +358,7 @@ fn model_artifact() -> Artifact {
                     },
                 },
                 artifact::DeclaredType {
+                    metadata: Default::default(),
                     name: "bundle@1.0.0::Effects".to_string(),
                     params: vec![artifact::Parameter {
                         sense: artifact::Sense::Effects,
@@ -372,6 +380,7 @@ fn model_artifact() -> Artifact {
             ],
             effects: vec![
                 artifact::DeclaredEffect {
+                    metadata: Default::default(),
                     name: "bundle@1.0.0::Log".to_string(),
                     params: Vec::new(),
                     identity: Some(artifact::EffectIdentity {
@@ -385,6 +394,7 @@ fn model_artifact() -> Artifact {
                     }]),
                 },
                 artifact::DeclaredEffect {
+                    metadata: Default::default(),
                     name: "bundle@1.0.0::Alias".to_string(),
                     params: Vec::new(),
                     identity: None,
@@ -913,6 +923,7 @@ fn canonical_pretty_layout_is_pinned_at_its_unicode_width_boundary() {
         UncheckedArtifact {
             header: artifact::Header {
                 compiler: ruddy::artifact::Stamp::current(),
+                modules: Vec::new(),
                 identity: artifact::Identity {
                     name,
                     version: "1".to_string(),
@@ -943,7 +954,8 @@ fn canonical_pretty_layout_is_pinned_at_its_unicode_width_boundary() {
          \x20   (dependencies)\n\
          \x20   (values)\n\
          \x20   (types)\n\
-         \x20   (effects))\n\
+         \x20   (effects)\n\
+         \x20   (modules))\n\
          \x20 (lir (externs) (functions) (globals)))\n"
         )
     );
@@ -957,7 +969,8 @@ fn canonical_pretty_layout_is_pinned_at_its_unicode_width_boundary() {
          \x20   (dependencies)\n\
          \x20   (values)\n\
          \x20   (types)\n\
-         \x20   (effects))\n\
+         \x20   (effects)\n\
+         \x20   (modules))\n\
          \x20 (lir (externs) (functions) (globals)))\n"
         )
     );
@@ -1722,12 +1735,14 @@ fn deeply_nested_artifact_semantics_decode_on_a_small_stack() {
     let mut value = UncheckedArtifact {
         header: artifact::Header {
             compiler: ruddy::artifact::Stamp::current(),
+            modules: Vec::new(),
             identity: artifact::Identity {
                 name: "deep".to_string(),
                 version: "1".to_string(),
             },
             dependencies: Vec::new(),
             values: vec![artifact::Value {
+                metadata: Default::default(),
                 name: "deep@1::value".to_string(),
                 scheme: Scheme {
                     count: 0,
@@ -2019,12 +2034,14 @@ fn recursive_artifact_ownership_clones_and_drops_on_a_small_stack() {
             let artifact = UncheckedArtifact {
                 header: artifact::Header {
                     compiler: ruddy::artifact::Stamp::current(),
+                    modules: Vec::new(),
                     identity: artifact::Identity {
                         name: "deep".into(),
                         version: "1".into(),
                     },
                     dependencies: Vec::new(),
                     values: vec![artifact::Value {
+                        metadata: Default::default(),
                         name: "deep@1::value".into(),
                         scheme: Scheme {
                             count: 0,
@@ -2035,6 +2052,7 @@ fn recursive_artifact_ownership_clones_and_drops_on_a_small_stack() {
                         },
                     }],
                     types: vec![artifact::DeclaredType {
+                        metadata: Default::default(),
                         name: "deep@1::Rows".into(),
                         params: Vec::new(),
                         scheme: Scheme {
@@ -2065,6 +2083,7 @@ fn recursive_artifact_ownership_clones_and_drops_on_a_small_stack() {
             // Public header components can also outlive their containing
             // artifact, and must not depend on `Artifact::drop` for safety.
             drop(artifact::Value {
+                metadata: Default::default(),
                 name: "deep@1::standalone".into(),
                 scheme: Scheme {
                     count: 0,
@@ -2075,6 +2094,7 @@ fn recursive_artifact_ownership_clones_and_drops_on_a_small_stack() {
                 },
             });
             drop(artifact::DeclaredType {
+                metadata: Default::default(),
                 name: "deep@1::StandaloneType".into(),
                 params: Vec::new(),
                 scheme: Scheme {
@@ -2136,8 +2156,8 @@ fn valid_deep_artifact_parses_and_drops_on_a_small_stack() {
     let formula = format!("{}true{}", "(not ".repeat(DEPTH), ")".repeat(DEPTH));
     let valid = format!(
         "(artifact (header (identity \"deep\" \"1\") (compiler \"0000000000000000\") (dependencies) \
-         (values (value \"deep@1::value\" (scheme 0 0 (existentials) {formula} (ty nat)))) \
-         (types) (effects)) (lir (externs) (functions) (globals)))"
+         (values (value \"deep@1::value\" (scheme 0 0 (existentials) {formula} (ty nat)) (metadata))) \
+         (types) (effects) (modules)) (lir (externs) (functions) (globals)))"
     );
 
     std::thread::Builder::new()
@@ -2198,8 +2218,8 @@ fn rejected_deep_semantic_model_is_destroyed_on_a_small_stack() {
     let formula = format!("{}true{}", "(not ".repeat(DEPTH), ")".repeat(DEPTH));
     let malformed = format!(
         "(artifact (header (identity \"deep\" \"1\") (compiler \"0000000000000000\") (dependencies) \
-         (values (value \"deep@1::value\" (scheme 0 0 (existentials) {formula} (ty (struct (row (labels) closed)))))) \
-         (types) (effects)) (lir (externs) (functions) wrong))"
+         (values (value \"deep@1::value\" (scheme 0 0 (existentials) {formula} (ty (struct (row (labels) closed)))) (metadata))) \
+         (types) (effects) (modules)) (lir (externs) (functions) wrong))"
     );
 
     let error = std::thread::Builder::new()
@@ -2401,6 +2421,7 @@ fn deep_and_wide_artifacts_print_and_parse_on_a_small_stack() {
         artifact.header.values.push(artifact::Value {
             name: format!("deep@1.0.0::value{index}"),
             scheme: artifact.header.values[0].scheme.clone(),
+            metadata: artifact::Metadata::new(),
         });
     }
     std::thread::Builder::new()
@@ -2421,4 +2442,272 @@ fn deep_and_wide_artifacts_print_and_parse_on_a_small_stack() {
         .unwrap()
         .join()
         .unwrap();
+}
+
+fn meta(entries: &[(&str, artifact::Data)]) -> artifact::Metadata {
+    entries
+        .iter()
+        .map(|(key, data)| (key.to_string(), data.clone()))
+        .collect()
+}
+
+fn unit_data() -> artifact::Data {
+    artifact::Data::Struct(IndexMap::new())
+}
+
+/// Every exported value, declared type, declared effect, and module publishes
+/// the metadata written in front of it: a struct of literal data, empty when
+/// none was written. Each name a pattern binds carries the statement's, and
+/// a hidden definition publishes nothing at all.
+#[test]
+fn metadata_is_published_for_every_declaration() {
+    let artifact = built(
+        "@doc \"Adds.\" @since 2n @flag let add = 1n\n\
+         @host \"m\" extern sqrt : Real -> Real = \"Math.sqrt\"\n\
+         @shape (1n, \"two\") type Pair = { first: Nat }\n\
+         @level #Debug effect Log = Nat -> ()\n\
+         @owner { team: \"core\" } module M = @inner [1i, 2i] let y = 1.5 end\n\
+         @k let (a, b) = (1n, 2n)\n\
+         @gone let _ = 3n\n\
+         let plain = 0n",
+    );
+    let header = artifact.header();
+    let value = |suffix: &str| {
+        header
+            .values
+            .iter()
+            .find(|value| value.name.ends_with(suffix))
+            .unwrap_or_else(|| panic!("no value ending in {suffix}: {:#?}", header.values))
+    };
+    assert_eq!(
+        value("::add").metadata,
+        meta(&[
+            ("doc", artifact::Data::String("Adds.".into())),
+            ("since", artifact::Data::Natural(2)),
+            ("flag", unit_data()),
+        ])
+    );
+    assert_eq!(
+        value("::sqrt").metadata,
+        meta(&[("host", artifact::Data::String("m".into()))])
+    );
+    assert_eq!(
+        value("::M::y").metadata,
+        meta(&[(
+            "inner",
+            artifact::Data::Array(vec![artifact::Data::Integer(1), artifact::Data::Integer(2)])
+        )])
+    );
+    assert_eq!(value("::a").metadata, meta(&[("k", unit_data())]));
+    assert_eq!(value("::b").metadata, meta(&[("k", unit_data())]));
+    assert_eq!(value("::plain").metadata, meta(&[]));
+    assert!(
+        header
+            .values
+            .iter()
+            .all(|value| !value.metadata.contains_key("gone")),
+        "a `let _` publishes nothing: {:#?}",
+        header.values
+    );
+
+    assert_eq!(header.types.len(), 1);
+    assert_eq!(
+        header.types[0].metadata,
+        meta(&[(
+            "shape",
+            artifact::Data::Struct(
+                [
+                    ("0".to_string(), artifact::Data::Natural(1)),
+                    ("1".to_string(), artifact::Data::String("two".into())),
+                ]
+                .into_iter()
+                .collect()
+            )
+        )])
+    );
+    assert_eq!(header.effects.len(), 1);
+    assert_eq!(
+        header.effects[0].metadata,
+        meta(&[(
+            "level",
+            artifact::Data::Tag {
+                name: "Debug".into(),
+                payload: Box::new(unit_data()),
+            }
+        )])
+    );
+    assert_eq!(header.modules.len(), 1);
+    assert_eq!(header.modules[0].name, "tests@0.1.0::M");
+    assert_eq!(
+        header.modules[0].metadata,
+        meta(&[(
+            "owner",
+            artifact::Data::Struct(
+                [("team".to_string(), artifact::Data::String("core".into()))]
+                    .into_iter()
+                    .collect()
+            )
+        )])
+    );
+}
+
+/// Metadata survives the artifact's text exactly: the three numeric kinds
+/// stay distinct, strings keep their escapes and newlines, tags keep their
+/// payloads, and nested values keep their order.
+#[test]
+fn metadata_round_trips_through_artifact_text() {
+    let artifact = built(
+        "@n 1n @i 1i @r 1.5 @whole 1 @b false\n\
+         @s \"a\\\"b\\\\c\\nd\\te\"\n\
+         @raw \\\\ first line\n     \\\\ second line\n\
+         @t #Tag (1n, [true, false])\n\
+         @o { \"x y\": 0n, plain: (), nested: { deep: #A }, 0: 1n }\n\
+         let x = 1n\n\
+         @m module M\n\
+         @e effect E = Nat -> ()\n\
+         @ty type T = Nat",
+    );
+    let printed = assert_round_trip(&artifact);
+    for expected in [
+        "(entry \"n\" (nat 1))",
+        "(entry \"i\" (int 1))",
+        "(entry \"r\" (real 1.5))",
+        "(entry \"whole\" (real 1))",
+        "(entry \"b\" (bool false))",
+        "(entry \"s\" (string \"a\\\"b\\\\c\\nd\\te\"))",
+        "(entry \"raw\" (string \" first line\\n second line\"))",
+        "\"Tag\"",
+        "(field \"0\" (nat 1))",
+        "(field \"1\" (array (bool true) (bool false)))",
+        "(field \"plain\" (struct))",
+        "(field \"deep\" (tag \"A\" (struct)))",
+        "(module \"tests@0.1.0::M\" (metadata (entry \"m\" (struct))))",
+    ] {
+        assert!(printed.contains(expected), "{expected}\n{printed}");
+    }
+    let header = artifact.header();
+    let value = &header.values[0];
+    assert!(matches!(value.metadata["whole"], artifact::Data::Real(value) if value == 1.0));
+    assert!(matches!(value.metadata["n"], artifact::Data::Natural(1)));
+    assert!(matches!(value.metadata["i"], artifact::Data::Integer(1)));
+    assert_eq!(header.effects[0].metadata, meta(&[("e", unit_data())]));
+    assert_eq!(header.types[0].metadata, meta(&[("ty", unit_data())]));
+}
+
+/// Every misspelling or misshaping of metadata text is refused by the
+/// reader: an unknown data kind, wrong arities, an atom where a list goes,
+/// a repeated key or field, and nesting past the depth the compiler admits.
+#[test]
+fn malformed_metadata_text_is_refused() {
+    let printed = built("@k { a: #T 1n } let x = 1n").print();
+    for (present, replacement) in [
+        ("(nat 1)", "(bogus 1)"),
+        ("(nat 1)", "(nat)"),
+        ("(nat 1)", "nat"),
+        ("(tag \"T\" (nat 1))", "(tag \"T\")"),
+        ("(field \"a\"", "(fld \"a\""),
+        ("(field \"a\" ", "(field "),
+        ("(metadata", "(meta"),
+        ("(entry \"k\"", "(entry"),
+        ("(entry \"k\"", "(key \"k\""),
+        ("(struct (field", "(struct field"),
+        ("(metadata (entry \"k\"", "(metadata k (entry \"k\""),
+        (
+            "(struct (field \"a\" (tag \"T\" (nat 1))))",
+            "(struct (field \"a\" (nat 1)) (field \"a\" (nat 2)))",
+        ),
+        (
+            "(metadata (entry \"k\" (struct (field \"a\" (tag \"T\" (nat 1)))))",
+            "(metadata (entry \"k\" (nat 1)) (entry \"k\" (nat 2)))",
+        ),
+        ("(modules)", "(modules (module \"tests@0.1.0::M\"))"),
+        ("(modules)", "(modules (mod \"tests@0.1.0::M\" (metadata)))"),
+    ] {
+        assert!(printed.contains(present), "{present}\n{printed}");
+        assert_malformed(&printed.replacen(present, replacement, 1));
+    }
+    assert_malformed(&printed.replacen("(modules)", "", 1));
+
+    let limit = ruddy::ir::METADATA_DEPTH_LIMIT;
+    let deep = format!("{}(nat 1){}", "(array ".repeat(limit), ")".repeat(limit));
+    let too_deep = printed.replacen("(nat 1)", &deep, 1);
+    let error = Artifact::try_parse(&too_deep).expect_err("nesting past the limit is refused");
+    assert_eq!(error.message(), "metadata nested too deeply");
+    // The `(nat 1)` sits inside a struct field inside a tag, three levels down
+    // already, so one array fewer than the limit fits exactly.
+    let just_fits = format!(
+        "{}(nat 1){}",
+        "(array ".repeat(limit - 3),
+        ")".repeat(limit - 3)
+    );
+    Artifact::try_parse(&printed.replacen("(nat 1)", &just_fits, 1))
+        .expect("nesting at the limit is admitted")
+        .validate()
+        .expect("and validates");
+}
+
+/// In-memory metadata is held to the same limit as text, and recovery
+/// discards a value or module whose metadata breaks it, leaving the rest.
+#[test]
+fn recovery_discards_declarations_whose_metadata_is_too_deep() {
+    let mut deep = unit_data();
+    for _ in 0..ruddy::ir::METADATA_DEPTH_LIMIT {
+        deep = artifact::Data::Array(vec![deep]);
+    }
+    let mut unchecked =
+        built("let kept = 1n\nlet discarded = 2n\nmodule M\nmodule Gone").to_unchecked();
+    unchecked.header.values[1]
+        .metadata
+        .insert("deep".into(), deep.clone());
+    unchecked.header.modules[1]
+        .metadata
+        .insert("deep".into(), deep);
+    let error = unchecked
+        .clone()
+        .validate()
+        .expect_err("too deep to validate");
+    assert_eq!(error.message(), "metadata nested too deeply");
+
+    let (recovered, facts) = unchecked.recover();
+    assert_eq!(recovered.header().values.len(), 1);
+    assert!(recovered.header().values[0].name.ends_with("::kept"));
+    assert_eq!(recovered.header().modules.len(), 1);
+    assert!(recovered.header().modules[0].name.ends_with("::M"));
+    assert!(facts.iter().any(|fact| matches!(
+        fact,
+        RecoveryFact::ValueDiscarded { index: 1, name, reason }
+            if name.ends_with("::discarded") && reason == "metadata nested too deeply"
+    )));
+    assert!(facts.iter().any(|fact| matches!(
+        fact,
+        RecoveryFact::ModuleDiscarded { index: 1, name, reason }
+            if name.ends_with("::Gone") && reason == "metadata nested too deeply"
+    )));
+}
+
+/// Two data values are the same exactly when they would print the same: a
+/// real compares by its representation, so signed zero is told apart, and
+/// every other kind by value.
+#[test]
+fn metadata_data_compares_by_representation() {
+    use artifact::Data;
+    assert_eq!(Data::Real(1.5), Data::Real(1.5));
+    assert_ne!(Data::Real(0.0), Data::Real(-0.0));
+    assert_ne!(Data::Natural(1), Data::Integer(1));
+    assert_ne!(Data::Real(1.0), Data::Natural(1));
+    assert_eq!(
+        Data::Tag {
+            name: "A".into(),
+            payload: Box::new(unit_data())
+        },
+        Data::Tag {
+            name: "A".into(),
+            payload: Box::new(unit_data())
+        }
+    );
+    assert_ne!(
+        Data::Array(vec![Data::Boolean(true)]),
+        Data::Array(vec![Data::Boolean(false)])
+    );
+    assert_ne!(Data::String("a".into()), Data::Boolean(true));
 }

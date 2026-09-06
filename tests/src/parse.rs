@@ -4,9 +4,9 @@ use std::fmt::{self, Write};
 
 use ruddy::{
     parse::{
-        EffectBody, EffectLabel, ErrorKind, Expected, ExprKind, ExternTypeKind, Found, Path,
-        PatternKind, Place, Related, RelatedKind, StmtKind, SumCase, Type, TypeField, TypeKind,
-        parse,
+        DataKind, EffectBody, EffectLabel, ErrorKind, Expected, ExprKind, ExternTypeKind, Found,
+        Path, PatternKind, Place, Related, RelatedKind, StmtKind, SumCase, Type, TypeField,
+        TypeKind, parse,
     },
     token::lex,
     tracking::FileID,
@@ -22,9 +22,9 @@ fn parses_let_and_type() {
     let out = parse(toks);
     assert_eq!(out.stmts.len(), 3, "stmts: {:#?}", out.stmts);
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
-    assert!(matches!(out.stmts[0].tracked, StmtKind::Let { .. }));
-    assert!(matches!(out.stmts[1].tracked, StmtKind::Type { .. }));
-    assert!(matches!(out.stmts[2].tracked, StmtKind::Let { .. }));
+    assert!(matches!(out.stmts[0].kind, StmtKind::Let { .. }));
+    assert!(matches!(out.stmts[1].kind, StmtKind::Type { .. }));
+    assert!(matches!(out.stmts[2].kind, StmtKind::Let { .. }));
 }
 
 /// Parse a single statement and render it back. Since grouping is dropped
@@ -49,7 +49,7 @@ fn parse_print(src: &str) -> String {
         out.errors
     );
     assert_eq!(out.stmts.len(), 1, "stmts: {:#?}", out.stmts);
-    print::ast::stmt(&out.stmts[0].tracked).to_string()
+    print::ast::stmt(&out.stmts[0]).to_string()
 }
 
 #[test]
@@ -68,7 +68,7 @@ fn parses_expression_pattern_and_type_tuples() {
         pattern,
         ty: Some(ty),
         body,
-    } = &out.stmts[0].tracked
+    } = &out.stmts[0].kind
     else {
         panic!("expected ascribed tuple let: {:#?}", out.stmts[0]);
     };
@@ -76,11 +76,11 @@ fn parses_expression_pattern_and_type_tuples() {
     assert!(matches!(&ty.ty.tracked, TypeKind::Tuple(items) if items.len() == 2));
     assert!(matches!(&body.tracked.tracked, ExprKind::Tuple(items) if items.len() == 2));
 
-    let StmtKind::Let { body, .. } = &out.stmts[1].tracked else {
+    let StmtKind::Let { body, .. } = &out.stmts[1].kind else {
         unreachable!()
     };
     assert!(matches!(&body.tracked.tracked, ExprKind::Ident { .. }));
-    let StmtKind::Let { body, .. } = &out.stmts[2].tracked else {
+    let StmtKind::Let { body, .. } = &out.stmts[2].kind else {
         unreachable!()
     };
     assert!(matches!(&body.tracked.tracked, ExprKind::Tuple(items) if items.len() == 1));
@@ -100,7 +100,7 @@ fn parses_homogeneous_array_literals_and_types() {
 
     let StmtKind::Let {
         ty: Some(ty), body, ..
-    } = &out.stmts[0].tracked
+    } = &out.stmts[0].kind
     else {
         panic!("expected an ascribed array: {:#?}", out.stmts[0]);
     };
@@ -109,12 +109,12 @@ fn parses_homogeneous_array_literals_and_types() {
     );
     assert!(matches!(&body.tracked.tracked, ExprKind::Array(items) if items.is_empty()));
 
-    let StmtKind::Let { body, .. } = &out.stmts[1].tracked else {
+    let StmtKind::Let { body, .. } = &out.stmts[1].kind else {
         unreachable!()
     };
     assert!(matches!(&body.tracked.tracked, ExprKind::Array(items) if items.len() == 1));
 
-    let StmtKind::Let { body, .. } = &out.stmts[2].tracked else {
+    let StmtKind::Let { body, .. } = &out.stmts[2].kind else {
         unreachable!()
     };
     assert!(matches!(&body.tracked.tracked, ExprKind::Array(items) if items.len() == 3));
@@ -142,7 +142,7 @@ fn parses_array_patterns_with_one_rest_anywhere() {
         .tokens,
     );
     assert!(out.errors.is_empty(), "errors: {:#?}", out.errors);
-    let StmtKind::Let { body, .. } = &out.stmts[0].tracked else {
+    let StmtKind::Let { body, .. } = &out.stmts[0].kind else {
         panic!("expected a let: {:#?}", out.stmts[0]);
     };
     let ExprKind::Function { body, .. } = &body.tracked.tracked else {
@@ -255,7 +255,7 @@ fn parses_array_spreads_anywhere_in_a_literal() {
         .tokens,
     );
     assert!(out.errors.is_empty(), "errors: {:#?}", out.errors);
-    let StmtKind::Let { body, .. } = &out.stmts[0].tracked else {
+    let StmtKind::Let { body, .. } = &out.stmts[0].kind else {
         unreachable!()
     };
     let ExprKind::Array(items) = &body.tracked.tracked else {
@@ -288,7 +288,7 @@ fn parses_a_struct_spread_after_its_fields() {
         .tokens,
     );
     assert!(out.errors.is_empty(), "errors: {:#?}", out.errors);
-    let StmtKind::Let { body, .. } = &out.stmts[0].tracked else {
+    let StmtKind::Let { body, .. } = &out.stmts[0].kind else {
         unreachable!()
     };
     let ExprKind::Struct {
@@ -302,7 +302,7 @@ fn parses_a_struct_spread_after_its_fields() {
     assert_eq!(names, ["a", "b c", "0"]);
     assert!(matches!(spread.value.tracked, ExprKind::Apply { .. }));
     assert_eq!((spread.span.start, spread.span.end()), (34, 36));
-    let StmtKind::Let { body, .. } = &out.stmts[1].tracked else {
+    let StmtKind::Let { body, .. } = &out.stmts[1].kind else {
         unreachable!()
     };
     let ExprKind::Struct {
@@ -386,7 +386,7 @@ fn a_struct_literal_spreads_one_value_and_spreads_it_last() {
 fn parses_numeric_projection_canonically() {
     let out = parse(lex("let value = pair.001", FileID::GENERATED).tokens);
     assert!(out.errors.is_empty(), "errors: {:#?}", out.errors);
-    let StmtKind::Let { body, .. } = &out.stmts[0].tracked else {
+    let StmtKind::Let { body, .. } = &out.stmts[0].kind else {
         unreachable!()
     };
     assert!(matches!(
@@ -689,7 +689,7 @@ fn a_type_hole_parses_as_a_type() {
     // And it is the node it says it is, rather than a name spelled `_`.
     let out = parse(lex("let k : _ = 1n", FileID::GENERATED).tokens);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    let StmtKind::Let { ty, .. } = &out.stmts[0].tracked else {
+    let StmtKind::Let { ty, .. } = &out.stmts[0].kind else {
         panic!("expected a definition");
     };
     let ty = ty.as_ref().expect("it is annotated");
@@ -738,7 +738,7 @@ fn an_absent_label_spans_its_mark() {
     let ascribed = |src: &str| -> Type {
         let out = parse(lex(src, FileID::GENERATED).tokens);
         assert!(out.errors.is_empty(), "{src:?}: {:#?}", out.errors);
-        match &out.stmts[0].tracked {
+        match &out.stmts[0].kind {
             StmtKind::Let { ty: Some(ty), .. } => ty.ty.clone(),
             other => panic!("expected an ascribed let, got {other:?}"),
         }
@@ -800,6 +800,81 @@ fn functions() {
         parse_one("let values = f 1n 2i 3"),
         "let values = f 1n 2i 3"
     );
+}
+
+#[test]
+fn match_function_shorthand_parses_and_prints() {
+    assert_eq!(
+        parse_one(
+            "let unwrap = fn\n\
+             | #Some x => x\n\
+             | #None => 0n"
+        ),
+        "let unwrap = fn | #Some x => x | #None => 0n"
+    );
+
+    let src = "let identity = fn | value => value";
+    let out = parse(lex(src, FileID::GENERATED).tokens);
+    assert!(out.errors.is_empty(), "errors: {:#?}", out.errors);
+    let StmtKind::Let { body, .. } = &out.stmts[0].kind else {
+        panic!("expected a let");
+    };
+    let ExprKind::MatchFunction { fn_span, arms } = &body.tracked.tracked else {
+        panic!("expected a match function");
+    };
+    assert_eq!(fn_span.start, src.find("fn").expect("the keyword"));
+    assert_eq!(fn_span.width, 2);
+    assert_eq!(arms.len(), 1);
+}
+
+#[test]
+fn match_function_shorthand_has_function_precedence_and_greedy_arms() {
+    assert_eq!(
+        parse_one("let mapped = map fn | #Some x => x | #None => 0n"),
+        "let mapped = map (fn | #Some x => x | #None => 0n)"
+    );
+    assert_eq!(
+        parse_one("let identity = (fn | x => x) 1n"),
+        "let identity = (fn | x => x) 1n"
+    );
+    assert_eq!(
+        parse_one(
+            "let nested = fn\n\
+             | #Outer x => (fn | #InnerA => 1n | #InnerB => 2n)\n\
+             | #Other => 3n"
+        ),
+        "let nested = fn | #Outer x => (fn | #InnerA => 1n | #InnerB => 2n) | #Other => 3n"
+    );
+    assert_eq!(
+        parse_one(
+            "let nested = fn\n\
+             | #Outer => (fn x => fn | #Inner => 1n)\n\
+             | #Other => 2n"
+        ),
+        "let nested = fn | #Outer => (fn x => fn | #Inner => 1n) | #Other => 2n"
+    );
+}
+
+#[test]
+fn malformed_match_function_shorthand_uses_existing_parse_errors() {
+    for (src, expected) in [
+        ("let f = fn |", Expected::Pattern),
+        ("let f = fn | value", Expected::Punctuation("=>")),
+        ("let f = fn | value =>", Expected::Value),
+        ("let f = fn value | _ => 0n", Expected::Punctuation("=>")),
+    ] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        let [error] = out.errors.as_slice() else {
+            panic!("{src}: expected one error: {:#?}", out.errors);
+        };
+        let ErrorKind::Expected {
+            expected: actual, ..
+        } = error.kind
+        else {
+            panic!("{src}: wrong error: {error:#?}");
+        };
+        assert_eq!(actual, expected, "{src}");
+    }
 }
 
 #[test]
@@ -2550,7 +2625,7 @@ fn a_struct_pattern_may_end_with_a_rest() {
     let src = "let { a, .. } = p";
     let out = parse(lex(src, FileID::GENERATED).tokens);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    let StmtKind::Let { pattern, .. } = &out.stmts[0].tracked else {
+    let StmtKind::Let { pattern, .. } = &out.stmts[0].kind else {
         panic!("a let");
     };
     let ruddy::parse::PatternKind::Struct { fields, rest } = &pattern.tracked else {
@@ -2951,7 +3026,7 @@ fn parse_stmt(src: &str) -> StmtKind {
     let [stmt] = &out.stmts[..] else {
         panic!("{src}: {:#?}", out.stmts);
     };
-    stmt.tracked.clone()
+    stmt.kind.clone()
 }
 
 /// The annotation of a `let`, which every arrow-binding test writes one of.
@@ -3042,7 +3117,7 @@ fn a_handler_arm_that_runs_out_reports_where_the_input_ended() {
 fn both_module_forms_parse() {
     let out = parse(lex("module A", FileID::GENERATED).tokens);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    let StmtKind::Module { name, body } = &out.stmts[0].tracked else {
+    let StmtKind::Module { name, body } = &out.stmts[0].kind else {
         panic!("expected a module: {:#?}", out.stmts);
     };
     assert_eq!(name.tracked, "A");
@@ -3052,7 +3127,7 @@ fn both_module_forms_parse() {
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     let StmtKind::Module {
         body: Some(body), ..
-    } = &out.stmts[0].tracked
+    } = &out.stmts[0].kind
     else {
         panic!("expected an inline module: {:#?}", out.stmts);
     };
@@ -3068,17 +3143,17 @@ fn a_module_body_holds_every_kind_of_statement() {
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     let StmtKind::Module {
         body: Some(body), ..
-    } = &out.stmts[0].tracked
+    } = &out.stmts[0].kind
     else {
         panic!("expected an inline module: {:#?}", out.stmts);
     };
     assert_eq!(body.len(), 4);
-    assert!(matches!(body[0].tracked, StmtKind::Type { .. }));
-    assert!(matches!(body[1].tracked, StmtKind::Effect { .. }));
-    assert!(matches!(body[2].tracked, StmtKind::Let { .. }));
+    assert!(matches!(body[0].kind, StmtKind::Type { .. }));
+    assert!(matches!(body[1].kind, StmtKind::Effect { .. }));
+    assert!(matches!(body[2].kind, StmtKind::Let { .. }));
     let StmtKind::Module {
         body: Some(inner), ..
-    } = &body[3].tracked
+    } = &body[3].kind
     else {
         panic!("expected a nested module: {:#?}", body);
     };
@@ -3229,7 +3304,7 @@ fn a_module_body_recovers_at_its_end() {
     let out = parse(lex(source, FileID::GENERATED).tokens);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(out.stmts.len(), 2, "{:#?}", out.stmts);
-    assert!(matches!(out.stmts[1].tracked, StmtKind::Let { .. }));
+    assert!(matches!(out.stmts[1].kind, StmtKind::Let { .. }));
 }
 
 #[test]
@@ -3239,7 +3314,7 @@ fn an_extern_declares_a_string_foreign_target_of_any_type() {
     let output = parse(lex(source, FileID::GENERATED).tokens);
     let StmtKind::Extern {
         name, ty, target, ..
-    } = &output.stmts[0].tracked
+    } = &output.stmts[0].kind
     else {
         panic!("extern did not parse: {:#?}", output.stmts);
     };
@@ -3266,7 +3341,7 @@ fn extern_fn_abi_desugars_to_curried_arrows_and_retains_arity() {
     let source = "extern add : fn(Nat, Nat,) -> Nat + !IO = \"host.add\"";
     let output = parse(lex(source, FileID::GENERATED).tokens);
     assert!(output.errors.is_empty(), "{:#?}", output.errors);
-    let StmtKind::Extern { ty, abi, .. } = &output.stmts[0].tracked else {
+    let StmtKind::Extern { ty, abi, .. } = &output.stmts[0].kind else {
         panic!("extern did not parse: {:#?}", output.stmts);
     };
     let ExternTypeKind::Function {
@@ -3304,7 +3379,7 @@ fn extern_fn_abi_supports_nullary_nested_grouped_and_where_forms() {
         "extern build : fn() -> (fn(Nat, String) -> Nat) + !Outer where 'a = 'a = \"host.build\"";
     let output = parse(lex(source, FileID::GENERATED).tokens);
     assert!(output.errors.is_empty(), "{:#?}", output.errors);
-    let StmtKind::Extern { ty, abi, .. } = &output.stmts[0].tracked else {
+    let StmtKind::Extern { ty, abi, .. } = &output.stmts[0].kind else {
         panic!("extern did not parse: {:#?}", output.stmts);
     };
     assert!(ty.clause.is_some());
@@ -3341,5 +3416,273 @@ fn fn_abi_syntax_is_extern_only_and_directly_nested() {
     let output = parse(lex(source, FileID::GENERATED).tokens);
     assert!(!output.errors.is_empty());
     assert_eq!(output.stmts.len(), 1, "recovery skipped the next extern");
-    assert!(matches!(output.stmts[0].tracked, StmtKind::Extern { .. }));
+    assert!(matches!(output.stmts[0].kind, StmtKind::Extern { .. }));
+}
+
+/// Metadata is written in front of a definition as attributes, `@key` or
+/// `@key <literal>`, and every kind of top-level definition — inside an
+/// inline module too — may carry them. Printing writes them back in front of
+/// the definition, one per attribute, so the printed statement reparses to
+/// the tree it came from.
+#[test]
+fn attributes_are_read_in_front_of_every_definition_kind() {
+    for (src, printed) in [
+        ("@test let x = 1n", "@test let x = 1n"),
+        (
+            "@since 2n extern f : Nat = \"f\"",
+            "@since 2n extern f : Nat = \"f\"",
+        ),
+        ("@doc \"text\" type T = Nat", "@doc \"text\" type T = Nat"),
+        (
+            "@stability #Experimental effect E = () -> ()",
+            "@stability #Experimental effect E = () -> ()",
+        ),
+        ("@owner \"core\" module M", "@owner \"core\" module M"),
+        (
+            "@outer module M = @inner let y = 1n end",
+            "@outer module M = @inner let y = 1n end",
+        ),
+        (
+            "@a @b 1n\n@c \"three\"\nlet x = 1n",
+            "@a @b 1n @c \"three\" let x = 1n",
+        ),
+        ("@k let (a, b) = (1n, 2n)", "@k let (a, b) = (1n, 2n)"),
+    ] {
+        assert_eq!(parse_one(src), printed, "{src:?}");
+    }
+}
+
+/// A value is literal data and nothing else: scalars, a tag with an optional
+/// literal payload, and tuples, arrays, and structs of those. A written `()`
+/// is the same as no value, so it prints as the bare attribute; grouping
+/// parentheses and trailing commas are dropped the way expressions drop them.
+#[test]
+fn attribute_values_are_literal_data() {
+    for (src, printed) in [
+        ("@k \"s\" let x = 1n", "@k \"s\" let x = 1n"),
+        ("@k 1n let x = 1n", "@k 1n let x = 1n"),
+        ("@k 1i let x = 1n", "@k 1i let x = 1n"),
+        ("@k 1.5 let x = 1n", "@k 1.5 let x = 1n"),
+        ("@k true let x = 1n", "@k true let x = 1n"),
+        ("@k () let x = 1n", "@k let x = 1n"),
+        ("@k (1n, \"a\") let x = 1n", "@k (1n, \"a\") let x = 1n"),
+        ("@k (1n, 2n,) let x = 1n", "@k (1n, 2n) let x = 1n"),
+        ("@k (1n,) let x = 1n", "@k (1n,) let x = 1n"),
+        ("@k ((1n)) let x = 1n", "@k 1n let x = 1n"),
+        ("@k [1n, 2n,] let x = 1n", "@k [1n, 2n] let x = 1n"),
+        ("@k [] let x = 1n", "@k [] let x = 1n"),
+        (
+            "@k { a: 1n, \"b c\": 2n, 0: 3n, } let x = 1n",
+            "@k { a: 1n, \"b c\": 2n, 0: 3n } let x = 1n",
+        ),
+        ("@k {} let x = 1n", "@k let x = 1n"),
+        ("@k #Tag let x = 1n", "@k #Tag let x = 1n"),
+        ("@k #Tag 1n let x = 1n", "@k #Tag 1n let x = 1n"),
+        (
+            "@k #Tag #Inner 2n let x = 1n",
+            "@k #Tag (#Inner 2n) let x = 1n",
+        ),
+        (
+            "@k #\"two words\" let x = 1n",
+            "@k #\"two words\" let x = 1n",
+        ),
+        (
+            "@k { a: [#T { b: () }, (1n, 2n)] } let x = 1n",
+            "@k { a: [#T { b: () }, (1n, 2n)] } let x = 1n",
+        ),
+        (
+            "@k \\\\ one\n   \\\\ two\nlet x = 1n",
+            "@k \" one\\n two\" let x = 1n",
+        ),
+    ] {
+        assert_eq!(parse_one(src), printed, "{src:?}");
+    }
+}
+
+/// The tree records what was written: the key without its sigil, the value
+/// or its absence, and the spans of each. The definition's own span starts at
+/// its keyword, so nothing that pointed at a definition moves.
+#[test]
+fn attributes_keep_their_spans_and_leave_the_definition_where_it_was() {
+    let src = "@a @b (1n, 2n) let x = 1n";
+    let out = parse(lex(src, FileID::GENERATED).tokens);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let [stmt] = &out.stmts[..] else {
+        panic!("one statement: {:#?}", out.stmts);
+    };
+    assert_eq!(stmt.span.start, src.find("let").expect("the `let`"));
+    let [a, b] = &stmt.attributes[..] else {
+        panic!("two attributes: {:#?}", stmt.attributes);
+    };
+    assert_eq!(a.key.tracked, "a");
+    assert_eq!((a.key.span.start, a.key.span.width), (0, 2));
+    assert_eq!((a.span.start, a.span.width), (0, 2));
+    assert!(a.value.is_none());
+    assert_eq!(b.key.tracked, "b");
+    let value = b.value.as_ref().expect("`@b` carries a value");
+    assert!(matches!(&value.tracked, DataKind::Tuple(elements) if elements.len() == 2));
+    assert_eq!((value.span.start, value.span.width), (6, 8));
+    assert_eq!((b.span.start, b.span.width), (3, 11));
+
+    let out = parse(lex("@k () let x = 1n", FileID::GENERATED).tokens);
+    let value = out.stmts[0].attributes[0].value.as_ref().expect("written");
+    assert!(matches!(value.tracked, DataKind::Unit));
+    let out = parse(lex("@k #Some let x = 1n", FileID::GENERATED).tokens);
+    let value = out.stmts[0].attributes[0].value.as_ref().expect("written");
+    assert!(matches!(
+        &value.tracked,
+        DataKind::Tag { payload: None, .. }
+    ));
+}
+
+/// Attributes with no definition after them describe nothing, and are
+/// reported at the attributes rather than at whatever stopped them. The
+/// statement list around them goes on: a module whose last thing is a stray
+/// attribute still closes.
+#[test]
+fn attributes_without_a_definition_are_refused_at_the_attributes() {
+    for (src, start, width, stmts) in [
+        ("@k", 0, 2, 0),
+        ("let x = 1n\n@a @b 1n", 11, 8, 1),
+        ("module M = @k end\nlet x = 1n", 11, 2, 2),
+    ] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        assert_eq!(out.errors.len(), 1, "{src:?}: {:#?}", out.errors);
+        assert_eq!(
+            out.errors[0].kind,
+            ErrorKind::AttributeWithoutDefinition,
+            "{src:?}"
+        );
+        assert_eq!(out.errors[0].span.start, start, "{src:?}");
+        assert_eq!(out.errors[0].span.width, width, "{src:?}");
+        assert_eq!(out.stmts.len(), stmts, "{src:?}: {:#?}", out.stmts);
+    }
+}
+
+/// A value that computes — a name, an application, an operator, anything
+/// that begins an expression but not a literal — is refused where it begins,
+/// at the top of a value and inside a tuple, array, struct field, or tag
+/// payload alike. The definition after it is still read.
+#[test]
+fn a_metadata_value_that_is_not_a_literal_is_refused_where_it_begins() {
+    for (src, at) in [
+        ("@since add 1n 2n\nlet x = 1n", "add"),
+        ("@k -1i\nlet x = 1n", "-"),
+        ("@k not true\nlet x = 1n", "not"),
+        ("@k fn a => a\nlet x = 1n", "fn"),
+        ("@k if true then 1n else 2n end\nlet x = 1n", "if"),
+        ("@k !Log\nlet x = 1n", "!Log"),
+        ("@k _\nlet x = 1n", "_"),
+        ("@k { a: add }\nlet x = 1n", "add"),
+        ("@k { ..base }\nlet x = 1n", ".."),
+        ("@k [..base]\nlet x = 1n", ".."),
+        ("@k (1n, y)\nlet x = 1n", "y"),
+        ("@k #Removed since\nlet x = 1n", "since"),
+        ("@k Math::pi\nlet x = 1n", "Math"),
+    ] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        assert_eq!(out.errors.len(), 1, "{src:?}: {:#?}", out.errors);
+        assert_eq!(out.errors[0].kind, ErrorKind::MetadataNotLiteral, "{src:?}");
+        assert_eq!(
+            out.errors[0].span.start,
+            src.find(at).expect("the offending token"),
+            "{src:?}"
+        );
+        assert_eq!(out.stmts.len(), 1, "{src:?}: {:#?}", out.stmts);
+        assert!(
+            out.stmts[0].attributes.is_empty(),
+            "{src:?}: {:#?}",
+            out.stmts[0].attributes
+        );
+    }
+}
+
+/// Metadata belongs to a top-level definition. On a block's `let` it is
+/// refused at the attribute and the `let` is kept without it; where an
+/// expression is expected it is refused as belonging in front of a
+/// definition, and the value after it is read so the definition is checked.
+#[test]
+fn attributes_are_refused_in_blocks_and_in_expressions() {
+    let src = "let a = do @k @j 1n let x = 1n return x end";
+    let out = parse(lex(src, FileID::GENERATED).tokens);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert_eq!(out.errors[0].kind, ErrorKind::AttributeInBlock);
+    assert_eq!(
+        out.errors[0].span.start,
+        src.find("@k").expect("the attribute")
+    );
+    assert_eq!(out.errors[0].span.width, "@k @j 1n".len());
+    let [stmt] = &out.stmts[..] else {
+        panic!("one statement: {:#?}", out.stmts);
+    };
+    let StmtKind::Let { body, .. } = &stmt.kind else {
+        panic!("a let: {stmt:#?}");
+    };
+    let ExprKind::Do { stmts, result } = &body.tracked.tracked else {
+        panic!("a block: {body:#?}");
+    };
+    assert_eq!(stmts.len(), 1);
+    assert!(stmts[0].attributes.is_empty());
+    assert!(result.is_some());
+
+    for (src, at) in [("let x = @k 1n", "@k"), ("let x = (1n, @k 2n)", "@k")] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        assert_eq!(out.errors.len(), 1, "{src:?}: {:#?}", out.errors);
+        assert_eq!(
+            out.errors[0].kind,
+            ErrorKind::AttributeInExpression,
+            "{src:?}"
+        );
+        assert_eq!(
+            out.errors[0].span.start,
+            src.find(at).expect("the attribute"),
+            "{src:?}"
+        );
+        assert_eq!(out.stmts.len(), 1, "{src:?}: {:#?}", out.stmts);
+    }
+}
+
+/// A metadata value that breaks in some way other than computing gets the
+/// complaint the same shape gets in an expression: a value expected, a closer
+/// expected, a discard where a field name goes. The definition after it is
+/// still read.
+#[test]
+fn malformed_metadata_values_get_the_ordinary_complaints() {
+    let src = "@k { a: = 1n } let x = 1n";
+    let out = parse(lex(src, FileID::GENERATED).tokens);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert!(matches!(
+        out.errors[0].kind,
+        ErrorKind::Expected {
+            expected: Expected::Value,
+            found: Found::Token,
+            ..
+        }
+    ));
+    assert_eq!(out.errors[0].span.start, src.find('=').expect("the `=`"));
+    assert_eq!(out.stmts.len(), 1);
+
+    let src = "@k (] let x = 1n";
+    let out = parse(lex(src, FileID::GENERATED).tokens);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert!(matches!(
+        out.errors[0].kind,
+        ErrorKind::Expected {
+            expected: Expected::Punctuation(")"),
+            ..
+        }
+    ));
+    assert_eq!(out.stmts.len(), 1);
+
+    let src = "@k { _: 1n } let x = 1n";
+    let out = parse(lex(src, FileID::GENERATED).tokens);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert_eq!(
+        out.errors[0].kind,
+        ErrorKind::Wildcard {
+            place: Place::Field
+        }
+    );
+    assert_eq!(out.errors[0].span.start, src.find('_').expect("the `_`"));
+    assert_eq!(out.stmts.len(), 1);
 }

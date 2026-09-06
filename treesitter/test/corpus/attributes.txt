@@ -1,0 +1,246 @@
+================================================================================
+A bare attribute and one with a value, on a definition
+================================================================================
+
+@test
+@since 2n
+let x = 1n
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (attribute
+    (attribute_key))
+  (attribute
+    (attribute_key)
+    (natural))
+  (let_definition
+    (identifier)
+    (natural)))
+
+================================================================================
+Attributes on every kind of definition
+================================================================================
+
+@host "m" extern f : Nat = "f"
+@shape (1n, "two") type T = Nat
+@level #Debug effect E = Nat -> ()
+@owner { team: "core" } module M = @inner [1i] let y = 1n end
+@file module N
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (attribute
+    (attribute_key)
+    (string))
+  (extern_definition
+    (identifier)
+    (extern_annotation
+      (identifier))
+    (string))
+  (attribute
+    (attribute_key)
+    (data_tuple
+      (natural)
+      (string)))
+  (type_definition
+    (identifier)
+    (annotation
+      (identifier)))
+  (attribute
+    (attribute_key)
+    (data_tag
+      (tag)))
+  (effect_definition
+    (identifier)
+    (function_type
+      (identifier)
+      (unit)))
+  (attribute
+    (attribute_key)
+    (data_struct
+      (data_field
+        (identifier)
+        (string))))
+  (module_definition
+    (identifier)
+    (attribute
+      (attribute_key)
+      (data_array
+        (natural)))
+    (let_definition
+      (identifier)
+      (natural)))
+  (attribute
+    (attribute_key))
+  (module_definition
+    (identifier)))
+
+================================================================================
+Every literal form a value may take
+================================================================================
+
+@a "s" @b 1n @c 1i @d 1.5 @e true @f ()
+@g (1n,) @h ((1n)) @i [1n, 2n,] @j []
+@k { a: 1n, "b c": 2n, 0: 3n, } @l {}
+@m #Tag @n #Tag 1n @o #Tag #Inner 2n @p #"two words" ()
+let x = 1n
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (attribute
+    (attribute_key)
+    (string))
+  (attribute
+    (attribute_key)
+    (natural))
+  (attribute
+    (attribute_key)
+    (natural))
+  (attribute
+    (attribute_key)
+    (natural))
+  (attribute
+    (attribute_key)
+    (boolean))
+  (attribute
+    (attribute_key)
+    (unit))
+  (attribute
+    (attribute_key)
+    (data_tuple
+      (natural)))
+  (attribute
+    (attribute_key)
+    (parenthesized_data
+      (parenthesized_data
+        (natural))))
+  (attribute
+    (attribute_key)
+    (data_array
+      (natural)
+      (natural)))
+  (attribute
+    (attribute_key)
+    (data_array))
+  (attribute
+    (attribute_key)
+    (data_struct
+      (data_field
+        (identifier)
+        (natural))
+      (data_field
+        (string)
+        (natural))
+      (data_field
+        (numeric_field)
+        (natural))))
+  (attribute
+    (attribute_key)
+    (data_struct))
+  (attribute
+    (attribute_key)
+    (data_tag
+      (tag)))
+  (attribute
+    (attribute_key)
+    (data_tag
+      (tag)
+      (natural)))
+  (attribute
+    (attribute_key)
+    (data_tag
+      (tag)
+      (data_tag
+        (tag)
+        (natural))))
+  (attribute
+    (attribute_key)
+    (data_tag
+      (tag)
+      (unit)))
+  (let_definition
+    (identifier)
+    (natural)))
+
+================================================================================
+A raw multi-line string is one value
+================================================================================
+
+@doc \\ one
+     \\ two
+let x = 1n
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (attribute
+    (attribute_key)
+    (string))
+  (let_definition
+    (identifier)
+    (natural)))
+
+================================================================================
+Attributes with no definition after them are an error
+================================================================================
+
+let x = 1n
+@k 1n
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (natural))
+  (ERROR
+    (attribute
+      (attribute_key)
+      (natural))))
+
+================================================================================
+A value that is not a literal is an error
+================================================================================
+
+@k add 1n
+let x = 1n
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (attribute
+    (attribute_key)
+    (ERROR
+      (identifier))
+    (natural))
+  (let_definition
+    (identifier)
+    (natural)))
+
+================================================================================
+An attribute in a block or an expression is an error
+================================================================================
+
+let a = do @k let x = 1n return x end
+let b = @k 1n
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (do_block
+      (ERROR
+        (attribute_key))
+      (let_definition
+        (identifier)
+        (natural))
+      (identifier)))
+  (let_definition
+    (identifier)
+    (ERROR
+      (attribute_key))
+    (natural)))
