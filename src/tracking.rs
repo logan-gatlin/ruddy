@@ -49,7 +49,9 @@ pub struct NodeId(u64);
 /// position.
 ///
 /// Ordered by definition and then by node, which is source order within a
-/// definition and declaration order across them.
+/// definition and no order in particular across them, since a symbol is a
+/// fingerprint. What wants source order across definitions sorts by an
+/// [`Order`], which the program supplies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Anchor {
     pub definition: Symbol,
@@ -65,6 +67,15 @@ pub struct Anchored<T> {
 }
 
 pub type AnchoredString = Anchored<String>;
+
+/// Where a program's definitions stand relative to each other, so that what
+/// carries anchors can be put in the order a reader meets it. A definition
+/// the program never declared — the compiler's own, or a dependency's — sorts
+/// after every one it did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Order {
+    ranks: HashMap<Symbol, usize>,
+}
 
 /// Where every anchor of a program points. Produced beside the lowered
 /// program and kept apart from it, so the program is a value about meaning
@@ -237,6 +248,31 @@ impl<T> Anchored<T> {
 
     pub fn into_anchored(self) -> T {
         self.anchored
+    }
+}
+
+impl Order {
+    /// The definitions in the order they stand, earliest first.
+    pub fn of(definitions: impl IntoIterator<Item = Symbol>) -> Self {
+        Self {
+            ranks: definitions
+                .into_iter()
+                .enumerate()
+                .map(|(rank, symbol)| (symbol, rank))
+                .collect(),
+        }
+    }
+
+    /// Where `definition` stands: a key that sorts declared definitions the
+    /// way they were declared and everything else after them.
+    pub fn rank(&self, definition: Symbol) -> usize {
+        self.ranks.get(&definition).copied().unwrap_or(usize::MAX)
+    }
+
+    /// A sort key for what was written at `at`: its definition's rank and then
+    /// its place in the definition.
+    pub fn key(&self, at: Anchor) -> (usize, NodeId) {
+        (self.rank(at.definition), at.node)
     }
 }
 

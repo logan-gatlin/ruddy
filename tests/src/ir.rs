@@ -57,6 +57,17 @@ fn build_src(src: &str) -> (Mint, Output) {
     (mint, out)
 }
 
+/// Lowered from a registered file, as a bundle's files are: a generated span
+/// is the compiler's own and is numbered absolutely on purpose, so a test
+/// about anchors staying put has to lex under a real file id.
+fn build_file(src: &str) -> Output {
+    let mut files = FileManager::new();
+    let id = files.register_new_file("test.hc".into(), src.into());
+    let parsed = parse::parse(lex(src, id).tokens);
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    build(&mut dummy_mint(), parsed.stmts)
+}
+
 fn built(src: &str) -> (Mint, Output) {
     let (mint, out) = build_src(src);
     assert!(out.errors.is_empty(), "ir errors: {:#?}", out.errors);
@@ -13084,6 +13095,37 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
     );
 }
 
+/// A symbol is a value of its path, so a local added to one definition is
+/// that definition's business alone: every other definition lowers to the
+/// same value it did, symbol for symbol and anchor for anchor. Together with
+/// [`whitespace_changes_leave_the_lowered_program_unchanged`] this is what a
+/// per-definition cache would be keyed on.
+#[test]
+fn a_local_added_to_one_definition_leaves_the_others_unchanged() {
+    let before = "let first = fn a => a\n\
+                  let second = fn b => { value: b }\n";
+    let after = "let first = fn a => do let extra = a return extra end\n\
+                 let second = fn b => { value: b }\n";
+    let one = build_file(before);
+    let two = build_file(after);
+    assert!(one.errors.is_empty() && two.errors.is_empty());
+    let second = |out: &Output| {
+        let symbol = out.program.terms.keys().nth(1).copied().expect("second");
+        (symbol, format!("{:?}", out.program.terms[&symbol]))
+    };
+    assert_eq!(second(&one), second(&two));
+    assert_eq!(
+        format!("{:?}", one.program.groups[1]),
+        format!("{:?}", two.program.groups[1])
+    );
+    // While `first` did change, in the one place it was edited.
+    let first = |out: &Output| {
+        let symbol = out.program.terms.keys().next().copied().expect("first");
+        format!("{:?}", out.program.terms[&symbol])
+    };
+    assert_ne!(first(&one), first(&two));
+}
+
 /// Whitespace between definitions is the file's business, not the program's:
 /// two spellings of one program that differ only in the blank lines and
 /// indentation around its definitions lower to the same value, anchor for
@@ -13099,15 +13141,6 @@ fn whitespace_changes_leave_the_lowered_program_unchanged() {
     let loose = "\n\n   type Pair 'a = { first: 'a, second: 'a }\n\n\n\
                  \t let swap = fn p => { first: p.second, second: p.first }\n\n\
                  let use = swap { first: 1n, second: 2n }\n\n";
-    // Lexed under a registered file, as a bundle's files are: a generated
-    // span is the compiler's own, and is numbered absolutely on purpose.
-    let mut files = FileManager::new();
-    let mut build_file = |src: &str| {
-        let id = files.register_new_file("swap.hc".into(), src.into());
-        let parsed = parse::parse(lex(src, id).tokens);
-        assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
-        build(&mut dummy_mint(), parsed.stmts)
-    };
     let one = build_file(tight);
     let two = build_file(loose);
     assert!(one.errors.is_empty() && two.errors.is_empty());

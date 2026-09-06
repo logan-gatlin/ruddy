@@ -339,7 +339,8 @@ pub fn check(program: &Program, inferred: &inference::Output) -> Output {
     // In the order the reader would meet them, whatever order the walk found
     // them in; the sort is stable, so two complaints about one span keep the
     // order the checks made them.
-    out.errors.sort_by_key(|error| error.at);
+    let order = program.order();
+    out.errors.sort_by_key(|error| order.key(error.at));
     out
 }
 

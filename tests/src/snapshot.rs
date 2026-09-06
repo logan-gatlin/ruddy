@@ -2068,10 +2068,10 @@ fn symbols_round_trip_through_the_mangler() {
         .collect();
     // In mint order, which is the row order: types are lowered first, and every
     // definition's name is minted before any body is lowered — so `f` comes
-    // before the `x` its own lambda binds.
+    // before the `x` its own lambda binds, and `x` is shown inside `f`.
     assert_eq!(
         paths,
-        [("T", "demo::T"), ("f", "demo::f"), ("x", "demo::_::x")]
+        [("T", "demo::T"), ("f", "demo::f"), ("x", "demo::f::_::x")]
     );
 }
 

@@ -540,3 +540,93 @@ fn a_path_names_every_enclosing_module() {
     let local = m.local(Some(b), Namespace::Terms, "y");
     assert_eq!(m.path(local).to_string(), "demo::A::B::_::y");
 }
+
+/// A local written inside a definition is that definition's: its path runs
+/// through the definition, it is counted against the definition alone, and
+/// it is shown inside it.
+#[test]
+fn a_local_of_a_definition_is_numbered_within_it() {
+    let mut m = mint();
+    let util = m.module(None, "util").unwrap();
+    let map = m.global(Some(util), Namespace::Terms, "map").unwrap();
+    let filter = m.global(Some(util), Namespace::Terms, "filter").unwrap();
+    let in_map = m.local_in(map, Namespace::Terms, "x");
+    let again_in_map = m.local_in(map, Namespace::Terms, "x");
+    let in_filter = m.local_in(filter, Namespace::Terms, "x");
+
+    assert_eq!(m.owner(in_map), Some(map));
+    assert_eq!(m.owner(map), None);
+    assert_eq!(m.parent(in_map), Some(util));
+    assert!(m.is_local(in_map));
+    assert_eq!(m.mangle(in_map), format!("{APP_PREFIX}M4utilV3mapV1xs0"));
+    assert_eq!(
+        m.mangle(again_in_map),
+        format!("{APP_PREFIX}M4utilV3mapV1xs1")
+    );
+    // `filter`'s first `x` is its own first, whatever `map` minted before it.
+    assert_eq!(
+        m.mangle(in_filter),
+        format!("{APP_PREFIX}M4utilV6filterV1xs0")
+    );
+    assert_eq!(m.path(in_map).to_string(), "app::util::map::_::x");
+
+    let demangled = demangle(&m.mangle(in_map)).unwrap();
+    assert_eq!(
+        demangled.path,
+        vec![
+            Component {
+                namespace: Namespace::Modules,
+                name: "util".into(),
+                disambiguator: None,
+            },
+            Component {
+                namespace: Namespace::Terms,
+                name: "map".into(),
+                disambiguator: None,
+            },
+            Component {
+                namespace: Namespace::Terms,
+                name: "x".into(),
+                disambiguator: Some(0),
+            },
+        ]
+    );
+}
+
+/// A symbol is a value of its path: two mints of one bundle that declare the
+/// same things hand out the same symbols, whatever else each minted and in
+/// whatever order. This is what keeps a definition's lowered form the same
+/// when a definition above it gains a local.
+#[test]
+fn a_symbol_is_the_fingerprint_of_its_path() {
+    let mut one = mint();
+    let mut two = mint();
+
+    let one_map = one.global(None, Namespace::Terms, "map").unwrap();
+    let one_x = one.local_in(one_map, Namespace::Terms, "x");
+    let one_filter = one.global(None, Namespace::Terms, "filter").unwrap();
+    let one_y = one.local_in(one_filter, Namespace::Terms, "y");
+
+    // The other mint declares `filter` first and gives `map` an extra local
+    // before the `x` the first mint knows about.
+    let two_filter = two.global(None, Namespace::Terms, "filter").unwrap();
+    let two_y = two.local_in(two_filter, Namespace::Terms, "y");
+    let two_map = two.global(None, Namespace::Terms, "map").unwrap();
+    let extra = two.local_in(two_map, Namespace::Terms, "extra");
+    let two_x = two.local_in(two_map, Namespace::Terms, "x");
+
+    assert_eq!(one_map, two_map);
+    assert_eq!(one_filter, two_filter);
+    assert_eq!(one_x, two_x);
+    assert_eq!(one_y, two_y);
+    assert_ne!(extra, two_x);
+    assert_eq!(one.mangle(one_x), two.mangle(two_x));
+    // And the fingerprint is of the path alone: the bundle is beside it.
+    assert_eq!(one_map.bundle(), one.bundle().hash());
+    assert_ne!(one_map.bits(), one_x.bits());
+
+    // Ownerless locals still count per module path.
+    let ownerless = one.local(None, Namespace::Terms, "x");
+    assert_eq!(one.mangle(ownerless), format!("{APP_PREFIX}V1xs0"));
+    assert_ne!(ownerless, one_x);
+}

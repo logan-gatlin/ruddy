@@ -10,7 +10,7 @@ use crate::{
     artifact,
     parse::{self, Expr, ExprKind, Stmt, StmtKind},
     symbol::{Mint, Module, Namespace, Symbol},
-    tracking::{Anchor, Anchored, AnchoredString, SourceMap, Span, Tracked, TrackedString},
+    tracking::{Anchor, Anchored, AnchoredString, Order, SourceMap, Span, Tracked, TrackedString},
     types::{EffectId, ParamKind, Presence, Prim, Rest, Scheme, Sense, Shape, Ty},
 };
 
@@ -2488,6 +2488,22 @@ impl TypeField {
             TypeField::Written { value, .. } => Some(value),
             TypeField::Absent { .. } => None,
         }
+    }
+}
+
+impl Program {
+    /// Where each definition stands, for sorting what carries anchors into the
+    /// order a reader meets it: types, then effects, then values, each in the
+    /// order they were declared.
+    pub fn order(&self) -> Order {
+        Order::of(
+            self.types
+                .keys()
+                .chain(self.effects.keys())
+                .chain(self.externs.keys())
+                .chain(self.terms.keys())
+                .copied(),
+        )
     }
 }
 
@@ -9092,6 +9108,16 @@ impl Builder<'_> {
         }
     }
 
+    /// A fresh local of the definition being lowered, or of the module when
+    /// no definition is: a pattern that declares nothing owns its nodes as
+    /// [`define`](Self::define) says, and its locals go the same way.
+    fn mint_local(&mut self, namespace: Namespace, name: &str) -> Symbol {
+        match self.current == Symbol::GENERATED {
+            true => self.mint.local(self.module, namespace, name),
+            false => self.mint.local_in(self.current, namespace, name),
+        }
+    }
+
     /// Lower `definition`'s own nodes, however deep the lowering of another
     /// definition was when it asked: an alias body is read the first time
     /// anything names it, which may be from above its declaration.
@@ -9586,10 +9612,13 @@ impl Builder<'_> {
                         // row refers to; each becomes a parameter symbol the
                         // syntactic row can name, so the alias expands at a
                         // use exactly as a local one does.
+                        // They belong to the alias rather than to whichever
+                        // definition named it first, so their symbols do not
+                        // depend on the order definitions were read in.
                         let params: Vec<Symbol> = (0..count)
                             .map(|index| {
-                                self.mint.local(
-                                    None,
+                                self.mint.local_in(
+                                    symbol,
                                     Namespace::Types,
                                     &format!("{}'{index}", declaration.name),
                                 )
@@ -9917,9 +9946,7 @@ impl Builder<'_> {
                 continue;
             }
             seen.push((&name.tracked, name.span));
-            let symbol = self
-                .mint
-                .local(self.module, Namespace::Types, &name.tracked);
+            let symbol = self.mint_local(Namespace::Types, &name.tracked);
             bound.push(Param {
                 at: self.anchor(name.span),
                 symbol,
@@ -11185,7 +11212,7 @@ impl Builder<'_> {
                     // The node keeps its shape either way.
                     let symbol = match arg.tracked {
                         parse::ArgKind::Name(name) => {
-                            let symbol = self.mint.local(self.module, Namespace::Terms, &name);
+                            let symbol = self.mint_local(Namespace::Terms, &name);
                             self.terms.bind(name, symbol);
                             symbol
                         }
@@ -11466,7 +11493,7 @@ impl Builder<'_> {
         let at = binder.span;
         let symbol = match binder.tracked {
             parse::ArgKind::Name(name) => {
-                let symbol = self.mint.local(self.module, Namespace::Terms, &name);
+                let symbol = self.mint_local(Namespace::Terms, &name);
                 self.terms.bind(name, symbol);
                 symbol
             }
@@ -12078,9 +12105,7 @@ impl Builder<'_> {
             parse::PatternKind::Ident { name } => {
                 let annotation = ty.map(|ty| Box::new(self.written(ty, Place::Annotation)));
                 let mark = self.terms.mark();
-                let symbol = self
-                    .mint
-                    .local(self.module, Namespace::Terms, &name.tracked);
+                let symbol = self.mint_local(Namespace::Terms, &name.tracked);
                 self.terms.bind(name.tracked, symbol);
                 let value = self.term(value);
                 let body = body(self);
@@ -12143,7 +12168,7 @@ impl Builder<'_> {
     /// name starts with `%`, which no identifier can, so the debugger shows it
     /// recognizably as the compiler's own.
     fn fresh(&mut self, name: &str, at: Anchor) -> Anchored<Symbol> {
-        at.anchor(self.mint.local(self.module, Namespace::Terms, name))
+        at.anchor(self.mint_local(Namespace::Terms, name))
     }
 
     /// The anchor of a synthesized node standing over everything from `from`
@@ -12182,9 +12207,7 @@ impl Builder<'_> {
         }
         match binders {
             Binders::Local => {
-                let symbol = self
-                    .mint
-                    .local(self.module, Namespace::Terms, &name.tracked);
+                let symbol = self.mint_local(Namespace::Terms, &name.tracked);
                 // The repeat binds nothing: the first binding is the one the
                 // body sees, the way a repeated definition stands.
                 if !repeat {
@@ -12201,9 +12224,7 @@ impl Builder<'_> {
                     // A name that bound nothing — a repeat, within the pattern
                     // or of an earlier definition — still gets a stand-in, so
                     // the walk stays total.
-                    None => self
-                        .mint
-                        .local(self.module, Namespace::Terms, &name.tracked),
+                    None => self.mint_local(Namespace::Terms, &name.tracked),
                 };
                 self.anchor(name.span).anchor(symbol)
             }

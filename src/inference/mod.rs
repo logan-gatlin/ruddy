@@ -87,7 +87,7 @@ use indexmap::{IndexMap, IndexSet};
 use crate::{
     ir::{self, Annotation, Clause, ClauseKind, Program, Tail, Term, TermKind, Type, TypeKind},
     symbol::{Mint, Symbol},
-    tracking::Anchor,
+    tracking::{Anchor, Order},
     types::{
         Assigned, Atom, EffectId, Formula, ParamKind, Presence, Rest, Row, RowField, Scheme, Sense,
         Shape, Ty, TyVar, same_finite_syntax, same_finite_syntax_metered,
@@ -4663,6 +4663,8 @@ struct ExplanationSources<'a> {
     aliases: &'a IndexMap<Symbol, Scheme>,
     /// See [`Table::effect_argument_reasons`].
     effect_arguments: &'a HashMap<ReasonId, (String, u32)>,
+    /// Where the definitions stand, for putting facts in source order.
+    order: &'a Order,
 }
 
 fn attach_ordinary_explanations(
@@ -4677,6 +4679,7 @@ fn attach_ordinary_explanations(
     let ExplanationSources {
         aliases,
         effect_arguments,
+        order,
     } = sources;
     let pivot_contexts = pivot_contexts(constraints);
     let all = all_constraints(constraints);
@@ -4870,17 +4873,18 @@ fn attach_ordinary_explanations(
             })
             .collect();
         constraint_slice.sort_by_key(|id| {
-            constraints
-                .get(id)
-                .map_or((true, Anchor::GENERATED, "", "", ""), |constraint| {
+            constraints.get(id).map_or(
+                (true, order.key(Anchor::GENERATED), "", "", ""),
+                |constraint| {
                     (
                         constraint.at.is_generated(),
-                        constraint.at,
+                        order.key(constraint.at),
                         constraint.origin.code(),
                         constraint.subjects.primary.code(),
                         constraint.subjects.secondary.map_or("", Subject::code),
                     )
-                })
+                },
+            )
         });
 
         let mut full_facts = Vec::new();
@@ -5151,7 +5155,7 @@ fn attach_ordinary_explanations(
         full_facts.sort_by_key(|fact| {
             (
                 fact.at.is_generated(),
-                fact.at,
+                order.key(fact.at),
                 fact.origin.code(),
                 fact.subject.code(),
                 fact.payload as u8,
@@ -6540,16 +6544,10 @@ pub fn infer(mint: &Mint, program: &mut Program, trace: Trace) -> Output {
     // solved in: a reader of either is reading the file, and which definition
     // had to be solved first is the solver's business rather than theirs.
     // [`DiagnosticView::steps`] is that business exactly, and stays in solve order.
-    let position: HashMap<Symbol, usize> = program
-        .externs
-        .keys()
-        .chain(program.terms.keys())
-        .enumerate()
-        .map(|(at, symbol)| (*symbol, at))
-        .collect();
-    schemes.sort_by(|one, _, other, _| position[one].cmp(&position[other]));
-    constraints.sort_by(|one, _, other, _| position[one].cmp(&position[other]));
-    promises.sort_by(|one, _, other, _| position[one].cmp(&position[other]));
+    let order = program.order();
+    schemes.sort_by(|one, _, other, _| order.rank(*one).cmp(&order.rank(*other)));
+    constraints.sort_by(|one, _, other, _| order.rank(*one).cmp(&order.rank(*other)));
+    promises.sort_by(|one, _, other, _| order.rank(*one).cmp(&order.rank(*other)));
 
     attach_ordinary_explanations(
         mint,
@@ -6561,6 +6559,7 @@ pub fn infer(mint: &Mint, program: &mut Program, trace: Trace) -> Output {
         ExplanationSources {
             aliases: &aliases,
             effect_arguments: &table.effect_argument_reasons,
+            order: &order,
         },
     );
 
@@ -6569,7 +6568,7 @@ pub fn infer(mint: &Mint, program: &mut Program, trace: Trace) -> Output {
     // the annotation's on its result. Sorting by position puts that back; the
     // sort is stable, so two complaints about one span keep the order the
     // solver found them in.
-    errors.sort_by_key(|error| error.at);
+    errors.sort_by_key(|error| order.key(error.at));
 
     // The store as the finished solve reads it: every variable followed to what
     // it was decided to be, so that what leaves inference can be reasoned about
@@ -6584,9 +6583,9 @@ pub fn infer(mint: &Mint, program: &mut Program, trace: Trace) -> Output {
         .collect();
     refinements.sort_by_key(|refinement| {
         (
-            position[&refinement.definition],
-            refinement.match_at,
-            refinement.arm_at,
+            order.rank(refinement.definition),
+            order.key(refinement.match_at),
+            order.key(refinement.arm_at),
         )
     });
 
