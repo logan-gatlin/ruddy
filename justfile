@@ -121,23 +121,10 @@ helix:
 # Everything CI would run.
 check: fmt-check clippy test
 
-# Run the whole suite, or the tests matching the filters given (`just test
-# ir::effects`), inside the same memory-limited scope either way.
+# Compile normally, then limit each test executable and its children. Cargo
+# uses the runner for unit tests, integration tests, and doctests.
 test *args:
-    #!/usr/bin/env bash
-    # Keep a runaway test inside its own cgroup so it cannot exhaust the desktop.
-    # Zero swap keeps the aggregate memory bound at 4 GiB rather than 4 GiB plus swap.
-    set -euo pipefail
-    if systemd-run --user --scope --quiet true 2>/dev/null; then
-        exec systemd-run --user --scope --quiet \
-            --property=MemoryMax=4G \
-            --property=MemorySwapMax=0 \
-            --property=OOMPolicy=continue \
-            timeout --signal=TERM --kill-after=30s 30m cargo test --workspace {{args}}
-    fi
-    # No systemd user bus — a container or another OS. Run unconfined rather
-    # than not at all.
-    exec cargo test --workspace {{args}}
+    cargo --config 'target."cfg(all())".runner = "scripts/test-runner.sh"' test --workspace {{args}}
 
 build:
     cargo build --workspace
