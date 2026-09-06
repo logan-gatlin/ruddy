@@ -73,7 +73,9 @@ Promise.
 ## Library exports and initialization
 
 The compiler computes conservative suspension summaries while compiling each
-bundle and persists them separately from source types. Proven synchronous
+bundle and persists them separately from source types, including the producer
+proofs used by global reads. Artifact validation checks synchronous indirect
+calls against those proofs; unknown parameters cannot certify themselves. Proven synchronous
 functions use synchronous JS exports. Potentially suspending functions use
 Promise exports. Returned source functions follow the same rule at each curried
 arrow. An unknown indirect call, handler implementation, or imported callable

@@ -2011,7 +2011,10 @@ fn op(mint: &Mint, value: &lir::Op) -> Op {
         Source::Extern { symbol, .. } => Op::Extern {
             target: qualified(mint, *symbol),
         },
-        Source::Global { symbol, .. } => Op::Global {
+        Source::Global {
+            symbol, callable, ..
+        } => Op::Global {
+            callable: *callable,
             target: qualified(mint, *symbol),
         },
         Source::NewTag => Op::NewTag,

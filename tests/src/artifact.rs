@@ -273,6 +273,7 @@ fn model_artifact() -> Artifact {
             captures: vec![0, 1],
         },
         Op::Global {
+            callable: None,
             target: "dep@1.0.0::value".to_string(),
         },
         Op::NewTag,
@@ -2633,5 +2634,20 @@ fn cps_artifacts_reject_forged_callable_summaries_and_handler_operands() {
     assert!(
         forged.validate().is_err(),
         "handler identities and continuations are distinct"
+    );
+}
+
+#[test]
+fn cps_artifacts_reject_synchronous_summaries_for_unknown_indirect_calls() {
+    let mut unchecked = built("let apply = fn f => f ()").to_unchecked();
+    for f in &mut unchecked.lir.functions {
+        f.suspension = ruddy::lir::Suspension::Synchronous;
+    }
+    for g in &mut unchecked.lir.globals {
+        g.callable = Some(ruddy::lir::Suspension::Synchronous);
+    }
+    assert!(
+        unchecked.validate().is_err(),
+        "an unknown higher-order call cannot certify itself synchronous"
     );
 }

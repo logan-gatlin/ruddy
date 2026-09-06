@@ -233,6 +233,7 @@ pub enum Op {
     /// Read a top-level Ruddy definition or adapted extern value.
     Global {
         target: String,
+        callable: Option<crate::lir::Suspension>,
     },
     /// Mint a fresh handler identity, once per dynamic evaluation of a `handle`.
     NewTag,
@@ -368,7 +369,13 @@ impl End {
 pub(super) fn validate(lir: &Lir) -> Result<(), String> {
     use std::collections::HashMap;
     let error = |message: &str| Err(message.to_owned());
-    for f in &lir.functions {
+    let remapped = remapped_captures(lir);
+    for (function_id, f) in lir.functions.iter().enumerate() {
+        let known = if f.suspension == crate::lir::Suspension::Synchronous {
+            callable_proofs(lir, function_id, &remapped[function_id])
+        } else {
+            HashMap::new()
+        };
         let Some(entry) = usize::try_from(f.entry)
             .ok()
             .and_then(|id| f.blocks.get(id))
@@ -448,6 +455,15 @@ pub(super) fn validate(lir: &Lir) -> Result<(), String> {
                     Op::NewTag if i.rep != Rep::Handler => {
                         return error("handler identity has the wrong representation");
                     }
+                    Op::Global {
+                        target,
+                        callable: Some(crate::lir::Suspension::Synchronous),
+                    } if lir.globals.iter().any(|g| {
+                        g.name == *target && g.callable != Some(crate::lir::Suspension::Synchronous)
+                    }) =>
+                    {
+                        return error("global read contradicts its producer's callable summary");
+                    }
                     Op::Callback { value, .. }
                         if (!compatible(Rep::Fn, available[value]) || i.rep != Rep::Fn) =>
                     {
@@ -496,6 +512,15 @@ pub(super) fn validate(lir: &Lir) -> Result<(), String> {
                     return error("indirect call operand is not a function");
                 }
                 _ => {}
+            }
+            if let End::Call {
+                callee: Callee::Indirect(callee),
+                ..
+            } = b.end
+                && f.suspension == crate::lir::Suspension::Synchronous
+                && known.get(&callee) != Some(&crate::lir::Suspension::Synchronous)
+            {
+                return error("synchronous function has no proof for an indirect call");
             }
             match &b.end {
                 End::Jump(edge) => check_edge(edge)?,
@@ -596,4 +621,83 @@ pub(super) fn validate(lir: &Lir) -> Result<(), String> {
 }
 fn compatible(want: Rep, have: Rep) -> bool {
     want == have || want == Rep::Any || have == Rep::Any
+}
+
+/// A callable proof follows a value's identity through block environments.
+/// Unknown parameters and computed results cannot certify synchronous calls.
+fn callable_proofs(
+    lir: &Lir,
+    function_id: usize,
+    remapped: &std::collections::HashSet<Temp>,
+) -> std::collections::HashMap<Temp, crate::lir::Suspension> {
+    use std::collections::{HashMap, HashSet};
+    let f = &lir.functions[function_id];
+    let mut proofs = HashMap::new();
+    let mut defined = HashSet::new();
+    let mut ambiguous = remapped.clone();
+    ambiguous.extend(f.params.iter().map(|p| p.temp));
+    for block in &f.blocks {
+        ambiguous.extend(block.result);
+        for i in &block.instrs {
+            if !defined.insert(i.temp) {
+                ambiguous.insert(i.temp);
+            }
+            let summary = match &i.op {
+                Op::Closure { func, .. } => usize::try_from(*func)
+                    .ok()
+                    .and_then(|id| lir.functions.get(id))
+                    .map(|f| f.suspension),
+                Op::Global { callable, .. } => *callable,
+                _ => None,
+            };
+            if let Some(summary) = summary {
+                proofs.insert(i.temp, summary);
+            }
+        }
+        let edges: Vec<_> = match &block.end {
+            End::Jump(edge) => vec![edge],
+            End::Branch { yes, no, .. } => vec![yes, no],
+            End::Enter { body, .. } => vec![body],
+            _ => vec![],
+        };
+        for edge in edges {
+            if let Some(target) = usize::try_from(edge.block)
+                .ok()
+                .and_then(|id| f.blocks.get(id))
+            {
+                for (param, argument) in target.params.iter().zip(&edge.args) {
+                    if param.temp != *argument {
+                        ambiguous.insert(param.temp);
+                    }
+                }
+            }
+        }
+    }
+    proofs.retain(|temp, _| !ambiguous.contains(temp));
+    proofs
+}
+
+/// Index incoming continuation environments once, keeping continuation verification linear in
+/// the artifact size even for bundles with many small functions.
+fn remapped_captures(lir: &Lir) -> Vec<std::collections::HashSet<Temp>> {
+    let mut remapped = vec![std::collections::HashSet::new(); lir.functions.len()];
+    for (owner, caller) in lir.functions.iter().enumerate() {
+        for i in caller.blocks.iter().flat_map(|b| &b.instrs) {
+            if let Op::Continuation { code, captures } = &i.op
+                && let Ok(function) = usize::try_from(code.function)
+                && let Some(target) = lir.functions.get(function).and_then(|f| {
+                    usize::try_from(code.block)
+                        .ok()
+                        .and_then(|id| f.blocks.get(id))
+                })
+            {
+                for (param, capture) in target.params.iter().zip(captures) {
+                    if owner != function || param.temp != *capture {
+                        remapped[function].insert(param.temp);
+                    }
+                }
+            }
+        }
+    }
+    remapped
 }

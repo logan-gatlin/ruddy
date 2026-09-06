@@ -140,12 +140,12 @@ install:
 cov *args:
     #!/usr/bin/env bash
     set -euo pipefail
+    coverage_toolchain="${RUDDY_COVERAGE_TOOLCHAIN:-nightly}"
     export CARGO_TARGET_DIR="{{justfile_directory()}}/target/llvm-cov-target"
-    cargo +nightly llvm-cov clean --workspace
-    eval "$(cargo +nightly llvm-cov show-env --sh)"
-    export RUSTFLAGS="${RUSTFLAGS:-} -Zcoverage-options=branch"
-    RUSTUP_TOOLCHAIN=nightly just test
-    cargo +nightly llvm-cov report --ignore-filename-regex '/(tests|debug|cli)/src/|/rustlib/' {{args}}
+    cargo +"$coverage_toolchain" llvm-cov clean --workspace
+    eval "$(cargo +"$coverage_toolchain" llvm-cov show-env --branch --sh)"
+    RUSTUP_TOOLCHAIN="$coverage_toolchain" just test
+    cargo +"$coverage_toolchain" llvm-cov report --ignore-filename-regex '/(tests|debug|cli)/src/|/rustlib/' {{args}}
 
 clippy:
     cargo clippy --workspace --all-targets

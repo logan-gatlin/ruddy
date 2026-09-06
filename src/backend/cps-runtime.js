@@ -34,10 +34,18 @@ function $finish(state, failed, value) {
   state.next = null; state.h = state.base;
   if (state.settle) state.settle();
 }
+// Internal waiters observe terminal state without assimilating result data.
+function $settled(state) {
+  if (!state.settled) state.settled = new Promise(resolve => {
+    state.settle = resolve;
+    if (state.done) resolve();
+  });
+  return state.settled;
+}
 function $promise(state) {
-  if (!state.promise) state.promise = new Promise((resolve, reject) => {
-    state.settle = () => state.failed ? reject(state.error) : resolve($export(state.value));
-    if (state.done) state.settle();
+  if (!state.promise) state.promise = $settled(state).then(() => {
+    if (state.failed) throw state.error;
+    return $export(state.value);
   });
   return state.promise;
 }
@@ -187,7 +195,7 @@ function $invoke(value, mode, args, foreign = false) {
       if (mode === "Completion") { if (state.failed) failure(state.error); else success($export(state.value)); }
       else if (state.failed) $report(state.error);
     };
-    if (state.done) done(); else $promise(state).then(done, done).catch($report);
+    if (state.done) done(); else $settled(state).then(done).catch($report);
     return undefined;
 }
 function $export(value) { return value; }
@@ -198,7 +206,10 @@ function $initialize(initializers) {
       const [name, f] = initializers[index++];
       const state = $start($closure(f, []), [], null);
       if (state.failed) throw state.error;
-      if (state.pending) return $promise(state).then(() => { $g[name] = state.value; return advance(); });
+      if (state.pending) return $settled(state).then(() => {
+        if (state.failed) throw state.error;
+        $g[name] = state.value; return advance();
+      });
       $g[name] = state.value;
     }
     return null;

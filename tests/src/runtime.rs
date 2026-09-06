@@ -242,3 +242,28 @@ fn executable_main_waits_for_async_initialization_and_preserves_process_exit() {
     assert_eq!(output.stdout, b"initialized\nmain\ninitialized");
     assert_eq!(output.stderr, b"error");
 }
+
+#[test]
+fn async_initialization_does_not_assimilate_ordinary_thenable_data() {
+    let project = tempfile::tempdir().unwrap();
+    fs::write(project.path().join("Ruddy.toml"), "name = \"async-data\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\ntarget = \"js\"\n[dependencies]\nstd = false\n").unwrap();
+    fs::write(project.path().join("main.hc"), r#"
+        @ffi { completion: "promise" }
+        extern wait : () -> () = "() => Promise.resolve(null)"
+        extern data : () -> { "then": Nat } = "() => ({ get then() { globalThis.inspected++; return () => {}; } })"
+        let value = do let _ = wait () return data () end
+    "#).unwrap();
+    fs::write(
+        project.path().join("data.test.mjs"),
+        r#"
+        import assert from 'node:assert/strict';
+        import { pathToFileURL } from 'node:url';
+        globalThis.inspected = 0;
+        const app = await import(pathToFileURL(process.argv[2]));
+        assert.equal(globalThis.inspected, 0);
+        assert.equal(typeof Object.getOwnPropertyDescriptor(app.value, 'then').get, 'function');
+    "#,
+    )
+    .unwrap();
+    run_assertions(project.path(), "data.test.mjs");
+}

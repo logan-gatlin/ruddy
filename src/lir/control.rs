@@ -244,14 +244,9 @@ impl Builder<'_> {
             }
             Finish::Return(_) => unreachable!(),
         };
-        let b = &mut self.blocks[block];
-        b.params.retain(|p| p.temp != result);
-        let captures = b.params.iter().map(|p| p.temp).collect();
-        b.params.push(Param {
-            temp: result,
-            rep: *self.reps.get(&result).unwrap_or(&Rep::Any),
-        });
-        b.result = Some(result);
+        self.result(block, result);
+        let params = &self.blocks[block].params;
+        let captures = params[..params.len() - 1].iter().map(|p| p.temp).collect();
         let temp = *self.next;
         *self.next += 1;
         self.reps.insert(temp, Rep::Cont);
@@ -268,6 +263,17 @@ impl Builder<'_> {
             },
         });
         temp
+    }
+    fn branch(&mut self, test: Test, yes: BlockId, no: BlockId, span: Span) -> BlockId {
+        self.block(
+            vec![],
+            End::Branch {
+                test,
+                yes: self.edge(yes),
+                no: self.edge(no),
+            },
+            span,
+        )
     }
     fn sequence(
         &mut self,
@@ -341,16 +347,13 @@ impl Builder<'_> {
                         for case in cases.iter().rev() {
                             let yes =
                                 self.sequence(&case.block.instrs, &case.block.end, destination);
-                            no = self.block(
-                                vec![],
-                                End::Branch {
-                                    test: Test::Tag {
-                                        on: *on,
-                                        name: case.name.clone(),
-                                    },
-                                    yes: self.edge(yes),
-                                    no: self.edge(no),
+                            no = self.branch(
+                                Test::Tag {
+                                    on: *on,
+                                    name: case.name.clone(),
                                 },
+                                yes,
+                                no,
                                 i.span,
                             );
                         }
@@ -369,16 +372,13 @@ impl Builder<'_> {
                         for case in cases.iter().rev() {
                             let yes =
                                 self.sequence(&case.block.instrs, &case.block.end, destination);
-                            no = self.block(
-                                vec![],
-                                End::Branch {
-                                    test: Test::Literal {
-                                        on: *on,
-                                        value: case.value.clone(),
-                                    },
-                                    yes: self.edge(yes),
-                                    no: self.edge(no),
+                            no = self.branch(
+                                Test::Literal {
+                                    on: *on,
+                                    value: case.value.clone(),
                                 },
+                                yes,
+                                no,
                                 i.span,
                             );
                         }
@@ -423,16 +423,13 @@ impl Builder<'_> {
                         for case in cases.iter().rev() {
                             let yes =
                                 self.sequence(&case.block.instrs, &case.block.end, destination);
-                            no = self.block(
-                                vec![],
-                                End::Branch {
-                                    test: Test::Length {
-                                        on: *on,
-                                        length: case.len,
-                                    },
-                                    yes: self.edge(yes),
-                                    no: self.edge(no),
+                            no = self.branch(
+                                Test::Length {
+                                    on: *on,
+                                    length: case.len,
                                 },
+                                yes,
+                                no,
                                 i.span,
                             );
                         }
@@ -555,6 +552,7 @@ fn ordinary(value: &lower::Op) -> Op {
             name: name.clone(),
         },
         Source::Global { symbol, name } => Op::Global {
+            callable: None,
             symbol: *symbol,
             name: name.clone(),
         },

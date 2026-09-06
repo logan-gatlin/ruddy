@@ -20,7 +20,7 @@ let through_effect = fn n => match n with
 end
 let handled = fn n => handle through_effect n with | !Step value => value + 1.0 end
 
-let recursive_handler = fn n => handle (match n with
+let recursive_handler : Real -> Real = fn n => handle (match n with
   | 0.0 => !Step 0.0
   | _ => recursive_handler (n - 1.0)
 end) with

@@ -367,6 +367,7 @@ fn generation_rejects_unlinked_and_internally_inconsistent_artifacts() {
     let mut bad_global = compiled("let value = 1n").to_unchecked();
     bad_global.lir.functions[bad_global.lir.globals[0].initializer as usize].blocks[0].instrs[0]
         .op = artifact::Op::Global {
+        callable: None,
         target: "unknown@1.0.0::value".to_string(),
     };
     let bad_global = bad_global

@@ -249,6 +249,8 @@ pub enum Op {
     Global {
         symbol: Symbol,
         name: String,
+        /// Callable proof supplied by this bundle or a dependency producer.
+        callable: Option<Suspension>,
     },
     /// Mint a fresh handler identity, once per dynamic evaluation of a `handle`.
     NewTag,

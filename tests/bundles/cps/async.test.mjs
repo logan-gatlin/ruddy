@@ -6,7 +6,9 @@ const completions = [];
 const reports = [];
 globalThis[Symbol.for('ruddy.runtime')] = { onUnhandledError: error => reports.push(error) };
 globalThis.observations = 0;
+globalThis.dataInspections = 0;
 globalThis.host = {
+  keepData: callback => { globalThis.dataCallback = callback; },
   keepFactory: callback => { globalThis.factoryCallback = callback; },
   keepSync: callback => { globalThis.syncCallback = callback; },
   observed: value => { globalThis.observations++; return value; },
@@ -130,6 +132,7 @@ assert.equal(await app.registrations(100_000), 0, 'synchronous registrations do 
 for (const delayed of [false, true]) {
   const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
     globalThis.host = {
+  keepData: callback => { globalThis.dataCallback = callback; },
       delayed: () => Promise.reject(new Error('uncaught delayed notification')),
       watch: callback => { globalThis.watched = callback; }
     };
@@ -149,3 +152,12 @@ await secondOperation;
 globalThis.onRegistration = undefined;
 pending.pop().ok();
 assert.equal(await nestedHandlers, 14, 'resumption restores evidence across nested handlers');
+
+app.completion_data(null);
+const completedData = new Promise((resolve, reject) => globalThis.dataCallback(1,
+  value => resolve({ value }), reject));
+pending.pop().ok();
+const { value: ordinaryData } = await completedData;
+assert.equal(typeof Object.getOwnPropertyDescriptor(ordinaryData, 'then').get, 'function',
+  'completion notification never assimilates ordinary returned data');
+assert.equal(globalThis.dataInspections, 0, 'runtime must not inspect thenable data');

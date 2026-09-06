@@ -98,4 +98,18 @@ pub(super) fn summarize(output: &mut Output, accepted: &AcceptedProgram) {
             Target::Imported(s) => *s,
         });
     }
+    let summaries: Vec<_> = output.functions.iter().map(|f| f.suspension).collect();
+    for i in output
+        .functions
+        .iter_mut()
+        .flat_map(|f| &mut f.blocks)
+        .flat_map(|b| &mut b.instrs)
+    {
+        if let Op::Global { callable, .. } = &mut i.op {
+            *callable = targets.get(&i.temp).map(|target| match target {
+                Target::Local(f) => summaries[*f],
+                Target::Imported(s) => *s,
+            });
+        }
+    }
 }

@@ -214,7 +214,7 @@ impl<'a> Generator<'a> {
                     Op::Extern { target } if !self.extern_names.contains(target.as_str()) => {
                         return Err(Error::InvalidGlobalReference(target.clone()));
                     }
-                    Op::Global { target } if !self.runtime_names.contains(target.as_str()) => {
+                    Op::Global { target, .. } if !self.runtime_names.contains(target.as_str()) => {
                         return Err(Error::InvalidGlobalReference(target.clone()));
                     }
                     _ => {}
@@ -341,7 +341,7 @@ impl<'a> Generator<'a> {
                 out.push_str("$callback(");
                 out.push_str(&v(*value));
                 out.push_str(", ");
-                string(&format!("{mode:?}"), out);
+                string(callback_protocol(*mode), out);
                 out.push(')');
             }
             Op::Const(lit) => literal(lit, out),
@@ -489,7 +489,7 @@ impl<'a> Generator<'a> {
                 string(target, out);
                 out.push(']');
             }
-            Op::Global { target } => {
+            Op::Global { target, .. } => {
                 out.push_str("$g[");
                 string(target, out);
                 out.push(']');
@@ -560,7 +560,7 @@ fn emit_end(function: usize, end: &End, out: &mut String) {
             out.push_str("], ");
             out.push_str(&temp(*continuation));
             out.push_str(", $ctx, ");
-            string(&format!("{completion:?}"), out);
+            string(completion_protocol(*completion), out);
             out.push(')');
         }
         End::Enter {
@@ -671,7 +671,7 @@ fn emit_export_value(node: &ExportNode, binding: &str, out: &mut String) {
         out.push(']');
         if let Some(mode) = node.adapter {
             out.push_str(", ");
-            string(&format!("{mode:?}"), out);
+            string(callback_protocol(mode), out);
             out.push_str(", false");
         }
         out.push(')');
@@ -703,7 +703,7 @@ fn emit_export_expression(node: &ExportNode, out: &mut String) {
         out.push(']');
         if let Some(mode) = node.adapter {
             out.push_str(", ");
-            string(&format!("{mode:?}"), out);
+            string(callback_protocol(mode), out);
             out.push_str(", false");
         }
         out.push(')');
@@ -1069,6 +1069,25 @@ fn export_name(name: &str, out: &mut String) {
         out.push_str(name);
     } else {
         string(name, out);
+    }
+}
+
+// These are runtime ABI names, deliberately independent of Debug rendering.
+fn callback_protocol(mode: crate::externs::Callback) -> &'static str {
+    use crate::externs::Callback;
+    match mode {
+        Callback::Sync => "Sync",
+        Callback::Promise => "Promise",
+        Callback::Completion => "Completion",
+        Callback::Notification => "Notification",
+    }
+}
+fn completion_protocol(mode: crate::externs::Completion) -> &'static str {
+    use crate::externs::Completion;
+    match mode {
+        Completion::Immediate => "Immediate",
+        Completion::Promise => "Promise",
+        Completion::Callback => "Callback",
     }
 }
 

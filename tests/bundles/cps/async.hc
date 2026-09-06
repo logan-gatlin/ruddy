@@ -76,7 +76,7 @@ let notify_failure = fn _ => watch (fn n => failure n)
 extern translated : Real -> Real = "n => Promise.reject(new Error('translated')).catch(() => n + 10)"
 let translation = fn n => translated n
 
-extern data : () -> { "then": Real } = "() => ({ get then() { throw new Error('data was inspected'); } })"
+extern data : () -> { "then": Real } = "() => ({ get then() { globalThis.dataInspections++; throw new Error('data was inspected'); } })"
 @export "sync"
 let immediate_data = fn _ => data ()
 @export "promise"
@@ -95,3 +95,10 @@ let nested_handlers = fn n => handle (handle do
 end with | !Ask.get value => delayed value end) with
   | !Other value => delayed (value + 10.0)
 end
+
+@ffi { parameters: [{ callback: "completion" }] }
+extern keep_data : fn(fn(Real) -> { "then": Real }) -> () = "globalThis.host.keepData"
+let completion_data = fn _ => keep_data (fn n => do
+  let _ = delayed n
+  return data ()
+end)
