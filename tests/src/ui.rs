@@ -810,9 +810,9 @@ fn inference_fixture_errors(source: &str) -> (SourceMap, Vec<inference::Error>) 
     );
     let bundle = Bundle::new("diagnostics", Version::new(0, 1, 0)).expect("valid bundle");
     let mut mint = Mint::new(bundle);
-    let mut built = ir::build(&mut mint, parsed.stmts);
+    let built = ir::build(&mut mint, parsed.stmts);
     assert!(built.errors.is_empty(), "IR errors: {:#?}", built.errors);
-    let errors = inference::infer(&mint, &mut built.program, inference::Trace::Off)
+    let errors = inference::infer(&mint, &built.program, inference::Trace::Off)
         .errors()
         .to_vec();
     (built.source, errors)
@@ -2254,7 +2254,8 @@ fn round_trip(prelude: &str, printed: &str) -> String {
     let mut mint = Mint::new(bundle);
     let mut built = ir::build(&mut mint, parsed.stmts);
     assert!(built.errors.is_empty(), "{source}: {:#?}", built.errors);
-    let inferred = inference::infer(&mint, &mut built.program, inference::Trace::Off);
+    let inferred = inference::infer(&mint, &built.program, inference::Trace::Off);
+    inferred.apply_types(&mut built.program);
     assert!(
         inferred.errors().is_empty(),
         "{source}: {:#?}",
@@ -2630,7 +2631,8 @@ fn a_written_absence_is_not_printed() {
     let mut mint = Mint::new(bundle);
     let mut built = ir::build(&mut mint, parsed.stmts);
     assert!(built.errors.is_empty(), "{:#?}", built.errors);
-    let inferred = inference::infer(&mint, &mut built.program, inference::Trace::Off);
+    let inferred = inference::infer(&mint, &built.program, inference::Trace::Off);
+    inferred.apply_types(&mut built.program);
     assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
 
     let printed: Vec<String> = built

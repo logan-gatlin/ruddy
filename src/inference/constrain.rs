@@ -13,8 +13,8 @@ use crate::{
 
 use super::{
     Annotated, Binding, Constraint, ConstraintKind, ConstraintOrigin, ConstraintSubjects, Coverage,
-    DeferredRequirement, ExplainedScheme, GuardedArm, Named, Origin, SemanticPivot, Subject, Table,
-    effective_conditions, lower_annotation, same_field_set,
+    DeferredRequirement, Env, ExplainedScheme, GuardedArm, Named, Origin, SemanticPivot, Subject,
+    Table, effective_conditions, lower_annotation, same_field_set,
 };
 
 /// Pass one: the walk that says what has to hold, and solves nothing.
@@ -26,8 +26,10 @@ pub struct Constrain<'a> {
     pub mint: &'a Mint,
     /// What each symbol in scope means. Symbols are globally unique, so one
     /// flat map serves every scope at once and nothing is ever popped: a
-    /// lambda argument can never collide with a top-level definition.
-    pub env: &'a mut HashMap<Symbol, Binding>,
+    /// lambda argument can never collide with a top-level definition. What
+    /// this walk binds goes in the group's own layer; what earlier groups
+    /// published is read through the shared one. See [`Env`].
+    pub env: &'a mut Env,
     /// What the declared types stand for, for the two arms that have to see a
     /// shape rather than a name: applying something annotated `Endo`, and
     /// checking a term against an annotation of `list`.
@@ -481,7 +483,7 @@ impl Constrain<'_> {
                 let rest = std::mem::replace(&mut self.out, outer);
 
                 self.table
-                    .binding_names
+                    .local_names
                     .insert(name.anchored, Rc::from(self.mint.name(name.anchored)));
                 self.emit(
                     name.at,
@@ -1718,7 +1720,12 @@ impl Constrain<'_> {
         // every earlier group's as a scheme — and a name that resolved to
         // nothing already became `TermKind::Error`. A lookup falling back to a
         // fresh variable would hide the day one of those stops holding.
-        match self.env[&symbol].clone() {
+        match self
+            .env
+            .get(symbol)
+            .cloned()
+            .expect("every name the lowering kept is bound before it is read")
+        {
             Binding::Mono(ty) => {
                 if let Some(provenance) = self.binding_effect_provenance.get(&symbol).cloned() {
                     self.term_effect_provenance.insert(span, provenance);

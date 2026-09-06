@@ -243,6 +243,14 @@ impl Symbol {
     }
 }
 
+/// What a symbol is before anything is named: the generated one, so that a
+/// record with a symbol in it can be built empty and filled in.
+impl Default for Symbol {
+    fn default() -> Self {
+        Self::GENERATED
+    }
+}
+
 impl Module {
     pub const fn symbol(self) -> Symbol {
         self.0

@@ -32,7 +32,8 @@ pub(crate) fn stmts(source: &str) -> Vec<parse::Stmt> {
 pub(crate) fn inferred(source: &str, trace: Trace) -> (Mint, ir::Output, inference::Output) {
     let mut mint = mint();
     let mut out = ir::build(&mut mint, stmts(source));
-    let inferred = inference::infer(&mint, &mut out.program, trace);
+    let inferred = inference::infer(&mint, &out.program, trace);
+    inferred.apply_types(&mut out.program);
     (mint, out, inferred)
 }
 

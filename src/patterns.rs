@@ -251,10 +251,17 @@ struct Check<'a> {
     /// than about the matrix — and, that column being nothing but structs and
     /// binders, everything it could be asked *is* presence.
     store: &'a Store,
-    /// Which batch, if any, left the store without a model. Everything after it
-    /// is suppressed: with no model at all, every arm reads unreachable and
-    /// every match reads unhandled, which is one mistake said in as many places
-    /// as the program has matches.
+    /// The scope of the definition being checked: the group it was solved
+    /// in. Its batches are the ones in the store whose ids carry this scope,
+    /// and the only ones this check reads. A variable's number is its
+    /// group's, so another group's batch says nothing about this one's
+    /// presences, and a store that flipped under another group is no reason
+    /// to doubt this one.
+    scope: Symbol,
+    /// Which batch of this scope, if any, left its store without a model.
+    /// Everything of the scope after it is suppressed: with no model at all,
+    /// every arm reads unreachable and every match reads unhandled, which is
+    /// one mistake said in as many places as the group has matches.
     flipped: Option<usize>,
     definition_at: usize,
     flipped_definition_at: Option<usize>,
@@ -296,11 +303,6 @@ fn constrained_origin(origin: &Origin) -> Option<(Formula, &Covers)> {
 /// aliases — the solved types themselves were written into the terms.
 pub fn check(program: &Program, inferred: &inference::Output) -> Output {
     let semantics = inferred.semantics();
-    let flipped = semantics
-        .store()
-        .batches
-        .iter()
-        .position(|batch| batch.flipped);
     let mut out = Output {
         reports: Vec::new(),
         errors: Vec::new(),
@@ -311,20 +313,37 @@ pub fn check(program: &Program, inferred: &inference::Output) -> Output {
         .enumerate()
         .map(|(at, symbol)| (*symbol, at))
         .collect();
-    let flipped_definition_at = flipped.and_then(|at| {
-        semantics.store().batches[at]
-            .definition
-            .and_then(|symbol| definitions.get(&symbol).copied())
-    });
+    // Each definition was solved in its group's scope, which is what its
+    // batches are marked with.
+    let scopes: HashMap<Symbol, Symbol> = program
+        .groups
+        .iter()
+        .flat_map(|group| {
+            let scope = group.members[0];
+            group.members.iter().map(move |member| (*member, scope))
+        })
+        .collect();
     // One definition at a time, because the presences its types name are its
     // own: the promise inference published for it is what the store came to
     // about them, and it is the only reading of the store the walk inside it
     // can use.
     for (definition_at, (symbol, decl)) in program.terms.iter().enumerate() {
+        let scope = scopes.get(symbol).copied().unwrap_or(*symbol);
+        let flipped = semantics
+            .store()
+            .batches
+            .iter()
+            .position(|batch| batch.flipped && batch.id.scope() == scope);
+        let flipped_definition_at = flipped.and_then(|at| {
+            semantics.store().batches[at]
+                .definition
+                .and_then(|symbol| definitions.get(&symbol).copied())
+        });
         let check = Check {
             aliases: semantics.aliases(),
             errors: inferred.errors(),
             store: semantics.store(),
+            scope,
             flipped,
             definition_at,
             flipped_definition_at,
@@ -891,11 +910,15 @@ impl Check<'_> {
     /// that has anything to say.
     fn known(&self) -> Formula {
         let upto = self.flipped.unwrap_or(self.store.batches.len());
-        Formula::all(
-            self.store.batches[..upto]
-                .iter()
-                .map(|batch| batch.formula.clone()),
-        )
+        Formula::all(self.own(upto).map(|batch| batch.formula.clone()))
+    }
+
+    /// The batches of this definition's scope among the first `upto` of the
+    /// store.
+    fn own(&self, upto: usize) -> impl Iterator<Item = &inference::Batch> {
+        self.store.batches[..upto]
+            .iter()
+            .filter(move |batch| batch.id.scope() == self.scope)
     }
 
     /// A value the arms of a flipped coverage batch leave unhandled, read off a
@@ -907,11 +930,7 @@ impl Check<'_> {
     /// model puts there — a field present with any value at all, which prints
     /// pun-style, because under this reading the presence *is* the information.
     fn witness(&self, found: &Constrained) -> Witness {
-        let before = Formula::all(
-            self.store.batches[..found.at]
-                .iter()
-                .map(|batch| batch.formula.clone()),
-        );
+        let before = Formula::all(self.own(found.at).map(|batch| batch.formula.clone()));
         let covered = Formula::any(found.coverage.arms.iter().cloned());
         let model = sat::model(&before.and(found.premise.clone()).and(covered.not()))
             .expect("the store had a model before the batch that flipped it");

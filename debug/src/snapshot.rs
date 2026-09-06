@@ -310,16 +310,19 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
             out
         });
 
-    // Inference mutates the program it types, so it borrows `built` mutably
-    // and finishes before any stage looks at either.
-    let inferred = built.as_mut().and_then(|built| {
+    let inferred = built.as_ref().and_then(|built| {
         let started = Instant::now();
         let out = guard("types", &mut panicked, || {
-            inference::infer(&mint, &mut built.program, inference::Trace::Complete)
+            inference::infer(&mint, &built.program, inference::Trace::Complete)
         });
         micros.infer = started.elapsed().as_micros() as u64;
         out
     });
+    // Inference answers with typed copies of the declarations; the program
+    // every later stage reads is the one with those written in.
+    if let (Some(built), Some(inferred)) = (&mut built, &inferred) {
+        inferred.apply_types(&mut built.program);
+    }
 
     // The pattern checks read the program inference just finished writing
     // solved types into, and run only when both phases did.
@@ -378,10 +381,14 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     if let (Some(inferred), Some(built)) = (&inferred, &built) {
         diagnostics.extend(inferred.errors().iter().map(|error| {
             let mut diagnostic = source_error("types", error.diagnostic(&built.source), &index);
-            diagnostic.inference_error_id = Some(error.id.get());
+            diagnostic.inference_error_id = Some(error.id.to_string());
             diagnostic.inference_cause = Some(match error.cause {
-                inference::ErrorCause::Step(id) => InferenceCause::Step { step_id: id.get() },
-                inference::ErrorCause::Batch(id) => InferenceCause::Batch { batch_id: id.get() },
+                inference::ErrorCause::Step(id) => InferenceCause::Step {
+                    step_id: id.to_string(),
+                },
+                inference::ErrorCause::Batch(id) => InferenceCause::Batch {
+                    batch_id: id.to_string(),
+                },
                 inference::ErrorCause::Direct => InferenceCause::Direct,
             });
             diagnostic.inference_explanation = error
@@ -744,7 +751,7 @@ fn wire_explanation(
         };
         crate::wire::ExplanationFact {
             span: loc(source.span(fact.at), files),
-            constraint_id: (!fact.direct).then(|| fact.constraint.get()),
+            constraint_id: (!fact.direct).then(|| fact.constraint.to_string()),
             direct: fact.direct,
             origin: fact.origin.code(),
             subject: fact.subject.code(),
@@ -820,19 +827,19 @@ fn wire_explanation(
             }),
         },
         cause: crate::wire::ExplanationCause {
-            error_id: explanation.cause.error.get(),
-            seed_reason_id: explanation.cause.seed.map(|id| id.get()),
+            error_id: explanation.cause.error.to_string(),
+            seed_reason_id: explanation.cause.seed.map(|id| id.to_string()),
             constraint_ids: explanation
                 .cause
                 .constraints
                 .iter()
-                .map(|id| id.get())
+                .map(|id| id.to_string())
                 .collect(),
             reason_ids: explanation
                 .cause
                 .reasons
                 .iter()
-                .map(|id| id.get())
+                .map(|id| id.to_string())
                 .collect(),
             omitted_reasons: explanation.cause.omitted_reasons,
         },

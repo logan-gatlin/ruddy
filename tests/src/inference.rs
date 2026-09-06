@@ -40,8 +40,76 @@ fn infer_src(src: &str) -> (Mint, ir::Output, inference::Output) {
     );
     let mut mint = dummy_mint();
     let mut out = ir::build(&mut mint, parsed.stmts);
-    let inferred = inference::infer(&mint, &mut out.program, inference::Trace::Complete);
+    let inferred = inference::infer(&mint, &out.program, inference::Trace::Complete);
+    inferred.apply_types(&mut out.program);
     (mint, out, inferred)
+}
+
+/// A group is a function of what it reads: its own declarations, the bindings
+/// of the names it mentions, and the program's declarations. A memo kept from
+/// one inference to the next hands back every group those did not change
+/// for, and what comes out is what solving everything again would have said.
+#[test]
+fn a_group_is_reused_when_nothing_it_reads_changed() {
+    use ruddy::inference::{GroupMemo, infer_with_memo};
+    // Lexed under a registered file, as a bundle's files are: a generated
+    // span is numbered absolutely on purpose, and this test is about an edit
+    // above a definition leaving the definition's anchors alone.
+    let lowered = |src: &str| {
+        let mut files = ruddy::tracking::FileManager::new();
+        let id = files.register_new_file("memo.hc".into(), src.into());
+        let parsed = parse::parse(lex(src, id).tokens);
+        assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+        let mut mint = dummy_mint();
+        let out = ir::build(&mut mint, parsed.stmts);
+        assert!(out.errors.is_empty(), "{:#?}", out.errors);
+        (mint, out)
+    };
+    let before = "let id = fn x => x\n\
+                  let twice = fn f => fn y => f (f y)\n\
+                  let use = twice id 1n\n\
+                  let apart = fn p => p.field\n";
+    let after = "let id = fn x => x\n\
+                 let twice = fn f => fn y => f (f y)\n\
+                 let use = twice id { n: 1n }\n\
+                 let apart = fn p => p.field\n";
+    let mut memo = GroupMemo::default();
+
+    let (mint, out) = lowered(before);
+    let first = infer_with_memo(&mint, &out.program, inference::Trace::Complete, &mut memo);
+    assert!(first.errors().is_empty(), "{:#?}", first.errors());
+    assert_eq!((memo.hits(), memo.misses()), (0, 4));
+
+    // Only `use` was edited, and only `use` is solved again: `id` and `twice`
+    // read nothing that changed, and `apart` reads nothing at all.
+    let (mint, out) = lowered(after);
+    let second = infer_with_memo(&mint, &out.program, inference::Trace::Complete, &mut memo);
+    assert_eq!((memo.hits(), memo.misses()), (3, 5));
+    let plain = inference::infer(&mint, &out.program, inference::Trace::Complete);
+    assert_eq!(
+        format!("{:?}", second.semantics()),
+        format!("{:?}", plain.semantics())
+    );
+    assert_eq!(
+        format!("{:?}", second.errors()),
+        format!("{:?}", plain.errors())
+    );
+    assert_eq!(
+        format!("{:?}", second.diagnostics().steps()),
+        format!("{:?}", plain.diagnostics().steps())
+    );
+
+    // A definition that mentions an edited one reads its scheme, so it is
+    // solved again when that scheme changes — and not when it does not.
+    let renamed_body = "let id = fn x => do let same = x return same end\n\
+                        let twice = fn f => fn y => f (f y)\n\
+                        let use = twice id { n: 1n }\n\
+                        let apart = fn p => p.field\n";
+    let (mint, out) = lowered(renamed_body);
+    infer_with_memo(&mint, &out.program, inference::Trace::Complete, &mut memo);
+    // `id` changed and so did what it publishes, since its provenance names
+    // new steps; `use` reads that and follows. `twice` and `apart` stand.
+    assert_eq!((memo.hits(), memo.misses()), (5, 7));
 }
 
 /// Ordinary compilation keeps no replay data, and a debugger keeps all of it;
@@ -54,7 +122,8 @@ fn a_complete_trace_is_the_only_thing_the_trace_setting_adds() {
         let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
         let mut mint = dummy_mint();
         let mut out = ir::build(&mut mint, parsed.stmts);
-        let inferred = inference::infer(&mint, &mut out.program, trace);
+        let inferred = inference::infer(&mint, &out.program, trace);
+        inferred.apply_types(&mut out.program);
         (out.source, inferred)
     };
     let (map, off) = publish(inference::Trace::Off);
@@ -2908,12 +2977,13 @@ fn replaying_the_steps_rebuilds_the_solution() {
     // Every change to the solution is a step's effect and nothing else, so
     // taking them in order is the substitution the solver ended with — which
     // is what lets a reader see the state at step k without re-running it.
-    let bound: Vec<TyVar> = output
+    // A variable's number is its group's, so a binding is the pair.
+    let bound: Vec<(Symbol, TyVar)> = output
         .diagnostics()
         .steps()
         .iter()
         .filter_map(|step| match step.effect {
-            Effect::Bound { var, .. } => Some(var),
+            Effect::Bound { var, .. } => Some((step.id.scope(), var)),
             _ => None,
         })
         .collect();
@@ -3280,12 +3350,12 @@ fn an_assumption_is_read_against_what_has_since_been_decided() {
     assert_eq!(
         steps(&mint, &output, "q")[..9],
         [
-            "unfold  Tree { x when ?3: Nat } ~ Wood { x: Nat } => replaced by the goals below",
-            "  struct  { value: { x when ?3: Nat }, kids: Forest } ~ { value: { x: Nat }, kids: Grove } \
+            "unfold  Tree { x when ?0: Nat } ~ Wood { x: Nat } => replaced by the goals below",
+            "  struct  { value: { x when ?0: Nat }, kids: Forest } ~ { value: { x: Nat }, kids: Grove } \
          => replaced by the goals below",
-            "    struct  { x when ?3: Nat } ~ { x: Nat } => replaced by the goals below",
+            "    struct  { x when ?0: Nat } ~ { x: Nat } => replaced by the goals below",
             // Here is where the argument stops being a question.
-            "      bind  ?3 ~ present => ?3 := present",
+            "      bind  ?0 ~ present => ?0 := present",
             "      prim  Nat ~ Nat => no change",
             "    unfold  Forest ~ Grove => replaced by the goals below",
             "      struct  { head: Tree { x: Nat }, tail: Forest } ~ \
@@ -3632,7 +3702,9 @@ fn malformed_non_nominal_recursive_growth_is_absorbed() {
         },
     );
 
-    let output = inference::infer(&mint, &mut lowered.program, inference::Trace::Complete);
+    let output = inference::infer(&mint, &lowered.program, inference::Trace::Complete);
+
+    output.apply_types(&mut lowered.program);
     assert!(output.errors().is_empty(), "{:#?}", output.errors());
     assert!(
         output
@@ -3698,7 +3770,9 @@ fn malformed_nominal_cross_alias_growth_is_absorbed() {
         );
     }
 
-    let output = inference::infer(&mint, &mut lowered.program, inference::Trace::Complete);
+    let output = inference::infer(&mint, &lowered.program, inference::Trace::Complete);
+
+    output.apply_types(&mut lowered.program);
     assert!(output.errors().is_empty(), "{:#?}", output.errors());
     assert!(
         output
@@ -3781,7 +3855,9 @@ fn malformed_mixed_class_cross_alias_growth_is_absorbed() {
         },
     );
 
-    let output = inference::infer(&mint, &mut lowered.program, inference::Trace::Complete);
+    let output = inference::infer(&mint, &lowered.program, inference::Trace::Complete);
+
+    output.apply_types(&mut lowered.program);
     assert!(output.errors().is_empty(), "{:#?}", output.errors());
     assert!(
         output
@@ -3842,7 +3918,9 @@ fn malformed_recursive_growth_is_still_reflexive() {
         },
     );
 
-    let output = inference::infer(&mint, &mut lowered.program, inference::Trace::Complete);
+    let output = inference::infer(&mint, &lowered.program, inference::Trace::Complete);
+
+    output.apply_types(&mut lowered.program);
     assert!(output.errors().is_empty(), "{:#?}", output.errors());
     assert!(
         output
@@ -7022,19 +7100,28 @@ fn local_instance_requirements_keep_their_reserved_source_slot() {
         output.semantics().store()
     );
     assert_eq!(map.span(output.errors()[0].at).start, first_empty);
-    // Generation reserved IDs 2 and 3 for the two use-site slots. Solving
-    // instantiates `g` through a temporary batch allocated after those slots;
-    // replacement must retain 2 rather than publishing that temporary ID.
-    assert_eq!(flipped.id.get(), 2, "{:#?}", output.semantics().store());
+    // Generation reserved ids 1 and 2 of `f`'s group for the two use-site
+    // slots, after the local match's coverage. Solving instantiates `g`
+    // through a temporary batch allocated after those slots; replacement must
+    // retain 1 rather than publishing that temporary id. `p`'s own coverage
+    // batch is numbered by its group, which is why it is a 0 as well.
+    assert_eq!(flipped.id.index(), 1, "{:#?}", output.semantics().store());
+    let (_, out, _) = infer_src(src);
+    let name = |scope: Symbol| {
+        out.program
+            .terms
+            .get_index_of(&scope)
+            .expect("a definition")
+    };
     assert_eq!(
         output
             .semantics()
             .store()
             .batches
             .iter()
-            .map(|batch| batch.id.get())
+            .map(|batch| (name(batch.id.scope()), batch.id.index()))
             .collect::<Vec<_>>(),
-        vec![0, 1, 2, 3]
+        vec![(0, 0), (1, 0), (1, 1), (1, 2)]
     );
 }
 
@@ -7401,8 +7488,36 @@ fn a_nested_annotation_is_the_contract_for_its_presences() {
 /// a definition's own: once something has left the store with no model, the
 /// clause is neither checked nor published, because everything downstream of
 /// one contradiction is the same mistake said again.
+///
+/// Downstream within the group, that is: each group has a store of its own,
+/// so a contradiction in one definition is no reason to doubt a clause in
+/// another group's, which is checked and published as if the first were not
+/// there. Here the flip is in `j`, which `k` is solved beside because the
+/// two name each other.
 #[test]
 fn a_flipped_store_silences_a_nested_clause() {
+    let locals = |output: &inference::Output, mint: &Mint| -> Vec<(String, String)> {
+        output
+            .semantics()
+            .locals()
+            .iter()
+            .filter(|(symbol, _)| !mint.name(**symbol).starts_with('%'))
+            .map(|(symbol, scheme)| (mint.name(*symbol).to_string(), scheme.to_string()))
+            .collect()
+    };
+    let src = "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
+               let j = fn n => do let _ = p {} return k n end\n\
+               let k = fn n => do let g : { x when 'a: Nat } -> {} where 'a = fn v => {} return j n end";
+    let (mint, _, output) = infer_src(src);
+    let [error] = output.errors() else {
+        panic!("expected one error: {:#?}", output.errors());
+    };
+    assert_eq!(error.kind.code(), "presence-required");
+    assert_eq!(
+        locals(&output, &mint),
+        [("g".to_string(), "{ x when 'a: Nat } -> ()".to_string())]
+    );
+
     let src = "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
                let bad = p {}\n\
                let k = do let g : { x when 'a: Nat } -> {} where 'a = fn v => {} return g end";
@@ -7411,13 +7526,13 @@ fn a_flipped_store_silences_a_nested_clause() {
         panic!("expected one error: {:#?}", output.errors());
     };
     assert_eq!(error.kind.code(), "presence-required");
-    let locals: Vec<(&str, String)> = output
-        .semantics()
-        .locals()
-        .iter()
-        .map(|(symbol, scheme)| (mint.name(*symbol), scheme.to_string()))
-        .collect();
-    assert_eq!(locals, [("g", "{ x when 'a: Nat } -> ()".to_string())]);
+    assert_eq!(
+        locals(&output, &mint),
+        [(
+            "g".to_string(),
+            "{ x when 'a: Nat } -> () where 'a".to_string()
+        )]
+    );
 }
 
 /// A column that tests anything but presence keeps today's behaviour end to
@@ -7467,15 +7582,17 @@ fn an_ordinary_program_requires_nothing() {
     }
 }
 
-/// The first batch to leave the store without a model owns the single error,
-/// and everything after it is suppressed — including the schemes, which would
-/// otherwise all publish a clause nothing satisfies.
+/// The first batch to leave a group's store without a model owns the single
+/// error, and everything after it in the group is suppressed — including the
+/// schemes, which would otherwise all publish a clause nothing satisfies.
+///
+/// Each group has a store of its own, so two definitions that each
+/// contradict `p` are two mistakes, said once each.
 #[test]
 fn the_first_flipping_batch_owns_the_error() {
     let (mint, _, output) = infer_src(
         "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
-         let bad = p {}\n\
-         let worse = p {}",
+         let bad = do let _ = p {} return p {} end",
     );
     assert_eq!(output.errors().len(), 1, "{:#?}", output.errors());
     assert_eq!(
@@ -7488,9 +7605,26 @@ fn the_first_flipping_batch_owns_the_error() {
             .count(),
         1
     );
-    // The definitions past the flip publish nothing about their presences: one
+    // The definition past the flip publishes nothing about its presences: one
     // contradiction, said once.
-    assert_eq!(scheme(&mint, &output, "worse"), "()");
+    assert_eq!(scheme(&mint, &output, "bad"), "()");
+
+    let (_, _, output) = infer_src(
+        "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
+         let bad = p {}\n\
+         let worse = p {}",
+    );
+    assert_eq!(output.errors().len(), 2, "{:#?}", output.errors());
+    assert_eq!(
+        output
+            .semantics()
+            .store()
+            .batches
+            .iter()
+            .filter(|batch| batch.flipped)
+            .count(),
+        2
+    );
 }
 
 /// A nested binding is generalized on the same terms as a definition, clause
@@ -7669,17 +7803,18 @@ fn a_use_site_is_aimed_at_the_argument_it_constrains() {
 }
 
 /// The cascade reaches the annotation check too: once a batch has left the
-/// store without a model, an annotation written after it is not held to a
-/// contract nothing could satisfy, and its scheme publishes nothing.
+/// store without a model, an annotation whose definition holds that batch is
+/// not held to a contract nothing could satisfy, and its scheme publishes
+/// nothing. A flip in another definition is another group's, and leaves the
+/// annotation checked as usual.
 #[test]
 fn an_annotation_after_the_flip_is_not_checked() {
     let (mint, _, output) = infer_src(
         "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
-         let bad = p {}\n\
          let after : { x when 'a: Nat, y when 'b: Nat } -> {} where 'a or 'b = fn v =>\n\
-         \x20 match v with | {x} => {} | {y} => {} end",
+         \x20 do let _ = p {} return match v with | {x} => {} | {y} => {} end end",
     );
-    // The use site's flip is the only complaint: the annotation below it would
+    // The use site's flip is the only complaint: the annotation would
     // otherwise be told it allows more than its definition requires.
     assert_eq!(
         output
@@ -7692,6 +7827,21 @@ fn an_annotation_after_the_flip_is_not_checked() {
     assert_eq!(
         scheme(&mint, &output, "after"),
         "{ x when 'a: Nat, y when 'b: Nat } -> ()"
+    );
+
+    let (_, _, output) = infer_src(
+        "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
+         let bad = p {}\n\
+         let after : { x when 'a: Nat, y when 'b: Nat } -> {} where 'a or 'b = fn v =>\n\
+         \x20 match v with | {x} => {} | {y} => {} end",
+    );
+    assert_eq!(
+        output
+            .errors()
+            .iter()
+            .map(|error| error.kind.code())
+            .collect::<Vec<_>>(),
+        ["presence-required", "annotation-allows-more"]
     );
 }
 
@@ -9277,7 +9427,8 @@ fn local_and_imported_alias_callback_tails_keep_exact_relations() {
             unresolved: None,
         },
     );
-    let output = inference::infer(&mint, &mut lowered.program, inference::Trace::Complete);
+    let output = inference::infer(&mint, &lowered.program, inference::Trace::Complete);
+    output.apply_types(&mut lowered.program);
     let [error] = output.errors() else {
         panic!("{:#?}", output.errors())
     };
@@ -9842,7 +9993,7 @@ fn inference_records_have_unique_direct_identities_across_nested_constraints() {
         output
             .errors()
             .iter()
-            .all(|error| error.id.get() != u64::MAX)
+            .all(|error| error.id.index() != u32::MAX)
     );
 }
 
@@ -10233,7 +10384,7 @@ fn direct_boundary_errors_have_stable_ids_without_solve_steps() {
         panic!("expected one boundary error: {:#?}", output.errors());
     };
     assert!(matches!(error.cause, inference::ErrorCause::Direct));
-    assert_ne!(error.id.get(), u64::MAX);
+    assert_ne!(error.id.index(), u32::MAX);
     assert!(
         output
             .diagnostics()
@@ -10250,7 +10401,7 @@ fn source_sorting_moves_errors_without_renumbering_their_identities() {
     let map = &out.source;
     assert_eq!(output.errors().len(), 2, "{:#?}", output.errors());
     assert!(map.span(output.errors()[0].at).start < map.span(output.errors()[1].at).start);
-    assert!(output.errors()[0].id.get() > output.errors()[1].id.get());
+    assert!(output.errors()[0].id != output.errors()[1].id);
     for error in output.errors() {
         let inference::ErrorCause::Step(step_id) = error.cause else {
             panic!("sorted solve error lost its step cause: {error:#?}");
@@ -10298,7 +10449,7 @@ fn variables_and_solver_changes_link_into_the_immutable_reason_arena() {
             .iter()
             .all(|reason| reason.parents.iter().all(|parent| ids.contains(parent)))
     );
-    for meta in output.diagnostics().variables() {
+    for meta in output.diagnostics().variables().values().flatten() {
         let reason = output
             .diagnostics()
             .reasons()
@@ -10543,7 +10694,7 @@ fn zero_step_rules_and_recovery_components_do_not_contaminate_later_steps() {
                     inference::Effect::Bound {
                         var,
                         ..
-                    } if output.diagnostics().variables()[var as usize].subject == inference::Subject::Parameter
+                    } if output.diagnostics().variable(step.id.scope(), var).expect("minted in the step's scope").subject == inference::Subject::Parameter
                 )
         })
         .expect("the abandoned inner parameter");
@@ -10629,9 +10780,17 @@ fn raise_result_has_its_own_semantic_subject() {
     let (_, _, output) = infer_src(
         "effect Fail = { abort: Nat -> Boolean }\nlet f = fn unit => raise Fail.abort 1n",
     );
-    assert!(output.diagnostics().variables().iter().any(|meta| {
-        meta.sort == inference::VarSort::Type && meta.subject == inference::Subject::RaiseResult
-    }));
+    assert!(
+        output
+            .diagnostics()
+            .variables()
+            .values()
+            .flatten()
+            .any(|meta| {
+                meta.sort == inference::VarSort::Type
+                    && meta.subject == inference::Subject::RaiseResult
+            })
+    );
 }
 
 #[test]
@@ -10719,7 +10878,8 @@ fn variable_metadata_uses_semantic_subjects_for_narrow_mint_sites() {
             output
                 .diagnostics()
                 .variables()
-                .iter()
+                .values()
+                .flatten()
                 .map(|meta| (meta.sort, meta.subject)),
         );
     }

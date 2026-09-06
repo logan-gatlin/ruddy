@@ -29,7 +29,8 @@ fn checked(src: &str) -> (ir::Output, inference::Output, patterns::Output) {
     );
     let mut mint = dummy_mint();
     let mut out = ir::build(&mut mint, parsed.stmts);
-    let inferred = inference::infer(&mint, &mut out.program, inference::Trace::Complete);
+    let inferred = inference::infer(&mint, &out.program, inference::Trace::Complete);
+    inferred.apply_types(&mut out.program);
     let checks = patterns::check(&out.program, &inferred);
     (out, inferred, checks)
 }
@@ -1173,13 +1174,14 @@ fn the_store_decides_reachability_for_a_converted_column() {
 }
 
 /// The cascade rule, in the phase that has to obey it: once a batch has left
-/// the store without a model, a later match's coverage cannot be reasoned
-/// from — every arm of it would read dead — so the checks stand aside.
+/// a group's store without a model, a later match of that group cannot be
+/// reasoned from — every arm of it would read dead — so the checks stand
+/// aside. A match in another definition is another group's, with a store of
+/// its own that nothing flipped, and is checked as usual.
 #[test]
 fn a_match_after_the_flip_stands_aside() {
     let src = "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
-               let bad = p {}\n\
-               let q = fn v => match v with | {u, w} => 1n | {} => 2n end";
+               let bad = fn v => do let _ = p {} return match v with | {u, w} => 1n | {} => 2n end end";
     let (_, inferred, checks) = checked(src);
     assert_eq!(inferred.errors().len(), 1, "{:#?}", inferred.errors());
     // The flip is the use site's, so nothing the patterns phase says is about
@@ -1189,10 +1191,19 @@ fn a_match_after_the_flip_stands_aside() {
     assert!(matches!(last.coverage, Coverage::Skipped));
     assert_eq!(verdicts(last), [Verdict::Skipped; 2]);
 
+    let src = "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
+               let bad = p {}\n\
+               let q = fn v => match v with | {u, w} => 1n | {} => 2n end";
+    let (_, inferred, checks) = checked(src);
+    assert_eq!(inferred.errors().len(), 1, "{:#?}", inferred.errors());
+    assert!(checks.errors.is_empty(), "{checks:#?}");
+    let last = checks.reports.last().expect("two matches were checked");
+    assert!(matches!(last.coverage, Coverage::Exhaustive), "{checks:#?}");
+    assert_eq!(verdicts(last), [Verdict::Reachable; 2]);
+
     let src = "let early : Nat -> Nat = fn n => match n with | 0n => 0n | x => x end\n\
                let p = fn a => match a with | {x} => {} | {y} => {} end\n\
-               let bad = p {}\n\
-               let q = fn n => match n with | 0n => 1n end";
+               let bad = fn n => do let _ = p {} return match n with | 0n => 1n end end";
     let (_, inferred, checks) = checked(src);
     assert_eq!(inferred.errors().len(), 1);
     assert!(checks.errors.is_empty(), "{checks:#?}");

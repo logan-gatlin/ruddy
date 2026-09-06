@@ -166,7 +166,8 @@ fn file_modules_share_structural_effects() {
     let mut mint = Mint::new(Bundle::new("demo", Version::new(0, 1, 0)).expect("valid bundle"));
     let mut lowered = ir::build(&mut mint, out.stmts);
     assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
-    let inferred = inference::infer(&mint, &mut lowered.program, inference::Trace::Off);
+    let inferred = inference::infer(&mint, &lowered.program, inference::Trace::Off);
+    inferred.apply_types(&mut lowered.program);
     assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     let cross = lowered
         .program

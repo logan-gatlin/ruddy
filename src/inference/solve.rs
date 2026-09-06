@@ -1596,14 +1596,18 @@ impl Solve<'_> {
         };
         for (position, (left, right)) in positions.into_iter().enumerate() {
             let before = self.errors.len();
-            let first_reason = self.table.next_reason_id;
+            let first_reason = self.table.next_reason();
             self.unify(span, &left, &right);
             // Every reason minted making this position agree is one a later
             // failure may descend from; see [`Table::effect_argument_reasons`].
-            for id in first_reason..self.table.next_reason_id {
-                self.table
-                    .effect_argument_reasons
-                    .insert(ReasonId(id), (effect.clone(), position as u32));
+            for id in first_reason.index..self.table.next_reason().index {
+                self.table.effect_argument_reasons.insert(
+                    ReasonId {
+                        scope: first_reason.scope,
+                        index: id,
+                    },
+                    (effect.clone(), position as u32),
+                );
             }
             for error in &mut self.errors[before..] {
                 error
@@ -1670,9 +1674,7 @@ impl Solve<'_> {
             bound,
             rigids,
             self.table
-                .binding_names
-                .get(&symbol)
-                .cloned()
+                .binding_name(symbol)
                 .unwrap_or_else(|| Rc::from("local binding")),
             binding_span,
             self.errors,

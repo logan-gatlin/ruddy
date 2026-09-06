@@ -73,8 +73,8 @@ fn rows(ids: &mut Ids, cx: &Cx, constraints: &[Constraint]) -> Vec<Node> {
             // what lets clicking one highlight the term that demanded it.
             let mut node = Node::new(ids.next(), constraint.kind.code(), constraint.to_string())
                 .at(cx.source.span(constraint.at))
-                .field("_constraint_id", constraint.id.get().to_string())
-                .field("_reason_id", constraint.reason.get().to_string())
+                .field("_constraint_id", constraint.id.to_string())
+                .field("_reason_id", constraint.reason.to_string())
                 .field("_origin", constraint.origin.code())
                 .field("_primary_subject", constraint.subjects.primary.code());
             if let Some(subject) = constraint.subjects.secondary {
@@ -103,7 +103,7 @@ fn rows(ids: &mut Ids, cx: &Cx, constraints: &[Constraint]) -> Vec<Node> {
                                             requirement.batch.formula.to_string(),
                                         )
                                         .at(cx.source.span(requirement.batch.at))
-                                        .field("_batch_id", requirement.batch.id.get().to_string()),
+                                        .field("_batch_id", requirement.batch.id.to_string()),
                                     )
                                 });
                             arm_node

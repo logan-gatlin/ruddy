@@ -7497,7 +7497,7 @@ fn grouping(terms: &IndexMap<Symbol, Decl<Term>>) -> Vec<Group> {
 ///
 /// [`mentioned`] about terms, down to what it is for — the edges of the graph
 /// [`grouping`] closes.
-fn references(term: &Term, out: &mut Vec<Symbol>) {
+pub(crate) fn references(term: &Term, out: &mut Vec<Symbol>) {
     match &term.kind {
         TermKind::Ident(symbol) => out.push(*symbol),
         TermKind::Unary { value, .. } => references(value, out),

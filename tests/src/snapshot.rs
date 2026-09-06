@@ -2811,6 +2811,7 @@ fn inference_stage_rows_serialize_compiler_identities() {
         .expect("a solve-caused inference diagnostic");
     let error_id = diagnostic
         .inference_error_id
+        .clone()
         .expect("stable inference error identity");
     let Some(InferenceCause::Step { step_id }) = diagnostic.inference_cause.as_ref() else {
         panic!("ordinary inference error should carry its step cause");
@@ -2826,7 +2827,7 @@ fn inference_stage_rows_serialize_compiler_identities() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|item| item["inference_error_id"] == error_id)
+        .find(|item| item["inference_error_id"] == error_id.as_str())
         .expect("stable inference metadata reaches the wire");
     assert!(serialized.get("id").is_some(), "display id remains present");
     assert_eq!(serialized["inference_cause"]["kind"], "step");

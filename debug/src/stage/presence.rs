@@ -95,21 +95,31 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     // batch by batch rather than being shown only where it ended up. Rebuilt as
     // the walk goes for the same reason inference rebuilds it: what a batch
     // says is only interesting beside everything said before it.
+    //
+    // One scope at a time: a batch's variables are numbered by the group that
+    // solved it, so a running conjunction across groups would be reading two
+    // groups' `?0` as one. The verdict starts over where the scope changes.
     let mut accumulated = Formula::True;
     // Which batch flipped the store, once one has: the verdict stays
     // unsatisfiable for every batch after it, and a row that named the batch it
     // is printed beside would blame each of them in turn for the one thing only
     // the first of them did.
     let mut flipped: Option<usize> = None;
+    let mut scope = None;
     for (at, batch) in semantics.store().batches.iter().enumerate() {
+        if scope != Some(batch.id.scope()) {
+            scope = Some(batch.id.scope());
+            accumulated = Formula::True;
+            flipped = None;
+        }
         accumulated = accumulated.and(batch.formula.clone());
         if batch.flipped {
             flipped = Some(at);
         }
         let mut node = Node::new(ids.next(), batch.origin.code(), batch.formula.to_string())
             .at(cx.source.span(batch.at))
-            .field("_batch_id", batch.id.get().to_string())
-            .field("_reason_id", batch.reason.get().to_string());
+            .field("_batch_id", batch.id.to_string())
+            .field("_reason_id", batch.reason.to_string());
         if batch.flipped {
             node = node.error();
         }

@@ -195,16 +195,12 @@ fn compile_with(
     artifact_dependencies: Vec<artifact::Dependency>,
     build: impl FnOnce(&mut Mint, Vec<parse::Stmt>) -> ir::Output,
 ) -> Result<AcceptedProgram, PartialCompilation> {
-    let ir = build(&mut mint, stmts);
-    let mut program = ir.program.clone();
-    let inference = inference::infer(&mint, &mut program, trace);
-    // Inference writes solved types into the program, so publish that coherent
-    // program rather than the pre-inference IR output.
-    let ir = ir::Output {
-        program,
-        source: ir.source,
-        errors: ir.errors,
-    };
+    let mut ir = build(&mut mint, stmts);
+    let inference = inference::infer(&mint, &ir.program, trace);
+    // Inference reads the program and answers with typed copies of its
+    // declarations; the program every later phase reads is the one with
+    // those written in.
+    inference.apply_types(&mut ir.program);
     let patterns = patterns::check(&ir.program, &inference);
     let mut errors = Vec::new();
     errors.extend(ir.errors.iter().cloned().map(Error::Ir));
