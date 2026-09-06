@@ -1152,6 +1152,7 @@ impl ir::ErrorKind {
         match self {
             ir::ErrorKind::ArrayInExtern => "array-in-extern",
             ir::ErrorKind::InvalidDependencyAlias { .. } => "invalid-dependency-alias",
+            ir::ErrorKind::ExecutableDependency { .. } => "executable-dependency",
             ir::ErrorKind::DuplicateDependencyAlias { .. } => "duplicate-dependency-alias",
             ir::ErrorKind::DuplicateDependency { .. } => "duplicate-dependency",
             ir::ErrorKind::Undefined { namespace, .. } => match namespace {
@@ -1251,6 +1252,11 @@ impl ir::Error {
             )
             .label("this array uses Ruddy's private persistent representation")
             .help("convert the value at a Ruddy boundary, or keep this function in Ruddy code"),
+            E::ExecutableDependency { name } => Diagnostic::new(
+                code,
+                format!("executable bundle `{name}` cannot be a dependency"),
+                span,
+            ).help("only library bundles can be imported"),
             E::InvalidDependencyAlias { alias } => Diagnostic::new(
                 code,
                 format!("`{alias}` cannot be used as a module name"),

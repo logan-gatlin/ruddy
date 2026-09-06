@@ -14,12 +14,16 @@ use crate::artifact::{self, Artifact, Callee, Op};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkError {
     EmptyGraph,
+    ExecutableDependency(String),
 }
 
 impl fmt::Display for LinkError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyGraph => f.write_str("cannot link an empty artifact graph"),
+            Self::ExecutableDependency(name) => {
+                write!(f, "executable bundle `{name}` cannot be a dependency")
+            }
         }
     }
 }
@@ -37,6 +41,13 @@ pub fn link(artifacts: &[Artifact]) -> Result<Artifact, LinkError> {
     let Some(root) = artifacts.last() else {
         return Err(LinkError::EmptyGraph);
     };
+    for dependency in &artifacts[..artifacts.len() - 1] {
+        if dependency.header().kind == artifact::Kind::Executable {
+            return Err(LinkError::ExecutableDependency(
+                dependency.header().identity.name.clone(),
+            ));
+        }
+    }
 
     let mut externs = Vec::new();
     let mut functions = Vec::new();

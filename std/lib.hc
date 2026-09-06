@@ -1,5 +1,11 @@
 type Never = |
 
+effect Console = { write: String -> (), write_error: String -> () }
+effect Process = { exit: Nat -> Never }
+
+module console
+module process
+
 type Option 't = #Some 't | #None
 type Maybe 't = #Nil | ..'t
 

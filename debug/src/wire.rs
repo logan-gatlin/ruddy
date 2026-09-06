@@ -29,6 +29,10 @@ pub struct Loc {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CompileRequest {
+    #[serde(default)]
+    pub kind: ruddy::artifact::Kind,
+    #[serde(default)]
+    pub target: Option<ruddy_cli::Target>,
     /// The bundle identity supplied by project configuration in a normal
     /// compilation. Defaults keep cached requests from older debugger pages
     /// usable after identity moved out of source files.
@@ -390,6 +394,8 @@ pub struct DocMeta {
 /// single snippet.
 #[derive(Debug, Serialize)]
 pub struct Doc {
+    pub kind: ruddy::artifact::Kind,
+    pub target: Option<ruddy_cli::Target>,
     pub name: String,
     pub bundle_name: String,
     pub version: String,
@@ -454,6 +460,10 @@ pub struct SessionViewUpdate {
 
 #[derive(Debug, Deserialize)]
 pub struct DocBody {
+    #[serde(default)]
+    pub kind: ruddy::artifact::Kind,
+    #[serde(default)]
+    pub target: Option<ruddy_cli::Target>,
     /// Optional only for compatibility with saves from debugger pages opened
     /// before identity moved into document configuration.
     #[serde(default)]

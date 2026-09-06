@@ -952,6 +952,7 @@ fn the_lir_tab_skips_a_program_with_errors() {
 fn artifact_stage_renders_one_dependency() {
     let artifact = UncheckedArtifact {
         header: Header {
+            kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
             modules: Vec::new(),
             identity: Identity {
@@ -1023,7 +1024,11 @@ fn artifact_stage_renders_one_dependency() {
         stage.summary,
         "1 dependency · 0 values · 0 types · 0 effects · 0 modules · 1 externs · 0 functions · 0 globals"
     );
-    let dependencies = &stage.nodes[0].children[0];
+    let dependencies = stage.nodes[0]
+        .children
+        .iter()
+        .find(|node| node.label == "dependencies")
+        .unwrap();
     assert_eq!(dependencies.label, "dependencies");
     assert_eq!(dependencies.text, "1 declared");
     assert_eq!(dependencies.children.len(), 1);
@@ -1107,9 +1112,13 @@ fn the_artifact_tab_exposes_canonical_text_and_skips_with_errors() {
         "{:#?}",
         artifact_stage.nodes
     );
-    assert_eq!(artifact_stage.nodes[0].children[0].label, "dependencies");
-    assert_eq!(artifact_stage.nodes[0].children[0].text, "0 declared");
-    assert!(artifact_stage.nodes[0].children[0].children.is_empty());
+    let dependencies = artifact_stage.nodes[0]
+        .children
+        .iter()
+        .find(|node| node.label == "dependencies")
+        .unwrap();
+    assert_eq!(dependencies.text, "0 declared");
+    assert!(dependencies.children.is_empty());
     assert!(
         artifact_stage.summary.contains("0 dependencies · 1 values"),
         "{}",
@@ -1439,6 +1448,8 @@ fn the_symbols_tab_says_which_module_and_file_a_symbol_came_from() {
 fn bundle(files: &[(&str, &str)]) -> Snapshot {
     compile(
         &CompileRequest {
+            kind: ruddy::artifact::Kind::Library,
+            target: None,
             name: "demo".to_string(),
             version: "0.1.0".to_string(),
             root: ROOT.to_string(),

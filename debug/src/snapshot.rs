@@ -483,6 +483,20 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
         _ => None,
     };
 
+    let artifact = artifact.and_then(|artifact| {
+        if req.kind == ruddy::artifact::Kind::Library {
+            return Some(artifact);
+        }
+        let dependencies: Vec<_> = linked_interfaces.iter().collect();
+        match ruddy::entry::executable(&artifact, &dependencies) {
+            Ok(artifact) => Some(artifact),
+            Err(error) => {
+                diagnostics.push(raw("entry", "invalid-entry-point", error.to_string(), None));
+                None
+            }
+        }
+    });
+
     // Linking is a distinct final phase. Dependency artifacts remain separate
     // compilation boundaries above; this output copies their code into the
     // active root and therefore needs no external artifacts at execution time.
@@ -519,6 +533,11 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     let mut js_error = None;
     let mut js_panicked = false;
     let js = linked.as_ref().and_then(|linked| {
+        if req.kind == ruddy::artifact::Kind::Executable
+            && req.target == Some(ruddy_cli::Target::Artifact)
+        {
+            return None;
+        }
         let started = Instant::now();
         let out = guard("js", &mut panicked, || ruddy::backend::js::generate(linked));
         js_panicked = out.is_none();
@@ -527,7 +546,11 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
             Some(Ok(source)) => Some(source),
             Some(Err(error)) => {
                 let message = error.to_string();
-                diagnostics.push(raw("js", "javascript-generation", message.clone(), None));
+                let code = match error {
+                    ruddy::backend::js::Error::Entry(_) => "unsupported-entry-effects",
+                    _ => "javascript-generation",
+                };
+                diagnostics.push(raw("js", code, message.clone(), None));
                 js_error = Some(message);
                 None
             }
@@ -930,6 +953,8 @@ mod tests {
             "let bad = action ()\n",
         );
         let request = CompileRequest {
+            kind: ruddy::artifact::Kind::Library,
+            target: None,
             name: "test".into(),
             version: "0.1.0".into(),
             root: ROOT.into(),

@@ -166,7 +166,7 @@ fn the_reserved_std_alias_is_never_persisted_as_a_declared_dependency() {
     std::fs::write(root.join("demo/main.hc"), "").unwrap();
     std::fs::write(
         root.join("demo/Ruddy.toml"),
-        "name = \"demo\"\nversion = \"0.1.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nstd = \"../standard\"\n",
+        "name = \"demo\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nstd = \"../standard\"\n",
     )
     .unwrap();
     let found = read(&root, "demo").unwrap_err();
@@ -284,7 +284,7 @@ fn standard_library_configuration_round_trips_and_defaults_to_installed() {
     );
     std::fs::write(
         root.join("demo/Ruddy.toml"),
-        "name = \"demo\"\nversion = \"0.1.0\"\nroot = \"main.hc\"\n[dependencies]\n",
+        "name = \"demo\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\n",
     )
     .unwrap();
     assert_eq!(read(&root, "demo").unwrap().std, StdConfig::Default);

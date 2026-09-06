@@ -145,6 +145,7 @@ pub struct Artifact {
 pub(crate) fn empty() -> Artifact {
     Artifact {
         header: Header {
+            kind: Kind::Library,
             identity: Identity {
                 name: String::new(),
                 version: String::new(),
@@ -318,6 +319,7 @@ fn recover_executable(mut lir: Lir) -> (Lir, Vec<RecoveryFact>) {
 /// never erases executable content that does not depend on it.
 fn recover_parts(header: Header, lir: Lir) -> (Artifact, Vec<RecoveryFact>) {
     let mut recovered = Header {
+        kind: header.kind,
         identity: header.identity,
         compiler: header.compiler,
         dependencies: header.dependencies,
@@ -420,6 +422,8 @@ impl Drop for Artifact {
 /// The public interface of one bundle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Header {
+    /// Whether this bundle is importable or provides a program entry point.
+    pub kind: Kind,
     pub identity: Identity,
     /// The compiler that wrote this artifact.
     pub compiler: Stamp,
@@ -436,6 +440,24 @@ pub struct Header {
     /// Every declared module, in source declaration order, with its metadata.
     /// A module is otherwise visible only as a segment of the names under it.
     pub modules: Vec<DeclaredModule>,
+}
+
+/// A bundle's role, independent of its output format.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    #[default]
+    Library,
+    Executable,
+}
+
+impl fmt::Display for Kind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Library => "library",
+            Self::Executable => "executable",
+        })
+    }
 }
 
 /// The identity that owns an artifact.
@@ -2216,6 +2238,7 @@ pub fn build_with_dependencies(
     let program = accepted.ir();
     let inference = accepted.semantics();
     let header = Header {
+        kind: Kind::Library,
         identity: Identity {
             name: mint.bundle().name().to_string(),
             version: mint.bundle().version().to_string(),
@@ -3105,6 +3128,7 @@ pub mod text {
     fn header(value: &Header) -> S {
         L(vec![
             A("header".into()),
+            L(vec![A("kind".into()), A(value.kind.to_string())]),
             L(vec![
                 A("identity".into()),
                 Q(value.identity.name.clone()),
@@ -4377,7 +4401,16 @@ pub mod text {
             }
         }
         fn read_header(&self, value: S) -> Header {
-            let mut values = self.exact(self.list(value, "header"), 7, "header");
+            let mut values = self.exact(self.list(value, "header"), 8, "header");
+            let mut kind = self.exact(self.list(self.take(&mut values), "kind"), 1, "kind");
+            let kind = match self.atom(self.take(&mut kind)).as_str() {
+                "library" => Kind::Library,
+                "executable" => Kind::Executable,
+                _ => {
+                    self.fail("invalid bundle kind");
+                    Kind::Library
+                }
+            };
             let identity = {
                 let mut value =
                     self.exact(self.list(self.take(&mut values), "identity"), 2, "identity");
@@ -4392,6 +4425,7 @@ pub mod text {
                 Stamp::recorded(self.string(self.take(&mut value)))
             };
             Header {
+                kind,
                 identity,
                 compiler,
                 dependencies: self
@@ -5830,6 +5864,7 @@ mod tests {
     fn artifact_with_target(target: &str) -> Artifact {
         Artifact {
             header: Header {
+                kind: Kind::Library,
                 identity: Identity {
                     name: "test".into(),
                     version: "1".into(),

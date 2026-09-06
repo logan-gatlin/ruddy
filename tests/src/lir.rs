@@ -286,6 +286,7 @@ fn imported_forwarding_cycles_recover_before_lir_representation() {
             };
             let dependency = a::UncheckedArtifact {
                 header: a::Header {
+                    kind: ruddy::artifact::Kind::Library,
                     compiler: ruddy::artifact::Stamp::current(),
                     modules: Vec::new(),
                     identity: a::Identity {
@@ -1047,6 +1048,7 @@ fn imported_and_local_handler_arms_build_one_complete_evidence_record() {
     };
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
             modules: Vec::new(),
             identity: a::Identity {

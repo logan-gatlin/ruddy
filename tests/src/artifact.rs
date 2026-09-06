@@ -54,6 +54,7 @@ fn exporting(mint: &Mint, scheme: &types::Scheme) -> Artifact {
     let version = mint.bundle().version().to_string();
     UncheckedArtifact {
         header: artifact::Header {
+            kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
             modules: Vec::new(),
             identity: artifact::Identity {
@@ -291,6 +292,7 @@ fn model_artifact() -> Artifact {
     ];
     UncheckedArtifact {
         header: artifact::Header {
+            kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
             modules: Vec::new(),
             identity: artifact::Identity {
@@ -922,6 +924,7 @@ fn canonical_pretty_layout_is_pinned_at_its_unicode_width_boundary() {
     let empty = |name: String| {
         UncheckedArtifact {
             header: artifact::Header {
+                kind: ruddy::artifact::Kind::Library,
                 compiler: ruddy::artifact::Stamp::current(),
                 modules: Vec::new(),
                 identity: artifact::Identity {
@@ -949,6 +952,7 @@ fn canonical_pretty_layout_is_pinned_at_its_unicode_width_boundary() {
         format!(
             "(artifact\n\
          \x20 (header\n\
+         \x20   (kind library)\n\
          \x20   (identity \"界界界界界界界界界界界界\" \"1\")\n\
          \x20   (compiler \"{compiler}\")\n\
          \x20   (dependencies)\n\
@@ -964,6 +968,7 @@ fn canonical_pretty_layout_is_pinned_at_its_unicode_width_boundary() {
         format!(
             "(artifact\n\
          \x20 (header\n\
+         \x20   (kind library)\n\
          \x20   (identity \"界界界界界界界界界界界界界\" \"1\")\n\
          \x20   (compiler \"{compiler}\")\n\
          \x20   (dependencies)\n\
@@ -1417,14 +1422,14 @@ fn malformed_text_returns_errors_while_trusted_api_panics() {
         "\"",
         "(artifact)",
         "(artifact (header) (lir))",
-        "(artifact (header (identity \"x\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)) trailing)",
-        "(artifact (header (identity \"x\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)) extra",
-        "(artifact (header (identity \"\\u001\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
-        "(artifact (header (identity \"\\u00gg\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
-        "(artifact (header (identity \"\\u0041\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
-        "(artifact (header (identity \"\\u000a\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
-        "(artifact (header (identity \"\\ud800\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
-        "(artifact (header (identity \"\\q\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
+        "(artifact (header (kind library) (identity \"x\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)) trailing)",
+        "(artifact (header (kind library) (identity \"x\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)) extra",
+        "(artifact (header (kind library) (identity \"\\u001\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
+        "(artifact (header (kind library) (identity \"\\u00gg\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
+        "(artifact (header (kind library) (identity \"\\u0041\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
+        "(artifact (header (kind library) (identity \"\\u000a\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
+        "(artifact (header (kind library) (identity \"\\ud800\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
+        "(artifact (header (kind library) (identity \"\\q\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
     ] {
         assert_malformed(text);
     }
@@ -1734,6 +1739,7 @@ fn deeply_nested_artifact_semantics_decode_on_a_small_stack() {
     const DEPTH: usize = 400;
     let mut value = UncheckedArtifact {
         header: artifact::Header {
+            kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
             modules: Vec::new(),
             identity: artifact::Identity {
@@ -2033,6 +2039,7 @@ fn recursive_artifact_ownership_clones_and_drops_on_a_small_stack() {
 
             let artifact = UncheckedArtifact {
                 header: artifact::Header {
+                    kind: ruddy::artifact::Kind::Library,
                     compiler: ruddy::artifact::Stamp::current(),
                     modules: Vec::new(),
                     identity: artifact::Identity {
@@ -2155,7 +2162,7 @@ fn valid_deep_artifact_parses_and_drops_on_a_small_stack() {
     const DEPTH: usize = 30_000;
     let formula = format!("{}true{}", "(not ".repeat(DEPTH), ")".repeat(DEPTH));
     let valid = format!(
-        "(artifact (header (identity \"deep\" \"1\") (compiler \"0000000000000000\") (dependencies) \
+        "(artifact (header (kind library) (identity \"deep\" \"1\") (compiler \"0000000000000000\") (dependencies) \
          (values (value \"deep@1::value\" (scheme 0 0 (existentials) {formula} (ty nat)) (metadata))) \
          (types) (effects) (modules)) (lir (externs) (functions) (globals)))"
     );
@@ -2188,7 +2195,7 @@ fn malformed_deep_syntax_fails_without_exhausting_the_stack() {
 fn balanced_malformed_deep_values_fail_on_a_small_stack() {
     const DEPTH: usize = 30_000;
     let nested = format!("{}wrong{}", "(wrong ".repeat(DEPTH), ")".repeat(DEPTH));
-    let header = "(header (identity \"deep\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects))";
+    let header = "(header (kind library) (identity \"deep\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects))";
     let lir = "(lir (externs) (functions) (globals))";
 
     // The first input is structurally balanced but puts an arbitrarily deep
@@ -2197,7 +2204,7 @@ fn balanced_malformed_deep_values_fail_on_a_small_stack() {
     // Both exercise destruction of fully built parser data on semantic error.
     let malformed = [
         format!(
-            "(artifact (header (identity \"deep\" \"1\") (dependencies (dependency {nested} \"1\")) (values) (types) (effects)) {lir})"
+            "(artifact (header (kind library) (identity \"deep\" \"1\") (dependencies (dependency {nested} \"1\")) (values) (types) (effects)) {lir})"
         ),
         format!("(artifact {header} {lir} {nested})"),
     ];
@@ -2217,7 +2224,7 @@ fn rejected_deep_semantic_model_is_destroyed_on_a_small_stack() {
     const DEPTH: usize = 30_000;
     let formula = format!("{}true{}", "(not ".repeat(DEPTH), ")".repeat(DEPTH));
     let malformed = format!(
-        "(artifact (header (identity \"deep\" \"1\") (compiler \"0000000000000000\") (dependencies) \
+        "(artifact (header (kind library) (identity \"deep\" \"1\") (compiler \"0000000000000000\") (dependencies) \
          (values (value \"deep@1::value\" (scheme 0 0 (existentials) {formula} (ty (struct (row (labels) closed)))) (metadata))) \
          (types) (effects) (modules)) (lir (externs) (functions) wrong))"
     );

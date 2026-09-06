@@ -1,0 +1,1 @@
+let exit = !Process.exit

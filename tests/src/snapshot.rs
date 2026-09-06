@@ -40,11 +40,47 @@ fn compiled(snippet: &str) -> String {
     snippet.to_string()
 }
 
+#[test]
+fn executable_contract_is_checked_and_artifact_targets_defer_node_support() {
+    let request = |source: &str, target: &str| -> CompileRequest {
+        serde_json::from_value(serde_json::json!({
+            "name": "app", "version": "1.0.0", "kind": "executable", "target": target,
+            "root": ROOT, "std": false, "files": [{"path": ROOT, "source": source}],
+        }))
+        .unwrap()
+    };
+    let missing = compile(&request("let value = ()", "js"), 0);
+    assert!(
+        missing
+            .diagnostics
+            .iter()
+            .any(|error| error.code == "invalid-entry-point")
+    );
+    assert!(missing.panic.is_none());
+    let source = "effect Custom = () -> ()\nlet main = fn _ => !Custom ()";
+    let artifact = compile(&request(source, "artifact"), 0);
+    assert!(
+        artifact.diagnostics.is_empty(),
+        "{:?}",
+        artifact.diagnostics
+    );
+    let js = compile(&request(source, "js"), 0);
+    assert!(
+        js.diagnostics
+            .iter()
+            .any(|error| error.code == "unsupported-entry-effects"),
+        "{:?}",
+        js.diagnostics
+    );
+}
+
 /// A whole bundle, each file exactly as written — the request the page posts,
 /// with nothing added to it.
 fn bundle(files: &[(&str, &str)]) -> Snapshot {
     compile(
         &CompileRequest {
+            kind: ruddy::artifact::Kind::Library,
+            target: None,
             name: "demo".to_string(),
             version: "0.1.0".to_string(),
             root: ROOT.to_string(),
@@ -143,6 +179,8 @@ fn dependency_paths_without_a_scratch_root_are_recoverable() {
     dependencies.insert("base".to_string(), "../base".into());
     let snapshot = compile(
         &CompileRequest {
+            kind: ruddy::artifact::Kind::Library,
+            target: None,
             name: "debugger".to_string(),
             version: "1.2.3".to_string(),
             root: ROOT.to_string(),
@@ -194,10 +232,12 @@ fn custom_standard_library_is_source_visible_rendered_and_sandboxed() {
     fs::write(standard.join("main.hc"), "let answer = 42n\n").unwrap();
     fs::write(
         standard.join("Ruddy.toml"),
-        "name = \"std\"\nversion = \"2.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
+        "name = \"std\"\nversion = \"2.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
     let request = CompileRequest {
+        kind: ruddy::artifact::Kind::Library,
+        target: None,
         name: "app".into(),
         version: "1.0.0".into(),
         root: ROOT.into(),
@@ -252,10 +292,12 @@ fn a_remembered_dependency_graph_follows_edits_to_its_sources() {
     fs::write(standard.join("main.hc"), "let answer = 42n\n").unwrap();
     fs::write(
         standard.join("Ruddy.toml"),
-        "name = \"std\"\nversion = \"2.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
+        "name = \"std\"\nversion = \"2.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
     let request = CompileRequest {
+        kind: ruddy::artifact::Kind::Library,
+        target: None,
         name: "app".into(),
         version: "1.0.0".into(),
         root: ROOT.into(),
@@ -328,10 +370,12 @@ fn installed_standard_library_child() {
     fs::write(standard.join("main.hc"), "let installed = 1n\n").unwrap();
     fs::write(
         standard.join("Ruddy.toml"),
-        "name = \"std\"\nversion = \"0.1.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
+        "name = \"std\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
     let request = CompileRequest {
+        kind: ruddy::artifact::Kind::Library,
+        target: None,
         name: "app".into(),
         version: "1.0.0".into(),
         root: ROOT.into(),
@@ -381,12 +425,14 @@ fn saved_dependency_projects_supply_artifact_identity_and_gate_lir() {
     fs::write(base.join("main.hc"), "let base = 0n\n").unwrap();
     fs::write(
         base.join("Ruddy.toml"),
-        "name = \"base\"\nversion = \"2.3.4\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
+        "name = \"base\"\nversion = \"2.3.4\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
     let mut dependencies = IndexMap::new();
     dependencies.insert("base".to_string(), "../base".into());
     let request = CompileRequest {
+        kind: ruddy::artifact::Kind::Library,
+        target: None,
         name: "app".to_string(),
         version: "1.0.0".to_string(),
         root: ROOT.to_string(),
@@ -510,7 +556,7 @@ fn dependencies_tab_correlates_same_bundle_versions_by_request_alias() {
         fs::write(
             path.join("Ruddy.toml"),
             format!(
-                "name = \"lib\"\nversion = \"{version}\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n"
+                "name = \"lib\"\nversion = \"{version}\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n"
             ),
         )
         .unwrap();
@@ -531,6 +577,8 @@ fn dependencies_tab_correlates_same_bundle_versions_by_request_alias() {
         ("new".into(), detailed("../new-lib")),
     ]);
     let request = CompileRequest {
+        kind: ruddy::artifact::Kind::Library,
+        target: None,
         name: "app".into(),
         version: "1.0.0".into(),
         root: ROOT.into(),
@@ -581,13 +629,13 @@ fn transitive_detailed_dependency_manifests_are_validated_and_compiled() {
     }
     fs::write(
         scratch.path().join("shared/Ruddy.toml"),
-        "name = \"shared-package\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
+        "name = \"shared-package\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
     fs::write(scratch.path().join("shared/main.hc"), "let value = 1n\n").unwrap();
     fs::write(
         scratch.path().join("base/Ruddy.toml"),
-        "name = \"base\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n[dependencies.shared]\nbundle = \"shared-package\"\npath = \"../shared\"\n",
+        "name = \"base\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n[dependencies.shared]\nbundle = \"shared-package\"\npath = \"../shared\"\n",
     )
     .unwrap();
     fs::write(
@@ -628,7 +676,7 @@ fn failed_graph_validation_is_reported_for_the_dependency_build() {
     fs::create_dir_all(scratch.path().join("base")).unwrap();
     fs::write(
         scratch.path().join("base/Ruddy.toml"),
-        "name = \"base\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nmissing = \"../../outside\"\n",
+        "name = \"base\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nmissing = \"../../outside\"\n",
     )
     .unwrap();
     fs::write(scratch.path().join("base/main.hc"), "let base = 0n\n").unwrap();
@@ -667,7 +715,7 @@ fn dependency_roots_cannot_be_absolute_or_escape_the_scratch_folder() {
     ] {
         fs::write(
             scratch.join("base/Ruddy.toml"),
-            format!("name = \"base\"\nversion = \"1.0.0\"\nroot = {root:?}\n[dependencies]\nstd = false\n"),
+            format!("name = \"base\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = {root:?}\n[dependencies]\nstd = false\n"),
         )
         .unwrap();
         let snapshot = compile_at(
@@ -697,8 +745,7 @@ fn symlinked_dependency_manifests_are_confined_to_the_scratch_folder() {
     fs::create_dir_all(scratch.join("app")).unwrap();
     fs::create_dir_all(&base).unwrap();
     fs::write(base.join("main.hc"), "let base = 0n\n").unwrap();
-    let manifest =
-        "name = \"base\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n";
+    let manifest = "name = \"base\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n";
     let outside = outer.path().join("outside.toml");
     fs::write(&outside, manifest).unwrap();
     std::os::unix::fs::symlink(&outside, base.join("Ruddy.toml")).unwrap();
@@ -746,7 +793,7 @@ fn symlinked_dependency_modules_cannot_escape_the_scratch_folder() {
     fs::create_dir_all(scratch.join("base")).unwrap();
     fs::write(
         scratch.join("base/Ruddy.toml"),
-        "name = \"base\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
+        "name = \"base\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
     fs::write(scratch.join("base/main.hc"), "module Escape\n").unwrap();
@@ -781,7 +828,7 @@ fn types_stage_walks_deep_imported_aliases_on_a_small_stack() {
             fs::create_dir_all(scratch.path().join("dep")).unwrap();
             fs::write(
                 scratch.path().join("dep/Ruddy.toml"),
-                "name = \"dep\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
+                "name = \"dep\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
             )
             .unwrap();
             let mut source = String::new();
@@ -827,6 +874,8 @@ fn dependency_request(dependencies: IndexMap<String, String>) -> CompileRequest 
         .map(|(name, path)| (name, path.into()))
         .collect();
     CompileRequest {
+        kind: ruddy::artifact::Kind::Library,
+        target: None,
         name: "app".to_string(),
         version: "1.0.0".to_string(),
         root: ROOT.to_string(),
@@ -2198,6 +2247,8 @@ fn a_bad_bundle_is_reported_rather_than_fatal() {
     ] {
         let snapshot = compile(
             &CompileRequest {
+                kind: ruddy::artifact::Kind::Library,
+                target: None,
                 name: name.to_string(),
                 version: version.to_string(),
                 root: ROOT.to_string(),
@@ -2233,6 +2284,8 @@ fn a_bad_bundle_is_reported_rather_than_fatal() {
 fn a_nested_debugger_root_resolves_module_files_beside_its_root() {
     let snapshot = compile(
         &CompileRequest {
+            kind: ruddy::artifact::Kind::Library,
+            target: None,
             name: "demo".into(),
             version: "0.1.0".into(),
             root: "src/main.hc".into(),

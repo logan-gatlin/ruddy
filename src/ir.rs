@@ -1374,6 +1374,10 @@ pub struct Error {
 
 #[derive(Debug, Clone)]
 pub enum ErrorKind {
+    /// Executables provide a launch root and cannot be imported as libraries.
+    ExecutableDependency {
+        name: String,
+    },
     /// Arrays have a private persistent representation and cannot cross a
     /// user-authored host boundary in this release.
     ArrayInExtern,
@@ -9460,7 +9464,14 @@ impl Builder<'_> {
                 import.artifact.header().identity.name.clone(),
                 import.artifact.header().identity.version.clone(),
             );
-            if !source_identifier(import.alias) {
+            if import.artifact.header().kind == artifact::Kind::Executable {
+                self.errors.push(Error {
+                    at: Anchor::GENERATED,
+                    kind: ErrorKind::ExecutableDependency {
+                        name: identity.0.clone(),
+                    },
+                });
+            } else if !source_identifier(import.alias) {
                 self.errors.push(Error {
                     at: Anchor::GENERATED,
                     kind: ErrorKind::InvalidDependencyAlias {

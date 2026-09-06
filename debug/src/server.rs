@@ -307,12 +307,14 @@ fn document(
             if !files.iter().all(|file| docs::valid_file_path(&file.path)) {
                 return fail(400, "invalid file path");
             }
-            match docs::write(
+            match docs::write_configured(
                 &state.cfg.scratch,
                 name,
                 body.name.as_deref().unwrap_or(name),
                 body.version.as_deref().unwrap_or("0.1.0"),
                 &body.root,
+                body.kind,
+                body.target,
                 &body.run,
                 &body.std,
                 &body.dependencies,
@@ -366,12 +368,14 @@ fn edit_session(state: &State, edit: SessionEdit) -> Response<io::Cursor<Vec<u8>
     let run = docs::read(&state.cfg.scratch, &current.request.document)
         .map(|doc| doc.run)
         .unwrap_or_default();
-    if let Err(error) = docs::write(
+    if let Err(error) = docs::write_configured(
         &state.cfg.scratch,
         &current.request.document,
         &current.request.name,
         &current.request.version,
         &current.request.root,
+        current.request.kind,
+        current.request.target,
         &run,
         &current.request.std,
         &current.request.dependencies,

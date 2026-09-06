@@ -15,7 +15,7 @@ use ariadne::{Color, Config, IndexType, Label, Report, ReportKind, sources};
 use clap::{Parser, Subcommand};
 use indexmap::IndexMap;
 use ruddy::{
-    artifact::{Artifact, Dependency},
+    artifact::{Artifact, Dependency, Kind},
     bundle::{self, Disk, Files},
     inference,
     symbol::{Bundle, Mint, Version},
@@ -212,10 +212,10 @@ pub fn new_project(path: impl AsRef<Path>) -> Result<(), CliError> {
     write_new_file(
         &manifest,
         &format!(
-            "name = {name:?}\nversion = {INITIAL_VERSION:?}\nroot = \"main.hc\"\ntarget = \"js\"\n\n[dependencies]\n"
+            "name = {name:?}\nversion = {INITIAL_VERSION:?}\nkind = \"executable\"\nroot = \"main.hc\"\ntarget = \"js\"\n\n[dependencies]\n"
         ),
     )?;
-    write_new_file(&root, "let main = 0n\n")?;
+    write_new_file(&root, "let main = fn _ => ()\n")?;
     write_new_file(&path.join(GITIGNORE), "/build/\n")?;
     initialize_git(path)
 }
@@ -402,6 +402,13 @@ fn install_project(directory: &Path) -> Result<InstalledBuild, CliError> {
 /// Build and execute the installed root JavaScript module. By default this uses
 /// Node.js; `[run].js` may select a different shell runner.
 pub fn run_project(directory: impl AsRef<Path>) -> Result<PathBuf, CliError> {
+    let manifest = load_manifest(directory.as_ref(), None)
+        .map_err(|error| CliError::one(error.to_string()))?;
+    if manifest.kind != Kind::Executable || manifest.target() != Target::Js {
+        return Err(CliError::one(
+            "`ruddy run` requires `kind = \"executable\"` and `target = \"js\"` (the executable default)",
+        ));
+    }
     let installed = install_project(directory.as_ref())?;
     if installed.target != Target::Js {
         return Err(CliError::one(
@@ -450,9 +457,12 @@ fn execute_javascript_runner(runner: &str, path: &Path, directory: &Path) -> Res
     if status.success() {
         Ok(())
     } else {
-        Err(CliError::one(format!(
-            "JavaScript runner `{runner}` exited with {status}"
-        )))
+        let mut error = CliError::one(format!("JavaScript runner `{runner}` exited with {status}"));
+        error.exit_code = status
+            .code()
+            .and_then(|code| u8::try_from(code).ok())
+            .unwrap_or(1);
+        Err(error)
     }
 }
 
@@ -519,10 +529,13 @@ fn execute_node_module(program: &OsStr, path: &Path, directory: &Path) -> Result
     } else {
         format!("\n{diagnostics}")
     };
-    Err(CliError::one(format!(
-        "Node.js exited with {}{detail}",
-        output.status
-    )))
+    let mut error = CliError::one(format!("Node.js exited with {}{detail}", output.status));
+    error.exit_code = output
+        .status
+        .code()
+        .and_then(|code| u8::try_from(code).ok())
+        .unwrap_or(1);
+    Err(error)
 }
 
 #[cfg(test)]
@@ -834,12 +847,12 @@ impl fmt::Display for CompileError {
 
 impl std::error::Error for CompileError {}
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Target {
     /// Write only the canonical linked artifact.
     #[default]
-    Lib,
+    Artifact,
     /// Write the canonical linked artifact and a JavaScript ESM module.
     Js,
 }
@@ -864,11 +877,21 @@ struct Manifest {
     name: String,
     version: String,
     root: PathBuf,
+    kind: Kind,
     #[serde(default)]
-    target: Target,
+    target: Option<Target>,
     #[serde(default)]
     run: RunConfig,
     dependencies: ManifestDependencies,
+}
+
+impl Manifest {
+    fn target(&self) -> Target {
+        self.target.unwrap_or(match self.kind {
+            Kind::Library => Target::Artifact,
+            Kind::Executable => Target::Js,
+        })
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1786,6 +1809,12 @@ impl GraphCompiler {
                     error
                 });
             }
+            if child_manifest.kind == Kind::Executable {
+                return Err(CompileError::report(
+                    "executable-dependency",
+                    format!("executable bundle `{expected}` cannot be a dependency"),
+                ));
+            }
             let index = self
                 .visit(child, Some((alias.clone(), declared.clone())))
                 .map_err(|error| {
@@ -1797,6 +1826,12 @@ impl GraphCompiler {
                     }
                 })?;
             let child_artifact = &self.projects[index].artifact;
+            if child_artifact.header().kind == Kind::Executable {
+                return Err(CompileError::report(
+                    "executable-dependency",
+                    format!("executable bundle `{expected}` cannot be a dependency"),
+                ));
+            }
             dependency_artifacts.push((alias.clone(), child_artifact.clone()));
             dependency_indices.push(index);
         }
@@ -1806,7 +1841,7 @@ impl GraphCompiler {
             .iter()
             .map(|project| project.artifact.clone())
             .collect();
-        let target = manifest.target;
+        let target = manifest.target();
         let run = manifest.run.clone();
         // A dependency is compiled only when the cache has no artifact for
         // this compiler, these sources and these dependencies. The root is
@@ -2109,7 +2144,17 @@ fn compile_one(
         }
     };
 
-    Ok(accepted.artifact().clone())
+    let artifact = match manifest.kind {
+        Kind::Library => accepted.artifact().clone(),
+        Kind::Executable => ruddy::entry::executable(accepted.artifact(), &checked)
+            .map_err(|error| CompileError::report("invalid-entry-point", error.to_string()))?,
+    };
+    if manifest.target() == Target::Js {
+        ruddy::backend::js::check_entry(&artifact, &checked).map_err(|error| {
+            CompileError::report("unsupported-entry-effects", error.to_string())
+        })?;
+    }
+    Ok(artifact)
 }
 
 fn toml_error_note(source: &str, error: &toml::de::Error) -> String {
