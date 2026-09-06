@@ -6,7 +6,26 @@
 
 use std::{fs, path::Path, process::Command};
 
-use ruddy_cli::run_project;
+use ruddy_cli::build_project;
+
+fn run_assertions(project: &Path, script: &str) -> std::path::PathBuf {
+    let generated = build_project(project)
+        .expect("the library builds")
+        .with_extension("js");
+    let output = Command::new("node")
+        .arg(script)
+        .arg(&generated)
+        .current_dir(project)
+        .output()
+        .expect("Node is available");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    generated
+}
 
 const FILES: &[&str] = &["Ruddy.toml", "main.hc", "Math.hc", "runtime.test.mjs"];
 
@@ -23,7 +42,7 @@ fn generated_javascript_passes_the_node_runtime_suite() {
             .unwrap_or_else(|error| panic!("could not copy runtime fixture {name}: {error}"));
     }
 
-    let generated = run_project(project.path()).expect("the Node runtime suite passes");
+    let generated = run_assertions(project.path(), "runtime.test.mjs");
     assert_eq!(generated, project.path().join("build/runtime-tests.js"));
     assert!(generated.is_file());
 }
@@ -59,14 +78,13 @@ fn run_bundle(fixture: &str, script: &str) {
     fs::write(
         project.path().join("Ruddy.toml"),
         format!(
-            "name = \"{fixture}\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\ntarget = \"js\"\n\n[run]\njs = \"node {script}\"\n\n[dependencies]\nstd = {:?}\n",
+            "name = \"{fixture}\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\ntarget = \"js\"\n\n[run]\njs = \"node {script}\"\n\n[dependencies]\nstd = {:?}\n",
             root.join("std")
         ),
     )
     .unwrap();
 
-    let generated =
-        run_project(project.path()).unwrap_or_else(|error| panic!("{fixture}: {error}"));
+    let generated = run_assertions(project.path(), script);
     assert!(generated.is_file());
 }
 

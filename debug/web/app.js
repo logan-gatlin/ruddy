@@ -31,6 +31,8 @@ const state = {
   name: "demo",
   version: "0.1.0",
   root: ROOT,
+  kind: "library",
+  target: null,
   /// Runtime configuration is not used by snapshots, but is preserved when
   /// debugger documents are loaded and saved.
   run: {},
@@ -278,6 +280,8 @@ async function openDoc(name) {
   state.name = configured?.bundle_name ?? configured?.name ?? name;
   state.version = configured?.version ?? "0.1.0";
   state.root = configured?.root ?? ROOT;
+  state.kind = configured?.kind ?? "library";
+  state.target = configured?.target ?? null;
   state.run = configured?.run ?? {};
   state.std = configured?.std ?? null;
   // Older caches have no stdPrevious. A currently configured custom source is
@@ -338,6 +342,8 @@ function sameDocumentConfiguration(cache, server, documentName) {
     cacheName === serverName &&
     (cache.version ?? "0.1.0") === (server.version ?? "0.1.0") &&
     (cache.root ?? ROOT) === (server.root ?? ROOT) &&
+    (cache.kind ?? "library") === (server.kind ?? "library") &&
+    (cache.target ?? null) === (server.target ?? null) &&
     JSON.stringify(cache.run ?? {}) === JSON.stringify(server.run ?? {}) &&
     JSON.stringify(cache.std ?? null) === JSON.stringify(server.std ?? null) &&
     sameFiles(cache.files ?? [], server.files ?? []) &&
@@ -361,6 +367,8 @@ function cacheLocally() {
           name: state.name,
           version: state.version,
           root: state.root,
+          kind: state.kind,
+          target: state.target,
           run: state.run,
           std: state.std,
           stdPrevious: state.stdPrevious,
@@ -398,6 +406,8 @@ async function saveNow() {
         name: state.name,
         version: state.version,
         root: state.root,
+        kind: state.kind,
+        target: state.target,
         run: state.run,
         ...(state.std === null ? {} : { std: state.std }),
         dependencies: state.dependencies,
@@ -434,6 +444,8 @@ async function compileNow() {
         name: state.name,
         version: state.version,
         root: state.root,
+        kind: state.kind,
+        target: state.target,
         document: state.doc,
         files: state.files,
         ...(state.std === null ? {} : { std: state.std }),
@@ -536,6 +548,8 @@ async function syncSharedSession(shared = null) {
   state.name = request.name;
   state.version = request.version;
   state.root = request.root;
+  state.kind = request.kind ?? "library";
+  state.target = request.target ?? null;
   state.std = request.std ?? null;
   state.dependencies = request.dependencies ?? {};
   state.files = request.files;
@@ -658,6 +672,18 @@ function wireTitlebar() {
     scheduleCompile();
     renderTitlebar();
   });
+  el("kind").addEventListener("change", event => {
+    state.kind = event.target.value;
+    cacheLocally();
+    scheduleSave();
+    scheduleCompile();
+  });
+  el("target").addEventListener("change", event => {
+    state.target = event.target.value || null;
+    cacheLocally();
+    scheduleSave();
+    scheduleCompile();
+  });
   el("std").addEventListener("click", () => {
     const current = state.std === null
       ? "default"
@@ -711,6 +737,8 @@ function renderTitlebar() {
   el("bundle").textContent = `${state.name}@${state.version}`;
   el("bundle").classList.toggle("none", state.snapshot && !state.snapshot.bundle);
   el("root").textContent = state.root;
+  el("kind").value = state.kind;
+  el("target").value = state.target ?? "";
   el("std").textContent = state.std === null
     ? "std: default"
     : state.std === false

@@ -9,6 +9,7 @@ pub mod artifact;
 pub mod ast;
 pub mod constraints;
 pub mod dependencies;
+pub mod entry;
 pub mod errors;
 pub mod externs;
 pub mod ir;
@@ -61,6 +62,9 @@ pub struct Cx<'a> {
     pub lir: Option<&'a ruddy::lir::Output>,
     /// The canonical, span-free per-project disk boundary built from accepted LIR.
     pub artifact: Option<&'a ruddy::artifact::Artifact>,
+    /// Target-neutral entry validation, absent for libraries or skipped phases.
+    pub entry: Option<&'a Result<ruddy::artifact::Artifact, ruddy::entry::Error>>,
+    pub entry_panicked: bool,
     /// The self-contained artifact produced by statically linking the graph.
     pub linked: Option<&'a ruddy::artifact::Artifact>,
     /// JavaScript generated from the linked artifact.
@@ -109,6 +113,7 @@ pub struct Phases {
     pub patterns: u64,
     pub lir: u64,
     pub artifact: u64,
+    pub entry: u64,
     pub link: u64,
     pub js: u64,
 }
@@ -328,6 +333,15 @@ pub const REGISTRY: &[Spec] = &[
         scoped: false,
         annotates: None,
         build: Build::Panel(artifact::build),
+    },
+    Spec {
+        id: "entry",
+        title: "Entry",
+        view: View::Text,
+        highlight: None,
+        scoped: false,
+        annotates: None,
+        build: Build::Panel(entry::build),
     },
     Spec {
         id: "linked",

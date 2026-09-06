@@ -1,4 +1,5 @@
 name = "runtime-tests"
+kind = "library"
 version = "1.0.0"
 root = "main.hc"
 target = "js"
@@ -7,3 +8,4 @@ target = "js"
 js = "node runtime.test.mjs"
 
 [dependencies]
+std = false

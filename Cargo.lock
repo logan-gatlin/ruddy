@@ -2576,6 +2576,7 @@ dependencies = [
  "esparse",
  "indexmap",
  "semver",
+ "serde",
  "twox-hash",
  "unicode-width",
  "varisat",

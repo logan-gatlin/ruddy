@@ -9,7 +9,7 @@ fn immutable_arrays_run_end_to_end_across_trie_and_tail_boundaries() {
     fs::write(
         project.path().join("Ruddy.toml"),
         format!(
-            "name = \"array-test\"\nversion = \"0.1.0\"\nroot = \"main.hc\"\ntarget = \"js\"\n\n[dependencies]\nstd = {:?}\n",
+            "name = \"array-test\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.hc\"\ntarget = \"js\"\n\n[dependencies]\nstd = {:?}\n",
             root.join("std")
         ),
     )
@@ -67,7 +67,7 @@ fn bundled_primitive_utilities_compile_and_run_through_the_javascript_boundary()
     fs::write(
         project.path().join("Ruddy.toml"),
         format!(
-            "name = \"str-test\"\nversion = \"0.1.0\"\nroot = \"main.hc\"\ntarget = \"js\"\n\n[dependencies]\nstd = {:?}\n",
+            "name = \"str-test\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.hc\"\ntarget = \"js\"\n\n[dependencies]\nstd = {:?}\n",
             root.join("std")
         ),
     )
@@ -170,7 +170,7 @@ fn bundled_functional_and_polymorphic_utilities_run_end_to_end() {
     fs::write(
         project.path().join("Ruddy.toml"),
         format!(
-            "name = \"std-test\"\nversion = \"0.1.0\"\nroot = \"main.hc\"\ntarget = \"js\"\n\n[dependencies]\nstd = {:?}\n",
+            "name = \"std-test\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.hc\"\ntarget = \"js\"\n\n[dependencies]\nstd = {:?}\n",
             root.join("std")
         ),
     )

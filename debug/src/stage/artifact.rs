@@ -45,6 +45,7 @@ pub fn render(spec: &Spec, cx: &Cx, artifact: &Artifact, micros: u64) -> Stage {
         })
         .collect();
     let mut interface = vec![
+        Node::new(ids.next(), "kind", artifact.header().kind.to_string()),
         Node::new(
             ids.next(),
             "dependencies",

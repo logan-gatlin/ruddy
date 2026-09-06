@@ -517,6 +517,7 @@ fn deep_alias_chains_and_generic_interfaces_use_bounded_stack() {
             }
             let dependency = ruddy::artifact::UncheckedArtifact {
                 header: ruddy::artifact::Header {
+                    kind: ruddy::artifact::Kind::Library,
                     compiler: ruddy::artifact::Stamp::current(),
                     modules: Vec::new(),
                     identity: ruddy::artifact::Identity {

@@ -14,6 +14,7 @@ mod bundle;
 mod cli;
 mod compile;
 mod docs;
+mod entry;
 mod inference;
 mod ir;
 mod js;

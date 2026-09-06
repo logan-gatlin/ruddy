@@ -28,6 +28,9 @@ const DEFAULT_VERSION: &str = "0.1.0";
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
+    kind: ruddy::artifact::Kind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target: Option<ruddy_cli::Target>,
     name: String,
     version: String,
     root: String,
@@ -169,6 +172,8 @@ pub fn read(root: &Path, name: &str) -> io::Result<Doc> {
     // can show its file strip in without sorting it again.
     files.sort_by_key(|file| (file.path != manifest.root, file.path.clone()));
     Ok(Doc {
+        kind: manifest.kind,
+        target: manifest.target,
         name: name.to_string(),
         bundle_name: manifest.name,
         version: manifest.version,
@@ -202,10 +207,42 @@ pub fn write(
     dependencies: &IndexMap<String, DependencySpec>,
     files: &[FileSpec],
 ) -> io::Result<u128> {
+    write_configured(
+        root,
+        name,
+        bundle_name,
+        version,
+        configured_root,
+        ruddy::artifact::Kind::Library,
+        None,
+        run,
+        std,
+        dependencies,
+        files,
+    )
+}
+
+/// Save a document with its executable/library and output-target contract.
+#[allow(clippy::too_many_arguments)]
+pub fn write_configured(
+    root: &Path,
+    name: &str,
+    bundle_name: &str,
+    version: &str,
+    configured_root: &str,
+    kind: ruddy::artifact::Kind,
+    target: Option<ruddy_cli::Target>,
+    run: &RunConfig,
+    std: &StdConfig,
+    dependencies: &IndexMap<String, DependencySpec>,
+    files: &[FileSpec],
+) -> io::Result<u128> {
     validate_dependencies(dependencies)?;
     let dir = path(root, name).ok_or_else(bad_name)?;
     fs::create_dir_all(&dir)?;
     let manifest = Manifest {
+        kind,
+        target,
         name: bundle_name.to_string(),
         version: version.to_string(),
         root: configured_root.to_string(),
@@ -305,7 +342,7 @@ pub fn ensure(root: &Path, seed: &Path) -> io::Result<()> {
         fs::write(
             demo.join(MANIFEST),
             format!(
-                "name = \"demo\"\nversion = \"{DEFAULT_VERSION}\"\nroot = \"{ROOT}\"\n\n[dependencies]\n"
+                "name = \"demo\"\nversion = \"{DEFAULT_VERSION}\"\nkind = \"library\"\nroot = \"{ROOT}\"\n\n[dependencies]\n"
             ),
         )?;
     }

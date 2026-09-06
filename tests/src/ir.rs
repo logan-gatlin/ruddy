@@ -6771,6 +6771,7 @@ fn prelude_artifact(bundle: &str) -> a::UncheckedArtifact {
     let qualified = |name: &str| format!("{bundle}@1.0.0::prelude::{name}");
     a::UncheckedArtifact {
         header: a::Header {
+            kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
             modules: Vec::new(),
             identity: a::Identity {
@@ -7072,6 +7073,7 @@ fn std_prelude_type_precedes_primitives_but_user_types_precede_the_prelude() {
 fn effect_artifact(bundle: &str, interface: &str) -> a::UncheckedArtifact {
     a::UncheckedArtifact {
         header: a::Header {
+            kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
             modules: Vec::new(),
             identity: a::Identity {
@@ -7588,6 +7590,7 @@ fn structurally_equivalent_dependencies_share_coverage_and_duplicates() {
 fn a_direct_only_interface_with_a_transitive_type_recovers_without_panicking() {
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
             modules: Vec::new(),
             identity: a::Identity {
@@ -7638,6 +7641,7 @@ fn missing_transitive_type_applications_keep_distinct_effect_identities() {
     };
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
             modules: Vec::new(),
             identity: a::Identity {
@@ -7724,6 +7728,7 @@ fn fixed_argument_recursive_types_terminate_during_effect_canonicalization() {
 fn direct_only_transitive_effects_keep_qualified_recovery_identity() {
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
             modules: Vec::new(),
             identity: a::Identity {
@@ -8616,6 +8621,7 @@ fn row_composition_is_flattened_across_local_and_imported_types() {
     };
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
             modules: Vec::new(),
             identity: a::Identity {
@@ -8719,6 +8725,7 @@ fn structural_rows_mask_inner_duplicates_and_preserve_ordinary_separator_labels(
     };
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
             modules: Vec::new(),
             identity: a::Identity {
@@ -8833,6 +8840,7 @@ fn absent_semantic_payloads_do_not_affect_structural_identity() {
         .collect();
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
             modules: Vec::new(),
             identity: a::Identity {
@@ -8989,6 +8997,7 @@ fn local_and_imported_structural_types_share_one_canonical_encoding() {
     };
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
             modules: Vec::new(),
             identity: a::Identity {
@@ -9061,6 +9070,7 @@ fn local_and_imported_structural_types_share_one_canonical_encoding() {
 fn imported_interfaces_keep_applied_types_effects_and_alias_overlap_structural() {
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
             modules: Vec::new(),
             identity: a::Identity {
@@ -9319,6 +9329,7 @@ fn imported_declared_types_exercise_every_semantic_identity_form() {
     ));
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
             modules: Vec::new(),
             identity: a::Identity {
@@ -9408,6 +9419,7 @@ fn malformed_dependency_declarations_are_ignored_without_shadow_symbols() {
 fn imported_alias_cycles_recover_without_a_spurious_structural_identity() {
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
             modules: Vec::new(),
             identity: a::Identity {
@@ -9678,6 +9690,7 @@ fn dependency_interfaces_import_every_semantic_form() {
 
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
             modules: Vec::new(),
             identity: a::Identity {
@@ -11925,6 +11938,8 @@ fn deeply_nested_imported_semantics_are_preserved_on_a_small_stack() {
             let dependency_declarations = IndexMap::new();
             let symbols = std::collections::HashMap::new();
             let cx = ruddy_debug::stage::Cx {
+                entry: None,
+                entry_panicked: false,
                 files: &[],
                 sources: &[],
                 diagnostics: &[],

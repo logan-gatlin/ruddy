@@ -40,11 +40,112 @@ fn compiled(snippet: &str) -> String {
     snippet.to_string()
 }
 
+#[test]
+fn executable_contract_is_checked_and_artifact_targets_defer_node_support() {
+    let request = |source: &str, target: &str| -> CompileRequest {
+        serde_json::from_value(serde_json::json!({
+            "name": "app", "version": "1.0.0", "kind": "executable", "target": target,
+            "root": ROOT, "std": false, "files": [{"path": ROOT, "source": source}],
+        }))
+        .unwrap()
+    };
+    let missing = compile(&request("let value = ()", "js"), 0);
+    assert!(
+        missing
+            .diagnostics
+            .iter()
+            .any(|error| error.code == "invalid-entry-point")
+    );
+    assert!(missing.panic.is_none());
+    assert_eq!(
+        missing
+            .stages
+            .iter()
+            .find(|s| s.id == "entry")
+            .unwrap()
+            .status,
+        Status::Error
+    );
+    assert_ne!(
+        missing
+            .stages
+            .iter()
+            .find(|s| s.id == "artifact")
+            .unwrap()
+            .status,
+        Status::Skipped
+    );
+    let source = "effect Custom = () -> ()\nlet main = fn _ => !Custom ()";
+    let artifact = compile(&request(source, "artifact"), 0);
+    assert_eq!(
+        artifact
+            .stages
+            .iter()
+            .find(|s| s.id == "entry")
+            .unwrap()
+            .status,
+        Status::Ok
+    );
+    assert!(
+        artifact.diagnostics.is_empty(),
+        "{:?}",
+        artifact.diagnostics
+    );
+    let js = compile(&request(source, "js"), 0);
+    assert!(
+        js.diagnostics
+            .iter()
+            .any(|error| error.code == "unsupported-entry-effects"),
+        "{:?}",
+        js.diagnostics
+    );
+}
+
+#[test]
+fn library_artifact_targets_including_the_default_skip_backend_validation() {
+    for target in [None, Some("artifact"), Some("js")] {
+        let request: CompileRequest = serde_json::from_value(serde_json::json!({
+            "name": "lib", "version": "1.0.0", "kind": "library", "target": target,
+            "root": ROOT, "std": false,
+            "files": [{"path": ROOT, "source": "extern invalid : Nat = \"?\""}],
+        }))
+        .unwrap();
+        let snapshot = compile(&request, 0);
+        assert_eq!(
+            snapshot
+                .stages
+                .iter()
+                .find(|s| s.id == "entry")
+                .unwrap()
+                .status,
+            Status::Skipped
+        );
+        let js = snapshot.stages.iter().find(|s| s.id == "js").unwrap();
+        if target == Some("js") {
+            assert!(
+                snapshot
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.code == "javascript-generation")
+            );
+        } else {
+            assert!(
+                snapshot.diagnostics.is_empty(),
+                "{:?}",
+                snapshot.diagnostics
+            );
+            assert_eq!(js.status, Status::Skipped);
+        }
+    }
+}
+
 /// A whole bundle, each file exactly as written — the request the page posts,
 /// with nothing added to it.
 fn bundle(files: &[(&str, &str)]) -> Snapshot {
     compile(
         &CompileRequest {
+            kind: ruddy::artifact::Kind::Library,
+            target: Some(ruddy_cli::Target::Js),
             name: "demo".to_string(),
             version: "0.1.0".to_string(),
             root: ROOT.to_string(),
@@ -143,6 +244,8 @@ fn dependency_paths_without_a_scratch_root_are_recoverable() {
     dependencies.insert("base".to_string(), "../base".into());
     let snapshot = compile(
         &CompileRequest {
+            kind: ruddy::artifact::Kind::Library,
+            target: None,
             name: "debugger".to_string(),
             version: "1.2.3".to_string(),
             root: ROOT.to_string(),
@@ -194,10 +297,12 @@ fn custom_standard_library_is_source_visible_rendered_and_sandboxed() {
     fs::write(standard.join("main.hc"), "let answer = 42n\n").unwrap();
     fs::write(
         standard.join("Ruddy.toml"),
-        "name = \"std\"\nversion = \"2.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
+        "name = \"std\"\nversion = \"2.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
     let request = CompileRequest {
+        kind: ruddy::artifact::Kind::Library,
+        target: None,
         name: "app".into(),
         version: "1.0.0".into(),
         root: ROOT.into(),
@@ -252,10 +357,12 @@ fn a_remembered_dependency_graph_follows_edits_to_its_sources() {
     fs::write(standard.join("main.hc"), "let answer = 42n\n").unwrap();
     fs::write(
         standard.join("Ruddy.toml"),
-        "name = \"std\"\nversion = \"2.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
+        "name = \"std\"\nversion = \"2.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
     let request = CompileRequest {
+        kind: ruddy::artifact::Kind::Library,
+        target: None,
         name: "app".into(),
         version: "1.0.0".into(),
         root: ROOT.into(),
@@ -328,10 +435,12 @@ fn installed_standard_library_child() {
     fs::write(standard.join("main.hc"), "let installed = 1n\n").unwrap();
     fs::write(
         standard.join("Ruddy.toml"),
-        "name = \"std\"\nversion = \"0.1.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
+        "name = \"std\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
     let request = CompileRequest {
+        kind: ruddy::artifact::Kind::Library,
+        target: None,
         name: "app".into(),
         version: "1.0.0".into(),
         root: ROOT.into(),
@@ -381,12 +490,14 @@ fn saved_dependency_projects_supply_artifact_identity_and_gate_lir() {
     fs::write(base.join("main.hc"), "let base = 0n\n").unwrap();
     fs::write(
         base.join("Ruddy.toml"),
-        "name = \"base\"\nversion = \"2.3.4\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
+        "name = \"base\"\nversion = \"2.3.4\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
     let mut dependencies = IndexMap::new();
     dependencies.insert("base".to_string(), "../base".into());
     let request = CompileRequest {
+        kind: ruddy::artifact::Kind::Library,
+        target: None,
         name: "app".to_string(),
         version: "1.0.0".to_string(),
         root: ROOT.to_string(),
@@ -510,7 +621,7 @@ fn dependencies_tab_correlates_same_bundle_versions_by_request_alias() {
         fs::write(
             path.join("Ruddy.toml"),
             format!(
-                "name = \"lib\"\nversion = \"{version}\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n"
+                "name = \"lib\"\nversion = \"{version}\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n"
             ),
         )
         .unwrap();
@@ -531,6 +642,8 @@ fn dependencies_tab_correlates_same_bundle_versions_by_request_alias() {
         ("new".into(), detailed("../new-lib")),
     ]);
     let request = CompileRequest {
+        kind: ruddy::artifact::Kind::Library,
+        target: None,
         name: "app".into(),
         version: "1.0.0".into(),
         root: ROOT.into(),
@@ -581,13 +694,13 @@ fn transitive_detailed_dependency_manifests_are_validated_and_compiled() {
     }
     fs::write(
         scratch.path().join("shared/Ruddy.toml"),
-        "name = \"shared-package\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
+        "name = \"shared-package\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
     fs::write(scratch.path().join("shared/main.hc"), "let value = 1n\n").unwrap();
     fs::write(
         scratch.path().join("base/Ruddy.toml"),
-        "name = \"base\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n[dependencies.shared]\nbundle = \"shared-package\"\npath = \"../shared\"\n",
+        "name = \"base\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n[dependencies.shared]\nbundle = \"shared-package\"\npath = \"../shared\"\n",
     )
     .unwrap();
     fs::write(
@@ -628,7 +741,7 @@ fn failed_graph_validation_is_reported_for_the_dependency_build() {
     fs::create_dir_all(scratch.path().join("base")).unwrap();
     fs::write(
         scratch.path().join("base/Ruddy.toml"),
-        "name = \"base\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nmissing = \"../../outside\"\n",
+        "name = \"base\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nmissing = \"../../outside\"\n",
     )
     .unwrap();
     fs::write(scratch.path().join("base/main.hc"), "let base = 0n\n").unwrap();
@@ -667,7 +780,7 @@ fn dependency_roots_cannot_be_absolute_or_escape_the_scratch_folder() {
     ] {
         fs::write(
             scratch.join("base/Ruddy.toml"),
-            format!("name = \"base\"\nversion = \"1.0.0\"\nroot = {root:?}\n[dependencies]\nstd = false\n"),
+            format!("name = \"base\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = {root:?}\n[dependencies]\nstd = false\n"),
         )
         .unwrap();
         let snapshot = compile_at(
@@ -697,8 +810,7 @@ fn symlinked_dependency_manifests_are_confined_to_the_scratch_folder() {
     fs::create_dir_all(scratch.join("app")).unwrap();
     fs::create_dir_all(&base).unwrap();
     fs::write(base.join("main.hc"), "let base = 0n\n").unwrap();
-    let manifest =
-        "name = \"base\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n";
+    let manifest = "name = \"base\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n";
     let outside = outer.path().join("outside.toml");
     fs::write(&outside, manifest).unwrap();
     std::os::unix::fs::symlink(&outside, base.join("Ruddy.toml")).unwrap();
@@ -746,7 +858,7 @@ fn symlinked_dependency_modules_cannot_escape_the_scratch_folder() {
     fs::create_dir_all(scratch.join("base")).unwrap();
     fs::write(
         scratch.join("base/Ruddy.toml"),
-        "name = \"base\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
+        "name = \"base\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
     fs::write(scratch.join("base/main.hc"), "module Escape\n").unwrap();
@@ -781,7 +893,7 @@ fn types_stage_walks_deep_imported_aliases_on_a_small_stack() {
             fs::create_dir_all(scratch.path().join("dep")).unwrap();
             fs::write(
                 scratch.path().join("dep/Ruddy.toml"),
-                "name = \"dep\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
+                "name = \"dep\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
             )
             .unwrap();
             let mut source = String::new();
@@ -827,6 +939,8 @@ fn dependency_request(dependencies: IndexMap<String, String>) -> CompileRequest 
         .map(|(name, path)| (name, path.into()))
         .collect();
     CompileRequest {
+        kind: ruddy::artifact::Kind::Library,
+        target: None,
         name: "app".to_string(),
         version: "1.0.0".to_string(),
         root: ROOT.to_string(),
@@ -861,6 +975,7 @@ fn every_stage_reports_on_the_demo() {
             "patterns",
             "lir",
             "artifact",
+            "entry",
             "linked",
             "js",
             "symbols",
@@ -890,6 +1005,7 @@ fn every_stage_reports_on_the_demo() {
                 | "patterns"
                 | "lir"
                 | "artifact"
+                | "entry"
                 | "linked"
                 | "js"
                 | "symbols"
@@ -930,6 +1046,7 @@ fn every_stage_reports_on_the_demo() {
             "Patterns",
             "LIR",
             "Artifact",
+            "Entry",
             "Linked Artifact",
             "JS",
             "Symbols"
@@ -1416,6 +1533,7 @@ fn frontend_errors_keep_reader_advice_and_skip_semantic_debugger_stages() {
         "patterns",
         "lir",
         "artifact",
+        "entry",
         "linked",
         "js",
         "symbols",
@@ -2198,6 +2316,8 @@ fn a_bad_bundle_is_reported_rather_than_fatal() {
     ] {
         let snapshot = compile(
             &CompileRequest {
+                kind: ruddy::artifact::Kind::Library,
+                target: None,
                 name: name.to_string(),
                 version: version.to_string(),
                 root: ROOT.to_string(),
@@ -2233,6 +2353,8 @@ fn a_bad_bundle_is_reported_rather_than_fatal() {
 fn a_nested_debugger_root_resolves_module_files_beside_its_root() {
     let snapshot = compile(
         &CompileRequest {
+            kind: ruddy::artifact::Kind::Library,
+            target: None,
             name: "demo".into(),
             version: "0.1.0".into(),
             root: "src/main.hc".into(),
@@ -2559,6 +2681,7 @@ fn only_the_stages_that_own_a_phase_report_a_time() {
             "solve",
             "lir",
             "artifact",
+            "entry",
             "linked",
             "js",
             "types-ir"
@@ -3260,6 +3383,10 @@ fn every_stage_reports_on_explicit_absence() {
         snapshot.diagnostics
     );
     for stage in &snapshot.stages {
+        if stage.id == "entry" {
+            assert_eq!(stage.status, Status::Skipped);
+            continue;
+        }
         // The Patterns tab has one section per match, and this program
         // matches nothing — an honest emptiness rather than a failure.
         if stage.id == "patterns" {
@@ -3541,6 +3668,10 @@ fn every_stage_reports_on_a_source_using_effects() {
     let snapshot = snapshot(source);
     assert!(snapshot.panic.is_none());
     for stage in &snapshot.stages {
+        if stage.id == "entry" {
+            assert_eq!(stage.status, Status::Skipped);
+            continue;
+        }
         assert!(
             !stage.nodes.is_empty() || stage.text.as_ref().is_some_and(|text| !text.is_empty()),
             "{} produced nothing",
