@@ -126,16 +126,22 @@ fn declarations(cx: &Cx) -> HashMap<Symbol, FileID> {
     let Some(program) = cx.program else {
         return HashMap::new();
     };
-    let terms = program.terms.iter().map(|(s, d)| (*s, d.name_span.file_id));
+    let terms = program
+        .terms
+        .iter()
+        .map(|(s, d)| (*s, cx.source.span(d.name_at).file_id));
     let externs = program
         .externs
         .iter()
-        .map(|(s, d)| (*s, d.name_span.file_id));
-    let types = program.types.iter().map(|(s, d)| (*s, d.name_span.file_id));
+        .map(|(s, d)| (*s, cx.source.span(d.name_at).file_id));
+    let types = program
+        .types
+        .iter()
+        .map(|(s, d)| (*s, cx.source.span(d.name_at).file_id));
     let effects = program
         .effects
         .iter()
-        .map(|(s, d)| (*s, d.name_span.file_id));
+        .map(|(s, d)| (*s, cx.source.span(d.name_at).file_id));
     terms.chain(externs).chain(types).chain(effects).collect()
 }
 

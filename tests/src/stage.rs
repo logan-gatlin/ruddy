@@ -987,6 +987,7 @@ fn artifact_stage_renders_one_dependency() {
         files: &[],
         sources: &[],
         diagnostics: &[],
+        source: &ruddy::tracking::SourceMap::default(),
         bundle: None,
         program: None,
         inference: None,

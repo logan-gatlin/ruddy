@@ -79,7 +79,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     let error_messages: HashMap<_, _> = output
         .errors()
         .iter()
-        .map(|error| (error.id, error.diagnostic().title))
+        .map(|error| (error.id, error.diagnostic(cx.source).title))
         .collect();
     let mut ids = Ids::default();
     let mut nodes: Vec<Node> = output
@@ -88,7 +88,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         .map(|step| {
             let effect = step.effect.to_string();
             let mut node = Node::new(ids.next(), step.rule.code(), step.goal.to_string())
-                .at(step.span)
+                .at(cx.source.span(step.at))
                 // What the rule does, in the compiler's own words rather than
                 // the page's: one wording, wherever it is read.
                 .field("_rule", step.rule.to_string())

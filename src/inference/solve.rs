@@ -10,7 +10,7 @@ use indexmap::{IndexMap, IndexSet};
 
 use crate::{
     symbol::Symbol,
-    tracking::Span,
+    tracking::Anchor,
     types::{Assigned, Formula, Presence, Rest, Row, RowField, Scheme, Sense, Shape, Ty, TyVar},
 };
 
@@ -356,7 +356,7 @@ impl Solve<'_> {
             self.table.begin_solver_act();
             let previous = self.constraint.replace(constraint.id);
             let previous_reason = self.constraint_reason.replace(constraint.reason);
-            let span = constraint.span;
+            let span = constraint.at;
             let source = matches!(
                 constraint.origin,
                 super::ConstraintOrigin::ApplicationArgument
@@ -385,7 +385,7 @@ impl Solve<'_> {
                         reason: constraint.reason,
                         origin: constraint.origin,
                         subject: source.0,
-                        span: source.1,
+                        at: source.1,
                     });
             match &constraint.kind {
                 ConstraintKind::Project {
@@ -510,7 +510,7 @@ impl Solve<'_> {
                             callback_type: boundary.callback_type.clone(),
                             extern_name: boundary.extern_name.clone(),
                             issues: vec![super::ExternCallbackIssue {
-                                callback_span: boundary.callback_span,
+                                callback_at: boundary.callback_at,
                                 callback_path: boundary.callback_path.clone(),
                                 callback_type: boundary.callback_type.clone(),
                                 missing_effects: missing_effects.clone(),
@@ -525,19 +525,19 @@ impl Solve<'_> {
                             error.id,
                             vec![
                                 (
-                                    boundary.callback_span,
+                                    boundary.callback_at,
                                     super::ConstraintOrigin::CallbackBoundary,
                                     super::Subject::CallbackRequired,
                                     super::ExplanationFactPayload::CallbackRequirement,
                                 ),
                                 (
-                                    boundary.capability_span,
+                                    boundary.capability_at,
                                     super::ConstraintOrigin::CallbackBoundary,
                                     super::Subject::CallbackAvailable,
                                     super::ExplanationFactPayload::ExternCapability,
                                 ),
                                 (
-                                    boundary.extern_span,
+                                    boundary.extern_at,
                                     super::ConstraintOrigin::Binding,
                                     super::Subject::Binding,
                                     super::ExplanationFactPayload::ExternDeclaration,
@@ -586,8 +586,8 @@ impl Solve<'_> {
     /// Solve a field projection after exposing only the base's outer constructor.
     fn project(
         &mut self,
-        field_span: Span,
-        base_span: Span,
+        field_span: Anchor,
+        base_span: Anchor,
         base: &Rc<Ty>,
         field: &str,
         result: &Rc<Ty>,
@@ -635,7 +635,7 @@ impl Solve<'_> {
                 }));
                 let origin = self.table.active_lacks_origin.clone().map(|mut origin| {
                     origin.subject = super::Subject::PatternDemand;
-                    origin.span = field_span;
+                    origin.at = field_span;
                     origin
                 });
                 self.table
@@ -656,8 +656,8 @@ impl Solve<'_> {
     /// ones so nothing can put one of them back.
     fn spread(
         &mut self,
-        span: Span,
-        operand_span: Span,
+        span: Anchor,
+        operand_span: Anchor,
         operand: &Rc<Ty>,
         demand: &Rc<Ty>,
         result: &Rc<Ty>,
@@ -678,7 +678,7 @@ impl Solve<'_> {
             _ => {
                 let origin = self.table.active_lacks_origin.clone().map(|mut origin| {
                     origin.subject = super::Subject::StructSpread;
-                    origin.span = span;
+                    origin.at = span;
                     origin
                 });
                 self.table
@@ -693,7 +693,7 @@ impl Solve<'_> {
     /// would have come of it.
     fn not_a_struct(
         &mut self,
-        span: Span,
+        span: Anchor,
         exposed: Rc<Ty>,
         demand: super::StructDemand,
         result: &Rc<Ty>,
@@ -724,7 +724,7 @@ impl Solve<'_> {
     /// regenerates a constraint or asks unification to run again.
     fn matched(
         &mut self,
-        span: Span,
+        span: Anchor,
         scrutinee: &Rc<Ty>,
         result: &Rc<Ty>,
         arms: &[GuardedArm],
@@ -778,8 +778,8 @@ impl Solve<'_> {
             let report = self.refinements.len();
             self.refinements.push(Refinement {
                 definition: self.definition,
-                match_span: span,
-                arm_span: arm.span,
+                match_at: span,
+                arm_at: arm.at,
                 raw: self.table.resolved(&arm.raw),
                 effective: effective.clone(),
                 reachable,
@@ -836,7 +836,7 @@ impl Solve<'_> {
             self.active_refinement = Some(report);
             let previous = self.constraint.replace(arm.result.id);
             let previous_reason = self.constraint_reason.replace(arm.result.reason);
-            self.unify(arm.result.span, &family, &body_ty);
+            self.unify(arm.result.at, &family, &body_ty);
             self.constraint = previous;
             self.constraint_reason = previous_reason;
         }
@@ -1378,7 +1378,7 @@ impl Solve<'_> {
     /// same variable as one on the scrutinee, publish that sharing directly in
     /// the type. This is a fixed match-end boundary, not feedback: it only
     /// folds an already entailed alias and never creates another constraint.
-    fn alias_result_presences(&mut self, span: Span, result: &Rc<Ty>, scrutinee: &Rc<Ty>) {
+    fn alias_result_presences(&mut self, span: Anchor, result: &Rc<Ty>, scrutinee: &Rc<Ty>) {
         if !self.table.store_satisfiable() {
             return;
         }
@@ -1422,7 +1422,7 @@ impl Solve<'_> {
             origin: Box::new(batch.origin),
         });
         self.record_obligation(
-            batch.span,
+            batch.at,
             premise.clone(),
             obligation.clone(),
             formula.clone(),
@@ -1437,7 +1437,7 @@ impl Solve<'_> {
         Batch {
             id: batch.id,
             definition: batch.definition,
-            span: batch.span,
+            at: batch.at,
             origin,
             reason,
             formula,
@@ -1447,7 +1447,7 @@ impl Solve<'_> {
 
     fn record_obligation(
         &mut self,
-        span: Span,
+        span: Anchor,
         premise: Formula,
         obligation: Formula,
         formula: Formula,
@@ -1456,7 +1456,7 @@ impl Solve<'_> {
             .active_refinement
             .expect("a guarded obligation belongs to the active arm");
         self.refinements[at].obligations.push(GuardedObligation {
-            span,
+            at: span,
             premise,
             obligation,
             formula,
@@ -1477,7 +1477,7 @@ impl Solve<'_> {
     /// complaint: a row that cannot take a label is an extra field, and an
     /// effect nothing will handle is something the reader fixes by widening a
     /// signature or writing a handler. Both readings are R11's.
-    fn performs(&mut self, span: Span, performed: &Row, ambient: &Row, inside: bool) {
+    fn performs(&mut self, span: Anchor, performed: &Row, ambient: &Row, inside: bool) {
         let want = self.table.canon(performed);
         let have = self.table.canon(ambient);
         let goal = Goal::Row {
@@ -1577,7 +1577,7 @@ impl Solve<'_> {
     /// own, and a failure there is reported as the effect-argument clash it
     /// is — with the failure the arguments met with kept as its cause — rather
     /// than as a mismatch between two tuples nobody wrote.
-    fn effect_arguments(&mut self, span: Span, label: &str, want: &Rc<Ty>, have: &Rc<Ty>) {
+    fn effect_arguments(&mut self, span: Anchor, label: &str, want: &Rc<Ty>, have: &Rc<Ty>) {
         let effect = crate::types::EffectId::parse_row_key(label)
             .map_or(label, |(name, _)| name)
             .to_string();
@@ -1631,7 +1631,7 @@ impl Solve<'_> {
     /// The scheme is released when the body ends, the way lowering released the
     /// name. Nothing could reach it afterwards — a symbol is unique — but a
     /// scope that is not closed is a scope that is not a scope.
-    fn bind_local(&mut self, symbol: Symbol, binding_span: Span, scoping: &Scoping<'_>) {
+    fn bind_local(&mut self, symbol: Symbol, binding_span: Anchor, scoping: &Scoping<'_>) {
         let &Scoping {
             bound,
             level,
@@ -1710,7 +1710,7 @@ impl Solve<'_> {
     /// diagnostic: generation emits this only for a name it bound itself, and
     /// the constraint sits inside the body of the `let` that bound it, so a
     /// symbol with no scheme in scope cannot arise.
-    fn instance(&mut self, span: Span, symbol: Symbol, ty: &Rc<Ty>, requirement: usize) {
+    fn instance(&mut self, span: Anchor, symbol: Symbol, ty: &Rc<Ty>, requirement: usize) {
         let scheme = self.schemes[&symbol].clone();
         // At the level of the use site, which is where the table is: a copy is
         // as new as the place it was made, whatever the scheme was generalized
@@ -1727,9 +1727,9 @@ impl Solve<'_> {
                 // Application generation may have aimed the reserved slot at
                 // the argument; retain that source attribution.
                 let reserved_id = self.table.store.batches[requirement].id;
-                let reserved_span = self.table.store.batches[requirement].span;
+                let reserved_span = self.table.store.batches[requirement].at;
                 batch.id = reserved_id;
-                batch.span = reserved_span;
+                batch.at = reserved_span;
                 batch.reason = self.table.reason(
                     ReasonOrigin::Batch(reserved_id),
                     self.constraint_reason.into_iter().collect(),
@@ -1767,7 +1767,7 @@ impl Solve<'_> {
     ///    [`Solve::unwrapped`].
     /// 4. Everything else is [`Solve::fielded`]: the labels and the constructor, in the
     ///    order it gives.
-    fn unify(&mut self, span: Span, expected: &Rc<Ty>, actual: &Rc<Ty>) {
+    fn unify(&mut self, span: Anchor, expected: &Rc<Ty>, actual: &Rc<Ty>) {
         let lhs = self.table.resolve(expected);
         let rhs = self.table.resolve(actual);
         self.unify_direct(span, lhs, rhs);
@@ -1781,7 +1781,7 @@ impl Solve<'_> {
     /// frame per enclosing constructor. A row that needs the full label rule,
     /// or a name that needs unfolding, falls back only at that node; recursive
     /// payload goals immediately enter this trampoline again.
-    fn unify_direct(&mut self, span: Span, lhs: Rc<Ty>, rhs: Rc<Ty>) {
+    fn unify_direct(&mut self, span: Anchor, lhs: Rc<Ty>, rhs: Rc<Ty>) {
         let original_depth = self.depth;
         let mut congruences = 0usize;
         // Every recursive type goal stays in this invocation's work list, so
@@ -2281,7 +2281,7 @@ impl Solve<'_> {
     /// Either way the two halves are one goal, so a failure in one abandons the
     /// other: a row tail bound inconsistently with its labels
     /// beside it is a type nothing can be. See [`Solve::abandon`].
-    fn types(&mut self, span: Span, goal: Goal, lhs: &Rc<Ty>, rhs: &Rc<Ty>) -> bool {
+    fn types(&mut self, span: Anchor, goal: Goal, lhs: &Rc<Ty>, rhs: &Rc<Ty>) -> bool {
         match (&**lhs, &**rhs) {
             (Ty::Var(var), _) => {
                 let var = *var;
@@ -2341,7 +2341,7 @@ impl Solve<'_> {
     #[allow(clippy::too_many_arguments)]
     fn rigid_broken(
         &mut self,
-        span: Span,
+        span: Anchor,
         goal: Goal,
         name: Rc<str>,
         id: u32,
@@ -2362,7 +2362,7 @@ impl Solve<'_> {
         false
     }
 
-    fn mismatch(&mut self, span: Span, goal: Goal, lhs: &Rc<Ty>, rhs: &Rc<Ty>) -> bool {
+    fn mismatch(&mut self, span: Anchor, goal: Goal, lhs: &Rc<Ty>, rhs: &Rc<Ty>) -> bool {
         let error = Error::new(
             span,
             ErrorKind::Mismatch {
@@ -2388,7 +2388,7 @@ impl Solve<'_> {
     /// flattened copy this function is holding — a field's type can mention
     /// its own tail — and an act performed on a stale tail is an act performed
     /// on the wrong type.
-    fn labels(&mut self, span: Span, lhs: SolveRow, rhs: SolveRow) -> Vec<SolveLabel> {
+    fn labels(&mut self, span: Anchor, lhs: SolveRow, rhs: SolveRow) -> Vec<SolveLabel> {
         let expected = lhs.view();
         let actual = rhs.view();
         let goal = Goal::Type {
@@ -2511,7 +2511,7 @@ impl Solve<'_> {
     /// reason it is one line: everything above this is the same question about
     /// two sets of labels, and everything below it is a question the two shapes
     /// answer with different machinery.
-    fn tails(&mut self, span: Span, lhs: &Tail, rhs: &Tail) {
+    fn tails(&mut self, span: Anchor, lhs: &Tail, rhs: &Tail) {
         self.rests(span, lhs.rest(), rhs.rest(), lhs.shape());
     }
 
@@ -2530,7 +2530,7 @@ impl Solve<'_> {
     /// included. There are none to take where the callers reach this, but
     /// binding the flattened row rather than its bare end is what makes that a
     /// fact about the callers instead of something this has to be told.
-    fn rests(&mut self, span: Span, lhs: &Rest, rhs: &Rest, shape: Shape) {
+    fn rests(&mut self, span: Anchor, lhs: &Rest, rhs: &Rest, shape: Shape) {
         let want = Rc::new(self.table.canon(&Row::of(lhs.clone())));
         let have = Rc::new(self.table.canon(&Row::of(rhs.clone())));
         let goal = Goal::Row {
@@ -2632,7 +2632,7 @@ impl Solve<'_> {
     /// matched on, so there is one reading of it and nothing here to drift.
     fn field(
         &mut self,
-        span: Span,
+        span: Anchor,
         name: &str,
         expected: Rowed<'_>,
         actual: Rowed<'_>,
@@ -2718,7 +2718,7 @@ impl Solve<'_> {
     /// pair that is already the same thing — said as `Same` rather than as
     /// [`Rule::Presence`] because that rule is worded about the label whose
     /// presence it is deciding, and here there is no row in sight to have one.
-    fn presences(&mut self, span: Span, lhs: &Presence, rhs: &Presence) {
+    fn presences(&mut self, span: Anchor, lhs: &Presence, rhs: &Presence) {
         if self.guard.is_some() {
             self.guarded_presence(span, lhs, rhs);
             return;
@@ -2793,7 +2793,7 @@ impl Solve<'_> {
 
     /// Record presence equality under the active arm premise without binding
     /// either presence globally.
-    fn guarded_presence(&mut self, span: Span, lhs: &Presence, rhs: &Presence) {
+    fn guarded_presence(&mut self, span: Anchor, lhs: &Presence, rhs: &Presence) {
         let premise = self
             .guard
             .clone()
@@ -2895,7 +2895,7 @@ impl Solve<'_> {
     /// where the annotation sits does.
     fn absorb(
         &mut self,
-        span: Span,
+        span: Anchor,
         side: Side,
         extras: IndexMap<String, RowField>,
         rest: &Tail,
@@ -3044,7 +3044,7 @@ impl Solve<'_> {
     /// it accepts. And a label still being decided has just met the thing that
     /// decides it: absent is the one answer both sides allow, and it is the
     /// answer [`Solve::absorb`] gives the same label against a closed row.
-    fn assign(&mut self, span: Span, goal: Goal, var: TyVar, value: Assigned) {
+    fn assign(&mut self, span: Anchor, goal: Goal, var: TyVar, value: Assigned) {
         if let Some(route) = self.table.occurs(var, &value) {
             let error = Error::new(span, ErrorKind::Recursive);
             let abandoned = [value.variable(var), value];
@@ -3128,7 +3128,7 @@ impl Solve<'_> {
         self.bound_step(span, Rule::Bind, goal, var, value, None);
     }
 
-    fn guarded_type(&mut self, span: Span, ty: &Rc<Ty>) -> Rc<Ty> {
+    fn guarded_type(&mut self, span: Anchor, ty: &Rc<Ty>) -> Rc<Ty> {
         enum Work {
             Type(Rc<Ty>),
             Row(Row),
@@ -3288,7 +3288,7 @@ impl Solve<'_> {
         types.pop().expect("guarded type result")
     }
 
-    fn guarded_row(&mut self, span: Span, row: &Row) -> Row {
+    fn guarded_row(&mut self, span: Anchor, row: &Row) -> Row {
         let guarded = self.guarded_type(span, &Rc::new(Ty::Struct(row.clone())));
         guarded.fields().cloned().unwrap_or_default()
     }
@@ -3306,13 +3306,13 @@ impl Solve<'_> {
     ///
     /// The error carries its own span rather than taking `span`, because the
     /// two need not be the same.
-    fn fail(&mut self, span: Span, rule: Rule, goal: Goal, error: Error, abandoned: &[Assigned]) {
+    fn fail(&mut self, span: Anchor, rule: Rule, goal: Goal, error: Error, abandoned: &[Assigned]) {
         self.fail_with_route(span, rule, goal, error, abandoned, None);
     }
 
     fn fail_recursive(
         &mut self,
-        span: Span,
+        span: Anchor,
         goal: Goal,
         error: Error,
         abandoned: &[Assigned],
@@ -3323,7 +3323,7 @@ impl Solve<'_> {
 
     fn fail_with_route(
         &mut self,
-        span: Span,
+        span: Anchor,
         rule: Rule,
         goal: Goal,
         mut error: Error,
@@ -3349,7 +3349,7 @@ impl Solve<'_> {
             reason,
             error: Some(error_id),
             definition: self.definition,
-            span,
+            at: span,
             depth: self.depth,
             rule,
             goal,
@@ -3371,7 +3371,7 @@ impl Solve<'_> {
     /// arms that meet something already undecided — an undecided presence or an
     /// undecided tail absorbs whatever it was put against, and everything that
     /// would have decided it is abandoned with it.
-    fn recover(&mut self, span: Span, value: &Assigned, because: ReasonId) {
+    fn recover(&mut self, span: Anchor, value: &Assigned, because: ReasonId) {
         match value {
             Assigned::Ty(ty) => self.recover_ty(span, ty, because),
             Assigned::Row(row) => self.recover_parts(span, None, Some(row.clone()), because),
@@ -3382,13 +3382,13 @@ impl Solve<'_> {
     /// [`recover`](Self::recover) over a type: its constructor, and then the fields it
     /// carries. A composite is abandoned by abandoning what it is made of —
     /// the goal that would have decided `?1 -> ?2` decided neither half.
-    fn recover_ty(&mut self, span: Span, ty: &Rc<Ty>, because: ReasonId) {
+    fn recover_ty(&mut self, span: Anchor, ty: &Rc<Ty>, because: ReasonId) {
         self.recover_parts(span, Some(ty.clone()), None, because);
     }
 
     /// [`recover`](Self::recover) over a sum's cases: every label, and then the
     /// tail saying what else the row might have had.
-    fn recover_row(&mut self, span: Span, row: &Row, because: ReasonId) {
+    fn recover_row(&mut self, span: Anchor, row: &Row, because: ReasonId) {
         self.recover_parts(span, None, Some(Rc::new(row.clone())), because);
     }
 
@@ -3402,7 +3402,7 @@ impl Solve<'_> {
     /// exponential even though the artifact itself is small.
     fn recover_parts(
         &mut self,
-        span: Span,
+        span: Anchor,
         ty: Option<Rc<Ty>>,
         row: Option<Rc<Row>>,
         because: ReasonId,
@@ -3569,7 +3569,7 @@ impl Solve<'_> {
     }
 
     /// [`recover`](Self::recover) over a presence.
-    fn recover_presence(&mut self, span: Span, presence: &Presence, because: ReasonId) {
+    fn recover_presence(&mut self, span: Anchor, presence: &Presence, because: ReasonId) {
         let mut presence = presence.clone();
         let mut visited = HashSet::new();
         while let Presence::Var(var) = presence {
@@ -3596,7 +3596,7 @@ impl Solve<'_> {
     /// Bind one abandoned variable, and say so: a reader following the state
     /// would otherwise see a variable acquire a value that no rule they were
     /// shown gave it.
-    fn settle(&mut self, span: Span, var: TyVar, value: Assigned, because: ReasonId) {
+    fn settle(&mut self, span: Anchor, var: TyVar, value: Assigned, because: ReasonId) {
         let goal = match &value {
             Assigned::Ty(ty) => Goal::Type {
                 expected: Rc::new(Ty::plain(Ty::Var(var))),
@@ -3616,7 +3616,7 @@ impl Solve<'_> {
 
     fn bound_step(
         &mut self,
-        span: Span,
+        span: Anchor,
         rule: Rule,
         goal: Goal,
         var: TyVar,
@@ -3644,7 +3644,7 @@ impl Solve<'_> {
             reason,
             error: None,
             definition: self.definition,
-            span,
+            at: span,
             depth: self.depth,
             rule,
             goal,
@@ -3658,7 +3658,7 @@ impl Solve<'_> {
         });
     }
 
-    fn step(&mut self, span: Span, rule: Rule, goal: Goal, effect: Effect) -> ReasonId {
+    fn step(&mut self, span: Anchor, rule: Rule, goal: Goal, effect: Effect) -> ReasonId {
         let id = self.table.step_id();
         let mut parents = self.table.take_binding_reads();
         if let Some(parent) = self.constraint_reason
@@ -3673,7 +3673,7 @@ impl Solve<'_> {
             reason,
             error: None,
             definition: self.definition,
-            span,
+            at: span,
             depth: self.depth,
             rule,
             goal,

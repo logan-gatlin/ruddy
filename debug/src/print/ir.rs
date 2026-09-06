@@ -14,7 +14,7 @@ use ruddy::{
         Program, Row, SumCase, Term, TermKind, TypeField, TypeKind, When,
     },
     symbol::Mint,
-    tracking::Tracked,
+    tracking::Anchored,
 };
 
 use crate::print::{
@@ -46,7 +46,7 @@ struct Binding<'a> {
 /// A term and a type wrap their kind in different bookkeeping — a type carries
 /// a span, a term carries a span and its type — and none of that bookkeeping is
 /// printed, since the IR prints as surface syntax. So the printers are generic
-/// over this rather than over [`Tracked`]: what they need from a node is its
+/// over this rather than over [`Anchored`]: what they need from a node is its
 /// kind, not the shape of the wrapper around it.
 trait Node {
     type Kind;
@@ -72,11 +72,11 @@ impl Node for Term {
     }
 }
 
-impl<T> Node for Tracked<T> {
+impl<T> Node for Anchored<T> {
     type Kind = T;
 
     fn kind(&self) -> &T {
-        &self.tracked
+        &self.anchored
     }
 }
 
@@ -292,7 +292,7 @@ impl Grouped for Show<'_, TermKind> {
         matches!(
             self.node,
             TermKind::Project { field, .. }
-                if ruddy::ui::canonical_tuple_index(&field.tracked).is_some()
+                if ruddy::ui::canonical_tuple_index(&field.anchored).is_some()
         )
     }
 }
@@ -327,7 +327,7 @@ impl Grouped for Show<'_, PatternKind> {
 impl fmt::Display for Show<'_, PatternKind> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.node {
-            PatternKind::Bind(name) => f.write_str(self.mint.name(name.tracked)),
+            PatternKind::Bind(name) => f.write_str(self.mint.name(name.anchored)),
             // The `_` as written: it names no symbol, so there is nothing for
             // the mint to spell.
             PatternKind::Wildcard => f.write_str("_"),
@@ -339,7 +339,7 @@ impl fmt::Display for Show<'_, PatternKind> {
             PatternKind::Unit => f.write_str("()"),
             PatternKind::Tag { name, payload } => write_tag(
                 f,
-                &name.tracked,
+                &name.anchored,
                 None,
                 payload.as_deref().map(|payload| self.show(payload)),
             ),
@@ -351,7 +351,7 @@ impl fmt::Display for Show<'_, PatternKind> {
                 f,
                 before.iter().map(|element| self.show(element)),
                 rest.as_ref()
-                    .map(|rest| rest.name.as_ref().map(|name| self.mint.name(name.tracked))),
+                    .map(|rest| rest.name.as_ref().map(|name| self.mint.name(name.anchored))),
                 after.iter().map(|element| self.show(element)),
             ),
             // Through `write_row` rather than `write_struct`, because a
@@ -448,7 +448,7 @@ impl fmt::Display for Show<'_, TermKind> {
             TermKind::Fn { arg, body } => write!(
                 f,
                 "fn {} => {}",
-                self.mint.name(arg.tracked),
+                self.mint.name(arg.anchored),
                 self.show(&**body)
             ),
             // A `let` is one statement of the `do` block that wrote it, and a
@@ -469,7 +469,7 @@ impl fmt::Display for Show<'_, TermKind> {
                 } = term
                 {
                     stmts.push(Binding {
-                        name: self.mint.name(name.tracked),
+                        name: self.mint.name(name.anchored),
                         annotation: annotation.as_deref().map(|ty| self.show(ty)),
                         value: self.show(&**value),
                     });
@@ -530,12 +530,12 @@ impl fmt::Display for Show<'_, TermKind> {
             // in the unit it means. See [`TermKind::Tag`].
             TermKind::Tag { name, payload } => write_tag(
                 f,
-                &name.tracked,
+                &name.anchored,
                 None,
                 payload.as_ref().map(|payload| self.show(&**payload)),
             ),
             TermKind::Project { base, field } => {
-                write_project(f, &self.show(&**base), &field.tracked)
+                write_project(f, &self.show(&**base), &field.anchored)
             }
             // The arms print as they stand: the normalized pattern — binders
             // named through the mint, puns already expanded — and the body,
@@ -552,7 +552,12 @@ impl fmt::Display for Show<'_, TermKind> {
             TermKind::Handle { body, handler } => self.write_handle(f, body, handler),
             TermKind::Raise(value) => write!(f, "raise {}", self.show(&**value)),
             TermKind::Operation { effect, selector } => {
-                write!(f, "!{}{}", self.mint.name(effect.tracked), selector.tracked)
+                write!(
+                    f,
+                    "!{}{}",
+                    self.mint.name(effect.anchored),
+                    selector.anchored
+                )
             }
         }
     }
@@ -574,9 +579,9 @@ impl Show<'_, TermKind> {
             write!(
                 f,
                 " | !{}{} {} => {}",
-                self.mint.name(arm.effect.tracked),
-                arm.selector.tracked,
-                self.mint.name(arm.binder.tracked),
+                self.mint.name(arm.effect.anchored),
+                arm.selector.anchored,
+                self.mint.name(arm.binder.anchored),
                 self.show(&arm.body),
             )?;
         }
@@ -584,7 +589,7 @@ impl Show<'_, TermKind> {
             write!(
                 f,
                 " | return {} => {}",
-                self.mint.name(ret.binder.tracked),
+                self.mint.name(ret.binder.anchored),
                 self.show(&*ret.body),
             )?;
         }
@@ -756,29 +761,29 @@ fn clause_at(f: &mut fmt::Formatter<'_>, clause: &ClauseKind, level: u8) -> fmt:
         ClauseKind::Name(name) => write!(f, "'{name}")?,
         ClauseKind::Not(inner) => {
             f.write_str("not ")?;
-            clause_at(f, &inner.tracked, 3)?;
+            clause_at(f, &inner.anchored, 3)?;
         }
         // Left-associative, so the right side is written one level tighter.
         ClauseKind::And(left, right) => {
-            clause_at(f, &left.tracked, 2)?;
+            clause_at(f, &left.anchored, 2)?;
             f.write_str(" and ")?;
-            clause_at(f, &right.tracked, 3)?;
+            clause_at(f, &right.anchored, 3)?;
         }
         ClauseKind::Or(left, right) => {
-            clause_at(f, &left.tracked, 1)?;
+            clause_at(f, &left.anchored, 1)?;
             f.write_str(" or ")?;
-            clause_at(f, &right.tracked, 2)?;
+            clause_at(f, &right.anchored, 2)?;
         }
         // Non-associative, so both sides go one level tighter.
         ClauseKind::Equal(left, right) => {
-            clause_at(f, &left.tracked, 1)?;
+            clause_at(f, &left.anchored, 1)?;
             f.write_str(" = ")?;
-            clause_at(f, &right.tracked, 1)?;
+            clause_at(f, &right.anchored, 1)?;
         }
         ClauseKind::NotEqual(left, right) => {
-            clause_at(f, &left.tracked, 1)?;
+            clause_at(f, &left.anchored, 1)?;
             f.write_str(" != ")?;
-            clause_at(f, &right.tracked, 1)?;
+            clause_at(f, &right.anchored, 1)?;
         }
     }
     if parens {

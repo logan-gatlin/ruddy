@@ -176,7 +176,7 @@ fn file_modules_share_structural_effects() {
         .map(|(_, decl)| decl)
         .expect("cross declaration");
     let TypeKind::Arrow { effects, .. } =
-        &cross.annotation.as_ref().expect("annotation").ty.tracked
+        &cross.annotation.as_ref().expect("annotation").ty.anchored
     else {
         panic!("cross has an arrow annotation");
     };

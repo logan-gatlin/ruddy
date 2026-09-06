@@ -335,6 +335,12 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
         _ => None,
     };
 
+    // Where every anchor the phases produced was written, or nothing when
+    // nothing was lowered: the one place positions come back into the
+    // picture, for the diagnostics and the panels the page shows.
+    let empty_source = ruddy::tracking::SourceMap::default();
+    let source_map = built.as_ref().map_or(&empty_source, |built| &built.source);
+
     // Every phase words and codes its own errors in `ruddy::ui`, so the strip
     // and the CLI driver cannot describe the same program differently, and a
     // new error kind reaches both the moment it exists. This layer only maps
@@ -366,12 +372,12 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
             built
                 .errors
                 .iter()
-                .map(|error| source_error("ir", error.diagnostic(), &index)),
+                .map(|error| source_error("ir", error.diagnostic(&built.source), &index)),
         );
     }
-    if let Some(inferred) = &inferred {
+    if let (Some(inferred), Some(built)) = (&inferred, &built) {
         diagnostics.extend(inferred.errors().iter().map(|error| {
-            let mut diagnostic = source_error("types", error.diagnostic(), &index);
+            let mut diagnostic = source_error("types", error.diagnostic(&built.source), &index);
             diagnostic.inference_error_id = Some(error.id.get());
             diagnostic.inference_cause = Some(match error.cause {
                 inference::ErrorCause::Step(id) => InferenceCause::Step { step_id: id.get() },
@@ -381,7 +387,7 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
             diagnostic.inference_explanation = error
                 .explanation
                 .as_ref()
-                .map(|explanation| wire_explanation(explanation, &index));
+                .map(|explanation| wire_explanation(explanation, source_map, &index));
             diagnostic
         }));
     }
@@ -391,7 +397,7 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
                 "patterns",
                 error.kind.code(),
                 error.kind.to_string(),
-                loc(error.span, &index),
+                loc(source_map.span(error.at), &index),
             )
         }));
     }
@@ -553,6 +559,7 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
         diagnostics: &diagnostics,
         bundle: loaded.as_ref(),
         program: built.as_ref().map(|built| &built.program),
+        source: source_map,
         inference: inferred.as_ref(),
         patterns: checked.as_ref(),
         lir: lowered.as_ref(),
@@ -686,6 +693,7 @@ pub fn install_hook() {
 
 fn wire_explanation(
     explanation: &inference::InferenceExplanation,
+    source: &ruddy::tracking::SourceMap,
     files: &HashMap<FileID, u32>,
 ) -> crate::wire::InferenceExplanation {
     fn description(value: inference::TypeDescription) -> &'static str {
@@ -706,6 +714,7 @@ fn wire_explanation(
     }
     fn fact(
         fact: &inference::ExplanationFact,
+        source: &ruddy::tracking::SourceMap,
         files: &HashMap<FileID, u32>,
     ) -> crate::wire::ExplanationFact {
         let payload = match fact.payload {
@@ -734,7 +743,7 @@ fn wire_explanation(
             inference::ExplanationFactPayload::ExternPosition => "extern-position",
         };
         crate::wire::ExplanationFact {
-            span: loc(fact.span, files),
+            span: loc(source.span(fact.at), files),
             constraint_id: (!fact.direct).then(|| fact.constraint.get()),
             direct: fact.direct,
             origin: fact.origin.code(),
@@ -745,7 +754,7 @@ fn wire_explanation(
     let full: Vec<_> = explanation
         .full_facts
         .iter()
-        .map(|item| fact(item, files))
+        .map(|item| fact(item, source, files))
         .collect();
     let abridged = explanation
         .abridged

@@ -11,9 +11,14 @@ use crate::{
     inference::{self, Trace},
     ir, lir, parse, patterns,
     symbol::Mint,
+    tracking::SourceMap,
 };
 
 /// Every checking error produced by a completed compiler phase.
+///
+/// An inference error is far larger than the others, and boxing it would
+/// touch every reader of one for a value that is only ever built on failure.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Error {
     Ir(ir::Error),
@@ -23,6 +28,9 @@ pub enum Error {
 
 /// A compilation which has not established the all-phases-accepted invariant.
 /// Completed phases stay available for diagnostics and tooling.
+///
+/// Returned whole in the `Err` of the compile entry points: it is built once
+/// per failed compile, so its size is no cost worth a box.
 #[derive(Debug)]
 pub struct PartialCompilation {
     pub mint: Mint,
@@ -76,6 +84,10 @@ impl AcceptedProgram {
     pub fn ir(&self) -> &ir::Program {
         &self.ir.program
     }
+    /// Where every anchor in the program was written.
+    pub fn source(&self) -> &SourceMap {
+        &self.ir.source
+    }
     pub fn semantics(&self) -> &inference::Semantics {
         self.inference.semantics()
     }
@@ -104,6 +116,7 @@ impl AcceptedProgram {
 }
 
 /// Compile a parsed source bundle with no dependency interfaces.
+#[allow(clippy::result_large_err)]
 pub fn compile(
     mint: Mint,
     stmts: Vec<parse::Stmt>,
@@ -120,6 +133,7 @@ pub fn compile(
 /// transitive dependencies are represented by entries without one. This keeps
 /// the source-visible interface and the linked implementation set together at
 /// the public compilation seam.
+#[allow(clippy::result_large_err)]
 pub fn compile_with_dependencies(
     mint: Mint,
     stmts: Vec<parse::Stmt>,
@@ -173,6 +187,7 @@ pub fn compile_with_dependencies(
     result
 }
 
+#[allow(clippy::result_large_err)]
 fn compile_with(
     mut mint: Mint,
     stmts: Vec<parse::Stmt>,
@@ -187,6 +202,7 @@ fn compile_with(
     // program rather than the pre-inference IR output.
     let ir = ir::Output {
         program,
+        source: ir.source,
         errors: ir.errors,
     };
     let patterns = patterns::check(&ir.program, &inference);

@@ -87,7 +87,7 @@ use indexmap::{IndexMap, IndexSet};
 use crate::{
     ir::{self, Annotation, Clause, ClauseKind, Program, Tail, Term, TermKind, Type, TypeKind},
     symbol::{Mint, Symbol},
-    tracking::Span,
+    tracking::Anchor,
     types::{
         Assigned, Atom, EffectId, Formula, ParamKind, Presence, Rest, Row, RowField, Scheme, Sense,
         Shape, Ty, TyVar, same_finite_syntax, same_finite_syntax_metered,
@@ -174,8 +174,8 @@ pub(crate) struct ReviewedExtern {
     pub(crate) scheme: Scheme,
     pub(crate) abi: ir::ExternType,
     pub(crate) target: String,
-    pub(crate) target_span: Span,
-    pub(crate) declaration_span: Span,
+    pub(crate) target_span: Anchor,
+    pub(crate) declaration_span: Anchor,
 }
 
 /// The diagnostic account of one inference run: its errors, and — when a
@@ -561,7 +561,7 @@ pub struct Batch {
     /// Top-level definition whose generation/solve emitted this batch.
     pub definition: Option<Symbol>,
     /// Where the program said it: the match, the use site, or the annotation.
-    pub span: Span,
+    pub at: Anchor,
     pub origin: Origin,
     /// Root of this batch's causal explanation.
     pub reason: ReasonId,
@@ -655,7 +655,7 @@ pub fn effective_conditions(raw: &[Formula]) -> Vec<Formula> {
 /// One arm inside a qualifying match constraint.
 #[derive(Debug, Clone)]
 pub struct GuardedArm {
-    pub span: Span,
+    pub at: Anchor,
     pub raw: Formula,
     pub effective: Formula,
     /// Coverage batch whose arm condition supplies this premise.
@@ -680,8 +680,8 @@ pub struct DeferredRequirement {
 #[derive(Debug, Clone)]
 pub struct Refinement {
     pub definition: Symbol,
-    pub match_span: Span,
-    pub arm_span: Span,
+    pub match_at: Anchor,
+    pub arm_at: Anchor,
     pub raw: Formula,
     pub effective: Formula,
     pub reachable: bool,
@@ -698,7 +698,7 @@ pub struct RefinementFact {
 
 #[derive(Debug, Clone)]
 pub struct GuardedObligation {
-    pub span: Span,
+    pub at: Anchor,
     pub premise: Formula,
     pub obligation: Formula,
     pub formula: Formula,
@@ -743,7 +743,7 @@ pub struct Step {
     /// The definition being solved. Solving runs per definition, so this is
     /// what divides one solve from the next in the flat list.
     pub definition: Symbol,
-    pub span: Span,
+    pub at: Anchor,
     /// How far inside a decomposition: the two halves of an arrow are one
     /// deeper than the arrow that produced them, and follow it immediately.
     pub depth: u32,
@@ -921,7 +921,7 @@ pub struct Constraint {
     pub id: ConstraintId,
     /// Immutable root reason for this generated requirement.
     pub reason: ReasonId,
-    pub span: Span,
+    pub at: Anchor,
     /// The source operation that required this constraint.
     pub origin: ConstraintOrigin,
     /// Source-facing names for the ordered operands carried by `kind`.
@@ -932,7 +932,7 @@ pub struct Constraint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SemanticPivot {
     FunctionInput(Symbol),
-    BranchResult(Span),
+    BranchResult(Anchor),
 }
 
 /// Why generation emitted a constraint. This describes generation rather than
@@ -988,9 +988,9 @@ impl ConstraintOrigin {
 pub struct ConstraintSubjects {
     pub semantic_pivot: Option<SemanticPivot>,
     pub primary: Subject,
-    pub primary_span: Option<Span>,
+    pub primary_span: Option<Anchor>,
     pub secondary: Option<Subject>,
-    pub secondary_span: Option<Span>,
+    pub secondary_span: Option<Anchor>,
 }
 
 impl PartialEq for ConstraintSubjects {
@@ -1025,9 +1025,9 @@ impl ConstraintSubjects {
     /// must not be turned into a diagnostic annotation.
     pub const fn pair_at(
         primary: Subject,
-        primary_span: Option<Span>,
+        primary_span: Option<Anchor>,
         secondary: Subject,
-        secondary_span: Option<Span>,
+        secondary_span: Option<Anchor>,
     ) -> Self {
         Self {
             semantic_pivot: None,
@@ -1124,7 +1124,7 @@ pub enum ConstraintKind {
         base: Rc<Ty>,
         field: String,
         result: Rc<Ty>,
-        base_span: Span,
+        base_span: Anchor,
     },
     /// Spread one value's fields into a struct literal. Distinct from
     /// ordinary equality for the reason a projection is: a known non-struct
@@ -1141,7 +1141,7 @@ pub enum ConstraintKind {
         /// The literal's own type — its named fields, certainly there, over
         /// the same rest — abandoned when the operand is no struct.
         result: Rc<Ty>,
-        operand_span: Span,
+        operand_span: Anchor,
     },
     /// Two types the program requires to be the same. `expected` is the side
     /// the context demanded — an annotation, a function's parameter, or the
@@ -1226,7 +1226,7 @@ pub enum ConstraintKind {
         /// source origins through calls and generalized aliases.
         effect_origins: Vec<EffectSource>,
         /// Source labels of handlers which extend `ambient`.
-        ambient_label_spans: IndexMap<String, Span>,
+        ambient_label_spans: IndexMap<String, Anchor>,
         /// Whether a `fn` encloses the application. What tells the two readings
         /// of a failure apart: outside every function the ambient is a
         /// definition's own, so nothing could ever have handled the effect,
@@ -1248,7 +1248,7 @@ pub enum ConstraintKind {
 /// constraint is what lets a failed solve still explain the written boundary.
 #[derive(Debug, Clone)]
 pub struct CallbackBoundary {
-    pub callback_span: Span,
+    pub callback_at: Anchor,
     pub callback_path: String,
     pub callback_type: String,
     /// One exact required-presence => available-presence implication per
@@ -1262,8 +1262,8 @@ pub struct CallbackBoundary {
     /// flattened. `None` means the callback row is closed.
     pub tail: Option<CallbackTailRelation>,
     pub extern_name: String,
-    pub extern_span: Span,
-    pub capability_span: Span,
+    pub extern_at: Anchor,
+    pub capability_at: Anchor,
 }
 
 #[derive(Debug, Clone)]
@@ -1286,7 +1286,7 @@ pub struct CallbackTailRelation {
 pub struct EffectOrigin {
     pub symbol: Symbol,
     pub interface: crate::types::EffectId,
-    pub declaration_span: Span,
+    pub declaration_at: Anchor,
 }
 
 /// Either an exact operation declaration or a callable supplied through a
@@ -1969,7 +1969,7 @@ mod effect_provenance_tests {
         let origin = EffectOrigin {
             symbol: effect,
             interface: crate::types::EffectId::structural("Log".into(), "test".into()),
-            declaration_span: Span::generated(1, 3),
+            declaration_at: Anchor::GENERATED,
         };
         let mut operations = 0;
         let mut real = EffectProvenance::origin(origin.clone());
@@ -2050,7 +2050,7 @@ mod effect_provenance_tests {
         let origin = EffectOrigin {
             symbol: effect,
             interface: crate::types::EffectId::structural("Log".into(), "test".into()),
-            declaration_span: Span::generated(7, 9),
+            declaration_at: Anchor::GENERATED,
         };
         // Construct directly: function() deliberately deduplicates its normal,
         // source-sized input, while this test models an adversarial replacement.
@@ -2086,7 +2086,7 @@ mod effect_provenance_tests {
         let origin = EffectOrigin {
             symbol: effect,
             interface: crate::types::EffectId::structural("Log".into(), "test".into()),
-            declaration_span: Span::generated(11, 13),
+            declaration_at: Anchor::GENERATED,
         };
         let replacement = EffectProvenance::origin(origin.clone());
         let too_long = vec![EffectPathStep::CallResult; EffectProvenance::PATH_BUDGET + 1];
@@ -2123,7 +2123,7 @@ mod effect_provenance_tests {
         let origin = EffectOrigin {
             symbol: effect,
             interface: crate::types::EffectId::structural("Log".into(), "test".into()),
-            declaration_span: Span::generated(2, 4),
+            declaration_at: Anchor::GENERATED,
         };
         let mut deep = EffectProvenance::origin(origin.clone());
         for _ in 0..100 {
@@ -2163,7 +2163,7 @@ pub struct Error {
     /// produced by a boundary/final check rather than by a solve step or SAT
     /// batch.
     pub cause: ErrorCause,
-    pub span: Span,
+    pub at: Anchor,
     pub kind: ErrorKind,
     /// Source-level account extracted from the immutable reason graph. Families
     /// not migrated yet deliberately leave this empty and use their established
@@ -2190,7 +2190,7 @@ pub struct InferenceExplanation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExplanationFact {
-    pub span: Span,
+    pub at: Anchor,
     /// True for source facts established by a direct boundary check.
     pub direct: bool,
     pub constraint: ConstraintId,
@@ -2352,11 +2352,11 @@ pub enum ErrorCause {
 impl Error {
     /// A direct, not-yet-explained error. Inference replaces the pending
     /// identity before publishing an [`Output`].
-    pub fn new(span: Span, kind: ErrorKind) -> Self {
+    pub fn new(span: Anchor, kind: ErrorKind) -> Self {
         Self {
             id: ErrorId::pending(),
             cause: ErrorCause::Direct,
-            span,
+            at: span,
             kind,
             explanation: None,
         }
@@ -2465,7 +2465,7 @@ pub enum ErrorKind {
         found: Rc<Ty>,
         name: Rc<str>,
         sense: Sense,
-        declared: Span,
+        declared: Anchor,
     },
     /// A label demanded of a variable: a projection, a match arm, a
     /// struct literal's field set.
@@ -2478,7 +2478,7 @@ pub enum ErrorKind {
         shape: Shape,
         field: String,
         name: Rc<str>,
-        declared: Span,
+        declared: Anchor,
     },
     /// A variable reaching a type outside the annotation that
     /// declared it.
@@ -2489,10 +2489,10 @@ pub enum ErrorKind {
     /// at the declaring name, which is the line that has to change.
     RigidEscapes {
         name: Rc<str>,
-        declared: Span,
+        declared: Anchor,
         destination: Rc<Ty>,
         destination_name: Rc<str>,
-        destination_span: Span,
+        destination_span: Anchor,
     },
     /// A `..` was decided to stand for a label the row it tails already names.
     /// `{ x: Nat, ..'r }` says "an `x`, plus whatever else `'r` is", so `'r`
@@ -2647,7 +2647,7 @@ pub struct RowFactOrigin {
     pub reason: ReasonId,
     pub origin: ConstraintOrigin,
     pub subject: Subject,
-    pub span: Span,
+    pub at: Anchor,
 }
 
 #[derive(Debug, Clone)]
@@ -2830,7 +2830,7 @@ struct Scoped {
 /// checked in the same place.
 struct Annotated {
     /// The annotation's span, which is the line the reader has to change.
-    span: Span,
+    span: Anchor,
     /// Ordered qualifying-arm premise in force where it was written.
     guard: Formula,
     /// The `where` clause it promised, or [`Formula::True`] where none was
@@ -2987,7 +2987,7 @@ struct Table {
     /// printed with no table beside it, and a span is not something a reader
     /// reads — so the second place a rigid complaint points at is looked up
     /// here. Program-global, exactly as the ids are.
-    rigids: HashMap<u32, Span>,
+    rigids: HashMap<u32, Anchor>,
     /// The rigids already reported as escaping. One mistake said once: a
     /// variable that reaches two schemes it does not belong to is still one
     /// annotation to rewrite. See [`ErrorKind::RigidEscapes`].
@@ -3050,7 +3050,7 @@ struct Table {
     /// evidence, are authoritative when their schemes are published.
     authoritative_bindings: HashSet<Symbol>,
     /// Binding-specific annotation identity used when publishing local schemes.
-    authoritative_spans: HashMap<Symbol, Span>,
+    authoritative_spans: HashMap<Symbol, Anchor>,
     /// The store, as one solver that has already been told every batch. See
     /// [`Table::store_assumptions`].
     sat: RefCell<StoreSat>,
@@ -3127,7 +3127,7 @@ pub fn compact_dag_failure_for_tests(definition: Symbol, depth: usize) -> (Vec<E
     let constraints = [Constraint {
         id: constraint_id,
         reason,
-        span: Span::default(),
+        at: Anchor::GENERATED,
         origin: ConstraintOrigin::ContextualCheck,
         subjects: ConstraintSubjects::pair(Subject::Context, Subject::Term),
         kind: ConstraintKind::Equal {
@@ -3234,7 +3234,7 @@ fn expose_packages(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Rc<Ty> {
 /// evidence-taking closure directly to the host.
 #[derive(Debug, Clone)]
 pub struct PolymorphicExternLeaf {
-    pub span: Span,
+    pub at: Anchor,
     pub variable: String,
     pub kind: ExternVariableKind,
     pub position: String,
@@ -3242,7 +3242,7 @@ pub struct PolymorphicExternLeaf {
 
 #[derive(Debug, Clone)]
 pub struct ExternCallbackIssue {
-    pub callback_span: Span,
+    pub callback_at: Anchor,
     pub callback_path: String,
     pub callback_type: String,
     pub missing_effects: Vec<String>,
@@ -3330,7 +3330,7 @@ enum ExternVariableIdentity {
 
 #[derive(Debug, Clone)]
 struct ExternVariableSource {
-    span: Span,
+    span: Anchor,
     name: String,
     hidden: bool,
 }
@@ -3346,14 +3346,14 @@ struct ExternSourceMap {
 }
 
 impl ExternSourceMap {
-    fn insert(&mut self, identity: ExternVariableIdentity, span: Span, name: impl Into<String>) {
+    fn insert(&mut self, identity: ExternVariableIdentity, span: Anchor, name: impl Into<String>) {
         self.insert_with_ownership(identity, span, name, false);
     }
 
     fn insert_with_ownership(
         &mut self,
         identity: ExternVariableIdentity,
-        span: Span,
+        span: Anchor,
         name: impl Into<String>,
         hidden: bool,
     ) {
@@ -3494,11 +3494,11 @@ fn push_callback_coverage(
     callback: &Rc<Ty>,
     available: &Row,
     sources: &ExternSourceMap,
-    callback_span: Span,
+    callback_span: Anchor,
     callback_path: String,
     extern_name: &str,
-    extern_span: Span,
-    capability_span: Span,
+    extern_span: Anchor,
+    capability_span: Anchor,
     out: &mut Vec<Constraint>,
 ) {
     let available = flatten_row(available);
@@ -3512,20 +3512,20 @@ fn push_callback_coverage(
                 available: callback_tail_spelling(&available.rest, sources),
             });
         let boundary = CallbackBoundary {
-            callback_span,
+            callback_at: callback_span,
             callback_path: callback_path.clone(),
             callback_type: callback.to_string(),
             effects,
             condition,
             tail,
             extern_name: extern_name.into(),
-            extern_span,
-            capability_span,
+            extern_at: extern_span,
+            capability_at: capability_span,
         };
         out.push(Constraint {
             id: ConstraintId::pending(),
             reason: ReasonId::pending(),
-            span: callback_span,
+            at: callback_span,
             origin: ConstraintOrigin::CallbackBoundary,
             subjects: ConstraintSubjects::pair(
                 Subject::CallbackRequired,
@@ -3556,7 +3556,7 @@ fn extern_boundary_review(
     root_ty: &Rc<Ty>,
     sources: &ExternSourceMap,
     extern_name: &str,
-    extern_span: Span,
+    extern_span: Anchor,
 ) -> ExternBoundaryReview {
     // This is intentionally an explicit work list. Extern annotations are user
     // input and generated annotations can contain tens of thousands of nested
@@ -3591,7 +3591,7 @@ fn extern_boundary_review(
             active_aliases.push(original.clone());
         }
 
-        match &abi.tracked {
+        match &abi.anchored {
             ir::ExternTypeKind::Group(inner) => {
                 work.push((inner, ty, path, active_aliases, report_row_leaves))
             }
@@ -3628,11 +3628,11 @@ fn extern_boundary_review(
                             input,
                             &available,
                             sources,
-                            parameter.span,
+                            parameter.at,
                             render_path(&paths, *child),
                             extern_name,
                             extern_span,
-                            abi.span,
+                            abi.at,
                             &mut review.coverage,
                         );
                     }
@@ -3666,7 +3666,7 @@ fn extern_boundary_review(
                             .and_then(|identity| sources.get(identity));
                         if let Some(source) = source.filter(|source| !source.hidden) {
                             review.leaves.push(PolymorphicExternLeaf {
-                                span: source.span,
+                                at: source.span,
                                 variable: source.name.clone(),
                                 kind: ExternVariableKind::Type,
                                 position: render_path(&paths, path),
@@ -3681,11 +3681,11 @@ fn extern_boundary_review(
                                 from,
                                 available,
                                 sources,
-                                abi.span,
+                                abi.at,
                                 render_path(&paths, callback_path),
                                 extern_name,
                                 extern_span,
-                                abi.span,
+                                abi.at,
                                 &mut review.coverage,
                             );
                         }
@@ -3697,7 +3697,7 @@ fn extern_boundary_review(
                         // established representation behavior instead of
                         // attributing an unrelated outer presence or tail.
                         let child_row_leaves = report_row_leaves
-                            && !matches!(written.tracked, ir::TypeKind::Arrow { .. });
+                            && !matches!(written.anchored, ir::TypeKind::Arrow { .. });
                         work.push((
                             abi,
                             to.clone(),
@@ -3721,7 +3721,7 @@ fn extern_boundary_review(
                                 .filter(|source| !source.hidden)
                         {
                             review.leaves.push(PolymorphicExternLeaf {
-                                span: source.span,
+                                at: source.span,
                                 variable: source.name.clone(),
                                 kind: ExternVariableKind::Row,
                                 position: render_child_path(&mut paths, path, "row tail"),
@@ -3734,7 +3734,7 @@ fn extern_boundary_review(
                                     .filter(|source| !source.hidden)
                             {
                                 review.leaves.push(PolymorphicExternLeaf {
-                                    span: source.span,
+                                    at: source.span,
                                     variable: source.name.clone(),
                                     kind: ExternVariableKind::Presence,
                                     position: render_child_path(
@@ -3760,18 +3760,18 @@ fn extern_boundary_review(
 #[cfg(test)]
 mod extern_boundary_depth_tests {
     use super::*;
-    use crate::{tracking::Tracked, types::Prim};
+    use crate::{tracking::Anchored, types::Prim};
 
     #[test]
     fn thirty_thousand_arrow_boundary_walk_is_stack_safe() {
-        let span = Span::generated(0, 1);
-        let written = Tracked {
-            tracked: ir::TypeKind::Prim(Prim::Nat),
-            span,
+        let span = Anchor::GENERATED;
+        let written = Anchored {
+            anchored: ir::TypeKind::Prim(Prim::Nat),
+            at: span,
         };
-        let abi = Tracked {
-            tracked: ir::ExternTypeKind::Ordinary(written),
-            span,
+        let abi = Anchored {
+            anchored: ir::ExternTypeKind::Ordinary(written),
+            at: span,
         };
         let mut ty = Rc::new(Ty::Nat);
         for _ in 0..30_000 {
@@ -4487,17 +4487,17 @@ fn all_constraints(
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum PivotKey {
     FunctionInput(PivotAnchor),
-    BranchResult(Span),
-    ProjectedField { base: Span, field: String },
-    FunctionEffects(Span),
-    WrittenBinder(Span),
-    Anonymous { span: Span, origin: &'static str },
+    BranchResult(Anchor),
+    ProjectedField { base: Anchor, field: String },
+    FunctionEffects(Anchor),
+    WrittenBinder(Anchor),
+    Anonymous { span: Anchor, origin: &'static str },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum PivotAnchor {
     Binder(Symbol),
-    Span(Span),
+    Anchor(Anchor),
 }
 
 impl PivotKey {
@@ -4526,8 +4526,8 @@ impl PivotKey {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct PivotContext {
-    branch: Option<Span>,
-    binder: Option<Span>,
+    branch: Option<Anchor>,
+    binder: Option<Anchor>,
 }
 
 fn pivot_contexts(
@@ -4546,7 +4546,7 @@ fn pivot_contexts(
         match &constraint.kind {
             ConstraintKind::Let { value, body, .. } => {
                 let nested = PivotContext {
-                    binder: Some(constraint.span),
+                    binder: Some(constraint.at),
                     ..inherited
                 };
                 work.extend(value.iter().map(|child| (child, nested)));
@@ -4554,7 +4554,7 @@ fn pivot_contexts(
             }
             ConstraintKind::Match { arms, .. } => {
                 let nested = PivotContext {
-                    branch: Some(constraint.span),
+                    branch: Some(constraint.at),
                     ..inherited
                 };
                 for arm in arms {
@@ -4572,16 +4572,16 @@ fn pivot_key(
     fact: &ExplanationFact,
     constraint: &Constraint,
     context: PivotContext,
-    instance_binders: &HashMap<Span, Symbol>,
+    instance_binders: &HashMap<Anchor, Symbol>,
 ) -> PivotKey {
     if constraint.origin == ConstraintOrigin::ApplicationArgument {
-        let call = constraint.subjects.primary_span.unwrap_or(constraint.span);
+        let call = constraint.subjects.primary_span.unwrap_or(constraint.at);
         return PivotKey::FunctionInput(match constraint.subjects.semantic_pivot {
             Some(SemanticPivot::FunctionInput(symbol)) => PivotAnchor::Binder(symbol),
             _ => instance_binders
                 .get(&call)
                 .copied()
-                .map_or(PivotAnchor::Span(call), PivotAnchor::Binder),
+                .map_or(PivotAnchor::Anchor(call), PivotAnchor::Binder),
         });
     }
     if matches!(
@@ -4590,7 +4590,7 @@ fn pivot_key(
     ) {
         return PivotKey::BranchResult(match constraint.subjects.semantic_pivot {
             Some(SemanticPivot::BranchResult(span)) => span,
-            _ => context.branch.unwrap_or(constraint.span),
+            _ => context.branch.unwrap_or(constraint.at),
         });
     }
     if let ConstraintKind::Project {
@@ -4603,16 +4603,16 @@ fn pivot_key(
         };
     }
     if matches!(constraint.kind, ConstraintKind::Performs { .. }) {
-        return PivotKey::FunctionEffects(constraint.span);
+        return PivotKey::FunctionEffects(constraint.at);
     }
     if matches!(
         fact.subject,
         Subject::Binding | Subject::TopLevelBinding | Subject::LocalBinding
     ) {
-        return PivotKey::WrittenBinder(context.binder.unwrap_or(fact.span));
+        return PivotKey::WrittenBinder(context.binder.unwrap_or(fact.at));
     }
     PivotKey::Anonymous {
-        span: constraint.span,
+        span: constraint.at,
         origin: constraint.origin.code(),
     }
 }
@@ -4683,17 +4683,15 @@ fn attach_ordinary_explanations(
     // `all` iterates in hash order, so when desugaring reuses one span for
     // several instances the earliest constraint wins explicitly — collecting
     // directly would print a different binder from run to run.
-    let mut instances: Vec<(ConstraintId, Span, Symbol)> = all
+    let mut instances: Vec<(ConstraintId, Anchor, Symbol)> = all
         .values()
         .filter_map(|constraint| match constraint.kind {
-            ConstraintKind::Instance { symbol, .. } => {
-                Some((constraint.id, constraint.span, symbol))
-            }
+            ConstraintKind::Instance { symbol, .. } => Some((constraint.id, constraint.at, symbol)),
             _ => None,
         })
         .collect();
     instances.sort_unstable_by_key(|(id, ..)| *id);
-    let mut instance_binders: HashMap<Span, Symbol> = HashMap::new();
+    let mut instance_binders: HashMap<Anchor, Symbol> = HashMap::new();
     for (_, span, symbol) in instances {
         instance_binders.entry(span).or_insert(symbol);
     }
@@ -4874,10 +4872,10 @@ fn attach_ordinary_explanations(
         constraint_slice.sort_by_key(|id| {
             constraints
                 .get(id)
-                .map_or((true, Span::default(), "", "", ""), |constraint| {
+                .map_or((true, Anchor::GENERATED, "", "", ""), |constraint| {
                     (
-                        constraint.span.is_generated(),
-                        constraint.span,
+                        constraint.at.is_generated(),
+                        constraint.at,
                         constraint.origin.code(),
                         constraint.subjects.primary.code(),
                         constraint.subjects.secondary.map_or("", Subject::code),
@@ -4911,7 +4909,7 @@ fn attach_ordinary_explanations(
             if let ConstraintKind::Project { base_span, .. } = &constraint.kind {
                 endpoints = vec![
                     (Subject::ProjectionBase, Some(*base_span), None),
-                    (Subject::PatternDemand, Some(constraint.span), None),
+                    (Subject::PatternDemand, Some(constraint.at), None),
                 ];
             } else if let ConstraintKind::Performs {
                 ambient_label_spans,
@@ -4919,7 +4917,7 @@ fn attach_ordinary_explanations(
             } = &constraint.kind
                 && kind == Some(ContradictionKind::RepeatedLabel)
             {
-                endpoints = vec![(Subject::PerformedEffects, Some(constraint.span), None)];
+                endpoints = vec![(Subject::PerformedEffects, Some(constraint.at), None)];
                 if let Some(ambient_span) = row
                     .as_ref()
                     .and_then(|row| ambient_label_spans.get(&row.label))
@@ -4935,7 +4933,7 @@ fn attach_ordinary_explanations(
                 // The ambient owner is effect-boundary provenance only. Other
                 // contradiction families retain the operation endpoint they
                 // had before boundaries became structured.
-                endpoints = vec![(Subject::PerformedEffects, Some(constraint.span), None)];
+                endpoints = vec![(Subject::PerformedEffects, Some(constraint.at), None)];
             } else if kind == Some(ContradictionKind::RecursiveValue) {
                 // A recursive cycle needs both source concepts even when one
                 // operand is semantic context (most notably a definition's
@@ -4945,7 +4943,7 @@ fn attach_ordinary_explanations(
                 // a useful two-fact explanation rather than a lone headline.
                 for (_, span, _) in &mut endpoints {
                     if span.is_none() {
-                        *span = Some(constraint.span);
+                        *span = Some(constraint.at);
                     }
                 }
                 if constraint.subjects.secondary.is_none() {
@@ -4954,7 +4952,7 @@ fn attach_ordinary_explanations(
             } else if kind.is_some() && endpoints.iter().all(|(_, span, _)| span.is_none()) {
                 // Unary/scoping constraints still own their written operation's
                 // range even when no independently written second operand exists.
-                endpoints[0].1 = Some(constraint.span);
+                endpoints[0].1 = Some(constraint.at);
             }
             for &(subject, span, side) in &endpoints {
                 let Some(span) = span else { continue };
@@ -4971,7 +4969,7 @@ fn attach_ordinary_explanations(
                             && origin.reason == constraint.reason
                             && origin.origin == constraint.origin
                             && origin.subject == subject
-                            && origin.span == span
+                            && origin.at == span
                     };
                     match repeated_origins {
                         Some((Some(introduction), _)) if matches(introduction) => {
@@ -5050,7 +5048,7 @@ fn attach_ordinary_explanations(
                     }
                 };
                 full_facts.push(ExplanationFact {
-                    span,
+                    at: span,
                     direct: false,
                     constraint: *id,
                     origin: constraint.origin,
@@ -5066,19 +5064,19 @@ fn attach_ordinary_explanations(
             _ => None,
         } {
             for fact in &mut full_facts {
-                if fact.span == error.span {
+                if fact.at == error.at {
                     fact.payload = ExplanationFactPayload::CallerChoiceUse;
                 }
-                if fact.span == declared {
+                if fact.at == declared {
                     fact.payload = ExplanationFactPayload::CallerChoiceDeclaration;
                 }
             }
-            if !full_facts.iter().any(|fact| fact.span == declared)
+            if !full_facts.iter().any(|fact| fact.at == declared)
                 && let Some(constraint) = constraint_slice.first().copied()
             {
                 full_facts.push(ExplanationFact {
                     direct: false,
-                    span: declared,
+                    at: declared,
                     constraint,
                     origin: ConstraintOrigin::ContextualCheck,
                     subject: Subject::Annotation,
@@ -5108,7 +5106,7 @@ fn attach_ordinary_explanations(
             // share a row while still naming different declarations here.
             full_facts.push(ExplanationFact {
                 direct: false,
-                span: origin.declaration_span,
+                at: origin.declaration_at,
                 constraint,
                 origin: ConstraintOrigin::ContextualCheck,
                 subject: Subject::EffectDeclaration,
@@ -5120,7 +5118,7 @@ fn attach_ordinary_explanations(
             forbidden: Some(forbidden),
             ..
         } = &error.kind
-            && introduction.span != forbidden.span
+            && introduction.at != forbidden.at
         {
             // Keep the complete causal slice. Exact row-fact provenance either
             // corrects the corresponding sliced fact in place or adds a missing
@@ -5130,7 +5128,7 @@ fn attach_ordinary_explanations(
                 (forbidden, ExplanationFactPayload::LabelForbidden),
             ] {
                 if let Some(at) = full_facts.iter().position(|fact| {
-                    fact.span == origin.span
+                    fact.at == origin.at
                         && fact.constraint == origin.constraint
                         && fact.origin == origin.origin
                         && fact.subject == origin.subject
@@ -5139,7 +5137,7 @@ fn attach_ordinary_explanations(
                 } else {
                     full_facts.push(ExplanationFact {
                         direct: false,
-                        span: origin.span,
+                        at: origin.at,
                         constraint: origin.constraint,
                         origin: origin.origin,
                         subject: origin.subject,
@@ -5152,8 +5150,8 @@ fn attach_ordinary_explanations(
         // no diagnostic order is allowed to inherit a solver identity.
         full_facts.sort_by_key(|fact| {
             (
-                fact.span.is_generated(),
-                fact.span,
+                fact.at.is_generated(),
+                fact.at,
                 fact.origin.code(),
                 fact.subject.code(),
                 fact.payload as u8,
@@ -5169,7 +5167,7 @@ fn attach_ordinary_explanations(
         for (at, fact) in full_facts.iter().enumerate() {
             // Constraint IDs distinguish solver records, not source facts.
             // Shared paths may repeat one written fact through several records.
-            if included.insert((fact.span, fact.origin, fact.subject, fact.payload)) {
+            if included.insert((fact.at, fact.origin, fact.subject, fact.payload)) {
                 candidates.push(at);
             }
         }
@@ -5204,7 +5202,7 @@ fn attach_ordinary_explanations(
                 .copied()
                 .find(|at| full_facts[*at].payload == first)?;
             let second = candidates.iter().rev().copied().find(|at| {
-                full_facts[*at].payload == second && full_facts[*at].span != full_facts[first].span
+                full_facts[*at].payload == second && full_facts[*at].at != full_facts[first].at
             })?;
             Some([first, second])
         });
@@ -5433,7 +5431,7 @@ fn attach_ordinary_explanations(
 /// schemes of its top-level definitions.
 fn direct_extern_explanation(
     error: ErrorId,
-    facts: Vec<(Span, ConstraintOrigin, Subject, ExplanationFactPayload)>,
+    facts: Vec<(Anchor, ConstraintOrigin, Subject, ExplanationFactPayload)>,
     kind: ContradictionKind,
     row: Option<RowContradiction>,
 ) -> InferenceExplanation {
@@ -5443,7 +5441,7 @@ fn direct_extern_explanation(
     let mut full_facts = Vec::new();
     for (span, origin, subject, payload) in facts {
         if full_facts.iter().any(|fact: &ExplanationFact| {
-            fact.span == span
+            fact.at == span
                 && fact.origin == origin
                 && fact.subject == subject
                 && fact.payload == payload
@@ -5451,7 +5449,7 @@ fn direct_extern_explanation(
             continue;
         }
         full_facts.push(ExplanationFact {
-            span,
+            at: span,
             direct: true,
             constraint,
             origin,
@@ -5552,7 +5550,7 @@ fn aggregate_callback_issues(
         let entry = merged
             .entry(issue.callback_path.clone())
             .or_insert_with(|| ExternCallbackIssue {
-                callback_span: issue.callback_span,
+                callback_at: issue.callback_at,
                 callback_path: issue.callback_path.clone(),
                 callback_type: issue.callback_type.clone(),
                 missing_effects: Vec::new(),
@@ -5625,7 +5623,7 @@ fn deduplicate_extern_facts(facts: Vec<ExplanationFact>) -> Vec<ExplanationFact>
     let mut found = Vec::new();
     for fact in facts {
         if let Some(at) = found.iter().position(|prior: &ExplanationFact| {
-            prior.span == fact.span
+            prior.at == fact.at
                 && prior.origin == fact.origin
                 && prior.subject == fact.subject
                 && prior.payload == fact.payload
@@ -5685,7 +5683,7 @@ fn direct_callback_issue(
         names,
     );
     Some(ExternCallbackIssue {
-        callback_span: boundary.callback_span,
+        callback_at: boundary.callback_at,
         callback_path: boundary.callback_path.clone(),
         callback_type: boundary.callback_type.clone(),
         missing_effects: failed.iter().map(|effect| effect.effect.clone()).collect(),
@@ -5778,7 +5776,7 @@ pub fn infer(mint: &Mint, program: &mut Program, trace: Trace) -> Output {
     let effect_declaration_spans: IndexMap<_, _> = program
         .effects
         .iter()
-        .map(|(symbol, declaration)| (*symbol, declaration.name_span))
+        .map(|(symbol, declaration)| (*symbol, declaration.name_at))
         .collect();
     let mut operations = program.external_operations.clone();
     let mut effect_aliases = IndexMap::new();
@@ -5839,7 +5837,7 @@ pub fn infer(mint: &Mint, program: &mut Program, trace: Trace) -> Output {
             errors.push(Error {
                 id: table.error_id(),
                 cause: ErrorCause::Direct,
-                span: annotation.ty.span,
+                at: annotation.ty.at,
                 kind: ErrorKind::ClauseImpossible {
                     formula: crate::ui::in_labels(&lowered.formula, &lowered.names),
                 },
@@ -5863,7 +5861,7 @@ pub fn infer(mint: &Mint, program: &mut Program, trace: Trace) -> Output {
                 &lowered.ty,
                 &lowered.extern_sources,
                 &extern_name,
-                decl.name_span,
+                decl.name_at,
             )
         } else {
             ExternBoundaryReview::default()
@@ -5881,7 +5879,7 @@ pub fn infer(mint: &Mint, program: &mut Program, trace: Trace) -> Output {
             let mut facts = Vec::new();
             for leaf in &leaves {
                 facts.push((
-                    leaf.span,
+                    leaf.at,
                     ConstraintOrigin::ContextualCheck,
                     Subject::Annotation,
                     ExplanationFactPayload::PolymorphicExternLeaf,
@@ -5889,20 +5887,20 @@ pub fn infer(mint: &Mint, program: &mut Program, trace: Trace) -> Output {
             }
             for issue in &callback_issues {
                 facts.push((
-                    issue.callback_span,
+                    issue.callback_at,
                     ConstraintOrigin::CallbackBoundary,
                     Subject::CallbackRequired,
                     ExplanationFactPayload::CallbackRequirement,
                 ));
             }
             facts.push((
-                decl.name_span,
+                decl.name_at,
                 ConstraintOrigin::Binding,
                 Subject::Binding,
                 ExplanationFactPayload::ExternPosition,
             ));
             facts.push((
-                decl.name_span,
+                decl.name_at,
                 ConstraintOrigin::Binding,
                 Subject::Binding,
                 ExplanationFactPayload::ExternDeclaration,
@@ -5916,7 +5914,7 @@ pub fn infer(mint: &Mint, program: &mut Program, trace: Trace) -> Output {
             errors.push(Error {
                 id,
                 cause: ErrorCause::Direct,
-                span: first.span,
+                at: first.at,
                 kind: ErrorKind::PolymorphicExternBoundary {
                     variable: first.variable.clone(),
                     variable_kind: first.kind,
@@ -5941,20 +5939,20 @@ pub fn infer(mint: &Mint, program: &mut Program, trace: Trace) -> Output {
             let mut facts = Vec::new();
             for issue in &callback_issues {
                 facts.push((
-                    issue.callback_span,
+                    issue.callback_at,
                     ConstraintOrigin::CallbackBoundary,
                     Subject::CallbackRequired,
                     ExplanationFactPayload::CallbackRequirement,
                 ));
             }
             facts.push((
-                decl.value.abi.span,
+                decl.value.abi.at,
                 ConstraintOrigin::CallbackBoundary,
                 Subject::CallbackAvailable,
                 ExplanationFactPayload::ExternCapability,
             ));
             facts.push((
-                decl.name_span,
+                decl.name_at,
                 ConstraintOrigin::Binding,
                 Subject::Binding,
                 ExplanationFactPayload::ExternDeclaration,
@@ -5974,7 +5972,7 @@ pub fn infer(mint: &Mint, program: &mut Program, trace: Trace) -> Output {
             errors.push(Error {
                 id,
                 cause: ErrorCause::Direct,
-                span: first.callback_span,
+                at: first.callback_at,
                 kind: ErrorKind::CallbackEffectsNotCovered {
                     missing_effects: first.missing_effects.clone(),
                     extern_effects: first.extern_effects.clone(),
@@ -6194,7 +6192,7 @@ pub fn infer(mint: &Mint, program: &mut Program, trace: Trace) -> Output {
                         // A true placeholder preserves source/debug ordering
                         // for a wholly package-owned clause without making its
                         // guarantee globally active.
-                        table.require(annotation.ty.span, origin, lowered.assumptions.clone());
+                        table.require(annotation.ty.at, origin, lowered.assumptions.clone());
                     }
                     lowered
                 });
@@ -6274,7 +6272,7 @@ pub fn infer(mint: &Mint, program: &mut Program, trace: Trace) -> Output {
                 ambient: constrain::Ambient {
                     row: Row::closed(),
                     inside: false,
-                    boundary_span: decl.name_span,
+                    boundary_at: decl.name_at,
                     label_spans: IndexMap::new(),
                 },
                 answer: None,
@@ -6291,10 +6289,7 @@ pub fn infer(mint: &Mint, program: &mut Program, trace: Trace) -> Output {
             } else {
                 Subject::TopLevelBinding
             };
-            let expected_span = decl
-                .annotation
-                .as_ref()
-                .map(|annotation| annotation.ty.span);
+            let expected_span = decl.annotation.as_ref().map(|annotation| annotation.ty.at);
             constrain.check_term(
                 &mut decl.value,
                 &scoped.bound,
@@ -6303,7 +6298,7 @@ pub fn infer(mint: &Mint, program: &mut Program, trace: Trace) -> Output {
             );
             let effect_provenance = constrain
                 .term_effect_provenance
-                .get(&decl.value.span)
+                .get(&decl.value.at)
                 .cloned()
                 .unwrap_or_default();
             let generated = constrain.out;
@@ -6394,7 +6389,7 @@ pub fn infer(mint: &Mint, program: &mut Program, trace: Trace) -> Output {
                 &member.ty,
                 &member.scoped.rigids,
                 Rc::from(mint.name(symbol)),
-                decl.name_span,
+                decl.name_at,
                 &mut errors,
             );
             // An annotation's `where` clause is the contract, so the body may
@@ -6423,7 +6418,7 @@ pub fn infer(mint: &Mint, program: &mut Program, trace: Trace) -> Output {
                 errors.push(Error {
                     id: table.error_id(),
                     cause: ErrorCause::Direct,
-                    span: annotation.ty.span,
+                    at: annotation.ty.at,
                     kind: ErrorKind::AnnotationAllows { allowed, required },
                     explanation: None,
                 });
@@ -6453,7 +6448,7 @@ pub fn infer(mint: &Mint, program: &mut Program, trace: Trace) -> Output {
                     errors.push(Error {
                         id: table.error_id(),
                         cause: ErrorCause::Direct,
-                        span: annotated.span,
+                        at: annotated.span,
                         kind: ErrorKind::AnnotationAllows { allowed, required },
                         explanation: None,
                     });
@@ -6523,7 +6518,7 @@ pub fn infer(mint: &Mint, program: &mut Program, trace: Trace) -> Output {
                     &subst,
                     scheme.count(),
                     &member.generated,
-                    decl.annotation.as_ref().expect("annotated").ty.span,
+                    decl.annotation.as_ref().expect("annotated").ty.at,
                 )
             } else {
                 table.scheme_provenance(&member.ty, scheme.body(), &subst, scheme.count())
@@ -6574,7 +6569,7 @@ pub fn infer(mint: &Mint, program: &mut Program, trace: Trace) -> Output {
     // the annotation's on its result. Sorting by position puts that back; the
     // sort is stable, so two complaints about one span keep the order the
     // solver found them in.
-    errors.sort_by_key(|error| error.span.start);
+    errors.sort_by_key(|error| error.at);
 
     // The store as the finished solve reads it: every variable followed to what
     // it was decided to be, so that what leaves inference can be reasoned about
@@ -6590,8 +6585,8 @@ pub fn infer(mint: &Mint, program: &mut Program, trace: Trace) -> Output {
     refinements.sort_by_key(|refinement| {
         (
             position[&refinement.definition],
-            refinement.match_span.start,
-            refinement.arm_span.start,
+            refinement.match_at,
+            refinement.arm_at,
         )
     });
 
@@ -6604,9 +6599,9 @@ pub fn infer(mint: &Mint, program: &mut Program, trace: Trace) -> Output {
                 ReviewedExtern {
                     scheme: externs[symbol].clone(),
                     abi: declaration.value.abi.clone(),
-                    target: declaration.value.target.tracked.clone(),
-                    target_span: declaration.value.target.span,
-                    declaration_span: declaration.name_span,
+                    target: declaration.value.target.anchored.clone(),
+                    target_span: declaration.value.target.at,
+                    declaration_span: declaration.name_at,
                 },
             )
         })
@@ -6751,7 +6746,7 @@ fn report_flip(table: &mut Table, errors: &mut Vec<Error>) -> Option<usize> {
     errors.push(Error {
         id: table.error_id(),
         cause: ErrorCause::Batch(batch.id),
-        span: batch.span,
+        at: batch.at,
         kind,
         explanation: None,
     });
@@ -7194,7 +7189,7 @@ impl Table {
     ///
     /// Indexed rather than looked up: every rigid in a type was minted by
     /// [`lower_annotation`], which records the span as it mints.
-    fn declared(&self, id: u32) -> Span {
+    fn declared(&self, id: u32) -> Anchor {
         self.rigids[&id]
     }
 
@@ -7929,13 +7924,13 @@ impl Table {
     /// origin the readers downstream need — a match's coverage is what the
     /// patterns phase asks its reachability questions of, whether or not the
     /// arms happened to relate anything.
-    fn require(&mut self, span: Span, origin: Origin, formula: Formula) -> ReasonId {
+    fn require(&mut self, span: Anchor, origin: Origin, formula: Formula) -> ReasonId {
         self.require_because(span, origin, formula, None)
     }
 
     fn require_because(
         &mut self,
-        span: Span,
+        span: Anchor,
         origin: Origin,
         formula: Formula,
         because: Option<ReasonId>,
@@ -7945,7 +7940,7 @@ impl Table {
         self.store.batches.push(Batch {
             id,
             definition: self.definition,
-            span,
+            at: span,
             origin,
             reason,
             formula,
@@ -7957,12 +7952,12 @@ impl Table {
     /// Point the use-site batches emitted since `from`, and still carrying
     /// `at`, at `span` instead. See [`Constrain::infer_term`]'s application
     /// arm, which is the one caller and the whole of the rule.
-    fn aim(&mut self, from: usize, at: Span, span: Span) {
+    fn aim(&mut self, from: usize, at: Anchor, span: Anchor) {
         for batch in &mut self.store.batches[from..] {
             match batch {
                 Batch {
                     origin: Origin::Instance(_),
-                    span: batch_span,
+                    at: batch_span,
                     ..
                 } if *batch_span == at => *batch_span = span,
                 _ => {}
@@ -7995,7 +7990,7 @@ impl Table {
             .map(|(_, batch)| Batch {
                 id: batch.id,
                 definition: batch.definition,
-                span: batch.span,
+                at: batch.at,
                 origin: self.settled_origin(&batch.origin),
                 reason: batch.reason,
                 formula: self.resolved(&batch.formula),
@@ -8036,8 +8031,8 @@ impl Table {
     fn settled_refinement(&self, refinement: &Refinement) -> Refinement {
         Refinement {
             definition: refinement.definition,
-            match_span: refinement.match_span,
-            arm_span: refinement.arm_span,
+            match_at: refinement.match_at,
+            arm_at: refinement.arm_at,
             raw: self.resolved(&refinement.raw),
             effective: self.resolved(&refinement.effective),
             reachable: refinement.reachable,
@@ -8051,7 +8046,7 @@ impl Table {
                 .obligations
                 .iter()
                 .map(|obligation| GuardedObligation {
-                    span: obligation.span,
+                    at: obligation.at,
                     premise: self.resolved(&obligation.premise),
                     obligation: self.resolved(&obligation.obligation),
                     formula: self.resolved(&obligation.formula),
@@ -8510,7 +8505,7 @@ impl Table {
     /// Packages nested in an arrow remain wrapped until result destruction.
     fn instantiate_local(
         &mut self,
-        span: Span,
+        span: Anchor,
         symbol: Symbol,
         explained: &ExplainedScheme,
     ) -> Rc<Ty> {
@@ -8733,7 +8728,7 @@ impl Table {
 
     fn instantiate_scoped(
         &mut self,
-        span: Span,
+        span: Anchor,
         explained: &ExplainedScheme,
         coherent: Option<(Symbol, IndexSet<u32>)>,
     ) -> Rc<Ty> {
@@ -8915,7 +8910,7 @@ impl Table {
     /// abstract presences on every destruction; root lexical packages retain
     /// the coherent identity selected by `instantiate_local` (including R16's
     /// fresh identity for a separately bound alias).
-    fn open_package(&mut self, span: Span, package: &Rc<Ty>) -> Rc<Ty> {
+    fn open_package(&mut self, span: Anchor, package: &Rc<Ty>) -> Rc<Ty> {
         let Ty::Package(body) = &**package else {
             return package.clone();
         };
@@ -9150,7 +9145,7 @@ impl Table {
         ty: &Rc<Ty>,
         owned: &[u32],
         destination_name: Rc<str>,
-        destination_span: Span,
+        destination_span: Anchor,
         errors: &mut Vec<Error>,
     ) {
         let mut found = IndexMap::new();
@@ -9165,7 +9160,7 @@ impl Table {
             let full_facts = vec![
                 ExplanationFact {
                     direct: false,
-                    span: declared,
+                    at: declared,
                     constraint,
                     origin: ConstraintOrigin::ContextualCheck,
                     subject: Subject::Annotation,
@@ -9173,7 +9168,7 @@ impl Table {
                 },
                 ExplanationFact {
                     direct: false,
-                    span: destination_span,
+                    at: destination_span,
                     constraint,
                     origin: ConstraintOrigin::Binding,
                     subject: Subject::Binding,
@@ -9183,7 +9178,7 @@ impl Table {
             errors.push(Error {
                 id: error_id,
                 cause: ErrorCause::Direct,
-                span: declared,
+                at: declared,
                 kind: ErrorKind::RigidEscapes {
                     name,
                     declared,
@@ -9850,7 +9845,7 @@ impl Table {
         subst: &Subst,
         count: u32,
         constraints: &[Constraint],
-        annotation_span: Span,
+        annotation_span: Anchor,
     ) -> SchemeProvenance {
         let mut provenance = self.scheme_provenance(ty, published, subst, count);
         for node in &mut provenance.nodes {
@@ -11290,7 +11285,7 @@ fn extern_annotation_sources(
             // not caller-chosen polymorphism at the host boundary. This is true
             // whether polarity later packages them existentially or leaves the
             // one monomorphic hole to inference.
-            sources.insert_with_ownership(identity, when.span, "conditional presence", true);
+            sources.insert_with_ownership(identity, when.at, "conditional presence", true);
         }
     }
 
@@ -11299,7 +11294,7 @@ fn extern_annotation_sources(
         if matches!(tail.of, ir::Row::Anything)
             && let Some(identity) = row_variable_identity(rest)
         {
-            sources.insert(identity, tail.span, "generic row");
+            sources.insert(identity, tail.at, "generic row");
         }
     }
 
@@ -11311,14 +11306,14 @@ fn extern_annotation_sources(
                 if let Some(ty) = tails.types.get(&variable.name)
                     && let Some(identity) = type_variable_identity(ty)
                 {
-                    sources.insert(identity, variable.span, name);
+                    sources.insert(identity, variable.at, name);
                 }
             }
             Sense::Fields | Sense::Cases | Sense::Effects => {
                 if let Some(rest) = tails.rows.get(&variable.name)
                     && let Some(identity) = row_variable_identity(rest)
                 {
-                    sources.insert(identity, variable.span, name);
+                    sources.insert(identity, variable.at, name);
                 }
             }
             Sense::Presence => {
@@ -11327,7 +11322,7 @@ fn extern_annotation_sources(
                 {
                     sources.insert_with_ownership(
                         identity,
-                        variable.span,
+                        variable.at,
                         name,
                         matches!(
                             variable.ownership,
@@ -11349,10 +11344,10 @@ fn extern_annotation_sources(
         while let Ty::Package(inner) = &*semantic {
             semantic = inner.clone();
         }
-        match (&written.tracked, &*semantic) {
+        match (&written.anchored, &*semantic) {
             (ir::TypeKind::Hole, Ty::Var(var)) => sources.insert(
                 ExternVariableIdentity::TypeVar(*var),
-                written.span,
+                written.at,
                 "generic type",
             ),
             (ir::TypeKind::Apply { args, .. }, Ty::Named { args: lowered, .. }) => {
@@ -11477,7 +11472,7 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
     let mut at: HashMap<u32, u32> = HashMap::new();
     let mut rigids = Vec::new();
     for variable in &annotation.variables {
-        table.rigids.insert(variable.id, variable.span);
+        table.rigids.insert(variable.id, variable.at);
         let name: Rc<str> = variable.name.as_str().into();
         match variable.sense {
             Sense::Type => {
@@ -11523,7 +11518,7 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
         Some(clause) => clause_formula(&tails, clause),
         None => Formula::True,
     };
-    let boundaries: HashSet<Span> = annotation
+    let boundaries: HashSet<Anchor> = annotation
         .variables
         .iter()
         .filter_map(|variable| match variable.ownership {
@@ -11652,7 +11647,7 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
 /// the labels inside it go with it — so it claims nothing rather than being
 /// looked up and found missing. The first complaint already speaks.
 fn clause_formula(tails: &Tails, clause: &Clause) -> Formula {
-    match &clause.tracked {
+    match &clause.anchored {
         ClauseKind::Name(name) => tails
             .presences
             .get(name)
@@ -11685,9 +11680,9 @@ fn lower_scoped(
     table: &mut Table,
     tails: &mut Tails,
     ty: &Type,
-    boundaries: Option<&HashSet<Span>>,
+    boundaries: Option<&HashSet<Anchor>>,
 ) -> Rc<Ty> {
-    let lowered = match &ty.tracked {
+    let lowered = match &ty.anchored {
         TypeKind::Prim(prim) => (*prim).into(),
         TypeKind::Ident(symbol) => Ty::Named {
             symbol: *symbol,
@@ -11792,7 +11787,7 @@ fn lower_scoped(
         TypeKind::Error => Ty::Undecided,
     };
     let body = Rc::new(lowered);
-    match boundaries.is_some_and(|boundaries| boundaries.contains(&ty.span)) {
+    match boundaries.is_some_and(|boundaries| boundaries.contains(&ty.at)) {
         true => Rc::new(Ty::Package(body)),
         false => body,
     }
@@ -11868,7 +11863,7 @@ fn effect_row(
     table: &mut Table,
     tails: &mut Tails,
     effects: &ir::EffectRow,
-    boundaries: Option<&HashSet<Span>>,
+    boundaries: Option<&HashSet<Anchor>>,
 ) -> Row {
     let mut labels = IndexMap::new();
     for (name, label) in &effects.effects {
@@ -11876,7 +11871,7 @@ fn effect_row(
             .args()
             .iter()
             .map(|arg| {
-                Assigned::Ty(match &arg.tracked {
+                Assigned::Ty(match &arg.anchored {
                     // A row of effects written as an argument travels as an
                     // effects argument, not as the sum a declaration's row
                     // argument lowers to: see [`Ty::effects_argument`].
@@ -12475,7 +12470,7 @@ mod existential_regressions {
             solve.run(&[Constraint {
                 id: constraint,
                 reason,
-                span: Span::default(),
+                at: Anchor::GENERATED,
                 origin: ConstraintOrigin::ContextualCheck,
                 subjects: ConstraintSubjects::pair(Subject::Context, Subject::Term),
                 kind: ConstraintKind::Equal { expected, actual },
@@ -13713,7 +13708,7 @@ mod identity_tests {
         QuantifiedProvenance, ReasonId, ReasonOrigin, SchemeProvenance, Subject, Table, VarSort,
         budget_reason_slice,
     };
-    use crate::tracking::Span;
+    use crate::tracking::Anchor;
     use crate::types::{Presence, Rest, Row, RowField, Scheme, Ty};
     use indexmap::IndexMap;
     use std::rc::Rc;
@@ -13911,7 +13906,7 @@ mod identity_tests {
             },
             effect_provenance: Box::default(),
         };
-        table.instantiate_scoped(Span::default(), &explained, None);
+        table.instantiate_scoped(Anchor::GENERATED, &explained, None);
         assert_eq!(table.var_meta.last().unwrap().sort, VarSort::Row);
         assert!(matches!(
             table.reasons[table.var_meta.last().unwrap().minted_by.get() as usize].origin,

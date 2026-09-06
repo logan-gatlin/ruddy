@@ -77,8 +77,8 @@ fn compilation_trace_retention_does_not_change_causal_errors() {
     {
         assert_eq!(without_trace.explanation, with_trace.explanation);
         assert_eq!(
-            without_trace.diagnostic().title,
-            with_trace.diagnostic().title
+            without_trace.diagnostic(&off.ir.source).title,
+            with_trace.diagnostic(&complete.ir.source).title
         );
     }
     assert!(

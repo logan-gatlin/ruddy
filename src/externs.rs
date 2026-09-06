@@ -2,7 +2,7 @@
 
 use indexmap::IndexMap;
 
-use crate::{inference, ir, symbol::Symbol, tracking::Span, types::Ty};
+use crate::{inference, ir, symbol::Symbol, tracking::Anchor, types::Ty};
 
 /// The reviewed foreign declarations later lowering may absorb without another
 /// inference walk.
@@ -20,8 +20,8 @@ pub struct Extern {
     /// The complete target-neutral conversion decision, made after inference.
     pub conversion: Conversion,
     pub target: String,
-    pub target_span: Span,
-    pub declaration_span: Span,
+    pub target_at: Anchor,
+    pub declaration_at: Anchor,
 }
 
 /// How one value crosses an extern boundary. This is deliberately independent
@@ -66,8 +66,8 @@ pub(crate) fn plan(semantics: &inference::Semantics) -> ExternPlan {
                             semantics.aliases(),
                         ),
                         target: reviewed.target.clone(),
-                        target_span: reviewed.target_span,
-                        declaration_span: reviewed.declaration_span,
+                        target_at: reviewed.target_span,
+                        declaration_at: reviewed.declaration_span,
                     },
                 )
             })
@@ -80,7 +80,7 @@ fn conversion(
     ty: &std::rc::Rc<Ty>,
     aliases: &indexmap::IndexMap<Symbol, crate::types::Scheme>,
 ) -> Conversion {
-    match &abi.tracked {
+    match &abi.anchored {
         ir::ExternTypeKind::Group(inner) => conversion(inner, ty, aliases),
         ir::ExternTypeKind::Ordinary(_) => match &*exposed(ty, aliases) {
             Ty::Arrow(..) => Conversion::OrdinaryFunction,

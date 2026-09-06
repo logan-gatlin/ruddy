@@ -35,7 +35,7 @@ fn checked(src: &str) -> (ir::Output, inference::Output, patterns::Output) {
 }
 
 /// [`checked`] for a program every phase should accept.
-fn clean(src: &str) -> patterns::Output {
+fn clean(src: &str) -> (ir::Output, patterns::Output) {
     let (out, inferred, checks) = checked(src);
     assert!(out.errors.is_empty(), "ir errors: {:#?}", out.errors);
     assert!(
@@ -48,16 +48,16 @@ fn clean(src: &str) -> patterns::Output {
         "pattern errors: {:#?}",
         checks.errors
     );
-    checks
+    (out, checks)
 }
 
 /// The phase's complaints as `code@offset`, the shape every error test here
 /// asserts on.
-fn errors(checks: &patterns::Output) -> Vec<String> {
+fn errors(out: &ir::Output, checks: &patterns::Output) -> Vec<String> {
     checks
         .errors
         .iter()
-        .map(|error| format!("{}@{}", error.kind.code(), error.span.start))
+        .map(|error| format!("{}@{}", error.kind.code(), out.source.span(error.at).start))
         .collect()
 }
 
@@ -88,12 +88,12 @@ fn witness_of(checks: &patterns::Output) -> String {
 /// exception to make. Else-if produces one exhaustive report per condition.
 #[test]
 fn desugared_conditionals_are_exhaustive_boolean_matches() {
-    let checks = clean("let choose = if true then 1n else 2n end");
+    let (_, checks) = clean("let choose = if true then 1n else 2n end");
     let report = sole_report(&checks);
     assert!(matches!(report.coverage, Coverage::Exhaustive));
     assert_eq!(verdicts(report), [Verdict::Reachable; 2]);
 
-    let checks = clean("let choose = if true then 1n else if false then 2n else 3n end");
+    let (_, checks) = clean("let choose = if true then 1n else if false then 2n else 3n end");
     assert_eq!(checks.reports.len(), 2, "{:#?}", checks.reports);
     for report in &checks.reports {
         assert!(matches!(report.coverage, Coverage::Exhaustive));
@@ -106,7 +106,7 @@ fn desugared_conditionals_are_exhaustive_boolean_matches() {
 /// inference's — no complaint from anywhere.
 #[test]
 fn the_motivating_program_is_exhaustive() {
-    let checks = clean(
+    let (_, checks) = clean(
         "let p = fn a => match a with \
          | {a, b} => () | {a} => {} | {b} => {} | {} => {} end",
     );
@@ -187,7 +187,7 @@ fn array_patterns_are_exhaustive_over_every_length() {
         ),
         ("let f = fn arr => match arr with | [..all] => all end", 1),
     ] {
-        let checks = clean(src);
+        let (_, checks) = clean(src);
         let report = sole_report(&checks);
         assert!(
             matches!(report.coverage, Coverage::Exhaustive),
@@ -238,7 +238,7 @@ fn array_patterns_report_the_shortest_unhandled_length() {
             inferred.errors()
         );
         assert_eq!(
-            errors(&checks),
+            errors(&out, &checks),
             [format!(
                 "unhandled-values@{}",
                 src.find("match").expect("the match")
@@ -257,9 +257,9 @@ fn array_patterns_report_the_shortest_unhandled_length() {
 #[test]
 fn array_arms_no_length_can_reach_are_unreachable() {
     let src = "let f = fn arr => match arr with | [..] => 0n | [] => 1n end";
-    let (_, _, checks) = checked(src);
+    let (out, _, checks) = checked(src);
     assert_eq!(
-        errors(&checks),
+        errors(&out, &checks),
         [format!(
             "misplaced-catch-all@{}",
             src.find("[..] => 0n").expect("the catch-all")
@@ -297,7 +297,7 @@ fn array_arms_no_length_can_reach_are_unreachable() {
             inferred.errors()
         );
         assert_eq!(
-            errors(&checks),
+            errors(&out, &checks),
             [format!(
                 "unreachable-arm@{}",
                 src.find(dead).expect("the dead arm")
@@ -333,7 +333,7 @@ fn an_array_pattern_over_another_shape_is_skipped() {
 
 #[test]
 fn tuple_patterns_are_exact_and_split_nested_fields_exhaustively() {
-    let checks = clean(
+    let (_, checks) = clean(
         "let choose : (Boolean, Nat) -> Nat = fn value => match value with \
          | (true, n) => n | (false, n) => n end",
     );
@@ -341,7 +341,7 @@ fn tuple_patterns_are_exact_and_split_nested_fields_exhaustively() {
     assert!(matches!(report.coverage, Coverage::Exhaustive));
     assert_eq!(verdicts(report), [Verdict::Reachable; 2]);
 
-    let checks = clean(
+    let (_, checks) = clean(
         "let only : (Nat,) -> Nat = fn value => match value with \
          | (n,) => n end",
     );
@@ -352,7 +352,7 @@ fn tuple_patterns_are_exact_and_split_nested_fields_exhaustively() {
 
 #[test]
 fn struct_pattern_compatibility_flattens_forwarded_rows() {
-    let checks = clean(
+    let (_, checks) = clean(
         "type WithX 'r = { x: Nat, ..'r }\n\
          let f : WithX { y: Nat } -> Nat = fn v =>\n\
          match v with | { y, .. } => y end",
@@ -383,7 +383,7 @@ fn scalar_witnesses_step_past_a_listed_zero_value() {
 fn an_outer_presence_guard_applies_to_a_nested_literal_match() {
     clean("let paths = fn v => match v with | {box: {x}} => 1n | {other} => 2n end");
 
-    let checks = clean(
+    let (_, checks) = clean(
         "let f = fn v => match v with\n\
          | {x} => match v with | {x: 0n} => 0n | {x: n} => 1n end\n\
          | {y} => 2n end",
@@ -426,7 +426,7 @@ fn dotted_quoted_presence_paths_remain_structured_in_nested_matches() {
 fn nested_presence_paths_are_translated_for_arm_guards() {
     let src = "let f = fn v => match v with \
                | {box: {x}} => 1n | {box: {y}} => 2n end";
-    let checks = clean(src);
+    let (_, checks) = clean(src);
     let report = sole_report(&checks);
     assert!(matches!(report.coverage, Coverage::Exhaustive));
     assert_eq!(verdicts(report), [Verdict::Reachable; 2]);
@@ -480,7 +480,7 @@ fn ordered_overlap_and_nested_guards_agree_with_pattern_reachability() {
             .any(|fact| fact.field == ["x".to_string()] && !fact.present)
     );
 
-    let checks = clean(
+    let (_, checks) = clean(
         "let nested = fn v => match v with\n\
          | {left} => match left with | {x} => 1n | {y} => 2n end\n\
          | {right} => 3n end",
@@ -531,7 +531,7 @@ fn a_scrutinee_that_contradicts_the_coverage_is_unhandled() {
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert_eq!(
-        errors(&checks),
+        errors(&out, &checks),
         [format!(
             "unhandled-values@{}",
             src.find("match").expect("the match")
@@ -557,7 +557,7 @@ fn a_solved_present_field_makes_the_empty_arm_unreachable() {
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert_eq!(
-        errors(&checks),
+        errors(&out, &checks),
         [format!(
             "unreachable-arm@{}",
             src.find("{} => 0n").expect("the empty arm")
@@ -580,7 +580,7 @@ fn a_misplaced_catch_all_is_reported_at_the_arm() {
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert_eq!(
-        errors(&checks),
+        errors(&out, &checks),
         [format!(
             "misplaced-catch-all@{}",
             src.find("x => 1n").expect("the catch-all")
@@ -599,9 +599,9 @@ fn a_misplaced_catch_all_is_reported_at_the_arm() {
     // A second catch-all after the first is starved like anything else: one
     // complaint per match, at the first.
     let src = "let f = fn e => match e with | a => 1n | b => 2n | c => 3n end";
-    let (_, _, checks) = checked(src);
+    let (out, _, checks) = checked(src);
     assert_eq!(
-        errors(&checks),
+        errors(&out, &checks),
         [format!(
             "misplaced-catch-all@{}",
             src.find("a => 1n").expect("the first catch-all")
@@ -611,9 +611,9 @@ fn a_misplaced_catch_all_is_reported_at_the_arm() {
 
     // A bare `{..}` accepts everything on its face, so it is one too.
     let src = "let f = fn e => match e with | {..} => 1n | {} => 2n end";
-    let (_, _, checks) = checked(src);
+    let (out, _, checks) = checked(src);
     assert_eq!(
-        errors(&checks),
+        errors(&out, &checks),
         [format!(
             "misplaced-catch-all@{}",
             src.find("{..}").expect("the open arm")
@@ -627,7 +627,7 @@ fn a_misplaced_catch_all_is_reported_at_the_arm() {
 /// misplaced-catch-all and is exhaustive: present is arm 1's, absent arm 2's.
 #[test]
 fn an_open_pattern_with_a_field_is_not_a_catch_all() {
-    let checks = clean("let f = fn v => match v with | {x, ..} => x | {} => 0n end");
+    let (_, checks) = clean("let f = fn v => match v with | {x, ..} => x | {} => 0n end");
     let report = sole_report(&checks);
     assert!(matches!(report.coverage, Coverage::Exhaustive));
     assert_eq!(verdicts(report), [Verdict::Reachable, Verdict::Reachable]);
@@ -637,7 +637,7 @@ fn an_open_pattern_with_a_field_is_not_a_catch_all() {
 /// both are reachable, and together they cover the one optional field.
 #[test]
 fn unit_and_empty_braces_are_one_pattern() {
-    let checks = clean("let g = fn v => match v with | {a} => a | () => 0n end");
+    let (_, checks) = clean("let g = fn v => match v with | {a} => a | () => 0n end");
     let report = sole_report(&checks);
     assert!(matches!(report.coverage, Coverage::Exhaustive));
     assert_eq!(verdicts(report), [Verdict::Reachable, Verdict::Reachable]);
@@ -653,7 +653,7 @@ fn naturals_still_need_a_final_catch_all() {
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert_eq!(
-        errors(&checks),
+        errors(&out, &checks),
         [format!(
             "unhandled-numbers@{}",
             src.find("match").expect("the match")
@@ -670,9 +670,9 @@ fn naturals_still_need_a_final_catch_all() {
     // unreachable arm it always was.
     clean("let f = fn n => match n with | 0n => 1n | k => k end");
     let src = "let f = fn n => match n with | 0n => 1n | 0n => 2n | k => 3n end";
-    let (_, _, checks) = checked(src);
+    let (out, _, checks) = checked(src);
     assert_eq!(
-        errors(&checks),
+        errors(&out, &checks),
         [format!(
             "unreachable-arm@{}",
             src.rfind("0n => 2n").expect("the duplicate")
@@ -687,9 +687,9 @@ fn naturals_still_need_a_final_catch_all() {
 #[test]
 fn sum_checks_read_the_solved_row() {
     let src = "let f = fn e => match e with | #A x => 1n | #A y => 2n end";
-    let (_, _, checks) = checked(src);
+    let (out, _, checks) = checked(src);
     assert_eq!(
-        errors(&checks),
+        errors(&out, &checks),
         [format!(
             "unreachable-arm@{}",
             src.find("#A y").expect("the shadowed arm")
@@ -698,9 +698,9 @@ fn sum_checks_read_the_solved_row() {
     );
 
     let src = "let f = fn e => match e with | #A 0n => 1n end";
-    let (_, _, checks) = checked(src);
+    let (out, _, checks) = checked(src);
     assert_eq!(
-        errors(&checks),
+        errors(&out, &checks),
         [format!(
             "unhandled-values@{}",
             src.find("match").expect("the match")
@@ -726,7 +726,7 @@ fn sum_checks_read_the_solved_row() {
 /// values to leave unhandled.
 #[test]
 fn an_empty_match_stays_silent() {
-    let checks = clean("let absurd = fn v => match v with end");
+    let (_, checks) = clean("let absurd = fn v => match v with end");
     let report = sole_report(&checks);
     assert!(matches!(report.coverage, Coverage::Exhaustive));
     assert!(report.arms.is_empty());
@@ -806,10 +806,10 @@ fn a_failed_typing_skips_the_checks() {
 fn nested_matches_are_checked_too() {
     let src = "let f = fn e => match e with \
                | k => match k with | 0n => 1n end end";
-    let (_, _, checks) = checked(src);
+    let (out, _, checks) = checked(src);
     assert_eq!(checks.reports.len(), 2, "{:#?}", checks.reports);
     assert_eq!(
-        errors(&checks),
+        errors(&out, &checks),
         [format!(
             "unhandled-numbers@{}",
             src.rfind("match k").expect("the inner match")
@@ -829,7 +829,7 @@ fn a_solved_absent_field_starves_its_arm() {
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert_eq!(
-        errors(&checks),
+        errors(&out, &checks),
         [format!(
             "unreachable-arm@{}",
             src.find("{a}").expect("the demanding arm")
@@ -847,11 +847,14 @@ fn a_solved_absent_field_starves_its_arm() {
 #[test]
 fn a_report_names_the_match_and_its_scrutinee() {
     let src = "let get = fn opt => match opt with | #Some x => x | #None => 0n end";
-    let checks = clean(src);
+    let (out, checks) = clean(src);
     let report = sole_report(&checks);
-    assert_eq!(report.span.start, src.find("match").expect("the match"));
     assert_eq!(
-        report.scrutinee_span.start,
+        out.source.span(report.at).start,
+        src.find("match").expect("the match")
+    );
+    assert_eq!(
+        out.source.span(report.scrutinee_at).start,
         src.find("opt with").expect("the scrutinee")
     );
     assert_eq!(report.scrutinee.to_string(), "#Some Nat | #None");
@@ -862,7 +865,7 @@ fn a_report_names_the_match_and_its_scrutinee() {
 /// alias is the one place a solved row still arrives as a chain.
 #[test]
 fn an_aliased_scrutinee_is_unfolded() {
-    let checks = clean(
+    let (_, checks) = clean(
         "type Fallible 'r = #Err Nat | ..'r\n\
          let f : Fallible (#Ok Nat) -> Nat = \
          fn t => match t with | #Err n => n | #Ok k => k end",
@@ -887,7 +890,7 @@ fn a_listed_number_can_witness_the_hole() {
 /// says nothing about the other, and the bare `{..}` takes the rest.
 #[test]
 fn open_arms_cover_by_their_own_fields() {
-    let checks =
+    let (_, checks) =
         clean("let f = fn v => match v with | {a, ..} => 1n | {b, ..} => 2n | {..} => 3n end");
     let report = sole_report(&checks);
     assert!(matches!(report.coverage, Coverage::Exhaustive));
@@ -898,7 +901,7 @@ fn open_arms_cover_by_their_own_fields() {
 /// exactness leaves — both reachable, nothing unhandled.
 #[test]
 fn a_binder_after_a_struct_arm_takes_the_rest() {
-    let checks = clean("let f = fn v => match v with | {a} => 1n | w => 2n end");
+    let (_, checks) = clean("let f = fn v => match v with | {a} => 1n | w => 2n end");
     let report = sole_report(&checks);
     assert!(matches!(report.coverage, Coverage::Exhaustive));
     assert_eq!(verdicts(report), [Verdict::Reachable, Verdict::Reachable]);
@@ -915,7 +918,7 @@ fn an_annotated_absence_starves_the_demanding_arm() {
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert_eq!(
-        errors(&checks),
+        errors(&out, &checks),
         [format!(
             "unreachable-arm@{}",
             src.find("{a, ..}").expect("the demanding arm")
@@ -1015,9 +1018,9 @@ fn an_abandoned_sum_rest_skips_the_checks() {
 #[test]
 fn arms_above_a_misplaced_catch_all_keep_their_verdicts() {
     let src = "let f = fn n => match n with | 2n => 3n | x => 1n | 4n => 5n end";
-    let (_, _, checks) = checked(src);
+    let (out, _, checks) = checked(src);
     assert_eq!(
-        errors(&checks),
+        errors(&out, &checks),
         [format!(
             "misplaced-catch-all@{}",
             src.find("x => 1n").expect("the catch-all")
@@ -1052,20 +1055,20 @@ fn an_empty_match_over_a_real_sum_is_skipped() {
 #[test]
 fn an_open_arm_behind_an_exact_one_is_reachable() {
     // Bare `{..}` after the exact empty pattern.
-    let checks = clean("let f = fn v => match v with | {} => 1n | {..} => 2n end");
+    let (_, checks) = clean("let f = fn v => match v with | {} => 1n | {..} => 2n end");
     let report = sole_report(&checks);
     assert!(matches!(report.coverage, Coverage::Exhaustive));
     assert_eq!(verdicts(report), [Verdict::Reachable, Verdict::Reachable]);
 
     // An open arm naming the same field the exact one names: a value with
     // `a` and anything else gets past the first arm.
-    let checks = clean("let f = fn v => match v with | {a} => 1n | {a, ..} => 2n end");
+    let (_, checks) = clean("let f = fn v => match v with | {a} => 1n | {a, ..} => 2n end");
     let report = sole_report(&checks);
     assert!(matches!(report.coverage, Coverage::Exhaustive));
     assert_eq!(verdicts(report), [Verdict::Reachable, Verdict::Reachable]);
 
     // A binder behind the exact empty pattern takes the values with fields.
-    let checks = clean("let f = fn v => match v with | {} => 1n | x => 2n end");
+    let (_, checks) = clean("let f = fn v => match v with | {} => 1n | x => 2n end");
     let report = sole_report(&checks);
     assert!(matches!(report.coverage, Coverage::Exhaustive));
     assert_eq!(verdicts(report), [Verdict::Reachable, Verdict::Reachable]);
@@ -1080,7 +1083,7 @@ fn a_duplicate_exact_arm_over_a_closed_row_is_unreachable() {
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert_eq!(
-        errors(&checks),
+        errors(&out, &checks),
         [format!(
             "unreachable-arm@{}",
             src.rfind("{a} => 2n").expect("the duplicate")
@@ -1102,7 +1105,7 @@ fn an_exact_arm_behind_a_covering_open_one_is_unreachable() {
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert_eq!(
-        errors(&checks),
+        errors(&out, &checks),
         [format!(
             "unreachable-arm@{}",
             src.rfind("{a} => 2n").expect("the exact arm")
@@ -1127,7 +1130,7 @@ fn a_closed_nested_rest_offers_no_escape() {
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert_eq!(
-        errors(&checks),
+        errors(&out, &checks),
         [format!(
             "unreachable-arm@{}",
             src.rfind("{b, ..} => 3n").expect("the shadowed arm")
@@ -1162,7 +1165,7 @@ fn the_store_decides_reachability_for_a_converted_column() {
         [Verdict::Reachable, Verdict::Unreachable],
         "{checks:#?}"
     );
-    assert_eq!(errors(&checks).len(), 1, "{checks:#?}");
+    assert_eq!(errors(&out, &checks).len(), 1, "{checks:#?}");
     assert_eq!(
         checks.errors[0].kind.code(),
         ErrorKind::UnreachableArm.code()
@@ -1255,7 +1258,7 @@ fn a_field_the_type_never_named_is_still_a_column() {
     assert!(matches!(report.coverage, Coverage::Exhaustive));
     assert_eq!(verdicts(report), [Verdict::Unreachable, Verdict::Reachable]);
     assert_eq!(
-        errors(&checks),
+        errors(&out, &checks),
         [format!(
             "unreachable-arm@{}",
             src.find("{a, ..}").expect("the arm")
@@ -1297,7 +1300,7 @@ fn a_non_qualifying_column_reads_the_store_for_reachability() {
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert_eq!(
-        errors(&checks),
+        errors(&out, &checks),
         [format!(
             "unreachable-arm@{}",
             src.find("{x: n, y}").expect("the arm the store forbids")
@@ -1357,7 +1360,7 @@ fn a_nested_binding_reads_the_store_for_reachability() {
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert_eq!(
-        errors(&checks),
+        errors(&out, &checks),
         [format!(
             "unreachable-arm@{}",
             src.find("{x: n, y}").expect("the arm the store forbids")
@@ -1392,7 +1395,7 @@ fn a_nested_written_clause_shapes_the_witness() {
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert_eq!(
-        errors(&checks),
+        errors(&out, &checks),
         [format!(
             "unhandled-values@{}",
             src.find("match").expect("the match")
@@ -1417,7 +1420,7 @@ fn a_non_qualifying_column_with_no_constraints_reads_as_before() {
         inferred.semantics().store()
     );
     assert_eq!(
-        errors(&checks),
+        errors(&out, &checks),
         [format!(
             "unhandled-values@{}",
             src.find("match").expect("the match")
@@ -1477,7 +1480,7 @@ fn other_primitive_literal_sets_need_a_wildcard() {
 
 #[test]
 fn quoted_struct_fields_are_exhaustive_by_their_decoded_names() {
-    let checks = clean(
+    let (_, checks) = clean(
         r###"let f = fn value => match value with | { "field name": x } => x | { "let": y } => y end"###,
     );
     let report = sole_report(&checks);
@@ -1487,7 +1490,7 @@ fn quoted_struct_fields_are_exhaustive_by_their_decoded_names() {
 
 #[test]
 fn quoted_sum_variants_are_exhaustive_by_their_decoded_names() {
-    let checks = clean(
+    let (_, checks) = clean(
         r###"let f : (#"some case" Nat | #"let" | #"line\n\"quote\"\\tail") -> Nat = fn value => match value with | #"some case" n => n | #"let" => 0n | #"line\n\"quote\"\\tail" => 0n end"###,
     );
     let report = sole_report(&checks);

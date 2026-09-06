@@ -19,7 +19,7 @@ use indexmap::IndexMap;
 use ruddy::{
     ir::{Program, Term, TermKind},
     symbol::{Mint, Symbol},
-    tracking::Tracked,
+    tracking::Anchored,
     types::{Formula, Rest, Row, Scheme, Ty},
 };
 
@@ -51,7 +51,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             "type",
             *symbol,
             ty.to_string(),
-            program.types.get(symbol).map(|decl| decl.name_span),
+            program.types.get(symbol).map(|decl| decl.name_at),
         )
     });
     let externs = output.externs().iter().map(|(symbol, scheme)| {
@@ -59,7 +59,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             "extern",
             *symbol,
             scheme.to_string(),
-            program.externs.get(symbol).map(|decl| decl.name_span),
+            program.externs.get(symbol).map(|decl| decl.name_at),
         )
     });
     let schemes = output.schemes().iter().map(|(symbol, scheme)| {
@@ -67,7 +67,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             "let",
             *symbol,
             scheme.to_string(),
-            program.terms.get(symbol).map(|decl| decl.name_span),
+            program.terms.get(symbol).map(|decl| decl.name_at),
         )
     });
     let relevant = relevant_parameters(output.aliases());
@@ -82,7 +82,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                 meaning,
             );
             if let Some(span) = name_span {
-                node = node.at(span);
+                node = node.at(cx.source.span(span));
             }
             node = with_symbol(node, cx, mint, symbol);
             // A declaration's parameters print as `a`, `b` in the meaning
@@ -94,7 +94,8 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             if let Some(decl) = program.types.get(&symbol) {
                 for (index, param) in decl.params.iter().enumerate() {
                     let letter = Ty::Bound(index as u32).to_string();
-                    let row = Node::new(ids.next(), letter, stands_for(mint, param)).at(param.span);
+                    let row = Node::new(ids.next(), letter, stands_for(mint, param))
+                        .at(cx.source.span(param.at));
                     node = node.child(with_symbol(row, cx, mint, param.symbol));
                 }
             }
@@ -125,7 +126,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             // knows whose it is.
             if let Some(decl) = program.terms.get(&symbol) {
                 for local in locals(&decl.value) {
-                    let scheme = match output.locals().get(&local.tracked) {
+                    let scheme = match output.locals().get(&local.anchored) {
                         Some(scheme) => scheme.to_string(),
                         // Nothing was published for it, which means inference
                         // never reached it: the definition failed to lower, and
@@ -134,11 +135,11 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                     };
                     let row = Node::new(
                         ids.next(),
-                        format!("local {}", mint.name(local.tracked)),
+                        format!("local {}", mint.name(local.anchored)),
                         scheme,
                     )
-                    .at(local.span);
-                    node = node.child(with_symbol(row, cx, mint, local.tracked));
+                    .at(cx.source.span(local.at));
+                    node = node.child(with_symbol(row, cx, mint, local.anchored));
                 }
             }
             node
@@ -253,13 +254,13 @@ fn ownership_metadata(scheme: &Scheme) -> (u32, Vec<u32>) {
 /// Every name a nested `let` binds inside one definition's value, in the order
 /// they were written — which is the order they were walked, and so the order
 /// their schemes were published in.
-fn locals(term: &Term) -> Vec<Tracked<Symbol>> {
+fn locals(term: &Term) -> Vec<Anchored<Symbol>> {
     let mut out = Vec::new();
     walk_locals(term, &mut out);
     out
 }
 
-fn walk_locals(term: &Term, out: &mut Vec<Tracked<Symbol>>) {
+fn walk_locals(term: &Term, out: &mut Vec<Anchored<Symbol>>) {
     match &term.kind {
         TermKind::Let {
             name, value, body, ..

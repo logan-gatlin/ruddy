@@ -107,13 +107,15 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             flipped = Some(at);
         }
         let mut node = Node::new(ids.next(), batch.origin.code(), batch.formula.to_string())
-            .at(batch.span)
+            .at(cx.source.span(batch.at))
             .field("_batch_id", batch.id.get().to_string())
             .field("_reason_id", batch.reason.get().to_string());
         if batch.flipped {
             node = node.error();
         }
-        node = node.child(Node::new(ids.next(), "origin", batch.origin.to_string()).at(batch.span));
+        node = node.child(
+            Node::new(ids.next(), "origin", batch.origin.to_string()).at(cx.source.span(batch.at)),
+        );
         // The verdict, with the evidence beside it: a model where there is one,
         // and the mark on the batch itself where there is not.
         let verdict = match sat::model(&accumulated) {
@@ -148,8 +150,12 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             )
             .error(),
         };
-        node = node.child(verdict.at(batch.span));
-        node = node.children(origin_details(&mut ids, &batch.origin, batch.span));
+        node = node.child(verdict.at(cx.source.span(batch.at)));
+        node = node.children(origin_details(
+            &mut ids,
+            &batch.origin,
+            cx.source.span(batch.at),
+        ));
         nodes.push(node);
     }
 
@@ -161,10 +167,10 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     for refinement in diagnostics.refinements() {
         match groups
             .iter_mut()
-            .find(|(span, _)| *span == refinement.match_span)
+            .find(|(span, _)| *span == cx.source.span(refinement.match_at))
         {
             Some((_, arms)) => arms.push(refinement),
-            None => groups.push((refinement.match_span, vec![refinement])),
+            None => groups.push((cx.source.span(refinement.match_at), vec![refinement])),
         }
     }
     for (span, arms) in groups {
@@ -179,10 +185,10 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                     false => "assumption unreachable — solved without refinement",
                 },
             )
-            .at(refinement.arm_span)
+            .at(cx.source.span(refinement.arm_at))
             .child(
                 Node::new(ids.next(), "raw coverage", refinement.raw.to_string())
-                    .at(refinement.arm_span),
+                    .at(cx.source.span(refinement.arm_at)),
             )
             .child(
                 Node::new(
@@ -190,7 +196,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                     "effective assumption",
                     refinement.effective.to_string(),
                 )
-                .at(refinement.arm_span),
+                .at(cx.source.span(refinement.arm_at)),
             );
             let path = |segments: &[String]| display_presence_path(segments);
             for (name, presence) in &refinement.fields {
@@ -200,7 +206,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                         format!("presence {}", path(name)),
                         presence.to_string(),
                     )
-                    .at(refinement.arm_span),
+                    .at(cx.source.span(refinement.arm_at)),
                 );
             }
             for fact in &refinement.facts {
@@ -214,7 +220,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                             path(&fact.field)
                         ),
                     )
-                    .at(refinement.arm_span),
+                    .at(cx.source.span(refinement.arm_at)),
                 );
             }
             for obligation in &refinement.obligations {
@@ -227,7 +233,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                             obligation.premise, obligation.obligation, obligation.formula
                         ),
                     )
-                    .at(obligation.span),
+                    .at(cx.source.span(obligation.at)),
                 );
             }
             matched = matched.child(arm);
@@ -249,7 +255,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         };
         let row = Node::new(ids.next(), format!("let {}", mint.name(*symbol)), clause);
         let row = match cx.program.and_then(|program| program.terms.get(symbol)) {
-            Some(decl) => row.at(decl.name_span),
+            Some(decl) => row.at(cx.source.span(decl.name_at)),
             None => row,
         };
         // Beside the clause, what the patterns phase walks the definition

@@ -10,7 +10,7 @@ use crate::{
     artifact,
     parse::{self, Expr, ExprKind, Stmt, StmtKind},
     symbol::{Mint, Module, Namespace, Symbol},
-    tracking::{Span, Tracked, TrackedString},
+    tracking::{Anchor, Anchored, AnchoredString, SourceMap, Span, Tracked, TrackedString},
     types::{EffectId, ParamKind, Presence, Prim, Rest, Scheme, Sense, Shape, Ty},
 };
 
@@ -82,7 +82,7 @@ pub struct Alias {
 /// An alias body: the applications it names and the tail it ends in.
 #[derive(Debug, Clone, Default)]
 pub struct AliasBody {
-    pub span: Span,
+    pub at: Anchor,
     pub cases: Vec<AliasCase>,
     pub tail: Option<Tail>,
 }
@@ -90,7 +90,7 @@ pub struct AliasBody {
 /// One application an alias body names: `!Ask 'a`, or `Sys::!Log`.
 #[derive(Debug, Clone)]
 pub struct AliasCase {
-    pub name_span: Span,
+    pub name_at: Anchor,
     pub symbol: Symbol,
     pub args: Vec<Type>,
 }
@@ -103,7 +103,7 @@ pub struct AliasCase {
 #[derive(Debug, Clone)]
 pub struct Operation {
     /// Where the selector (or the unnamed signature) was written.
-    pub name_span: Span,
+    pub name_at: Anchor,
     pub from: Type,
     pub to: Type,
 }
@@ -146,7 +146,7 @@ impl OperationSelector {
 /// resolve through.
 #[derive(Debug, Clone)]
 pub struct Named {
-    pub name_span: Span,
+    pub name_at: Anchor,
     pub symbol: Symbol,
 }
 
@@ -190,7 +190,7 @@ pub struct Group {
 /// split [`Field`] uses.
 #[derive(Debug, Clone)]
 pub struct Decl<T> {
-    pub name_span: Span,
+    pub name_at: Anchor,
     /// The written type the definition is to be checked against, when it was
     /// ascribed one. Always `None` for a `type` declaration: that *is* a type,
     /// so there is nothing to check it against.
@@ -206,7 +206,7 @@ pub struct Decl<T> {
 #[derive(Debug, Clone)]
 pub struct Param {
     /// Where the name was written, so a repeat can point at what it repeats.
-    pub span: Span,
+    pub at: Anchor,
     pub symbol: Symbol,
     /// What it stands for. Not known while the body is being lowered — it
     /// follows from how the body uses it — so it is [`ParamKind::Type`] until
@@ -235,7 +235,7 @@ pub struct Param {
 /// unchanged; target-independent lowering does not interpret it.
 #[derive(Debug, Clone)]
 pub struct Extern {
-    pub target: TrackedString,
+    pub target: AnchoredString,
     /// This declaration matched one exact compiler-reserved array intrinsic
     /// signature during lowering. Source-controlled names and targets alone
     /// are not authority to bypass ordinary host-boundary checks.
@@ -250,7 +250,7 @@ pub struct Extern {
 /// A resolved extern boundary type. Every leaf contains the corresponding
 /// part of the already-resolved annotation, while marked functions retain
 /// their host arity and callback nesting.
-pub type ExternType = Tracked<ExternTypeKind>;
+pub type ExternType = Anchored<ExternTypeKind>;
 
 #[derive(Debug, Clone)]
 pub enum ExternTypeKind {
@@ -270,12 +270,12 @@ pub enum ExternTypeKind {
 /// is nullary). Invalid annotation pieces are deliberately retained as error
 /// leaves rather than making ABI retention depend on successful resolution.
 fn resolved_extern_type(written: parse::ExternType, resolved: &Type) -> ExternType {
-    let span = written.span;
+    // The ABI tree mirrors the annotation it was resolved against, so its
+    // nodes are anchored where the annotation's are.
+    let at = resolved.at;
     match written.tracked {
-        parse::ExternTypeKind::Ordinary(_) => {
-            span.track(ExternTypeKind::Ordinary(resolved.clone()))
-        }
-        parse::ExternTypeKind::Group(inner) => span.track(ExternTypeKind::Group(Box::new(
+        parse::ExternTypeKind::Ordinary(_) => at.anchor(ExternTypeKind::Ordinary(resolved.clone())),
+        parse::ExternTypeKind::Group(inner) => at.anchor(ExternTypeKind::Group(Box::new(
             resolved_extern_type(*inner, resolved),
         ))),
         parse::ExternTypeKind::Function {
@@ -286,7 +286,7 @@ fn resolved_extern_type(written: parse::ExternType, resolved: &Type) -> ExternTy
             let arrow_count = parameters.len().max(1);
             let mut effects = Box::new(EffectRow::default());
             for at in 0..arrow_count {
-                match cursor.tracked.clone() {
+                match cursor.anchored.clone() {
                     TypeKind::Arrow {
                         from,
                         to,
@@ -305,9 +305,9 @@ fn resolved_extern_type(written: parse::ExternType, resolved: &Type) -> ExternTy
                         // the ABI tree total so diagnostics remain the only
                         // observable consequence of the malformed annotation.
                         if at < parameters.len() {
-                            resolved_parameters.push(span.track(TypeKind::Error));
+                            resolved_parameters.push(cursor.at.anchor(TypeKind::Error));
                         }
-                        cursor = span.track(TypeKind::Error);
+                        cursor = cursor.at.anchor(TypeKind::Error);
                     }
                 }
             }
@@ -317,7 +317,7 @@ fn resolved_extern_type(written: parse::ExternType, resolved: &Type) -> ExternTy
                 .map(|(parameter, resolved)| resolved_extern_type(parameter, resolved))
                 .collect();
             let result = Box::new(resolved_extern_type(*result, &cursor));
-            span.track(ExternTypeKind::Function {
+            at.anchor(ExternTypeKind::Function {
                 parameters,
                 result,
                 effects,
@@ -332,7 +332,7 @@ pub struct Term {
     /// until then this is [`Ty::default`], the undecided type — see
     /// [`TermKind::with_span`].
     pub ty: Rc<Ty>,
-    pub span: Span,
+    pub at: Anchor,
     pub kind: TermKind,
 }
 
@@ -352,7 +352,7 @@ pub enum TermKind {
         arg: Box<Term>,
     },
     Fn {
-        arg: Tracked<Symbol>,
+        arg: Anchored<Symbol>,
         body: Box<Term>,
     },
     /// A name given a value for the length of a body.
@@ -363,7 +363,7 @@ pub enum TermKind {
     /// same term. It is also what the reader wrote, which is what the IR is for.
     Let {
         /// The name this binds, and where it was written.
-        name: Tracked<Symbol>,
+        name: Anchored<Symbol>,
         /// The written type, lowered, when the binding was ascribed one.
         ///
         /// Boxed because an annotation is the largest thing a term can carry
@@ -399,7 +399,7 @@ pub enum TermKind {
     /// unit all the same, which [`inference`](crate::inference) says where it
     /// builds the type rather than the tree.
     Tag {
-        name: TrackedString,
+        name: AnchoredString,
         payload: Option<Box<Term>>,
     },
     /// Reading one field out of a struct. The name stays a string for the
@@ -408,7 +408,7 @@ pub enum TermKind {
     /// is no symbol to resolve it to and nothing here can fail to resolve.
     Project {
         base: Box<Term>,
-        field: TrackedString,
+        field: AnchoredString,
     },
     /// Dispatch on what a value is: the written match, one arm per written
     /// arm, each field_summaries its pattern normalized — names resolved, puns
@@ -451,8 +451,8 @@ pub enum TermKind {
     /// it, and lowering has already checked that the name is one of that
     /// effect's.
     Operation {
-        effect: Tracked<Symbol>,
-        selector: Tracked<OperationSelector>,
+        effect: Anchored<Symbol>,
+        selector: Anchored<OperationSelector>,
     },
     Ident(Symbol),
     /// Numeric literals carry no symbol: a literal names nothing, so there is
@@ -497,7 +497,7 @@ pub struct Handler {
     /// where it was written is not kept, because nothing depends on it.
     pub ret: Option<ReturnArm>,
     /// The effects fully covered, in the order the arms first name them.
-    pub discharges: Vec<Tracked<Symbol>>,
+    pub discharges: Vec<Anchored<Symbol>>,
 }
 
 /// One operation arm: the operation it answers, the name it binds the payload
@@ -508,11 +508,11 @@ pub struct Handler {
 /// neither.
 #[derive(Debug, Clone)]
 pub struct HandlerArm {
-    pub effect: Tracked<Symbol>,
-    pub selector: Tracked<OperationSelector>,
+    pub effect: Anchored<Symbol>,
+    pub selector: Anchored<OperationSelector>,
     /// The binder, as a symbol. A `_` gets a fresh one nothing can name, the
     /// way a `fn` header's wildcard does.
-    pub binder: Tracked<Symbol>,
+    pub binder: Anchored<Symbol>,
     pub body: Term,
 }
 
@@ -521,8 +521,8 @@ pub struct HandlerArm {
 #[derive(Debug, Clone)]
 pub struct ReturnArm {
     /// Where the `return` was written, so a second one can point at the first.
-    pub span: Span,
-    pub binder: Tracked<Symbol>,
+    pub at: Anchor,
+    pub binder: Anchored<Symbol>,
     /// Boxed where an operation arm's is not: those sit in a `Vec`, which is
     /// already a step away, and there is at most one of these.
     pub body: Box<Term>,
@@ -532,7 +532,7 @@ pub struct ReturnArm {
 /// expanded, grouping parentheses gone. What a [`TermKind::Match`] arm keeps
 /// of what the reader wrote — the structure survives, only the surface
 /// conveniences are erased.
-pub type Pattern = Tracked<PatternKind>;
+pub type Pattern = Anchored<PatternKind>;
 
 // spans field_summary per node as the IR's other types do
 /// One scalar value that can be written both as an expression and a pattern.
@@ -579,7 +579,7 @@ impl Hash for Literal {
 #[derive(Debug, Clone)]
 pub enum PatternKind {
     /// An identifier: binds the whole value at this position.
-    Bind(Tracked<Symbol>),
+    Bind(Anchored<Symbol>),
     /// `_`: accepts the whole value at this position and binds nothing. A
     /// variant of its own rather than a fresh [`Bind`](PatternKind::Bind), so
     /// the tree still says what was written: printing gives back the `_`, the
@@ -595,12 +595,12 @@ pub enum PatternKind {
         /// exactly the fields it names — which is what the column rule in
         /// inference and the typed checks in [`patterns`](crate::patterns)
         /// both read off this marker.
-        rest: Option<Span>,
+        rest: Option<Anchor>,
     },
     /// Payload `None` means "written bare": constrains the payload to
     /// unit, binding nothing — the same convention TermKind::Tag keeps.
     Tag {
-        name: TrackedString,
+        name: AnchoredString,
         payload: Option<Box<Pattern>>,
     },
     Natural(u64),
@@ -620,7 +620,7 @@ pub enum PatternKind {
     },
 }
 
-pub type Type = Tracked<TypeKind>;
+pub type Type = Anchored<TypeKind>;
 
 #[derive(Debug, Clone)]
 pub enum TypeKind {
@@ -669,7 +669,7 @@ pub enum TypeKind {
         /// is about the whole application — counting the arguments is the thing
         /// the reader has to do, and underlining four characters of a name says
         /// nothing about how many follow it. See [`Builder::apply`].
-        head_span: Span,
+        head_at: Anchor,
         args: Vec<Type>,
     },
     /// A parameter of the declaration this type is the body of.
@@ -719,15 +719,15 @@ pub enum TypeKind {
 pub enum TypeField {
     /// `name [when a]: T`, as written.
     Written {
-        name_span: Span,
+        name_at: Anchor,
         when: Option<Box<When>>,
         value: Type,
     },
     /// `\name` — the label is explicitly absent, so there is no type here to
     /// carry: what the entry lowers to is [`Presence::Absent`](crate::types::Presence)
-    /// with its type deliberately unconstrained. `name_span` covers the whole
+    /// with its type deliberately unconstrained. `name_at` covers the whole
     /// `\name`, which is where a complaint about the entry points.
-    Absent { name_span: Span },
+    Absent { name_at: Anchor },
 }
 
 /// The `when` clause on one label, lowered.
@@ -739,7 +739,7 @@ pub enum TypeField {
 /// other and named by nothing, so no [`Clause`] can mention it.
 #[derive(Debug, Clone)]
 pub struct When {
-    pub span: Span,
+    pub at: Anchor,
     pub name: Option<String>,
     /// Program-unique even for `when _`; anonymous occurrences must never
     /// accidentally share an inferred package slot.
@@ -754,7 +754,7 @@ pub struct When {
 /// without a lookup that could fail. Kept as the tree it was written as rather
 /// than as a normal form, because an annotation is a contract and prints back
 /// as itself; normalizing is generalization's, once.
-pub type Clause = Tracked<ClauseKind>;
+pub type Clause = Anchored<ClauseKind>;
 
 #[derive(Debug, Clone)]
 pub enum ClauseKind {
@@ -788,7 +788,7 @@ pub struct Annotation {
     pub variables: Vec<Variable>,
     /// Anonymous positive-only occurrences and their exact producer boundary.
     /// Each `when _` has its own id even when several share a boundary.
-    pub anonymous_existentials: Vec<(u32, Span)>,
+    pub anonymous_existentials: Vec<(u32, Anchor)>,
     pub clause: Option<Clause>,
 }
 
@@ -803,7 +803,7 @@ pub struct Variable {
     pub ownership: PresenceOwnership,
     /// Where the name was written, so a complaint about what the body did with
     /// it can point back at the promise it broke.
-    pub span: Span,
+    pub at: Anchor,
     pub name: String,
     /// What the type beside it uses the name as. Worked out from the uses, the
     /// way a declaration parameter's [`ParamKind`] is; a variable used nowhere
@@ -825,14 +825,14 @@ pub struct Variable {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PresenceOwnership {
     Universal,
-    Existential { boundary: Span },
+    Existential { boundary: Anchor },
 }
 
 #[derive(Debug, Clone, Default)]
 struct PresenceOccurrences {
     positive: u32,
     negative: u32,
-    owners: Vec<Span>,
+    owners: Vec<Anchor>,
 }
 
 impl PresenceOccurrences {
@@ -840,7 +840,7 @@ impl PresenceOccurrences {
     /// occurrence. Containing boundaries are deliberately not unified: an
     /// invocation result makes a fresh choice, so its witness cannot also be
     /// the witness of the enclosing value (or of a sibling invocation).
-    fn owner(&self) -> Result<Span, (Span, Span)> {
+    fn owner(&self) -> Result<Anchor, (Anchor, Anchor)> {
         let owner = self
             .owners
             .first()
@@ -865,7 +865,7 @@ fn presence_polarities(
         out: &mut HashMap<u32, PresenceOccurrences>,
         when: &Option<Box<When>>,
         positive: bool,
-        owner: Span,
+        owner: Anchor,
     ) {
         let Some(when) = when.as_ref() else { return };
         let occurrence = out.entry(when.id).or_default();
@@ -878,8 +878,8 @@ fn presence_polarities(
     }
 
     enum Work<'a> {
-        Ty(&'a Type, bool, Span),
-        Effects(&'a EffectRow, bool, Span),
+        Ty(&'a Type, bool, Anchor),
+        Effects(&'a EffectRow, bool, Anchor),
     }
 
     // An explicit worklist is important here: annotations and imported alias
@@ -887,8 +887,8 @@ fn presence_polarities(
     // stack. Push in reverse source order so first-occurrence diagnostics stay
     // deterministic.
     let mut out = HashMap::new();
-    let mut seen: HashMap<(usize, Span), u8> = HashMap::new();
-    let mut work = vec![Work::Ty(ty, true, ty.span)];
+    let mut seen: HashMap<(usize, Anchor), u8> = HashMap::new();
+    let mut work = vec![Work::Ty(ty, true, ty.at)];
     while let Some(part) = work.pop() {
         match part {
             Work::Effects(row, positive, owner) => {
@@ -905,10 +905,10 @@ fn presence_polarities(
                     continue;
                 }
                 *visited |= bit;
-                match &ty.tracked {
+                match &ty.anchored {
                     TypeKind::Arrow { from, to, effects } => {
                         work.push(Work::Effects(effects, positive, owner));
-                        let result_owner = if positive { to.span } else { owner };
+                        let result_owner = if positive { to.at } else { owner };
                         work.push(Work::Ty(to, positive, result_owner));
                         work.push(Work::Ty(from, !positive, owner));
                     }
@@ -994,7 +994,7 @@ fn declaration_variances(
                     continue;
                 }
                 *visited |= bit;
-                match &ty.tracked {
+                match &ty.anchored {
                     TypeKind::Param { index, .. } => {
                         *out.entry((*owner, *index)).or_default() |= bit;
                     }
@@ -1159,13 +1159,13 @@ fn declaration_variances(
 pub enum SumCase {
     /// `#Name [(when a)] [T]`, as written.
     Written {
-        name_span: Span,
+        name_at: Anchor,
         when: Option<Box<When>>,
         payload: Option<Type>,
     },
     /// `\#Name` — the case is explicitly absent, field_summaries nothing.
-    /// `name_span` covers the whole `\#Name`.
-    Absent { name_span: Span },
+    /// `name_at` covers the whole `\#Name`.
+    Absent { name_at: Anchor },
 }
 
 /// The effects an arrow may perform, lowered: the effects it names, and what is
@@ -1182,7 +1182,7 @@ pub enum SumCase {
 /// both mean this.
 #[derive(Debug, Clone, Default)]
 pub struct EffectRow {
-    pub span: Span,
+    pub at: Anchor,
     pub written: bool,
     pub effects: IndexMap<EffectId, EffectLabel>,
     pub tail: Option<Tail>,
@@ -1199,23 +1199,23 @@ pub struct EffectRow {
 pub enum EffectLabel {
     /// `!Log`, `!Ask Nat`, or `!Log (when a)`.
     Written {
-        name_span: Span,
+        name_at: Anchor,
         symbol: Symbol,
         /// The arguments, one per parameter the effect declares, in order.
         args: Vec<Type>,
         /// Whether this label came out of an alias rather than being written.
         ///
         /// `!Console` stands for `!Log` and `!IO`, and neither of
-        /// those names is anywhere on the page — `name_span` is the alias's.
+        /// those names is anywhere on the page — `name_at` is the alias's.
         /// What reads this is the debugger, which may paint a span in the
         /// editor as a use of a name only where the name really is.
         expanded: bool,
         when: Option<Box<When>>,
     },
-    /// `\!Log` — definitely not performed. `name_span` covers the whole
+    /// `\!Log` — definitely not performed. `name_at` covers the whole
     /// `\!Log`.
     Absent {
-        name_span: Span,
+        name_at: Anchor,
         symbol: Symbol,
         args: Vec<Type>,
         expanded: bool,
@@ -1225,7 +1225,7 @@ pub enum EffectLabel {
 /// The `..` tail of a struct type: what is said about the fields not named.
 #[derive(Debug, Clone)]
 pub struct Tail {
-    pub span: Span,
+    pub at: Anchor,
     pub of: Row,
 }
 
@@ -1262,7 +1262,7 @@ pub enum Row {
 /// paths anything can refer to, so they have no place in a module tree.
 #[derive(Debug, Clone)]
 pub struct Field<T> {
-    pub name_span: Span,
+    pub name_at: Anchor,
     pub value: T,
 }
 
@@ -1270,7 +1270,7 @@ pub struct Field<T> {
 /// surface carries, the value lowered.
 #[derive(Debug, Clone)]
 pub struct Spread {
-    pub span: Span,
+    pub at: Anchor,
     pub value: Box<Term>,
 }
 
@@ -1278,7 +1278,7 @@ pub struct Spread {
 /// when the item spreads an array rather than supplying one value.
 #[derive(Debug, Clone)]
 pub struct ArrayItem {
-    pub spread: Option<Span>,
+    pub spread: Option<Anchor>,
     pub value: Term,
 }
 
@@ -1286,13 +1286,13 @@ pub struct ArrayItem {
 /// surface carries, the name resolved to the symbol it binds.
 #[derive(Debug, Clone)]
 pub struct ArrayRest {
-    pub span: Span,
-    pub name: Option<Tracked<Symbol>>,
+    pub at: Anchor,
+    pub name: Option<Anchored<Symbol>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Error {
-    pub span: Span,
+    pub at: Anchor,
     pub kind: ErrorKind,
 }
 
@@ -1323,18 +1323,18 @@ pub enum ErrorKind {
     Duplicate {
         name: String,
         namespace: Namespace,
-        previous: Span,
+        previous: Anchor,
     },
     DuplicateField {
         name: String,
-        previous: Span,
+        previous: Anchor,
     },
     /// A second case of a name in one sum, one effect row, or one alias — all
     /// three being a set of labels a name may appear in once.
     DuplicateCase {
         shape: Shape,
         name: String,
-        previous: Span,
+        previous: Anchor,
     },
     /// An explicitly absent label in a composite with no `..` tail, as in
     /// `{ a: Nat, \y }` or `#A | \#B`.
@@ -1457,7 +1457,7 @@ pub enum ErrorKind {
     IncompatiblePresenceOwnership {
         name: String,
         /// The other actionable production boundary.
-        previous: Span,
+        previous: Anchor,
     },
     /// A type given a different number of arguments than it takes, including a
     /// name written bare that takes some.
@@ -1496,7 +1496,7 @@ pub enum ErrorKind {
     /// A row given two tails: one it wrote, and one an alias it names brought
     /// with it.
     TwoTails {
-        previous: Span,
+        previous: Anchor,
     },
     /// Something that is not a declared type, applied: a primitive, a struct,
     /// a parenthesized arrow.
@@ -1514,7 +1514,7 @@ pub enum ErrorKind {
     /// One declaration binding a name twice: `type Pair 'A 'A = ...`.
     DuplicateParameter {
         name: String,
-        previous: Span,
+        previous: Anchor,
     },
     /// A type that leads back to itself having been given an argument built out
     /// of what it takes, as in `type T 'a = { next: T { x: 'a } }`.
@@ -1558,7 +1558,7 @@ pub enum ErrorKind {
     MixedTail {
         first: Sense,
         second: Sense,
-        previous: Span,
+        previous: Anchor,
     },
     /// A parameter used as both of the things a parameter can be — a whole type
     /// and the rest of a sum — as in `type M 'r = { g: (#A | ..'r), f: 'r }`.
@@ -1677,7 +1677,7 @@ pub enum ErrorKind {
     /// arms — may of course bind the same name.
     DuplicateBinding {
         name: String,
-        previous: Span,
+        previous: Anchor,
     },
     /// A second operation of a name in one effect:
     /// `effect Log = { write: Nat -> (), write: () -> () }`.
@@ -1687,7 +1687,7 @@ pub enum ErrorKind {
     /// declare a `write` and two `write` in one may not.
     DuplicateOperation {
         name: String,
-        previous: Span,
+        previous: Anchor,
     },
     /// An operation whose signature is not a function, retained after the
     /// parser rejects `effect Log = { write: Nat }`.
@@ -1762,12 +1762,12 @@ pub enum ErrorKind {
     DuplicateArm {
         effect: String,
         selector: OperationSelector,
-        previous: Span,
+        previous: Anchor,
     },
     /// Two `return` arms in one handler. Reported at the second; the first is
     /// the one that stands.
     DuplicateReturn {
-        previous: Span,
+        previous: Anchor,
     },
     /// A `raise` with no handler arm enclosing it.
     RaiseOutsideArm,
@@ -1779,7 +1779,7 @@ pub enum ErrorKind {
     /// handler on the stack. The mirror case needs no rule, because the row
     /// already tracks it.
     RaiseInFunction {
-        function: Span,
+        function: Anchor,
     },
 }
 
@@ -1843,6 +1843,9 @@ pub enum Witness {
 #[derive(Debug, Clone)]
 pub struct Output {
     pub program: Program,
+    /// Where every anchor in `program` was written. Kept beside the program
+    /// rather than in it: see [`Anchor`].
+    pub source: SourceMap,
     pub errors: Vec<Error>,
 }
 
@@ -1909,6 +1912,19 @@ struct Builder<'a> {
     /// from above the declaration that binds it and from another file. R9's
     /// walk reads it once per enclosing module, outward to the bundle root.
     globals: HashMap<(Option<Module>, Namespace, String), (Symbol, Span)>,
+    /// Where every node lowered so far was written, by the anchor that names
+    /// it. See [`Anchor`].
+    source: SourceMap,
+    /// The top-level definition being lowered, which every anchor minted
+    /// meanwhile belongs to. [`Symbol::GENERATED`] outside any: the anchors
+    /// minted there resolve, but no definition owns them.
+    current: Symbol,
+    /// Where the current definition's text starts, which its nodes are
+    /// numbered from. See [`NodeId`](crate::tracking::NodeId).
+    current_base: usize,
+    /// Where each declared definition's text starts, for lowering one of its
+    /// parts later, as an alias body is.
+    bases: HashMap<Symbol, usize>,
     /// The modules themselves, which are their own namespace: `module Pair`,
     /// `type Pair`, `let Pair` and `effect Pair` may all coexist in one scope.
     /// Kept apart from [`Builder::globals`] because a [`Module`] is a symbol
@@ -2081,11 +2097,11 @@ type Body = Tracked<Expr>;
 struct Declared {
     /// Where the name was written, which is what a repeat points back at and
     /// what an unused declaration is reported at.
-    span: Span,
+    at: Anchor,
     id: u32,
     /// What the first use read it as, and where that use was. `None` until
     /// something uses it, which is what [`ErrorKind::UnusedVariable`] refuses.
-    sense: Option<(Sense, Span)>,
+    sense: Option<(Sense, Anchor)>,
     /// Whether a `when` in the type ever wore this name. A formula is written
     /// about presences a label carries, so a variable read as a presence by a
     /// clause alone is one no label gives a meaning to — see
@@ -2143,7 +2159,7 @@ enum Answering {
     /// An arm encloses it, and nothing has come between.
     Arm,
     /// An arm encloses it, but a `fn` lies between the two.
-    UnderFn(Span),
+    UnderFn(Anchor),
 }
 
 /// Where one parameter sits: the declaration that binds it, and its position
@@ -2300,29 +2316,29 @@ struct Loops {
 #[derive(Debug, Clone)]
 enum Calm {
     /// Binds the whole value.
-    Bind(Tracked<Symbol>),
+    Bind(Anchored<Symbol>),
     /// `_`: binds nothing and constrains nothing. The value is still held —
     /// by a fresh definition nothing can name — so it is still typechecked;
     /// see [`Builder::destructure_stmt`] and R5/R6 of the wildcard spec.
-    Wildcard(Span),
+    Wildcard(Anchor),
     /// Binds nothing, and constrains the value to unit. What `()` reads as,
     /// and `{}` too: the two are one pattern — exactly no fields.
-    Unit(Span),
+    Unit(Anchor),
     /// Reaches into fields, each with a pattern that cannot fail. Exact
     /// without the `..` — the value has these fields and no others, a demand
     /// [`Builder::destructure`] writes as an annotation — and open with it,
     /// asking only for the fields it names.
     Struct {
-        span: Span,
-        fields: Vec<(TrackedString, Calm)>,
-        rest: Option<Span>,
+        at: Anchor,
+        fields: Vec<(AnchoredString, Calm)>,
+        rest: Option<Anchor>,
     },
     /// `[..r]` or `[..]`: constrains the value to an array and binds the whole
     /// of it to the name, when one was written. The one array pattern that
     /// cannot fail, since it names no element for a length to fall short of.
     ArrayRest {
-        span: Span,
-        name: Option<Tracked<Symbol>>,
+        at: Anchor,
+        name: Option<Anchored<Symbol>>,
     },
 }
 
@@ -2455,9 +2471,12 @@ struct Chain<'a> {
 impl TypeField {
     /// Where the label was written: the name of an ordinary field, the whole
     /// `\name` of an absent one.
-    pub fn name_span(&self) -> Span {
+    pub fn name_at(&self) -> Anchor {
         match self {
-            TypeField::Written { name_span, .. } | TypeField::Absent { name_span } => *name_span,
+            TypeField::Written {
+                name_at: name_span, ..
+            }
+            | TypeField::Absent { name_at: name_span } => *name_span,
         }
     }
 
@@ -2475,11 +2494,14 @@ impl TypeField {
 impl EffectLabel {
     /// Where the label was written: the name of a performed effect, the whole
     /// `\!Log` of one written absent.
-    pub fn name_span(&self) -> Span {
+    pub fn name_at(&self) -> Anchor {
         match self {
-            EffectLabel::Written { name_span, .. } | EffectLabel::Absent { name_span, .. } => {
-                *name_span
+            EffectLabel::Written {
+                name_at: name_span, ..
             }
+            | EffectLabel::Absent {
+                name_at: name_span, ..
+            } => *name_span,
         }
     }
 
@@ -2527,10 +2549,13 @@ impl EffectLabel {
 }
 
 impl SumCase {
-    /// Where the label was written: the [`TypeField::name_span`] of a case.
-    pub fn name_span(&self) -> Span {
+    /// Where the label was written: the [`TypeField::name_at`] of a case.
+    pub fn name_at(&self) -> Anchor {
         match self {
-            SumCase::Written { name_span, .. } | SumCase::Absent { name_span } => *name_span,
+            SumCase::Written {
+                name_at: name_span, ..
+            }
+            | SumCase::Absent { name_at: name_span } => *name_span,
         }
     }
 
@@ -2545,10 +2570,10 @@ impl SumCase {
 }
 
 impl TermKind {
-    fn with_span(self, span: Span) -> Term {
+    fn at(self, at: Anchor) -> Term {
         Term {
             ty: Default::default(),
-            span,
+            at,
             kind: self,
         }
     }
@@ -2619,6 +2644,10 @@ fn build_with_dependency_imports_inner(
         errors: Vec::new(),
         terms: Names::default(),
         globals: HashMap::new(),
+        source: SourceMap::default(),
+        current: Symbol::GENERATED,
+        current_base: 0,
+        bases: HashMap::new(),
         modules: HashMap::new(),
         std_prelude: None,
         expanded: HashMap::new(),
@@ -2678,8 +2707,10 @@ fn build_with_dependency_imports_inner(
     let bound: Vec<Vec<Param>> = flat
         .types
         .iter()
-        .map(|(module, _, params, _)| {
+        .zip(&declared)
+        .map(|((module, name, params, _), symbol)| {
             b.module = *module;
+            b.define(*symbol, name.span.start);
             b.declare_params(params)
         })
         .collect();
@@ -2700,6 +2731,7 @@ fn build_with_dependency_imports_inner(
         .map(|(module, name, params, _)| {
             b.module = *module;
             let symbol = b.declare(Scope::Effects, name);
+            b.define(symbol, name.span.start);
             // The parameters are bound before any body is lowered, so that an
             // application can be counted wherever it appears — in an
             // operation's signature above the declaration it names included.
@@ -2713,6 +2745,7 @@ fn build_with_dependency_imports_inner(
     let mut aliases = Vec::new();
     for ((symbol, params), (module, name, _, cases)) in named.into_iter().zip(flat.effects) {
         b.module = module;
+        b.define(symbol, name.span.start);
         let value = match cases {
             // An alias body is read when something first names it, which
             // may be an operation signature above it. Its declaration takes
@@ -2732,7 +2765,7 @@ fn build_with_dependency_imports_inner(
                 }
                 Effect::Alias(Alias {
                     body: AliasBody::default(),
-                    expanded: name.span.track(TypeKind::Error),
+                    expanded: b.anchor(name.span).anchor(TypeKind::Error),
                 })
             }
             cases => {
@@ -2747,7 +2780,7 @@ fn build_with_dependency_imports_inner(
             program.effects.insert(
                 symbol,
                 Decl {
-                    name_span: name.span,
+                    name_at: b.anchor(name.span),
                     annotation: None,
                     params,
                     value,
@@ -2760,7 +2793,7 @@ fn build_with_dependency_imports_inner(
     // says of the arguments, so that is the row its parameters are read off.
     for symbol in aliases {
         let params = program.effects[&symbol].params.clone();
-        let value = b.declared_alias(symbol, &params);
+        let value = b.within(symbol, |b| b.declared_alias(symbol, &params));
         program.effects[&symbol].value = Effect::Alias(value);
     }
     // What each effect name stands for, once every declaration is in: itself,
@@ -2785,6 +2818,7 @@ fn build_with_dependency_imports_inner(
         // The parameters are in scope for the length of the body and released
         // after it, the way a lambda's argument is — this is the type
         // language's only binder, and its only scope.
+        b.define(symbol, name.span.start);
         b.scope_params(&params);
         // A declaration's body is read as an annotation so that a `where`
         // written there can be refused rather than misparsed; what survives is
@@ -2795,7 +2829,7 @@ fn build_with_dependency_imports_inner(
             program.types.insert(
                 symbol,
                 Decl {
-                    name_span: name.span,
+                    name_at: b.anchor(name.span),
                     annotation: None,
                     params,
                     value,
@@ -2818,8 +2852,8 @@ fn build_with_dependency_imports_inner(
         .collect();
     for symbol in circular {
         let decl = &mut program.types[&symbol];
-        let span = decl.value.span;
-        decl.value = span.track(TypeKind::Error);
+        let span = decl.value.at;
+        decl.value = span.anchor(TypeKind::Error);
         // Two loops and one erasure. A loop with a struct's `..` on it reaches a
         // shape every time round and adds a field doing it, which is a different
         // thing gone wrong from a loop that reaches no shape at all. See
@@ -2830,15 +2864,15 @@ fn build_with_dependency_imports_inner(
                 namespace: Namespace::Types,
             },
         };
-        b.error(span, kind);
+        b.error_at(span, kind);
     }
     // The other recursion the solver cannot be handed: one that builds a bigger
     // argument on the way round. See [`ErrorKind::GrowingRecursion`].
     for (symbol, at) in growing(&program.types) {
         let decl = &mut program.types[&symbol];
-        let span = decl.value.span;
-        decl.value = span.track(TypeKind::Error);
-        b.error(at, ErrorKind::GrowingRecursion);
+        let span = decl.value.at;
+        decl.value = span.anchor(TypeKind::Error);
+        b.error_at(at, ErrorKind::GrowingRecursion);
     }
     // What each effect's parameters stand for is part of the effect's
     // identity, and the lacks a parameter carries are spelled with identities:
@@ -2893,8 +2927,8 @@ fn build_with_dependency_imports_inner(
     // applications are not checked against a reading it never had.
     for symbol in &mixed {
         if let Some(decl) = program.types.get_mut(symbol) {
-            let span = decl.value.span;
-            decl.value = span.track(TypeKind::Error);
+            let span = decl.value.at;
+            decl.value = span.anchor(TypeKind::Error);
         }
         kinds.remove(symbol);
     }
@@ -2976,6 +3010,7 @@ fn build_with_dependency_imports_inner(
             DeclaredValue::Extern { at, symbol } => {
                 let (module, name, annotation, abi, target) = flat.externs[at].clone();
                 b.module = module;
+                b.define(symbol, name.span.start);
                 let annotation = b.written(annotation, Place::Annotation);
                 let runtime_array_primitive = array_intrinsic_signature(
                     target.tracked.as_str(),
@@ -2985,7 +3020,7 @@ fn build_with_dependency_imports_inner(
                 if !runtime_array_primitive
                     && type_contains_array(&annotation.ty, &program.types, &program.external_types)
                 {
-                    b.error(annotation.ty.span, ErrorKind::ArrayInExtern);
+                    b.error_at(annotation.ty.at, ErrorKind::ArrayInExtern);
                 }
                 // Resolve the ABI against the annotation we just lowered. Its
                 // leaves are clones of the same parsed types, so lowering them
@@ -2996,11 +3031,11 @@ fn build_with_dependency_imports_inner(
                     program.externs.insert(
                         symbol,
                         Decl {
-                            name_span: name.span,
+                            name_at: b.anchor(name.span),
                             annotation: Some(annotation),
                             params: Vec::new(),
                             value: Extern {
-                                target,
+                                target: b.anchored(target),
                                 abi,
                                 array_intrinsic: runtime_array_primitive,
                             },
@@ -3020,13 +3055,14 @@ fn build_with_dependency_imports_inner(
                             .into_iter()
                             .next()
                             .expect("a bare name declares one symbol");
+                        b.define(symbol, name.span.start);
                         let annotation = ty.map(|ty| b.written(ty, Place::Annotation));
                         let value = b.term(body.tracked);
                         if let Some(symbol) = symbol {
                             program.terms.insert(
                                 symbol,
                                 Decl {
-                                    name_span: name.span,
+                                    name_at: b.anchor(name.span),
                                     annotation,
                                     params: Vec::new(),
                                     value,
@@ -3037,6 +3073,10 @@ fn build_with_dependency_imports_inner(
                     tracked => {
                         let pspan = pattern.span;
                         let pattern = pspan.track(tracked);
+                        // A pattern declares several names at once; its nodes
+                        // belong to the first, and to the run when it names
+                        // nothing.
+                        b.define(declared.iter().find_map(|symbol| *symbol), pspan.start);
                         let annotation = ty.map(|ty| b.written(ty, Place::Annotation));
                         let value = b.term(body.tracked);
                         let mut binders = Binders::Declared(declared.into_iter());
@@ -3050,12 +3090,13 @@ fn build_with_dependency_imports_inner(
                             None => {
                                 let (at, found) = refuter(&pattern)
                                     .expect("a pattern that is not calm names what refutes it");
-                                b.error(at, ErrorKind::RefutableBinding { found });
-                                let held = b.fresh("%value", pspan);
+                                b.error_at(at, ErrorKind::RefutableBinding { found });
+                                let held_at = b.anchor(pspan);
+                                let held = b.fresh("%value", held_at);
                                 program.terms.insert(
-                                    held.tracked,
+                                    held.anchored,
                                     Decl {
-                                        name_span: pspan,
+                                        name_at: b.anchor(pspan),
                                         annotation,
                                         params: Vec::new(),
                                         value,
@@ -3068,12 +3109,12 @@ fn build_with_dependency_imports_inner(
                         }
                         for name in dropped {
                             program.terms.insert(
-                                name.tracked,
+                                name.anchored,
                                 Decl {
-                                    name_span: name.span,
+                                    name_at: name.at,
                                     annotation: None,
                                     params: Vec::new(),
-                                    value: TermKind::Error.with_span(name.span),
+                                    value: TermKind::Error.at(name.at),
                                 },
                             );
                         }
@@ -3095,7 +3136,7 @@ fn build_with_dependency_imports_inner(
         erase_circular(&mut decl.value, &circling, &mut nested_loops);
     }
     for span in nested_loops {
-        b.error(
+        b.error_at(
             span,
             ErrorKind::Circular {
                 namespace: Namespace::Terms,
@@ -3110,9 +3151,9 @@ fn build_with_dependency_imports_inner(
         .collect();
     for symbol in circular {
         let decl = &mut program.terms[&symbol];
-        let span = decl.value.span;
-        decl.value = TermKind::Error.with_span(span);
-        b.error(
+        let span = decl.value.at;
+        decl.value = TermKind::Error.at(span);
+        b.error_at(
             span,
             ErrorKind::Circular {
                 namespace: Namespace::Terms,
@@ -3198,8 +3239,13 @@ fn build_with_dependency_imports_inner(
     // diagnostics for its own reasons, and a driver that prints them in the
     // order they arrive should not be the only one telling the reader about
     // line 3 before line 2.
-    b.errors.sort_by_key(|error| error.span.start);
+    // In the order the reader would meet them: by where they point, which
+    // anchors alone do not say once a hoist-time complaint sits beside one
+    // from inside a definition.
+    let source = std::mem::take(&mut b.source);
+    b.errors.sort_by_key(|error| source.span(error.at));
     Output {
+        source,
         program,
         errors: b.errors,
     }
@@ -3214,7 +3260,7 @@ fn array_intrinsic_signature(
     declarations: &IndexMap<Symbol, Decl<Type>>,
 ) -> bool {
     fn arrow(ty: &Type) -> Option<(&Type, &Type)> {
-        match &ty.tracked {
+        match &ty.anchored {
             TypeKind::Arrow { from, to, effects }
                 if effects.effects.is_empty() && effects.tail.is_none() =>
             {
@@ -3225,27 +3271,27 @@ fn array_intrinsic_signature(
     }
 
     fn variable(ty: &Type) -> Option<&str> {
-        match &ty.tracked {
+        match &ty.anchored {
             TypeKind::Var(name) => Some(name.as_str()),
             _ => None,
         }
     }
 
     fn array_variable(ty: &Type) -> Option<&str> {
-        match &ty.tracked {
+        match &ty.anchored {
             TypeKind::Array(element) => variable(element),
             _ => None,
         }
     }
 
     fn natural(ty: &Type) -> bool {
-        matches!(ty.tracked, TypeKind::Prim(crate::types::Prim::Nat))
+        matches!(ty.anchored, TypeKind::Prim(crate::types::Prim::Nat))
     }
 
     /// The two halves of a written pair `(A, B)`: the closed positional
     /// struct a tuple type lowers to, with no `when` on either field.
     fn pair(ty: &Type) -> Option<(&Type, &Type)> {
-        let TypeKind::Struct { fields, tail: None } = &ty.tracked else {
+        let TypeKind::Struct { fields, tail: None } = &ty.anchored else {
             return None;
         };
         match (fields.len(), fields.get("0"), fields.get("1")) {
@@ -3267,11 +3313,11 @@ fn array_intrinsic_signature(
     }
 
     fn option<'a>(ty: &'a Type, declarations: &IndexMap<Symbol, Decl<Type>>) -> Option<&'a Type> {
-        let TypeKind::Apply { head, args, .. } = &ty.tracked else {
+        let TypeKind::Apply { head, args, .. } = &ty.anchored else {
             return None;
         };
         let declaration = declarations.get(head)?;
-        let TypeKind::Sum { cases, tail: None } = &declaration.value.tracked else {
+        let TypeKind::Sum { cases, tail: None } = &declaration.value.anchored else {
             return None;
         };
         let some = cases.get("Some")?;
@@ -3284,7 +3330,7 @@ fn array_intrinsic_signature(
                     when: None,
                     payload: Some(payload),
                     ..
-                } if matches!(payload.tracked, TypeKind::Param { index: 0, .. })
+                } if matches!(payload.anchored, TypeKind::Param { index: 0, .. })
             )
             && matches!(
                 none,
@@ -3393,7 +3439,7 @@ fn type_contains_array(
     let mut visited_rows = Vec::new();
     while let Some(part) = work.pop() {
         match part {
-            Work::Ir(ty) => match &ty.tracked {
+            Work::Ir(ty) => match &ty.anchored {
                 TypeKind::Array(_) => return true,
                 TypeKind::Arrow { from, to, .. } => {
                     work.push(Work::Ir(to));
@@ -3523,21 +3569,21 @@ fn imported_syntax(
     effect_rows: &ImportedEffectRows,
     depth: usize,
 ) -> Type {
-    let span = Span::default();
+    let span = Anchor::GENERATED;
     if depth > 256 {
-        return span.track(TypeKind::Error);
+        return span.anchor(TypeKind::Error);
     }
     let tail_of = |rest: &artifact::Rest| match rest {
         artifact::Rest::Closed => None,
         artifact::Rest::Bound(index) => params.get(*index as usize).map(|symbol| Tail {
-            span,
+            at: span,
             of: Row::Param {
                 symbol: *symbol,
                 index: *index,
             },
         }),
         _ => Some(Tail {
-            span,
+            at: span,
             of: Row::Anything,
         }),
     };
@@ -3572,7 +3618,7 @@ fn imported_syntax(
                 true => TypeKind::Ident(head),
                 false => TypeKind::Apply {
                     head,
-                    head_span: span,
+                    head_at: span,
                     args: args
                         .iter()
                         .map(|arg| {
@@ -3595,7 +3641,7 @@ fn imported_syntax(
             for (name, field) in &row.labels {
                 let field = match field.presence {
                     artifact::Presence::Present => TypeField::Written {
-                        name_span: span,
+                        name_at: span,
                         when: None,
                         value: imported_syntax(
                             mint,
@@ -3607,8 +3653,8 @@ fn imported_syntax(
                             depth + 1,
                         ),
                     },
-                    artifact::Presence::Absent => TypeField::Absent { name_span: span },
-                    _ => return span.track(TypeKind::Error),
+                    artifact::Presence::Absent => TypeField::Absent { name_at: span },
+                    _ => return span.anchor(TypeKind::Error),
                 };
                 fields.insert(name.clone(), field);
             }
@@ -3622,7 +3668,7 @@ fn imported_syntax(
             for (name, field) in &row.labels {
                 let case = match field.presence {
                     artifact::Presence::Present => SumCase::Written {
-                        name_span: span,
+                        name_at: span,
                         when: None,
                         payload: Some(imported_syntax(
                             mint,
@@ -3634,8 +3680,8 @@ fn imported_syntax(
                             depth + 1,
                         )),
                     },
-                    artifact::Presence::Absent => SumCase::Absent { name_span: span },
-                    _ => return span.track(TypeKind::Error),
+                    artifact::Presence::Absent => SumCase::Absent { name_at: span },
+                    _ => return span.anchor(TypeKind::Error),
                 };
                 cases.insert(name.clone(), case);
             }
@@ -3668,11 +3714,11 @@ fn imported_syntax(
                                     effect_rows,
                                     depth + 1,
                                 );
-                                match arrow.tracked {
+                                match arrow.anchored {
                                     TypeKind::Arrow { effects, .. } => {
-                                        span.track(TypeKind::Effects(effects))
+                                        span.anchor(TypeKind::Effects(effects))
                                     }
-                                    other => span.track(other),
+                                    other => span.anchor(other),
                                 }
                             }
                             _ => imported_syntax(
@@ -3690,13 +3736,13 @@ fn imported_syntax(
                 };
                 let lowered = match field.presence {
                     artifact::Presence::Absent => EffectLabel::Absent {
-                        name_span: span,
+                        name_at: span,
                         symbol,
                         args,
                         expanded: false,
                     },
                     _ => EffectLabel::Written {
-                        name_span: span,
+                        name_at: span,
                         symbol,
                         args,
                         expanded: false,
@@ -3726,7 +3772,7 @@ fn imported_syntax(
                     depth + 1,
                 )),
                 effects: Box::new(EffectRow {
-                    span,
+                    at: span,
                     written,
                     effects,
                     tail: tail_of(&row.rest),
@@ -3737,7 +3783,7 @@ fn imported_syntax(
             TypeKind::Error
         }
     };
-    span.track(tracked)
+    span.anchor(tracked)
 }
 
 fn import_scheme(
@@ -4442,7 +4488,7 @@ fn structuralize_effects(
                 // written case gets its own expansion, so two differently
                 // named aliases that reach the same structural effect are not
                 // silently collapsed by the expansion map.
-                let mut seen: HashMap<EffectId, Span> = HashMap::new();
+                let mut seen: HashMap<EffectId, Anchor> = HashMap::new();
                 for item in &alias.body.cases {
                     let mut duplicate = None;
                     for concrete in expansions
@@ -4454,13 +4500,13 @@ fn structuralize_effects(
                             if let Some(previous) = seen.get(id) {
                                 duplicate.get_or_insert_with(|| (id.name().to_string(), *previous));
                             } else {
-                                seen.insert(id.clone(), item.name_span);
+                                seen.insert(id.clone(), item.name_at);
                             }
                         }
                     }
                     if let Some((name, previous)) = duplicate {
                         errors.push(Error {
-                            span: item.name_span,
+                            at: item.name_at,
                             kind: ErrorKind::DuplicateCase {
                                 shape: Shape::Effect,
                                 name,
@@ -4830,7 +4876,7 @@ impl RegularType<'_> {
                         .collect();
                     values.push(self.with_fields(core, fields));
                 }
-                Work::Type(ty, args) => match &ty.tracked {
+                Work::Type(ty, args) => match &ty.anchored {
                     TypeKind::Array(element) => {
                         work.push(Work::Make("array".into(), vec!["element".into()]));
                         work.push(Work::Type(element, args));
@@ -5635,7 +5681,7 @@ fn type_effect_dependencies<'a>(
     let mut named_seen = HashSet::new();
     let mut dependencies = Vec::new();
     while let Some(ty) = pending.pop() {
-        match &ty.tracked {
+        match &ty.anchored {
             TypeKind::Array(element) => pending.push(element),
             TypeKind::Struct { fields, .. } => {
                 pending.extend(fields.values().rev().filter_map(|field| match field {
@@ -5986,11 +6032,11 @@ fn rekey_row(row: &mut EffectRow, ids: &IndexMap<Symbol, EffectId>, errors: &mut
         }; // aliases never survive expansion
         if let Some(previous) = row.effects.get(id) {
             errors.push(Error {
-                span: label.name_span(),
+                at: label.name_at(),
                 kind: ErrorKind::DuplicateCase {
                     shape: Shape::Effect,
                     name: id.name().to_string(),
-                    previous: previous.name_span(),
+                    previous: previous.name_at(),
                 },
             });
         } else {
@@ -6000,7 +6046,7 @@ fn rekey_row(row: &mut EffectRow, ids: &IndexMap<Symbol, EffectId>, errors: &mut
 }
 
 fn rekey_type(ty: &mut Type, ids: &IndexMap<Symbol, EffectId>, errors: &mut Vec<Error>) {
-    match &mut ty.tracked {
+    match &mut ty.anchored {
         TypeKind::Struct { fields, .. } => {
             for field in fields.values_mut() {
                 if let TypeField::Written { value, .. } = field {
@@ -6109,27 +6155,27 @@ fn rekey_term(
             // repeated selector across either spelling is still one duplicate.
             let mut covered: IndexMap<
                 EffectId,
-                (Tracked<Symbol>, IndexMap<OperationSelector, Span>),
+                (Anchored<Symbol>, IndexMap<OperationSelector, Anchor>),
             > = IndexMap::new();
             let mut unique = Vec::new();
             for arm in std::mem::take(&mut handler.arms) {
-                let effect = ids[&arm.effect.tracked].clone();
+                let effect = ids[&arm.effect.anchored].clone();
                 let group = covered
                     .entry(effect.clone())
                     .or_insert_with(|| (arm.effect, IndexMap::new()));
-                if let Some(previous) = group.1.get(&arm.selector.tracked) {
+                if let Some(previous) = group.1.get(&arm.selector.anchored) {
                     errors.push(Error {
-                        span: arm.selector.span,
+                        at: arm.selector.at,
                         kind: ErrorKind::DuplicateArm {
                             effect: effect.name().to_string(),
-                            selector: arm.selector.tracked,
+                            selector: arm.selector.anchored,
                             previous: *previous,
                         },
                     });
                 } else {
                     group
                         .1
-                        .insert(arm.selector.tracked.clone(), arm.selector.span);
+                        .insert(arm.selector.anchored.clone(), arm.selector.at);
                     unique.push(arm);
                 }
             }
@@ -6145,7 +6191,7 @@ fn rekey_term(
                     handler.discharges.push(representative);
                 } else {
                     errors.push(Error {
-                        span: representative.span,
+                        at: representative.at,
                         kind: ErrorKind::PartialHandler {
                             effect: effect.name().to_string(),
                             missing,
@@ -6359,7 +6405,7 @@ impl<'a> Follow<'a> {
                     self.done.insert(symbol, stands);
                     answer = Some(stands);
                 }
-                FollowWork::Written(ty) => match &ty.tracked {
+                FollowWork::Written(ty) => match &ty.anchored {
                     // A struct whose `..` names a parameter stands for that
                     // parameter, with any fields written in front of it.
                     TypeKind::Struct {
@@ -6564,15 +6610,15 @@ fn circling(terms: &IndexMap<Symbol, Decl<Term>>) -> IndexSet<Symbol> {
 /// one loop — and erasing the outer one takes the inner one's value out of the
 /// program with it. Every binding on the loop is told, which is what the
 /// top-level walk already does.
-fn erase_circular(term: &mut Term, looping: &IndexSet<Symbol>, out: &mut Vec<Span>) {
+fn erase_circular(term: &mut Term, looping: &IndexSet<Symbol>, out: &mut Vec<Anchor>) {
     match &mut term.kind {
         TermKind::Let {
             name, value, body, ..
         } => {
             erase_circular(value, looping, out);
-            if looping.contains(&name.tracked) {
-                out.push(value.span);
-                **value = TermKind::Error.with_span(value.span);
+            if looping.contains(&name.anchored) {
+                out.push(value.at);
+                **value = TermKind::Error.at(value.at);
             }
             erase_circular(body, looping, out);
         }
@@ -6641,7 +6687,7 @@ fn nested<'a>(term: &'a Term, out: &mut HashMap<Symbol, &'a Term>) {
         TermKind::Let {
             name, value, body, ..
         } => {
-            out.insert(name.tracked, value);
+            out.insert(name.anchored, value);
             nested(value, out);
             nested(body, out);
         }
@@ -6776,11 +6822,11 @@ impl Chain<'_> {
 /// complaint about a binding that can fail quotes, and where it points. `None`
 /// exactly for an irrefutable pattern, which is the syntactic rule of R3: a
 /// pattern is refutable iff it contains a tag or literal anywhere inside it.
-fn refuter(pattern: &Pattern) -> Option<(Span, Refuter)> {
-    let literal = |value| Some((pattern.span, Refuter::Literal(value)));
-    match &pattern.tracked {
+fn refuter(pattern: &Pattern) -> Option<(Anchor, Refuter)> {
+    let literal = |value| Some((pattern.at, Refuter::Literal(value)));
+    match &pattern.anchored {
         PatternKind::Bind(_) | PatternKind::Wildcard | PatternKind::Unit => None,
-        PatternKind::Tag { name, .. } => Some((name.span, Refuter::Case(name.tracked.clone()))),
+        PatternKind::Tag { name, .. } => Some((name.at, Refuter::Case(name.anchored.clone()))),
         PatternKind::Struct { fields, .. } => {
             fields.values().find_map(|field| refuter(&field.value))
         }
@@ -6797,7 +6843,7 @@ fn refuter(pattern: &Pattern) -> Option<(Span, Refuter)> {
             after,
         } => match before.is_empty() && after.is_empty() && rest.is_some() {
             true => None,
-            false => Some((pattern.span, Refuter::Length)),
+            false => Some((pattern.at, Refuter::Length)),
         },
     }
 }
@@ -6807,22 +6853,22 @@ fn refuter(pattern: &Pattern) -> Option<(Span, Refuter)> {
 /// so destructuring takes a value that cannot fail and meets no test it would
 /// have to call unreachable.
 fn calm(pattern: &Pattern) -> Option<Calm> {
-    match &pattern.tracked {
+    match &pattern.anchored {
         PatternKind::Bind(name) => Some(Calm::Bind(*name)),
-        PatternKind::Wildcard => Some(Calm::Wildcard(pattern.span)),
-        PatternKind::Unit => Some(Calm::Unit(pattern.span)),
+        PatternKind::Wildcard => Some(Calm::Wildcard(pattern.at)),
+        PatternKind::Unit => Some(Calm::Unit(pattern.at)),
         // `{}` and `()` are one pattern — exactly no fields — so the exact
         // empty struct reads as the unit it is and the two lower alike.
         PatternKind::Struct { fields, rest: None } if fields.is_empty() => {
-            Some(Calm::Unit(pattern.span))
+            Some(Calm::Unit(pattern.at))
         }
         PatternKind::Struct { fields, rest } => {
             let mut lowered = Vec::with_capacity(fields.len());
             for (name, field) in fields {
-                lowered.push((field.name_span.track(name.clone()), calm(&field.value)?));
+                lowered.push((field.name_at.anchor(name.clone()), calm(&field.value)?));
             }
             Some(Calm::Struct {
-                span: pattern.span,
+                at: pattern.at,
                 fields: lowered,
                 rest: *rest,
             })
@@ -6832,7 +6878,7 @@ fn calm(pattern: &Pattern) -> Option<Calm> {
             rest: Some(rest),
             after,
         } if before.is_empty() && after.is_empty() => Some(Calm::ArrayRest {
-            span: pattern.span,
+            at: pattern.at,
             name: rest.name,
         }),
         PatternKind::Tag { .. }
@@ -6848,8 +6894,8 @@ fn calm(pattern: &Pattern) -> Option<Calm> {
 /// Every name a normalized pattern binds, in the order the pattern walk met
 /// them. What a refused binding still has to bind — to error values — so
 /// downstream uses resolve.
-fn pattern_binders(pattern: &Pattern, out: &mut Vec<Tracked<Symbol>>) {
-    match &pattern.tracked {
+fn pattern_binders(pattern: &Pattern, out: &mut Vec<Anchored<Symbol>>) {
+    match &pattern.anchored {
         PatternKind::Bind(name) => out.push(*name),
         PatternKind::Wildcard
         | PatternKind::Unit
@@ -6891,18 +6937,18 @@ fn pattern_binders(pattern: &Pattern, out: &mut Vec<Tracked<Symbol>>) {
 /// names get, and what the binders of a struct pattern's dropped duplicate
 /// field get: the value they would have named is no longer part of the
 /// program, and one mistake should make one complaint.
-fn bound_to_errors(names: Vec<Tracked<Symbol>>, body: Term) -> Term {
+fn bound_to_errors(names: Vec<Anchored<Symbol>>, body: Term) -> Term {
     let mut inner = body;
     for name in names.into_iter().rev() {
-        let error = TermKind::Error.with_span(name.span);
-        let at = name.span.merge(inner.span);
+        let error = TermKind::Error.at(name.at);
+        let at = name.at;
         inner = TermKind::Let {
             name,
             annotation: None,
             value: Box::new(error),
             body: Box::new(inner),
         }
-        .with_span(at);
+        .at(at);
     }
     inner
 }
@@ -6919,26 +6965,26 @@ fn bound_to_errors(names: Vec<Tracked<Symbol>>, body: Term) -> Term {
 /// the reader's spelling of the same thing — a hole is there to be decided
 /// whoever wrote it, so the desugar needs no mark of its own to be exempt from
 /// anything.
-fn exact_demand(span: Span, fields: &[(TrackedString, Calm)]) -> Annotation {
+fn exact_demand(at: Anchor, fields: &[(AnchoredString, Calm)]) -> Annotation {
     let fields = fields
         .iter()
         .map(|(name, _)| {
             let field = TypeField::Written {
-                name_span: name.span,
+                name_at: name.at,
                 when: None,
-                value: name.span.track(TypeKind::Hole),
+                value: name.at.anchor(TypeKind::Hole),
             };
-            (name.tracked.clone(), field)
+            (name.anchored.clone(), field)
         })
         .collect();
-    demand(span.track(TypeKind::Struct { fields, tail: None }))
+    demand(at.anchor(TypeKind::Struct { fields, tail: None }))
 }
 
 /// The demand a lone-rest array pattern makes of the value a `let` binds it
 /// to: an array, of elements the pattern says nothing about — a hole, as an
 /// exact struct pattern's fields are.
-fn array_demand(span: Span) -> Annotation {
-    demand(span.track(TypeKind::Array(Box::new(span.track(TypeKind::Hole)))))
+fn array_demand(at: Anchor) -> Annotation {
+    demand(at.anchor(TypeKind::Array(Box::new(at.anchor(TypeKind::Hole)))))
 }
 
 /// A type the compiler wrote itself, as the annotation it travels in.
@@ -6960,10 +7006,10 @@ fn demand(ty: Type) -> Annotation {
 /// binds is the one wildcard, a bare tag carries a wildcard payload, and `{}`
 /// — which reaches into nothing — is a wildcard too.
 fn mat(pattern: &Pattern) -> Mat {
-    match &pattern.tracked {
+    match &pattern.anchored {
         PatternKind::Bind(_) | PatternKind::Wildcard | PatternKind::Unit => Mat::Wild,
         PatternKind::Tag { name, payload } => Mat::Tag {
-            name: name.tracked.clone(),
+            name: name.anchored.clone(),
             payload: Box::new(payload.as_deref().map(mat).unwrap_or(Mat::Wild)),
         },
         PatternKind::Struct { fields, .. } if fields.is_empty() => Mat::Wild,
@@ -7017,7 +7063,7 @@ impl Matrix {
     /// wildcard is a binder minus the name, and the name is no part of what
     /// this reads: the position is open either way.
     fn collect(&mut self, pattern: &Pattern, path: &mut Vec<Step>) {
-        match &pattern.tracked {
+        match &pattern.anchored {
             PatternKind::Bind(_) | PatternKind::Wildcard => self.binds.push(path.clone()),
             PatternKind::Unit => {}
             PatternKind::Tag { name, payload } => {
@@ -7025,9 +7071,9 @@ impl Matrix {
                     .entry(path.clone())
                     .or_default()
                     .tags
-                    .insert(name.tracked.clone());
+                    .insert(name.anchored.clone());
                 if let Some(payload) = payload {
-                    path.push(Step::Payload(name.tracked.clone()));
+                    path.push(Step::Payload(name.anchored.clone()));
                     self.collect(payload, path);
                     path.pop();
                 }
@@ -7655,7 +7701,7 @@ fn kinds(
                 });
                 if !below {
                     told.push(Error {
-                        span: param.span,
+                        at: param.at,
                         kind: ErrorKind::MixedParameter {
                             first: read_as[0],
                             second: read_as[1],
@@ -7728,7 +7774,7 @@ fn arguments(
 ) {
     for (at, arg) in args.iter().enumerate() {
         let slot = (head, at as u32);
-        match &arg.tracked {
+        match &arg.anchored {
             // A parameter handed straight on stands for whatever it is
             // handed to. This is the statement that crosses
             // declarations, and the only one that needs resolving
@@ -7811,7 +7857,7 @@ fn constrain(
     summaries: &HashMap<Shape, HashMap<Symbol, RowSummary>>,
     out: &mut impl FnMut(Fact),
 ) {
-    match &ty.tracked {
+    match &ty.anchored {
         // A name reached as a type is one: this walk only descends through
         // positions a type goes in, so arriving here at all is the statement.
         TypeKind::Param { index, .. } => out(Fact::Says(
@@ -7923,7 +7969,7 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
         rows: &HashMap<Symbol, Sense>,
         out: &mut Vec<Error>,
     ) {
-        match &mut ty.tracked {
+        match &mut ty.anchored {
             TypeKind::Apply { head, args, .. } => {
                 applied(*head, args, kinds, carries, rows, out);
             }
@@ -7989,11 +8035,11 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
             // effects with none — which is what a printed pure
             // effects argument reads back as.
             if matches!(kind, Some(kind) if kind.row().is_some_and(|(shape, _)| shape == Shape::Effect))
-                && matches!(&arg.tracked, TypeKind::Sum { cases, tail: None } if cases.is_empty())
+                && matches!(&arg.anchored, TypeKind::Sum { cases, tail: None } if cases.is_empty())
             {
-                let span = arg.span;
-                *arg = span.track(TypeKind::Effects(Box::new(EffectRow {
-                    span,
+                let span = arg.at;
+                *arg = span.anchor(TypeKind::Effects(Box::new(EffectRow {
+                    at: span,
                     written: true,
                     effects: IndexMap::new(),
                     tail: None,
@@ -8023,11 +8069,11 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
                 _ => None,
             };
             if let Some(kind) = refused {
-                let span = arg.span;
-                out.push(Error { span, kind });
+                let at = arg.at;
+                out.push(Error { at, kind });
                 // Nothing left inside to walk: what it was made of is no
                 // longer part of the program.
-                *arg = span.track(TypeKind::Error);
+                *arg = at.anchor(TypeKind::Error);
                 continue;
             }
             walk(arg, kinds, carries, rows, out);
@@ -8204,7 +8250,7 @@ fn row_shaped(
         shape: Shape,
         summaries: &HashMap<Symbol, RowSummary>,
     ) -> bool {
-        match &ty.tracked {
+        match &ty.anchored {
             TypeKind::Error => true,
             TypeKind::Struct { .. } => shape == Shape::Struct,
             TypeKind::Sum { .. } => shape == Shape::Sum,
@@ -8428,7 +8474,7 @@ fn row_summaries(
                         ..RowSummary::default()
                     })),
                 },
-                Work::Artifact(ty) => match &ty.tracked {
+                Work::Artifact(ty) => match &ty.anchored {
                     TypeKind::Struct { fields, tail } if shape == Shape::Struct => {
                         work.push(Work::Value(written_row_summary(
                             fields.keys().cloned(),
@@ -8567,7 +8613,7 @@ fn written_summary(labels: impl IntoIterator<Item = String>, tail: &Option<Tail>
 }
 
 fn row_summary(ty: &Type, decls: &HashMap<Symbol, RowSummary>, shape: Shape) -> RowSummary {
-    match &ty.tracked {
+    match &ty.anchored {
         TypeKind::Struct { fields, tail } if shape == Shape::Struct => {
             written_summary(fields.keys().cloned(), tail)
         }
@@ -8639,7 +8685,7 @@ fn row_summary(ty: &Type, decls: &HashMap<Symbol, RowSummary>, shape: Shape) -> 
 ///
 /// See [`ErrorKind::GrowingRecursion`] for why the restriction is here, and
 /// [`Solve::unfold`](crate::inference) for what rests on it.
-fn growing(types: &IndexMap<Symbol, Decl<Type>>) -> Vec<(Symbol, Span)> {
+fn growing(types: &IndexMap<Symbol, Decl<Type>>) -> Vec<(Symbol, Anchor)> {
     // Who each declaration mentions, directly, and then everything each one
     // leads to. Closed once rather than walked per pair: the table is one file
     // long, and a pair being mutually reachable is the whole of what a group
@@ -8747,7 +8793,7 @@ fn relevance(types: &IndexMap<Symbol, Decl<Type>>) -> HashSet<Slot> {
     /// inside — innermost order does not matter, since all of them have to
     /// survive.
     fn occurrences(ty: &Type, under: &mut Vec<Slot>, out: &mut impl FnMut(u32, &[Slot])) {
-        match &ty.tracked {
+        match &ty.anchored {
             TypeKind::Param { index, .. } => out(*index, under),
             TypeKind::Array(element) => occurrences(element, under, out),
             TypeKind::Struct { fields, tail } => {
@@ -8855,7 +8901,7 @@ fn relevance(types: &IndexMap<Symbol, Decl<Type>>) -> HashSet<Slot> {
 /// Every declaration a type mentions, at any depth. A parameter is not one: it
 /// is a local, and no declaration answers to it.
 fn mentioned(ty: &Type, out: &mut Vec<Symbol>) {
-    match &ty.tracked {
+    match &ty.anchored {
         TypeKind::Ident(symbol) => out.push(*symbol),
         TypeKind::Array(element) => mentioned(element, out),
         TypeKind::Apply { head, args, .. } => {
@@ -8915,8 +8961,8 @@ fn mentioned(ty: &Type, out: &mut Vec<Symbol>) {
 /// the solver's assumption repeat. Order and repetition are free:
 /// `type A 'a 'b = { x: B 'b 'a }` only ever permutes what it was handed. See
 /// [`ErrorKind::GrowingRecursion`] and [`Solve::unfold`](crate::inference).
-fn grows(ty: &Type, group: &[Symbol], report: &mut impl FnMut(Span)) {
-    match &ty.tracked {
+fn grows(ty: &Type, group: &[Symbol], report: &mut impl FnMut(Anchor)) {
+    match &ty.anchored {
         // A group member written bare hands on nothing — and if it takes
         // something, the arity check has already spoken and this would be a
         // second complaint about one mistake.
@@ -8924,11 +8970,11 @@ fn grows(ty: &Type, group: &[Symbol], report: &mut impl FnMut(Span)) {
         TypeKind::Array(element) => grows(element, group, report),
         TypeKind::Apply {
             head,
-            head_span,
+            head_at: head_span,
             args,
         } => {
             let safe = |arg: &Type| {
-                matches!(arg.tracked, TypeKind::Param { .. }) || !mentions_a_parameter(arg)
+                matches!(arg.anchored, TypeKind::Param { .. }) || !mentions_a_parameter(arg)
             };
             if group.contains(head) && !args.iter().all(safe) {
                 report(*head_span);
@@ -8975,7 +9021,7 @@ fn grows(ty: &Type, group: &[Symbol], report: &mut impl FnMut(Span)) {
 /// a [`TypeKind::Param`] node, and a type handed on with a parameter in its tail
 /// grows exactly as one with a parameter in a field does.
 fn mentions_a_parameter(ty: &Type) -> bool {
-    match &ty.tracked {
+    match &ty.anchored {
         TypeKind::Param { .. } => true,
         TypeKind::Array(element) => mentions_a_parameter(element),
         TypeKind::Apply { args, .. } => args.iter().any(mentions_a_parameter),
@@ -9030,8 +9076,48 @@ impl Names {
 }
 
 impl Builder<'_> {
+    /// The anchor of something written at `span` in the definition being
+    /// lowered.
+    fn anchor(&mut self, span: Span) -> Anchor {
+        self.source.record(self.current, self.current_base, span)
+    }
+
+    /// Start lowering the definition `symbol` declares, whose text starts at
+    /// `base`: every anchor minted until the next definition is its.
+    fn define(&mut self, symbol: Option<Symbol>, base: usize) {
+        self.current = symbol.unwrap_or(Symbol::GENERATED);
+        self.current_base = base;
+        if let Some(symbol) = symbol {
+            self.bases.insert(symbol, base);
+        }
+    }
+
+    /// Lower `definition`'s own nodes, however deep the lowering of another
+    /// definition was when it asked: an alias body is read the first time
+    /// anything names it, which may be from above its declaration.
+    fn within<T>(&mut self, definition: Symbol, lower: impl FnOnce(&mut Self) -> T) -> T {
+        let base = self.bases.get(&definition).copied().unwrap_or(0);
+        let outer = (
+            std::mem::replace(&mut self.current, definition),
+            std::mem::replace(&mut self.current_base, base),
+        );
+        let out = lower(self);
+        (self.current, self.current_base) = outer;
+        out
+    }
+
     fn error(&mut self, span: Span, kind: ErrorKind) {
-        self.errors.push(Error { span, kind });
+        let at = self.anchor(span);
+        self.errors.push(Error { at, kind });
+    }
+
+    /// A parsed value anchored where it was written.
+    fn anchored<T>(&mut self, tracked: Tracked<T>) -> Anchored<T> {
+        self.anchor(tracked.span).anchor(tracked.tracked)
+    }
+
+    fn error_at(&mut self, at: Anchor, kind: ErrorKind) {
+        self.errors.push(Error { at, kind });
     }
 
     /// Mint every module in one statement list, depth-first, and record what
@@ -9090,6 +9176,7 @@ impl Builder<'_> {
         let namespace = Namespace::from(scope);
         let key = (self.module, namespace, name.tracked.clone());
         if let Some(&(_, previous)) = self.globals.get(&key) {
+            let previous = self.anchor(previous);
             self.error(
                 name.span,
                 ErrorKind::Duplicate {
@@ -9129,14 +9216,14 @@ impl Builder<'_> {
             );
             if !source_identifier(import.alias) {
                 self.errors.push(Error {
-                    span: Span::default(),
+                    at: Anchor::GENERATED,
                     kind: ErrorKind::InvalidDependencyAlias {
                         alias: import.alias.to_string(),
                     },
                 });
             } else if identities.contains(&identity) {
                 self.errors.push(Error {
-                    span: Span::default(),
+                    at: Anchor::GENERATED,
                     kind: ErrorKind::DuplicateDependency {
                         name: import.artifact.header().identity.name.clone(),
                         version: import.artifact.header().identity.version.clone(),
@@ -9144,7 +9231,7 @@ impl Builder<'_> {
                 });
             } else if aliases.contains(import.alias) {
                 self.errors.push(Error {
-                    span: Span::default(),
+                    at: Anchor::GENERATED,
                     kind: ErrorKind::DuplicateDependencyAlias {
                         alias: import.alias.to_string(),
                     },
@@ -9535,14 +9622,14 @@ impl Builder<'_> {
                                 })
                                 .collect();
                             cases.push(AliasCase {
-                                name_span: Span::default(),
+                                name_at: Anchor::GENERATED,
                                 symbol: target,
                                 args,
                             });
                         }
                         let tail = row.tail.and_then(|index| {
                             params.get(index as usize).map(|symbol| Tail {
-                                span: Span::default(),
+                                at: Anchor::GENERATED,
                                 of: Row::Param {
                                     symbol: *symbol,
                                     index,
@@ -9554,7 +9641,7 @@ impl Builder<'_> {
                         self.alias_bodies.insert(
                             symbol,
                             AliasBody {
-                                span: Span::default(),
+                                at: Anchor::GENERATED,
                                 cases,
                                 tail,
                             },
@@ -9652,6 +9739,7 @@ impl Builder<'_> {
     fn declare_module(&mut self, name: &TrackedString) -> Module {
         let key = (self.module, name.tracked.clone());
         if let Some(&(module, previous)) = self.modules.get(&key) {
+            let previous = self.anchor(previous);
             self.error(
                 name.span,
                 ErrorKind::Duplicate {
@@ -9818,6 +9906,7 @@ impl Builder<'_> {
         let mut seen: Vec<(&str, Span)> = Vec::new();
         for name in params {
             if let Some(&(_, previous)) = seen.iter().find(|(seen, _)| *seen == name.tracked) {
+                let previous = self.anchor(previous);
                 self.error(
                     name.span,
                     ErrorKind::DuplicateParameter {
@@ -9832,7 +9921,7 @@ impl Builder<'_> {
                 .mint
                 .local(self.module, Namespace::Types, &name.tracked);
             bound.push(Param {
-                span: name.span,
+                at: self.anchor(name.span),
                 symbol,
                 // Both read off the bodies once every body is in; see [`kinds`]
                 // and [`relevance`].
@@ -9867,25 +9956,27 @@ impl Builder<'_> {
             // Alias bodies are lowered when first named; see [`build`].
             parse::EffectBody::Alias(row) => Effect::Alias(Alias {
                 body: AliasBody::default(),
-                expanded: row.span.track(TypeKind::Error),
+                expanded: self.anchor(row.span).anchor(TypeKind::Error),
             }),
             parse::EffectBody::Unnamed { signature } => {
                 let span = signature.span;
+                let here = self.anchor(span);
                 let selector = OperationSelector::Unnamed;
-                let operation = self.operation(&span.track("<unnamed>".to_string()), *signature);
+                let operation = self.operation(&here.anchor("<unnamed>".to_string()), *signature);
                 Effect::Operations([(selector, operation)].into_iter().collect())
             }
             parse::EffectBody::Named(fields) => {
                 let mut operations: IndexMap<OperationSelector, Operation> = IndexMap::new();
                 for (name, signature) in fields {
                     let selector = OperationSelector::Named(name.tracked.clone());
+                    let name = self.anchored(name);
                     let operation = self.operation(&name, *signature);
                     if let Some(previous) = operations.get(&selector) {
-                        self.error(
-                            name.span,
+                        self.error_at(
+                            name.at,
                             ErrorKind::DuplicateOperation {
-                                name: name.tracked,
-                                previous: previous.name_span,
+                                name: name.anchored,
+                                previous: previous.name_at,
                             },
                         );
                         continue;
@@ -9921,7 +10012,7 @@ impl Builder<'_> {
         let params = std::mem::take(&mut self.params);
         let vars = std::mem::take(&mut self.vars);
         self.scope_params(&pending.params);
-        let body = self.alias_row(pending.row);
+        let body = self.within(symbol, |this| this.alias_row(pending.row));
         self.module = module;
         self.params = params;
         self.vars = vars;
@@ -9962,7 +10053,7 @@ impl Builder<'_> {
                     ErrorKind::DuplicateCase {
                         shape: Shape::Effect,
                         name: effect_key(self.mint, symbol),
-                        previous: previous.name_span,
+                        previous: previous.name_at,
                     },
                 );
                 continue;
@@ -9972,7 +10063,7 @@ impl Builder<'_> {
                 .map(|arg| self.argument(arg, Place::Declaration))
                 .collect();
             cases.push(AliasCase {
-                name_span: at,
+                name_at: self.anchor(at),
                 symbol,
                 args,
             });
@@ -9981,7 +10072,7 @@ impl Builder<'_> {
             .tail(row.tail, Place::Declaration, Shape::Effect)
             .unwrap_or_default();
         AliasBody {
-            span: row.span,
+            at: self.anchor(row.span),
             cases,
             tail,
         }
@@ -9994,14 +10085,14 @@ impl Builder<'_> {
             .iter()
             .enumerate()
             .map(|(index, param)| {
-                param.span.track(TypeKind::Param {
+                param.at.anchor(TypeKind::Param {
                     symbol: param.symbol,
                     index: index as u32,
                 })
             })
             .collect();
         let body = self.alias_body(symbol);
-        let at = body.span;
+        let at = body.at;
         let expansion = self.expand_alias(symbol, &args, at);
         let mut effects: IndexMap<EffectId, EffectLabel> = IndexMap::new();
         for label in expansion.labels {
@@ -10009,8 +10100,8 @@ impl Builder<'_> {
                 .entry(EffectId::pending(label.symbol()))
                 .or_insert(label);
         }
-        let expanded = at.track(TypeKind::Effects(Box::new(EffectRow {
-            span: at,
+        let expanded = at.anchor(TypeKind::Effects(Box::new(EffectRow {
+            at,
             written: true,
             effects,
             tail: expansion.tail,
@@ -10031,7 +10122,7 @@ impl Builder<'_> {
     /// The aliases being expanded are frames on a stack of this function's
     /// own, since a chain of aliases is as long as a bundle cares to make it
     /// and must not be a chain of native frames.
-    fn expand_alias(&mut self, symbol: Symbol, args: &[Type], at: Span) -> Expansion {
+    fn expand_alias(&mut self, symbol: Symbol, args: &[Type], at: Anchor) -> Expansion {
         struct Frame {
             body: AliasBody,
             args: Vec<Type>,
@@ -10041,7 +10132,7 @@ impl Builder<'_> {
         if !self.is_alias(symbol) {
             return Expansion {
                 labels: vec![EffectLabel::Written {
-                    name_span: at,
+                    name_at: at,
                     symbol,
                     args: args.to_vec(),
                     expanded: false,
@@ -10054,7 +10145,7 @@ impl Builder<'_> {
         let open = |this: &mut Self,
                     symbol: Symbol,
                     args: Vec<Type>,
-                    at: Span,
+                    at: Anchor,
                     frames: &mut Vec<Frame>| {
             if this.opened_alias(symbol, at) {
                 let body = this.alias_body(symbol);
@@ -10081,7 +10172,7 @@ impl Builder<'_> {
                     .map(|arg| self.substituted(arg, &frame_args))
                     .collect();
                 if self.is_alias(case.symbol) {
-                    open(self, case.symbol, case_args, case.name_span, &mut frames);
+                    open(self, case.symbol, case_args, case.name_at, &mut frames);
                 } else {
                     frames
                         .last_mut()
@@ -10089,7 +10180,7 @@ impl Builder<'_> {
                         .expansion
                         .labels
                         .push(EffectLabel::Written {
-                            name_span: case.name_span,
+                            name_at: case.name_at,
                             symbol: case.symbol,
                             args: case_args,
                             expanded: true,
@@ -10124,7 +10215,7 @@ impl Builder<'_> {
     /// on the stack of those being expanded; `false` for one a ring was
     /// already reported at, or one met again on the way down — which is the
     /// ring, reported here at the application that closes it.
-    fn opened_alias(&mut self, symbol: Symbol, at: Span) -> bool {
+    fn opened_alias(&mut self, symbol: Symbol, at: Anchor) -> bool {
         if self.cyclic.contains(&symbol) {
             return false;
         }
@@ -10139,12 +10230,12 @@ impl Builder<'_> {
                         && matches!(body.cases.as_slice(), [case] if case
                             .args
                             .iter()
-                            .all(|arg| matches!(arg.tracked, TypeKind::Param { .. })))
+                            .all(|arg| matches!(arg.anchored, TypeKind::Param { .. })))
                 })
             });
             if !self.imported_aliases.contains(&symbol) {
                 let name = self.mint.name(symbol).to_string();
-                self.error(at, ErrorKind::AliasCycle { name, growing });
+                self.error_at(at, ErrorKind::AliasCycle { name, growing });
             }
             self.cyclic.insert(symbol);
             return false;
@@ -10158,26 +10249,26 @@ impl Builder<'_> {
     /// supplies, and its tail.
     fn splice_tail(&mut self, expansion: &mut Expansion, body: &AliasBody, args: &[Type]) {
         let Some(Tail {
-            span,
+            at: span,
             of: Row::Param { index, .. },
         }) = &body.tail
         else {
             return;
         };
-        match args.get(*index as usize).map(|arg| &arg.tracked) {
+        match args.get(*index as usize).map(|arg| &arg.anchored) {
             Some(TypeKind::Effects(row)) => {
                 // The row spliced in may not name what the alias already
                 // supplies: the parameter's lacks, said where the argument
                 // was written. Whichever arguments the two carry, one
                 // constructor stands once in a row.
-                let arg_span = args[*index as usize].span;
+                let arg_span = args[*index as usize].at;
                 for label in row.effects.values() {
                     let supplied = expansion
                         .labels
                         .iter()
                         .any(|previous| previous.symbol() == label.symbol());
                     if supplied {
-                        self.error(
+                        self.error_at(
                             arg_span,
                             ErrorKind::RepeatedRowField {
                                 shape: Shape::Effect,
@@ -10197,7 +10288,7 @@ impl Builder<'_> {
                 index: outer,
             }) => {
                 let tail = Tail {
-                    span: *span,
+                    at: *span,
                     of: Row::Param {
                         symbol: *param,
                         index: *outer,
@@ -10207,8 +10298,8 @@ impl Builder<'_> {
             }
             Some(TypeKind::Error) | None => {}
             Some(_) => {
-                let span = args[*index as usize].span;
-                self.error(
+                let span = args[*index as usize].at;
+                self.error_at(
                     span,
                     ErrorKind::NotARow {
                         sense: Sense::Effects,
@@ -10222,8 +10313,8 @@ impl Builder<'_> {
     fn adopt_tail(&mut self, into: &mut Option<Tail>, tail: Tail) {
         match into {
             Some(previous) => {
-                let previous = previous.span;
-                self.error(tail.span, ErrorKind::TwoTails { previous });
+                let previous = previous.at;
+                self.error_at(tail.at, ErrorKind::TwoTails { previous });
             }
             None => *into = Some(tail),
         }
@@ -10234,13 +10325,13 @@ impl Builder<'_> {
     /// spliced: the argument's own labels join the row, and its tail becomes
     /// the row's.
     fn substituted(&mut self, ty: &Type, args: &[Type]) -> Type {
-        let span = ty.span;
-        let tracked = match &ty.tracked {
+        let span = ty.at;
+        let tracked = match &ty.anchored {
             TypeKind::Param { index, .. } => {
                 return args
                     .get(*index as usize)
                     .cloned()
-                    .unwrap_or_else(|| span.track(TypeKind::Error));
+                    .unwrap_or_else(|| span.anchor(TypeKind::Error));
             }
             TypeKind::Struct { fields, tail } => {
                 let mut fields: IndexMap<String, TypeField> = fields
@@ -10248,11 +10339,11 @@ impl Builder<'_> {
                     .map(|(name, field)| {
                         let field = match field {
                             TypeField::Written {
-                                name_span,
+                                name_at: name_span,
                                 when,
                                 value,
                             } => TypeField::Written {
-                                name_span: *name_span,
+                                name_at: *name_span,
                                 when: when.clone(),
                                 value: self.substituted(value, args),
                             },
@@ -10267,7 +10358,7 @@ impl Builder<'_> {
                     ..
                 }) = &tail
                 {
-                    match args.get(*index as usize).map(|arg| &arg.tracked) {
+                    match args.get(*index as usize).map(|arg| &arg.anchored) {
                         Some(TypeKind::Struct {
                             fields: more,
                             tail: rest,
@@ -10279,7 +10370,7 @@ impl Builder<'_> {
                         }
                         Some(TypeKind::Param { symbol, index }) => {
                             tail = tail.map(|tail| Tail {
-                                span: tail.span,
+                                at: tail.at,
                                 of: Row::Param {
                                     symbol: *symbol,
                                     index: *index,
@@ -10288,8 +10379,8 @@ impl Builder<'_> {
                         }
                         Some(TypeKind::Error) | None => tail = None,
                         Some(_) => {
-                            self.error(
-                                args[*index as usize].span,
+                            self.error_at(
+                                args[*index as usize].at,
                                 ErrorKind::NotARow {
                                     sense: Sense::Fields,
                                 },
@@ -10306,11 +10397,11 @@ impl Builder<'_> {
                     .map(|(name, case)| {
                         let case = match case {
                             SumCase::Written {
-                                name_span,
+                                name_at: name_span,
                                 when,
                                 payload,
                             } => SumCase::Written {
-                                name_span: *name_span,
+                                name_at: *name_span,
                                 when: when.clone(),
                                 payload: payload
                                     .as_ref()
@@ -10327,7 +10418,7 @@ impl Builder<'_> {
                     ..
                 }) = &tail
                 {
-                    match args.get(*index as usize).map(|arg| &arg.tracked) {
+                    match args.get(*index as usize).map(|arg| &arg.anchored) {
                         Some(TypeKind::Sum {
                             cases: more,
                             tail: rest,
@@ -10339,7 +10430,7 @@ impl Builder<'_> {
                         }
                         Some(TypeKind::Param { symbol, index }) => {
                             tail = tail.map(|tail| Tail {
-                                span: tail.span,
+                                at: tail.at,
                                 of: Row::Param {
                                     symbol: *symbol,
                                     index: *index,
@@ -10348,8 +10439,8 @@ impl Builder<'_> {
                         }
                         Some(TypeKind::Error) | None => tail = None,
                         Some(_) => {
-                            self.error(
-                                args[*index as usize].span,
+                            self.error_at(
+                                args[*index as usize].at,
                                 ErrorKind::NotARow {
                                     sense: Sense::Cases,
                                 },
@@ -10371,11 +10462,11 @@ impl Builder<'_> {
             TypeKind::Array(element) => TypeKind::Array(Box::new(self.substituted(element, args))),
             TypeKind::Apply {
                 head,
-                head_span,
+                head_at: head_span,
                 args: applied,
             } => TypeKind::Apply {
                 head: *head,
-                head_span: *head_span,
+                head_at: *head_span,
                 args: applied
                     .iter()
                     .map(|arg| self.substituted(arg, args))
@@ -10385,9 +10476,9 @@ impl Builder<'_> {
             | TypeKind::Prim(_)
             | TypeKind::Var(_)
             | TypeKind::Hole
-            | TypeKind::Error => ty.tracked.clone(),
+            | TypeKind::Error => ty.anchored.clone(),
         };
-        span.track(tracked)
+        span.anchor(tracked)
     }
 
     /// [`substituted`](Self::substituted) for a row of effects: the arguments
@@ -10407,7 +10498,7 @@ impl Builder<'_> {
             ..
         }) = &tail
         {
-            match args.get(*index as usize).map(|arg| &arg.tracked) {
+            match args.get(*index as usize).map(|arg| &arg.anchored) {
                 Some(TypeKind::Effects(more)) => {
                     for (key, label) in &more.effects {
                         effects.entry(key.clone()).or_insert_with(|| label.clone());
@@ -10416,7 +10507,7 @@ impl Builder<'_> {
                 }
                 Some(TypeKind::Param { symbol, index }) => {
                     tail = tail.map(|tail| Tail {
-                        span: tail.span,
+                        at: tail.at,
                         of: Row::Param {
                             symbol: *symbol,
                             index: *index,
@@ -10425,8 +10516,8 @@ impl Builder<'_> {
                 }
                 Some(TypeKind::Error) | None => tail = None,
                 Some(_) => {
-                    self.error(
-                        args[*index as usize].span,
+                    self.error_at(
+                        args[*index as usize].at,
                         ErrorKind::NotARow {
                             sense: Sense::Effects,
                         },
@@ -10436,7 +10527,7 @@ impl Builder<'_> {
             }
         }
         EffectRow {
-            span: row.span,
+            at: row.at,
             written: row.written,
             effects,
             tail,
@@ -10449,22 +10540,23 @@ impl Builder<'_> {
     /// An operation that is not an arrow is refused — a perform site is always
     /// an application, so there would be nowhere for one to be — and the two
     /// sides fall back to the error type, which absorbs.
-    fn operation(&mut self, name: &TrackedString, signature: parse::Type) -> Operation {
+    fn operation(&mut self, name: &AnchoredString, signature: parse::Type) -> Operation {
         // A signature is a whole written type, so it is a scope of its own for
         // the reason an annotation is — even though it has no a variable of
         // its own to put anything in it.
         self.vars.clear();
         let span = signature.span;
+        let here = self.anchor(span);
         let lowered = self.ty(signature, Place::Operation);
-        let (from, to) = match lowered.tracked {
+        let (from, to) = match lowered.anchored {
             TypeKind::Arrow { from, to, effects } => {
                 // The outer arrow is the one an operation performs through,
                 // and performing it introduces the declaring effect and
                 // nothing else. An arrow nested inside either side may carry
                 // effects like any other type written there.
                 if effects.written {
-                    self.error(
-                        effects.span,
+                    self.error_at(
+                        effects.at,
                         ErrorKind::ImpureOperation {
                             found: OperationTypeProblem::Effects,
                         },
@@ -10480,15 +10572,16 @@ impl Builder<'_> {
                     self.error(
                         span,
                         ErrorKind::NotAnOperation {
-                            name: name.tracked.clone(),
+                            name: name.anchored.clone(),
                         },
                     );
                 }
-                (span.track(TypeKind::Error), span.track(TypeKind::Error))
+                let at = here;
+                (at.anchor(TypeKind::Error), at.anchor(TypeKind::Error))
             }
         };
         Operation {
-            name_span: name.span,
+            name_at: name.at,
             from,
             to,
         }
@@ -10550,17 +10643,19 @@ impl Builder<'_> {
         if !self.vars.contains_key(&name.tracked) {
             let id = self.rigids;
             self.rigids += 1;
+            let at = self.anchor(name.span);
             self.vars.insert(
                 name.tracked.clone(),
                 Declared {
-                    span: name.span,
+                    at,
                     id,
                     sense: None,
                     labelled: false,
                 },
             );
         }
-        self.used(name, sense)
+        let at = self.anchor(name.span);
+        self.used(&name.tracked, at, sense)
     }
 
     /// Read one variable already minted at `sense`, and say whether that
@@ -10570,15 +10665,15 @@ impl Builder<'_> {
     /// to that. A use that disagrees is reported where it was written — the one
     /// that brought the two readings together — and answers `false`, which is
     /// whatever asked absorbing rather than being lowered as one of two things.
-    fn used(&mut self, name: &TrackedString, sense: Sense) -> bool {
+    fn used(&mut self, name: &str, at: Anchor, sense: Sense) -> bool {
         let declared = self
             .vars
-            .get_mut(&name.tracked)
+            .get_mut(name)
             .expect("the caller found the declaration");
         match declared.sense {
             Some((first, previous)) if first != sense => {
-                self.error(
-                    name.span,
+                self.error_at(
+                    at,
                     ErrorKind::MixedTail {
                         first,
                         second: sense,
@@ -10589,7 +10684,7 @@ impl Builder<'_> {
             }
             Some(_) => true,
             None => {
-                declared.sense = Some((sense, name.span));
+                declared.sense = Some((sense, at));
                 true
             }
         }
@@ -10636,10 +10731,9 @@ impl Builder<'_> {
             // `where a; b` says what `where a and b` says.
             clause = Some(match clause {
                 None => lowered,
-                Some(before) => {
-                    let span = before.span.merge(lowered.span);
-                    span.track(ClauseKind::And(Box::new(before), Box::new(lowered)))
-                }
+                Some(before) => before
+                    .at
+                    .anchor(ClauseKind::And(Box::new(before), Box::new(lowered))),
             });
         }
         let polarity = presence_polarities(&ty, &self.variances);
@@ -10668,7 +10762,7 @@ impl Builder<'_> {
                             Ok(boundary) => PresenceOwnership::Existential { boundary },
                             Err((previous, second)) => {
                                 ownership_errors.push(Error {
-                                    span: second,
+                                    at: second,
                                     kind: ErrorKind::IncompatiblePresenceOwnership {
                                         name: name.clone(),
                                         previous,
@@ -10684,7 +10778,7 @@ impl Builder<'_> {
                 };
                 Variable {
                     ownership,
-                    span: declared.span,
+                    at: declared.at,
                     name: name.clone(),
                     sense,
                     id: declared.id,
@@ -10722,11 +10816,12 @@ impl Builder<'_> {
     /// declared gets, because the reader's fix is the same either way.
     fn clause(&mut self, clause: parse::Clause) -> Option<Clause> {
         let span = clause.span;
+        let here = self.anchor(span);
         let kind = match clause.tracked {
             parse::ClauseKind::Name(name) => {
-                let named = span.track(name.clone());
+                let named = here.anchor(name.clone());
                 let declared = self.vars.get(&name).is_some();
-                if declared && !self.used(&named, Sense::Presence) {
+                if declared && !self.used(&name, named.at, Sense::Presence) {
                     return None;
                 }
                 if !self.vars.get(&name).is_some_and(|var| var.labelled) {
@@ -10756,7 +10851,7 @@ impl Builder<'_> {
                 ClauseKind::NotEqual(Box::new(left?), Box::new(right?))
             }
         };
-        Some(span.track(kind))
+        Some(here.anchor(kind))
     }
 
     /// Lower one label's `when` clause.
@@ -10777,7 +10872,7 @@ impl Builder<'_> {
             let id = self.rigids;
             self.rigids += 1;
             return Some(Box::new(When {
-                span: when.span,
+                at: self.anchor(when.span),
                 name: when.name.map(|name| name.tracked),
                 id,
             }));
@@ -10803,7 +10898,7 @@ impl Builder<'_> {
             id
         });
         Some(Box::new(When {
-            span: when.span,
+            at: self.anchor(when.span),
             name,
             id,
         }))
@@ -10822,8 +10917,9 @@ impl Builder<'_> {
             return Ok(None);
         };
         let span = tail.span;
+        let here = self.anchor(span);
         match self.row(span, tail.of, place, shape) {
-            Some(of) => Ok(Some(Tail { span, of })),
+            Some(of) => Ok(Some(Tail { at: here, of })),
             None => Err(()),
         }
     }
@@ -10849,13 +10945,13 @@ impl Builder<'_> {
         &mut self,
         place: Place,
         shape: Shape,
-        marks: impl IntoIterator<Item = Span>,
+        marks: impl IntoIterator<Item = Anchor>,
         tail: &Option<Tail>,
     ) -> bool {
         let Some(kind) = openness(place, shape) else {
             return true;
         };
-        let marks: Vec<Span> = marks.into_iter().collect();
+        let marks: Vec<Anchor> = marks.into_iter().collect();
         let open_tail = matches!(
             tail,
             Some(Tail {
@@ -10867,7 +10963,7 @@ impl Builder<'_> {
             return true;
         }
         for span in marks {
-            self.error(span, kind.clone());
+            self.error_at(span, kind.clone());
         }
         place == Place::Operation
     }
@@ -10884,7 +10980,7 @@ impl Builder<'_> {
     fn tailed(
         &mut self,
         shape: Shape,
-        absences: impl IntoIterator<Item = (String, Span)>,
+        absences: impl IntoIterator<Item = (String, Anchor)>,
         tail: &Option<Tail>,
     ) -> bool {
         if tail.is_some() {
@@ -10892,7 +10988,7 @@ impl Builder<'_> {
         }
         let mut tailed = true;
         for (label, span) in absences {
-            self.error(span, ErrorKind::AbsentInClosed { shape, label });
+            self.error_at(span, ErrorKind::AbsentInClosed { shape, label });
             tailed = false;
         }
         tailed
@@ -10944,7 +11040,7 @@ impl Builder<'_> {
                     head_span,
                     ErrorKind::ParameterApplied { name: name.tracked },
                 );
-                return span.track(TypeKind::Error);
+                return self.anchored(span.track(TypeKind::Error));
             }
             // Something that is not a name cannot be applied, but it is still a
             // written type: it is lowered for its own complaints and the result
@@ -10952,13 +11048,13 @@ impl Builder<'_> {
             written => {
                 self.ty(head_span.track(written), place);
                 self.error(head_span, ErrorKind::NotAConstructor);
-                return span.track(TypeKind::Error);
+                return self.anchored(span.track(TypeKind::Error));
             }
         };
         let symbol = match self.find(&name, Namespace::Types) {
             Ok(symbol) => symbol,
             // A segment named no module; the complaint is already at it.
-            Err(Missing::Segment) => return span.track(TypeKind::Error),
+            Err(Missing::Segment) => return self.anchored(span.track(TypeKind::Error)),
             Err(Missing::Name) => {
                 // A primitive takes nothing, so applying one is an arity
                 // complaint rather than a "not a constructor": the reader wrote
@@ -10983,7 +11079,7 @@ impl Builder<'_> {
                         },
                     );
                 }
-                return span.track(TypeKind::Error);
+                return self.anchored(span.track(TypeKind::Error));
             }
         };
         let expected = self.arity(symbol);
@@ -11003,11 +11099,12 @@ impl Builder<'_> {
                     found,
                 },
             );
-            return span.track(TypeKind::Error);
+            return self.anchored(span.track(TypeKind::Error));
         }
-        span.track(TypeKind::Apply {
+        let at = self.anchor(span);
+        at.anchor(TypeKind::Apply {
             head: symbol,
-            head_span,
+            head_at: self.anchor(head_span),
             args,
         })
     }
@@ -11026,16 +11123,16 @@ impl Builder<'_> {
                 fields: Default::default(),
                 spread: None,
             }
-            .with_span(span),
+            .at(self.anchor(span)),
             ExprKind::Ident { name } => match self.resolve(&name, Namespace::Terms) {
-                Some(symbol) => TermKind::Ident(symbol).with_span(span),
-                None => TermKind::Error.with_span(span),
+                Some(symbol) => TermKind::Ident(symbol).at(self.anchor(span)),
+                None => TermKind::Error.at(self.anchor(span)),
             },
-            ExprKind::Natural(value) => TermKind::Natural(value).with_span(span),
-            ExprKind::Integer(value) => TermKind::Integer(value).with_span(span),
-            ExprKind::Real(value) => TermKind::Real(value).with_span(span),
-            ExprKind::String(value) => TermKind::String(value).with_span(span),
-            ExprKind::Boolean(value) => TermKind::Boolean(value).with_span(span),
+            ExprKind::Natural(value) => TermKind::Natural(value).at(self.anchor(span)),
+            ExprKind::Integer(value) => TermKind::Integer(value).at(self.anchor(span)),
+            ExprKind::Real(value) => TermKind::Real(value).at(self.anchor(span)),
+            ExprKind::String(value) => TermKind::String(value).at(self.anchor(span)),
+            ExprKind::Boolean(value) => TermKind::Boolean(value).at(self.anchor(span)),
             ExprKind::Unary { op, value } => TermKind::Unary {
                 op: match op {
                     parse::UnaryOp::Neg => UnaryOp::Neg,
@@ -11043,7 +11140,7 @@ impl Builder<'_> {
                 },
                 value: Box::new(self.term(*value)),
             }
-            .with_span(span),
+            .at(self.anchor(span)),
             ExprKind::Binary { op, left, right } => TermKind::Binary {
                 op: match op {
                     parse::BinaryOp::Add => BinaryOp::Add,
@@ -11057,7 +11154,7 @@ impl Builder<'_> {
                 left: Box::new(self.term(*left)),
                 right: Box::new(self.term(*right)),
             }
-            .with_span(span),
+            .at(self.anchor(span)),
             ExprKind::Pipe { value, function } => {
                 let func = self.term(*function);
                 let arg = self.term(*value);
@@ -11065,7 +11162,7 @@ impl Builder<'_> {
                     func: Box::new(func),
                     arg: Box::new(arg),
                 }
-                .with_span(span)
+                .at(self.anchor(span))
             }
             ExprKind::Apply { func, arg } => {
                 let func = self.term(*func);
@@ -11074,13 +11171,14 @@ impl Builder<'_> {
                     func: Box::new(func),
                     arg: Box::new(arg),
                 }
-                .with_span(span)
+                .at(self.anchor(span))
             }
             ExprKind::Function { args, body } => {
                 let mark = self.terms.mark();
                 let mut bound = Vec::with_capacity(args.len());
                 for arg in args {
                     let span = arg.span;
+                    let here = self.anchor(span);
                     // A name is bound over the body; a `_` gets a fresh symbol
                     // that goes into no scope, so the argument is typechecked —
                     // the arrow still has a domain — and nothing can name it.
@@ -11091,28 +11189,31 @@ impl Builder<'_> {
                             self.terms.bind(name, symbol);
                             symbol
                         }
-                        parse::ArgKind::Wildcard => self.fresh("%discard", span).tracked,
+                        parse::ArgKind::Wildcard => {
+                            let at = self.anchor(span);
+                            self.fresh("%discard", at).anchored
+                        }
                     };
-                    bound.push(span.track(symbol));
+                    bound.push(here.anchor(symbol));
                 }
                 // A closure can be returned by the computation and outlive the
                 // `handle` it was written in, so a `raise` inside one answers
                 // nothing that is certain to still be on the stack. See R17.
                 let inner = match self.answering {
                     Answering::Nowhere => Answering::Nowhere,
-                    Answering::Arm | Answering::UnderFn(_) => Answering::UnderFn(span),
+                    Answering::Arm | Answering::UnderFn(_) => Answering::UnderFn(self.anchor(span)),
                 };
                 let outer = std::mem::replace(&mut self.answering, inner);
                 let body = self.term(*body);
                 self.answering = outer;
                 self.terms.release(mark);
                 bound.into_iter().rev().fold(body, |body, arg| {
-                    let span = arg.span.merge(body.span);
+                    let span = self.cover(arg.at, body.at);
                     TermKind::Fn {
                         arg,
                         body: Box::new(body),
                     }
-                    .with_span(span)
+                    .at(span)
                 })
             }
             // A block is a spelling of the nested bindings it holds, one term
@@ -11149,21 +11250,21 @@ impl Builder<'_> {
             ExprKind::Struct { fields, spread } => {
                 let fields = self.fields(fields, |b, value| b.term(value));
                 let spread = spread.map(|spread| Spread {
-                    span: spread.span,
+                    at: self.anchor(spread.span),
                     value: Box::new(self.term(*spread.value)),
                 });
-                TermKind::Struct { fields, spread }.with_span(span)
+                TermKind::Struct { fields, spread }.at(self.anchor(span))
             }
             ExprKind::Array(items) => TermKind::Array(
                 items
                     .into_iter()
                     .map(|item| ArrayItem {
-                        spread: item.spread,
+                        spread: item.spread.map(|spread| self.anchor(spread)),
                         value: self.term(item.value),
                     })
                     .collect(),
             )
-            .with_span(span),
+            .at(self.anchor(span)),
             // Tuples are positional structs at the IR boundary. Decimal keys
             // are canonical and zero-based; the element's own span stands in
             // for the generated field name, since no label was written.
@@ -11176,7 +11277,7 @@ impl Builder<'_> {
                         (
                             index.to_string(),
                             Field {
-                                name_span,
+                                name_at: self.anchor(name_span),
                                 value: self.term(element),
                             },
                         )
@@ -11186,35 +11287,39 @@ impl Builder<'_> {
                     fields,
                     spread: None,
                 }
-                .with_span(span)
+                .at(self.anchor(span))
             }
             ExprKind::Tag { name, payload } => {
                 let payload = payload.map(|payload| Box::new(self.term(*payload)));
-                TermKind::Tag { name, payload }.with_span(span)
+                TermKind::Tag {
+                    name: self.anchored(name),
+                    payload,
+                }
+                .at(self.anchor(span))
             }
             ExprKind::Project { base, field } => {
                 let base = self.term(*base);
                 TermKind::Project {
                     base: Box::new(base),
-                    field,
+                    field: self.anchored(field),
                 }
-                .with_span(span)
+                .at(self.anchor(span))
             }
             // An operation is an ordinary value: what it resolves to is the
             // effect and the label, and the type it gets is the declared
             // signature with the effect's own label on its outermost arrow.
             ExprKind::Operation { effect, selector } => {
-                let selector = selector.span.track(match selector.tracked {
+                let selector = self.anchor(selector.span).anchor(match selector.tracked {
                     parse::OperationSelector::Unnamed => OperationSelector::Unnamed,
                     parse::OperationSelector::Named(name) => OperationSelector::Named(name),
                 });
                 match self.operation_of(&effect, &selector) {
                     Some(symbol) => TermKind::Operation {
-                        effect: effect.span().track(symbol),
+                        effect: self.anchor(effect.span()).anchor(symbol),
                         selector,
                     }
-                    .with_span(span),
-                    None => TermKind::Error.with_span(span),
+                    .at(self.anchor(span)),
+                    None => TermKind::Error.at(self.anchor(span)),
                 }
             }
             ExprKind::Handle { body, arms } => self.handle_term(span, *body, arms),
@@ -11231,7 +11336,7 @@ impl Builder<'_> {
                 if let Some(kind) = kind {
                     self.error(span, kind);
                 }
-                TermKind::Raise(Box::new(self.term(*value))).with_span(span)
+                TermKind::Raise(Box::new(self.term(*value))).at(self.anchor(span))
             }
         }
     }
@@ -11245,14 +11350,14 @@ impl Builder<'_> {
     fn operation_of(
         &mut self,
         effect: &parse::Path,
-        selector: &Tracked<OperationSelector>,
+        selector: &Anchored<OperationSelector>,
     ) -> Option<Symbol> {
         let symbol = self.resolve(effect, Namespace::Effects)?;
         match self.operations.get(&symbol) {
-            Some(operations) if operations.contains(&selector.tracked) => Some(symbol),
+            Some(operations) if operations.contains(&selector.anchored) => Some(symbol),
             Some(operations) => {
                 let effect_name = self.mint.name(symbol).to_string();
-                let kind = match &selector.tracked {
+                let kind = match &selector.anchored {
                     OperationSelector::Unnamed => ErrorKind::BareOperationUnavailable {
                         effect: effect_name,
                         suggestion: operations.iter().next().map(OperationSelector::source_name),
@@ -11270,7 +11375,7 @@ impl Builder<'_> {
                         op: op.clone(),
                     },
                 };
-                self.error(selector.span, kind);
+                self.error_at(selector.at, kind);
                 None
             }
             None => {
@@ -11306,20 +11411,15 @@ impl Builder<'_> {
             match arm.head {
                 parse::ArmHead::Return { span: at } => {
                     if let Some(first) = &ret {
-                        self.error(
-                            at,
-                            ErrorKind::DuplicateReturn {
-                                previous: first.span,
-                            },
-                        );
+                        self.error(at, ErrorKind::DuplicateReturn { previous: first.at });
                     }
                     let (binder, body) = self.arm_body(arm.binder, arm.body);
                     // The first `return` arm is the one that stands, the way a
                     // repeated definition is.
                     if ret.is_none() {
                         ret = Some(ReturnArm {
-                            span: at,
-                            binder,
+                            at: self.anchor(at),
+                            binder: self.anchored(binder),
                             body: Box::new(body),
                         });
                     }
@@ -11329,15 +11429,16 @@ impl Builder<'_> {
                         parse::OperationSelector::Unnamed => OperationSelector::Unnamed,
                         parse::OperationSelector::Named(name) => OperationSelector::Named(name),
                     });
+                    let selector = self.anchored(selector);
                     let symbol = self.operation_of(&effect, &selector);
                     let (binder, body) = self.arm_body(arm.binder, arm.body);
                     let Some(symbol) = symbol else {
                         continue;
                     };
                     lowered.push(HandlerArm {
-                        effect: effect.span().track(symbol),
+                        effect: self.anchor(effect.span()).anchor(symbol),
                         selector,
-                        binder,
+                        binder: self.anchored(binder),
                         body,
                     });
                 }
@@ -11355,7 +11456,7 @@ impl Builder<'_> {
                 discharges: Vec::new(),
             },
         }
-        .with_span(span)
+        .at(self.anchor(span))
     }
 
     /// One handler arm's binder and body: the name bound for the length of the
@@ -11371,7 +11472,10 @@ impl Builder<'_> {
             }
             // A `_` gets a symbol nothing can name, so the payload is still
             // typed and the body still cannot reach it — a `fn` header's rule.
-            parse::ArgKind::Wildcard => self.fresh("%discard", at).tracked,
+            parse::ArgKind::Wildcard => {
+                let at = self.anchor(at);
+                self.fresh("%discard", at).anchored
+            }
         };
         let body = self.term(body);
         self.terms.release(mark);
@@ -11400,11 +11504,12 @@ impl Builder<'_> {
     /// here is only that a row was allowed to be written at all.
     fn argument(&mut self, ty: parse::Type, place: Place) -> Type {
         let span = ty.span;
+        let here = self.anchor(span);
         match ty.tracked {
             parse::TypeKind::Effects(written) => {
                 match self.effect_row(span, Some(*written), place) {
-                    Some(row) => span.track(TypeKind::Effects(Box::new(row))),
-                    None => span.track(TypeKind::Error),
+                    Some(row) => here.anchor(TypeKind::Effects(Box::new(row))),
+                    None => here.anchor(TypeKind::Error),
                 }
             }
             written => self.ty(span.track(written), place),
@@ -11413,6 +11518,7 @@ impl Builder<'_> {
 
     fn ty(&mut self, ty: parse::Type, place: Place) -> Type {
         let span = ty.span;
+        let here = self.anchor(span);
         match ty.tracked {
             // A row where a type goes. Lowered all the same and the result
             // dropped, the way a head that cannot be applied is: the effects it
@@ -11421,11 +11527,11 @@ impl Builder<'_> {
             parse::TypeKind::Effects(written) => {
                 self.effect_row(span, Some(*written), place);
                 self.error(span, ErrorKind::EffectsOutsideRow);
-                span.track(TypeKind::Error)
+                here.anchor(TypeKind::Error)
             }
             // As in [`term`](Self::term): the two surface spellings of the
             // empty struct, `()` and `{}`, meet here as a closed empty row.
-            parse::TypeKind::Unit => span.track(TypeKind::Struct {
+            parse::TypeKind::Unit => here.anchor(TypeKind::Struct {
                 fields: Default::default(),
                 tail: None,
             }),
@@ -11436,13 +11542,13 @@ impl Builder<'_> {
             parse::TypeKind::Hole => match place {
                 Place::Declaration => {
                     self.error(span, ErrorKind::HoleInDeclaration);
-                    span.track(TypeKind::Error)
+                    here.anchor(TypeKind::Error)
                 }
                 Place::Operation => {
                     self.error(span, ErrorKind::HoleInOperation);
-                    span.track(TypeKind::Error)
+                    here.anchor(TypeKind::Error)
                 }
-                Place::Annotation => span.track(TypeKind::Hole),
+                Place::Annotation => here.anchor(TypeKind::Hole),
             },
             // Two things a `'a` can be, in this order: the parameter of the
             // declaration this is the body of, or a variable of the annotation
@@ -11453,18 +11559,18 @@ impl Builder<'_> {
                 // A parameter stands for one type outright, so the name alone
                 // is the whole of writing one and there is nothing to count.
                 if let Some(&(symbol, index)) = self.params.get(&name.tracked) {
-                    return span.track(TypeKind::Param { symbol, index });
+                    return here.anchor(TypeKind::Param { symbol, index });
                 }
                 // A declaration and an operation's signature each say the same
                 // thing wherever they are used, so neither has anything for a
                 // caller to pick — and each says so in its own words.
                 if let Some(kind) = wherever(place, &name.tracked) {
                     self.error(name.span, kind);
-                    return span.track(TypeKind::Error);
+                    return here.anchor(TypeKind::Error);
                 }
                 match self.variable(&name, Sense::Type) {
-                    true => span.track(TypeKind::Var(name.tracked)),
-                    false => span.track(TypeKind::Error),
+                    true => here.anchor(TypeKind::Var(name.tracked)),
+                    false => here.anchor(TypeKind::Error),
                 }
             }
             // Two things a bare name can be, in this order: a declared type or
@@ -11479,7 +11585,7 @@ impl Builder<'_> {
                 // A declaration written bare is applied to nothing, which is
                 // only enough if it takes nothing. See [`ErrorKind::Arity`].
                 Ok(symbol) => match self.arity(symbol) {
-                    0 => span.track(TypeKind::Ident(symbol)),
+                    0 => here.anchor(TypeKind::Ident(symbol)),
                     expected => {
                         self.error(
                             name.span(),
@@ -11489,11 +11595,11 @@ impl Builder<'_> {
                                 found: 0,
                             },
                         );
-                        span.track(TypeKind::Error)
+                        here.anchor(TypeKind::Error)
                     }
                 },
                 // A segment named no module; the complaint is already at it.
-                Err(Missing::Segment) => span.track(TypeKind::Error),
+                Err(Missing::Segment) => here.anchor(TypeKind::Error),
                 // A primitive lives in no module, so only a bare name can
                 // reach one.
                 Err(Missing::Name) => {
@@ -11503,7 +11609,7 @@ impl Builder<'_> {
                         .then(|| Prim::from_name(&name.name.tracked))
                         .flatten();
                     match prim {
-                        Some(prim) => span.track(TypeKind::Prim(prim)),
+                        Some(prim) => here.anchor(TypeKind::Prim(prim)),
                         None => {
                             self.error(
                                 name.name.span,
@@ -11512,7 +11618,7 @@ impl Builder<'_> {
                                     namespace: Namespace::Types,
                                 },
                             );
-                            span.track(TypeKind::Error)
+                            here.anchor(TypeKind::Error)
                         }
                     }
                 }
@@ -11520,7 +11626,7 @@ impl Builder<'_> {
             parse::TypeKind::Apply { head, args } => self.apply(span, *head, args, place),
             parse::TypeKind::Array(element) => {
                 let element = self.ty(*element, place);
-                span.track(TypeKind::Array(Box::new(element)))
+                here.anchor(TypeKind::Array(Box::new(element)))
             }
             // A tuple type is a closed struct with unconditional, zero-based
             // decimal fields. As with tuple terms, an element's span is the
@@ -11535,14 +11641,14 @@ impl Builder<'_> {
                         (
                             index.to_string(),
                             TypeField::Written {
-                                name_span,
+                                name_at: self.anchor(name_span),
                                 when: None,
                                 value,
                             },
                         )
                     })
                     .collect();
-                span.track(TypeKind::Struct { fields, tail: None })
+                here.anchor(TypeKind::Struct { fields, tail: None })
             }
             parse::TypeKind::Struct { fields, tail } => {
                 // The values are lowered before openness is judged, so a bad
@@ -11568,12 +11674,12 @@ impl Builder<'_> {
                     .map(|(name, field)| {
                         let lowered = match field.value {
                             Some((when, value)) => TypeField::Written {
-                                name_span: field.name_span,
+                                name_at: field.name_at,
                                 when,
                                 value,
                             },
                             None => TypeField::Absent {
-                                name_span: field.name_span,
+                                name_at: field.name_at,
                             },
                         };
                         (name, lowered)
@@ -11581,7 +11687,7 @@ impl Builder<'_> {
                     .collect();
                 let tail = match self.tail(tail, place, Shape::Struct) {
                     Ok(tail) => tail,
-                    Err(()) => return span.track(TypeKind::Error),
+                    Err(()) => return here.anchor(TypeKind::Error),
                 };
                 // Where a declaration is held to being closed, and where a `\`
                 // is held to having a `..` to speak about; see
@@ -11591,19 +11697,19 @@ impl Builder<'_> {
                 let marks = lowered.values().filter_map(|field| match field {
                     TypeField::Written {
                         when: Some(when), ..
-                    } => Some(when.span),
+                    } => Some(when.at),
                     _ => None,
                 });
                 let closed = self.closed(place, Shape::Struct, marks, &tail);
                 let absences = lowered.iter().filter_map(|(name, field)| match field {
-                    TypeField::Absent { name_span } => Some((name.clone(), *name_span)),
+                    TypeField::Absent { name_at: name_span } => Some((name.clone(), *name_span)),
                     TypeField::Written { .. } => None,
                 });
                 let tailed = self.tailed(Shape::Struct, absences, &tail);
                 if !closed || !tailed {
-                    return span.track(TypeKind::Error);
+                    return here.anchor(TypeKind::Error);
                 }
-                span.track(TypeKind::Struct {
+                here.anchor(TypeKind::Struct {
                     fields: lowered,
                     tail,
                 })
@@ -11634,12 +11740,12 @@ impl Builder<'_> {
                     .map(|(name, case)| {
                         let lowered = match case.value {
                             Some((when, payload)) => SumCase::Written {
-                                name_span: case.name_span,
+                                name_at: case.name_at,
                                 when,
                                 payload,
                             },
                             None => SumCase::Absent {
-                                name_span: case.name_span,
+                                name_at: case.name_at,
                             },
                         };
                         (name, lowered)
@@ -11647,24 +11753,24 @@ impl Builder<'_> {
                     .collect();
                 let tail = match self.tail(tail, place, Shape::Sum) {
                     Ok(tail) => tail,
-                    Err(()) => return span.track(TypeKind::Error),
+                    Err(()) => return here.anchor(TypeKind::Error),
                 };
                 let marks = lowered.values().filter_map(|case| match case {
                     SumCase::Written {
                         when: Some(when), ..
-                    } => Some(when.span),
+                    } => Some(when.at),
                     _ => None,
                 });
                 let closed = self.closed(place, Shape::Sum, marks, &tail);
                 let absences = lowered.iter().filter_map(|(name, case)| match case {
-                    SumCase::Absent { name_span } => Some((name.clone(), *name_span)),
+                    SumCase::Absent { name_at: name_span } => Some((name.clone(), *name_span)),
                     SumCase::Written { .. } => None,
                 });
                 let tailed = self.tailed(Shape::Sum, absences, &tail);
                 if !closed || !tailed {
-                    return span.track(TypeKind::Error);
+                    return here.anchor(TypeKind::Error);
                 }
-                span.track(TypeKind::Sum {
+                here.anchor(TypeKind::Sum {
                     cases: lowered,
                     tail,
                 })
@@ -11673,9 +11779,9 @@ impl Builder<'_> {
                 let from = self.ty(*from, place);
                 let to = self.ty(*to, place);
                 let Some(effects) = self.effect_row(span, effects.map(|row| *row), place) else {
-                    return span.track(TypeKind::Error);
+                    return here.anchor(TypeKind::Error);
                 };
-                span.track(TypeKind::Arrow {
+                here.anchor(TypeKind::Arrow {
                     from: Box::new(from),
                     to: Box::new(to),
                     effects: Box::new(effects),
@@ -11704,7 +11810,7 @@ impl Builder<'_> {
     ) -> Option<EffectRow> {
         let Some(written) = written else {
             return Some(EffectRow {
-                span,
+                at: self.anchor(span),
                 ..EffectRow::default()
             });
         };
@@ -11751,12 +11857,13 @@ impl Builder<'_> {
                 .into_iter()
                 .map(|arg| self.argument(arg, place))
                 .collect();
+            let at = self.anchor(at);
             let expansion = self.expand_alias(symbol, &args, at);
             // A `\` or a `when` on an alias distributes to every effect it
             // stands for, which is only a row when the expansion is closed:
             // an open tail is nobody's to mark.
             if (absent || when.is_some()) && expansion.tail.is_some() {
-                self.error(
+                self.error_at(
                     at,
                     ErrorKind::ModifiedOpenAlias {
                         name: self.mint.name(symbol).to_string(),
@@ -11775,13 +11882,13 @@ impl Builder<'_> {
                 let expanded = label_symbol != symbol;
                 let lowered = match (absent, label) {
                     (true, label) => EffectLabel::Absent {
-                        name_span: at,
+                        name_at: at,
                         symbol: label_symbol,
                         args: label.args().to_vec(),
                         expanded,
                     },
                     (false, EffectLabel::Absent { args, .. }) => EffectLabel::Absent {
-                        name_span: at,
+                        name_at: at,
                         symbol: label_symbol,
                         args,
                         expanded,
@@ -11792,7 +11899,7 @@ impl Builder<'_> {
                             args, when: inner, ..
                         },
                     ) => EffectLabel::Written {
-                        name_span: at,
+                        name_at: at,
                         symbol: label_symbol,
                         args,
                         expanded,
@@ -11806,12 +11913,12 @@ impl Builder<'_> {
                     if expanded && origins.get(&label_symbol) == Some(&origin) {
                         continue;
                     }
-                    self.error(
+                    self.error_at(
                         at,
                         ErrorKind::DuplicateCase {
                             shape: Shape::Effect,
                             name: effect_key(self.mint, label_symbol),
-                            previous: previous.name_span(),
+                            previous: previous.name_at(),
                         },
                     );
                     continue;
@@ -11826,10 +11933,10 @@ impl Builder<'_> {
         };
         let tail = match (tail, brought) {
             (Some(written), Some(brought)) => {
-                self.error(
-                    brought.span,
+                self.error_at(
+                    brought.at,
                     ErrorKind::TwoTails {
-                        previous: written.span,
+                        previous: written.at,
                     },
                 );
                 Some(written)
@@ -11839,15 +11946,15 @@ impl Builder<'_> {
         // The same two checks a struct and a sum make, in the effect reading:
         // a position that holds for every definition may leave nothing open,
         // and a `\` needs a `..` beside it to speak about.
-        let marks = effects
-            .values()
-            .filter_map(|label| Some(label.when()?.span));
+        let marks = effects.values().filter_map(|label| Some(label.when()?.at));
         let closed = self.closed(place, Shape::Effect, marks, &tail);
         let absences: Vec<_> = effects
             .values()
             .filter_map(|label| match label {
                 EffectLabel::Absent {
-                    name_span, symbol, ..
+                    name_at: name_span,
+                    symbol,
+                    ..
                 } => Some((self.mint.name(*symbol).to_string(), *name_span)),
                 EffectLabel::Written { .. } => None,
             })
@@ -11855,7 +11962,7 @@ impl Builder<'_> {
         let tailed = self.tailed(Shape::Effect, absences, &tail);
         match closed && tailed {
             true => Some(EffectRow {
-                span: written.span,
+                at: self.anchor(written.span),
                 written: true,
                 effects,
                 tail,
@@ -11886,7 +11993,7 @@ impl Builder<'_> {
     fn labels<S, T>(
         &mut self,
         labels: IndexMap<TrackedString, S>,
-        repeat: impl Fn(String, Span) -> ErrorKind,
+        repeat: impl Fn(String, Anchor) -> ErrorKind,
         lower: impl Fn(&mut Self, S) -> T,
     ) -> IndexMap<String, Field<T>> {
         let mut lowered: IndexMap<String, Field<T>> = IndexMap::new();
@@ -11894,10 +12001,16 @@ impl Builder<'_> {
             let name_span = name.span;
             let value = lower(self, value);
             if let Some(previous) = lowered.get(&name.tracked) {
-                self.error(name_span, repeat(name.tracked.clone(), previous.name_span));
+                self.error(name_span, repeat(name.tracked.clone(), previous.name_at));
                 continue;
             }
-            lowered.insert(name.tracked, Field { name_span, value });
+            lowered.insert(
+                name.tracked,
+                Field {
+                    name_at: self.anchor(name_span),
+                    value,
+                },
+            );
         }
         lowered
     }
@@ -11925,7 +12038,7 @@ impl Builder<'_> {
                     fields: Default::default(),
                     spread: None,
                 }
-                .with_span(span),
+                .at(self.anchor(span)),
             };
         };
         let StmtKind::Let { pattern, ty, body } = stmt.tracked else {
@@ -11973,12 +12086,12 @@ impl Builder<'_> {
                 let body = body(self);
                 self.terms.release(mark);
                 TermKind::Let {
-                    name: name.span.track(symbol),
+                    name: self.anchored(name.span.track(symbol)),
                     annotation,
                     value: Box::new(value),
                     body: Box::new(body),
                 }
-                .with_span(span)
+                .at(self.anchor(span))
             }
             tracked => {
                 let pspan = pattern.span;
@@ -11995,7 +12108,7 @@ impl Builder<'_> {
                 match calm(&pattern) {
                     Some(calm) => {
                         let mut term = self.destructure(calm, value, annotation, body);
-                        term.span = span;
+                        term.at = self.anchor(span);
                         term
                     }
                     // The binding has to accept every value, and this
@@ -12006,18 +12119,19 @@ impl Builder<'_> {
                     None => {
                         let (at, found) = refuter(&pattern)
                             .expect("a pattern that is not calm names what refutes it");
-                        self.error(at, ErrorKind::RefutableBinding { found });
+                        self.error_at(at, ErrorKind::RefutableBinding { found });
                         let mut names = Vec::new();
                         pattern_binders(&pattern, &mut names);
                         let inner = bound_to_errors(names, body);
-                        let held = self.fresh("%value", pspan);
+                        let held_at = self.anchor(pspan);
+                        let held = self.fresh("%value", held_at);
                         TermKind::Let {
                             name: held,
                             annotation,
                             value: Box::new(value),
                             body: Box::new(inner),
                         }
-                        .with_span(span)
+                        .at(self.anchor(span))
                     }
                 }
             }
@@ -12028,8 +12142,15 @@ impl Builder<'_> {
     /// bound into any scope, so nothing written can name or capture it. The
     /// name starts with `%`, which no identifier can, so the debugger shows it
     /// recognizably as the compiler's own.
-    fn fresh(&mut self, name: &str, span: Span) -> Tracked<Symbol> {
-        span.track(self.mint.local(self.module, Namespace::Terms, name))
+    fn fresh(&mut self, name: &str, at: Anchor) -> Anchored<Symbol> {
+        at.anchor(self.mint.local(self.module, Namespace::Terms, name))
+    }
+
+    /// The anchor of a synthesized node standing over everything from `from`
+    /// to `to`: the span the two resolve to, merged, recorded as its own.
+    fn cover(&mut self, from: Anchor, to: Anchor) -> Anchor {
+        let span = self.source.span(from).merge(self.source.span(to));
+        self.anchor(span)
     }
 
     /// One name a pattern binds. `seen` is every name the whole pattern has
@@ -12041,13 +12162,14 @@ impl Builder<'_> {
         name: TrackedString,
         seen: &mut Vec<(String, Span)>,
         binders: &mut Binders,
-    ) -> Tracked<Symbol> {
+    ) -> Anchored<Symbol> {
         let previous = seen
             .iter()
             .find(|(seen, _)| *seen == name.tracked)
             .map(|(_, span)| *span);
         let repeat = previous.is_some();
         if let Some(previous) = previous {
+            let previous = self.anchor(previous);
             self.error(
                 name.span,
                 ErrorKind::DuplicateBinding {
@@ -12068,7 +12190,7 @@ impl Builder<'_> {
                 if !repeat {
                     self.terms.bind(name.tracked.clone(), symbol);
                 }
-                name.span.track(symbol)
+                self.anchor(name.span).anchor(symbol)
             }
             Binders::Declared(declared) => {
                 let declared = declared
@@ -12083,7 +12205,7 @@ impl Builder<'_> {
                         .mint
                         .local(self.module, Namespace::Terms, &name.tracked),
                 };
-                name.span.track(symbol)
+                self.anchor(name.span).anchor(symbol)
             }
         }
     }
@@ -12103,23 +12225,25 @@ impl Builder<'_> {
         pattern: parse::Pattern,
         seen: &mut Vec<(String, Span)>,
         binders: &mut Binders,
-        dropped: &mut Vec<Tracked<Symbol>>,
+        dropped: &mut Vec<Anchored<Symbol>>,
     ) -> Pattern {
         let span = pattern.span;
+        let here = self.anchor(span);
         match pattern.tracked {
             parse::PatternKind::Ident { name } => {
-                span.track(PatternKind::Bind(self.bound(name, seen, binders)))
+                let bound = self.bound(name, seen, binders);
+                self.anchor(span).anchor(PatternKind::Bind(bound))
             }
             // Nothing to resolve and nothing to repeat: a wildcard never goes
             // through [`bound`](Self::bound), which is the whole of how it
             // stays out of the duplicate-binder check.
-            parse::PatternKind::Wildcard => span.track(PatternKind::Wildcard),
-            parse::PatternKind::Natural(value) => span.track(PatternKind::Natural(value)),
-            parse::PatternKind::Integer(value) => span.track(PatternKind::Integer(value)),
-            parse::PatternKind::Real(value) => span.track(PatternKind::Real(value)),
-            parse::PatternKind::String(value) => span.track(PatternKind::String(value)),
-            parse::PatternKind::Boolean(value) => span.track(PatternKind::Boolean(value)),
-            parse::PatternKind::Unit => span.track(PatternKind::Unit),
+            parse::PatternKind::Wildcard => here.anchor(PatternKind::Wildcard),
+            parse::PatternKind::Natural(value) => here.anchor(PatternKind::Natural(value)),
+            parse::PatternKind::Integer(value) => here.anchor(PatternKind::Integer(value)),
+            parse::PatternKind::Real(value) => here.anchor(PatternKind::Real(value)),
+            parse::PatternKind::String(value) => here.anchor(PatternKind::String(value)),
+            parse::PatternKind::Boolean(value) => here.anchor(PatternKind::Boolean(value)),
+            parse::PatternKind::Unit => here.anchor(PatternKind::Unit),
             // A bare tag keeps its `None`: what it constrains the payload to —
             // unit — is said where the type is built rather than written into
             // a tree node the reader never wrote, the convention
@@ -12127,7 +12251,8 @@ impl Builder<'_> {
             parse::PatternKind::Tag { name, payload } => {
                 let payload =
                     payload.map(|payload| Box::new(self.pattern(*payload, seen, binders, dropped)));
-                span.track(PatternKind::Tag { name, payload })
+                let name = self.anchored(name);
+                self.anchor(span).anchor(PatternKind::Tag { name, payload })
             }
             // Tuple patterns are exact positional struct patterns. Lowering
             // each element through this same walk preserves binder order and
@@ -12139,10 +12264,16 @@ impl Builder<'_> {
                     .map(|(index, element)| {
                         let name_span = element.span;
                         let value = self.pattern(element, seen, binders, dropped);
-                        (index.to_string(), Field { name_span, value })
+                        (
+                            index.to_string(),
+                            Field {
+                                name_at: self.anchor(name_span),
+                                value,
+                            },
+                        )
                     })
                     .collect();
-                span.track(PatternKind::Struct { fields, rest: None })
+                here.anchor(PatternKind::Struct { fields, rest: None })
             }
             parse::PatternKind::Struct {
                 fields: entries,
@@ -12157,11 +12288,12 @@ impl Builder<'_> {
                         // bound twice, which the binder walk below words
                         // better than a complaint about the field would.
                         Some((_, earlier, previous)) if !(pun && *earlier) => {
+                            let previous = self.anchor(*previous);
                             self.error(
                                 name.span,
                                 ErrorKind::DuplicateField {
                                     name: name.tracked.clone(),
-                                    previous: *previous,
+                                    previous,
                                 },
                             );
                             false
@@ -12180,7 +12312,7 @@ impl Builder<'_> {
                         Some(sub) => self.pattern(sub, seen, binders, dropped),
                         None => {
                             let bound = self.bound(name.clone(), seen, binders);
-                            name.span.track(PatternKind::Bind(bound))
+                            self.anchor(name.span).anchor(PatternKind::Bind(bound))
                         }
                     };
                     match keep {
@@ -12188,7 +12320,7 @@ impl Builder<'_> {
                             fields.insert(
                                 name.tracked,
                                 Field {
-                                    name_span: name.span,
+                                    name_at: self.anchor(name.span),
                                     value: sub,
                                 },
                             );
@@ -12196,7 +12328,8 @@ impl Builder<'_> {
                         false => pattern_binders(&sub, dropped),
                     }
                 }
-                span.track(PatternKind::Struct { fields, rest })
+                let rest = rest.map(|rest| self.anchor(rest));
+                here.anchor(PatternKind::Struct { fields, rest })
             }
             parse::PatternKind::Array {
                 before,
@@ -12208,14 +12341,14 @@ impl Builder<'_> {
                     .map(|element| self.pattern(element, seen, binders, dropped))
                     .collect();
                 let rest = rest.map(|rest| ArrayRest {
-                    span: rest.span,
+                    at: self.anchor(rest.span),
                     name: rest.name.map(|name| self.bound(name, seen, binders)),
                 });
                 let after = after
                     .into_iter()
                     .map(|element| self.pattern(element, seen, binders, dropped))
                     .collect();
-                span.track(PatternKind::Array {
+                here.anchor(PatternKind::Array {
                     before,
                     rest,
                     after,
@@ -12237,14 +12370,14 @@ impl Builder<'_> {
     ) -> Term {
         match calm {
             Calm::Bind(name) => {
-                let span = name.span.merge(inner.span);
+                let at = self.cover(name.at, inner.at);
                 TermKind::Let {
                     name,
                     annotation,
                     value: Box::new(value),
                     body: Box::new(inner),
                 }
-                .with_span(span)
+                .at(at)
             }
             // The binding a name would have made, made to a name nothing can
             // write: the value keeps its place — typechecked, its mistakes
@@ -12252,14 +12385,14 @@ impl Builder<'_> {
             // and the body cannot reach it.
             Calm::Wildcard(span) => {
                 let held = self.fresh("%discard", span);
-                let at = span.merge(inner.span);
+                let at = self.cover(span, inner.at);
                 TermKind::Let {
                     name: held,
                     annotation,
                     value: Box::new(value),
                     body: Box::new(inner),
                 }
-                .with_span(at)
+                .at(at)
             }
             Calm::Unit(span) => match annotation {
                 // The written type is the contract on the whole value, and the
@@ -12267,62 +12400,62 @@ impl Builder<'_> {
                 // it, so both are said and neither displaces the other.
                 Some(annotation) => {
                     let held = self.fresh("%value", span);
-                    let again = TermKind::Ident(held.tracked).with_span(span);
+                    let again = TermKind::Ident(held.anchored).at(span);
                     let constrained = self.destructure(Calm::Unit(span), again, None, inner);
-                    let at = span.merge(constrained.span);
+                    let at = self.cover(span, constrained.at);
                     TermKind::Let {
                         name: held,
                         annotation: Some(annotation),
                         value: Box::new(value),
                         body: Box::new(constrained),
                     }
-                    .with_span(at)
+                    .at(at)
                 }
                 None => {
-                    let unit = demand(span.track(TypeKind::Struct {
+                    let unit = demand(span.anchor(TypeKind::Struct {
                         fields: IndexMap::new(),
                         tail: None,
                     }));
                     let name = self.fresh("%unit", span);
-                    let at = span.merge(inner.span);
+                    let at = self.cover(span, inner.at);
                     TermKind::Let {
                         name,
                         annotation: Some(Box::new(unit)),
                         value: Box::new(value),
                         body: Box::new(inner),
                     }
-                    .with_span(at)
+                    .at(at)
                 }
             },
             // The unit pattern's split again: a written annotation holds the
             // whole value on a binding of its own, and the pattern's demand —
             // an array, see [`array_demand`] — goes on the binding the rest
             // makes, named as written or as nothing can name.
-            Calm::ArrayRest { span, name } => match annotation {
+            Calm::ArrayRest { at: span, name } => match annotation {
                 Some(annotation) => {
                     let held = self.fresh("%value", span);
-                    let again = TermKind::Ident(held.tracked).with_span(span);
+                    let again = TermKind::Ident(held.anchored).at(span);
                     let constrained =
-                        self.destructure(Calm::ArrayRest { span, name }, again, None, inner);
-                    let at = span.merge(constrained.span);
+                        self.destructure(Calm::ArrayRest { at: span, name }, again, None, inner);
+                    let at = self.cover(span, constrained.at);
                     TermKind::Let {
                         name: held,
                         annotation: Some(annotation),
                         value: Box::new(value),
                         body: Box::new(constrained),
                     }
-                    .with_span(at)
+                    .at(at)
                 }
                 None => {
                     let name = name.unwrap_or_else(|| self.fresh("%array", span));
-                    let at = span.merge(inner.span);
+                    let at = self.cover(span, inner.at);
                     TermKind::Let {
                         name,
                         annotation: Some(Box::new(array_demand(span))),
                         value: Box::new(value),
                         body: Box::new(inner),
                     }
-                    .with_span(at)
+                    .at(at)
                 }
             },
             // Without the `..` the pattern is exact, and the demand — the
@@ -12332,20 +12465,28 @@ impl Builder<'_> {
             // its own and the demand on a second, the way a unit pattern's
             // does. With the `..` the pattern asks only for the fields it
             // names, which is the demand the projections already make.
-            Calm::Struct { span, fields, rest } => match (annotation, rest) {
+            Calm::Struct {
+                at: span,
+                fields,
+                rest,
+            } => match (annotation, rest) {
                 (Some(annotation), None) => {
                     let held = self.fresh("%value", span);
-                    let again = TermKind::Ident(held.tracked).with_span(span);
-                    let calm = Calm::Struct { span, fields, rest };
+                    let again = TermKind::Ident(held.anchored).at(span);
+                    let calm = Calm::Struct {
+                        at: span,
+                        fields,
+                        rest,
+                    };
                     let constrained = self.destructure(calm, again, None, inner);
-                    let at = span.merge(constrained.span);
+                    let at = self.cover(span, constrained.at);
                     TermKind::Let {
                         name: held,
                         annotation: Some(annotation),
                         value: Box::new(value),
                         body: Box::new(constrained),
                     }
-                    .with_span(at)
+                    .at(at)
                 }
                 (annotation, rest) => {
                     let annotation = match rest {
@@ -12355,22 +12496,22 @@ impl Builder<'_> {
                     let held = self.fresh("%struct", span);
                     let mut inner = inner;
                     for (name, sub) in fields.into_iter().rev() {
-                        let base = TermKind::Ident(held.tracked).with_span(name.span);
+                        let base = TermKind::Ident(held.anchored).at(name.at);
                         let field = TermKind::Project {
                             base: Box::new(base),
                             field: name.clone(),
                         }
-                        .with_span(name.span);
+                        .at(name.at);
                         inner = self.destructure(sub, field, None, inner);
                     }
-                    let at = span.merge(inner.span);
+                    let at = self.cover(span, inner.at);
                     TermKind::Let {
                         name: held,
                         annotation,
                         value: Box::new(value),
                         body: Box::new(inner),
                     }
-                    .with_span(at)
+                    .at(at)
                 }
             },
         }
@@ -12389,9 +12530,9 @@ impl Builder<'_> {
         match calm {
             Calm::Bind(name) => {
                 out.insert(
-                    name.tracked,
+                    name.anchored,
                     Decl {
-                        name_span: name.span,
+                        name_at: name.at,
                         annotation,
                         params: Vec::new(),
                         value,
@@ -12406,9 +12547,9 @@ impl Builder<'_> {
             Calm::Wildcard(span) => {
                 let held = self.fresh("%discard", span);
                 out.insert(
-                    held.tracked,
+                    held.anchored,
                     Decl {
-                        name_span: span,
+                        name_at: span,
                         annotation,
                         params: Vec::new(),
                         value,
@@ -12419,27 +12560,27 @@ impl Builder<'_> {
                 Some(annotation) => {
                     let held = self.fresh("%value", span);
                     out.insert(
-                        held.tracked,
+                        held.anchored,
                         Decl {
-                            name_span: span,
+                            name_at: span,
                             annotation: Some(annotation),
                             params: Vec::new(),
                             value,
                         },
                     );
-                    let again = TermKind::Ident(held.tracked).with_span(span);
+                    let again = TermKind::Ident(held.anchored).at(span);
                     self.destructure_stmt(Calm::Unit(span), None, again, out);
                 }
                 None => {
-                    let unit = demand(span.track(TypeKind::Struct {
+                    let unit = demand(span.anchor(TypeKind::Struct {
                         fields: IndexMap::new(),
                         tail: None,
                     }));
                     let name = self.fresh("%unit", span);
                     out.insert(
-                        name.tracked,
+                        name.anchored,
                         Decl {
-                            name_span: span,
+                            name_at: span,
                             annotation: Some(unit),
                             params: Vec::new(),
                             value,
@@ -12447,27 +12588,27 @@ impl Builder<'_> {
                     );
                 }
             },
-            Calm::ArrayRest { span, name } => match annotation {
+            Calm::ArrayRest { at: span, name } => match annotation {
                 Some(annotation) => {
                     let held = self.fresh("%value", span);
                     out.insert(
-                        held.tracked,
+                        held.anchored,
                         Decl {
-                            name_span: span,
+                            name_at: span,
                             annotation: Some(annotation),
                             params: Vec::new(),
                             value,
                         },
                     );
-                    let again = TermKind::Ident(held.tracked).with_span(span);
-                    self.destructure_stmt(Calm::ArrayRest { span, name }, None, again, out);
+                    let again = TermKind::Ident(held.anchored).at(span);
+                    self.destructure_stmt(Calm::ArrayRest { at: span, name }, None, again, out);
                 }
                 None => {
                     let name = name.unwrap_or_else(|| self.fresh("%array", span));
                     out.insert(
-                        name.tracked,
+                        name.anchored,
                         Decl {
-                            name_span: span,
+                            name_at: span,
                             annotation: Some(array_demand(span)),
                             params: Vec::new(),
                             value,
@@ -12479,20 +12620,28 @@ impl Builder<'_> {
             // annotation holds the whole value on a binding of its own, and
             // the exact pattern's demand — see [`exact_demand`] — rides on the
             // `%struct` the projections read from.
-            Calm::Struct { span, fields, rest } => match (annotation, rest) {
+            Calm::Struct {
+                at: span,
+                fields,
+                rest,
+            } => match (annotation, rest) {
                 (Some(annotation), None) => {
                     let held = self.fresh("%value", span);
                     out.insert(
-                        held.tracked,
+                        held.anchored,
                         Decl {
-                            name_span: span,
+                            name_at: span,
                             annotation: Some(annotation),
                             params: Vec::new(),
                             value,
                         },
                     );
-                    let again = TermKind::Ident(held.tracked).with_span(span);
-                    let calm = Calm::Struct { span, fields, rest };
+                    let again = TermKind::Ident(held.anchored).at(span);
+                    let calm = Calm::Struct {
+                        at: span,
+                        fields,
+                        rest,
+                    };
                     self.destructure_stmt(calm, None, again, out);
                 }
                 (annotation, rest) => {
@@ -12502,21 +12651,21 @@ impl Builder<'_> {
                     };
                     let held = self.fresh("%struct", span);
                     out.insert(
-                        held.tracked,
+                        held.anchored,
                         Decl {
-                            name_span: span,
+                            name_at: span,
                             annotation,
                             params: Vec::new(),
                             value,
                         },
                     );
                     for (name, sub) in fields {
-                        let base = TermKind::Ident(held.tracked).with_span(name.span);
+                        let base = TermKind::Ident(held.anchored).at(name.at);
                         let field = TermKind::Project {
                             base: Box::new(base),
                             field: name.clone(),
                         }
-                        .with_span(name.span);
+                        .at(name.at);
                         self.destructure_stmt(sub, None, field, out);
                     }
                 }
@@ -12550,7 +12699,7 @@ impl Builder<'_> {
             scrutinee: Box::new(scrutinee),
             arms: lowered,
         }
-        .with_span(span)
+        .at(self.anchor(span))
     }
 }
 
@@ -12641,9 +12790,10 @@ mod tests {
         assert!(lowered.errors.is_empty(), "IR errors: {:?}", lowered.errors);
 
         let external = lowered.program.externs.values().next().unwrap();
-        assert_eq!(external.value.target.tracked, "globalThis.answer");
+        assert_eq!(external.value.target.anchored, "globalThis.answer");
         let start = source.find('"').unwrap();
-        assert_eq!(external.value.target.span.start, start);
-        assert_eq!(external.value.target.span.width, source.len() - start);
+        let target = lowered.source.span(external.value.target.at);
+        assert_eq!(target.start, start);
+        assert_eq!(target.width, source.len() - start);
     }
 }

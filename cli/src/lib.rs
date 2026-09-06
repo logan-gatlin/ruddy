@@ -2076,11 +2076,12 @@ fn compile_one(
             let errors = partial.errors.len();
             if errors != 0 {
                 let mut diagnostics = Vec::with_capacity(errors);
+                let source = &partial.ir.source;
                 for error in &partial.ir.errors {
                     diagnostics.push(source_diagnostic(
                         &mut files,
                         "ir",
-                        &error.diagnostic(),
+                        &error.diagnostic(source),
                         source_directory,
                     ));
                 }
@@ -2088,7 +2089,7 @@ fn compile_one(
                     diagnostics.push(source_diagnostic(
                         &mut files,
                         "types",
-                        &error.diagnostic(),
+                        &error.diagnostic(source),
                         source_directory,
                     ));
                 }
@@ -2097,7 +2098,7 @@ fn compile_one(
                         &mut files,
                         "patterns",
                         error.kind.code(),
-                        error.span,
+                        source.span(error.at),
                         &error.kind,
                         source_directory,
                     ));

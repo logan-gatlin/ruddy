@@ -19,9 +19,9 @@ use ruddy::{
     ir::{self, ErrorKind as IrError},
     parse,
     patterns::ErrorKind as PatternError,
-    symbol::{Bundle, Mint, Namespace, Version},
+    symbol::{Bundle, Mint, Namespace, Symbol, Version},
     token::{self, ErrorKind as LexError, Kind as TokenKind},
-    tracking::{FileID, Span},
+    tracking::{Anchor, FileID, SourceMap, Span},
     types::{EffectId, Formula, Presence, Prim, Rest, Row, RowField, Sense, Shape, Ty},
     ui::{self, Entry, Mark},
 };
@@ -30,7 +30,7 @@ use ruddy_debug::print;
 /// One value of every inference error variant. Shared by the inventory and the
 /// structured-diagnostic audit so those two hand-maintained checks cannot
 /// silently drift apart.
-fn inference_error_kinds(span: Span) -> Vec<TypeError> {
+fn inference_error_kinds(span: Anchor) -> Vec<TypeError> {
     let nat = Rc::new(Ty::plain(Ty::Nat));
     vec![
         TypeError::NotAStruct {
@@ -129,7 +129,9 @@ fn inference_error_kinds(span: Span) -> Vec<TypeError> {
 /// is the exact thing this module exists to catch, so it is worth the reminder
 /// that adding one means coming back.
 fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
+    let mut map = SourceMap::default();
     let span = Span::generated(0, 1);
+    let at = map.record(Symbol::GENERATED, 0, span);
 
     let mut all: Vec<(&str, &str, String)> = Vec::new();
     for kind in [
@@ -203,7 +205,7 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
             IrError::Duplicate {
                 name: "x".to_string(),
                 namespace,
-                previous: span,
+                previous: at,
             },
         ] {
             all.push(("ir", kind.code(), kind.to_string()));
@@ -229,7 +231,7 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         },
         IrError::DuplicateField {
             name: "x".to_string(),
-            previous: span,
+            previous: at,
         },
         IrError::AbsentInClosed {
             shape: Shape::Struct,
@@ -259,25 +261,25 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         IrError::ModifiedOpenAlias {
             name: "Both".to_string(),
         },
-        IrError::TwoTails { previous: span },
+        IrError::TwoTails { previous: at },
         IrError::NotAConstructor,
         IrError::ParameterApplied {
             name: "f".to_string(),
         },
         IrError::DuplicateParameter {
             name: "a".to_string(),
-            previous: span,
+            previous: at,
         },
         IrError::GrowingRecursion,
         IrError::DuplicateCase {
             shape: Shape::Sum,
             name: "A".to_string(),
-            previous: span,
+            previous: at,
         },
         IrError::MixedTail {
             first: Sense::Type,
             second: Sense::Cases,
-            previous: span,
+            previous: at,
         },
         IrError::MixedParameter {
             first: Sense::Type,
@@ -296,7 +298,7 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         },
         IrError::DuplicateBinding {
             name: "x".to_string(),
-            previous: span,
+            previous: at,
         },
         IrError::ClauseInDeclaration,
         IrError::VariableInDeclaration {
@@ -309,11 +311,11 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         },
         IrError::IncompatiblePresenceOwnership {
             name: "c".to_string(),
-            previous: span,
+            previous: at,
         },
         IrError::DuplicateOperation {
             name: "write".to_string(),
-            previous: span,
+            previous: at,
         },
         IrError::NotAnOperation {
             name: "here".to_string(),
@@ -344,11 +346,11 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         IrError::DuplicateArm {
             effect: "Log".to_string(),
             selector: ir::OperationSelector::Named("write".to_string()),
-            previous: span,
+            previous: at,
         },
-        IrError::DuplicateReturn { previous: span },
+        IrError::DuplicateReturn { previous: at },
         IrError::RaiseOutsideArm,
-        IrError::RaiseInFunction { function: span },
+        IrError::RaiseInFunction { function: at },
     ] {
         all.push(("ir", kind.code(), kind.to_string()));
     }
@@ -369,7 +371,7 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         all.push(("patterns", kind.code(), kind.to_string()));
     }
 
-    for kind in inference_error_kinds(span) {
+    for kind in inference_error_kinds(at) {
         all.push(("types", kind.code(), kind.to_string()));
     }
     all
@@ -627,14 +629,20 @@ fn a_loop_of_bare_names_is_worded_for_its_namespace() {
 
 #[test]
 fn every_inference_error_exposes_a_complete_structured_diagnostic() {
-    let use_span = Span::generated(4, 5);
-    let declared = Span::generated(1, 2);
+    let mut map = SourceMap::default();
+    let use_span = map.record(Symbol::GENERATED, 0, Span::generated(4, 5));
+    let declared = map.record(Symbol::GENERATED, 0, Span::generated(1, 2));
     let kinds = inference_error_kinds(declared);
     assert_eq!(kinds.len(), 18);
 
     for kind in kinds {
-        let diagnostic = inference::Error::new(use_span, kind).diagnostic();
-        assert_eq!(diagnostic.primary.span, use_span, "{}", diagnostic.code);
+        let diagnostic = inference::Error::new(use_span, kind).diagnostic(&map);
+        assert_eq!(
+            diagnostic.primary.span,
+            map.span(use_span),
+            "{}",
+            diagnostic.code
+        );
         assert!(!diagnostic.code.is_empty());
         assert!(!diagnostic.title.is_empty(), "{}", diagnostic.code);
         assert!(
@@ -655,9 +663,10 @@ fn every_inference_error_exposes_a_complete_structured_diagnostic() {
 /// Keep solver implementation terms out of the structured fields it did migrate.
 #[test]
 fn inference_diagnostic_prose_avoids_solver_jargon() {
-    let span = Span::generated(0, 1);
+    let mut map = SourceMap::default();
+    let span = map.record(Symbol::GENERATED, 0, Span::generated(0, 1));
     for kind in inference_error_kinds(span) {
-        let diagnostic = inference::Error::new(span, kind).diagnostic();
+        let diagnostic = inference::Error::new(span, kind).diagnostic(&map);
         let prose = std::iter::once(diagnostic.title.as_str())
             .chain(std::iter::once(diagnostic.primary.message.as_str()))
             .chain(diagnostic.related.iter().map(|note| note.message.as_str()))
@@ -711,8 +720,9 @@ fn inference_diagnostic_prose_avoids_solver_jargon() {
 
 #[test]
 fn rigid_field_diagnostics_name_the_caller_chosen_set_by_shape() {
-    let use_span = Span::generated(4, 5);
-    let declared = Span::generated(1, 2);
+    let mut map = SourceMap::default();
+    let use_span = map.record(Symbol::GENERATED, 0, Span::generated(4, 5));
+    let declared = map.record(Symbol::GENERATED, 0, Span::generated(1, 2));
     for (shape, field, action, choices) in [
         (Shape::Struct, "item", "reads field", "struct fields"),
         (Shape::Sum, "Some", "matches case", "cases"),
@@ -727,10 +737,10 @@ fn rigid_field_diagnostics_name_the_caller_chosen_set_by_shape() {
                 declared,
             },
         )
-        .diagnostic();
+        .diagnostic(&map);
 
         assert_eq!(diagnostic.code, "rigid-field");
-        assert_eq!(diagnostic.related[0].span, declared);
+        assert_eq!(diagnostic.related[0].span, map.span(declared));
         assert_eq!(
             diagnostic.related[0].message,
             format!("the caller's choice of {choices} starts here")
@@ -791,7 +801,7 @@ fn guarded_origins_keep_their_source_and_premise_readable() {
 /// rather than a string the test would have to re-derive the grouping rules to
 /// predict — which would be the rules under test standing in as their own
 /// expectation.
-fn inference_fixture_errors(source: &str) -> Vec<inference::Error> {
+fn inference_fixture_errors(source: &str) -> (SourceMap, Vec<inference::Error>) {
     let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
     assert!(
         parsed.errors.is_empty(),
@@ -802,37 +812,41 @@ fn inference_fixture_errors(source: &str) -> Vec<inference::Error> {
     let mut mint = Mint::new(bundle);
     let mut built = ir::build(&mut mint, parsed.stmts);
     assert!(built.errors.is_empty(), "IR errors: {:#?}", built.errors);
-    inference::infer(&mint, &mut built.program, inference::Trace::Off)
+    let errors = inference::infer(&mint, &mut built.program, inference::Trace::Off)
         .errors()
-        .to_vec()
+        .to_vec();
+    (built.source, errors)
 }
 
 fn inference_fixture_diagnostics(source: &str) -> Vec<ui::Diagnostic> {
-    inference_fixture_errors(source)
+    let (map, errors) = inference_fixture_errors(source);
+    errors
         .into_iter()
-        .map(|error| error.diagnostic())
+        .map(|error| error.diagnostic(&map))
         .collect()
 }
 
-fn explained_facts(source: &str) -> Vec<inference::ExplanationFact> {
-    let errors = inference_fixture_errors(source);
+fn explained_facts(source: &str) -> (SourceMap, Vec<inference::ExplanationFact>) {
+    let (map, errors) = inference_fixture_errors(source);
     let error = errors.last().expect("fixture error");
-    error
+    let facts = error
         .explanation
         .as_ref()
         .expect("structured explanation")
         .full_facts
-        .clone()
+        .clone();
+    (map, facts)
 }
 
 #[test]
 fn generalized_accessor_explains_its_original_projection() {
     let source = "let field = fn value => value.x\nlet bad = field 1n";
-    let facts = explained_facts(source);
+    let (map, facts) = explained_facts(source);
     let projection = source.find(".x").unwrap() + 1;
     assert!(
         facts.iter().any(|fact| {
-            fact.span.start == projection && fact.origin == inference::ConstraintOrigin::Projection
+            map.span(fact.at).start == projection
+                && fact.origin == inference::ConstraintOrigin::Projection
         }),
         "the scheme must reopen the accessor's source demand: {facts:#?}"
     );
@@ -845,15 +859,17 @@ fn wide_definition_keeps_a_late_semantically_relevant_fact() {
         source.push_str(&format!("noise{at}: {at}n, "));
     }
     source.push_str("target: value.target }\nlet bad = field 1n");
-    let facts = explained_facts(&source);
+    let (map, facts) = explained_facts(&source);
     let target = source.find(".target").unwrap() + 1;
     assert!(
-        facts.iter().any(|fact| fact.span.start == target),
+        facts.iter().any(|fact| map.span(fact.at).start == target),
         "{facts:#?}"
     );
     let first_noise = source.find("noise0").unwrap();
     assert!(
-        facts.iter().all(|fact| fact.span.start != first_noise),
+        facts
+            .iter()
+            .all(|fact| map.span(fact.at).start != first_noise),
         "{facts:#?}"
     );
 }
@@ -861,24 +877,30 @@ fn wide_definition_keeps_a_late_semantically_relevant_fact() {
 #[test]
 fn annotated_definition_publishes_contract_not_unrelated_body_facts() {
     let source = "let fixed : Nat -> Nat = fn value => value\nlet bad = fixed false";
-    let facts = explained_facts(source);
+    let (map, facts) = explained_facts(source);
     let annotation = source.find("Nat -> Nat").unwrap();
     let body = source.find("fn value => value").unwrap();
-    assert!(facts.iter().any(|fact| fact.span.start == annotation));
     assert!(
         facts
             .iter()
-            .all(|fact| fact.span.start < body || fact.span.start >= body + 17)
+            .any(|fact| map.span(fact.at).start == annotation)
+    );
+    assert!(
+        facts
+            .iter()
+            .all(|fact| map.span(fact.at).start < body || map.span(fact.at).start >= body + 17)
     );
 }
 
 #[test]
 fn annotated_row_rigid_reopens_as_a_row_and_keeps_contract_provenance() {
     let source = "let field : { x: Nat, ..'r } -> Nat = fn value => value.x\nlet bad = field 1n";
-    let facts = explained_facts(source);
+    let (map, facts) = explained_facts(source);
     let annotation = source.find("{ x: Nat, ..'r }").unwrap();
     assert!(
-        facts.iter().any(|fact| fact.span.start == annotation),
+        facts
+            .iter()
+            .any(|fact| map.span(fact.at).start == annotation),
         "{facts:#?}"
     );
 }
@@ -886,15 +908,15 @@ fn annotated_row_rigid_reopens_as_a_row_and_keeps_contract_provenance() {
 #[test]
 fn authoritative_provenance_uses_the_owning_annotation() {
     let source = "let outer : Nat -> Nat = fn value => do let inner : Boolean -> Boolean = fn flag => flag return value end\nlet bad = outer false";
-    let facts = explained_facts(source);
+    let (map, facts) = explained_facts(source);
     let outer = source.find("Nat -> Nat").unwrap();
     let inner = source.find("Boolean -> Boolean").unwrap();
     assert!(
-        facts.iter().any(|fact| fact.span.start == outer),
+        facts.iter().any(|fact| map.span(fact.at).start == outer),
         "{facts:#?}"
     );
     assert!(
-        facts.iter().all(|fact| fact.span.start != inner),
+        facts.iter().all(|fact| map.span(fact.at).start != inner),
         "{facts:#?}"
     );
 }
@@ -909,14 +931,14 @@ fn scheme_provenance_survives_a_long_definition_chain_iteratively() {
         previous = next;
     }
     source.push_str(&format!("let bad = {previous} 1n"));
-    let errors = inference_fixture_errors(&source);
+    let (map, errors) = inference_fixture_errors(&source);
     let explanation = errors.last().unwrap().explanation.as_ref().unwrap();
     let projection = source.find(".x").unwrap() + 1;
     assert!(
         explanation
             .full_facts
             .iter()
-            .any(|fact| fact.span.start == projection)
+            .any(|fact| map.span(fact.at).start == projection)
     );
     assert!((2..=4).contains(&explanation.abridged.len()));
     assert!(explanation.cause.reasons.len() <= 16_384);
@@ -925,12 +947,13 @@ fn scheme_provenance_survives_a_long_definition_chain_iteratively() {
 #[test]
 fn repeated_accessor_uses_each_reach_the_shared_definition_fact() {
     let source = "let field = fn value => value.x\nlet first = field 1n\nlet second = field false";
-    let errors = inference_fixture_errors(source);
+    let (map, errors) = inference_fixture_errors(source);
     assert_eq!(errors.len(), 2);
     let projection = source.find(".x").unwrap() + 1;
     for error in errors {
         assert!(error.explanation.unwrap().full_facts.iter().any(|fact| {
-            fact.span.start == projection && fact.origin == inference::ConstraintOrigin::Projection
+            map.span(fact.at).start == projection
+                && fact.origin == inference::ConstraintOrigin::Projection
         }));
     }
 }
@@ -945,7 +968,7 @@ fn unrelated_definitions_do_not_change_cross_definition_abridgement() {
         inference::ExplanationFactPayload,
         String,
     )> {
-        let errors = inference_fixture_errors(source);
+        let (map, errors) = inference_fixture_errors(source);
         let explanation = errors.last().unwrap().explanation.as_ref().unwrap();
         explanation
             .abridged
@@ -956,7 +979,7 @@ fn unrelated_definitions_do_not_change_cross_definition_abridgement() {
                     fact.origin,
                     fact.subject,
                     fact.payload,
-                    source[fact.span.start..fact.span.end()].to_string(),
+                    source[map.span(fact.at).start..map.span(fact.at).end()].to_string(),
                 )
             })
             .collect()
@@ -969,21 +992,21 @@ fn unrelated_definitions_do_not_change_cross_definition_abridgement() {
 #[test]
 fn imported_contracts_fall_back_to_local_authoritative_uses() {
     let source = "extern consume : Nat -> Nat = \"host.consume\"\nlet bad = consume false";
-    let facts = explained_facts(source);
+    let (map, facts) = explained_facts(source);
     let argument = source.rfind("false").unwrap();
-    assert!(facts.iter().any(|fact| fact.span.start == argument));
+    assert!(facts.iter().any(|fact| map.span(fact.at).start == argument));
     assert!(
         facts
             .iter()
-            .all(|fact| fact.span.start >= source.find("let bad").unwrap())
+            .all(|fact| map.span(fact.at).start >= source.find("let bad").unwrap())
     );
 }
 
 #[test]
 fn ordinary_mismatch_explanations_keep_full_and_abridged_causal_evidence() {
     let source = include_str!("../diagnostics/inference/repeated-calls.hc");
-    let first = inference_fixture_errors(source);
-    let second = inference_fixture_errors(source);
+    let (_, first) = inference_fixture_errors(source);
+    let (map, second) = inference_fixture_errors(source);
     let [first] = first.as_slice() else {
         panic!("the repeated calls fixture must have one error: {first:#?}");
     };
@@ -998,11 +1021,13 @@ fn ordinary_mismatch_explanations_keep_full_and_abridged_causal_evidence() {
     let selected_spans: HashSet<_> = explanation
         .abridged
         .iter()
-        .map(|at| explanation.full_facts[*at].span)
+        .map(|at| explanation.full_facts[*at].at)
         .collect();
     for endpoint in [source.find("1n").unwrap(), source.find("false").unwrap()] {
         assert!(
-            selected_spans.iter().any(|span| span.start == endpoint),
+            selected_spans
+                .iter()
+                .any(|span| map.span(*span).start == endpoint),
             "both conflicting call arguments need their own label: {explanation:#?}"
         );
     }
@@ -1020,7 +1045,7 @@ fn ordinary_mismatch_explanations_keep_full_and_abridged_causal_evidence() {
             inference::RepairDirection::ChangeSecondUse,
         ]
     );
-    let rendered = first.diagnostic();
+    let rendered = first.diagnostic(&map);
     for forbidden in ["expected", "found", "?", "~", "->"] {
         assert!(
             !rendered.title.contains(forbidden)
@@ -1059,7 +1084,7 @@ fn pivots_name_repeated_inputs_branches_and_anonymous_shared_values_once() {
         ),
     ];
     for (source, kind, spelling) in cases {
-        let errors = inference_fixture_errors(source);
+        let (map, errors) = inference_fixture_errors(source);
         let explanation = errors.last().unwrap().explanation.as_ref().unwrap();
         let pivot = explanation
             .pivot
@@ -1073,7 +1098,7 @@ fn pivots_name_repeated_inputs_branches_and_anonymous_shared_values_once() {
                 .iter()
                 .all(|at| explanation.abridged.contains(at))
         );
-        let diagnostic = errors.last().unwrap().diagnostic();
+        let diagnostic = errors.last().unwrap().diagnostic(&map);
         let prose = std::iter::once(diagnostic.primary.message.as_str())
             .chain(diagnostic.related.iter().map(|note| note.message.as_str()))
             .collect::<Vec<_>>()
@@ -1086,7 +1111,7 @@ fn pivots_name_repeated_inputs_branches_and_anonymous_shared_values_once() {
 #[test]
 fn pivot_labels_avoid_visible_source_names_without_solver_spelling() {
     let source = "let Input = fn use => { first: use 1n, second: use false }";
-    let errors = inference_fixture_errors(source);
+    let (_, errors) = inference_fixture_errors(source);
     let pivot = errors[0]
         .explanation
         .as_ref()
@@ -1098,7 +1123,8 @@ fn pivot_labels_avoid_visible_source_names_without_solver_spelling() {
 
 #[test]
 fn unrelated_whole_path_facts_do_not_create_a_false_pivot() {
-    let errors = inference_fixture_errors(include_str!("../diagnostics/inference/non-function.hc"));
+    let (_, errors) =
+        inference_fixture_errors(include_str!("../diagnostics/inference/non-function.hc"));
     let explanation = errors[0].explanation.as_ref().unwrap();
     assert!(explanation.full_facts.len() >= explanation.abridged.len());
     assert!(explanation.pivot.is_none());
@@ -1106,13 +1132,14 @@ fn unrelated_whole_path_facts_do_not_create_a_false_pivot() {
 
 #[test]
 fn a_failure_without_two_grounded_facts_has_no_pivot() {
-    let errors = inference_fixture_errors(include_str!("../diagnostics/inference/non-function.hc"));
+    let (map, errors) =
+        inference_fixture_errors(include_str!("../diagnostics/inference/non-function.hc"));
     let explanation = errors[0].explanation.as_ref().unwrap();
     assert_eq!(explanation.abridged.len(), 1);
     assert!(explanation.pivot.is_none());
     assert!(
         !errors[0]
-            .diagnostic()
+            .diagnostic(&map)
             .primary
             .message
             .contains("Let’s call")
@@ -1122,7 +1149,7 @@ fn a_failure_without_two_grounded_facts_has_no_pivot() {
 #[test]
 fn abridgement_is_source_ordered_counts_omissions_and_ignores_noise() {
     fn account(source: &str) -> (Vec<String>, usize, Option<String>) {
-        let errors = inference_fixture_errors(source);
+        let (map, errors) = inference_fixture_errors(source);
         let explanation = errors.last().unwrap().explanation.as_ref().unwrap();
         assert!(
             explanation
@@ -1139,8 +1166,8 @@ fn abridgement_is_source_ordered_counts_omissions_and_ignores_noise() {
                 .abridged
                 .iter()
                 .map(|at| {
-                    let span = explanation.full_facts[*at].span;
-                    source[span.start..span.end()].to_string()
+                    let span = explanation.full_facts[*at].at;
+                    source[map.span(span).start..map.span(span).end()].to_string()
                 })
                 .collect(),
             explanation.omitted_facts,
@@ -1200,7 +1227,7 @@ fn recursive_types_have_grounded_structured_cycle_explanations() {
     ];
 
     for (source, expected_shape) in cases {
-        let errors = inference_fixture_errors(source);
+        let (map, errors) = inference_fixture_errors(source);
         let [error] = errors.as_slice() else {
             panic!("expected one recursive error for {source}: {errors:#?}");
         };
@@ -1233,7 +1260,7 @@ fn recursive_types_have_grounded_structured_cycle_explanations() {
             ]
         );
 
-        let rendered = error.diagnostic();
+        let rendered = error.diagnostic(&map);
         let text = std::iter::once(rendered.title.as_str())
             .chain(std::iter::once(rendered.primary.message.as_str()))
             .chain(rendered.related.iter().map(|note| note.message.as_str()))
@@ -1279,7 +1306,7 @@ fn recursive_types_have_grounded_structured_cycle_explanations() {
 #[test]
 fn recursive_failure_path_excludes_siblings_and_recovers_for_the_next_error() {
     let source = "let bad = fn f => { cycle: f f, innocent: 1n }  let later : Nat = false";
-    let errors = inference_fixture_errors(source);
+    let (map, errors) = inference_fixture_errors(source);
     assert_eq!(errors.len(), 2, "{errors:#?}");
     let recursive = errors
         .iter()
@@ -1296,14 +1323,14 @@ fn recursive_failure_path_excludes_siblings_and_recovers_for_the_next_error() {
         explanation
             .full_facts
             .iter()
-            .all(|fact| fact.span.start != innocent && fact.span.start != later_at),
+            .all(|fact| map.span(fact.at).start != innocent && map.span(fact.at).start != later_at),
         "unrelated siblings must not enter the exact cycle: {explanation:#?}"
     );
     assert!(
         explanation
             .full_facts
             .iter()
-            .any(|fact| fact.span.start == source.find("f f").unwrap()),
+            .any(|fact| map.span(fact.at).start == source.find("f f").unwrap()),
         "the closing call stays in the cycle path: {explanation:#?}"
     );
     let later_explanation = later.explanation.as_ref().expect("later path");
@@ -1311,20 +1338,20 @@ fn recursive_failure_path_excludes_siblings_and_recovers_for_the_next_error() {
         later_explanation
             .full_facts
             .iter()
-            .any(|fact| fact.span.start == later_at)
+            .any(|fact| map.span(fact.at).start == later_at)
     );
     assert!(
         later_explanation
             .full_facts
             .iter()
-            .all(|fact| fact.span.start >= source.find("let later").unwrap())
+            .all(|fact| map.span(fact.at).start >= source.find("let later").unwrap())
     );
 }
 
 #[test]
 fn row_explanations_keep_both_source_sides_and_normalize_solver_direction() {
     let projection = include_str!("../diagnostics/inference/projection-closed-later.hc");
-    let errors = inference_fixture_errors(projection);
+    let (_, errors) = inference_fixture_errors(projection);
     let [error] = errors.as_slice() else {
         panic!("projection closed by a later use must have one error");
     };
@@ -1363,7 +1390,7 @@ fn row_explanations_keep_both_source_sides_and_normalize_solver_direction() {
             103..108,
         ),
     ] {
-        let errors = inference_fixture_errors(source);
+        let (map, errors) = inference_fixture_errors(source);
         let [error] = errors.as_slice() else {
             panic!("each repeated-label shape must have one error");
         };
@@ -1386,9 +1413,15 @@ fn row_explanations_keep_both_source_sides_and_normalize_solver_direction() {
             .iter()
             .find(|fact| fact.payload == inference::ExplanationFactPayload::LabelForbidden)
             .expect("remainder/lacks origin");
-        assert_eq!(introduced.span.start..introduced.span.end(), introduction);
-        assert_eq!(lacked.span.start..lacked.span.end(), forbidden);
-        assert_ne!(introduced.span, lacked.span);
+        assert_eq!(
+            map.span(introduced.at).start..map.span(introduced.at).end(),
+            introduction
+        );
+        assert_eq!(
+            map.span(lacked.at).start..map.span(lacked.at).end(),
+            forbidden
+        );
+        assert_ne!(introduced.at, lacked.at);
         let selected: HashSet<_> = explanation
             .abridged
             .iter()
@@ -1398,7 +1431,7 @@ fn row_explanations_keep_both_source_sides_and_normalize_solver_direction() {
         assert!(selected.contains(&inference::ExplanationFactPayload::LabelForbidden));
     }
 
-    let errors = inference_fixture_errors(include_str!(
+    let (_, errors) = inference_fixture_errors(include_str!(
         "../diagnostics/inference/repeated-field-effect.hc"
     ));
     let [effect_error] = errors.as_slice() else {
@@ -1419,7 +1452,7 @@ fn row_explanations_keep_both_source_sides_and_normalize_solver_direction() {
         previous = format!("link{at}");
     }
     deep.push_str(&format!("let close : {{}} -> Nat = {previous}\n"));
-    let errors = inference_fixture_errors(&deep);
+    let (_, errors) = inference_fixture_errors(&deep);
     assert_eq!(errors.len(), 1, "deep closed rows retain one complaint");
     let explanation = errors[0].explanation.as_ref().expect("deep row cause");
     let selected: HashSet<_> = explanation
@@ -1441,7 +1474,7 @@ fn repeated_labels_keep_the_full_intermediate_path_and_exact_endpoints() {
         partial = format!("id ({partial})");
     }
     source.push_str(&format!("let bad = fn value => ({partial}) {{ x: 1n }}\n"));
-    let errors = inference_fixture_errors(&source);
+    let (map, errors) = inference_fixture_errors(&source);
     let [error] = errors.as_slice() else {
         panic!("repeated intermediate fixture must have one error: {errors:#?}");
     };
@@ -1454,7 +1487,7 @@ fn repeated_labels_keep_the_full_intermediate_path_and_exact_endpoints() {
         .full_facts
         .iter()
         .position(|fact| {
-            (fact.span.start..fact.span.end()) == (199..208)
+            (map.span(fact.at).start..map.span(fact.at).end()) == (199..208)
                 && fact.origin == inference::ConstraintOrigin::ApplicationArgument
                 && fact.subject == inference::Subject::Argument
                 && fact.payload == inference::ExplanationFactPayload::LabelIntroduction
@@ -1464,7 +1497,7 @@ fn repeated_labels_keep_the_full_intermediate_path_and_exact_endpoints() {
         .full_facts
         .iter()
         .position(|fact| {
-            (fact.span.start..fact.span.end()) == (180..185)
+            (map.span(fact.at).start..map.span(fact.at).end()) == (180..185)
                 && fact.origin == inference::ConstraintOrigin::ApplicationArgument
                 && fact.subject == inference::Subject::Argument
                 && fact.payload == inference::ExplanationFactPayload::LabelForbidden
@@ -1482,7 +1515,7 @@ fn same_label_performs_facts_do_not_invent_repeated_endpoints() {
         "  (fn action => action ()) (fn _ => do let _ = !Tick.tick () return !Log.write n end)\n",
         "end\n",
     );
-    let errors = inference_fixture_errors(source);
+    let (map, errors) = inference_fixture_errors(source);
     let [error] = errors.as_slice() else {
         panic!("same-label intermediate fixture must have one error: {errors:#?}");
     };
@@ -1494,7 +1527,10 @@ fn same_label_performs_facts_do_not_invent_repeated_endpoints() {
     else {
         panic!("same-label intermediate must retain its exact origin: {error:#?}");
     };
-    assert_eq!(introduction.span.start..introduction.span.end(), 197..209);
+    assert_eq!(
+        map.span(introduction.at).start..map.span(introduction.at).end(),
+        197..209
+    );
     assert!(forbidden.is_none());
     assert!(
         error.explanation.is_none(),
@@ -1509,7 +1545,7 @@ fn repeated_effects_keep_full_facts_and_exact_abridged_endpoints() {
         "let split : (() -> () + !Log + ..'r) -> (() -> () + ..'r) -> Nat = fn whole => fn rest => 0n\n",
         "let bad = fn action => split action (fn _ => !Log.write 0n)\n",
     );
-    let errors = inference_fixture_errors(source);
+    let (map, errors) = inference_fixture_errors(source);
     let [error] = errors.as_slice() else {
         panic!("exact repeated-effect fixture must have one error: {errors:#?}");
     };
@@ -1519,7 +1555,7 @@ fn repeated_effects_keep_full_facts_and_exact_abridged_endpoints() {
         .iter()
         .map(|fact| {
             (
-                fact.span.start..fact.span.end(),
+                map.span(fact.at).start..map.span(fact.at).end(),
                 fact.origin,
                 fact.subject,
                 fact.payload,
@@ -1632,7 +1668,7 @@ fn effect_boundaries_keep_source_causal_paths_and_repairs() {
             K::EffectNotAllowed,
         ),
     ] {
-        let errors = inference_fixture_errors(source);
+        let (map, errors) = inference_fixture_errors(source);
         let error = errors
             .iter()
             .find(|error| {
@@ -1662,7 +1698,7 @@ fn effect_boundaries_keep_source_causal_paths_and_repairs() {
             "effect paths need no invented name"
         );
 
-        let diagnostic = error.diagnostic();
+        let diagnostic = error.diagnostic(&map);
         let prose = format!("{diagnostic:?}");
         for forbidden in ["solver", "constraint", "row tail", "unification"] {
             assert!(!prose.contains(forbidden), "{prose}");
@@ -1692,7 +1728,7 @@ fn effect_declarations_keep_qualified_identity_through_aliases_and_primary_roles
         "let action : () -> () + C::!Log = fn _ => C::!Log.write 0n\n",
         "let bad = action ()\n",
     );
-    let errors = inference_fixture_errors(source);
+    let (map, errors) = inference_fixture_errors(source);
     let error = errors
         .iter()
         .find(|error| matches!(error.kind, inference::ErrorKind::Unhandled { .. }))
@@ -1706,23 +1742,26 @@ fn effect_declarations_keep_qualified_identity_through_aliases_and_primary_roles
         .find(|fact| fact.payload == P::EffectDeclaration)
         .expect("resolved declaration evidence");
     assert_eq!(
-        &source[declaration.span.start..declaration.span.end()],
+        &source[map.span(declaration.at).start..map.span(declaration.at).end()],
         "Log"
     );
     assert!(
-        declaration.span.start > source.find("module C").unwrap(),
+        map.span(declaration.at).start > source.find("module C").unwrap(),
         "the coalesced A::!Log declaration must not overwrite C::!Log evidence, while distinct B::!Log remains separate"
     );
     let primary = &explanation.full_facts[explanation.abridged[0]];
     assert_eq!(primary.payload, P::EffectUse);
-    assert_eq!(&source[primary.span.start..primary.span.end()], "action ()");
-    let diagnostic = error.diagnostic();
-    assert_eq!(diagnostic.primary.span, primary.span);
+    assert_eq!(
+        &source[map.span(primary.at).start..map.span(primary.at).end()],
+        "action ()"
+    );
+    let diagnostic = error.diagnostic(&map);
+    assert_eq!(diagnostic.primary.span, map.span(primary.at));
     assert!(
         diagnostic
             .related
             .iter()
-            .any(|related| related.span == declaration.span)
+            .any(|related| related.span == map.span(declaration.at))
     );
 }
 
@@ -1748,7 +1787,7 @@ fn bare_operation_values_keep_exact_origins_through_value_flow() {
         let source = format!(
             "module A = effect Log = {{ write: Nat -> () }} end\nmodule C = effect Log = {{ write: Nat -> () }} end\n{tail}"
         );
-        let errors = inference_fixture_errors(&source);
+        let (map, errors) = inference_fixture_errors(&source);
         let error = errors
             .iter()
             .find(|error| matches!(error.kind, inference::ErrorKind::Unhandled { .. }))
@@ -1762,7 +1801,7 @@ fn bare_operation_values_keep_exact_origins_through_value_flow() {
             .find(|fact| fact.payload == P::EffectDeclaration)
             .expect("resolved operation declaration");
         assert!(
-            declaration.span.start > source.find("module C").unwrap(),
+            map.span(declaration.at).start > source.find("module C").unwrap(),
             "value flow must retain C::!Log rather than coalesced A::!Log: {tail}"
         );
     }
@@ -1774,7 +1813,7 @@ fn returning_an_effectful_callback_does_not_perform_its_body() {
         "module A = effect Log = { write: Nat -> () } end\nmodule C = effect Log = { write: Nat -> () } end\nlet defer = fn holder => fn _ => holder.run 0n\nlet callback = defer { run: C::!Log.write }\n",
         "module A = effect Log = { write: Nat -> () } end\nmodule C = effect Log = { write: Nat -> () } end\nlet produce = fn _ => { run: C::!Log.write }\nlet saved = produce ()\n",
     ] {
-        let errors = inference_fixture_errors(source);
+        let (_, errors) = inference_fixture_errors(source);
         assert!(
             !errors
                 .iter()
@@ -1798,7 +1837,7 @@ fn call_result_and_field_provenance_paths_remain_bounded() {
     let source = format!(
         "module A = effect Log = {{ write: Nat -> () }} end\nmodule C = effect Log = {{ write: Nat -> () }} end\nlet produce = {producer}\nlet invoke = fn maker => {selected} 0n\nlet bad = invoke produce\n"
     );
-    let errors = inference_fixture_errors(&source);
+    let (map, errors) = inference_fixture_errors(&source);
     let error = errors
         .iter()
         .find(|error| matches!(error.kind, inference::ErrorKind::Unhandled { .. }))
@@ -1811,7 +1850,7 @@ fn call_result_and_field_provenance_paths_remain_bounded() {
         .iter()
         .find(|fact| fact.payload == inference::ExplanationFactPayload::EffectDeclaration)
         .expect("resolved operation declaration");
-    assert!(declaration.span.start > source.find("module C").unwrap());
+    assert!(map.span(declaration.at).start > source.find("module C").unwrap());
 }
 
 #[test]
@@ -1836,7 +1875,7 @@ fn thirty_duplicate_struct_substitutions_remain_bounded_and_project_invocation_o
         chain("0n", "empty")
     );
     assert!(
-        inference_fixture_errors(&empty).is_empty(),
+        inference_fixture_errors(&empty).1.is_empty(),
         "duplicating an origin-free value must remain origin-free"
     );
 
@@ -1845,7 +1884,7 @@ fn thirty_duplicate_struct_substitutions_remain_bounded_and_project_invocation_o
         "module C = effect Log = {{ write: Nat -> () }} end\nlet dup = fn x => {{ a: x, b: x }}\n{}let bad = {projection} 0n\n",
         chain("C::!Log.write", "real")
     );
-    let errors = inference_fixture_errors(&source);
+    let (map, errors) = inference_fixture_errors(&source);
     let error = errors
         .iter()
         .find(|error| matches!(error.kind, inference::ErrorKind::Unhandled { .. }))
@@ -1859,7 +1898,7 @@ fn thirty_duplicate_struct_substitutions_remain_bounded_and_project_invocation_o
         .find(|fact| fact.payload == inference::ExplanationFactPayload::EffectDeclaration)
         .expect("operation declaration");
     assert_eq!(
-        &source[declaration.span.start..declaration.span.end()],
+        &source[map.span(declaration.at).start..map.span(declaration.at).end()],
         "Log"
     );
 }
@@ -1878,7 +1917,7 @@ fn deep_and_multiple_effect_boundaries_remain_bounded_and_counted() {
         deep.push(')');
     }
     deep.push_str(" ()\n");
-    let errors = inference_fixture_errors(&deep);
+    let (_, errors) = inference_fixture_errors(&deep);
     let [error] = errors.as_slice() else {
         panic!("a deep propagated effect remains one error: {errors:#?}");
     };
@@ -1902,7 +1941,7 @@ fn deep_and_multiple_effect_boundaries_remain_bounded_and_counted() {
         "effect Both = !Log + !Tick\n",
         "let bad : () -> () = fn _ => do let _ = !Log.write 0n return !Tick.tick () end\n",
     );
-    let errors = inference_fixture_errors(multiple);
+    let (_, errors) = inference_fixture_errors(multiple);
     assert_eq!(errors.len(), 2, "one diagnostic per refused source effect");
     let declared: HashSet<_> = errors
         .iter()
@@ -1949,7 +1988,7 @@ fn row_roles_follow_the_resolved_rejected_side() {
             inference::Subject::Annotation,
         ),
     ] {
-        let errors = inference_fixture_errors(source);
+        let (_, errors) = inference_fixture_errors(source);
         let [error] = errors.as_slice() else {
             panic!("direction-neutral fixture must have one error: {errors:#?}");
         };
@@ -1978,7 +2017,7 @@ fn row_roles_follow_the_resolved_rejected_side() {
 
 #[test]
 fn a_lone_projection_does_not_invent_closed_row_evidence() {
-    let errors = inference_fixture_errors("let direct : {} -> Nat = fn p => p.x\n");
+    let (_, errors) = inference_fixture_errors("let direct : {} -> Nat = fn p => p.x\n");
     let [error] = errors.as_slice() else {
         panic!("lone projection fixture must have one error: {errors:#?}");
     };
@@ -1991,7 +2030,7 @@ fn a_lone_projection_does_not_invent_closed_row_evidence() {
 #[test]
 fn a_function_argument_mismatch_is_not_called_a_non_function_callee() {
     let source = include_str!("../diagnostics/inference/function-argument.hc");
-    let errors = inference_fixture_errors(source);
+    let (map, errors) = inference_fixture_errors(source);
     let [error] = errors.as_slice() else {
         panic!("function argument fixture must produce one mismatch: {errors:#?}");
     };
@@ -2010,7 +2049,12 @@ fn a_function_argument_mismatch_is_not_called_a_non_function_callee() {
             inference::TypeDescription::Boolean,
         )
     );
-    assert!(!error.diagnostic().title.contains("called as a function"));
+    assert!(
+        !error
+            .diagnostic(&map)
+            .title
+            .contains("called as a function")
+    );
 }
 
 /// Source-owned examples pin the diagnostic a reader is meant to see, rather
@@ -2185,7 +2229,7 @@ fn inference_source_corpus_matches_abridged_structured_goldens() {
         writeln!(found).unwrap();
     }
     found.pop();
-    let expected: HashSet<_> = inference_error_kinds(Span::generated(0, 1))
+    let expected: HashSet<_> = inference_error_kinds(Anchor::GENERATED)
         .into_iter()
         .map(|kind| kind.code())
         .collect();
@@ -3390,7 +3434,8 @@ fn a_label_complaint_reads_the_shape_it_was_handed() {
 /// to spread, and what to remove is the spread.
 #[test]
 fn spreading_a_non_struct_is_worded_as_the_spread_it_is() {
-    let span = Span::generated(3, 2);
+    let mut map = SourceMap::default();
+    let span = map.record(Symbol::GENERATED, 0, Span::generated(3, 2));
     let kind = TypeError::NotAStruct {
         base: Rc::new(Ty::plain(Ty::Nat)),
         demand: inference::StructDemand::Spread,
@@ -3399,9 +3444,9 @@ fn spreading_a_non_struct_is_worded_as_the_spread_it_is() {
         kind.to_string(),
         "`Nat` is not a struct, so it has no fields to spread"
     );
-    let diagnostic = inference::Error::new(span, kind).diagnostic();
+    let diagnostic = inference::Error::new(span, kind).diagnostic(&map);
     assert_eq!(diagnostic.code, "not-a-struct");
-    assert_eq!(diagnostic.primary.span, span);
+    assert_eq!(diagnostic.primary.span, map.span(span));
     assert_eq!(diagnostic.primary.message, "this spread requires a struct");
     assert_eq!(
         diagnostic.help,
@@ -3460,14 +3505,15 @@ fn nothing_is_coded_as_annotation_too_open_any_more() {
 /// where the whole surface can be read at once.
 #[test]
 fn the_variable_complaints_read_as_what_went_wrong() {
-    let span = Span::generated(0, 1);
+    let mut map = SourceMap::default();
+    let span = map.record(Symbol::GENERATED, 0, Span::generated(0, 1));
     let variable = ir::Error {
-        span,
+        at: span,
         kind: IrError::VariableInDeclaration {
             name: "a".to_string(),
         },
     }
-    .diagnostic();
+    .diagnostic(&map);
     assert_eq!(variable.title, "`'a` is not declared in this type's header");
     assert_eq!(
         variable.primary.message,
@@ -3486,12 +3532,12 @@ fn the_variable_complaints_read_as_what_went_wrong() {
     // the headline identifies the unused presence, while the label and help
     // connect it to the `when` spelling the reader can change.
     let unbound = ir::Error {
-        span,
+        at: span,
         kind: IrError::UnboundPresence {
             name: "b".to_string(),
         },
     }
-    .diagnostic();
+    .diagnostic(&map);
     assert_eq!(unbound.title, "`'b` does not control any field or case");
     assert_eq!(
         unbound.primary.message,
@@ -3535,7 +3581,7 @@ fn the_variable_complaints_read_as_what_went_wrong() {
         "this closes the effects it may perform, but `'e` stands for whatever effects the caller allows"
     );
     assert_eq!(
-        closure.diagnostic().help,
+        closure.diagnostic(&map).help,
         [
             "preserve the caller-chosen effect remainder instead of closing it",
             "or remove or change the open effect remainder in the annotation",
@@ -3568,7 +3614,7 @@ fn the_variable_complaints_read_as_what_went_wrong() {
         "this restricts which effect it may perform, but `'e` stands for whatever effects the caller allows"
     );
     assert_eq!(
-        restriction.diagnostic().help,
+        restriction.diagnostic(&map).help,
         [
             "handle the performed effect inside the body",
             "or list that effect explicitly in the annotation",
@@ -3616,12 +3662,13 @@ fn the_variable_complaints_read_as_what_went_wrong() {
 /// reworded one about an argument that names a label twice.
 #[test]
 fn the_complaints_about_a_declarations_own_labels_are_worded_once() {
+    let mut map = SourceMap::default();
     assert_eq!(IrError::EndlessFields.code(), "endless-fields");
     let endless = ir::Error {
-        span: Span::generated(0, 1),
+        at: map.record(Symbol::GENERATED, 0, Span::generated(0, 1)),
         kind: IrError::EndlessFields,
     }
-    .diagnostic();
+    .diagnostic(&map);
     assert_eq!(
         endless.title,
         "this recursive type adds more fields on every cycle"
@@ -3659,7 +3706,8 @@ fn the_complaints_about_a_declarations_own_labels_are_worded_once() {
 /// beside the one it was used at before.
 #[test]
 fn a_mixed_tail_names_the_two_senses_it_was_given() {
-    let span = Span::generated(0, 1);
+    let mut map = SourceMap::default();
+    let span = map.record(Symbol::GENERATED, 0, Span::generated(0, 1));
     let said = |first, second| {
         IrError::MixedTail {
             first,
@@ -3800,7 +3848,7 @@ fn no_two_kinds_of_constraint_are_coded_the_same() {
             base: nat.clone(),
             field: "x".into(),
             result: nat.clone(),
-            base_span: Span::generated(0, 1),
+            base_span: Anchor::GENERATED,
         },
         ConstraintKind::Equal {
             expected: nat.clone(),
@@ -3850,13 +3898,9 @@ fn no_two_kinds_of_constraint_are_coded_the_same() {
 /// error tests in `ir.rs` key on.
 #[test]
 fn the_pattern_complaints_say_what_was_written() {
-    let diagnose = |kind| {
-        ir::Error {
-            span: Span::generated(0, 1),
-            kind,
-        }
-        .diagnostic()
-    };
+    let mut map = SourceMap::default();
+    let at = map.record(Symbol::GENERATED, 0, Span::generated(0, 1));
+    let diagnose = |kind| ir::Error { at, kind }.diagnostic(&map);
     let case = diagnose(IrError::RefutableBinding {
         found: ir::Refuter::Case("Some".to_string()),
     });
@@ -3962,7 +4006,7 @@ fn the_pattern_complaints_say_what_was_written() {
 
     let bound = IrError::DuplicateBinding {
         name: "x".to_string(),
-        previous: Span::generated(0, 1),
+        previous: Anchor::GENERATED,
     };
     assert_eq!(bound.code(), "duplicate-binding");
     assert_eq!(bound.to_string(), "this pattern binds `x` more than once");
@@ -4543,6 +4587,7 @@ fn a_formula_can_be_quoted_in_its_labels() {
 /// wrote.
 #[test]
 fn the_effect_complaints_are_read_in_effects() {
+    let mut map = SourceMap::default();
     for (kind, message) in [
         (
             IrError::NotAnOperation {
@@ -4580,7 +4625,7 @@ fn the_effect_complaints_are_read_in_effects() {
             IrError::DuplicateArm {
                 effect: "Log".to_string(),
                 selector: ir::OperationSelector::Named("write".to_string()),
-                previous: Span::generated(0, 1),
+                previous: Anchor::GENERATED,
             },
             "duplicate arm for `!Log.write`",
         ),
@@ -4588,13 +4633,13 @@ fn the_effect_complaints_are_read_in_effects() {
             IrError::DuplicateArm {
                 effect: "Log".to_string(),
                 selector: ir::OperationSelector::Unnamed,
-                previous: Span::generated(0, 1),
+                previous: Anchor::GENERATED,
             },
             "duplicate arm for `!Log`",
         ),
         (
             IrError::DuplicateReturn {
-                previous: Span::generated(0, 1),
+                previous: Anchor::GENERATED,
             },
             "this handler has more than one `return` arm",
         ),
@@ -4608,7 +4653,7 @@ fn the_effect_complaints_are_read_in_effects() {
         ),
         (
             IrError::RaiseInFunction {
-                function: Span::generated(0, 1),
+                function: Anchor::GENERATED,
             },
             "`raise` cannot cross a function boundary",
         ),
@@ -4625,7 +4670,7 @@ fn the_effect_complaints_are_read_in_effects() {
     // Each reason an operation signature is rejected keeps the actionable
     // detail in its label and repair rather than forcing reporters to split a
     // headline apart.
-    let span = Span::generated(0, 1);
+    let span = map.record(Symbol::GENERATED, 0, Span::generated(0, 1));
     for (found, title, label, help) in [
         (
             ir::OperationTypeProblem::Effects,
@@ -4647,23 +4692,23 @@ fn the_effect_complaints_are_read_in_effects() {
         ),
     ] {
         let diagnostic = ir::Error {
-            span,
+            at: span,
             kind: IrError::ImpureOperation { found },
         }
-        .diagnostic();
+        .diagnostic(&map);
         assert_eq!(diagnostic.title, title);
         assert_eq!(diagnostic.primary.message, label);
         assert_eq!(diagnostic.help, [help]);
     }
 
     let empty = ir::Error {
-        span,
+        at: span,
         kind: IrError::BareOperationUnavailable {
             effect: "Nil".to_string(),
             suggestion: None,
         },
     }
-    .diagnostic();
+    .diagnostic(&map);
     assert_eq!(empty.title, "effect `!Nil` declares nothing to perform");
     assert_eq!(
         empty.primary.message,
@@ -4717,15 +4762,17 @@ fn the_effect_complaints_are_read_in_effects() {
 /// the instruction rather than a count of how far off they are.
 #[test]
 fn a_partial_handler_names_every_operation_with_no_arm() {
+    let mut map = SourceMap::default();
+    let at = map.record(Symbol::GENERATED, 0, Span::generated(0, 1));
     let named = |missing: &[&str]| {
         ir::Error {
-            span: Span::generated(0, 1),
+            at,
             kind: IrError::PartialHandler {
                 effect: "Log".to_string(),
                 missing: missing.iter().map(|name| name.to_string()).collect(),
             },
         }
-        .diagnostic()
+        .diagnostic(&map)
     };
     for (missing, listed) in [
         (&["flush"][..], "`flush`"),
@@ -4807,8 +4854,9 @@ fn the_effect_tokens_print_as_they_were_written() {
 /// whose previous span predated the other redesigned variants.
 #[test]
 fn ir_duplicate_diagnostics_point_back_to_the_first_occurrence() {
-    let primary = Span::generated(12, 2);
-    let previous = Span::generated(3, 1);
+    let mut map = SourceMap::default();
+    let primary = map.record(Symbol::GENERATED, 0, Span::generated(12, 2));
+    let previous = map.record(Symbol::GENERATED, 0, Span::generated(3, 1));
     let examples = [
         (
             IrError::DuplicateField {
@@ -4866,18 +4914,14 @@ fn ir_duplicate_diagnostics_point_back_to_the_first_occurrence() {
     ];
 
     for (kind, title, label, related_label) in examples {
-        let diagnostic = ir::Error {
-            span: primary,
-            kind,
-        }
-        .diagnostic();
+        let diagnostic = ir::Error { at: primary, kind }.diagnostic(&map);
         assert_eq!(diagnostic.title, title);
-        assert_eq!(diagnostic.primary.span, primary);
+        assert_eq!(diagnostic.primary.span, map.span(primary));
         assert_eq!(diagnostic.primary.message, label);
         assert_eq!(
             diagnostic.related,
             [ui::Annotation {
-                span: previous,
+                span: map.span(previous),
                 message: related_label.to_string(),
             }]
         );
@@ -4889,7 +4933,8 @@ fn ir_duplicate_diagnostics_point_back_to_the_first_occurrence() {
 /// a reporter never has to split prose back apart to present them.
 #[test]
 fn redesigned_ir_diagnostics_expose_labels_and_help() {
-    let span = Span::generated(9, 1);
+    let mut map = SourceMap::default();
+    let span = map.record(Symbol::GENERATED, 0, Span::generated(9, 1));
     for (kind, title, label, help) in [
         (
             IrError::OpenDeclaredType { shape: Shape::Sum },
@@ -4921,7 +4966,7 @@ fn redesigned_ir_diagnostics_expose_labels_and_help() {
             "write a signature such as `write : Nat -> ()`",
         ),
     ] {
-        let diagnostic = ir::Error { span, kind }.diagnostic();
+        let diagnostic = ir::Error { at: span, kind }.diagnostic(&map);
         assert_eq!(diagnostic.title, title);
         assert_eq!(diagnostic.primary.message, label);
         assert_eq!(diagnostic.help, [help]);
@@ -4933,11 +4978,12 @@ fn redesigned_ir_diagnostics_expose_labels_and_help() {
 /// type complaint.
 #[test]
 fn a_hole_in_an_operation_has_its_own_code_and_title() {
+    let mut map = SourceMap::default();
     let diagnostic = ir::Error {
-        span: Span::generated(5, 1),
+        at: map.record(Symbol::GENERATED, 0, Span::generated(5, 1)),
         kind: IrError::HoleInOperation,
     }
-    .diagnostic();
+    .diagnostic(&map);
     assert_eq!(diagnostic.code, "hole-in-operation");
     assert_eq!(
         diagnostic.title,
@@ -4961,7 +5007,7 @@ fn the_module_namespace_has_codes_of_its_own() {
     let duplicate = IrError::Duplicate {
         name: "Math".to_string(),
         namespace: Namespace::Modules,
-        previous: Span::generated(0, 1),
+        previous: Anchor::GENERATED,
     };
     assert_eq!(duplicate.code(), "duplicate-module");
     assert_eq!(duplicate.to_string(), "`Math` is defined more than once");
@@ -5046,9 +5092,10 @@ fn applied_effect_complaints_name_the_effect_and_the_repair() {
         let [error] = out.errors.as_slice() else {
             panic!("{source}: {:#?}", out.errors);
         };
-        (error.diagnostic(), source.to_string())
+        let diagnostic = error.diagnostic(&out.source);
+        (out.source, diagnostic, source.to_string())
     };
-    let (diagnostic, source) = lowered(&format!("{base}let f : () -> Nat + !Ask = fn _ => 0n"));
+    let (_, diagnostic, source) = lowered(&format!("{base}let f : () -> Nat + !Ask = fn _ => 0n"));
     assert_eq!(diagnostic.code, "effect-arity");
     assert_eq!(
         diagnostic.title,
@@ -5061,7 +5108,7 @@ fn applied_effect_complaints_name_the_effect_and_the_repair() {
     assert_eq!(diagnostic.primary.span.start, source.rfind("!Ask").unwrap());
     assert_eq!(diagnostic.help, ["add the missing effect arguments"]);
 
-    let (diagnostic, source) = lowered(&format!(
+    let (_, diagnostic, source) = lowered(&format!(
         "{base}let f : () -> Nat + !Ask Nat Nat = fn _ => 0n"
     ));
     assert_eq!(diagnostic.code, "effect-arity");
@@ -5072,20 +5119,21 @@ fn applied_effect_complaints_name_the_effect_and_the_repair() {
     assert_eq!(diagnostic.help, ["remove the extra effect arguments"]);
     assert_eq!(diagnostic.primary.span.start, source.rfind("!Ask").unwrap());
 
-    let (diagnostic, source) = lowered(&format!("{base}let f : () -> Nat + !Run Nat = fn _ => 0n"));
+    let (_, diagnostic, source) =
+        lowered(&format!("{base}let f : () -> Nat + !Run Nat = fn _ => 0n"));
     assert_eq!(diagnostic.code, "not-a-row");
     assert_eq!(
         diagnostic.primary.span.start,
         source.rfind("Nat =").unwrap()
     );
 
-    let (diagnostic, _) = lowered(&format!(
+    let (_, diagnostic, _) = lowered(&format!(
         "{base}let f : () -> Nat + !Run (!Log) = fn _ => 0n"
     ));
     assert_eq!(diagnostic.code, "repeated-row-field");
     assert!(diagnostic.title.contains("`!Log`"), "{}", diagnostic.title);
 
-    let (diagnostic, source) = lowered(&format!(
+    let (_, diagnostic, source) = lowered(&format!(
         "{base}let f : () -> Nat + !Both Nat (!Log) = fn _ => 0n"
     ));
     assert_eq!(diagnostic.code, "repeated-row-field");
@@ -5094,7 +5142,7 @@ fn applied_effect_complaints_name_the_effect_and_the_repair() {
         source.rfind("(!Log)").unwrap()
     );
 
-    let (diagnostic, source) = lowered(&format!(
+    let (_, diagnostic, source) = lowered(&format!(
         "{base}let f : () -> Nat + \\!Both Nat (..'e) + ..'e = fn _ => 0n"
     ));
     assert_eq!(diagnostic.code, "modified-open-alias");
@@ -5115,7 +5163,7 @@ fn applied_effect_complaints_name_the_effect_and_the_repair() {
         ["give the alias every effect it stands for, or mark each effect yourself"]
     );
 
-    let (diagnostic, source) = lowered(&format!(
+    let (_, diagnostic, source) = lowered(&format!(
         "{base}let f : () -> Nat + !Both Nat (..'e) + ..'f = fn _ => 0n"
     ));
     assert_eq!(diagnostic.code, "two-tails");
@@ -5132,7 +5180,7 @@ fn applied_effect_complaints_name_the_effect_and_the_repair() {
         ["keep one `..`: write the other's effects out, or drop one"]
     );
 
-    let (diagnostic, source) = lowered("effect A 'e = !B 'e\neffect B 'e = !A 'e");
+    let (_, diagnostic, source) = lowered("effect A 'e = !B 'e\neffect B 'e = !A 'e");
     assert_eq!(diagnostic.code, "alias-cycle");
     assert_eq!(diagnostic.title, "effect `!A` only ever stands for itself");
     assert_eq!(
@@ -5148,7 +5196,7 @@ fn applied_effect_complaints_name_the_effect_and_the_repair() {
         ["name the effects the alias stands for without going through itself"]
     );
 
-    let (diagnostic, _) =
+    let (_, diagnostic, _) =
         lowered("effect Log = { write: Nat -> () }\neffect Grow 'e = !Log + !Grow 'e");
     assert_eq!(diagnostic.code, "growing-alias-cycle");
     assert_eq!(
@@ -5165,13 +5213,13 @@ fn applied_effect_complaints_name_the_effect_and_the_repair() {
 /// the causal detail of the arguments that could not agree.
 #[test]
 fn an_argument_clash_renders_the_applications_and_its_cause() {
-    let errors = inference_fixture_errors(include_str!(
+    let (map, errors) = inference_fixture_errors(include_str!(
         "../diagnostics/inference/effect-argument-mismatch.hc"
     ));
     let [error] = errors.as_slice() else {
         panic!("{errors:#?}");
     };
-    let diagnostic = error.diagnostic();
+    let diagnostic = error.diagnostic(&map);
     assert_eq!(diagnostic.code, "effect-argument-mismatch");
     assert_eq!(
         diagnostic.title,

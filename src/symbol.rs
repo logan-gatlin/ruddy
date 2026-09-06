@@ -214,6 +214,15 @@ impl BundleHash {
 }
 
 impl Symbol {
+    /// The symbol an [`Anchor`](crate::tracking::Anchor) names when what it
+    /// anchors was written by no definition: what the compiler generated, or
+    /// a dependency's declaration. No mint ever hands this out, so nothing a
+    /// program declares can collide with it.
+    pub const GENERATED: Symbol = Symbol {
+        bundle: BundleHash(0),
+        index: u32::MAX,
+    };
+
     pub const fn bundle(self) -> BundleHash {
         self.bundle
     }

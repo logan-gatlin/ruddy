@@ -25,7 +25,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                     format!("extern {}", mint.name(*symbol)),
                     target.clone(),
                 )
-                .at(decl.name_span),
+                .at(cx.source.span(decl.name_at)),
                 cx,
                 mint,
                 *symbol,
@@ -48,7 +48,9 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                     crate::print::lir::rep(external.rep),
                 ));
             }
-            node.child(Node::new(ids.next(), "Target", target).at(decl.value.target.span))
+            node.child(
+                Node::new(ids.next(), "Target", target).at(cx.source.span(decl.value.target.at)),
+            )
         })
         .collect();
     if nodes.is_empty() {

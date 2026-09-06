@@ -46,7 +46,7 @@ use crate::{
     inference::{self, Coverage as Covers, Origin, Store, effective_conditions, sat, unfold},
     ir::{Literal, Pattern, PatternKind, Program, Term, TermKind, Witness},
     symbol::Symbol,
-    tracking::Span,
+    tracking::Anchor,
     types::{Atom, Formula, Presence, Rest, Row, Scheme, Ty},
 };
 
@@ -63,10 +63,10 @@ pub struct Output {
 #[derive(Debug, Clone)]
 pub struct Report {
     /// The whole match's span.
-    pub span: Span,
+    pub at: Anchor,
     /// The solved scrutinee type, zonked — what the typed checks read.
     pub scrutinee: Rc<Ty>,
-    pub scrutinee_span: Span,
+    pub scrutinee_at: Anchor,
     pub arms: Vec<Arm>,
     pub coverage: Coverage,
 }
@@ -77,7 +77,7 @@ pub struct Report {
 pub struct Arm {
     /// The arm's span — pattern and body together, which is where its
     /// complaints point.
-    pub span: Span,
+    pub at: Anchor,
     pub pattern: Pattern,
     pub verdict: Verdict,
 }
@@ -110,7 +110,7 @@ pub enum Coverage {
 
 #[derive(Debug, Clone)]
 pub struct Error {
-    pub span: Span,
+    pub at: Anchor,
     pub kind: ErrorKind,
 }
 
@@ -339,7 +339,7 @@ pub fn check(program: &Program, inferred: &inference::Output) -> Output {
     // In the order the reader would meet them, whatever order the walk found
     // them in; the sort is stable, so two complaints about one span keep the
     // order the checks made them.
-    out.errors.sort_by_key(|error| error.span.start);
+    out.errors.sort_by_key(|error| error.at);
     out
 }
 
@@ -351,9 +351,9 @@ fn walk(check: &Check, term: &Term, out: &mut Output) {
 fn walk_under(check: &Check, term: &Term, assumed: &Formula, out: &mut Output) {
     match &term.kind {
         TermKind::Match { scrutinee, arms } => {
-            check.matched(term.span, scrutinee, arms, assumed, out);
+            check.matched(term.at, scrutinee, arms, assumed, out);
             walk_under(check, scrutinee, assumed, out);
-            let guards = check.arm_assumptions(term.span, scrutinee);
+            let guards = check.arm_assumptions(term.at, scrutinee);
             for (at, (_, body)) in arms.iter().enumerate() {
                 let inside = guards.as_ref().map_or_else(
                     || assumed.clone(),
@@ -426,7 +426,7 @@ fn walk_under(check: &Check, term: &Term, assumed: &Formula, out: &mut Output) {
 /// misplaced-catch-all wording lands only where the arm accepts everything
 /// however the scrutinee solves.
 fn catch_all(pattern: &Pattern) -> bool {
-    match &pattern.tracked {
+    match &pattern.anchored {
         PatternKind::Bind(_) | PatternKind::Wildcard => true,
         PatternKind::Struct {
             fields,
@@ -443,7 +443,7 @@ fn catch_all(pattern: &Pattern) -> bool {
 
 /// A pattern as the typed matrix matches it.
 fn cell(pattern: &Pattern) -> Cell {
-    match &pattern.tracked {
+    match &pattern.anchored {
         PatternKind::Bind(_) | PatternKind::Wildcard => Cell::Wild,
         PatternKind::Natural(value) => Cell::Literal(Literal::Natural(*value)),
         PatternKind::Integer(value) => Cell::Literal(Literal::Integer(*value)),
@@ -465,7 +465,7 @@ fn cell(pattern: &Pattern) -> Cell {
         // A bare tag's payload demands unit; the types were told so, and the
         // cell says the same thing.
         PatternKind::Tag { name, payload } => Cell::Tag {
-            name: name.tracked.clone(),
+            name: name.anchored.clone(),
             payload: Box::new(payload.as_deref().map(cell).unwrap_or(Cell::Struct {
                 fields: Vec::new(),
                 exact: true,
@@ -547,7 +547,7 @@ impl Check<'_> {
     /// say — onto the output.
     fn matched(
         &self,
-        span: Span,
+        span: Anchor,
         scrutinee: &Term,
         arms: &[(Pattern, Term)],
         assumed: &Formula,
@@ -571,9 +571,9 @@ impl Check<'_> {
                 _ => false,
             };
             out.reports.push(Report {
-                span,
+                at: span,
                 scrutinee: ty,
-                scrutinee_span: scrutinee.span,
+                scrutinee_at: scrutinee.at,
                 arms: Vec::new(),
                 coverage: match empty {
                     true => Coverage::Exhaustive,
@@ -583,10 +583,7 @@ impl Check<'_> {
             return;
         }
 
-        let spans: Vec<Span> = arms
-            .iter()
-            .map(|(pattern, body)| pattern.span.merge(body.span))
-            .collect();
+        let spans: Vec<Anchor> = arms.iter().map(|(pattern, _)| pattern.at).collect();
         let cells: Vec<Cell> = arms.iter().map(|(pattern, _)| cell(pattern)).collect();
 
         // The cascade rule: a match whose scrutinee — or any position the
@@ -596,17 +593,17 @@ impl Check<'_> {
         // Incompatibility is read off the solved types; the solver's own
         // complaint at the scrutinee covers the failures that still left a
         // shape behind.
-        let failed = self.errors.iter().any(|error| error.span == scrutinee.span);
+        let failed = self.errors.iter().any(|error| error.at == scrutinee.at);
         if cells.iter().any(|cell| !self.compatible(&ty, cell)) || failed {
             out.reports.push(Report {
-                span,
+                at: span,
                 scrutinee: ty,
-                scrutinee_span: scrutinee.span,
+                scrutinee_at: scrutinee.at,
                 arms: arms
                     .iter()
                     .zip(&spans)
                     .map(|((pattern, _), at)| Arm {
-                        span: *at,
+                        at: *at,
                         pattern: pattern.clone(),
                         verdict: Verdict::Skipped,
                     })
@@ -630,26 +627,22 @@ impl Check<'_> {
                 Some(flipped) if flipped > self.definition_at => false,
                 _ => {
                     let flipped = &self.store.batches[first];
-                    matches!(
-                        (
-                            flipped.span.file_id == span.file_id,
-                            flipped.span.start < span.start,
-                        ),
-                        (true, true)
-                    )
+                    // Earlier in the source: anchors order by definition and
+                    // then by node, which is the order the file was read in.
+                    matches!((true, flipped.at < span), (true, true))
                 }
             },
         });
         if cascaded {
             out.reports.push(Report {
-                span,
+                at: span,
                 scrutinee: ty,
-                scrutinee_span: scrutinee.span,
+                scrutinee_at: scrutinee.at,
                 arms: arms
                     .iter()
                     .zip(&spans)
                     .map(|((pattern, _), at)| Arm {
-                        span: *at,
+                        at: *at,
                         pattern: pattern.clone(),
                         verdict: Verdict::Skipped,
                     })
@@ -668,7 +661,7 @@ impl Check<'_> {
             .position(|(pattern, _)| catch_all(pattern));
         if let Some(at) = misplaced {
             out.errors.push(Error {
-                span: spans[at],
+                at: spans[at],
                 kind: ErrorKind::MisplacedCatchAll,
             });
         }
@@ -710,7 +703,7 @@ impl Check<'_> {
                         true => Verdict::Reachable,
                         false => {
                             out.errors.push(Error {
-                                span: spans[at],
+                                at: spans[at],
                                 kind: ErrorKind::UnreachableArm,
                             });
                             Verdict::Unreachable
@@ -719,7 +712,7 @@ impl Check<'_> {
                 }
             };
             reported.push(Arm {
-                span: spans[at],
+                at: spans[at],
                 pattern: pattern.clone(),
                 verdict,
             });
@@ -740,7 +733,7 @@ impl Check<'_> {
                 true => {
                     let witness = self.witness(found);
                     out.errors.push(Error {
-                        span,
+                        at: span,
                         kind: ErrorKind::UnhandledValues {
                             witness: witness.clone(),
                         },
@@ -764,7 +757,7 @@ impl Check<'_> {
                                 witness: witness.clone(),
                             },
                         };
-                        out.errors.push(Error { span, kind });
+                        out.errors.push(Error { at: span, kind });
                         Coverage::Unhandled(witness)
                     }
                     None => Coverage::Exhaustive,
@@ -773,9 +766,9 @@ impl Check<'_> {
         };
 
         out.reports.push(Report {
-            span,
+            at: span,
             scrutinee: ty,
-            scrutinee_span: scrutinee.span,
+            scrutinee_at: scrutinee.at,
             arms: reported,
             coverage,
         });
@@ -785,7 +778,7 @@ impl Check<'_> {
     /// variables into the bound presences the zonked term types use. These are
     /// carried into nested non-qualifying matches, whose literal/tag matrix
     /// still needs to know which outer presence branch it sits in.
-    fn arm_assumptions(&self, span: Span, scrutinee: &Term) -> Option<Vec<Formula>> {
+    fn arm_assumptions(&self, span: Anchor, scrutinee: &Term) -> Option<Vec<Formula>> {
         let found = self.constrained(span)?;
         let raw: Vec<Formula> = found
             .coverage
@@ -831,13 +824,13 @@ impl Check<'_> {
     ///
     /// Matched by span, which is the batch's own: one match writes one coverage
     /// batch, and the span is where the batch says it came from.
-    fn constrained(&self, span: Span) -> Option<Constrained<'_>> {
+    fn constrained(&self, span: Anchor) -> Option<Constrained<'_>> {
         self.store
             .batches
             .iter()
             .enumerate()
             .find_map(|(at, batch)| {
-                (batch.span == span)
+                (batch.at == span)
                     .then(|| constrained_origin(&batch.origin))
                     .flatten()
                     .map(|(premise, coverage)| Constrained {
@@ -1670,7 +1663,7 @@ mod tests {
             .iter()
             .find(|batch| matches!(batch.origin, inference::Origin::Coverage(_)))
             .expect("the qualifying match has a coverage batch");
-        let (definition, span) = (coverage.definition, coverage.span);
+        let (definition, span) = (coverage.definition, coverage.at);
 
         let named = || inference::Named {
             labels: Vec::new(),
@@ -1692,7 +1685,7 @@ mod tests {
                 inference::Batch {
                     id: inference::BatchId::synthetic(0),
                     definition,
-                    span,
+                    at: span,
                     origin,
                     reason: inference::ReasonId::synthetic(0),
                     formula: Formula::True,
