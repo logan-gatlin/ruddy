@@ -24,7 +24,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MissingMain => f.write_str("an executable must define root-module `main`"),
+            Self::MissingMain => f.write_str("an executable must define public root-module `main`"),
             Self::InvalidMain(messages) => {
                 write!(f, "invalid program entry point: {}", messages.join("; "))
             }

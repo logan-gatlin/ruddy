@@ -312,6 +312,7 @@ fn model_artifact() -> Artifact {
             values,
             types: vec![
                 artifact::DeclaredType {
+                    exported: true,
                     metadata: Default::default(),
                     name: "bundle@1.0.0::Type".to_string(),
                     params: vec![artifact::Parameter {
@@ -328,6 +329,7 @@ fn model_artifact() -> Artifact {
                     },
                 },
                 artifact::DeclaredType {
+                    exported: true,
                     metadata: Default::default(),
                     name: "bundle@1.0.0::Fields".to_string(),
                     params: vec![artifact::Parameter {
@@ -344,6 +346,7 @@ fn model_artifact() -> Artifact {
                     },
                 },
                 artifact::DeclaredType {
+                    exported: true,
                     metadata: Default::default(),
                     name: "bundle@1.0.0::Cases".to_string(),
                     params: vec![artifact::Parameter {
@@ -360,6 +363,7 @@ fn model_artifact() -> Artifact {
                     },
                 },
                 artifact::DeclaredType {
+                    exported: true,
                     metadata: Default::default(),
                     name: "bundle@1.0.0::Effects".to_string(),
                     params: vec![artifact::Parameter {
@@ -382,6 +386,7 @@ fn model_artifact() -> Artifact {
             ],
             effects: vec![
                 artifact::DeclaredEffect {
+                    exported: true,
                     metadata: Default::default(),
                     name: "bundle@1.0.0::Log".to_string(),
                     params: Vec::new(),
@@ -396,6 +401,7 @@ fn model_artifact() -> Artifact {
                     }]),
                 },
                 artifact::DeclaredEffect {
+                    exported: true,
                     metadata: Default::default(),
                     name: "bundle@1.0.0::Alias".to_string(),
                     params: Vec::new(),
@@ -2059,6 +2065,7 @@ fn recursive_artifact_ownership_clones_and_drops_on_a_small_stack() {
                         },
                     }],
                     types: vec![artifact::DeclaredType {
+                        exported: true,
                         metadata: Default::default(),
                         name: "deep@1::Rows".into(),
                         params: Vec::new(),
@@ -2101,6 +2108,7 @@ fn recursive_artifact_ownership_clones_and_drops_on_a_small_stack() {
                 },
             });
             drop(artifact::DeclaredType {
+                exported: true,
                 metadata: Default::default(),
                 name: "deep@1::StandaloneType".into(),
                 params: Vec::new(),
@@ -2348,7 +2356,7 @@ fn parameterized_effects_and_generic_aliases_round_trip() {
     let printed = assert_round_trip(&artifact);
     // The row a use writes carries the arguments the label was applied to.
     assert!(
-        compact(&printed).contains("(effect \"tests@0.1.0::Both\" (params (param type true (lacks)) (param effects true (lacks"),
+        compact(&printed).contains("(effect \"tests@0.1.0::Both\" true (params (param type true (lacks)) (param effects true (lacks"),
         "{printed}"
     );
 

@@ -528,6 +528,7 @@ fn deep_alias_chains_and_generic_interfaces_use_bounded_stack() {
                     values: Vec::new(),
                     types: Vec::new(),
                     effects: vec![ruddy::artifact::DeclaredEffect {
+                        exported: true,
                         metadata: Default::default(),
                         name: "dep@1.0.0::Deep".into(),
                         params: vec![ruddy::artifact::Parameter {
@@ -563,4 +564,206 @@ fn deep_alias_chains_and_generic_interfaces_use_bounded_stack() {
         .expect("the bounded-stack regression thread starts")
         .join()
         .expect("deep alias chains and generic interfaces use bounded stack");
+}
+
+#[test]
+fn private_values_and_modules_are_bundle_local() {
+    let producer = accepted(
+        "@private let (secret, other) = (40n, 2n)\n\
+         @private extern host : Nat -> Nat = \"x => x\"\n\
+         @private module Hidden =\n\
+           module Nested = let value = host secret end\n\
+         end\n\
+         module Visible = @private let hidden = other let shown = hidden end\n\
+         let answer = (Hidden::Nested::value, Visible::shown)",
+    );
+    let header = producer.artifact().header();
+    let names: Vec<_> = header
+        .values
+        .iter()
+        .map(|value| value.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        ["tests@0.1.0::Visible::shown", "tests@0.1.0::answer"]
+    );
+    let modules: Vec<_> = header
+        .modules
+        .iter()
+        .map(|module| module.name.as_str())
+        .collect();
+    assert_eq!(modules, ["tests@0.1.0::Visible"]);
+    let dependency = ruddy::artifact::Artifact::try_parse(&producer.artifact().print()).unwrap();
+    accepted_with(
+        "let answer = (dep::answer, dep::Visible::shown)",
+        &dependency,
+    );
+    for path in [
+        "secret",
+        "other",
+        "host",
+        "Hidden::Nested::value",
+        "Visible::hidden",
+    ] {
+        let source = format!("let stolen = dep::{path}");
+        let parsed = parse::parse(token::lex(&source, FileID::GENERATED).tokens);
+        let partial = compile::compile_with_dependencies(
+            Mint::new(Bundle::new("consumer", Version::new(0, 1, 0)).unwrap()),
+            parsed.stmts,
+            &[compile::Dependency {
+                alias: Some("dep"),
+                artifact: compile::DependencyArtifact::Unchecked(&dependency),
+            }],
+            inference::Trace::Off,
+        )
+        .expect_err("private names must not resolve in a dependent bundle");
+        assert!(
+            partial
+                .errors
+                .iter()
+                .any(|error| matches!(error, Error::Ir(_))),
+            "{partial:#?}"
+        );
+    }
+}
+
+#[test]
+fn private_types_and_effects_support_public_structural_signatures() {
+    let producer = accepted(
+        "@private type Hidden = Nat\n\
+         @private effect Secret = { get: () -> Hidden }\n\
+         @private module Internal =\n\
+           type Box 'a = { value: 'a }\n\
+           type Chain = #End | #Next Chain\n\
+           effect Ask 'a = { get: () -> Box 'a }\n\
+           effect Alias 'a = !Ask 'a\n\
+         end\n\
+         type Visible = Hidden\n\
+         type Box 'a = Internal::Box 'a\n\
+         effect Ask 'a = Internal::!Alias 'a\n\
+         effect Public = { echo: Hidden -> Internal::Box Nat }\n\
+         let explicit : Hidden = 42n\n\
+         let inferred = explicit\n\
+         let chain : Internal::Chain = #Next #End\n\
+         let ask : () -> Internal::Box Nat + Internal::!Ask Nat = fn _ => Internal::!Ask.get ()\n\
+         let secret : () -> Hidden + !Secret = fn _ => !Secret.get ()",
+    );
+    let dependency = ruddy::artifact::Artifact::try_parse(&producer.artifact().print()).unwrap();
+    let restored = dependency
+        .clone()
+        .validate()
+        .expect("private semantic declarations survive serialization");
+    assert_eq!(producer.artifact(), &restored);
+    accepted_with(
+        "effect Secret = { get: () -> Nat }\n\
+         let explicit : Nat = dep::explicit\n\
+         let inferred : dep::Visible = dep::inferred\n\
+         let box : dep::Box Nat = { value: explicit }\n\
+         let chain = dep::chain\n\
+         let ask : () -> { value: Nat } + dep::!Ask Nat = dep::ask\n\
+         let public = fn _ => dep::!Public.echo explicit\n\
+         let run = fn _ => handle dep::secret () with | !Secret.get _ => 42n end",
+        &dependency,
+    );
+    for source in [
+        "let bad : dep::Hidden = 1n",
+        "type Bad = dep::Internal::Box Nat",
+        "let bad = fn _ => dep::!Secret.get ()",
+        "effect Bad = dep::Internal::!Alias Nat",
+    ] {
+        let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
+        assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+        let partial = compile::compile_with_dependencies(
+            Mint::new(Bundle::new("consumer", Version::new(0, 1, 0)).unwrap()),
+            parsed.stmts,
+            &[compile::Dependency {
+                alias: Some("dep"),
+                artifact: compile::DependencyArtifact::Unchecked(&dependency),
+            }],
+            inference::Trace::Off,
+        )
+        .expect_err("private semantic declarations must not enter source lookup");
+        assert!(
+            partial
+                .errors
+                .iter()
+                .any(|error| matches!(error, Error::Ir(_))),
+            "{partial:#?}"
+        );
+    }
+}
+
+#[test]
+fn private_attribute_requires_unit_on_every_declaration_kind() {
+    for declaration in [
+        "let value = 1n",
+        "let (a, b) = (1n, 2n)",
+        "let _ = 1n",
+        "extern value : Nat = \"1n\"",
+        "type Value = Nat",
+        "effect Read = () -> Nat",
+        "module Hidden = let value = 1n end",
+    ] {
+        for unit in ["", "()", "{}"] {
+            accepted(&format!("@private {unit} {declaration}"));
+        }
+        for payload in [
+            "false",
+            "true",
+            "1n",
+            "1i",
+            "1.0",
+            "\"reason\"",
+            "[]",
+            "#Flag",
+            "{ x: () }",
+        ] {
+            let source = format!("@private {payload} {declaration}");
+            let partial = rejected(&source);
+            assert_eq!(codes(&partial), ["invalid-private-value"], "{source}");
+            let diagnostic = partial.ir.errors[0].diagnostic(&partial.ir.source);
+            assert_eq!(diagnostic.title, "`@private` requires unit");
+            assert_eq!(diagnostic.primary.span.start, 9);
+            assert_eq!(diagnostic.primary.span.width, payload.len());
+        }
+    }
+}
+
+#[test]
+fn private_semantic_support_survives_transitive_public_aliases() {
+    let producer = accepted(
+        "@private type Hidden = Nat\n\
+         @private effect Read = { get: () -> Hidden }\n\
+         let value : Hidden = 42n\n\
+         let read : () -> Hidden + !Read = fn _ => !Read.get ()",
+    );
+    let middle = accepted_with(
+        "let value = dep::value\nlet read = dep::read",
+        &producer.artifact().to_unchecked(),
+    );
+    let middle = ruddy::artifact::Artifact::try_parse(&middle.artifact().print())
+        .unwrap()
+        .validate()
+        .unwrap();
+    let source = "effect Read = { get: () -> Nat }\n\
+                  let value : Nat = middle::value\n\
+                  let read = fn _ => handle middle::read () with | !Read.get _ => value end";
+    let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    compile::compile_with_dependencies(
+        Mint::new(Bundle::new("consumer", Version::new(0, 1, 0)).unwrap()),
+        parsed.stmts,
+        &[
+            compile::Dependency {
+                alias: None,
+                artifact: compile::DependencyArtifact::Checked(producer.artifact()),
+            },
+            compile::Dependency {
+                alias: Some("middle"),
+                artifact: compile::DependencyArtifact::Checked(&middle),
+            },
+        ],
+        inference::Trace::Off,
+    )
+    .unwrap_or_else(|partial| panic!("{:#?}", partial.errors));
 }

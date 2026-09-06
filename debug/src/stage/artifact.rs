@@ -61,11 +61,17 @@ pub fn render(spec: &Spec, cx: &Cx, artifact: &Artifact, micros: u64) -> Stage {
     }
     for ty in &artifact.header().types {
         interface.push(
-            Node::new(ids.next(), "type", &ty.name).children(metadata(&mut ids, &ty.metadata)),
+            Node::new(ids.next(), "type", &ty.name)
+                .field("visibility", if ty.exported { "public" } else { "private" })
+                .children(metadata(&mut ids, &ty.metadata)),
         );
     }
     for effect in &artifact.header().effects {
         let mut node = Node::new(ids.next(), "effect", &effect.name)
+            .field(
+                "visibility",
+                if effect.exported { "public" } else { "private" },
+            )
             .children(metadata(&mut ids, &effect.metadata));
         for param in &effect.params {
             node = node.child(Node::new(

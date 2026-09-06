@@ -3841,3 +3841,80 @@ fn dependency_artifacts_cache_child() {
     fs::write(app.join("main.hc"), "let main = dep::more\n").unwrap();
     build_project(&app).unwrap();
 }
+
+#[test]
+fn private_file_modules_execute_without_exposing_javascript_exports() {
+    let directory = tempfile::tempdir().unwrap();
+    write_project(directory.path(), "privacy", "1.0.0", &[]);
+    let manifest = fs::read_to_string(directory.path().join("Ruddy.toml")).unwrap();
+    fs::write(
+        directory.path().join("Ruddy.toml"),
+        manifest.replace("root =", "target = \"js\"\nroot ="),
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("main.hc"),
+        "@private module Hidden\n\
+         @private extern remember : Nat -> Nat = \"x => (globalThis.ruddyPrivateInit = x, x)\"\n\
+         @private let initialized = remember 7n\n\
+         @private let helper = fn _ => Hidden::Nested::answer\n\
+         module Visible = @private let hidden = 1n let shown = initialized end\n\
+         let answer = helper ()\n\
+         let exposed = helper\n\
+         @private let main = fn _ => ()",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("Hidden.hc"),
+        "module Nested = let answer = 42n end",
+    )
+    .unwrap();
+    check_project(directory.path()).expect("a library may have a private main");
+    let artifact = build_project(directory.path()).expect("private module code remains executable");
+    let script = format!(
+        "import * as api from {};\n\
+         console.log(Object.keys(api).sort().join(','));\n\
+         console.log(Object.keys(api.Visible).join(','));\n\
+         console.log(String(api.answer), String(api.exposed()), String(api.Visible.shown), String(globalThis.ruddyPrivateInit));",
+        serde_json::to_string(&artifact.with_extension("js")).unwrap(),
+    );
+    let output = Command::new("node")
+        .args(["--input-type=module", "-e", &script])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"Visible,answer,exposed\nshown\n42 42 7 7\n");
+}
+
+#[test]
+fn private_main_is_rejected_for_every_executable_target() {
+    for target in ["artifact", "js"] {
+        let directory = tempfile::tempdir().unwrap();
+        executable_project(
+            directory.path(),
+            "@private let main = fn _ => ()",
+            Some(target),
+        );
+        for error in [
+            check_project(directory.path())
+                .expect_err("check requires a public main")
+                .to_string(),
+            build_project(directory.path())
+                .expect_err("build requires a public main")
+                .to_string(),
+        ] {
+            assert!(error.contains("public root-module `main`"), "{error}");
+        }
+        fs::write(
+            directory.path().join("main.hc"),
+            "@private let start = fn _ => ()\nlet main = start",
+        )
+        .unwrap();
+        check_project(directory.path()).expect("a public main may alias a private function");
+        build_project(directory.path()).expect("the public main builds");
+    }
+}

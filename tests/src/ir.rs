@@ -6793,12 +6793,14 @@ fn prelude_artifact(bundle: &str) -> a::UncheckedArtifact {
             ],
             types: vec![
                 a::DeclaredType {
+                    exported: true,
                     metadata: Default::default(),
                     name: qualified("Shared"),
                     params: Vec::new(),
                     scheme: artifact_scheme(artifact_type(a::Type::String)),
                 },
                 a::DeclaredType {
+                    exported: true,
                     metadata: Default::default(),
                     name: qualified("Nat"),
                     params: Vec::new(),
@@ -6806,6 +6808,7 @@ fn prelude_artifact(bundle: &str) -> a::UncheckedArtifact {
                 },
             ],
             effects: vec![a::DeclaredEffect {
+                exported: true,
                 metadata: Default::default(),
                 name: qualified("Shared"),
                 params: Vec::new(),
@@ -7084,6 +7087,7 @@ fn effect_artifact(bundle: &str, interface: &str) -> a::UncheckedArtifact {
             values: Vec::new(),
             types: Vec::new(),
             effects: vec![a::DeclaredEffect {
+                exported: true,
                 metadata: Default::default(),
                 name: format!("{bundle}@1.0.0::IO"),
                 params: Vec::new(),
@@ -7233,6 +7237,7 @@ fn imported_effect_row_keys_follow_canonical_identities_by_shape() {
     ]);
     dependency.header.types.extend([
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::Effects".into(),
             params: vec![a::Parameter {
@@ -7249,6 +7254,7 @@ fn imported_effect_row_keys_follow_canonical_identities_by_shape() {
             },
         },
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::Cases".into(),
             params: Vec::new(),
@@ -7371,6 +7377,7 @@ fn legacy_operation_effects_get_fallback_identity_before_row_normalization() {
         )),
     });
     dependency.header.types.push(a::DeclaredType {
+        exported: true,
         metadata: Default::default(),
         name: "dep@1.0.0::Effects".into(),
         params: vec![a::Parameter {
@@ -7603,6 +7610,7 @@ fn a_direct_only_interface_with_a_transitive_type_recovers_without_panicking() {
             }],
             values: Vec::new(),
             types: vec![a::DeclaredType {
+                exported: true,
                 metadata: Default::default(),
                 name: "dep@1.0.0::Wrapper".to_string(),
                 params: Vec::new(),
@@ -7631,6 +7639,7 @@ fn a_direct_only_interface_with_a_transitive_type_recovers_without_panicking() {
 #[test]
 fn missing_transitive_type_applications_keep_distinct_effect_identities() {
     let alias = |name: &str, argument| a::DeclaredType {
+        exported: true,
         metadata: Default::default(),
         name: format!("dep@1.0.0::{name}"),
         params: Vec::new(),
@@ -7747,6 +7756,7 @@ fn direct_only_transitive_effects_keep_qualified_recovery_identity() {
             ]
             .into_iter()
             .map(|(name, target)| a::DeclaredEffect {
+                exported: true,
                 metadata: Default::default(),
                 name: format!("dep@1.0.0::{name}"),
                 params: Vec::new(),
@@ -7754,6 +7764,7 @@ fn direct_only_transitive_effects_keep_qualified_recovery_identity() {
                 kind: a::EffectKind::Alias(a::AliasRow::naming(vec![target.into()])),
             })
             .chain(std::iter::once(a::DeclaredEffect {
+                exported: true,
                 metadata: Default::default(),
                 name: "dep@1.0.0::Legacy".into(),
                 params: Vec::new(),
@@ -7987,6 +7998,7 @@ fn generated_and_malformed_imported_effect_keys_decode_exactly_and_totally() {
 
     let mut semantic = effect_artifact("semantic", &io);
     semantic.header.types.push(a::DeclaredType {
+        exported: true,
         metadata: Default::default(),
         name: "semantic@1.0.0::Carrier".into(),
         params: Vec::new(),
@@ -8037,6 +8049,7 @@ fn imported_presence_variables_keep_alpha_correlation_in_effect_identity() {
     // Two quantified presences per declaration, so a bound position is in
     // range whether the two labels share one or take one each.
     let declaration = |name: &str, left, right| a::DeclaredType {
+        exported: true,
         metadata: Default::default(),
         name: format!("dep@1.0.0::{name}"),
         params: Vec::new(),
@@ -8163,6 +8176,7 @@ fn operation_inputs_and_outputs_share_one_presence_alpha_scope() {
 fn imported_bound_presences_are_local_to_each_scheme_instantiation() {
     let mut dependency = effect_artifact("dep", "bound-scopes");
     let declaration = |name: &str| a::DeclaredType {
+        exported: true,
         metadata: Default::default(),
         name: format!("dep@1.0.0::{name}"),
         params: Vec::new(),
@@ -8219,6 +8233,7 @@ fn imported_bound_presences_are_local_to_each_scheme_instantiation() {
 fn imported_presence_vars_use_a_disjoint_recovery_variant() {
     let mut dependency = effect_artifact("dep", "recovered-presence");
     dependency.header.types.push(a::DeclaredType {
+        exported: true,
         metadata: Default::default(),
         name: "dep@1.0.0::Carrier".into(),
         params: Vec::new(),
@@ -8331,6 +8346,7 @@ fn source_and_imported_absent_effect_payloads_have_one_identity() {
     let io = local_effect_interface(io_source, "IO");
     let mut dependency = effect_artifact("dep", &io);
     dependency.header.types.push(a::DeclaredType {
+        exported: true,
         metadata: Default::default(),
         name: "dep@1.0.0::Carrier".into(),
         params: Vec::new(),
@@ -8489,6 +8505,7 @@ fn imported_structural_identity_respects_effect_and_case_parameter_senses() {
         relevant: true,
     };
     let declared = |name: &str, params, count, body| a::DeclaredType {
+        exported: true,
         metadata: Default::default(),
         name: format!("dep@1.0.0::{name}"),
         params,
@@ -8610,6 +8627,7 @@ fn row_composition_is_flattened_across_local_and_imported_types() {
         })
     };
     let declared = |name: &str, body| a::DeclaredType {
+        exported: true,
         metadata: Default::default(),
         name: format!("dep@1.0.0::{name}"),
         params: Vec::new(),
@@ -8708,6 +8726,7 @@ fn structural_rows_mask_inner_duplicates_and_preserve_ordinary_separator_labels(
         })
     };
     let declared = |name: &str, params, count, body| a::DeclaredType {
+        exported: true,
         metadata: Default::default(),
         name: format!("dep@1.0.0::{name}"),
         params,
@@ -8810,6 +8829,7 @@ fn absent_semantic_payloads_do_not_affect_structural_identity() {
         ty,
     };
     let declared = |name: &str, body| a::DeclaredType {
+        exported: true,
         metadata: Default::default(),
         name: format!("dep@1.0.0::{name}"),
         params: Vec::new(),
@@ -8990,6 +9010,7 @@ fn local_and_imported_structural_types_share_one_canonical_encoding() {
         rest: a::Rest::Closed,
     }));
     let declared = |name: &str, body| a::DeclaredType {
+        exported: true,
         metadata: Default::default(),
         name: format!("dep@1.0.0::{name}"),
         params: Vec::new(),
@@ -9080,6 +9101,7 @@ fn imported_interfaces_keep_applied_types_effects_and_alias_overlap_structural()
             dependencies: Vec::new(),
             values: Vec::new(),
             types: vec![a::DeclaredType {
+                exported: true,
                 metadata: Default::default(),
                 name: "dep@1.0.0::Box".into(),
                 params: vec![a::Parameter {
@@ -9102,6 +9124,7 @@ fn imported_interfaces_keep_applied_types_effects_and_alias_overlap_structural()
             ]
             .into_iter()
             .map(|(name, interface)| a::DeclaredEffect {
+                exported: true,
                 metadata: Default::default(),
                 name: format!("dep@1.0.0::{name}"),
                 params: Vec::new(),
@@ -9112,6 +9135,7 @@ fn imported_interfaces_keep_applied_types_effects_and_alias_overlap_structural()
                 kind: a::EffectKind::Operations(Vec::new()),
             })
             .chain(["A", "B"].into_iter().map(|name| a::DeclaredEffect {
+                exported: true,
                 metadata: Default::default(),
                 name: format!("dep@1.0.0::{name}"),
                 params: Vec::new(),
@@ -9218,12 +9242,14 @@ fn imported_declared_types_exercise_every_semantic_identity_form() {
     let field = |presence, ty| a::RowField { presence, ty };
     let unit = || artifact_type(artifact_unit());
     let row_type = |name: &str, labels, rest| a::DeclaredType {
+        exported: true,
         metadata: Default::default(),
         name: format!("dep@1.0.0::{name}"),
         params: Vec::new(),
         scheme: artifact_scheme(artifact_type(a::Type::Sum(a::Row { labels, rest }))),
     };
     let declared = |name: &str, body| a::DeclaredType {
+        exported: true,
         metadata: Default::default(),
         name: format!("dep@1.0.0::{name}"),
         params: Vec::new(),
@@ -9232,6 +9258,7 @@ fn imported_declared_types_exercise_every_semantic_identity_form() {
     // A bound position has to sit inside its scheme's quantifier space, so
     // the forms that use one quantify enough positions to hold it.
     let quantified = |name: &str, count, presences, body| a::DeclaredType {
+        exported: true,
         metadata: Default::default(),
         name: format!("dep@1.0.0::{name}"),
         params: Vec::new(),
@@ -9380,18 +9407,21 @@ fn malformed_dependency_declarations_are_ignored_without_shadow_symbols() {
     };
     dependency.header.values = vec![value.clone(), value];
     dependency.header.types.push(a::DeclaredType {
+        exported: true,
         metadata: Default::default(),
         name: "dep@1.0.0::".into(),
         params: Vec::new(),
         scheme: artifact_scheme(artifact_type(a::Type::Nat)),
     });
     dependency.header.types.push(a::DeclaredType {
+        exported: true,
         metadata: Default::default(),
         name: "other@1.0.0::Ignored".into(),
         params: Vec::new(),
         scheme: artifact_scheme(artifact_type(a::Type::Nat)),
     });
     dependency.header.effects.push(a::DeclaredEffect {
+        exported: true,
         metadata: Default::default(),
         name: "other@1.0.0::Ignored".into(),
         params: Vec::new(),
@@ -9432,6 +9462,7 @@ fn imported_alias_cycles_recover_without_a_spurious_structural_identity() {
             effects: [("A", "dep@1.0.0::B"), ("B", "dep@1.0.0::A")]
                 .into_iter()
                 .map(|(name, target)| a::DeclaredEffect {
+                    exported: true,
                     metadata: Default::default(),
                     name: format!("dep@1.0.0::{name}"),
                     params: Vec::new(),
@@ -9701,6 +9732,7 @@ fn dependency_interfaces_import_every_semantic_form() {
             values,
             types: vec![
                 a::DeclaredType {
+                    exported: true,
                     metadata: Default::default(),
                     name: "dep@1.0.0::M::T".to_string(),
                     params: vec![
@@ -9726,6 +9758,7 @@ fn dependency_interfaces_import_every_semantic_form() {
                     })),
                 },
                 a::DeclaredType {
+                    exported: true,
                     metadata: Default::default(),
                     name: "dep@1.0.0::StructMore".into(),
                     params: Vec::new(),
@@ -9778,6 +9811,7 @@ fn dependency_interfaces_import_every_semantic_form() {
                     },
                 },
                 a::DeclaredType {
+                    exported: true,
                     metadata: Default::default(),
                     name: "dep@1.0.0::StructVar".into(),
                     params: Vec::new(),
@@ -9787,6 +9821,7 @@ fn dependency_interfaces_import_every_semantic_form() {
                     }))),
                 },
                 a::DeclaredType {
+                    exported: true,
                     metadata: Default::default(),
                     name: "dep@1.0.0::StructBound".into(),
                     params: vec![a::Parameter {
@@ -9806,6 +9841,7 @@ fn dependency_interfaces_import_every_semantic_form() {
                     },
                 },
                 a::DeclaredType {
+                    exported: true,
                     metadata: Default::default(),
                     name: "dep@1.0.0::StructMissing".into(),
                     params: Vec::new(),
@@ -9820,6 +9856,7 @@ fn dependency_interfaces_import_every_semantic_form() {
                     },
                 },
                 a::DeclaredType {
+                    exported: true,
                     metadata: Default::default(),
                     name: "dep@1.0.0::StructRigid".into(),
                     params: Vec::new(),
@@ -9832,6 +9869,7 @@ fn dependency_interfaces_import_every_semantic_form() {
                     }))),
                 },
                 a::DeclaredType {
+                    exported: true,
                     metadata: Default::default(),
                     name: "dep@1.0.0::StructUnknown".into(),
                     params: Vec::new(),
@@ -9841,6 +9879,7 @@ fn dependency_interfaces_import_every_semantic_form() {
                     }))),
                 },
                 a::DeclaredType {
+                    exported: true,
                     metadata: Default::default(),
                     name: "dep@1.0.0::RowLoop".into(),
                     params: vec![a::Parameter {
@@ -9860,6 +9899,7 @@ fn dependency_interfaces_import_every_semantic_form() {
                     },
                 },
                 a::DeclaredType {
+                    exported: true,
                     metadata: Default::default(),
                     name: "dep@1.0.0::RowCycle".into(),
                     params: Vec::new(),
@@ -9874,6 +9914,7 @@ fn dependency_interfaces_import_every_semantic_form() {
             ],
             effects: vec![
                 a::DeclaredEffect {
+                    exported: true,
                     metadata: Default::default(),
                     name: "dep@1.0.0::M::Read".to_string(),
                     // One fields parameter, which the `bound` operation's row
@@ -9991,6 +10032,7 @@ fn dependency_interfaces_import_every_semantic_form() {
                     ]),
                 },
                 a::DeclaredEffect {
+                    exported: true,
                     metadata: Default::default(),
                     name: "dep@1.0.0::Alias".to_string(),
                     params: Vec::new(),
@@ -10304,6 +10346,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
     let mut dependency = effect_artifact("dep", "forwarding");
     dependency.header.types = vec![
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::Id".into(),
             params: vec![a::Parameter {
@@ -10323,6 +10366,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
             },
         },
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::Identity".into(),
             params: vec![a::Parameter {
@@ -10339,6 +10383,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
             },
         },
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::First".into(),
             params: vec![
@@ -10362,6 +10407,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
             },
         },
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::MissingSelect".into(),
             params: Vec::new(),
@@ -10371,6 +10417,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
             })),
         },
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::GenericUnknown".into(),
             params: vec![a::Parameter {
@@ -10387,6 +10434,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
             },
         },
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::Twice".into(),
             params: vec![a::Parameter {
@@ -10409,6 +10457,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
             },
         },
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::Chain".into(),
             params: vec![a::Parameter {
@@ -10428,6 +10477,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
             },
         },
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::Second".into(),
             params: vec![
@@ -10454,6 +10504,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
             },
         },
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::WithX".into(),
             params: vec![a::Parameter {
@@ -10479,6 +10530,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
             },
         },
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::MaybeX".into(),
             params: vec![a::Parameter {
@@ -10504,6 +10556,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
             },
         },
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::AbsentX".into(),
             params: vec![a::Parameter {
@@ -10532,6 +10585,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
     if include_cycle {
         dependency.header.types.extend([
             a::DeclaredType {
+                exported: true,
                 metadata: Default::default(),
                 name: "dep@1.0.0::Cycle".into(),
                 params: Vec::new(),
@@ -10541,6 +10595,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
                 })),
             },
             a::DeclaredType {
+                exported: true,
                 metadata: Default::default(),
                 name: "dep@1.0.0::BrokenSlot".into(),
                 params: vec![a::Parameter {
@@ -10568,6 +10623,7 @@ fn case_rows_artifact() -> a::UncheckedArtifact {
     let mut dependency = forwarding_rows_artifact(false);
     dependency.header.types.extend([
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::CaseAlias".into(),
             params: Vec::new(),
@@ -10588,6 +10644,7 @@ fn case_rows_artifact() -> a::UncheckedArtifact {
             }))),
         },
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::CaseTransitive".into(),
             params: Vec::new(),
@@ -10597,6 +10654,7 @@ fn case_rows_artifact() -> a::UncheckedArtifact {
             })),
         },
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::AddB".into(),
             params: vec![a::Parameter {
@@ -10622,6 +10680,7 @@ fn case_rows_artifact() -> a::UncheckedArtifact {
             },
         },
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::SelectSecond".into(),
             params: vec![
@@ -10650,6 +10709,7 @@ fn case_rows_artifact() -> a::UncheckedArtifact {
         // No parameters, despite the malformed semantic rest. The importer
         // must absorb slot zero rather than assigning it to a local parameter.
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::BrokenBare".into(),
             params: Vec::new(),
@@ -10754,6 +10814,7 @@ fn imported_forwarding_aliases_classify_local_recursion() {
 fn malformed_named_applications_of_unequal_arity_are_not_congruent() {
     let mut dependency = effect_artifact("dep", "bad-arity");
     dependency.header.types = vec![a::DeclaredType {
+        exported: true,
         metadata: Default::default(),
         name: "dep@1.0.0::Box".into(),
         params: vec![a::Parameter {
@@ -10813,6 +10874,7 @@ fn malformed_nested_imported_applications_recover_during_effect_identity() {
     let mut dependency = effect_artifact("dep", "bad-nested-arity");
     dependency.header.types = vec![
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::Box".into(),
             params: vec![a::Parameter {
@@ -10829,6 +10891,7 @@ fn malformed_nested_imported_applications_recover_during_effect_identity() {
             },
         },
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::Broken".into(),
             params: Vec::new(),
@@ -10952,12 +11015,14 @@ fn imported_effect_identity_graph_is_stack_safe_and_absorbs_growing_types() {
             let mut dependency = effect_artifact("dep", "identity-graph");
             dependency.header.types = vec![
                 a::DeclaredType {
+                    exported: true,
                     metadata: Default::default(),
                     name: "dep@1.0.0::Deep".into(),
                     params: Vec::new(),
                     scheme: artifact_scheme(deep),
                 },
                 a::DeclaredType {
+                    exported: true,
                     metadata: Default::default(),
                     name: "dep@1.0.0::Grow".into(),
                     params: vec![a::Parameter {
@@ -11030,6 +11095,7 @@ fn imported_recursive_instantiations_close_through_forwarding_aliases() {
     };
     dependency.header.types = vec![
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::Id".into(),
             params: vec![parameter()],
@@ -11042,6 +11108,7 @@ fn imported_recursive_instantiations_close_through_forwarding_aliases() {
             },
         },
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::Loop".into(),
             params: vec![parameter()],
@@ -11101,6 +11168,7 @@ fn a_finite_imported_rotation_longer_than_256_states_remains_exact() {
         .map(|index| a::Type::Bound(index as u32))
         .collect();
     let rotate = a::DeclaredType {
+        exported: true,
         metadata: Default::default(),
         name: "dep@1.0.0::Rotate".into(),
         params: parameters,
@@ -11149,6 +11217,7 @@ fn a_finite_imported_rotation_longer_than_256_states_remains_exact() {
                     ));
                 }
                 a::DeclaredType {
+                    exported: true,
                     metadata: Default::default(),
                     name: format!("dep@1.0.0::{prefix}{index}"),
                     params: Vec::new(),
@@ -11158,6 +11227,7 @@ fn a_finite_imported_rotation_longer_than_256_states_remains_exact() {
             .collect::<Vec<_>>()
     };
     let alias = |name: &str, prefix: &str| a::DeclaredType {
+        exported: true,
         metadata: Default::default(),
         name: format!("dep@1.0.0::{name}"),
         params: Vec::new(),
@@ -11216,6 +11286,7 @@ fn structurally_growing_imported_rotation_recovers_without_a_depth_cap() {
     let mut dependency = effect_artifact("dep", "growing-rotation");
     dependency.header.types = vec![
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::Grow".into(),
             params: vec![
@@ -11251,6 +11322,7 @@ fn structurally_growing_imported_rotation_recovers_without_a_depth_cap() {
             },
         },
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::Loop".into(),
             params: Vec::new(),
@@ -11269,6 +11341,7 @@ fn structurally_growing_imported_rotation_recovers_without_a_depth_cap() {
         // A malformed changing arity is finite here and must not be mistaken
         // for constructor growth merely because its active vectors differ.
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::Odd".into(),
             params: vec![a::Parameter {
@@ -11342,6 +11415,7 @@ fn sequential_imported_instantiations_do_not_exhaust_the_active_recursion_limit(
         .collect();
     dependency.header.types = vec![
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::Box".into(),
             params: vec![a::Parameter {
@@ -11358,6 +11432,7 @@ fn sequential_imported_instantiations_do_not_exhaust_the_active_recursion_limit(
             },
         },
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::Wide".into(),
             params: Vec::new(),
@@ -11543,6 +11618,7 @@ fn malformed_effect_keys_cannot_collide_with_encoded_unknown_atoms() {
     ]
     .into_iter()
     .map(|(name, key)| a::DeclaredType {
+        exported: true,
         metadata: Default::default(),
         name: format!("dep@1.0.0::{name}"),
         params: Vec::new(),
@@ -11588,6 +11664,7 @@ fn malformed_effect_keys_cannot_collide_with_encoded_unknown_atoms() {
 fn forwarded_field_addition_respects_outer_absent_shadowing() {
     let mut dependency = effect_artifact("dep", "shadow");
     dependency.header.types = vec![a::DeclaredType {
+        exported: true,
         metadata: Default::default(),
         name: "dep@1.0.0::Shadow".into(),
         params: vec![a::Parameter {
@@ -11705,6 +11782,7 @@ fn deep_field_summary_artifact(depth: usize, cycle: bool) -> a::UncheckedArtifac
                 }
             };
             a::DeclaredType {
+                exported: true,
                 metadata: Default::default(),
                 name,
                 params,
@@ -11750,6 +11828,7 @@ fn deeply_nested_imported_more_rows_are_imported_and_clamped_iteratively() {
             }
             let mut dependency = effect_artifact("dep", "deep-more");
             dependency.header.types = vec![a::DeclaredType {
+                exported: true,
                 metadata: Default::default(),
                 name: "dep@1.0.0::Deep".into(),
                 params: Vec::new(),
@@ -11855,6 +11934,7 @@ fn deeply_nested_imported_semantics_are_preserved_on_a_small_stack() {
 
             let mut dependency = effect_artifact("dep", "deep-semantics");
             dependency.header.types.push(a::DeclaredType {
+                exported: true,
                 metadata: Default::default(),
                 name: "dep@1.0.0::Deep".into(),
                 params: Vec::new(),
@@ -12068,6 +12148,7 @@ fn malformed_imported_scheme_bounds_recover_for_types_and_values() {
         },
     });
     dependency.header.types.push(a::DeclaredType {
+        exported: true,
         metadata: Default::default(),
         name: "dep@1.0.0::Broken".into(),
         params: Vec::new(),
@@ -12155,6 +12236,7 @@ fn imported_interfaces_discard_foreign_solver_local_ids_before_inference() {
         ),
     ] {
         dependency.header.types.push(a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: format!("dep@1.0.0::{name}"),
             params: Vec::new(),
@@ -12277,6 +12359,7 @@ fn arrow_effect_more_rows_use_one_canonical_form_in_both_directions() {
     let mut dependency = effect_artifact("dep", "effect-more-equality");
     dependency.header.types = vec![
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::Effectful".into(),
             params: vec![a::Parameter {
@@ -12293,6 +12376,7 @@ fn arrow_effect_more_rows_use_one_canonical_form_in_both_directions() {
             },
         },
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::Composed".into(),
             params: Vec::new(),
@@ -12305,6 +12389,7 @@ fn arrow_effect_more_rows_use_one_canonical_form_in_both_directions() {
             }),
         },
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::Flat".into(),
             params: Vec::new(),
@@ -12416,6 +12501,7 @@ fn deep_equal_imported_types_unify_on_a_bounded_stack() {
             let mut dependency = effect_artifact("dep", "deep-equal");
             dependency.header.types = vec![
                 a::DeclaredType {
+                    exported: true,
                     metadata: Default::default(),
                     name: "dep@1.0.0::Wrap".into(),
                     params: vec![a::Parameter {
@@ -12432,18 +12518,21 @@ fn deep_equal_imported_types_unify_on_a_bounded_stack() {
                     },
                 },
                 a::DeclaredType {
+                    exported: true,
                     metadata: Default::default(),
                     name: "dep@1.0.0::A".into(),
                     params: Vec::new(),
                     scheme: artifact_scheme(deep(a::Type::Nat, a::Type::Nat)),
                 },
                 a::DeclaredType {
+                    exported: true,
                     metadata: Default::default(),
                     name: "dep@1.0.0::B".into(),
                     params: Vec::new(),
                     scheme: artifact_scheme(deep(a::Type::String, a::Type::Nat)),
                 },
                 a::DeclaredType {
+                    exported: true,
                     metadata: Default::default(),
                     name: "dep@1.0.0::C".into(),
                     params: Vec::new(),
@@ -12567,6 +12656,7 @@ fn deep_alias_reentry_shares_one_congruence_transaction() {
             };
             let mut dependency = effect_artifact("dep", "deep-alias-transaction");
             dependency.header.types.push(a::DeclaredType {
+                exported: true,
                 metadata: Default::default(),
                 name: "dep@1.0.0::Wrap".into(),
                 params: vec![a::Parameter {
@@ -12590,6 +12680,7 @@ fn deep_alias_reentry_shares_one_congruence_transaction() {
                         false => wrapped(format!("dep@1.0.0::{side}{}", index + 1)),
                     };
                     dependency.header.types.push(a::DeclaredType {
+                        exported: true,
                         metadata: Default::default(),
                         name: format!("dep@1.0.0::{side}{index}"),
                         params: Vec::new(),
@@ -12685,6 +12776,7 @@ fn recursive_imported_alias_reentry_compares_malformed_arities() {
     let mut dependency = effect_artifact("dep", "malformed-recursive-arity");
     dependency.header.types = vec![
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::A".into(),
             params: vec![parameter()],
@@ -12697,6 +12789,7 @@ fn recursive_imported_alias_reentry_compares_malformed_arities() {
             },
         },
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::B".into(),
             params: vec![parameter()],
@@ -12799,12 +12892,14 @@ fn deep_unequal_imported_struct_rows_unify_on_a_bounded_stack() {
                 let mut dependency = effect_artifact("dep", "deep-unequal-rows");
                 dependency.header.types = vec![
                     a::DeclaredType {
+                        exported: true,
                         metadata: Default::default(),
                         name: "dep@1.0.0::Expected".into(),
                         params: Vec::new(),
                         scheme: artifact_scheme(nested("bottom", a::Presence::Present, false)),
                     },
                     a::DeclaredType {
+                        exported: true,
                         metadata: Default::default(),
                         name: "dep@1.0.0::Actual".into(),
                         params: Vec::new(),
@@ -13020,6 +13115,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
     let mut dependency = effect_artifact("dep", "empty");
     dependency.header.types = vec![
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::Record".into(),
             params: Vec::new(),
@@ -13032,6 +13128,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
             )])),
         },
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::Fields".into(),
             params: vec![a::Parameter {
@@ -13051,6 +13148,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
             },
         },
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::IdentityRow".into(),
             params: vec![a::Parameter {
@@ -13067,6 +13165,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
             },
         },
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::ForwardRow".into(),
             params: vec![a::Parameter {
@@ -13086,6 +13185,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
             },
         },
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::Cases".into(),
             params: Vec::new(),
@@ -13095,6 +13195,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
             }))),
         },
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::MissingTail".into(),
             params: Vec::new(),
@@ -13104,12 +13205,14 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
             }))),
         },
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::Nat".into(),
             params: Vec::new(),
             scheme: artifact_scheme(artifact_type(a::Type::Nat)),
         },
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::More".into(),
             params: Vec::new(),
@@ -13128,6 +13231,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
             }))),
         },
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::Cycle".into(),
             params: Vec::new(),
@@ -13137,12 +13241,14 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
             })),
         },
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::Unknown".into(),
             params: Vec::new(),
             scheme: artifact_scheme(artifact_type(a::Type::Undecided)),
         },
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::Pass".into(),
             params: vec![a::Parameter {
@@ -13162,6 +13268,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
             },
         },
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::Box".into(),
             params: vec![a::Parameter {
@@ -13184,6 +13291,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
             },
         },
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::Alias".into(),
             params: Vec::new(),
@@ -13199,6 +13307,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
             })),
         },
         a::DeclaredType {
+            exported: true,
             metadata: Default::default(),
             name: "dep@1.0.0::Phantom".into(),
             params: vec![a::Parameter {
@@ -13288,6 +13397,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
 
     let mut dependency = effect_artifact("dep", "empty");
     dependency.header.types = vec![a::DeclaredType {
+        exported: true,
         metadata: Default::default(),
         name: "dep@1.0.0::Record".into(),
         params: Vec::new(),

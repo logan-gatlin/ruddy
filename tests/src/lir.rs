@@ -297,6 +297,7 @@ fn imported_forwarding_cycles_recover_before_lir_representation() {
                     values: Vec::new(),
                     types: vec![
                         a::DeclaredType {
+                            exported: true,
                             metadata: Default::default(),
                             name: "dep@1.0.0::A".into(),
                             params: Vec::new(),
@@ -312,6 +313,7 @@ fn imported_forwarding_cycles_recover_before_lir_representation() {
                             ),
                         },
                         a::DeclaredType {
+                            exported: true,
                             metadata: Default::default(),
                             name: "dep@1.0.0::Id".into(),
                             params: vec![a::Parameter {
@@ -1059,6 +1061,7 @@ fn imported_and_local_handler_arms_build_one_complete_evidence_record() {
             values: Vec::new(),
             types: Vec::new(),
             effects: vec![a::DeclaredEffect {
+                exported: true,
                 metadata: Default::default(),
                 name: "dep@1.0.0::Log".into(),
                 params: Vec::new(),

@@ -1419,6 +1419,8 @@ pub enum ErrorKind {
     /// A metadata value nested below [`METADATA_DEPTH_LIMIT`]. Reported at
     /// the value that crossed the line, which stands in as unit.
     MetadataTooDeep,
+    /// The compiler-interpreted privacy marker accepts only unit.
+    InvalidPrivateValue,
     /// A second case of a name in one sum, one effect row, or one alias — all
     /// three being a set of labels a name may appear in once.
     DuplicateCase {
@@ -9356,6 +9358,14 @@ impl Builder<'_> {
                 Some(data) => self.data(data, 1),
                 None => unit_data(key_at),
             };
+            if key.tracked == "private"
+                && !matches!(&value.anchored, DataKind::Struct(fields) if fields.is_empty())
+            {
+                self.errors.push(Error {
+                    at: value.at,
+                    kind: ErrorKind::InvalidPrivateValue,
+                });
+            }
             metadata.insert(key.tracked, Attribute { key_at, value });
         }
         metadata
@@ -9631,6 +9641,7 @@ impl Builder<'_> {
                         .header
                         .types
                         .iter()
+                        .filter(|value| value.exported)
                         .map(|value| (Namespace::Types, &value.name)),
                 )
                 .chain(
@@ -9638,6 +9649,7 @@ impl Builder<'_> {
                         .header
                         .effects
                         .iter()
+                        .filter(|value| value.exported)
                         .map(|value| (Namespace::Effects, &value.name)),
                 )
             {
