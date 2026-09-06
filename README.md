@@ -25,8 +25,10 @@ for executables and `artifact` for libraries. `artifact` writes the portable
 compiler artifact without running a backend; `js` writes both the artifact
 and Node.js ESM. A library targeting JS exports its values without calling
 an entry point. The optional `platform` names where the output runs, `node`
-(the default) or `web`; today it decides only what `@if` guards see and which
-cache entry a dependency gets.
+(the default) or `web`. It decides what `@if` guards see and which cache entry
+a dependency gets. A library builds for either platform; an executable for the
+web is refused until the JavaScript backend has a web entry adapter, since
+today's entry adapter writes to Node's streams and exits its process.
 
 Executables define `main`, callable with `()` and returning a value compatible
 with `()` (including a function that never returns). Its effects must be

@@ -498,6 +498,21 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
         if req.kind == ruddy::artifact::Kind::Library {
             return None;
         }
+        // What the command line refuses in the manifest: the entry adapter
+        // is Node's, so an executable for the web has no honest launch.
+        if output.platform == ruddy_cli::Platform::Web {
+            let mut diagnostic = raw(
+                "entry",
+                "platform-unsupported",
+                "an executable on the `web` platform is not supported yet".to_string(),
+                None,
+            );
+            diagnostic
+                .help
+                .push("choose the `node` platform, or make the document a library".to_string());
+            diagnostics.push(diagnostic);
+            return None;
+        }
         let dependencies: Vec<_> = linked_interfaces.iter().collect();
         let started = Instant::now();
         let out = guard("entry", &mut panicked, || {

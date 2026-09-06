@@ -3886,6 +3886,44 @@ fn a_manifests_platform_is_judged_by_guards_and_defaults_to_node() {
     assert!(error.contains("deno"), "{error}");
 }
 
+/// A web library is an ordinary JavaScript build, with nothing of Node in its
+/// output; a web executable is refused at the manifest, since the only entry
+/// adapter writes to Node's streams and exits its process.
+#[test]
+fn a_web_library_builds_and_a_web_executable_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    write_project(directory.path(), "web_lib", "1.0.0", &[]);
+    let manifest = fs::read_to_string(directory.path().join("Ruddy.toml")).unwrap();
+    fs::write(
+        directory.path().join("Ruddy.toml"),
+        manifest.replace("root =", "target = \"js\"\nplatform = \"web\"\nroot ="),
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("main.hc"),
+        "@if {platform: \"web\"} let value = 1n\nlet main = fn _ => ()\n",
+    )
+    .unwrap();
+    let artifact = build_project(directory.path()).expect("a web library builds");
+    let javascript = fs::read_to_string(artifact.with_extension("js")).unwrap();
+    assert!(javascript.contains("value"), "{javascript}");
+    assert!(!javascript.contains("process."), "{javascript}");
+
+    let app = directory.path().join("app");
+    executable_project(&app, "let main = fn _ => ()", Some("js"));
+    let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
+    fs::write(
+        app.join("Ruddy.toml"),
+        manifest.replace("root =", "platform = \"web\"\nroot ="),
+    )
+    .unwrap();
+    let error = build_project(&app).unwrap_err().to_string();
+    assert!(error.contains("platform-unsupported"), "{error}");
+    assert!(error.contains("`web` platform"), "{error}");
+    let error = check_project(&app).unwrap_err().to_string();
+    assert!(error.contains("platform-unsupported"), "{error}");
+}
+
 /// A dependency's guards are judged against the root build's target, not the
 /// library's own manifest, so a library can carry one definition per target
 /// and a JavaScript executable gets the JavaScript one.

@@ -135,6 +135,31 @@ fn guards_follow_the_documents_configured_target_and_platform() {
     assert!(undefined(&artifact), "{:?}", artifact.diagnostics);
 }
 
+/// The debugger says at its entry stage what the command line says at the
+/// manifest: an executable for the web has no launch adapter yet. A web
+/// library is unaffected.
+#[test]
+fn a_web_executable_is_refused_at_the_entry_stage() {
+    let request = |kind: &str| -> CompileRequest {
+        serde_json::from_value(serde_json::json!({
+            "name": "app", "version": "1.0.0", "kind": kind, "target": "js",
+            "platform": "web", "root": ROOT, "std": false,
+            "files": [{"path": ROOT, "source": "let main = fn _ => ()\n"}],
+        }))
+        .unwrap()
+    };
+    let executable = compile(&request("executable"), 0);
+    let refused = executable
+        .diagnostics
+        .iter()
+        .find(|error| error.code == "platform-unsupported")
+        .unwrap_or_else(|| panic!("{:?}", executable.diagnostics));
+    assert_eq!(refused.stage, "entry");
+    assert!(executable.panic.is_none());
+    let library = compile(&request("library"), 0);
+    assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+}
+
 #[test]
 fn library_artifact_targets_including_the_default_skip_backend_validation() {
     for target in [None, Some("artifact"), Some("js")] {

@@ -91,9 +91,11 @@ All are bundle-stage errors, recoverable: the definition is kept.
   let each root use its own manifest.
 - `cache::key` digests every fact alongside the sources and dependency keys.
 - The debugger's in-process dependency memo keys on the build too.
-- The backend and the Node entry check do not read the platform yet; a web
-  build still emits the Node runtime handlers. Making them platform-aware is
-  separate work.
+- The backend's entry adapter and epilogue are Node's, so an executable with
+  `platform = "web"` is refused where the manifest is read
+  (`platform-unsupported`), and the debugger reports the same at its entry
+  stage. A web library builds as any other: nothing a library emits touches
+  Node. A web entry adapter is separate work.
 
 ## Out of Scope
 

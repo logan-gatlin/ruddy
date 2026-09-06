@@ -883,9 +883,10 @@ impl Target {
 /// Where a build's output is loaded and run. Distinct from [`Target`], which
 /// is what the compiler emits: the same JavaScript runs under Node or in a
 /// browser, and what differs is the host — which externs exist, which effects
-/// the runtime handles. Today the platform decides only what `@if` guards see
-/// and which cache entry a dependency gets; the backend and the entry check
-/// do not yet read it.
+/// the runtime handles. The platform decides what `@if` guards see and which
+/// cache entry a dependency gets. A library builds for either; an executable
+/// is refused for the web until the backend has a web entry adapter, since
+/// today's adapter and epilogue are Node's.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Platform {
@@ -2437,6 +2438,21 @@ fn load_manifest(directory: &Path, sandbox: Option<&Path>) -> Result<Manifest, C
         .with_note(toml_error_note(&source, &error))
         .with_help("fix the named field in `Ruddy.toml` and try again")
     })?;
+    // The JavaScript backend's entry adapter and epilogue are Node's: they
+    // write to `process.stdout` and call `process.exit`. Until there is a web
+    // adapter, an executable for the web would be a Node program with the
+    // wrong label, so it is refused here, where every build begins.
+    if manifest.kind == Kind::Executable && manifest.platform() == Platform::Web {
+        return Err(CompileError::report(
+            "platform-unsupported",
+            format!(
+                "`{}` asks for an executable on the `web` platform, which is not supported yet",
+                path.display()
+            ),
+        )
+        .with_note("executables run under Node's entry adapter; a web library builds as any other")
+        .with_help("set `platform = \"node\"`, or make the project a library"));
+    }
     Ok(manifest)
 }
 
