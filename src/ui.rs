@@ -1197,6 +1197,7 @@ impl ir::ErrorKind {
     /// have to re-inspect the variant to tell them apart.
     pub fn code(&self) -> &'static str {
         match self {
+            ir::ErrorKind::ForeignProtocol { .. } => "foreign-protocol",
             ir::ErrorKind::ArrayInExtern => "array-in-extern",
             ir::ErrorKind::InvalidDependencyAlias { .. } => "invalid-dependency-alias",
             ir::ErrorKind::ExecutableDependency { .. } => "executable-dependency",
@@ -1293,6 +1294,7 @@ impl ir::Error {
         let code = self.kind.code();
         let span = source.span(self.at);
         match &self.kind {
+            E::ForeignProtocol { message } => Diagnostic::new(self.kind.code(), message.clone(), source.span(self.at)),
             E::ArrayInExtern => Diagnostic::new(
                 code,
                 "arrays cannot cross an extern boundary yet",

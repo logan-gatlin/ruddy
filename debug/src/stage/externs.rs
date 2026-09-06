@@ -48,6 +48,16 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                     crate::print::lir::rep(external.rep),
                 ));
             }
+            if let Some(protocol) = decl.metadata.get("ffi") {
+                node = node.child(
+                    Node::new(
+                        ids.next(),
+                        "Completion protocol",
+                        format!("{:?}", protocol.value.anchored),
+                    )
+                    .at(cx.source.span(protocol.key_at)),
+                );
+            }
             node.child(
                 Node::new(ids.next(), "Target", target).at(cx.source.span(decl.value.target.at)),
             )

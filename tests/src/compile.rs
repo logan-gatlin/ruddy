@@ -767,3 +767,64 @@ fn private_semantic_support_survives_transitive_public_aliases() {
     )
     .unwrap_or_else(|partial| panic!("{:#?}", partial.errors));
 }
+
+#[test]
+fn foreign_protocols_and_sync_export_eligibility_are_checked_during_compilation() {
+    let pure = accepted("@export \"sync\" let identity = fn n => n");
+    assert_eq!(
+        pure.artifact().lir().globals[0].callable,
+        Some(ruddy::lir::Suspension::Synchronous)
+    );
+    for source in [
+        "@export \"sync\" let apply = fn f => f ()",
+        "@ffi { completion: \"promise\" } extern wait : Nat -> Nat = \"host.wait\"\n@export \"sync\" let run = fn n => wait n",
+        "@ffi { completion: \"maybe\" } extern wait : Nat -> Nat = \"host.wait\"",
+        "@ffi { completion: \"promise\" } extern value : Nat = \"host.value\"",
+        "@ffi { parameters: [] } extern apply : fn(Nat) -> Nat = \"host.apply\"",
+        "@ffi { parameters: [{ callback: \"promise\" }] } extern apply : fn(Nat) -> Nat = \"host.apply\"",
+        "@ffi { unknown: true } extern wait : Nat -> Nat = \"host.wait\"",
+        "@export \"sometimes\" let identity = fn n => n",
+    ] {
+        let partial = rejected(source);
+        assert!(
+            codes(&partial).contains(&"foreign-protocol"),
+            "{source}: {partial:#?}"
+        );
+        assert!(
+            !partial.ir.errors[0]
+                .diagnostic(&partial.ir.source)
+                .title
+                .is_empty()
+        );
+    }
+    accepted("@export \"promise\" let identity = fn n => n");
+}
+
+#[test]
+fn imported_callable_summaries_control_sync_export_eligibility_before_linking() {
+    let source = "@export \"sync\" let run = fn n => dep::identity n";
+    let mut dependency = exported("let identity = fn n => n");
+    let persisted =
+        ruddy::artifact::Artifact::try_parse(&dependency.clone().validate().unwrap().print())
+            .unwrap();
+    let consumer = accepted_with(source, &persisted);
+    assert_eq!(
+        consumer.artifact().lir().globals[0].callable,
+        Some(ruddy::lir::Suspension::Synchronous)
+    );
+    // A valid producer can omit its callable proof. The consumer must
+    // remain conservative even though the imported function has an empty row.
+    dependency.lir.globals[0].callable = None;
+    let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
+    let partial = compile::compile_with_dependencies(
+        Mint::new(Bundle::new("app", Version::new(0, 1, 0)).unwrap()),
+        parsed.stmts,
+        &[compile::Dependency {
+            alias: Some("dep"),
+            artifact: compile::DependencyArtifact::Unchecked(&dependency),
+        }],
+        inference::Trace::Off,
+    )
+    .expect_err("missing imported proof is potentially suspending");
+    assert!(codes(&partial).contains(&"foreign-protocol"));
+}

@@ -16,17 +16,17 @@ const app = await import(pathToFileURL(generated).href);
 // strict deep equality compare fields alone.
 const fields = (record) => ({ ...record });
 
-test("annotated definitions compute what unannotated ones would", () => {
+test("annotated definitions compute what unannotated ones would", async () => {
   assert.equal(app.add(2)(3), 5);
   assert.deepEqual(fields(app.pair), { first: 3, second: "three" });
   assert.equal(app.left, 8);
   assert.equal(app.right, "hello");
-  assert.equal(app.Inline.doubled(21), 42);
+  assert.equal(await app.Inline.doubled(21), 42);
   assert.equal(app.Notes.greeting, "hello");
   assert.equal(app.quiet, 7);
 });
 
-test("metadata leaves no trace in the generated module", () => {
+test("metadata leaves no trace in the generated module", async () => {
   const exported = Object.keys(app).sort();
   assert.deepEqual(exported, [
     "Inline",

@@ -3877,7 +3877,7 @@ fn extern_values_reach_every_import_and_artifact_view() {
             artifact
                 .text
                 .as_deref()
-                .is_some_and(|text| text.contains("(target \"host.answer\")")),
+                .is_some_and(|text| text.contains(r#"\"target\":\"host.answer\""#)),
             "{id}: {:?}",
             artifact.text
         );

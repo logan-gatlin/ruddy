@@ -1,17 +1,6 @@
-//! Rendering the lowered instruction stream.
-//!
-//! Unlike [`ast`](super::ast) and [`ir`](super::ir), this prints no surface
-//! syntax: LIR has none, and never will. What it has is one canonical listing —
-//! a section per function and per global, one instruction per line as
-//! `%N: rep = op operands`, child blocks indented under the instruction that
-//! owns them, and terminators written bare. That listing lives here, in the
-//! debugger, for the reason every other printer does: turning a compiler
-//! structure into something a person reads is a debugging concern, and the
-//! compiler crate does not do it.
-//!
-//! The LIR tab and the tests both read this module, so there is one format
-//! rather than two that could drift. [`arms`] is why: the tree the tab builds
-//! and the text this file writes walk the same child blocks in the same order.
+//! Rendering portable CPS control flow. Functions have explicit identities,
+//! parameterized blocks, saved continuation environments and terminal transfers.
+//! Source spans remain on instructions and transfers for debugger navigation.
 
 use std::{collections::HashSet, fmt::Write};
 
@@ -61,9 +50,7 @@ impl Labels {
     }
 }
 
-/// How far one level of nesting indents. An arm label sits one level under its
-/// instruction and the arm's block one level under that, which is what makes a
-/// decision tree readable as a tree.
+/// Indentation between function, block and instruction rows.
 const STEP: usize = 2;
 
 /// The whole listing: imports, functions, then initialized globals, one blank
@@ -79,13 +66,16 @@ pub fn program(output: &Output, labels: &Labels) -> String {
         first = false;
         let _ = writeln!(out, "{}", extern_header(external));
     }
-    for function in &output.functions {
+    for (id, function) in output.functions.iter().enumerate() {
         if !first {
             out.push('\n');
         }
         first = false;
-        let _ = writeln!(out, "{}", signature(function));
-        block(output, labels, &function.body, STEP, &mut out);
+        let _ = writeln!(out, "{}", function_header(id, function));
+        for (id, body) in function.blocks.iter().enumerate() {
+            let _ = writeln!(out, "  {}", block_header(id, body));
+            block(output, labels, body, STEP * 2, &mut out);
+        }
     }
     for global in &output.globals {
         if !first {
@@ -93,7 +83,11 @@ pub fn program(output: &Output, labels: &Labels) -> String {
         }
         first = false;
         let _ = writeln!(out, "{}", header(global));
-        block(output, labels, &global.body, STEP, &mut out);
+        let _ = writeln!(
+            out,
+            "  initializer f{} ({})",
+            global.initializer, output.functions[global.initializer].name
+        );
     }
     out
 }
@@ -117,7 +111,23 @@ pub fn signature(function: &Function) -> String {
         .iter()
         .map(|param| format!("%{}: {}", param.temp, rep(param.rep)))
         .collect();
-    format!("fn {}({}):", function.name, params.join(", "))
+    format!(
+        "fn {}({}; %{}: cont) entry b{}:",
+        function.name,
+        params.join(", "),
+        function.continuation,
+        function.entry
+    )
+}
+
+/// A code-table identity and its independently compiled suspension summary.
+pub fn function_header(id: usize, function: &Function) -> String {
+    let signature = signature(function);
+    format!(
+        "{} [f{id}, {:?}]:",
+        signature.trim_end_matches(':'),
+        function.suspension
+    )
 }
 
 /// A global's header line.
@@ -125,9 +135,7 @@ pub fn header(global: &Global) -> String {
     format!("global {}:", global.name)
 }
 
-/// One instruction, without its child blocks: the temp it assigns, how that temp
-/// is held, and what it does. A block-valued instruction ends in the `:` its
-/// blocks hang under.
+/// One value instruction: its temporary, representation and operands.
 pub fn instruction(output: &Output, labels: &Labels, instr: &Instr) -> String {
     format!(
         "%{}: {} = {}",
@@ -161,17 +169,11 @@ pub fn opcode(op: &Op) -> &'static str {
         Op::NthBack { .. } => "nth_back",
         Op::Slice { .. } => "slice",
         Op::Closure { .. } => "closure",
-        Op::Call { .. } => "call",
-        Op::RawCall { .. } => "raw_call",
+        Op::Continuation { .. } => "continuation",
         Op::Extern { .. } => "extern",
         Op::Global { .. } => "global",
+        Op::Callback { .. } => "callback",
         Op::NewTag => "new_tag",
-        Op::Catch { .. } => "catch",
-        Op::SwitchTag { .. } => "switch_tag",
-        Op::SwitchPrim { .. } => "switch_prim",
-        Op::SwitchLen { .. } => "switch_len",
-        Op::SwitchPresence { .. } => "switch_presence",
-        Op::SwitchRest { .. } => "switch_rest",
     }
 }
 
@@ -189,79 +191,104 @@ pub fn rep(rep: Rep) -> &'static str {
         Rep::Sum => "sum",
         Rep::Fn => "fn",
         Rep::Any => "any",
+        Rep::Cont => "cont",
+        Rep::Handler => "handler",
     }
 }
 
 /// A terminator, written bare — a block ends with one and it assigns nothing.
-pub fn terminator(end: &Terminator) -> String {
+pub fn terminator(output: &Output, end: &Terminator) -> String {
     match &end.kind {
-        End::Ret(temp) => format!("ret %{temp}"),
-        End::Yield(temp) => format!("yield %{temp}"),
-        End::Throw { tag, value } => format!("throw %{tag}, %{value}"),
+        End::Continue {
+            continuation,
+            value,
+        } => format!("continue %{continuation}, %{value}"),
+        End::Jump(e) => format!("jump {}", edge(e)),
+        End::Branch { test, yes, no } => {
+            let (kind, on, value) = match test {
+                ruddy::lir::Test::Tag { on, name } => ("tag", on, super::label(Shape::Sum, name)),
+                ruddy::lir::Test::Literal { on, value } => ("prim", on, literal(value)),
+                ruddy::lir::Test::Presence { on, field } => ("presence", on, super::string(field)),
+                ruddy::lir::Test::Rest { on, fields } => ("rest", on, format!("{fields:?}")),
+                ruddy::lir::Test::Length { on, length } => ("len", on, length.to_string()),
+            };
+            format!(
+                "branch_{kind} %{on}, {value} => {}, otherwise {}",
+                edge(yes),
+                edge(no)
+            )
+        }
+        End::Call {
+            callee,
+            args,
+            continuation,
+        } => format!(
+            "call {}, {} -> %{continuation}{}",
+            match callee {
+                Callee::Direct(f) => output.functions[*f].name.clone(),
+                Callee::Indirect(t) => format!("%{t}"),
+            },
+            temps(args),
+            match callee {
+                Callee::Direct(f) => format!(" [f{f}]"),
+                _ => String::new(),
+            }
+        ),
+        End::RawCall {
+            callee,
+            args,
+            continuation,
+            completion,
+        } => format!(
+            "raw_call {completion:?} %{callee}, {} -> %{continuation}",
+            temps(args)
+        ),
+        End::Enter {
+            tag,
+            body,
+            continuation,
+        } => format!("enter %{tag}, {}, %{continuation}", edge(body)),
+        End::Leave { tag, value } => format!("leave %{tag}, %{value}"),
+        End::Abort { tag, value } => format!("abort %{tag}, %{value}"),
+        End::Unreachable => "unreachable".into(),
     }
 }
-
-/// Which of the three a terminator is, for the row that shows it.
+fn temps(values: &[u32]) -> String {
+    values
+        .iter()
+        .map(|v| format!("%{v}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+fn edge(e: &ruddy::lir::Edge) -> String {
+    format!("b{}({})", e.block, temps(&e.args))
+}
+pub fn block_header(id: usize, b: &Block) -> String {
+    format!(
+        "b{id}({}){}:",
+        b.params
+            .iter()
+            .map(|p| format!("%{}: {}", p.temp, rep(p.rep)))
+            .collect::<Vec<_>>()
+            .join(", "),
+        if b.result.is_some() {
+            " continuation"
+        } else {
+            ""
+        }
+    )
+}
 pub fn end_label(end: &Terminator) -> &'static str {
     match end.kind {
-        End::Ret(_) => "ret",
-        End::Yield(_) => "yield",
-        End::Throw { .. } => "throw",
-    }
-}
-
-/// The blocks one instruction owns, each with the answer that selects it — or
-/// `None` for a block nothing selects, which is a `catch`'s single body.
-///
-/// The one place the shape of a block-valued instruction is written down. The
-/// listing and the tab both walk it, so a new dispatch cannot reach one of them
-/// and not the other.
-pub fn arms(op: &Op) -> Vec<(Option<String>, &Block)> {
-    match op {
-        Op::Catch { body, .. } => vec![(None, body)],
-        Op::SwitchTag {
-            cases, fallback, ..
-        } => cases
-            .iter()
-            .map(|case| {
-                (
-                    Some(crate::print::label(Shape::Sum, &case.name)),
-                    &case.block,
-                )
-            })
-            .chain(
-                fallback
-                    .iter()
-                    .map(|block| (Some("else".to_string()), &**block)),
-            )
-            .collect(),
-        Op::SwitchPrim {
-            cases, fallback, ..
-        } => cases
-            .iter()
-            .map(|case| (Some(literal(&case.value)), &case.block))
-            .chain(
-                fallback
-                    .iter()
-                    .map(|block| (Some("else".to_string()), &**block)),
-            )
-            .collect(),
-        Op::SwitchPresence {
-            present, absent, ..
-        } => vec![
-            (Some("present".to_string()), &**present),
-            (Some("absent".to_string()), &**absent),
-        ],
-        Op::SwitchRest { none, some, .. } => vec![
-            (Some("none".to_string()), &**none),
-            (Some("some".to_string()), &**some),
-        ],
-        Op::SwitchLen { cases, beyond, .. } => cases
-            .iter()
-            .map(|case| (Some(case.len.to_string()), &case.block))
-            .chain(std::iter::once((Some("else".to_string()), &**beyond)))
-            .collect(),
-        _ => Vec::new(),
+        End::Continue { .. } => "continue",
+        End::Jump(_) => "jump",
+        End::Branch { .. } => "branch",
+        End::Call { .. } => "call",
+        End::RawCall { .. } => "raw_call",
+        End::Enter { .. } => "enter",
+        End::Leave { .. } => "leave",
+        End::Abort { .. } => "abort",
+        End::Unreachable => "unreachable",
     }
 }
 
@@ -275,21 +302,12 @@ fn block(output: &Output, labels: &Labels, block: &Block, indent: usize, out: &m
             instruction(output, labels, instr),
             indent = indent
         );
-        for (label, child) in arms(&instr.op) {
-            match label {
-                Some(label) => {
-                    let _ = writeln!(out, "{:indent$}{label} =>", "", indent = indent + STEP);
-                    self::block(output, labels, child, indent + STEP * 2, out);
-                }
-                None => self::block(output, labels, child, indent + STEP, out),
-            }
-        }
     }
     let _ = writeln!(
         out,
         "{:indent$}{}",
         "",
-        terminator(&block.end),
+        terminator(output, &block.end),
         indent = indent
     );
 }
@@ -370,39 +388,16 @@ fn operation(output: &Output, labels: &Labels, generated: bool, op: &Op) -> Stri
                 held.join(", ")
             )
         }
-        Op::Call { callee, args } => {
-            let callee = match callee {
-                Callee::Direct(func) => output.functions[*func].name.clone(),
-                Callee::Indirect(temp) => format!("%{temp}"),
-            };
-            let mut written = vec![callee];
-            written.extend(args.iter().map(|temp| format!("%{temp}")));
-            format!("call {}", written.join(", "))
-        }
-        Op::RawCall { callee, args } => {
-            let mut written = vec![format!("%{callee}")];
-            written.extend(args.iter().map(|temp| format!("%{temp}")));
-            format!("raw_call {}", written.join(", "))
-        }
+        Op::Continuation { code, captures } => format!(
+            "continuation {}:b{}, [{}] [f{}]",
+            output.functions[code.function].name,
+            code.block,
+            temps(captures),
+            code.function
+        ),
         Op::Extern { name, .. } => format!("extern {name}"),
         Op::Global { name, .. } => format!("global {name}"),
+        Op::Callback { value, mode } => format!("callback {mode:?} %{}", value),
         Op::NewTag => "new_tag".to_string(),
-        Op::Catch { tag, .. } => format!("catch %{tag}:"),
-        Op::SwitchTag { on, .. } => format!("switch_tag %{on}:"),
-        Op::SwitchPrim { on, .. } => format!("switch_prim %{on}:"),
-        Op::SwitchLen { on, .. } => format!("switch_len %{on}:"),
-        Op::SwitchPresence { on, field, .. } => {
-            format!(
-                "switch_presence %{on}, {:?}:",
-                labels.named(field, generated)
-            )
-        }
-        Op::SwitchRest { on, fields, .. } => {
-            let names: Vec<String> = fields
-                .iter()
-                .map(|name| format!("{:?}", labels.named(name, generated)))
-                .collect();
-            format!("switch_rest %{on}, [{}]:", names.join(", "))
-        }
     }
 }

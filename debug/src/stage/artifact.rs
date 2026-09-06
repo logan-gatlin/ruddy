@@ -149,11 +149,50 @@ pub fn render(spec: &Spec, cx: &Cx, artifact: &Artifact, micros: u64) -> Stage {
             ),
         ));
     }
-    for function in &artifact.lir().functions {
-        lowered.push(Node::new(ids.next(), "function", &function.name));
+    for (function_id, function) in artifact.lir().functions.iter().enumerate() {
+        let mut blocks = Vec::new();
+        for (block_id, block) in function.blocks.iter().enumerate() {
+            let mut instructions = Vec::new();
+            for instruction in &block.instrs {
+                instructions.push(Node::new(
+                    ids.next(),
+                    "value",
+                    format!(
+                        "%{}: {:?} = {:?}",
+                        instruction.temp, instruction.rep, instruction.op
+                    ),
+                ));
+            }
+            instructions.push(Node::new(
+                ids.next(),
+                "transfer",
+                format!("{:?}", block.end),
+            ));
+            blocks.push(
+                Node::new(ids.next(), "block", format!("f{function_id}:b{block_id}"))
+                    .field("parameters", format!("{:?}", block.params))
+                    .field("result", format!("{:?}", block.result))
+                    .children(instructions),
+            );
+        }
+        lowered.push(
+            Node::new(
+                ids.next(),
+                "function",
+                format!("f{function_id} {}", function.name),
+            )
+            .field("entry", format!("b{}", function.entry))
+            .field("suspension", format!("{:?}", function.suspension))
+            .children(blocks),
+        );
     }
     for global in &artifact.lir().globals {
-        lowered.push(Node::new(ids.next(), "global", &global.name));
+        lowered.push(
+            Node::new(ids.next(), "global", &global.name)
+                .field("initializer", format!("f{}", global.initializer))
+                .field("callable", format!("{:?}", global.callable))
+                .field("adapter", format!("{:?}", global.adapter)),
+        );
     }
     let lir = Node::new(
         ids.next(),

@@ -74,10 +74,14 @@ pub struct AcceptedProgram {
     inference: inference::Output,
     patterns: patterns::Output,
     externs: externs::ExternPlan,
+    imported_summaries: std::collections::HashMap<String, lir::Suspension>,
     artifact: artifact::Artifact,
 }
 
 impl AcceptedProgram {
+    pub(crate) fn imported_suspension(&self, name: &str) -> Option<lir::Suspension> {
+        self.imported_summaries.get(name).copied()
+    }
     pub fn mint(&self) -> &Mint {
         &self.mint
     }
@@ -122,9 +126,14 @@ pub fn compile(
     stmts: Vec<parse::Stmt>,
     trace: Trace,
 ) -> Result<AcceptedProgram, PartialCompilation> {
-    compile_with(mint, stmts, trace, Vec::new(), |mint, stmts| {
-        ir::build(mint, stmts)
-    })
+    compile_with(
+        mint,
+        stmts,
+        trace,
+        Vec::new(),
+        Default::default(),
+        ir::build,
+    )
 }
 
 /// Compile a parsed source bundle against one coherent dependency graph.
@@ -177,9 +186,19 @@ pub fn compile_with_dependencies(
         .iter()
         .map(|(artifact, _)| artifact.as_ref())
         .collect();
-    let mut result = compile_with(mint, stmts, trace, artifact_dependencies, |mint, stmts| {
-        ir::build_with_dependency_imports(mint, stmts, &imports, &linked)
-    });
+    let imported_summaries = linked
+        .iter()
+        .flat_map(|artifact| &artifact.lir().globals)
+        .filter_map(|g| g.callable.map(|s| (g.name.clone(), s)))
+        .collect();
+    let mut result = compile_with(
+        mint,
+        stmts,
+        trace,
+        artifact_dependencies,
+        imported_summaries,
+        |mint, stmts| ir::build_with_dependency_imports(mint, stmts, &imports, &linked),
+    );
     match &mut result {
         Ok(accepted) => accepted.inference.publish_recovery_facts(facts),
         Err(partial) => partial.inference.publish_recovery_facts(facts),
@@ -193,14 +212,30 @@ fn compile_with(
     stmts: Vec<parse::Stmt>,
     trace: Trace,
     artifact_dependencies: Vec<artifact::Dependency>,
+    imported_summaries: std::collections::HashMap<String, lir::Suspension>,
     build: impl FnOnce(&mut Mint, Vec<parse::Stmt>) -> ir::Output,
 ) -> Result<AcceptedProgram, PartialCompilation> {
     let mut ir = build(&mut mint, stmts);
+    ir.errors.extend(
+        ir.program
+            .externs
+            .values()
+            .filter_map(|declaration| externs::protocol(&declaration.metadata).err()),
+    );
+    ir.errors.extend(
+        ir.program
+            .terms
+            .values()
+            .filter_map(|declaration| externs::export_request(&declaration.metadata).err()),
+    );
     let inference = inference::infer(&mint, &ir.program, trace);
     // Inference reads the program and answers with typed copies of its
     // declarations; the program every later phase reads is the one with
     // those written in.
     inference.apply_types(&mut ir.program);
+    if inference.errors().is_empty() {
+        ir.errors.extend(externs::review(inference.semantics()));
+    }
     let patterns = patterns::check(&ir.program, &inference);
     let mut errors = Vec::new();
     errors.extend(ir.errors.iter().cloned().map(Error::Ir));
@@ -226,8 +261,21 @@ fn compile_with(
         inference,
         patterns,
         externs,
+        imported_summaries,
         artifact: artifact::empty(),
     };
-    accepted.artifact = artifact::build_with_dependencies(&accepted, artifact_dependencies);
+    let lowered = accepted.lower();
+    let errors = externs::check_exports(&accepted, &lowered);
+    if !errors.is_empty() {
+        accepted.ir.errors.extend(errors.clone());
+        return Err(PartialCompilation {
+            mint: accepted.mint,
+            ir: accepted.ir,
+            inference: accepted.inference,
+            patterns: accepted.patterns,
+            errors: errors.into_iter().map(Error::Ir).collect(),
+        });
+    }
+    accepted.artifact = artifact::build_lowered(&accepted, artifact_dependencies, &lowered);
     Ok(accepted)
 }

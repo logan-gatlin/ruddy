@@ -22,59 +22,59 @@ const seeded = (seed) => () => {
 };
 
 const build = (values) => values.reduce((arr, value) => app.push(arr)(value), app.empty);
-const contents = (arr) => {
+const contents = async (arr) => {
   const out = [];
-  for (let i = 0; i < app.len(arr); i += 1) out.push(app.get_or(arr)(i)(-1));
+  for (let i = 0; i < app.len(arr); i += 1) out.push(await app.get_or(arr)(i)(-1));
   return out;
 };
-const same = (arr, model, what) => {
+const same = async (arr, model, what) => {
   assert.equal(app.len(arr), model.length, `${what}: length`);
-  assert.deepEqual(contents(arr), model, `${what}: contents`);
-  assert.equal(app.get_or(arr)(model.length)(-1), -1, `${what}: past the end`);
+  assert.deepEqual(await contents(arr), model, `${what}: contents`);
+  assert.equal(await app.get_or(arr)(model.length)(-1), -1, `${what}: past the end`);
 };
 
-test("pushes across the leaf and node boundaries", () => {
+test("pushes across the leaf and node boundaries", async () => {
   const model = [];
   let arr = app.empty;
   for (let i = 0; i < 33 * 33 + 5; i += 1) {
     model.push(i);
     arr = app.push(arr)(i);
-    if ([31, 32, 33, 1023, 1024, 1025, 1088, 1089].includes(i)) same(arr, model, `after push ${i}`);
+    if ([31, 32, 33, 1023, 1024, 1025, 1088, 1089].includes(i)) await same(arr, model, `after push ${i}`);
   }
-  same(arr, model, "after every push");
+  await same(arr, model, "after every push");
 });
 
-test("sets, slices, prepends and pops agree with a plain array", () => {
+test("sets, slices, prepends and pops agree with a plain array", async () => {
   const random = seeded(20260904);
   const pick = (n) => Math.floor(random() * n);
   let model = Array.from({ length: 1100 }, (_, i) => i);
   let arr = build(model);
-  same(arr, model, "the start");
+  await same(arr, model, "the start");
   for (let step = 0; step < 300; step += 1) {
     const choice = pick(6);
     if (choice === 0 && model.length > 0) {
       const i = pick(model.length);
       const value = 100000 + step;
-      const before = contents(arr);
-      arr = app.set_or(arr)(i)(value);
+      const before = await contents(arr);
+      arr = await app.set_or(arr)(i)(value);
       model = model.slice();
       model[i] = value;
       assert.equal(before[i] !== value, true, "set leaves the original alone");
     } else if (choice === 1) {
       const from = pick(model.length + 1);
       const to = from + pick(model.length - from + 1);
-      assert.equal(app.slice_ok(arr)(from)(to), true);
-      arr = app.slice_or(arr)(from)(to);
+      assert.equal(await app.slice_ok(arr)(from)(to), true);
+      arr = await app.slice_or(arr)(from)(to);
       model = model.slice(from, to);
     } else if (choice === 2) {
       const value = 200000 + step;
       arr = app.prepend(arr)(value);
       model = [value, ...model];
     } else if (choice === 3) {
-      assert.equal(app.pop_ok(arr), model.length > 0);
+      assert.equal(await app.pop_ok(arr), model.length > 0);
       if (model.length > 0) {
-        assert.equal(app.pop_last(arr)(-1), model[model.length - 1]);
-        arr = app.pop_rest(arr);
+        assert.equal(await app.pop_last(arr)(-1), model[model.length - 1]);
+        arr = await app.pop_rest(arr);
         model = model.slice(0, -1);
       }
     } else if (choice === 4) {
@@ -86,11 +86,11 @@ test("sets, slices, prepends and pops agree with a plain array", () => {
       arr = app.push(arr)(value);
       model = [...model, value];
     }
-    same(arr, model, `step ${step} (choice ${choice})`);
+    await same(arr, model, `step ${step} (choice ${choice})`);
   }
 });
 
-test("concatenation of uneven pieces stays correct and balanced", () => {
+test("concatenation of uneven pieces stays correct and balanced", async () => {
   const random = seeded(7);
   const pick = (n) => Math.floor(random() * n);
   const whole = Array.from({ length: 4000 }, (_, i) => i);
@@ -102,50 +102,50 @@ test("concatenation of uneven pieces stays correct and balanced", () => {
   for (let round = 0; round < 40; round += 1) {
     const from = pick(whole.length);
     const to = from + pick(Math.min(900, whole.length - from) + 1);
-    const piece = app.slice_or(base)(from)(to);
-    same(piece, whole.slice(from, to), `piece ${round}`);
+    const piece = await app.slice_or(base)(from)(to);
+    await same(piece, whole.slice(from, to), `piece ${round}`);
     arr = round % 2 === 0 ? app.concat(arr)(piece) : app.concat(piece)(arr);
     model = round % 2 === 0 ? [...model, ...whole.slice(from, to)] : [...whole.slice(from, to), ...model];
-    same(arr, model, `join ${round}`);
+    await same(arr, model, `join ${round}`);
   }
   // Everything still works after the joins: sets and pushes at the far end.
-  arr = app.set_or(arr)(0)(-7);
+  arr = await app.set_or(arr)(0)(-7);
   model[0] = -7;
   arr = app.push(arr)(-8);
   model.push(-8);
-  same(arr, model, "after the joins");
+  await same(arr, model, "after the joins");
 });
 
-test("slice rejects a backwards or overlong range and accepts the ends", () => {
+test("slice rejects a backwards or overlong range and accepts the ends", async () => {
   const arr = build([1, 2, 3]);
-  assert.equal(app.slice_ok(arr)(2)(1), false);
-  assert.equal(app.slice_ok(arr)(0)(4), false);
-  assert.equal(app.slice_ok(arr)(3)(3), true);
-  assert.deepEqual(contents(app.slice_or(arr)(3)(3)), []);
-  assert.deepEqual(contents(app.slice_or(arr)(0)(3)), [1, 2, 3]);
-  assert.equal(app.pop_ok(app.empty), false);
-  assert.deepEqual(contents(app.prepend(app.empty)(9)), [9]);
-  assert.deepEqual(contents(app.concat(app.empty)(arr)), [1, 2, 3]);
-  assert.deepEqual(contents(app.concat(arr)(app.empty)), [1, 2, 3]);
+  assert.equal(await app.slice_ok(arr)(2)(1), false);
+  assert.equal(await app.slice_ok(arr)(0)(4), false);
+  assert.equal(await app.slice_ok(arr)(3)(3), true);
+  assert.deepEqual(await contents(await app.slice_or(arr)(3)(3)), []);
+  assert.deepEqual(await contents(await app.slice_or(arr)(0)(3)), [1, 2, 3]);
+  assert.equal(await app.pop_ok(app.empty), false);
+  assert.deepEqual(await contents(app.prepend(app.empty)(9)), [9]);
+  assert.deepEqual(await contents(app.concat(app.empty)(arr)), [1, 2, 3]);
+  assert.deepEqual(await contents(app.concat(arr)(app.empty)), [1, 2, 3]);
 });
 
-test("array patterns take arrays apart from either end", () => {
+test("array patterns take arrays apart from either end", async () => {
   const values = (n) => build(Array.from({ length: n }, (_, i) => i));
-  assert.equal(app.count(app.empty), 0);
-  assert.equal(app.count(values(1)), 1);
-  assert.equal(app.count(values(100)), 100);
+  assert.equal(await app.count(app.empty), 0);
+  assert.equal(await app.count(values(1)), 1);
+  assert.equal(await app.count(values(100)), 100);
   assert.equal(app.last_or(app.empty)(-1), -1);
   assert.equal(app.last_or(values(5))(-1), 4);
-  assert.deepEqual(contents(app.ends(values(5))), [0, 4]);
-  assert.deepEqual(contents(app.ends(values(2))), [0, 1]);
-  assert.deepEqual(contents(app.ends(values(1))), []);
-  assert.deepEqual(contents(app.init_of(values(5))), [0, 1, 2, 3]);
-  assert.deepEqual(contents(app.init_of(values(1))), []);
-  assert.deepEqual(contents(app.init_of(app.empty)), []);
-  assert.deepEqual(contents(app.init_of(values(40))), Array.from({ length: 39 }, (_, i) => i));
-  assert.deepEqual(contents(app.middle(values(5))), [1, 2, 3]);
-  assert.deepEqual(contents(app.middle(values(2))), []);
-  assert.deepEqual(contents(app.middle(values(1))), []);
+  assert.deepEqual(await contents(app.ends(values(5))), [0, 4]);
+  assert.deepEqual(await contents(app.ends(values(2))), [0, 1]);
+  assert.deepEqual(await contents(app.ends(values(1))), []);
+  assert.deepEqual(await contents(app.init_of(values(5))), [0, 1, 2, 3]);
+  assert.deepEqual(await contents(app.init_of(values(1))), []);
+  assert.deepEqual(await contents(app.init_of(app.empty)), []);
+  assert.deepEqual(await contents(app.init_of(values(40))), Array.from({ length: 39 }, (_, i) => i));
+  assert.deepEqual(await contents(app.middle(values(5))), [1, 2, 3]);
+  assert.deepEqual(await contents(app.middle(values(2))), []);
+  assert.deepEqual(await contents(app.middle(values(1))), []);
   assert.equal(app.describe(app.empty), "empty");
   assert.equal(app.describe(build([0])), "zero");
   assert.equal(app.describe(build([1])), "one");
@@ -153,15 +153,15 @@ test("array patterns take arrays apart from either end", () => {
   assert.equal(app.describe(build([0, 1])), "many");
   assert.equal(app.describe(build([3, 0, 0])), "many");
   // A rest bound past the tail boundary is the slice it names.
-  assert.deepEqual(contents(app.middle(values(70))), Array.from({ length: 68 }, (_, i) => i + 1));
+  assert.deepEqual(await contents(app.middle(values(70))), Array.from({ length: 68 }, (_, i) => i + 1));
 });
 
-test("spreads join arrays in place", () => {
+test("spreads join arrays in place", async () => {
   const values = (n) => build(Array.from({ length: n }, (_, i) => i));
-  assert.deepEqual(contents(app.wrap(values(3))), [0, 1, 2, 0, 1, 2]);
-  assert.deepEqual(contents(app.around(values(2))(9)), [9, 0, 1, 9]);
-  assert.deepEqual(contents(app.around(app.empty)(9)), [9, 9]);
-  assert.deepEqual(contents(app.copy(values(40))), Array.from({ length: 40 }, (_, i) => i));
-  assert.deepEqual(contents(app.none(values(2))), [0, 1]);
-  assert.deepEqual(contents(app.wrap(values(1000))).length, 2000);
+  assert.deepEqual(await contents(app.wrap(values(3))), [0, 1, 2, 0, 1, 2]);
+  assert.deepEqual(await contents(app.around(values(2))(9)), [9, 0, 1, 9]);
+  assert.deepEqual(await contents(app.around(app.empty)(9)), [9, 9]);
+  assert.deepEqual(await contents(app.copy(values(40))), Array.from({ length: 40 }, (_, i) => i));
+  assert.deepEqual(await contents(app.none(values(2))), [0, 1]);
+  assert.deepEqual((await contents(app.wrap(values(1000)))).length, 2000);
 });

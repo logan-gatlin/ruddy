@@ -178,6 +178,7 @@ pub struct EffectAliasRow {
 /// reviewed.
 #[derive(Debug, Clone)]
 pub(crate) struct ReviewedExtern {
+    pub(crate) protocol: Option<crate::externs::Protocol>,
     pub(crate) scheme: Scheme,
     pub(crate) abi: ir::ExternType,
     pub(crate) target: String,
@@ -7193,6 +7194,9 @@ fn assemble(
             (
                 *symbol,
                 ReviewedExtern {
+                    protocol: crate::externs::protocol(&declaration.metadata)
+                        .ok()
+                        .flatten(),
                     scheme: externs[symbol].clone(),
                     abi: declaration.value.abi.clone(),
                     target: declaration.value.target.anchored.clone(),

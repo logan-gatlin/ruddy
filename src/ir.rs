@@ -1374,6 +1374,10 @@ pub struct Error {
 
 #[derive(Debug, Clone)]
 pub enum ErrorKind {
+    /// Invalid or inapplicable foreign completion metadata.
+    ForeignProtocol {
+        message: String,
+    },
     /// Executables provide a launch root and cannot be imported as libraries.
     ExecutableDependency {
         name: String,

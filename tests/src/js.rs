@@ -22,7 +22,11 @@ fn retag_numeric_global(
         .iter_mut()
         .find(|global| global.name.ends_with(&format!("::{name}")))
         .unwrap_or_else(|| panic!("no global named {name}"));
-    for instr in &mut global.body.instrs {
+    for instr in artifact.lir.functions[global.initializer as usize]
+        .blocks
+        .iter_mut()
+        .flat_map(|b| &mut b.instrs)
+    {
         if instr.rep == artifact::Rep::Real {
             instr.rep = rep;
         }
@@ -44,7 +48,9 @@ fn split_record_into_merge(artifact: &mut artifact::UncheckedArtifact, name: &st
         .iter_mut()
         .find(|global| global.name.ends_with(&format!("::{name}")))
         .unwrap_or_else(|| panic!("no global named {name}"));
-    let combined = global.body.instrs.pop().expect("record constructor");
+    let function = &mut artifact.lir.functions[global.initializer as usize];
+    let body = &mut function.blocks[function.entry as usize];
+    let combined = body.instrs.pop().expect("record constructor");
     let artifact::Op::Struct(fields) = &combined.op else {
         panic!("{name} does not end in a record")
     };
@@ -53,22 +59,25 @@ fn split_record_into_merge(artifact: &mut artifact::UncheckedArtifact, name: &st
     let left_temp = combined.temp;
     let right_temp = left_temp + 1;
     let merged_temp = left_temp + 2;
-    global.body.instrs.push(artifact::Instr {
+    body.instrs.push(artifact::Instr {
         temp: left_temp,
         rep: artifact::Rep::Struct,
         op: artifact::Op::Struct(vec![fields[0].clone()]),
     });
-    global.body.instrs.push(artifact::Instr {
+    body.instrs.push(artifact::Instr {
         temp: right_temp,
         rep: artifact::Rep::Struct,
         op: artifact::Op::Struct(vec![fields[1].clone()]),
     });
-    global.body.instrs.push(artifact::Instr {
+    body.instrs.push(artifact::Instr {
         temp: merged_temp,
         rep: artifact::Rep::Struct,
         op: artifact::Op::Merge(vec![left_temp, right_temp]),
     });
-    global.body.end = artifact::End::Ret(merged_temp);
+    let artifact::End::Continue { value, .. } = &mut body.end else {
+        panic!("record initializer must return")
+    };
+    *value = merged_temp;
 }
 
 fn retag_primitive_cases(
@@ -76,32 +85,40 @@ fn retag_primitive_cases(
     name: &str,
     rep: artifact::Rep,
 ) {
-    let function = artifact
+    for function in artifact
         .lir
         .functions
         .iter_mut()
-        .find(|function| function.name.contains(name))
-        .unwrap_or_else(|| panic!("no function named {name}"));
-    function.params[0].rep = rep;
-    let cases = function
-        .body
-        .instrs
-        .iter_mut()
-        .find_map(|instr| match &mut instr.op {
-            artifact::Op::SwitchPrim { cases, .. } => Some(cases),
-            _ => None,
-        })
-        .unwrap_or_else(|| panic!("{name} has no primitive switch"));
-    for case in cases {
-        let artifact::Literal::Real(bits) = case.value else {
-            panic!("{name} has a non-real source case")
-        };
-        let value = f64::from_bits(bits);
-        case.value = match rep {
-            artifact::Rep::Nat => artifact::Literal::Natural(value as u64),
-            artifact::Rep::Int => artifact::Literal::Integer(value as i64),
-            _ => panic!("primitive retag requires an integer representation"),
-        };
+        .filter(|f| f.name.contains(name) && !f.params.is_empty())
+    {
+        for param in &mut function.params {
+            if param.rep == artifact::Rep::Real {
+                param.rep = rep;
+            }
+        }
+        let input = function.params[0].temp;
+        for block in &mut function.blocks {
+            for param in &mut block.params {
+                if param.temp == input {
+                    param.rep = rep;
+                }
+            }
+            if let artifact::End::Branch {
+                test: artifact::Test::Literal { value, .. },
+                ..
+            } = &mut block.end
+            {
+                let artifact::Literal::Real(bits) = value else {
+                    panic!("expected a real case")
+                };
+                let number = f64::from_bits(*bits);
+                *value = match rep {
+                    artifact::Rep::Nat => artifact::Literal::Natural(number as u64),
+                    artifact::Rep::Int => artifact::Literal::Integer(number as i64),
+                    _ => panic!("primitive retag requires an integer representation"),
+                };
+            }
+        }
     }
 }
 
@@ -156,7 +173,7 @@ fn generated_module_executes_values_functions_records_and_sums_in_node() {
     fs::write(&path, module).unwrap();
 
     let probe = format!(
-        "import * as app from {}; console.log(JSON.stringify([app.answer, app.apply(app.identity)(2), app.record.value, typeof app.tagged]));",
+        "import * as app from {}; console.log(JSON.stringify([app.answer, await app.apply(app.identity)(2), app.record.value, typeof app.tagged]));",
         serde_json::to_string(path.to_str().unwrap()).unwrap()
     );
     let output = Command::new("node")
@@ -303,7 +320,7 @@ fn generated_runtime_preserves_arithmetic_switch_record_effect_and_literal_seman
     );
     fs::write(&path, module).unwrap();
     let probe = format!(
-        "const app = await import({}); const values = [app.nat_sub, app.int_div, Object.is(app.int_negative_zero, -0), Number.isFinite(app.real_div), app.real_literal, app.classify_nat(-0), app.classify_nat(7), app.classify_int(app.int_negative_zero), app.classify_real(0), app.classify_real(-0), app.payload, app.tag_fallback, app.shape({{x: 4}}), app.shape({{x: 4, y: 5}}), app.shape({{y: 5}}), app.merged.left + app.merged.right, app.bump(4), app.read(null), app.calculated(4), app.asked(4)]; console.log(JSON.stringify(values));",
+        "const app = await import({}); const values = [app.nat_sub, app.int_div, Object.is(app.int_negative_zero, -0), Number.isFinite(app.real_div), app.real_literal, app.classify_nat(-0), app.classify_nat(7), app.classify_int(app.int_negative_zero), app.classify_real(0), app.classify_real(-0), app.payload, app.tag_fallback, app.shape({{x: 4}}), app.shape({{x: 4, y: 5}}), app.shape({{y: 5}}), app.merged.left + app.merged.right, await app.bump(4), await app.read(null), await app.calculated(4), await app.asked(4)]; console.log(JSON.stringify(values));",
         serde_json::to_string(path.to_str().unwrap()).unwrap()
     );
     let output = Command::new("node")
@@ -348,7 +365,8 @@ fn generation_rejects_unlinked_and_internally_inconsistent_artifacts() {
     );
 
     let mut bad_global = compiled("let value = 1n").to_unchecked();
-    bad_global.lir.globals[0].body.instrs[0].op = artifact::Op::Global {
+    bad_global.lir.functions[bad_global.lir.globals[0].initializer as usize].blocks[0].instrs[0]
+        .op = artifact::Op::Global {
         target: "unknown@1.0.0::value".to_string(),
     };
     let bad_global = bad_global
@@ -362,10 +380,10 @@ fn generation_rejects_unlinked_and_internally_inconsistent_artifacts() {
     );
 
     let mut bad_function = compiled("let identity = fn x => x").to_unchecked();
-    let closure = bad_function.lir.globals[0]
-        .body
-        .instrs
+    let closure = bad_function.lir.functions[bad_function.lir.globals[0].initializer as usize]
+        .blocks
         .iter_mut()
+        .flat_map(|b| &mut b.instrs)
         .find(|instr| matches!(instr.op, artifact::Op::Closure { .. }))
         .unwrap();
     closure.op = artifact::Op::Closure {

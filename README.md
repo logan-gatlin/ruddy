@@ -114,6 +114,11 @@ that is not a string is refused.
 @if {target: "artifact"} let now = fn _ => 0n
 ```
 
+`@ffi` declares foreign completion and callback protocols. `@export "sync"`
+and `@export "promise"` select fixed JavaScript export contracts. Ruddy code
+uses the same function types for immediate and delayed completion; see
+[CPS execution and foreign completion](docs/cps.md) for the boundary contracts.
+
 All other metadata keys remain uninterpreted.
 
 Immutable homogeneous arrays use `[value, ...]` literals and `[Type]` types.

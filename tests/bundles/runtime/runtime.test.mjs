@@ -58,10 +58,10 @@ globalThis.host = {
 
 const app = await import(pathToFileURL(generated).href);
 
-test("exports values, closures, and file-backed modules", () => {
+test("exports values, closures, and file-backed modules", async () => {
   assert.equal(app.answer, 42);
   assert.equal(app.identity("value"), "value");
-  assert.equal(app.apply(app.identity)(7), 7);
+  assert.equal(await app.apply(app.identity)(7), 7);
   assert.equal(app.captured(20)(22), 42);
   assert.equal(app.Math.answer, 42);
   assert.equal(app.Math.identity(false), false);
@@ -69,7 +69,7 @@ test("exports values, closures, and file-backed modules", () => {
   assert.ok(Object.isFrozen(app.Math));
 });
 
-test("preserves records and pattern matching", () => {
+test("preserves records and pattern matching", async () => {
   assert.equal(Object.getPrototypeOf(app.record), null);
   assert.deepEqual({ ...app.record }, { answer: 42, ready: true });
   assert.equal(app.classify_record(app.record), 42);
@@ -78,15 +78,15 @@ test("preserves records and pattern matching", () => {
   assert.equal(app.read_tag({}), 0);
 });
 
-test("runs effects and binds raw and marked extern adapters to their receiver", () => {
-  assert.equal(app.bump(41), 42);
+test("runs effects and binds raw and marked extern adapters to their receiver", async () => {
+  assert.equal(await app.bump(41), 42);
   assert.equal(app.next(2), 42);
   // `add` has a generated n-ary `#extern` adapter, unlike the raw unary `next`.
   assert.equal(app.added, 62);
   assert.equal(app.add_twenty(2), 62);
 });
 
-test("adapts n-ary, nullary, curried, callback, and returned extern functions", () => {
+test("adapts n-ary, nullary, curried, callback, and returned extern functions", async () => {
   assert.equal(app.nullary_answer, 42);
   assert.equal(app.curried_answer, 42);
   assert.equal(app.callback_answer, 42);

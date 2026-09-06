@@ -774,38 +774,28 @@ fn the_lir_tab_renders_the_listing_as_a_tree() {
         "lir",
         "let f = fn a => match a with | #A n => n | b => 0n end",
     );
-    let roots: Vec<(&str, &str)> = nodes
-        .iter()
-        .map(|node| (node.label.as_str(), node.text.as_str()))
-        .collect();
     assert_eq!(
-        roots,
-        [
-            ("global", "global f:"),
-            ("fn", "fn f(%0: sum):"),
-            ("fn", "fn f#1(%4: sum):"),
-        ],
-        "{nodes:#?}"
+        nodes.iter().map(|n| n.label.as_str()).collect::<Vec<_>>(),
+        ["global", "fn", "fn", "fn"]
     );
-
-    // The dispatch owns its cases, and each case owns the block it selects.
-    let switch = &nodes[1].children[0];
-    assert_eq!(switch.label, "switch_tag");
-    assert_eq!(switch.text, "%3: nat = switch_tag %0:");
-    let cases: Vec<&str> = switch
-        .children
+    assert_eq!(nodes[0].text, "global f:");
+    assert_eq!(nodes[0].children[0].text, "f2");
+    assert!(nodes[1].text.starts_with("fn f(%0: sum;"));
+    assert!(nodes[1].text.contains("[f0, Synchronous]"));
+    assert!(nodes[3].text.starts_with("fn f#init("));
+    assert!(nodes[1].children.iter().all(|node| node.label == "block"));
+    let rows = flatten(&nodes[1].children);
+    let branch = rows
         .iter()
-        .map(|node| node.text.as_str())
-        .collect();
-    assert_eq!(cases, ["#A =>", "else =>"], "{switch:#?}");
-    let inside: Vec<(&str, &str)> = switch.children[0]
-        .children
-        .iter()
-        .map(|node| (node.label.as_str(), node.text.as_str()))
-        .collect();
-    assert_eq!(
-        inside,
-        [("payload", "%1: nat = payload %0"), ("yield", "yield %1")]
+        .find(|n| n.label == "branch")
+        .expect("tag branch");
+    assert!(branch.text.contains("#A => b"), "{branch:?}");
+    assert!(branch.text.contains("otherwise b"), "{branch:?}");
+    let payload = rows.iter().find(|n| n.label == "payload").expect("payload");
+    assert_eq!(payload.text, "%1: nat = payload %0");
+    assert!(
+        rows.iter()
+            .any(|n| n.label == "continue" && n.text.ends_with(", %1"))
     );
 
     // A row the source wrote points back at it, so the tab and the editor
@@ -864,7 +854,8 @@ fn quoted_sum_labels_and_separator_fields_reach_the_debugger_tabs() {
         "{lir:#?}"
     );
     assert!(
-        lir.iter().any(|node| node.text == "#\"case name\" =>"),
+        lir.iter()
+            .any(|node| node.text.contains("#\"case name\" => b")),
         "{lir:#?}"
     );
 }
@@ -899,7 +890,7 @@ fn the_lir_tab_marks_the_evidence_it_plumbs_as_generated() {
 
     // The `handle` itself is the reader's, and so is the perform inside the
     // function the evidence reaches.
-    let caught = row("= catch %");
+    let caught = row("enter %");
     assert!(!caught.generated, "{caught:#?}");
     assert!(caught.span.is_some(), "{caught:#?}");
 }
@@ -937,7 +928,7 @@ fn the_lir_tab_skips_a_program_with_errors() {
 
     let ok = stage("let f = fn a => a\n");
     assert_eq!(ok.status, Status::Ok);
-    assert_eq!(ok.summary, "1 global · 2 functions");
+    assert_eq!(ok.summary, "1 global · 3 functions");
 
     // A type error, which is one the earlier phases all survive: the program is
     // built and inferred, and lowering still stands aside.
@@ -1152,7 +1143,7 @@ fn the_artifact_tab_exposes_canonical_text_and_skips_with_errors() {
     assert_eq!(effect.children[0].text, "fields");
     assert_eq!(effect.children[1].label, "selector");
     let text = unnamed.text.as_deref().expect("canonical artifact text");
-    assert!(text.contains("(field-key unnamed-operation)"), "{text}");
+    assert!(text.contains("UnnamedOperation"), "{text}");
     assert!(!text.contains("ruddy:unnamed-operation"), "{text}");
     assert!(!unnamed.debug.contains("ruddy:unnamed-operation"));
     let lowered = stage("lir", source);
@@ -1601,4 +1592,46 @@ fn metadata_is_shown_across_the_debugger_tabs() {
             .all(|node| node.children.iter().all(|child| child.label == "metadata")),
         "{header:#?}"
     );
+}
+
+#[test]
+fn cps_debugger_views_expose_suspension_saved_environments_and_protocols() {
+    let source = "@ffi { completion: \"promise\" } extern wait : Real -> Real = \"host.wait\"\nlet run = fn n => n + wait n";
+    let externs = tab("externs", source);
+    assert!(
+        flatten(&externs)
+            .iter()
+            .any(|n| n.label == "Completion protocol"
+                && n.text.contains("promise")
+                && n.span.is_some())
+    );
+    let lir = tab("lir", source);
+    let rows = flatten(&lir);
+    assert!(
+        rows.iter()
+            .any(|n| n.label == "fn" && n.text.contains("MaySuspend"))
+    );
+    assert!(
+        rows.iter()
+            .any(|n| n.label == "continuation" && n.text.contains("[f") && n.text.contains("[%"))
+    );
+    assert!(
+        rows.iter()
+            .any(|n| n.label == "raw_call" && n.text.contains("Promise"))
+    );
+    for id in ["artifact", "linked"] {
+        let nodes = tab(id, source);
+        let rows = flatten(&nodes);
+        assert!(
+            rows.iter().any(|n| n
+                .fields
+                .iter()
+                .any(|f| f.name == "suspension" && f.value.contains("MaySuspend"))),
+            "{id}: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|n| n.text.contains("Continuation")),
+            "{id}: {rows:?}"
+        );
+    }
 }

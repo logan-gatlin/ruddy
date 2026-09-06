@@ -239,58 +239,7 @@ impl UncheckedArtifact {
 /// rechecking a target adapter's own syntax or semantics. The traversal is
 /// iterative because portable blocks can be arbitrarily deeply nested.
 fn validate_executable_relationships(lir: &Lir) -> Result<(), ValidationError> {
-    let function_count = lir.functions.len() as u64;
-    let mut pending: Vec<&Block> = lir
-        .functions
-        .iter()
-        .map(|function| &function.body)
-        .chain(lir.globals.iter().map(|global| &global.body))
-        .collect();
-
-    while let Some(block) = pending.pop() {
-        for instruction in &block.instrs {
-            match &instruction.op {
-                Op::Closure { func, .. }
-                | Op::Call {
-                    callee: Callee::Direct(func),
-                    ..
-                } if *func >= function_count => {
-                    return Err(ValidationError::new(format!(
-                        "artifact function reference {func} is outside its function table"
-                    )));
-                }
-                Op::Catch { body, .. } => pending.push(body),
-                Op::SwitchTag {
-                    cases, fallback, ..
-                } => {
-                    pending.extend(cases.iter().map(|case| &case.block));
-                    pending.extend(fallback.as_deref());
-                }
-                Op::SwitchPrim {
-                    cases, fallback, ..
-                } => {
-                    pending.extend(cases.iter().map(|case| &case.block));
-                    pending.extend(fallback.as_deref());
-                }
-                Op::SwitchPresence {
-                    present, absent, ..
-                } => {
-                    pending.push(present);
-                    pending.push(absent);
-                }
-                Op::SwitchRest { none, some, .. } => {
-                    pending.push(none);
-                    pending.push(some);
-                }
-                Op::SwitchLen { cases, beyond, .. } => {
-                    pending.extend(cases.iter().map(|case| &case.block));
-                    pending.push(beyond);
-                }
-                _ => {}
-            }
-        }
-    }
-    Ok(())
+    cps::validate(lir).map_err(ValidationError::new)
 }
 
 /// An invalid local function reference has no target-neutral repair. Keep the
@@ -1308,930 +1257,8 @@ fn drain_formula(value: &mut Formula, pending: &mut Vec<Formula>) {
     }
 }
 
-/// The span-free LIR portion of an artifact.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Lir {
-    /// Target-provided values, in source order for an unlinked artifact and
-    /// dependency-first artifact order after linking.
-    pub externs: Vec<Extern>,
-    pub functions: Vec<Function>,
-    pub globals: Vec<Global>,
-}
-
-/// One target-provided value in a backend import table.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Extern {
-    /// The qualified Ruddy name used by [`Op::Global`] references.
-    pub name: QualifiedName,
-    /// Target-specific source, interpreted only by the backend.
-    pub target: String,
-    pub rep: Rep,
-}
-
-/// A lifted LIR function.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Function {
-    pub name: String,
-    pub params: Vec<Param>,
-    pub body: Block,
-}
-
-/// An LIR parameter.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Param {
-    pub temp: u32,
-    pub rep: Rep,
-}
-
-/// A top-level initializer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Global {
-    pub name: QualifiedName,
-    pub body: Block,
-}
-
-/// An ordered instruction list and one terminator.
-#[derive(Debug)]
-pub struct Block {
-    pub instrs: Vec<Instr>,
-    pub end: End,
-}
-
-/// A value-producing instruction.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Instr {
-    pub temp: u32,
-    pub rep: Rep,
-    pub op: Op,
-}
-
-/// A typed key in a span-free LIR record.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FieldKey {
-    Named(String),
-    UnnamedOperation,
-}
-
-/// A span-free LIR operation.
-#[derive(Debug)]
-pub enum Op {
-    Const(Literal),
-    Neg(u32),
-    Not(u32),
-    And {
-        left: u32,
-        right: u32,
-    },
-    Or {
-        left: u32,
-        right: u32,
-    },
-    Xor {
-        left: u32,
-        right: u32,
-    },
-    Add {
-        left: u32,
-        right: u32,
-    },
-    Sub {
-        left: u32,
-        right: u32,
-    },
-    Mul {
-        left: u32,
-        right: u32,
-    },
-    Div {
-        left: u32,
-        right: u32,
-    },
-    Struct(Vec<(FieldKey, u32)>),
-    Array(Vec<u32>),
-    Merge(Vec<u32>),
-    Concat(Vec<u32>),
-    Project {
-        base: u32,
-        field: FieldKey,
-    },
-    Tag {
-        name: String,
-        payload: Option<u32>,
-    },
-    Payload(u32),
-    Nth {
-        base: u32,
-        index: u64,
-    },
-    NthBack {
-        base: u32,
-        index: u64,
-    },
-    Slice {
-        base: u32,
-        start: u64,
-        drop: u64,
-    },
-    Closure {
-        /// Index into [`Lir::functions`], fixed-width on the artifact boundary.
-        func: u64,
-        captures: Vec<u32>,
-    },
-    Call {
-        callee: Callee,
-        args: Vec<u32>,
-    },
-    /// A foreign ABI call containing only host-visible arguments.
-    RawCall {
-        callee: u32,
-        args: Vec<u32>,
-    },
-    Extern {
-        target: QualifiedName,
-    },
-    Global {
-        target: QualifiedName,
-    },
-    NewTag,
-    Catch {
-        tag: u32,
-        body: Box<Block>,
-    },
-    SwitchTag {
-        on: u32,
-        cases: Vec<TagCase>,
-        fallback: Option<Box<Block>>,
-    },
-    SwitchPrim {
-        on: u32,
-        cases: Vec<PrimCase>,
-        fallback: Option<Box<Block>>,
-    },
-    SwitchPresence {
-        on: u32,
-        field: String,
-        present: Box<Block>,
-        absent: Box<Block>,
-    },
-    SwitchRest {
-        on: u32,
-        fields: Vec<String>,
-        none: Box<Block>,
-        some: Box<Block>,
-    },
-    SwitchLen {
-        on: u32,
-        cases: Vec<LenCase>,
-        beyond: Box<Block>,
-    },
-}
-
-/// One length-dispatch branch.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LenCase {
-    pub len: u64,
-    pub block: Block,
-}
-
-/// The target of an LIR call.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Callee {
-    /// Index into [`Lir::functions`], fixed-width on the artifact boundary.
-    Direct(u64),
-    Indirect(u32),
-}
-
-/// One tag-dispatch branch.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TagCase {
-    pub name: String,
-    pub block: Block,
-}
-
-/// One primitive-dispatch branch.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PrimCase {
-    pub value: Literal,
-    pub block: Block,
-}
-
-/// A block terminator.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum End {
-    Ret(u32),
-    Yield(u32),
-    Throw { tag: u32, value: u32 },
-}
-
-/// A literal.  Reals retain their bit representation, including NaNs and signed
-/// zero, so equality does not accidentally change program data.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Literal {
-    Natural(u64),
-    Integer(i64),
-    Real(u64),
-    String(String),
-    Boolean(bool),
-}
-
-/// The machine representation retained by LIR.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Rep {
-    Nat,
-    Int,
-    Real,
-    String,
-    Boolean,
-    Unit,
-    Struct,
-    Array,
-    Sum,
-    Fn,
-    Any,
-}
-
-// `Block` and `Op` form a mutually recursive ownership tree. They are public
-// artifact values in their own right, so their ordinary ownership operations
-// must not depend on an enclosing `Artifact` to provide a safe traversal.
-enum LirCloneWork<'a> {
-    Block(&'a Block),
-    Op(&'a Op),
-    FinishBlock {
-        instrs: Vec<(u32, Rep)>,
-        end: End,
-    },
-    FinishCatch(u32),
-    FinishSwitchTag {
-        on: u32,
-        names: Vec<String>,
-        fallback: bool,
-    },
-    FinishSwitchPrim {
-        on: u32,
-        values: Vec<Literal>,
-        fallback: bool,
-    },
-    FinishSwitchPresence {
-        on: u32,
-        field: String,
-    },
-    FinishSwitchRest {
-        on: u32,
-        fields: Vec<String>,
-    },
-    FinishSwitchLen {
-        on: u32,
-        lens: Vec<u64>,
-    },
-}
-
-fn clone_lir_tree(root: LirCloneWork<'_>) -> (Vec<Block>, Vec<Op>) {
-    let mut work = vec![root];
-    let mut blocks = Vec::new();
-    let mut ops = Vec::new();
-    while let Some(part) = work.pop() {
-        match part {
-            LirCloneWork::Block(block) => {
-                work.push(LirCloneWork::FinishBlock {
-                    instrs: block
-                        .instrs
-                        .iter()
-                        .map(|instr| (instr.temp, instr.rep))
-                        .collect(),
-                    end: block.end.clone(),
-                });
-                work.extend(
-                    block
-                        .instrs
-                        .iter()
-                        .rev()
-                        .map(|instr| LirCloneWork::Op(&instr.op)),
-                );
-            }
-            LirCloneWork::Op(op) => match op {
-                Op::Const(value) => ops.push(Op::Const(value.clone())),
-                Op::Neg(value) => ops.push(Op::Neg(*value)),
-                Op::Not(value) => ops.push(Op::Not(*value)),
-                Op::And { left, right } => ops.push(Op::And {
-                    left: *left,
-                    right: *right,
-                }),
-                Op::Or { left, right } => ops.push(Op::Or {
-                    left: *left,
-                    right: *right,
-                }),
-                Op::Xor { left, right } => ops.push(Op::Xor {
-                    left: *left,
-                    right: *right,
-                }),
-                Op::Add { left, right } => ops.push(Op::Add {
-                    left: *left,
-                    right: *right,
-                }),
-                Op::Sub { left, right } => ops.push(Op::Sub {
-                    left: *left,
-                    right: *right,
-                }),
-                Op::Mul { left, right } => ops.push(Op::Mul {
-                    left: *left,
-                    right: *right,
-                }),
-                Op::Div { left, right } => ops.push(Op::Div {
-                    left: *left,
-                    right: *right,
-                }),
-                Op::Struct(fields) => ops.push(Op::Struct(fields.clone())),
-                Op::Array(values) => ops.push(Op::Array(values.clone())),
-                Op::Merge(values) => ops.push(Op::Merge(values.clone())),
-                Op::Concat(values) => ops.push(Op::Concat(values.clone())),
-                Op::Project { base, field } => ops.push(Op::Project {
-                    base: *base,
-                    field: field.clone(),
-                }),
-                Op::Tag { name, payload } => ops.push(Op::Tag {
-                    name: name.clone(),
-                    payload: *payload,
-                }),
-                Op::Payload(value) => ops.push(Op::Payload(*value)),
-                Op::Nth { base, index } => ops.push(Op::Nth {
-                    base: *base,
-                    index: *index,
-                }),
-                Op::NthBack { base, index } => ops.push(Op::NthBack {
-                    base: *base,
-                    index: *index,
-                }),
-                Op::Slice { base, start, drop } => ops.push(Op::Slice {
-                    base: *base,
-                    start: *start,
-                    drop: *drop,
-                }),
-                Op::Closure { func, captures } => ops.push(Op::Closure {
-                    func: *func,
-                    captures: captures.clone(),
-                }),
-                Op::Call { callee, args } => ops.push(Op::Call {
-                    callee: callee.clone(),
-                    args: args.clone(),
-                }),
-                Op::RawCall { callee, args } => ops.push(Op::RawCall {
-                    callee: *callee,
-                    args: args.clone(),
-                }),
-                Op::Extern { target } => ops.push(Op::Extern {
-                    target: target.clone(),
-                }),
-                Op::Global { target } => ops.push(Op::Global {
-                    target: target.clone(),
-                }),
-                Op::NewTag => ops.push(Op::NewTag),
-                Op::Catch { tag, body } => {
-                    work.push(LirCloneWork::FinishCatch(*tag));
-                    work.push(LirCloneWork::Block(body));
-                }
-                Op::SwitchTag {
-                    on,
-                    cases,
-                    fallback,
-                } => {
-                    work.push(LirCloneWork::FinishSwitchTag {
-                        on: *on,
-                        names: cases.iter().map(|case| case.name.clone()).collect(),
-                        fallback: fallback.is_some(),
-                    });
-                    if let Some(fallback) = fallback {
-                        work.push(LirCloneWork::Block(fallback));
-                    }
-                    work.extend(
-                        cases
-                            .iter()
-                            .rev()
-                            .map(|case| LirCloneWork::Block(&case.block)),
-                    );
-                }
-                Op::SwitchPrim {
-                    on,
-                    cases,
-                    fallback,
-                } => {
-                    work.push(LirCloneWork::FinishSwitchPrim {
-                        on: *on,
-                        values: cases.iter().map(|case| case.value.clone()).collect(),
-                        fallback: fallback.is_some(),
-                    });
-                    if let Some(fallback) = fallback {
-                        work.push(LirCloneWork::Block(fallback));
-                    }
-                    work.extend(
-                        cases
-                            .iter()
-                            .rev()
-                            .map(|case| LirCloneWork::Block(&case.block)),
-                    );
-                }
-                Op::SwitchPresence {
-                    on,
-                    field,
-                    present,
-                    absent,
-                } => {
-                    work.push(LirCloneWork::FinishSwitchPresence {
-                        on: *on,
-                        field: field.clone(),
-                    });
-                    work.push(LirCloneWork::Block(absent));
-                    work.push(LirCloneWork::Block(present));
-                }
-                Op::SwitchRest {
-                    on,
-                    fields,
-                    none,
-                    some,
-                } => {
-                    work.push(LirCloneWork::FinishSwitchRest {
-                        on: *on,
-                        fields: fields.clone(),
-                    });
-                    work.push(LirCloneWork::Block(some));
-                    work.push(LirCloneWork::Block(none));
-                }
-                Op::SwitchLen { on, cases, beyond } => {
-                    work.push(LirCloneWork::FinishSwitchLen {
-                        on: *on,
-                        lens: cases.iter().map(|case| case.len).collect(),
-                    });
-                    work.push(LirCloneWork::Block(beyond));
-                    work.extend(
-                        cases
-                            .iter()
-                            .rev()
-                            .map(|case| LirCloneWork::Block(&case.block)),
-                    );
-                }
-            },
-            LirCloneWork::FinishBlock { instrs, end } => {
-                let split = ops.len() - instrs.len();
-                let instrs = instrs
-                    .into_iter()
-                    .zip(ops.drain(split..))
-                    .map(|((temp, rep), op)| Instr { temp, rep, op })
-                    .collect();
-                blocks.push(Block { instrs, end });
-            }
-            LirCloneWork::FinishCatch(tag) => {
-                ops.push(Op::Catch {
-                    tag,
-                    body: Box::new(blocks.pop().expect("cloned catch body")),
-                });
-            }
-            LirCloneWork::FinishSwitchTag {
-                on,
-                names,
-                fallback,
-            } => {
-                let fallback =
-                    fallback.then(|| Box::new(blocks.pop().expect("cloned tag fallback")));
-                let split = blocks.len() - names.len();
-                let cases = names
-                    .into_iter()
-                    .zip(blocks.drain(split..))
-                    .map(|(name, block)| TagCase { name, block })
-                    .collect();
-                ops.push(Op::SwitchTag {
-                    on,
-                    cases,
-                    fallback,
-                });
-            }
-            LirCloneWork::FinishSwitchPrim {
-                on,
-                values,
-                fallback,
-            } => {
-                let fallback =
-                    fallback.then(|| Box::new(blocks.pop().expect("cloned primitive fallback")));
-                let split = blocks.len() - values.len();
-                let cases = values
-                    .into_iter()
-                    .zip(blocks.drain(split..))
-                    .map(|(value, block)| PrimCase { value, block })
-                    .collect();
-                ops.push(Op::SwitchPrim {
-                    on,
-                    cases,
-                    fallback,
-                });
-            }
-            LirCloneWork::FinishSwitchPresence { on, field } => {
-                let absent = Box::new(blocks.pop().expect("cloned absent branch"));
-                let present = Box::new(blocks.pop().expect("cloned present branch"));
-                ops.push(Op::SwitchPresence {
-                    on,
-                    field,
-                    present,
-                    absent,
-                });
-            }
-            LirCloneWork::FinishSwitchRest { on, fields } => {
-                let some = Box::new(blocks.pop().expect("cloned nonempty-rest branch"));
-                let none = Box::new(blocks.pop().expect("cloned empty-rest branch"));
-                ops.push(Op::SwitchRest {
-                    on,
-                    fields,
-                    none,
-                    some,
-                });
-            }
-            LirCloneWork::FinishSwitchLen { on, lens } => {
-                let beyond = Box::new(blocks.pop().expect("cloned beyond-length branch"));
-                let split = blocks.len() - lens.len();
-                let cases = lens
-                    .into_iter()
-                    .zip(blocks.drain(split..))
-                    .map(|(len, block)| LenCase { len, block })
-                    .collect();
-                ops.push(Op::SwitchLen { on, cases, beyond });
-            }
-        }
-    }
-    (blocks, ops)
-}
-
-impl Clone for Block {
-    fn clone(&self) -> Self {
-        let (mut blocks, ops) = clone_lir_tree(LirCloneWork::Block(self));
-        debug_assert!(ops.is_empty());
-        blocks.pop().expect("cloned block")
-    }
-}
-
-impl Clone for Op {
-    fn clone(&self) -> Self {
-        let (blocks, mut ops) = clone_lir_tree(LirCloneWork::Op(self));
-        debug_assert!(blocks.is_empty());
-        ops.pop().expect("cloned operation")
-    }
-}
-
-#[derive(PartialEq)]
-enum OpHead<'a> {
-    Const(&'a Literal),
-    Unary(u8, u32),
-    Binary(u8, u32, u32),
-    Struct(&'a [(FieldKey, u32)]),
-    Array(&'a [u32]),
-    Merge(&'a [u32]),
-    Concat(&'a [u32]),
-    Project(u32, &'a FieldKey),
-    Tag(&'a str, Option<u32>),
-    Closure(u64, &'a [u32]),
-    Call(&'a Callee, &'a [u32]),
-    RawCall(u32, &'a [u32]),
-    Extern(&'a str),
-    Global(&'a str),
-    NewTag,
-    Catch(u32),
-    SwitchTag(u32, Vec<&'a str>, bool),
-    SwitchPrim(u32, Vec<&'a Literal>, bool),
-    SwitchPresence(u32, &'a str),
-    SwitchRest(u32, &'a [String]),
-    Nth(u32, u64),
-    NthBack(u32, u64),
-    Slice(u32, u64, u64),
-    SwitchLen(u32, Vec<u64>),
-}
-
-impl<'a> From<&'a Op> for OpHead<'a> {
-    fn from(op: &'a Op) -> Self {
-        match op {
-            Op::Const(value) => Self::Const(value),
-            Op::Neg(value) => Self::Unary(0, *value),
-            Op::Not(value) => Self::Unary(1, *value),
-            Op::And { left, right } => Self::Binary(0, *left, *right),
-            Op::Or { left, right } => Self::Binary(1, *left, *right),
-            Op::Xor { left, right } => Self::Binary(2, *left, *right),
-            Op::Add { left, right } => Self::Binary(3, *left, *right),
-            Op::Sub { left, right } => Self::Binary(4, *left, *right),
-            Op::Mul { left, right } => Self::Binary(5, *left, *right),
-            Op::Div { left, right } => Self::Binary(6, *left, *right),
-            Op::Struct(fields) => Self::Struct(fields),
-            Op::Array(values) => Self::Array(values),
-            Op::Merge(values) => Self::Merge(values),
-            Op::Concat(values) => Self::Concat(values),
-            Op::Project { base, field } => Self::Project(*base, field),
-            Op::Tag { name, payload } => Self::Tag(name, *payload),
-            Op::Payload(value) => Self::Unary(2, *value),
-            Op::Closure { func, captures } => Self::Closure(*func, captures),
-            Op::Call { callee, args } => Self::Call(callee, args),
-            Op::RawCall { callee, args } => Self::RawCall(*callee, args),
-            Op::Extern { target } => Self::Extern(target),
-            Op::Global { target } => Self::Global(target),
-            Op::NewTag => Self::NewTag,
-            Op::Catch { tag, .. } => Self::Catch(*tag),
-            Op::SwitchTag {
-                on,
-                cases,
-                fallback,
-            } => Self::SwitchTag(
-                *on,
-                cases.iter().map(|case| case.name.as_str()).collect(),
-                fallback.is_some(),
-            ),
-            Op::SwitchPrim {
-                on,
-                cases,
-                fallback,
-            } => Self::SwitchPrim(
-                *on,
-                cases.iter().map(|case| &case.value).collect(),
-                fallback.is_some(),
-            ),
-            Op::SwitchPresence { on, field, .. } => Self::SwitchPresence(*on, field),
-            Op::SwitchRest { on, fields, .. } => Self::SwitchRest(*on, fields),
-            Op::Nth { base, index } => Self::Nth(*base, *index),
-            Op::NthBack { base, index } => Self::NthBack(*base, *index),
-            Op::Slice { base, start, drop } => Self::Slice(*base, *start, *drop),
-            Op::SwitchLen { on, cases, .. } => {
-                Self::SwitchLen(*on, cases.iter().map(|case| case.len).collect())
-            }
-        }
-    }
-}
-
-enum LirPair<'a> {
-    Block(&'a Block, &'a Block),
-    Op(&'a Op, &'a Op),
-}
-
-fn lir_tree_eq(root: LirPair<'_>) -> bool {
-    let mut work = vec![root];
-    while let Some(part) = work.pop() {
-        match part {
-            LirPair::Block(left, right) => {
-                let left_head = (
-                    &left.end,
-                    left.instrs
-                        .iter()
-                        .map(|instr| (instr.temp, instr.rep))
-                        .collect::<Vec<_>>(),
-                );
-                let right_head = (
-                    &right.end,
-                    right
-                        .instrs
-                        .iter()
-                        .map(|instr| (instr.temp, instr.rep))
-                        .collect::<Vec<_>>(),
-                );
-                if left_head != right_head {
-                    return false;
-                }
-                work.extend(
-                    left.instrs
-                        .iter()
-                        .zip(&right.instrs)
-                        .map(|(left, right)| LirPair::Op(&left.op, &right.op)),
-                );
-            }
-            LirPair::Op(left, right) => {
-                if OpHead::from(left) != OpHead::from(right) {
-                    return false;
-                }
-                match (left, right) {
-                    (Op::Catch { body: left, .. }, Op::Catch { body: right, .. }) => {
-                        work.push(LirPair::Block(left, right));
-                    }
-                    (
-                        Op::SwitchTag {
-                            cases: left_cases,
-                            fallback: left_fallback,
-                            ..
-                        },
-                        Op::SwitchTag {
-                            cases: right_cases,
-                            fallback: right_fallback,
-                            ..
-                        },
-                    ) => {
-                        work.extend(
-                            left_cases
-                                .iter()
-                                .zip(right_cases)
-                                .map(|(left, right)| LirPair::Block(&left.block, &right.block)),
-                        );
-                        work.extend(
-                            left_fallback
-                                .iter()
-                                .zip(right_fallback)
-                                .map(|(left, right)| LirPair::Block(left, right)),
-                        );
-                    }
-                    (
-                        Op::SwitchPrim {
-                            cases: left_cases,
-                            fallback: left_fallback,
-                            ..
-                        },
-                        Op::SwitchPrim {
-                            cases: right_cases,
-                            fallback: right_fallback,
-                            ..
-                        },
-                    ) => {
-                        work.extend(
-                            left_cases
-                                .iter()
-                                .zip(right_cases)
-                                .map(|(left, right)| LirPair::Block(&left.block, &right.block)),
-                        );
-                        work.extend(
-                            left_fallback
-                                .iter()
-                                .zip(right_fallback)
-                                .map(|(left, right)| LirPair::Block(left, right)),
-                        );
-                    }
-                    (
-                        Op::SwitchPresence {
-                            present: left_present,
-                            absent: left_absent,
-                            ..
-                        },
-                        Op::SwitchPresence {
-                            present: right_present,
-                            absent: right_absent,
-                            ..
-                        },
-                    ) => {
-                        work.push(LirPair::Block(left_absent, right_absent));
-                        work.push(LirPair::Block(left_present, right_present));
-                    }
-                    (
-                        Op::SwitchRest {
-                            none: left_none,
-                            some: left_some,
-                            ..
-                        },
-                        Op::SwitchRest {
-                            none: right_none,
-                            some: right_some,
-                            ..
-                        },
-                    ) => {
-                        work.push(LirPair::Block(left_some, right_some));
-                        work.push(LirPair::Block(left_none, right_none));
-                    }
-                    (
-                        Op::SwitchLen {
-                            cases: left_cases,
-                            beyond: left_beyond,
-                            ..
-                        },
-                        Op::SwitchLen {
-                            cases: right_cases,
-                            beyond: right_beyond,
-                            ..
-                        },
-                    ) => {
-                        work.extend(
-                            left_cases
-                                .iter()
-                                .zip(right_cases)
-                                .map(|(left, right)| LirPair::Block(&left.block, &right.block)),
-                        );
-                        work.push(LirPair::Block(left_beyond, right_beyond));
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    true
-}
-
-impl PartialEq for Block {
-    fn eq(&self, other: &Self) -> bool {
-        lir_tree_eq(LirPair::Block(self, other))
-    }
-}
-
-impl Eq for Block {}
-
-impl PartialEq for Op {
-    fn eq(&self, other: &Self) -> bool {
-        lir_tree_eq(LirPair::Op(self, other))
-    }
-}
-
-impl Eq for Op {}
-
-fn empty_block() -> Block {
-    Block {
-        instrs: Vec::new(),
-        end: End::Ret(0),
-    }
-}
-
-fn drain_lir_op(op: &mut Op, pending: &mut Vec<Block>) {
-    match op {
-        Op::Catch { body, .. } => pending.push(std::mem::replace(body.as_mut(), empty_block())),
-        Op::SwitchTag {
-            cases, fallback, ..
-        } => {
-            pending.extend(
-                cases
-                    .iter_mut()
-                    .map(|case| std::mem::replace(&mut case.block, empty_block())),
-            );
-            if let Some(block) = fallback.take() {
-                pending.push(*block);
-            }
-        }
-        Op::SwitchPrim {
-            cases, fallback, ..
-        } => {
-            pending.extend(
-                cases
-                    .iter_mut()
-                    .map(|case| std::mem::replace(&mut case.block, empty_block())),
-            );
-            if let Some(block) = fallback.take() {
-                pending.push(*block);
-            }
-        }
-        Op::SwitchPresence {
-            present, absent, ..
-        } => {
-            pending.push(std::mem::replace(present.as_mut(), empty_block()));
-            pending.push(std::mem::replace(absent.as_mut(), empty_block()));
-        }
-        Op::SwitchRest { none, some, .. } => {
-            pending.push(std::mem::replace(none.as_mut(), empty_block()));
-            pending.push(std::mem::replace(some.as_mut(), empty_block()));
-        }
-        Op::SwitchLen { cases, beyond, .. } => {
-            pending.extend(
-                cases
-                    .iter_mut()
-                    .map(|case| std::mem::replace(&mut case.block, empty_block())),
-            );
-            pending.push(std::mem::replace(beyond.as_mut(), empty_block()));
-        }
-        Op::Const(_)
-        | Op::Neg(_)
-        | Op::Not(_)
-        | Op::And { .. }
-        | Op::Or { .. }
-        | Op::Xor { .. }
-        | Op::Add { .. }
-        | Op::Sub { .. }
-        | Op::Mul { .. }
-        | Op::Div { .. }
-        | Op::Struct(_)
-        | Op::Array(_)
-        | Op::Merge(_)
-        | Op::Concat(_)
-        | Op::Project { .. }
-        | Op::Tag { .. }
-        | Op::Payload(_)
-        | Op::Nth { .. }
-        | Op::NthBack { .. }
-        | Op::Slice { .. }
-        | Op::Closure { .. }
-        | Op::Call { .. }
-        | Op::RawCall { .. }
-        | Op::Extern { .. }
-        | Op::Global { .. }
-        | Op::NewTag => {}
-    }
-}
-
-fn drain_lir_block(block: &mut Block, pending: &mut Vec<Block>) {
-    for instr in &mut block.instrs {
-        drain_lir_op(&mut instr.op, pending);
-    }
-    block.instrs.clear();
-}
-
-impl Drop for Block {
-    fn drop(&mut self) {
-        let mut pending = Vec::new();
-        drain_lir_block(self, &mut pending);
-        while let Some(mut block) = pending.pop() {
-            drain_lir_block(&mut block, &mut pending);
-        }
-    }
-}
-
-impl Drop for Op {
-    fn drop(&mut self) {
-        let mut pending = Vec::new();
-        drain_lir_op(self, &mut pending);
-        while let Some(mut block) = pending.pop() {
-            drain_lir_block(&mut block, &mut pending);
-        }
-    }
-}
+mod cps;
+pub use cps::*;
 
 /// Build an artifact after inference and LIR lowering succeeded.
 pub fn build(accepted: &AcceptedProgram) -> Artifact {
@@ -2244,6 +1271,14 @@ pub fn build_with_dependencies(
     dependencies: Vec<Dependency>,
 ) -> Artifact {
     let lir = accepted.lower();
+    build_lowered(accepted, dependencies, &lir)
+}
+
+pub(crate) fn build_lowered(
+    accepted: &AcceptedProgram,
+    dependencies: Vec<Dependency>,
+    lir: &lir::Output,
+) -> Artifact {
     let mint = accepted.mint();
     let program = accepted.ir();
     let inference = accepted.semantics();
@@ -2383,7 +1418,7 @@ pub fn build_with_dependencies(
     };
     Artifact {
         header,
-        lir: lower_lir(mint, &lir),
+        lir: lower_lir(mint, lir),
     }
 }
 
@@ -2796,51 +1831,93 @@ fn lower_lir(mint: &Mint, output: &lir::Output) -> Lir {
         externs: output
             .externs
             .iter()
-            .map(|external| Extern {
-                name: qualified(mint, external.symbol),
-                target: external.target.clone(),
-                rep: rep(external.rep),
-            })
-            .collect(),
-        functions: output
-            .functions
-            .iter()
-            .map(|function| Function {
-                name: function.name.clone(),
-                params: function
-                    .params
-                    .iter()
-                    .map(|param| Param {
-                        temp: param.temp,
-                        rep: rep(param.rep),
-                    })
-                    .collect(),
-                body: block(mint, &function.body),
+            .map(|e| Extern {
+                name: qualified(mint, e.symbol),
+                target: e.target.clone(),
+                rep: rep(e.rep),
             })
             .collect(),
         globals: output
             .globals
             .iter()
-            .map(|global| Global {
-                name: qualified(mint, global.symbol),
-                body: block(mint, &global.body),
+            .map(|g| Global {
+                adapter: g.adapter,
+                callable: g.callable,
+                name: qualified(mint, g.symbol),
+                initializer: g.initializer as u64,
+            })
+            .collect(),
+        functions: output
+            .functions
+            .iter()
+            .map(|f| Function {
+                suspension: f.suspension,
+                name: f.name.clone(),
+                params: f.params.iter().map(param).collect(),
+                continuation: f.continuation,
+                entry: f.entry as u64,
+                blocks: f
+                    .blocks
+                    .iter()
+                    .map(|b| Block {
+                        params: b.params.iter().map(param).collect(),
+                        result: b.result,
+                        instrs: b
+                            .instrs
+                            .iter()
+                            .map(|i| Instr {
+                                temp: i.temp,
+                                rep: rep(i.rep),
+                                op: op(mint, &i.op),
+                            })
+                            .collect(),
+                        end: end(&b.end.kind),
+                    })
+                    .collect(),
             })
             .collect(),
     }
 }
-
-fn block(mint: &Mint, value: &lir::Block) -> Block {
-    Block {
-        instrs: value
-            .instrs
-            .iter()
-            .map(|instr| Instr {
-                temp: instr.temp,
-                rep: rep(instr.rep),
-                op: op(mint, &instr.op),
-            })
-            .collect(),
-        end: end(value.end.kind),
+fn param(p: &lir::Param) -> Param {
+    Param {
+        temp: p.temp,
+        rep: rep(p.rep),
+    }
+}
+fn edge(e: &lir::Edge) -> Edge {
+    Edge {
+        block: e.block as u64,
+        args: e.args.clone(),
+    }
+}
+fn test(t: &lir::Test) -> Test {
+    match t {
+        lir::Test::Tag { on, name } => Test::Tag {
+            on: *on,
+            name: name.clone(),
+        },
+        lir::Test::Literal { on, value } => Test::Literal {
+            on: *on,
+            value: literal(value),
+        },
+        lir::Test::Presence { on, field } => Test::Presence {
+            on: *on,
+            field: field.clone(),
+        },
+        lir::Test::Rest { on, fields } => Test::Rest {
+            on: *on,
+            fields: fields.clone(),
+        },
+        lir::Test::Length { on, length } => Test::Length {
+            on: *on,
+            length: *length as u64,
+        },
+    }
+}
+fn callee(c: lir::Callee) -> Callee {
+    match c {
+        lir::Callee::Direct(f) => Callee::Direct(f as u64),
+        lir::Callee::Indirect(t) => Callee::Indirect(t),
     }
 }
 
@@ -2854,6 +1931,10 @@ fn field_key(value: &lir::FieldKey) -> FieldKey {
 fn op(mint: &Mint, value: &lir::Op) -> Op {
     use lir::Op as Source;
     match value {
+        Source::Callback { value, mode } => Op::Callback {
+            value: *value,
+            mode: *mode,
+        },
         Source::Const(value) => Op::Const(literal(value)),
         Source::Neg(value) => Op::Neg(*value),
         Source::Not(value) => Op::Not(*value),
@@ -2920,18 +2001,12 @@ fn op(mint: &Mint, value: &lir::Op) -> Op {
             func: u64::try_from(*func).expect("LIR function index does not fit artifact format"),
             captures: captures.clone(),
         },
-        Source::Call { callee, args } => Op::Call {
-            callee: match callee {
-                lir::Callee::Direct(value) => Callee::Direct(
-                    u64::try_from(*value).expect("LIR function index does not fit artifact format"),
-                ),
-                lir::Callee::Indirect(value) => Callee::Indirect(*value),
+        Source::Continuation { code, captures } => Op::Continuation {
+            code: CodeRef {
+                function: code.function as u64,
+                block: code.block as u64,
             },
-            args: args.clone(),
-        },
-        Source::RawCall { callee, args } => Op::RawCall {
-            callee: *callee,
-            args: args.clone(),
+            captures: captures.clone(),
         },
         Source::Extern { symbol, .. } => Op::Extern {
             target: qualified(mint, *symbol),
@@ -2940,77 +2015,6 @@ fn op(mint: &Mint, value: &lir::Op) -> Op {
             target: qualified(mint, *symbol),
         },
         Source::NewTag => Op::NewTag,
-        Source::Catch { tag, body } => Op::Catch {
-            tag: *tag,
-            body: Box::new(block(mint, body)),
-        },
-        Source::SwitchTag {
-            on,
-            cases,
-            fallback,
-        } => Op::SwitchTag {
-            on: *on,
-            cases: cases
-                .iter()
-                .map(|case| TagCase {
-                    name: case.name.clone(),
-                    block: block(mint, &case.block),
-                })
-                .collect(),
-            fallback: fallback
-                .as_ref()
-                .map(|block_| Box::new(block(mint, block_))),
-        },
-        Source::SwitchPrim {
-            on,
-            cases,
-            fallback,
-        } => Op::SwitchPrim {
-            on: *on,
-            cases: cases
-                .iter()
-                .map(|case| PrimCase {
-                    value: literal(&case.value),
-                    block: block(mint, &case.block),
-                })
-                .collect(),
-            fallback: fallback
-                .as_ref()
-                .map(|block_| Box::new(block(mint, block_))),
-        },
-        Source::SwitchPresence {
-            on,
-            field,
-            present,
-            absent,
-        } => Op::SwitchPresence {
-            on: *on,
-            field: field.clone(),
-            present: Box::new(block(mint, present)),
-            absent: Box::new(block(mint, absent)),
-        },
-        Source::SwitchRest {
-            on,
-            fields,
-            none,
-            some,
-        } => Op::SwitchRest {
-            on: *on,
-            fields: fields.clone(),
-            none: Box::new(block(mint, none)),
-            some: Box::new(block(mint, some)),
-        },
-        Source::SwitchLen { on, cases, beyond } => Op::SwitchLen {
-            on: *on,
-            cases: cases
-                .iter()
-                .map(|case| LenCase {
-                    len: case.len as u64,
-                    block: block(mint, &case.block),
-                })
-                .collect(),
-            beyond: Box::new(block(mint, beyond)),
-        },
     }
 }
 
@@ -3023,13 +2027,62 @@ fn literal(value: &ir::Literal) -> Literal {
         ir::Literal::Boolean(value) => Literal::Boolean(*value),
     }
 }
-fn end(value: lir::End) -> End {
-    match value {
-        lir::End::Ret(value) => End::Ret(value),
-        lir::End::Yield(value) => End::Yield(value),
-        lir::End::Throw { tag, value } => End::Throw { tag, value },
+fn end(e: &lir::End) -> End {
+    match e {
+        lir::End::Continue {
+            continuation,
+            value,
+        } => End::Continue {
+            continuation: *continuation,
+            value: *value,
+        },
+        lir::End::Jump(e) => End::Jump(edge(e)),
+        lir::End::Branch { test: t, yes, no } => End::Branch {
+            test: test(t),
+            yes: edge(yes),
+            no: edge(no),
+        },
+        lir::End::Call {
+            callee: c,
+            args,
+            continuation,
+        } => End::Call {
+            callee: callee(*c),
+            args: args.clone(),
+            continuation: *continuation,
+        },
+        lir::End::RawCall {
+            callee,
+            args,
+            continuation,
+            completion,
+        } => End::RawCall {
+            callee: *callee,
+            args: args.clone(),
+            continuation: *continuation,
+            completion: *completion,
+        },
+        lir::End::Enter {
+            tag,
+            body,
+            continuation,
+        } => End::Enter {
+            tag: *tag,
+            body: edge(body),
+            continuation: *continuation,
+        },
+        lir::End::Leave { tag, value } => End::Leave {
+            tag: *tag,
+            value: *value,
+        },
+        lir::End::Abort { tag, value } => End::Abort {
+            tag: *tag,
+            value: *value,
+        },
+        lir::End::Unreachable => End::Unreachable,
     }
 }
+
 fn rep(value: lir::Rep) -> Rep {
     match value {
         lir::Rep::Nat => Rep::Nat,
@@ -3043,6 +2096,8 @@ fn rep(value: lir::Rep) -> Rep {
         lir::Rep::Sum => Rep::Sum,
         lir::Rep::Fn => Rep::Fn,
         lir::Rep::Any => Rep::Any,
+        lir::Rep::Cont => Rep::Cont,
+        lir::Rep::Handler => Rep::Handler,
     }
 }
 
@@ -3630,368 +2685,9 @@ pub mod text {
 
     fn lir(value: &Lir) -> S {
         L(vec![
-            A("lir".into()),
-            L(std::iter::once(A("externs".into()))
-                .chain(value.externs.iter().map(extern_))
-                .collect()),
-            L(std::iter::once(A("functions".into()))
-                .chain(value.functions.iter().map(function))
-                .collect()),
-            L(std::iter::once(A("globals".into()))
-                .chain(value.globals.iter().map(global))
-                .collect()),
+            A("cps-lir".into()),
+            Q(serde_json::to_string(value).expect("portable CPS data serializes")),
         ])
-    }
-    fn extern_(value: &Extern) -> S {
-        L(vec![
-            A("extern".into()),
-            Q(value.name.clone()),
-            L(vec![A("target".into()), Q(value.target.clone())]),
-            A(rep_name(value.rep).into()),
-        ])
-    }
-    fn function(value: &Function) -> S {
-        L(vec![
-            A("function".into()),
-            Q(value.name.clone()),
-            L(std::iter::once(A("params".into()))
-                .chain(value.params.iter().map(param))
-                .collect()),
-            block(&value.body),
-        ])
-    }
-    fn param(value: &Param) -> S {
-        L(vec![
-            A("param".into()),
-            A(value.temp.to_string()),
-            A(rep_name(value.rep).into()),
-        ])
-    }
-    fn global(value: &Global) -> S {
-        L(vec![
-            A("global".into()),
-            Q(value.name.clone()),
-            block(&value.body),
-        ])
-    }
-    /// Render one block. Nested blocks are data, not control flow: a `catch`
-    /// or `switch` thirty thousand levels deep has to print on the same stack
-    /// the reader decodes it on, so the walk keeps its continuations on the
-    /// heap and every closure below assembles one node from children already
-    /// rendered.
-    fn block(root: &Block) -> S {
-        type Wrap<'a> = Box<dyn FnOnce(Vec<S>) -> S + 'a>;
-        enum Task<'a> {
-            Block(&'a Block),
-            Instr(&'a Instr),
-            Op(&'a Op),
-            /// Take the last `count` rendered values and combine them.
-            Wrap(usize, Wrap<'a>),
-        }
-        let mut work = vec![Task::Block(root)];
-        let mut out: Vec<S> = Vec::new();
-        while let Some(task) = work.pop() {
-            match task {
-                Task::Block(block) => {
-                    let count = block.instrs.len();
-                    let end = &block.end;
-                    work.push(Task::Wrap(
-                        count,
-                        Box::new(move |instrs| {
-                            L(vec![
-                                A("block".into()),
-                                L(std::iter::once(A("instrs".into())).chain(instrs).collect()),
-                                self::end(end),
-                            ])
-                        }),
-                    ));
-                    work.extend(block.instrs.iter().rev().map(Task::Instr));
-                }
-                Task::Instr(instr) => {
-                    let (temp, rep) = (instr.temp, instr.rep);
-                    work.push(Task::Wrap(
-                        1,
-                        Box::new(move |mut op| {
-                            L(vec![
-                                A("instr".into()),
-                                A(temp.to_string()),
-                                A(rep_name(rep).into()),
-                                op.pop().expect("an instruction renders one operation"),
-                            ])
-                        }),
-                    ));
-                    work.push(Task::Op(&instr.op));
-                }
-                Task::Op(op) => {
-                    let children = nested(op);
-                    work.push(Task::Wrap(
-                        children.len(),
-                        Box::new(move |rendered| self::op(op, rendered)),
-                    ));
-                    work.extend(children.into_iter().rev().map(Task::Block));
-                }
-                Task::Wrap(count, wrap) => {
-                    let at = out.len() - count;
-                    let children = out.split_off(at);
-                    out.push(wrap(children));
-                }
-            }
-        }
-        out.pop().expect("a block renders one value")
-    }
-    fn field_key(value: &FieldKey) -> S {
-        match value {
-            FieldKey::Named(name) => L(vec![
-                A("field-key".into()),
-                A("named".into()),
-                Q(name.clone()),
-            ]),
-            FieldKey::UnnamedOperation => {
-                L(vec![A("field-key".into()), A("unnamed-operation".into())])
-            }
-        }
-    }
-    /// The blocks an operation holds, in the order [`op`] consumes them once
-    /// they are rendered.
-    fn nested(value: &Op) -> Vec<&Block> {
-        match value {
-            Op::Catch { body, .. } => vec![body],
-            Op::SwitchTag {
-                cases, fallback, ..
-            } => cases
-                .iter()
-                .map(|case| &case.block)
-                .chain(fallback.iter().map(|block| &**block))
-                .collect(),
-            Op::SwitchPrim {
-                cases, fallback, ..
-            } => cases
-                .iter()
-                .map(|case| &case.block)
-                .chain(fallback.iter().map(|block| &**block))
-                .collect(),
-            Op::SwitchPresence {
-                present, absent, ..
-            } => vec![present, absent],
-            Op::SwitchRest { none, some, .. } => vec![none, some],
-            Op::SwitchLen { cases, beyond, .. } => cases
-                .iter()
-                .map(|case| &case.block)
-                .chain(std::iter::once(&**beyond))
-                .collect(),
-            _ => Vec::new(),
-        }
-    }
-    /// Render one operation, given its nested blocks already rendered by
-    /// [`block`] in the order [`nested`] lists them.
-    fn op(value: &Op, mut blocks: Vec<S>) -> S {
-        match value {
-            Op::Const(value) => L(vec![A("const".into()), literal(value)]),
-            Op::Neg(value) => unary("neg", *value),
-            Op::Not(value) => unary("not", *value),
-            Op::And { left, right } => binary("and", *left, *right),
-            Op::Or { left, right } => binary("or", *left, *right),
-            Op::Xor { left, right } => binary("xor", *left, *right),
-            Op::Add { left, right } => binary("add", *left, *right),
-            Op::Sub { left, right } => binary("sub", *left, *right),
-            Op::Mul { left, right } => binary("mul", *left, *right),
-            Op::Div { left, right } => binary("div", *left, *right),
-            Op::Struct(fields) => L(std::iter::once(A("struct".into()))
-                .chain(
-                    fields
-                        .iter()
-                        .map(|(field, value)| L(vec![field_key(field), A(value.to_string())])),
-                )
-                .collect()),
-            Op::Array(values) => L(std::iter::once(A("array".into()))
-                .chain(values.iter().map(|value| A(value.to_string())))
-                .collect()),
-            Op::Merge(values) => L(std::iter::once(A("merge".into()))
-                .chain(values.iter().map(|value| A(value.to_string())))
-                .collect()),
-            Op::Concat(values) => L(std::iter::once(A("concat".into()))
-                .chain(values.iter().map(|value| A(value.to_string())))
-                .collect()),
-            Op::Project { base, field } => L(vec![
-                A("project".into()),
-                A(base.to_string()),
-                field_key(field),
-            ]),
-            Op::Tag { name, payload } => L(std::iter::once(A("tag".into()))
-                .chain(std::iter::once(Q(name.clone())))
-                .chain(payload.iter().map(|value| A(value.to_string())))
-                .collect()),
-            Op::Payload(value) => unary("payload", *value),
-            Op::Nth { base, index } => L(vec![
-                A("nth".into()),
-                A(base.to_string()),
-                A(index.to_string()),
-            ]),
-            Op::NthBack { base, index } => L(vec![
-                A("nth-back".into()),
-                A(base.to_string()),
-                A(index.to_string()),
-            ]),
-            Op::Slice { base, start, drop } => L(vec![
-                A("slice".into()),
-                A(base.to_string()),
-                A(start.to_string()),
-                A(drop.to_string()),
-            ]),
-            Op::SwitchLen { on, cases, .. } => {
-                let beyond = blocks.pop().expect("a beyond branch renders");
-                L(vec![
-                    A("switch-len".into()),
-                    A(on.to_string()),
-                    L(std::iter::once(A("cases".into()))
-                        .chain(
-                            cases
-                                .iter()
-                                .zip(blocks)
-                                .map(|(case, block)| L(vec![A(case.len.to_string()), block])),
-                        )
-                        .collect()),
-                    beyond,
-                ])
-            }
-            Op::Closure { func, captures } => L(vec![
-                A("closure".into()),
-                A(func.to_string()),
-                L(std::iter::once(A("captures".into()))
-                    .chain(captures.iter().map(|value| A(value.to_string())))
-                    .collect()),
-            ]),
-            Op::Call { callee, args } => L(vec![
-                A("call".into()),
-                match callee {
-                    Callee::Direct(value) => L(vec![A("direct".into()), A(value.to_string())]),
-                    Callee::Indirect(value) => L(vec![A("indirect".into()), A(value.to_string())]),
-                },
-                L(std::iter::once(A("args".into()))
-                    .chain(args.iter().map(|value| A(value.to_string())))
-                    .collect()),
-            ]),
-            Op::RawCall { callee, args } => L(vec![
-                A("raw-call".into()),
-                A(callee.to_string()),
-                L(std::iter::once(A("args".into()))
-                    .chain(args.iter().map(|value| A(value.to_string())))
-                    .collect()),
-            ]),
-            Op::Extern { target } => L(vec![A("extern".into()), Q(target.clone())]),
-            Op::Global { target } => L(vec![A("global".into()), Q(target.clone())]),
-            Op::NewTag => A("new-tag".into()),
-            Op::Catch { tag, .. } => L(vec![
-                A("catch".into()),
-                A(tag.to_string()),
-                blocks.pop().expect("a catch renders one body"),
-            ]),
-            Op::SwitchTag { on, cases, .. } => {
-                let fallback = blocks.split_off(cases.len());
-                L(vec![
-                    A("switch-tag".into()),
-                    A(on.to_string()),
-                    L(std::iter::once(A("cases".into()))
-                        .chain(
-                            cases
-                                .iter()
-                                .zip(blocks)
-                                .map(|(case, block)| L(vec![Q(case.name.clone()), block])),
-                        )
-                        .collect()),
-                    L(std::iter::once(A("fallback".into()))
-                        .chain(fallback)
-                        .collect()),
-                ])
-            }
-            Op::SwitchPrim { on, cases, .. } => {
-                let fallback = blocks.split_off(cases.len());
-                L(vec![
-                    A("switch-prim".into()),
-                    A(on.to_string()),
-                    L(std::iter::once(A("cases".into()))
-                        .chain(
-                            cases
-                                .iter()
-                                .zip(blocks)
-                                .map(|(case, block)| L(vec![literal(&case.value), block])),
-                        )
-                        .collect()),
-                    L(std::iter::once(A("fallback".into()))
-                        .chain(fallback)
-                        .collect()),
-                ])
-            }
-            Op::SwitchPresence { on, field, .. } => {
-                let absent = blocks.pop().expect("an absent branch renders");
-                let present = blocks.pop().expect("a present branch renders");
-                L(vec![
-                    A("switch-presence".into()),
-                    A(on.to_string()),
-                    Q(field.clone()),
-                    present,
-                    absent,
-                ])
-            }
-            Op::SwitchRest { on, fields, .. } => {
-                let some = blocks.pop().expect("a some branch renders");
-                let none = blocks.pop().expect("a none branch renders");
-                L(vec![
-                    A("switch-rest".into()),
-                    A(on.to_string()),
-                    L(std::iter::once(A("fields".into()))
-                        .chain(fields.iter().cloned().map(Q))
-                        .collect()),
-                    none,
-                    some,
-                ])
-            }
-        }
-    }
-    fn unary(tag: &str, value: u32) -> S {
-        L(vec![A(tag.into()), A(value.to_string())])
-    }
-    fn binary(tag: &str, left: u32, right: u32) -> S {
-        L(vec![
-            A(tag.into()),
-            A(left.to_string()),
-            A(right.to_string()),
-        ])
-    }
-    fn end(value: &End) -> S {
-        match value {
-            End::Ret(value) => unary("ret", *value),
-            End::Yield(value) => unary("yield", *value),
-            End::Throw { tag, value } => L(vec![
-                A("throw".into()),
-                A(tag.to_string()),
-                A(value.to_string()),
-            ]),
-        }
-    }
-    fn literal(value: &Literal) -> S {
-        match value {
-            Literal::Natural(value) => L(vec![A("nat".into()), A(value.to_string())]),
-            Literal::Integer(value) => L(vec![A("int".into()), A(value.to_string())]),
-            Literal::Real(value) => L(vec![A("real".into()), A(value.to_string())]),
-            Literal::String(value) => L(vec![A("string".into()), Q(value.clone())]),
-            Literal::Boolean(value) => L(vec![A("bool".into()), A(value.to_string())]),
-        }
-    }
-    fn rep_name(value: Rep) -> &'static str {
-        match value {
-            Rep::Nat => "nat",
-            Rep::Int => "int",
-            Rep::Real => "real",
-            Rep::String => "string",
-            Rep::Boolean => "boolean",
-            Rep::Unit => "unit",
-            Rep::Struct => "struct",
-            Rep::Array => "array",
-            Rep::Sum => "sum",
-            Rep::Fn => "fn",
-            Rep::Any => "any",
-        }
     }
 
     /// One step of laying a tree out: a value to write at an indentation,
@@ -4301,10 +2997,6 @@ pub mod text {
             discard_type(scheme.body);
         }
 
-        fn discard_block(block: Block) {
-            drop(block);
-        }
-
         for value in artifact.header.values.drain(..) {
             discard_scheme(value.scheme);
         }
@@ -4319,12 +3011,8 @@ pub mod text {
                 }
             }
         }
-        for function in artifact.lir.functions.drain(..) {
-            discard_block(function.body);
-        }
-        for global in artifact.lir.globals.drain(..) {
-            discard_block(global.body);
-        }
+        artifact.lir.functions.clear();
+        artifact.lir.globals.clear();
     }
 
     struct Reader {
@@ -5325,584 +4013,18 @@ pub mod text {
         }
 
         fn read_lir(&self, value: S) -> Lir {
-            let mut value = self.exact(self.list(value, "lir"), 3, "lir");
-            Lir {
-                externs: self
-                    .many(self.take(&mut value), "externs")
-                    .into_iter()
-                    .map(|value| self.read_extern(value))
-                    .collect(),
-                functions: self
-                    .many(self.take(&mut value), "functions")
-                    .into_iter()
-                    .map(|value| self.read_function(value))
-                    .collect(),
-                globals: self
-                    .many(self.take(&mut value), "globals")
-                    .into_iter()
-                    .map(|value| self.read_global(value))
-                    .collect(),
-            }
-        }
-        fn read_extern(&self, value: S) -> Extern {
-            let mut value = self.exact(self.list(value, "extern"), 3, "extern");
-            let name = self.string(self.take(&mut value));
-            let mut target = self.exact(self.list(self.take(&mut value), "target"), 1, "target");
-            Extern {
-                name,
-                target: self.string(self.take(&mut target)),
-                rep: self.read_rep(self.take(&mut value)),
-            }
-        }
-        fn read_function(&self, value: S) -> Function {
-            let mut value = self.exact(self.list(value, "function"), 3, "function");
-            Function {
-                name: self.string(self.take(&mut value)),
-                params: self
-                    .many(self.take(&mut value), "params")
-                    .into_iter()
-                    .map(|value| self.read_param(value))
-                    .collect(),
-                body: self.read_block(self.take(&mut value)),
-            }
-        }
-        fn read_param(&self, value: S) -> Param {
-            let mut value = self.exact(self.list(value, "param"), 2, "param");
-            Param {
-                temp: self.number(self.take(&mut value)),
-                rep: self.read_rep(self.take(&mut value)),
-            }
-        }
-        fn read_global(&self, value: S) -> Global {
-            let mut value = self.exact(self.list(value, "global"), 2, "global");
-            Global {
-                name: self.string(self.take(&mut value)),
-                body: self.read_block(self.take(&mut value)),
-            }
-        }
-        fn read_block(&self, value: S) -> Block {
-            enum Task {
-                Block(S),
-                Instr(S),
-                Op(S),
-                BuildBlock {
-                    count: usize,
-                    end: End,
-                },
-                BuildInstr {
-                    temp: u32,
-                    rep: Rep,
-                },
-                Catch {
-                    tag: u32,
-                },
-                SwitchTag {
-                    on: u32,
-                    names: Vec<String>,
-                    fallback: bool,
-                },
-                SwitchPrim {
-                    on: u32,
-                    values: Vec<Literal>,
-                    fallback: bool,
-                },
-                SwitchPresence {
-                    on: u32,
-                    field: String,
-                },
-                SwitchRest {
-                    on: u32,
-                    fields: Vec<String>,
-                },
-                SwitchLen {
-                    on: u32,
-                    lens: Vec<u64>,
-                },
-            }
-            #[derive(Clone, Copy)]
-            enum Recursive {
-                Catch,
-                SwitchTag,
-                SwitchPrim,
-                SwitchPresence,
-                SwitchRest,
-                SwitchLen,
-            }
-            let mut tasks = vec![Task::Block(value)];
-            // As in semantic type decoding, a task's result sort is fixed by
-            // the task itself. Separate stacks make an impossible internal
-            // sort mismatch unrepresentable as a malformed-input fallback.
-            let mut blocks_out = Vec::new();
-            let mut instrs_out = Vec::new();
-            let mut ops = Vec::new();
-            while let Some(task) = tasks.pop() {
-                match task {
-                    Task::Block(value) => {
-                        let mut values = self.exact(self.list(value, "block"), 2, "block");
-                        let instrs = self.many(self.take(&mut values), "instrs");
-                        let end = self.read_end(self.take(&mut values));
-                        tasks.push(Task::BuildBlock {
-                            count: instrs.len(),
-                            end,
-                        });
-                        for instr in instrs.into_iter().rev() {
-                            tasks.push(Task::Instr(instr));
-                        }
-                    }
-                    Task::Instr(value) => {
-                        let mut values = self.exact(self.list(value, "instr"), 3, "instr");
-                        let temp = self.number(self.take(&mut values));
-                        let rep = self.read_rep(self.take(&mut values));
-                        let op = self.take(&mut values);
-                        tasks.push(Task::BuildInstr { temp, rep });
-                        tasks.push(Task::Op(op));
-                    }
-                    Task::Op(value) => {
-                        let recursive = match &value {
-                            L(values) => match values.first() {
-                                Some(A(tag)) => match tag.as_str() {
-                                    "catch" => Some(Recursive::Catch),
-                                    "switch-tag" => Some(Recursive::SwitchTag),
-                                    "switch-prim" => Some(Recursive::SwitchPrim),
-                                    "switch-presence" => Some(Recursive::SwitchPresence),
-                                    "switch-rest" => Some(Recursive::SwitchRest),
-                                    "switch-len" => Some(Recursive::SwitchLen),
-                                    _ => None,
-                                },
-                                _ => None,
-                            },
-                            _ => None,
-                        };
-                        let Some(recursive) = recursive else {
-                            ops.push(self.read_leaf_op(value));
-                            continue;
-                        };
-                        let mut values = list_contents(value).expect("recursive op is a list");
-                        self.take(&mut values);
-                        match recursive {
-                            Recursive::Catch => {
-                                let mut values = self.exact(values, 2, "catch");
-                                let tag = self.number(self.take(&mut values));
-                                let body = self.take(&mut values);
-                                tasks.push(Task::Catch { tag });
-                                tasks.push(Task::Block(body));
-                            }
-                            Recursive::SwitchTag => {
-                                let mut values = self.exact(values, 3, "switch-tag");
-                                let on = self.number(self.take(&mut values));
-                                let cases = self.many(self.take(&mut values), "cases");
-                                let fallback = self.list(self.take(&mut values), "fallback");
-                                if fallback.len() > 1 {
-                                    self.fail("bad optional block");
-                                }
-                                let fallback = fallback.into_iter().next();
-                                let mut names = Vec::with_capacity(cases.len());
-                                let mut blocks = Vec::with_capacity(cases.len());
-                                for case in cases {
-                                    let values = list_contents(case).unwrap_or_else(|| {
-                                        self.invalid("bad tag case", Vec::new())
-                                    });
-                                    let mut values = self.exact(values, 2, "tag case");
-                                    names.push(self.string(self.take(&mut values)));
-                                    blocks.push(self.take(&mut values));
-                                }
-                                tasks.push(Task::SwitchTag {
-                                    on,
-                                    names,
-                                    fallback: fallback.is_some(),
-                                });
-                                if let Some(block) = fallback {
-                                    tasks.push(Task::Block(block));
-                                }
-                                for block in blocks.into_iter().rev() {
-                                    tasks.push(Task::Block(block));
-                                }
-                            }
-                            Recursive::SwitchPrim => {
-                                let mut values = self.exact(values, 3, "switch-prim");
-                                let on = self.number(self.take(&mut values));
-                                let cases = self.many(self.take(&mut values), "cases");
-                                let fallback = self.list(self.take(&mut values), "fallback");
-                                if fallback.len() > 1 {
-                                    self.fail("bad optional block");
-                                }
-                                let fallback = fallback.into_iter().next();
-                                let mut literals = Vec::with_capacity(cases.len());
-                                let mut blocks = Vec::with_capacity(cases.len());
-                                for case in cases {
-                                    let values = list_contents(case).unwrap_or_else(|| {
-                                        self.invalid("bad primitive case", Vec::new())
-                                    });
-                                    let mut values = self.exact(values, 2, "primitive case");
-                                    literals.push(self.read_literal(self.take(&mut values)));
-                                    blocks.push(self.take(&mut values));
-                                }
-                                tasks.push(Task::SwitchPrim {
-                                    on,
-                                    values: literals,
-                                    fallback: fallback.is_some(),
-                                });
-                                if let Some(block) = fallback {
-                                    tasks.push(Task::Block(block));
-                                }
-                                for block in blocks.into_iter().rev() {
-                                    tasks.push(Task::Block(block));
-                                }
-                            }
-                            Recursive::SwitchLen => {
-                                let mut values = self.exact(values, 3, "switch-len");
-                                let on = self.number(self.take(&mut values));
-                                let cases = self.many(self.take(&mut values), "cases");
-                                let beyond = self.take(&mut values);
-                                let mut lens = Vec::with_capacity(cases.len());
-                                let mut blocks = Vec::with_capacity(cases.len());
-                                for case in cases {
-                                    let values = list_contents(case).unwrap_or_else(|| {
-                                        self.invalid("bad length case", Vec::new())
-                                    });
-                                    let mut values = self.exact(values, 2, "length case");
-                                    lens.push(self.number(self.take(&mut values)));
-                                    blocks.push(self.take(&mut values));
-                                }
-                                tasks.push(Task::SwitchLen { on, lens });
-                                tasks.push(Task::Block(beyond));
-                                for block in blocks.into_iter().rev() {
-                                    tasks.push(Task::Block(block));
-                                }
-                            }
-                            Recursive::SwitchPresence => {
-                                let mut values = self.exact(values, 4, "switch-presence");
-                                let on = self.number(self.take(&mut values));
-                                let field = self.string(self.take(&mut values));
-                                let present = self.take(&mut values);
-                                let absent = self.take(&mut values);
-                                tasks.push(Task::SwitchPresence { on, field });
-                                tasks.push(Task::Block(absent));
-                                tasks.push(Task::Block(present));
-                            }
-                            Recursive::SwitchRest => {
-                                let mut values = self.exact(values, 4, "switch-rest");
-                                let on = self.number(self.take(&mut values));
-                                let fields = self
-                                    .many(self.take(&mut values), "fields")
-                                    .into_iter()
-                                    .map(|v| self.string(v))
-                                    .collect();
-                                let none = self.take(&mut values);
-                                let some = self.take(&mut values);
-                                tasks.push(Task::SwitchRest { on, fields });
-                                tasks.push(Task::Block(some));
-                                tasks.push(Task::Block(none));
-                            }
-                        }
-                    }
-                    Task::BuildInstr { temp, rep } => {
-                        let op = ops
-                            .pop()
-                            .expect("an instruction task produces an operation");
-                        instrs_out.push(Instr { temp, rep, op });
-                    }
-                    Task::BuildBlock { count, end } => {
-                        let split = instrs_out.len() - count;
-                        let instrs = instrs_out.split_off(split);
-                        blocks_out.push(Block { instrs, end });
-                    }
-                    Task::Catch { tag } => {
-                        let body = pop_block(&mut blocks_out);
-                        ops.push(Op::Catch {
-                            tag,
-                            body: Box::new(body),
-                        });
-                    }
-                    Task::SwitchTag {
-                        on,
-                        names,
-                        fallback,
-                    } => {
-                        let fallback = fallback.then(|| Box::new(pop_block(&mut blocks_out)));
-                        let split = blocks_out.len() - names.len();
-                        let blocks = blocks_out.split_off(split);
-                        ops.push(Op::SwitchTag {
-                            on,
-                            cases: names
-                                .into_iter()
-                                .zip(blocks)
-                                .map(|(name, block)| TagCase { name, block })
-                                .collect(),
-                            fallback,
-                        });
-                    }
-                    Task::SwitchPrim {
-                        on,
-                        values,
-                        fallback,
-                    } => {
-                        let fallback = fallback.then(|| Box::new(pop_block(&mut blocks_out)));
-                        let split = blocks_out.len() - values.len();
-                        let blocks = blocks_out.split_off(split);
-                        ops.push(Op::SwitchPrim {
-                            on,
-                            cases: values
-                                .into_iter()
-                                .zip(blocks)
-                                .map(|(value, block)| PrimCase { value, block })
-                                .collect(),
-                            fallback,
-                        });
-                    }
-                    Task::SwitchPresence { on, field } => {
-                        let absent = pop_block(&mut blocks_out);
-                        let present = pop_block(&mut blocks_out);
-                        ops.push(Op::SwitchPresence {
-                            on,
-                            field,
-                            present: Box::new(present),
-                            absent: Box::new(absent),
-                        });
-                    }
-                    Task::SwitchLen { on, lens } => {
-                        let beyond = Box::new(pop_block(&mut blocks_out));
-                        let split = blocks_out.len() - lens.len();
-                        let blocks = blocks_out.split_off(split);
-                        ops.push(Op::SwitchLen {
-                            on,
-                            cases: lens
-                                .into_iter()
-                                .zip(blocks)
-                                .map(|(len, block)| LenCase { len, block })
-                                .collect(),
-                            beyond,
-                        });
-                    }
-                    Task::SwitchRest { on, fields } => {
-                        let some = pop_block(&mut blocks_out);
-                        let none = pop_block(&mut blocks_out);
-                        ops.push(Op::SwitchRest {
-                            on,
-                            fields,
-                            none: Box::new(none),
-                            some: Box::new(some),
-                        });
-                    }
-                }
-            }
-            return pop_block(&mut blocks_out);
-
-            fn pop_block(out: &mut Vec<Block>) -> Block {
-                out.pop().expect("a block task produces a block")
-            }
-        }
-        fn read_rep(&self, value: S) -> Rep {
-            match self.atom(value).as_str() {
-                "nat" => Rep::Nat,
-                "int" => Rep::Int,
-                "real" => Rep::Real,
-                "string" => Rep::String,
-                "boolean" => Rep::Boolean,
-                "unit" => Rep::Unit,
-                "struct" => Rep::Struct,
-                "array" => Rep::Array,
-                "sum" => Rep::Sum,
-                "fn" => Rep::Fn,
-                "any" => Rep::Any,
-                _ => self.invalid("invalid representation", Rep::Any),
-            }
-        }
-        fn read_field_key(&self, value: S) -> FieldKey {
-            let Some(values) = list_contents(value) else {
-                return self.invalid("invalid field key", FieldKey::UnnamedOperation);
-            };
-            let mut values = values;
-            if self.atom(self.take(&mut values)) != "field-key" {
-                return self.invalid("invalid field key", FieldKey::UnnamedOperation);
-            }
-            match self.atom(self.take(&mut values)).as_str() {
-                "named" => {
-                    let mut values = self.exact(values, 1, "named field key");
-                    FieldKey::Named(self.string(self.take(&mut values)))
-                }
-                "unnamed-operation" => {
-                    self.exact(values, 0, "unnamed operation field key");
-                    FieldKey::UnnamedOperation
-                }
-                _ => self.invalid("invalid field key", FieldKey::UnnamedOperation),
-            }
-        }
-        fn read_leaf_op(&self, value: S) -> Op {
-            if matches!(&value, A(atom) if atom == "new-tag") {
-                return Op::NewTag;
-            }
-            let Some(mut values) = list_contents(value) else {
-                return self.invalid("invalid operation", Op::NewTag);
-            };
-            let tag = self.atom(self.take(&mut values));
-            match tag.as_str() {
-                "const" => Op::Const(self.read_literal(self.exact(values, 1, "const").remove(0))),
-                "neg" => Op::Neg(self.number(self.exact(values, 1, "neg").remove(0))),
-                "not" => Op::Not(self.number(self.exact(values, 1, "not").remove(0))),
-                "and" => self.op_binary(values, |left, right| Op::And { left, right }, "and"),
-                "or" => self.op_binary(values, |left, right| Op::Or { left, right }, "or"),
-                "xor" => self.op_binary(values, |left, right| Op::Xor { left, right }, "xor"),
-                "add" => self.op_binary(values, |left, right| Op::Add { left, right }, "add"),
-                "sub" => self.op_binary(values, |left, right| Op::Sub { left, right }, "sub"),
-                "mul" => self.op_binary(values, |left, right| Op::Mul { left, right }, "mul"),
-                "div" => self.op_binary(values, |left, right| Op::Div { left, right }, "div"),
-                "struct" => Op::Struct(
-                    values
-                        .into_iter()
-                        .map(|value| {
-                            let value = list_contents(value)
-                                .unwrap_or_else(|| self.invalid("bad struct entry", Vec::new()));
-                            let mut value = self.exact(value, 2, "struct entry");
-                            (
-                                self.read_field_key(self.take(&mut value)),
-                                self.number(self.take(&mut value)),
-                            )
-                        })
-                        .collect(),
-                ),
-                "array" => Op::Array(values.into_iter().map(|value| self.number(value)).collect()),
-                "merge" => Op::Merge(values.into_iter().map(|value| self.number(value)).collect()),
-                "concat" => {
-                    Op::Concat(values.into_iter().map(|value| self.number(value)).collect())
-                }
-                "project" => {
-                    let mut values = self.exact(values, 2, "project");
-                    Op::Project {
-                        base: self.number(self.take(&mut values)),
-                        field: self.read_field_key(self.take(&mut values)),
-                    }
-                }
-                "tag" => {
-                    if values.is_empty() || values.len() > 2 {
-                        self.fail("bad tag");
-                        values.truncate(2);
-                    }
-                    let name = self.string(self.take(&mut values));
-                    Op::Tag {
-                        name,
-                        payload: values.pop().map(|value| self.number(value)),
-                    }
-                }
-                "payload" => Op::Payload(self.number(self.exact(values, 1, "payload").remove(0))),
-                "nth" => {
-                    let mut values = self.exact(values, 2, "nth");
-                    Op::Nth {
-                        base: self.number(self.take(&mut values)),
-                        index: self.number(self.take(&mut values)),
-                    }
-                }
-                "nth-back" => {
-                    let mut values = self.exact(values, 2, "nth-back");
-                    Op::NthBack {
-                        base: self.number(self.take(&mut values)),
-                        index: self.number(self.take(&mut values)),
-                    }
-                }
-                "slice" => {
-                    let mut values = self.exact(values, 3, "slice");
-                    Op::Slice {
-                        base: self.number(self.take(&mut values)),
-                        start: self.number(self.take(&mut values)),
-                        drop: self.number(self.take(&mut values)),
-                    }
-                }
-                "closure" => {
-                    let mut values = self.exact(values, 2, "closure");
-                    Op::Closure {
-                        func: self.number(self.take(&mut values)),
-                        captures: self
-                            .many(self.take(&mut values), "captures")
-                            .into_iter()
-                            .map(|value| self.number(value))
-                            .collect(),
-                    }
-                }
-                "call" => {
-                    let mut values = self.exact(values, 2, "call");
-                    let callee = match list_contents(self.take(&mut values)) {
-                        Some(target) => {
-                            let mut target = self.exact(target, 2, "call target");
-                            match self.atom(self.take(&mut target)).as_str() {
-                                "direct" => Callee::Direct(self.number(self.take(&mut target))),
-                                "indirect" => Callee::Indirect(self.number(self.take(&mut target))),
-                                _ => self.invalid("bad call target", Callee::Indirect(0)),
-                            }
-                        }
-                        _ => self.invalid("bad call target", Callee::Indirect(0)),
-                    };
-                    let args = self
-                        .many(self.take(&mut values), "args")
-                        .into_iter()
-                        .map(|value| self.number(value))
-                        .collect();
-                    Op::Call { callee, args }
-                }
-                "raw-call" => {
-                    let mut values = self.exact(values, 2, "raw-call");
-                    let callee = self.number(self.take(&mut values));
-                    let args = self
-                        .many(self.take(&mut values), "args")
-                        .into_iter()
-                        .map(|value| self.number(value))
-                        .collect();
-                    Op::RawCall { callee, args }
-                }
-                "extern" => Op::Extern {
-                    target: self.string(self.exact(values, 1, "extern").remove(0)),
-                },
-                "global" => Op::Global {
-                    target: self.string(self.exact(values, 1, "global").remove(0)),
-                },
-                _ => self.invalid("invalid operation", Op::NewTag),
-            }
-        }
-        fn op_binary(&self, values: Vec<S>, make: fn(u32, u32) -> Op, tag: &str) -> Op {
-            let mut values = self.exact(values, 2, tag);
-            make(
-                self.number(self.take(&mut values)),
-                self.number(self.take(&mut values)),
-            )
-        }
-        fn read_end(&self, value: S) -> End {
-            let mut values = list_contents(value)
-                .unwrap_or_else(|| self.invalid("invalid terminator", Vec::new()));
-            let tag = self.atom(self.take(&mut values));
-            match tag.as_str() {
-                "ret" => End::Ret(self.number(self.exact(values, 1, "ret").remove(0))),
-                "yield" => End::Yield(self.number(self.exact(values, 1, "yield").remove(0))),
-                "throw" => {
-                    let mut values = self.exact(values, 2, "throw");
-                    End::Throw {
-                        tag: self.number(self.take(&mut values)),
-                        value: self.number(self.take(&mut values)),
-                    }
-                }
-                _ => self.invalid("invalid terminator", End::Ret(0)),
-            }
-        }
-        fn read_literal(&self, value: S) -> Literal {
-            let mut values =
-                list_contents(value).unwrap_or_else(|| self.invalid("invalid literal", Vec::new()));
-            let tag = self.atom(self.take(&mut values));
-            match tag.as_str() {
-                "nat" => {
-                    Literal::Natural(self.number(self.exact(values, 1, "nat literal").remove(0)))
-                }
-                "int" => {
-                    Literal::Integer(self.number(self.exact(values, 1, "int literal").remove(0)))
-                }
-                "real" => {
-                    Literal::Real(self.number(self.exact(values, 1, "real literal").remove(0)))
-                }
-                "string" => {
-                    Literal::String(self.string(self.exact(values, 1, "string literal").remove(0)))
-                }
-                "bool" => {
-                    Literal::Boolean(self.boolean(self.exact(values, 1, "bool literal").remove(0)))
-                }
-                _ => self.invalid("invalid literal", Literal::Boolean(false)),
-            }
+            let mut values = self.exact(self.list(value, "cps-lir"), 1, "cps-lir");
+            let encoded = self.string(self.take(&mut values));
+            serde_json::from_str(&encoded).unwrap_or_else(|_| {
+                self.invalid(
+                    "invalid CPS LIR",
+                    Lir {
+                        externs: vec![],
+                        functions: vec![],
+                        globals: vec![],
+                    },
+                )
+            })
         }
     }
 }
@@ -5940,76 +4062,47 @@ mod tests {
 
     #[test]
     fn extern_target_uses_one_canonical_string() {
-        for (target, target_form) in [
-            ("", "(target \"\")"),
-            ("console.log", "(target \"console.log\")"),
-            (
-                "(value) => value\n+ 1",
-                "(target \"(value) => value\\n+ 1\")",
-            ),
-            ("a \"quote\"", "(target \"a \\\"quote\\\"\")"),
-        ] {
+        for target in ["", "console.log", "(value) => value\n+ 1", "a \"quote\""] {
             let artifact = artifact_with_target(target);
             let printed = print(&artifact);
             assert_eq!(try_parse(&printed).unwrap().validate().unwrap(), artifact);
-            assert!(printed.contains(target_form), "{printed}");
+            assert_eq!(try_parse(&printed).unwrap().lir.externs[0].target, target);
         }
     }
 
     #[test]
     fn extern_target_rejects_old_path_encoding() {
         let printed = print(&artifact_with_target("console.log"));
-        let old = printed.replace("(target \"console.log\")", "(target \"console\" \"log\")");
-        assert_eq!(try_parse(&old).unwrap_err().message(), "bad `target` arity");
+        let old = printed.replace(
+            r#"\"target\":\"console.log\""#,
+            r#"\"target\":[\"console\",\"log\"]"#,
+        );
+        assert_ne!(old, printed);
+        assert_eq!(try_parse(&old).unwrap_err().message(), "invalid CPS LIR");
     }
 
     #[test]
     fn validation_rejects_out_of_range_function_references() {
-        for op in [
-            Op::Closure {
-                func: 1,
-                captures: Vec::new(),
-            },
-            Op::Call {
-                callee: Callee::Direct(1),
-                args: Vec::new(),
-            },
-        ] {
-            let mut unchecked = artifact_with_target("host.value").to_unchecked();
-            unchecked.lir.globals.push(Global {
-                name: "test@1::value".into(),
-                body: Block {
-                    instrs: vec![Instr {
-                        temp: 0,
-                        rep: Rep::Any,
-                        op,
-                    }],
-                    end: End::Ret(0),
-                },
-            });
-            assert_eq!(
-                unchecked.validate().unwrap_err().message(),
-                "artifact function reference 1 is outside its function table"
-            );
-        }
+        let mut unchecked = artifact_with_target("host.value").to_unchecked();
+        unchecked.lir.globals.push(Global {
+            adapter: None,
+            callable: None,
+            name: "test@1::value".into(),
+            initializer: 1,
+        });
+        assert_eq!(
+            unchecked.validate().unwrap_err().message(),
+            "initializer outside function table"
+        );
     }
-
     #[test]
     fn recovery_discards_unrepairable_executable_data() {
         let mut unchecked = artifact_with_target("host.value").to_unchecked();
         unchecked.lir.globals.push(Global {
+            adapter: None,
+            callable: None,
             name: "test@1::value".into(),
-            body: Block {
-                instrs: vec![Instr {
-                    temp: 0,
-                    rep: Rep::Any,
-                    op: Op::Closure {
-                        func: 1,
-                        captures: Vec::new(),
-                    },
-                }],
-                end: End::Ret(0),
-            },
+            initializer: 1,
         });
         let (recovered, facts) = unchecked.recover();
         assert!(recovered.lir().functions.is_empty());

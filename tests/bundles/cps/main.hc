@@ -1,0 +1,29 @@
+let count = fn n => match n with
+  | 0.0 => 0.0
+  | _ => count (n - 1.0)
+end
+
+let sum = fn n => match n with
+  | 0.0 => 0.0
+  | _ => n + sum (n - 1.0)
+end
+
+let left = fn n => match n with | 0.0 => 1.0 | _ => right (n - 1.0) end
+let right = fn n => match n with | 0.0 => 2.0 | _ => left (n - 1.0) end
+let apply = fn f n => f n
+let higher = fn n => match n with | 0.0 => 0.0 | _ => apply higher (n - 1.0) end
+
+effect Step = Real -> Real
+let through_effect = fn n => match n with
+  | 0.0 => 0.0
+  | _ => !Step (through_effect (n - 1.0))
+end
+let handled = fn n => handle through_effect n with | !Step value => value + 1.0 end
+
+let recursive_handler = fn n => handle (match n with
+  | 0.0 => !Step 0.0
+  | _ => recursive_handler (n - 1.0)
+end) with
+  | !Step value => raise value
+  | return value => value + 1.0
+end
