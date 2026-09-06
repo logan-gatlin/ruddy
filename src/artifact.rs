@@ -141,6 +141,7 @@ pub(crate) fn empty() -> Artifact {
                 name: String::new(),
                 version: String::new(),
             },
+            compiler: Stamp::current(),
             dependencies: Vec::new(),
             values: Vec::new(),
             types: Vec::new(),
@@ -157,6 +158,13 @@ pub(crate) fn empty() -> Artifact {
 impl UncheckedArtifact {
     /// Strictly establish the portable artifact invariants.
     pub fn validate(self) -> Result<Artifact, ValidationError> {
+        self.validate_ref()
+    }
+
+    /// [`validate`](Self::validate) without giving the data up: the decoder
+    /// reads it by reference and answers with a fresh artifact either way, so
+    /// recovery can validate first and still have the original to repair.
+    fn validate_ref(&self) -> Result<Artifact, ValidationError> {
         if self.header.identity.name.is_empty() || self.header.identity.version.is_empty() {
             return Err(ValidationError::new(
                 "artifact identity must name a bundle and version",
@@ -175,25 +183,17 @@ impl UncheckedArtifact {
         // thirty thousand deep is indented thirty thousand times per line, so
         // the layout alone would be quadratic in the artifact, while the
         // decoder's checks are the same either way.
-        let portable = Artifact {
-            header: self.header,
-            lir: self.lir,
-        };
-        text::decode(&portable).map_err(|error| ValidationError::new(error.to_string()))
+        text::decode_parts(&self.header, &self.lir)
+            .map_err(|error| ValidationError::new(error.to_string()))
     }
 
     /// Admit a dependency artifact while recording that validation had to be
     /// relaxed. Recovery facts are diagnostics, not source compilation errors.
     pub fn recover(self) -> (Artifact, Vec<RecoveryFact>) {
-        let UncheckedArtifact { header, lir } = self;
-        match (UncheckedArtifact {
-            header: header.clone(),
-            lir: lir.clone(),
-        })
-        .validate()
-        {
+        match self.validate_ref() {
             Ok(artifact) => (artifact, Vec::new()),
             Err(_) => {
+                let UncheckedArtifact { header, lir } = self;
                 // Recovery is deliberately local. One malformed spelling must
                 // not erase unaffected declarations or executable content.
                 let mut header = header;
@@ -310,6 +310,7 @@ fn recover_executable(mut lir: Lir) -> (Lir, Vec<RecoveryFact>) {
 fn recover_parts(header: Header, lir: Lir) -> (Artifact, Vec<RecoveryFact>) {
     let mut recovered = Header {
         identity: header.identity,
+        compiler: header.compiler,
         dependencies: header.dependencies,
         values: Vec::new(),
         types: Vec::new(),
@@ -391,6 +392,8 @@ impl Drop for Artifact {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Header {
     pub identity: Identity,
+    /// The compiler that wrote this artifact.
+    pub compiler: Stamp,
     /// The bundles this artifact depends on.
     pub dependencies: Vec<Dependency>,
     /// Every source-addressable top-level value exported by the bundle. Externs
@@ -408,6 +411,40 @@ pub struct Header {
 pub struct Identity {
     pub name: String,
     pub version: String,
+}
+
+/// The digest of the compiler that wrote an artifact: a hash of the
+/// compiler's own source, taken when it was built, rather than a version
+/// number anyone has to remember to bump. Two compilers with the same stamp
+/// write the same artifact for the same source, so a cached artifact whose
+/// stamp is this compiler's can be trusted without being recompiled — and one
+/// whose stamp is not can only be recompiled, since nothing says what has
+/// changed in between.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stamp(String);
+
+/// The stamp of the compiler this is, computed by the build script.
+pub const COMPILER_HASH: &str = env!("RUDDY_COMPILER_HASH");
+
+impl Stamp {
+    /// The stamp of the compiler this is.
+    pub fn current() -> Self {
+        Self(COMPILER_HASH.to_string())
+    }
+
+    /// A stamp read back from an artifact, whatever compiler wrote it.
+    pub fn recorded(text: String) -> Self {
+        Self(text)
+    }
+
+    /// Whether the compiler that wrote the artifact is this one.
+    pub fn is_current(&self) -> bool {
+        self.0 == COMPILER_HASH
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// The identity of one bundle this artifact depends on.
@@ -2093,6 +2130,7 @@ pub fn build_with_dependencies(
             name: mint.bundle().name().to_string(),
             version: mint.bundle().version().to_string(),
         },
+        compiler: Stamp::current(),
         dependencies,
         values: program
             .externs
@@ -2814,7 +2852,7 @@ fn rep(value: lir::Rep) -> Rep {
 /// the parser accepts trusted output only.
 pub mod text {
     use super::*;
-    use pretty::RcDoc;
+    use unicode_width::UnicodeWidthStr;
 
     /// The fixed width of canonical artifact text. Keeping this here rather
     /// than at the call site makes line breaking part of the format.
@@ -2857,17 +2895,18 @@ pub mod text {
     /// Print one artifact as canonical text, pretty-printed at a fixed width
     /// and always ending in one newline.
     pub fn print(value: &Artifact) -> String {
-        let mut out = Vec::new();
-        doc(&artifact(value))
-            .render(WIDTH, &mut out)
-            .expect("writing an artifact to memory cannot fail");
-        out.push(b'\n');
-        String::from_utf8(out).expect("artifact text is UTF-8")
+        let mut out = layout(&artifact(value));
+        out.push('\n');
+        out
     }
     /// Decode an artifact's own portable tree through the reader, which is
     /// what parsing its canonical text would do minus the text.
-    pub(crate) fn decode(value: &Artifact) -> Result<Artifact, ParseError> {
-        Reader::new().artifact(expanded(artifact(value))?)
+    pub(crate) fn decode_parts(header: &Header, lir: &Lir) -> Result<Artifact, ParseError> {
+        Reader::new().artifact(expanded(L(vec![
+            A("artifact".into()),
+            self::header(header),
+            self::lir(lir),
+        ]))?)
     }
     /// Replace every compact type spelling in a tree with the list it reads
     /// as, so the tree is exactly what parsing its text would have produced.
@@ -2938,6 +2977,10 @@ pub mod text {
                 A("identity".into()),
                 Q(value.identity.name.clone()),
                 Q(value.identity.version.clone()),
+            ]),
+            L(vec![
+                A("compiler".into()),
+                Q(value.compiler.as_str().to_string()),
             ]),
             L(std::iter::once(A("dependencies".into()))
                 .chain(value.dependencies.iter().map(dependency))
@@ -3702,36 +3745,124 @@ pub mod text {
         }
     }
 
-    fn doc(value: &S) -> RcDoc<'_, ()> {
-        enum Work<'a> {
-            Value(&'a S),
-            List(usize),
-        }
-        let mut work = vec![Work::Value(value)];
-        let mut out = Vec::new();
-        while let Some(part) = work.pop() {
-            match part {
-                Work::Value(A(value)) | Work::Value(Raw(value)) => {
-                    out.push(RcDoc::text(value.as_str()))
+    /// One step of laying a tree out: a value to write at an indentation,
+    /// flat or broken, the text of a bracket, or the separator between two
+    /// values of a list, which is a space when the list is flat and a line
+    /// break to the list's indentation otherwise.
+    enum Cmd<'a> {
+        Value(&'a S, usize, bool),
+        Text(&'static str),
+        Line(usize, bool),
+    }
+
+    /// Lay a tree out at [`WIDTH`], with every list either on one line or
+    /// with each of its values on a line of its own, indented two past the
+    /// list.
+    ///
+    /// A list goes on one line when it fits there together with whatever
+    /// follows it on that line — the brackets closing its ancestors — which
+    /// is the rule the Wadler-style printers apply, and the one this text
+    /// was canonical under before it was laid out here. Both the layout and
+    /// its fitting check run on explicit stacks: a list nested as deeply as
+    /// an artifact's blocks can be costs memory, not stack, and the check
+    /// stops the moment a line is overrun, so it reads at most a line's worth
+    /// of text however large the list.
+    fn layout(root: &S) -> String {
+        let mut out = String::new();
+        let mut column = 0;
+        let mut stack = vec![Cmd::Value(root, 0, false)];
+        while let Some(cmd) = stack.pop() {
+            match cmd {
+                Cmd::Text(text) => {
+                    out.push_str(text);
+                    column += text.len();
                 }
-                Work::Value(Q(value)) => out.push(RcDoc::text(quoted(value))),
-                Work::Value(L(values)) => {
-                    work.push(Work::List(values.len()));
-                    work.extend(values.iter().rev().map(Work::Value));
+                Cmd::Line(_, true) => {
+                    out.push(' ');
+                    column += 1;
                 }
-                Work::List(len) => {
-                    let at = out.len() - len;
-                    let children = out.split_off(at);
-                    out.push(
-                        RcDoc::text("(")
-                            .append(RcDoc::intersperse(children, RcDoc::line()).nest(2))
-                            .append(")")
-                            .group(),
-                    );
+                Cmd::Line(indent, false) => {
+                    out.push('\n');
+                    out.extend(std::iter::repeat_n(' ', indent));
+                    column = indent;
+                }
+                Cmd::Value(L(values), indent, flat) => {
+                    let flat = flat || fits(values, &stack, WIDTH.saturating_sub(column));
+                    stack.push(Cmd::Text(")"));
+                    for (at, value) in values.iter().enumerate().rev() {
+                        stack.push(Cmd::Value(value, indent + 2, flat));
+                        if at > 0 {
+                            stack.push(Cmd::Line(indent + 2, flat));
+                        }
+                    }
+                    stack.push(Cmd::Text("("));
+                }
+                Cmd::Value(value, _, _) => {
+                    let text = leaf(value);
+                    column += text.width();
+                    out.push_str(&text);
                 }
             }
         }
-        out.pop().expect("one document root")
+        out
+    }
+
+    /// Whether a list laid out flat fits in `remaining` columns along with
+    /// what the pending commands put after it on the same line: text up to
+    /// the first line break that is not itself flat.
+    fn fits(values: &[S], pending: &[Cmd<'_>], remaining: usize) -> bool {
+        let mut remaining = remaining as isize;
+        // The list itself, flat: its brackets, its values and the spaces
+        // between them, in order.
+        let mut work: Vec<Cmd<'_>> = vec![Cmd::Text(")")];
+        for (at, value) in values.iter().enumerate().rev() {
+            work.push(Cmd::Value(value, 0, true));
+            if at > 0 {
+                work.push(Cmd::Line(0, true));
+            }
+        }
+        work.push(Cmd::Text("("));
+        let mut after = pending.iter().rev();
+        loop {
+            let cmd = match work.pop() {
+                Some(cmd) => cmd,
+                None => match after.next() {
+                    // Nothing follows on the line, and everything fit.
+                    None => return true,
+                    Some(Cmd::Value(value, indent, flat)) => Cmd::Value(value, *indent, *flat),
+                    Some(Cmd::Text(text)) => Cmd::Text(text),
+                    Some(Cmd::Line(indent, flat)) => Cmd::Line(*indent, *flat),
+                },
+            };
+            match cmd {
+                Cmd::Line(_, false) => return true,
+                Cmd::Line(_, true) => remaining -= 1,
+                Cmd::Text(text) => remaining -= text.len() as isize,
+                Cmd::Value(L(values), _, flat) => {
+                    work.push(Cmd::Text(")"));
+                    for (at, value) in values.iter().enumerate().rev() {
+                        work.push(Cmd::Value(value, 0, flat));
+                        if at > 0 {
+                            work.push(Cmd::Line(0, flat));
+                        }
+                    }
+                    work.push(Cmd::Text("("));
+                }
+                Cmd::Value(value, _, _) => remaining -= leaf(value).width() as isize,
+            }
+            if remaining < 0 {
+                return false;
+            }
+        }
+    }
+
+    /// The text of a value that is not a list.
+    fn leaf(value: &S) -> std::borrow::Cow<'_, str> {
+        match value {
+            A(text) | Raw(text) => std::borrow::Cow::Borrowed(text),
+            Q(text) => std::borrow::Cow::Owned(quoted(text)),
+            L(_) => unreachable!("lists are laid out, not written"),
+        }
     }
 
     fn quoted(value: &str) -> String {
@@ -4068,7 +4199,7 @@ pub mod text {
             }
         }
         fn read_header(&self, value: S) -> Header {
-            let mut values = self.exact(self.list(value, "header"), 5, "header");
+            let mut values = self.exact(self.list(value, "header"), 6, "header");
             let identity = {
                 let mut value =
                     self.exact(self.list(self.take(&mut values), "identity"), 2, "identity");
@@ -4077,8 +4208,14 @@ pub mod text {
                     version: self.string(self.take(&mut value)),
                 }
             };
+            let compiler = {
+                let mut value =
+                    self.exact(self.list(self.take(&mut values), "compiler"), 1, "compiler");
+                Stamp::recorded(self.string(self.take(&mut value)))
+            };
             Header {
                 identity,
+                compiler,
                 dependencies: self
                     .many(self.take(&mut values), "dependencies")
                     .into_iter()
@@ -5447,6 +5584,7 @@ mod tests {
                     name: "test".into(),
                     version: "1".into(),
                 },
+                compiler: Stamp::current(),
                 dependencies: Vec::new(),
                 values: Vec::new(),
                 types: Vec::new(),

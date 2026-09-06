@@ -332,3 +332,37 @@ fn the_constructors_fold_the_constants() {
     // A double negative is the thing itself.
     assert_eq!(var(0).not().not(), var(0));
 }
+
+/// The store's solver keeps every clause and answers under assumptions: a
+/// batch is in force only while its guard is assumed, a binding only while
+/// its literal is, and an equivalence only under its own guard — so what was
+/// rolled back is simply not assumed, and what stands is asked again each
+/// time.
+#[test]
+fn an_incremental_solver_answers_under_assumptions() {
+    let mut solver = sat::Incremental::default();
+    let a = solver.atom(Atom::Var(0));
+    let b = solver.atom(Atom::Var(1));
+    // Batch one: `a != b`. Batch two: `a`.
+    let one = solver.add_guarded(&var(0).xor(var(1)));
+    let two = solver.add_guarded(&var(0));
+    assert!(solver.satisfiable(&[one, two]));
+    // With both in force `b` is settled absent: assuming it present has no
+    // model, assuming it absent does.
+    assert!(!solver.satisfiable(&[one, two, b]));
+    assert!(solver.satisfiable(&[one, two, !b]));
+    // Batch two rolled back: nothing settles `b` any more.
+    assert!(solver.satisfiable(&[one, b]));
+    assert!(solver.satisfiable(&[one, !b]));
+    // A binding `a = c` said as an equivalence under a guard, then `c` bound
+    // present: `b` is settled through the chain, and only while the guard
+    // is assumed.
+    let c = solver.atom(Atom::Var(2));
+    let same = solver.add_equivalence(Atom::Var(0), Atom::Var(2));
+    assert!(!solver.satisfiable(&[one, same, c, b]));
+    assert!(solver.satisfiable(&[one, c, b]));
+    // Nothing added has made the whole thing inconsistent on its own.
+    assert!(solver.satisfiable(&[]));
+    assert!(!solver.satisfiable(&[a, !a]));
+    assert_eq!(solver.atoms().count(), 3);
+}

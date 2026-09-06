@@ -30,7 +30,8 @@
 
 use std::collections::HashMap;
 
-use varisat::{ExtendFormula, Lit, Solver, Var};
+pub use varisat::Lit;
+use varisat::{ExtendFormula, Solver, Var};
 
 use crate::types::{Atom, Formula};
 
@@ -65,12 +66,33 @@ const MINTERMS: usize = 256;
 /// this holds whatever the store relates.
 type Cube = Vec<Option<bool>>;
 
-/// One Tseitin encoding in progress: the solver being filled, and which
-/// variable each atom was given.
-struct Encoding {
+/// A solver that keeps what it has been told between questions.
+///
+/// Encoding a formula is most of what answering a question about it costs —
+/// the formulas the store holds are a few atoms each, and building a solver
+/// to decide one takes longer than deciding it — so the store's questions are
+/// put to one solver that already holds every batch. What changes between
+/// questions is not the formulas but which of them are in force and what
+/// the variables in them have been decided to be, and both are said with
+/// assumptions rather than clauses: a batch's clauses hold only under its
+/// guard literal, and a variable's binding is assumed for the one question
+/// it is asked in. A batch rolled back is a guard never assumed again; a
+/// binding rolled back is simply not assumed next time. Nothing added is
+/// ever wrong later, which is what lets the clauses accumulate.
+pub struct Incremental {
     solver: Solver<'static>,
     atoms: HashMap<Atom, Var>,
     next: usize,
+}
+
+impl Default for Incremental {
+    fn default() -> Self {
+        Self {
+            solver: Solver::new(),
+            atoms: HashMap::new(),
+            next: 0,
+        }
+    }
 }
 
 /// Whether any assignment satisfies `formula`.
@@ -96,11 +118,7 @@ pub fn model(formula: &Formula) -> Option<HashMap<Atom, bool>> {
     if let Some(answer) = literal_model(formula) {
         return answer;
     }
-    let mut encoding = Encoding {
-        solver: Solver::new(),
-        atoms: HashMap::new(),
-        next: 0,
-    };
+    let mut encoding = Incremental::default();
     let top = encoding.encode(formula);
     encoding.solver.add_clause(&[top]);
     let solved = encoding
@@ -533,7 +551,47 @@ fn rebuild(atoms: &[Atom], mut cover: Vec<Cube>) -> Formula {
     Formula::any(cover.iter().map(|cube| product(atoms, cube)))
 }
 
-impl Encoding {
+impl Incremental {
+    /// The literal standing for `atom`, minted on first mention.
+    pub fn atom(&mut self, atom: Atom) -> Lit {
+        let next = self.next;
+        let var = *self.atoms.entry(atom).or_insert_with(|| {
+            self.next += 1;
+            Var::from_index(next)
+        });
+        Lit::from_var(var, true)
+    }
+
+    /// Every atom the solver has been told about, in no particular order.
+    pub fn atoms(&self) -> impl Iterator<Item = Atom> + '_ {
+        self.atoms.keys().copied()
+    }
+
+    /// Add `formula` to hold whenever the returned guard is assumed.
+    pub fn add_guarded(&mut self, formula: &Formula) -> Lit {
+        let guard = self.fresh();
+        let top = self.encode(formula);
+        self.solver.add_clause(&[!guard, top]);
+        guard
+    }
+
+    /// Add `left = right` to hold whenever the returned guard is assumed.
+    pub fn add_equivalence(&mut self, left: Atom, right: Atom) -> Lit {
+        let guard = self.fresh();
+        let (left, right) = (self.atom(left), self.atom(right));
+        self.solver.add_clause(&[!guard, !left, right]);
+        self.solver.add_clause(&[!guard, left, !right]);
+        guard
+    }
+
+    /// Whether everything added so far has a model under `assumptions`.
+    pub fn satisfiable(&mut self, assumptions: &[Lit]) -> bool {
+        self.solver.assume(assumptions);
+        self.solver
+            .solve()
+            .expect("the solver is handed finite clauses and assumptions")
+    }
+
     /// A literal that holds exactly when `formula` does, with the clauses that
     /// make it so added to the solver.
     fn encode(&mut self, formula: &Formula) -> Lit {
@@ -558,12 +616,8 @@ impl Encoding {
                     values.push(lit);
                 }
                 Work::Formula(Formula::Atom(atom)) => {
-                    let next = self.next;
-                    let var = *self.atoms.entry(*atom).or_insert_with(|| {
-                        self.next += 1;
-                        Var::from_index(next)
-                    });
-                    values.push(Lit::from_var(var, true));
+                    let lit = self.atom(*atom);
+                    values.push(lit);
                 }
                 Work::Formula(Formula::Owned(_, inner)) => {
                     work.push(Work::Formula(inner));

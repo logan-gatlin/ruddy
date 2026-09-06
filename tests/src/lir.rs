@@ -34,12 +34,11 @@ fn lowered_with_dependencies(
     assert!(parsed.errors.is_empty(), "{source}: {:#?}", parsed.errors);
 
     let bundle = Bundle::new("tests", Version::new(0, 1, 0)).expect("the bundle name is valid");
-    let unchecked: Vec<_> = dependencies.iter().map(a::Artifact::to_unchecked).collect();
-    let imports: Vec<_> = unchecked
+    let imports: Vec<_> = dependencies
         .iter()
         .map(|artifact| ruddy::compile::Dependency {
-            alias: Some(&artifact.header.identity.name),
-            artifact,
+            alias: Some(&artifact.header().identity.name),
+            artifact: ruddy::compile::DependencyArtifact::Checked(artifact),
         })
         .collect();
     let accepted = ruddy::compile::compile_with_dependencies(
@@ -287,6 +286,7 @@ fn imported_forwarding_cycles_recover_before_lir_representation() {
             };
             let dependency = a::UncheckedArtifact {
                 header: a::Header {
+                    compiler: ruddy::artifact::Stamp::current(),
                     identity: a::Identity {
                         name: "dep".into(),
                         version: "1.0.0".into(),
@@ -1044,6 +1044,7 @@ fn imported_and_local_handler_arms_build_one_complete_evidence_record() {
     };
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            compiler: ruddy::artifact::Stamp::current(),
             identity: a::Identity {
                 name: "dep".into(),
                 version: "1.0.0".into(),

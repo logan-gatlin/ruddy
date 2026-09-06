@@ -3051,6 +3051,32 @@ struct Table {
     authoritative_bindings: HashSet<Symbol>,
     /// Binding-specific annotation identity used when publishing local schemes.
     authoritative_spans: HashMap<Symbol, Span>,
+    /// The store, as one solver that has already been told every batch. See
+    /// [`Table::store_assumptions`].
+    sat: RefCell<StoreSat>,
+}
+
+/// The store's batches encoded once each into a solver kept for the run.
+///
+/// A batch is encoded as it was emitted, over the variables it named then,
+/// and what the solve has since decided those variables to be is said afresh
+/// as assumptions at every question — which is what makes the encoding
+/// survive both a variable being bound after its batch was added and a
+/// binding being rolled back. See [`sat::Incremental`].
+#[derive(Default)]
+struct StoreSat {
+    solver: sat::Incremental,
+    /// The guard of each batch's encoding and a digest of the formula it
+    /// encoded, by the batch's position in the store. Kept no longer than
+    /// the store, and re-encoded where the store put a different batch in a
+    /// slot: a reserved slot is filled in once its local use is solved. A
+    /// batch rolled back or replaced leaves its clauses in the solver under
+    /// a guard nothing assumes again.
+    guards: Vec<(u64, sat::Lit)>,
+    /// The guard of each `atom = atom` said so far, so that a variable that
+    /// resolved to another is related to it by one pair of clauses however
+    /// many questions are asked while the binding stands.
+    equivalences: HashMap<(Atom, Atom), sat::Lit>,
 }
 
 /// Which quantified position each thing a scheme closes over was given, in the
@@ -6656,6 +6682,34 @@ fn unguarded_formula<'a>(origin: &'a Origin, formula: &'a Formula) -> &'a Formul
     }
 }
 
+/// A digest of a formula's structure, for telling whether the batch in a
+/// store slot is still the one the solver encoded. Iterative, since a formula
+/// can be as deep as the match that wrote it.
+fn formula_digest(formula: &Formula) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    let mut work = vec![formula];
+    while let Some(formula) = work.pop() {
+        std::mem::discriminant(formula).hash(&mut hasher);
+        match formula {
+            Formula::True | Formula::False => {}
+            Formula::Atom(atom) => atom.hash(&mut hasher),
+            Formula::Owned(owner, inner) => {
+                owner.hash(&mut hasher);
+                work.push(inner);
+            }
+            Formula::Not(inner) => work.push(inner),
+            Formula::And(left, right)
+            | Formula::Or(left, right)
+            | Formula::Iff(left, right)
+            | Formula::Xor(left, right) => {
+                work.push(right);
+                work.push(left);
+            }
+        }
+    }
+    hasher.finish()
+}
+
 /// Returns the index of the batch this call newly marked as the flip, so a
 /// caller which then discards the flip's error can roll the mark back.
 fn report_flip(table: &mut Table, errors: &mut Vec<Error>) -> Option<usize> {
@@ -8057,14 +8111,131 @@ impl Table {
     /// tiny and there is one batch per match, use and annotation, so replaying
     /// is cheaper than keeping a second copy of the solve honest.
     fn flip(&self) -> Option<usize> {
-        let mut accumulated = Formula::True;
-        for (at, batch) in self.store.batches.iter().enumerate() {
-            accumulated = accumulated.and(self.resolved(&batch.formula));
-            if !sat::satisfiable(&accumulated) {
-                return Some(at);
+        let count = self.store.batches.len();
+        if self.store_prefix_satisfiable(count) {
+            return None;
+        }
+        // Satisfiability of a prefix only ever goes one way as it lengthens,
+        // so the shortest unsatisfiable prefix is found by halving, each half
+        // one question to the solver that already holds every batch.
+        let (mut low, mut high) = (1, count);
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if self.store_prefix_satisfiable(middle) {
+                low = middle + 1;
+            } else {
+                high = middle;
             }
         }
-        None
+        Some(low - 1)
+    }
+
+    /// The assumptions under which the solver in [`Table::sat`] is the first
+    /// `prefix` batches of the store as the solve has resolved them so far:
+    /// those batches' guards, and for every variable the solver knows, what
+    /// it has been decided to be — a constant assumed as its literal, another
+    /// variable as the guard of the pair's equivalence.
+    ///
+    /// Batches the store has since gained are encoded here first, and ones it
+    /// has rolled back are forgotten, so the solver always mirrors the store.
+    fn store_assumptions(&self, prefix: usize) -> Vec<sat::Lit> {
+        let mut sat = self.sat.borrow_mut();
+        let sat = &mut *sat;
+        sat.guards.truncate(self.store.batches.len());
+        for (at, batch) in self.store.batches.iter().enumerate() {
+            let digest = formula_digest(&batch.formula);
+            if sat
+                .guards
+                .get(at)
+                .is_some_and(|(encoded, _)| *encoded == digest)
+            {
+                continue;
+            }
+            let guard = sat.solver.add_guarded(&batch.formula);
+            match sat.guards.get_mut(at) {
+                Some(slot) => *slot = (digest, guard),
+                None => sat.guards.push((digest, guard)),
+            }
+        }
+        let mut assumptions: Vec<sat::Lit> = sat.guards[..prefix]
+            .iter()
+            .map(|(_, guard)| *guard)
+            .collect();
+        let atoms: Vec<Atom> = sat.solver.atoms().collect();
+        for atom in atoms {
+            let Atom::Var(var) = atom else { continue };
+            let resolved = match self.presence_of(&Presence::Var(var)).formula() {
+                Formula::True => Some(true),
+                Formula::False => Some(false),
+                Formula::Atom(other) if other != atom => {
+                    let guard = *sat
+                        .equivalences
+                        .entry((atom, other))
+                        .or_insert_with(|| sat.solver.add_equivalence(atom, other));
+                    assumptions.push(guard);
+                    None
+                }
+                _ => None,
+            };
+            if let Some(value) = resolved {
+                let literal = sat.solver.atom(atom);
+                assumptions.push(if value { literal } else { !literal });
+            }
+        }
+        assumptions
+    }
+
+    /// Whether the first `prefix` batches of the store have a model.
+    fn store_prefix_satisfiable(&self, prefix: usize) -> bool {
+        let assumptions = self.store_assumptions(prefix);
+        self.sat.borrow_mut().solver.satisfiable(&assumptions)
+    }
+
+    /// Whether the whole store has a model.
+    fn store_satisfiable(&self) -> bool {
+        self.store_prefix_satisfiable(self.store.batches.len())
+    }
+
+    /// Whether the store, assumed satisfiable, forces `var` to `value`.
+    fn store_settles(&self, var: TyVar, value: bool) -> bool {
+        let mut assumptions = self.store_assumptions(self.store.batches.len());
+        let mut sat = self.sat.borrow_mut();
+        let literal = sat.solver.atom(Atom::Var(var));
+        assumptions.push(if value { !literal } else { literal });
+        !sat.solver.satisfiable(&assumptions)
+    }
+
+    /// Whether the store, assumed satisfiable, forces `left` and `right` to
+    /// agree: neither can be there without the other.
+    fn store_equates(&self, left: TyVar, right: TyVar) -> bool {
+        let assumptions = self.store_assumptions(self.store.batches.len());
+        let mut sat = self.sat.borrow_mut();
+        let (left, right) = (
+            sat.solver.atom(Atom::Var(left)),
+            sat.solver.atom(Atom::Var(right)),
+        );
+        let mut one_way = assumptions.clone();
+        one_way.extend([left, !right]);
+        let mut other_way = assumptions;
+        other_way.extend([!left, right]);
+        !sat.solver.satisfiable(&one_way) && !sat.solver.satisfiable(&other_way)
+    }
+
+    /// The variables some batch of the store, as resolved so far, still
+    /// names: the only ones it could settle. A variable no batch reaches is
+    /// not asked about, which for most definitions is every variable.
+    fn store_mentions(&self) -> HashSet<TyVar> {
+        let atoms: Vec<Atom> = self.sat.borrow().solver.atoms().collect();
+        atoms
+            .into_iter()
+            .filter_map(|atom| match atom {
+                Atom::Var(var) => match self.presence_of(&Presence::Var(var)) {
+                    Presence::Var(var) => Some(var),
+                    _ => None,
+                },
+                Atom::Bound(_) => None,
+            })
+            .collect()
     }
 
     /// Everything the store says about `atoms` and about whatever those reach:
@@ -8214,17 +8385,19 @@ impl Table {
     /// definition generalizes to `{x: a} -> {}` with no variables and no
     /// `where` clause left over.
     fn fold_back(&mut self, ty: &Rc<Ty>) {
-        let known = self.known();
-        if !sat::satisfiable(&known) {
+        if !self.store_satisfiable() {
             return;
         }
         let mut found = IndexSet::new();
         self.presences_in(ty, &mut found);
+        let mentioned = self.store_mentions();
         for var in found {
-            let literal = Formula::var(var);
-            let settled = if sat::entails(&known, &literal) {
+            if !mentioned.contains(&var) {
+                continue;
+            }
+            let settled = if self.store_settles(var, true) {
                 Presence::Present
-            } else if sat::entails(&known, &literal.clone().not()) {
+            } else if self.store_settles(var, false) {
                 Presence::Absent
             } else {
                 continue;

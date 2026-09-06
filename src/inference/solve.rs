@@ -1379,8 +1379,7 @@ impl Solve<'_> {
     /// the type. This is a fixed match-end boundary, not feedback: it only
     /// folds an already entailed alias and never creates another constraint.
     fn alias_result_presences(&mut self, span: Span, result: &Rc<Ty>, scrutinee: &Rc<Ty>) {
-        let known = self.table.known();
-        if !crate::inference::sat::satisfiable(&known) {
+        if !self.table.store_satisfiable() {
             return;
         }
         let mut outputs = IndexSet::new();
@@ -1393,8 +1392,7 @@ impl Solve<'_> {
         // the input set remains canonical throughout this loop.
         for output in outputs {
             for input in &inputs {
-                let equal = Formula::var(output).iff(Formula::var(*input));
-                if crate::inference::sat::entails(&known, &equal) {
+                if self.table.store_equates(output, *input) {
                     self.presences(span, &Presence::Var(output), &Presence::Var(*input));
                     break;
                 }

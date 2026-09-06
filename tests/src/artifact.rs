@@ -54,6 +54,7 @@ fn exporting(mint: &Mint, scheme: &types::Scheme) -> Artifact {
     let version = mint.bundle().version().to_string();
     UncheckedArtifact {
         header: artifact::Header {
+            compiler: ruddy::artifact::Stamp::current(),
             identity: artifact::Identity {
                 name: name.clone(),
                 version: version.clone(),
@@ -287,6 +288,7 @@ fn model_artifact() -> Artifact {
     ];
     UncheckedArtifact {
         header: artifact::Header {
+            compiler: ruddy::artifact::Stamp::current(),
             identity: artifact::Identity {
                 name: "bundle".to_string(),
                 version: "1.0.0".to_string(),
@@ -910,6 +912,7 @@ fn canonical_pretty_layout_is_pinned_at_its_unicode_width_boundary() {
     let empty = |name: String| {
         UncheckedArtifact {
             header: artifact::Header {
+                compiler: ruddy::artifact::Stamp::current(),
                 identity: artifact::Identity {
                     name,
                     version: "1".to_string(),
@@ -929,27 +932,34 @@ fn canonical_pretty_layout_is_pinned_at_its_unicode_width_boundary() {
         .expect("an empty artifact validates")
     };
 
+    let compiler = ruddy::artifact::COMPILER_HASH;
     assert_eq!(
         empty("界".repeat(12)).print(),
-        "(artifact\n\
+        format!(
+            "(artifact\n\
          \x20 (header\n\
          \x20   (identity \"界界界界界界界界界界界界\" \"1\")\n\
+         \x20   (compiler \"{compiler}\")\n\
          \x20   (dependencies)\n\
          \x20   (values)\n\
          \x20   (types)\n\
          \x20   (effects))\n\
          \x20 (lir (externs) (functions) (globals)))\n"
+        )
     );
     assert_eq!(
         empty("界".repeat(13)).print(),
-        "(artifact\n\
+        format!(
+            "(artifact\n\
          \x20 (header\n\
          \x20   (identity \"界界界界界界界界界界界界界\" \"1\")\n\
+         \x20   (compiler \"{compiler}\")\n\
          \x20   (dependencies)\n\
          \x20   (values)\n\
          \x20   (types)\n\
          \x20   (effects))\n\
          \x20 (lir (externs) (functions) (globals)))\n"
+        )
     );
 }
 
@@ -1394,14 +1404,14 @@ fn malformed_text_returns_errors_while_trusted_api_panics() {
         "\"",
         "(artifact)",
         "(artifact (header) (lir))",
-        "(artifact (header (identity \"x\" \"1\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)) trailing)",
-        "(artifact (header (identity \"x\" \"1\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)) extra",
-        "(artifact (header (identity \"\\u001\" \"1\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
-        "(artifact (header (identity \"\\u00gg\" \"1\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
-        "(artifact (header (identity \"\\u0041\" \"1\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
-        "(artifact (header (identity \"\\u000a\" \"1\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
-        "(artifact (header (identity \"\\ud800\" \"1\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
-        "(artifact (header (identity \"\\q\" \"1\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
+        "(artifact (header (identity \"x\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)) trailing)",
+        "(artifact (header (identity \"x\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)) extra",
+        "(artifact (header (identity \"\\u001\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
+        "(artifact (header (identity \"\\u00gg\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
+        "(artifact (header (identity \"\\u0041\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
+        "(artifact (header (identity \"\\u000a\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
+        "(artifact (header (identity \"\\ud800\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
+        "(artifact (header (identity \"\\q\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
     ] {
         assert_malformed(text);
     }
@@ -1711,6 +1721,7 @@ fn deeply_nested_artifact_semantics_decode_on_a_small_stack() {
     const DEPTH: usize = 400;
     let mut value = UncheckedArtifact {
         header: artifact::Header {
+            compiler: ruddy::artifact::Stamp::current(),
             identity: artifact::Identity {
                 name: "deep".to_string(),
                 version: "1".to_string(),
@@ -2007,6 +2018,7 @@ fn recursive_artifact_ownership_clones_and_drops_on_a_small_stack() {
 
             let artifact = UncheckedArtifact {
                 header: artifact::Header {
+                    compiler: ruddy::artifact::Stamp::current(),
                     identity: artifact::Identity {
                         name: "deep".into(),
                         version: "1".into(),
@@ -2123,7 +2135,7 @@ fn valid_deep_artifact_parses_and_drops_on_a_small_stack() {
     const DEPTH: usize = 30_000;
     let formula = format!("{}true{}", "(not ".repeat(DEPTH), ")".repeat(DEPTH));
     let valid = format!(
-        "(artifact (header (identity \"deep\" \"1\") (dependencies) \
+        "(artifact (header (identity \"deep\" \"1\") (compiler \"0000000000000000\") (dependencies) \
          (values (value \"deep@1::value\" (scheme 0 0 (existentials) {formula} (ty nat)))) \
          (types) (effects)) (lir (externs) (functions) (globals)))"
     );
@@ -2156,7 +2168,7 @@ fn malformed_deep_syntax_fails_without_exhausting_the_stack() {
 fn balanced_malformed_deep_values_fail_on_a_small_stack() {
     const DEPTH: usize = 30_000;
     let nested = format!("{}wrong{}", "(wrong ".repeat(DEPTH), ")".repeat(DEPTH));
-    let header = "(header (identity \"deep\" \"1\") (dependencies) (values) (types) (effects))";
+    let header = "(header (identity \"deep\" \"1\") (compiler \"0000000000000000\") (dependencies) (values) (types) (effects))";
     let lir = "(lir (externs) (functions) (globals))";
 
     // The first input is structurally balanced but puts an arbitrarily deep
@@ -2185,7 +2197,7 @@ fn rejected_deep_semantic_model_is_destroyed_on_a_small_stack() {
     const DEPTH: usize = 30_000;
     let formula = format!("{}true{}", "(not ".repeat(DEPTH), ")".repeat(DEPTH));
     let malformed = format!(
-        "(artifact (header (identity \"deep\" \"1\") (dependencies) \
+        "(artifact (header (identity \"deep\" \"1\") (compiler \"0000000000000000\") (dependencies) \
          (values (value \"deep@1::value\" (scheme 0 0 (existentials) {formula} (ty (struct (row (labels) closed)))))) \
          (types) (effects)) (lir (externs) (functions) wrong))"
     );
@@ -2328,4 +2340,85 @@ fn parameterized_effects_and_generic_aliases_round_trip() {
         "(case \"tests@0.1.0::Log\")",
         "(case \"tests@0.1.0::Both\" (ty nat) (ty nat))",
     );
+}
+
+/// An artifact records the compiler that wrote it, and the stamp survives the
+/// text round trip: this compiler recognizes its own, and nothing else.
+#[test]
+fn artifacts_are_stamped_with_their_compiler() {
+    let artifact = model_artifact();
+    assert!(artifact.header().compiler.is_current());
+    let printed = artifact.print();
+    assert!(printed.contains(&format!(
+        "(compiler \"{}\")",
+        ruddy::artifact::COMPILER_HASH
+    )));
+    let parsed = Artifact::try_parse(&printed).unwrap().validate().unwrap();
+    assert!(parsed.header().compiler.is_current());
+
+    let other = printed.replace(ruddy::artifact::COMPILER_HASH, "0000000000000000");
+    let parsed = Artifact::try_parse(&other).unwrap().validate().unwrap();
+    assert!(!parsed.header().compiler.is_current());
+    assert_eq!(parsed.header().compiler.as_str(), "0000000000000000");
+    assert_eq!(ruddy::artifact::COMPILER_HASH.len(), 16);
+}
+
+/// Printing and reading an artifact cost memory rather than stack: a block
+/// nested thousands deep and a header listing thousands of values both go to
+/// text and back on a thread with a stack no traversal could recurse down.
+/// The depth is bounded by the text rather than the printer — every level
+/// indents every line under it, so the text of a nesting grows with its
+/// square — and is many times what a recursive layout survives on this
+/// stack.
+#[test]
+fn deep_and_wide_artifacts_print_and_parse_on_a_small_stack() {
+    const DEPTH: usize = 3_000;
+    const WIDTH: usize = 4_096;
+    let mut body = artifact::Block {
+        instrs: Vec::new(),
+        end: artifact::End::Ret(0),
+    };
+    for level in 0..DEPTH {
+        body = artifact::Block {
+            instrs: vec![artifact::Instr {
+                temp: level as u32,
+                rep: artifact::Rep::Nat,
+                op: artifact::Op::Catch {
+                    tag: 0,
+                    body: Box::new(body),
+                },
+            }],
+            end: artifact::End::Ret(level as u32),
+        };
+    }
+    let mut artifact = model_artifact().to_unchecked();
+    artifact.lir.functions.push(artifact::Function {
+        name: "deep@1.0.0::deep".into(),
+        params: Vec::new(),
+        body,
+    });
+    for index in 0..WIDTH {
+        artifact.header.values.push(artifact::Value {
+            name: format!("deep@1.0.0::value{index}"),
+            scheme: artifact.header.values[0].scheme.clone(),
+        });
+    }
+    std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            let artifact = artifact.validate().expect("the deep artifact validates");
+            let printed = artifact.print();
+            let parsed = Artifact::try_parse(&printed)
+                .expect("the deep artifact parses")
+                .validate()
+                .expect("the deep artifact validates again");
+            assert_eq!(parsed.lir().functions.len(), artifact.lir().functions.len());
+            assert_eq!(parsed.header().values.len(), artifact.header().values.len());
+            assert_eq!(parsed.print(), printed);
+            drop(parsed);
+            drop(artifact);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }

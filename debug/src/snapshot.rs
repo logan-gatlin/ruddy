@@ -298,11 +298,12 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
                     .zip(&dependency_interfaces)
                     .map(|(alias, artifact)| ir::DependencyImport { alias, artifact })
                     .collect();
+                let linked: Vec<&artifact::Artifact> = linked_interfaces.iter().collect();
                 ir::build_with_dependency_imports(
                     &mut mint,
                     loaded.stmts.clone(),
                     &imports,
-                    &linked_interfaces,
+                    &linked,
                 )
             });
             micros.build = started.elapsed().as_micros() as u64;
@@ -410,31 +411,28 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
         .as_ref()
         .filter(|_| diagnostics.is_empty())
         .and_then(|loaded| {
-            let mut unchecked: Vec<_> = linked_interfaces
-                .iter()
-                .map(ruddy::artifact::Artifact::to_unchecked)
-                .collect();
+            // Every graph artifact was validated when it was compiled, so it
+            // crosses the seam as the proof it already is.
+            let mut checked: Vec<&artifact::Artifact> = linked_interfaces.iter().collect();
             for dependency in &dependency_interfaces {
-                if !unchecked.iter().any(|artifact| {
-                    artifact.header.identity.name == dependency.header().identity.name
-                        && artifact.header.identity.version == dependency.header().identity.version
-                }) {
-                    unchecked.push(dependency.to_unchecked());
+                if !checked
+                    .iter()
+                    .any(|artifact| artifact.header().identity == dependency.header().identity)
+                {
+                    checked.push(dependency);
                 }
             }
-            let dependencies: Vec<_> = unchecked
+            let dependencies: Vec<_> = checked
                 .iter()
                 .map(|artifact| ruddy::compile::Dependency {
                     alias: dependency_aliases
                         .iter()
                         .zip(&dependency_interfaces)
                         .find(|(_, dependency)| {
-                            artifact.header.identity.name == dependency.header().identity.name
-                                && artifact.header.identity.version
-                                    == dependency.header().identity.version
+                            artifact.header().identity == dependency.header().identity
                         })
                         .map(|(alias, _)| alias.as_str()),
-                    artifact,
+                    artifact: ruddy::compile::DependencyArtifact::Checked(artifact),
                 })
                 .collect();
             ruddy::compile::compile_with_dependencies(

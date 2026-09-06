@@ -24,6 +24,10 @@ use ruddy::{
 };
 use serde::{Deserialize, Serialize};
 
+mod cache;
+
+pub use cache::fingerprint;
+
 mod git;
 pub use git::{LOCKFILE, LockedGit, LockedSelector, Lockfile, ruddy_home};
 
@@ -1235,6 +1239,11 @@ pub fn compile_graph(directory: impl AsRef<Path>) -> Result<CompiledGraph, Compi
     let mut compiler = GraphCompiler {
         root: Some(root.clone()),
         resolver: Some(resolver),
+        // Beside the Git checkouts, under Ruddy home: one standard library
+        // compiled once serves every project.
+        cache: ruddy_home()
+            .ok()
+            .map(|home| cache::ArtifactCache::at(home.join("cache").join("artifacts"))),
         ..GraphCompiler::default()
     };
     compiler.visit(root, None)?;
@@ -1368,6 +1377,11 @@ where
     let project = canonical_project_in(project, Some(&sandbox))?;
     let resolver = git::Resolver::new(&project)?;
     let mut compiler = GraphCompiler {
+        // A sandboxed compile writes nowhere outside its sandbox, its cache
+        // included.
+        cache: Some(cache::ArtifactCache::at(
+            sandbox.join(".cache").join("artifacts"),
+        )),
         sandbox: Some(sandbox),
         resolver: Some(resolver),
         ..GraphCompiler::default()
@@ -1556,6 +1570,11 @@ struct GraphCompiler {
     identities: HashMap<(String, String), PathBuf>,
     active: Vec<(PathBuf, String)>,
     projects: Vec<CompiledProject>,
+    /// Where dependency artifacts are kept between runs, when they are.
+    cache: Option<cache::ArtifactCache>,
+    /// The cache key of each project in `projects` that has one: every
+    /// dependency, since a root is what the run is for and never cached.
+    keys: HashMap<usize, u64>,
 }
 
 impl Default for GraphCompiler {
@@ -1571,6 +1590,8 @@ impl Default for GraphCompiler {
             identities: HashMap::new(),
             active: Vec::new(),
             projects: Vec::new(),
+            cache: None,
+            keys: HashMap::new(),
         }
     }
 }
@@ -1659,6 +1680,7 @@ impl GraphCompiler {
         );
 
         let mut dependency_artifacts = Vec::with_capacity(dependencies.len());
+        let mut dependency_indices = Vec::with_capacity(dependencies.len());
         for (alias, specification, installed_default) in &dependencies {
             let expected = specification.bundle(alias).to_string();
             if let Err(error) = specification.validate() {
@@ -1776,6 +1798,7 @@ impl GraphCompiler {
                 })?;
             let child_artifact = &self.projects[index].artifact;
             dependency_artifacts.push((alias.clone(), child_artifact.clone()));
+            dependency_indices.push(index);
         }
 
         let linked_artifacts = self
@@ -1785,16 +1808,40 @@ impl GraphCompiler {
             .collect();
         let target = manifest.target;
         let run = manifest.run.clone();
-        let artifact = compile_one(
-            &directory,
-            manifest,
-            identity,
-            dependency_artifacts,
-            linked_artifacts,
-            boundary.as_deref(),
-        )?;
+        // A dependency is compiled only when the cache has no artifact for
+        // this compiler, these sources and these dependencies. The root is
+        // what the run is for, and always compiled.
+        let key = match &self.cache {
+            Some(_) if edge.is_some() => dependency_indices
+                .iter()
+                .map(|index| self.keys.get(index).copied())
+                .collect::<Option<Vec<u64>>>()
+                .map(|children| cache::key(&directory, &children)),
+            _ => None,
+        };
+        let cached = key.and_then(|key| self.cache.as_ref()?.load(key, &manifest.name));
+        let artifact = match cached {
+            Some(artifact) => artifact,
+            None => {
+                let artifact = compile_one(
+                    &directory,
+                    manifest,
+                    identity,
+                    dependency_artifacts,
+                    linked_artifacts,
+                    boundary.as_deref(),
+                )?;
+                if let (Some(key), Some(cache)) = (key, &mut self.cache) {
+                    cache.store(key, &artifact);
+                }
+                artifact
+            }
+        };
         self.active.pop();
         let index = self.projects.len();
+        if let Some(key) = key {
+            self.keys.insert(index, key);
+        }
         self.projects.push(CompiledProject {
             source: if self.root.as_ref() == Some(&directory) {
                 ProjectSource::Local
@@ -1996,27 +2043,25 @@ fn compile_one(
     let mint = Mint::new(identity);
     // The core seam receives one dependency graph. Direct interfaces select
     // their aliases from this linked collection rather than arriving as an
-    // unrelated second slice.
-    let mut unchecked: Vec<_> = linked.iter().map(Artifact::to_unchecked).collect();
+    // unrelated second slice. Every artifact here was validated when it was
+    // compiled or read, so each crosses the seam as the proof it already is.
+    let mut checked: Vec<&Artifact> = linked.iter().collect();
     for (_, dependency) in &dependencies {
-        if !unchecked.iter().any(|artifact| {
-            artifact.header.identity.name == dependency.header().identity.name
-                && artifact.header.identity.version == dependency.header().identity.version
-        }) {
-            unchecked.push(dependency.to_unchecked());
+        if !checked
+            .iter()
+            .any(|artifact| artifact.header().identity == dependency.header().identity)
+        {
+            checked.push(dependency);
         }
     }
-    let dependencies: Vec<_> = unchecked
+    let dependencies: Vec<_> = checked
         .iter()
         .map(|artifact| ruddy::compile::Dependency {
             alias: dependencies
                 .iter()
-                .find(|(_, dependency)| {
-                    artifact.header.identity.name == dependency.header().identity.name
-                        && artifact.header.identity.version == dependency.header().identity.version
-                })
+                .find(|(_, dependency)| artifact.header().identity == dependency.header().identity)
                 .map(|(alias, _)| alias.as_str()),
-            artifact,
+            artifact: ruddy::compile::DependencyArtifact::Checked(artifact),
         })
         .collect();
     let accepted = ruddy::compile::compile_with_dependencies(

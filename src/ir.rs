@@ -2584,7 +2584,7 @@ pub fn build_with_dependency_imports(
     mint: &mut Mint,
     stmts: Vec<Stmt>,
     dependencies: &[DependencyImport<'_>],
-    linked: &[artifact::Artifact],
+    linked: &[&artifact::Artifact],
 ) -> Output {
     build_with_dependency_imports_inner(mint, stmts, dependencies, linked)
 }
@@ -2595,7 +2595,7 @@ pub fn build_with_dependency_graph(
     mint: &mut Mint,
     stmts: Vec<Stmt>,
     dependencies: &[artifact::Artifact],
-    linked: &[artifact::Artifact],
+    linked: &[&artifact::Artifact],
 ) -> Output {
     let imports: Vec<_> = dependencies
         .iter()
@@ -2611,7 +2611,7 @@ fn build_with_dependency_imports_inner(
     mint: &mut Mint,
     stmts: Vec<Stmt>,
     dependencies: &[DependencyImport<'_>],
-    linked: &[artifact::Artifact],
+    linked: &[&artifact::Artifact],
 ) -> Output {
     let mut b = Builder {
         mint,
@@ -9115,7 +9115,7 @@ impl Builder<'_> {
     fn import_dependencies(
         &mut self,
         dependencies: &[DependencyImport<'_>],
-        linked: &[artifact::Artifact],
+        linked: &[&artifact::Artifact],
         program: &mut Program,
     ) {
         let mut symbols: HashMap<(Namespace, String), Symbol> = HashMap::new();
@@ -9163,6 +9163,7 @@ impl Builder<'_> {
         let mut effect_rows = ImportedEffectRows::default();
         for dependency in linked
             .iter()
+            .copied()
             .chain(valid.iter().map(|import| import.artifact))
         {
             for declaration in &dependency.header().effects {
@@ -9225,6 +9226,7 @@ impl Builder<'_> {
         // installs those symbols into source resolution tables.
         for dependency in linked
             .iter()
+            .copied()
             .chain(valid.iter().map(|import| import.artifact))
         {
             for (namespace, qualified) in dependency
@@ -9331,6 +9333,7 @@ impl Builder<'_> {
 
         for dependency in linked
             .iter()
+            .copied()
             .chain(valid.iter().map(|import| import.artifact))
         {
             for value in &dependency.header().values {

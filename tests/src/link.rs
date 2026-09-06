@@ -37,6 +37,7 @@ fn artifact(
         .collect();
     validated(a::UncheckedArtifact {
         header: a::Header {
+            compiler: ruddy::artifact::Stamp::current(),
             identity: a::Identity {
                 name: name.into(),
                 version: "1.0.0".into(),

@@ -254,7 +254,7 @@ fn accepted_with(
         parsed.stmts,
         &[compile::Dependency {
             alias: Some("dep"),
-            artifact: dependency,
+            artifact: compile::DependencyArtifact::Unchecked(dependency),
         }],
         inference::Trace::Off,
     )
@@ -318,7 +318,7 @@ fn imported_effects_and_aliases_behave_like_local_declarations() {
             parsed.stmts,
             &[compile::Dependency {
                 alias: Some("dep"),
-                artifact: &dependency,
+                artifact: compile::DependencyArtifact::Unchecked(&dependency),
             }],
             inference::Trace::Off,
         )
@@ -344,7 +344,7 @@ fn imported_effects_and_aliases_behave_like_local_declarations() {
             parsed.stmts,
             &[compile::Dependency {
                 alias: Some("dep"),
-                artifact: &dependency,
+                artifact: compile::DependencyArtifact::Unchecked(&dependency),
             }],
             inference::Trace::Off,
         )
@@ -517,6 +517,7 @@ fn deep_alias_chains_and_generic_interfaces_use_bounded_stack() {
             }
             let dependency = ruddy::artifact::UncheckedArtifact {
                 header: ruddy::artifact::Header {
+                    compiler: ruddy::artifact::Stamp::current(),
                     identity: ruddy::artifact::Identity {
                         name: "dep".into(),
                         version: "1.0.0".into(),

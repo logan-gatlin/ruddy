@@ -953,6 +953,7 @@ fn the_lir_tab_skips_a_program_with_errors() {
 fn artifact_stage_renders_one_dependency() {
     let artifact = UncheckedArtifact {
         header: Header {
+            compiler: ruddy::artifact::Stamp::current(),
             identity: Identity {
                 name: "demo".to_string(),
                 version: "1.0.0".to_string(),

@@ -13,15 +13,14 @@
 
 use std::{
     collections::HashMap,
-    env, fs,
-    hash::{DefaultHasher, Hash, Hasher},
+    env,
     path::{Path, PathBuf},
     sync::{LazyLock, Mutex},
 };
 
 use indexmap::IndexMap;
 use ruddy::artifact::Dependency;
-use ruddy_cli::{CompileError, CompiledGraph, DependencySpec, StdConfig};
+use ruddy_cli::{CompileError, CompiledGraph, DependencySpec, StdConfig, fingerprint};
 
 /// The most requests remembered before the memo is emptied. A browser debugs
 /// one document at a time, so this is far more than one ever needs; the
@@ -110,57 +109,4 @@ fn key(
         env::var_os("RUDDY_HOME"),
         env::var_os("HOME"),
     )
-}
-
-/// A digest of every source file, manifest and lockfile under `inputs`, in a
-/// fixed order, with a file that cannot be read digested as its error so that
-/// a directory going missing reads as a change rather than as nothing.
-///
-/// Contents rather than modification times: the files are few and small, and
-/// an editor that rewrites a file with the same text within one timestamp
-/// tick is the case timestamps get wrong.
-fn fingerprint(inputs: &[PathBuf]) -> u64 {
-    let mut files = Vec::new();
-    for input in inputs {
-        if input.is_dir() {
-            collect(input, &mut files);
-        } else {
-            files.push(input.clone());
-        }
-    }
-    files.sort();
-    files.dedup();
-    let mut hasher = DefaultHasher::new();
-    for file in &files {
-        file.hash(&mut hasher);
-        match fs::read(file) {
-            Ok(contents) => contents.hash(&mut hasher),
-            Err(error) => error.kind().hash(&mut hasher),
-        }
-    }
-    hasher.finish()
-}
-
-/// Every file under `dir` the compiler could have read, skipping hidden
-/// entries so a Git checkout's own metadata is not walked.
-fn collect(dir: &Path, files: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        // Unreadable is a state worth digesting: the entry stands in for
-        // the directory itself, and reading it below records the error.
-        files.push(dir.to_path_buf());
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with('.') {
-            continue;
-        }
-        if path.is_dir() {
-            collect(&path, files);
-        } else if name == "Ruddy.toml" || name == "Ruddy.lock" || name.ends_with(".hc") {
-            files.push(path);
-        }
-    }
 }

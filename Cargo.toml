@@ -8,12 +8,15 @@ autotests = false
 [workspace]
 members = ["cli", "debug", "esparse", "tests"]
 
+[build-dependencies]
+twox-hash = { version = "2.1.3", default-features = false, features = ["xxhash3_64"] }
+
 [dependencies]
 esparse = { path = "esparse" }
 indexmap = "2"
-pretty = "0.12.5"
 semver = "1.0.28"
 twox-hash = { version = "2.1.3", default-features = false, features = ["xxhash3_64"] }
+unicode-width = "0.2"
 varisat = "0.2.2"
 
 # The debugger is served from a dev build. Optimizing the dependencies alone

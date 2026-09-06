@@ -6664,6 +6664,7 @@ fn prelude_artifact(bundle: &str) -> a::UncheckedArtifact {
     let qualified = |name: &str| format!("{bundle}@1.0.0::prelude::{name}");
     a::UncheckedArtifact {
         header: a::Header {
+            compiler: ruddy::artifact::Stamp::current(),
             identity: a::Identity {
                 name: bundle.into(),
                 version: "1.0.0".into(),
@@ -6958,6 +6959,7 @@ fn std_prelude_type_precedes_primitives_but_user_types_precede_the_prelude() {
 fn effect_artifact(bundle: &str, interface: &str) -> a::UncheckedArtifact {
     a::UncheckedArtifact {
         header: a::Header {
+            compiler: ruddy::artifact::Stamp::current(),
             identity: a::Identity {
                 name: bundle.into(),
                 version: "1.0.0".into(),
@@ -7464,6 +7466,7 @@ fn structurally_equivalent_dependencies_share_coverage_and_duplicates() {
 fn a_direct_only_interface_with_a_transitive_type_recovers_without_panicking() {
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            compiler: ruddy::artifact::Stamp::current(),
             identity: a::Identity {
                 name: "dep".to_string(),
                 version: "1.0.0".to_string(),
@@ -7509,6 +7512,7 @@ fn missing_transitive_type_applications_keep_distinct_effect_identities() {
     };
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            compiler: ruddy::artifact::Stamp::current(),
             identity: a::Identity {
                 name: "dep".into(),
                 version: "1.0.0".into(),
@@ -7593,6 +7597,7 @@ fn fixed_argument_recursive_types_terminate_during_effect_canonicalization() {
 fn direct_only_transitive_effects_keep_qualified_recovery_identity() {
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            compiler: ruddy::artifact::Stamp::current(),
             identity: a::Identity {
                 name: "dep".into(),
                 version: "1.0.0".into(),
@@ -8474,6 +8479,7 @@ fn row_composition_is_flattened_across_local_and_imported_types() {
     };
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            compiler: ruddy::artifact::Stamp::current(),
             identity: a::Identity {
                 name: "dep".into(),
                 version: "1.0.0".into(),
@@ -8574,6 +8580,7 @@ fn structural_rows_mask_inner_duplicates_and_preserve_ordinary_separator_labels(
     };
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            compiler: ruddy::artifact::Stamp::current(),
             identity: a::Identity {
                 name: "dep".into(),
                 version: "1.0.0".into(),
@@ -8685,6 +8692,7 @@ fn absent_semantic_payloads_do_not_affect_structural_identity() {
         .collect();
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            compiler: ruddy::artifact::Stamp::current(),
             identity: a::Identity {
                 name: "dep".into(),
                 version: "1.0.0".into(),
@@ -8836,6 +8844,7 @@ fn local_and_imported_structural_types_share_one_canonical_encoding() {
     };
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            compiler: ruddy::artifact::Stamp::current(),
             identity: a::Identity {
                 name: "dep".into(),
                 version: "1.0.0".into(),
@@ -8906,6 +8915,7 @@ fn local_and_imported_structural_types_share_one_canonical_encoding() {
 fn imported_interfaces_keep_applied_types_effects_and_alias_overlap_structural() {
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            compiler: ruddy::artifact::Stamp::current(),
             identity: a::Identity {
                 name: "dep".into(),
                 version: "1.0.0".into(),
@@ -9153,6 +9163,7 @@ fn imported_declared_types_exercise_every_semantic_identity_form() {
     ));
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            compiler: ruddy::artifact::Stamp::current(),
             identity: a::Identity {
                 name: "dep".into(),
                 version: "1.0.0".into(),
@@ -9236,6 +9247,7 @@ fn malformed_dependency_declarations_are_ignored_without_shadow_symbols() {
 fn imported_alias_cycles_recover_without_a_spurious_structural_identity() {
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            compiler: ruddy::artifact::Stamp::current(),
             identity: a::Identity {
                 name: "dep".into(),
                 version: "1.0.0".into(),
@@ -9500,6 +9512,7 @@ fn dependency_interfaces_import_every_semantic_form() {
 
     let dependency = a::UncheckedArtifact {
         header: a::Header {
+            compiler: ruddy::artifact::Stamp::current(),
             identity: a::Identity {
                 name: "dep".to_string(),
                 version: "1.0.0".to_string(),
