@@ -48,6 +48,11 @@ fn lowered_with_dependencies(
         inference::Trace::Off,
     )
     .unwrap_or_else(|partial| panic!("{source}: {partial:#?}"));
+    accepted
+        .artifact()
+        .to_unchecked()
+        .validate()
+        .expect("lowered control flow validates");
     let labels = print::lir::Labels::new(accepted.ir());
     (accepted.lower(), labels)
 }
@@ -78,9 +83,13 @@ fn listing(source: &str) -> String {
 /// One section of a listing, by its header line.
 fn section(source: &str, header: &str) -> String {
     let whole = listing(source);
+    let header = header
+        .strip_prefix("global ")
+        .map(|name| format!("fn {}#init(", name.trim_end_matches(':')))
+        .unwrap_or_else(|| header.to_string());
     whole
         .split("\n\n")
-        .find(|part| part.starts_with(header))
+        .find(|part| part.starts_with(&header))
         .unwrap_or_else(|| panic!("`{header}` is a section of:\n{whole}"))
         .trim_end()
         .to_string()
@@ -92,7 +101,7 @@ fn an_if_uses_the_existing_boolean_primitive_dispatch() {
         "let choose = fn p => if p then 1n else 2n end",
         "fn choose(",
     );
-    assert_eq!(printed.matches("switch_prim").count(), 1, "{printed}");
+    assert_eq!(printed.matches("branch_prim").count(), 2, "{printed}");
     assert!(printed.contains("true =>"), "{printed}");
     assert!(printed.contains("false =>"), "{printed}");
     assert!(!printed.contains("else =>"), "{printed}");
@@ -103,7 +112,7 @@ fn an_if_uses_the_existing_boolean_primitive_dispatch() {
         "let choose = fn p q => if p then 1n else if q then 2n else 3n end",
         "fn choose(",
     );
-    assert_eq!(chained.matches("switch_prim").count(), 2, "{chained}");
+    assert_eq!(chained.matches("branch_prim").count(), 4, "{chained}");
 }
 
 #[test]
@@ -142,14 +151,15 @@ fn a_nested_expression_flattens_in_source_order() {
     );
     assert_eq!(
         printed,
-        "global f:\n\
-         \x20 %0: nat = const 1n\n\
-         \x20 %1: struct = struct { a: %0 }\n\
-         \x20 %2: nat = project %1, \"a\"\n\
-         \x20 %3: nat = const 2n\n\
-         \x20 %4: struct = struct { b: %2, c: %3 }\n\
-         \x20 %5: sum = tag #Some, %4\n\
-         \x20 ret %5"
+        r#"fn f#init(; %6: cont) entry b0 [f0, Synchronous]:
+  b0(%6: cont):
+    %0: nat = const 1n
+    %1: struct = struct { a: %0 }
+    %2: nat = project %1, "a"
+    %3: nat = const 2n
+    %4: struct = struct { b: %2, c: %3 }
+    %5: sum = tag #Some, %4
+    continue %6, %5"#
     );
 }
 
@@ -160,7 +170,10 @@ fn a_nested_expression_flattens_in_source_order() {
 fn a_binding_emits_no_instruction_of_its_own() {
     assert_eq!(
         section("let f = do let p : Nat = 1n return p end", "global f"),
-        "global f:\n  %0: nat = const 1n\n  ret %0"
+        r#"fn f#init(; %1: cont) entry b0 [f0, Synchronous]:
+  b0(%1: cont):
+    %0: nat = const 1n
+    continue %1, %0"#
     );
 }
 
@@ -172,11 +185,12 @@ fn a_shadowed_name_is_put_back_afterwards() {
             "let f = do let p = 1n return { one: do let p = 2n return p end, two: p } end",
             "global f"
         ),
-        "global f:\n\
-         \x20 %0: nat = const 1n\n\
-         \x20 %1: nat = const 2n\n\
-         \x20 %2: struct = struct { one: %1, two: %0 }\n\
-         \x20 ret %2"
+        r#"fn f#init(; %3: cont) entry b0 [f0, Synchronous]:
+  b0(%3: cont):
+    %0: nat = const 1n
+    %1: nat = const 2n
+    %2: struct = struct { one: %1, two: %0 }
+    continue %3, %2"#
     );
 }
 
@@ -189,10 +203,10 @@ fn forwarded_empty_struct_rows_have_unit_representation_everywhere() {
                   let id : RowId {} -> RowId {} = fn x => x\n\
                   let called = id {}";
     let function = section(source, "fn id(");
-    assert!(function.starts_with("fn id(%0: unit):"), "{function}");
+    assert!(function.starts_with("fn id(%0: unit;"), "{function}");
     let call = section(source, "global called");
     assert!(call.contains(": unit = struct {}"), "{call}");
-    assert!(call.contains(": unit = call id"), "{call}");
+    assert!(call.contains("call id"), "{call}");
 
     let absent = section(
         "type NoY 'r = { \\y, ..'r }\nlet value : NoY {} = {}",
@@ -205,7 +219,7 @@ fn forwarded_empty_struct_rows_have_unit_representation_everywhere() {
          let open : RowId { ..'s } -> RowId { ..'s } = fn x => x",
         "fn open(",
     );
-    assert!(open.starts_with("fn open(%0: struct):"), "{open}");
+    assert!(open.starts_with("fn open(%0: struct;"), "{open}");
     let nonempty = section(
         "type RowId 'r = { ..'r }\n\
          let point : RowId { x: Nat } = { x: 1n }",
@@ -237,19 +251,19 @@ fn existential_packages_are_transparent_to_container_lowering() {
 
     let value = section(source, "global value");
     assert!(
-        value.contains(": struct = call"),
+        value.contains("global choose") && value.contains("call %"),
         "a packaged call result keeps its runtime representation:\n{value}"
     );
 
     let projected = section(source, "global projected");
     assert!(
-        projected.contains(": nat = project"),
+        projected.contains(": nat = project") && projected.contains(": struct) continuation"),
         "a packaged container still declares its member representation:\n{projected}"
     );
 
     let matched = section(source, "global matched");
     assert!(
-        matched.contains("switch_presence") && matched.contains(": nat = project"),
+        matched.contains("branch_presence") && matched.contains(": nat = project"),
         "a packaged struct still widens into presence and field tests:\n{matched}"
     );
 }
@@ -338,7 +352,7 @@ fn imported_forwarding_cycles_recover_before_lir_representation() {
             let source = "let id : dep::A -> dep::A = fn x => x";
             let (output, labels) = lowered_with_dependencies(source, &[dependency]);
             let printed = print::lir::program(&output, &labels);
-            assert!(printed.contains("fn id(%0: any):"), "{printed}");
+            assert!(printed.contains("fn id(%0: any;"), "{printed}");
         })
         .expect("the bounded-stack regression thread starts")
         .join()
@@ -358,11 +372,11 @@ fn every_representation_comes_off_the_solved_type() {
     assert!(section(source, "global c").contains(": sum = tag #A"));
     assert!(section(source, "global i").contains(": fn = closure i#1"));
     // The polymorphic identity's argument is held as anything at all.
-    assert!(section(source, "fn i(").starts_with("fn i(%5: any):"));
-    assert!(section(source, "fn int(").contains(": int64):"));
-    assert!(section(source, "fn real(").contains(": real64):"));
-    assert!(section(source, "fn string(").contains(": string):"));
-    assert!(section(source, "fn boolean(").contains(": boolean):"));
+    assert!(section(source, "fn i(").starts_with("fn i(%5: any;"));
+    assert!(section(source, "fn int(").contains(": int64;"));
+    assert!(section(source, "fn real(").contains(": real64;"));
+    assert!(section(source, "fn string(").contains(": string;"));
+    assert!(section(source, "fn boolean(").contains(": boolean;"));
 }
 
 /// A `fn` lifts to a top-level function whose parameters are its captures and
@@ -377,7 +391,7 @@ fn a_lifted_function_captures_in_order_of_first_use() {
         "{}",
         listing(source)
     );
-    assert!(section(source, "fn two#3").starts_with("fn two#3(%3: any, %4: any, %2: any):"));
+    assert!(section(source, "fn two#3").starts_with("fn two#3(%3: any, %4: any, %2: any;"));
 }
 
 /// A lambda that closes over nothing carries no captures.
@@ -385,7 +399,7 @@ fn a_lifted_function_captures_in_order_of_first_use() {
 fn a_lambda_that_closes_over_nothing_captures_nothing() {
     let source = "let k = fn w => { f: fn x => x }";
     assert!(section(source, "fn k(").contains("closure k#2, []"));
-    assert!(section(source, "fn k#2").starts_with("fn k#2(%1: any):"));
+    assert!(section(source, "fn k#2").starts_with("fn k#2(%1: any;"));
 }
 
 /// A recursive local function reconstructs its own closure inside the lifted
@@ -396,15 +410,20 @@ fn a_local_recursive_function_reconstructs_its_closure() {
         "let main = do let loop = fn n => do let again = loop n return loop n end return loop end";
     assert_eq!(
         section(source, "fn main#1"),
-        "fn main#1(%0: any):\n\
-         \x20 %1: fn = closure main#1, []\n\
-         \x20 %2: any = call %1, %0\n\
-         \x20 %3: any = call %1, %0\n\
-         \x20 ret %3"
+        r#"fn main#1(%0: any; %5: cont) entry b1 [f0, Synchronous]:
+  b0(%0: any, %1: fn, %5: cont, %2: any) continuation:
+    call %1, %0 -> %5
+  b1(%0: any, %5: cont):
+    %1: fn = closure main#1, []
+    %6: cont = continuation main#1:b0, [%0, %1, %5] [f0]
+    call %1, %0 -> %6"#
     );
     assert_eq!(
         section(source, "global main"),
-        "global main:\n  %4: fn = closure main#1, []\n  ret %4"
+        r#"fn main#init(; %7: cont) entry b0 [f1, Synchronous]:
+  b0(%7: cont):
+    %4: fn = closure main#1, []
+    continue %7, %4"#
     );
 }
 
@@ -417,7 +436,7 @@ fn a_local_recursive_function_keeps_its_outer_captures() {
     assert!(outer.contains("closure make#2, [%0]"), "{outer}");
     let recursive = section(source, "fn make#2");
     assert!(
-        recursive.starts_with("fn make#2(%2: real64, %1: any):"),
+        recursive.starts_with("fn make#2(%2: real64, %1: any;"),
         "{recursive}"
     );
     assert!(
@@ -447,7 +466,10 @@ fn a_top_level_name_is_read_rather_than_captured() {
     let source = "let c = 1n\nlet r = fn w => { f: fn x => c }";
     assert_eq!(
         section(source, "fn r#2"),
-        "fn r#2(%2: any):\n  %3: nat = global c\n  ret %3"
+        r#"fn r#2(%2: any; %11: cont) entry b0 [f2, Synchronous]:
+  b0(%11: cont):
+    %3: nat = global c
+    continue %11, %3"#
     );
     assert!(section(source, "fn r(").contains("closure r#2, []"));
 }
@@ -459,15 +481,17 @@ fn a_full_application_is_one_direct_call() {
     let source = "let add = fn a => fn b => a\nlet main = add 1n 2n";
     assert_eq!(
         section(source, "global main"),
-        "global main:\n\
-         \x20 %8: nat = const 1n\n\
-         \x20 %9: nat = const 2n\n\
-         \x20 %10: nat = call add, %8, %9\n\
-         \x20 ret %10"
+        r#"fn main#init(; %15: cont) entry b0 [f4, Synchronous]:
+  b0(%15: cont):
+    %8: nat = const 1n
+    %9: nat = const 2n
+    call add, %8, %9 -> %15 [f0]"#
     );
     assert_eq!(
         section(source, "fn add("),
-        "fn add(%0: any, %1: any):\n  ret %0"
+        r#"fn add(%0: any, %1: any; %11: cont) entry b0 [f0, Synchronous]:
+  b0(%0: any, %11: cont):
+    continue %11, %0"#
     );
 }
 
@@ -478,13 +502,19 @@ fn a_partial_application_is_a_wrapper_closure() {
     let source = "let two = fn a => fn b => a\nlet part = two 1n";
     assert_eq!(
         section(source, "global part"),
-        "global part:\n  %8: nat = const 1n\n  %9: fn = closure two#2, [%8]\n  ret %9"
+        r#"fn part#init(; %14: cont) entry b0 [f4, Synchronous]:
+  b0(%14: cont):
+    %8: nat = const 1n
+    %9: fn = closure two#2, [%8]
+    continue %14, %9"#
     );
     // The wrapper it names takes what was captured and then the argument left,
     // and hands the lot to the uncurried function.
     assert_eq!(
         section(source, "fn two#2"),
-        "fn two#2(%4: any, %5: any):\n  %6: any = call two, %4, %5\n  ret %6"
+        r#"fn two#2(%4: any, %5: any; %12: cont) entry b0 [f2, Synchronous]:
+  b0(%4: any, %5: any, %12: cont):
+    call two, %4, %5 -> %12 [f0]"#
     );
 }
 
@@ -496,15 +526,24 @@ fn a_known_function_used_as_a_value_is_its_global() {
     let source = "let two = fn a => fn b => a\nlet bare = two";
     assert_eq!(
         section(source, "global bare"),
-        "global bare:\n  %8: fn = global two\n  ret %8"
+        r#"fn bare#init(; %13: cont) entry b0 [f4, Synchronous]:
+  b0(%13: cont):
+    %8: fn = global two
+    continue %13, %8"#
     );
     assert_eq!(
         section(source, "global two"),
-        "global two:\n  %7: fn = closure two#1, []\n  ret %7"
+        r#"fn two#init(; %12: cont) entry b0 [f3, Synchronous]:
+  b0(%12: cont):
+    %7: fn = closure two#1, []
+    continue %12, %7"#
     );
     assert_eq!(
         section(source, "fn two#1"),
-        "fn two#1(%2: any):\n  %3: fn = closure two#2, [%2]\n  ret %3"
+        r#"fn two#1(%2: any; %10: cont) entry b0 [f1, Synchronous]:
+  b0(%2: any, %10: cont):
+    %3: fn = closure two#2, [%2]
+    continue %10, %3"#
     );
 }
 
@@ -515,13 +554,15 @@ fn an_over_application_calls_direct_and_then_indirectly() {
     let source = "let id = fn x => x\nlet two = fn a => fn b => a\nlet over = two id 1n 2n";
     assert_eq!(
         section(source, "global over"),
-        "global over:\n\
-         \x20 %12: fn = global id\n\
-         \x20 %13: nat = const 1n\n\
-         \x20 %14: fn = call two, %12, %13\n\
-         \x20 %15: nat = const 2n\n\
-         \x20 %16: nat = call %14, %15\n\
-         \x20 ret %16"
+        r#"fn over#init(; %24: cont) entry b1 [f7, MaySuspend]:
+  b0(%24: cont, %14: fn) continuation:
+    %15: nat = const 2n
+    call %14, %15 -> %24
+  b1(%24: cont):
+    %12: fn = global id
+    %13: nat = const 1n
+    %25: cont = continuation over#init:b0, [%24] [f7]
+    call two, %12, %13 -> %25 [f2]"#
     );
 }
 
@@ -532,7 +573,9 @@ fn an_unknown_callee_stays_unary() {
     let source = "let go = fn f => fn x => f x";
     assert_eq!(
         section(source, "fn go("),
-        "fn go(%0: fn, %1: struct, %2: any):\n  %3: any = call %0, %1, %2\n  ret %3"
+        r#"fn go(%0: fn, %1: struct, %2: any; %11: cont) entry b0 [f0, MaySuspend]:
+  b0(%0: fn, %1: struct, %2: any, %11: cont):
+    call %0, %1, %2 -> %11"#
     );
 }
 
@@ -547,7 +590,7 @@ fn globals_are_emitted_in_group_order() {
         .map(|global| global.name.as_str())
         .collect();
     assert_eq!(names, ["a", "b", "c"]);
-    assert!(output.functions.is_empty());
+    assert_eq!(output.functions.len(), output.globals.len());
 }
 
 /// Two functions in one group call each other directly: the slot a function's
@@ -558,11 +601,15 @@ fn mutual_recursion_calls_direct() {
     let source = "let ping = fn n => pong n\nlet pong = fn n => ping n";
     assert_eq!(
         section(source, "fn ping("),
-        "fn ping(%0: any):\n  %1: any = call pong, %0\n  ret %1"
+        r#"fn ping(%0: any; %10: cont) entry b0 [f0, Synchronous]:
+  b0(%0: any, %10: cont):
+    call pong, %0 -> %10 [f2]"#
     );
     assert_eq!(
         section(source, "fn pong("),
-        "fn pong(%5: any):\n  %6: any = call ping, %5\n  ret %6"
+        r#"fn pong(%5: any; %12: cont) entry b0 [f2, Synchronous]:
+  b0(%5: any, %12: cont):
+    call ping, %5 -> %12 [f0]"#
     );
 }
 
@@ -571,7 +618,11 @@ fn mutual_recursion_calls_direct() {
 fn a_plain_value_global_is_its_own_initializer() {
     assert_eq!(
         section("let v = { x: 1n }", "global v"),
-        "global v:\n  %0: nat = const 1n\n  %1: struct = struct { x: %0 }\n  ret %1"
+        r#"fn v#init(; %2: cont) entry b0 [f0, Synchronous]:
+  b0(%2: cont):
+    %0: nat = const 1n
+    %1: struct = struct { x: %0 }
+    continue %2, %1"#
     );
 }
 
@@ -585,21 +636,28 @@ fn a_match_tests_each_position_once() {
             "let pick = fn v => match v with | #Some 0n => 100n | #Some n => n | #None => 0n end",
             "fn pick("
         ),
-        "fn pick(%0: sum):\n\
-         \x20 %5: nat = switch_tag %0:\n\
-         \x20   #Some =>\n\
-         \x20     %1: nat = payload %0\n\
-         \x20     %3: nat = switch_prim %1:\n\
-         \x20       0n =>\n\
-         \x20         %2: nat = const 100n\n\
-         \x20         yield %2\n\
-         \x20       else =>\n\
-         \x20         yield %1\n\
-         \x20     yield %3\n\
-         \x20   #None =>\n\
-         \x20     %4: nat = const 0n\n\
-         \x20     yield %4\n\
-         \x20 ret %5"
+        r#"fn pick(%0: sum; %9: cont) entry b8 [f0, Synchronous]:
+  b0():
+    unreachable
+  b1(%9: cont):
+    %4: nat = const 0n
+    continue %9, %4
+  b2(%0: sum, %9: cont):
+    branch_tag %0, #None => b1(%9), otherwise b0()
+  b3(%1: nat, %9: cont):
+    continue %9, %1
+  b4(%9: cont):
+    %2: nat = const 100n
+    continue %9, %2
+  b5(%1: nat, %9: cont):
+    branch_prim %1, 0n => b4(%9), otherwise b3(%1, %9)
+  b6(%0: sum, %9: cont):
+    %1: nat = payload %0
+    jump b5(%1, %9)
+  b7(%0: sum, %9: cont):
+    branch_tag %0, #Some => b6(%0, %9), otherwise b2(%0, %9)
+  b8(%0: sum, %9: cont):
+    jump b7(%0, %9)"#
     );
 }
 
@@ -614,20 +672,24 @@ fn an_array_match_dispatches_on_length_once() {
             "let len = fn arr => match arr with | [] => 0n | [_, ..rest] => 1n end",
             "fn len("
         ),
-        "fn len(%0: array):\n\
-         \x20 %6: nat = switch_len %0:\n\
-         \x20   0 =>\n\
-         \x20     %1: nat = const 0n\n\
-         \x20     yield %1\n\
-         \x20   1 =>\n\
-         \x20     %2: array = slice %0, 1, 0\n\
-         \x20     %3: nat = const 1n\n\
-         \x20     yield %3\n\
-         \x20   else =>\n\
-         \x20     %4: array = slice %0, 1, 0\n\
-         \x20     %5: nat = const 1n\n\
-         \x20     yield %5\n\
-         \x20 ret %6"
+        r#"fn len(%0: array; %10: cont) entry b5 [f0, Synchronous]:
+  b0(%0: array, %10: cont):
+    %4: array = slice %0, 1, 0
+    %5: nat = const 1n
+    continue %10, %5
+  b1(%0: array, %10: cont):
+    %2: array = slice %0, 1, 0
+    %3: nat = const 1n
+    continue %10, %3
+  b2(%0: array, %10: cont):
+    branch_len %0, 1 => b1(%0, %10), otherwise b0(%0, %10)
+  b3(%10: cont):
+    %1: nat = const 0n
+    continue %10, %1
+  b4(%0: array, %10: cont):
+    branch_len %0, 0 => b3(%10), otherwise b2(%0, %10)
+  b5(%0: array, %10: cont):
+    jump b4(%0, %10)"#
     );
     // A rest with nothing on either side is the array itself: no slice, and
     // with no arm naming an element, no length to dispatch on either.
@@ -636,8 +698,9 @@ fn an_array_match_dispatches_on_length_once() {
             "let same = fn arr => match arr with | [..all] => all end",
             "fn same("
         ),
-        "fn same(%0: array):\n\
-         \x20 ret %0"
+        r#"fn same(%0: array; %4: cont) entry b0 [f0, Synchronous]:
+  b0(%0: array, %4: cont):
+    continue %4, %0"#
     );
 }
 
@@ -651,70 +714,86 @@ fn array_elements_are_read_from_whichever_end_the_length_fixes() {
             "let ends = fn arr => match arr with | [first, ..middle, last] => middle | [..rest] => rest end",
             "fn ends("
         ),
-        "fn ends(%0: array):\n\
-         \x20 %7: array = switch_len %0:\n\
-         \x20   0 =>\n\
-         \x20     yield %0\n\
-         \x20   1 =>\n\
-         \x20     yield %0\n\
-         \x20   2 =>\n\
-         \x20     %1: any = nth %0, 0\n\
-         \x20     %2: any = nth %0, 1\n\
-         \x20     %3: array = slice %0, 1, 1\n\
-         \x20     yield %3\n\
-         \x20   else =>\n\
-         \x20     %4: any = nth %0, 0\n\
-         \x20     %5: any = nth_back %0, 0\n\
-         \x20     %6: array = slice %0, 1, 1\n\
-         \x20     yield %6\n\
-         \x20 ret %7"
+        r#"fn ends(%0: array; %11: cont) entry b7 [f0, Synchronous]:
+  b0(%0: array, %11: cont):
+    %4: any = nth %0, 0
+    %5: any = nth_back %0, 0
+    %6: array = slice %0, 1, 1
+    continue %11, %6
+  b1(%0: array, %11: cont):
+    %1: any = nth %0, 0
+    %2: any = nth %0, 1
+    %3: array = slice %0, 1, 1
+    continue %11, %3
+  b2(%0: array, %11: cont):
+    branch_len %0, 2 => b1(%0, %11), otherwise b0(%0, %11)
+  b3(%0: array, %11: cont):
+    continue %11, %0
+  b4(%0: array, %11: cont):
+    branch_len %0, 1 => b3(%0, %11), otherwise b2(%0, %11)
+  b5(%0: array, %11: cont):
+    continue %11, %0
+  b6(%0: array, %11: cont):
+    branch_len %0, 0 => b5(%0, %11), otherwise b4(%0, %11)
+  b7(%0: array, %11: cont):
+    jump b6(%0, %11)"#
     );
     assert_eq!(
         section(
             "let pick = fn arr => match arr with | [1n, .., 2n] => 3n | [.., last] => last | [] => 0n end",
             "fn pick("
         ),
-        "fn pick(%0: array):\n\
-         \x20 %15: nat = switch_len %0:\n\
-         \x20   0 =>\n\
-         \x20     %1: nat = const 0n\n\
-         \x20     yield %1\n\
-         \x20   1 =>\n\
-         \x20     %2: nat = nth %0, 0\n\
-         \x20     yield %2\n\
-         \x20   2 =>\n\
-         \x20     %3: nat = nth %0, 0\n\
-         \x20     %8: nat = switch_prim %3:\n\
-         \x20       1n =>\n\
-         \x20         %4: nat = nth %0, 1\n\
-         \x20         %6: nat = switch_prim %4:\n\
-         \x20           2n =>\n\
-         \x20             %5: nat = const 3n\n\
-         \x20             yield %5\n\
-         \x20           else =>\n\
-         \x20             yield %4\n\
-         \x20         yield %6\n\
-         \x20       else =>\n\
-         \x20         %7: nat = nth %0, 1\n\
-         \x20         yield %7\n\
-         \x20     yield %8\n\
-         \x20   else =>\n\
-         \x20     %9: nat = nth %0, 0\n\
-         \x20     %14: nat = switch_prim %9:\n\
-         \x20       1n =>\n\
-         \x20         %10: nat = nth_back %0, 0\n\
-         \x20         %12: nat = switch_prim %10:\n\
-         \x20           2n =>\n\
-         \x20             %11: nat = const 3n\n\
-         \x20             yield %11\n\
-         \x20           else =>\n\
-         \x20             yield %10\n\
-         \x20         yield %12\n\
-         \x20       else =>\n\
-         \x20         %13: nat = nth_back %0, 0\n\
-         \x20         yield %13\n\
-         \x20     yield %14\n\
-         \x20 ret %15"
+        r#"fn pick(%0: array; %19: cont) entry b19 [f0, Synchronous]:
+  b0(%0: array, %19: cont):
+    %13: nat = nth_back %0, 0
+    continue %19, %13
+  b1(%10: nat, %19: cont):
+    continue %19, %10
+  b2(%19: cont):
+    %11: nat = const 3n
+    continue %19, %11
+  b3(%10: nat, %19: cont):
+    branch_prim %10, 2n => b2(%19), otherwise b1(%10, %19)
+  b4(%0: array, %19: cont):
+    %10: nat = nth_back %0, 0
+    jump b3(%10, %19)
+  b5(%0: array, %9: nat, %19: cont):
+    branch_prim %9, 1n => b4(%0, %19), otherwise b0(%0, %19)
+  b6(%0: array, %19: cont):
+    %9: nat = nth %0, 0
+    jump b5(%0, %9, %19)
+  b7(%0: array, %19: cont):
+    %7: nat = nth %0, 1
+    continue %19, %7
+  b8(%4: nat, %19: cont):
+    continue %19, %4
+  b9(%19: cont):
+    %5: nat = const 3n
+    continue %19, %5
+  b10(%4: nat, %19: cont):
+    branch_prim %4, 2n => b9(%19), otherwise b8(%4, %19)
+  b11(%0: array, %19: cont):
+    %4: nat = nth %0, 1
+    jump b10(%4, %19)
+  b12(%0: array, %3: nat, %19: cont):
+    branch_prim %3, 1n => b11(%0, %19), otherwise b7(%0, %19)
+  b13(%0: array, %19: cont):
+    %3: nat = nth %0, 0
+    jump b12(%0, %3, %19)
+  b14(%0: array, %19: cont):
+    branch_len %0, 2 => b13(%0, %19), otherwise b6(%0, %19)
+  b15(%0: array, %19: cont):
+    %2: nat = nth %0, 0
+    continue %19, %2
+  b16(%0: array, %19: cont):
+    branch_len %0, 1 => b15(%0, %19), otherwise b14(%0, %19)
+  b17(%19: cont):
+    %1: nat = const 0n
+    continue %19, %1
+  b18(%0: array, %19: cont):
+    branch_len %0, 0 => b17(%19), otherwise b16(%0, %19)
+  b19(%0: array, %19: cont):
+    jump b18(%0, %19)"#
     );
 }
 
@@ -728,33 +807,39 @@ fn an_arm_binding_the_whole_array_takes_every_length() {
             "let f = fn arr => match arr with | [] => 0n | other => 1n end",
             "fn f("
         ),
-        "fn f(%0: array):\n\
-         \x20 %3: nat = switch_len %0:\n\
-         \x20   0 =>\n\
-         \x20     %1: nat = const 0n\n\
-         \x20     yield %1\n\
-         \x20   else =>\n\
-         \x20     %2: nat = const 1n\n\
-         \x20     yield %2\n\
-         \x20 ret %3"
+        r#"fn f(%0: array; %7: cont) entry b3 [f0, Synchronous]:
+  b0(%7: cont):
+    %2: nat = const 1n
+    continue %7, %2
+  b1(%7: cont):
+    %1: nat = const 0n
+    continue %7, %1
+  b2(%0: array, %7: cont):
+    branch_len %0, 0 => b1(%7), otherwise b0(%7)
+  b3(%0: array, %7: cont):
+    jump b2(%0, %7)"#
     );
     assert_eq!(
         section(
             "let g = fn arr => match arr with | [x, ..] => x | _ => 0n end",
             "fn g("
         ),
-        "fn g(%0: array):\n\
-         \x20 %4: nat = switch_len %0:\n\
-         \x20   0 =>\n\
-         \x20     %1: nat = const 0n\n\
-         \x20     yield %1\n\
-         \x20   1 =>\n\
-         \x20     %2: nat = nth %0, 0\n\
-         \x20     yield %2\n\
-         \x20   else =>\n\
-         \x20     %3: nat = nth %0, 0\n\
-         \x20     yield %3\n\
-         \x20 ret %4"
+        r#"fn g(%0: array; %8: cont) entry b5 [f0, Synchronous]:
+  b0(%0: array, %8: cont):
+    %3: nat = nth %0, 0
+    continue %8, %3
+  b1(%0: array, %8: cont):
+    %2: nat = nth %0, 0
+    continue %8, %2
+  b2(%0: array, %8: cont):
+    branch_len %0, 1 => b1(%0, %8), otherwise b0(%0, %8)
+  b3(%8: cont):
+    %1: nat = const 0n
+    continue %8, %1
+  b4(%0: array, %8: cont):
+    branch_len %0, 0 => b3(%8), otherwise b2(%0, %8)
+  b5(%0: array, %8: cont):
+    jump b4(%0, %8)"#
     );
 }
 
@@ -777,42 +862,74 @@ fn a_spread_literal_joins_its_pieces_in_order() {
 fn a_struct_spread_lays_the_named_fields_over_the_value() {
     assert_eq!(
         section("let c = { y: 2n }\nlet a = { x: 1n, ..c }", "global a"),
-        "global a:\n\
-         \x20 %2: nat = const 1n\n\
-         \x20 %3: struct = global c\n\
-         \x20 %4: struct = struct { x: %2 }\n\
-         \x20 %5: struct = merge %3, %4\n\
-         \x20 ret %5"
+        r#"fn a#init(; %7: cont) entry b0 [f1, Synchronous]:
+  b0(%7: cont):
+    %2: nat = const 1n
+    %3: struct = global c
+    %4: struct = struct { x: %2 }
+    %5: struct = merge %3, %4
+    continue %7, %5"#
     );
-    let ordered = section(
-        "let f = fn n => { y: n }\nlet a = { x: f 1n, ..f 2n }",
-        "global a",
+    let output = lowered("let f = fn n => { y: n }\nlet a = { x: f 1n, ..f 2n }");
+    let global = output.globals.iter().find(|g| g.name == "a").unwrap();
+    let function = &output.functions[global.initializer];
+    let next = |block: &lir::Block| {
+        let lir::End::Call { continuation, .. } = block.end.kind else {
+            panic!("expected a call")
+        };
+        block
+            .instrs
+            .iter()
+            .find_map(|i| match &i.op {
+                lir::Op::Continuation { code, .. } if i.temp == continuation => {
+                    Some(&function.blocks[code.block])
+                }
+                _ => None,
+            })
+            .expect("call has a saved return destination")
+    };
+    let first = &function.blocks[function.entry];
+    let second = next(first);
+    let merged = next(second);
+    assert!(
+        first
+            .instrs
+            .iter()
+            .any(|i| matches!(i.op, lir::Op::Const(ir::Literal::Natural(1))))
     );
-    let first = ordered.find("call").expect("the field's call");
-    let second = ordered.rfind("call").expect("the spread's call");
-    let merged = ordered.find("merge").expect("the merge");
-    assert!(first < second && second < merged, "{ordered}");
-    assert_eq!(ordered.matches("call").count(), 2, "{ordered}");
+    assert!(
+        second
+            .instrs
+            .iter()
+            .any(|i| matches!(i.op, lir::Op::Const(ir::Literal::Natural(2))))
+    );
+    assert!(
+        merged
+            .instrs
+            .iter()
+            .any(|i| matches!(i.op, lir::Op::Merge(_)))
+    );
+    assert!(matches!(merged.end.kind, lir::End::Continue { .. }));
 }
 
 /// A case no listed one covers needs somewhere 'to go: an arm that accepts
 /// anything gives the dispatch its `else`. With every case of a closed row
 /// listed there is nothing left over, and no `else` is written.
 #[test]
-fn a_tag_dispatch_has_an_else_only_where_something_is_left_over() {
+fn a_tag_dispatch_marks_impossible_paths_unreachable() {
     assert!(
-        section(
+        !section(
             "let f = fn v => match v with | #A x => x | b => 0n end",
             "fn f("
         )
-        .contains("else =>")
+        .contains("unreachable")
     );
     assert!(
-        !section(
+        section(
             "let f = fn v => match v with | #A x => x | #B => 0n end",
             "fn f("
         )
-        .contains("else =>")
+        .contains("unreachable")
     );
 }
 
@@ -826,15 +943,15 @@ fn an_optional_field_becomes_a_presence_test() {
             "let f = fn s => match s with | { x, y } => y | { x } => x end",
             "fn f("
         ),
-        "fn f(%0: struct):\n\
-         \x20 %1: any = project %0, \"x\"\n\
-         \x20 %3: any = switch_presence %0, \"y\":\n\
-         \x20   present =>\n\
-         \x20     %2: any = project %0, \"y\"\n\
-         \x20     yield %2\n\
-         \x20   absent =>\n\
-         \x20     yield %1\n\
-         \x20 ret %3"
+        r#"fn f(%0: struct; %7: cont) entry b2 [f0, Synchronous]:
+  b0(%0: struct, %7: cont):
+    %2: any = project %0, "y"
+    continue %7, %2
+  b1(%1: any, %7: cont):
+    continue %7, %1
+  b2(%0: struct, %7: cont):
+    %1: any = project %0, "x"
+    branch_presence %0, "y" => b0(%0, %7), otherwise b1(%1, %7)"#
     );
 }
 
@@ -849,7 +966,7 @@ fn a_refined_swap_uses_the_existing_presence_switch() {
     ] {
         let printed = section(source, "fn swap(");
         assert_eq!(
-            printed.matches("switch_presence").count(),
+            printed.matches("branch_presence").count(),
             1,
             "the second presence is entailed on each path:\n{printed}"
         );
@@ -864,7 +981,7 @@ fn a_refined_swap_uses_the_existing_presence_switch() {
          | {right} => 3n end",
         "fn nested(",
     );
-    assert_eq!(nested.matches("switch_presence").count(), 2, "{nested}");
+    assert_eq!(nested.matches("branch_presence").count(), 2, "{nested}");
 }
 
 /// An exact pattern against a type that is open has to ask whether the value
@@ -877,16 +994,16 @@ fn an_exact_pattern_over_an_open_type_tests_the_rest() {
             "let f = fn s => match s with | {x} => 1n | {x, ..} => 2n end",
             "fn f("
         ),
-        "fn f(%0: struct):\n\
-         \x20 %1: any = project %0, \"x\"\n\
-         \x20 %4: nat = switch_rest %0, [\"x\"]:\n\
-         \x20   none =>\n\
-         \x20     %2: nat = const 1n\n\
-         \x20     yield %2\n\
-         \x20   some =>\n\
-         \x20     %3: nat = const 2n\n\
-         \x20     yield %3\n\
-         \x20 ret %4"
+        r#"fn f(%0: struct; %8: cont) entry b2 [f0, Synchronous]:
+  b0(%8: cont):
+    %2: nat = const 1n
+    continue %8, %2
+  b1(%8: cont):
+    %3: nat = const 2n
+    continue %8, %3
+  b2(%0: struct, %8: cont):
+    %1: any = project %0, "x"
+    branch_rest %0, ["x"] => b0(%8), otherwise b1(%8)"#
     );
 }
 
@@ -896,7 +1013,10 @@ fn an_exact_pattern_over_an_open_type_tests_the_rest() {
 fn a_wildcard_match_tests_nothing() {
     assert_eq!(
         section("let w = fn v => match v with | _ => 1n end", "fn w("),
-        "fn w(%0: any):\n  %1: nat = const 1n\n  ret %1"
+        r#"fn w(%0: any; %5: cont) entry b0 [f0, Synchronous]:
+  b0(%5: cont):
+    %1: nat = const 1n
+    continue %5, %1"#
     );
 }
 
@@ -909,14 +1029,16 @@ fn a_binder_arm_binds_the_scrutinee_temp() {
             "let f = fn n => match n with | 0n => 1n | m => m end",
             "fn f("
         ),
-        "fn f(%0: nat):\n\
-         \x20 %2: nat = switch_prim %0:\n\
-         \x20   0n =>\n\
-         \x20     %1: nat = const 1n\n\
-         \x20     yield %1\n\
-         \x20   else =>\n\
-         \x20     yield %0\n\
-         \x20 ret %2"
+        r#"fn f(%0: nat; %6: cont) entry b3 [f0, Synchronous]:
+  b0(%0: nat, %6: cont):
+    continue %6, %0
+  b1(%6: cont):
+    %1: nat = const 1n
+    continue %6, %1
+  b2(%0: nat, %6: cont):
+    branch_prim %0, 0n => b1(%6), otherwise b0(%0, %6)
+  b3(%0: nat, %6: cont):
+    jump b2(%0, %6)"#
     );
 }
 
@@ -924,7 +1046,7 @@ fn a_binder_arm_binds_the_scrutinee_temp() {
 /// spelling in the case so a backend can compare the value at its own
 /// representation.
 #[test]
-fn every_primitive_pattern_uses_switch_prim() {
+fn every_primitive_pattern_uses_branch_prim() {
     for (literal, case) in [
         ("1n", "1n =>"),
         ("1i", "1i =>"),
@@ -936,7 +1058,7 @@ fn every_primitive_pattern_uses_switch_prim() {
             &format!("let f = fn x => match x with | {literal} => {literal} | _ => {literal} end"),
             "fn f(",
         );
-        assert!(printed.contains("switch_prim"), "{printed}");
+        assert!(printed.contains("branch_prim"), "{printed}");
         assert!(printed.contains(case), "{printed}");
     }
 }
@@ -947,7 +1069,7 @@ fn a_complete_boolean_and_typed_wildcards_take_both_dispatch_paths() {
         "let f = fn x => match x with | false => 0n | true => 1n end",
         "fn f(",
     );
-    assert!(boolean.contains("switch_prim"), "{boolean}");
+    assert!(boolean.contains("branch_prim"), "{boolean}");
     assert!(!boolean.contains("else =>"), "{boolean}");
 
     for primitive in ["Nat", "Int", "Real", "String", "Boolean"] {
@@ -955,7 +1077,7 @@ fn a_complete_boolean_and_typed_wildcards_take_both_dispatch_paths() {
             &format!("let f : {primitive} -> {primitive} = fn x => match x with | y => y end"),
             "fn f(",
         );
-        assert!(!printed.contains("switch_prim"), "{primitive}: {printed}");
+        assert!(!printed.contains("branch_prim"), "{primitive}: {printed}");
     }
 }
 
@@ -965,7 +1087,11 @@ fn a_complete_boolean_and_typed_wildcards_take_both_dispatch_paths() {
 fn a_match_with_no_arms_dispatches_over_nothing() {
     assert_eq!(
         section("let e = fn v => match v with end", "fn e("),
-        "fn e(%0: sum):\n  %1: any = switch_tag %0:\n  ret %1"
+        r#"fn e(%0: sum; %5: cont) entry b1 [f0, Synchronous]:
+  b0():
+    unreachable
+  b1():
+    jump b0()"#
     );
 }
 
@@ -979,10 +1105,10 @@ fn performing_an_operation_reads_it_out_of_the_evidence() {
             "effect Log = { write: Nat -> () }\nlet shout = fn x => !Log.write x",
             "fn shout("
         ),
-        "fn shout(%0: struct, %1: nat):\n\
-         \x20 %2: fn = project %0, \"write\"\n\
-         \x20 %3: unit = call %2, %1\n\
-         \x20 ret %3"
+        r#"fn shout(%0: struct, %1: nat; %8: cont) entry b0 [f0, MaySuspend]:
+  b0(%0: struct, %1: nat, %8: cont):
+    %2: fn = project %0, "write"
+    call %2, %1 -> %8"#
     );
 }
 
@@ -1009,15 +1135,18 @@ fn a_handler_builds_evidence_and_catches_its_own_tag() {
              let main = fn w => handle shout 5n with | !Log.write n => {} end",
             "fn main("
         ),
-        "fn main(%8: any):\n\
-         \x20 %9: any = new_tag\n\
-         \x20 %12: fn = closure main#2, []\n\
-         \x20 %13: struct = struct { write: %12 }\n\
-         \x20 %16: unit = catch %9:\n\
-         \x20   %14: nat = const 5n\n\
-         \x20   %15: unit = call shout, %13, %14\n\
-         \x20   yield %15\n\
-         \x20 ret %16"
+        r#"fn main(%8: any; %22: cont) entry b2 [f2, MaySuspend]:
+  b0(%9: handler, %23: any) continuation:
+    leave %9, %23
+  b1(%9: handler, %13: struct):
+    %14: nat = const 5n
+    %24: cont = continuation main:b0, [%9] [f2]
+    call shout, %13, %14 -> %24 [f0]
+  b2(%22: cont):
+    %9: handler = new_tag
+    %12: fn = closure main#2, []
+    %13: struct = struct { write: %12 }
+    enter %9, b1(%9, %13), %22"#
     );
 }
 
@@ -1134,13 +1263,16 @@ fn a_raise_throws_to_the_tag_its_arm_captured() {
            handle !Fail.oops () with | !Fail.oops z => raise 0n | return r => r end";
     assert_eq!(
         section(source, "fn recover#2"),
-        "fn recover#2(%4: any, %2: unit):\n  %3: nat = const 0n\n  throw %4, %3"
+        r#"fn recover#2(%4: any, %2: unit; %18: cont) entry b0 [f2, Synchronous]:
+  b0(%4: any):
+    %3: nat = const 0n
+    abort %4, %3"#
     );
     // The arm captures the very tag the `catch` beside it was minted with.
     let recover = section(source, "fn recover(");
-    assert!(recover.contains("%1: any = new_tag"), "{recover}");
+    assert!(recover.contains("%1: handler = new_tag"), "{recover}");
     assert!(recover.contains("closure recover#2, [%1]"), "{recover}");
-    assert!(recover.contains("catch %1:"), "{recover}");
+    assert!(recover.contains("enter %1,"), "{recover}");
 }
 
 /// Two handlers of one effect, one inside the other: each mints its own
@@ -1155,8 +1287,8 @@ fn nested_handlers_of_one_effect_shadow_and_stay_apart() {
         "fn nest(",
     );
     assert_eq!(printed.matches("new_tag").count(), 2, "{printed}");
-    assert!(printed.contains("%1: any = new_tag"), "{printed}");
-    assert!(printed.contains("%6: any = new_tag"), "{printed}");
+    assert!(printed.contains("%1: handler = new_tag"), "{printed}");
+    assert!(printed.contains("%6: handler = new_tag"), "{printed}");
     // The inner record — the one built beside the inner tag — is what the
     // perform reads from.
     assert!(
@@ -1179,7 +1311,9 @@ fn an_effect_polymorphic_call_forwards_its_bundle() {
             "let piped : (Nat -> Nat + ..'e) -> Nat -> Nat + ..'e = fn g => fn n => g n",
             "fn piped("
         ),
-        "fn piped(%0: fn, %1: struct, %2: nat):\n  %3: nat = call %0, %1, %2\n  ret %3"
+        r#"fn piped(%0: fn, %1: struct, %2: nat; %11: cont) entry b0 [f0, MaySuspend]:
+  b0(%0: fn, %1: struct, %2: nat, %11: cont):
+    call %0, %1, %2 -> %11"#
     );
 }
 
@@ -1209,10 +1343,10 @@ fn a_bundle_is_built_where_none_can_be_forwarded() {
     assert!(printed.contains("call piped, %30, %31, %24"), "{printed}");
     assert_eq!(
         section(source, "fn use#3"),
-        "fn use#3(%25: fn, %26: struct, %27: nat):\n\
-         \x20 %28: struct = project %26, \"Log\"\n\
-         \x20 %29: nat = call %25, %28, %27\n\
-         \x20 ret %29"
+        r#"fn use#3(%25: fn, %26: struct, %27: nat; %47: cont) entry b0 [f8, MaySuspend]:
+  b0(%25: fn, %26: struct, %27: nat, %47: cont):
+    %28: struct = project %26, "Log"
+    call %25, %28, %27 -> %47"#
     );
 }
 
@@ -1238,17 +1372,19 @@ fn a_function_receives_the_evidence_it_projects() {
     );
     assert_eq!(
         section(source, "fn logger#1"),
-        "fn logger#1(%15: struct, %16: nat):\n  %17: nat = call logger, %15, %16\n  ret %17"
+        r#"fn logger#1(%15: struct, %16: nat; %44: cont) entry b0 [f4, MaySuspend]:
+  b0(%15: struct, %16: nat, %44: cont):
+    call logger, %15, %16 -> %44 [f3]"#
     );
     // The adapter reads that record out of the bundle `piped` was declared to
     // take, and the bundle the call built holds the handler's record under the
     // effect's name.
     assert_eq!(
         section(source, "fn use#3"),
-        "fn use#3(%27: fn, %28: struct, %29: nat):\n\
-         \x20 %30: struct = project %28, \"Log\"\n\
-         \x20 %31: nat = call %27, %30, %29\n\
-         \x20 ret %31"
+        r#"fn use#3(%27: fn, %28: struct, %29: nat; %50: cont) entry b0 [f8, MaySuspend]:
+  b0(%27: fn, %28: struct, %29: nat, %50: cont):
+    %30: struct = project %28, "Log"
+    call %27, %30, %29 -> %50"#
     );
     let use_ = section(source, "fn use(");
     assert!(
@@ -1268,14 +1404,17 @@ fn an_operation_used_as_a_value_gets_a_wrapper() {
          let go = fn w => handle op 1n with | !Log.write n => {} end";
     assert_eq!(
         section(source, "fn op#1"),
-        "fn op#1(%0: struct, %1: nat):\n\
-         \x20 %2: fn = project %0, \"write\"\n\
-         \x20 %3: unit = call %2, %1\n\
-         \x20 ret %3"
+        r#"fn op#1(%0: struct, %1: nat; %22: cont) entry b0 [f2, MaySuspend]:
+  b0(%0: struct, %1: nat, %22: cont):
+    %2: fn = project %0, "write"
+    call %2, %1 -> %22"#
     );
     assert_eq!(
         section(source, "global op"),
-        "global op:\n  %4: fn = closure op#1, []\n  ret %4"
+        r#"fn op#init(; %24: cont) entry b0 [f4, Synchronous]:
+  b0(%24: cont):
+    %4: fn = closure op#1, []
+    continue %24, %4"#
     );
     assert!(section(source, "fn go(").contains("call %11, %10, %12"));
 }
@@ -1291,13 +1430,15 @@ fn a_definite_effect_and_an_open_rest_are_both_passed() {
              let both = fn g => do let z = !Log.write 1n return g 2n end",
             "fn both("
         ),
-        "fn both(%0: struct, %1: struct, %2: fn):\n\
-         \x20 %3: fn = project %0, \"write\"\n\
-         \x20 %4: nat = const 1n\n\
-         \x20 %5: unit = call %3, %4\n\
-         \x20 %6: nat = const 2n\n\
-         \x20 %7: any = call %2, %0, %1, %6\n\
-         \x20 ret %7"
+        r#"fn both(%0: struct, %1: struct, %2: fn; %13: cont) entry b1 [f0, MaySuspend]:
+  b0(%0: struct, %1: struct, %2: fn, %13: cont, %5: unit) continuation:
+    %6: nat = const 2n
+    call %2, %0, %1, %6 -> %13
+  b1(%0: struct, %1: struct, %2: fn, %13: cont):
+    %3: fn = project %0, "write"
+    %4: nat = const 1n
+    %14: cont = continuation both:b0, [%0, %1, %2, %13] [f0]
+    call %3, %4 -> %14"#
     );
 }
 
@@ -1309,26 +1450,36 @@ fn a_definite_effect_and_an_open_rest_are_both_passed() {
 fn the_listing_is_the_canonical_format() {
     assert_eq!(
         listing("let add = fn a => fn b => a\nlet main = add 1n 2n"),
-        "fn add(%0: any, %1: any):\n\
-         \x20 ret %0\n\
-         \n\
-         fn add#1(%2: any):\n\
-         \x20 %3: fn = closure add#2, [%2]\n\
-         \x20 ret %3\n\
-         \n\
-         fn add#2(%4: any, %5: any):\n\
-         \x20 %6: any = call add, %4, %5\n\
-         \x20 ret %6\n\
-         \n\
-         global add:\n\
-         \x20 %7: fn = closure add#1, []\n\
-         \x20 ret %7\n\
-         \n\
-         global main:\n\
-         \x20 %8: nat = const 1n\n\
-         \x20 %9: nat = const 2n\n\
-         \x20 %10: nat = call add, %8, %9\n\
-         \x20 ret %10\n"
+        r#"fn add(%0: any, %1: any; %11: cont) entry b0 [f0, Synchronous]:
+  b0(%0: any, %11: cont):
+    continue %11, %0
+
+fn add#1(%2: any; %12: cont) entry b0 [f1, Synchronous]:
+  b0(%2: any, %12: cont):
+    %3: fn = closure add#2, [%2]
+    continue %12, %3
+
+fn add#2(%4: any, %5: any; %13: cont) entry b0 [f2, Synchronous]:
+  b0(%4: any, %5: any, %13: cont):
+    call add, %4, %5 -> %13 [f0]
+
+fn add#init(; %14: cont) entry b0 [f3, Synchronous]:
+  b0(%14: cont):
+    %7: fn = closure add#1, []
+    continue %14, %7
+
+fn main#init(; %15: cont) entry b0 [f4, Synchronous]:
+  b0(%15: cont):
+    %8: nat = const 1n
+    %9: nat = const 2n
+    call add, %8, %9 -> %15 [f0]
+
+global add:
+  initializer f3 (add#init)
+
+global main:
+  initializer f4 (main#init)
+"#
     );
 }
 
@@ -1344,7 +1495,7 @@ fn an_empty_program_lowers_to_an_empty_output() {
 
 /// A declared sum applied to more cases is one row by the time the dispatch is
 /// built: the tail a use site handed the declaration is flattened into the
-/// cases beside it, so both are ordinary entries of one `switch_tag`.
+/// cases beside it, so both are ordinary entries of one `branch_tag`.
 #[test]
 fn a_declared_sums_cases_are_flattened_before_dispatch() {
     assert_eq!(
@@ -1354,15 +1505,21 @@ fn a_declared_sums_cases_are_flattened_before_dispatch() {
                fn t => match t with | #Err n => n | #Ok n => n end",
             "fn h("
         ),
-        "fn h(%0: sum):\n\
-         \x20 %3: nat = switch_tag %0:\n\
-         \x20   #Err =>\n\
-         \x20     %1: nat = payload %0\n\
-         \x20     yield %1\n\
-         \x20   #Ok =>\n\
-         \x20     %2: nat = payload %0\n\
-         \x20     yield %2\n\
-         \x20 ret %3"
+        r#"fn h(%0: sum; %7: cont) entry b5 [f0, Synchronous]:
+  b0():
+    unreachable
+  b1(%0: sum, %7: cont):
+    %2: nat = payload %0
+    continue %7, %2
+  b2(%0: sum, %7: cont):
+    branch_tag %0, #Ok => b1(%0, %7), otherwise b0()
+  b3(%0: sum, %7: cont):
+    %1: nat = payload %0
+    continue %7, %1
+  b4(%0: sum, %7: cont):
+    branch_tag %0, #Err => b3(%0, %7), otherwise b2(%0, %7)
+  b5(%0: sum, %7: cont):
+    jump b4(%0, %7)"#
     );
 }
 
@@ -1372,7 +1529,10 @@ fn a_declared_sums_cases_are_flattened_before_dispatch() {
 fn a_unit_pattern_tests_nothing() {
     assert_eq!(
         section("let u = fn v => match v with | () => 1n end", "fn u("),
-        "fn u(%0: unit):\n  %1: nat = const 1n\n  ret %1"
+        r#"fn u(%0: unit; %5: cont) entry b0 [f0, Synchronous]:
+  b0(%5: cont):
+    %1: nat = const 1n
+    continue %5, %1"#
     );
 }
 
@@ -1383,7 +1543,10 @@ fn a_value_captured_twice_is_one_parameter() {
     assert!(section(source, "fn d(").contains("closure d#2, [%0]"));
     assert_eq!(
         section(source, "fn d#2"),
-        "fn d#2(%2: any, %1: any):\n  %3: struct = struct { p: %2, q: %2 }\n  ret %3"
+        r#"fn d#2(%2: any, %1: any; %11: cont) entry b0 [f2, Synchronous]:
+  b0(%2: any, %11: cont):
+    %3: struct = struct { p: %2, q: %2 }
+    continue %11, %3"#
     );
 }
 
@@ -1397,29 +1560,27 @@ fn an_open_pattern_says_nothing_about_a_field_it_omits() {
             "let f = fn s => match s with | {x, ..} => 1n | {y} => 2n | _ => 3n end",
             "fn f("
         ),
-        "fn f(%0: struct):\n\
-         \x20 %9: nat = switch_presence %0, \"x\":\n\
-         \x20   present =>\n\
-         \x20     %1: any = project %0, \"x\"\n\
-         \x20     %2: nat = const 1n\n\
-         \x20     yield %2\n\
-         \x20   absent =>\n\
-         \x20     %8: nat = switch_presence %0, \"y\":\n\
-         \x20       present =>\n\
-         \x20         %3: any = project %0, \"y\"\n\
-         \x20         %6: nat = switch_rest %0, [\"x\", \"y\"]:\n\
-         \x20           none =>\n\
-         \x20             %4: nat = const 2n\n\
-         \x20             yield %4\n\
-         \x20           some =>\n\
-         \x20             %5: nat = const 3n\n\
-         \x20             yield %5\n\
-         \x20         yield %6\n\
-         \x20       absent =>\n\
-         \x20         %7: nat = const 3n\n\
-         \x20         yield %7\n\
-         \x20     yield %8\n\
-         \x20 ret %9"
+        r#"fn f(%0: struct; %13: cont) entry b6 [f0, Synchronous]:
+  b0(%0: struct, %13: cont):
+    %1: any = project %0, "x"
+    %2: nat = const 1n
+    continue %13, %2
+  b1(%13: cont):
+    %4: nat = const 2n
+    continue %13, %4
+  b2(%13: cont):
+    %5: nat = const 3n
+    continue %13, %5
+  b3(%0: struct, %13: cont):
+    %3: any = project %0, "y"
+    branch_rest %0, ["x", "y"] => b1(%13), otherwise b2(%13)
+  b4(%13: cont):
+    %7: nat = const 3n
+    continue %13, %7
+  b5(%0: struct, %13: cont):
+    branch_presence %0, "y" => b3(%0, %13), otherwise b4(%13)
+  b6(%0: struct, %13: cont):
+    branch_presence %0, "x" => b0(%0, %13), otherwise b5(%0, %13)"#
     );
 }
 
@@ -1432,7 +1593,10 @@ fn a_field_no_arm_asks_about_is_never_read() {
             "let f : { x: Nat, y: Nat } -> Nat = fn s => match s with | {x, ..} => x end",
             "fn f("
         ),
-        "fn f(%0: struct):\n  %1: nat = project %0, \"x\"\n  ret %1"
+        r#"fn f(%0: struct; %5: cont) entry b0 [f0, Synchronous]:
+  b0(%0: struct, %5: cont):
+    %1: nat = project %0, "x"
+    continue %5, %1"#
     );
 }
 
@@ -1443,15 +1607,15 @@ fn a_field_every_arm_ignores_is_tested_but_not_read() {
             "let f = fn s => match s with | {x: _, y: _} => 1n | {x: _} => 2n end",
             "fn f("
         ),
-        "fn f(%0: struct):\n\
-         \x20 %3: nat = switch_presence %0, \"y\":\n\
-         \x20   present =>\n\
-         \x20     %1: nat = const 1n\n\
-         \x20     yield %1\n\
-         \x20   absent =>\n\
-         \x20     %2: nat = const 2n\n\
-         \x20     yield %2\n\
-         \x20 ret %3"
+        r#"fn f(%0: struct; %7: cont) entry b2 [f0, Synchronous]:
+  b0(%7: cont):
+    %1: nat = const 1n
+    continue %7, %1
+  b1(%7: cont):
+    %2: nat = const 2n
+    continue %7, %2
+  b2(%0: struct, %7: cont):
+    branch_presence %0, "y" => b0(%7), otherwise b1(%7)"#
     );
 }
 
@@ -1465,8 +1629,8 @@ fn an_operation_returning_a_function_keeps_applying() {
         "fn go(",
     );
     assert!(printed.contains("%7: fn = project %6, \"mk\""), "{printed}");
-    assert!(printed.contains("%9: fn = call %7, %8"), "{printed}");
-    assert!(printed.contains("%11: nat = call %9, %10"), "{printed}");
+    assert!(printed.contains("call %7, %8"), "{printed}");
+    assert!(printed.contains("call %9, %10"), "{printed}");
 }
 
 /// A nested binding whose own effects reach no further than itself still gets
@@ -1479,17 +1643,16 @@ fn a_nested_binding_takes_a_bundle_of_its_own() {
             "let outer = fn z => do let g = fn h => h z return 0n end",
             "fn outer#2"
         ),
-        "fn outer#2(%3: any, %1: struct, %2: fn):\n  %4: any = call %2, %1, %3\n  ret %4"
+        r#"fn outer#2(%3: any, %1: struct, %2: fn; %12: cont) entry b0 [f2, MaySuspend]:
+  b0(%1: struct, %2: fn, %3: any, %12: cont):
+    call %2, %1, %3 -> %12"#
     );
 }
 
-/// Every temp in a listing is defined exactly once, which is what lets the tab
-/// light `%17` wherever it appears without asking which function it is in. The
-/// curried wrappers are where that is easiest to lose: each one receives what
-/// the one before it captured, and names it with a temp of its own rather than
-/// borrowing the number it arrived under.
+/// Each CPS block closes over explicitly declared parameters; definitions are
+/// unique within the block even when a temp is forwarded to several blocks.
 #[test]
-fn every_temp_is_defined_once_in_the_whole_listing() {
+fn every_block_defines_each_temp_once() {
     for source in [
         "let three = fn a => fn b => fn c => a\nlet p = three 1n",
         "effect Log = { write: Nat -> () }\n\
@@ -1500,44 +1663,21 @@ fn every_temp_is_defined_once_in_the_whole_listing() {
          let logger : Nat -> Nat + !Log = fn n => do let z = !Log.write n return n end\n\
          let use = fn w => handle piped logger 1n with | !Log.write s => {} end",
     ] {
-        let printed = listing(source);
-        let defined = definitions(&printed);
-        let mut once = defined.clone();
-        once.sort();
-        once.dedup();
-        assert!(!defined.is_empty(), "{printed}");
-        assert_eq!(once.len(), defined.len(), "{printed}");
-    }
-}
-
-/// Every temp a listing *defines*: the parameters of each header line, and the
-/// target of each instruction. A use is never at the head of a line, so what is
-/// left out is exactly the uses.
-fn definitions(printed: &str) -> Vec<String> {
-    let mut defined = Vec::new();
-    for line in printed.lines() {
-        let line = line.trim_start();
-        match line.strip_prefix("fn ") {
-            Some(signature) => {
-                let (_, params) = signature
-                    .split_once('(')
-                    .expect("a header line names its parameters");
-                for param in params.trim_end_matches("):").split(", ") {
-                    if let Some((temp, _)) = param.split_once(':') {
-                        defined.push(temp.to_string());
-                    }
-                }
-            }
-            None => {
-                if let Some((temp, _)) = line.split_once(':')
-                    && temp.starts_with('%')
+        let output = lowered(source);
+        for function in &output.functions {
+            for block in &function.blocks {
+                let mut defined = std::collections::HashSet::new();
+                for temp in block
+                    .params
+                    .iter()
+                    .map(|p| p.temp)
+                    .chain(block.instrs.iter().map(|i| i.temp))
                 {
-                    defined.push(temp.to_string());
+                    assert!(defined.insert(temp), "duplicate %{temp} in {function:?}");
                 }
             }
         }
     }
-    defined
 }
 
 /// A value takes the evidence of the row it was written with, and the position
@@ -1552,10 +1692,7 @@ fn evidence_of_the_same_shape_is_handed_straight_over() {
          let same = fn w => handle takes noisy with | !Log.write s => {} end";
     let printed = section(source, "fn same(");
     assert!(printed.contains("%22: fn = global noisy"), "{printed}");
-    assert!(
-        printed.contains("%23: nat = call takes, %21, %22"),
-        "{printed}"
-    );
+    assert!(printed.contains("call takes, %21, %22"), "{printed}");
 }
 
 /// Fitting compares two evidence shapes, and a type that does not pin its
@@ -1572,12 +1709,14 @@ fn a_level_no_type_pins_down_is_crossed_rather_than_repacked() {
     let source = "let id = fn x => x\nlet idv = id\nlet go = fn f => (idv f) 1n";
     assert_eq!(
         section(source, "fn go("),
-        "fn go(%5: struct, %6: fn):\n\
-         \x20 %7: fn = global idv\n\
-         \x20 %8: fn = call %7, %6\n\
-         \x20 %9: nat = const 1n\n\
-         \x20 %10: any = call %8, %5, %9\n\
-         \x20 ret %10"
+        r#"fn go(%5: struct, %6: fn; %17: cont) entry b1 [f2, MaySuspend]:
+  b0(%5: struct, %17: cont, %8: fn) continuation:
+    %9: nat = const 1n
+    call %8, %5, %9 -> %17
+  b1(%5: struct, %6: fn, %17: cont):
+    %7: fn = global idv
+    %18: cont = continuation go:b0, [%5, %17] [f2]
+    call %7, %6 -> %18"#
     );
 }
 
@@ -1606,27 +1745,27 @@ fn an_adapter_packs_a_record_into_the_bundle_a_value_expects() {
          let packed = fn w => handle takes openish with | !Log.write s => {} end";
     assert_eq!(
         section(source, "fn openish("),
-        "fn openish(%8: struct, %9: struct, %10: nat):\n\
-         \x20 %11: fn = project %8, \"write\"\n\
-         \x20 %12: unit = call %11, %10\n\
-         \x20 ret %10"
+        r#"fn openish(%8: struct, %9: struct, %10: nat; %38: cont) entry b1 [f2, MaySuspend]:
+  b0(%10: nat, %38: cont, %12: unit) continuation:
+    continue %38, %10
+  b1(%8: struct, %10: nat, %38: cont):
+    %11: fn = project %8, "write"
+    %39: cont = continuation openish:b0, [%10, %38] [f2]
+    call %11, %10 -> %39"#
     );
     assert_eq!(
         section(source, "fn packed#3"),
-        "fn packed#3(%25: fn, %26: struct, %27: nat):\n\
-         \x20 %28: struct = struct { Log: %26 }\n\
-         \x20 %29: nat = call %25, %26, %28, %27\n\
-         \x20 ret %29"
+        r#"fn packed#3(%25: fn, %26: struct, %27: nat; %46: cont) entry b0 [f7, MaySuspend]:
+  b0(%25: fn, %26: struct, %27: nat, %46: cont):
+    %28: struct = struct { Log: %26 }
+    call %25, %26, %28, %27 -> %46"#
     );
     let printed = section(source, "fn packed(");
     assert!(
         printed.contains("%30: fn = closure packed#3, [%24]"),
         "{printed}"
     );
-    assert!(
-        printed.contains("%31: nat = call takes, %23, %30"),
-        "{printed}"
-    );
+    assert!(printed.contains("call takes, %23, %30"), "{printed}");
 }
 
 /// The other way round: a position polymorphic in its effects passes one
@@ -1650,25 +1789,25 @@ fn an_adapter_forwards_the_bundle_it_was_handed() {
            fn g => do let z = !Log.write 1n return g 2n end\n\
          let fwd : {} -> Nat + !Log + ..'t = fn w => hof2 both";
     assert!(
-        section(source, "fn both(").starts_with("fn both(%10: struct, %11: struct, %12: fn):"),
+        section(source, "fn both(").starts_with("fn both(%10: struct, %11: struct, %12: fn;"),
         "{}",
         listing(source)
     );
     assert_eq!(
         section(source, "fn fwd#3"),
-        "fn fwd#3(%27: fn, %28: struct, %29: fn):\n\
-         \x20 %30: struct = project %28, \"Log\"\n\
-         \x20 %38: fn = closure fwd#2, [%29]\n\
-         \x20 %39: nat = call %27, %30, %28, %38\n\
-         \x20 ret %39"
+        r#"fn fwd#3(%27: fn, %28: struct, %29: fn; %56: cont) entry b0 [f8, MaySuspend]:
+  b0(%27: fn, %28: struct, %29: fn, %56: cont):
+    %30: struct = project %28, "Log"
+    %38: fn = closure fwd#2, [%29]
+    call %27, %30, %28, %38 -> %56"#
     );
     assert_eq!(
         section(source, "fn fwd#2"),
-        "fn fwd#2(%31: fn, %32: struct, %33: struct, %34: nat):\n\
-         \x20 %35: struct = struct { Log: %32 }\n\
-         \x20 %36: struct = merge %33, %35\n\
-         \x20 %37: nat = call %31, %36, %34\n\
-         \x20 ret %37"
+        r#"fn fwd#2(%31: fn, %32: struct, %33: struct, %34: nat; %55: cont) entry b0 [f7, MaySuspend]:
+  b0(%31: fn, %32: struct, %33: struct, %34: nat, %55: cont):
+    %35: struct = struct { Log: %32 }
+    %36: struct = merge %33, %35
+    call %31, %36, %34 -> %55"#
     );
 }
 
@@ -1691,7 +1830,7 @@ fn a_partial_application_is_fitted_to_the_shape_its_wrapper_takes() {
     // The wrapper the partial application becomes takes a record and a bundle.
     assert!(
         section(source, "fn two#2")
-            .starts_with("fn two#2(%8: nat, %9: struct, %10: struct, %11: nat):"),
+            .starts_with("fn two#2(%8: nat, %9: struct, %10: struct, %11: nat;"),
         "{}",
         listing(source)
     );
@@ -1699,15 +1838,15 @@ fn a_partial_application_is_fitted_to_the_shape_its_wrapper_takes() {
     // after its capture are exactly those two.
     assert_eq!(
         section(source, "fn go#3"),
-        "fn go#3(%30: fn, %31: struct, %32: nat):\n\
-         \x20 %33: struct = struct { Log: %31 }\n\
-         \x20 %34: nat = call %30, %31, %33, %32\n\
-         \x20 ret %34"
+        r#"fn go#3(%30: fn, %31: struct, %32: nat; %52: cont) entry b0 [f8, MaySuspend]:
+  b0(%30: fn, %31: struct, %32: nat, %52: cont):
+    %33: struct = struct { Log: %31 }
+    call %30, %31, %33, %32 -> %52"#
     );
     let go = section(source, "fn go(");
     assert!(go.contains("%29: fn = closure two#2, [%28]"), "{go}");
     assert!(go.contains("%35: fn = closure go#3, [%29]"), "{go}");
-    assert!(go.contains("%36: nat = call takes, %27, %35"), "{go}");
+    assert!(go.contains("call takes, %27, %35"), "{go}");
 }
 
 /// A *full* application is a value like any other: the wrappers are behind it,
@@ -1723,17 +1862,22 @@ fn a_full_application_stands_for_what_it_came_to() {
          let go = fn w => handle takes (pick 1n 2n) with | !Log.write s => {} end";
     assert_eq!(
         section(source, "fn go("),
-        "fn go(%25: any):\n\
-         \x20 %26: any = new_tag\n\
-         \x20 %29: fn = closure go#2, []\n\
-         \x20 %30: struct = struct { write: %29 }\n\
-         \x20 %35: nat = catch %26:\n\
-         \x20   %31: nat = const 1n\n\
-         \x20   %32: nat = const 2n\n\
-         \x20   %33: fn = call pick, %31, %32\n\
-         \x20   %34: nat = call takes, %30, %33\n\
-         \x20   yield %34\n\
-         \x20 ret %35"
+        r#"fn go(%25: any; %47: cont) entry b3 [f7, MaySuspend]:
+  b0(%26: handler, %48: any) continuation:
+    leave %26, %48
+  b1(%26: handler, %30: struct, %33: fn) continuation:
+    %49: cont = continuation go:b0, [%26] [f7]
+    call takes, %30, %33 -> %49 [f5]
+  b2(%26: handler, %30: struct):
+    %31: nat = const 1n
+    %32: nat = const 2n
+    %50: cont = continuation go:b1, [%26, %30] [f7]
+    call pick, %31, %32 -> %50 [f2]
+  b3(%47: cont):
+    %26: handler = new_tag
+    %29: fn = closure go#2, []
+    %30: struct = struct { write: %29 }
+    enter %26, b2(%26, %30), %47"#
     );
 }
 
@@ -1754,31 +1898,31 @@ fn a_definition_read_through_a_binding_arrives_callable() {
     // calls what it is given with two records before it — so the adapter packs
     // the two into the bundle, keyed by effect name.
     assert!(
-        section(source, "fn poly(").starts_with("fn poly(%0: struct, %1: nat):"),
+        section(source, "fn poly(").starts_with("fn poly(%0: struct, %1: nat;"),
         "{}",
         listing(source)
     );
     assert_eq!(
         section(source, "fn go#4"),
-        "fn go#4(%28: fn, %29: struct, %30: struct, %31: nat):\n\
-         \x20 %32: struct = struct { A: %29, B: %30 }\n\
-         \x20 %33: nat = call %28, %32, %31\n\
-         \x20 ret %33"
+        r#"fn go#4(%28: fn, %29: struct, %30: struct, %31: nat; %53: cont) entry b0 [f8, MaySuspend]:
+  b0(%28: fn, %29: struct, %30: struct, %31: nat, %53: cont):
+    %32: struct = struct { A: %29, B: %30 }
+    call %28, %32, %31 -> %53"#
     );
     // The adapter is built where the global is read, and it is the adapter that
     // travels through the binding into the call.
     let go = section(source, "fn go(");
     assert!(go.contains("%27: fn = global poly"), "{go}");
     assert!(go.contains("%34: fn = closure go#4, [%27]"), "{go}");
-    assert!(go.contains("%35: nat = call run, %26, %21, %34"), "{go}");
+    assert!(go.contains("call run, %26, %21, %34"), "{go}");
     // Which is what makes the indirect call inside `run` reach a function of as
     // many parameters as it passes arguments.
     assert_eq!(
         section(source, "fn run("),
-        "fn run(%6: struct, %7: struct, %8: fn):\n\
-         \x20 %9: nat = const 1n\n\
-         \x20 %10: nat = call %8, %6, %7, %9\n\
-         \x20 ret %10"
+        r#"fn run(%6: struct, %7: struct, %8: fn; %43: cont) entry b0 [f2, MaySuspend]:
+  b0(%6: struct, %7: struct, %8: fn, %43: cont):
+    %9: nat = const 1n
+    call %8, %6, %7, %9 -> %43"#
     );
 }
 
@@ -1796,24 +1940,25 @@ fn a_definition_returned_from_a_function_arrives_callable() {
            with | !A.a s => {} end with | !B.b s => {} end";
     assert_eq!(
         section(source, "fn get("),
-        "fn get(%6: unit):\n\
-         \x20 %7: fn = global poly\n\
-         \x20 %14: fn = closure get#2, [%7]\n\
-         \x20 ret %14"
+        r#"fn get(%6: unit; %49: cont) entry b0 [f2, Synchronous]:
+  b0(%49: cont):
+    %7: fn = global poly
+    %14: fn = closure get#2, [%7]
+    continue %49, %14"#
     );
     assert_eq!(
         section(source, "fn get#2"),
-        "fn get#2(%8: fn, %9: struct, %10: struct, %11: nat):\n\
-         \x20 %12: struct = struct { A: %9, B: %10 }\n\
-         \x20 %13: nat = call %8, %12, %11\n\
-         \x20 ret %13"
+        r#"fn get#2(%8: fn, %9: struct, %10: struct, %11: nat; %60: cont) entry b0 [f8, MaySuspend]:
+  b0(%8: fn, %9: struct, %10: struct, %11: nat, %60: cont):
+    %12: struct = struct { A: %9, B: %10 }
+    call %8, %12, %11 -> %60"#
     );
     assert_eq!(
         section(source, "fn run("),
-        "fn run(%18: struct, %19: struct, %20: fn):\n\
-         \x20 %21: nat = const 1n\n\
-         \x20 %22: nat = call %20, %18, %19, %21\n\
-         \x20 ret %22"
+        r#"fn run(%18: struct, %19: struct, %20: fn; %51: cont) entry b0 [f4, MaySuspend]:
+  b0(%18: struct, %19: struct, %20: fn, %51: cont):
+    %21: nat = const 1n
+    call %20, %18, %19, %21 -> %51"#
     );
 }
 
@@ -1839,7 +1984,7 @@ fn a_polymorphic_value_bound_by_a_let_is_called_at_the_shape_it_holds() {
     // The lifted `app` and its wrapper take a bundle and the argument: two
     // parameters, which is what every call of the value has to supply.
     assert!(
-        section(source, "fn app#1").starts_with("fn app#1(%16: struct, %17: fn):"),
+        section(source, "fn app#1").starts_with("fn app#1(%16: struct, %17: fn;"),
         "{}",
         listing(source)
     );
@@ -1853,7 +1998,7 @@ fn a_polymorphic_value_bound_by_a_let_is_called_at_the_shape_it_holds() {
         direct.contains("%39: fn = closure direct#4, [%31]"),
         "{direct}"
     );
-    assert!(direct.contains("%40: nat = call app, %32, %39"), "{direct}");
+    assert!(direct.contains("call app, %32, %39"), "{direct}");
     // `bound` calls the same value through `h`, and the call has the same
     // shape: the bundle keyed by effect name, the adapter over `global both`,
     // and two arguments handed to the temp the global read produced.
@@ -1868,15 +2013,15 @@ fn a_polymorphic_value_bound_by_a_let_is_called_at_the_shape_it_holds() {
         bound.contains("%66: fn = closure bound#4, [%58]"),
         "{bound}"
     );
-    assert!(bound.contains("%67: nat = call %57, %59, %66"), "{bound}");
+    assert!(bound.contains("call %57, %59, %66"), "{bound}");
     // The two adapters repack the same two records into the same bundle.
     assert_eq!(
         section(source, "fn bound#4"),
-        "fn bound#4(%60: fn, %61: struct, %62: nat):\n\
-         \x20 %63: struct = project %61, \"A\"\n\
-         \x20 %64: struct = project %61, \"B\"\n\
-         \x20 %65: nat = call %60, %63, %64, %62\n\
-         \x20 ret %65"
+        r#"fn bound#4(%60: fn, %61: struct, %62: nat; %96: cont) entry b0 [f13, MaySuspend]:
+  b0(%60: fn, %61: struct, %62: nat, %96: cont):
+    %63: struct = project %61, "A"
+    %64: struct = project %61, "B"
+    call %60, %63, %64, %62 -> %96"#
     );
 }
 
@@ -1895,17 +2040,17 @@ fn a_parameter_is_called_at_one_shape_however_the_uses_instantiate_it() {
     // The lifted `h` takes a bundle and its argument: two parameters.
     assert_eq!(
         section(source, "fn go#3"),
-        "fn go#3(%18: struct, %19: fn):\n\
-         \x20 %20: nat = const 1n\n\
-         \x20 %21: any = call %19, %18, %20\n\
-         \x20 ret %21"
+        r#"fn go#3(%18: struct, %19: fn; %55: cont) entry b0 [f7, MaySuspend]:
+  b0(%18: struct, %19: fn, %55: cont):
+    %20: nat = const 1n
+    call %19, %18, %20 -> %55"#
     );
     // Both calls of the closure pass two arguments — a bundle and the adapted
     // function — although one use reads `h` at `Log` and the other reads it
     // pure.
     let go = section(source, "fn go(");
-    assert!(go.contains("%31: nat = call %22, %24, %30"), "{go}");
-    assert!(go.contains("%39: nat = call %22, %33, %38"), "{go}");
+    assert!(go.contains("call %22, %24, %30"), "{go}");
+    assert!(go.contains("call %22, %33, %38"), "{go}");
     assert!(go.contains("%24: struct = struct { Log: %17 }"), "{go}");
     assert!(go.contains("%30: fn = closure go#4, [%23]"), "{go}");
     assert!(go.contains("%38: fn = closure go#5, [%32]"), "{go}");
@@ -1913,16 +2058,16 @@ fn a_parameter_is_called_at_one_shape_however_the_uses_instantiate_it() {
     // drops the bundle it has no use for.
     assert_eq!(
         section(source, "fn go#4"),
-        "fn go#4(%25: fn, %26: struct, %27: nat):\n\
-         \x20 %28: struct = project %26, \"Log\"\n\
-         \x20 %29: nat = call %25, %28, %27\n\
-         \x20 ret %29"
+        r#"fn go#4(%25: fn, %26: struct, %27: nat; %56: cont) entry b0 [f8, MaySuspend]:
+  b0(%25: fn, %26: struct, %27: nat, %56: cont):
+    %28: struct = project %26, "Log"
+    call %25, %28, %27 -> %56"#
     );
     assert_eq!(
         section(source, "fn go#5"),
-        "fn go#5(%34: fn, %35: struct, %36: nat):\n\
-         \x20 %37: nat = call %34, %36\n\
-         \x20 ret %37"
+        r#"fn go#5(%34: fn, %35: struct, %36: nat; %57: cont) entry b0 [f9, MaySuspend]:
+  b0(%34: fn, %36: nat, %57: cont):
+    call %34, %36 -> %57"#
     );
 }
 
@@ -1941,21 +2086,21 @@ fn a_value_returned_from_a_call_is_called_at_the_shape_it_holds() {
          let late = fn w => handle handle (pick {}) both\n\
            with | !A.a s => {} end with | !B.b s => {} end";
     let late = section(source, "fn late(");
-    assert!(late.contains("%37: fn = call pick, %36"), "{late}");
+    assert!(late.contains("call pick, %36"), "{late}");
     assert!(late.contains("%38: fn = global both"), "{late}");
     assert!(
         late.contains("%39: struct = struct { B: %30, A: %35 }"),
         "{late}"
     );
     assert!(late.contains("%46: fn = closure late#4, [%38]"), "{late}");
-    assert!(late.contains("%47: nat = call %37, %39, %46"), "{late}");
+    assert!(late.contains("call %37, %39, %46"), "{late}");
     assert_eq!(
         section(source, "fn late#4"),
-        "fn late#4(%40: fn, %41: struct, %42: nat):\n\
-         \x20 %43: struct = project %41, \"A\"\n\
-         \x20 %44: struct = project %41, \"B\"\n\
-         \x20 %45: nat = call %40, %43, %44, %42\n\
-         \x20 ret %45"
+        r#"fn late#4(%40: fn, %41: struct, %42: nat; %70: cont) entry b0 [f10, MaySuspend]:
+  b0(%40: fn, %41: struct, %42: nat, %70: cont):
+    %43: struct = project %41, "A"
+    %44: struct = project %41, "B"
+    call %40, %43, %44, %42 -> %70"#
     );
 }
 
@@ -1980,9 +2125,9 @@ fn a_function_read_out_of_a_struct_field_is_called_at_the_shape_the_field_holds(
     // the capture, two arguments — never the use site's positional records.
     assert_eq!(
         section(source, "fn s#1"),
-        "fn s#1(%3: fn, %1: struct, %2: any):\n\
-         \x20 %4: any = call %3, %1, %2\n\
-         \x20 ret %4"
+        r#"fn s#1(%3: fn, %1: struct, %2: any; %71: cont) entry b0 [f4, MaySuspend]:
+  b0(%1: struct, %2: any, %3: fn, %71: cont):
+    call %3, %1, %2 -> %71"#
     );
     // The projection is fitted where it is read, and every call downstream
     // passes exactly as many arguments as its callee has parameters.
@@ -1990,26 +2135,26 @@ fn a_function_read_out_of_a_struct_field_is_called_at_the_shape_the_field_holds(
     assert!(go.contains("%31: struct = global s"), "{go}");
     assert!(go.contains("%32: fn = project %31, \"f\""), "{go}");
     assert!(go.contains("%50: fn = closure go#6, [%32]"), "{go}");
-    assert!(go.contains("%52: fn = call %50, %51"), "{go}");
-    assert!(go.contains("%54: nat = call %52, %30, %25, %53"), "{go}");
+    assert!(go.contains("call %50, %51"), "{go}");
+    assert!(go.contains("call %52, %30, %25, %53"), "{go}");
     // `both` goes in through an adapter that unpacks the bundle back into the
     // two records it takes.
     assert_eq!(
         section(source, "fn go#4"),
-        "fn go#4(%35: fn, %36: struct, %37: any):\n\
-         \x20 %38: struct = project %36, \"Log\"\n\
-         \x20 %39: struct = project %36, \"Fail\"\n\
-         \x20 %40: nat = call %35, %38, %39, %37\n\
-         \x20 ret %40"
+        r#"fn go#4(%35: fn, %36: struct, %37: any; %75: cont) entry b0 [f8, MaySuspend]:
+  b0(%35: fn, %36: struct, %37: any, %75: cont):
+    %38: struct = project %36, "Log"
+    %39: struct = project %36, "Fail"
+    call %35, %38, %39, %37 -> %75"#
     );
     // And the use site's two records are packed into the one bundle the
     // stored function's next level takes.
     assert_eq!(
         section(source, "fn go#5"),
-        "fn go#5(%43: fn, %44: struct, %45: struct, %46: nat):\n\
-         \x20 %47: struct = struct { Log: %44, Fail: %45 }\n\
-         \x20 %48: any = call %43, %47, %46\n\
-         \x20 ret %48"
+        r#"fn go#5(%43: fn, %44: struct, %45: struct, %46: nat; %76: cont) entry b0 [f9, MaySuspend]:
+  b0(%43: fn, %44: struct, %45: struct, %46: nat, %76: cont):
+    %47: struct = struct { Log: %44, Fail: %45 }
+    call %43, %47, %46 -> %76"#
     );
 }
 
@@ -2085,16 +2230,16 @@ fn a_function_carried_as_a_sum_payload_is_called_at_the_shape_the_case_holds() {
     let go = section(source, "fn go(");
     assert!(go.contains("%32: fn = payload %31"), "{go}");
     assert!(go.contains("%50: fn = closure go#6, [%32]"), "{go}");
-    assert!(go.contains("%54: nat = call %52, %30, %25, %53"), "{go}");
+    assert!(go.contains("call %52, %30, %25, %53"), "{go}");
     // The same unpacking adapter stands in front of `both` as in the struct
     // spelling: the payload's shape survived the container.
     assert_eq!(
         section(source, "fn go#4"),
-        "fn go#4(%35: fn, %36: struct, %37: any):\n\
-         \x20 %38: struct = project %36, \"Log\"\n\
-         \x20 %39: struct = project %36, \"Fail\"\n\
-         \x20 %40: nat = call %35, %38, %39, %37\n\
-         \x20 ret %40"
+        r#"fn go#4(%35: fn, %36: struct, %37: any; %77: cont) entry b0 [f8, MaySuspend]:
+  b0(%35: fn, %36: struct, %37: any, %77: cont):
+    %38: struct = project %36, "Log"
+    %39: struct = project %36, "Fail"
+    call %35, %38, %39, %37 -> %77"#
     );
 }
 
@@ -2119,14 +2264,14 @@ fn a_match_arm_yields_a_function_fitted_to_what_the_match_stands_for() {
     let go = section(source, "fn go(");
     assert!(go.contains("%51: fn = closure go#5, [%37]"), "{go}");
     assert!(go.contains("%67: fn = closure go#7, [%53]"), "{go}");
-    assert!(go.contains("%70: nat = call %68, %35, %30, %69"), "{go}");
+    assert!(go.contains("call %68, %35, %30, %69"), "{go}");
     assert_eq!(
         section(source, "fn go#5"),
-        "fn go#5(%38: fn, %39: struct, %40: struct, %41: fn):\n\
-         \x20 %42: struct = struct { A: %39, B: %40 }\n\
-         \x20 %49: fn = closure go#4, [%41]\n\
-         \x20 %50: any = call %38, %42, %49\n\
-         \x20 ret %50"
+        r#"fn go#5(%38: fn, %39: struct, %40: struct, %41: fn; %95: cont) entry b0 [f11, MaySuspend]:
+  b0(%38: fn, %39: struct, %40: struct, %41: fn, %95: cont):
+    %42: struct = struct { A: %39, B: %40 }
+    %49: fn = closure go#4, [%41]
+    call %38, %42, %49 -> %95"#
     );
 }
 
@@ -2140,24 +2285,28 @@ fn a_value_already_at_the_containers_shape_goes_in_and_out_untouched() {
          let go = fn w => handle s.f 1n with | !Log.write x => {} end";
     assert_eq!(
         section(source, "global s"),
-        "global s:\n\
-         \x20 %4: fn = closure s#1, []\n\
-         \x20 %5: struct = struct { f: %4 }\n\
-         \x20 ret %5"
+        r#"fn s#init(; %27: cont) entry b0 [f4, Synchronous]:
+  b0(%27: cont):
+    %4: fn = closure s#1, []
+    %5: struct = struct { f: %4 }
+    continue %27, %5"#
     );
     assert_eq!(
         section(source, "fn go("),
-        "fn go(%6: any):\n\
-         \x20 %7: any = new_tag\n\
-         \x20 %10: fn = closure go#2, []\n\
-         \x20 %11: struct = struct { write: %10 }\n\
-         \x20 %16: nat = catch %7:\n\
-         \x20   %12: struct = global s\n\
-         \x20   %13: fn = project %12, \"f\"\n\
-         \x20   %14: nat = const 1n\n\
-         \x20   %15: nat = call %13, %11, %14\n\
-         \x20   yield %15\n\
-         \x20 ret %16"
+        r#"fn go(%6: any; %20: cont) entry b2 [f0, MaySuspend]:
+  b0(%7: handler, %21: any) continuation:
+    leave %7, %21
+  b1(%7: handler, %11: struct):
+    %12: struct = global s
+    %13: fn = project %12, "f"
+    %14: nat = const 1n
+    %22: cont = continuation go:b0, [%7] [f0]
+    call %13, %11, %14 -> %22
+  b2(%20: cont):
+    %7: handler = new_tag
+    %10: fn = closure go#2, []
+    %11: struct = struct { write: %10 }
+    enter %7, b1(%7, %11), %20"#
     );
 }
 
@@ -2168,9 +2317,10 @@ fn a_value_already_at_the_containers_shape_goes_in_and_out_untouched() {
 fn a_payload_no_type_pinned_down_goes_in_as_it_stands() {
     assert_eq!(
         section("let f = fn v => #F v", "fn f("),
-        "fn f(%0: any):\n\
-         \x20 %1: sum = tag #F, %0\n\
-         \x20 ret %1"
+        r#"fn f(%0: any; %5: cont) entry b0 [f0, Synchronous]:
+  b0(%0: any, %5: cont):
+    %1: sum = tag #F, %0
+    continue %5, %1"#
     );
 }
 
@@ -2184,26 +2334,31 @@ fn a_case_the_production_type_never_named_reads_at_the_uses_word() {
             "let w = #F 1n\nlet f = fn v => match w with | #F x => x | #G 0n => 7n | _ => 0n end",
             "fn f("
         ),
-        "fn f(%2: any):\n\
-         \x20 %3: sum = global w\n\
-         \x20 %10: nat = switch_tag %3:\n\
-         \x20   #F =>\n\
-         \x20     %4: nat = payload %3\n\
-         \x20     yield %4\n\
-         \x20   #G =>\n\
-         \x20     %5: nat = payload %3\n\
-         \x20     %8: nat = switch_prim %5:\n\
-         \x20       0n =>\n\
-         \x20         %6: nat = const 7n\n\
-         \x20         yield %6\n\
-         \x20       else =>\n\
-         \x20         %7: nat = const 0n\n\
-         \x20         yield %7\n\
-         \x20     yield %8\n\
-         \x20   else =>\n\
-         \x20     %9: nat = const 0n\n\
-         \x20     yield %9\n\
-         \x20 ret %10"
+        r#"fn f(%2: any; %14: cont) entry b8 [f0, Synchronous]:
+  b0(%14: cont):
+    %9: nat = const 0n
+    continue %14, %9
+  b1(%14: cont):
+    %7: nat = const 0n
+    continue %14, %7
+  b2(%14: cont):
+    %6: nat = const 7n
+    continue %14, %6
+  b3(%5: nat, %14: cont):
+    branch_prim %5, 0n => b2(%14), otherwise b1(%14)
+  b4(%3: sum, %14: cont):
+    %5: nat = payload %3
+    jump b3(%5, %14)
+  b5(%3: sum, %14: cont):
+    branch_tag %3, #G => b4(%3, %14), otherwise b0(%14)
+  b6(%3: sum, %14: cont):
+    %4: nat = payload %3
+    continue %14, %4
+  b7(%3: sum, %14: cont):
+    branch_tag %3, #F => b6(%3, %14), otherwise b5(%3, %14)
+  b8(%14: cont):
+    %3: sum = global w
+    jump b7(%3, %14)"#
     );
 }
 
@@ -2220,18 +2375,18 @@ fn a_bundle_names_an_effect_once_however_many_frames_hold_it() {
     // the bundle built inside `inner` names the effect once — as the record
     // `inner` itself was handed, which is the innermost one.
     assert!(
-        section(source, "fn outer(").starts_with("fn outer(%15: struct, %16: nat):"),
+        section(source, "fn outer(").starts_with("fn outer(%15: struct, %16: nat;"),
         "{}",
         listing(source)
     );
     assert_eq!(
         section(source, "fn outer#3"),
-        "fn outer#3(%17: struct, %18: nat):\n\
-         \x20 %19: fn = global idn\n\
-         \x20 %24: fn = closure outer#2, [%19]\n\
-         \x20 %25: struct = struct { Log: %17 }\n\
-         \x20 %26: nat = call piped, %24, %25, %18\n\
-         \x20 ret %26"
+        r#"fn outer#3(%17: struct, %18: nat; %41: cont) entry b0 [f8, MaySuspend]:
+  b0(%17: struct, %18: nat, %41: cont):
+    %19: fn = global idn
+    %24: fn = closure outer#2, [%19]
+    %25: struct = struct { Log: %17 }
+    call piped, %24, %25, %18 -> %41 [f0]"#
     );
 }
 
@@ -2251,11 +2406,11 @@ fn a_bundle_with_no_identity_hands_over_what_it_holds() {
          let maybe : Nat -> Nat + !Log (when 'a) = fn n => piped idn n";
     assert_eq!(
         section(source, "fn maybe("),
-        "fn maybe(%15: struct, %16: nat):\n\
-         \x20 %17: fn = global idn\n\
-         \x20 %22: fn = closure maybe#2, [%17]\n\
-         \x20 %23: nat = call piped, %22, %15, %16\n\
-         \x20 ret %23"
+        r#"fn maybe(%15: struct, %16: nat; %33: cont) entry b0 [f5, MaySuspend]:
+  b0(%15: struct, %16: nat, %33: cont):
+    %17: fn = global idn
+    %22: fn = closure maybe#2, [%17]
+    call piped, %22, %15, %16 -> %33 [f0]"#
     );
 }
 
@@ -2281,24 +2436,27 @@ fn a_bundle_is_forwarded_only_where_the_use_shares_the_variable() {
            fn g => fn n => piped g n";
     assert_eq!(
         section(source, "fn caller("),
-        "fn caller(%19: fn, %20: struct, %21: nat):\n\
-         \x20 %22: any = new_tag\n\
-         \x20 %25: fn = closure caller#3, []\n\
-         \x20 %26: struct = struct { write: %25 }\n\
-         \x20 %37: nat = catch %22:\n\
-         \x20   %27: fn = global noisy\n\
-         \x20   %33: fn = closure caller#4, [%27]\n\
-         \x20   %34: struct = struct { Log: %26 }\n\
-         \x20   %35: struct = merge %20, %34\n\
-         \x20   %36: nat = call piped, %33, %35, %21\n\
-         \x20   yield %36\n\
-         \x20 ret %37"
+        r#"fn caller(%19: fn, %20: struct, %21: nat; %62: cont) entry b2 [f5, MaySuspend]:
+  b0(%22: handler, %63: any) continuation:
+    leave %22, %63
+  b1(%20: struct, %21: nat, %22: handler, %26: struct):
+    %27: fn = global noisy
+    %33: fn = closure caller#4, [%27]
+    %34: struct = struct { Log: %26 }
+    %35: struct = merge %20, %34
+    %64: cont = continuation caller:b0, [%22] [f5]
+    call piped, %33, %35, %21 -> %64 [f0]
+  b2(%20: struct, %21: nat, %62: cont):
+    %22: handler = new_tag
+    %25: fn = closure caller#3, []
+    %26: struct = struct { write: %25 }
+    enter %22, b1(%20, %21, %22, %26), %62"#
     );
     assert_eq!(
         section(source, "fn twice("),
-        "fn twice(%45: fn, %46: struct, %47: nat):\n\
-         \x20 %48: nat = call piped, %45, %46, %47\n\
-         \x20 ret %48"
+        r#"fn twice(%45: fn, %46: struct, %47: nat; %67: cont) entry b0 [f8, MaySuspend]:
+  b0(%45: fn, %46: struct, %47: nat, %67: cont):
+    call piped, %45, %46, %47 -> %67 [f0]"#
     );
 }
 
@@ -2316,7 +2474,10 @@ fn nothing_after_a_raise_is_emitted() {
                | return r => r end",
             "fn recover#2"
         ),
-        "fn recover#2(%4: any, %2: unit):\n  %3: nat = const 0n\n  throw %4, %3"
+        r#"fn recover#2(%4: any, %2: unit; %19: cont) entry b0 [f2, Synchronous]:
+  b0(%4: any):
+    %3: nat = const 0n
+    abort %4, %3"#
     );
 }
 
@@ -2327,21 +2488,25 @@ fn nothing_after_a_raise_is_emitted() {
 fn a_callee_written_inline_is_called_indirectly() {
     assert_eq!(
         section("let main = (fn n => n) 1n", "global main"),
-        "global main:\n\
-         \x20 %1: fn = closure main#1, []\n\
-         \x20 %2: nat = const 1n\n\
-         \x20 %3: nat = call %1, %2\n\
-         \x20 ret %3"
+        r#"fn main#init(; %5: cont) entry b0 [f1, Synchronous]:
+  b0(%5: cont):
+    %1: fn = closure main#1, []
+    %2: nat = const 1n
+    call %1, %2 -> %5"#
     );
 }
 
 /// A sum position no arm looks into is not dispatched on: the one arm accepts
-/// every case, so there is nothing to tell apart and no `switch_tag` to write.
+/// every case, so there is nothing to tell apart and no `branch_tag` to write.
 #[test]
 fn a_sum_no_arm_tests_is_not_dispatched_on() {
     assert_eq!(
         section("let f = fn w => match #A with | y => 0n end", "fn f("),
-        "fn f(%0: any):\n  %1: sum = tag #A\n  %2: nat = const 0n\n  ret %2"
+        r#"fn f(%0: any; %6: cont) entry b0 [f0, Synchronous]:
+  b0(%6: cont):
+    %1: sum = tag #A
+    %2: nat = const 0n
+    continue %6, %2"#
     );
 }
 
@@ -2354,11 +2519,11 @@ fn a_number_written_twice_in_one_column_is_one_case() {
         "let f = fn s => match s with | {a: 0n, b: 0n} => 1n | {a: 0n, b: 1n} => 2n | _ => 3n end",
         "fn f(",
     );
-    assert_eq!(printed.matches("switch_prim %1:").count(), 1, "{printed}");
+    assert_eq!(printed.matches("branch_prim %1,").count(), 1, "{printed}");
     assert_eq!(
         printed
             .lines()
-            .filter(|line| line.trim() == "0n =>")
+            .filter(|line| line.contains(", 0n =>"))
             .count(),
         2,
         "{printed}"
@@ -2376,15 +2541,21 @@ fn a_case_the_type_proves_absent_leaves_nothing_over() {
              let f : T (#C Nat) -> Nat = fn v => match v with | #A n => n | #C n => n end",
             "fn f("
         ),
-        "fn f(%0: sum):\n\
-         \x20 %3: nat = switch_tag %0:\n\
-         \x20   #A =>\n\
-         \x20     %1: nat = payload %0\n\
-         \x20     yield %1\n\
-         \x20   #C =>\n\
-         \x20     %2: nat = payload %0\n\
-         \x20     yield %2\n\
-         \x20 ret %3"
+        r#"fn f(%0: sum; %7: cont) entry b5 [f0, Synchronous]:
+  b0():
+    unreachable
+  b1(%0: sum, %7: cont):
+    %2: nat = payload %0
+    continue %7, %2
+  b2(%0: sum, %7: cont):
+    branch_tag %0, #C => b1(%0, %7), otherwise b0()
+  b3(%0: sum, %7: cont):
+    %1: nat = payload %0
+    continue %7, %1
+  b4(%0: sum, %7: cont):
+    branch_tag %0, #A => b3(%0, %7), otherwise b2(%0, %7)
+  b5(%0: sum, %7: cont):
+    jump b4(%0, %7)"#
     );
 }
 
@@ -2398,13 +2569,15 @@ fn a_case_the_type_proves_absent_leaves_nothing_over() {
 fn a_function_an_indirect_call_returns_is_called_in_turn() {
     assert_eq!(
         section("let main = (fn a => fn b => a) 1n 2n", "global main"),
-        "global main:\n\
-         \x20 %4: fn = closure main#2, []\n\
-         \x20 %5: nat = const 1n\n\
-         \x20 %6: fn = call %4, %5\n\
-         \x20 %7: nat = const 2n\n\
-         \x20 %8: nat = call %6, %7\n\
-         \x20 ret %8"
+        r#"fn main#init(; %11: cont) entry b1 [f2, MaySuspend]:
+  b0(%11: cont, %6: fn) continuation:
+    %7: nat = const 2n
+    call %6, %7 -> %11
+  b1(%11: cont):
+    %4: fn = closure main#2, []
+    %5: nat = const 1n
+    %12: cont = continuation main#init:b0, [%11] [f2]
+    call %4, %5 -> %12"#
     );
 }
 
@@ -2439,7 +2612,7 @@ fn recursive_ordinary_extern_adapters_close_cycles_in_both_directions() {
     let printed = listing(source);
     let adapters: Vec<_> = printed
         .lines()
-        .filter(|line| line.starts_with("fn "))
+        .filter(|line| line.starts_with("fn ") && line.contains("#extern#"))
         .collect();
     assert_eq!(
         adapters.len(),
@@ -2506,7 +2679,7 @@ fn callback_evidence_joins_conditional_then_definite_occurrences() {
         .find(|part| part.starts_with("fn install#extern#callback#1"))
         .expect("the first callback adapter is printed");
     assert!(
-        first_adapter.find("struct { Needed:") < first_adapter.find(" = call "),
+        first_adapter.find("struct { Needed:") < first_adapter.find("call "),
         "the promoted evidence is repacked for the outer conditional arrow before its call:\n{printed}"
     );
 }
@@ -2530,7 +2703,8 @@ fn callback_evidence_joins_definite_then_conditional_occurrences() {
         .find(|part| part.starts_with("fn install#extern#callback#1"))
         .expect("the first callback adapter is printed");
     assert!(
-        first_adapter.find(" = call ") < first_adapter.find("struct { Needed:"),
+        first_adapter.contains("call %4, %5, %6")
+            && first_adapter.contains("struct { Needed: %5 }"),
         "the first definite occurrence remains direct evidence at its call:\n{printed}"
     );
 }
@@ -2567,11 +2741,9 @@ fn conditional_named_evidence_overlays_the_same_shared_open_tail() {
         .find(|part| part.starts_with("fn install#extern#0"))
         .expect("the marked extern adapter is emitted");
     assert!(
-        marked.contains(concat!(
-            "  %5: struct = struct { Needed: %2 }\n",
-            "  %6: struct = merge %3, %5\n",
-            "  %14: fn = closure install#extern#callback#1, [%4, %6]"
-        )),
+        marked.contains("%5: struct = struct { Needed: %2 }")
+            && marked.contains("%6: struct = merge %3, %5")
+            && marked.contains("closure install#extern#callback#1, [%4, %6]"),
         "Needed must overlay the instantiated Spare tail captured by the callback:\n{printed}"
     );
     assert!(
@@ -2593,11 +2765,9 @@ fn restricted_callback_bundles_project_shared_open_tails() {
         .find(|part| part.starts_with("fn install#extern#0"))
         .expect("the marked extern adapter is emitted");
     assert!(
-        marked.contains(concat!(
-            "  %4: struct = project %2, \"Needed\"\n",
-            "  %5: struct = struct { Needed: %4 }\n",
-            "  %12: fn = closure install#extern#callback#1, [%3, %5]"
-        )),
+        marked.contains("%4: struct = project %2, \"Needed\"")
+            && marked.contains("%5: struct = struct { Needed: %4 }")
+            && marked.contains("closure install#extern#callback#1, [%3, %5]"),
         "the callback must capture exactly its value and projected Needed record, not ambient %2:\n{printed}"
     );
     assert!(
@@ -2658,7 +2828,7 @@ let choose = fn p =>
   | return n => ()
   end"###;
     let printed = section(source, "fn choose(");
-    assert!(printed.contains("switch_prim"), "{printed}");
+    assert!(printed.contains("branch_prim"), "{printed}");
     assert!(printed.contains(r###"struct { "if": %"###), "{printed}");
     assert!(printed.contains(r###"project %"###), "{printed}");
     assert!(printed.contains(r###", "if""###), "{printed}");
@@ -2673,7 +2843,7 @@ let choose : (#"some case" Nat | #"let" | #"line\n\"quote\"\\tail") -> Nat = fn 
     assert!(tagged.contains(r###"tag #"some case","###), "{tagged}");
 
     let switched = section(source, "fn choose(");
-    assert!(switched.contains("switch_tag"), "{switched}");
+    assert!(switched.contains("branch_tag"), "{switched}");
     for case in [
         r###"#"some case" =>"###,
         r###"#let =>"###,

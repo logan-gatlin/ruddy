@@ -151,13 +151,24 @@ fn stmt_node(ids: &mut Ids, stmt: &Stmt) -> Node {
             module
         }
         StmtKind::Extern {
-            name, ty, target, ..
+            name,
+            ty,
+            abi,
+            target,
         } => Node {
             label: "Extern".into(),
             ..node
         }
         .child(Node::new(ids.next(), "Name", name.tracked.clone()).at(name.span))
         .child(annotation_node(ids, ty))
+        .child(
+            Node::new(
+                ids.next(),
+                "Boundary",
+                print::ast::extern_type(&abi.tracked).to_string(),
+            )
+            .at(abi.span),
+        )
         .child(Node::new(ids.next(), "Target", target.to_string()).at(target.span)),
         StmtKind::Let { pattern, ty, body } => {
             let mut let_node = Node {

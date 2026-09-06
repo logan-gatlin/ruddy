@@ -10146,6 +10146,43 @@ fn externs_bind_terms_without_becoming_initializer_groups() {
 }
 
 #[test]
+fn extern_boundary_metadata_keeps_source_anchors_after_resolution() {
+    let source =
+        "@async extern use : fn(@async fn(Nat) -> Nat) -> (@async fn(Nat) -> Nat) = \"host.use\"";
+    let (_, output) = build_src(source);
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+    let mut work = vec![&output.program.externs.first().unwrap().1.value.abi];
+    let mut starts = Vec::new();
+    while let Some(abi) = work.pop() {
+        match &abi.anchored {
+            ExternTypeKind::Annotated { metadata, inner } => {
+                let attribute = &metadata["async"];
+                let span = output.source.span(attribute.key_at);
+                assert_eq!(&source[span.start..span.start + span.width], "@async");
+                starts.push(span.start);
+                work.push(inner);
+            }
+            ExternTypeKind::Group(inner) => work.push(inner),
+            ExternTypeKind::Function {
+                parameters, result, ..
+            } => {
+                work.extend(parameters);
+                work.push(result);
+            }
+            ExternTypeKind::Ordinary(_) => {}
+        }
+    }
+    starts.sort_unstable();
+    assert_eq!(
+        starts,
+        source
+            .match_indices("@async")
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn extern_abi_retains_resolved_arity_callback_nesting_and_effects() {
     let (_, output) = build_src(
         "effect Log = { write: () -> () }\n\

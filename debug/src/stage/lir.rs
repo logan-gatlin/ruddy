@@ -1,15 +1,11 @@
 //! The lowered instruction stream, as a tree.
 //!
-//! One root per global and then per function, wearing its header line; under it one
-//! row per instruction, labelled with its opcode and showing the line the
-//! listing would print — representation and all — with the child blocks of a
-//! `catch` or a `switch` nested underneath, each behind the answer that selects
-//! it. The rows come from [`print::lir`], which is also what the tests read, so
-//! the tab and the canonical listing cannot drift apart.
+//! Functions own flat parameterized blocks. Each block lists value instructions
+//! and one terminal transfer, including the destination and capture environment
+//! of saved continuations. Rendering is shared with the canonical LIR listing.
 //!
-//! Temps are numbered program-wide, so the tab lights `%17` wherever it appears
-//! — its one definition and every use, in whatever function each of them is in.
-//! That is why the highlight is unscoped where the type tabs' is not.
+//! Temp identities are preserved when forwarded into another block, so the
+//! debugger highlights each occurrence across the function's control flow.
 //!
 //! The globals lead, which is the other way round from the listing: a reader
 //! opening the tab is looking for the definition they wrote, while a reader of
@@ -45,11 +41,25 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     }
     for global in &output.globals {
         let node = Node::new(ids.next(), "global", print::lir::header(global)).at(global.span);
-        nodes.push(node.children(rows(output, &labels, &global.body, &mut ids)));
+        nodes.push(node.child(Node::new(
+            ids.next(),
+            "initializer",
+            format!("f{}", global.initializer),
+        )));
     }
-    for function in &output.functions {
-        let node = Node::new(ids.next(), "fn", print::lir::signature(function)).at(function.span);
-        nodes.push(node.children(rows(output, &labels, &function.body, &mut ids)));
+    for (id, function) in output.functions.iter().enumerate() {
+        let node = Node::new(ids.next(), "fn", print::lir::function_header(id, function))
+            .at(function.span);
+        let blocks: Vec<_> = function
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(id, b)| {
+                let node = Node::new(ids.next(), "block", print::lir::block_header(id, b));
+                node.children(rows(output, &labels, b, &mut ids))
+            })
+            .collect();
+        nodes.push(node.children(blocks));
     }
 
     Stage {
@@ -82,37 +92,25 @@ fn rows(output: &Output, labels: &print::lir::Labels, block: &Block, ids: &mut I
         .iter()
         .map(|instr| row(output, labels, instr, ids))
         .collect();
-    nodes.push(end(&block.end, ids));
+    nodes.push(end(output, &block.end, ids));
     nodes
 }
 
-/// One instruction, with whatever blocks it owns nested under it. A `catch`'s
-/// single body hangs directly off the instruction; a dispatch's blocks each hang
-/// off the answer that selects them.
+/// One value instruction, with its source navigation anchor.
 fn row(output: &Output, labels: &print::lir::Labels, instr: &Instr, ids: &mut Ids) -> Node {
-    let mut node = Node::new(
+    Node::new(
         ids.next(),
         print::lir::opcode(&instr.op),
         print::lir::instruction(output, labels, instr),
     )
-    .at(instr.span);
-    for (label, block) in print::lir::arms(&instr.op) {
-        node = match label {
-            Some(label) => {
-                let case = Node::new(ids.next(), "case", format!("{label} =>")).at(instr.span);
-                node.child(case.children(rows(output, labels, block, ids)))
-            }
-            None => node.children(rows(output, labels, block, ids)),
-        };
-    }
-    node
+    .at(instr.span)
 }
 
-fn end(terminator: &Terminator, ids: &mut Ids) -> Node {
+fn end(output: &Output, terminator: &Terminator, ids: &mut Ids) -> Node {
     Node::new(
         ids.next(),
         print::lir::end_label(terminator),
-        print::lir::terminator(terminator),
+        print::lir::terminator(output, terminator),
     )
     .at(terminator.span)
 }

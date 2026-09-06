@@ -8,13 +8,13 @@ use std::{
 use indexmap::{IndexMap, IndexSet};
 use ruddy::{
     artifact::{
-        self, Artifact, Block, Callee, End, Formula, Global, Instr, Lir, Literal, Op, Param,
-        Presence, RecoveryFact, Rep, Rest, Row, RowField, Scheme, Type, UncheckedArtifact,
+        self, Artifact, Block, End, Formula, Global, Instr, Lir, Literal, Op, Param, Presence,
+        RecoveryFact, Rep, Rest, Row, RowField, Scheme, Type, UncheckedArtifact,
     },
     compile, inference, ir, lir, parse,
     symbol::{Bundle, Mint, Namespace, Version},
     token,
-    tracking::{FileManager, Span},
+    tracking::FileManager,
     types,
 };
 
@@ -105,6 +105,53 @@ fn row(rest: Rest) -> Row {
     }
 }
 
+fn with_cps_text(artifact: &Artifact, payload: &str) -> String {
+    replace_balanced(
+        &artifact.print(),
+        "(cps-lir",
+        &format!("(cps-lir {})", serde_json::to_string(payload).unwrap()),
+    )
+}
+fn cps_json(artifact: &Artifact) -> serde_json::Value {
+    serde_json::to_value(artifact.lir()).unwrap()
+}
+
+/// A long control-flow graph stays flat during persistence, cloning and destruction.
+fn flat_function(name: &str, length: usize) -> artifact::Function {
+    artifact::Function {
+        suspension: ruddy::lir::Suspension::MaySuspend,
+        name: name.into(),
+        params: vec![],
+        continuation: 99,
+        entry: 0,
+        blocks: (0..length)
+            .map(|index| Block {
+                params: vec![Param {
+                    temp: 99,
+                    rep: Rep::Cont,
+                }],
+                result: None,
+                instrs: vec![Instr {
+                    temp: 0,
+                    rep: Rep::Unit,
+                    op: Op::Struct(vec![]),
+                }],
+                end: if index + 1 == length {
+                    End::Continue {
+                        continuation: 99,
+                        value: 0,
+                    }
+                } else {
+                    End::Jump(artifact::Edge {
+                        block: (index + 1) as u64,
+                        args: vec![99],
+                    })
+                },
+            })
+            .collect(),
+    }
+}
+
 /// A hand-built artifact covers semantic states that a source program cannot
 /// conveniently preserve through inference, such as every normalized variable
 /// form and every LIR representation.
@@ -187,14 +234,6 @@ fn model_artifact() -> Artifact {
             },
         })
         .collect();
-    let yielded = Block {
-        instrs: Vec::new(),
-        end: End::Yield(98),
-    };
-    let thrown = Block {
-        instrs: Vec::new(),
-        end: End::Throw { tag: 97, value: 96 },
-    };
     let ops = vec![
         Op::Const(Literal::Natural(u64::MAX)),
         Op::Const(Literal::Integer(i64::MIN)),
@@ -231,52 +270,13 @@ fn model_artifact() -> Artifact {
         Op::Payload(3),
         Op::Closure {
             func: 0,
-            captures: vec![1, 2],
-        },
-        Op::Call {
-            callee: Callee::Direct(0),
-            args: vec![1],
-        },
-        Op::Call {
-            callee: Callee::Indirect(2),
-            args: vec![3],
+            captures: vec![0, 1],
         },
         Op::Global {
+            callable: None,
             target: "dep@1.0.0::value".to_string(),
         },
         Op::NewTag,
-        Op::Catch {
-            tag: 1,
-            body: Box::new(thrown.clone()),
-        },
-        Op::SwitchTag {
-            on: 1,
-            cases: vec![artifact::TagCase {
-                name: "A".to_string(),
-                block: yielded.clone(),
-            }],
-            fallback: Some(Box::new(thrown.clone())),
-        },
-        Op::SwitchPrim {
-            on: 1,
-            cases: vec![artifact::PrimCase {
-                value: Literal::Boolean(false),
-                block: yielded.clone(),
-            }],
-            fallback: None,
-        },
-        Op::SwitchPresence {
-            on: 1,
-            field: "x".to_string(),
-            present: Box::new(yielded.clone()),
-            absent: Box::new(thrown.clone()),
-        },
-        Op::SwitchRest {
-            on: 1,
-            fields: vec!["x".to_string(), "y".to_string()],
-            none: Box::new(yielded.clone()),
-            some: Box::new(thrown.clone()),
-        },
     ];
     let reps = [
         Rep::Nat,
@@ -289,6 +289,9 @@ fn model_artifact() -> Artifact {
         Rep::Sum,
         Rep::Fn,
         Rep::Any,
+        Rep::Array,
+        Rep::Cont,
+        Rep::Handler,
     ];
     UncheckedArtifact {
         header: artifact::Header {
@@ -418,32 +421,62 @@ fn model_artifact() -> Artifact {
                 target: "console.log".to_string(),
                 rep: Rep::Fn,
             }],
-            functions: vec![artifact::Function {
-                name: "f".to_string(),
-                params: reps
-                    .iter()
-                    .enumerate()
-                    .map(|(temp, rep)| Param {
-                        temp: temp as u32,
-                        rep: *rep,
-                    })
-                    .collect(),
-                body: Block {
-                    instrs: ops
-                        .into_iter()
+            functions: vec![
+                artifact::Function {
+                    suspension: ruddy::lir::Suspension::MaySuspend,
+                    name: "f".into(),
+                    params: reps
+                        .iter()
                         .enumerate()
-                        .map(|(temp, op)| Instr {
+                        .map(|(temp, rep)| Param {
                             temp: temp as u32,
-                            rep: reps[temp % reps.len()],
-                            op,
+                            rep: *rep,
                         })
                         .collect(),
-                    end: End::Ret(0),
+                    continuation: 99,
+                    entry: 0,
+                    blocks: vec![Block {
+                        params: reps
+                            .iter()
+                            .enumerate()
+                            .map(|(temp, rep)| Param {
+                                temp: temp as u32,
+                                rep: *rep,
+                            })
+                            .chain([Param {
+                                temp: 99,
+                                rep: Rep::Cont,
+                            }])
+                            .collect(),
+                        result: None,
+                        instrs: ops
+                            .into_iter()
+                            .enumerate()
+                            .map(|(temp, op)| Instr {
+                                temp: temp as u32 + 100,
+                                rep: if matches!(op, Op::NewTag) {
+                                    Rep::Handler
+                                } else if matches!(op, Op::Closure { .. }) {
+                                    Rep::Fn
+                                } else {
+                                    reps[temp % reps.len()]
+                                },
+                                op,
+                            })
+                            .collect(),
+                        end: End::Continue {
+                            continuation: 99,
+                            value: 100,
+                        },
+                    }],
                 },
-            }],
+                flat_function("g#init", 1),
+            ],
             globals: vec![Global {
-                name: "bundle@1.0.0::g".to_string(),
-                body: thrown,
+                adapter: None,
+                callable: None,
+                name: "bundle@1.0.0::g".into(),
+                initializer: 1,
             }],
         },
     }
@@ -629,7 +662,15 @@ fn array_types_representations_and_constructors_round_trip() {
     let artifact = built("let values : [Nat] = [1n, 2n]");
     let printed = assert_round_trip(&artifact);
     assert!(printed.contains("(ty (array (ty nat)))"), "{printed}");
-    assert!(printed.contains("(array 0 1)"), "{printed}");
+    assert!(
+        artifact
+            .lir()
+            .functions
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.instrs)
+            .any(|i| matches!(&i.op, Op::Array(values) if values == &[0, 1]))
+    );
 }
 
 #[test]
@@ -917,10 +958,6 @@ fn compiler_externs_cross_the_artifact_boundary_without_symbols_or_spans() {
         }]
     );
     let printed = assert_round_trip(&artifact);
-    assert!(
-        printed.contains("(extern \"tests@0.1.0::Host::log\" (target \"console.log\") fn)"),
-        "{printed}"
-    );
     assert!(!printed.contains("Span"), "{printed}");
     assert!(!printed.contains("Symbol"), "{printed}");
 }
@@ -953,6 +990,10 @@ fn canonical_pretty_layout_is_pinned_at_its_unicode_width_boundary() {
     };
 
     let compiler = ruddy::artifact::COMPILER_HASH;
+    let empty_lir = format!(
+        "(cps-lir {})",
+        serde_json::to_string(r#"{"externs":[],"functions":[],"globals":[]}"#).unwrap()
+    );
     assert_eq!(
         empty("界".repeat(12)).print(),
         format!(
@@ -966,7 +1007,7 @@ fn canonical_pretty_layout_is_pinned_at_its_unicode_width_boundary() {
          \x20   (types)\n\
          \x20   (effects)\n\
          \x20   (modules))\n\
-         \x20 (lir (externs) (functions) (globals)))\n"
+         \x20 {empty_lir})\n"
         )
     );
     assert_eq!(
@@ -982,7 +1023,7 @@ fn canonical_pretty_layout_is_pinned_at_its_unicode_width_boundary() {
          \x20   (types)\n\
          \x20   (effects)\n\
          \x20   (modules))\n\
-         \x20 (lir (externs) (functions) (globals)))\n"
+         \x20 {empty_lir})\n"
         )
     );
 }
@@ -1024,20 +1065,18 @@ fn every_semantic_type_scheme_and_lir_variant_round_trips() {
 }
 
 #[test]
-fn building_translates_every_compiler_semantic_and_lir_variant() {
+fn building_translates_every_compiler_semantic_variant() {
     let (mut mint, program, _inferred, _) = compiled(
         "type OpenCases 'r = #A | ..'r\n\
          type Runner 'e = Nat -> Nat + ..'e\n\
          let value = 0\n",
     );
-    let symbol = *program.terms.keys().next().expect("source has one term");
     let type_symbol = *program
         .types
         .keys()
         .next()
         .expect("source has declared types");
     mint.register_external(type_symbol, "dependency@1.0.0::OpenCases");
-    let local_symbol = mint.local(None, Namespace::Terms, "wildcard");
     let compiler_plain = |core| Rc::new(types::Ty::plain(core));
     let compiler_field = |presence, core| types::RowField {
         presence,
@@ -1147,158 +1186,6 @@ fn building_translates_every_compiler_semantic_and_lir_variant() {
     );
     let custom = types::Scheme::constrained(7, 3, body, formula);
 
-    let span = Span::default();
-    let nested = |kind| lir::Block {
-        instrs: Vec::new(),
-        end: lir::Terminator { span, kind },
-    };
-    let yielded = nested(lir::End::Yield(90));
-    let thrown = nested(lir::End::Throw { tag: 91, value: 92 });
-    let ops = vec![
-        lir::Op::Const(ir::Literal::Natural(u64::MAX)),
-        lir::Op::Const(ir::Literal::Integer(i64::MIN)),
-        lir::Op::Const(ir::Literal::Real(-0.0)),
-        lir::Op::Const(ir::Literal::String("text".to_string())),
-        lir::Op::Const(ir::Literal::Boolean(false)),
-        lir::Op::Neg(1),
-        lir::Op::Not(2),
-        lir::Op::And { left: 1, right: 2 },
-        lir::Op::Or { left: 1, right: 2 },
-        lir::Op::Xor { left: 1, right: 2 },
-        lir::Op::Add { left: 1, right: 2 },
-        lir::Op::Sub { left: 1, right: 2 },
-        lir::Op::Mul { left: 1, right: 2 },
-        lir::Op::Div { left: 1, right: 2 },
-        lir::Op::Struct(IndexMap::from([
-            (lir::FieldKey::Named("x".to_string()), 1),
-            (lir::FieldKey::UnnamedOperation, 2),
-        ])),
-        lir::Op::Merge(vec![1, 2]),
-        lir::Op::Project {
-            base: 1,
-            field: lir::FieldKey::Named("x".to_string()),
-        },
-        lir::Op::Tag {
-            name: "None".to_string(),
-            payload: None,
-        },
-        lir::Op::Tag {
-            name: "Some".to_string(),
-            payload: Some(2),
-        },
-        lir::Op::Payload(2),
-        lir::Op::Closure {
-            func: 0,
-            captures: vec![1, 2],
-        },
-        lir::Op::Call {
-            callee: lir::Callee::Direct(0),
-            args: vec![1],
-        },
-        lir::Op::Call {
-            callee: lir::Callee::Indirect(2),
-            args: vec![3],
-        },
-        lir::Op::Global {
-            symbol,
-            name: "value".to_string(),
-        },
-        lir::Op::NewTag,
-        lir::Op::Catch {
-            tag: 1,
-            body: Box::new(thrown.clone()),
-        },
-        lir::Op::SwitchTag {
-            on: 1,
-            cases: vec![lir::TagCase {
-                name: "A".to_string(),
-                block: yielded.clone(),
-            }],
-            fallback: Some(Box::new(thrown.clone())),
-        },
-        lir::Op::SwitchPrim {
-            on: 1,
-            cases: vec![lir::PrimCase {
-                value: ir::Literal::Boolean(true),
-                block: yielded.clone(),
-            }],
-            fallback: Some(Box::new(thrown.clone())),
-        },
-        lir::Op::SwitchPresence {
-            on: 1,
-            field: "x".to_string(),
-            present: Box::new(yielded.clone()),
-            absent: Box::new(thrown.clone()),
-        },
-        lir::Op::SwitchRest {
-            on: 1,
-            fields: vec!["x".to_string()],
-            none: Box::new(yielded.clone()),
-            some: Box::new(thrown.clone()),
-        },
-    ];
-    let reps = [
-        lir::Rep::Nat,
-        lir::Rep::Int,
-        lir::Rep::Real,
-        lir::Rep::String,
-        lir::Rep::Boolean,
-        lir::Rep::Unit,
-        lir::Rep::Struct,
-        lir::Rep::Sum,
-        lir::Rep::Fn,
-        lir::Rep::Any,
-    ];
-    // TODO: the LIR half of this fixture used to reach `Artifact::build`
-    // directly. Building now consumes an `AcceptedProgram`, which only core
-    // compilation can produce, so hand-built LIR cannot cross the artifact
-    // boundary through the public API and only the scheme half is exercised.
-    let _lowered = lir::Output {
-        externs: Vec::new(),
-        functions: vec![lir::Function {
-            name: "all".to_string(),
-            params: reps
-                .iter()
-                .enumerate()
-                .map(|(temp, rep)| lir::Param {
-                    temp: temp as u32,
-                    rep: *rep,
-                })
-                .collect(),
-            body: lir::Block {
-                instrs: ops
-                    .into_iter()
-                    .enumerate()
-                    .map(|(temp, op)| lir::Instr {
-                        temp: temp as u32,
-                        rep: reps[temp % reps.len()],
-                        span,
-                        op,
-                    })
-                    .collect(),
-                end: lir::Terminator {
-                    span,
-                    kind: lir::End::Ret(0),
-                },
-            },
-            span,
-        }],
-        globals: vec![
-            lir::Global {
-                symbol,
-                name: "value".to_string(),
-                body: thrown.clone(),
-                span,
-            },
-            lir::Global {
-                symbol: local_symbol,
-                name: "wildcard".to_string(),
-                body: thrown,
-                span,
-            },
-        ],
-    };
-
     let mut artifact = built("let value = 0n").to_unchecked();
     // The exported value wears the hand-built scheme: no source program reaches
     // every semantic variant, and the export adapter is the same one building
@@ -1330,7 +1217,7 @@ fn canonical_text_escapes_and_parses_every_control_character() {
             rest: Rest::Closed,
         },
     ));
-    artifact.lir.functions[0].body.instrs[3].op = Op::Const(Literal::String(escaped));
+    artifact.lir.functions[0].blocks[0].instrs[3].op = Op::Const(Literal::String(escaped));
 
     let artifact = artifact
         .validate()
@@ -1381,41 +1268,33 @@ fn array_dispatch_and_reads_round_trip_and_reject_malformed_spellings() {
          | [1n, .., 2n] => [] | [first, ..middle, last] => middle | [..rest] => rest end",
     );
     let valid = compact(&assert_round_trip(&artifact));
-    // The first leaf list spelled with `prefix`, temps and all: the ops read
-    // out of an array carry no nested list, so the first `)` closes them.
-    let leaf = |prefix: &str| -> String {
-        let start = valid
-            .find(prefix)
-            .unwrap_or_else(|| panic!("{prefix} in {valid}"));
-        let end = valid[start..].find(')').expect("a closed leaf");
-        valid[start..start + end + 1].to_string()
-    };
-    let nth = leaf("(nth ");
-    let nth_back = leaf("(nth-back ");
-    let slice = leaf("(slice ");
-    assert!(valid.contains("(switch-len "), "{valid}");
-    assert!(valid.contains("(cases (0 "), "{valid}");
-    assert!(valid.contains("(concat "), "{valid}");
-    let dropped_last = |list: &str| list[..list.len() - 3].to_string() + ")";
-    let extended = |list: &str| list[..list.len() - 1].to_string() + " 0)";
-    for (from, to) in [
-        ("(switch-len ", "(length-switch "),
-        ("(switch-len ", "(switch-len 0 "),
-        ("(cases (0 ", "(cases 0 "),
-        ("(cases (0 ", "(cases (zero "),
-        ("(cases (0 ", "(cases (0 extra "),
-        ("(nth ", "(element "),
-        (nth.as_str(), dropped_last(&nth).as_str()),
-        ("(nth-back ", "(last-element "),
-        (nth_back.as_str(), extended(&nth_back).as_str()),
-        ("(slice ", "(between "),
-        (slice.as_str(), dropped_last(&slice).as_str()),
-        ("(concat ", "(join "),
-    ] {
-        assert_bad_replacement(&valid, from, to);
+    let blocks = artifact
+        .lir()
+        .functions
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .collect::<Vec<_>>();
+    assert!(blocks.iter().any(|b| matches!(
+        b.end,
+        End::Branch {
+            test: artifact::Test::Length { .. },
+            ..
+        }
+    )));
+    for name in ["Nth", "NthBack", "Slice", "Concat", "Length"] {
+        let json = serde_json::to_string(artifact.lir()).unwrap();
+        assert!(
+            json.contains(&format!("\"{name}\"")),
+            "missing {name}: {valid}"
+        );
+        assert_malformed(&with_cps_text(
+            &artifact,
+            &json.replace(&format!("\"{name}\""), "\"UnknownInstruction\""),
+        ));
     }
-    // A length case that is no list at all, the arity of the switch intact.
-    assert_malformed(&replace_balanced(&valid, "(0 (block", "0"));
+    let mut json = cps_json(&artifact);
+    json["functions"][0]["entry"] = serde_json::json!("zero");
+    assert_malformed(&with_cps_text(&artifact, &json.to_string()));
 }
 
 #[test]
@@ -1478,34 +1357,7 @@ fn malformed_text_returns_errors_while_trusted_api_panics() {
         ("(or ", "(disjunction "),
         ("(iff ", "(equivalence "),
         ("(xor ", "(inequality "),
-        ("(lir ", "(lowered "),
-        ("(externs ", "(imports "),
-        ("(extern ", "(import "),
-        ("(target ", "(foreign-path "),
-        ("(functions ", "(function-list "),
-        ("(function ", "(fn "),
-        ("(param 0 nat)", "(param 0 bogus)"),
-        ("(globals ", "(global-list "),
-        ("(global ", "(external "),
-        ("(block ", "(basic-block "),
-        ("(instrs ", "(instructions "),
-        ("(instr ", "(instruction "),
-        ("(const ", "(constant "),
-        ("(direct ", "(static "),
-        ("(captures ", "(closed-over "),
-        ("(args ", "(arguments "),
-        ("new-tag", "unknown-op"),
-        ("(switch-tag ", "(tag-switch "),
-        ("(cases ", "(branches "),
-        ("(fallback ", "(otherwise "),
-        ("(switch-prim ", "(primitive-switch "),
-        ("(switch-presence ", "(presence-switch "),
-        ("(switch-rest ", "(rest-switch "),
-        ("(ret ", "(return "),
-        ("(yield ", "(suspend "),
-        ("(throw ", "(raise "),
-        ("(bool ", "(boolean-literal "),
-        ("(bool true)", "(bool maybe)"),
+        ("(cps-lir ", "(lowered "),
     ] {
         assert_bad_replacement(&valid, from, to);
     }
@@ -1516,15 +1368,6 @@ fn malformed_text_returns_errors_while_trusted_api_panics() {
         ("(dependency \"base\" \"2.1.0\")", "(dependency \"base\")"),
         ("(scheme 15 7", "(scheme 15"),
         ("(ty nat)", "(ty nat extra)"),
-        ("(param 0 nat)", "(param 0 nat extra)"),
-        ("(tag \"Case\")", "(tag \"Case\" 1 2)"),
-        ("(direct 0)", "(direct 0 1)"),
-        (
-            "(fallback)",
-            "(fallback (block (instrs) (ret 0)) (block (instrs) (ret 0)))",
-        ),
-        ("(ret 0)", "(ret 0 1)"),
-        ("(nat 18446744073709551615)", "(nat -1)"),
     ] {
         assert_bad_replacement(&valid, from, to);
     }
@@ -1544,13 +1387,13 @@ fn malformed_text_exercises_every_parser_and_reader_error_shape() {
 
     // Invalid values of each S-expression shape reach reader paths that a tag
     // miss or arity error does not.
-    assert_bad_replacement(&valid, "(param 0 nat)", "(param 0 ())");
-    assert_bad_replacement(&valid, "(target \"console.log\")", "(target)");
-    assert_bad_replacement(
+    assert_malformed(&replace_balanced(&valid, "(cps-lir", "(cps-lir)"));
+    assert_malformed(&replace_balanced(&valid, "(cps-lir", "(cps-lir 0)"));
+    assert_malformed(&replace_balanced(
         &valid,
-        "(target \"console.log\")",
-        "(target \"console\" \"log\")",
-    );
+        "(cps-lir",
+        "(cps-lir \"{}\" extra)",
+    ));
     assert_bad_replacement(&valid, "(selector named \"write\")", "\"write\"");
     assert_bad_replacement(
         &valid,
@@ -1578,26 +1421,6 @@ fn malformed_text_exercises_every_parser_and_reader_error_shape() {
         " 7 (existentials) wrong ",
     );
 
-    // Recursive LIR collections distinguish malformed entries, both optional
-    // block cardinalities, and a non-list call target.
-    let fallback_block = "(block (instrs) (throw 97 96))";
-    assert_bad_replacement(
-        &valid,
-        &format!("(fallback {fallback_block})"),
-        &format!("(fallback {fallback_block} {fallback_block})"),
-    );
-    let without_tag_fallback =
-        valid.replacen(&format!("(fallback {fallback_block})"), "(fallback)", 1);
-    assert_ne!(without_tag_fallback, valid);
-    assert!(Artifact::try_parse(&without_tag_fallback).is_ok());
-    assert_malformed(&replace_balanced(&valid, "(\"A\" (block", "bad-tag-case"));
-    assert_malformed(&replace_balanced(
-        &valid,
-        "((bool false) (block",
-        "bad-primitive-case",
-    ));
-    assert_bad_replacement(&valid, "(direct 0)", "bad-call-target");
-    assert_bad_replacement(&valid, "(tag \"Case\")", "(tag)");
     assert_malformed(&replace_balanced(
         &valid,
         "(\"present\" (field",
@@ -1608,29 +1431,6 @@ fn malformed_text_exercises_every_parser_and_reader_error_shape() {
         "(\"label\" (field",
         "bad-row-label",
     ));
-    assert_malformed(&replace_balanced(
-        &valid,
-        "((field-key named \"first\") 1)",
-        "bad-struct-entry",
-    ));
-    assert_bad_replacement(
-        &valid,
-        "(field-key named \"first\")",
-        "\"legacy-string-key\"",
-    );
-    assert_bad_replacement(
-        &valid,
-        "(field-key unnamed-operation)",
-        "(field-key unnamed-operation extra)",
-    );
-    assert_bad_replacement(&valid, "(field-key named \"first\")", "(field-key named)");
-    assert_bad_replacement(&valid, "(field-key named \"first\")", "(field-key mystery)");
-    assert_bad_replacement(
-        &valid,
-        "(field-key named \"first\")",
-        "(wrong-key named \"first\")",
-    );
-    assert_bad_replacement(&valid, "new-tag", "(())");
 }
 
 #[test]
@@ -1769,13 +1569,12 @@ fn deeply_nested_artifact_semantics_decode_on_a_small_stack() {
         },
         lir: Lir {
             externs: Vec::new(),
-            functions: Vec::new(),
+            functions: vec![flat_function("value#init", DEPTH)],
             globals: vec![Global {
-                name: "deep@1::value".to_string(),
-                body: Block {
-                    instrs: Vec::new(),
-                    end: End::Ret(0),
-                },
+                adapter: None,
+                callable: None,
+                name: "deep@1::value".into(),
+                initializer: 0,
             }],
         },
     };
@@ -1791,23 +1590,6 @@ fn deeply_nested_artifact_semantics_decode_on_a_small_stack() {
                 plain(unit()),
             )],
         });
-        value.lir.globals[0].body = Block {
-            instrs: vec![Instr {
-                temp: 0,
-                rep: Rep::Unit,
-                op: Op::Catch {
-                    tag: 0,
-                    body: Box::new(std::mem::replace(
-                        &mut value.lir.globals[0].body,
-                        Block {
-                            instrs: Vec::new(),
-                            end: End::Ret(0),
-                        },
-                    )),
-                },
-            }],
-            end: End::Ret(0),
-        };
     }
 
     // Printing remains the compiler side of the round trip. Parsing and all
@@ -1990,58 +1772,7 @@ fn recursive_artifact_ownership_clones_and_drops_on_a_small_stack() {
                 }
                 Type::Struct(row)
             };
-            let empty_block = || Block {
-                instrs: Vec::new(),
-                end: End::Ret(0),
-            };
-            let deep_block = || {
-                let mut block = empty_block();
-                for depth in 0..DEPTH {
-                    let op = match depth % 5 {
-                        0 => Op::Catch {
-                            tag: 0,
-                            body: Box::new(block),
-                        },
-                        1 => Op::SwitchTag {
-                            on: 0,
-                            cases: vec![artifact::TagCase {
-                                name: "A".into(),
-                                block,
-                            }],
-                            fallback: Some(Box::new(empty_block())),
-                        },
-                        2 => Op::SwitchPrim {
-                            on: 0,
-                            cases: vec![artifact::PrimCase {
-                                value: Literal::Boolean(true),
-                                block,
-                            }],
-                            fallback: Some(Box::new(empty_block())),
-                        },
-                        3 => Op::SwitchPresence {
-                            on: 0,
-                            field: "x".into(),
-                            present: Box::new(block),
-                            absent: Box::new(empty_block()),
-                        },
-                        _ => Op::SwitchRest {
-                            on: 0,
-                            fields: vec!["x".into()],
-                            none: Box::new(empty_block()),
-                            some: Box::new(block),
-                        },
-                    };
-                    block = Block {
-                        instrs: vec![Instr {
-                            temp: depth as u32,
-                            rep: Rep::Any,
-                            op,
-                        }],
-                        end: End::Ret(depth as u32),
-                    };
-                }
-                block
-            };
+            let deep_blocks = || flat_function("deep", DEPTH).blocks;
 
             let artifact = UncheckedArtifact {
                 header: artifact::Header {
@@ -2082,9 +1813,12 @@ fn recursive_artifact_ownership_clones_and_drops_on_a_small_stack() {
                 lir: Lir {
                     externs: Vec::new(),
                     functions: vec![artifact::Function {
+                        suspension: ruddy::lir::Suspension::MaySuspend,
                         name: "deep".into(),
                         params: Vec::new(),
-                        body: deep_block(),
+                        continuation: 99,
+                        entry: 0,
+                        blocks: deep_blocks(),
                     }],
                     globals: Vec::new(),
                 },
@@ -2124,14 +1858,14 @@ fn recursive_artifact_ownership_clones_and_drops_on_a_small_stack() {
             drop(deep_row_type());
             drop(deep_formula());
 
-            let block = deep_block();
+            let block = deep_blocks();
             let cloned = block.clone();
             assert_eq!(cloned, block);
             assert_ne!(
-                empty_block(),
-                Block {
-                    instrs: Vec::new(),
-                    end: End::Yield(0),
+                End::Unreachable,
+                End::Continue {
+                    continuation: 99,
+                    value: 0
                 }
             );
             assert_ne!(Op::Neg(0), Op::Neg(1));
@@ -2141,9 +1875,12 @@ fn recursive_artifact_ownership_clones_and_drops_on_a_small_stack() {
             let instr = Instr {
                 temp: 0,
                 rep: Rep::Any,
-                op: Op::Catch {
-                    tag: 0,
-                    body: Box::new(deep_block()),
+                op: Op::Continuation {
+                    code: artifact::CodeRef {
+                        function: 0,
+                        block: 1,
+                    },
+                    captures: (0..DEPTH as u32).collect(),
                 },
             };
             let cloned = instr.clone();
@@ -2151,9 +1888,12 @@ fn recursive_artifact_ownership_clones_and_drops_on_a_small_stack() {
             drop(cloned);
             drop(instr);
 
-            let op = Op::Catch {
-                tag: 0,
-                body: Box::new(deep_block()),
+            let op = Op::Continuation {
+                code: artifact::CodeRef {
+                    function: 0,
+                    block: 1,
+                },
+                captures: (0..DEPTH as u32).collect(),
             };
             let cloned = op.clone();
             assert_eq!(cloned, op);
@@ -2169,10 +1909,14 @@ fn recursive_artifact_ownership_clones_and_drops_on_a_small_stack() {
 fn valid_deep_artifact_parses_and_drops_on_a_small_stack() {
     const DEPTH: usize = 30_000;
     let formula = format!("{}true{}", "(not ".repeat(DEPTH), ")".repeat(DEPTH));
+    let empty_lir = format!(
+        "(cps-lir {})",
+        serde_json::to_string(r#"{"externs":[],"functions":[],"globals":[]}"#).unwrap()
+    );
     let valid = format!(
         "(artifact (header (kind library) (identity \"deep\" \"1\") (compiler \"0000000000000000\") (dependencies) \
          (values (value \"deep@1::value\" (scheme 0 0 (existentials) {formula} (ty nat)) (metadata))) \
-         (types) (effects) (modules)) (lir (externs) (functions) (globals)))"
+         (types) (effects) (modules)) {empty_lir})"
     );
 
     std::thread::Builder::new()
@@ -2234,7 +1978,7 @@ fn rejected_deep_semantic_model_is_destroyed_on_a_small_stack() {
     let malformed = format!(
         "(artifact (header (kind library) (identity \"deep\" \"1\") (compiler \"0000000000000000\") (dependencies) \
          (values (value \"deep@1::value\" (scheme 0 0 (existentials) {formula} (ty (struct (row (labels) closed)))) (metadata))) \
-         (types) (effects) (modules)) (lir (externs) (functions) wrong))"
+         (types) (effects) (modules)) (cps-lir wrong))"
     );
 
     let error = std::thread::Builder::new()
@@ -2243,7 +1987,7 @@ fn rejected_deep_semantic_model_is_destroyed_on_a_small_stack() {
         .unwrap()
         .join()
         .unwrap();
-    assert_eq!(error.message(), "expected `globals` list");
+    assert_eq!(error.message(), "expected artifact string");
 }
 
 #[test]
@@ -2259,8 +2003,7 @@ fn non_struct_fields_are_not_representable_in_artifact_text() {
 #[test]
 fn artifact_function_indices_are_fixed_width_and_checked_by_the_parser() {
     let mut value = model_artifact().to_unchecked();
-    let closure = value.lir.functions[0]
-        .body
+    let closure = value.lir.functions[0].blocks[0]
         .instrs
         .iter_mut()
         .find_map(|instr| match &mut instr.op {
@@ -2283,14 +2026,19 @@ fn artifact_function_indices_are_fixed_width_and_checked_by_the_parser() {
         "{error}"
     );
 
-    let printed =
-        model_artifact()
-            .print()
-            .replacen("(closure 0 ", &format!("(closure {} ", u64::MAX), 1);
-    assert!(printed.contains(&u64::MAX.to_string()));
+    let artifact = model_artifact();
+    let mut json = cps_json(&artifact);
+    let instructions = json["functions"][0]["blocks"][0]["instrs"]
+        .as_array_mut()
+        .unwrap();
+    let closure = instructions
+        .iter_mut()
+        .find(|i| i["op"].get("Closure").is_some())
+        .unwrap();
+    closure["op"]["Closure"]["func"] = serde_json::json!(u64::MAX);
+    let printed = with_cps_text(&artifact, &json.to_string());
     let parsed = Artifact::try_parse(&printed).expect("a fixed-width index parses");
-    let index = parsed.lir.functions[0]
-        .body
+    let index = parsed.lir.functions[0].blocks[0]
         .instrs
         .iter()
         .find_map(|instr| match &instr.op {
@@ -2409,29 +2157,11 @@ fn artifacts_are_stamped_with_their_compiler() {
 fn deep_and_wide_artifacts_print_and_parse_on_a_small_stack() {
     const DEPTH: usize = 3_000;
     const WIDTH: usize = 4_096;
-    let mut body = artifact::Block {
-        instrs: Vec::new(),
-        end: artifact::End::Ret(0),
-    };
-    for level in 0..DEPTH {
-        body = artifact::Block {
-            instrs: vec![artifact::Instr {
-                temp: level as u32,
-                rep: artifact::Rep::Nat,
-                op: artifact::Op::Catch {
-                    tag: 0,
-                    body: Box::new(body),
-                },
-            }],
-            end: artifact::End::Ret(level as u32),
-        };
-    }
     let mut artifact = model_artifact().to_unchecked();
-    artifact.lir.functions.push(artifact::Function {
-        name: "deep@1.0.0::deep".into(),
-        params: Vec::new(),
-        body,
-    });
+    artifact
+        .lir
+        .functions
+        .push(flat_function("deep@1.0.0::deep", DEPTH));
     for index in 0..WIDTH {
         artifact.header.values.push(artifact::Value {
             name: format!("deep@1.0.0::value{index}"),
@@ -2725,4 +2455,197 @@ fn metadata_data_compares_by_representation() {
         Data::Array(vec![Data::Boolean(false)])
     );
     assert_ne!(Data::String("a".into()), Data::Boolean(true));
+}
+
+#[test]
+fn cps_artifacts_reject_invalid_destinations_environments_and_summaries() {
+    let artifact = built(
+        "let sum = fn n => match n with | 0.0 => 0.0 | _ => n + sum (n - 1.0) end\nlet value = sum 5.0",
+    );
+    let (function, block, instruction, code) = artifact
+        .lir()
+        .functions
+        .iter()
+        .enumerate()
+        .find_map(|(f, function)| {
+            function.blocks.iter().enumerate().find_map(|(b, block)| {
+                block
+                    .instrs
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, instruction)| match instruction.op {
+                        Op::Continuation { code, .. } => Some((f, b, i, code)),
+                        _ => None,
+                    })
+            })
+        })
+        .expect("non-tail recursion saves a continuation");
+    type Corruption = (&'static str, Box<dyn Fn(&mut Lir)>);
+    let edits: Vec<Corruption> = vec![
+        (
+            "entry",
+            Box::new(move |lir| lir.functions[function].entry = u64::MAX),
+        ),
+        (
+            "initializer",
+            Box::new(|lir| lir.globals[0].initializer = u64::MAX),
+        ),
+        (
+            "continuation function",
+            Box::new(move |lir| {
+                let Op::Continuation { code, .. } =
+                    &mut lir.functions[function].blocks[block].instrs[instruction].op
+                else {
+                    unreachable!()
+                };
+                code.function = u64::MAX;
+            }),
+        ),
+        (
+            "continuation block",
+            Box::new(move |lir| {
+                let Op::Continuation { code, .. } =
+                    &mut lir.functions[function].blocks[block].instrs[instruction].op
+                else {
+                    unreachable!()
+                };
+                code.block = u64::MAX;
+            }),
+        ),
+        (
+            "capture arity",
+            Box::new(move |lir| {
+                let Op::Continuation { captures, .. } =
+                    &mut lir.functions[function].blocks[block].instrs[instruction].op
+                else {
+                    unreachable!()
+                };
+                captures.pop();
+            }),
+        ),
+        (
+            "capture availability",
+            Box::new(move |lir| {
+                let Op::Continuation { captures, .. } =
+                    &mut lir.functions[function].blocks[block].instrs[instruction].op
+                else {
+                    unreachable!()
+                };
+                captures[0] = u32::MAX;
+            }),
+        ),
+        (
+            "entry kind",
+            Box::new(move |lir| {
+                lir.functions[code.function as usize].blocks[code.block as usize].result = None
+            }),
+        ),
+        (
+            "result convention",
+            Box::new(move |lir| {
+                lir.functions[code.function as usize].blocks[code.block as usize].result =
+                    Some(u32::MAX)
+            }),
+        ),
+        (
+            "duplicate parameter",
+            Box::new(move |lir| {
+                let b = &mut lir.functions[function].blocks[block];
+                b.params.push(b.params[0]);
+            }),
+        ),
+        (
+            "continuation representation",
+            Box::new(move |lir| {
+                lir.functions[function].blocks[block].instrs[instruction].rep = Rep::Fn
+            }),
+        ),
+        (
+            "unproved synchronous export",
+            Box::new(|lir| {
+                lir.globals[0].adapter = Some(ruddy::externs::Callback::Sync);
+                lir.globals[0].callable = None;
+            }),
+        ),
+    ];
+    for (name, edit) in edits {
+        let mut unchecked = artifact.to_unchecked();
+        edit(&mut unchecked.lir);
+        assert!(
+            unchecked.clone().validate().is_err(),
+            "accepted invalid {name}"
+        );
+        let (recovered, facts) = unchecked.recover();
+        assert!(
+            recovered.lir().functions.is_empty(),
+            "retained invalid {name}"
+        );
+        assert!(matches!(
+            facts.as_slice(),
+            [RecoveryFact::ExecutableDiscarded { .. }]
+        ));
+    }
+    let mut asynchronous = built("@async extern wait : Nat -> Nat = \"host.wait\"").to_unchecked();
+    for f in &mut asynchronous.lir.functions {
+        f.suspension = ruddy::lir::Suspension::Synchronous;
+    }
+    assert!(
+        asynchronous
+            .validate()
+            .unwrap_err()
+            .message()
+            .contains("synchronous function")
+    );
+}
+
+#[test]
+fn cps_artifacts_reject_forged_callable_summaries_and_handler_operands() {
+    let mut forged = built("let invoke = fn f => f ()").to_unchecked();
+    let global = forged
+        .lir
+        .globals
+        .iter_mut()
+        .find(|g| g.callable == Some(ruddy::lir::Suspension::MaySuspend))
+        .unwrap();
+    global.callable = Some(ruddy::lir::Suspension::Synchronous);
+    global.adapter = Some(ruddy::externs::Callback::Sync);
+    assert!(
+        forged.validate().is_err(),
+        "callable summary must agree with its closure"
+    );
+
+    let original = built(
+        "effect Exit = Nat -> Nat\nlet run = fn n => handle !Exit n with | !Exit value => raise value end",
+    );
+    let mut forged = original.to_unchecked();
+    for instr in forged
+        .lir
+        .functions
+        .iter_mut()
+        .flat_map(|f| &mut f.blocks)
+        .flat_map(|b| &mut b.instrs)
+    {
+        if matches!(instr.op, Op::NewTag) {
+            instr.rep = Rep::Cont;
+        }
+    }
+    assert!(
+        forged.validate().is_err(),
+        "handler identities and continuations are distinct"
+    );
+}
+
+#[test]
+fn cps_artifacts_reject_synchronous_summaries_for_unknown_indirect_calls() {
+    let mut unchecked = built("let apply = fn f => f ()").to_unchecked();
+    for f in &mut unchecked.lir.functions {
+        f.suspension = ruddy::lir::Suspension::Synchronous;
+    }
+    for g in &mut unchecked.lir.globals {
+        g.callable = Some(ruddy::lir::Suspension::Synchronous);
+    }
+    assert!(
+        unchecked.validate().is_err(),
+        "an unknown higher-order call cannot certify itself synchronous"
+    );
 }

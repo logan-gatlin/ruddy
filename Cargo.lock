@@ -2577,6 +2577,7 @@ dependencies = [
  "indexmap",
  "semver",
  "serde",
+ "serde_json",
  "twox-hash",
  "unicode-width",
  "varisat",

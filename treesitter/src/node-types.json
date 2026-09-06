@@ -306,6 +306,88 @@
     }
   },
   {
+    "type": "annotated_extern_type",
+    "named": true,
+    "fields": {
+      "type": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "array_type",
+            "named": true
+          },
+          {
+            "type": "effect_type",
+            "named": true
+          },
+          {
+            "type": "extern_function_type",
+            "named": true
+          },
+          {
+            "type": "function_type",
+            "named": true
+          },
+          {
+            "type": "hole",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "parenthesized_extern_function_type",
+            "named": true
+          },
+          {
+            "type": "parenthesized_type",
+            "named": true
+          },
+          {
+            "type": "path",
+            "named": true
+          },
+          {
+            "type": "struct_type",
+            "named": true
+          },
+          {
+            "type": "sum_type",
+            "named": true
+          },
+          {
+            "type": "tuple_type",
+            "named": true
+          },
+          {
+            "type": "type_application",
+            "named": true
+          },
+          {
+            "type": "type_variable",
+            "named": true
+          },
+          {
+            "type": "unit",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "attribute",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "annotation",
     "named": true,
     "fields": {
@@ -2544,6 +2626,10 @@
         "required": true,
         "types": [
           {
+            "type": "annotated_extern_type",
+            "named": true
+          },
+          {
             "type": "array_type",
             "named": true
           },
@@ -2662,6 +2748,10 @@
         "required": false,
         "types": [
           {
+            "type": "annotated_extern_type",
+            "named": true
+          },
+          {
             "type": "array_type",
             "named": true
           },
@@ -2727,6 +2817,10 @@
         "multiple": false,
         "required": true,
         "types": [
+          {
+            "type": "annotated_extern_type",
+            "named": true
+          },
           {
             "type": "array_type",
             "named": true
@@ -4749,6 +4843,10 @@
         "multiple": false,
         "required": true,
         "types": [
+          {
+            "type": "annotated_extern_type",
+            "named": true
+          },
           {
             "type": "extern_function_type",
             "named": true

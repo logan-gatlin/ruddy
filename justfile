@@ -138,7 +138,14 @@ install:
 # Line and branch coverage for the compiler library. Branch coverage is a
 # nightly-only rustc feature, hence `+nightly`.
 cov *args:
-    cargo +nightly llvm-cov --branch --workspace --ignore-filename-regex '/(tests|debug|cli)/src/|/rustlib/' {{args}}
+    #!/usr/bin/env bash
+    set -euo pipefail
+    coverage_toolchain="${RUDDY_COVERAGE_TOOLCHAIN:-nightly}"
+    export CARGO_TARGET_DIR="{{justfile_directory()}}/target/llvm-cov-target"
+    eval "$(cargo +"$coverage_toolchain" llvm-cov show-env --branch --sh)"
+    cargo +"$coverage_toolchain" llvm-cov clean
+    RUSTUP_TOOLCHAIN="$coverage_toolchain" just test
+    cargo +"$coverage_toolchain" llvm-cov report --ignore-filename-regex '/(tests|debug|cli)/src/|/rustlib/' {{args}}
 
 clippy:
     cargo clippy --workspace --all-targets

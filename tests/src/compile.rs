@@ -767,3 +767,116 @@ fn private_semantic_support_survives_transitive_public_aliases() {
     )
     .unwrap_or_else(|partial| panic!("{:#?}", partial.errors));
 }
+
+#[test]
+fn foreign_protocols_and_sync_export_eligibility_are_checked_during_compilation() {
+    let pure = accepted("@export \"sync\" let identity = fn n => n");
+    assert_eq!(
+        pure.artifact().lir().globals[0].callable,
+        Some(ruddy::lir::Suspension::Synchronous)
+    );
+    for source in [
+        "@export \"sync\" let apply = fn f => f ()",
+        "@async extern wait : Nat -> Nat = \"host.wait\"\n@export \"sync\" let run = fn n => wait n",
+        "@async extern value : Nat = \"host.value\"",
+        "@export \"sometimes\" let identity = fn n => n",
+    ] {
+        let partial = rejected(source);
+        assert!(
+            codes(&partial).contains(&"foreign-protocol"),
+            "{source}: {partial:#?}"
+        );
+        assert!(
+            !partial.ir.errors[0]
+                .diagnostic(&partial.ir.source)
+                .title
+                .is_empty()
+        );
+    }
+    accepted("@export \"promise\" let identity = fn n => n");
+}
+
+#[test]
+fn async_boundary_annotations_are_local_and_preserve_outer_shorthand() {
+    for source in [
+        "@async extern wait : fn(Nat) -> Nat = \"host.wait\"",
+        "extern wait : @async fn(Nat) -> Nat = \"host.wait\"",
+        "extern wait : (@async fn(Nat) -> Nat) = \"host.wait\"",
+        "extern wait : @async (fn(Nat) -> Nat) = \"host.wait\"",
+        "@async extern wait : @async fn(Nat) -> Nat = \"host.wait\"",
+        "type Wait = Nat -> Nat\nextern wait : @async Wait = \"host.wait\"",
+    ] {
+        let program = accepted(&format!("{source}\nlet run = fn n => wait n"));
+        assert_eq!(
+            program.artifact().lir().globals[0].callable,
+            Some(ruddy::lir::Suspension::MaySuspend)
+        );
+    }
+    for source in [
+        "extern apply : fn(@async fn(Nat) -> Nat) -> Nat = \"host.apply\"",
+        "extern factory : fn() -> @async fn(Nat) -> Nat = \"host.factory\"",
+        "extern factory : fn(fn() -> @async fn(Nat) -> Nat) -> () = \"host.factory\"",
+    ] {
+        accepted(source);
+    }
+    // An async returned function does not make its factory async.
+    accepted(
+        "extern factory : fn() -> @async fn(Nat) -> Nat = \"host.factory\"\n@export \"sync\" let run = fn _ => factory ()",
+    );
+    accepted("extern call : Nat -> Nat = \"host.call\"\n@export \"sync\" let run = fn n => call n");
+}
+
+#[test]
+fn invalid_boundary_metadata_is_rejected() {
+    for source in [
+        "@async false extern call : Nat -> Nat = \"host.call\"",
+        "extern call : @async false fn(Nat) -> Nat = \"host.call\"",
+        "extern call : fn(@async Nat) -> Nat = \"host.call\"",
+        "extern call : fn(Nat) -> @async Nat = \"host.call\"",
+        "type Record = { value: Nat }\nextern call : @async Record = \"host.call\"",
+        "extern call : fn(@unknown fn(Nat) -> Nat) -> Nat = \"host.call\"",
+        "extern call : fn(Nat) -> @encoding \"utf8\" String = \"host.call\"",
+    ] {
+        assert!(
+            codes(&rejected(source)).contains(&"foreign-protocol"),
+            "{source}"
+        );
+    }
+    let duplicate = rejected("extern call : @async @async fn(Nat) -> Nat = \"host.call\"");
+    assert!(
+        duplicate
+            .ir
+            .errors
+            .iter()
+            .any(|e| matches!(e.kind, ruddy::ir::ErrorKind::DuplicateAttribute { .. }))
+    );
+}
+
+#[test]
+fn imported_callable_summaries_control_sync_export_eligibility_before_linking() {
+    let source = "@export \"sync\" let run = fn n => dep::identity n";
+    let mut dependency = exported("let identity = fn n => n");
+    let persisted =
+        ruddy::artifact::Artifact::try_parse(&dependency.clone().validate().unwrap().print())
+            .unwrap();
+    let consumer = accepted_with(source, &persisted);
+    assert_eq!(
+        consumer.artifact().lir().globals[0].callable,
+        Some(ruddy::lir::Suspension::Synchronous)
+    );
+    // A valid producer can omit its callable proof. The consumer must
+    // remain conservative even though the imported function has an empty row.
+    dependency.lir.globals[0].callable = None;
+    let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
+    let partial = compile::compile_with_dependencies(
+        Mint::new(Bundle::new("app", Version::new(0, 1, 0)).unwrap()),
+        parsed.stmts,
+        &[compile::Dependency {
+            alias: Some("dep"),
+            artifact: compile::DependencyArtifact::Unchecked(&dependency),
+        }],
+        inference::Trace::Off,
+    )
+    .expect_err("missing imported proof is potentially suspending");
+    assert!(codes(&partial).contains(&"foreign-protocol"));
+}

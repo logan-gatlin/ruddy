@@ -48,6 +48,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                     crate::print::lir::rep(external.rep),
                 ));
             }
+            node = node.child(boundary(&mut ids, cx, &decl.value.abi));
             node.child(
                 Node::new(ids.next(), "Target", target).at(cx.source.span(decl.value.target.at)),
             )
@@ -65,5 +66,42 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         nodes,
         debug: format!("{:#?}", program.externs),
         ..spec.stage(cx.status(), plural(program.externs.len(), "extern"))
+    }
+}
+
+fn boundary(ids: &mut Ids, cx: &Cx, abi: &ruddy::ir::ExternType) -> Node {
+    use ruddy::ir::ExternTypeKind;
+    let node = Node::new(ids.next(), "Boundary", "").at(cx.source.span(abi.at));
+    match &abi.anchored {
+        ExternTypeKind::Annotated { metadata, inner } => {
+            let mut node = node;
+            for (key, attribute) in metadata {
+                let (label, text) = if key == "async" {
+                    ("Completion protocol", "promise (@async)".to_owned())
+                } else {
+                    (
+                        "Boundary attribute",
+                        format!("@{key} {:?}", attribute.value.anchored),
+                    )
+                };
+                node = node
+                    .child(Node::new(ids.next(), label, text).at(cx.source.span(attribute.key_at)));
+            }
+            node.child(boundary(ids, cx, inner))
+        }
+        ExternTypeKind::Group(inner) => node.child(boundary(ids, cx, inner)),
+        ExternTypeKind::Function {
+            parameters, result, ..
+        } => {
+            let mut node = node;
+            for (i, parameter) in parameters.iter().enumerate() {
+                node = node.child(
+                    Node::new(ids.next(), format!("Parameter {}", i + 1), "")
+                        .child(boundary(ids, cx, parameter)),
+                );
+            }
+            node.child(Node::new(ids.next(), "Result", "").child(boundary(ids, cx, result)))
+        }
+        ExternTypeKind::Ordinary(_) => node,
     }
 }

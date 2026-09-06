@@ -3762,7 +3762,15 @@ fn extern_boundary_review(
         if !seen.insert((abi as *const ir::ExternType, Rc::as_ptr(&original))) {
             continue;
         }
-        if matches!(&*original, Ty::Named { .. }) {
+        // Transparent ABI wrappers have not traversed the alias yet. Recording
+        // it here would make the inner node look like a recursive occurrence
+        // and skip its representation and callback-effect checks.
+        if matches!(&*original, Ty::Named { .. })
+            && !matches!(
+                &abi.anchored,
+                ir::ExternTypeKind::Group(_) | ir::ExternTypeKind::Annotated { .. }
+            )
+        {
             if active_aliases
                 .iter()
                 .any(|prior| same_finite_syntax(prior, &original))
@@ -3773,7 +3781,7 @@ fn extern_boundary_review(
         }
 
         match &abi.anchored {
-            ir::ExternTypeKind::Group(inner) => {
+            ir::ExternTypeKind::Group(inner) | ir::ExternTypeKind::Annotated { inner, .. } => {
                 work.push((inner, ty, path, active_aliases, report_row_leaves))
             }
             ir::ExternTypeKind::Function {

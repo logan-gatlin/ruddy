@@ -24,7 +24,7 @@ const app = await import(pathToFileURL(generated).href);
 // strict deep equality compare fields alone.
 const fields = (record) => ({ ...record });
 
-test("a block is what its return carries, and unit without one", () => {
+test("a block is what its return carries, and unit without one", async () => {
   assert.deepEqual(fields(app.several), { first: 1, second: 1 });
   assert.deepEqual(fields(app.empty), {});
   assert.equal(app.only, 7);
@@ -32,13 +32,13 @@ test("a block is what its return carries, and unit without one", () => {
   assert.deepEqual(fields(app.unit_block(9)), {});
 });
 
-test("a binding sees the ones before it, itself, and shadows an earlier name", () => {
+test("a binding sees the ones before it, itself, and shadows an earlier name", async () => {
   assert.equal(app.self_recursive, "done");
   assert.deepEqual(fields(app.taken_apart), { x: 1, y: 2, v: 3 });
   assert.deepEqual(fields(app.shadowed), { was: 1 });
 });
 
-test("statements run top to bottom, whether or not their values are kept", () => {
+test("statements run top to bottom, whether or not their values are kept", async () => {
   log.length = 0;
   assert.equal(app.ordered(0), 3);
   assert.deepEqual(log, [1, 2, 3]);
@@ -46,8 +46,8 @@ test("statements run top to bottom, whether or not their values are kept", () =>
   assert.deepEqual(log, [1, 2, 3, 9]);
 });
 
-test("effects performed by a block's statements reach the handler in order", () => {
+test("effects performed by a block's statements reach the handler in order", async () => {
   log.length = 0;
-  assert.equal(app.handled(0), 30);
+  assert.equal(await app.handled(0), 30);
   assert.deepEqual(log, [10, 20]);
 });

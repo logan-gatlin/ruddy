@@ -7,18 +7,10 @@ use ruddy::{
     tracking::FileManager,
 };
 
-/// Hand-built link inputs cross the strict artifact boundary like a bundle
-/// read from disk. Rendering canonical text recurses, and the relocation
-/// regressions below nest thirty thousand blocks deep, so validation always
-/// runs on a generously sized thread of its own.
+/// Link inputs cross the same strict artifact boundary as bundles read from disk.
 fn validated(artifact: a::UncheckedArtifact) -> a::Artifact {
-    std::thread::Builder::new()
-        .name("artifact-validation".into())
-        .stack_size(256 * 1024 * 1024)
-        .spawn(move || artifact.validate())
-        .expect("the artifact validation thread starts")
-        .join()
-        .expect("artifact validation completes")
+    artifact
+        .validate()
         .expect("a hand-built artifact validates")
 }
 
@@ -81,111 +73,131 @@ fn scheme() -> a::Scheme {
     }
 }
 
+const K: u32 = 999;
 fn block(ops: Vec<a::Op>) -> a::Block {
     a::Block {
+        params: vec![a::Param {
+            temp: K,
+            rep: a::Rep::Cont,
+        }],
+        result: None,
         instrs: ops
             .into_iter()
             .enumerate()
             .map(|(temp, op)| a::Instr {
                 temp: temp as u32,
-                rep: a::Rep::Any,
+                rep: if matches!(op, a::Op::Closure { .. }) {
+                    a::Rep::Fn
+                } else {
+                    a::Rep::Any
+                },
                 op,
             })
             .collect(),
-        end: a::End::Ret(0),
+        end: a::End::Continue {
+            continuation: K,
+            value: 0,
+        },
     }
 }
-
 fn function(name: &str, body: a::Block) -> a::Function {
     a::Function {
+        suspension: ruddy::lir::Suspension::MaySuspend,
         name: name.into(),
-        params: Vec::new(),
-        body,
+        params: vec![],
+        continuation: K,
+        entry: 0,
+        blocks: vec![body],
     }
 }
-
-fn global(name: &str, body: a::Block) -> a::Global {
-    a::Global {
-        name: name.into(),
-        body,
-    }
-}
-
 fn local_references() -> a::Block {
-    block(vec![
-        a::Op::Closure {
-            func: 0,
-            captures: vec![],
-        },
-        a::Op::Call {
+    let mut b = block(vec![a::Op::Closure {
+        func: 0,
+        captures: vec![],
+    }]);
+    b.end = a::End::Call {
+        callee: a::Callee::Direct(0),
+        args: vec![],
+        continuation: K,
+    };
+    b
+}
+fn continuation_function(name: &str, width: usize) -> a::Function {
+    let mut f = function(name, local_references());
+    for index in 0..width {
+        let mut b = local_references();
+        b.instrs.push(a::Instr {
+            temp: 1,
+            rep: a::Rep::Cont,
+            op: a::Op::Continuation {
+                code: a::CodeRef {
+                    function: 0,
+                    block: (index + 1) as u64,
+                },
+                captures: vec![K],
+            },
+        });
+        b.end = a::End::Call {
             callee: a::Callee::Direct(0),
             args: vec![],
-        },
-    ])
+            continuation: 1,
+        };
+        f.blocks[index] = b;
+        f.blocks.push(a::Block {
+            params: vec![
+                a::Param {
+                    temp: K,
+                    rep: a::Rep::Cont,
+                },
+                a::Param {
+                    temp: 2,
+                    rep: a::Rep::Any,
+                },
+            ],
+            result: Some(2),
+            instrs: vec![],
+            end: a::End::Continue {
+                continuation: K,
+                value: 2,
+            },
+        });
+        // Entries reached by saved continuations receive the operation result last.
+        if index > 0 {
+            f.blocks[index].params.push(a::Param {
+                temp: 2,
+                rep: a::Rep::Any,
+            });
+            f.blocks[index].result = Some(2);
+        }
+    }
+    f
 }
 
 #[test]
-fn links_every_item_and_recursively_relocates_function_indices() {
-    let nested = block(vec![
-        a::Op::Catch {
-            tag: 0,
-            body: Box::new(local_references()),
-        },
-        a::Op::SwitchTag {
-            on: 0,
-            cases: vec![a::TagCase {
-                name: "A".into(),
-                block: local_references(),
-            }],
-            fallback: Some(Box::new(local_references())),
-        },
-        a::Op::SwitchPrim {
-            on: 0,
-            cases: vec![a::PrimCase {
-                value: a::Literal::Boolean(true),
-                block: local_references(),
-            }],
-            fallback: Some(Box::new(local_references())),
-        },
-        a::Op::SwitchTag {
-            on: 0,
-            cases: vec![],
-            fallback: None,
-        },
-        a::Op::SwitchPrim {
-            on: 0,
-            cases: vec![],
-            fallback: None,
-        },
-        a::Op::SwitchPresence {
-            on: 0,
-            field: "x".into(),
-            present: Box::new(local_references()),
-            absent: Box::new(local_references()),
-        },
-        a::Op::SwitchRest {
-            on: 0,
-            fields: vec![],
-            none: Box::new(local_references()),
-            some: Box::new(local_references()),
-        },
-        a::Op::Global {
-            target: "dep@1.0.0::value".into(),
-        },
-    ]);
+fn links_every_item_and_relocates_calls_continuations_and_initializers() {
     let dep = artifact(
         "dep",
         &[],
-        vec![function("dep-f", local_references())],
-        vec![global("dep@1.0.0::value", local_references())],
+        vec![continuation_function("dep-f", 2)],
+        vec![a::Global {
+            adapter: None,
+            callable: None,
+            name: "dep@1.0.0::value".into(),
+            initializer: 0,
+        }],
     );
-    let mut root = artifact(
+    let root = artifact(
         "app",
         &[("dep", "1.0.0")],
-        vec![function("app-f", nested)],
-        vec![global("app@1.0.0::main", local_references())],
-    )
-    .to_unchecked();
+        vec![continuation_function("app-f", 2)],
+        vec![a::Global {
+            adapter: None,
+            callable: None,
+            name: "app@1.0.0::main".into(),
+            initializer: 0,
+        }],
+    );
+    let mut root = root.to_unchecked();
     // An existential witness is a presence the value's package owns, so the
     // scheme quantifies one presence and its body packages a label wearing it.
     root.header.values[0].scheme = a::Scheme {
@@ -213,122 +225,53 @@ fn links_every_item_and_recursively_relocates_function_indices() {
     });
 
     let root = validated(root);
+    // Each bundle survives independent persistence before final numbering exists.
+    let dep = a::Artifact::try_parse(&dep.print())
+        .unwrap()
+        .validate()
+        .unwrap();
+    let root = a::Artifact::try_parse(&root.print())
+        .unwrap()
+        .validate()
+        .unwrap();
     let linked = link::link(&[dep, root.clone()]).unwrap();
     assert_eq!(linked.header().identity, root.header().identity);
     assert_eq!(linked.header().values, root.header().values);
-    assert_eq!(linked.header().values[0].scheme.existentials, vec![0]);
     assert_eq!(linked.header().types, root.header().types);
     assert!(linked.header().dependencies.is_empty());
     assert_eq!(linked.lir().externs.len(), 2);
-    assert_eq!(linked.lir().externs[0].name, "dep@1.0.0::host");
-    assert_eq!(linked.lir().externs[1].name, "app@1.0.0::host");
-    assert_eq!(linked.lir().functions.len(), 2);
     assert_eq!(linked.lir().globals.len(), 2);
-    assert_eq!(linked.lir().globals[0].name, "dep@1.0.0::value");
-
-    fn assert_relocated(block: &a::Block, expected: u64) {
-        for instr in &block.instrs {
-            match &instr.op {
-                a::Op::Closure { func, .. } => assert_eq!(*func, expected),
-                a::Op::Call {
-                    callee: a::Callee::Direct(func),
-                    ..
-                } => assert_eq!(*func, expected),
-                a::Op::Catch { body, .. } => assert_relocated(body, expected),
-                a::Op::SwitchTag {
-                    cases, fallback, ..
-                } => {
-                    for case in cases {
-                        assert_relocated(&case.block, expected);
-                    }
-                    if let Some(fallback) = fallback {
-                        assert_relocated(fallback, expected);
-                    }
+    assert_eq!(linked.lir().functions.len(), 2);
+    for (offset, function) in linked.lir().functions.iter().enumerate() {
+        assert_eq!(linked.lir().globals[offset].initializer, offset as u64);
+        for (index, block) in function.blocks.iter().take(2).enumerate() {
+            assert_eq!(
+                block.instrs[0].op,
+                a::Op::Closure {
+                    func: offset as u64,
+                    captures: vec![]
                 }
-                a::Op::SwitchPrim {
-                    cases, fallback, ..
-                } => {
-                    for case in cases {
-                        assert_relocated(&case.block, expected);
-                    }
-                    if let Some(fallback) = fallback {
-                        assert_relocated(fallback, expected);
-                    }
+            );
+            assert_eq!(
+                block.instrs[1].op,
+                a::Op::Continuation {
+                    code: a::CodeRef {
+                        function: offset as u64,
+                        block: (index + 1) as u64
+                    },
+                    captures: vec![K]
                 }
-                a::Op::SwitchPresence {
-                    present, absent, ..
-                } => {
-                    assert_relocated(present, expected);
-                    assert_relocated(absent, expected);
-                }
-                a::Op::SwitchRest { none, some, .. } => {
-                    assert_relocated(none, expected);
-                    assert_relocated(some, expected);
-                }
-                _ => {}
-            }
+            );
+            assert!(
+                matches!(block.end, a::End::Call { callee: a::Callee::Direct(f), .. } if f == offset as u64)
+            );
         }
     }
-    assert_relocated(&linked.lir().functions[0].body, 0);
-    assert_relocated(&linked.lir().globals[0].body, 0);
-    assert_relocated(&linked.lir().functions[1].body, 1);
-    assert_relocated(&linked.lir().globals[1].body, 1);
 }
 
 #[test]
-fn relocates_thirty_thousand_nested_catches_and_switches_iteratively_in_order() {
-    const DEPTH: usize = 30_000;
-
-    let mut nested = local_references();
-    for depth in (0..DEPTH).rev() {
-        nested = match depth % 5 {
-            0 => block(vec![a::Op::Catch {
-                tag: depth as u32,
-                body: Box::new(nested),
-            }]),
-            1 => block(vec![a::Op::SwitchTag {
-                on: depth as u32,
-                cases: vec![
-                    a::TagCase {
-                        name: "nested".into(),
-                        block: nested,
-                    },
-                    a::TagCase {
-                        name: "sibling".into(),
-                        block: local_references(),
-                    },
-                ],
-                fallback: Some(Box::new(local_references())),
-            }]),
-            2 => block(vec![a::Op::SwitchPrim {
-                on: depth as u32,
-                cases: vec![
-                    a::PrimCase {
-                        value: a::Literal::Natural(depth as u64),
-                        block: nested,
-                    },
-                    a::PrimCase {
-                        value: a::Literal::Boolean(true),
-                        block: local_references(),
-                    },
-                ],
-                fallback: Some(Box::new(local_references())),
-            }]),
-            3 => block(vec![a::Op::SwitchPresence {
-                on: depth as u32,
-                field: "field".into(),
-                present: Box::new(nested),
-                absent: Box::new(local_references()),
-            }]),
-            _ => block(vec![a::Op::SwitchRest {
-                on: depth as u32,
-                fields: vec!["field".into()],
-                none: Box::new(nested),
-                some: Box::new(local_references()),
-            }]),
-        };
-    }
-
+fn relocates_thirty_thousand_blocks_preserving_local_destinations() {
+    const WIDTH: usize = 30_000;
     let dep = artifact(
         "dep",
         &[],
@@ -338,96 +281,38 @@ fn relocates_thirty_thousand_nested_catches_and_switches_iteratively_in_order() 
     let root = artifact(
         "app",
         &[("dep", "1.0.0")],
-        vec![function("root", nested)],
+        vec![continuation_function("root", WIDTH)],
         vec![],
     );
     let linked = link::link(&[dep, root]).unwrap();
-
-    fn assert_references(block: &a::Block) {
-        let a::Op::Closure { func, .. } = &block.instrs[0].op else {
-            panic!("expected closure")
-        };
-        assert_eq!(*func, 1);
-        let a::Op::Call {
-            callee: a::Callee::Direct(func),
-            ..
-        } = &block.instrs[1].op
-        else {
-            panic!("expected direct call")
-        };
-        assert_eq!(*func, 1);
+    let f = &linked.lir().functions[1];
+    assert_eq!(f.blocks.len(), WIDTH + 1);
+    for (index, b) in f.blocks.iter().take(WIDTH).enumerate() {
+        assert_eq!(
+            b.instrs[0].op,
+            a::Op::Closure {
+                func: 1,
+                captures: vec![]
+            }
+        );
+        assert_eq!(
+            b.instrs[1].op,
+            a::Op::Continuation {
+                code: a::CodeRef {
+                    function: 1,
+                    block: (index + 1) as u64
+                },
+                captures: vec![K]
+            }
+        );
+        assert!(matches!(
+            b.end,
+            a::End::Call {
+                callee: a::Callee::Direct(1),
+                ..
+            }
+        ));
     }
-
-    let mut current = &linked.lir().functions[1].body;
-    for depth in 0..DEPTH {
-        assert_eq!(current.instrs.len(), 1);
-        current = match (&current.instrs[0].op, depth % 5) {
-            (a::Op::Catch { tag, body }, 0) => {
-                assert_eq!(*tag, depth as u32);
-                body
-            }
-            (
-                a::Op::SwitchTag {
-                    on,
-                    cases,
-                    fallback,
-                },
-                1,
-            ) => {
-                assert_eq!(*on, depth as u32);
-                assert_eq!(cases[0].name, "nested");
-                assert_eq!(cases[1].name, "sibling");
-                assert_references(&cases[1].block);
-                assert_references(fallback.as_deref().unwrap());
-                &cases[0].block
-            }
-            (
-                a::Op::SwitchPrim {
-                    on,
-                    cases,
-                    fallback,
-                },
-                2,
-            ) => {
-                assert_eq!(*on, depth as u32);
-                assert_eq!(cases[0].value, a::Literal::Natural(depth as u64));
-                assert_eq!(cases[1].value, a::Literal::Boolean(true));
-                assert_references(&cases[1].block);
-                assert_references(fallback.as_deref().unwrap());
-                &cases[0].block
-            }
-            (
-                a::Op::SwitchPresence {
-                    on,
-                    field,
-                    present,
-                    absent,
-                },
-                3,
-            ) => {
-                assert_eq!(*on, depth as u32);
-                assert_eq!(field, "field");
-                assert_references(absent);
-                present
-            }
-            (
-                a::Op::SwitchRest {
-                    on,
-                    fields,
-                    none,
-                    some,
-                },
-                4,
-            ) => {
-                assert_eq!(*on, depth as u32);
-                assert_eq!(fields, &["field"]);
-                assert_references(some);
-                none
-            }
-            _ => panic!("unexpected nested operation at depth {depth}"),
-        };
-    }
-    assert_references(current);
 }
 
 #[test]
@@ -480,7 +365,7 @@ fn copies_valid_dependency_first_transitive_diamond_graph_without_pruning() {
         ]
     );
     for (index, function) in linked.lir().functions.iter().enumerate() {
-        assert_references(&function.body, index as u64);
+        assert_references(&function.blocks[function.entry as usize], index as u64);
     }
 
     fn assert_references(block: &a::Block, expected: u64) {
@@ -488,10 +373,10 @@ fn copies_valid_dependency_first_transitive_diamond_graph_without_pruning() {
             panic!()
         };
         assert_eq!(*func, expected);
-        let a::Op::Call {
+        let a::End::Call {
             callee: a::Callee::Direct(func),
             ..
-        } = &block.instrs[1].op
+        } = &block.end
         else {
             panic!()
         };
