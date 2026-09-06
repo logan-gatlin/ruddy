@@ -95,6 +95,10 @@ pub const FIRST_DECLARATION: &str = "first declared here";
 /// [`inference::ErrorKind::RigidField`].
 pub const DECLARED_HERE: &str = "declared here";
 
+/// What every `@if` complaint reminds the reader of: the shape of a guard and
+/// the one fact it can ask about.
+const CONDITIONS: &str = "`@if {target: \"js\"}` compiles a definition only when the root project is built for that target; every field written must hold";
+
 /// A node a printer has to parenthesize by precedence. Implemented by every
 /// wrapper that prints as surface syntax, and by [`Ty`], which prints as one
 /// directly.
@@ -1165,10 +1169,6 @@ impl bundle::Error {
         }
     }
 }
-
-/// What every `@if` complaint reminds the reader of: the shape of a guard and
-/// the one fact it can ask about.
-const CONDITIONS: &str = "`@if {target: \"js\"}` compiles a definition only when the root project is built for that target; every field written must hold";
 
 impl fmt::Display for bundle::ErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

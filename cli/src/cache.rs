@@ -4,9 +4,9 @@
 //! dependency's own sources, the artifacts of its dependencies, and the target
 //! of the build it was compiled for, which its `@if` guards were judged
 //! against. Each is digested into the key an artifact is stored under, so a
-//! cached artifact is used only while all four are what they were — and there is no versioning
-//! to keep up with, because the compiler's part of the key is the
-//! [`Stamp`](ruddy::artifact::Stamp) its build script computed from its
+//! cached artifact is used only while all four are what they were — and there
+//! is no versioning to keep up with, because the compiler's part of the key is
+//! the [`Stamp`](ruddy::artifact::Stamp) its build script computed from its
 //! source.
 //!
 //! An artifact read back from the cache is trusted on its stamp: it was

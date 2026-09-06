@@ -29,12 +29,17 @@ impl Files for Memory {
     }
 }
 
+/// A build for the named target, which is all an [`Environment`] says.
+fn environment(target: &str) -> Environment {
+    Environment {
+        target: target.to_string(),
+    }
+}
+
 /// The build most tests load for: a JavaScript one. Only the guard tests care
 /// which, and they say so.
 fn js() -> Environment {
-    Environment {
-        target: "js".to_string(),
-    }
+    environment("js")
 }
 
 /// Load an in-memory bundle rooted at `main.hc` for a JavaScript build, with
@@ -52,10 +57,7 @@ fn load_for(target: &str, files: &[(&str, &str)]) -> (FileManager, Output) {
             .collect(),
     );
     let mut manager = FileManager::new();
-    let environment = Environment {
-        target: target.to_string(),
-    };
-    let out = bundle::load(&mut manager, &fs, "main.hc", &environment);
+    let out = bundle::load(&mut manager, &fs, "main.hc", &environment(target));
     (manager, out)
 }
 
@@ -467,6 +469,40 @@ fn definitions_guarded_for_different_targets_do_not_collide() {
         let mut mint = Mint::new(Bundle::new("demo", Version::new(0, 1, 0)).expect("valid bundle"));
         let built = ruddy::ir::build(&mut mint, out.stmts);
         assert!(built.errors.is_empty(), "{target}: {:#?}", built.errors);
+    }
+}
+
+/// A repeated `@if`, or a repeated field inside one, is the duplicate that
+/// lowering already refuses. The loader keeps the definition so that lowering
+/// sees it and says so, rather than judging one of two spellings and dropping
+/// the definition in silence.
+#[test]
+fn a_repeated_guard_or_field_is_kept_for_lowering_to_refuse() {
+    for (source, code) in [
+        (
+            "@if {target: \"artifact\"} @if {target: \"js\"} let x = 1n\n",
+            "duplicate-metadata-key",
+        ),
+        (
+            "@if {target: \"artifact\", target: \"js\"} let x = 1n\n",
+            "duplicate-field",
+        ),
+    ] {
+        let out = one(source);
+        assert!(out.errors.is_empty(), "{source:?}: {:#?}", out.errors);
+        assert_eq!(names(&out.stmts), ["let x"], "{source:?}");
+        let mut mint = Mint::new(Bundle::new("demo", Version::new(0, 1, 0)).expect("valid bundle"));
+        let built = ruddy::ir::build(&mut mint, out.stmts);
+        assert_eq!(
+            built
+                .errors
+                .iter()
+                .map(|error| error.kind.code())
+                .collect::<Vec<_>>(),
+            [code],
+            "{source:?}: {:#?}",
+            built.errors
+        );
     }
 }
 

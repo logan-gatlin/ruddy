@@ -334,23 +334,28 @@ impl Loader<'_> {
     }
 
     /// Whether `stmt` is to be compiled: it carries no `@if`, or the
-    /// conditions of its first `@if` all hold. A second `@if` is the repeated
-    /// key lowering refuses, and is not judged here.
+    /// conditions of its one `@if` all hold.
+    ///
+    /// A second `@if` is the repeated key lowering refuses; the definition is
+    /// kept so that lowering sees it and says so, rather than the guard being
+    /// judged by one of two spellings and the definition dropped in silence.
     fn holds(&mut self, stmt: &Stmt) -> bool {
-        match stmt
+        let mut guards = stmt
             .attributes
             .iter()
-            .find(|attribute| attribute.key.tracked == CONDITION_KEY)
-        {
-            Some(guard) => self.condition(guard),
-            None => true,
+            .filter(|attribute| attribute.key.tracked == CONDITION_KEY);
+        match (guards.next(), guards.next()) {
+            (Some(guard), None) => self.guard_holds(guard),
+            _ => true,
         }
     }
 
     /// Judge one `@if`. A malformed guard is reported and holds, so that the
     /// one complaint is not followed by an unresolved name for everything that
-    /// used the definition it guards.
-    fn condition(&mut self, guard: &Attribute) -> bool {
+    /// used the definition it guards. A guard with a repeated field holds for
+    /// the same reason, and is not reported here: lowering refuses the repeat
+    /// on the definition kept, as it does in every metadata struct.
+    fn guard_holds(&mut self, guard: &Attribute) -> bool {
         let Some(value) = &guard.value else {
             self.error(guard.span, ErrorKind::ConditionMissing);
             return true;
@@ -366,6 +371,14 @@ impl Loader<'_> {
                 return true;
             }
         };
+        if fields.keys().enumerate().any(|(at, label)| {
+            fields
+                .keys()
+                .take(at)
+                .any(|seen| seen.tracked == label.tracked)
+        }) {
+            return true;
+        }
         let mut holds = true;
         for (label, field) in fields {
             match label.tracked.as_str() {

@@ -54,8 +54,10 @@ that adding one later cannot silently change what an existing guard means.
 - The guard is judged in the bundle loader, before any module file is read
   under the definition and before lowering mints any name. Excluded inline
   code is still lexed and parsed, so its syntax errors are still reported.
-- Only the first `@if` on a definition is judged; a second one is the
-  repeated key lowering already refuses on the definitions that survive.
+- A definition with two `@if`s, or a guard with a repeated field, is kept
+  unjudged: the repeat is the duplicate lowering already refuses, and keeping
+  the definition is what lets lowering see it, so no misspelling can drop a
+  definition in silence.
 - Several fields in the struct must all hold.
 - Excluded definitions leave no trace in the tree, the IR, or the artifact.
 
