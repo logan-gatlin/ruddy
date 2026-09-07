@@ -1,16 +1,17 @@
-let pair : 'a -> 'b -> ('a, 'b) = fn first second => (first, second)
-let duplicate : 'a -> ('a, 'a) = fn value => (value, value)
+let pair: 'a -> 'b -> ('a, 'b) = fn first second => (first, second)
+let duplicate: 'a -> ('a, 'a) = fn value => (value, value)
 
-let first : { 0: 'a, ..'rest } -> 'a = fn values => values.0
-let second : { 0: 'a, 1: 'b, ..'rest } -> 'b = fn values => values.1
+let first: { 0: 'a, ..'rest } -> 'a = fn values => values.0
+let second: { 0: 'a, 1: 'b, ..'rest } -> 'b = fn values => values.1
 
-let swap : ('a, 'b) -> ('b, 'a) = fn values => (values.1, values.0)
+let swap: ('a, 'b) -> ('b, 'a) = fn values => (values.1, values.0)
 
-let map_first : ('a -> 'c + ..'effects) -> ('a, 'b) -> ('c, 'b) + ..'effects =
-  fn function values => (function (values.0), values.1)
+let map_first: ('a -> 'c + ..'effects) -> ('a, 'b) -> ('c, 'b) + ..'effects =
+  fn function values => (function values.0, values.1)
 
-let map_second : ('b -> 'c + ..'effects) -> ('a, 'b) -> ('a, 'c) + ..'effects =
-  fn function values => (values.0, function (values.1))
+let map_second: ('b -> 'c + ..'effects) -> ('a, 'b) -> ('a, 'c) + ..'effects =
+  fn function values => (values.0, function values.1)
 
-let map_both : ('a -> 'c + ..'effects) -> ('b -> 'd + ..'effects) -> ('a, 'b) -> ('c, 'd) + ..'effects =
-  fn left right values => (left (values.0), right (values.1))
+let map_both:
+  ('a -> 'c + ..'effects) -> ('b -> 'd + ..'effects) -> ('a, 'b) -> ('c, 'd) + ..'effects =
+  fn left right values => (left values.0, right values.1)
