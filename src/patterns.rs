@@ -211,6 +211,7 @@ enum Mode {
 #[derive(Clone, Copy)]
 enum Scalar {
     Infinite(InfiniteScalar),
+    Fixed(crate::types::FixedInt),
     Boolean,
 }
 
@@ -431,6 +432,7 @@ fn walk_under(check: &Check, term: &Term, assumed: &Formula, out: &mut Output) {
         TermKind::Operation { .. }
         | TermKind::Ident(_)
         | TermKind::Natural(_)
+        | TermKind::Fixed(_)
         | TermKind::Integer(_)
         | TermKind::Real(_)
         | TermKind::String(_)
@@ -466,6 +468,7 @@ fn cell(pattern: &Pattern) -> Cell {
     match &pattern.anchored {
         PatternKind::Bind(_) | PatternKind::Wildcard => Cell::Wild,
         PatternKind::Natural(value) => Cell::Literal(Literal::Natural(*value)),
+        PatternKind::Fixed(value) => Cell::Literal(Literal::Fixed(*value)),
         PatternKind::Integer(value) => Cell::Literal(Literal::Integer(*value)),
         PatternKind::Real(value) => Cell::Literal(Literal::Real(*value)),
         PatternKind::String(value) => Cell::Literal(Literal::String(value.clone())),
@@ -966,6 +969,9 @@ impl Check<'_> {
     fn compatible(&self, ty: &Rc<Ty>, cell: &Cell) -> bool {
         let ty = self.shape(ty);
         match cell {
+            Cell::Literal(Literal::Fixed(value)) => {
+                matches!(&*ty, Ty::Fixed(kind) if *kind == value.kind())
+            }
             Cell::Literal(literal) => matches!(
                 (literal, &*ty),
                 (Literal::Natural(_), Ty::Nat)
@@ -1438,6 +1444,7 @@ impl Check<'_> {
     ) -> Option<Vec<Option<Witness>>> {
         match &**ty {
             Ty::Nat => self.scalars(rows, Scalar::Infinite(InfiniteScalar::Nat), later, q, walk),
+            Ty::Fixed(kind) => self.scalars(rows, Scalar::Fixed(*kind), later, q, walk),
             Ty::Int => self.scalars(rows, Scalar::Infinite(InfiniteScalar::Int), later, q, walk),
             Ty::Real => self.scalars(rows, Scalar::Infinite(InfiniteScalar::Real), later, q, walk),
             Ty::String => self.scalars(
@@ -1461,10 +1468,9 @@ impl Check<'_> {
         }
     }
 
-    /// A scalar primitive type. Boolean has precisely two values, so its two
-    /// exact patterns cover it. The other scalar types deliberately keep the
-    /// literal-pattern rule `Nat` had: no finite list of literals is total, so
-    /// a wildcard is needed to accept the value outside that list.
+    /// A scalar primitive type. Booleans and fixed-width integers have finite
+    /// domains and can be covered by listing every value. The target-sized
+    /// types require a wildcard to cover values outside the listed literals.
     fn scalars(
         &self,
         rows: &[Vec<Cell>],
@@ -1521,6 +1527,29 @@ impl Check<'_> {
                             }
                         }
                         return None;
+                    }
+                    Scalar::Fixed(kind) => {
+                        let mut listed_values: Vec<i128> = listed
+                            .iter()
+                            .filter_map(|literal| {
+                                if let Literal::Fixed(value) = literal {
+                                    Some(value.value())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        listed_values.sort_unstable();
+                        listed_values.dedup();
+                        let mut missing = kind.min();
+                        for value in listed_values {
+                            if value != missing {
+                                break;
+                            }
+                            missing += 1;
+                        }
+                        return crate::types::FixedLiteral::new(kind, missing)
+                            .and_then(|value| ask(&Literal::Fixed(value)));
                     }
                     Scalar::Infinite(core) => core,
                 };

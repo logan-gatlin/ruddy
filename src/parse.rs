@@ -56,6 +56,7 @@ pub type Data = Tracked<DataKind>;
 pub enum DataKind {
     Natural(u64),
     Integer(i64),
+    Fixed(crate::types::FixedLiteral),
     Real(f64),
     String(String),
     Boolean(bool),
@@ -391,6 +392,7 @@ pub enum ExprKind {
     },
     Natural(u64),
     Integer(i64),
+    Fixed(crate::types::FixedLiteral),
     Real(f64),
     String(String),
     Boolean(bool),
@@ -498,6 +500,7 @@ pub enum PatternKind {
     /// A primitive literal: matches exactly that value.
     Natural(u64),
     Integer(i64),
+    Fixed(crate::types::FixedLiteral),
     Real(f64),
     String(String),
     Boolean(bool),
@@ -1522,6 +1525,7 @@ impl Parser {
             Some(
                 Kind::String(_)
                     | Kind::Natural(_)
+                    | Kind::Fixed(_)
                     | Kind::Integer(_)
                     | Kind::Real(_)
                     | Kind::Boolean(_)
@@ -1579,6 +1583,10 @@ impl Parser {
             &Kind::Integer(value) => {
                 self.advance();
                 Some(span.track(DataKind::Integer(value)))
+            }
+            &Kind::Fixed(value) => {
+                self.advance();
+                Some(span.track(DataKind::Fixed(value)))
             }
             &Kind::Real(value) => {
                 self.advance();
@@ -2335,6 +2343,7 @@ impl Parser {
                 tok.tracked,
                 Kind::Identifier(_)
                     | Kind::Natural(_)
+                    | Kind::Fixed(_)
                     | Kind::Integer(_)
                     | Kind::Real(_)
                     | Kind::String(_)
@@ -2624,6 +2633,10 @@ impl Parser {
             &Kind::Integer(value) => {
                 self.advance();
                 Some(span.track(ExprKind::Integer(value)))
+            }
+            &Kind::Fixed(value) => {
+                self.advance();
+                Some(span.track(ExprKind::Fixed(value)))
             }
             &Kind::Real(value) => {
                 self.advance();
@@ -3167,6 +3180,7 @@ impl Parser {
                 tok.tracked,
                 Kind::Identifier(_)
                     | Kind::Natural(_)
+                    | Kind::Fixed(_)
                     | Kind::Integer(_)
                     | Kind::Real(_)
                     | Kind::String(_)
@@ -3223,6 +3237,10 @@ impl Parser {
             &Kind::Integer(value) => {
                 self.advance();
                 Some(span.track(PatternKind::Integer(value)))
+            }
+            &Kind::Fixed(value) => {
+                self.advance();
+                Some(span.track(PatternKind::Fixed(value)))
             }
             &Kind::Real(value) => {
                 self.advance();

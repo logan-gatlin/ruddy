@@ -4009,6 +4009,13 @@ fn describe_type(ty: &Rc<Ty>) -> TypeDescription {
     match &**ty {
         Ty::Nat => TypeDescription::NaturalNumber,
         Ty::Int => TypeDescription::Integer,
+        Ty::Fixed(kind) => {
+            if kind.signed() {
+                TypeDescription::Integer
+            } else {
+                TypeDescription::NaturalNumber
+            }
+        }
         Ty::Real => TypeDescription::RealNumber,
         Ty::String => TypeDescription::Text,
         Ty::Boolean => TypeDescription::Boolean,
@@ -4118,6 +4125,7 @@ impl MismatchFingerprints {
                     match &*ty {
                         Ty::Nat => values.push(tagged(0, [])),
                         Ty::Int => values.push(tagged(1, [])),
+                        Ty::Fixed(kind) => values.push(tagged(30, [*kind as u64])),
                         Ty::Real => values.push(tagged(2, [])),
                         Ty::String => values.push(tagged(3, [])),
                         Ty::Boolean => values.push(tagged(4, [])),
@@ -4561,6 +4569,7 @@ fn smallest_incompatible_counted_with_mask(
                     return descriptions;
                 }
             }
+            (Ty::Fixed(left), Ty::Fixed(right)) if left == right => {}
             (Ty::Nat, Ty::Nat)
             | (Ty::Int, Ty::Int)
             | (Ty::Real, Ty::Real)
@@ -6093,6 +6102,10 @@ impl Fingerprint {
                 match ty {
                     Ty::Nat => self.word(0x01),
                     Ty::Int => self.word(0x02),
+                    Ty::Fixed(kind) => {
+                        self.word(0x20);
+                        self.word(*kind as u64);
+                    }
                     Ty::Real => self.word(0x03),
                     Ty::String => self.word(0x04),
                     Ty::Boolean => self.word(0x05),
@@ -8016,6 +8029,7 @@ impl Table {
                 Work::Ty(a, b) => {
                     let (a, b) = (self.resolve(&a), self.resolve(&b));
                     match (&*a, &*b) {
+                        (Ty::Fixed(left), Ty::Fixed(right)) if left == right => {}
                         (Ty::Nat, Ty::Nat)
                         | (Ty::Int, Ty::Int)
                         | (Ty::Real, Ty::Real)
@@ -8257,6 +8271,7 @@ impl Table {
                             Ty::Var(_)
                             | Ty::Nat
                             | Ty::Int
+                            | Ty::Fixed(_)
                             | Ty::Real
                             | Ty::String
                             | Ty::Boolean
@@ -8460,6 +8475,7 @@ impl Table {
                         }
                         Ty::Nat
                         | Ty::Int
+                        | Ty::Fixed(_)
                         | Ty::Real
                         | Ty::String
                         | Ty::Boolean
@@ -8585,6 +8601,7 @@ impl Table {
                         }
                         Ty::Nat
                         | Ty::Int
+                        | Ty::Fixed(_)
                         | Ty::Real
                         | Ty::String
                         | Ty::Boolean
@@ -9254,6 +9271,7 @@ impl Table {
                         }
                         Ty::Nat
                         | Ty::Int
+                        | Ty::Fixed(_)
                         | Ty::Real
                         | Ty::String
                         | Ty::Boolean
@@ -11316,6 +11334,7 @@ impl Table {
             TermKind::Operation { .. }
             | TermKind::Ident(_)
             | TermKind::Natural(_)
+            | TermKind::Fixed(_)
             | TermKind::Integer(_)
             | TermKind::Real(_)
             | TermKind::String(_)

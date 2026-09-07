@@ -324,7 +324,7 @@ fn distinct_primitives_are_spelled_differently() {
     // spelling would make one of them unreachable through `from_name`.
     let names: std::collections::HashSet<_> = Prim::ALL.iter().map(|prim| prim.name()).collect();
     assert_eq!(names.len(), Prim::ALL.len());
-    assert_eq!(Prim::ALL.len(), 5);
+    assert_eq!(Prim::ALL.len(), 13);
     assert_eq!(Prim::Int.name(), "Int");
     assert_eq!(Prim::Real.name(), "Real");
     assert_eq!(Prim::String.name(), "String");

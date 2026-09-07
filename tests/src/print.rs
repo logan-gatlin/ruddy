@@ -1227,3 +1227,20 @@ fn mutation_syntax_round_trips_with_assignment_grouping() {
     assert!(ast.contains("(a := b) := c"));
     assert_eq!(ast_of(&ast), ast);
 }
+
+#[test]
+fn signed_literals_and_operator_negation_print_without_becoming_comments() {
+    for source in [
+        "let value = - -1.5",
+        "let value = - - 1.5",
+        "let value = (fn x => x) -42i",
+        "@negative -1.5\nlet value = -0.0",
+        "let value = fn x => match x with | -1i => -2i | _ => 0i end",
+    ] {
+        let (ast, ir) = printed(source);
+        assert_eq!(printed(&ast).0, ast);
+        assert_eq!(printed(&ir).1, ir);
+        assert!(!ast.contains("--"), "{ast}");
+        assert!(!ir.contains("--"), "{ir}");
+    }
+}

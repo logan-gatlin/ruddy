@@ -430,3 +430,38 @@ assert.equal(Object.hasOwn(await none({}), 'label'), false);
     success(&output);
     assert_eq!(output.stdout, b"step\nstep\nstep\n");
 }
+
+#[test]
+fn host_exports_handle_binary_files_and_curried_copies() {
+    let project = project(
+        r#"
+let read = std::fs::read_bytes
+let first_byte = fn path => match read path with
+  | #Some [byte, ..] => byte
+  | _ => 0n8
+end
+let copy_bytes = fn source destination => match read source with
+  | #Some bytes => std::fs::write_bytes destination bytes
+  | #Error error => #Error error
+end
+let append_bytes = fn path => std::fs::append_bytes path [0n8, 128n8, 255n8]
+"#,
+        "node",
+    );
+    fs::write(project.path().join("input"), [255, 0, 128, 1]).unwrap();
+    let output = run(
+        project.path(),
+        r#"
+assert.equal(await app.first_byte('input'), 255);
+const copy = await app.copy_bytes('input');
+assert.equal(typeof copy, 'function');
+await copy('output');
+await app.append_bytes('output');
+"#,
+    );
+    success(&output);
+    assert_eq!(
+        fs::read(project.path().join("output")).unwrap(),
+        [255, 0, 128, 1, 0, 128, 255]
+    );
+}

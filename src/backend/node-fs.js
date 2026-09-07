@@ -58,18 +58,41 @@ const $fsCall = async (path, operation) => {
     ]));
   }
 };
-const $fs = {
-  read_text: path => $fsCall(path, async fs => {
-    const file = await fs.open(path, "r");
-    try {
-      if ((await file.stat()).isDirectory()) {
-        throw $fsFailure("EISDIR", "Cannot read a directory as text", path);
-      }
-      return $fsDecode(await file.readFile());
-    } finally {
-      await file.close();
+const $fsRead = (path, decode) => $fsCall(path, async fs => {
+  const file = await fs.open(path, "r");
+  try {
+    if ((await file.stat()).isDirectory()) {
+      throw $fsFailure("EISDIR", "Cannot read a directory as a file", path);
     }
-  }),
+    return decode(await file.readFile());
+  } finally {
+    await file.close();
+  }
+});
+const $fsByteList = bytes => {
+  let result = $sum("None", undefined);
+  for (let index = bytes.length - 1; index >= 0; index--) {
+    result = $sum("Cons", $record([["0", bytes[index]], ["1", result]]));
+  }
+  return result;
+};
+const $fsByteBuffer = bytes => {
+  let length = 0;
+  for (let rest = bytes; rest[$tag] === "Cons"; rest = rest[$payload]["1"]) length++;
+  const buffer = new Uint8Array(length);
+  let index = 0;
+  for (let rest = bytes; rest[$tag] === "Cons"; rest = rest[$payload]["1"]) {
+    buffer[index++] = rest[$payload]["0"];
+  }
+  return buffer;
+};
+const $fs = {
+  read_bytes: path => $fsRead(path, $fsByteList),
+  write_bytes: request => $fsCall(request.path,
+    fs => fs.writeFile(request.path, $fsByteBuffer(request.bytes))),
+  append_bytes: request => $fsCall(request.path,
+    fs => fs.appendFile(request.path, $fsByteBuffer(request.bytes))),
+  read_text: path => $fsRead(path, $fsDecode),
   write_text: request => $fsCall(request.path,
     fs => fs.writeFile(request.path, $fsEncode(request.text))),
   append_text: request => $fsCall(request.path,

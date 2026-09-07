@@ -463,6 +463,7 @@ fn rep(r: lower::Rep) -> Rep {
     match r {
         lower::Rep::Nat => Rep::Nat,
         lower::Rep::Int => Rep::Int,
+        lower::Rep::Fixed(kind) => Rep::Fixed(kind),
         lower::Rep::Real => Rep::Real,
         lower::Rep::String => Rep::String,
         lower::Rep::Boolean => Rep::Boolean,

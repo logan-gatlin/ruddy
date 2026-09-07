@@ -1,6 +1,9 @@
   | !Console.write text => write text
   | !Console.write_error text => write_error text
   | !Process.exit code => match host_exit code with end
+  | !FileSystem.read_bytes request => read_bytes request
+  | !FileSystem.write_bytes request => write_bytes request
+  | !FileSystem.append_bytes request => append_bytes request
   | !FileSystem.read_text request => fs_read_text request
   | !FileSystem.write_text request => fs_write_text request
   | !FileSystem.append_text request => fs_append_text request

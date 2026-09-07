@@ -1081,6 +1081,12 @@ fn literal(value: &Literal, out: &mut String) {
     match value {
         Literal::Natural(value) => out.push_str(&value.to_string()),
         Literal::Integer(value) => out.push_str(&value.to_string()),
+        Literal::Fixed(value) => {
+            out.push_str(&value.value().to_string());
+            if value.kind().bits() == 64 {
+                out.push('n');
+            }
+        }
         Literal::Real(bits) => {
             out.push_str("$real(\"");
             out.push_str(&format!("{bits:016x}"));

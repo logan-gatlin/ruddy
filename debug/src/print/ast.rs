@@ -109,6 +109,7 @@ impl Grouped for Ast<'_, ExprKind> {
             | ExprKind::Ident { .. }
             | ExprKind::Natural(_)
             | ExprKind::Integer(_)
+            | ExprKind::Fixed(_)
             | ExprKind::Real(_)
             | ExprKind::String(_)
             | ExprKind::Boolean(_)
@@ -200,6 +201,7 @@ impl fmt::Display for Ast<'_, DataKind> {
         match self.0 {
             DataKind::Natural(value) => write!(f, "{value}n"),
             DataKind::Integer(value) => write!(f, "{value}i"),
+            DataKind::Fixed(value) => write!(f, "{value}"),
             DataKind::Real(value) => write!(f, "{value}"),
             DataKind::String(value) => f.write_str(&string(value)),
             DataKind::Boolean(value) => write!(f, "{value}"),
@@ -653,6 +655,7 @@ impl fmt::Display for Ast<'_, ExprKind> {
             ExprKind::Ident { name } => write!(f, "{name}"),
             ExprKind::Natural(value) => write!(f, "{value}n"),
             ExprKind::Integer(value) => write!(f, "{value}i"),
+            ExprKind::Fixed(value) => write!(f, "{value}"),
             ExprKind::Real(value) => write!(f, "{value}"),
             ExprKind::String(value) => f.write_str(&string(value)),
             ExprKind::Boolean(value) => write!(f, "{value}"),
@@ -672,6 +675,7 @@ impl Grouped for Ast<'_, PatternKind> {
             | PatternKind::Wildcard
             | PatternKind::Natural(_)
             | PatternKind::Integer(_)
+            | PatternKind::Fixed(_)
             | PatternKind::Real(_)
             | PatternKind::String(_)
             | PatternKind::Boolean(_)
@@ -690,6 +694,7 @@ impl fmt::Display for Ast<'_, PatternKind> {
             PatternKind::Wildcard => f.write_str("_"),
             PatternKind::Natural(value) => write!(f, "{value}n"),
             PatternKind::Integer(value) => write!(f, "{value}i"),
+            PatternKind::Fixed(value) => write!(f, "{value}"),
             PatternKind::Real(value) => write!(f, "{value}"),
             PatternKind::String(value) => f.write_str(&string(value)),
             PatternKind::Boolean(value) => write!(f, "{value}"),

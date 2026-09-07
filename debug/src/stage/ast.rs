@@ -495,6 +495,10 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
             label: "Integer".into(),
             ..node
         },
+        ExprKind::Fixed(_) => Node {
+            label: "Fixed".into(),
+            ..node
+        },
         ExprKind::Real(_) => Node {
             label: "Real".into(),
             ..node
@@ -554,6 +558,10 @@ fn pattern_node(ids: &mut Ids, pattern: &Pattern) -> Node {
         },
         PatternKind::Integer(_) => Node {
             label: "Integer".into(),
+            ..node
+        },
+        PatternKind::Fixed(_) => Node {
+            label: "Fixed".into(),
             ..node
         },
         PatternKind::Real(_) => Node {

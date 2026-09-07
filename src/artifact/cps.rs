@@ -248,10 +248,11 @@ pub enum Op {
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub enum Rep {
-    /// An unsigned 64-bit integer.
+    /// A target-sized natural number.
     Nat,
-    /// A signed 64-bit integer.
+    /// A target-sized signed integer.
     Int,
+    Fixed(crate::types::FixedInt),
     /// A 64-bit floating-point number.
     Real,
     String,
@@ -277,6 +278,7 @@ pub enum Rep {
 pub enum Literal {
     Natural(u64),
     Integer(i64),
+    Fixed(crate::types::FixedLiteral),
     Real(u64),
     String(String),
     Boolean(bool),

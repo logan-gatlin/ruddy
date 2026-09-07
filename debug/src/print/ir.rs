@@ -308,6 +308,7 @@ impl fmt::Display for Show<'_, DataKind> {
         match self.node {
             DataKind::Natural(value) => write!(f, "{value}n"),
             DataKind::Integer(value) => write!(f, "{value}i"),
+            DataKind::Fixed(value) => write!(f, "{value}"),
             DataKind::Real(value) => write!(f, "{value}"),
             DataKind::String(value) => f.write_str(&string(value)),
             DataKind::Boolean(value) => write!(f, "{value}"),
@@ -395,6 +396,7 @@ impl Grouped for Show<'_, TermKind> {
             | TermKind::Ident(_)
             | TermKind::Natural(_)
             | TermKind::Integer(_)
+            | TermKind::Fixed(_)
             | TermKind::Real(_)
             | TermKind::String(_)
             | TermKind::Boolean(_)
@@ -424,6 +426,7 @@ impl Grouped for Show<'_, PatternKind> {
             | PatternKind::Wildcard
             | PatternKind::Natural(_)
             | PatternKind::Integer(_)
+            | PatternKind::Fixed(_)
             | PatternKind::Real(_)
             | PatternKind::String(_)
             | PatternKind::Boolean(_)
@@ -447,6 +450,7 @@ impl fmt::Display for Show<'_, PatternKind> {
             PatternKind::Wildcard => f.write_str("_"),
             PatternKind::Natural(value) => write!(f, "{value}n"),
             PatternKind::Integer(value) => write!(f, "{value}i"),
+            PatternKind::Fixed(value) => write!(f, "{value}"),
             PatternKind::Real(value) => write!(f, "{value}"),
             PatternKind::String(value) => f.write_str(&string(value)),
             PatternKind::Boolean(value) => write!(f, "{value}"),
@@ -531,6 +535,7 @@ impl fmt::Display for Show<'_, TermKind> {
             TermKind::Ident(symbol) => f.write_str(self.mint.name(*symbol)),
             TermKind::Natural(value) => write!(f, "{value}n"),
             TermKind::Integer(value) => write!(f, "{value}i"),
+            TermKind::Fixed(value) => write!(f, "{value}"),
             TermKind::Real(value) => write!(f, "{value}"),
             TermKind::String(value) => f.write_str(&string(value)),
             TermKind::Boolean(value) => write!(f, "{value}"),

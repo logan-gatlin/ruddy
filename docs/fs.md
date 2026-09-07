@@ -19,6 +19,9 @@ Every function below has the `!FileSystem` effect. These are interface signature
 the definitions live in [`std/fs.hc`](../std/fs.hc).
 
 ```text
+read_bytes: String -> Result [Nat8] Error
+write_bytes: String -> [Nat8] -> Result () Error
+append_bytes: String -> [Nat8] -> Result () Error
 read_text: String -> Result String Error
 write_text: String -> String -> Result () Error
 append_text: String -> String -> Result () Error
@@ -44,18 +47,34 @@ type Metadata = { kind: FileKind, size: Nat }
 type DirEntry = { name: String, kind: FileKind }
 ```
 
-Writes and appends take the path first and text second. Rename and copy take
+Writes and appends take the path first and contents second. Binary contents
+are immutable arrays of `Nat8` values (`0n8` through `255n8`). Rename and copy take
 the source first and destination second. The underlying effect operations
 take named-field structs for these multi-argument requests:
 
 ```text
+write_bytes: { path: String, bytes: [Nat8] } -> Result () fs::Error
+append_bytes: { path: String, bytes: [Nat8] } -> Result () fs::Error
 write_text: { path: String, text: String } -> Result () fs::Error
 append_text: { path: String, text: String } -> Result () fs::Error
 rename: { source: String, destination: String } -> Result () fs::Error
 copy_file: { source: String, destination: String } -> Result () fs::Error
 ```
 
-## Paths, text, and errors
+For example, write a file containing a NUL byte, a high-bit byte, and `255`:
+
+```hc
+let main = fn _ => match std::fs::write_bytes "data.bin" [0n8, 128n8, 255n8] with
+  | #Some _ => ()
+  | #Error error => std::console::print_error error.message
+end
+```
+
+Local `!FileSystem` handlers must cover the three binary operations as well as
+the text and directory operations. Binary write and append handlers receive
+`{ path, bytes }`; binary read handlers return `#Some bytes` or `#Error error`.
+
+## Paths, contents, and errors
 
 Paths are strings interpreted by the host filesystem. Relative paths use the
 process working directory. NULs and unpaired Unicode surrogates return
@@ -64,11 +83,17 @@ as UTF-8 also return `#InvalidPath`.
 
 Text is UTF-8. Reads reject malformed bytes with `#InvalidEncoding` and preserve
 the BOM, if present. Writes and appends reject unpaired surrogates before
-opening or modifying the destination. Files are read entirely into memory.
+opening or modifying the destination. Binary operations preserve every byte
+without decoding or encoding, including NULs, malformed UTF-8, and BOMs.
+Empty files read as `[]`. Files are read entirely into memory; binary writes
+and appends leave their input arrays unchanged.
 
-`write_text` creates a missing file or truncates an existing file. `append_text`
-creates a missing file or appends to an existing file. Neither creates parent
-directories. Both follow symlinks.
+`write_text` and `write_bytes` create a missing file or truncate an existing
+file. `append_text` and `append_bytes` create a missing file or append to an
+existing file. Empty writes still create or truncate the destination; empty
+appends create a missing file and otherwise leave its contents unchanged.
+None create parent directories, and all follow symlinks. Reading a directory
+as either text or bytes returns `#IsDirectory`.
 
 `exists` follows symlinks. It returns `#Some false` for a missing path or dangling
 symlink, and `#Some true` for an existing target, including a directory.
@@ -108,5 +133,5 @@ filesystem semantics.
 
 The adapter uses Node's [promise-based filesystem functions](https://nodejs.org/api/fs.html#promises-api)
 and [fatal UTF-8 decoding](https://nodejs.org/api/util.html#new-textdecoderencoding-options).
-Streams, watchers, handles, binary I/O, and recursive deletion are outside this
+Streams, watchers, handles, and recursive deletion are outside this
 module's current interface.

@@ -66,7 +66,7 @@ which write to stdout and stderr without adding a newline, and
 Normal return exits successfully.
 
 The Node runtime also handles `std::FileSystem`, exposed through `std::fs`.
-It provides whole-file UTF-8 reads, writes and appends, existence checks,
+It provides whole-file UTF-8 and binary reads, writes and appends, existence checks,
 directory listings and creation, metadata, file and empty-directory removal,
 rename, and copy. Operations may suspend and return `Result` values; callers
 need no `await`. See [the filesystem module](docs/fs.md) for its signatures
@@ -162,3 +162,5 @@ just cov         # measure compiler coverage (nightly Rust)
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for project conventions. Run tests through `just test`, not `cargo test`.
+
+See [Numbers](docs/numbers.md) for target-sized and fixed-width integer types, literals, and arithmetic.

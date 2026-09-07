@@ -3643,7 +3643,7 @@ fn attributes_without_a_definition_are_refused_at_the_attributes() {
 fn a_metadata_value_that_is_not_a_literal_is_refused_where_it_begins() {
     for (src, at) in [
         ("@since add 1n 2n\nlet x = 1n", "add"),
-        ("@k -1i\nlet x = 1n", "-"),
+        ("@k - 1i\nlet x = 1n", "-"),
         ("@k not true\nlet x = 1n", "not"),
         ("@k fn a => a\nlet x = 1n", "fn"),
         ("@k if true then 1n else 2n end\nlet x = 1n", "if"),

@@ -511,6 +511,7 @@ pub type Metadata = IndexMap<String, Data>;
 pub enum Data {
     Natural(u64),
     Integer(i64),
+    Fixed(crate::types::FixedLiteral),
     Real(f64),
     String(String),
     Boolean(bool),
@@ -523,6 +524,7 @@ impl PartialEq for Data {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Natural(a), Self::Natural(b)) => a == b,
+            (Self::Fixed(a), Self::Fixed(b)) => a == b,
             (Self::Integer(a), Self::Integer(b)) => a == b,
             (Self::Real(a), Self::Real(b)) => a.to_bits() == b.to_bits(),
             (Self::String(a), Self::String(b)) => a == b,
@@ -663,6 +665,7 @@ pub struct Scheme {
 pub enum Type {
     Nat,
     Int,
+    Fixed(crate::types::FixedInt),
     Real,
     String,
     Boolean,
@@ -756,6 +759,7 @@ fn semantic_eq(root: SemanticPair<'_>) -> bool {
     while let Some(pair) = pending.pop() {
         match pair {
             SemanticPair::Type(left, right) => match (left, right) {
+                (Type::Fixed(left), Type::Fixed(right)) if left == right => {}
                 (Type::Nat, Type::Nat)
                 | (Type::Int, Type::Int)
                 | (Type::Real, Type::Real)
@@ -935,6 +939,7 @@ fn clone_semantic(root: SemanticRef<'_>) -> (Vec<Type>, Vec<Row>) {
             CloneWork::Semantic(SemanticRef::Type(value)) => match value {
                 Type::Nat => types.push(Type::Nat),
                 Type::Int => types.push(Type::Int),
+                Type::Fixed(kind) => types.push(Type::Fixed(*kind)),
                 Type::Real => types.push(Type::Real),
                 Type::String => types.push(Type::String),
                 Type::Boolean => types.push(Type::Boolean),
@@ -1136,6 +1141,7 @@ fn drain_type(value: &mut Type, pending: &mut Vec<SemanticOwned>) {
         }
         Type::Nat
         | Type::Int
+        | Type::Fixed(_)
         | Type::Real
         | Type::String
         | Type::Boolean
@@ -1490,6 +1496,7 @@ fn metadata(value: &ir::Metadata) -> Metadata {
 fn data(value: &ir::Data) -> Data {
     match &value.anchored {
         ir::DataKind::Natural(value) => Data::Natural(*value),
+        ir::DataKind::Fixed(value) => Data::Fixed(*value),
         ir::DataKind::Integer(value) => Data::Integer(*value),
         ir::DataKind::Real(value) => Data::Real(*value),
         ir::DataKind::String(value) => Data::String(value.clone()),
@@ -1680,6 +1687,7 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
             Work::Ty(value) => match value {
                 types::Ty::Nat => tys.push(Type::Nat),
                 types::Ty::Int => tys.push(Type::Int),
+                types::Ty::Fixed(kind) => tys.push(Type::Fixed(*kind)),
                 types::Ty::Real => tys.push(Type::Real),
                 types::Ty::String => tys.push(Type::String),
                 types::Ty::Boolean => tys.push(Type::Boolean),
@@ -2072,6 +2080,7 @@ fn op(mint: &Mint, value: &lir::Op) -> Op {
 fn literal(value: &ir::Literal) -> Literal {
     match value {
         ir::Literal::Natural(value) => Literal::Natural(*value),
+        ir::Literal::Fixed(value) => Literal::Fixed(*value),
         ir::Literal::Integer(value) => Literal::Integer(*value),
         ir::Literal::Real(value) => Literal::Real(value.to_bits()),
         ir::Literal::String(value) => Literal::String(value.clone()),
@@ -2138,6 +2147,7 @@ fn rep(value: lir::Rep) -> Rep {
     match value {
         lir::Rep::Nat => Rep::Nat,
         lir::Rep::Int => Rep::Int,
+        lir::Rep::Fixed(kind) => Rep::Fixed(kind),
         lir::Rep::Real => Rep::Real,
         lir::Rep::String => Rep::String,
         lir::Rep::Boolean => Rep::Boolean,
@@ -2329,6 +2339,11 @@ pub mod text {
     fn data(value: &Data) -> S {
         match value {
             Data::Natural(value) => L(vec![A("nat".into()), A(value.to_string())]),
+            Data::Fixed(value) => L(vec![
+                A("fixed".into()),
+                A(value.kind().suffix().into()),
+                A(value.value().to_string()),
+            ]),
             Data::Integer(value) => L(vec![A("int".into()), A(value.to_string())]),
             Data::Real(value) => L(vec![A("real".into()), A(value.to_string())]),
             Data::String(value) => L(vec![A("string".into()), Q(value.clone())]),
@@ -2485,6 +2500,7 @@ pub mod text {
                     match value {
                         Type::Nat => work.push(Work::Text("nat")),
                         Type::Int => work.push(Work::Text("int")),
+                        Type::Fixed(kind) => work.push(Work::Text(kind.suffix())),
                         Type::Real => work.push(Work::Text("real")),
                         Type::String => work.push(Work::Text("string")),
                         Type::Boolean => work.push(Work::Text("boolean")),
@@ -3287,6 +3303,19 @@ pub mod text {
             let tag = self.atom(self.take(&mut values));
             match tag.as_str() {
                 "nat" => Data::Natural(self.number(self.exact(values, 1, "nat").remove(0))),
+                "fixed" => {
+                    let mut values = self.exact(values, 2, "fixed");
+                    let suffix = self.atom(self.take(&mut values));
+                    let number = self.number(self.take(&mut values));
+                    let literal = crate::types::FixedInt::ALL
+                        .into_iter()
+                        .find(|kind| kind.suffix() == suffix)
+                        .and_then(|kind| crate::types::FixedLiteral::new(kind, number));
+                    match literal {
+                        Some(value) => Data::Fixed(value),
+                        None => self.invalid("invalid fixed-width literal", Data::Integer(0)),
+                    }
+                }
                 "int" => Data::Integer(self.number(self.exact(values, 1, "int").remove(0))),
                 "real" => Data::Real(self.number(self.exact(values, 1, "real").remove(0))),
                 "string" => Data::String(self.string(self.exact(values, 1, "string").remove(0))),
@@ -3822,6 +3851,14 @@ pub mod text {
                             A(value) => tys.push(match value.as_str() {
                                 "nat" => Type::Nat,
                                 "int" => Type::Int,
+                                "n8" => Type::Fixed(crate::types::FixedInt::Nat8),
+                                "n16" => Type::Fixed(crate::types::FixedInt::Nat16),
+                                "n32" => Type::Fixed(crate::types::FixedInt::Nat32),
+                                "n64" => Type::Fixed(crate::types::FixedInt::Nat64),
+                                "i8" => Type::Fixed(crate::types::FixedInt::Int8),
+                                "i16" => Type::Fixed(crate::types::FixedInt::Int16),
+                                "i32" => Type::Fixed(crate::types::FixedInt::Int32),
+                                "i64" => Type::Fixed(crate::types::FixedInt::Int64),
                                 "real" => Type::Real,
                                 "string" => Type::String,
                                 "boolean" => Type::Boolean,

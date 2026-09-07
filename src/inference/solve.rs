@@ -645,6 +645,7 @@ impl Solve<'_> {
         match &*exposed {
             Ty::Nat
             | Ty::Int
+            | Ty::Fixed(_)
             | Ty::Real
             | Ty::String
             | Ty::Boolean
@@ -716,6 +717,7 @@ impl Solve<'_> {
         match &*exposed {
             Ty::Nat
             | Ty::Int
+            | Ty::Fixed(_)
             | Ty::Real
             | Ty::String
             | Ty::Boolean
@@ -994,6 +996,7 @@ impl Solve<'_> {
                             match &*ty {
                                 Ty::Nat => values.push(tagged(0, [])),
                                 Ty::Int => values.push(tagged(1, [])),
+                                Ty::Fixed(kind) => values.push(tagged(30, [*kind as u64])),
                                 Ty::Real => values.push(tagged(2, [])),
                                 Ty::String => values.push(tagged(3, [])),
                                 Ty::Boolean => values.push(tagged(4, [])),
@@ -2014,6 +2017,9 @@ impl Solve<'_> {
                                 ));
                             }
                         }
+                        (Ty::Fixed(left), Ty::Fixed(right)) if left == right => {
+                            self.step(span, Rule::Prim, goal, Effect::None);
+                        }
                         (Ty::Nat, Ty::Nat)
                         | (Ty::Int, Ty::Int)
                         | (Ty::Real, Ty::Real)
@@ -2366,6 +2372,7 @@ impl Solve<'_> {
                         }
                         Ty::Nat
                         | Ty::Int
+                        | Ty::Fixed(_)
                         | Ty::Real
                         | Ty::String
                         | Ty::Boolean
@@ -3620,6 +3627,7 @@ impl Solve<'_> {
                     }
                     Ty::Nat
                     | Ty::Int
+                    | Ty::Fixed(_)
                     | Ty::Real
                     | Ty::String
                     | Ty::Boolean

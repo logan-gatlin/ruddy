@@ -738,3 +738,38 @@ fn mutation_keeps_arrays_persistent_and_conditional_effects_callable() {
         "{\"original\":1,\"changed\":3}"
     );
 }
+
+#[test]
+fn signed_literals_run_in_arguments_patterns_and_metadata() {
+    let artifact = compiled(
+        "@negative -42i\nlet integer = (fn x => x) -42i\n\
+         @negative_zero -0.0\nlet zero = -0.0\n\
+         let real = (fn x => x) -1.5\n\
+         let negated = - -1.5\n\
+         let difference = 3 - 5\n\
+         let int_case = match integer with | -42i => true | _ => false end\n\
+         let real_case = match real with | -1.5 => true | _ => false end\n\
+         let zero_case = match zero with | -0.0 => true | 0.0 => false | _ => false end\n",
+    );
+    let parsed = Artifact::try_parse(&artifact.print())
+        .unwrap()
+        .validate()
+        .unwrap();
+    assert_eq!(parsed, artifact);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("signed.mjs");
+    fs::write(&path, js::generate(&parsed).unwrap()).unwrap();
+    let probe = format!(
+        "import assert from 'node:assert/strict'; const x = await import({}); assert.equal(x.integer, -42); assert.equal(x.real, -1.5); assert.ok(Object.is(x.zero, -0)); assert.equal(x.negated, 1.5); assert.equal(x.difference, -2); assert.ok(x.int_case && x.real_case && x.zero_case);",
+        serde_json::to_string(path.to_str().unwrap()).unwrap()
+    );
+    let output = Command::new("node")
+        .args(["--input-type=module", "--eval", &probe])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

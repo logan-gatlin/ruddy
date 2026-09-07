@@ -143,6 +143,15 @@ fn whole_file_errors_are_results_and_invalid_text_does_not_overwrite_files() {
 extern invalid_path: String = "'bad' + String.fromCharCode(0) + 'path'"
 extern invalid_text: String = "String.fromCharCode(55296)"
 let main = fn _ => do
+  let _ = expect_error "NotFound" (std::fs::read_bytes "missing")
+  let _ = expect_error "NotFound" (std::fs::write_bytes "missing/child" [0n8])
+  let _ = expect_error "NotFound" (std::fs::append_bytes "missing/child" [0n8])
+  let _ = expect_error "IsDirectory" (std::fs::read_bytes "directory")
+  let _ = expect_error "IsDirectory" (std::fs::write_bytes "directory" [0n8])
+  let _ = expect_error "IsDirectory" (std::fs::append_bytes "directory" [0n8])
+  let _ = expect_error "InvalidPath" (std::fs::read_bytes invalid_path)
+  let _ = expect_error "InvalidPath" (std::fs::write_bytes invalid_path [0n8])
+  let _ = expect_error "InvalidPath" (std::fs::append_bytes invalid_path [0n8])
   let _ = expect_error "NotFound" (std::fs::read_text "missing")
   let _ = expect_error "NotFound" (std::fs::remove_file "missing")
   let _ = expect_error "NotFound" (std::fs::remove_dir "missing")
@@ -258,12 +267,36 @@ fn whole_file_local_handlers_receive_named_fields_and_survive_suspension() {
 extern pause: () -> () = "() => new Promise(resolve => setTimeout(() => resolve({}), 1))"
 let main = fn _ => handle do
     let _ = pause ()
+    let _ = expect (std::fs::write_bytes "virtual" [0n8, 255n8])
+    let _ = expect (std::fs::append_bytes "virtual" [128n8])
+    let _ = match expect (std::fs::read_bytes "virtual") with
+      | [0n8, 255n8, 128n8] => ()
+      | _ => fail "Local binary read"
+    end
     let _ = expect (std::fs::write_text "virtual" "contents")
     let _ = expect (std::fs::append_text "virtual" "contents")
     let _ = expect (std::fs::rename "virtual" "destination")
     let _ = expect (std::fs::copy_file "virtual" "destination")
     return assert (std::str::equal (expect (std::fs::read_text "virtual")) "virtual contents") "Local read"
   end with
+  | std::!FileSystem.read_bytes _ => do
+      let _ = pause ()
+      return #Some [0n8, 255n8, 128n8]
+    end
+  | std::!FileSystem.write_bytes request => do
+      let _ = assert (std::str::equal request.path "virtual") "Named binary write path"
+      return match request.bytes with
+        | [0n8, 255n8] => #Some ()
+        | _ => fail "Named binary write bytes"
+      end
+    end
+  | std::!FileSystem.append_bytes request => do
+      let _ = assert (std::str::equal request.path "virtual") "Named binary append path"
+      return match request.bytes with
+        | [128n8] => #Some ()
+        | _ => fail "Named binary append bytes"
+      end
+    end
   | std::!FileSystem.read_text _ => do
       let _ = pause ()
       return #Some "virtual contents"
@@ -300,4 +333,84 @@ let main = fn _ => handle do
     run(project.path(), "");
     assert!(!project.path().join("virtual").exists());
     assert!(!project.path().join("destination").exists());
+}
+
+#[test]
+fn whole_file_binary_bytes_preserve_all_values_order_and_array_boundaries() {
+    let project = project(
+        r#"
+let byte_at = fn bytes index => match std::array::get bytes index with
+  | #Some byte => byte
+  | #None => fail "Missing byte"
+end
+let verify = fn bytes index =>
+  if std::nat::equal index (std::array::len bytes) then ()
+  else do
+    let expected = std::nat::from_nat8 (std::nat::remainder index 256n)
+    let _ = assert (std::nat::equal8 (byte_at bytes index) expected) "Byte changed"
+    return verify bytes (std::nat::add index 1n)
+  end end
+let main = fn _ => do
+  let bytes : [Nat8] = expect (std::fs::read_bytes "input")
+  let _ = assert (std::nat::equal (std::array::len bytes) 65537n) "Binary length"
+  let _ = verify bytes 0n
+  let _ = expect_error "InvalidEncoding" (std::fs::read_text "input")
+  let write = std::fs::write_bytes "output"
+  let _ = expect (write bytes)
+  let _ = expect (std::fs::append_bytes "output" [0n8, 255n8, 128n8])
+  let reread = expect (std::fs::read_bytes "output")
+  let _ = assert (std::nat::equal (std::array::len reread) 65540n) "Append length"
+  let _ = assert (std::nat::equal8 (byte_at reread 65538n) 255n8) "Append order"
+  let _ = assert (std::nat::equal8 (byte_at reread 65539n) 128n8) "Append high bit"
+  let _ = expect (std::fs::write_bytes "truncated" [255n8])
+  let _ = expect (std::fs::write_bytes "empty" [])
+  let _ = expect (std::fs::append_bytes "appended" [128n8])
+  let _ = expect (std::fs::append_bytes "empty-append" [])
+  let _ = match expect (std::fs::read_bytes "empty") with
+    | [] => ()
+    | _ => fail "Empty binary read"
+  end
+  let changed = match std::array::set bytes 0n 255n8 with
+    | #Some changed => changed
+    | #None => fail "Cannot update byte array"
+  end
+  let _ = expect (std::fs::write_bytes "changed" changed)
+  return assert (std::nat::equal8 (byte_at bytes 0n) 0n8) "Writing mutated source array"
+end
+"#,
+    );
+    let bytes: Vec<u8> = (0..65537).map(|index| (index % 256) as u8).collect();
+    fs::write(project.path().join("input"), &bytes).unwrap();
+    fs::write(project.path().join("truncated"), &bytes).unwrap();
+    fs::write(project.path().join("empty"), &bytes).unwrap();
+    run(project.path(), "");
+    let mut appended = bytes.clone();
+    appended.extend([0, 255, 128]);
+    assert_eq!(fs::read(project.path().join("output")).unwrap(), appended);
+    assert_eq!(fs::read(project.path().join("truncated")).unwrap(), [255]);
+    assert!(fs::read(project.path().join("empty")).unwrap().is_empty());
+    assert!(
+        fs::read(project.path().join("empty-append"))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(fs::read(project.path().join("appended")).unwrap(), [128]);
+    let mut changed = bytes.clone();
+    changed[0] = 255;
+    assert_eq!(fs::read(project.path().join("changed")).unwrap(), changed);
+    assert_eq!(fs::read(project.path().join("input")).unwrap(), bytes);
+}
+
+#[test]
+fn whole_file_binary_writes_require_nat8_elements() {
+    for literal in ["1n", "1i8", "1"] {
+        let project = project(&format!(
+            "let main = fn _ => match std::fs::write_bytes \"out\" [{literal}] with | #Some _ => () | #Error _ => () end"
+        ));
+        let error = ruddy_cli::check_project(project.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("[type-mismatch]"), "{error}");
+        assert!(!project.path().join("out").exists());
+    }
 }

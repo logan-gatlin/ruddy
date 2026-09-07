@@ -264,10 +264,11 @@ pub enum Op {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rep {
-    /// An unsigned 64-bit integer.
+    /// A target-sized natural number.
     Nat,
-    /// A signed 64-bit integer.
+    /// A target-sized signed integer.
     Int,
+    Fixed(crate::types::FixedInt),
     /// A 64-bit floating-point number.
     Real,
     String,

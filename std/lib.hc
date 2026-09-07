@@ -4,6 +4,9 @@ effect Console = { write: String -> (), write_error: String -> () }
 effect Process = { exit: Nat -> Never }
 
 effect FileSystem = {
+  read_bytes: String -> Result [Nat8] fs::Error,
+  write_bytes: { path: String, bytes: [Nat8] } -> Result () fs::Error,
+  append_bytes: { path: String, bytes: [Nat8] } -> Result () fs::Error,
   read_text: String -> Result String fs::Error,
   write_text: { path: String, text: String } -> Result () fs::Error,
   append_text: { path: String, text: String } -> Result () fs::Error,

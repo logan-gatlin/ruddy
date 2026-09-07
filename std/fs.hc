@@ -17,6 +17,14 @@ type FileKind = #File | #Directory | #Symlink | #Other
 type Metadata = { kind: FileKind, size: Nat }
 type DirEntry = { name: String, kind: FileKind }
 
+let read_bytes = !FileSystem.read_bytes
+
+let write_bytes = fn path bytes =>
+  !FileSystem.write_bytes { path: path, bytes: bytes }
+
+let append_bytes = fn path bytes =>
+  !FileSystem.append_bytes { path: path, bytes: bytes }
+
 let read_text = !FileSystem.read_text
 
 let write_text = fn path text =>
