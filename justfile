@@ -6,11 +6,13 @@
 port := "7878"
 dev_dir := justfile_directory() / "debug/.dev"
 
-# The Ruddy sources `just fmt` keeps formatted: the standard library, the
-# backend's platform files, and the demo. The tree-sitter corpus and the
-# diagnostics fixtures are left alone, since their exact text is under test,
-# and so is the handler fragment the backend splices into generated code.
-ruddy_sources := "std demo.rud src/backend/node-platform.rud src/backend/node-entry.rud"
+# The Ruddy sources `just fmt` keeps formatted: the standard library and the
+# backend's platform files. The tree-sitter corpus and the diagnostics
+# fixtures are left alone, since their exact text is under test; so is the
+# handler fragment the backend splices into generated code, which is not a
+# file; and so is the debugger's demo, which ends in deliberate syntax errors
+# that a format run rightly reports.
+ruddy_sources := "std src/backend/node-platform.rud src/backend/node-entry.rud"
 
 _default:
     @just --list --unsorted

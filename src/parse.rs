@@ -2991,7 +2991,8 @@ impl Parser {
     /// mistaken for the block's; and read with its complaints put back, since
     /// nothing in it was going to be kept.
     fn skip_block(&mut self, from: usize) {
-        let mark = (self.errors.len(), self.skipped.len(), from);
+        let errors_before = self.errors.len();
+        let skipped_before = self.skipped.len();
         while self
             .peek()
             .is_some_and(|tok| !matches!(tok.tracked, Kind::End))
@@ -3004,11 +3005,11 @@ impl Parser {
             }
             self.block_stmt();
         }
-        self.errors.truncate(mark.0);
+        self.errors.truncate(errors_before);
         // The whole of what was read is one dropped region, whatever the
         // statements inside it recorded on their own.
-        self.skipped.truncate(mark.1);
-        self.dropped_since(mark.2);
+        self.skipped.truncate(skipped_before);
+        self.dropped_since(from);
     }
 
     /// `match <expr> with | <arm> (| <arm>)* end`, where an arm is

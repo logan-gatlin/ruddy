@@ -25,41 +25,32 @@ fn main() -> ExitCode {
             for diagnostic in &report.diagnostics {
                 eprintln!("{}", diagnostic.render(stderr_color()));
             }
+            let (per_file, verb, changed) = if report.check {
+                ("Would format", "Checked", "would change")
+            } else {
+                ("Formatted", "Formatted", "changed")
+            };
             for path in &report.changed {
-                println!(
-                    "{} `{}`",
-                    if report.check {
-                        "Would format"
-                    } else {
-                        "Formatted"
-                    },
-                    path.display()
-                );
+                println!("{per_file} `{}`", path.display());
             }
             let files = report.changed.len() + report.unchanged.len();
-            println!(
-                "{} {} {}, {} {}",
-                if report.check { "Checked" } else { "Formatted" },
-                files,
-                if files == 1 { "file" } else { "files" },
-                report.changed.len(),
-                if report.check {
-                    "would change"
-                } else {
-                    "changed"
-                }
-            );
+            let noun = if files == 1 { "file" } else { "files" };
+            println!("{verb} {files} {noun}, {} {changed}", report.changed.len());
             if report.failed() {
                 ExitCode::FAILURE
             } else {
                 ExitCode::SUCCESS
             }
         }
-        Ok(ruddy_cli::Outcome::FormattedStdin { errors }) => {
-            if errors {
-                ExitCode::FAILURE
-            } else {
+        Ok(ruddy_cli::Outcome::FormattedStdin { text, diagnostics }) => {
+            for diagnostic in &diagnostics {
+                eprintln!("{}", diagnostic.render(stderr_color()));
+            }
+            print!("{text}");
+            if diagnostics.is_empty() {
                 ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
             }
         }
         Err(error) if error.is_success() => {

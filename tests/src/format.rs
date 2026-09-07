@@ -832,3 +832,61 @@ fn width_is_measured_in_characters() {
     );
     assert_eq!(fmt(&exact), format!("{exact}\n"));
 }
+
+/// A comment on the line before an operand goes in front of its operator,
+/// one before a case in front of its bar, and one between a definition's
+/// attributes and its keyword between them.
+#[test]
+fn comments_before_operators_stay_in_front_of_them() {
+    assert_eq!(
+        fmt("let p = a\n  -- about f\n  |> f\n  |> g"),
+        "let p = a\n  -- about f\n  |> f\n  |> g\n"
+    );
+    assert_eq!(
+        fmt("let b = a\n  -- about b\n  + b\nlet c = cell\n  -- about the value\n  := 1n"),
+        "let b = a\n  -- about b\n  + b\nlet c = cell\n  -- about the value\n  := 1n\n"
+    );
+    assert_eq!(
+        fmt("let f = g\n  -- about a\n  a\n  b"),
+        "let f = g\n  -- about a\n  a\n  b\n"
+    );
+    assert_eq!(
+        fmt("type T =\n  Nat\n  -- about the result\n  -> Nat"),
+        "type T =\n  Nat\n  -- about the result\n  -> Nat\n"
+    );
+    assert_eq!(
+        fmt("type T =\n  -- first\n  | #A\n  -- second\n  | #B\ntype E = | -- tail\n  ..'r"),
+        "type T =\n  -- first\n  | #A\n  -- second\n  | #B\ntype E =\n  | -- tail\n  ..'r\n"
+    );
+    assert_eq!(
+        fmt("@doc \"x\"\n-- about x\nlet x = 1n\n@a\n(* inline *) type T = Nat"),
+        "@doc \"x\"\n-- about x\nlet x = 1n\n@a\n(* inline *)\ntype T = Nat\n"
+    );
+}
+
+#[test]
+fn indented_comment_lines_stay_as_written() {
+    assert_eq!(
+        fmt("-- para\n--   deeper one\n--   deeper two\n-- para again\nlet x = 1n"),
+        "-- para\n--   deeper one\n--   deeper two\n-- para again\nlet x = 1n\n"
+    );
+    assert_eq!(
+        fmt("(*\n  first\n    indented\n  second\n*)\nlet x = 1n"),
+        "(*\n  first\n    indented\n  second\n*)\nlet x = 1n\n"
+    );
+    // A block comment beside code that spans lines is re-indented too.
+    assert_eq!(
+        fmt("let x = 1n (* a\n  b *)\nlet y = (* c\nd *) 2n"),
+        "let x = 1n (* a\n  b\n*)\nlet y = (* c\n  d\n*) 2n\n"
+    );
+}
+
+/// The break the author made is between `then` and `end`; one in front of
+/// `then` is not one.
+#[test]
+fn a_newline_before_then_does_not_break_a_conditional() {
+    assert_eq!(
+        fmt("let c = if a\n  then b else c end"),
+        "let c = if a then b else c end\n"
+    );
+}

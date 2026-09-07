@@ -31,11 +31,13 @@ trailing newline, never hard tabs.
   parser internals stay untouched.
 - **Literals.** Strings, quoted tags and quoted field labels are copied
   verbatim from the source by span, so the author's escapes survive. Numbers
-  are normalized: reals print as the shortest decimal that round-trips to the
-  same `f64` (`1.0` → `1`, `1.50` → `1.5`, `007` → `7`); naturals, integers
-  and fixed-width literals print their value followed by their suffix. No
-  exponent notation exists in the grammar so none is produced. Positional
-  field indices print as digits.
+  are normalized: reals textually — no leading zeros on the whole part, no
+  trailing zeros on the fraction, no fraction when it is zero (`1.0` → `1`,
+  `1.50` → `1.5`, `007` → `7`) — rather than through the decoded double, so
+  a literal wider than a double's precision keeps every digit the author
+  wrote; naturals, integers and fixed-width literals print their value
+  followed by their suffix. No exponent notation exists in the grammar so
+  none is produced. Positional field indices print as digits.
 
 ## Error recovery contract
 
@@ -94,15 +96,24 @@ trailing newline, never hard tabs.
 - Broken `if` chains use the corpus style: the branch stays on the `then`
   line when it fits, `else if` and `else` sit at the `if` column, `end`
   closes at the `if` column.
-- Long `let`: break after `=` first, then at `->` in the type signature
-  (continuation lines at the type's indentation), then inside the body by its
-  own rules. A `let`, `fn` or `return` whose body is a `match`, `handle` or
-  `do` hugs: the block's first line stays on the `=`/`=>` line and its arms
-  or statements follow at that line's indentation.
+- A body after `=` or `=>` is laid out by what it is. A block (`match`,
+  `handle`, `do`), a braced or bracketed literal, or a function *hugs*: it
+  stays on the line when its first line fits there — a match's arms follow
+  at that line's indentation, a brace opens there, a function keeps its
+  header there — and moves down a line otherwise. Anything else after `=`
+  or `return` is *fluid*: whole on the same line when it fits, else whole on
+  the next line one level in, else its first line on the same line and the
+  rest broken under it, else broken on the next line. Anything else after
+  an arm's `=>` moves down a line, whole when it fits and broken otherwise;
+  a nested `match` never hugs an arm, since its arms would sit in the column
+  of the arms around it. Only after that does a `let` header break: after
+  `:` with the type one level in, then at `->` in the type signature
+  (continuation lines at the type's indentation).
 - Broken applications put each argument on its own line, indented one level
-  under the function. Broken pipelines put each `|> step` on its own line at
-  the indentation of the first operand. Broken operator chains break before
-  the operator with the continuation indented one level.
+  under the function, except that a braced or bracketed last argument hugs
+  the call when the head and the other arguments fit in front of its
+  bracket. Broken pipelines and operator chains break before each `|>` or
+  operator, indented one level under the first operand.
 - Raw `\\` strings are re-indented line by line to the current indentation,
   their content untouched, and nothing is ever inserted between consecutive
   `\\` lines. Nothing follows a raw string on its line.
@@ -128,7 +139,10 @@ trailing newline, never hard tabs.
   get their interior re-indented one level under the `(*` column with the
   same paragraph rules applied.
 - A trailing comment that overflows the width wraps onto continuation `--`
-  lines aligned under the original `--`.
+  lines aligned under the original `--`; a line comment aligned under a
+  trailing comment's `--` on the next line is read back as its
+  continuation, which is what makes the wrapping a fixed point. Rule lines
+  (`---`, `===`) and indented lines are kept verbatim like list items.
 - Blank lines between a leading comment and its node are preserved,
   collapsed to one.
 
@@ -138,7 +152,9 @@ trailing newline, never hard tabs.
 - `just fmt` also runs `ruddy fmt` over the repository's Ruddy sources and
   `just fmt-check` runs `--check`, so `just check` enforces it.
   `treesitter/test/` and the diagnostics fixtures are excluded: their exact
-  text is under test.
+  text is under test. So is the backend's handler fragment, which is not a
+  file, and the debugger's demo, which ends in deliberate syntax errors that
+  a format run rightly reports (it was reformatted once by hand).
 - The corpus reformat lands as the final commit and doubles as the
   idempotence test. Tests live in `tests/src/format.rs` and
   `tests/src/cli.rs`, run via `just test`.

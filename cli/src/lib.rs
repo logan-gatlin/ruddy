@@ -98,9 +98,12 @@ pub enum Outcome {
     Ran(PathBuf),
     /// Source files were formatted, or checked.
     Formatted(FormatReport),
-    /// Standard input was formatted to standard output. Carries whether the
-    /// input had syntax errors, which the output was written despite.
-    FormattedStdin { errors: bool },
+    /// Standard input was formatted: the text to write to standard output,
+    /// and the syntax errors it was formatted around.
+    FormattedStdin {
+        text: String,
+        diagnostics: Vec<CompileDiagnostic>,
+    },
 }
 
 /// What `ruddy fmt` did to a set of files.
@@ -229,15 +232,7 @@ where
                 CliError::one(format!("could not read standard input: {error}"))
             })?;
             let (text, diagnostics) = format_source(&source, Path::new("<stdin>"));
-            for diagnostic in &diagnostics {
-                eprintln!("{}", diagnostic.render(stderr_color()));
-            }
-            io::stdout().write_all(text.as_bytes()).map_err(|error| {
-                CliError::one(format!("could not write standard output: {error}"))
-            })?;
-            Ok(Outcome::FormattedStdin {
-                errors: !diagnostics.is_empty(),
-            })
+            Ok(Outcome::FormattedStdin { text, diagnostics })
         }
         Command::Fmt { paths, check, .. } => {
             format_paths(&paths, current_directory, check).map(Outcome::Formatted)
@@ -316,22 +311,11 @@ fn format_source(source: &str, path: &Path) -> (String, Vec<CompileDiagnostic>) 
     let id = files.register_new_file(name, source.to_string());
     let formatted = ruddy::format::format(source, id);
     let directory = path.parent().unwrap_or(Path::new(""));
-    let mut errors: Vec<(&'static str, ui::Diagnostic)> = formatted
-        .lex_errors
-        .iter()
-        .map(|error| ("lex", error.diagnostic()))
-        .chain(
-            formatted
-                .parse_errors
-                .iter()
-                .map(|error| ("parse", error.diagnostic())),
-        )
-        .collect();
-    errors.sort_by_key(|(_, error)| error.primary.span.start);
-    let diagnostics = errors
-        .iter()
-        .map(|(stage, error)| source_diagnostic(&mut files, stage, error, directory))
-        .collect();
+    let diagnostics = source_diagnostics(
+        &mut files,
+        syntax_diagnostics(&formatted.lex_errors, &formatted.parse_errors),
+        directory,
+    );
     (formatted.text, diagnostics)
 }
 
@@ -369,21 +353,17 @@ fn collect_sources(
     if nested && directory.join(MANIFEST).is_file() {
         return Ok(());
     }
+    let unreadable = |error: io::Error| {
+        CliError::one(format!(
+            "could not read folder `{}`: {error}",
+            directory.display()
+        ))
+    };
     let mut entries: Vec<PathBuf> = fs::read_dir(directory)
-        .map_err(|error| {
-            CliError::one(format!(
-                "could not read folder `{}`: {error}",
-                directory.display()
-            ))
-        })?
+        .map_err(unreadable)?
         .map(|entry| entry.map(|entry| entry.path()))
         .collect::<Result<_, _>>()
-        .map_err(|error| {
-            CliError::one(format!(
-                "could not read folder `{}`: {error}",
-                directory.display()
-            ))
-        })?;
+        .map_err(unreadable)?;
     entries.sort();
     for path in entries {
         if path.is_dir() {
@@ -2399,27 +2379,19 @@ fn compile_one(
     if frontend_errors != 0 {
         let mut diagnostics = Vec::with_capacity(frontend_errors);
         for file in &loaded.loaded {
-            let mut source_errors: Vec<(&'static str, ui::Diagnostic)> = file
-                .lex_errors
-                .iter()
-                .map(|error| ("lex", error.diagnostic()))
-                .chain(
-                    file.parse_errors
-                        .iter()
-                        .map(|error| ("parse", error.diagnostic())),
-                )
-                .chain(
-                    loaded
-                        .errors
-                        .iter()
-                        .filter(|error| error.span.file_id == file.id)
-                        .map(|error| ("bundle", error.diagnostic_in(source_directory))),
-                )
-                .collect();
-            source_errors.sort_by_key(|(_, error)| error.primary.span.start);
-            diagnostics.extend(source_errors.iter().map(|(stage, error)| {
-                source_diagnostic(&mut files, stage, error, source_directory)
-            }));
+            let mut source_errors = syntax_diagnostics(&file.lex_errors, &file.parse_errors);
+            source_errors.extend(
+                loaded
+                    .errors
+                    .iter()
+                    .filter(|error| error.span.file_id == file.id)
+                    .map(|error| ("bundle", error.diagnostic_in(source_directory))),
+            );
+            diagnostics.extend(source_diagnostics(
+                &mut files,
+                source_errors,
+                source_directory,
+            ));
         }
         return Err(CompileError::from_diagnostics(diagnostics));
     }
@@ -2834,6 +2806,36 @@ pub fn render_diagnostic_with_advice(
         .expect("Ariadne diagnostics are UTF-8")
         .trim_end()
         .to_owned()
+}
+
+/// The diagnostics of one file's lexical and syntactic errors, each with the
+/// phase that found it.
+fn syntax_diagnostics(
+    lex_errors: &[ruddy::token::Error],
+    parse_errors: &[ruddy::parse::Error],
+) -> Vec<(&'static str, ui::Diagnostic)> {
+    lex_errors
+        .iter()
+        .map(|error| ("lex", error.diagnostic()))
+        .chain(
+            parse_errors
+                .iter()
+                .map(|error| ("parse", error.diagnostic())),
+        )
+        .collect()
+}
+
+/// One file's diagnostics, rendered in source order.
+fn source_diagnostics(
+    files: &mut FileManager,
+    mut errors: Vec<(&'static str, ui::Diagnostic)>,
+    source_directory: &Path,
+) -> Vec<CompileDiagnostic> {
+    errors.sort_by_key(|(_, error)| error.primary.span.start);
+    errors
+        .iter()
+        .map(|(stage, error)| source_diagnostic(files, stage, error, source_directory))
+        .collect()
 }
 
 fn source_diagnostic(

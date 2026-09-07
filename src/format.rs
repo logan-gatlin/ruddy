@@ -49,6 +49,10 @@ pub const WIDTH: usize = 100;
 /// One level of indentation, in spaces.
 pub const INDENT: usize = 2;
 
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
 /// A file, formatted, with the diagnostics found on the way. The text is
 /// complete whatever the errors: what the parser could not read is copied
 /// from the source rather than dropped.
@@ -58,80 +62,6 @@ pub struct Formatted {
     pub lex_errors: Vec<token::Error>,
     pub parse_errors: Vec<parse::Error>,
 }
-
-impl Formatted {
-    /// Whether the source had any lexical or syntactic error.
-    pub fn has_errors(&self) -> bool {
-        !self.lex_errors.is_empty() || !self.parse_errors.is_empty()
-    }
-}
-
-/// Lex, parse and format one file.
-pub fn format(source: &str, file: FileID) -> Formatted {
-    let lexed = token::lex(source, file);
-    let parsed = parse::parse(lexed.tokens);
-    let text = format_parsed(source, &parsed, &lexed.errors);
-    Formatted {
-        text,
-        lex_errors: lexed.errors,
-        parse_errors: parsed.errors,
-    }
-}
-
-/// Format a file already parsed. `source` must be the text `parsed` was read
-/// from: every span in the tree indexes it.
-pub fn format_parsed(source: &str, parsed: &parse::Output, lex_errors: &[token::Error]) -> String {
-    let mut problems: Vec<usize> = lex_errors
-        .iter()
-        .map(|error| error.span.start)
-        .chain(parsed.errors.iter().map(|error| error.span.start))
-        .chain(parsed.skipped.iter().map(|span| span.start))
-        .collect();
-    problems.sort_unstable();
-    problems.dedup();
-    let mut printer = Printer {
-        source,
-        skipped: &parsed.skipped,
-        problems,
-        leading: HashMap::new(),
-        trailing: HashMap::new(),
-        dangling: HashMap::new(),
-    };
-    // One byte past the source, so no statement that fills the whole file
-    // shares the root's span and takes its comments.
-    let file = FileID::GENERATED.span(0, source.len() + 1);
-    let root = printer.file_skeleton(&parsed.stmts, file);
-    for comment in &parsed.comments {
-        let (text, block) = match &comment.tracked {
-            Kind::LineComment(text) => (text.clone(), false),
-            Kind::BlockComment(text) => (text.clone(), true),
-            _ => continue,
-        };
-        printer.attach(
-            &root,
-            Comment {
-                span: comment.span,
-                text,
-                block,
-                own_line: false,
-            },
-        );
-    }
-    let mut doc = printer.file(&parsed.stmts, file);
-    propagate_breaks(&mut doc);
-    let mut text = print(&doc);
-    while text.ends_with('\n') {
-        text.pop();
-    }
-    if !text.is_empty() {
-        text.push('\n');
-    }
-    text
-}
-
-// ---------------------------------------------------------------------------
-// The document
-// ---------------------------------------------------------------------------
 
 /// What a printer builds: text and the places it may bend.
 #[derive(Debug, Clone)]
@@ -207,6 +137,144 @@ enum Layout {
     /// fits and broken otherwise.
     Down,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Flat,
+    Break,
+}
+
+#[derive(Clone, Copy)]
+struct Cmd<'d> {
+    indent: usize,
+    mode: Mode,
+    doc: &'d Doc,
+}
+
+static SPACE: Doc = Doc::Space;
+static LINE: Doc = Doc::Line;
+
+#[derive(Debug, Clone)]
+struct Comment {
+    span: Span,
+    text: String,
+    block: bool,
+    /// Whether the comment prints on a line of its own in front of its node,
+    /// as opposed to inline on the node's line. Decided when attached.
+    own_line: bool,
+}
+
+/// One node of the tree, as a span and its children, for attaching comments.
+/// A node that ends in a closing token — `end`, `}`, `)`, `]` — takes the
+/// comments written after its last child as its own, to print before the
+/// closer. A verbatim node is copied from the source with its comments in
+/// it, so none attaches to anything inside.
+struct Skel {
+    span: Span,
+    closer: bool,
+    verbatim: bool,
+    kids: Vec<Skel>,
+}
+
+/// One entry of a statement list: a statement the parser read, or a region
+/// it dropped, copied back as written.
+#[derive(Clone, Copy)]
+enum Item<'a> {
+    Stmt(&'a Stmt),
+    Skipped(Span),
+}
+
+struct Printer<'a> {
+    source: &'a str,
+    /// Every comment's span, in source order: a newline inside one is not
+    /// a break the author made around the code.
+    comment_spans: Vec<Span>,
+    skipped: &'a [Span],
+    /// Where every error and every dropped region starts, sorted.
+    problems: Vec<usize>,
+    leading: HashMap<Span, Vec<Comment>>,
+    trailing: HashMap<Span, Vec<Comment>>,
+    dangling: HashMap<Span, Vec<Comment>>,
+}
+
+// ---------------------------------------------------------------------------
+// Entry points
+// ---------------------------------------------------------------------------
+
+impl Formatted {
+    /// Whether the source had any lexical or syntactic error.
+    pub fn has_errors(&self) -> bool {
+        !self.lex_errors.is_empty() || !self.parse_errors.is_empty()
+    }
+}
+
+/// Lex, parse and format one file.
+pub fn format(source: &str, file: FileID) -> Formatted {
+    let lexed = token::lex(source, file);
+    let parsed = parse::parse(lexed.tokens);
+    let text = format_parsed(source, &parsed, &lexed.errors);
+    Formatted {
+        text,
+        lex_errors: lexed.errors,
+        parse_errors: parsed.errors,
+    }
+}
+
+/// Format a file already parsed. `source` must be the text `parsed` was read
+/// from: every span in the tree indexes it.
+pub fn format_parsed(source: &str, parsed: &parse::Output, lex_errors: &[token::Error]) -> String {
+    let mut problems: Vec<usize> = lex_errors
+        .iter()
+        .map(|error| error.span.start)
+        .chain(parsed.errors.iter().map(|error| error.span.start))
+        .chain(parsed.skipped.iter().map(|span| span.start))
+        .collect();
+    problems.sort_unstable();
+    problems.dedup();
+    let mut printer = Printer {
+        source,
+        comment_spans: parsed.comments.iter().map(|comment| comment.span).collect(),
+        skipped: &parsed.skipped,
+        problems,
+        leading: HashMap::new(),
+        trailing: HashMap::new(),
+        dangling: HashMap::new(),
+    };
+    // One byte past the source, so no statement that fills the whole file
+    // shares the root's span and takes its comments.
+    let file = FileID::GENERATED.span(0, source.len() + 1);
+    let root = printer.file_skeleton(&parsed.stmts, file);
+    for comment in &parsed.comments {
+        let (text, block) = match &comment.tracked {
+            Kind::LineComment(text) => (text.clone(), false),
+            Kind::BlockComment(text) => (text.clone(), true),
+            _ => continue,
+        };
+        printer.attach(
+            &root,
+            Comment {
+                span: comment.span,
+                text,
+                block,
+                own_line: false,
+            },
+        );
+    }
+    let mut doc = printer.file(&parsed.stmts, file);
+    propagate_breaks(&mut doc);
+    let mut text = print(&doc);
+    while text.ends_with('\n') {
+        text.pop();
+    }
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    text
+}
+
+// ---------------------------------------------------------------------------
+// The document and its layout
+// ---------------------------------------------------------------------------
 
 fn text(text: impl Into<String>) -> Doc {
     Doc::Text(text.into())
@@ -296,22 +364,6 @@ fn propagate_breaks(doc: &mut Doc) -> bool {
         }
     }
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    Flat,
-    Break,
-}
-
-#[derive(Clone, Copy)]
-struct Cmd<'d> {
-    indent: usize,
-    mode: Mode,
-    doc: &'d Doc,
-}
-
-static SPACE: Doc = Doc::Space;
-static LINE: Doc = Doc::Line;
 
 fn width_of(text: &str) -> usize {
     text.chars().count()
@@ -821,10 +873,9 @@ fn verbatim_comment_line(trimmed: &str) -> bool {
 /// after the comment's `--`; each output line is text to print after `-- `,
 /// or empty for a blank comment line.
 ///
-/// Consecutive lines at one indentation are a paragraph, refilled to
-/// `width`. A paragraph ends at a blank line, at a line indented deeper than
-/// the paragraph's first (kept verbatim), at a list item or rule (kept
-/// verbatim), or at a line indented less (which starts a new paragraph).
+/// Consecutive unindented lines are a paragraph, refilled to `width`. A
+/// paragraph ends at a blank line, at an indented line, or at a list item
+/// or rule, each of which is kept verbatim.
 fn reflow(lines: &[String], width: usize) -> Vec<String> {
     let normalized: Vec<(usize, String)> = lines
         .iter()
@@ -839,7 +890,8 @@ fn reflow(lines: &[String], width: usize) -> Vec<String> {
     let mut at = 0;
     while at < normalized.len() {
         let (indent, ref first) = normalized[at];
-        if verbatim_comment_line(first) {
+        // An indented line is a code sample or a diagram: kept as written.
+        if indent > 0 || verbatim_comment_line(first) {
             out.push(if first.is_empty() {
                 String::new()
             } else {
@@ -852,19 +904,27 @@ fn reflow(lines: &[String], width: usize) -> Vec<String> {
         let mut end = at + 1;
         while end < normalized.len() {
             let (next_indent, ref next) = normalized[end];
-            if next_indent != indent || verbatim_comment_line(next) {
+            if next_indent > 0 || verbatim_comment_line(next) {
                 break;
             }
             paragraph.push(next);
             end += 1;
         }
-        let joined = paragraph.join(" ");
-        for line in fill(&joined, width.saturating_sub(indent)) {
-            out.push(format!("{}{line}", " ".repeat(indent)));
-        }
+        out.extend(fill(&paragraph.join(" "), width));
         at = end;
     }
     out
+}
+
+/// A block comment on a line with code: as written when it fits on the
+/// line, and re-indented under its opener when it spans lines, since a text
+/// may not hold a newline.
+fn inline_block_comment(comment: &str) -> Doc {
+    if comment.contains('\n') {
+        Doc::BlockComment(comment.to_string())
+    } else {
+        text(format!("(*{comment}*)"))
+    }
 }
 
 /// The lines of an own-line block comment as printed: `(*` and `*)` at the
@@ -914,30 +974,8 @@ fn block_comment_lines(comment: &str, width: usize) -> Vec<(usize, String)> {
 }
 
 // ---------------------------------------------------------------------------
-// Comments and their attachment
+// Spans, skeletons and comment attachment
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-struct Comment {
-    span: Span,
-    text: String,
-    block: bool,
-    /// Whether the comment prints on a line of its own in front of its node,
-    /// as opposed to inline on the node's line. Decided when attached.
-    own_line: bool,
-}
-
-/// One node of the tree, as a span and its children, for attaching comments.
-/// A node that ends in a closing token — `end`, `}`, `)`, `]` — takes the
-/// comments written after its last child as its own, to print before the
-/// closer. A verbatim node is copied from the source with its comments in
-/// it, so none attaches to anything inside.
-struct Skel {
-    span: Span,
-    closer: bool,
-    verbatim: bool,
-    kids: Vec<Skel>,
-}
 
 impl Skel {
     fn leaf(span: Span) -> Self {
@@ -966,14 +1004,6 @@ impl Skel {
             kids: Vec::new(),
         }
     }
-}
-
-/// One entry of a statement list: a statement the parser read, or a region
-/// it dropped, copied back as written.
-#[derive(Clone, Copy)]
-enum Item<'a> {
-    Stmt(&'a Stmt),
-    Skipped(Span),
 }
 
 impl Item<'_> {
@@ -1044,16 +1074,6 @@ fn effect_label_span(path: &Path, label: &EffectLabel) -> Span {
 // The printer
 // ---------------------------------------------------------------------------
 
-struct Printer<'a> {
-    source: &'a str,
-    skipped: &'a [Span],
-    /// Where every error and every dropped region starts, sorted.
-    problems: Vec<usize>,
-    leading: HashMap<Span, Vec<Comment>>,
-    trailing: HashMap<Span, Vec<Comment>>,
-    dangling: HashMap<Span, Vec<Comment>>,
-}
-
 impl<'a> Printer<'a> {
     // -- the source ---------------------------------------------------------
 
@@ -1061,9 +1081,18 @@ impl<'a> Printer<'a> {
         &self.source[span.start..span.end()]
     }
 
-    /// Whether the source has a newline in `from..to`.
+    /// Whether the source has a newline in `from..to` outside any comment.
     fn newline_between(&self, from: usize, to: usize) -> bool {
-        from < to && self.source[from..to].contains('\n')
+        if from >= to {
+            return false;
+        }
+        self.source[from..to]
+            .match_indices('\n')
+            .map(|(offset, _)| from + offset)
+            .any(|at| {
+                let next = self.comment_spans.partition_point(|span| span.start <= at);
+                next == 0 || self.comment_spans[next - 1].end() <= at
+            })
     }
 
     /// Whether the source has a whole blank line in `from..to`.
@@ -1257,7 +1286,7 @@ impl<'a> Printer<'a> {
         while at < comments.len() {
             let comment = &comments[at];
             if !comment.own_line {
-                parts.push(text(format!("(*{}*)", comment.text)));
+                parts.push(inline_block_comment(&comment.text));
                 parts.push(Doc::Space);
                 at += 1;
                 continue;
@@ -1298,7 +1327,7 @@ impl<'a> Printer<'a> {
             .iter()
             .flat_map(|comment| {
                 if comment.block {
-                    vec![Doc::Space, text(format!("(*{}*)", comment.text))]
+                    vec![Doc::Space, inline_block_comment(&comment.text)]
                 } else {
                     vec![Doc::LineSuffix(comment.text.clone()), Doc::BreakParent]
                 }
@@ -1507,8 +1536,19 @@ impl<'a> Printer<'a> {
         Skel::new(file, kids).closed()
     }
 
+    /// The span of the keyword a statement begins with, after its
+    /// attributes: what a comment between them attaches to.
+    fn keyword_span(&self, stmt: &Stmt) -> Span {
+        let keyword = self.source[stmt.span.start..]
+            .split(|c: char| !c.is_alphabetic())
+            .next()
+            .unwrap_or("");
+        stmt.span.file_id.span(stmt.span.start, keyword.len())
+    }
+
     fn stmt_skeleton(&self, stmt: &Stmt) -> Skel {
         let mut kids: Vec<Skel> = stmt.attributes.iter().map(attribute_skeleton).collect();
+        kids.push(Skel::leaf(self.keyword_span(stmt)));
         let mut closer = false;
         match &stmt.kind {
             StmtKind::Extern {
@@ -1572,6 +1612,8 @@ impl<'a> Printer<'a> {
             parts.push(self.attribute(attribute));
             parts.push(Doc::HardLine);
         }
+        // A comment between the attributes and the keyword stays there.
+        parts.extend(self.leading_docs(self.keyword_span(stmt)));
         parts.push(match &stmt.kind {
             StmtKind::Extern {
                 name,
@@ -1883,13 +1925,15 @@ impl<'a> Printer<'a> {
                     first.span.end(),
                     steps.iter().map(|(_, function)| function.span),
                 );
-                // Each inner node of the chain ends at its operand, so its
-                // trailing comments go after that operand.
+                // A comment in front of an operand goes in front of its
+                // operator; each inner node of the chain ends at its operand,
+                // so its trailing comments go after that operand.
                 let mut rest = Vec::new();
                 for (at, (node, function)) in steps.iter().enumerate() {
                     rest.push(Doc::Line);
+                    rest.extend(self.leading_docs(function.span));
                     rest.push(text("|> "));
-                    rest.push(self.expr_in(function, prec(function) <= Prec::Pipeline));
+                    rest.push(self.expr_after(function, prec(function) <= Prec::Pipeline));
                     if at + 1 < steps.len() {
                         rest.extend(self.trailing_docs(node.span));
                     }
@@ -1945,13 +1989,13 @@ impl<'a> Printer<'a> {
                         unreachable!("matched a binary expression")
                     };
                     let signal = self.newline_between(left.span.end(), right.span.start);
+                    let mut rest = vec![Doc::Line];
+                    rest.extend(self.leading_docs(right.span));
+                    rest.push(text(":= "));
+                    rest.push(self.expr_after(right, prec(right) < level));
                     let doc = concat(vec![
                         self.expr_in(left, prec(left) <= level),
-                        nest(concat(vec![
-                            Doc::Line,
-                            text(":= "),
-                            self.expr_in(right, prec(right) < level),
-                        ])),
+                        nest(concat(rest)),
                     ]);
                     return if signal { broken(doc) } else { group(doc) };
                 }
@@ -1974,8 +2018,9 @@ impl<'a> Printer<'a> {
                 let mut rest = Vec::new();
                 for (at, (node, op, right)) in operands.iter().enumerate() {
                     rest.push(Doc::Line);
+                    rest.extend(self.leading_docs(right.span));
                     rest.push(text(format!("{} ", symbol(op))));
-                    rest.push(self.expr_in(right, prec(right) <= level));
+                    rest.push(self.expr_after(right, prec(right) <= level));
                     if at + 1 < operands.len() {
                         rest.extend(self.trailing_docs(node.span));
                     }
@@ -2002,7 +2047,9 @@ impl<'a> Printer<'a> {
                 let arg_doc = |at: usize, arg: &Expr| {
                     let bare_tag = at + 1 == args.len()
                         && matches!(arg.tracked, ExprKind::Tag { payload: None, .. });
-                    self.expr_in(arg, prec(arg) < Prec::Atom && !bare_tag)
+                    let mut parts = self.leading_docs(arg.span);
+                    parts.push(self.expr_after(arg, prec(arg) < Prec::Atom && !bare_tag));
+                    concat(parts)
                 };
                 let head_doc = self.expr_in(head, prec(head) < Prec::Apply);
                 let mut rest = Vec::new();
@@ -2155,7 +2202,12 @@ impl<'a> Printer<'a> {
                 consequent,
                 alternative,
             } => {
-                let signal = self.newline_between(predicate.span.end(), expr.span.end());
+                let then_end = self.source[predicate.span.end()..]
+                    .find("then")
+                    .map_or(predicate.span.end(), |at| {
+                        predicate.span.end() + at + "then".len()
+                    });
+                let signal = self.newline_between(then_end, expr.span.end());
                 let mut parts = Vec::new();
                 let clause = |keyword: &str, predicate: &Expr, consequent: &Expr| {
                     vec![
@@ -2347,6 +2399,17 @@ impl<'a> Printer<'a> {
         } else {
             text(format!("{open}{close}"))
         }
+    }
+
+    /// An expression without the comments in front of it, for a position
+    /// that prints those in front of the operator or keyword before it.
+    fn expr_after(&self, expr: &Expr, parens: bool) -> Doc {
+        parenthesized(parens, self.with_trailing(expr.span, self.expr_kind(expr)))
+    }
+
+    /// [`expr_after`](Self::expr_after) for a type.
+    fn ty_after(&self, ty: &Type, parens: bool) -> Doc {
+        parenthesized(parens, self.with_trailing(ty.span, self.type_kind(ty)))
     }
 
     fn with_trailing(&self, span: Span, doc: Doc) -> Doc {
@@ -2603,10 +2666,11 @@ impl<'a> Printer<'a> {
                     }
                 }
                 parts.push(Doc::Line);
+                parts.extend(self.leading_docs(result.span));
                 parts.push(text("-> "));
                 spans.push(result.span);
                 let last_effects = steps.last().and_then(|(_, _, effects)| *effects);
-                parts.push(self.ty_in(
+                parts.push(self.ty_after(
                     result,
                     last_effects.is_some() && prec(result) == Prec::Arrow,
                 ));
@@ -2677,13 +2741,13 @@ impl<'a> Printer<'a> {
                             }
                             SumCase::Absent => text(self.slice(name.span)),
                         };
-                        (span, self.with_comments(span, doc))
+                        (span, self.with_trailing(span, doc))
                     })
                     .collect();
                 if let Some(tail) = tail {
                     entries.push((
                         tail.span,
-                        self.with_comments(tail.span, self.tail(&tail.of)),
+                        self.with_trailing(tail.span, self.tail(&tail.of)),
                     ));
                 }
                 // The empty sum, and the sum that is nothing but its tail:
@@ -2691,19 +2755,26 @@ impl<'a> Printer<'a> {
                 // without the bar.
                 if cases.is_empty() {
                     let mut parts = vec![text("|")];
-                    for (_, doc) in entries {
+                    for (span, doc) in entries {
                         parts.push(Doc::Space);
+                        parts.extend(self.leading_docs(span));
                         parts.push(doc);
                     }
                     return concat(parts);
                 }
                 let signal =
                     self.gaps_have_newline(ty.span.start, entries.iter().map(|(span, _)| *span));
-                let mut parts = vec![if_break(text("| "), nil())];
-                for (at, (_, doc)) in entries.into_iter().enumerate() {
+                // A comment in front of a case goes in front of its bar.
+                let mut parts = Vec::new();
+                for (at, (span, doc)) in entries.into_iter().enumerate() {
                     if at > 0 {
-                        parts.push(if_break(concat(vec![Doc::Line, text("| ")]), text(" | ")));
+                        parts.push(if_break(Doc::Line, nil()));
                     }
+                    parts.extend(self.leading_docs(span));
+                    parts.push(if_break(
+                        text("| "),
+                        if at == 0 { nil() } else { text(" | ") },
+                    ));
                     parts.push(doc);
                 }
                 let doc = concat(parts);
@@ -2944,7 +3015,120 @@ impl<'a> Printer<'a> {
             }
         }
     }
+
+    fn expr_skeleton(&self, expr: &Expr) -> Skel {
+        let kids = match &expr.tracked {
+            ExprKind::Function { args, body } => {
+                let mut kids: Vec<Skel> = args.iter().map(|arg| Skel::leaf(arg.span)).collect();
+                kids.push(self.expr_skeleton(body));
+                kids
+            }
+            ExprKind::MatchFunction { arms, .. } => {
+                arms.iter().map(|arm| self.arm_skeleton(arm)).collect()
+            }
+            ExprKind::Match { scrutinee, arms } => {
+                let mut kids = vec![self.expr_skeleton(scrutinee)];
+                kids.extend(arms.iter().map(|arm| self.arm_skeleton(arm)));
+                return Skel::new(expr.span, kids).closed();
+            }
+            ExprKind::Handle { body, arms } => {
+                let mut kids = vec![self.expr_skeleton(body)];
+                kids.extend(arms.iter().map(|arm| {
+                    Skel::new(
+                        handler_arm_span(arm),
+                        vec![Skel::leaf(arm.binder.span), self.expr_skeleton(&arm.body)],
+                    )
+                }));
+                return Skel::new(expr.span, kids).closed();
+            }
+            ExprKind::Do { stmts, result } => {
+                let mut kids: Vec<Skel> = self
+                    .items(stmts, result.as_ref().map(|result| result.span), expr.span)
+                    .into_iter()
+                    .map(|item| match item {
+                        Item::Stmt(stmt) => self.stmt_skeleton(stmt),
+                        Item::Skipped(span) => Skel::verbatim(span),
+                    })
+                    .collect();
+                kids.extend(result.iter().map(|result| self.expr_skeleton(result)));
+                return Skel::new(expr.span, kids).closed();
+            }
+            ExprKind::If { .. } => {
+                return Skel::new(
+                    expr.span,
+                    expr_children(expr)
+                        .into_iter()
+                        .map(|child| self.expr_skeleton(child))
+                        .collect(),
+                )
+                .closed();
+            }
+            ExprKind::Struct { fields, spread } => {
+                let mut kids: Vec<Skel> = fields
+                    .iter()
+                    .map(|(name, value)| {
+                        Skel::new(
+                            field_span(name, Some(value)),
+                            vec![self.expr_skeleton(value)],
+                        )
+                    })
+                    .collect();
+                if let Some(spread) = spread {
+                    kids.push(Skel::new(
+                        spread.span.merge(spread.value.span),
+                        vec![self.expr_skeleton(&spread.value)],
+                    ));
+                }
+                return Skel::new(expr.span, kids).closed();
+            }
+            ExprKind::Tuple(elements) => {
+                return Skel::new(
+                    expr.span,
+                    elements
+                        .iter()
+                        .map(|element| self.expr_skeleton(element))
+                        .collect(),
+                )
+                .closed();
+            }
+            ExprKind::Array(items) => {
+                return Skel::new(
+                    expr.span,
+                    items
+                        .iter()
+                        .map(|item| {
+                            let span = item
+                                .spread
+                                .map_or(item.value.span, |spread| spread.merge(item.value.span));
+                            Skel::new(span, vec![self.expr_skeleton(&item.value)])
+                        })
+                        .collect(),
+                )
+                .closed();
+            }
+            ExprKind::Unit => return Skel::leaf(expr.span).closed(),
+            _ => expr_children(expr)
+                .into_iter()
+                .map(|child| self.expr_skeleton(child))
+                .collect(),
+        };
+        Skel::new(expr.span, kids)
+    }
+
+    fn arm_skeleton(&self, arm: &Arm) -> Skel {
+        Skel::new(
+            arm_span(arm),
+            vec![
+                pattern_skeleton(&arm.pattern),
+                self.expr_skeleton(&arm.body),
+            ],
+        )
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Helpers over the tree
+// ---------------------------------------------------------------------------
 
 /// A real literal with its spelling normalized and its digits kept: no
 /// leading zeros on the whole part, no trailing zeros on the fraction, and
@@ -3096,8 +3280,6 @@ fn expr_children(expr: &Expr) -> Vec<&Expr> {
     }
 }
 
-// -- skeletons of the nodes without statement lists ----------------------------
-
 fn attribute_skeleton(attribute: &Attribute) -> Skel {
     Skel::new(
         attribute.span,
@@ -3151,117 +3333,6 @@ fn data_skeleton(data: &Data) -> Skel {
         ),
         DataKind::Unit => Skel::leaf(data.span).closed(),
         _ => Skel::leaf(data.span),
-    }
-}
-
-impl Printer<'_> {
-    fn expr_skeleton(&self, expr: &Expr) -> Skel {
-        let kids = match &expr.tracked {
-            ExprKind::Function { args, body } => {
-                let mut kids: Vec<Skel> = args.iter().map(|arg| Skel::leaf(arg.span)).collect();
-                kids.push(self.expr_skeleton(body));
-                kids
-            }
-            ExprKind::MatchFunction { arms, .. } => {
-                arms.iter().map(|arm| self.arm_skeleton(arm)).collect()
-            }
-            ExprKind::Match { scrutinee, arms } => {
-                let mut kids = vec![self.expr_skeleton(scrutinee)];
-                kids.extend(arms.iter().map(|arm| self.arm_skeleton(arm)));
-                return Skel::new(expr.span, kids).closed();
-            }
-            ExprKind::Handle { body, arms } => {
-                let mut kids = vec![self.expr_skeleton(body)];
-                kids.extend(arms.iter().map(|arm| {
-                    Skel::new(
-                        handler_arm_span(arm),
-                        vec![Skel::leaf(arm.binder.span), self.expr_skeleton(&arm.body)],
-                    )
-                }));
-                return Skel::new(expr.span, kids).closed();
-            }
-            ExprKind::Do { stmts, result } => {
-                let mut kids: Vec<Skel> = self
-                    .items(stmts, result.as_ref().map(|result| result.span), expr.span)
-                    .into_iter()
-                    .map(|item| match item {
-                        Item::Stmt(stmt) => self.stmt_skeleton(stmt),
-                        Item::Skipped(span) => Skel::verbatim(span),
-                    })
-                    .collect();
-                kids.extend(result.iter().map(|result| self.expr_skeleton(result)));
-                return Skel::new(expr.span, kids).closed();
-            }
-            ExprKind::If { .. } => {
-                return Skel::new(
-                    expr.span,
-                    expr_children(expr)
-                        .into_iter()
-                        .map(|child| self.expr_skeleton(child))
-                        .collect(),
-                )
-                .closed();
-            }
-            ExprKind::Struct { fields, spread } => {
-                let mut kids: Vec<Skel> = fields
-                    .iter()
-                    .map(|(name, value)| {
-                        Skel::new(
-                            field_span(name, Some(value)),
-                            vec![self.expr_skeleton(value)],
-                        )
-                    })
-                    .collect();
-                if let Some(spread) = spread {
-                    kids.push(Skel::new(
-                        spread.span.merge(spread.value.span),
-                        vec![self.expr_skeleton(&spread.value)],
-                    ));
-                }
-                return Skel::new(expr.span, kids).closed();
-            }
-            ExprKind::Tuple(elements) => {
-                return Skel::new(
-                    expr.span,
-                    elements
-                        .iter()
-                        .map(|element| self.expr_skeleton(element))
-                        .collect(),
-                )
-                .closed();
-            }
-            ExprKind::Array(items) => {
-                return Skel::new(
-                    expr.span,
-                    items
-                        .iter()
-                        .map(|item| {
-                            let span = item
-                                .spread
-                                .map_or(item.value.span, |spread| spread.merge(item.value.span));
-                            Skel::new(span, vec![self.expr_skeleton(&item.value)])
-                        })
-                        .collect(),
-                )
-                .closed();
-            }
-            ExprKind::Unit => return Skel::leaf(expr.span).closed(),
-            _ => expr_children(expr)
-                .into_iter()
-                .map(|child| self.expr_skeleton(child))
-                .collect(),
-        };
-        Skel::new(expr.span, kids)
-    }
-
-    fn arm_skeleton(&self, arm: &Arm) -> Skel {
-        Skel::new(
-            arm_span(arm),
-            vec![
-                pattern_skeleton(&arm.pattern),
-                self.expr_skeleton(&arm.body),
-            ],
-        )
     }
 }
 

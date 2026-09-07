@@ -562,7 +562,7 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
             // than a valid field followed by surprising extra tokens.
             c if c.is_ascii_digit()
                 && numeric_field_position(&tokens, &delimiters)
-                && previous(&tokens).is_some_and(|tok| {
+                && last_non_comment(&tokens).is_some_and(|tok| {
                     errors
                         .last()
                         .is_none_or(|error| error.span.start < tok.span.start)
@@ -877,7 +877,7 @@ fn number(chars: &mut Peekable<CharIndices<'_>>) -> String {
 /// the first field and every brace-level field after a comma. A backslash is
 /// included for an absent struct-type field.
 fn numeric_field_position(tokens: &[Token], delimiters: &[Delimiter]) -> bool {
-    let Some(previous) = previous(tokens) else {
+    let Some(previous) = last_non_comment(tokens) else {
         return false;
     };
     matches!(previous.tracked, Kind::Dot | Kind::LeftBrace)
@@ -888,7 +888,7 @@ fn numeric_field_position(tokens: &[Token], delimiters: &[Delimiter]) -> bool {
 /// The last token that is not a comment: what the numeric-field rule reads,
 /// since a comment between `.` and `0` is not a token in the sense that rule
 /// means.
-fn previous(tokens: &[Token]) -> Option<&Token> {
+fn last_non_comment(tokens: &[Token]) -> Option<&Token> {
     tokens.iter().rev().find(|tok| !tok.tracked.is_comment())
 }
 
