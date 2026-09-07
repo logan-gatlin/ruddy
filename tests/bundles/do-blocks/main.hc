@@ -41,7 +41,7 @@ let ordered = fn seed => do
   let last = mark 3n
   return last
 end
-let logged : () -> Nat + !Log = fn _ => do
+@private let logged : () -> Nat + !Log = fn _ => do
   let _ = !Log 10n
   let _ = !Log 20n
   return 30n

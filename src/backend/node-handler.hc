@@ -1,0 +1,16 @@
+  | !Console.write text => write text
+  | !Console.write_error text => write_error text
+  | !Process.exit code => match host_exit code with end
+  | !FileSystem.read_text request => fs_read_text request
+  | !FileSystem.write_text request => fs_write_text request
+  | !FileSystem.append_text request => fs_append_text request
+  | !FileSystem.exists request => fs_exists request
+  | !FileSystem.read_dir request => read_dir request
+  | !FileSystem.metadata request => fs_metadata request
+  | !FileSystem.symlink_metadata request => fs_symlink_metadata request
+  | !FileSystem.create_dir request => fs_create_dir request
+  | !FileSystem.create_dir_all request => fs_create_dir_all request
+  | !FileSystem.remove_file request => fs_remove_file request
+  | !FileSystem.remove_dir request => fs_remove_dir request
+  | !FileSystem.rename request => fs_rename request
+  | !FileSystem.copy_file request => fs_copy_file request

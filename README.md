@@ -65,10 +65,24 @@ which write to stdout and stderr without adding a newline, and
 255, never resumes, and drains pending console output before termination.
 Normal return exits successfully.
 
+The Node runtime also handles `std::FileSystem`, exposed through `std::fs`.
+It provides whole-file UTF-8 reads, writes and appends, existence checks,
+directory listings and creation, metadata, file and empty-directory removal,
+rename, and copy. Operations may suspend and return `Result` values; callers
+need no `await`. See [the filesystem module](docs/fs.md) for its signatures
+and error behavior.
+
 Local effect handlers can intercept all these operations. Platform effects
 are recognized by their complete structural identity, independently of where
 they were declared. Std can still be overridden or disabled with `std = false`;
 a pure executable needs no std dependency.
+
+When a JavaScript root bundle is built, its public values receive host-callable
+adapters. On Node, exported functions run under the Console, Process, and
+FileSystem handlers, including aliases imported from std. Both `check` and
+`build` reject exports whose effects cannot be handled. Dependency artifacts,
+private definitions, and internal Ruddy calls retain their effect interfaces;
+local handlers can still intercept them. See [host exports](docs/cps.md#library-exports-and-initialization).
 
 A struct literal may spread one value's fields into itself with `..`, written
 last, as in `{ x: 1, ..base }`: the result has every field of `base` and the

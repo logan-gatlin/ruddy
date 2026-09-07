@@ -35,7 +35,9 @@ impl Error for LinkError {}
 ///
 /// The root is the final input. Its identity and public interface are retained;
 /// its dependency list is cleared because all dependency code is copied into
-/// the returned LIR. Semantically malformed artifacts are outside this API's
+/// the returned LIR. Dependency type and effect declarations remain available
+/// to interpret the root's schemes, including recursive outgoing callables.
+/// Semantically malformed artifacts are outside this API's
 /// contract and are not validated here.
 pub fn link(artifacts: &[Artifact]) -> Result<Artifact, LinkError> {
     let Some(root) = artifacts.last() else {
@@ -73,6 +75,29 @@ pub fn link(artifacts: &[Artifact]) -> Result<Artifact, LinkError> {
 
     let mut header = root.header().clone();
     header.dependencies.clear();
+    let mut types: std::collections::HashSet<_> =
+        header.types.iter().map(|ty| ty.name.clone()).collect();
+    let mut effects: std::collections::HashSet<_> = header
+        .effects
+        .iter()
+        .map(|effect| effect.name.clone())
+        .collect();
+    for dependency in &artifacts[..artifacts.len() - 1] {
+        for ty in &dependency.header().types {
+            if types.insert(ty.name.clone()) {
+                let mut ty = ty.clone();
+                ty.exported = false;
+                header.types.push(ty);
+            }
+        }
+        for effect in &dependency.header().effects {
+            if effects.insert(effect.name.clone()) {
+                let mut effect = effect.clone();
+                effect.exported = false;
+                header.effects.push(effect);
+            }
+        }
+    }
     Ok(Artifact::from_validated_parts(
         header,
         artifact::Lir {

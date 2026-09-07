@@ -32,7 +32,7 @@ let pair = { first: add 1n 2n, second: "three" }
 @k let (left, right) = (Inline::doubled 4n, Notes::greeting)
 
 @test
-let logged : () -> Nat + !Log = fn _ => do
+@private let logged : () -> Nat + !Log = fn _ => do
   let _ = !Log 1n
   return 7n
 end

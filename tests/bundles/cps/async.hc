@@ -22,8 +22,8 @@ extern completed : Real -> Real = "n => new Promise((resolve, reject) => globalT
 let via_wrapped_callback = fn n => 1.0 + completed n
 
 effect Exit = { stop: Real -> Real }
-extern keep_exit : fn(@async fn(Real) -> Real + !Exit) -> () + !Exit = "globalThis.host.keepExit"
-extern run_exit : fn(fn(Real) -> Real + !Exit) -> Real + !Exit = "globalThis.host.runExit"
+@private extern keep_exit : fn(@async fn(Real) -> Real + !Exit) -> () + !Exit = "globalThis.host.keepExit"
+@private extern run_exit : fn(fn(Real) -> Real + !Exit) -> Real + !Exit = "globalThis.host.runExit"
 let expired = fn _ => handle do
   let _ = keep_exit (fn n => !Exit.stop n)
   return 99.0
@@ -38,7 +38,7 @@ let inline_exit = fn _ => handle run_exit (fn n => !Exit.stop n) with
 end
 
 effect Reader = { get: Real -> Real }
-extern keep_reader : fn(@async fn(Real) -> Real + !Reader) -> () + !Reader = "globalThis.host.keepReader"
+@private extern keep_reader : fn(@async fn(Real) -> Real + !Reader) -> () + !Reader = "globalThis.host.keepReader"
 let ordinary_evidence = fn offset => handle keep_reader (fn n => !Reader.get n) with
   | !Reader.get n => n + offset
 end

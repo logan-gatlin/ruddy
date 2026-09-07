@@ -173,7 +173,7 @@ fn generated_module_executes_values_functions_records_and_sums_in_node() {
     fs::write(&path, module).unwrap();
 
     let probe = format!(
-        "import * as app from {}; console.log(JSON.stringify([app.answer, await app.apply(app.identity)(2), app.record.value, typeof app.tagged]));",
+        "import * as app from {}; console.log(JSON.stringify([app.answer, await (await app.apply(app.identity))(2), app.record.value, typeof app.tagged]));",
         serde_json::to_string(path.to_str().unwrap()).unwrap()
     );
     let output = Command::new("node")
@@ -296,7 +296,7 @@ fn generated_runtime_preserves_arithmetic_switch_record_effect_and_literal_seman
          let read = fn _ => handle !Read.get () with | !Read.get _ => 42n end\n\
          effect Plus = { apply: Real -> Real }\n\
          effect Times = { apply: Real -> Real }\n\
-         let calculate : Real -> Real + !Plus + !Times = fn n => do let x = !Plus.apply n return !Times.apply x end\n\
+         @private let calculate : Real -> Real + !Plus + !Times = fn n => do let x = !Plus.apply n return !Times.apply x end\n\
          let calculated = fn n => handle (handle calculate n with | !Plus.apply value => value + 1.0 end) with | !Times.apply value => value * 2.0 end\n\
          effect Ask 'a = { get: () -> 'a }\n\
          let asked = fn n => handle do let x = !Ask.get () return x + n end with | !Ask.get _ => 1.0 end\n",
@@ -566,7 +566,7 @@ fn metadata_changes_neither_schemes_nor_generated_javascript() {
 #[test]
 fn mutation_factories_preserve_freshness_aliases_and_assignment_results() {
     let artifact = compiled(
-        "let counter = fn _ => do let cell = mut 0 return fn _ => cell := ~cell + 1 end
+        "@private let counter = fn _ => do let cell = mut 0 return fn _ => cell := ~cell + 1 end
         let run = fn _ => do
           let first = counter ()
           let second = counter ()
@@ -639,8 +639,8 @@ fn mutation_operands_execute_once_in_target_then_value_order() {
 fn mutation_survives_foreign_aliases_callbacks_and_suspension() {
     let artifact = compiled(
         "extern alias: mut 'r Real -> mut 'r Real = \"host.alias\"
-        extern update: mut 'r Real -> () + !mut 'r = \"host.update\"
-        @async extern later: (() -> Real + !mut 'r) -> Real + !mut 'r = \"host.later\"
+        @private extern update: mut 'r Real -> () + !mut 'r = \"host.update\"
+        @private @async extern later: (() -> Real + !mut 'r) -> Real + !mut 'r = \"host.later\"
         let run = fn _ => do
           let cell = mut 1
           let same = alias cell
@@ -675,7 +675,7 @@ fn mutation_survives_foreign_aliases_callbacks_and_suspension() {
 fn mutation_composes_with_effect_polymorphism_and_stack_safe_recursion() {
     let artifact = compiled(
         "let apply = fn f => fn x => f x
-        let loop = fn pair => match pair.1 with
+        @private let loop = fn pair => match pair.1 with
           | 0 => ~pair.0
           | _ => do let _ = pair.0 := ~pair.0 + 1 return loop (pair.0, pair.1 - 1) end
         end

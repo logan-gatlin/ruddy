@@ -360,7 +360,7 @@ fn install_project(directory: &Path) -> Result<InstalledBuild, CliError> {
     // reading an artifact back from disk.
     let javascript = (target == Target::Js)
         .then(|| {
-            ruddy::backend::js::generate(&linked)
+            ruddy::backend::js::generate_for_platform(&linked, root_project.platform.backend())
                 .map_err(|error| CliError::one(format!("could not generate JavaScript: {error}")))
         })
         .transpose()?;
@@ -898,6 +898,12 @@ pub enum Platform {
 }
 
 impl Platform {
+    pub fn backend(self) -> ruddy::backend::js::Platform {
+        match self {
+            Self::Node => ruddy::backend::js::Platform::Node,
+            Self::Web => ruddy::backend::js::Platform::Web,
+        }
+    }
     /// The platform as `Ruddy.toml` spells it, which is also what an `@if`
     /// guard in source names.
     pub fn name(self) -> &'static str {
@@ -1303,6 +1309,7 @@ pub struct CompiledProject {
     ///
     /// Only the requested root's target affects [`build_project`].
     pub target: Target,
+    pub platform: Platform,
     /// Runtime configuration from this project's manifest.
     ///
     /// Only the requested root's configuration affects [`run_project`].
@@ -1355,6 +1362,17 @@ pub fn compile_graph(directory: impl AsRef<Path>) -> Result<CompiledGraph, Compi
         ..GraphCompiler::default()
     };
     compiler.visit(root, None)?;
+    if build.target == Target::Js {
+        let (root, dependencies) = compiler.projects.split_last().expect("root was compiled");
+        let dependencies: Vec<_> = dependencies
+            .iter()
+            .map(|project| &project.artifact)
+            .collect();
+        ruddy::backend::js::check_exports(&root.artifact, &dependencies, build.platform.backend())
+            .map_err(|error| {
+                CompileError::report("unsupported-export-effects", error.to_string())
+            })?;
+    }
     if let Some(resolver) = &compiler.resolver {
         resolver.write_if_changed()?;
     }
@@ -2007,6 +2025,7 @@ impl GraphCompiler {
             },
             directory: directory.clone(),
             target,
+            platform: build.platform,
             run,
             artifact,
         });

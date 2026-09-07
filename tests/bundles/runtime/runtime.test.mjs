@@ -61,7 +61,7 @@ const app = await import(pathToFileURL(generated).href);
 test("exports values, closures, and file-backed modules", async () => {
   assert.equal(app.answer, 42);
   assert.equal(app.identity("value"), "value");
-  assert.equal(await app.apply(app.identity)(7), 7);
+  assert.equal(await (await app.apply(app.identity))(7), 7);
   assert.equal(app.captured(20)(22), 42);
   assert.equal(app.Math.answer, 42);
   assert.equal(app.Math.identity(false), false);
