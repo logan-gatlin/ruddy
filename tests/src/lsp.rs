@@ -39,7 +39,7 @@ fn editor_can_initialize_open_hover_and_shutdown() {
             json!({}),
         )))
         .unwrap();
-    client.sender.send(Message::Notification(Notification::new("textDocument/didOpen".into(), json!({"textDocument":{"uri":uri,"languageId":"ruddy","version":1,"text":"let value = false\nlet use = value"}})))).unwrap();
+    client.sender.send(Message::Notification(Notification::new("textDocument/didOpen".into(), json!({"textDocument":{"uri":uri,"languageId":"ruddy","version":1,"text":"let value = false\nlet use = value\nextern add : fn(Nat, Nat) -> Nat = \"(left, right) => left + right\""}})))).unwrap();
     client
         .sender
         .send(Message::Request(Request::new(
@@ -59,6 +59,28 @@ fn editor_can_initialize_open_hover_and_shutdown() {
                     .as_str()
                     .unwrap()
                     .contains("Boolean")
+            );
+            break;
+        }
+    }
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            5.into(),
+            "textDocument/hover".into(),
+            json!({"textDocument":{"uri":uri},"position":{"line":2,"character":8}}),
+        )))
+        .unwrap();
+    loop {
+        if let Message::Response(response) = client
+            .receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+        {
+            assert_eq!(
+                response.response_result.unwrap()["contents"]["value"],
+                "```ruddy\nNat -> Nat -> Nat\n```",
+                "extern declaration hover reaches the editor"
             );
             break;
         }

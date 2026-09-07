@@ -609,3 +609,47 @@ fn symlinked_document_paths_share_unsaved_source_identity() {
     assert!(workspace.file(&real.join("Added.hc")).is_some());
     assert!(workspace.definition(&link.join("main.hc"), 31).is_some());
 }
+
+#[test]
+fn hover_includes_extern_declaration_names() {
+    let text =
+        "extern add : fn(Nat, Nat) -> Nat = \"(left, right) => left + right\"\nlet local = 1n";
+    let analysis = editor_source(text);
+    assert!(analysis.diagnostics.is_empty());
+    assert!(
+        analysis
+            .hover("main.hc", text.find("local").unwrap() + 1)
+            .is_some()
+    );
+    assert!(
+        analysis
+            .hover("main.hc", text.find("add").unwrap() + 1)
+            .is_some(),
+        "extern declaration names need hover types just like let declarations"
+    );
+}
+
+#[test]
+fn hover_includes_type_effect_and_module_declarations() {
+    let text = "type Box 'value = { value: 'value }\neffect Read 'value = { read: () -> 'value }\neffect Alias 'value = !Read 'value\nmodule Helpers = end";
+    let analysis = editor_source(text);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:?}",
+        analysis.diagnostics
+    );
+    for (name, expected) in [
+        ("Box", "value:"),
+        ("Read", "read:"),
+        ("Alias", "!Read"),
+        ("Helpers", "module Helpers"),
+    ] {
+        let start = text.find(name).unwrap();
+        let hover = analysis
+            .hover("main.hc", start)
+            .unwrap_or_else(|| panic!("missing hover for {name}"));
+        assert_eq!(hover.span.start, start);
+        assert_eq!(hover.span.width, name.len());
+        assert!(hover.ty.contains(expected), "{name}: {}", hover.ty);
+    }
+}

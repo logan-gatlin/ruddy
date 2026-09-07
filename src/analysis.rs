@@ -466,24 +466,106 @@ impl Analysis {
     }
 
     pub fn hover(&self, path: &str, offset: usize) -> Option<Hover> {
-        for (symbol, decl) in self.terms_in(path) {
-            let span = self.built.source.span(decl.name_at);
+        let program = &self.built.program;
+        let declarations = self
+            .terms_in(path)
+            .map(|(symbol, decl)| (symbol, decl.name_at))
+            .chain(
+                program
+                    .externs
+                    .iter()
+                    .map(|(symbol, decl)| (*symbol, decl.name_at)),
+            )
+            .chain(
+                program
+                    .types
+                    .iter()
+                    .map(|(symbol, decl)| (*symbol, decl.name_at)),
+            )
+            .chain(
+                program
+                    .effects
+                    .iter()
+                    .map(|(symbol, decl)| (*symbol, decl.name_at)),
+            )
+            .chain(
+                program
+                    .modules
+                    .iter()
+                    .map(|(symbol, decl)| (*symbol, decl.name_at)),
+            );
+        for (symbol, name_at) in declarations {
+            let span = self.built.source.span(name_at);
             if self.contains(span, path, offset) {
-                return self
-                    .inferred
-                    .semantics()
-                    .schemes()
-                    .get(&symbol)
-                    .map(|scheme| Hover {
-                        span,
-                        ty: scheme.to_string(),
-                    });
+                return self.declaration_type(symbol).map(|ty| Hover { span, ty });
             }
         }
         self.term_at(path, offset).map(|term| Hover {
             span: self.built.source.span(term.at),
             ty: term.ty.to_string(),
         })
+    }
+
+    fn declaration_type(&self, symbol: Symbol) -> Option<String> {
+        use crate::types::{Row, Ty};
+        let semantics = self.inferred.semantics();
+        if let Some(scheme) = semantics
+            .schemes()
+            .get(&symbol)
+            .or_else(|| semantics.externs().get(&symbol))
+            .or_else(|| semantics.aliases().get(&symbol))
+        {
+            return Some(scheme.to_string());
+        }
+        let name = self.mint.name(symbol);
+        if self.built.program.modules.contains_key(&symbol) {
+            return Some(format!("module {name}"));
+        }
+        let declaration = self.built.program.effects.get(&symbol)?;
+        // Semantic signatures use positional bound variables. Match their
+        // spelling in the header, regardless of the source parameter names.
+        let parameters = (0..declaration.params.len())
+            .map(|index| format!(" {}", Ty::Bound(index as u32)))
+            .collect::<String>();
+        let body = match &declaration.value {
+            ir::Effect::Operations(operations) => {
+                let signatures = operations
+                    .keys()
+                    .map(|selector| {
+                        let (from, to) = semantics.operations().get(&(symbol, selector.clone()))?;
+                        let signature = Ty::Arrow(from.clone(), to.clone(), Row::closed());
+                        Some(match selector {
+                            ir::OperationSelector::Named(name) => format!("{name}: {signature}"),
+                            ir::OperationSelector::Unnamed => signature.to_string(),
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                format!("{{ {} }}", signatures.join(", "))
+            }
+            ir::Effect::Alias(_) => {
+                let alias = semantics.effect_aliases().get(&symbol)?;
+                let mut cases = alias
+                    .cases
+                    .iter()
+                    .map(|(effect, args)| {
+                        let mut case = format!("!{}", self.mint.name(*effect));
+                        for arg in args {
+                            case.push_str(&format!(" ({arg})"));
+                        }
+                        case
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(tail) = alias.tail {
+                    cases.push(format!("..{}", Ty::Bound(tail)));
+                }
+                if cases.is_empty() {
+                    "()".into()
+                } else {
+                    cases.join(" + ")
+                }
+            }
+        };
+        Some(format!("effect {name}{parameters} = {body}"))
     }
 
     fn written_types(&self, path: &str) -> Vec<&ir::Type> {
