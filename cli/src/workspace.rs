@@ -449,11 +449,11 @@ impl Workspace {
 
     pub fn definition(&self, path: &Path, offset: usize) -> Option<(PathBuf, Span)> {
         let (project, logical) = self.file(path)?;
-        let symbol = project.analysis.referenced_symbol(logical, offset)?;
-        if let Some(span) = project.analysis.binding_span(symbol) {
+        if let Some(span) = project.analysis.definition(logical, offset) {
             let path = project.analysis.paths.get(&span.file_id)?;
             return Some((normalize(&project.source_directory.join(path)), span));
         }
+        let symbol = project.analysis.referenced_symbol(logical, offset)?;
         let qualified = project.analysis.mint().external(symbol)?;
         self.projects.iter().find_map(|project| {
             let symbol = project.analysis.symbol_named(qualified)?;

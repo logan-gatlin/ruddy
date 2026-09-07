@@ -419,7 +419,19 @@ impl Worker {
         Ok(match request.method.as_str() {
             "textDocument/hover" => project.analysis.hover(logical, at).map(|hover| json!({"contents":{"kind":"markdown","value":format!("```ruddy\n{}\n```",hover.ty)},"range":range(source, hover.span)})).unwrap_or(Value::Null),
             "textDocument/completion" => Value::Array(project.analysis.completions(logical, at).into_iter().map(|item| {
-                let kind = match item.kind { CompletionKind::Value => 6, CompletionKind::Type => 7, CompletionKind::Effect => 8, CompletionKind::Module => 9, CompletionKind::Field => 5 };
+                // LSP has no general type kind. Class and TypeParameter both
+                // misdescribe aliases and primitive types; name the category
+                // in the detail instead of making clients display either one.
+                let kind = match item.kind {
+                    CompletionKind::Type => {
+                        let detail = item.detail.map_or_else(|| format!("type {}", item.label), |ty| format!("type {} = {ty}", item.label));
+                        return json!({"label":item.label,"detail":detail});
+                    }
+                    CompletionKind::Value => 6,
+                    CompletionKind::Effect => 8,
+                    CompletionKind::Module => 9,
+                    CompletionKind::Field => 5,
+                };
                 json!({"label":item.label,"detail":item.detail,"kind":kind})
             }).collect()),
             "textDocument/definition" => self.workspace.definition(&path, at).and_then(|(path, span)| {

@@ -103,6 +103,9 @@ pub struct Output {
     pub stmts: Vec<Stmt>,
     /// Root first, then depth-first in declaration order.
     pub loaded: Vec<Loaded>,
+    /// File-module declaration names and the source files selected for them.
+    /// Kept even when the selected file is empty or has no parsed statements.
+    pub module_files: std::collections::HashMap<Span, FileID>,
     pub errors: Vec<Error>,
 }
 
@@ -253,6 +256,7 @@ pub fn load(
         out: Output {
             stmts: Vec::new(),
             loaded: Vec::new(),
+            module_files: std::collections::HashMap::new(),
             errors: Vec::new(),
         },
     };
@@ -368,21 +372,26 @@ impl Loader<'_> {
         {
             return Vec::new();
         }
-        match (
+        let selected = match (
             self.fs.read(&beside).is_some(),
             self.fs.read(&inside).is_some(),
         ) {
-            (true, false) => self.file(&beside),
-            (false, true) => self.file(&inside),
+            (true, false) => beside,
+            (false, true) => inside,
             (true, true) => {
                 self.error(at, ErrorKind::ModuleFileAmbiguous { beside, inside });
-                Vec::new()
+                return Vec::new();
             }
             (false, false) => {
                 self.error(at, ErrorKind::ModuleFileMissing { beside, inside });
-                Vec::new()
+                return Vec::new();
             }
-        }
+        };
+        let body = self.file(&selected);
+        self.out
+            .module_files
+            .insert(at, self.out.loaded.last().expect("file just loaded").id);
+        body
     }
 
     /// Whether `stmt` is to be compiled: it carries no `@if`, or the

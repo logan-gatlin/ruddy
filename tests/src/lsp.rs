@@ -2,6 +2,138 @@ use lsp_server::{Connection, Message, Notification, Request};
 use serde_json::json;
 use std::time::Duration;
 
+fn editor_request(
+    files: &[(&str, &str)],
+    method: &str,
+    line: u32,
+    character: u32,
+) -> serde_json::Value {
+    let tree = tempfile::tempdir().unwrap();
+    std::fs::write(tree.path().join("Ruddy.toml"), "name = \"editor\"\nversion = \"0.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false").unwrap();
+    for (path, text) in files {
+        let path = tree.path().join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let root = format!("file://{}/", tree.path().display());
+    let uri = format!("{root}main.hc");
+    let (server, client) = Connection::memory();
+    let worker = std::thread::spawn(move || ruddy_lsp::serve(server).unwrap());
+    let request = |id: i32, method: &str, params| {
+        client
+            .sender
+            .send(Message::Request(Request::new(
+                id.into(),
+                method.into(),
+                params,
+            )))
+            .unwrap();
+        loop {
+            if let Message::Response(response) = client
+                .receiver
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+            {
+                break response.response_result.unwrap();
+            }
+        }
+    };
+    request(1, "initialize", json!({"rootUri":root,"capabilities":{}}));
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "initialized".into(),
+            json!({}),
+        )))
+        .unwrap();
+    client.sender.send(Message::Notification(Notification::new("textDocument/didOpen".into(), json!({"textDocument":{"uri":uri,"languageId":"ruddy","version":1,"text":files.iter().find(|(path, _)| *path == "main.hc").unwrap().1}})))).unwrap();
+    let mut result = request(
+        2,
+        method,
+        json!({"textDocument":{"uri":uri},"position":{"line":line,"character":character}}),
+    );
+    request(3, "shutdown", json!(null));
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "exit".into(),
+            json!(null),
+        )))
+        .unwrap();
+    worker.join().unwrap();
+    if let Some(uri) = result.get_mut("uri") {
+        *uri = json!(uri.as_str().unwrap().strip_prefix(root.as_str()).unwrap());
+    }
+    result
+}
+
+#[test]
+fn editor_type_completions_do_not_claim_to_be_classes() {
+    let items = editor_request(
+        &[("main.hc", "type Person = { name: String }\nlet value : Per")],
+        "textDocument/completion",
+        1,
+        15,
+    );
+    let person = items
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["label"] == "Person")
+        .unwrap();
+    assert!(
+        person.get("kind").is_none(),
+        "LSP has no general type kind: {person}"
+    );
+    assert!(person["detail"].as_str().unwrap().starts_with("type "));
+}
+
+#[test]
+fn editor_module_declarations_navigate_to_the_loaded_file() {
+    for (target, body) in [
+        ("Child.hc", "let value = 1n"),
+        ("Child/module.hc", ""),
+        ("Child/module.hc", "// empty module\n"),
+    ] {
+        let result = editor_request(
+            &[("main.hc", "module Child"), (target, body)],
+            "textDocument/definition",
+            0,
+            8,
+        );
+        assert_eq!(
+            result["uri"], target,
+            "module declaration should open its source file"
+        );
+        assert_eq!(result["range"]["start"], json!({"line":0,"character":0}));
+    }
+    let result = editor_request(
+        &[
+            ("main.hc", "module Parent = module Child end"),
+            ("Parent/Child.hc", ""),
+        ],
+        "textDocument/definition",
+        0,
+        24,
+    );
+    assert_eq!(result["uri"], "Parent/Child.hc");
+}
+
+#[test]
+fn editor_module_navigation_does_not_guess_missing_or_ambiguous_files() {
+    for files in [
+        vec![("main.hc", "module Child")],
+        vec![
+            ("main.hc", "module Child"),
+            ("Child.hc", ""),
+            ("Child/module.hc", ""),
+        ],
+        vec![("main.hc", "module Child = end"), ("Child.hc", "")],
+    ] {
+        assert!(editor_request(&files, "textDocument/definition", 0, 8).is_null());
+    }
+}
+
 #[test]
 fn editor_can_initialize_open_hover_and_shutdown() {
     let tree = tempfile::tempdir().unwrap();

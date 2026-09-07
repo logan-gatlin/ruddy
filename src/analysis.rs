@@ -277,6 +277,7 @@ impl Host {
         }
         let mut analysis = Analysis {
             file_terms,
+            module_files: loaded.module_files,
             mint,
             built,
             inferred,
@@ -315,6 +316,7 @@ struct Prepared {
 
 pub struct Analysis {
     file_terms: HashMap<String, Vec<Symbol>>,
+    module_files: HashMap<Span, FileID>,
     mint: Arc<Mint>,
     built: Prepared,
     inferred: inference::Output,
@@ -617,6 +619,13 @@ impl Analysis {
     }
 
     pub fn definition(&self, path: &str, offset: usize) -> Option<Span> {
+        if let Some((_, file)) = self
+            .module_files
+            .iter()
+            .find(|(name, _)| self.contains(**name, path, offset))
+        {
+            return Some(file.span(0, 0));
+        }
         self.binding_span(self.referenced_symbol(path, offset)?)
     }
 
