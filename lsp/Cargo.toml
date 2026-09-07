@@ -3,6 +3,10 @@ name = "ruddy-lsp"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "ruddy-ls"
+path = "src/main.rs"
+
 [dependencies]
 ruddy = { path = ".." }
 ruddy-cli = { package = "cli", path = "../cli" }
