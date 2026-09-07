@@ -73,7 +73,7 @@ fn default_version() -> String {
 }
 
 fn default_root() -> String {
-    "main.hc".to_string()
+    "main.rud".to_string()
 }
 
 /// One file of a bundle, as the page holds it.

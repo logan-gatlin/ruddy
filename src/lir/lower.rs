@@ -20,7 +20,7 @@
 //! onto either without a second round of lowering, but no code is generated and
 //! no LIR is ever run.
 
-use std::{collections::HashMap, rc::Rc};
+use std::{collections::HashMap, sync::Arc};
 
 use indexmap::IndexMap;
 
@@ -423,8 +423,8 @@ struct Shape {
 /// parameters those effects come to.
 #[derive(Debug, Clone)]
 struct Level {
-    from: Rc<Ty>,
-    to: Rc<Ty>,
+    from: Arc<Ty>,
+    to: Arc<Ty>,
     row: Row,
     evidence: usize,
 }
@@ -441,7 +441,7 @@ struct Known {
     levels: Vec<Level>,
     /// The type the wrappers were built against, which is the type naming the
     /// definition as a value stands for however it is instantiated at the use.
-    ty: Rc<Ty>,
+    ty: Arc<Ty>,
 }
 
 /// What the variable part of an effect row is, so that a caller can tell whether
@@ -475,7 +475,7 @@ struct Capture {
 /// when the recursive name is actually used.
 struct Recursive {
     symbol: Symbol,
-    ty: Rc<Ty>,
+    ty: Arc<Ty>,
     temp: Option<Temp>,
 }
 
@@ -594,9 +594,9 @@ enum Index {
 #[derive(Debug, Clone)]
 struct Element {
     base: Temp,
-    base_ty: Rc<Ty>,
+    base_ty: Arc<Ty>,
     at: Index,
-    ty: Rc<Ty>,
+    ty: Arc<Ty>,
 }
 
 /// The elements of an array between its first `start` and its last `drop`:
@@ -604,27 +604,27 @@ struct Element {
 #[derive(Debug, Clone)]
 struct Between {
     base: Temp,
-    base_ty: Rc<Ty>,
+    base_ty: Arc<Ty>,
     start: usize,
     drop: usize,
-    ty: Rc<Ty>,
+    ty: Arc<Ty>,
 }
 
 /// A whole value, at the temp holding it.
 #[derive(Debug, Clone)]
 struct Value {
     temp: Temp,
-    ty: Rc<Ty>,
+    ty: Arc<Ty>,
 }
 
 /// One field of a struct: whether it is there, and what it holds when it is.
 #[derive(Debug, Clone)]
 struct Field {
     base: Temp,
-    base_ty: Rc<Ty>,
+    base_ty: Arc<Ty>,
     name: String,
     presence: Presence,
-    ty: Rc<Ty>,
+    ty: Arc<Ty>,
 }
 
 /// Whatever a struct carries past the fields its type names. `open` is whether
@@ -670,12 +670,12 @@ struct Matrix {
 struct Tree<'a> {
     arms: &'a [(Pattern, Term)],
     rep: Rep,
-    ty: Rc<Ty>,
+    ty: Arc<Ty>,
     span: Span,
     allowed: Formula,
 }
 
-fn alias_symbols(want: &Rc<Ty>, have: &Rc<Ty>) -> Option<(Symbol, Symbol)> {
+fn alias_symbols(want: &Arc<Ty>, have: &Arc<Ty>) -> Option<(Symbol, Symbol)> {
     match (&**want, &**have) {
         (Ty::Named { symbol: want, .. }, Ty::Named { symbol: have, .. }) => Some((*want, *have)),
         _ => None,
@@ -683,35 +683,35 @@ fn alias_symbols(want: &Rc<Ty>, have: &Rc<Ty>) -> Option<(Symbol, Symbol)> {
 }
 
 fn same_alias_pair(
-    left_want: &Rc<Ty>,
-    left_have: &Rc<Ty>,
-    right_want: &Rc<Ty>,
-    right_have: &Rc<Ty>,
+    left_want: &Arc<Ty>,
+    left_have: &Arc<Ty>,
+    right_want: &Arc<Ty>,
+    right_have: &Arc<Ty>,
 ) -> bool {
     same_finite_syntax(left_want, right_want) && same_finite_syntax(left_have, right_have)
 }
 
 fn same_row_syntax(left: &Row, right: &Row) -> bool {
-    let unit = Rc::new(Ty::unit());
+    let unit = Arc::new(Ty::unit());
     same_finite_syntax(
-        &Rc::new(Ty::Arrow(unit.clone(), unit.clone(), left.clone())),
-        &Rc::new(Ty::Arrow(unit.clone(), unit, right.clone())),
+        &Arc::new(Ty::Arrow(unit.clone(), unit.clone(), left.clone())),
+        &Arc::new(Ty::Arrow(unit.clone(), unit, right.clone())),
     )
 }
 
-type TypePair = (Rc<Ty>, Rc<Ty>);
+type TypePair = (Arc<Ty>, Arc<Ty>);
 type AliasPairs = HashMap<(Symbol, Symbol), Vec<TypePair>>;
-type AdapterAliases = HashMap<(Symbol, Symbol), Vec<(Rc<Ty>, Rc<Ty>, FuncId)>>;
-type CachedFit = (Rc<Ty>, Rc<Ty>, bool);
+type AdapterAliases = HashMap<(Symbol, Symbol), Vec<(Arc<Ty>, Arc<Ty>, FuncId)>>;
+type CachedFit = (Arc<Ty>, Arc<Ty>, bool);
 
 struct OrdinaryExternAdapter {
     completion: crate::externs::Completion,
-    ty: Rc<Ty>,
+    ty: Arc<Ty>,
     id: FuncId,
 }
 
 struct OrdinaryCallbackAdapter {
-    ty: Rc<Ty>,
+    ty: Arc<Ty>,
     available: Row,
     id: FuncId,
 }
@@ -728,7 +728,7 @@ struct FitsCache {
 /// these on the heap is what lets a source type contain an arbitrary number of
 /// arrow levels without consuming the Rust call stack.
 struct FittedContext {
-    want: Rc<Ty>,
+    want: Arc<Ty>,
     wrapped: Temp,
     params: Vec<Param>,
     body: Body,
@@ -739,8 +739,8 @@ struct FittedContext {
 enum FittedStage {
     Argument {
         args: Vec<Temp>,
-        have_to: Rc<Ty>,
-        want_to: Rc<Ty>,
+        have_to: Arc<Ty>,
+        want_to: Arc<Ty>,
     },
     Result,
 }
@@ -769,7 +769,7 @@ struct Lower<'a> {
     /// to know which type that was. `None` where no producer recorded one, in
     /// which case production and use are the same place and the use's type is
     /// the type held.
-    held: Vec<Option<Rc<Ty>>>,
+    held: Vec<Option<Arc<Ty>>>,
     /// Reserved before anything is emitted, because a definition may call itself
     /// or its neighbour: a slot exists from the moment its name does, and is
     /// filled when its body is built.
@@ -840,6 +840,7 @@ fn lower_parts(
     let order = low.order();
     low.reserve(&order);
     for symbol in &order {
+        crate::cancellation::checkpoint();
         low.define(*symbol);
     }
     Output {
@@ -1226,7 +1227,7 @@ impl Lower<'_> {
     fn host_to_ruddy(
         &mut self,
         conversion: &crate::externs::Conversion,
-        ty: &Rc<Ty>,
+        ty: &Arc<Ty>,
         raw: Temp,
         body: &mut Body,
     ) -> Temp {
@@ -1241,7 +1242,7 @@ impl Lower<'_> {
     fn host_to_ruddy_protocol(
         &mut self,
         conversion: &crate::externs::Conversion,
-        ty: &Rc<Ty>,
+        ty: &Arc<Ty>,
         raw: Temp,
         body: &mut Body,
         completion: crate::externs::Completion,
@@ -1298,7 +1299,7 @@ impl Lower<'_> {
     /// Ruddy closure ABI and intentionally omitted from the raw unary call.
     fn ordinary_extern_level(
         &mut self,
-        ty: Rc<Ty>,
+        ty: Arc<Ty>,
         completion: crate::externs::Completion,
     ) -> FuncId {
         if matches!(&*ty, Ty::Named { .. })
@@ -1380,7 +1381,7 @@ impl Lower<'_> {
     /// can ask for. Walking the semantic result spine (rather than the written
     /// ABI leaves) sees through aliases; remembering alias applications keeps
     /// regular recursive callback types finite.
-    fn callback_evidence(&self, ty: &Rc<Ty>, available: &Row) -> Row {
+    fn callback_evidence(&self, ty: &Arc<Ty>, available: &Row) -> Row {
         let mut required = Row::closed();
         let mut cursor = ty.clone();
         let mut seen = Vec::new();
@@ -1448,7 +1449,7 @@ impl Lower<'_> {
     fn ruddy_to_host(
         &mut self,
         conversion: &crate::externs::Conversion,
-        ty: &Rc<Ty>,
+        ty: &Arc<Ty>,
         value: Temp,
         available: &Row,
         body: &mut Body,
@@ -1521,7 +1522,7 @@ impl Lower<'_> {
         }
     }
 
-    fn ordinary_callback(&mut self, ty: Rc<Ty>, available: Row) -> FuncId {
+    fn ordinary_callback(&mut self, ty: Arc<Ty>, available: Row) -> FuncId {
         if matches!(&*ty, Ty::Named { .. })
             && let Some(adapter) = self.callback_adapters.iter().rev().find(|adapter| {
                 same_finite_syntax(&adapter.ty, &ty)
@@ -1601,7 +1602,7 @@ impl Lower<'_> {
 
     fn marked_callback(
         &mut self,
-        ty: Rc<Ty>,
+        ty: Arc<Ty>,
         parameter_conversions: Vec<crate::externs::Conversion>,
         result_conversion: crate::externs::Conversion,
         available: Row,
@@ -1695,8 +1696,8 @@ impl Lower<'_> {
         &mut self,
         _outer_raw: Temp,
         carried: Vec<Rep>,
-        carried_types: Vec<Rc<Ty>>,
-        ty: Rc<Ty>,
+        carried_types: Vec<Arc<Ty>>,
+        ty: Arc<Ty>,
         arity: usize,
         nullary: bool,
         parameter_conversions: Vec<crate::externs::Conversion>,
@@ -1871,7 +1872,7 @@ impl Lower<'_> {
 
     /// Record the type whose shape a temp holds. A function value is the one
     /// thing a caller must match; containers are [`Lower::contain`]'s to note.
-    fn hold(&mut self, temp: Temp, ty: &Rc<Ty>) {
+    fn hold(&mut self, temp: Temp, ty: &Arc<Ty>) {
         if self.rep(ty) == Rep::Fn {
             self.held[temp as usize] = Some(ty.clone());
         }
@@ -1881,7 +1882,7 @@ impl Lower<'_> {
     /// function values, each stored at the shape the container's own type
     /// gives its member — so a read out of the container has to know that
     /// type, not whatever type a use instantiates the container to.
-    fn contain(&mut self, temp: Temp, ty: &Rc<Ty>) {
+    fn contain(&mut self, temp: Temp, ty: &Arc<Ty>) {
         if matches!(self.rep(ty), Rep::Struct | Rep::Sum) {
             self.held[temp as usize] = Some(ty.clone());
         }
@@ -1890,7 +1891,7 @@ impl Lower<'_> {
     /// The type whose shape a temp's value actually holds: what its producer
     /// recorded, or the type the value is being read at where none did — in
     /// which case production and use are the same place and the two agree.
-    fn holding(&self, temp: Temp, ty: &Rc<Ty>) -> Rc<Ty> {
+    fn holding(&self, temp: Temp, ty: &Arc<Ty>) -> Arc<Ty> {
         self.held[temp as usize]
             .clone()
             .unwrap_or_else(|| ty.clone())
@@ -1933,7 +1934,7 @@ impl Lower<'_> {
     /// scheme quantified, everything an annotation made rigid, and everything
     /// nothing decided is [`Rep::Any`] — monomorphization is deferred, so there
     /// is no narrower answer to give.
-    fn rep(&self, ty: &Rc<Ty>) -> Rep {
+    fn rep(&self, ty: &Arc<Ty>) -> Rep {
         let ty = self.erased(ty);
         match &*ty {
             Ty::Nat => Rep::Nat,
@@ -1968,7 +1969,7 @@ impl Lower<'_> {
     /// inference, but the value inside a package is stored exactly as its body.
     /// Opening aliases again after each package also handles a package whose
     /// body starts with a declared name.
-    fn erased(&self, ty: &Rc<Ty>) -> Rc<Ty> {
+    fn erased(&self, ty: &Arc<Ty>) -> Arc<Ty> {
         let mut ty = unfold(self.inference.aliases(), ty);
         while let Ty::Package(body) = &*ty {
             ty = unfold(self.inference.aliases(), body);
@@ -1984,7 +1985,7 @@ impl Lower<'_> {
     /// parameter has the type that parameter was declared with, and a callee
     /// that is none of those is a program inference refused — which R2 says
     /// this pass is never handed.
-    fn arrow(&self, ty: &Rc<Ty>) -> (Rc<Ty>, Rc<Ty>, Row) {
+    fn arrow(&self, ty: &Arc<Ty>) -> (Arc<Ty>, Arc<Ty>, Row) {
         let ty = self.erased(ty);
         let Ty::Arrow(from, to, row) = &*ty else {
             panic!("LIR runs only on programs with no errors");
@@ -1994,7 +1995,7 @@ impl Lower<'_> {
 
     /// The type reached by walking `steps` arrows down from `ty`, which is what
     /// a value applied that many times short of its arity stands for.
-    fn walked(&self, ty: &Rc<Ty>, steps: usize) -> Rc<Ty> {
+    fn walked(&self, ty: &Arc<Ty>, steps: usize) -> Arc<Ty> {
         let mut ty = ty.clone();
         for _ in 0..steps {
             let (_, to, _) = self.arrow(&ty);
@@ -2008,7 +2009,7 @@ impl Lower<'_> {
     /// name the member — a use may dispatch on a case the production type
     /// never listed — or does not pin its shape down, in which case the use
     /// site's own reading is all there is to go on.
-    fn member_of(&self, ty: &Rc<Ty>, name: &str) -> Option<Rc<Ty>> {
+    fn member_of(&self, ty: &Arc<Ty>, name: &str) -> Option<Arc<Ty>> {
         let ty = self.erased(ty);
         let member = match &*ty {
             Ty::Sum(row) | Ty::Struct(row) => {
@@ -2019,7 +2020,7 @@ impl Lower<'_> {
         member.filter(|member| self.rep(member) != Rep::Any)
     }
 
-    fn array_element(&self, ty: &Rc<Ty>) -> Option<Rc<Ty>> {
+    fn array_element(&self, ty: &Arc<Ty>) -> Option<Arc<Ty>> {
         let ty = self.erased(ty);
         match &*ty {
             Ty::Array(element) => Some(element.clone()),
@@ -2046,14 +2047,14 @@ impl Lower<'_> {
     /// trees: revisiting the same pair of alias applications after inspecting
     /// an arrow is a guarded back edge, and therefore a successful end to this
     /// path rather than another recursive Rust call.
-    fn fits(&self, want: &Rc<Ty>, have: &Rc<Ty>, cache: &mut FitsCache) -> bool {
+    fn fits(&self, want: &Arc<Ty>, have: &Arc<Ty>, cache: &mut FitsCache) -> bool {
         let mut want = want.clone();
         let mut have = have.clone();
         let mut direct = Vec::new();
         let mut aliases = AliasPairs::new();
 
         let answer = loop {
-            let direct_key = (Rc::as_ptr(&want) as usize, Rc::as_ptr(&have) as usize);
+            let direct_key = (Arc::as_ptr(&want) as usize, Arc::as_ptr(&have) as usize);
             if !matches!((&*want, &*have), (Ty::Named { .. }, Ty::Named { .. })) {
                 if let Some((_, _, answer)) = cache.direct.get(&direct_key) {
                     break *answer;
@@ -2375,7 +2376,7 @@ impl Lower<'_> {
     /// stands between them, taking what the declaration passes, rebuilding out
     /// of it what the value expects, and calling the value — which is code
     /// nobody wrote, so all of it is generated.
-    fn fitted(&mut self, want: &Rc<Ty>, have: &Rc<Ty>, temp: Temp, body: &mut Body) -> Temp {
+    fn fitted(&mut self, want: &Arc<Ty>, have: &Arc<Ty>, temp: Temp, body: &mut Body) -> Temp {
         let mut cache = FitsCache::default();
         let mut contexts: Vec<FittedContext> = Vec::new();
         let mut adapters = AdapterAliases::new();
@@ -2882,6 +2883,7 @@ impl Lower<'_> {
     /// Lower one term into the block being built, and hand back the temp its
     /// value lands in.
     fn term(&mut self, term: &Term, body: &mut Body) -> Temp {
+        crate::cancellation::checkpoint();
         let span = term.at;
         let rep = self.rep(&term.ty);
         match &term.kind {
@@ -3345,7 +3347,7 @@ impl Lower<'_> {
     /// known chain takes everything past its arity — over-applying a definition
     /// is calling what its last level gave back, which is a value like any
     /// other.
-    fn spun(&mut self, head: Temp, ty: &Rc<Ty>, applies: &[Apply], body: &mut Body) -> Temp {
+    fn spun(&mut self, head: Temp, ty: &Arc<Ty>, applies: &[Apply], body: &mut Body) -> Temp {
         let mut value = head;
         let mut carrying = ty.clone();
         for apply in applies {
@@ -3367,7 +3369,7 @@ impl Lower<'_> {
     /// this node stands for, so the temp handed on holds its own term's shape.
     fn indirect(
         &mut self,
-        callee_ty: &Rc<Ty>,
+        callee_ty: &Arc<Ty>,
         callee: Temp,
         apply: Apply,
         body: &mut Body,
@@ -3455,7 +3457,7 @@ impl Lower<'_> {
     fn call_known(
         &mut self,
         known: &Known,
-        used: &Rc<Ty>,
+        used: &Arc<Ty>,
         applies: &[Apply],
         body: &mut Body,
     ) -> Temp {
@@ -3783,7 +3785,7 @@ impl Lower<'_> {
     fn switch_len(
         &mut self,
         temp: Temp,
-        ty: &Rc<Ty>,
+        ty: &Arc<Ty>,
         matrix: Matrix,
         tree: &Tree,
         body: &mut Body,
@@ -3838,8 +3840,8 @@ impl Lower<'_> {
     /// slice column, and whatever bound the whole array bound to it.
     fn by_length(
         temp: Temp,
-        ty: &Rc<Ty>,
-        element: &Rc<Ty>,
+        ty: &Arc<Ty>,
+        element: &Arc<Ty>,
         matrix: &Matrix,
         len: Option<usize>,
     ) -> Matrix {
@@ -4142,7 +4144,7 @@ impl Lower<'_> {
     fn widen(
         &mut self,
         temp: Temp,
-        ty: &Rc<Ty>,
+        ty: &Arc<Ty>,
         matrix: Matrix,
         tree: &Tree,
         body: &mut Body,
@@ -4155,7 +4157,7 @@ impl Lower<'_> {
             // pattern itself names are added below, and lowering remains total.
             _ => Row::of(Rest::Undecided),
         };
-        let mut named: Vec<(String, Presence, Rc<Ty>)> = row
+        let mut named: Vec<(String, Presence, Arc<Ty>)> = row
             .labels
             .iter()
             .map(|(name, field)| (name.clone(), field.presence.clone(), field.ty.clone()))
@@ -4167,7 +4169,7 @@ impl Lower<'_> {
             if let Cell::Struct { fields, .. } = &line.cells[0] {
                 for (name, _) in fields {
                     if !named.iter().any(|(known, _, _)| known == name) {
-                        named.push((name.clone(), Presence::Absent, Rc::new(Ty::default())));
+                        named.push((name.clone(), Presence::Absent, Arc::new(Ty::default())));
                     }
                 }
             }
@@ -4434,7 +4436,7 @@ mod tests {
     //! crate-private, so they live here rather than in the workspace's test
     //! crate, which lowers accepted programs only.
 
-    use std::rc::Rc;
+    use std::sync::Arc;
 
     use super::*;
     use crate::{
@@ -4473,7 +4475,7 @@ mod tests {
                 let ir::TermKind::Match { scrutinee, .. } = &mut body.kind else {
                     panic!("match fixture")
                 };
-                scrutinee.ty = Rc::new(Ty::Nat);
+                scrutinee.ty = Arc::new(Ty::Nat);
             },
         );
         assert!(!projects_any_field(&output), "{output:#?}");
@@ -4494,7 +4496,7 @@ mod tests {
                 let ir::TermKind::Match { scrutinee, .. } = &mut body.kind else {
                     panic!("match fixture")
                 };
-                let Ty::Struct(row) = Rc::make_mut(&mut scrutinee.ty) else {
+                let Ty::Struct(row) = Arc::make_mut(&mut scrutinee.ty) else {
                     panic!("struct fixture")
                 };
                 row.labels.clear();
@@ -4569,29 +4571,29 @@ mod tests {
                      let go = takes have",
                     |program, _| {
                         let symbols: Vec<_> = program.terms.keys().copied().collect();
-                        let mut want_to = Rc::new(Ty::Nat);
-                        let mut have_to = Rc::new(Ty::Nat);
+                        let mut want_to = Arc::new(Ty::Nat);
+                        let mut have_to = Arc::new(Ty::Nat);
                         for _ in 0..DEPTH {
-                            want_to = Rc::new(Ty::Arrow(
-                                Rc::new(Ty::Nat),
+                            want_to = Arc::new(Ty::Arrow(
+                                Arc::new(Ty::Nat),
                                 want_to,
                                 Row::closed(),
                             ));
-                            have_to = Rc::new(Ty::Arrow(
-                                Rc::new(Ty::Nat),
+                            have_to = Arc::new(Ty::Arrow(
+                                Arc::new(Ty::Nat),
                                 have_to,
                                 Row::closed(),
                             ));
                         }
-                        let want = Rc::new(Ty::Arrow(
-                            Rc::new(Ty::Nat),
+                        let want = Arc::new(Ty::Arrow(
+                            Arc::new(Ty::Nat),
                             want_to,
                             Row {
                                 labels: [(
                                     "Log".to_string(),
                                     RowField {
                                         presence: Presence::Present,
-                                        ty: Rc::new(Ty::Undecided),
+                                        ty: Arc::new(Ty::Undecided),
                                     },
                                 )]
                                 .into_iter()
@@ -4599,15 +4601,15 @@ mod tests {
                                 rest: Rest::Closed,
                             },
                         ));
-                        let have = Rc::new(Ty::Arrow(
-                            Rc::new(Ty::Nat),
+                        let have = Arc::new(Ty::Arrow(
+                            Arc::new(Ty::Nat),
                             have_to,
                             Row::of(Rest::Bound(0)),
                         ));
 
-                        program.terms.get_mut(&symbols[0]).unwrap().value.ty = Rc::new(Ty::Arrow(
+                        program.terms.get_mut(&symbols[0]).unwrap().value.ty = Arc::new(Ty::Arrow(
                             want,
-                            Rc::new(Ty::Nat),
+                            Arc::new(Ty::Nat),
                             Row::closed(),
                         ));
                         program.terms.get_mut(&symbols[1]).unwrap().value.ty = have.clone();
@@ -4680,7 +4682,7 @@ mod tests {
     #[test]
     fn a_corrupted_container_type_uses_the_written_member_type() {
         let output = lowered_after_check("let value = { x: 1n }", |program, _| {
-            program.terms.values_mut().next().unwrap().value.ty = Rc::new(Ty::Nat);
+            program.terms.values_mut().next().unwrap().value.ty = Arc::new(Ty::Nat);
         });
         assert!(
             instructions(&output).iter().any(|instr| {
@@ -4706,7 +4708,7 @@ mod tests {
         let ir::TermKind::Match { scrutinee, .. } = &mut body.kind else {
             panic!("the fixture function immediately matches")
         };
-        let Ty::Struct(row) = Rc::make_mut(&mut scrutinee.ty) else {
+        let Ty::Struct(row) = Arc::make_mut(&mut scrutinee.ty) else {
             panic!("struct scrutinee")
         };
         row.labels
@@ -4755,25 +4757,26 @@ mod tests {
                 let [x, y, a, b, c, d] = aliases.as_slice() else {
                     panic!("the six test aliases remain available")
                 };
-                let named = |symbol, name: &str, args: Vec<Rc<Ty>>| {
-                    Rc::new(Ty::Named {
+                let named = |symbol, name: &str, args: Vec<Arc<Ty>>| {
+                    Arc::new(Ty::Named {
                         symbol,
-                        name: Rc::from(name),
+                        name: Arc::from(name),
                         args: args.into(),
                     })
                 };
                 let application = |outer, argument| named(outer, "Recursive", vec![argument]);
                 let hidden = |symbol| named(symbol, "Arg", Vec::new());
-                let arrow = |result, effects| Rc::new(Ty::Arrow(Rc::new(Ty::Nat), result, effects));
+                let arrow =
+                    |result, effects| Arc::new(Ty::Arrow(Arc::new(Ty::Nat), result, effects));
 
                 inferred
                     .semantics_mut()
                     .aliases
-                    .insert(*x, Scheme::new(1, Rc::new(Ty::Bound(0))));
+                    .insert(*x, Scheme::new(1, Arc::new(Ty::Bound(0))));
                 inferred
                     .semantics_mut()
                     .aliases
-                    .insert(*y, Scheme::new(1, Rc::new(Ty::Bound(0))));
+                    .insert(*y, Scheme::new(1, Arc::new(Ty::Bound(0))));
                 inferred.semantics_mut().aliases.insert(
                     *a,
                     Scheme::new(0, arrow(application(*x, hidden(*b)), Row::closed())),
@@ -4785,7 +4788,7 @@ mod tests {
                         arrow(
                             application(*x, hidden(*b)),
                             Row {
-                                labels: [("Log".into(), RowField::present(Rc::new(Ty::unit())))]
+                                labels: [("Log".into(), RowField::present(Arc::new(Ty::unit())))]
                                     .into_iter()
                                     .collect(),
                                 rest: Rest::Closed,
@@ -4806,7 +4809,7 @@ mod tests {
                 let have = application(*y, hidden(*c));
                 let terms: Vec<_> = program.terms.keys().copied().collect();
                 program.terms.get_mut(&terms[0]).unwrap().value.ty =
-                    Rc::new(Ty::Arrow(want, Rc::new(Ty::Nat), Row::closed()));
+                    Arc::new(Ty::Arrow(want, Arc::new(Ty::Nat), Row::closed()));
                 program.terms.get_mut(&terms[1]).unwrap().value.ty = have.clone();
                 let ir::TermKind::Apply { arg, .. } =
                     &mut program.terms.get_mut(&terms[2]).unwrap().value.kind
@@ -4850,20 +4853,20 @@ mod tests {
                     let [x, y] = aliases.as_slice() else {
                         panic!("the two test aliases remain available")
                     };
-                    let named = |symbol, args: Vec<Rc<Ty>>| {
-                        Rc::new(Ty::Named {
+                    let named = |symbol, args: Vec<Arc<Ty>>| {
+                        Arc::new(Ty::Named {
                             symbol,
-                            name: Rc::from("Recursive"),
+                            name: Arc::from("Recursive"),
                             args: args.into(),
                         })
                     };
                     let recovered = |id| {
-                        Rc::new(Ty::Struct(Row {
+                        Arc::new(Ty::Struct(Row {
                             labels: [(
                                 "field".into(),
                                 RowField {
                                     presence: Presence::Recovered(id),
-                                    ty: Rc::new(Ty::Nat),
+                                    ty: Arc::new(Ty::Nat),
                                 },
                             )]
                             .into_iter()
@@ -4874,9 +4877,9 @@ mod tests {
                     let recursive = |symbol, effects| {
                         Scheme::new(
                             2,
-                            Rc::new(Ty::Arrow(
-                                Rc::new(Ty::Nat),
-                                named(symbol, vec![Rc::new(Ty::Bound(1)), Rc::new(Ty::Bound(1))]),
+                            Arc::new(Ty::Arrow(
+                                Arc::new(Ty::Nat),
+                                named(symbol, vec![Arc::new(Ty::Bound(1)), Arc::new(Ty::Bound(1))]),
                                 effects,
                             )),
                         )
@@ -4886,7 +4889,7 @@ mod tests {
                         recursive(
                             *x,
                             Row {
-                                labels: [("Log".into(), RowField::present(Rc::new(Ty::unit())))]
+                                labels: [("Log".into(), RowField::present(Arc::new(Ty::unit())))]
                                     .into_iter()
                                     .collect(),
                                 rest: Rest::Closed,
@@ -4902,7 +4905,7 @@ mod tests {
                     let have = named(*y, vec![recovered(first_id), recovered(2)]);
                     let terms: Vec<_> = program.terms.keys().copied().collect();
                     program.terms.get_mut(&terms[0]).unwrap().value.ty =
-                        Rc::new(Ty::Arrow(want, Rc::new(Ty::Nat), Row::closed()));
+                        Arc::new(Ty::Arrow(want, Arc::new(Ty::Nat), Row::closed()));
                     program.terms.get_mut(&terms[1]).unwrap().value.ty = have.clone();
                     let ir::TermKind::Apply { arg, .. } =
                         &mut program.terms.get_mut(&terms[2]).unwrap().value.kind
@@ -4946,10 +4949,10 @@ mod tests {
                         let [x, y, carrier, a, b, c] = symbols.as_slice() else {
                             panic!("the six test aliases remain available")
                         };
-                        let named = |symbol, name: &str, args: Vec<Rc<Ty>>| {
-                            Rc::new(Ty::Named {
+                        let named = |symbol, name: &str, args: Vec<Arc<Ty>>| {
+                            Arc::new(Ty::Named {
                                 symbol,
-                                name: Rc::from(name),
+                                name: Arc::from(name),
                                 args: args.into(),
                             })
                         };
@@ -4966,13 +4969,13 @@ mod tests {
                         inferred
                             .semantics_mut()
                             .aliases
-                            .insert(*carrier, Scheme::new(1, Rc::new(Ty::Bound(0))));
+                            .insert(*carrier, Scheme::new(1, Arc::new(Ty::Bound(0))));
                         inferred.semantics_mut().aliases.insert(
                             *x,
                             Scheme::new(
                                 1,
-                                Rc::new(Ty::Arrow(
-                                    Rc::new(Ty::Nat),
+                                Arc::new(Ty::Arrow(
+                                    Arc::new(Ty::Nat),
                                     application(*x, deep_b.clone()),
                                     Row::closed(),
                                 )),
@@ -4982,8 +4985,8 @@ mod tests {
                             *y,
                             Scheme::new(
                                 1,
-                                Rc::new(Ty::Arrow(
-                                    Rc::new(Ty::Nat),
+                                Arc::new(Ty::Arrow(
+                                    Arc::new(Ty::Nat),
                                     application(*y, deep_c.clone()),
                                     Row::closed(),
                                 )),
@@ -4994,7 +4997,7 @@ mod tests {
                         let have = application(*y, deep_c);
                         let terms: Vec<_> = program.terms.keys().copied().collect();
                         program.terms.get_mut(&terms[0]).unwrap().value.ty =
-                            Rc::new(Ty::Arrow(want, Rc::new(Ty::Nat), Row::closed()));
+                            Arc::new(Ty::Arrow(want, Arc::new(Ty::Nat), Row::closed()));
                         program.terms.get_mut(&terms[1]).unwrap().value.ty = have.clone();
                         let ir::TermKind::Apply { arg, .. } =
                             &mut program.terms.get_mut(&terms[2]).unwrap().value.kind

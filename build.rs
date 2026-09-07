@@ -45,7 +45,7 @@ fn collect(dir: &Path, files: &mut Vec<std::path::PathBuf>) {
             collect(&path, files);
         } else if path
             .extension()
-            .is_some_and(|extension| extension == "rs" || extension == "js" || extension == "hc")
+            .is_some_and(|extension| extension == "rs" || extension == "js" || extension == "rud")
         {
             files.push(path);
         }

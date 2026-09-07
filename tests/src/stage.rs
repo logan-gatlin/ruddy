@@ -20,8 +20,8 @@ use ruddy_debug::{
 /// its parent's name spells.
 const NESTED: &[(&str, &str)] = &[
     (ROOT, "module Math\nlet four = Math::double 2n\n"),
-    ("Math.hc", "module Vec\nlet double = fn x => x\n"),
-    ("Math/Vec.hc", "let zero = 0n\n"),
+    ("Math.rud", "module Vec\nlet double = fn x => x\n"),
+    ("Math/Vec.rud", "let zero = 0n\n"),
 ];
 
 /// The page finds a stage's variables by the pattern the stage declares, and by
@@ -1224,9 +1224,9 @@ fn the_tokens_tab_groups_its_rows_by_file() {
     assert_eq!(
         rows,
         [
-            ("File", "main.hc · 9 tokens"),
-            ("File", "Math.hc · 9 tokens"),
-            ("File", "Math/Vec.hc · 4 tokens"),
+            ("File", "main.rud · 9 tokens"),
+            ("File", "Math.rud · 9 tokens"),
+            ("File", "Math/Vec.rud · 4 tokens"),
         ],
         "{:#?}",
         stage.nodes
@@ -1336,9 +1336,9 @@ fn the_ast_tab_groups_its_rows_by_file() {
     assert_eq!(
         files,
         [
-            ("File", "main.hc"),
-            ("File", "Math.hc"),
-            ("File", "Math/Vec.hc"),
+            ("File", "main.rud"),
+            ("File", "Math.rud"),
+            ("File", "Math/Vec.rud"),
         ],
         "{:#?}",
         stage.nodes
@@ -1352,7 +1352,7 @@ fn the_ast_tab_groups_its_rows_by_file() {
             .collect()
     };
     assert_eq!(children(0), ["Module", "Let"]);
-    // The module whose body is in `Math.hc` carries its name and nothing else:
+    // The module whose body is in `Math.rud` carries its name and nothing else:
     // the body is that file's row.
     let math = &stage.nodes[0].children[0];
     assert_eq!(
@@ -1409,14 +1409,14 @@ fn the_symbols_tab_says_which_module_and_file_a_symbol_came_from() {
 
     // Two modules deep, declared in the file its own path spells.
     assert_eq!(field("zero", "module"), "Math::Vec");
-    assert_eq!(field("zero", "file"), "Math/Vec.hc");
+    assert_eq!(field("zero", "file"), "Math/Vec.rud");
     // One deep, in the file its parent's declaration named.
     assert_eq!(field("double", "module"), "Math");
-    assert_eq!(field("double", "file"), "Math.hc");
+    assert_eq!(field("double", "file"), "Math.rud");
     // And at the bundle root, which is a real position in the tree rather than
     // a missing one — so it is written as one rather than left blank.
     assert_eq!(field("four", "module"), "—");
-    assert_eq!(field("four", "file"), "main.hc");
+    assert_eq!(field("four", "file"), "main.rud");
 
     // A local is written inside a definition rather than declared, so there is
     // no declaration to read a file off: the column is blank, and the module is

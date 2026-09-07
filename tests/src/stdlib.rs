@@ -9,13 +9,13 @@ fn immutable_arrays_run_end_to_end_across_trie_and_tail_boundaries() {
     fs::write(
         project.path().join("Ruddy.toml"),
         format!(
-            "name = \"array-test\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.hc\"\ntarget = \"js\"\n\n[dependencies]\nstd = {:?}\n",
-            root.join("std")
+            "name = \"array-test\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.rud\"\ntarget = \"js\"\n\n[dependencies]\nstd = {:?}\n",
+            root
         ),
     )
     .unwrap();
     fs::write(
-        project.path().join("main.hc"),
+        project.path().join("main.rud"),
         r#"let original = [0n, 1n, 2n, 3n, 4n, 5n, 6n, 7n, 8n, 9n, 10n, 11n, 12n, 13n, 14n, 15n, 16n, 17n, 18n, 19n, 20n, 21n, 22n, 23n, 24n, 25n, 26n, 27n, 28n, 29n, 30n, 31n, 32n]
 let changed = match std::array::set original 0n 99n with | #Some values => values | #None => original end
 let original_first = match std::array::get original 0n with | #Some value => value | #None => 999n end
@@ -67,13 +67,13 @@ fn bundled_primitive_utilities_compile_and_run_through_the_javascript_boundary()
     fs::write(
         project.path().join("Ruddy.toml"),
         format!(
-            "name = \"str-test\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.hc\"\ntarget = \"js\"\n\n[dependencies]\nstd = {:?}\n",
-            root.join("std")
+            "name = \"str-test\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.rud\"\ntarget = \"js\"\n\n[dependencies]\nstd = {:?}\n",
+            root
         ),
     )
     .unwrap();
     fs::write(
-        project.path().join("main.hc"),
+        project.path().join("main.rud"),
         r#"let joined = std::str::concat "rud" "dy"
 let size = std::str::len joined
 let empty = std::str::is_empty ""
@@ -170,13 +170,13 @@ fn bundled_functional_and_polymorphic_utilities_run_end_to_end() {
     fs::write(
         project.path().join("Ruddy.toml"),
         format!(
-            "name = \"std-test\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.hc\"\ntarget = \"js\"\n\n[dependencies]\nstd = {:?}\n",
-            root.join("std")
+            "name = \"std-test\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.rud\"\ntarget = \"js\"\n\n[dependencies]\nstd = {:?}\n",
+            root
         ),
     )
     .unwrap();
     fs::write(
-        project.path().join("main.hc"),
+        project.path().join("main.rud"),
         r#"let ordering_name = fn ordering => match ordering with
   | #Less => "less"
   | #Equal => "equal"

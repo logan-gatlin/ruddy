@@ -41,7 +41,7 @@ fn js() -> Environment {
     environment("js")
 }
 
-/// Load an in-memory bundle rooted at `main.hc` for a JavaScript build, with
+/// Load an in-memory bundle rooted at `main.rud` for a JavaScript build, with
 /// the file manager the spans name their files through.
 fn load(files: &[(&str, &str)]) -> (FileManager, Output) {
     load_for("js", files)
@@ -61,13 +61,13 @@ fn load_in(environment: &Environment, files: &[(&str, &str)]) -> (FileManager, O
             .collect(),
     );
     let mut manager = FileManager::new();
-    let out = bundle::load(&mut manager, &fs, "main.hc", environment);
+    let out = bundle::load(&mut manager, &fs, "main.rud", environment);
     (manager, out)
 }
 
 /// One file's worth of bundle, which is what most of the tests below want.
 fn one(source: &str) -> Output {
-    load(&[("main.hc", source)]).1
+    load(&[("main.rud", source)]).1
 }
 
 /// The paths the loader read, in the order it read them.
@@ -112,9 +112,9 @@ fn fixture(name: &str) -> Disk {
 #[test]
 fn a_sandbox_that_cannot_be_resolved_reads_nothing() {
     let directory = tempfile::tempdir().unwrap();
-    std::fs::write(directory.path().join("main.hc"), "let main = 0n\n").unwrap();
+    std::fs::write(directory.path().join("main.rud"), "let main = 0n\n").unwrap();
     let disk = Disk::sandboxed(directory.path(), directory.path().join("missing"));
-    assert!(disk.read("main.hc").is_none());
+    assert!(disk.read("main.rud").is_none());
 }
 
 /// The ordinary case: one file and nothing to splice. Everything after it is
@@ -124,7 +124,7 @@ fn a_sandbox_that_cannot_be_resolved_reads_nothing() {
 fn a_single_file_bundle_loads_with_no_errors() {
     let out = one("let id = fn x => x\n");
 
-    assert_eq!(paths(&out), ["main.hc"]);
+    assert_eq!(paths(&out), ["main.rud"]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert_eq!(names(&out.stmts), ["let id"]);
 }
@@ -137,13 +137,13 @@ fn a_single_file_bundle_loads_with_no_errors() {
 #[test]
 fn a_nested_bundle_splices_every_file_into_one_tree() {
     let (manager, out) = load(&[
-        ("main.hc", "module Math\nlet four = Math::double 2n\n"),
-        ("Math.hc", "module Vec\nlet double = fn x => x\n"),
-        ("Math/Vec.hc", "let zero = 0n\n"),
+        ("main.rud", "module Math\nlet four = Math::double 2n\n"),
+        ("Math.rud", "module Vec\nlet double = fn x => x\n"),
+        ("Math/Vec.rud", "let zero = 0n\n"),
     ]);
 
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    assert_eq!(paths(&out), ["main.hc", "Math.hc", "Math/Vec.hc"]);
+    assert_eq!(paths(&out), ["main.rud", "Math.rud", "Math/Vec.rud"]);
     assert_eq!(names(&out.stmts), ["module Math", "let four"]);
 
     let math = body(&out.stmts, "Math");
@@ -177,11 +177,11 @@ fn a_nested_bundle_splices_every_file_into_one_tree() {
 fn file_modules_share_structural_effects() {
     let out = load(&[
         (
-            "main.hc",
+            "main.rud",
             "module Foo\nmodule Bar\nlet cross : Nat -> {} + Foo::!Log = fn n => do let _ = Bar::!Log.write n return {} end\n",
         ),
-        ("Foo.hc", "effect Log = { write: Nat -> () }\n"),
-        ("Bar.hc", "effect Log = { write: Nat -> () }\n"),
+        ("Foo.rud", "effect Log = { write: Nat -> () }\n"),
+        ("Bar.rud", "effect Log = { write: Nat -> () }\n"),
     ])
     .1;
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
@@ -207,19 +207,19 @@ fn file_modules_share_structural_effects() {
     assert_eq!(effects.effects.keys().next().expect("effect").name(), "Log");
 }
 
-/// The second spelling. `A/module.hc` and `A.hc` are the same module written
+/// The second spelling. `A/module.rud` and `A.rud` are the same module written
 /// two ways, so the tree they produce has to be the same tree — only the path
 /// the loader read differs.
 #[test]
 fn a_module_directory_serves_in_place_of_a_file_beside_it() {
     let out = load(&[
-        ("main.hc", "module Math\n"),
-        ("Math/module.hc", "let double = fn x => x\n"),
+        ("main.rud", "module Math\n"),
+        ("Math/module.rud", "let double = fn x => x\n"),
     ])
     .1;
 
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    assert_eq!(paths(&out), ["main.hc", "Math/module.hc"]);
+    assert_eq!(paths(&out), ["main.rud", "Math/module.rud"]);
     assert_eq!(names(body(&out.stmts, "Math")), ["let double"]);
 }
 
@@ -230,16 +230,16 @@ fn a_module_directory_serves_in_place_of_a_file_beside_it() {
 #[test]
 fn a_file_module_inside_an_inline_module_is_looked_for_under_it() {
     let out = load(&[
-        ("main.hc", "module A =\n  module B\nend\n"),
-        ("A/B.hc", "let x = 1n\n"),
+        ("main.rud", "module A =\n  module B\nend\n"),
+        ("A/B.rud", "let x = 1n\n"),
         // Beside the root, where it must *not* be found: a loader that dropped
         // the enclosing module from the path would read this one and pass.
-        ("B.hc", "let wrong = 1n\n"),
+        ("B.rud", "let wrong = 1n\n"),
     ])
     .1;
 
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    assert_eq!(paths(&out), ["main.hc", "A/B.hc"]);
+    assert_eq!(paths(&out), ["main.rud", "A/B.rud"]);
     let a = body(&out.stmts, "A");
     assert_eq!(names(body(a, "B")), ["let x"]);
 }
@@ -256,8 +256,8 @@ fn a_module_with_no_file_is_reported_and_the_rest_still_loads() {
     assert_eq!(
         out.errors[0].kind,
         ErrorKind::ModuleFileMissing {
-            beside: "Gone.hc".to_string(),
-            inside: "Gone/module.hc".to_string(),
+            beside: "Gone.rud".to_string(),
+            inside: "Gone/module.rud".to_string(),
         }
     );
     // At the declaration, which is the name the reader wrote.
@@ -276,12 +276,12 @@ fn a_module_with_no_file_is_reported_and_the_rest_still_loads() {
 #[test]
 fn a_repeated_file_module_does_not_splice_its_body_twice() {
     let out = load(&[
-        ("main.hc", "module Math\nmodule Math\n"),
-        ("Math.hc", "let double = fn x => x\n"),
+        ("main.rud", "module Math\nmodule Math\n"),
+        ("Math.rud", "let double = fn x => x\n"),
     ])
     .1;
 
-    assert_eq!(paths(&out), ["main.hc", "Math.hc"]);
+    assert_eq!(paths(&out), ["main.rud", "Math.rud"]);
     let mut mint = Mint::new(Bundle::new("demo", Version::new(0, 1, 0)).expect("valid bundle"));
     let built = ruddy::ir::build(&mut mint, out.stmts);
     assert_eq!(
@@ -302,9 +302,9 @@ fn a_repeated_file_module_does_not_splice_its_body_twice() {
 #[test]
 fn a_module_with_two_files_is_reported_and_neither_is_read() {
     let out = load(&[
-        ("main.hc", "module Math\nlet x = 1n\n"),
-        ("Math.hc", "let beside = 1n\n"),
-        ("Math/module.hc", "let inside = 1n\n"),
+        ("main.rud", "module Math\nlet x = 1n\n"),
+        ("Math.rud", "let beside = 1n\n"),
+        ("Math/module.rud", "let inside = 1n\n"),
     ])
     .1;
 
@@ -312,11 +312,11 @@ fn a_module_with_two_files_is_reported_and_neither_is_read() {
     assert_eq!(
         out.errors[0].kind,
         ErrorKind::ModuleFileAmbiguous {
-            beside: "Math.hc".to_string(),
-            inside: "Math/module.hc".to_string(),
+            beside: "Math.rud".to_string(),
+            inside: "Math/module.rud".to_string(),
         }
     );
-    assert_eq!(paths(&out), ["main.hc"]);
+    assert_eq!(paths(&out), ["main.rud"]);
     assert_eq!(names(body(&out.stmts, "Math")), [] as [String; 0]);
     assert_eq!(names(&out.stmts), ["module Math", "let x"]);
 }
@@ -327,14 +327,14 @@ fn a_module_with_two_files_is_reported_and_neither_is_read() {
 #[test]
 fn a_root_name_collision_does_not_hide_ambiguous_module_files() {
     let fs = Memory(HashMap::from([
-        ("Child.hc".to_string(), "module Child\n".to_string()),
+        ("Child.rud".to_string(), "module Child\n".to_string()),
         (
-            "Child/module.hc".to_string(),
+            "Child/module.rud".to_string(),
             "let inside = 1n\n".to_string(),
         ),
     ]));
     let mut manager = FileManager::new();
-    let out = bundle::load(&mut manager, &fs, "Child.hc", &js());
+    let out = bundle::load(&mut manager, &fs, "Child.rud", &js());
 
     assert_eq!(
         out.errors
@@ -342,13 +342,13 @@ fn a_root_name_collision_does_not_hide_ambiguous_module_files() {
             .map(|error| &error.kind)
             .collect::<Vec<_>>(),
         [&ErrorKind::ModuleFileAmbiguous {
-            beside: "Child.hc".to_string(),
-            inside: "Child/module.hc".to_string(),
+            beside: "Child.rud".to_string(),
+            inside: "Child/module.rud".to_string(),
         }],
         "{:#?}",
         out.errors,
     );
-    assert_eq!(paths(&out), ["Child.hc"]);
+    assert_eq!(paths(&out), ["Child.rud"]);
     assert_eq!(names(body(&out.stmts, "Child")), [] as [String; 0]);
 }
 
@@ -359,9 +359,9 @@ fn a_root_name_collision_does_not_hide_ambiguous_module_files() {
 #[test]
 fn each_file_carries_its_own_lex_and_parse_errors() {
     let out = load(&[
-        ("main.hc", "module A\nmodule B\n"),
-        ("A.hc", "let x = @\n"),
-        ("B.hc", "let = 1n\n"),
+        ("main.rud", "module A\nmodule B\n"),
+        ("A.rud", "let x = @\n"),
+        ("B.rud", "let = 1n\n"),
     ])
     .1;
 
@@ -387,13 +387,13 @@ fn a_guard_keeps_a_definition_for_its_target_and_drops_it_for_others() {
                   @if {target: \"artifact\"} module M = let inner = 0n end\n\
                   @if {target: \"js\"} extern f : Nat = \"1\"\n";
 
-    let out = load_for("js", &[("main.hc", source)]).1;
+    let out = load_for("js", &[("main.rud", source)]).1;
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert_eq!(names(&out.stmts), ["let a", "let c", "type T", "extern f"]);
     assert_eq!(out.stmts[0].attributes[0].key.tracked, "if");
     assert!(out.stmts[1].attributes.is_empty());
 
-    let out = load_for("artifact", &[("main.hc", source)]).1;
+    let out = load_for("artifact", &[("main.rud", source)]).1;
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert_eq!(
         names(&out.stmts),
@@ -408,20 +408,20 @@ fn a_guard_keeps_a_definition_for_its_target_and_drops_it_for_others() {
 fn a_guarded_file_module_is_only_looked_for_when_its_guard_holds() {
     let files = [
         (
-            "main.hc",
+            "main.rud",
             "@if {target: \"js\"} module js\n@if {target: \"artifact\"} module native\nlet x = 1n\n",
         ),
-        ("js.hc", "let now = 0n\n"),
+        ("js.rud", "let now = 0n\n"),
     ];
 
     let out = load_for("js", &files).1;
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    assert_eq!(paths(&out), ["main.hc", "js.hc"]);
+    assert_eq!(paths(&out), ["main.rud", "js.rud"]);
     assert_eq!(names(&out.stmts), ["module js", "let x"]);
     assert_eq!(names(body(&out.stmts, "js")), ["let now"]);
 
     let out = load_for("artifact", &files).1;
-    assert_eq!(paths(&out), ["main.hc"]);
+    assert_eq!(paths(&out), ["main.rud"]);
     assert_eq!(names(&out.stmts), ["module native", "let x"]);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert!(matches!(
@@ -439,11 +439,11 @@ fn guards_are_judged_inside_module_bodies() {
         "js",
         &[
             (
-                "main.hc",
+                "main.rud",
                 "module A\nmodule B = @if {target: \"artifact\"} let hidden = 0n let shown = 1n end\n@if {target: \"artifact\"} module C = module D end\n",
             ),
             (
-                "A.hc",
+                "A.rud",
                 "@if {target: \"artifact\"} let gone = 0n\nlet kept = 1n\n@if {target: \"artifact\"} module Deep\n",
             ),
         ],
@@ -451,7 +451,7 @@ fn guards_are_judged_inside_module_bodies() {
     .1;
 
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    assert_eq!(paths(&out), ["main.hc", "A.hc"]);
+    assert_eq!(paths(&out), ["main.rud", "A.rud"]);
     assert_eq!(names(&out.stmts), ["module A", "module B"]);
     assert_eq!(names(body(&out.stmts, "A")), ["let kept"]);
     assert_eq!(names(body(&out.stmts, "B")), ["let shown"]);
@@ -467,7 +467,7 @@ fn definitions_guarded_for_different_targets_do_not_collide() {
                   @if {target: \"artifact\"} let f = 2n\n\
                   @if {target: \"rust\"} let f = 3n\n";
     for target in ["js", "artifact"] {
-        let out = load_for(target, &[("main.hc", source)]).1;
+        let out = load_for(target, &[("main.rud", source)]).1;
         assert!(out.errors.is_empty(), "{target}: {:#?}", out.errors);
         assert_eq!(names(&out.stmts), ["let f"], "{target}");
         let mut mint = Mint::new(Bundle::new("demo", Version::new(0, 1, 0)).expect("valid bundle"));
@@ -493,7 +493,7 @@ fn a_guard_holds_when_every_fact_it_names_holds() {
         ("artifact", "node", &["let n"]),
     ] {
         let environment = Environment::new([("target", target), ("platform", platform)]);
-        let out = load_in(&environment, &[("main.hc", source)]).1;
+        let out = load_in(&environment, &[("main.rud", source)]).1;
         assert!(
             out.errors.is_empty(),
             "{target}/{platform}: {:#?}",
@@ -593,23 +593,23 @@ fn a_malformed_guard_is_reported_and_keeps_its_definition() {
 fn disk_reads_a_checked_in_fixture() {
     let fs = fixture("nested");
     let mut manager = FileManager::new();
-    let out = bundle::load(&mut manager, &fs, "main.hc", &js());
+    let out = bundle::load(&mut manager, &fs, "main.rud", &js());
 
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    assert_eq!(paths(&out), ["main.hc", "Math.hc", "Math/Vec.hc"]);
+    assert_eq!(paths(&out), ["main.rud", "Math.rud", "Math/Vec.rud"]);
     let math = body(&out.stmts, "Math");
     assert_eq!(names(body(math, "Vec")), ["let zero"]);
 }
 
-/// The `A/module.hc` spelling, on a real filesystem, for the reason above.
+/// The `A/module.rud` spelling, on a real filesystem, for the reason above.
 #[test]
 fn disk_reads_the_directory_spelling() {
     let fs = fixture("dir-form");
     let mut manager = FileManager::new();
-    let out = bundle::load(&mut manager, &fs, "main.hc", &js());
+    let out = bundle::load(&mut manager, &fs, "main.rud", &js());
 
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    assert_eq!(paths(&out), ["main.hc", "Math/module.hc"]);
+    assert_eq!(paths(&out), ["main.rud", "Math/module.rud"]);
 }
 
 /// A fixture whose module file is genuinely absent, so the complaint is reached
@@ -618,7 +618,7 @@ fn disk_reads_the_directory_spelling() {
 fn disk_reports_a_fixture_whose_module_file_is_missing() {
     let fs = fixture("broken");
     let mut manager = FileManager::new();
-    let out = bundle::load(&mut manager, &fs, "main.hc", &js());
+    let out = bundle::load(&mut manager, &fs, "main.rud", &js());
 
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert!(matches!(
@@ -634,9 +634,9 @@ fn disk_reports_a_fixture_whose_module_file_is_missing() {
 fn disk_answers_none_for_a_path_that_is_not_there() {
     let fs = fixture("nested");
 
-    assert!(fs.read("main.hc").is_some());
-    assert!(fs.read("Nope.hc").is_none());
-    assert!(fs.read("Math/Nope.hc").is_none());
+    assert!(fs.read("main.rud").is_some());
+    assert!(fs.read("Nope.rud").is_none());
+    assert!(fs.read("Math/Nope.rud").is_none());
 }
 
 /// A root the loader cannot read is an empty file rather than a panic. Only the
@@ -645,7 +645,7 @@ fn disk_answers_none_for_a_path_that_is_not_there() {
 fn a_root_that_is_not_there_loads_as_an_empty_file() {
     let out = load(&[]).1;
 
-    assert_eq!(paths(&out), ["main.hc"]);
+    assert_eq!(paths(&out), ["main.rud"]);
     assert!(out.stmts.is_empty());
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
 }

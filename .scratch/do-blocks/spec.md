@@ -78,7 +78,7 @@ keyword.
 - Each desugared `Let` term keeps the span of its own written statement, so diagnostics point at the statement that caused them.
 - A block's scope is released at its `end`; no binding leaks past it.
 - The surface printer prints a block as `do`, its statements, the optional `return`, and `end`. The normalized printer prints a chain of `Let` terms as one block: consecutive `Let` bodies fold into one statement list, and a final unit-literal body prints as a block without `return`. Grouping follows the existing rules for `if` and `match`.
-- Every `let ... in` in `std/`, `demo.hc`, tests, tree-sitter corpus files, and code comments is rewritten as a block. The doc comment on `ExprKind::Operation` that says there is no `do` form is corrected.
+- Every `let ... in` in `std/`, `demo.rud`, tests, tree-sitter corpus files, and code comments is rewritten as a block. The doc comment on `ExprKind::Operation` that says there is no `do` form is corrected.
 - No diagnostic is added for the old `let ... in` spelling. Source that still writes `in` is read as an application to a name called `in` and reported however that fails.
 
 ## Testing Decisions

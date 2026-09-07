@@ -25,6 +25,7 @@ use ruddy::{
 use serde::{Deserialize, Serialize};
 
 mod cache;
+pub mod workspace;
 
 pub use cache::fingerprint;
 
@@ -32,7 +33,7 @@ mod git;
 pub use git::{LOCKFILE, LockedGit, LockedSelector, Lockfile, ruddy_home};
 
 const MANIFEST: &str = "Ruddy.toml";
-const ROOT: &str = "main.hc";
+const ROOT: &str = "main.rud";
 const GITIGNORE: &str = ".gitignore";
 const BUILD_DIRECTORY: &str = "build";
 const NODE_PACKAGE: &[u8] = b"{\"type\":\"module\"}\n";
@@ -221,7 +222,7 @@ pub fn new_project(path: impl AsRef<Path>) -> Result<(), CliError> {
     write_new_file(
         &manifest,
         &format!(
-            "name = {name:?}\nversion = {INITIAL_VERSION:?}\nkind = \"executable\"\nroot = \"main.hc\"\ntarget = \"js\"\n\n[dependencies]\n"
+            "name = {name:?}\nversion = {INITIAL_VERSION:?}\nkind = \"executable\"\nroot = \"main.rud\"\ntarget = \"js\"\n\n[dependencies]\n"
         ),
     )?;
     write_new_file(&root, "let main = fn _ => ()\n")?;
@@ -1462,6 +1463,24 @@ where
     I: IntoIterator<Item = (A, DependencySpec)>,
     A: Into<String>,
 {
+    let specifications = dependency_specs(
+        std,
+        dependencies
+            .into_iter()
+            .map(|(alias, spec)| (alias.into(), spec)),
+    )?;
+    compile_sandboxed_dependency_specs_inner(
+        specifications,
+        project.as_ref(),
+        sandbox.as_ref(),
+        build,
+    )
+}
+
+fn dependency_specs(
+    std: &StdConfig,
+    dependencies: impl IntoIterator<Item = (String, DependencySpec)>,
+) -> Result<Vec<(String, DependencySpec, bool)>, CompileError> {
     let mut specifications = Vec::new();
     match std {
         StdConfig::Default => {
@@ -1476,7 +1495,6 @@ where
         }
     }
     for (alias, specification) in dependencies {
-        let alias = alias.into();
         if alias == "std" {
             return Err(CompileError::report(
                 "dependency-alias-reserved",
@@ -1486,12 +1504,7 @@ where
         }
         specifications.push((alias, specification, false));
     }
-    compile_sandboxed_dependency_specs_inner(
-        specifications,
-        project.as_ref(),
-        sandbox.as_ref(),
-        build,
-    )
+    Ok(specifications)
 }
 
 fn compile_sandboxed_dependency_specs_inner<I>(
@@ -1801,26 +1814,14 @@ impl GraphCompiler {
         // Synthesize std before declared dependencies for deterministic graph,
         // header, and source-import order. Each visited manifest makes this
         // decision independently, including path and Git dependencies.
-        let mut dependencies = Vec::with_capacity(manifest.dependencies.declared.len() + 1);
-        match &manifest.dependencies.std {
-            StdConfig::Default => {
-                let specification = ruddy_home()
-                    .map(|home| DependencySpec::Path(home.join("std")))
-                    .map_err(default_std_error)?;
-                dependencies.push(("std".to_string(), specification, true));
-            }
-            StdConfig::Disabled => {}
-            StdConfig::Dependency(specification) => {
-                dependencies.push(("std".to_string(), specification.clone(), false));
-            }
-        }
-        dependencies.extend(
+        let dependencies = dependency_specs(
+            &manifest.dependencies.std,
             manifest
                 .dependencies
                 .declared
                 .iter()
-                .map(|(alias, specification)| (alias.clone(), specification.clone(), false)),
-        );
+                .map(|(alias, spec)| (alias.clone(), spec.clone())),
+        )?;
 
         let mut dependency_artifacts = Vec::with_capacity(dependencies.len());
         let mut dependency_indices = Vec::with_capacity(dependencies.len());
@@ -2122,7 +2123,7 @@ fn compile_one(
             "project-root-invalid",
             "`root` must name a Ruddy source file",
         )
-        .with_help("set `root` to a file such as `main.hc`"));
+        .with_help("set `root` to a file such as `main.rud`"));
     };
     let source_directory = manifest.root.parent().unwrap_or(Path::new(""));
     let root = directory.join(&manifest.root);
@@ -2449,12 +2450,17 @@ fn load_manifest(directory: &Path, sandbox: Option<&Path>) -> Result<Manifest, C
         )
         .with_note(error.to_string())
     })?;
-    let manifest: Manifest = toml::from_str(&source).map_err(|error| {
+    parse_manifest(directory, &source)
+}
+
+fn parse_manifest(directory: &Path, source: &str) -> Result<Manifest, CompileError> {
+    let path = directory.join(MANIFEST);
+    let manifest: Manifest = toml::from_str(source).map_err(|error| {
         CompileError::report(
             "manifest-invalid",
             format!("`{}` contains invalid project settings", path.display()),
         )
-        .with_note(toml_error_note(&source, &error))
+        .with_note(toml_error_note(source, &error))
         .with_help("fix the named field in `Ruddy.toml` and try again")
     })?;
     // The JavaScript backend's entry adapter and epilogue are Node's: they

@@ -16,7 +16,7 @@ end
 ```
 
 Every function below has the `!FileSystem` effect. These are interface signatures;
-the definitions live in [`std/fs.hc`](../std/fs.hc).
+the definitions live in [`std/fs.rud`](../std/fs.rud).
 
 ```text
 read_bytes: String -> Result [Nat8] Error
@@ -63,7 +63,7 @@ copy_file: { source: String, destination: String } -> Result () fs::Error
 
 For example, write a file containing a NUL byte, a high-bit byte, and `255`:
 
-```hc
+```ruddy
 let main = fn _ => match std::fs::write_bytes "data.bin" [0n8, 128n8, 255n8] with
   | #Some _ => ()
   | #Error error => std::console::print_error error.message

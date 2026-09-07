@@ -1,0 +1,2 @@
+# Preserve generated workspaces locally without adding repeated corpus copies to Git.
+workspace-*/

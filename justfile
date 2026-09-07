@@ -53,6 +53,10 @@ dev:
 debug *args:
     cargo run -p ruddy-debug -- --port {{port}} {{args}}
 
+# Run the language server over stdio.
+lsp:
+    cargo run -p ruddy-lsp --bin ruddy-ls
+
 # Regenerate the tree-sitter parser and run its corpus tests.
 grammar *args:
     #!/usr/bin/env bash
@@ -90,6 +94,9 @@ helix:
     echo "built $runtime/grammars/ruddy.so"
 
     cp "$grammar"/queries/*.scm "$runtime/queries/ruddy/"
+    # Helix reads the class suffix on local definitions. Its locals engine
+    # treats Tree-sitter's bare capture as a discard, so omit that companion.
+    sed 's/@local\.definition / /g' "$grammar/queries/locals.scm" > "$runtime/queries/ruddy/locals.scm"
     echo "copied $(ls "$grammar"/queries/*.scm | wc -l) queries to $runtime/queries/ruddy"
 
     # Appended rather than written: `languages.toml` is the editor's own file
@@ -105,7 +112,7 @@ helix:
     name = "ruddy"
     scope = "source.ruddy"
     injection-regex = "ruddy"
-    file-types = ["hc"]
+    file-types = ["rud"]
     indent = { tab-width = 2, unit = "  " }
     grammar = "ruddy"
 
@@ -116,7 +123,7 @@ helix:
         echo "appended the ruddy language to $languages"
     fi
 
-    echo "open a .hc file, or check with: hx --health ruddy"
+    echo "open a .rud file, or check with: hx --health ruddy"
 
 # Everything CI would run.
 check: fmt-check clippy test
@@ -129,11 +136,12 @@ test *args:
 build:
     cargo build --workspace
 
-# Build and install the CLI, then atomically replace the bundled standard
+# Build and install the CLI and language server, then replace the bundled standard
 # library under RUDDY_HOME (or ~/.ruddy when RUDDY_HOME is unset or empty).
 install:
     cargo install --locked --path "{{justfile_directory()}}/cli"
-    "{{justfile_directory()}}/scripts/install-std.sh" "{{justfile_directory()}}/std"
+    cargo install --locked --path "{{justfile_directory()}}/lsp" --bin ruddy-ls
+    "{{justfile_directory()}}/scripts/install-std.sh" "{{justfile_directory()}}"
 
 # Line and branch coverage for the compiler library. Branch coverage is a
 # nightly-only rustc feature, hence `+nightly`.
@@ -145,7 +153,7 @@ cov *args:
     eval "$(cargo +"$coverage_toolchain" llvm-cov show-env --branch --sh)"
     cargo +"$coverage_toolchain" llvm-cov clean
     RUSTUP_TOOLCHAIN="$coverage_toolchain" just test
-    cargo +"$coverage_toolchain" llvm-cov report --ignore-filename-regex '/(tests|debug|cli)/src/|/rustlib/' {{args}}
+    cargo +"$coverage_toolchain" llvm-cov report --ignore-filename-regex '/(tests|debug|cli|lsp)/src/|/vendor/|/rustlib/' {{args}}
 
 clippy:
     cargo clippy --workspace --all-targets

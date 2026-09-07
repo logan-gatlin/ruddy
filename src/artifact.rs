@@ -1314,10 +1314,26 @@ pub(crate) fn build_lowered(
     dependencies: Vec<Dependency>,
     lir: &lir::Output,
 ) -> Artifact {
-    let mint = accepted.mint();
-    let program = accepted.ir();
-    let inference = accepted.semantics();
-    let header = Header {
+    Artifact {
+        header: interface(
+            accepted.mint(),
+            accepted.ir(),
+            accepted.semantics(),
+            dependencies,
+        ),
+        lir: lower_lir(accepted.mint(), lir),
+    }
+}
+
+/// Publish the current semantic interface without lowering or constructing an
+/// executable artifact. Recovery types remain explicit in editor interfaces.
+pub fn interface(
+    mint: &Mint,
+    program: &ir::Program,
+    inference: &crate::inference::Semantics,
+    dependencies: Vec<Dependency>,
+) -> Header {
+    Header {
         kind: Kind::Library,
         identity: Identity {
             name: mint.bundle().name().to_string(),
@@ -1344,7 +1360,8 @@ pub(crate) fn build_lowered(
                     // `let _`; they must be initialized, but have no source
                     // name through which another bundle could import them.
                     .filter(|(symbol, declaration)| {
-                        is_exported(mint, program, **symbol, &declaration.metadata)
+                        inference.schemes().contains_key(*symbol)
+                            && is_exported(mint, program, **symbol, &declaration.metadata)
                     })
                     .map(|(symbol, declaration)| Value {
                         name: qualified(mint, *symbol),
@@ -1452,10 +1469,6 @@ pub(crate) fn build_lowered(
                 metadata: metadata(&declaration.metadata),
             })
             .collect(),
-    };
-    Artifact {
-        header,
-        lir: lower_lir(mint, lir),
     }
 }
 
@@ -1579,7 +1592,7 @@ pub fn try_parse(input: &str) -> Result<UncheckedArtifact, ParseError> {
     })
 }
 
-fn qualified(mint: &Mint, symbol: Symbol) -> QualifiedName {
+pub fn qualified(mint: &Mint, symbol: Symbol) -> QualifiedName {
     if let Some(qualified) = mint.external(symbol) {
         return qualified.to_owned();
     }

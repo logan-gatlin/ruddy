@@ -62,7 +62,7 @@ fn build_src(src: &str) -> (Mint, Output) {
 /// about anchors staying put has to lex under a real file id.
 fn build_file(src: &str) -> Output {
     let mut files = FileManager::new();
-    let id = files.register_new_file("test.hc".into(), src.into());
+    let id = files.register_new_file("test.rud".into(), src.into());
     let parsed = parse::parse(lex(src, id).tokens);
     assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
     build(&mut dummy_mint(), parsed.stmts)
@@ -12655,15 +12655,10 @@ fn deep_equal_imported_types_unify_on_a_bounded_stack() {
 
             // A memo fingerprints what each group reads, the deep imported
             // schemes included, and has to do so on the same stack.
-            let mut memo = inference::GroupMemo::default();
-            inference::infer_with_memo(&mint, &out.program, inference::Trace::Complete, &mut memo);
-            let again = inference::infer_with_memo(
-                &mint,
-                &out.program,
-                inference::Trace::Complete,
-                &mut memo,
-            );
-            assert_eq!((memo.hits(), memo.misses()), (3, 3));
+            let mut memo = inference::Session::default();
+            memo.infer(&mint, &out.program, inference::Trace::Complete);
+            let again = memo.infer(&mint, &out.program, inference::Trace::Complete);
+            assert_eq!((memo.reused_groups(), memo.solved_groups()), (3, 3));
             // Compared without printing: the mismatch names the deep types.
             assert_eq!(again.errors().len(), 1);
             assert!(matches!(

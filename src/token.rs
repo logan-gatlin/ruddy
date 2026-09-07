@@ -246,6 +246,7 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
 
     let mut chars = input.char_indices().peekable();
     while let Some(&(start, c)) = chars.peek() {
+        crate::cancellation::checkpoint();
         match c {
             // Whitespace is not significant.
             c if c.is_whitespace() => {

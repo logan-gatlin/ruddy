@@ -74,12 +74,16 @@ mod constrain;
 pub mod sat;
 mod solve;
 
+mod flow;
+mod queries;
+pub use queries::Session;
+
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     ops::Range,
-    rc::{Rc, Weak},
+    sync::{Arc, Weak},
 };
 
 use indexmap::{IndexMap, IndexSet};
@@ -131,7 +135,7 @@ pub struct Output {
 
 /// The two sides of every declared operation, keyed by the effect that declares
 /// it and the operation's own name. See [`Semantics::operations`].
-pub type Operations = IndexMap<(Symbol, ir::OperationSelector), (Rc<Ty>, Rc<Ty>)>;
+pub type Operations = IndexMap<(Symbol, ir::OperationSelector), (Arc<Ty>, Arc<Ty>)>;
 
 /// The accepted semantic facts of one inference run, read-only.
 ///
@@ -167,7 +171,7 @@ pub struct Semantics {
 #[derive(Debug, Clone)]
 pub struct EffectAliasRow {
     /// The effects the alias applies, each with its arguments in order.
-    pub cases: Vec<(Symbol, Vec<Rc<Ty>>)>,
+    pub cases: Vec<(Symbol, Vec<Arc<Ty>>)>,
     /// The parameter position the alias ends in, if it ends in one.
     pub tail: Option<u32>,
 }
@@ -692,7 +696,7 @@ pub fn display_presence_path(path: &[String]) -> String {
 /// Every reachable structural field path and the presence worn at that path.
 /// An absent field contributes its own path but never exposes its meaningless
 /// payload.
-pub fn structural_presence_paths(ty: &Rc<Ty>) -> Vec<(PresencePath, Presence)> {
+pub fn structural_presence_paths(ty: &Arc<Ty>) -> Vec<(PresencePath, Presence)> {
     constrain::structural_presence_paths(ty)
 }
 
@@ -846,12 +850,12 @@ pub struct Step {
 #[derive(Debug, Clone)]
 pub enum Goal {
     Type {
-        expected: Rc<Ty>,
-        actual: Rc<Ty>,
+        expected: Arc<Ty>,
+        actual: Arc<Ty>,
     },
     Row {
-        expected: Rc<Row>,
-        actual: Rc<Row>,
+        expected: Arc<Row>,
+        actual: Arc<Row>,
     },
     Presence {
         expected: Presence,
@@ -1203,8 +1207,8 @@ pub enum ConstraintKind {
     Isolate {
         /// Operations and callees contributing to this body's effect boundary.
         effect_origins: Vec<EffectSource>,
-        input: Rc<Ty>,
-        output: Rc<Ty>,
+        input: Arc<Ty>,
+        output: Arc<Ty>,
         internal: Row,
         external: Row,
         level: u32,
@@ -1212,9 +1216,9 @@ pub enum ConstraintKind {
     /// Read one field from a base. The operation stays distinct from ordinary
     /// equality so a known non-struct can be diagnosed at the base.
     Project {
-        base: Rc<Ty>,
+        base: Arc<Ty>,
         field: String,
-        result: Rc<Ty>,
+        result: Arc<Ty>,
         base_span: Anchor,
     },
     /// Spread one value's fields into a struct literal. Distinct from
@@ -1223,15 +1227,15 @@ pub enum ConstraintKind {
     /// spread, rather than as a mismatch against the row it was asked for.
     Spread {
         /// What was written after the `..`.
-        operand: Rc<Ty>,
+        operand: Arc<Ty>,
         /// What the literal asks of it: a struct that may or may not have
         /// each field the literal names — holding anything where it does,
         /// since the literal's own value replaces it — and past those, the
         /// rest the result keeps.
-        demand: Rc<Ty>,
+        demand: Arc<Ty>,
         /// The literal's own type — its named fields, certainly there, over
         /// the same rest — abandoned when the operand is no struct.
-        result: Rc<Ty>,
+        result: Arc<Ty>,
         operand_span: Anchor,
     },
     /// Two types the program requires to be the same. `expected` is the side
@@ -1239,7 +1243,7 @@ pub enum ConstraintKind {
     /// arrow shape a call site needs of something that is not one — and
     /// `actual` is what the term turned out to be, which is the order a
     /// mismatch is worded in.
-    Equal { expected: Rc<Ty>, actual: Rc<Ty> },
+    Equal { expected: Arc<Ty>, actual: Arc<Ty> },
     /// A name bound for the length of a body, and generalized before the body
     /// is looked at.
     ///
@@ -1252,7 +1256,7 @@ pub enum ConstraintKind {
         /// annotation, or a variable standing for whatever the value turns out
         /// to be. Monomorphic there, so a recursive use is the one type being
         /// decided, and the type generalization is taken of once it is.
-        bound: Rc<Ty>,
+        bound: Arc<Ty>,
         /// The level the value was walked at. Everything still unbound at or
         /// above it when the value is solved is the value's to quantify.
         level: u32,
@@ -1265,9 +1269,6 @@ pub enum ConstraintKind {
         /// ones the scheme this publishes may quantify. Empty where none was
         /// written. See [`ErrorKind::RigidEscapes`].
         rigids: Vec<u32>,
-        /// Operation values produced by the bound expression, kept outside its
-        /// semantic scheme while the solver publishes that scheme.
-        effect_provenance: EffectProvenance,
         initializer_effects: Row,
         ambient: Row,
         inside: bool,
@@ -1282,7 +1283,7 @@ pub enum ConstraintKind {
     /// enclosing [`ConstraintKind::Let`] published for `symbol`.
     Instance {
         symbol: Symbol,
-        ty: Rc<Ty>,
+        ty: Arc<Ty>,
         /// Source-order store slot reserved during generation for the scheme
         /// requirement solving may discover.
         requirement: usize,
@@ -1291,8 +1292,8 @@ pub enum ConstraintKind {
     /// store requirements generated by its body; solving applies its ordered
     /// condition as a premise and constructs one structural result family.
     Match {
-        scrutinee: Rc<Ty>,
-        result: Rc<Ty>,
+        scrutinee: Arc<Ty>,
+        result: Arc<Ty>,
         arms: Vec<GuardedArm>,
         /// The first store slot generated after this match. Arm-boundary
         /// reachability ignores later source requirements.
@@ -1413,7 +1414,7 @@ struct EffectParameter {
 /// one argument into several fields therefore installs the same node at every
 /// occurrence instead of recursively cloning its complete replacement tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EffectProvenance(Rc<EffectProvenanceNode>);
+pub struct EffectProvenance(Arc<EffectProvenanceNode>);
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct EffectProvenanceNode {
@@ -1430,22 +1431,22 @@ pub struct EffectProvenanceNode {
 
 impl Default for EffectProvenance {
     fn default() -> Self {
-        Self(Rc::new(EffectProvenanceNode::default()))
+        Self(Arc::new(EffectProvenanceNode::default()))
     }
 }
 
 impl Drop for EffectProvenance {
     fn drop(&mut self) {
-        // Rc normally destroys a uniquely-owned chain recursively. Provenance
+        // Arc normally destroys a uniquely-owned chain recursively. Provenance
         // paths are generated data and can be much deeper than the machine
-        // stack, so detach unique children breadth-first before Rc drops them.
+        // stack, so detach unique children breadth-first before Arc drops them.
         let mut work = Vec::new();
-        if let Some(node) = Rc::get_mut(&mut self.0) {
+        if let Some(node) = Arc::get_mut(&mut self.0) {
             work.extend(node.result.take());
             work.extend(std::mem::take(&mut node.fields).into_values());
         }
         while let Some(mut child) = work.pop() {
-            if let Some(node) = Rc::get_mut(&mut child.0) {
+            if let Some(node) = Arc::get_mut(&mut child.0) {
                 work.extend(node.result.take());
                 work.extend(std::mem::take(&mut node.fields).into_values());
             }
@@ -1522,7 +1523,7 @@ impl EffectProvenance {
         {
             Self::default()
         } else {
-            Self(Rc::new(node))
+            Self(Arc::new(node))
         }
     }
 
@@ -1735,12 +1736,12 @@ impl EffectProvenance {
         }
 
         let mut meter = ProvenanceMeter { left: *budget };
-        let root = Rc::as_ptr(&self.0);
+        let root = Arc::as_ptr(&self.0);
         let mut work = vec![Task::Visit(self.clone())];
         while let Some(task) = work.pop() {
             match task {
                 Task::Visit(original) => {
-                    let key = Rc::as_ptr(&original.0);
+                    let key = Arc::as_ptr(&original.0);
                     if memo.contains_key(&key) {
                         continue;
                     }
@@ -1769,7 +1770,7 @@ impl EffectProvenance {
                     }));
                 }
                 Task::Resume(mut frame) => {
-                    let key = Rc::as_ptr(&frame.original.0);
+                    let key = Arc::as_ptr(&frame.original.0);
                     let failed = match frame.stage {
                         Stage::ResultStart => {
                             if let Some(child) = frame.original.result.clone() {
@@ -1792,7 +1793,7 @@ impl EffectProvenance {
                                 .original
                                 .result
                                 .as_ref()
-                                .and_then(|c| memo.get(&Rc::as_ptr(&c.0)))
+                                .and_then(|c| memo.get(&Arc::as_ptr(&c.0)))
                                 .cloned()
                                 .unwrap_or_default();
                             if !add_exact(&mut frame, &child.exact_origins, &mut meter) {
@@ -1832,7 +1833,7 @@ impl EffectProvenance {
                                 .get_index(at)
                                 .map(|(name, old)| (name.clone(), old.clone()))
                                 .expect("field frame");
-                            let child = memo.get(&Rc::as_ptr(&old.0)).cloned().unwrap_or_default();
+                            let child = memo.get(&Arc::as_ptr(&old.0)).cloned().unwrap_or_default();
                             if !add_exact(&mut frame, &child.exact_origins, &mut meter) {
                                 true
                             } else {
@@ -2012,7 +2013,7 @@ mod effect_provenance_tests {
         let mut seen = std::collections::HashSet::new();
         let mut work = vec![root];
         while let Some(node) = work.pop() {
-            if !seen.insert(Rc::as_ptr(&node.0)) {
+            if !seen.insert(Arc::as_ptr(&node.0)) {
                 continue;
             }
             work.extend(node.fields.values());
@@ -2085,7 +2086,7 @@ mod effect_provenance_tests {
         for _ in 0..DEPTH {
             let a = selected.fields.get("a").expect("duplicated a");
             let b = selected.fields.get("b").expect("duplicated b");
-            assert!(Rc::ptr_eq(&a.0, &b.0), "identical branches share one node");
+            assert!(Arc::ptr_eq(&a.0, &b.0), "identical branches share one node");
             selected = selected.projected("a".into()).expect("projected a");
         }
         assert_eq!(selected.callable, [EffectSource::Origin(origin)]);
@@ -2473,12 +2474,12 @@ pub enum StructDemand {
 pub enum ErrorKind {
     /// A value whose outer type is known not to be a struct was asked for its
     /// fields — read one at a time, or spread all at once.
-    NotAStruct { base: Rc<Ty>, demand: StructDemand },
+    NotAStruct { base: Arc<Ty>, demand: StructDemand },
     /// Two types that had to be equal are not. `expected` is the side the
     /// context demanded — an annotation, a function's parameter, or the arrow
     /// shape a call site needs — and `actual` is what the term turned out to
     /// be.
-    Mismatch { expected: Rc<Ty>, actual: Rc<Ty> },
+    Mismatch { expected: Arc<Ty>, actual: Arc<Ty> },
     /// Two applications of one effect met and their arguments at one
     /// position could not be made equal: one computation would be using
     /// incompatible versions of the effect. The failure the arguments met
@@ -2509,7 +2510,7 @@ pub enum ErrorKind {
     /// a row was asked for a label it does not have.
     MissingField {
         shape: Shape,
-        base: Rc<Ty>,
+        base: Arc<Ty>,
         field: String,
     },
     /// A label the row has but the type it is against does not allow: a closed
@@ -2536,7 +2537,7 @@ pub enum ErrorKind {
     /// `Nat` ``. See [`Solve::absorb`], which says this from the other end.
     ExtraField {
         shape: Shape,
-        base: Rc<Ty>,
+        base: Arc<Ty>,
         field: String,
     },
     /// A body deciding what one of its annotation's variables is.
@@ -2557,8 +2558,8 @@ pub enum ErrorKind {
     /// wording follows: a type is something the caller picks, a rest and a row
     /// of effects are something the caller allows.
     RigidBroken {
-        found: Rc<Ty>,
-        name: Rc<str>,
+        found: Arc<Ty>,
+        name: Arc<str>,
         sense: Sense,
         declared: Anchor,
     },
@@ -2572,7 +2573,7 @@ pub enum ErrorKind {
     RigidField {
         shape: Shape,
         field: String,
-        name: Rc<str>,
+        name: Arc<str>,
         declared: Anchor,
     },
     /// A variable reaching a type outside the annotation that
@@ -2583,10 +2584,10 @@ pub enum ErrorKind {
     /// its own callers something only somebody else's caller decides. Reported
     /// at the declaring name, which is the line that has to change.
     RigidEscapes {
-        name: Rc<str>,
+        name: Arc<str>,
         declared: Anchor,
-        destination: Rc<Ty>,
-        destination_name: Rc<str>,
+        destination: Arc<Ty>,
+        destination_name: Arc<str>,
         destination_span: Anchor,
     },
     /// A `..` was decided to stand for a label the row it tails already names.
@@ -2783,7 +2784,7 @@ struct Known {
 /// the walk is the [`Scheme`] in [`Semantics::schemes`].
 #[derive(Debug, Clone)]
 enum Binding {
-    Mono(Rc<Ty>),
+    Mono(Arc<Ty>),
     Poly(ExplainedScheme),
     /// A name a nested `let` bound, whose scheme only the solver will know.
     ///
@@ -2806,7 +2807,6 @@ enum Binding {
 struct ExplainedScheme {
     scheme: Scheme,
     provenance: SchemeProvenance,
-    effect_provenance: Box<EffectProvenance>,
 }
 
 /// A compact causal skeleton keyed like the zonked scheme body. Child edges,
@@ -2860,20 +2860,11 @@ impl ExplainedScheme {
         Self {
             scheme,
             provenance: SchemeProvenance::default(),
-            effect_provenance: Box::default(),
         }
     }
 
-    fn local(
-        scheme: Scheme,
-        provenance: SchemeProvenance,
-        effect_provenance: EffectProvenance,
-    ) -> Self {
-        Self {
-            scheme,
-            provenance,
-            effect_provenance: Box::new(effect_provenance),
-        }
+    fn local(scheme: Scheme, provenance: SchemeProvenance) -> Self {
+        Self { scheme, provenance }
     }
 }
 
@@ -2899,7 +2890,7 @@ struct Scoped {
     /// What the definition is bound to for the length of the group: its
     /// lowered annotation, or a variable standing for whatever the body turns
     /// out to be.
-    bound: Rc<Ty>,
+    bound: Arc<Ty>,
     /// The variables its annotation declared, which are the ones
     /// its scheme is entitled to quantify. Empty for a definition with no
     /// annotation, which is entitled to none. See
@@ -2944,14 +2935,12 @@ struct Solved {
     scoped: Scoped,
     /// The type this definition publishes: its annotation, which is the
     /// contract, or what its body turned out to be.
-    ty: Rc<Ty>,
+    ty: Arc<Ty>,
     /// What generation asked of it, kept exactly as it was asked. See
     /// [`DiagnosticView::constraints`].
     generated: Vec<Constraint>,
     /// Every annotation written on a nested `let` inside it. See [`Annotated`].
     annotated: Vec<Annotated>,
-    /// Exact operation-value provenance inferred for this value.
-    effect_provenance: EffectProvenance,
     /// Where the schemes this definition's nested lets published begin in the
     /// shared list, so that each can be numbered for printing once the group is
     /// solved. See [`Table::published`].
@@ -2987,7 +2976,7 @@ struct Signatures {
     effect_kinds: HashMap<String, Vec<ParamKind>>,
     /// Source spellings for bindings whose nested generalization may report
     /// an escape.
-    binding_names: HashMap<Symbol, Rc<str>>,
+    binding_names: HashMap<Symbol, Arc<str>>,
     /// What each declaration's parameters stand for, in the declaration's
     /// own order. Read only by [`Table::note_lacks`], and only for the one
     /// thing a [`ParamKind`] carries that a type cannot: the labels the
@@ -3021,7 +3010,7 @@ struct Signatures {
 /// the shared map, and what the group itself binds, kept apart so that the
 /// group leaves nothing behind in what the next one reads.
 struct Env {
-    outer: Rc<HashMap<Symbol, Binding>>,
+    outer: Arc<HashMap<Symbol, Binding>>,
     own: HashMap<Symbol, Binding>,
 }
 
@@ -3042,7 +3031,7 @@ struct GroupParts {
 /// One table's result, complete in itself: the declaration stage's, or one
 /// group's. A value with no variable in it that the table it came from would
 /// have to be asked about, so that [`assemble`] needs no table at all — and
-/// so that a [`GroupMemo`] can hand it back for a group whose inputs did not
+/// so that a query can hand it back for a group whose inputs did not
 /// change.
 #[derive(Clone)]
 struct GroupResult {
@@ -3068,24 +3057,7 @@ struct GroupResult {
     effect_argument_reasons: HashMap<ReasonId, (String, u32)>,
 }
 
-/// Group results kept from one inference to the next, by what each group
-/// read: its own declarations, the bindings of every name it mentions, and
-/// the program's declarations. A group whose inputs fingerprint the same is
-/// handed its last result rather than solved again, which is sound because
-/// [`infer_group`] reads nothing else — symbols are fingerprints of their
-/// paths and anchors count from their definition's start, so the fingerprint
-/// is of the group's meaning rather than of where in the file it sits.
-///
-/// Holds `Rc`s, so it lives on one thread; a tool that compiles on several
-/// keeps one per thread or none.
-#[derive(Default)]
-pub struct GroupMemo {
-    entries: HashMap<Vec<Symbol>, (u64, GroupResult)>,
-    hits: usize,
-    misses: usize,
-}
-
-/// What a [`GroupMemo`] keys on: the bytes of everything a solve reads,
+/// Canonical bytes used to compare a query projection: what a solve reads,
 /// hashed once they are all written. Types and formulas are walked without
 /// the stack, since an imported one may be deeper than any stack; what is
 /// written by hand, and the provenance beside a scheme, is taken as it
@@ -3100,11 +3072,11 @@ struct Table {
     /// What every identity minted here is scoped to. See [`inference_id!`].
     scope: Symbol,
     /// The declarations, shared with every other table. See [`Signatures`].
-    signatures: Rc<Signatures>,
+    signatures: Arc<Signatures>,
     /// Source spellings for the nested bindings walked here, whose
     /// generalization may report an escape. The top-level bindings' are in
     /// the signatures; see [`Table::binding_name`].
-    local_names: HashMap<Symbol, Rc<str>>,
+    local_names: HashMap<Symbol, Arc<str>>,
     /// One slot per variable; [`Ty::Var`] indexes into it.
     ///
     /// A group rather than a definition, and the difference is only where the
@@ -3172,7 +3144,7 @@ struct Table {
     /// Guarantees are inert until their exact package is destroyed. The key is
     /// the package's producer-owned presence identities: scheme instantiation
     /// mints these afresh, while cloning and substitution preserve them. Unlike
-    /// an `Rc` address this cannot alias after an allocation is released, and
+    /// an `Arc` address this cannot alias after an allocation is released, and
     /// the whole map dies with this inference table.
     package_guarantees: HashMap<Vec<TyVar>, PackageGuarantee>,
     /// What the program has required of its presences so far. Grown by
@@ -3242,12 +3214,12 @@ struct Table {
     /// Source cause currently introducing row syntax. Lacks facts copy this
     /// value when they are created and retain it across every tail binding.
     active_lacks_origin: Option<RowFactOrigin>,
-    /// Opened scheme roots keyed by the root `Rc<Ty>` identity. This covers
+    /// Opened scheme roots keyed by the root `Arc<Ty>` identity. This covers
     /// closed schemes, which mint no variable on which to hang provenance.
     /// Entries live only for this inference run and never affect semantics.
     opened_provenance: HashMap<usize, (Weak<Ty>, Vec<ReasonId>)>,
     /// Presence-position evidence follows the opened presence variable itself.
-    /// It must not ride on the field payload's `Rc`: distinct sibling fields
+    /// It must not ride on the field payload's `Arc`: distinct sibling fields
     /// may deliberately share a payload node without sharing presence causes.
     opened_presence_provenance: HashMap<TyVar, (ReasonId, Vec<ReasonId>)>,
     /// Nested bindings whose written contracts, rather than implementation
@@ -3317,14 +3289,14 @@ impl Subst {
 
 /// Run a real failing equality over a compact, exponentially expanding type
 /// DAG. Integration regressions use this to cover recovery independently of
-/// source parsing, which cannot express shared Rc identity.
+/// source parsing, which cannot express shared Arc identity.
 #[doc(hidden)]
 pub fn compact_dag_failure_for_tests(definition: Symbol, depth: usize) -> (Vec<Error>, Vec<Step>) {
     let mut table = Table::default();
     let leaf = table.fresh_type_for(Subject::Term);
     let mut dag = leaf;
     for _ in 0..depth {
-        dag = Rc::new(Ty::Arrow(dag.clone(), dag, Row::closed()));
+        dag = Arc::new(Ty::Arrow(dag.clone(), dag, Row::closed()));
     }
     let constraint_id = ConstraintId::synthetic(0);
     let reason = table.reason(ReasonOrigin::Constraint(constraint_id), Vec::new());
@@ -3335,7 +3307,7 @@ pub fn compact_dag_failure_for_tests(definition: Symbol, depth: usize) -> (Vec<E
         origin: ConstraintOrigin::ContextualCheck,
         subjects: ConstraintSubjects::pair(Subject::Context, Subject::Term),
         kind: ConstraintKind::Equal {
-            expected: Rc::new(Ty::Nat),
+            expected: Arc::new(Ty::Nat),
             actual: dag,
         },
     }];
@@ -3375,8 +3347,8 @@ pub fn compact_dag_failure_for_tests(definition: Symbol, depth: usize) -> (Vec<E
 pub fn structural_family_for_tests(
     definition: Symbol,
     aliases: &IndexMap<Symbol, Scheme>,
-    types: &[Rc<Ty>],
-) -> Rc<Ty> {
+    types: &[Arc<Ty>],
+) -> Arc<Ty> {
     let mut table = Table::default();
     let mut errors = Vec::new();
     let mut steps = Vec::new();
@@ -3409,23 +3381,23 @@ pub fn structural_family_for_tests(
 /// by integration regressions.
 #[doc(hidden)]
 pub fn package_positive_presences_for_tests(
-    body: &Rc<Ty>,
+    body: &Arc<Ty>,
     presences: u32,
     variances: &HashMap<(Symbol, u32), u8>,
-) -> (Rc<Ty>, IndexSet<u32>) {
+) -> (Arc<Ty>, IndexSet<u32>) {
     package_positive_presences(body, presences, &IndexSet::new(), variances)
 }
 
 /// Alternately erase transparent packages and unfold transparent names until
 /// neither operation exposes another wrapper.
-fn expose_packages(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Rc<Ty> {
+fn expose_packages(aliases: &IndexMap<Symbol, Scheme>, ty: &Arc<Ty>) -> Arc<Ty> {
     let mut exposed = ty.clone();
     loop {
         while let Ty::Package(body) = &*exposed {
             exposed = body.clone();
         }
         let next = unfold(aliases, &exposed);
-        if Rc::ptr_eq(&next, &exposed) {
+        if Arc::ptr_eq(&next, &exposed) {
             return exposed;
         }
         exposed = next;
@@ -3630,7 +3602,7 @@ fn presence_formula(presence: &Presence) -> Option<Formula> {
     }
 }
 
-fn callback_rows(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Vec<Row> {
+fn callback_rows(aliases: &IndexMap<Symbol, Scheme>, ty: &Arc<Ty>) -> Vec<Row> {
     let mut rows = Vec::new();
     let mut cursor = ty.clone();
     let mut seen = Vec::new();
@@ -3695,7 +3667,7 @@ fn callback_effect_conditions(required: &Row, available: &Row) -> Vec<CallbackEf
 #[allow(clippy::too_many_arguments)]
 fn push_callback_coverage(
     aliases: &IndexMap<Symbol, Scheme>,
-    callback: &Rc<Ty>,
+    callback: &Arc<Ty>,
     available: &Row,
     sources: &ExternSourceMap,
     callback_span: Anchor,
@@ -3757,7 +3729,7 @@ struct ExternBoundaryReview {
 fn extern_boundary_review(
     aliases: &IndexMap<Symbol, Scheme>,
     root_abi: &ir::ExternType,
-    root_ty: &Rc<Ty>,
+    root_ty: &Arc<Ty>,
     sources: &ExternSourceMap,
     extern_name: &str,
     extern_span: Anchor,
@@ -3768,7 +3740,7 @@ fn extern_boundary_review(
     let mut review = ExternBoundaryReview::default();
     let mut paths = Vec::new();
     let root = root_path(&mut paths);
-    let mut work = vec![(root_abi, root_ty.clone(), root, Vec::<Rc<Ty>>::new(), true)];
+    let mut work = vec![(root_abi, root_ty.clone(), root, Vec::<Arc<Ty>>::new(), true)];
     let mut seen: HashSet<(*const ir::ExternType, *const Ty)> = HashSet::new();
     while let Some((abi, mut ty, path, mut active_aliases, mut report_row_leaves)) = work.pop() {
         // A package fixes the representation choices it encloses, but callbacks
@@ -3782,7 +3754,7 @@ fn extern_boundary_review(
         // argument for both sides of every arrow, so walking occurrences rather
         // than nodes turns depth N into 2^N work. The ABI node is part of the
         // key so distinct written parameters still retain distinct paths.
-        if !seen.insert((abi as *const ir::ExternType, Rc::as_ptr(&original))) {
+        if !seen.insert((abi as *const ir::ExternType, Arc::as_ptr(&original))) {
             continue;
         }
         // Transparent ABI wrappers have not traversed the alias yet. Recording
@@ -3985,9 +3957,9 @@ mod extern_boundary_depth_tests {
             anchored: ir::ExternTypeKind::Ordinary(written),
             at: span,
         };
-        let mut ty = Rc::new(Ty::Nat);
+        let mut ty = Arc::new(Ty::Nat);
         for _ in 0..30_000 {
-            ty = Rc::new(Ty::Arrow(Rc::new(Ty::Nat), ty, Row::closed()));
+            ty = Arc::new(Ty::Arrow(Arc::new(Ty::Nat), ty, Row::closed()));
         }
         let aliases = IndexMap::new();
         let sources = ExternSourceMap::default();
@@ -3996,12 +3968,12 @@ mod extern_boundary_depth_tests {
         assert!(review.coverage.is_empty());
         // A 30k recursively represented test value also needs iterative
         // destruction; leaking this one synthetic value keeps the test focused
-        // on the boundary walkers rather than `Rc<Ty>`'s destructor.
+        // on the boundary walkers rather than `Arc<Ty>`'s destructor.
         std::mem::forget(ty);
     }
 }
 
-fn describe_type(ty: &Rc<Ty>) -> TypeDescription {
+fn describe_type(ty: &Arc<Ty>) -> TypeDescription {
     let mut ty = ty;
     while let Ty::Package(inner) = &**ty {
         ty = inner;
@@ -4031,8 +4003,8 @@ fn describe_type(ty: &Rc<Ty>) -> TypeDescription {
 }
 
 struct MismatchWork {
-    left: Rc<Ty>,
-    right: Rc<Ty>,
+    left: Arc<Ty>,
+    right: Arc<Ty>,
     alias_path: Option<usize>,
     alias_work: usize,
     root: bool,
@@ -4040,9 +4012,9 @@ struct MismatchWork {
 
 struct AliasGoal {
     left_symbol: Symbol,
-    left_args: Rc<[Rc<Ty>]>,
+    left_args: Arc<[Arc<Ty>]>,
     right_symbol: Symbol,
-    right_args: Rc<[Rc<Ty>]>,
+    right_args: Arc<[Arc<Ty>]>,
     parent: Option<usize>,
     depth: usize,
     fingerprint: u64,
@@ -4052,7 +4024,7 @@ struct AliasGoal {
 /// Hash matches are still checked with metered exact finite-syntax equality, so
 /// collisions can cost bounded work but cannot alter a diagnostic.
 struct MismatchFingerprints {
-    types: HashMap<*const Ty, (Rc<Ty>, u64)>,
+    types: HashMap<*const Ty, (Arc<Ty>, u64)>,
     argument_hash_mask: u64,
 }
 
@@ -4066,14 +4038,14 @@ impl Default for MismatchFingerprints {
 }
 
 enum MismatchFingerprintWork {
-    Type(Rc<Ty>),
-    Finish(*const Ty, Rc<Ty>, u8, usize, Option<Symbol>),
+    Type(Arc<Ty>),
+    Finish(*const Ty, Arc<Ty>, u8, usize, Option<Symbol>),
     Row(Row),
     FinishRow(Vec<(String, Presence, bool)>, Rest, usize),
 }
 
 impl MismatchFingerprints {
-    fn arguments(&mut self, args: &[Rc<Ty>], work_left: &mut usize) -> Option<u64> {
+    fn arguments(&mut self, args: &[Arc<Ty>], work_left: &mut usize) -> Option<u64> {
         fn tagged(tag: u8, parts: impl IntoIterator<Item = u64>) -> u64 {
             let mut hash = DefaultHasher::new();
             tag.hash(&mut hash);
@@ -4117,7 +4089,7 @@ impl MismatchFingerprints {
             *work_left -= 1;
             match next {
                 MismatchFingerprintWork::Type(ty) => {
-                    let key = Rc::as_ptr(&ty);
+                    let key = Arc::as_ptr(&ty);
                     if let Some((_, hash)) = self.types.get(&key) {
                         values.push(*hash);
                         continue;
@@ -4313,8 +4285,8 @@ impl MismatchFingerprints {
 /// a declared or undecided type rather than guessed from solver variables.
 fn smallest_incompatible(
     aliases: &IndexMap<Symbol, Scheme>,
-    left: &Rc<Ty>,
-    right: &Rc<Ty>,
+    left: &Arc<Ty>,
+    right: &Arc<Ty>,
 ) -> (TypeDescription, TypeDescription) {
     let mut operations = 0;
     smallest_incompatible_counted(aliases, left, right, &mut operations)
@@ -4322,8 +4294,8 @@ fn smallest_incompatible(
 
 fn smallest_incompatible_counted(
     aliases: &IndexMap<Symbol, Scheme>,
-    left: &Rc<Ty>,
-    right: &Rc<Ty>,
+    left: &Arc<Ty>,
+    right: &Arc<Ty>,
     operations: &mut usize,
 ) -> (TypeDescription, TypeDescription) {
     smallest_incompatible_counted_with_mask(aliases, left, right, operations, u64::MAX)
@@ -4331,8 +4303,8 @@ fn smallest_incompatible_counted(
 
 fn smallest_incompatible_counted_with_mask(
     aliases: &IndexMap<Symbol, Scheme>,
-    left: &Rc<Ty>,
-    right: &Rc<Ty>,
+    left: &Arc<Ty>,
+    right: &Arc<Ty>,
     operations: &mut usize,
     argument_hash_mask: u64,
 ) -> (TypeDescription, TypeDescription) {
@@ -4403,12 +4375,12 @@ fn smallest_incompatible_counted_with_mask(
             // coinductive key. The forwarding classifier is the same semantic
             // machinery used by alias opening; it is iterative and also marks
             // mutually-forwarding recovery cycles.
-            let left_args: Rc<[Rc<Ty>]> = left_args
+            let left_args: Arc<[Arc<Ty>]> = left_args
                 .iter()
                 .map(|arg| canonical_alias_argument(aliases, &mut forwarding, arg))
                 .collect::<Vec<_>>()
                 .into();
-            let right_args: Rc<[Rc<Ty>]> = right_args
+            let right_args: Arc<[Arc<Ty>]> = right_args
                 .iter()
                 .map(|arg| canonical_alias_argument(aliases, &mut forwarding, arg))
                 .collect::<Vec<_>>()
@@ -4441,7 +4413,7 @@ fn smallest_incompatible_counted_with_mask(
                 // cannot smuggle an unbounded structural walk past the meter.
                 alias_work -= 1;
                 let goal = &alias_goals[index];
-                let mut same_arguments = |known: &[Rc<Ty>], current: &[Rc<Ty>]| {
+                let mut same_arguments = |known: &[Arc<Ty>], current: &[Arc<Ty>]| {
                     if known.len() != current.len() {
                         return Some(false);
                     }
@@ -4596,8 +4568,8 @@ fn smallest_incompatible_counted_with_mask(
 fn canonical_alias_argument(
     aliases: &IndexMap<Symbol, Scheme>,
     forwarding: &mut Forwarding,
-    argument: &Rc<Ty>,
-) -> Rc<Ty> {
+    argument: &Arc<Ty>,
+) -> Arc<Ty> {
     let mut argument = argument.clone();
     loop {
         let Ty::Named { symbol, args, .. } = &*argument else {
@@ -4609,9 +4581,9 @@ fn canonical_alias_argument(
         match forwarding.projection(aliases, scheme.body()) {
             Some(index) => match args.get(index as usize) {
                 Some(selected) => argument = selected.clone(),
-                None => return Rc::new(Ty::Undecided),
+                None => return Arc::new(Ty::Undecided),
             },
-            None if forwarding.cycles.contains(symbol) => return Rc::new(Ty::Undecided),
+            None if forwarding.cycles.contains(symbol) => return Arc::new(Ty::Undecided),
             None => return argument,
         }
     }
@@ -4910,6 +4882,9 @@ fn attach_ordinary_explanations(
     omitted_reason_parents: &HashMap<ReasonId, usize>,
     sources: ExplanationSources<'_>,
 ) {
+    if errors.is_empty() {
+        return;
+    }
     let ExplanationSources {
         aliases,
         effect_arguments,
@@ -5939,70 +5914,12 @@ fn direct_callback_issue(
 }
 
 pub fn infer(mint: &Mint, program: &Program, trace: Trace) -> Output {
-    infer_groups(mint, program, trace, None)
-}
-
-/// [`infer`], reusing from `memo` the result of every group whose inputs are
-/// what they were when the memo last saw it, and leaving the memo holding
-/// this run's results for the next.
-pub fn infer_with_memo(
-    mint: &Mint,
-    program: &Program,
-    trace: Trace,
-    memo: &mut GroupMemo,
-) -> Output {
-    infer_groups(mint, program, trace, Some(memo))
-}
-
-fn infer_groups(
-    mint: &Mint,
-    program: &Program,
-    trace: Trace,
-    mut memo: Option<&mut GroupMemo>,
-) -> Output {
-    let (signatures, declared) = declarations(mint, program);
-    let declared_fingerprint = memo.as_ref().map(|_| Fingerprint::of_declarations(program));
-    // What every group may name: the declarations, and then each group's
-    // published schemes as it finishes. Shared by reference with the group
-    // being solved and added to only between groups.
-    let mut env = Rc::new(signatures.env.clone());
-    let mut results = vec![declared];
-    for group in &program.groups {
-        let solve = || infer_group(mint, program, &signatures, env.clone(), &group.members);
-        let result = match (&mut memo, declared_fingerprint) {
-            (Some(memo), Some(declared)) => {
-                let fingerprint = Fingerprint::of_group(program, &env, &group.members, declared);
-                match memo.entries.get(&group.members) {
-                    Some((known, result)) if *known == fingerprint => {
-                        memo.hits += 1;
-                        result.clone()
-                    }
-                    _ => {
-                        memo.misses += 1;
-                        let result = solve();
-                        memo.entries
-                            .insert(group.members.clone(), (fingerprint, result.clone()));
-                        result
-                    }
-                }
-            }
-            _ => solve(),
-        };
-        let env = Rc::get_mut(&mut env).expect("the group's view of the environment is gone");
-        for (symbol, published) in &result.published {
-            env.insert(*symbol, Binding::Poly(published.clone()));
-        }
-        results.push(result);
-    }
-    assemble(mint, program, signatures, results, trace)
+    Session::default().infer(mint, program, trace)
 }
 
 impl Fingerprint {
-    /// A fingerprint of everything [`declarations`] reads: the program's
-    /// types, effects, externs and imports, which every group's signatures
-    /// come from.
-    fn of_declarations(program: &Program) -> u64 {
-        let mut fingerprint = Self::default();
+    fn declarations(&mut self, program: &Program) {
+        let fingerprint = self;
         fingerprint.debug(&program.externs);
         fingerprint.debug(&program.types);
         fingerprint.debug(&program.external_names);
@@ -6026,49 +5943,6 @@ impl Fingerprint {
         fingerprint.debug(&program.effect_params);
         fingerprint.debug(&program.effects);
         fingerprint.debug(&program.effect_ids);
-        fingerprint.finish()
-    }
-
-    /// A fingerprint of everything [`infer_group`] reads for `members`: their
-    /// declarations, the binding of every name their terms mention that was
-    /// solved before them, and the declarations every group reads.
-    fn of_group(
-        program: &Program,
-        env: &HashMap<Symbol, Binding>,
-        members: &[Symbol],
-        declared: u64,
-    ) -> u64 {
-        let mut fingerprint = Self::default();
-        fingerprint.word(declared);
-        let mut mentioned = Vec::new();
-        for symbol in members {
-            let decl = &program.terms[symbol];
-            fingerprint.debug(symbol);
-            fingerprint.debug(decl);
-            ir::references(&decl.value, &mut mentioned);
-        }
-        mentioned.sort_unstable();
-        mentioned.dedup();
-        for symbol in mentioned {
-            let Some(binding) = env.get(&symbol) else {
-                continue;
-            };
-            fingerprint.debug(&symbol);
-            match binding {
-                Binding::Mono(ty) => {
-                    fingerprint.word(1);
-                    fingerprint.ty(ty);
-                }
-                Binding::Poly(explained) => {
-                    fingerprint.word(2);
-                    fingerprint.scheme(&explained.scheme);
-                    fingerprint.debug(&explained.provenance);
-                    fingerprint.debug(&explained.effect_provenance);
-                }
-                Binding::Local => fingerprint.word(3),
-            }
-        }
-        fingerprint.finish()
     }
 
     fn word(&mut self, word: u64) {
@@ -6085,6 +5959,7 @@ impl Fingerprint {
     fn scheme(&mut self, scheme: &Scheme) {
         self.word(scheme.count() as u64);
         self.word(scheme.presences() as u64);
+        self.word(scheme.existentials().len() as u64);
         for existential in scheme.existentials() {
             self.word(*existential as u64);
         }
@@ -6094,7 +5969,7 @@ impl Fingerprint {
 
     /// A type's structure, walked with a list rather than the stack: an
     /// imported type may be as deep as an artifact cares to make it.
-    fn ty(&mut self, ty: &Rc<Ty>) {
+    fn ty(&mut self, ty: &Arc<Ty>) {
         let mut work: Vec<&Ty> = vec![ty];
         let mut rows: Vec<&Row> = Vec::new();
         loop {
@@ -6164,7 +6039,10 @@ impl Fingerprint {
             self.word(0x52);
             let mut row = row;
             loop {
-                for (label, field) in &row.labels {
+                self.word(row.labels.len() as u64);
+                let mut labels: Vec<_> = row.labels.iter().collect();
+                labels.sort_unstable_by_key(|(label, _)| *label);
+                for (label, field) in labels {
                     self.debug(label);
                     self.debug(&field.presence);
                     work.push(&field.ty);
@@ -6239,10 +6117,6 @@ impl Fingerprint {
             }
         }
     }
-
-    fn finish(self) -> u64 {
-        twox_hash::XxHash3_64::oneshot(&self.text)
-    }
 }
 
 /// Lower and review every declaration: the aliases, operations, effect
@@ -6250,12 +6124,12 @@ impl Fingerprint {
 /// back is the signatures, and the declaration stage's own result — the
 /// extern reviews' errors, constraints and steps, which are solved in a table
 /// of their own the way a group's are.
-fn declarations(mint: &Mint, program: &Program) -> (Rc<Signatures>, GroupResult) {
+fn declarations(mint: &Mint, program: &Program) -> (Arc<Signatures>, GroupResult) {
     let binding_names = program
         .terms
         .keys()
         .copied()
-        .map(|symbol| (symbol, Rc::from(mint.name(symbol))))
+        .map(|symbol| (symbol, Arc::from(mint.name(symbol))))
         .collect();
     let mut env = HashMap::new();
     let mut aliases = IndexMap::new();
@@ -6302,7 +6176,7 @@ fn declarations(mint: &Mint, program: &Program) -> (Rc<Signatures>, GroupResult)
     // filled in below as they are made.
     let mut table = Table::new(
         Symbol::GENERATED,
-        Rc::new(Signatures {
+        Arc::new(Signatures {
             effect_kinds: program
                 .effect_ids
                 .iter()
@@ -6719,9 +6593,9 @@ fn declarations(mint: &Mint, program: &Program) -> (Rc<Signatures>, GroupResult)
         params,
         nominal,
         ..
-    } = Rc::try_unwrap(std::mem::take(&mut table.signatures))
+    } = Arc::try_unwrap(std::mem::take(&mut table.signatures))
         .unwrap_or_else(|shared| (*shared).clone());
-    let signatures = Rc::new(Signatures {
+    let signatures = Arc::new(Signatures {
         effect_kinds,
         binding_names,
         params,
@@ -6759,8 +6633,8 @@ fn declarations(mint: &Mint, program: &Program) -> (Rc<Signatures>, GroupResult)
 fn infer_group(
     mint: &Mint,
     program: &Program,
-    signatures: &Rc<Signatures>,
-    outer: Rc<HashMap<Symbol, Binding>>,
+    signatures: &Arc<Signatures>,
+    outer: Arc<HashMap<Symbol, Binding>>,
     members: &[Symbol],
 ) -> GroupResult {
     let scope = *members.first().expect("a group has a member");
@@ -6898,11 +6772,6 @@ fn infer_group(
             operations: &signatures.operations,
             effect_ids: &program.effect_ids,
             effect_params: &program.effect_params,
-            effect_declaration_spans: &signatures.effect_declaration_spans,
-            term_effect_provenance: HashMap::new(),
-            local_effect_provenance: HashMap::new(),
-            binding_effect_provenance: HashMap::new(),
-            callable_effect_scopes: Vec::new(),
             // A definition's value is computed where no handler can reach
             // it, so it is walked at the empty closed row and outside every
             // function — which is what makes performing an effect at the
@@ -6934,11 +6803,6 @@ fn infer_group(
             expected_subject,
             expected_span,
         );
-        let effect_provenance = constrain
-            .term_effect_provenance
-            .get(&decl.value.at)
-            .cloned()
-            .unwrap_or_default();
         let generated = constrain.out;
         let annotated = constrain.annotated;
         let ty = match &decl.annotation {
@@ -6983,7 +6847,6 @@ fn infer_group(
             ty,
             generated,
             annotated,
-            effect_provenance,
             reported,
             locals: published,
         });
@@ -7026,7 +6889,7 @@ fn infer_group(
         table.escapes(
             &member.ty,
             &member.scoped.rigids,
-            Rc::from(mint.name(symbol)),
+            Arc::from(mint.name(symbol)),
             decl.name_at,
             &mut errors,
         );
@@ -7161,8 +7024,7 @@ fn infer_group(
         } else {
             table.scheme_provenance(&member.ty, scheme.body(), &subst, scheme.count())
         };
-        let explained =
-            ExplainedScheme::local(scheme.clone(), provenance, member.effect_provenance);
+        let explained = ExplainedScheme::local(scheme.clone(), provenance);
         env.insert(symbol, Binding::Poly(explained.clone()));
         published_schemes.insert(symbol, explained);
         schemes.insert(symbol, scheme);
@@ -7186,8 +7048,8 @@ fn infer_group(
 fn assemble(
     mint: &Mint,
     program: &Program,
-    signatures: Rc<Signatures>,
-    results: Vec<GroupResult>,
+    signatures: Arc<Signatures>,
+    results: Vec<&GroupResult>,
     trace: Trace,
 ) -> Output {
     let mut typed = IndexMap::new();
@@ -7203,20 +7065,61 @@ fn assemble(
     let mut reasons = Vec::new();
     let mut omitted_reason_parents = HashMap::new();
     let mut effect_argument_reasons = HashMap::new();
+    let evidence =
+        trace == Trace::Complete || results.iter().any(|result| !result.errors.is_empty());
     for result in results {
-        typed.extend(result.typed);
-        schemes.extend(result.schemes);
-        locals.extend(result.locals);
-        promises.extend(result.promises);
-        constraints.extend(result.constraints);
-        errors.extend(result.errors);
-        steps.extend(result.steps);
-        refinements.extend(result.refinements);
-        batches.extend(result.store.batches);
-        variables.insert(result.scope, result.variables);
-        reasons.extend(result.reasons);
-        omitted_reason_parents.extend(result.omitted_reason_parents);
-        effect_argument_reasons.extend(result.effect_argument_reasons);
+        typed.extend(
+            result
+                .typed
+                .iter()
+                .map(|(symbol, decl)| (*symbol, decl.clone())),
+        );
+        schemes.extend(
+            result
+                .schemes
+                .iter()
+                .map(|(symbol, scheme)| (*symbol, scheme.clone())),
+        );
+        locals.extend(
+            result
+                .locals
+                .iter()
+                .map(|(symbol, scheme)| (*symbol, scheme.clone())),
+        );
+        promises.extend(
+            result
+                .promises
+                .iter()
+                .map(|(symbol, promise)| (*symbol, promise.clone())),
+        );
+        errors.extend(result.errors.iter().cloned());
+        batches.extend(result.store.batches.iter().cloned());
+        if evidence {
+            constraints.extend(
+                result
+                    .constraints
+                    .iter()
+                    .map(|(symbol, constraints)| (*symbol, constraints.clone())),
+            );
+            steps.extend(result.steps.iter().cloned());
+            reasons.extend(result.reasons.iter().cloned());
+            omitted_reason_parents.extend(
+                result
+                    .omitted_reason_parents
+                    .iter()
+                    .map(|(id, count)| (*id, *count)),
+            );
+            effect_argument_reasons.extend(
+                result
+                    .effect_argument_reasons
+                    .iter()
+                    .map(|(id, reason)| (*id, reason.clone())),
+            );
+        }
+        if trace == Trace::Complete {
+            refinements.extend(result.refinements.iter().cloned());
+            variables.insert(result.scope, result.variables.clone());
+        }
     }
     let store = Store { batches };
 
@@ -7229,6 +7132,10 @@ fn assemble(
     constraints.sort_by(|one, _, other, _| order.rank(*one).cmp(&order.rank(*other)));
     promises.sort_by(|one, _, other, _| order.rank(*one).cmp(&order.rank(*other)));
     typed.sort_by(|one, _, other, _| order.rank(*one).cmp(&order.rank(*other)));
+
+    if evidence {
+        flow::refresh(program, &signatures, &mut constraints);
+    }
 
     attach_ordinary_explanations(
         mint,
@@ -7264,7 +7171,7 @@ fn assemble(
         effect_aliases,
         externs,
         ..
-    } = Rc::try_unwrap(signatures).unwrap_or_else(|shared| (*shared).clone());
+    } = Arc::try_unwrap(signatures).unwrap_or_else(|shared| (*shared).clone());
     let reviewed_externs = program
         .externs
         .iter()
@@ -7427,18 +7334,6 @@ fn report_flip(table: &mut Table, errors: &mut Vec<Error>) -> Option<usize> {
     Some(at)
 }
 
-impl GroupMemo {
-    /// How many groups the memo answered for since it was made.
-    pub fn hits(&self) -> usize {
-        self.hits
-    }
-
-    /// How many groups had to be solved since the memo was made.
-    pub fn misses(&self) -> usize {
-        self.misses
-    }
-}
-
 impl Env {
     fn get(&self, symbol: Symbol) -> Option<&Binding> {
         self.own.get(&symbol).or_else(|| self.outer.get(&symbol))
@@ -7450,7 +7345,7 @@ impl Env {
 }
 
 impl Table {
-    fn new(scope: Symbol, signatures: Rc<Signatures>) -> Self {
+    fn new(scope: Symbol, signatures: Arc<Signatures>) -> Self {
         Self {
             scope,
             signatures,
@@ -7460,7 +7355,7 @@ impl Table {
 
     /// How `symbol` was spelled, for an escape complaint: a top-level
     /// binding's from the signatures, a nested one's from this table.
-    fn binding_name(&self, symbol: Symbol) -> Option<Rc<str>> {
+    fn binding_name(&self, symbol: Symbol) -> Option<Arc<str>> {
         self.local_names
             .get(&symbol)
             .or_else(|| self.signatures.binding_names.get(&symbol))
@@ -7544,11 +7439,11 @@ impl Table {
         self.reason(ReasonOrigin::Constraint(id), Vec::new())
     }
 
-    fn note_opened_type(&self, ty: &Rc<Ty>) {
-        if let Some((opened, reasons)) = self.opened_provenance.get(&(Rc::as_ptr(ty) as usize))
+    fn note_opened_type(&self, ty: &Arc<Ty>) {
+        if let Some((opened, reasons)) = self.opened_provenance.get(&(Arc::as_ptr(ty) as usize))
             && opened
                 .upgrade()
-                .is_some_and(|opened| Rc::ptr_eq(&opened, ty))
+                .is_some_and(|opened| Arc::ptr_eq(&opened, ty))
         {
             for reason in reasons {
                 self.note_binding_read(*reason);
@@ -7557,7 +7452,7 @@ impl Table {
     }
 
     fn constraint_reason_for(&mut self, id: ConstraintId, kind: &ConstraintKind) -> ReasonId {
-        let roots: Vec<&Rc<Ty>> = match kind {
+        let roots: Vec<&Arc<Ty>> = match kind {
             ConstraintKind::Isolate { input, output, .. } => vec![input, output],
             ConstraintKind::Project { base, result, .. } => vec![base, result],
             ConstraintKind::Spread {
@@ -7574,10 +7469,10 @@ impl Table {
         let mut parents = Vec::new();
         for ty in roots {
             if let Some((opened, opened_parents)) =
-                self.opened_provenance.get(&(Rc::as_ptr(ty) as usize))
+                self.opened_provenance.get(&(Arc::as_ptr(ty) as usize))
                 && opened
                     .upgrade()
-                    .is_some_and(|opened| Rc::ptr_eq(&opened, ty))
+                    .is_some_and(|opened| Arc::ptr_eq(&opened, ty))
             {
                 for parent in opened_parents {
                     if !parents.contains(parent) {
@@ -7811,15 +7706,15 @@ impl Table {
     }
 
     /// An inferred identity used by cell types and mutation effects.
-    fn fresh_region(&mut self) -> Rc<Ty> {
-        Rc::new(Ty::Var(self.mint(VarSort::Region, Subject::Term)))
+    fn fresh_region(&mut self) -> Arc<Ty> {
+        Arc::new(Ty::Var(self.mint(VarSort::Region, Subject::Term)))
     }
 
     /// A variable standing for a whole type: an unconstrained type
     /// of its own, so that binding it takes whatever it is against entire.
-    fn fresh_type_for(&mut self, subject: Subject) -> Rc<Ty> {
+    fn fresh_type_for(&mut self, subject: Subject) -> Arc<Ty> {
         let var = self.mint(VarSort::Type, subject);
-        Rc::new(Ty::plain(Ty::Var(var)))
+        Arc::new(Ty::plain(Ty::Var(var)))
     }
 
     /// A variable standing for the rest of a row.
@@ -7844,7 +7739,7 @@ impl Table {
         self.fresh_presence_for(Subject::Instance)
     }
 
-    fn fresh_match_family_type(&mut self) -> Rc<Ty> {
+    fn fresh_match_family_type(&mut self) -> Arc<Ty> {
         self.fresh_type_for(Subject::MatchResult)
     }
 
@@ -7874,7 +7769,7 @@ impl Table {
     /// in the occurs check would cost. A chain that follows more bindings than
     /// there are variables has visited one of them twice, so an off counter is
     /// a panic the debugger renders rather than a hang that says nothing.
-    fn resolve(&self, ty: &Rc<Ty>) -> Rc<Ty> {
+    fn resolve(&self, ty: &Arc<Ty>) -> Arc<Ty> {
         let mut ty = ty.clone();
         let mut budget = self.vars.len();
         while let Ty::Var(v) = &*ty {
@@ -8016,9 +7911,9 @@ impl Table {
     /// Says no where it cannot tell. Answering no to a question that is really
     /// yes costs a repeated goal; answering yes to one that is really no would
     /// accept two types that differ, so the one-sided error is the one to make.
-    fn alike(&self, a: &Rc<Ty>, b: &Rc<Ty>) -> bool {
+    fn alike(&self, a: &Arc<Ty>, b: &Arc<Ty>) -> bool {
         enum Work {
-            Ty(Rc<Ty>, Rc<Ty>),
+            Ty(Arc<Ty>, Arc<Ty>),
             Row(Row, Row),
         }
 
@@ -8149,10 +8044,10 @@ impl Table {
         // preserving both the cycle path and its source-level closing edge.
         #[derive(Clone)]
         enum Part {
-            Ty(Rc<Ty>),
-            Row(Rc<Row>),
+            Ty(Arc<Ty>),
+            Row(Arc<Row>),
             Presence(Presence),
-            Field(Rc<Ty>, Presence),
+            Field(Arc<Ty>, Presence),
         }
         struct Trace {
             reason: ReasonId,
@@ -8204,7 +8099,7 @@ impl Table {
                         } else {
                             false
                         }
-                    } else if !seen_tys.insert(Rc::as_ptr(&ty) as usize) {
+                    } else if !seen_tys.insert(Arc::as_ptr(&ty) as usize) {
                         false
                     } else {
                         visited_tys.push(ty.clone());
@@ -8235,7 +8130,7 @@ impl Table {
                                 // output, then effects. This ordering is semantic:
                                 // the first exact route wins, not a union of sibling routes.
                                 work.push((
-                                    Part::Row(Rc::new(effects.clone())),
+                                    Part::Row(Arc::new(effects.clone())),
                                     trace,
                                     Route {
                                         containment: true,
@@ -8254,7 +8149,7 @@ impl Table {
                             }
                             Ty::Struct(row) | Ty::Sum(row) => {
                                 work.push((
-                                    Part::Row(Rc::new(row.clone())),
+                                    Part::Row(Arc::new(row.clone())),
                                     trace,
                                     Route {
                                         containment: true,
@@ -8283,7 +8178,7 @@ impl Table {
                     }
                 }
                 Part::Row(row) => {
-                    if !seen_rows.insert(Rc::as_ptr(&row) as usize) {
+                    if !seen_rows.insert(Arc::as_ptr(&row) as usize) {
                         false
                     } else {
                         visited_rows.push(row.clone());
@@ -8367,7 +8262,7 @@ impl Table {
                     Presence::Undecided | Presence::Recovered(_) | Presence::Bound(_) => false,
                     Presence::Var(found) if found == var => true,
                     Presence::Var(found)
-                        if seen_field_presences.insert((Rc::as_ptr(&ty) as usize, found)) =>
+                        if seen_field_presences.insert((Arc::as_ptr(&ty) as usize, found)) =>
                     {
                         if let Slot::Bound {
                             value: Assigned::Presence(next_presence),
@@ -8446,9 +8341,9 @@ impl Table {
     }
 
     /// Every variable `ty` mentions — in its constructor, and in the fields it carries.
-    fn mentions_ty(&self, ty: &Rc<Ty>, found: &mut Vec<TyVar>) {
+    fn mentions_ty(&self, ty: &Arc<Ty>, found: &mut Vec<TyVar>) {
         enum Work {
-            Ty(Rc<Ty>),
+            Ty(Arc<Ty>),
             Row(Row),
         }
         let mut work = vec![Work::Ty(ty.clone())];
@@ -8549,9 +8444,9 @@ impl Table {
     /// The tail chain is followed to its end, so a row whose tail is already
     /// bound to another row puts the names of both onto whatever is still open
     /// past them — the flattening [`Table::canon`] does, for the same reason.
-    fn note_lacks(&mut self, ty: &Rc<Ty>) {
+    fn note_lacks(&mut self, ty: &Arc<Ty>) {
         enum Work {
-            Ty(Rc<Ty>),
+            Ty(Arc<Ty>),
             Row(Row, Shape),
         }
 
@@ -9182,7 +9077,7 @@ impl Table {
     /// `x` present, the match's `a != b` then forces `y` absent, and the
     /// definition generalizes to `{x: a} -> {}` with no variables and no
     /// `where` clause left over.
-    fn fold_back(&mut self, ty: &Rc<Ty>) {
+    fn fold_back(&mut self, ty: &Arc<Ty>) {
         if !self.store_satisfiable() {
             return;
         }
@@ -9242,9 +9137,9 @@ impl Table {
     /// A set, because a type may mention one variable twice — two labels
     /// sharing a presence is the whole of what a `when` name buys — and the
     /// order is the first mention's.
-    fn presences_in(&self, ty: &Rc<Ty>, found: &mut IndexSet<TyVar>) {
+    fn presences_in(&self, ty: &Arc<Ty>, found: &mut IndexSet<TyVar>) {
         enum Work {
-            Ty(Rc<Ty>),
+            Ty(Arc<Ty>),
             Row(Row),
             Presence(Presence),
         }
@@ -9316,14 +9211,14 @@ impl Table {
         span: Anchor,
         symbol: Symbol,
         explained: &ExplainedScheme,
-    ) -> Rc<Ty> {
+    ) -> Arc<Ty> {
         let scheme = &explained.scheme;
         // Only slots occurring directly in the root package are coherent for a
         // lexical value. Nested package nodes are separate production
         // boundaries and must remain fresh even when the same scheme also owns
         // an arrow-value effect at its root.
         enum Work {
-            Ty(Rc<Ty>),
+            Ty(Arc<Ty>),
             Row(Row),
         }
         let mut root_slots = IndexSet::new();
@@ -9377,10 +9272,10 @@ impl Table {
     /// Replay a scheme's semantic skeleton over the exact opened structure.
     /// A marker is minted only for a node with contributors of its own; sibling
     /// fields and branches therefore cannot inherit one another's body facts.
-    fn mark_opened_type(&mut self, root: &Rc<Ty>, provenance: &SchemeProvenance) {
+    fn mark_opened_type(&mut self, root: &Arc<Ty>, provenance: &SchemeProvenance) {
         enum Opened {
-            Ty(Rc<Ty>),
-            Row(Row, Rc<Ty>),
+            Ty(Arc<Ty>),
+            Row(Row, Arc<Ty>),
             Presence(Presence),
         }
         let Some(mut root_node) = (!provenance.nodes.is_empty()).then_some(0) else {
@@ -9403,7 +9298,7 @@ impl Table {
             let Some(node) = provenance.nodes.get(at) else {
                 continue;
             };
-            let attach = |table: &mut Self, owner: &Rc<Ty>| {
+            let attach = |table: &mut Self, owner: &Arc<Ty>| {
                 if node.roots.is_empty() && node.omitted == 0 {
                     return;
                 }
@@ -9421,16 +9316,16 @@ impl Table {
                 );
                 let entry = table
                     .opened_provenance
-                    .entry(Rc::as_ptr(owner) as usize)
-                    .or_insert_with(|| (Rc::downgrade(owner), Vec::new()));
+                    .entry(Arc::as_ptr(owner) as usize)
+                    .or_insert_with(|| (Arc::downgrade(owner), Vec::new()));
                 if entry
                     .0
                     .upgrade()
-                    .is_some_and(|opened| Rc::ptr_eq(&opened, owner))
+                    .is_some_and(|opened| Arc::ptr_eq(&opened, owner))
                 {
                     entry.1.push(marker);
                 } else {
-                    *entry = (Rc::downgrade(owner), vec![marker]);
+                    *entry = (Arc::downgrade(owner), vec![marker]);
                 }
             };
             match opened {
@@ -9542,7 +9437,7 @@ impl Table {
         }
     }
 
-    fn region_bounds(&self, root: &Rc<Ty>) -> HashSet<u32> {
+    fn region_bounds(&self, root: &Arc<Ty>) -> HashSet<u32> {
         enum Work<'a> {
             Ty(&'a Ty),
             Region(&'a Ty),
@@ -9623,7 +9518,7 @@ impl Table {
         span: Anchor,
         explained: &ExplainedScheme,
         coherent: Option<(Symbol, IndexSet<u32>)>,
-    ) -> Rc<Ty> {
+    ) -> Arc<Ty> {
         let scheme = &explained.scheme;
         let regions = self.region_bounds(scheme.body());
         // One fresh variable per position the scheme bound, handed over as a
@@ -9670,7 +9565,7 @@ impl Table {
                     }
                     Assigned::Presence(presence)
                 }
-                false => Assigned::Ty(Rc::new(Ty::plain(Ty::Var(
+                false => Assigned::Ty(Arc::new(Ty::plain(Ty::Var(
                     self.mint_from_budgeted(
                         explained
                             .provenance
@@ -9725,9 +9620,9 @@ impl Table {
 
     /// Attach each owned conjunct to the package allocation named by its
     /// structural preorder owner. Unowned/mixed conjuncts remain immediate.
-    fn register_package_guarantees(&mut self, ty: &Rc<Ty>, formula: Formula) -> Formula {
+    fn register_package_guarantees(&mut self, ty: &Arc<Ty>, formula: Formula) -> Formula {
         enum Work {
-            Ty(Rc<Ty>, bool),
+            Ty(Arc<Ty>, bool),
             Row(Row),
         }
         let mut packages = Vec::new();
@@ -9816,7 +9711,7 @@ impl Table {
     /// abstract presences on every destruction; root lexical packages retain
     /// the coherent identity selected by `instantiate_local` (including R16's
     /// fresh identity for a separately bound alias).
-    fn open_package(&mut self, span: Anchor, package: &Rc<Ty>) -> Rc<Ty> {
+    fn open_package(&mut self, span: Anchor, package: &Arc<Ty>) -> Arc<Ty> {
         let Ty::Package(body) = &**package else {
             return package.clone();
         };
@@ -9874,7 +9769,7 @@ impl Table {
     /// demands are structural, so a declared name cannot reach this walk.
     fn presence_paths(
         &self,
-        ty: &Rc<Ty>,
+        ty: &Arc<Ty>,
         prefix: &mut PresencePath,
         found: &mut IndexMap<PresencePath, Presence>,
     ) {
@@ -9901,13 +9796,13 @@ impl Table {
     /// nested shapes must use the neutral diagnostic vocabulary.
     fn labels_in(
         &self,
-        ty: &Rc<Ty>,
+        ty: &Arc<Ty>,
         found: &mut IndexMap<String, (String, Presence)>,
         formula_shape: &mut Option<Shape>,
         formula: &Formula,
     ) {
         enum Work {
-            Ty(Rc<Ty>),
+            Ty(Arc<Ty>),
             Field(Shape, String, RowField),
             Effects(Row),
         }
@@ -10016,7 +9911,7 @@ impl Table {
     /// solver goes through [`lower_type`] or [`Constrain::instantiate`] first,
     /// and both note what they built — at the cost of resolving every variable
     /// and allocating a set per row, on nearly every constraint.
-    fn unfolded(&mut self, aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Rc<Ty> {
+    fn unfolded(&mut self, aliases: &IndexMap<Symbol, Scheme>, ty: &Arc<Ty>) -> Arc<Ty> {
         // A package may conceal a name and an alias may unfold to another
         // package. Alternate the two transparent operations until a real shape
         // is exposed; doing either only once leaves `Package (Alias
@@ -10027,12 +9922,12 @@ impl Table {
                 exposed = body.clone();
             }
             let next = unfold(aliases, &exposed);
-            if Rc::ptr_eq(&next, &exposed) {
+            if Arc::ptr_eq(&next, &exposed) {
                 break;
             }
             exposed = next;
         }
-        if !Rc::ptr_eq(&exposed, ty) {
+        if !Arc::ptr_eq(&exposed, ty) {
             self.note_lacks(&exposed);
         }
         exposed
@@ -10052,9 +9947,9 @@ impl Table {
     /// and a reader sent to the same line twice learns nothing the second time.
     fn escapes(
         &mut self,
-        ty: &Rc<Ty>,
+        ty: &Arc<Ty>,
         owned: &[u32],
-        destination_name: Rc<str>,
+        destination_name: Arc<str>,
         destination_span: Anchor,
         errors: &mut Vec<Error>,
     ) {
@@ -10131,9 +10026,9 @@ impl Table {
     /// the order the type mentions them. A leaf wherever it appears, so this is
     /// the ordinary walk with one arm that collects — and two rows a rigid can
     /// tail, a sum's cases and an arrow's effects, read the same way.
-    fn rigids_in(&self, ty: &Rc<Ty>, found: &mut IndexMap<u32, Rc<str>>) {
+    fn rigids_in(&self, ty: &Arc<Ty>, found: &mut IndexMap<u32, Arc<str>>) {
         enum Work {
-            Ty(Rc<Ty>),
+            Ty(Arc<Ty>),
             Row(Row),
         }
         let mut work = vec![Work::Ty(ty.clone())];
@@ -10288,7 +10183,7 @@ impl Table {
     ///
     /// And only what this scheme would quantify: a variable below `level`
     /// belongs to a binder further out, which may still put an effect in it.
-    fn close_effects(&mut self, ty: &Rc<Ty>, level: u32) {
+    fn close_effects(&mut self, ty: &Arc<Ty>, level: u32) {
         let mut counted: IndexMap<TyVar, usize> = IndexMap::new();
         self.count_effects(ty, &mut counted);
         for (var, count) in counted {
@@ -10297,7 +10192,7 @@ impl Table {
             }
             self.default_bind(
                 var,
-                Assigned::Row(Rc::new(Row::closed())),
+                Assigned::Row(Arc::new(Row::closed())),
                 DefaultBinding::CloseEffects,
                 DefaultAssignment::EmptyRow,
                 Vec::new(),
@@ -10312,9 +10207,9 @@ impl Table {
     /// variable's sort is fixed where it was minted, and nothing can unify a
     /// sum's tail with an arrow's effects, so a variable found here is found
     /// nowhere but here.
-    fn count_effects(&self, ty: &Rc<Ty>, found: &mut IndexMap<TyVar, usize>) {
+    fn count_effects(&self, ty: &Arc<Ty>, found: &mut IndexMap<TyVar, usize>) {
         enum Work {
-            Ty(Rc<Ty>),
+            Ty(Arc<Ty>),
             Row(Row, bool),
         }
         let mut work = vec![Work::Ty(ty.clone())];
@@ -10373,7 +10268,7 @@ impl Table {
     /// [`Table::demote`] — and it is why a scheme published here may still
     /// mention the table. A definition's own scheme never does: its level is 0,
     /// and nothing is below that.
-    fn generalize(&self, ty: &Rc<Ty>, level: u32, formula: Formula) -> (Scheme, Subst) {
+    fn generalize(&self, ty: &Arc<Ty>, level: u32, formula: Formula) -> (Scheme, Subst) {
         let mut subst = Subst::default();
         self.quantify(ty, &mut subst, level);
         let body = self.zonk(ty, &subst);
@@ -10407,13 +10302,13 @@ impl Table {
     /// by semantic nodes rather than by the size of the defining body.
     fn scheme_provenance(
         &self,
-        ty: &Rc<Ty>,
-        published: &Rc<Ty>,
+        ty: &Arc<Ty>,
+        published: &Arc<Ty>,
         subst: &Subst,
         count: u32,
     ) -> SchemeProvenance {
         enum Work {
-            Ty(Rc<Ty>, Option<usize>),
+            Ty(Arc<Ty>, Option<usize>),
             Row(Row, Option<usize>),
             Presence(Presence, Option<usize>),
         }
@@ -10452,10 +10347,10 @@ impl Table {
                     Work::Ty(mut ty, _) => {
                         let mut roots = Vec::new();
                         if let Some((opened, reasons)) =
-                            self.opened_provenance.get(&(Rc::as_ptr(&ty) as usize))
+                            self.opened_provenance.get(&(Arc::as_ptr(&ty) as usize))
                             && opened
                                 .upgrade()
-                                .is_some_and(|opened| Rc::ptr_eq(&opened, &ty))
+                                .is_some_and(|opened| Arc::ptr_eq(&opened, &ty))
                         {
                             roots.extend(reasons);
                         }
@@ -10592,7 +10487,7 @@ impl Table {
         // in lockstep. Opening can therefore replay nested synthesized packages
         // without guessing from the pre-packaging body.
         enum Published {
-            Ty(Rc<Ty>, Option<usize>, Option<usize>),
+            Ty(Arc<Ty>, Option<usize>, Option<usize>),
             Row(Row, Option<usize>, Option<usize>),
             Presence(Option<usize>, Option<usize>),
         }
@@ -10775,8 +10670,8 @@ impl Table {
     /// incidental implementation facts are never published through it.
     fn authoritative_provenance(
         &mut self,
-        ty: &Rc<Ty>,
-        published: &Rc<Ty>,
+        ty: &Arc<Ty>,
+        published: &Arc<Ty>,
         subst: &Subst,
         count: u32,
         constraints: &[Constraint],
@@ -10850,14 +10745,14 @@ impl Table {
     /// Silent once something has already flipped the store: the cascade rule.
     /// A `where false` on every scheme downstream of one contradiction is the
     /// same mistake said in as many places as the program has definitions.
-    fn required(&self, ty: &Rc<Ty>) -> Formula {
+    fn required(&self, ty: &Arc<Ty>) -> Formula {
         self.required_given(ty, &Formula::True)
     }
 
     /// What a type generalized inside a reachable arm requires while that arm's
     /// premise holds. Conjoining the premise before projection prevents
     /// existential elimination from turning `E -> Q(local)` into `true`.
-    fn required_given(&self, ty: &Rc<Ty>, premise: &Formula) -> Formula {
+    fn required_given(&self, ty: &Arc<Ty>, premise: &Formula) -> Formula {
         if self.unsat {
             return Formula::True;
         }
@@ -10966,7 +10861,7 @@ impl Table {
     /// reading the type left to right could predict. Whichever pass runs, a
     /// variable can only be numbered by one of them — a variable's sort is
     /// fixed where it was minted — so the two can never number one twice.
-    fn quantify(&self, ty: &Rc<Ty>, subst: &mut Subst, level: u32) {
+    fn quantify(&self, ty: &Arc<Ty>, subst: &mut Subst, level: u32) {
         self.quantify_walk(ty, subst, level, true);
         self.quantify_walk(ty, subst, level, false);
     }
@@ -10983,9 +10878,9 @@ impl Table {
     /// numbering it first would call the rightmost thing on the line `a`. No
     /// special case for it either way — it is descended into exactly where it
     /// sits.
-    fn quantify_walk(&self, ty: &Rc<Ty>, subst: &mut Subst, level: u32, presences: bool) {
+    fn quantify_walk(&self, ty: &Arc<Ty>, subst: &mut Subst, level: u32, presences: bool) {
         enum Work {
-            Ty(Rc<Ty>),
+            Ty(Arc<Ty>),
             Row(Row),
             Presence(Presence),
             Tail(Rest),
@@ -11083,9 +10978,9 @@ impl Table {
     /// table only where the caller chose to leave it mentioning one — see
     /// [`Table::generalize`], whose scheme keeps an enclosing binder's
     /// variables free — so everything published at level 0 outlives the solver.
-    fn zonk(&self, ty: &Rc<Ty>, subst: &Subst) -> Rc<Ty> {
+    fn zonk(&self, ty: &Arc<Ty>, subst: &Subst) -> Arc<Ty> {
         enum Work {
-            Ty(Rc<Ty>),
+            Ty(Arc<Ty>),
             Arrow,
             Package,
             Array,
@@ -11094,7 +10989,7 @@ impl Table {
             Sum,
             Named {
                 symbol: Symbol,
-                name: Rc<str>,
+                name: Arc<str>,
                 args: usize,
             },
             Row(Row),
@@ -11112,14 +11007,14 @@ impl Table {
                 Work::Ty(ty) => {
                     let ty = self.resolve(&ty);
                     match &*ty {
-                        Ty::Var(var) => types.push(Rc::new(
+                        Ty::Var(var) => types.push(Arc::new(
                             subst
                                 .types
                                 .get(var)
                                 .map_or(Ty::Var(*var), |at| Ty::Bound(*at)),
                         )),
                         Ty::Rigid { id, .. } => types.push(match subst.rigids.get(id) {
-                            Some(index) => Rc::new(Ty::Bound(*index)),
+                            Some(index) => Arc::new(Ty::Bound(*index)),
                             None if self.region_rigids.contains(id) => ty.clone(),
                             None => panic!("a quantified type rigid must have a binder"),
                         }),
@@ -11158,7 +11053,7 @@ impl Table {
                             });
                             work.extend(args.iter().rev().cloned().map(Work::Ty));
                         }
-                        other => types.push(Rc::new(other.clone())),
+                        other => types.push(Arc::new(other.clone())),
                     }
                 }
                 Work::Row(row) => {
@@ -11200,28 +11095,28 @@ impl Table {
                     let effects = rows.pop().expect("zonked effects row");
                     let to = types.pop().expect("zonked arrow result");
                     let from = types.pop().expect("zonked arrow argument");
-                    types.push(Rc::new(Ty::Arrow(from, to, effects)));
+                    types.push(Arc::new(Ty::Arrow(from, to, effects)));
                 }
                 Work::Package => {
                     let body = types.pop().expect("zonked package body");
-                    types.push(Rc::new(Ty::Package(body)));
+                    types.push(Arc::new(Ty::Package(body)));
                 }
                 Work::Array => {
                     let element = types.pop().expect("zonked array element");
-                    types.push(Rc::new(Ty::Array(element)));
+                    types.push(Arc::new(Ty::Array(element)));
                 }
                 Work::Mut => {
                     let element = types.pop().expect("cell element");
                     let region = types.pop().expect("cell region");
-                    types.push(Rc::new(Ty::Mut(region, element)));
+                    types.push(Arc::new(Ty::Mut(region, element)));
                 }
                 Work::Struct => {
                     let row = rows.pop().expect("zonked struct row");
-                    types.push(Rc::new(Ty::Struct(row)));
+                    types.push(Arc::new(Ty::Struct(row)));
                 }
                 Work::Sum => {
                     let row = rows.pop().expect("zonked sum row");
-                    types.push(Rc::new(Ty::Sum(row)));
+                    types.push(Arc::new(Ty::Sum(row)));
                 }
                 Work::Named { symbol, name, args } => {
                     let mut opened = Vec::with_capacity(args);
@@ -11229,7 +11124,7 @@ impl Table {
                         opened.push(types.pop().expect("zonked named argument"));
                     }
                     opened.reverse();
-                    types.push(Rc::new(Ty::Named {
+                    types.push(Arc::new(Ty::Named {
                         symbol,
                         name,
                         args: opened.into(),
@@ -11239,7 +11134,7 @@ impl Table {
                     let mut built = Vec::with_capacity(labels.len());
                     for (name, presence) in labels.into_iter().rev() {
                         let ty = match presence {
-                            Presence::Absent => Rc::new(Ty::Undecided),
+                            Presence::Absent => Arc::new(Ty::Undecided),
                             _ => types.pop().expect("zonked field payload"),
                         };
                         built.push((name, RowField { presence, ty }));
@@ -11274,7 +11169,7 @@ impl Table {
     /// complaint still mentions when the group is done belongs to nobody
     /// further out, so every variable left in it is named rather than left for
     /// a reader to resolve.
-    fn close(&self, ty: &Rc<Ty>, subst: &mut Subst) -> Rc<Ty> {
+    fn close(&self, ty: &Arc<Ty>, subst: &mut Subst) -> Arc<Ty> {
         self.quantify(ty, subst, 0);
         self.zonk(ty, subst)
     }
@@ -11527,9 +11422,9 @@ fn immediate_formula(formula: Formula) -> Formula {
     Formula::all(parts)
 }
 
-fn collect_owned_existentials(body: &Rc<Ty>, abstract_: &HashSet<TyVar>) -> IndexSet<TyVar> {
+fn collect_owned_existentials(body: &Arc<Ty>, abstract_: &HashSet<TyVar>) -> IndexSet<TyVar> {
     enum Work {
-        Ty(Rc<Ty>),
+        Ty(Arc<Ty>),
         Row(Row),
     }
     let mut found = IndexSet::new();
@@ -11572,9 +11467,9 @@ fn collect_owned_existentials(body: &Rc<Ty>, abstract_: &HashSet<TyVar>) -> Inde
 
 /// Alpha-rename presence variables throughout one package without using the
 /// native stack; payloads and composed rows can be adversarially deep.
-fn substitute_presence_vars(root: &Rc<Ty>, renames: &HashMap<TyVar, Presence>) -> Rc<Ty> {
+fn substitute_presence_vars(root: &Arc<Ty>, renames: &HashMap<TyVar, Presence>) -> Arc<Ty> {
     enum Work {
-        Ty(Rc<Ty>),
+        Ty(Arc<Ty>),
         Row(Row),
         Arrow,
         Package,
@@ -11582,7 +11477,7 @@ fn substitute_presence_vars(root: &Rc<Ty>, renames: &HashMap<TyVar, Presence>) -
         Mut,
         Struct,
         Sum,
-        Named(Symbol, Rc<str>, usize),
+        Named(Symbol, Arc<str>, usize),
         BuiltRow(Vec<(String, Presence)>, Rest),
     }
     let mut work = vec![Work::Ty(root.clone())];
@@ -11622,7 +11517,7 @@ fn substitute_presence_vars(root: &Rc<Ty>, renames: &HashMap<TyVar, Presence>) -
                     work.push(Work::Named(*symbol, name.clone(), args.len()));
                     work.extend(args.iter().rev().cloned().map(Work::Ty));
                 }
-                other => types.push(Rc::new(other.clone())),
+                other => types.push(Arc::new(other.clone())),
             },
             Work::Row(row) => {
                 let labels = row
@@ -11654,30 +11549,30 @@ fn substitute_presence_vars(root: &Rc<Ty>, renames: &HashMap<TyVar, Presence>) -
                 let effects = rows.pop().unwrap();
                 let to = types.pop().unwrap();
                 let from = types.pop().unwrap();
-                types.push(Rc::new(Ty::Arrow(from, to, effects)));
+                types.push(Arc::new(Ty::Arrow(from, to, effects)));
             }
             Work::Package => {
                 let body = types.pop().unwrap();
-                types.push(Rc::new(Ty::Package(body)));
+                types.push(Arc::new(Ty::Package(body)));
             }
             Work::Array => {
                 let element = types.pop().unwrap();
-                types.push(Rc::new(Ty::Array(element)));
+                types.push(Arc::new(Ty::Array(element)));
             }
             Work::Mut => {
                 let element = types.pop().expect("cell element");
                 let region = types.pop().expect("cell region");
-                types.push(Rc::new(Ty::Mut(region, element)));
+                types.push(Arc::new(Ty::Mut(region, element)));
             }
-            Work::Struct => types.push(Rc::new(Ty::Struct(rows.pop().unwrap()))),
-            Work::Sum => types.push(Rc::new(Ty::Sum(rows.pop().unwrap()))),
+            Work::Struct => types.push(Arc::new(Ty::Struct(rows.pop().unwrap()))),
+            Work::Sum => types.push(Arc::new(Ty::Sum(rows.pop().unwrap()))),
             Work::Named(symbol, name, count) => {
                 let mut args = Vec::with_capacity(count);
                 for _ in 0..count {
                     args.push(types.pop().unwrap());
                 }
                 args.reverse();
-                types.push(Rc::new(Ty::Named {
+                types.push(Arc::new(Ty::Named {
                     symbol,
                     name,
                     args: args.into(),
@@ -11685,13 +11580,13 @@ fn substitute_presence_vars(root: &Rc<Ty>, renames: &HashMap<TyVar, Presence>) -
             }
             Work::BuiltRow(labels, rest) => {
                 let rest = match rest {
-                    Rest::More(_) => Rest::More(Rc::new(rows.pop().unwrap())),
+                    Rest::More(_) => Rest::More(Arc::new(rows.pop().unwrap())),
                     rest => rest,
                 };
                 let mut built = Vec::with_capacity(labels.len());
                 for (name, presence) in labels.into_iter().rev() {
                     let ty = if matches!(presence, Presence::Absent) {
-                        Rc::new(Ty::Undecided)
+                        Arc::new(Ty::Undecided)
                     } else {
                         types.pop().unwrap()
                     };
@@ -11714,7 +11609,7 @@ fn substitute_presence_vars(root: &Rc<Ty>, renames: &HashMap<TyVar, Presence>) -
 /// erased, covariant, contravariant and invariant parameters exactly.
 fn semantic_variances(aliases: &IndexMap<Symbol, Scheme>) -> HashMap<(Symbol, u32), u8> {
     enum Work {
-        Ty(Rc<Ty>, bool),
+        Ty(Arc<Ty>, bool),
         Row(Row, bool),
     }
     let mut out = HashMap::new();
@@ -11735,7 +11630,7 @@ fn semantic_variances(aliases: &IndexMap<Symbol, Scheme>) -> HashMap<(Symbol, u3
                 match part {
                     Work::Ty(ty, positive) => {
                         let bit = if positive { 1 } else { 2 };
-                        let visited = seen.entry(Rc::as_ptr(&ty) as usize).or_default();
+                        let visited = seen.entry(Arc::as_ptr(&ty) as usize).or_default();
                         if *visited & bit != 0 {
                             continue;
                         }
@@ -11805,11 +11700,11 @@ fn semantic_variances(aliases: &IndexMap<Symbol, Scheme>) -> HashMap<(Symbol, u3
 /// annotation variables are rigids rather than these low presence positions,
 /// so this cannot turn a caller-chosen annotation variable existential.
 fn package_positive_presences(
-    body: &Rc<Ty>,
+    body: &Arc<Ty>,
     presences: u32,
     already: &IndexSet<u32>,
     variances: &HashMap<(Symbol, u32), u8>,
-) -> (Rc<Ty>, IndexSet<u32>) {
+) -> (Arc<Ty>, IndexSet<u32>) {
     #[derive(Default)]
     struct Uses {
         positive: u32,
@@ -11817,10 +11712,10 @@ fn package_positive_presences(
         owners: IndexSet<usize>,
     }
     enum Scan {
-        Ty(Rc<Ty>, bool, usize),
+        Ty(Arc<Ty>, bool, usize),
         Row(Row, bool, usize),
     }
-    let root = Rc::as_ptr(body) as usize;
+    let root = Arc::as_ptr(body) as usize;
     let mut uses: HashMap<u32, Uses> = HashMap::new();
     // A named invariant argument is traversed at both polarities. Memoize the
     // joined polarity state per package owner and semantic allocation so deep
@@ -11831,7 +11726,7 @@ fn package_positive_presences(
         match item {
             Scan::Ty(ty, positive, owner) => {
                 let bit = if positive { 1 } else { 2 };
-                let visited = seen.entry((owner, Rc::as_ptr(&ty) as usize)).or_default();
+                let visited = seen.entry((owner, Arc::as_ptr(&ty) as usize)).or_default();
                 if *visited & bit != 0 {
                     continue;
                 }
@@ -11840,7 +11735,7 @@ fn package_positive_presences(
                     Ty::Arrow(from, to, effects) => {
                         work.push(Scan::Ty(from.clone(), !positive, owner));
                         let result_owner = if positive {
-                            Rc::as_ptr(to) as usize
+                            Arc::as_ptr(to) as usize
                         } else {
                             owner
                         };
@@ -11913,14 +11808,14 @@ fn package_positive_presences(
     }
 
     enum Build {
-        Ty(Rc<Ty>),
+        Ty(Arc<Ty>),
         Arrow(bool),
         Package(bool),
         Array(bool),
         Mut(bool),
         Struct(bool),
         Sum(bool),
-        Named(bool, Symbol, Rc<str>, usize),
+        Named(bool, Symbol, Arc<str>, usize),
         Row(Row),
         FinishRow(Vec<(String, Presence)>, Rest),
     }
@@ -11930,7 +11825,7 @@ fn package_positive_presences(
     while let Some(item) = work.pop() {
         match item {
             Build::Ty(ty) => {
-                let wrap = owners.contains(&(Rc::as_ptr(&ty) as usize));
+                let wrap = owners.contains(&(Arc::as_ptr(&ty) as usize));
                 match &*ty {
                     Ty::Arrow(from, to, effects) => {
                         work.push(Build::Arrow(wrap));
@@ -11964,9 +11859,9 @@ fn package_positive_presences(
                         work.extend(args.iter().rev().cloned().map(Build::Ty));
                     }
                     other => {
-                        let value = Rc::new(other.clone());
+                        let value = Arc::new(other.clone());
                         types.push(if wrap {
-                            Rc::new(Ty::Package(value))
+                            Arc::new(Ty::Package(value))
                         } else {
                             value
                         });
@@ -12004,7 +11899,7 @@ fn package_positive_presences(
                 built.reverse();
                 let rest = match rest {
                     Rest::More(_) => {
-                        Rest::More(Rc::new(rows.pop().expect("packaged composed row tail")))
+                        Rest::More(Arc::new(rows.pop().expect("packaged composed row tail")))
                     }
                     rest => rest,
                 };
@@ -12017,17 +11912,17 @@ fn package_positive_presences(
                 let effects = rows.pop().unwrap();
                 let to = types.pop().unwrap();
                 let from = types.pop().unwrap();
-                let value = Rc::new(Ty::Arrow(from, to, effects));
+                let value = Arc::new(Ty::Arrow(from, to, effects));
                 types.push(if wrap {
-                    Rc::new(Ty::Package(value))
+                    Arc::new(Ty::Package(value))
                 } else {
                     value
                 });
             }
             Build::Package(wrap) => {
-                let value = Rc::new(Ty::Package(types.pop().unwrap()));
+                let value = Arc::new(Ty::Package(types.pop().unwrap()));
                 types.push(if wrap {
-                    Rc::new(Ty::Package(value))
+                    Arc::new(Ty::Package(value))
                 } else {
                     value
                 });
@@ -12035,33 +11930,33 @@ fn package_positive_presences(
             Build::Mut(wrap) => {
                 let element = types.pop().unwrap();
                 let region = types.pop().unwrap();
-                let value = Rc::new(Ty::Mut(region, element));
+                let value = Arc::new(Ty::Mut(region, element));
                 types.push(if wrap {
-                    Rc::new(Ty::Package(value))
+                    Arc::new(Ty::Package(value))
                 } else {
                     value
                 });
             }
             Build::Array(wrap) => {
-                let value = Rc::new(Ty::Array(types.pop().unwrap()));
+                let value = Arc::new(Ty::Array(types.pop().unwrap()));
                 types.push(if wrap {
-                    Rc::new(Ty::Package(value))
+                    Arc::new(Ty::Package(value))
                 } else {
                     value
                 });
             }
             Build::Struct(wrap) => {
-                let value = Rc::new(Ty::Struct(rows.pop().unwrap()));
+                let value = Arc::new(Ty::Struct(rows.pop().unwrap()));
                 types.push(if wrap {
-                    Rc::new(Ty::Package(value))
+                    Arc::new(Ty::Package(value))
                 } else {
                     value
                 });
             }
             Build::Sum(wrap) => {
-                let value = Rc::new(Ty::Sum(rows.pop().unwrap()));
+                let value = Arc::new(Ty::Sum(rows.pop().unwrap()));
                 types.push(if wrap {
-                    Rc::new(Ty::Package(value))
+                    Arc::new(Ty::Package(value))
                 } else {
                     value
                 });
@@ -12072,13 +11967,13 @@ fn package_positive_presences(
                     args.push(types.pop().unwrap());
                 }
                 args.reverse();
-                let value = Rc::new(Ty::Named {
+                let value = Arc::new(Ty::Named {
                     symbol,
                     name,
                     args: args.into(),
                 });
                 types.push(if wrap {
-                    Rc::new(Ty::Package(value))
+                    Arc::new(Ty::Package(value))
                 } else {
                     value
                 });
@@ -12101,9 +11996,9 @@ fn package_positive_presences(
 /// Unconditional over [`Ty::Bound`] and [`Rest::Bound`]: every one of those is
 /// a type or a row position by construction, since a presence is only ever
 /// written as a [`Presence::Bound`].
-fn shift(ty: &Rc<Ty>, by: u32) -> Rc<Ty> {
+fn shift(ty: &Arc<Ty>, by: u32) -> Arc<Ty> {
     enum Work {
-        Ty(Rc<Ty>),
+        Ty(Arc<Ty>),
         Row(Row),
         Arrow,
         Package,
@@ -12111,7 +12006,7 @@ fn shift(ty: &Rc<Ty>, by: u32) -> Rc<Ty> {
         Mut,
         Struct,
         Sum,
-        Named(Symbol, Rc<str>, usize),
+        Named(Symbol, Arc<str>, usize),
         BuiltRow(Vec<(String, Presence)>, Rest),
     }
     let mut work = vec![Work::Ty(ty.clone())];
@@ -12120,7 +12015,7 @@ fn shift(ty: &Rc<Ty>, by: u32) -> Rc<Ty> {
     while let Some(part) = work.pop() {
         match part {
             Work::Ty(ty) => match &*ty {
-                Ty::Bound(at) => types.push(Rc::new(Ty::Bound(at + by))),
+                Ty::Bound(at) => types.push(Arc::new(Ty::Bound(at + by))),
                 Ty::Arrow(from, to, effects) => {
                     work.push(Work::Arrow);
                     work.push(Work::Row(effects.clone()));
@@ -12152,7 +12047,7 @@ fn shift(ty: &Rc<Ty>, by: u32) -> Rc<Ty> {
                     work.push(Work::Named(*symbol, name.clone(), args.len()));
                     work.extend(args.iter().rev().cloned().map(Work::Ty));
                 }
-                other => types.push(Rc::new(other.clone())),
+                other => types.push(Arc::new(other.clone())),
             },
             Work::Row(row) => {
                 let labels = row
@@ -12176,30 +12071,30 @@ fn shift(ty: &Rc<Ty>, by: u32) -> Rc<Ty> {
                 let effects = rows.pop().expect("shifted effects");
                 let to = types.pop().expect("shifted result");
                 let from = types.pop().expect("shifted parameter");
-                types.push(Rc::new(Ty::Arrow(from, to, effects)));
+                types.push(Arc::new(Ty::Arrow(from, to, effects)));
             }
             Work::Package => {
                 let body = types.pop().expect("shifted package");
-                types.push(Rc::new(Ty::Package(body)));
+                types.push(Arc::new(Ty::Package(body)));
             }
             Work::Array => {
                 let element = types.pop().expect("shifted array element");
-                types.push(Rc::new(Ty::Array(element)));
+                types.push(Arc::new(Ty::Array(element)));
             }
             Work::Mut => {
                 let element = types.pop().expect("cell element");
                 let region = types.pop().expect("cell region");
-                types.push(Rc::new(Ty::Mut(region, element)));
+                types.push(Arc::new(Ty::Mut(region, element)));
             }
-            Work::Struct => types.push(Rc::new(Ty::Struct(rows.pop().expect("shifted struct")))),
-            Work::Sum => types.push(Rc::new(Ty::Sum(rows.pop().expect("shifted sum")))),
+            Work::Struct => types.push(Arc::new(Ty::Struct(rows.pop().expect("shifted struct")))),
+            Work::Sum => types.push(Arc::new(Ty::Sum(rows.pop().expect("shifted sum")))),
             Work::Named(symbol, name, count) => {
                 let mut args = Vec::with_capacity(count);
                 for _ in 0..count {
                     args.push(types.pop().expect("shifted named argument"));
                 }
                 args.reverse();
-                types.push(Rc::new(Ty::Named {
+                types.push(Arc::new(Ty::Named {
                     symbol,
                     name,
                     args: args.into(),
@@ -12208,13 +12103,15 @@ fn shift(ty: &Rc<Ty>, by: u32) -> Rc<Ty> {
             Work::BuiltRow(labels, rest) => {
                 let rest = match rest {
                     Rest::Bound(at) => Rest::Bound(at + by),
-                    Rest::More(_) => Rest::More(Rc::new(rows.pop().expect("shifted composed row"))),
+                    Rest::More(_) => {
+                        Rest::More(Arc::new(rows.pop().expect("shifted composed row")))
+                    }
                     rest => rest,
                 };
                 let mut built = Vec::with_capacity(labels.len());
                 for (name, presence) in labels.into_iter().rev() {
                     let ty = match presence {
-                        Presence::Absent => Rc::new(Ty::Undecided),
+                        Presence::Absent => Arc::new(Ty::Undecided),
                         _ => types.pop().expect("shifted field payload"),
                     };
                     built.push((name, RowField { presence, ty }));
@@ -12255,7 +12152,7 @@ fn shift(ty: &Rc<Ty>, by: u32) -> Rc<Ty> {
 /// to something with no [`Ty::Var`] anywhere in it, which several walks here
 /// rely on: it is why they may stop at a name rather than descend into what it
 /// stands for.
-fn lower_type(mint: &Mint, table: &mut Table, ty: &Type) -> Rc<Ty> {
+fn lower_type(mint: &Mint, table: &mut Table, ty: &Type) -> Arc<Ty> {
     let mut tails = Tails::default();
     let lowered = lower(mint, table, &mut tails, ty);
     // A tail stands for the fields its row did not write out, and this is
@@ -12292,7 +12189,7 @@ struct Tails {
 fn extern_annotation_sources(
     annotation: &Annotation,
     tails: &Tails,
-    semantic: &Rc<Ty>,
+    semantic: &Arc<Ty>,
 ) -> ExternSourceMap {
     fn source_when(
         sources: &mut ExternSourceMap,
@@ -12457,7 +12354,7 @@ struct Lowered {
     /// The skolemized type. Its variables are rigids and its holes
     /// are ordinary solver variables, which is the whole of the difference
     /// between what the annotation promises and what it leaves to inference.
-    ty: Rc<Ty>,
+    ty: Arc<Ty>,
     /// [`Lowered::ty`] with its rigids quantified and nothing else — what a
     /// recursive use of the name is a copy of.
     ///
@@ -12502,7 +12399,7 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
         if variable.sense == Sense::Region {
             table.region_rigids.insert(variable.id);
         }
-        let name: Rc<str> = variable.name.as_str().into();
+        let name: Arc<str> = variable.name.as_str().into();
         match variable.sense {
             Sense::Type | Sense::Region => {
                 at.insert(variable.id, at.len() as u32);
@@ -12636,7 +12533,7 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
         table.zonk(&ty, &subst),
         quantify_formula(&formula, &subst),
     );
-    let mut original = vec![Assigned::Ty(Rc::new(Ty::Undecided)); scheme.count() as usize];
+    let mut original = vec![Assigned::Ty(Arc::new(Ty::Undecided)); scheme.count() as usize];
     for (var, index) in &subst.presences {
         original[*index as usize] = Assigned::Presence(Presence::Var(*var));
     }
@@ -12698,7 +12595,7 @@ fn clause_formula(tails: &Tails, clause: &Clause) -> Formula {
 
 /// The recursion inside [`lower_type`], carrying the annotation's named-tail
 /// scope.
-fn lower(mint: &Mint, table: &mut Table, tails: &mut Tails, ty: &Type) -> Rc<Ty> {
+fn lower(mint: &Mint, table: &mut Table, tails: &mut Tails, ty: &Type) -> Arc<Ty> {
     lower_scoped(mint, table, tails, ty, None)
 }
 
@@ -12711,7 +12608,7 @@ fn lower_scoped(
     tails: &mut Tails,
     ty: &Type,
     boundaries: Option<&HashSet<Anchor>>,
-) -> Rc<Ty> {
+) -> Arc<Ty> {
     let lowered = match &ty.anchored {
         TypeKind::Prim(prim) => (*prim).into(),
         TypeKind::Ident(symbol) => Ty::Named {
@@ -12719,7 +12616,7 @@ fn lower_scoped(
             name: mint.name(*symbol).into(),
             // Lowering counted the arguments, so a name that reaches here bare
             // is one that takes none.
-            args: Rc::from([]),
+            args: Arc::from([]),
         },
         TypeKind::Apply { head, args, .. } => Ty::Named {
             symbol: *head,
@@ -12766,7 +12663,7 @@ fn lower_scoped(
                     },
                     ir::TypeField::Absent { .. } => RowField {
                         presence: Presence::Absent,
-                        ty: Rc::new(Ty::default()),
+                        ty: Arc::new(Ty::default()),
                     },
                 };
                 labels.insert(name.clone(), lowered);
@@ -12787,7 +12684,7 @@ fn lower_scoped(
                         let presence = presence(table, tails, when);
                         let carried = match payload {
                             Some(payload) => lower_scoped(mint, table, tails, payload, boundaries),
-                            None => Rc::new(Ty::unit()),
+                            None => Arc::new(Ty::unit()),
                         };
                         RowField {
                             presence,
@@ -12798,7 +12695,7 @@ fn lower_scoped(
                     // never be carries nothing worth constraining.
                     ir::SumCase::Absent { .. } => RowField {
                         presence: Presence::Absent,
-                        ty: Rc::new(Ty::default()),
+                        ty: Arc::new(Ty::default()),
                     },
                 };
                 labels.insert(name.clone(), lowered);
@@ -12820,9 +12717,9 @@ fn lower_scoped(
         TypeKind::Var(name) => tails.types[name].clone(),
         TypeKind::Error => Ty::Undecided,
     };
-    let body = Rc::new(lowered);
+    let body = Arc::new(lowered);
     match boundaries.is_some_and(|boundaries| boundaries.contains(&ty.at)) {
-        true => Rc::new(Ty::Package(body)),
+        true => Arc::new(Ty::Package(body)),
         false => body,
     }
 }
@@ -12909,7 +12806,7 @@ fn effect_row(
                     // A row of effects written as an argument travels as an
                     // effects argument, not as the sum a declaration's row
                     // argument lowers to: see [`Ty::effects_argument`].
-                    TypeKind::Effects(row) => Rc::new(Ty::effects_argument(effect_row(
+                    TypeKind::Effects(row) => Arc::new(Ty::effects_argument(effect_row(
                         mint, table, tails, row, boundaries,
                     ))),
                     _ => lower_scoped(mint, table, tails, arg, boundaries),
@@ -12960,7 +12857,7 @@ fn effect_row(
 ///
 /// A name with no declaration behind it is [`Ty::Undecided`]: the only way to
 /// write one is to repeat a type's name, which was already reported.
-pub fn unfold(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Rc<Ty> {
+pub fn unfold(aliases: &IndexMap<Symbol, Scheme>, ty: &Arc<Ty>) -> Arc<Ty> {
     Unfold {
         aliases,
         growing: HashSet::new(),
@@ -12983,7 +12880,7 @@ struct Unfold<'a> {
 }
 
 impl Unfold<'_> {
-    fn ty(&mut self, ty: &Rc<Ty>) -> Rc<Ty> {
+    fn ty(&mut self, ty: &Arc<Ty>) -> Arc<Ty> {
         let mut ty = ty.clone();
         let mut entered = Vec::new();
         let result = loop {
@@ -12991,7 +12888,7 @@ impl Unfold<'_> {
                 break ty;
             };
             let Some(scheme) = self.aliases.get(symbol) else {
-                break Rc::new(Ty::Undecided);
+                break Arc::new(Ty::Undecided);
             };
             let body = scheme.body().clone();
             let grows = self.forwarding.projection(self.aliases, &body).is_none();
@@ -13000,7 +12897,7 @@ impl Unfold<'_> {
             // forwarding classifier has already walked that declaration graph
             // and marked every alias on the cycle-reaching path.
             if grows && adds_argument_structure(&body) && self.forwarding.cycles.contains(symbol) {
-                break Rc::new(Ty::Undecided);
+                break Arc::new(Ty::Undecided);
             }
             // A forwarding declaration selects an existing argument and thus
             // strictly consumes the finite application tree; it needs no
@@ -13010,7 +12907,7 @@ impl Unfold<'_> {
             // retained graph memory rather than storing N flattened maps of
             // sizes 1 through N.
             if grows && !self.growing.insert(*symbol) {
-                break Rc::new(Ty::Undecided);
+                break Arc::new(Ty::Undecided);
             }
             entered.push(grows.then_some(*symbol));
 
@@ -13069,11 +12966,11 @@ struct Forwarding {
 }
 
 impl Forwarding {
-    fn projection(&mut self, aliases: &IndexMap<Symbol, Scheme>, root: &Rc<Ty>) -> Option<u32> {
+    fn projection(&mut self, aliases: &IndexMap<Symbol, Scheme>, root: &Arc<Ty>) -> Option<u32> {
         enum Work {
-            Expression(Rc<Ty>),
+            Expression(Arc<Ty>),
             Alias(Symbol),
-            AfterAlias(Rc<[Rc<Ty>]>),
+            AfterAlias(Arc<[Arc<Ty>]>),
             FinishExpression(usize),
             FinishAlias(Symbol),
             Value(Option<u32>),
@@ -13086,7 +12983,7 @@ impl Forwarding {
             match part {
                 Work::Value(value) => values.push(value),
                 Work::Expression(ty) => {
-                    let address = Rc::as_ptr(&ty) as usize;
+                    let address = Arc::as_ptr(&ty) as usize;
                     if let Some(value) = self.expressions.get(&address) {
                         values.push(*value);
                     } else {
@@ -13164,7 +13061,7 @@ impl Ty {
     /// named row alias, so look through that argument before converting it to
     /// the row spliced at [`Rest::More`]. Ordinary bound type positions keep
     /// the written named type intact.
-    fn open_alias(&self, fresh: &[Assigned], unfold: &mut Unfold<'_>) -> Rc<Ty> {
+    fn open_alias(&self, fresh: &[Assigned], unfold: &mut Unfold<'_>) -> Arc<Ty> {
         substitute_type(
             self,
             fresh,
@@ -13172,7 +13069,7 @@ impl Ty {
                 fresh
                     .get(index as usize)
                     .map(Assigned::as_ty)
-                    .unwrap_or_else(|| Rc::new(Ty::Undecided))
+                    .unwrap_or_else(|| Arc::new(Ty::Undecided))
             },
             |index| {
                 fresh.get(index as usize).map(Assigned::as_ty).map_or_else(
@@ -13195,7 +13092,7 @@ impl Ty {
     /// decided here rather than by the caller, because the position is what
     /// knows: see [`Assigned::as_row`]. The worklist keeps imported schemes of
     /// arbitrary arrow, named-argument, row, and payload depth stack safe.
-    pub fn open(&self, fresh: &[Assigned]) -> Rc<Ty> {
+    pub fn open(&self, fresh: &[Assigned]) -> Arc<Ty> {
         substitute_type(
             self,
             fresh,
@@ -13203,7 +13100,7 @@ impl Ty {
                 fresh
                     .get(index as usize)
                     .map(Assigned::as_ty)
-                    .unwrap_or_else(|| Rc::new(Ty::Undecided))
+                    .unwrap_or_else(|| Arc::new(Ty::Undecided))
             },
             |index| {
                 fresh
@@ -13219,9 +13116,9 @@ impl Ty {
 fn substitute_type(
     root: &Ty,
     fresh: &[Assigned],
-    mut bound_ty: impl FnMut(u32) -> Rc<Ty>,
+    mut bound_ty: impl FnMut(u32) -> Arc<Ty>,
     mut bound_row: impl FnMut(u32) -> Row,
-) -> Rc<Ty> {
+) -> Arc<Ty> {
     enum Work<'a> {
         Ty(&'a Ty),
         Row(&'a Row),
@@ -13233,7 +13130,7 @@ fn substitute_type(
         Sum,
         Named {
             symbol: Symbol,
-            name: Rc<str>,
+            name: Arc<str>,
             args: usize,
         },
         BuiltRow(&'a Row),
@@ -13281,7 +13178,7 @@ fn substitute_type(
                     });
                     work.extend(args.iter().rev().map(|arg| Work::Ty(arg)));
                 }
-                other => types.push(Rc::new(other.clone())),
+                other => types.push(Arc::new(other.clone())),
             },
             Work::Row(row) => {
                 work.push(Work::BuiltRow(row));
@@ -13304,28 +13201,28 @@ fn substitute_type(
                 let effects = rows.pop().expect("row substitution postorder");
                 let to = types.pop().expect("result substitution postorder");
                 let from = types.pop().expect("argument substitution postorder");
-                types.push(Rc::new(Ty::Arrow(from, to, effects)));
+                types.push(Arc::new(Ty::Arrow(from, to, effects)));
             }
             Work::Package => {
                 let body = types.pop().expect("package substitution postorder");
-                types.push(Rc::new(Ty::Package(body)));
+                types.push(Arc::new(Ty::Package(body)));
             }
             Work::Array => {
                 let element = types.pop().expect("array substitution postorder");
-                types.push(Rc::new(Ty::Array(element)));
+                types.push(Arc::new(Ty::Array(element)));
             }
             Work::Mut => {
                 let element = types.pop().expect("cell element");
                 let region = types.pop().expect("cell region");
-                types.push(Rc::new(Ty::Mut(region, element)));
+                types.push(Arc::new(Ty::Mut(region, element)));
             }
             Work::Struct => {
                 let row = rows.pop().expect("struct substitution postorder");
-                types.push(Rc::new(Ty::Struct(row)));
+                types.push(Arc::new(Ty::Struct(row)));
             }
             Work::Sum => {
                 let row = rows.pop().expect("sum substitution postorder");
-                types.push(Rc::new(Ty::Sum(row)));
+                types.push(Arc::new(Ty::Sum(row)));
             }
             Work::Named { symbol, name, args } => {
                 let mut opened = Vec::with_capacity(args);
@@ -13333,7 +13230,7 @@ fn substitute_type(
                     opened.push(types.pop().expect("named substitution postorder"));
                 }
                 opened.reverse();
-                types.push(Rc::new(Ty::Named {
+                types.push(Arc::new(Ty::Named {
                     symbol,
                     name,
                     args: opened.into(),
@@ -13341,8 +13238,8 @@ fn substitute_type(
             }
             Work::BuiltRow(row) => {
                 let rest = match &row.rest {
-                    Rest::Bound(index) => Rest::More(Rc::new(bound_row(*index))),
-                    Rest::More(_) => Rest::More(Rc::new(
+                    Rest::Bound(index) => Rest::More(Arc::new(bound_row(*index))),
+                    Rest::More(_) => Rest::More(Arc::new(
                         rows.pop().expect("nested row substitution postorder"),
                     )),
                     rest => rest.clone(),
@@ -13358,7 +13255,7 @@ fn substitute_type(
                         presence => presence.clone(),
                     };
                     let ty = match presence {
-                        Presence::Absent => Rc::new(Ty::Undecided),
+                        Presence::Absent => Arc::new(Ty::Undecided),
                         _ => types.pop().expect("field substitution postorder"),
                     };
                     labels.push((name.clone(), RowField { presence, ty }));
@@ -13402,19 +13299,19 @@ mod existential_regressions {
             unreachable!()
         };
         table.abstract_existentials.insert(hidden);
-        let body = Rc::new(Ty::Struct(Row {
+        let body = Arc::new(Ty::Struct(Row {
             labels: [(
                 "hidden".into(),
                 RowField {
                     presence: Presence::Var(hidden),
-                    ty: Rc::new(Ty::Nat),
+                    ty: Arc::new(Ty::Nat),
                 },
             )]
             .into_iter()
             .collect(),
             rest: Rest::Closed,
         }));
-        let package = Rc::new(Ty::Package(body));
+        let package = Arc::new(Ty::Package(body));
         let clause = Formula::owned(0, Formula::var(hidden));
 
         for _ in 0..5_000 {
@@ -13457,12 +13354,12 @@ mod existential_regressions {
         table.abstract_existentials.insert(hidden);
 
         let presence_arg = |presence| {
-            Rc::new(Ty::Struct(Row {
+            Arc::new(Ty::Struct(Row {
                 labels: [(
                     "hidden".into(),
                     RowField {
                         presence,
-                        ty: Rc::new(Ty::Nat),
+                        ty: Arc::new(Ty::Nat),
                     },
                 )]
                 .into_iter()
@@ -13470,19 +13367,19 @@ mod existential_regressions {
                 rest: Rest::Closed,
             }))
         };
-        let named = |args: Vec<Rc<Ty>>| {
-            Rc::new(Ty::Named {
+        let named = |args: Vec<Arc<Ty>>| {
+            Arc::new(Ty::Named {
                 symbol: wrapper,
-                name: Rc::from("Wrapper"),
+                name: Arc::from("Wrapper"),
                 args: args.into(),
             })
         };
         // The first argument speculatively aliases `alias` to the abstract
         // identity. The second fails, forcing congruence to discard that work.
-        let expected = named(vec![presence_arg(Presence::Var(hidden)), Rc::new(Ty::Nat)]);
+        let expected = named(vec![presence_arg(Presence::Var(hidden)), Arc::new(Ty::Nat)]);
         let actual = named(vec![
             presence_arg(Presence::Var(alias)),
-            Rc::new(Ty::String),
+            Arc::new(Ty::String),
         ]);
         let aliases = IndexMap::new();
         let nominal = [wrapper].into_iter().collect();
@@ -13547,21 +13444,21 @@ mod existential_regressions {
         let bundle = Bundle::new("leaf-test", Version::new(1, 0, 0)).unwrap();
         let mut mint = Mint::new(bundle);
         let wrapper = mint.global(None, Namespace::Types, "Wrapper").unwrap();
-        let unit = Rc::new(Ty::unit());
+        let unit = Arc::new(Ty::unit());
         let effect = Row {
-            labels: [("effect".into(), RowField::present(Rc::new(Ty::Bound(0))))]
+            labels: [("effect".into(), RowField::present(Arc::new(Ty::Bound(0))))]
                 .into_iter()
                 .collect(),
             rest: Rest::Closed,
         };
-        let arrow = Rc::new(Ty::Arrow(unit.clone(), unit, effect));
-        let sum = Rc::new(Ty::Sum(Row {
+        let arrow = Arc::new(Ty::Arrow(unit.clone(), unit, effect));
+        let sum = Arc::new(Ty::Sum(Row {
             labels: [("Case".into(), RowField::present(arrow))]
                 .into_iter()
                 .collect(),
             rest: Rest::Closed,
         }));
-        let body = Rc::new(Ty::Struct(Row {
+        let body = Arc::new(Ty::Struct(Row {
             labels: [("field".into(), RowField::present(sum))]
                 .into_iter()
                 .collect(),
@@ -13569,10 +13466,10 @@ mod existential_regressions {
         }));
         let aliases = [(wrapper, Scheme::new(1, body))].into_iter().collect();
         let named = |argument| {
-            Rc::new(Ty::Named {
+            Arc::new(Ty::Named {
                 symbol: wrapper,
                 name: "Wrapper".into(),
-                args: Rc::from([Rc::new(argument)]),
+                args: Arc::from([Arc::new(argument)]),
             })
         };
         assert_eq!(
@@ -13582,8 +13479,8 @@ mod existential_regressions {
 
         let missing_left = mint.global(None, Namespace::Types, "MissingLeft").unwrap();
         let missing_right = mint.global(None, Namespace::Types, "MissingRight").unwrap();
-        let missing = |symbol, name: &'static str, args: Rc<[Rc<Ty>]>| {
-            Rc::new(Ty::Named {
+        let missing = |symbol, name: &'static str, args: Arc<[Arc<Ty>]>| {
+            Arc::new(Ty::Named {
                 symbol,
                 name: name.into(),
                 args,
@@ -13592,8 +13489,8 @@ mod existential_regressions {
         assert_eq!(
             smallest_incompatible(
                 &aliases,
-                &missing(missing_left, "MissingLeft", Rc::from([])),
-                &missing(missing_right, "MissingRight", Rc::from([])),
+                &missing(missing_left, "MissingLeft", Arc::from([])),
+                &missing(missing_right, "MissingRight", Arc::from([])),
             ),
             (TypeDescription::DeclaredType, TypeDescription::DeclaredType),
             "missing semantic definitions must keep the declared-type fallback"
@@ -13601,11 +13498,11 @@ mod existential_regressions {
         assert_eq!(
             smallest_incompatible(
                 &aliases,
-                &missing(missing_left, "MissingLeft", Rc::from([Rc::new(Ty::Nat)])),
+                &missing(missing_left, "MissingLeft", Arc::from([Arc::new(Ty::Nat)])),
                 &missing(
                     missing_left,
                     "MissingLeft",
-                    Rc::from([Rc::new(Ty::Boolean)]),
+                    Arc::from([Arc::new(Ty::Boolean)]),
                 ),
             ),
             (TypeDescription::DeclaredType, TypeDescription::DeclaredType),
@@ -13614,8 +13511,8 @@ mod existential_regressions {
         assert_eq!(
             smallest_incompatible(
                 &aliases,
-                &missing(missing_left, "MissingLeft", Rc::from([Rc::new(Ty::Nat)])),
-                &Rc::new(Ty::Boolean),
+                &missing(missing_left, "MissingLeft", Arc::from([Arc::new(Ty::Nat)])),
+                &Arc::new(Ty::Boolean),
             ),
             (TypeDescription::DeclaredType, TypeDescription::Boolean),
             "one unavailable alias must remain declared without hiding the other side"
@@ -13630,13 +13527,13 @@ mod existential_regressions {
         let mut mint = Mint::new(bundle);
         let left_name = mint.global(None, Namespace::Types, "Left").unwrap();
         let right_name = mint.global(None, Namespace::Types, "Right").unwrap();
-        let unit = Rc::new(Ty::unit());
+        let unit = Arc::new(Ty::unit());
         let arrow = |effect: &'static str| {
-            Rc::new(Ty::Arrow(
+            Arc::new(Ty::Arrow(
                 unit.clone(),
                 unit.clone(),
                 Row {
-                    labels: [(effect.into(), RowField::present(Rc::new(Ty::unit())))]
+                    labels: [(effect.into(), RowField::present(Arc::new(Ty::unit())))]
                         .into_iter()
                         .collect(),
                     rest: Rest::Closed,
@@ -13650,10 +13547,10 @@ mod existential_regressions {
         .into_iter()
         .collect();
         let named = |symbol, name: &'static str| {
-            Rc::new(Ty::Named {
+            Arc::new(Ty::Named {
                 symbol,
                 name: name.into(),
-                args: Rc::from([]),
+                args: Arc::from([]),
             })
         };
 
@@ -13683,7 +13580,7 @@ mod existential_regressions {
                 "hidden".into(),
                 RowField {
                     presence,
-                    ty: Rc::new(ty),
+                    ty: Arc::new(ty),
                 },
             )]
             .into_iter()
@@ -13695,21 +13592,21 @@ mod existential_regressions {
                 struct_left,
                 Scheme::new(
                     0,
-                    Rc::new(Ty::Struct(hidden_row(Presence::Absent, Ty::Nat))),
+                    Arc::new(Ty::Struct(hidden_row(Presence::Absent, Ty::Nat))),
                 ),
             ),
             (
                 struct_right,
                 Scheme::new(
                     0,
-                    Rc::new(Ty::Struct(hidden_row(Presence::Absent, Ty::Boolean))),
+                    Arc::new(Ty::Struct(hidden_row(Presence::Absent, Ty::Boolean))),
                 ),
             ),
             (
                 sum_left,
                 Scheme::new(
                     0,
-                    Rc::new(Ty::Package(Rc::new(Ty::Sum(hidden_row(
+                    Arc::new(Ty::Package(Arc::new(Ty::Sum(hidden_row(
                         Presence::Recovered(1),
                         Ty::Nat,
                     ))))),
@@ -13719,7 +13616,7 @@ mod existential_regressions {
                 sum_right,
                 Scheme::new(
                     0,
-                    Rc::new(Ty::Package(Rc::new(Ty::Sum(hidden_row(
+                    Arc::new(Ty::Package(Arc::new(Ty::Sum(hidden_row(
                         Presence::Recovered(1),
                         Ty::Boolean,
                     ))))),
@@ -13729,10 +13626,10 @@ mod existential_regressions {
         .into_iter()
         .collect();
         let named = |symbol, name: &'static str| {
-            Rc::new(Ty::Named {
+            Arc::new(Ty::Named {
                 symbol,
                 name: name.into(),
-                args: Rc::from([]),
+                args: Arc::from([]),
             })
         };
 
@@ -13757,27 +13654,27 @@ mod existential_regressions {
 
     #[test]
     fn mismatch_rows_ignore_label_order_and_walk_composed_tail_payloads() {
-        let field = |ty| RowField::present(Rc::new(ty));
-        let left = Rc::new(Ty::Struct(Row {
+        let field = |ty| RowField::present(Arc::new(ty));
+        let left = Arc::new(Ty::Struct(Row {
             labels: [
                 ("first".into(), field(Ty::unit())),
                 ("second".into(), field(Ty::unit())),
             ]
             .into_iter()
             .collect(),
-            rest: Rest::More(Rc::new(Row {
+            rest: Rest::More(Arc::new(Row {
                 labels: [("tail".into(), field(Ty::Nat))].into_iter().collect(),
                 rest: Rest::Closed,
             })),
         }));
-        let right = Rc::new(Ty::Struct(Row {
+        let right = Arc::new(Ty::Struct(Row {
             labels: [
                 ("second".into(), field(Ty::unit())),
                 ("first".into(), field(Ty::unit())),
             ]
             .into_iter()
             .collect(),
-            rest: Rest::More(Rc::new(Row {
+            rest: Rest::More(Arc::new(Row {
                 labels: [("tail".into(), field(Ty::Boolean))].into_iter().collect(),
                 rest: Rest::Closed,
             })),
@@ -13791,15 +13688,15 @@ mod existential_regressions {
 
     #[test]
     fn mismatch_rows_compare_segmented_and_flat_canonical_shapes() {
-        let field = |ty| RowField::present(Rc::new(ty));
-        let left = Rc::new(Ty::Struct(Row {
+        let field = |ty| RowField::present(Arc::new(ty));
+        let left = Arc::new(Ty::Struct(Row {
             labels: [("outer".into(), field(Ty::unit()))].into_iter().collect(),
-            rest: Rest::More(Rc::new(Row {
+            rest: Rest::More(Arc::new(Row {
                 labels: [("leaf".into(), field(Ty::Nat))].into_iter().collect(),
                 rest: Rest::Closed,
             })),
         }));
-        let right = Rc::new(Ty::Struct(Row {
+        let right = Arc::new(Ty::Struct(Row {
             labels: [
                 ("leaf".into(), field(Ty::Boolean)),
                 ("outer".into(), field(Ty::unit())),
@@ -13816,11 +13713,11 @@ mod existential_regressions {
 
     #[test]
     fn mismatch_rows_give_duplicate_outer_labels_precedence() {
-        let field = |ty| RowField::present(Rc::new(ty));
+        let field = |ty| RowField::present(Arc::new(ty));
         let segmented = |outer, hidden, leaf| {
-            Rc::new(Ty::Struct(Row {
+            Arc::new(Ty::Struct(Row {
                 labels: [("duplicate".into(), field(outer))].into_iter().collect(),
-                rest: Rest::More(Rc::new(Row {
+                rest: Rest::More(Arc::new(Row {
                     labels: [
                         ("duplicate".into(), field(hidden)),
                         ("leaf".into(), field(leaf)),
@@ -13851,12 +13748,12 @@ mod existential_regressions {
                         format!("f{at}"),
                         RowField {
                             presence: presence.clone(),
-                            ty: Rc::new(payload.clone()),
+                            ty: Arc::new(payload.clone()),
                         },
                     )
                 })
                 .collect();
-            Rc::new(Ty::Struct(Row {
+            Arc::new(Ty::Struct(Row {
                 labels,
                 rest: Rest::Closed,
             }))
@@ -13900,12 +13797,12 @@ mod existential_regressions {
     #[test]
     fn mismatch_rows_do_not_read_semantically_unavailable_payloads() {
         let row = |presence, ty| {
-            Rc::new(Ty::Struct(Row {
+            Arc::new(Ty::Struct(Row {
                 labels: [(
                     "x".into(),
                     RowField {
                         presence,
-                        ty: Rc::new(ty),
+                        ty: Arc::new(ty),
                     },
                 )]
                 .into_iter()
@@ -13940,15 +13837,15 @@ mod existential_regressions {
         // Put the recursive field first: the DFS must encounter and suppress
         // that cycle, then continue to the value field rather than returning a
         // container fallback or looping forever.
-        let recursive = Rc::new(Ty::Named {
+        let recursive = Arc::new(Ty::Named {
             symbol: stream,
             name: "Stream".into(),
-            args: Rc::from([Rc::new(Ty::Bound(0))]),
+            args: Arc::from([Arc::new(Ty::Bound(0))]),
         });
-        let body = Rc::new(Ty::Struct(Row {
+        let body = Arc::new(Ty::Struct(Row {
             labels: [
                 ("tail".into(), RowField::present(recursive)),
-                ("value".into(), RowField::present(Rc::new(Ty::Bound(0)))),
+                ("value".into(), RowField::present(Arc::new(Ty::Bound(0)))),
             ]
             .into_iter()
             .collect(),
@@ -13956,14 +13853,14 @@ mod existential_regressions {
         }));
         let aliases = [(stream, Scheme::new(1, body))].into_iter().collect();
         let named = |argument| {
-            Rc::new(Ty::Named {
+            Arc::new(Ty::Named {
                 symbol: stream,
                 name: "Stream".into(),
-                args: Rc::from([argument]),
+                args: Arc::from([argument]),
             })
         };
-        let left = named(Rc::new(Ty::Nat));
-        let right = named(Rc::new(Ty::Boolean));
+        let left = named(Arc::new(Ty::Nat));
+        let right = named(Arc::new(Ty::Boolean));
         for _ in 0..32 {
             assert_eq!(
                 smallest_incompatible(&aliases, &left, &right),
@@ -13988,8 +13885,8 @@ mod existential_regressions {
         let wrapper = mint.global(None, Namespace::Types, "Wrapper").unwrap();
         let mut aliases = IndexMap::new();
         for (at, symbols) in growth.windows(2).enumerate() {
-            let argument = Rc::new(Ty::Struct(Row {
-                labels: [("x".into(), RowField::present(Rc::new(Ty::Bound(0))))]
+            let argument = Arc::new(Ty::Struct(Row {
+                labels: [("x".into(), RowField::present(Arc::new(Ty::Bound(0))))]
                     .into_iter()
                     .collect(),
                 rest: Rest::Closed,
@@ -13998,24 +13895,24 @@ mod existential_regressions {
                 symbols[0],
                 Scheme::new(
                     1,
-                    Rc::new(Ty::Named {
+                    Arc::new(Ty::Named {
                         symbol: symbols[1],
                         name: format!("Growth{}", at + 1).into(),
-                        args: Rc::from([argument]),
+                        args: Arc::from([argument]),
                     }),
                 ),
             );
         }
-        aliases.insert(wrapper, Scheme::new(1, Rc::new(Ty::Bound(0))));
+        aliases.insert(wrapper, Scheme::new(1, Arc::new(Ty::Bound(0))));
         let named = |symbol, name: String, argument| {
-            Rc::new(Ty::Named {
+            Arc::new(Ty::Named {
                 symbol,
                 name: name.into(),
-                args: Rc::from([argument]),
+                args: Arc::from([argument]),
             })
         };
         let row = |bad, good| {
-            Rc::new(Ty::Struct(Row {
+            Arc::new(Ty::Struct(Row {
                 labels: [
                     ("bad".into(), RowField::present(bad)),
                     ("good".into(), RowField::present(good)),
@@ -14026,12 +13923,12 @@ mod existential_regressions {
             }))
         };
         let left = row(
-            named(growth[0], "Growth0".into(), Rc::new(Ty::Nat)),
-            named(wrapper, "Wrapper".into(), Rc::new(Ty::Nat)),
+            named(growth[0], "Growth0".into(), Arc::new(Ty::Nat)),
+            named(wrapper, "Wrapper".into(), Arc::new(Ty::Nat)),
         );
         let right = row(
-            named(growth[0], "Growth0".into(), Rc::new(Ty::Nat)),
-            named(wrapper, "Wrapper".into(), Rc::new(Ty::Boolean)),
+            named(growth[0], "Growth0".into(), Arc::new(Ty::Nat)),
+            named(wrapper, "Wrapper".into(), Arc::new(Ty::Boolean)),
         );
 
         assert_eq!(
@@ -14055,8 +13952,8 @@ mod existential_regressions {
             .collect();
         let mut aliases = IndexMap::new();
         for (at, symbols) in growth.windows(2).enumerate() {
-            let argument = Rc::new(Ty::Struct(Row {
-                labels: [("x".into(), RowField::present(Rc::new(Ty::Bound(0))))]
+            let argument = Arc::new(Ty::Struct(Row {
+                labels: [("x".into(), RowField::present(Arc::new(Ty::Bound(0))))]
                     .into_iter()
                     .collect(),
                 rest: Rest::Closed,
@@ -14065,18 +13962,18 @@ mod existential_regressions {
                 symbols[0],
                 Scheme::new(
                     1,
-                    Rc::new(Ty::Named {
+                    Arc::new(Ty::Named {
                         symbol: symbols[1],
                         name: format!("Growth{}", at + 1).into(),
-                        args: Rc::from([argument]),
+                        args: Arc::from([argument]),
                     }),
                 ),
             );
         }
-        let named = Rc::new(Ty::Named {
+        let named = Arc::new(Ty::Named {
             symbol: growth[0],
             name: "Growth0".into(),
-            args: Rc::from([Rc::new(Ty::Nat)]),
+            args: Arc::from([Arc::new(Ty::Nat)]),
         });
         assert_eq!(
             smallest_incompatible(&aliases, &named, &named),
@@ -14095,28 +13992,28 @@ mod existential_regressions {
         // Recovery input equivalent to `type Grow 'a = Grow { x: 'a }`.
         // Every opening has a distinct, one-node-larger argument, so an
         // ancestor-by-ancestor deep equality walk is superlinear.
-        let larger = Rc::new(Ty::Struct(Row {
-            labels: [("x".into(), RowField::present(Rc::new(Ty::Bound(0))))]
+        let larger = Arc::new(Ty::Struct(Row {
+            labels: [("x".into(), RowField::present(Arc::new(Ty::Bound(0))))]
                 .into_iter()
                 .collect(),
             rest: Rest::Closed,
         }));
-        let recursive = Rc::new(Ty::Named {
+        let recursive = Arc::new(Ty::Named {
             symbol: grow,
             name: "Grow".into(),
-            args: Rc::from([larger]),
+            args: Arc::from([larger]),
         });
-        let body = Rc::new(Ty::Struct(Row {
+        let body = Arc::new(Ty::Struct(Row {
             labels: [("next".into(), RowField::present(recursive))]
                 .into_iter()
                 .collect(),
             rest: Rest::Closed,
         }));
         let aliases = [(grow, Scheme::new(1, body))].into_iter().collect();
-        let named = Rc::new(Ty::Named {
+        let named = Arc::new(Ty::Named {
             symbol: grow,
             name: "Grow".into(),
-            args: Rc::from([Rc::new(Ty::Nat)]),
+            args: Arc::from([Arc::new(Ty::Nat)]),
         });
         let mut operations = 0;
         assert_eq!(
@@ -14142,33 +14039,33 @@ mod existential_regressions {
         let id = mint.global(None, Namespace::Types, "Id").unwrap();
         let forward = mint.global(None, Namespace::Types, "Forward").unwrap();
         let pass = mint.global(None, Namespace::Types, "Pass").unwrap();
-        let id_body = Rc::new(Ty::Bound(0));
+        let id_body = Arc::new(Ty::Bound(0));
         // Malformed imported interfaces can also contain a mutually-forwarding
         // cycle. It has no observable body and canonicalizes deterministically
         // to recovery instead of retaining an ever-growing argument spelling.
-        let forward_body = Rc::new(Ty::Named {
+        let forward_body = Arc::new(Ty::Named {
             symbol: pass,
             name: "Pass".into(),
-            args: Rc::from([Rc::new(Ty::Bound(0))]),
+            args: Arc::from([Arc::new(Ty::Bound(0))]),
         });
-        let pass_body = Rc::new(Ty::Named {
+        let pass_body = Arc::new(Ty::Named {
             symbol: forward,
             name: "Forward".into(),
-            args: Rc::from([Rc::new(Ty::Bound(0))]),
+            args: Arc::from([Arc::new(Ty::Bound(0))]),
         });
-        let recursive = Rc::new(Ty::Named {
+        let recursive = Arc::new(Ty::Named {
             symbol: stream,
             name: "Stream".into(),
-            args: Rc::from([Rc::new(Ty::Named {
+            args: Arc::from([Arc::new(Ty::Named {
                 symbol: id,
                 name: "Id".into(),
-                args: Rc::from([Rc::new(Ty::Bound(0))]),
+                args: Arc::from([Arc::new(Ty::Bound(0))]),
             })]),
         });
-        let stream_body = Rc::new(Ty::Struct(Row {
+        let stream_body = Arc::new(Ty::Struct(Row {
             labels: [
                 ("tail".into(), RowField::present(recursive)),
-                ("value".into(), RowField::present(Rc::new(Ty::Bound(0)))),
+                ("value".into(), RowField::present(Arc::new(Ty::Bound(0)))),
             ]
             .into_iter()
             .collect(),
@@ -14183,24 +14080,24 @@ mod existential_regressions {
         .into_iter()
         .collect();
         let named = |argument| {
-            Rc::new(Ty::Named {
+            Arc::new(Ty::Named {
                 symbol: stream,
                 name: "Stream".into(),
-                args: Rc::from([argument]),
+                args: Arc::from([argument]),
             })
         };
         assert_eq!(
             smallest_incompatible(
                 &aliases,
-                &named(Rc::new(Ty::Nat)),
-                &named(Rc::new(Ty::Boolean)),
+                &named(Arc::new(Ty::Nat)),
+                &named(Arc::new(Ty::Boolean)),
             ),
             (TypeDescription::NaturalNumber, TypeDescription::Boolean)
         );
-        let cyclic = Rc::new(Ty::Named {
+        let cyclic = Arc::new(Ty::Named {
             symbol: forward,
             name: "Forward".into(),
-            args: Rc::from([Rc::new(Ty::Nat)]),
+            args: Arc::from([Arc::new(Ty::Nat)]),
         });
         for _ in 0..32 {
             assert!(matches!(
@@ -14230,32 +14127,32 @@ mod existential_regressions {
                 let mut aliases = IndexMap::new();
                 for (at, symbol) in forwards.iter().copied().enumerate() {
                     let body = match forwards.get(at + 1) {
-                        Some(next) => Rc::new(Ty::Named {
+                        Some(next) => Arc::new(Ty::Named {
                             symbol: *next,
                             name: format!("Forward{}", at + 1).into(),
-                            args: Rc::from([Rc::new(Ty::Bound(0))]),
+                            args: Arc::from([Arc::new(Ty::Bound(0))]),
                         }),
-                        None => Rc::new(Ty::Bound(0)),
+                        None => Arc::new(Ty::Bound(0)),
                     };
                     aliases.insert(symbol, Scheme::new(1, body));
                 }
-                let recursive = Rc::new(Ty::Named {
+                let recursive = Arc::new(Ty::Named {
                     symbol: stream,
                     name: "Stream".into(),
-                    args: Rc::from([Rc::new(Ty::Named {
+                    args: Arc::from([Arc::new(Ty::Named {
                         symbol: forwards[0],
                         name: "Forward0".into(),
-                        args: Rc::from([Rc::new(Ty::Bound(0))]),
+                        args: Arc::from([Arc::new(Ty::Bound(0))]),
                     })]),
                 });
                 aliases.insert(
                     stream,
                     Scheme::new(
                         1,
-                        Rc::new(Ty::Struct(Row {
+                        Arc::new(Ty::Struct(Row {
                             labels: [
                                 ("tail".into(), RowField::present(recursive)),
-                                ("value".into(), RowField::present(Rc::new(Ty::Bound(0)))),
+                                ("value".into(), RowField::present(Arc::new(Ty::Bound(0)))),
                             ]
                             .into_iter()
                             .collect(),
@@ -14264,17 +14161,17 @@ mod existential_regressions {
                     ),
                 );
                 let named = |argument| {
-                    Rc::new(Ty::Named {
+                    Arc::new(Ty::Named {
                         symbol: stream,
                         name: "Stream".into(),
-                        args: Rc::from([argument]),
+                        args: Arc::from([argument]),
                     })
                 };
                 assert_eq!(
                     smallest_incompatible(
                         &aliases,
-                        &named(Rc::new(Ty::Nat)),
-                        &named(Rc::new(Ty::Boolean)),
+                        &named(Arc::new(Ty::Nat)),
+                        &named(Arc::new(Ty::Boolean)),
                     ),
                     (TypeDescription::NaturalNumber, TypeDescription::Boolean)
                 );
@@ -14292,13 +14189,13 @@ mod existential_regressions {
         let mut mint = Mint::new(bundle);
         let cycle = mint.global(None, Namespace::Types, "Cycle").unwrap();
         let named = || {
-            Rc::new(Ty::Named {
+            Arc::new(Ty::Named {
                 symbol: cycle,
                 name: "Cycle".into(),
-                args: Rc::from([]),
+                args: Arc::from([]),
             })
         };
-        let body = Rc::new(Ty::Struct(Row {
+        let body = Arc::new(Ty::Struct(Row {
             labels: [("next".into(), RowField::present(named()))]
                 .into_iter()
                 .collect(),
@@ -14322,15 +14219,15 @@ mod existential_regressions {
                 let bundle = Bundle::new("deep-recursive-leaf", Version::new(1, 0, 0)).unwrap();
                 let mut mint = Mint::new(bundle);
                 let stream = mint.global(None, Namespace::Types, "Stream").unwrap();
-                let recursive = Rc::new(Ty::Named {
+                let recursive = Arc::new(Ty::Named {
                     symbol: stream,
                     name: "Stream".into(),
-                    args: Rc::from([Rc::new(Ty::Bound(0))]),
+                    args: Arc::from([Arc::new(Ty::Bound(0))]),
                 });
-                let body = Rc::new(Ty::Struct(Row {
+                let body = Arc::new(Ty::Struct(Row {
                     labels: [
                         ("tail".into(), RowField::present(recursive)),
-                        ("value".into(), RowField::present(Rc::new(Ty::Bound(0)))),
+                        ("value".into(), RowField::present(Arc::new(Ty::Bound(0)))),
                     ]
                     .into_iter()
                     .collect(),
@@ -14338,16 +14235,16 @@ mod existential_regressions {
                 }));
                 let aliases: IndexMap<_, _> =
                     [(stream, Scheme::new(1, body))].into_iter().collect();
-                let mut left_argument = Rc::new(Ty::Nat);
-                let mut right_argument = Rc::new(Ty::Boolean);
+                let mut left_argument = Arc::new(Ty::Nat);
+                let mut right_argument = Arc::new(Ty::Boolean);
                 for _ in 0..30_000 {
-                    left_argument = Rc::new(Ty::Struct(Row {
+                    left_argument = Arc::new(Ty::Struct(Row {
                         labels: [("x".into(), RowField::present(left_argument))]
                             .into_iter()
                             .collect(),
                         rest: Rest::Closed,
                     }));
-                    right_argument = Rc::new(Ty::Struct(Row {
+                    right_argument = Arc::new(Ty::Struct(Row {
                         labels: [("x".into(), RowField::present(right_argument))]
                             .into_iter()
                             .collect(),
@@ -14355,10 +14252,10 @@ mod existential_regressions {
                     }));
                 }
                 let named = |argument| {
-                    Rc::new(Ty::Named {
+                    Arc::new(Ty::Named {
                         symbol: stream,
                         name: "Stream".into(),
-                        args: Rc::from([argument]),
+                        args: Arc::from([argument]),
                     })
                 };
                 let left = named(left_argument);
@@ -14381,16 +14278,16 @@ mod existential_regressions {
             .name("deep-mismatch-leaf".into())
             .stack_size(512 * 1024)
             .spawn(|| {
-                let mut left = Rc::new(Ty::Nat);
-                let mut right = Rc::new(Ty::Boolean);
+                let mut left = Arc::new(Ty::Nat);
+                let mut right = Arc::new(Ty::Boolean);
                 for _ in 0..30_000 {
-                    left = Rc::new(Ty::Struct(Row {
+                    left = Arc::new(Ty::Struct(Row {
                         labels: [("x".into(), RowField::present(left))]
                             .into_iter()
                             .collect(),
                         rest: Rest::Closed,
                     }));
-                    right = Rc::new(Ty::Struct(Row {
+                    right = Arc::new(Ty::Struct(Row {
                         labels: [("x".into(), RowField::present(right))]
                             .into_iter()
                             .collect(),
@@ -14401,7 +14298,7 @@ mod existential_regressions {
                     smallest_incompatible(&IndexMap::new(), &left, &right),
                     (TypeDescription::NaturalNumber, TypeDescription::Boolean)
                 );
-                // Deep Rc destruction is unrelated to the iterative reader.
+                // Deep Arc destruction is unrelated to the iterative reader.
                 std::mem::forget(left);
                 std::mem::forget(right);
             })
@@ -14419,21 +14316,21 @@ mod existential_regressions {
         let first_reason = table.reason(ReasonOrigin::Recovery, Vec::new());
         let second_reason = table.reason(ReasonOrigin::Recovery, Vec::new());
         table.vars[first as usize] = Slot::Bound {
-            value: Assigned::Ty(Rc::new(Ty::plain(Ty::Var(second)))),
+            value: Assigned::Ty(Arc::new(Ty::plain(Ty::Var(second)))),
             by: first_reason,
         };
         table.vars[second as usize] = Slot::Bound {
-            value: Assigned::Ty(Rc::new(Ty::plain(Ty::Var(target)))),
+            value: Assigned::Ty(Arc::new(Ty::plain(Ty::Var(target)))),
             by: second_reason,
         };
         // The input closes the first exact route. A containment route in the
         // result is an innocent sibling and must not override call advice.
-        let candidate = Assigned::Ty(Rc::new(Ty::Arrow(
-            Rc::new(Ty::plain(Ty::Var(first))),
-            Rc::new(Ty::Struct(Row {
+        let candidate = Assigned::Ty(Arc::new(Ty::Arrow(
+            Arc::new(Ty::plain(Ty::Var(first))),
+            Arc::new(Ty::Struct(Row {
                 labels: [(
                     "sibling".into(),
-                    RowField::present(Rc::new(Ty::Var(target))),
+                    RowField::present(Arc::new(Ty::Var(target))),
                 )]
                 .into_iter()
                 .collect(),
@@ -14452,12 +14349,12 @@ mod existential_regressions {
 
         // An absent call-input sibling has no payload. The later present
         // containment route is therefore the exact route returned.
-        let absent_sibling = Assigned::Ty(Rc::new(Ty::Arrow(
-            Rc::new(Ty::Struct(Row {
+        let absent_sibling = Assigned::Ty(Arc::new(Ty::Arrow(
+            Arc::new(Ty::Struct(Row {
                 labels: [(
                     "gone".into(),
                     RowField {
-                        ty: Rc::new(Ty::Var(target)),
+                        ty: Arc::new(Ty::Var(target)),
                         presence: Presence::Absent,
                     },
                 )]
@@ -14465,8 +14362,8 @@ mod existential_regressions {
                 .collect(),
                 rest: Rest::Closed,
             })),
-            Rc::new(Ty::Struct(Row {
-                labels: [("kept".into(), RowField::present(Rc::new(Ty::Var(target))))]
+            Arc::new(Ty::Struct(Row {
+                labels: [("kept".into(), RowField::present(Arc::new(Ty::Var(target))))]
                     .into_iter()
                     .collect(),
                 rest: Rest::Closed,
@@ -14486,9 +14383,9 @@ mod existential_regressions {
     fn recursive_cycle_walk_is_linear_over_a_compact_exponential_dag() {
         let mut table = Table::default();
         let target = table.mint(VarSort::Type, Subject::Term);
-        let mut shared = Rc::new(Ty::Nat);
+        let mut shared = Arc::new(Ty::Nat);
         for _ in 0..28 {
-            shared = Rc::new(Ty::Arrow(shared.clone(), shared.clone(), Row::closed()));
+            shared = Arc::new(Ty::Arrow(shared.clone(), shared.clone(), Row::closed()));
         }
 
         table.enter_solver_scope();
@@ -14508,11 +14405,11 @@ mod existential_regressions {
         let first_reason = table.reason(ReasonOrigin::Recovery, Vec::new());
         let second_reason = table.reason(ReasonOrigin::Recovery, Vec::new());
         table.vars[first as usize] = Slot::Bound {
-            value: Assigned::Ty(Rc::new(Ty::Var(second))),
+            value: Assigned::Ty(Arc::new(Ty::Var(second))),
             by: first_reason,
         };
         table.vars[second as usize] = Slot::Bound {
-            value: Assigned::Ty(Rc::new(Ty::Var(first))),
+            value: Assigned::Ty(Arc::new(Ty::Var(first))),
             by: second_reason,
         };
 
@@ -14520,13 +14417,13 @@ mod existential_regressions {
         table.begin_solver_act();
         assert!(
             table
-                .occurs(target, &Assigned::Ty(Rc::new(Ty::Var(first))))
+                .occurs(target, &Assigned::Ty(Arc::new(Ty::Var(first))))
                 .is_none()
         );
         assert!(table.take_binding_reads().is_empty());
         // A failed search must not suppress or pollute the next independent
         // search in the same solver act.
-        let direct = Assigned::Ty(Rc::new(Ty::Var(target)));
+        let direct = Assigned::Ty(Arc::new(Ty::Var(target)));
         assert_eq!(
             table.occurs(target, &direct),
             Some(RecursiveCycleShape::Neutral)
@@ -14543,7 +14440,7 @@ mod existential_regressions {
         let row_first = table.mint(VarSort::Row, Subject::Term);
         let row_reason = table.reason(ReasonOrigin::Recovery, Vec::new());
         table.vars[row_first as usize] = Slot::Bound {
-            value: Assigned::Row(Rc::new(Row::of(Rest::Var(row_target)))),
+            value: Assigned::Row(Arc::new(Row::of(Rest::Var(row_target)))),
             by: row_reason,
         };
 
@@ -14560,7 +14457,7 @@ mod existential_regressions {
         let right = table.mint(VarSort::Type, Subject::Term);
         let left_reason = table.reason(ReasonOrigin::Recovery, Vec::new());
         let right_reason = table.reason(ReasonOrigin::Recovery, Vec::new());
-        let shared_target = Rc::new(Ty::Var(ty_target));
+        let shared_target = Arc::new(Ty::Var(ty_target));
         table.vars[left as usize] = Slot::Bound {
             value: Assigned::Ty(shared_target.clone()),
             by: left_reason,
@@ -14569,9 +14466,9 @@ mod existential_regressions {
             value: Assigned::Ty(shared_target),
             by: right_reason,
         };
-        let siblings = Assigned::Ty(Rc::new(Ty::Arrow(
-            Rc::new(Ty::Var(left)),
-            Rc::new(Ty::Var(right)),
+        let siblings = Assigned::Ty(Arc::new(Ty::Arrow(
+            Arc::new(Ty::Var(left)),
+            Arc::new(Ty::Var(right)),
             Row::closed(),
         )));
 
@@ -14580,7 +14477,7 @@ mod existential_regressions {
         assert_eq!(
             table.occurs(
                 row_target,
-                &Assigned::Row(Rc::new(Row::of(Rest::Var(row_first))))
+                &Assigned::Row(Arc::new(Row::of(Rest::Var(row_first))))
             ),
             Some(RecursiveCycleShape::Neutral)
         );
@@ -14605,19 +14502,19 @@ mod existential_regressions {
             value: Assigned::Presence(Presence::Present),
             by: shared_presence_reason,
         };
-        let shared_fields = Assigned::Row(Rc::new(Row {
+        let shared_fields = Assigned::Row(Arc::new(Row {
             labels: [
                 (
                     "first".into(),
                     RowField {
-                        ty: Rc::new(Ty::Nat),
+                        ty: Arc::new(Ty::Nat),
                         presence: Presence::Var(shared_presence),
                     },
                 ),
                 (
                     "second".into(),
                     RowField {
-                        ty: Rc::new(Ty::Var(ty_target)),
+                        ty: Arc::new(Ty::Var(ty_target)),
                         presence: Presence::Var(shared_presence),
                     },
                 ),
@@ -14644,11 +14541,11 @@ mod existential_regressions {
             Presence::Bound(0),
             Presence::Undecided,
         ] {
-            let unavailable_payload = Assigned::Row(Rc::new(Row {
+            let unavailable_payload = Assigned::Row(Arc::new(Row {
                 labels: [(
                     "gone".into(),
                     RowField {
-                        ty: Rc::new(Ty::Var(ty_target)),
+                        ty: Arc::new(Ty::Var(ty_target)),
                         presence: unavailable,
                     },
                 )]
@@ -14680,7 +14577,7 @@ mod existential_regressions {
                 let var = *var;
                 let mut nested = target;
                 for at in 0..30_000 {
-                    nested = Rc::new(Ty::Struct(Row {
+                    nested = Arc::new(Ty::Struct(Row {
                         labels: [(format!("f{at}"), RowField::present(nested))]
                             .into_iter()
                             .collect(),
@@ -14689,7 +14586,7 @@ mod existential_regressions {
                 }
                 assert!(table.occurs(var, &Assigned::Ty(nested.clone())).is_some());
                 // The property under test is the explicit walk, not recursive
-                // destruction of a deliberately pathological Rc tree.
+                // destruction of a deliberately pathological Arc tree.
                 std::mem::forget(nested);
             })
             .unwrap()
@@ -14710,15 +14607,15 @@ mod existential_regressions {
                         format!("f{at}"),
                         RowField {
                             presence: Presence::Bound(0),
-                            ty: Rc::new(Ty::Bound(3)),
+                            ty: Arc::new(Ty::Bound(3)),
                         },
                     );
                     row = Row {
                         labels,
-                        rest: Rest::More(Rc::new(row)),
+                        rest: Rest::More(Arc::new(row)),
                     };
                 }
-                let shifted = shift(&Rc::new(Ty::Struct(row)), 4);
+                let shifted = shift(&Arc::new(Ty::Struct(row)), 4);
                 let Ty::Struct(row) = &*shifted else {
                     unreachable!()
                 };
@@ -14756,7 +14653,7 @@ mod identity_tests {
     use crate::tracking::Anchor;
     use crate::types::{Presence, Rest, Row, RowField, Scheme, Ty};
     use indexmap::IndexMap;
-    use std::rc::Rc;
+    use std::sync::Arc;
 
     #[test]
     fn full_reason_budget_preserves_oldest_and_failure_endpoints_and_counts_omissions() {
@@ -14771,9 +14668,9 @@ mod identity_tests {
     #[test]
     fn package_and_absent_payload_provenance_follow_zonked_structure() {
         let table = Table::default();
-        let absent_payload = Rc::new(Ty::Arrow(
-            Rc::new(Ty::Nat),
-            Rc::new(Ty::Boolean),
+        let absent_payload = Arc::new(Ty::Arrow(
+            Arc::new(Ty::Nat),
+            Arc::new(Ty::Boolean),
             Row::closed(),
         ));
         let mut labels = IndexMap::new();
@@ -14784,8 +14681,8 @@ mod identity_tests {
                 ty: absent_payload,
             },
         );
-        labels.insert("shown".into(), RowField::present(Rc::new(Ty::Nat)));
-        let root = Rc::new(Ty::Package(Rc::new(Ty::Struct(Row {
+        labels.insert("shown".into(), RowField::present(Arc::new(Ty::Nat)));
+        let root = Arc::new(Ty::Package(Arc::new(Ty::Struct(Row {
             labels,
             rest: Rest::Closed,
         }))));
@@ -14806,22 +14703,22 @@ mod identity_tests {
     #[test]
     fn synthesized_nested_packages_rebuild_the_published_provenance_body() {
         let table = Table::default();
-        let result = Rc::new(Ty::Struct(Row {
+        let result = Arc::new(Ty::Struct(Row {
             labels: [(
                 "hidden".into(),
                 RowField {
                     presence: Presence::Bound(0),
-                    ty: Rc::new(Ty::Nat),
+                    ty: Arc::new(Ty::Nat),
                 },
             )]
             .into_iter()
             .collect(),
             rest: Rest::Closed,
         }));
-        let source = Rc::new(Ty::Arrow(Rc::new(Ty::Nat), result.clone(), Row::closed()));
-        let published = Rc::new(Ty::Arrow(
-            Rc::new(Ty::Nat),
-            Rc::new(Ty::Package(result)),
+        let source = Arc::new(Ty::Arrow(Arc::new(Ty::Nat), result.clone(), Row::closed()));
+        let published = Arc::new(Ty::Arrow(
+            Arc::new(Ty::Nat),
+            Arc::new(Ty::Package(result)),
             Row::closed(),
         ));
 
@@ -14845,8 +14742,8 @@ mod identity_tests {
         let right_root = table.constraint_reason(ConstraintId::synthetic(20));
         let left = table.fresh_instance_presence();
         let right = table.fresh_instance_presence();
-        let shared = Rc::new(Ty::Nat);
-        let root = Rc::new(Ty::Struct(Row {
+        let shared = Arc::new(Ty::Nat);
+        let root = Arc::new(Ty::Struct(Row {
             labels: [
                 (
                     "left".into(),
@@ -14940,7 +14837,7 @@ mod identity_tests {
     fn quantified_row_positions_keep_their_sort_when_opened() {
         let mut table = Table::default();
         let explained = ExplainedScheme {
-            scheme: Scheme::new(1, Rc::new(Ty::Struct(Row::of(Rest::Bound(0))))),
+            scheme: Scheme::new(1, Arc::new(Ty::Struct(Row::of(Rest::Bound(0))))),
             provenance: SchemeProvenance {
                 nodes: Vec::new(),
                 quantified: vec![QuantifiedProvenance {
@@ -14949,7 +14846,6 @@ mod identity_tests {
                     omitted: 0,
                 }],
             },
-            effect_provenance: Box::default(),
         };
         table.instantiate_scoped(Anchor::GENERATED, &explained, None);
         assert_eq!(table.var_meta.last().unwrap().sort, VarSort::Row);

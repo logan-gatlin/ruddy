@@ -9,7 +9,7 @@
 use std::{
     collections::HashSet,
     fmt::{self, Write as _},
-    rc::Rc,
+    sync::Arc,
 };
 
 use indexmap::IndexMap;
@@ -31,7 +31,7 @@ use ruddy_debug::print;
 /// structured-diagnostic audit so those two hand-maintained checks cannot
 /// silently drift apart.
 fn inference_error_kinds(span: Anchor) -> Vec<TypeError> {
-    let nat = Rc::new(Ty::plain(Ty::Nat));
+    let nat = Arc::new(Ty::plain(Ty::Nat));
     vec![
         TypeError::NotAStruct {
             base: nat.clone(),
@@ -39,14 +39,14 @@ fn inference_error_kinds(span: Anchor) -> Vec<TypeError> {
         },
         TypeError::Mismatch {
             expected: nat.clone(),
-            actual: Rc::new(Ty::default()),
+            actual: Arc::new(Ty::default()),
         },
         TypeError::EffectArgument {
             effect: "Ask".to_string(),
             position: 0,
             cause: Box::new(TypeError::Mismatch {
                 expected: nat.clone(),
-                actual: Rc::new(Ty::default()),
+                actual: Arc::new(Ty::default()),
             }),
         },
         TypeError::Recursive,
@@ -182,12 +182,12 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
     // Loading can refuse either spelling of a module file.
     for kind in [
         BundleError::ModuleFileMissing {
-            beside: "Math.hc".to_string(),
-            inside: "Math/module.hc".to_string(),
+            beside: "Math.rud".to_string(),
+            inside: "Math/module.rud".to_string(),
         },
         BundleError::ModuleFileAmbiguous {
-            beside: "Math.hc".to_string(),
-            inside: "Math/module.hc".to_string(),
+            beside: "Math.rud".to_string(),
+            inside: "Math/module.rud".to_string(),
         },
     ] {
         all.push(("bundle", kind.code(), kind.to_string()));
@@ -1014,7 +1014,7 @@ fn imported_contracts_fall_back_to_local_authoritative_uses() {
 
 #[test]
 fn ordinary_mismatch_explanations_keep_full_and_abridged_causal_evidence() {
-    let source = include_str!("../diagnostics/inference/repeated-calls.hc");
+    let source = include_str!("../diagnostics/inference/repeated-calls.rud");
     let (_, first) = inference_fixture_errors(source);
     let (map, second) = inference_fixture_errors(source);
     let [first] = first.as_slice() else {
@@ -1073,12 +1073,12 @@ fn ordinary_mismatch_explanations_keep_full_and_abridged_causal_evidence() {
 fn pivots_name_repeated_inputs_branches_and_anonymous_shared_values_once() {
     let cases = [
         (
-            include_str!("../diagnostics/inference/repeated-calls.hc"),
+            include_str!("../diagnostics/inference/repeated-calls.rud"),
             inference::ExplanationPivotKind::FunctionInput,
             "`Input`",
         ),
         (
-            include_str!("../diagnostics/inference/branches.hc"),
+            include_str!("../diagnostics/inference/branches.rud"),
             inference::ExplanationPivotKind::BranchResult,
             "`Result`",
         ),
@@ -1134,7 +1134,7 @@ fn pivot_labels_avoid_visible_source_names_without_solver_spelling() {
 #[test]
 fn unrelated_whole_path_facts_do_not_create_a_false_pivot() {
     let (_, errors) =
-        inference_fixture_errors(include_str!("../diagnostics/inference/non-function.hc"));
+        inference_fixture_errors(include_str!("../diagnostics/inference/non-function.rud"));
     let explanation = errors[0].explanation.as_ref().unwrap();
     assert!(explanation.full_facts.len() >= explanation.abridged.len());
     assert!(explanation.pivot.is_none());
@@ -1143,7 +1143,7 @@ fn unrelated_whole_path_facts_do_not_create_a_false_pivot() {
 #[test]
 fn a_failure_without_two_grounded_facts_has_no_pivot() {
     let (map, errors) =
-        inference_fixture_errors(include_str!("../diagnostics/inference/non-function.hc"));
+        inference_fixture_errors(include_str!("../diagnostics/inference/non-function.rud"));
     let explanation = errors[0].explanation.as_ref().unwrap();
     assert_eq!(explanation.abridged.len(), 1);
     assert!(explanation.pivot.is_none());
@@ -1360,7 +1360,7 @@ fn recursive_failure_path_excludes_siblings_and_recovers_for_the_next_error() {
 
 #[test]
 fn row_explanations_keep_both_source_sides_and_normalize_solver_direction() {
-    let projection = include_str!("../diagnostics/inference/projection-closed-later.hc");
+    let projection = include_str!("../diagnostics/inference/projection-closed-later.rud");
     let (_, errors) = inference_fixture_errors(projection);
     let [error] = errors.as_slice() else {
         panic!("projection closed by a later use must have one error");
@@ -1390,12 +1390,12 @@ fn row_explanations_keep_both_source_sides_and_normalize_solver_direction() {
 
     for (source, introduction, forbidden) in [
         (
-            include_str!("../diagnostics/inference/repeated-field-struct.hc"),
+            include_str!("../diagnostics/inference/repeated-field-struct.rud"),
             110..119,
             104..109,
         ),
         (
-            include_str!("../diagnostics/inference/repeated-field-sum.hc"),
+            include_str!("../diagnostics/inference/repeated-field-sum.rud"),
             109..116,
             103..108,
         ),
@@ -1442,7 +1442,7 @@ fn row_explanations_keep_both_source_sides_and_normalize_solver_direction() {
     }
 
     let (_, errors) = inference_fixture_errors(include_str!(
-        "../diagnostics/inference/repeated-field-effect.hc"
+        "../diagnostics/inference/repeated-field-effect.rud"
     ));
     let [effect_error] = errors.as_slice() else {
         panic!("repeated effect fixture must have one error: {errors:#?}");
@@ -1633,11 +1633,11 @@ fn effect_boundaries_keep_source_causal_paths_and_repairs() {
             K::UnhandledEffect,
         ),
         (
-            include_str!("../diagnostics/inference/unhandled-effect.hc"),
+            include_str!("../diagnostics/inference/unhandled-effect.rud"),
             K::UnhandledEffect,
         ),
         (
-            include_str!("../diagnostics/inference/effect-not-allowed.hc"),
+            include_str!("../diagnostics/inference/effect-not-allowed.rud"),
             K::EffectNotAllowed,
         ),
         (
@@ -2040,7 +2040,7 @@ fn a_lone_projection_does_not_invent_closed_row_evidence() {
 
 #[test]
 fn a_function_argument_mismatch_is_not_called_a_non_function_callee() {
-    let source = include_str!("../diagnostics/inference/function-argument.hc");
+    let source = include_str!("../diagnostics/inference/function-argument.rud");
     let (map, errors) = inference_fixture_errors(source);
     let [error] = errors.as_slice() else {
         panic!("function argument fixture must produce one mismatch: {errors:#?}");
@@ -2077,123 +2077,123 @@ fn inference_source_corpus_matches_abridged_structured_goldens() {
     let fixtures = [
         (
             "not-a-struct",
-            include_str!("../diagnostics/inference/not-a-struct.hc"),
+            include_str!("../diagnostics/inference/not-a-struct.rud"),
         ),
         (
             "spread-not-a-struct",
-            include_str!("../diagnostics/inference/spread-not-a-struct.hc"),
+            include_str!("../diagnostics/inference/spread-not-a-struct.rud"),
         ),
         (
             "type-mismatch",
-            include_str!("../diagnostics/inference/type-mismatch.hc"),
+            include_str!("../diagnostics/inference/type-mismatch.rud"),
         ),
         (
             "effect-argument-mismatch",
-            include_str!("../diagnostics/inference/effect-argument-mismatch.hc"),
+            include_str!("../diagnostics/inference/effect-argument-mismatch.rud"),
         ),
         (
             "recursive-type",
-            include_str!("../diagnostics/inference/recursive-type.hc"),
+            include_str!("../diagnostics/inference/recursive-type.rud"),
         ),
         (
             "missing-field",
-            include_str!("../diagnostics/inference/missing-field.hc"),
+            include_str!("../diagnostics/inference/missing-field.rud"),
         ),
         (
             "extra-field-struct",
-            include_str!("../diagnostics/inference/extra-field-struct.hc"),
+            include_str!("../diagnostics/inference/extra-field-struct.rud"),
         ),
         (
             "extra-field-sum",
-            include_str!("../diagnostics/inference/extra-field-sum.hc"),
+            include_str!("../diagnostics/inference/extra-field-sum.rud"),
         ),
         (
             "rigid-broken",
-            include_str!("../diagnostics/inference/rigid-broken.hc"),
+            include_str!("../diagnostics/inference/rigid-broken.rud"),
         ),
         (
             "rigid-broken-effect-closure",
-            include_str!("../diagnostics/inference/rigid-broken-effect-closure.hc"),
+            include_str!("../diagnostics/inference/rigid-broken-effect-closure.rud"),
         ),
         (
             "rigid-field-struct",
-            include_str!("../diagnostics/inference/rigid-field-struct.hc"),
+            include_str!("../diagnostics/inference/rigid-field-struct.rud"),
         ),
         (
             "rigid-field-sum",
-            include_str!("../diagnostics/inference/rigid-field-sum.hc"),
+            include_str!("../diagnostics/inference/rigid-field-sum.rud"),
         ),
         (
             "rigid-field-effect",
-            include_str!("../diagnostics/inference/rigid-field-effect.hc"),
+            include_str!("../diagnostics/inference/rigid-field-effect.rud"),
         ),
         (
             "rigid-escapes",
-            include_str!("../diagnostics/inference/rigid-escapes.hc"),
+            include_str!("../diagnostics/inference/rigid-escapes.rud"),
         ),
         (
             "repeated-field-struct",
-            include_str!("../diagnostics/inference/repeated-field-struct.hc"),
+            include_str!("../diagnostics/inference/repeated-field-struct.rud"),
         ),
         (
             "repeated-field-sum",
-            include_str!("../diagnostics/inference/repeated-field-sum.hc"),
+            include_str!("../diagnostics/inference/repeated-field-sum.rud"),
         ),
         (
             "repeated-field-effect",
-            include_str!("../diagnostics/inference/repeated-field-effect.hc"),
+            include_str!("../diagnostics/inference/repeated-field-effect.rud"),
         ),
         (
             "presence-required",
-            include_str!("../diagnostics/inference/presence-required.hc"),
+            include_str!("../diagnostics/inference/presence-required.rud"),
         ),
         (
             "presence-impossible",
-            include_str!("../diagnostics/inference/presence-impossible.hc"),
+            include_str!("../diagnostics/inference/presence-impossible.rud"),
         ),
         (
             "clause-impossible",
-            include_str!("../diagnostics/inference/clause-impossible.hc"),
+            include_str!("../diagnostics/inference/clause-impossible.rud"),
         ),
         (
             "annotation-allows-more",
-            include_str!("../diagnostics/inference/annotation-allows-more.hc"),
+            include_str!("../diagnostics/inference/annotation-allows-more.rud"),
         ),
         (
             "unhandled-effect",
-            include_str!("../diagnostics/inference/unhandled-effect.hc"),
+            include_str!("../diagnostics/inference/unhandled-effect.rud"),
         ),
         (
             "effect-not-allowed",
-            include_str!("../diagnostics/inference/effect-not-allowed.hc"),
+            include_str!("../diagnostics/inference/effect-not-allowed.rud"),
         ),
         (
             "callback-effects-not-covered",
-            include_str!("../diagnostics/inference/callback-effects-not-covered.hc"),
+            include_str!("../diagnostics/inference/callback-effects-not-covered.rud"),
         ),
         (
             "polymorphic-extern-boundary",
-            include_str!("../diagnostics/inference/polymorphic-extern-boundary.hc"),
+            include_str!("../diagnostics/inference/polymorphic-extern-boundary.rud"),
         ),
         (
             "repeated-calls",
-            include_str!("../diagnostics/inference/repeated-calls.hc"),
+            include_str!("../diagnostics/inference/repeated-calls.rud"),
         ),
         (
             "branches",
-            include_str!("../diagnostics/inference/branches.hc"),
+            include_str!("../diagnostics/inference/branches.rud"),
         ),
         (
             "non-function",
-            include_str!("../diagnostics/inference/non-function.hc"),
+            include_str!("../diagnostics/inference/non-function.rud"),
         ),
         (
             "cross-definition",
-            include_str!("../diagnostics/inference/cross-definition.hc"),
+            include_str!("../diagnostics/inference/cross-definition.rud"),
         ),
         (
             "long-alias",
-            include_str!("../diagnostics/inference/long-alias.hc"),
+            include_str!("../diagnostics/inference/long-alias.rud"),
         ),
     ];
 
@@ -2295,8 +2295,8 @@ fn round_trip(prelude: &str, printed: &str) -> String {
 /// whole claim a diagnostic quoting a type makes.
 #[test]
 fn a_printed_closed_type_reads_back_as_the_type_it_was_printed_from() {
-    let nat = Rc::new(Ty::plain(Ty::Nat));
-    let endo = Rc::new(Ty::plain(Ty::pure(nat.clone(), nat.clone())));
+    let nat = Arc::new(Ty::plain(Ty::Nat));
+    let endo = Arc::new(Ty::plain(Ty::pure(nat.clone(), nat.clone())));
 
     // A declared type prints as its name and is an atom whatever it stands
     // for, so the arrow behind this one leaks no parentheses through it. It
@@ -2305,10 +2305,10 @@ fn a_printed_closed_type_reads_back_as_the_type_it_was_printed_from() {
     let symbol = mint
         .global(None, Namespace::Types, "Endo")
         .expect("a fresh name");
-    let named = Rc::new(Ty::plain(Ty::Named {
+    let named = Arc::new(Ty::plain(Ty::Named {
         symbol,
         name: "Endo".into(),
-        args: Rc::from([]),
+        args: Arc::from([]),
     }));
 
     for (prelude, ty, printed) in [
@@ -2317,16 +2317,16 @@ fn a_printed_closed_type_reads_back_as_the_type_it_was_printed_from() {
         // the right side must not acquire any.
         (
             "",
-            Rc::new(Ty::plain(Ty::pure(endo.clone(), endo.clone()))),
+            Arc::new(Ty::plain(Ty::pure(endo.clone(), endo.clone()))),
             "(Nat -> Nat) -> Nat -> Nat",
         ),
         // The empty struct is unit, and prints as the one spelling this
         // language has for it. See `Ty::Unit` for why it is `{}` and not
         // `()`.
-        ("", Rc::new(Ty::unit()), "()"),
+        ("", Arc::new(Ty::unit()), "()"),
         (
             "",
-            Rc::new(Ty::Struct(Row {
+            Arc::new(Ty::Struct(Row {
                 labels: [("x".to_string(), RowField::present(endo.clone()))]
                     .into_iter()
                     .collect(),
@@ -2336,7 +2336,7 @@ fn a_printed_closed_type_reads_back_as_the_type_it_was_printed_from() {
         ),
         (
             "type Endo = Nat -> Nat\n",
-            Rc::new(Ty::plain(Ty::pure(named.clone(), named.clone()))),
+            Arc::new(Ty::plain(Ty::pure(named.clone(), named.clone()))),
             "Endo -> Endo",
         ),
     ] {
@@ -2350,8 +2350,8 @@ fn a_printed_closed_type_reads_back_as_the_type_it_was_printed_from() {
 /// the same control character remain user data.
 #[test]
 fn applied_effect_rows_hide_only_their_generated_identity_suffixes() {
-    let nat = Rc::new(Ty::plain(Ty::Nat));
-    let unit = Rc::new(Ty::unit());
+    let nat = Arc::new(Ty::plain(Ty::Nat));
+    let unit = Arc::new(Ty::unit());
     let row = Row {
         labels: [
             (
@@ -2371,8 +2371,8 @@ fn applied_effect_rows_hide_only_their_generated_identity_suffixes() {
         .collect(),
         rest: Rest::Closed,
     };
-    let effect_argument = Rc::new(Ty::plain(Ty::Sum(row.clone())));
-    let ordinary_sum_argument = Rc::new(Ty::plain(Ty::Sum(Row {
+    let effect_argument = Arc::new(Ty::plain(Ty::Sum(row.clone())));
+    let ordinary_sum_argument = Arc::new(Ty::plain(Ty::Sum(Row {
         labels: [(
             "user\u{1f}payload".to_string(),
             RowField::present(nat.clone()),
@@ -2381,7 +2381,7 @@ fn applied_effect_rows_hide_only_their_generated_identity_suffixes() {
         .collect(),
         rest: Rest::Closed,
     })));
-    let fielded_argument = Rc::new(Ty::Struct(Row {
+    let fielded_argument = Arc::new(Ty::Struct(Row {
         labels: [("x".to_string(), RowField::present(nat))]
             .into_iter()
             .collect(),
@@ -2395,7 +2395,7 @@ fn applied_effect_rows_hide_only_their_generated_identity_suffixes() {
     let applied = Ty::plain(Ty::Named {
         symbol,
         name: "Runner".into(),
-        args: Rc::from([effect_argument, ordinary_sum_argument, fielded_argument]),
+        args: Arc::from([effect_argument, ordinary_sum_argument, fielded_argument]),
     })
     .to_string();
 
@@ -2423,7 +2423,7 @@ fn applied_effect_rows_hide_only_their_generated_identity_suffixes() {
 /// compile, which is what makes that the right trade.
 #[test]
 fn an_open_row_prints_in_surface_notation_it_cannot_be_read_back_from() {
-    let nat = Rc::new(Ty::plain(Ty::Nat));
+    let nat = Arc::new(Ty::plain(Ty::Nat));
 
     // A row's tail prints in the surface spelling, after the fields; a
     // quantified tail wears its letter and an undecided one has nothing to
@@ -2532,19 +2532,19 @@ fn the_notes_pointing_elsewhere_are_worded_once() {
 /// what this pins.
 #[test]
 fn a_complaint_about_a_sum_says_case_and_writes_the_sigil() {
-    let sum = Rc::new(Ty::plain(Ty::Sum(Row {
+    let sum = Arc::new(Ty::plain(Ty::Sum(Row {
         labels: [(
             "A".to_string(),
             RowField {
                 presence: Presence::Present,
-                ty: Rc::new(Ty::plain(Ty::Nat)),
+                ty: Arc::new(Ty::plain(Ty::Nat)),
             },
         )]
         .into_iter()
         .collect(),
         rest: Rest::Closed,
     })));
-    let nat = Rc::new(Ty::plain(Ty::Nat));
+    let nat = Arc::new(Ty::plain(Ty::Nat));
 
     let missing = TypeError::MissingField {
         shape: Shape::Sum,
@@ -2824,17 +2824,17 @@ fn a_primitive_prints_as_the_name_it_is_written_with() {
 /// does not have.
 #[test]
 fn a_case_settled_absent_is_not_part_of_the_sum() {
-    let sum = Rc::new(Ty::plain(Ty::Sum(Row {
+    let sum = Arc::new(Ty::plain(Ty::Sum(Row {
         labels: [
             (
                 "A".to_string(),
-                RowField::present(Rc::new(Ty::plain(Ty::Nat))),
+                RowField::present(Arc::new(Ty::plain(Ty::Nat))),
             ),
             (
                 "B".to_string(),
                 RowField {
                     presence: Presence::Absent,
-                    ty: Rc::new(Ty::plain(Ty::Nat)),
+                    ty: Arc::new(Ty::plain(Ty::Nat)),
                 },
             ),
         ]
@@ -2847,11 +2847,11 @@ fn a_case_settled_absent_is_not_part_of_the_sum() {
     // A case carrying anything that is not unit keeps its payload: only the
     // type with nothing of its own and no fields is written as no payload at
     // all.
-    let open = Rc::new(Ty::plain(Ty::Sum(Row {
+    let open = Arc::new(Ty::plain(Ty::Sum(Row {
         labels: [(
             "A".to_string(),
-            RowField::present(Rc::new(Ty::Struct(Row {
-                labels: [("x".to_string(), RowField::present(Rc::new(Ty::unit())))]
+            RowField::present(Arc::new(Ty::Struct(Row {
+                labels: [("x".to_string(), RowField::present(Arc::new(Ty::unit())))]
                     .into_iter()
                     .collect(),
                 rest: Rest::Bound(0),
@@ -2865,12 +2865,12 @@ fn a_case_settled_absent_is_not_part_of_the_sum() {
 
     // The two forms that write no case at all keep the leading bar, which is
     // the only thing that makes either read back as a sum.
-    let empty = Rc::new(Ty::plain(Ty::Sum(Row {
+    let empty = Arc::new(Ty::plain(Ty::Sum(Row {
         labels: Default::default(),
         rest: Rest::Closed,
     })));
     assert_eq!(empty.to_string(), "|");
-    let only_tail = Rc::new(Ty::plain(Ty::Sum(Row {
+    let only_tail = Arc::new(Ty::plain(Ty::Sum(Row {
         labels: Default::default(),
         rest: Rest::Bound(0),
     })));
@@ -2990,16 +2990,16 @@ fn generic_rows_render_undecided_marks() {
 
 #[test]
 fn a_printer_reports_a_writer_that_refuses_it() {
-    let nat = Rc::new(Ty::plain(Ty::Nat));
+    let nat = Arc::new(Ty::plain(Ty::Nat));
     let mut mint = Mint::new(Bundle::new("test", Version::new(0, 1, 0)).expect("valid bundle"));
     let module = mint.module(None, "util").expect("a fresh name");
     let local = mint.local(Some(module), Namespace::Terms, "x");
-    let named = Rc::new(Ty::plain(Ty::Named {
+    let named = Arc::new(Ty::plain(Ty::Named {
         symbol: mint
             .global(None, Namespace::Types, "Pair")
             .expect("a fresh name"),
         name: "Pair".into(),
-        args: Rc::from([nat.clone(), nat.clone()]),
+        args: Arc::from([nat.clone(), nat.clone()]),
     }));
 
     // A path, which writes the bundle, a module, and the anonymous segment a
@@ -3017,12 +3017,12 @@ fn a_printer_reports_a_writer_that_refuses_it() {
     for (what, ty) in [
         (
             "an arrow",
-            Rc::new(Ty::plain(Ty::pure(nat.clone(), nat.clone()))),
+            Arc::new(Ty::plain(Ty::pure(nat.clone(), nat.clone()))),
         ),
         ("an application", named.clone()),
         (
             "an open struct",
-            Rc::new(Ty::Struct(Row {
+            Arc::new(Ty::Struct(Row {
                 labels: [
                     ("x".to_string(), RowField::present(nat.clone())),
                     ("y".to_string(), optional.clone()),
@@ -3034,7 +3034,7 @@ fn a_printer_reports_a_writer_that_refuses_it() {
         ),
         (
             "an open sum",
-            Rc::new(Ty::plain(Ty::Sum(Row {
+            Arc::new(Ty::plain(Ty::Sum(Row {
                 labels: [
                     ("A".to_string(), RowField::present(nat.clone())),
                     ("B".to_string(), optional.clone()),
@@ -3046,22 +3046,22 @@ fn a_printer_reports_a_writer_that_refuses_it() {
         ),
         (
             "the empty sum",
-            Rc::new(Ty::plain(Ty::Sum(Row {
+            Arc::new(Ty::plain(Ty::Sum(Row {
                 labels: Default::default(),
                 rest: Rest::Closed,
             }))),
         ),
         (
             "the sum that is only its tail",
-            Rc::new(Ty::plain(Ty::Sum(Row {
+            Arc::new(Ty::plain(Ty::Sum(Row {
                 labels: Default::default(),
                 rest: Rest::Bound(0),
             }))),
         ),
         (
             "a case carrying unit",
-            Rc::new(Ty::plain(Ty::Sum(Row {
-                labels: [("None".to_string(), RowField::present(Rc::new(Ty::unit())))]
+            Arc::new(Ty::plain(Ty::Sum(Row {
+                labels: [("None".to_string(), RowField::present(Arc::new(Ty::unit())))]
                     .into_iter()
                     .collect(),
                 rest: Rest::Closed,
@@ -3122,15 +3122,15 @@ fn a_printer_reports_a_writer_that_refuses_it() {
     every_failure_is_reported("a witness", &witness);
 
     let formula = Formula::Iff(
-        Rc::new(Formula::And(
-            Rc::new(Formula::True),
-            Rc::new(Formula::var(0)),
+        Arc::new(Formula::And(
+            Arc::new(Formula::True),
+            Arc::new(Formula::var(0)),
         )),
-        Rc::new(Formula::Xor(
-            Rc::new(Formula::Not(Rc::new(Formula::False))),
-            Rc::new(Formula::Or(
-                Rc::new(Formula::var(1)),
-                Rc::new(Formula::var(2)),
+        Arc::new(Formula::Xor(
+            Arc::new(Formula::Not(Arc::new(Formula::False))),
+            Arc::new(Formula::Or(
+                Arc::new(Formula::var(1)),
+                Arc::new(Formula::var(2)),
             )),
         )),
     );
@@ -3147,7 +3147,6 @@ fn a_printer_reports_a_writer_that_refuses_it() {
             level: 1,
             promised: Formula::var(0),
             rigids: Vec::new(),
-            effect_provenance: Default::default(),
             initializer_effects: Row::closed(),
             ambient: Row::closed(),
             inside: true,
@@ -3259,9 +3258,9 @@ fn a_printer_reports_a_writer_that_refuses_it() {
 /// prints as no tail at all.
 #[test]
 fn a_spliced_tail_prints_in_the_notation_of_the_row_it_ends() {
-    let nat = Rc::new(Ty::plain(Ty::Nat));
+    let nat = Arc::new(Ty::plain(Ty::Nat));
     let more = |labels: Vec<(&str, RowField)>, rest: Rest| {
-        Rest::More(Rc::new(Row {
+        Rest::More(Arc::new(Row {
             labels: labels
                 .into_iter()
                 .map(|(name, field)| (name.to_string(), field))
@@ -3273,7 +3272,7 @@ fn a_spliced_tail_prints_in_the_notation_of_the_row_it_ends() {
     // `type G 'r = #Err Nat | ..'r` applied to `#Ok Nat`, and to a row
     // naming nothing, which leaves the sum closed at the case it wrote.
     let err_nat = |rest: Rest| {
-        Rc::new(Ty::plain(Ty::Sum(Row {
+        Arc::new(Ty::plain(Ty::Sum(Row {
             labels: [("Err".to_string(), RowField::present(nat.clone()))]
                 .into_iter()
                 .collect(),
@@ -3316,7 +3315,7 @@ fn a_spliced_tail_prints_in_the_notation_of_the_row_it_ends() {
     // with no payload at all.
     assert_eq!(
         Ty::plain(Ty::Sum(Row {
-            labels: [("A".to_string(), RowField::present(Rc::new(Ty::unit())))]
+            labels: [("A".to_string(), RowField::present(Arc::new(Ty::unit())))]
                 .into_iter()
                 .collect(),
             rest: Rest::Closed,
@@ -3324,9 +3323,9 @@ fn a_spliced_tail_prints_in_the_notation_of_the_row_it_ends() {
         .to_string(),
         "#A"
     );
-    let nested_empty = Rc::new(Ty::Struct(Row {
+    let nested_empty = Arc::new(Ty::Struct(Row {
         labels: Default::default(),
-        rest: Rest::More(Rc::new(Row::closed())),
+        rest: Rest::More(Arc::new(Row::closed())),
     }));
     assert_eq!(
         Ty::Sum(Row {
@@ -3338,9 +3337,9 @@ fn a_spliced_tail_prints_in_the_notation_of_the_row_it_ends() {
         .to_string(),
         "#Nested"
     );
-    let nested_open = Rc::new(Ty::Struct(Row {
+    let nested_open = Arc::new(Ty::Struct(Row {
         labels: Default::default(),
-        rest: Rest::More(Rc::new(Row {
+        rest: Rest::More(Arc::new(Row {
             labels: Default::default(),
             rest: Rest::Var(9),
         })),
@@ -3362,19 +3361,19 @@ fn a_spliced_tail_prints_in_the_notation_of_the_row_it_ends() {
 /// other two are what taking a type apart reaches.
 #[test]
 fn a_goal_prints_as_the_constraint_it_is() {
-    let nat = Rc::new(Ty::plain(Ty::Nat));
+    let nat = Arc::new(Ty::plain(Ty::Nat));
     assert_eq!(
         Goal::Type {
             expected: nat.clone(),
-            actual: Rc::new(Ty::plain(Ty::Var(0))),
+            actual: Arc::new(Ty::plain(Ty::Var(0))),
         }
         .to_string(),
         "Nat ~ ?0"
     );
     assert_eq!(
         Goal::Row {
-            expected: Rc::new(Row::closed()),
-            actual: Rc::new(Row {
+            expected: Arc::new(Row::closed()),
+            actual: Arc::new(Row {
                 labels: Default::default(),
                 rest: Rest::Var(1),
             }),
@@ -3398,10 +3397,10 @@ fn a_goal_prints_as_the_constraint_it_is() {
 /// *field*, and reading the word off the base would call it a case.
 #[test]
 fn a_label_complaint_reads_the_shape_it_was_handed() {
-    let sum = Rc::new(Ty::plain(Ty::Sum(Row {
+    let sum = Arc::new(Ty::plain(Ty::Sum(Row {
         labels: [(
             "A".to_string(),
-            RowField::present(Rc::new(Ty::plain(Ty::Nat))),
+            RowField::present(Arc::new(Ty::plain(Ty::Nat))),
         )]
         .into_iter()
         .collect(),
@@ -3453,7 +3452,7 @@ fn spreading_a_non_struct_is_worded_as_the_spread_it_is() {
     let mut map = SourceMap::default();
     let span = map.record(Symbol::GENERATED, 0, Span::generated(3, 2));
     let kind = TypeError::NotAStruct {
-        base: Rc::new(Ty::plain(Ty::Nat)),
+        base: Arc::new(Ty::plain(Ty::Nat)),
         demand: inference::StructDemand::Spread,
     };
     assert_eq!(
@@ -3568,7 +3567,7 @@ fn the_variable_complaints_read_as_what_went_wrong() {
     // out to be beside what it had promised to be.
     assert_eq!(
         TypeError::RigidBroken {
-            found: Rc::new(Ty::plain(Ty::Nat)),
+            found: Arc::new(Ty::plain(Ty::Nat)),
             name: "a".into(),
             sense: Sense::Type,
             declared: span,
@@ -3578,9 +3577,9 @@ fn the_variable_complaints_read_as_what_went_wrong() {
     );
     // Closing an open effect remainder is distinct from restricting it with a
     // performed operation, because the two mistakes have different repairs.
-    let closed_effects = Rc::new(Ty::plain(Ty::Arrow(
-        Rc::new(Ty::unit()),
-        Rc::new(Ty::unit()),
+    let closed_effects = Arc::new(Ty::plain(Ty::Arrow(
+        Arc::new(Ty::unit()),
+        Arc::new(Ty::unit()),
         Row::closed(),
     )));
     let closure = inference::Error::new(
@@ -3609,15 +3608,15 @@ fn the_variable_complaints_read_as_what_went_wrong() {
         "Log".into(),
         RowField {
             presence: Presence::Present,
-            ty: Rc::new(Ty::unit()),
+            ty: Arc::new(Ty::unit()),
         },
     );
     let restriction = inference::Error::new(
         span,
         TypeError::RigidBroken {
-            found: Rc::new(Ty::plain(Ty::Arrow(
-                Rc::new(Ty::unit()),
-                Rc::new(Ty::unit()),
+            found: Arc::new(Ty::plain(Ty::Arrow(
+                Arc::new(Ty::unit()),
+                Arc::new(Ty::unit()),
                 performed_row,
             ))),
             name: "e".into(),
@@ -3664,7 +3663,7 @@ fn the_variable_complaints_read_as_what_went_wrong() {
         TypeError::RigidEscapes {
             name: "a".into(),
             declared: span,
-            destination: Rc::new(Ty::Nat),
+            destination: Arc::new(Ty::Nat),
             destination_name: "outside".into(),
             destination_span: span,
         }
@@ -3757,12 +3756,12 @@ fn a_mixed_tail_names_the_two_senses_it_was_given() {
 /// source-representable row; the solver's own record is where one surfaces.
 #[test]
 fn a_row_with_no_shape_to_hand_down_prints_in_braces() {
-    let nat = Rc::new(Ty::plain(Ty::Nat));
+    let nat = Arc::new(Ty::plain(Ty::Nat));
     let row = Row {
         labels: [("x".to_string(), RowField::present(nat.clone()))]
             .into_iter()
             .collect(),
-        rest: Rest::More(Rc::new(Row {
+        rest: Rest::More(Arc::new(Row {
             labels: [("y".to_string(), RowField::present(nat))]
                 .into_iter()
                 .collect(),
@@ -3774,13 +3773,13 @@ fn a_row_with_no_shape_to_hand_down_prints_in_braces() {
 
 #[test]
 fn flattened_rows_print_with_outer_wins_and_hide_interface_keys() {
-    let nat = Rc::new(Ty::Nat);
+    let nat = Arc::new(Ty::Nat);
     let inner = Row {
         labels: [
             ("masked".into(), RowField::present(nat.clone())),
             (
                 "Log\u{1f}generated-interface".into(),
-                RowField::present(Rc::new(Ty::unit())),
+                RowField::present(Arc::new(Ty::unit())),
             ),
         ]
         .into_iter()
@@ -3792,12 +3791,12 @@ fn flattened_rows_print_with_outer_wins_and_hide_interface_keys() {
             "masked".into(),
             RowField {
                 presence: Presence::Absent,
-                ty: Rc::new(Ty::String),
+                ty: Arc::new(Ty::String),
             },
         )]
         .into_iter()
         .collect(),
-        rest: Rest::More(Rc::new(inner)),
+        rest: Rest::More(Arc::new(inner)),
     };
 
     assert_eq!(
@@ -3814,7 +3813,7 @@ fn flattened_rows_print_with_outer_wins_and_hide_interface_keys() {
     let effect_inner = Row {
         labels: [(
             EffectId::structural("Log".into(), "generated-interface".into()).row_key(),
-            RowField::present(Rc::new(Ty::unit())),
+            RowField::present(Arc::new(Ty::unit())),
         )]
         .into_iter()
         .collect(),
@@ -3822,14 +3821,14 @@ fn flattened_rows_print_with_outer_wins_and_hide_interface_keys() {
     };
     let effect_outer = Row {
         labels: Default::default(),
-        rest: Rest::More(Rc::new(effect_inner)),
+        rest: Rest::More(Arc::new(effect_inner)),
     };
     let mut mint = Mint::new(Bundle::new("test", Version::new(0, 1, 0)).unwrap());
     let runner = mint.global(None, Namespace::Types, "Runner").unwrap();
     let applied = Ty::Named {
         symbol: runner,
         name: "Runner".into(),
-        args: vec![Rc::new(Ty::Sum(effect_outer))].into(),
+        args: vec![Arc::new(Ty::Sum(effect_outer))].into(),
     };
     assert_eq!(applied.to_string(), "Runner (#Log)");
 
@@ -3855,7 +3854,7 @@ fn flattened_rows_print_with_outer_wins_and_hide_interface_keys() {
 /// code would make two different demands read as one.
 #[test]
 fn no_two_kinds_of_constraint_are_coded_the_same() {
-    let nat = Rc::new(Ty::plain(Ty::Nat));
+    let nat = Arc::new(Ty::plain(Ty::Nat));
     let mut mint = Mint::new(Bundle::new("test", Version::new(0, 1, 0)).expect("valid bundle"));
     let symbol = mint.local(None, Namespace::Terms, "x");
 
@@ -3876,7 +3875,6 @@ fn no_two_kinds_of_constraint_are_coded_the_same() {
             level: 1,
             promised: Formula::True,
             rigids: Vec::new(),
-            effect_provenance: Default::default(),
             initializer_effects: Row::closed(),
             ambient: Row::closed(),
             inside: true,
@@ -4524,11 +4522,11 @@ fn a_printed_formula_reads_back_as_itself() {
 /// and nothing parses it back, which is exactly what it is reporting.
 #[test]
 fn an_abandoned_presence_still_prints_as_a_question_mark() {
-    let undecided = |ty: Rc<Ty>| RowField {
+    let undecided = |ty: Arc<Ty>| RowField {
         presence: Presence::Undecided,
         ty,
     };
-    let nat = Rc::new(Ty::plain(Ty::Nat));
+    let nat = Arc::new(Ty::plain(Ty::Nat));
     let fields: IndexMap<String, RowField> = [("x".to_string(), undecided(nat.clone()))]
         .into_iter()
         .collect();
@@ -4754,9 +4752,9 @@ fn the_effect_complaints_are_read_in_effects() {
         (
             TypeError::ExtraField {
                 shape: Shape::Effect,
-                base: Rc::new(Ty::plain(Ty::pure(
-                    Rc::new(Ty::plain(Ty::Nat)),
-                    Rc::new(Ty::plain(Ty::Nat)),
+                base: Arc::new(Ty::plain(Ty::pure(
+                    Arc::new(Ty::plain(Ty::Nat)),
+                    Arc::new(Ty::plain(Ty::Nat)),
                 ))),
                 field: "Log".to_string(),
             },
@@ -4821,7 +4819,7 @@ fn the_performs_constraint_reads_as_a_widening() {
     let row = |labels: &[&str], rest: Rest| Row {
         labels: labels
             .iter()
-            .map(|name| (name.to_string(), RowField::present(Rc::new(Ty::unit()))))
+            .map(|name| (name.to_string(), RowField::present(Arc::new(Ty::unit()))))
             .collect(),
         rest,
     };
@@ -5041,8 +5039,8 @@ fn the_bundle_phase_words_and_codes_its_refusals() {
     let missing = ruddy::bundle::Error {
         span,
         kind: BundleError::ModuleFileMissing {
-            beside: "Math.hc".to_string(),
-            inside: "Math/module.hc".to_string(),
+            beside: "Math.rud".to_string(),
+            inside: "Math/module.rud".to_string(),
         },
     };
     let diagnostic = missing.diagnostic();
@@ -5053,15 +5051,15 @@ fn the_bundle_phase_words_and_codes_its_refusals() {
         diagnostic.primary.message,
         "no file was found for this module"
     );
-    assert_eq!(diagnostic.help, ["create `Math.hc` or `Math/module.hc`"]);
+    assert_eq!(diagnostic.help, ["create `Math.rud` or `Math/module.rud`"]);
     assert_eq!(diagnostic.notes.len(), 1);
     assert!(diagnostic.related.is_empty());
 
     let ambiguous = ruddy::bundle::Error {
         span,
         kind: BundleError::ModuleFileAmbiguous {
-            beside: "Math.hc".to_string(),
-            inside: "Math/module.hc".to_string(),
+            beside: "Math.rud".to_string(),
+            inside: "Math/module.rud".to_string(),
         },
     };
     let diagnostic = ambiguous.diagnostic();
@@ -5073,7 +5071,7 @@ fn the_bundle_phase_words_and_codes_its_refusals() {
     );
     assert_eq!(
         diagnostic.help,
-        ["keep one of `Math.hc` or `Math/module.hc` and delete the other"]
+        ["keep one of `Math.rud` or `Math/module.rud` and delete the other"]
     );
     assert_eq!(diagnostic.notes.len(), 1);
 }
@@ -5309,7 +5307,7 @@ fn applied_effect_complaints_name_the_effect_and_the_repair() {
 #[test]
 fn an_argument_clash_renders_the_applications_and_its_cause() {
     let (map, errors) = inference_fixture_errors(include_str!(
-        "../diagnostics/inference/effect-argument-mismatch.hc"
+        "../diagnostics/inference/effect-argument-mismatch.rud"
     ));
     let [error] = errors.as_slice() else {
         panic!("{errors:#?}");

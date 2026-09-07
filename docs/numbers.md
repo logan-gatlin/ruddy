@@ -34,7 +34,7 @@ The suffix is also used in literal patterns and metadata values.
 The existing `std::nat` and `std::int` modules provide functions with a trailing
 width. For example:
 
-```hc
+```ruddy
 let wrapped : Nat8 = std::nat::add8 255n8 1n8 -- 0n8
 let signed : Int8 = std::int::add8 127i8 1i8 -- -128i8
 let exact : Nat64 = std::nat::subtract64 9007199254740993n64 9007199254740992n64 -- 1n64

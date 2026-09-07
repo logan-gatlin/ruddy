@@ -7,7 +7,7 @@
       "scope": "source.ruddy",
       "path": ".",
       "file-types": [
-        "hc"
+        "rud"
       ],
       "highlights": [
         "queries/highlights.scm"
@@ -15,7 +15,7 @@
       "locals": [
         "queries/locals.scm"
       ],
-      "injection-regex": "^(ruddy|hc)$"
+      "injection-regex": "^(ruddy|rud)$"
     }
   ],
   "metadata": {

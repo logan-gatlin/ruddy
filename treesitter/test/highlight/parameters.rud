@@ -1,0 +1,27 @@
+let identity = fn item => item
+--                ^^^^ @variable.parameter
+--                        ^^^^ @variable.parameter
+
+let capture = fn outer => fn inner => outer
+--                                    ^^^^^ @variable.parameter
+
+let shadow = fn item => do
+  let item = 1n
+--    ^^^^ @variable
+  return item
+--       ^^^^ @variable
+end
+
+let record = fn item => item.item
+--                      ^^^^ @variable.parameter
+--                           ^^^^ @property
+
+let apply = fn f x => f x
+--                    ^ @variable.parameter
+--                      ^ @variable.parameter
+
+let qualified = fn item => Other::item
+--                                ^^^^ @variable
+
+let pick = fn item => match item with | #Some item => item end
+--                                                    ^^^^ @variable

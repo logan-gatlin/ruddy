@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
-    rc::Rc,
+    sync::Arc,
 };
 
 use indexmap::{IndexMap, IndexSet};
@@ -14,7 +14,7 @@ use crate::{
     types::{EffectId, ParamKind, Presence, Prim, Rest, Scheme, Sense, Shape, Ty},
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Program {
     /// Target-provided values. They bind in the term namespace but have no
     /// initializer, so recursive initializer grouping never sees them.
@@ -27,7 +27,7 @@ pub struct Program {
     pub external_names: IndexMap<Symbol, artifact::QualifiedName>,
     pub external_schemes: IndexMap<Symbol, Scheme>,
     pub external_types: IndexMap<Symbol, ExternalType>,
-    pub external_operations: IndexMap<(Symbol, OperationSelector), (Rc<Ty>, Rc<Ty>)>,
+    pub external_operations: IndexMap<(Symbol, OperationSelector), (Arc<Ty>, Arc<Ty>)>,
     /// What each effect's parameters stand for, local and imported alike, in
     /// the order they are applied. An operation reference or a handler mints
     /// one fresh argument per entry; an effect declared without parameters
@@ -423,7 +423,7 @@ pub struct Term {
     /// What the term was inferred to be. Lowering runs before inference, so
     /// until then this is [`Ty::default`], the undecided type — see
     /// [`TermKind::with_span`].
-    pub ty: Rc<Ty>,
+    pub ty: Arc<Ty>,
     pub at: Anchor,
     pub kind: TermKind,
 }
@@ -1983,10 +1983,52 @@ pub enum Witness {
 #[derive(Debug, Clone)]
 pub struct Output {
     pub program: Program,
+    pub names: ScopeNames,
     /// Where every anchor in `program` was written. Kept beside the program
     /// rather than in it: see [`Anchor`].
     pub source: SourceMap,
     pub errors: Vec<Error>,
+}
+
+/// The names source resolution made visible, including dependency aliases and
+/// the standard prelude. Editor completion reads this same namespace table.
+#[derive(Debug, Clone, Default)]
+pub struct ScopeNames {
+    globals: HashMap<(Option<Module>, Namespace, String), Symbol>,
+    modules: HashMap<(Option<Module>, String), Module>,
+    pub prelude: Option<Module>,
+    scopes: Vec<(Span, Module)>,
+}
+impl ScopeNames {
+    /// The innermost source module, including positions with no recovered term.
+    pub fn scope_at(&self, file: crate::tracking::FileID, offset: usize) -> Option<Module> {
+        self.scopes
+            .iter()
+            .filter(|(span, _)| {
+                span.file_id == file && span.start <= offset && offset <= span.end()
+            })
+            .min_by_key(|(span, _)| span.width)
+            .map(|(_, module)| *module)
+    }
+
+    pub fn globals(
+        &self,
+        module: Option<Module>,
+    ) -> impl Iterator<Item = (Namespace, &str, Symbol)> {
+        self.globals
+            .iter()
+            .filter(move |((parent, _, _), _)| *parent == module)
+            .map(|((_, namespace, name), symbol)| (*namespace, name.as_str(), *symbol))
+    }
+    pub fn modules(&self, module: Option<Module>) -> impl Iterator<Item = (&str, Module)> {
+        self.modules
+            .iter()
+            .filter(move |((parent, _), _)| *parent == module)
+            .map(|((_, name), child)| (name.as_str(), *child))
+    }
+    pub fn module(&self, parent: Option<Module>, name: &str) -> Option<Module> {
+        self.modules.get(&(parent, name.to_owned())).copied()
+    }
 }
 
 /// The namespaces a `let`, a `type` and an `effect` declaration write into.
@@ -2073,6 +2115,7 @@ struct Builder<'a> {
     /// already known to be one, and passing a term where a containing module
     /// goes is what that newtype exists to rule out.
     modules: HashMap<(Option<Module>, String), (Module, Span)>,
+    module_scopes: Vec<(Span, Module)>,
     /// The immediate `prelude` module of the direct dependency imported under
     /// the source alias `std`. Bare lookup consults its direct members only,
     /// after every ordinary user scope has failed.
@@ -2412,9 +2455,9 @@ enum Stands {
 enum FollowWork<'a> {
     Decl(Symbol),
     Written(&'a Type),
-    Semantic(&'a Rc<Ty>),
+    Semantic(&'a Arc<Ty>),
     SelectWritten(&'a [Type]),
-    SelectSemantic(&'a [Rc<Ty>]),
+    SelectSemantic(&'a [Arc<Ty>]),
     FinishSelect { fields: bool },
     FinishDecl(Symbol),
 }
@@ -2779,6 +2822,13 @@ pub struct DependencyImport<'a> {
     pub artifact: &'a artifact::Artifact,
 }
 
+/// A current semantic dependency, independent of executable artifact bodies.
+#[derive(Debug, Clone, Copy)]
+pub struct InterfaceImport<'a> {
+    pub alias: &'a str,
+    pub header: &'a artifact::Header,
+}
+
 /// Build against explicitly aliased direct dependencies and linked interfaces.
 pub fn build_with_dependency_imports(
     mint: &mut Mint,
@@ -2786,7 +2836,15 @@ pub fn build_with_dependency_imports(
     dependencies: &[DependencyImport<'_>],
     linked: &[&artifact::Artifact],
 ) -> Output {
-    build_with_dependency_imports_inner(mint, stmts, dependencies, linked)
+    let imports: Vec<_> = dependencies
+        .iter()
+        .map(|import| InterfaceImport {
+            alias: import.alias,
+            header: import.artifact.header(),
+        })
+        .collect();
+    let linked: Vec<_> = linked.iter().map(|artifact| artifact.header()).collect();
+    build_with_interfaces(mint, stmts, &imports, &linked)
 }
 
 /// Build against direct source-visible dependencies and additional linked
@@ -2804,14 +2862,14 @@ pub fn build_with_dependency_graph(
             artifact,
         })
         .collect();
-    build_with_dependency_imports_inner(mint, stmts, &imports, linked)
+    build_with_dependency_imports(mint, stmts, &imports, linked)
 }
 
-fn build_with_dependency_imports_inner(
+pub fn build_with_interfaces(
     mint: &mut Mint,
     stmts: Vec<Stmt>,
-    dependencies: &[DependencyImport<'_>],
-    linked: &[&artifact::Artifact],
+    dependencies: &[InterfaceImport<'_>],
+    linked: &[&artifact::Header],
 ) -> Output {
     let mut b = Builder {
         mint,
@@ -2827,6 +2885,7 @@ fn build_with_dependency_imports_inner(
         bases: HashMap::new(),
         modules: HashMap::new(),
         std_prelude: None,
+        module_scopes: Vec::new(),
         expanded: HashMap::new(),
         operations: HashMap::new(),
         answering: Answering::Nowhere,
@@ -3461,6 +3520,20 @@ fn build_with_dependency_imports_inner(
     let source = std::mem::take(&mut b.source);
     b.errors.sort_by_key(|error| source.span(error.at));
     Output {
+        names: ScopeNames {
+            globals: b
+                .globals
+                .into_iter()
+                .map(|(key, (symbol, _))| (key, symbol))
+                .collect(),
+            modules: b
+                .modules
+                .into_iter()
+                .map(|(key, (module, _))| (key, module))
+                .collect(),
+            prelude: b.std_prelude,
+            scopes: b.module_scopes,
+        },
         source,
         program,
         errors: b.errors,
@@ -3625,8 +3698,8 @@ fn type_contains_array(
 ) -> bool {
     enum Work<'a> {
         Ir(&'a Type),
-        Semantic(Rc<Ty>),
-        SemanticRow(Rc<crate::types::Row>),
+        Semantic(Arc<Ty>),
+        SemanticRow(Arc<crate::types::Row>),
     }
 
     fn push_alias<'a>(
@@ -3698,13 +3771,13 @@ fn type_contains_array(
                 }
                 Ty::Array(_) => return true,
                 Ty::Arrow(from, to, effects) => {
-                    work.push(Work::SemanticRow(Rc::new(effects.clone())));
+                    work.push(Work::SemanticRow(Arc::new(effects.clone())));
                     work.push(Work::Semantic(to.clone()));
                     work.push(Work::Semantic(from.clone()));
                 }
                 Ty::Package(body) => work.push(Work::Semantic(body.clone())),
                 Ty::Struct(row) | Ty::Sum(row) => {
-                    work.push(Work::SemanticRow(Rc::new(row.clone())))
+                    work.push(Work::SemanticRow(Arc::new(row.clone())))
                 }
                 Ty::Named { symbol, args, .. } => {
                     work.extend(args.iter().cloned().map(Work::Semantic));
@@ -3722,7 +3795,7 @@ fn type_contains_array(
                 | Ty::Undecided => {}
             },
             Work::SemanticRow(row) => {
-                if !expanded_rows.insert(Rc::as_ptr(&row) as usize) {
+                if !expanded_rows.insert(Arc::as_ptr(&row) as usize) {
                     continue;
                 }
                 visited_rows.push(row.clone());
@@ -3740,11 +3813,10 @@ fn type_contains_array(
     false
 }
 
-fn dependency_path(dependency: &artifact::Artifact, qualified: &str) -> Option<Vec<String>> {
+fn dependency_path(dependency: &artifact::Header, qualified: &str) -> Option<Vec<String>> {
     let prefix = format!(
         "{}@{}::",
-        dependency.header().identity.name,
-        dependency.header().identity.version
+        dependency.identity.name, dependency.identity.version
     );
     let path = qualified.strip_prefix(&prefix)?;
     let parts: Vec<String> = path.split("::").map(str::to_owned).collect();
@@ -4068,7 +4140,7 @@ fn import_scheme(
 /// slots occupy the remainder. Foreign solver-local variables and rigids are
 /// recovery input as well. The explicit postorder stack keeps arbitrarily deep
 /// types, field payloads, and `Rest::More` rows safe to import.
-fn clamp_bounds(ty: Rc<Ty>, count: usize, presences: usize) -> Rc<Ty> {
+fn clamp_bounds(ty: Arc<Ty>, count: usize, presences: usize) -> Arc<Ty> {
     enum Work<'a> {
         Ty(&'a Ty),
         Row(&'a crate::types::Row),
@@ -4080,7 +4152,7 @@ fn clamp_bounds(ty: Rc<Ty>, count: usize, presences: usize) -> Rc<Ty> {
         Sum,
         Named {
             symbol: Symbol,
-            name: Rc<str>,
+            name: Arc<str>,
             args: usize,
         },
         BuiltRow {
@@ -4096,17 +4168,17 @@ fn clamp_bounds(ty: Rc<Ty>, count: usize, presences: usize) -> Rc<Ty> {
     while let Some(part) = work.pop() {
         match part {
             Work::Ty(value) => match value {
-                Ty::Nat => types.push(Rc::new(Ty::Nat)),
-                Ty::Int => types.push(Rc::new(Ty::Int)),
-                Ty::Fixed(kind) => types.push(Rc::new(Ty::Fixed(*kind))),
-                Ty::Real => types.push(Rc::new(Ty::Real)),
-                Ty::String => types.push(Rc::new(Ty::String)),
-                Ty::Boolean => types.push(Rc::new(Ty::Boolean)),
+                Ty::Nat => types.push(Arc::new(Ty::Nat)),
+                Ty::Int => types.push(Arc::new(Ty::Int)),
+                Ty::Fixed(kind) => types.push(Arc::new(Ty::Fixed(*kind))),
+                Ty::Real => types.push(Arc::new(Ty::Real)),
+                Ty::String => types.push(Arc::new(Ty::String)),
+                Ty::Boolean => types.push(Arc::new(Ty::Boolean)),
                 Ty::Bound(index) if (*index as usize) < count && (*index as usize) >= presences => {
-                    types.push(Rc::new(Ty::Bound(*index)))
+                    types.push(Arc::new(Ty::Bound(*index)))
                 }
                 Ty::Bound(_) | Ty::Var(_) | Ty::Rigid { .. } | Ty::Undecided => {
-                    types.push(Rc::new(Ty::Undecided))
+                    types.push(Arc::new(Ty::Undecided))
                 }
                 Ty::Arrow(from, to, effects) => {
                     work.push(Work::Arrow);
@@ -4181,28 +4253,28 @@ fn clamp_bounds(ty: Rc<Ty>, count: usize, presences: usize) -> Rc<Ty> {
                 let effects = rows.pop().expect("row postorder stays balanced");
                 let to = types.pop().expect("type postorder stays balanced");
                 let from = types.pop().expect("type postorder stays balanced");
-                types.push(Rc::new(Ty::Arrow(from, to, effects)));
+                types.push(Arc::new(Ty::Arrow(from, to, effects)));
             }
             Work::Package => {
                 let body = types.pop().expect("package postorder stays balanced");
-                types.push(Rc::new(Ty::Package(body)));
+                types.push(Arc::new(Ty::Package(body)));
             }
             Work::Array => {
                 let element = types.pop().expect("array postorder stays balanced");
-                types.push(Rc::new(Ty::Array(element)));
+                types.push(Arc::new(Ty::Array(element)));
             }
             Work::Mut => {
                 let element = types.pop().expect("cell element");
                 let region = types.pop().expect("cell region");
-                types.push(Rc::new(Ty::Mut(region, element)));
+                types.push(Arc::new(Ty::Mut(region, element)));
             }
             Work::Struct => {
                 let fields = rows.pop().expect("row postorder stays balanced");
-                types.push(Rc::new(Ty::Struct(fields)));
+                types.push(Arc::new(Ty::Struct(fields)));
             }
             Work::Sum => {
                 let cases = rows.pop().expect("row postorder stays balanced");
-                types.push(Rc::new(Ty::Sum(cases)));
+                types.push(Arc::new(Ty::Sum(cases)));
             }
             Work::Named { symbol, name, args } => {
                 let mut imported = Vec::with_capacity(args);
@@ -4210,7 +4282,7 @@ fn clamp_bounds(ty: Rc<Ty>, count: usize, presences: usize) -> Rc<Ty> {
                     imported.push(types.pop().expect("type postorder stays balanced"));
                 }
                 imported.reverse();
-                types.push(Rc::new(Ty::Named {
+                types.push(Arc::new(Ty::Named {
                     symbol,
                     name,
                     args: imported.into(),
@@ -4234,7 +4306,7 @@ fn clamp_bounds(ty: Rc<Ty>, count: usize, presences: usize) -> Rc<Ty> {
                         Presence::Var(_) | Presence::Undecided => Presence::Undecided,
                     };
                     let ty = match presence {
-                        Presence::Absent => Rc::new(Ty::Undecided),
+                        Presence::Absent => Arc::new(Ty::Undecided),
                         _ => types.pop().expect("type postorder stays balanced"),
                     };
                     fields.push((name.clone(), crate::types::RowField { presence, ty }));
@@ -4245,7 +4317,7 @@ fn clamp_bounds(ty: Rc<Ty>, count: usize, presences: usize) -> Rc<Ty> {
                     rest,
                 };
                 rows.push(match composed {
-                    true => crate::types::Row::of(Rest::More(Rc::new(row))),
+                    true => crate::types::Row::of(Rest::More(Arc::new(row))),
                     false => row,
                 });
             }
@@ -4259,10 +4331,10 @@ fn clamp_bounds(ty: Rc<Ty>, count: usize, presences: usize) -> Rc<Ty> {
 /// Destroy a possibly deep temporary semantic type with an explicit stack.
 /// Importing and clamping intentionally build two independent trees; letting
 /// Rust recursively release the first one would undo the stack-safe walk.
-fn drop_type_iterative(root: Rc<Ty>) {
+fn drop_type_iterative(root: Arc<Ty>) {
     enum Work {
-        Ty(Rc<Ty>),
-        Row(Rc<crate::types::Row>),
+        Ty(Arc<Ty>),
+        Row(Arc<crate::types::Row>),
     }
 
     fn row(row: &crate::types::Row, work: &mut Vec<Work>) {
@@ -4316,7 +4388,7 @@ fn drop_type_iterative(root: Rc<Ty>) {
 fn drop_formula_iterative(root: crate::types::Formula) {
     use crate::types::Formula;
 
-    fn children(formula: &Formula, work: &mut Vec<Rc<Formula>>) {
+    fn children(formula: &Formula, work: &mut Vec<Arc<Formula>>) {
         match formula {
             Formula::Owned(_, inner) | Formula::Not(inner) => work.push(inner.clone()),
             Formula::And(left, right)
@@ -4438,7 +4510,7 @@ fn import_type(
     symbols: &mut HashMap<(Namespace, String), Symbol>,
     names: &mut IndexMap<Symbol, artifact::QualifiedName>,
     effect_rows: &ImportedEffectRows,
-) -> Rc<Ty> {
+) -> Arc<Ty> {
     enum Work<'a> {
         Ty(&'a artifact::Type, bool),
         Row(&'a artifact::Row, bool),
@@ -4450,7 +4522,7 @@ fn import_type(
         Sum,
         Named {
             symbol: Symbol,
-            name: Rc<str>,
+            name: Arc<str>,
             args: usize,
         },
         BuiltRow(&'a artifact::Row, bool),
@@ -4462,16 +4534,16 @@ fn import_type(
     while let Some(part) = work.pop() {
         match part {
             Work::Ty(value, is_effect_row) => match value {
-                artifact::Type::Nat => types.push(Rc::new(Ty::Nat)),
-                artifact::Type::Int => types.push(Rc::new(Ty::Int)),
-                artifact::Type::Fixed(kind) => types.push(Rc::new(Ty::Fixed(*kind))),
-                artifact::Type::Real => types.push(Rc::new(Ty::Real)),
-                artifact::Type::String => types.push(Rc::new(Ty::String)),
-                artifact::Type::Boolean => types.push(Rc::new(Ty::Boolean)),
-                artifact::Type::Bound(index) => types.push(Rc::new(Ty::Bound(*index))),
+                artifact::Type::Nat => types.push(Arc::new(Ty::Nat)),
+                artifact::Type::Int => types.push(Arc::new(Ty::Int)),
+                artifact::Type::Fixed(kind) => types.push(Arc::new(Ty::Fixed(*kind))),
+                artifact::Type::Real => types.push(Arc::new(Ty::Real)),
+                artifact::Type::String => types.push(Arc::new(Ty::String)),
+                artifact::Type::Boolean => types.push(Arc::new(Ty::Boolean)),
+                artifact::Type::Bound(index) => types.push(Arc::new(Ty::Bound(*index))),
                 artifact::Type::Var(_)
                 | artifact::Type::Rigid { .. }
-                | artifact::Type::Undecided => types.push(Rc::new(Ty::Undecided)),
+                | artifact::Type::Undecided => types.push(Arc::new(Ty::Undecided)),
                 artifact::Type::Arrow(from, to, effects) => {
                     work.push(Work::Arrow);
                     work.push(Work::Row(effects, true));
@@ -4503,7 +4575,7 @@ fn import_type(
                     let symbol = imported_symbol(mint, Namespace::Types, name, symbols, names);
                     work.push(Work::Named {
                         symbol,
-                        name: Rc::from(name.as_str()),
+                        name: Arc::from(name.as_str()),
                         args: args.len(),
                     });
                     work.extend(args.iter().enumerate().rev().map(|(index, arg)| {
@@ -4525,28 +4597,28 @@ fn import_type(
                 let effects = rows.pop().expect("row postorder stays balanced");
                 let to = types.pop().expect("type postorder stays balanced");
                 let from = types.pop().expect("type postorder stays balanced");
-                types.push(Rc::new(Ty::Arrow(from, to, effects)));
+                types.push(Arc::new(Ty::Arrow(from, to, effects)));
             }
             Work::Package => {
                 let body = types.pop().expect("package postorder stays balanced");
-                types.push(Rc::new(Ty::Package(body)));
+                types.push(Arc::new(Ty::Package(body)));
             }
             Work::Array => {
                 let element = types.pop().expect("array postorder stays balanced");
-                types.push(Rc::new(Ty::Array(element)));
+                types.push(Arc::new(Ty::Array(element)));
             }
             Work::Mut => {
                 let element = types.pop().expect("cell element");
                 let region = types.pop().expect("cell region");
-                types.push(Rc::new(Ty::Mut(region, element)));
+                types.push(Arc::new(Ty::Mut(region, element)));
             }
             Work::Struct => {
                 let fields = rows.pop().expect("row postorder stays balanced");
-                types.push(Rc::new(Ty::Struct(fields)));
+                types.push(Arc::new(Ty::Struct(fields)));
             }
             Work::Sum => {
                 let cases = rows.pop().expect("row postorder stays balanced");
-                types.push(Rc::new(Ty::Sum(cases)));
+                types.push(Arc::new(Ty::Sum(cases)));
             }
             Work::Named { symbol, name, args } => {
                 let mut imported = Vec::with_capacity(args);
@@ -4554,7 +4626,7 @@ fn import_type(
                     imported.push(types.pop().expect("type postorder stays balanced"));
                 }
                 imported.reverse();
-                types.push(Rc::new(Ty::Named {
+                types.push(Arc::new(Ty::Named {
                     symbol,
                     name,
                     args: imported.into(),
@@ -4565,7 +4637,7 @@ fn import_type(
                     artifact::Rest::Closed => Rest::Closed,
                     artifact::Rest::Bound(index) => Rest::Bound(*index),
                     artifact::Rest::More(_) => {
-                        Rest::More(Rc::new(rows.pop().expect("row postorder stays balanced")))
+                        Rest::More(Arc::new(rows.pop().expect("row postorder stays balanced")))
                     }
                     artifact::Rest::Var(_)
                     | artifact::Rest::Rigid { .. }
@@ -4585,7 +4657,7 @@ fn import_type(
                         artifact::Presence::Undecided => Presence::Undecided,
                     };
                     let ty = match presence {
-                        Presence::Absent => Rc::new(Ty::Undecided),
+                        Presence::Absent => Arc::new(Ty::Undecided),
                         _ => types.pop().expect("type postorder stays balanced"),
                     };
                     let name = match is_effect_row {
@@ -4673,7 +4745,7 @@ fn import_formula(value: &artifact::Formula) -> (crate::types::Formula, bool) {
             }
             Work::Not => {
                 let inner = values.pop().expect("not visits one operand");
-                values.push(Formula::Not(Rc::new(inner)));
+                values.push(Formula::Not(Arc::new(inner)));
             }
             Work::Binary(operator) => {
                 let right = values
@@ -4683,10 +4755,10 @@ fn import_formula(value: &artifact::Formula) -> (crate::types::Formula, bool) {
                     .pop()
                     .expect("a binary formula visits its left operand");
                 values.push(match operator {
-                    Binary::And => Formula::And(Rc::new(left), Rc::new(right)),
-                    Binary::Or => Formula::Or(Rc::new(left), Rc::new(right)),
-                    Binary::Iff => Formula::Iff(Rc::new(left), Rc::new(right)),
-                    Binary::Xor => Formula::Xor(Rc::new(left), Rc::new(right)),
+                    Binary::And => Formula::And(Arc::new(left), Arc::new(right)),
+                    Binary::Or => Formula::Or(Arc::new(left), Arc::new(right)),
+                    Binary::Iff => Formula::Iff(Arc::new(left), Arc::new(right)),
+                    Binary::Xor => Formula::Xor(Arc::new(left), Arc::new(right)),
                 });
             }
         }
@@ -7717,79 +7789,115 @@ fn pattern_names(pattern: &parse::Pattern, out: &mut Vec<TrackedString>) {
 /// inference runs in, so a hash anywhere in here would be a program that
 /// type-checks on one run and not the next.
 fn grouping(terms: &IndexMap<Symbol, Decl<Term>>) -> Vec<Group> {
-    // Who each definition names, and then everything each one leads to. The
-    // same closure the type half takes for the same question; a pair being
-    // mutually reachable is the whole of what a group is.
-    let mentions: IndexMap<Symbol, Vec<Symbol>> = terms
-        .iter()
-        .map(|(symbol, decl)| {
-            let mut out = Vec::new();
-            references(&decl.value, &mut out);
-            out.retain(|named| terms.contains_key(named));
-            (*symbol, out)
-        })
-        .collect();
-    let reachable = closure(&mentions);
-
-    // The groups, and which one each definition landed in. Walked in source
-    // order, so the first definition of a group reached is its earliest and the
-    // members it collects are in source order too. A definition leading back to
-    // itself is what makes its group recursive — including a group of one,
-    // which is the case the flag exists for, and including every group of two
-    // or more, where being a group at all makes it so.
-    let mut of: HashMap<Symbol, usize> = HashMap::new();
-    let mut groups: Vec<Group> = Vec::new();
-    for symbol in terms.keys() {
-        if of.contains_key(symbol) {
+    use std::{cmp::Reverse, collections::BinaryHeap};
+    let symbols: Vec<_> = terms.keys().copied().collect();
+    let mut edges = vec![Vec::new(); symbols.len()];
+    let mut reverse = vec![Vec::new(); symbols.len()];
+    for (at, decl) in terms.values().enumerate() {
+        crate::cancellation::checkpoint();
+        let mut names = Vec::new();
+        references(&decl.value, &mut names);
+        edges[at] = names
+            .iter()
+            .filter_map(|name| terms.get_index_of(name))
+            .collect();
+        edges[at].sort_unstable();
+        edges[at].dedup();
+        for &next in &edges[at] {
+            reverse[next].push(at);
+        }
+    }
+    // Kosaraju's two iterative walks find SCCs without materializing a
+    // quadratic reachability closure or borrowing the native call stack.
+    let mut seen = vec![false; symbols.len()];
+    let mut finished = Vec::new();
+    for root in 0..symbols.len() {
+        if seen[root] {
             continue;
         }
-        let reaches = &reachable[symbol];
-        let members: Vec<Symbol> = terms
-            .keys()
-            .copied()
-            .filter(|other| {
-                other == symbol || (reaches.contains(other) && reachable[other].contains(symbol))
-            })
-            .collect();
-        for member in &members {
-            of.insert(*member, groups.len());
-        }
-        groups.push(Group {
-            members,
-            recursive: reaches.contains(symbol),
-        });
-    }
-
-    // Which groups each group has to wait for: the ones its members name and
-    // are not in. A group never waits for itself, which is what makes this a
-    // graph with no loops in it — everything mutually reachable is already one
-    // node here.
-    let mut needs: Vec<IndexSet<usize>> = vec![IndexSet::new(); groups.len()];
-    for (at, group) in groups.iter().enumerate() {
-        for named in group.members.iter().flat_map(|member| &mentions[member]) {
-            let other = of[named];
-            if other != at {
-                needs[at].insert(other);
+        seen[root] = true;
+        let mut work = vec![(root, 0)];
+        while let Some((at, next)) = work.last_mut() {
+            crate::cancellation::checkpoint();
+            if let Some(&child) = edges[*at].get(*next) {
+                *next += 1;
+                if !seen[child] {
+                    seen[child] = true;
+                    work.push((child, 0));
+                }
+            } else {
+                finished.push(*at);
+                work.pop();
             }
         }
     }
-
-    // Dependency order, taking the earliest group that is ready at every step.
-    // `groups` is already in order of earliest member, so the lowest index that
-    // is ready is the earliest one, and two groups with nothing between them
-    // come out in the order they were written.
-    //
-    // Every group is placed. Each round places one unless nothing is ready, and
-    // nothing being ready in a graph with no loops means nothing is left.
-    let mut placed = vec![false; groups.len()];
-    let mut order = Vec::with_capacity(groups.len());
-    while let Some(next) =
-        (0..groups.len()).find(|at| !placed[*at] && needs[*at].iter().all(|need| placed[*need]))
-    {
-        placed[next] = true;
-        order.push(next);
+    seen.fill(false);
+    let mut components = Vec::new();
+    for root in finished.into_iter().rev() {
+        if seen[root] {
+            continue;
+        }
+        seen[root] = true;
+        let mut members = Vec::new();
+        let mut work = vec![root];
+        while let Some(at) = work.pop() {
+            crate::cancellation::checkpoint();
+            members.push(at);
+            for &next in &reverse[at] {
+                if !seen[next] {
+                    seen[next] = true;
+                    work.push(next);
+                }
+            }
+        }
+        members.sort_unstable();
+        components.push(members);
     }
-    order.into_iter().map(|at| groups[at].clone()).collect()
+    components.sort_unstable_by_key(|members| members[0]);
+    let mut owner = vec![0; symbols.len()];
+    for (group, members) in components.iter().enumerate() {
+        for &member in members {
+            owner[member] = group;
+        }
+    }
+    let mut pending = vec![0; components.len()];
+    let mut consumers = vec![Vec::new(); components.len()];
+    for (group, members) in components.iter().enumerate() {
+        let mut needs: Vec<_> = members
+            .iter()
+            .flat_map(|at| &edges[*at])
+            .map(|at| owner[*at])
+            .filter(|other| *other != group)
+            .collect();
+        needs.sort_unstable();
+        needs.dedup();
+        pending[group] = needs.len();
+        for need in needs {
+            consumers[need].push(group);
+        }
+    }
+    // Preserve the original source-order tie break among ready groups.
+    let mut ready: BinaryHeap<_> = pending
+        .iter()
+        .enumerate()
+        .filter(|(_, count)| **count == 0)
+        .map(|(at, _)| Reverse(at))
+        .collect();
+    let mut groups = Vec::new();
+    while let Some(Reverse(at)) = ready.pop() {
+        let members = &components[at];
+        groups.push(Group {
+            members: members.iter().map(|member| symbols[*member]).collect(),
+            recursive: members.len() > 1 || edges[members[0]].contains(&members[0]),
+        });
+        for &consumer in &consumers[at] {
+            pending[consumer] -= 1;
+            if pending[consumer] == 0 {
+                ready.push(Reverse(consumer));
+            }
+        }
+    }
+    groups
 }
 
 /// Every definition a value names, at any depth, in the order it names them. A
@@ -7798,74 +7906,70 @@ fn grouping(terms: &IndexMap<Symbol, Decl<Term>>) -> Vec<Group> {
 /// [`mentioned`] about terms, down to what it is for — the edges of the graph
 /// [`grouping`] closes.
 pub(crate) fn references(term: &Term, out: &mut Vec<Symbol>) {
-    match &term.kind {
-        TermKind::Ident(symbol) => out.push(*symbol),
-        TermKind::Unary { value, .. } => references(value, out),
-        TermKind::Binary { left, right, .. } => {
-            references(left, out);
-            references(right, out);
+    for term in term.walk() {
+        if let TermKind::Ident(symbol) = term.kind {
+            out.push(symbol);
         }
-        TermKind::Apply { func, arg } => {
-            references(func, out);
-            references(arg, out);
-        }
-        // The binder names nothing here; only the body can name anything, and
-        // a use of the binder inside it is a symbol this walk pushes and
-        // [`grouping`] then drops, since it is in no definition table.
-        TermKind::Fn { body, .. } => references(body, out),
-        // Both halves, and no filtering of its own: the name a nested `let`
-        // binds is a local, so a use of it is pushed here and dropped by
-        // [`grouping`] along with a lambda argument's, and a top-level name
-        // mentioned from inside one still lands in the right group.
-        TermKind::Let { value, body, .. } => {
-            references(value, out);
-            references(body, out);
-        }
-        TermKind::Struct { fields, spread } => {
-            for field in fields.values() {
-                references(&field.value, out);
+    }
+}
+
+impl Term {
+    /// Preorder over expression nodes, using an explicit continuation stack.
+    pub fn walk(&self) -> impl Iterator<Item = &Term> {
+        let mut work = vec![self];
+        std::iter::from_fn(move || {
+            let term = work.pop()?;
+            match &term.kind {
+                TermKind::Unary { value, .. } | TermKind::Raise(value) => work.push(value),
+                TermKind::Binary { left, right, .. } => {
+                    work.push(right);
+                    work.push(left);
+                }
+                TermKind::Apply { func, arg } => {
+                    work.push(arg);
+                    work.push(func);
+                }
+                TermKind::Fn { body, .. } => work.push(body),
+                TermKind::Let { value, body, .. } => {
+                    work.push(body);
+                    work.push(value);
+                }
+                TermKind::Struct { fields, spread } => {
+                    if let Some(spread) = spread {
+                        work.push(&spread.value);
+                    }
+                    work.extend(fields.values().rev().map(|field| &field.value));
+                }
+                TermKind::Array(items) => work.extend(items.iter().rev().map(|item| &item.value)),
+                TermKind::Tag { payload, .. } => {
+                    if let Some(payload) = payload {
+                        work.push(payload);
+                    }
+                }
+                TermKind::Project { base, .. } => work.push(base),
+                TermKind::Match { scrutinee, arms } => {
+                    work.extend(arms.iter().rev().map(|(_, body)| body));
+                    work.push(scrutinee);
+                }
+                TermKind::Handle { body, handler } => {
+                    if let Some(ret) = &handler.ret {
+                        work.push(&ret.body);
+                    }
+                    work.extend(handler.arms.iter().rev().map(|arm| &arm.body));
+                    work.push(body);
+                }
+                TermKind::Operation { .. }
+                | TermKind::Ident(_)
+                | TermKind::Natural(_)
+                | TermKind::Fixed(_)
+                | TermKind::Integer(_)
+                | TermKind::Real(_)
+                | TermKind::String(_)
+                | TermKind::Boolean(_)
+                | TermKind::Error => {}
             }
-            if let Some(spread) = spread {
-                references(&spread.value, out);
-            }
-        }
-        TermKind::Array(items) => {
-            for item in items {
-                references(&item.value, out);
-            }
-        }
-        TermKind::Tag { payload, .. } => {
-            if let Some(payload) = payload {
-                references(payload, out);
-            }
-        }
-        TermKind::Project { base, .. } => references(base, out),
-        TermKind::Match { scrutinee, arms } => {
-            references(scrutinee, out);
-            for (_, body) in arms {
-                references(body, out);
-            }
-        }
-        TermKind::Handle { body, handler } => {
-            references(body, out);
-            for arm in &handler.arms {
-                references(&arm.body, out);
-            }
-            if let Some(ret) = &handler.ret {
-                references(&ret.body, out);
-            }
-        }
-        TermKind::Raise(value) => references(value, out),
-        // An operation names an effect, which is no definition and so no node
-        // of the graph a group is read off.
-        TermKind::Operation { .. }
-        | TermKind::Natural(_)
-        | TermKind::Fixed(_)
-        | TermKind::Integer(_)
-        | TermKind::Real(_)
-        | TermKind::String(_)
-        | TermKind::Boolean(_)
-        | TermKind::Error => {}
+            Some(term)
+        })
     }
 }
 
@@ -8685,7 +8789,7 @@ fn row_summaries(
         FinishNamed(Symbol),
         Semantic(&'a Ty),
         Artifact(&'a Type),
-        SemanticApply(&'a [Rc<Ty>]),
+        SemanticApply(&'a [Arc<Ty>]),
         ArtifactApply(&'a [Type]),
         FinishApply {
             shaped: bool,
@@ -9065,12 +9169,12 @@ fn growing(types: &IndexMap<Symbol, Decl<Type>>) -> Vec<(Symbol, Anchor)> {
     // one at all; everything mutually reachable with it is in the same one, and
     // shares the answer — so the members are collected from the first of them
     // reached and handed to the rest, and a declaration on no loop has no entry.
-    let mut groups: HashMap<Symbol, Rc<[Symbol]>> = HashMap::new();
+    let mut groups: HashMap<Symbol, Arc<[Symbol]>> = HashMap::new();
     for (symbol, reaches) in &reachable {
         if groups.contains_key(symbol) || !reaches.contains(symbol) {
             continue;
         }
-        let group: Rc<[Symbol]> = reaches
+        let group: Arc<[Symbol]> = reaches
             .iter()
             .copied()
             .filter(|other| {
@@ -9562,8 +9666,17 @@ impl Builder<'_> {
                         };
                         flat.modules.push((module, declaration));
                     }
+                    let body = body.unwrap_or_default();
+                    // Spliced file modules have children in another file. Their
+                    // lexical scope covers that whole file, including recovery
+                    // gaps after its last successfully parsed declaration.
+                    let scope = body
+                        .first()
+                        .filter(|child| child.span.file_id != stmt.span.file_id)
+                        .map_or(stmt.span, |child| child.span.file_id.span(0, usize::MAX));
+                    self.module_scopes.push((scope, module));
                     self.module = Some(module);
-                    self.flatten(body.unwrap_or_default(), flat);
+                    self.flatten(body, flat);
                     self.module = outer;
                 }
             }
@@ -9696,8 +9809,8 @@ impl Builder<'_> {
     /// resolver.
     fn import_dependencies(
         &mut self,
-        dependencies: &[DependencyImport<'_>],
-        linked: &[&artifact::Artifact],
+        dependencies: &[InterfaceImport<'_>],
+        linked: &[&artifact::Header],
         program: &mut Program,
     ) {
         let mut symbols: HashMap<(Namespace, String), Symbol> = HashMap::new();
@@ -9706,10 +9819,10 @@ impl Builder<'_> {
         let mut valid = Vec::with_capacity(dependencies.len());
         for import in dependencies {
             let identity = (
-                import.artifact.header().identity.name.clone(),
-                import.artifact.header().identity.version.clone(),
+                import.header.identity.name.clone(),
+                import.header.identity.version.clone(),
             );
-            if import.artifact.header().kind == artifact::Kind::Executable {
+            if import.header.kind == artifact::Kind::Executable {
                 self.errors.push(Error {
                     at: Anchor::GENERATED,
                     kind: ErrorKind::ExecutableDependency {
@@ -9727,8 +9840,8 @@ impl Builder<'_> {
                 self.errors.push(Error {
                     at: Anchor::GENERATED,
                     kind: ErrorKind::DuplicateDependency {
-                        name: import.artifact.header().identity.name.clone(),
-                        version: import.artifact.header().identity.version.clone(),
+                        name: import.header.identity.name.clone(),
+                        version: import.header.identity.version.clone(),
                     },
                 });
             } else if aliases.contains(import.alias) {
@@ -9753,9 +9866,9 @@ impl Builder<'_> {
         for dependency in linked
             .iter()
             .copied()
-            .chain(valid.iter().map(|import| import.artifact))
+            .chain(valid.iter().map(|import| import.header))
         {
-            for declaration in &dependency.header().effects {
+            for declaration in &dependency.effects {
                 if dependency_path(dependency, &declaration.name).is_none() {
                     continue;
                 }
@@ -9799,7 +9912,7 @@ impl Builder<'_> {
                 );
                 effect_rows.insert_identity(&declaration.name, identity);
             }
-            for declaration in &dependency.header().types {
+            for declaration in &dependency.types {
                 if dependency_path(dependency, &declaration.name).is_none() {
                     continue;
                 }
@@ -9816,23 +9929,20 @@ impl Builder<'_> {
         for dependency in linked
             .iter()
             .copied()
-            .chain(valid.iter().map(|import| import.artifact))
+            .chain(valid.iter().map(|import| import.header))
         {
             for (namespace, qualified) in dependency
-                .header
                 .values
                 .iter()
                 .map(|value| (Namespace::Terms, &value.name))
                 .chain(
                     dependency
-                        .header
                         .types
                         .iter()
                         .map(|value| (Namespace::Types, &value.name)),
                 )
                 .chain(
                     dependency
-                        .header
                         .effects
                         .iter()
                         .map(|value| (Namespace::Effects, &value.name)),
@@ -9855,7 +9965,7 @@ impl Builder<'_> {
         // refer forward, sideways, or through a transitive implementation
         // dependency, so conversion happens in the second pass.
         for import in &valid {
-            let dependency = import.artifact;
+            let dependency = import.header;
             let root_name = import.alias;
             // Valid dependency aliases are unique, and imports are installed
             // before source modules are flattened, so this root is necessarily
@@ -9867,13 +9977,11 @@ impl Builder<'_> {
             self.modules
                 .insert((None, root_name.to_string()), (root, Span::default()));
             for (namespace, qualified) in dependency
-                .header
                 .values
                 .iter()
                 .map(|value| (Namespace::Terms, &value.name))
                 .chain(
                     dependency
-                        .header
                         .types
                         .iter()
                         .filter(|value| value.exported)
@@ -9881,7 +9989,6 @@ impl Builder<'_> {
                 )
                 .chain(
                     dependency
-                        .header
                         .effects
                         .iter()
                         .filter(|value| value.exported)
@@ -9925,9 +10032,9 @@ impl Builder<'_> {
         for dependency in linked
             .iter()
             .copied()
-            .chain(valid.iter().map(|import| import.artifact))
+            .chain(valid.iter().map(|import| import.header))
         {
-            for value in &dependency.header().values {
+            for value in &dependency.values {
                 let Some(&symbol) = symbols.get(&(Namespace::Terms, value.name.clone())) else {
                     continue;
                 };
@@ -9940,7 +10047,7 @@ impl Builder<'_> {
                 );
                 program.external_schemes.insert(symbol, scheme);
             }
-            for declaration in &dependency.header().types {
+            for declaration in &dependency.types {
                 let Some(&symbol) = symbols.get(&(Namespace::Types, declaration.name.clone()))
                 else {
                     continue;
@@ -9997,7 +10104,7 @@ impl Builder<'_> {
                     },
                 );
             }
-            for declaration in &dependency.header().effects {
+            for declaration in &dependency.effects {
                 let Some(&symbol) = symbols.get(&(Namespace::Effects, declaration.name.clone()))
                 else {
                     continue;
@@ -10232,7 +10339,7 @@ impl Builder<'_> {
                 ExternalType {
                     params: Vec::new(),
                     relevant: Vec::new(),
-                    scheme: Scheme::new(0, Rc::new(Ty::default())),
+                    scheme: Scheme::new(0, Arc::new(Ty::default())),
                     unresolved: program.external_names.get(&symbol).cloned(),
                 },
             );
@@ -11694,6 +11801,7 @@ impl Builder<'_> {
     /// guarantees every function binds at least one argument, so the fold is
     /// never empty.
     fn term(&mut self, expr: Expr) -> Term {
+        crate::cancellation::checkpoint();
         let span = expr.span;
         match expr.tracked {
             // `()` is the empty struct rather than a form of its own, so it is

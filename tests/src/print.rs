@@ -1,6 +1,6 @@
 //! Tests for [`ruddy_debug::print`].
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use indexmap::IndexMap;
 use ruddy::{
@@ -163,14 +163,14 @@ fn canonical_tuple_fields_are_exact_and_insertion_order_independent() {
                 "1".to_string(),
                 RowField {
                     presence: Presence::Present,
-                    ty: Rc::new(Ty::String),
+                    ty: Arc::new(Ty::String),
                 },
             ),
             (
                 "0".to_string(),
                 RowField {
                     presence: Presence::Present,
-                    ty: Rc::new(Ty::Nat),
+                    ty: Arc::new(Ty::Nat),
                 },
             ),
         ]),
@@ -866,22 +866,22 @@ fn a_scheme_declares_the_letters_it_quantifies() {
         "A".to_string(),
         RowField {
             presence: Presence::Bound(0),
-            ty: Rc::new(Ty::plain(Ty::Bound(1))),
+            ty: Arc::new(Ty::plain(Ty::Bound(1))),
         },
     )]
     .into_iter()
     .collect();
-    let body = Rc::new(Ty::plain(Ty::pure(
-        Rc::new(Ty::Struct(Row {
+    let body = Arc::new(Ty::plain(Ty::pure(
+        Arc::new(Ty::Struct(Row {
             labels: [(
                 "x".to_string(),
-                RowField::present(Rc::new(Ty::plain(Ty::Bound(1)))),
+                RowField::present(Arc::new(Ty::plain(Ty::Bound(1)))),
             )]
             .into_iter()
             .collect(),
             rest: Rest::Bound(2),
         })),
-        Rc::new(Ty::plain(Ty::Sum(Row {
+        Arc::new(Ty::plain(Ty::Sum(Row {
             labels: cases,
             rest: Rest::Bound(3),
         }))),
@@ -897,20 +897,20 @@ fn a_scheme_declares_the_letters_it_quantifies() {
     let both = Scheme::constrained(
         2,
         2,
-        Rc::new(Ty::Struct(Row {
+        Arc::new(Ty::Struct(Row {
             labels: [
                 (
                     "x".to_string(),
                     RowField {
                         presence: Presence::Bound(0),
-                        ty: Rc::new(Ty::plain(Ty::Nat)),
+                        ty: Arc::new(Ty::plain(Ty::Nat)),
                     },
                 ),
                 (
                     "y".to_string(),
                     RowField {
                         presence: Presence::Bound(1),
-                        ty: Rc::new(Ty::plain(Ty::Nat)),
+                        ty: Arc::new(Ty::plain(Ty::Nat)),
                     },
                 ),
             ]
@@ -928,19 +928,19 @@ fn a_scheme_declares_the_letters_it_quantifies() {
     // A scheme requiring something of a presence it does not itself quantify
     // writes the clause and no `let`: there are no letters to declare, and the
     // formula is still what the scheme requires.
-    let free = Scheme::constrained(0, 0, Rc::new(Ty::plain(Ty::Nat)), Formula::var(3));
+    let free = Scheme::constrained(0, 0, Arc::new(Ty::plain(Ty::Nat)), Formula::var(3));
     assert_eq!(free.to_string(), "Nat where ?3");
 
     // A scheme quantifying nothing and requiring nothing writes no `where` at
     // all, which is every scheme in a monomorphic program.
-    let plain = Scheme::new(0, Rc::new(Ty::plain(Ty::Nat)));
+    let plain = Scheme::new(0, Arc::new(Ty::plain(Ty::Nat)));
     assert_eq!(plain.to_string(), "Nat");
 
     // A rigid prints as the name its `where 'let` gave it, in either sort.
-    let rigid = Rc::new(Ty::Struct(Row {
+    let rigid = Arc::new(Ty::Struct(Row {
         labels: [(
             "x".to_string(),
-            RowField::present(Rc::new(Ty::plain(Ty::Rigid {
+            RowField::present(Arc::new(Ty::plain(Ty::Rigid {
                 id: 1,
                 name: "a".into(),
             }))),
@@ -956,12 +956,12 @@ fn a_scheme_declares_the_letters_it_quantifies() {
 
     // And a solver variable is unchanged: `?3` for a type or a rest, `?3` in a
     // `when` for a presence, a bare `?` for the undecided.
-    let solver = Rc::new(Ty::Struct(Row {
+    let solver = Arc::new(Ty::Struct(Row {
         labels: [(
             "x".to_string(),
             RowField {
                 presence: Presence::Var(4),
-                ty: Rc::new(Ty::default()),
+                ty: Arc::new(Ty::default()),
             },
         )]
         .into_iter()

@@ -123,7 +123,7 @@ pub fn model(formula: &Formula) -> Option<HashMap<Atom, bool>> {
     encoding.solver.add_clause(&[top]);
     let solved = encoding
         .solver
-        .solve()
+        .solve_with(crate::cancellation::checkpoint)
         .expect("the solver is handed a finite formula and no assumptions");
     if !solved {
         return None;
@@ -588,7 +588,7 @@ impl Incremental {
     pub fn satisfiable(&mut self, assumptions: &[Lit]) -> bool {
         self.solver.assume(assumptions);
         self.solver
-            .solve()
+            .solve_with(crate::cancellation::checkpoint)
             .expect("the solver is handed finite clauses and assumptions")
     }
 
@@ -604,6 +604,7 @@ impl Incremental {
         let mut work = vec![Work::Formula(formula)];
         let mut values = Vec::new();
         while let Some(part) = work.pop() {
+            crate::cancellation::checkpoint();
             match part {
                 Work::Formula(Formula::True) => {
                     let lit = self.fresh();

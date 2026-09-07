@@ -1,6 +1,6 @@
 //! Tests for [`ruddy::types`].
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use indexmap::IndexMap;
 use ruddy::symbol::{Bundle, Mint, Namespace, Version};
@@ -40,10 +40,10 @@ fn effect_row_keys_are_unambiguous_and_read_legacy_artifacts() {
     assert_eq!(EffectId::parse_row_key("ordinary"), None);
 }
 
-fn semantic_name(symbol: ruddy::symbol::Symbol, ty: Rc<Ty>) -> Rc<Ty> {
-    Rc::new(Ty::Named {
+fn semantic_name(symbol: ruddy::symbol::Symbol, ty: Arc<Ty>) -> Arc<Ty> {
+    Arc::new(Ty::Named {
         symbol,
-        name: Rc::from("Layer"),
+        name: Arc::from("Layer"),
         args: vec![ty].into(),
     })
 }
@@ -55,7 +55,7 @@ fn opening_scrubs_imported_recovery_presences_before_solving() {
             "x".into(),
             RowField {
                 presence: Presence::Recovered(u32::MAX),
-                ty: Rc::new(Ty::Nat),
+                ty: Arc::new(Ty::Nat),
             },
         )]
         .into_iter()
@@ -71,7 +71,7 @@ fn opening_scrubs_imported_recovery_presences_before_solving() {
 
 #[test]
 fn finite_semantic_syntax_equality_compares_every_identity_and_position() {
-    let ty = |ty| Rc::new(ty);
+    let ty = |ty| Arc::new(ty);
     let same = |left, right| same_finite_syntax(&ty(left), &ty(right));
 
     for primitive in [Ty::Nat, Ty::Int, Ty::Real, Ty::String, Ty::Boolean] {
@@ -86,21 +86,21 @@ fn finite_semantic_syntax_equality_compares_every_identity_and_position() {
     assert!(same(
         Ty::Rigid {
             id: 1,
-            name: Rc::from("left"),
+            name: Arc::from("left"),
         },
         Ty::Rigid {
             id: 1,
-            name: Rc::from("right"),
+            name: Arc::from("right"),
         },
     ));
     assert!(!same(
         Ty::Rigid {
             id: 1,
-            name: Rc::from("a"),
+            name: Arc::from("a"),
         },
         Ty::Rigid {
             id: 2,
-            name: Rc::from("a"),
+            name: Arc::from("a"),
         },
     ));
 
@@ -146,22 +146,22 @@ fn finite_semantic_syntax_equality_compares_every_identity_and_position() {
         (
             Rest::Rigid {
                 id: 1,
-                name: Rc::from("left"),
+                name: Arc::from("left"),
             },
             Rest::Rigid {
                 id: 1,
-                name: Rc::from("right"),
+                name: Arc::from("right"),
             },
             true,
         ),
         (
             Rest::Rigid {
                 id: 1,
-                name: Rc::from("a"),
+                name: Arc::from("a"),
             },
             Rest::Rigid {
                 id: 2,
-                name: Rc::from("a"),
+                name: Arc::from("a"),
             },
             false,
         ),
@@ -173,10 +173,10 @@ fn finite_semantic_syntax_equality_compares_every_identity_and_position() {
         );
     }
     assert!(same(
-        Ty::Struct(Row::of(Rest::More(Rc::new(Row::closed())))),
-        Ty::Struct(Row::of(Rest::More(Rc::new(Row::closed())))),
+        Ty::Struct(Row::of(Rest::More(Arc::new(Row::closed())))),
+        Ty::Struct(Row::of(Rest::More(Arc::new(Row::closed())))),
     ));
-    let shared_row = Rc::new(row(Presence::Present, Rest::Closed));
+    let shared_row = Arc::new(row(Presence::Present, Rest::Closed));
     assert!(same(
         Ty::Struct(Row::of(Rest::More(shared_row.clone()))),
         Ty::Struct(Row::of(Rest::More(shared_row))),
@@ -232,9 +232,9 @@ fn finite_semantic_syntax_equality_compares_every_identity_and_position() {
     let right_symbol = mint
         .global(None, Namespace::Types, "Right")
         .expect("fresh symbol");
-    let named = |symbol, name: &str, args: Vec<Rc<Ty>>| Ty::Named {
+    let named = |symbol, name: &str, args: Vec<Arc<Ty>>| Ty::Named {
         symbol,
-        name: Rc::from(name),
+        name: Arc::from(name),
         args: args.into(),
     };
     assert!(same(
@@ -260,9 +260,9 @@ fn finite_semantic_syntax_equality_compares_every_identity_and_position() {
 
 #[test]
 fn finite_semantic_syntax_equality_memoizes_independent_shared_dags() {
-    fn binary_dag(mut leaf: Rc<Ty>, depth: usize) -> Rc<Ty> {
+    fn binary_dag(mut leaf: Arc<Ty>, depth: usize) -> Arc<Ty> {
         for _ in 0..depth {
-            leaf = Rc::new(Ty::Arrow(leaf.clone(), leaf, Row::closed()));
+            leaf = Arc::new(Ty::Arrow(leaf.clone(), leaf, Row::closed()));
         }
         leaf
     }
@@ -270,20 +270,20 @@ fn finite_semantic_syntax_equality_memoizes_independent_shared_dags() {
     // These have 41 independently allocated nodes apiece but 2^40 unfolded
     // paths. Pair memoization must compare the shared presentations, not every
     // path through their infinite-tree interpretation.
-    let left = binary_dag(Rc::new(Ty::Nat), 40);
-    let right = binary_dag(Rc::new(Ty::Nat), 40);
+    let left = binary_dag(Arc::new(Ty::Nat), 40);
+    let right = binary_dag(Arc::new(Ty::Nat), 40);
     assert!(same_finite_syntax(&left, &right));
 
-    let different = binary_dag(Rc::new(Ty::Int), 40);
+    let different = binary_dag(Arc::new(Ty::Int), 40);
     assert!(!same_finite_syntax(&left, &different));
 
     // Distinct type wrappers can also converge on one shared `Rest::More`
     // pair, so row pairs need the same memoization as type pairs.
-    let left_row = Rc::new(Row::closed());
-    let right_row = Rc::new(Row::closed());
-    let wrap = |row: &Rc<Row>| Rc::new(Ty::Struct(Row::of(Rest::More(row.clone()))));
-    let left = Rc::new(Ty::pure(wrap(&left_row), wrap(&left_row)));
-    let right = Rc::new(Ty::pure(wrap(&right_row), wrap(&right_row)));
+    let left_row = Arc::new(Row::closed());
+    let right_row = Arc::new(Row::closed());
+    let wrap = |row: &Arc<Row>| Arc::new(Ty::Struct(Row::of(Rest::More(row.clone()))));
+    let left = Arc::new(Ty::pure(wrap(&left_row), wrap(&left_row)));
+    let right = Arc::new(Ty::pure(wrap(&right_row), wrap(&right_row)));
     assert!(same_finite_syntax(&left, &right));
 }
 
@@ -365,7 +365,7 @@ fn each_empty_type_has_one_constructor() {
 #[test]
 fn only_struct_types_carry_fields() {
     let ty = Ty::Struct(Row {
-        labels: [("x".to_string(), RowField::present(Rc::new(Ty::unit())))]
+        labels: [("x".to_string(), RowField::present(Arc::new(Ty::unit())))]
             .into_iter()
             .collect(),
         rest: Rest::Var(3),
@@ -380,7 +380,7 @@ fn only_struct_types_carry_fields() {
 #[test]
 fn a_row_is_reachable_only_through_a_sum() {
     let cases = Row {
-        labels: [("A".to_string(), RowField::present(Rc::new(Ty::unit())))]
+        labels: [("A".to_string(), RowField::present(Arc::new(Ty::unit())))]
             .into_iter()
             .collect(),
         rest: Rest::Var(2),
@@ -404,9 +404,9 @@ fn a_row_is_reachable_only_through_a_sum() {
 /// rather than with a rule for something nobody can write.
 #[test]
 fn an_assigned_value_reads_as_the_sort_its_position_asks_for() {
-    let nat = Assigned::Ty(Rc::new(Ty::plain(Ty::Nat)));
-    let row = Assigned::Row(Rc::new(Row {
-        labels: [("x".to_string(), RowField::present(Rc::new(Ty::unit())))]
+    let nat = Assigned::Ty(Arc::new(Ty::plain(Ty::Nat)));
+    let row = Assigned::Row(Arc::new(Row {
+        labels: [("x".to_string(), RowField::present(Arc::new(Ty::unit())))]
             .into_iter()
             .collect(),
         rest: Rest::Closed,
@@ -421,10 +421,10 @@ fn an_assigned_value_reads_as_the_sort_its_position_asks_for() {
     // A type at a row or a presence position is read for what it carries: the
     // cases it allows, and — for a bare variable, which is what instantiating a
     // scheme hands over — the variable itself.
-    let fresh = Assigned::Ty(Rc::new(Ty::plain(Ty::Var(7))));
+    let fresh = Assigned::Ty(Arc::new(Ty::plain(Ty::Var(7))));
     assert!(matches!(fresh.as_row().rest, Rest::Var(7)));
-    let structure = Assigned::Ty(Rc::new(Ty::Struct(Row::closed())));
-    let sum = Assigned::Ty(Rc::new(Ty::Sum(Row::closed())));
+    let structure = Assigned::Ty(Arc::new(Ty::Struct(Row::closed())));
+    let sum = Assigned::Ty(Arc::new(Ty::Sum(Row::closed())));
     assert!(matches!(structure.as_row().rest, Rest::Closed));
     assert!(matches!(sum.as_row().rest, Rest::Closed));
     assert!(matches!(nat.as_row().rest, Rest::Undecided));
@@ -443,8 +443,8 @@ fn an_assigned_value_reads_as_the_sort_its_position_asks_for() {
 #[test]
 fn a_value_can_name_a_variable_and_a_nothing_of_its_own_sort() {
     let cases = [
-        Assigned::Ty(Rc::new(Ty::plain(Ty::Nat))),
-        Assigned::Row(Rc::new(Row::closed())),
+        Assigned::Ty(Arc::new(Ty::plain(Ty::Nat))),
+        Assigned::Row(Arc::new(Row::closed())),
         Assigned::Presence(Presence::Present),
     ];
     for value in &cases {
@@ -503,7 +503,7 @@ fn a_parameter_says_what_an_argument_has_to_be() {
 /// one case — cannot disagree about what "there" is.
 #[test]
 fn a_written_label_is_present() {
-    let field = RowField::present(Rc::new(Ty::plain(Ty::Nat)));
+    let field = RowField::present(Arc::new(Ty::plain(Ty::Nat)));
     assert!(matches!(field.presence, Presence::Present));
     assert_eq!(field.ty.to_string(), "Nat");
 }
@@ -600,9 +600,9 @@ fn deep_formula_opening_and_use_site_walks_are_stack_safe() {
             let mut formula = Formula::bound(0);
             for depth in 0..30_000 {
                 formula = match depth % 3 {
-                    0 => Formula::Not(Rc::new(formula)),
-                    1 => Formula::And(Rc::new(formula), Rc::new(Formula::bound(1))),
-                    _ => Formula::Or(Rc::new(Formula::bound(1)), Rc::new(formula)),
+                    0 => Formula::Not(Arc::new(formula)),
+                    1 => Formula::And(Arc::new(formula), Arc::new(Formula::bound(1))),
+                    _ => Formula::Or(Arc::new(Formula::bound(1)), Arc::new(formula)),
                 };
             }
             let opened = formula.open(&[
@@ -646,12 +646,12 @@ fn deep_semantic_type_and_scheme_display_are_stack_safe() {
             let layer = mint
                 .global(None, Namespace::Types, "Layer")
                 .expect("a semantic name");
-            let mut ty = Rc::new(Ty::Nat);
+            let mut ty = Arc::new(Ty::Nat);
             for depth in 0..30_000 {
                 ty = match depth % 3 {
                     0 => semantic_name(layer, ty),
-                    1 => Rc::new(Ty::Arrow(Rc::new(Ty::Nat), ty, Row::closed())),
-                    _ => Rc::new(Ty::Struct(Row {
+                    1 => Arc::new(Ty::Arrow(Arc::new(Ty::Nat), ty, Row::closed())),
+                    _ => Arc::new(Ty::Struct(Row {
                         labels: [(
                             "payload".into(),
                             RowField {
@@ -683,31 +683,31 @@ fn deep_package_formatting_and_structural_accessors_are_stack_safe() {
         .spawn(|| {
             const DEPTH: usize = 30_000;
 
-            let mut record = Rc::new(Ty::Struct(Row {
-                labels: [("marker".into(), RowField::present(Rc::new(Ty::Nat)))]
+            let mut record = Arc::new(Ty::Struct(Row {
+                labels: [("marker".into(), RowField::present(Arc::new(Ty::Nat)))]
                     .into_iter()
                     .collect(),
                 rest: Rest::Closed,
             }));
             for _ in 0..DEPTH {
-                record = Rc::new(Ty::Package(record));
+                record = Arc::new(Ty::Package(record));
             }
 
             // Formatting an arrow asks its input for its precedence before the
             // explicit formatter consumes it. Both that query and the package
             // jobs themselves must remain on the heap work list.
-            let arrow = Ty::pure(record.clone(), Rc::new(Ty::Nat));
+            let arrow = Ty::pure(record.clone(), Arc::new(Ty::Nat));
             assert_eq!(arrow.to_string(), "{ marker: Nat } -> Nat");
             assert!(record.fields().unwrap().labels.contains_key("marker"));
 
-            let mut sum = Rc::new(Ty::Sum(Row {
-                labels: [("Only".into(), RowField::present(Rc::new(Ty::unit())))]
+            let mut sum = Arc::new(Ty::Sum(Row {
+                labels: [("Only".into(), RowField::present(Arc::new(Ty::unit())))]
                     .into_iter()
                     .collect(),
                 rest: Rest::Closed,
             }));
             for _ in 0..DEPTH {
-                sum = Rc::new(Ty::Package(sum));
+                sum = Arc::new(Ty::Package(sum));
             }
             assert!(sum.cases().labels.contains_key("Only"));
             assert_eq!(sum.to_string(), "#Only");
@@ -725,13 +725,13 @@ fn deep_formula_display_and_simplifying_destruction_are_stack_safe() {
         .spawn(|| {
             let mut formula = Formula::var(0);
             for _ in 0..30_000 {
-                formula = Formula::Not(Rc::new(formula));
+                formula = Formula::Not(Arc::new(formula));
             }
             let printed = formula.to_string();
             assert!(printed.starts_with("not not not "));
             assert!(printed.ends_with("?0"));
 
-            // Folding this conjunction discards the entire unique Rc chain.
+            // Folding this conjunction discards the entire unique Arc chain.
             // Its release is part of substitution/constructor semantics and
             // must use the heap worklist rather than recursive Drop.
             assert_eq!(Formula::False.and(formula), Formula::False);
@@ -762,19 +762,19 @@ fn standalone_deep_row_destruction_is_stack_safe_for_shared_semantic_dags() {
         .spawn(|| {
             const DEPTH: usize = 30_000;
 
-            let mut shared = Rc::new(Row::closed());
-            let bottom = Rc::downgrade(&shared);
+            let mut shared = Arc::new(Row::closed());
+            let bottom = Arc::downgrade(&shared);
             for _ in 0..DEPTH {
-                shared = Rc::new(Row::of(Rest::More(shared)));
+                shared = Arc::new(Row::of(Rest::More(shared)));
             }
-            let top = Rc::downgrade(&shared);
+            let top = Arc::downgrade(&shared);
 
             // The root reaches the same row chain directly and through a type
             // shared by two labels. Dropping one work-list edge must not steal
             // the other edge, while dropping the final edge must reclaim the
             // whole chain without recursing through Rest::More.
-            let payload = Rc::new(Ty::Struct(Row::of(Rest::More(shared.clone()))));
-            let payload_weak = Rc::downgrade(&payload);
+            let payload = Arc::new(Ty::Struct(Row::of(Rest::More(shared.clone()))));
+            let payload_weak = Arc::downgrade(&payload);
             let root = Row {
                 labels: [
                     ("left".into(), RowField::present(payload.clone())),
@@ -811,16 +811,16 @@ fn deep_type_opening_is_stack_safe_for_every_nested_semantic_position() {
             let symbol = mint
                 .global(None, Namespace::Types, "Layer")
                 .expect("a type symbol");
-            let mut ty = Rc::new(Ty::Bound(0));
+            let mut ty = Arc::new(Ty::Bound(0));
             for depth in 0..30_000 {
                 ty = match depth % 3 {
-                    0 => Rc::new(Ty::Arrow(Rc::new(Ty::Nat), ty, Row::closed())),
-                    1 => Rc::new(Ty::Named {
+                    0 => Arc::new(Ty::Arrow(Arc::new(Ty::Nat), ty, Row::closed())),
+                    1 => Arc::new(Ty::Named {
                         symbol,
-                        name: Rc::from("Layer"),
+                        name: Arc::from("Layer"),
                         args: vec![ty].into(),
                     }),
-                    _ => Rc::new(Ty::Struct(Row {
+                    _ => Arc::new(Ty::Struct(Row {
                         labels: [("payload".into(), RowField::present(ty))]
                             .into_iter()
                             .collect(),
@@ -828,15 +828,15 @@ fn deep_type_opening_is_stack_safe_for_every_nested_semantic_position() {
                     })),
                 };
             }
-            let opened = ty.open(&[Assigned::Ty(Rc::new(Ty::Nat))]);
+            let opened = ty.open(&[Assigned::Ty(Arc::new(Ty::Nat))]);
             assert!(matches!(&*opened, Ty::Struct(_)));
 
             let mut row = Row::of(Rest::Bound(0));
             for _ in 0..30_000 {
-                row = Row::of(Rest::More(Rc::new(row)));
+                row = Row::of(Rest::More(Arc::new(row)));
             }
             let row_ty = Ty::Struct(row);
-            let opened_row = row_ty.open(&[Assigned::Ty(Rc::new(Ty::unit()))]);
+            let opened_row = row_ty.open(&[Assigned::Ty(Arc::new(Ty::unit()))]);
             assert!(matches!(&*opened_row, Ty::Struct(_)));
         })
         .expect("the bounded-stack regression thread starts")
@@ -850,7 +850,7 @@ fn deep_type_opening_is_stack_safe_for_every_nested_semantic_position() {
 /// the printer writes as nothing at all.
 #[test]
 fn an_arrow_carries_the_effects_calling_it_may_perform() {
-    let nat = || Rc::new(Ty::plain(Ty::Nat));
+    let nat = || Arc::new(Ty::plain(Ty::Nat));
     // The constructor every position with no effects to put on an arrow goes
     // through, so the empty row is one value rather than six literals.
     let pure = Ty::plain(Ty::pure(nat(), nat()));
@@ -865,7 +865,7 @@ fn an_arrow_carries_the_effects_calling_it_may_perform() {
         nat(),
         nat(),
         Row {
-            labels: [("Log".to_string(), RowField::present(Rc::new(Ty::unit())))]
+            labels: [("Log".to_string(), RowField::present(Arc::new(Ty::unit())))]
                 .into_iter()
                 .collect(),
             rest: Rest::Var(3),
@@ -909,7 +909,7 @@ fn a_parameter_may_stand_for_an_arrows_effects() {
 fn a_scheme_numbers_every_sort_in_one_space() {
     // A declaration's scheme quantifies its parameters and requires nothing, so
     // it has no presences and its count is the whole of it.
-    let body = Rc::new(Ty::plain(Ty::Bound(1)));
+    let body = Arc::new(Ty::plain(Ty::Bound(1)));
     let declaration = Scheme::new(2, body.clone());
     assert_eq!(declaration.count(), 2);
     assert_eq!(declaration.presences(), 0);
@@ -921,12 +921,12 @@ fn a_scheme_numbers_every_sort_in_one_space() {
         "x".to_string(),
         RowField {
             presence: Presence::Bound(0),
-            ty: Rc::new(Ty::plain(Ty::Bound(1))),
+            ty: Arc::new(Ty::plain(Ty::Bound(1))),
         },
     )]
     .into_iter()
     .collect();
-    let body = Rc::new(Ty::Struct(Row {
+    let body = Arc::new(Ty::Struct(Row {
         labels: fields,
         rest: Rest::Bound(2),
     }));
@@ -938,8 +938,8 @@ fn a_scheme_numbers_every_sort_in_one_space() {
     // a presence, and the rest are types.
     let fresh = [
         Assigned::Presence(Presence::Var(7)),
-        Assigned::Ty(Rc::new(Ty::plain(Ty::Nat))),
-        Assigned::Ty(Rc::new(Ty::unit())),
+        Assigned::Ty(Arc::new(Ty::plain(Ty::Nat))),
+        Assigned::Ty(Arc::new(Ty::unit())),
     ];
     let opened = scheme.body().open(&fresh);
     assert_eq!(opened.to_string(), "{ x when ?7: Nat }");
@@ -950,8 +950,8 @@ fn a_scheme_numbers_every_sort_in_one_space() {
 /// answers nothing for anything that is not one.
 #[test]
 fn the_element_accessor_looks_through_packages() {
-    let nat = Rc::new(Ty::Nat);
-    let array = Rc::new(Ty::Array(nat.clone()));
+    let nat = Arc::new(Ty::Nat);
+    let array = Arc::new(Ty::Array(nat.clone()));
     assert!(matches!(array.element(), Some(element) if matches!(**element, Ty::Nat)));
     let packaged = Ty::Package(array.clone());
     assert!(matches!(packaged.element(), Some(element) if matches!(**element, Ty::Nat)));
@@ -961,12 +961,12 @@ fn the_element_accessor_looks_through_packages() {
 
 #[test]
 fn existential_presence_ownership_descends_through_arrays() {
-    let element = Rc::new(Ty::Struct(Row {
+    let element = Arc::new(Ty::Struct(Row {
         labels: [(
             "value".to_string(),
             RowField {
                 presence: Presence::Bound(0),
-                ty: Rc::new(Ty::Nat),
+                ty: Arc::new(Ty::Nat),
             },
         )]
         .into_iter()
@@ -977,7 +977,7 @@ fn existential_presence_ownership_descends_through_arrays() {
         1,
         1,
         [0].into_iter().collect(),
-        Rc::new(Ty::Array(element)),
+        Arc::new(Ty::Array(element)),
         Formula::bound(0),
     );
     assert!(matches!(&**scheme.body(), Ty::Package(body) if matches!(&**body, Ty::Array(_))));
@@ -991,11 +991,11 @@ fn existential_presence_ownership_descends_through_arrays() {
 #[test]
 fn a_value_of_the_wrong_sort_opens_to_nothing() {
     assert_eq!(
-        Assigned::Ty(Rc::new(Ty::plain(Ty::Nat))).presence(),
+        Assigned::Ty(Arc::new(Ty::plain(Ty::Nat))).presence(),
         Presence::Undecided
     );
     assert_eq!(
-        Assigned::Row(Rc::new(Row::closed())).presence(),
+        Assigned::Row(Arc::new(Row::closed())).presence(),
         Presence::Undecided
     );
     assert_eq!(
@@ -1009,20 +1009,20 @@ fn a_value_of_the_wrong_sort_opens_to_nothing() {
 /// annotation's own variable stands for while its body is being checked.
 #[test]
 fn a_rigid_is_a_leaf_that_opening_leaves_alone() {
-    let rigid = Rc::new(Ty::plain(Ty::Rigid {
+    let rigid = Arc::new(Ty::plain(Ty::Rigid {
         id: 4,
         name: "r".into(),
     }));
-    let opened = rigid.open(&[Assigned::Ty(Rc::new(Ty::plain(Ty::Nat)))]);
+    let opened = rigid.open(&[Assigned::Ty(Arc::new(Ty::plain(Ty::Nat)))]);
     assert!(matches!(&*opened, Ty::Rigid { id: 4, .. }));
 
     // A sum's rest goes the same way, and prints as its name either side of
     // the substitution.
-    let cases = Rc::new(Ty::plain(Ty::Sum(Row::of(Rest::Rigid {
+    let cases = Arc::new(Ty::plain(Ty::Sum(Row::of(Rest::Rigid {
         id: 5,
         name: "s".into(),
     }))));
     assert_eq!(cases.to_string(), "| ..'s");
-    let opened = cases.open(&[Assigned::Ty(Rc::new(Ty::plain(Ty::Nat)))]);
+    let opened = cases.open(&[Assigned::Ty(Arc::new(Ty::plain(Ty::Nat)))]);
     assert_eq!(opened.to_string(), "| ..'s");
 }

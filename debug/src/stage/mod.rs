@@ -23,7 +23,7 @@ pub mod symbols;
 pub mod tokens;
 pub mod types;
 
-use std::{collections::HashMap, rc::Rc};
+use std::{collections::HashMap, sync::Arc};
 
 use ruddy::{
     ir::Param,
@@ -159,7 +159,7 @@ pub struct Trace {
     /// the IR stage renders them: every `type`, then every `extern` and `let`.
     pub decls: Vec<u32>,
     /// One entry per term row, with the type of the term it stands for.
-    pub terms: Vec<(u32, Rc<Ty>)>,
+    pub terms: Vec<(u32, Arc<Ty>)>,
 }
 
 /// How the type printer spells the things that are *not* concrete types: a

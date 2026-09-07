@@ -32,19 +32,16 @@ end
 
 fn project(source: &str) -> tempfile::TempDir {
     let project = tempfile::tempdir().unwrap();
-    let standard = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("std");
+    let standard = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     fs::write(
         project.path().join("Ruddy.toml"),
         format!(
-            "name = \"fs-test\"\nversion = \"0.1.0\"\nkind = \"executable\"\nroot = \"main.hc\"\ntarget = \"js\"\n\n[dependencies]\nstd = {standard:?}\n"
+            "name = \"fs-test\"\nversion = \"0.1.0\"\nkind = \"executable\"\nroot = \"main.rud\"\ntarget = \"js\"\n\n[dependencies]\nstd = {standard:?}\n"
         ),
     )
     .unwrap();
     fs::write(
-        project.path().join("main.hc"),
+        project.path().join("main.rud"),
         format!("{ASSERTIONS}\n{source}"),
     )
     .unwrap();

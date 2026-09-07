@@ -38,7 +38,7 @@
 //! scrutinee type, a verdict per arm, and the coverage — which is what the
 //! debugger's Patterns tab renders.
 
-use std::{collections::HashMap, rc::Rc};
+use std::{collections::HashMap, sync::Arc};
 
 use indexmap::IndexMap;
 
@@ -65,7 +65,7 @@ pub struct Report {
     /// The whole match's span.
     pub at: Anchor,
     /// The solved scrutinee type, zonked — what the typed checks read.
-    pub scrutinee: Rc<Ty>,
+    pub scrutinee: Arc<Ty>,
     pub scrutinee_at: Anchor,
     pub arms: Vec<Arm>,
     pub coverage: Coverage,
@@ -181,10 +181,10 @@ enum Cell {
 /// fields the value has beyond the ones the type names.
 #[derive(Clone)]
 enum Col {
-    Whole(Rc<Ty>),
+    Whole(Arc<Ty>),
     Field {
         presence: Presence,
-        ty: Rc<Ty>,
+        ty: Arc<Ty>,
     },
     /// The fields beyond the named ones. `open` says whether the solved row
     /// admits any — a row tail still free or quantified does, the fieldless unit
@@ -303,6 +303,14 @@ fn constrained_origin(origin: &Origin) -> Option<(Formula, &Covers)> {
 /// Run the checks over every match in the program. `inferred` is read for its
 /// aliases — the solved types themselves were written into the terms.
 pub fn check(program: &Program, inferred: &inference::Output) -> Output {
+    check_terms(program, inferred, false)
+}
+
+pub(crate) fn check_inferred(program: &Program, inferred: &inference::Output) -> Output {
+    check_terms(program, inferred, true)
+}
+
+fn check_terms(program: &Program, inferred: &inference::Output, only_inferred: bool) -> Output {
     let semantics = inferred.semantics();
     let mut out = Output {
         reports: Vec::new(),
@@ -329,6 +337,15 @@ pub fn check(program: &Program, inferred: &inference::Output) -> Output {
     // about them, and it is the only reading of the store the walk inside it
     // can use.
     for (definition_at, (symbol, decl)) in program.terms.iter().enumerate() {
+        let decl = if only_inferred {
+            let Some(decl) = semantics.typed().get(symbol) else {
+                continue;
+            };
+            decl
+        } else {
+            decl
+        };
+        crate::cancellation::checkpoint();
         let scope = scopes.get(symbol).copied().unwrap_or(*symbol);
         let flipped = semantics
             .store()
@@ -562,7 +579,7 @@ impl Walk {
 impl Check<'_> {
     /// A type as the checks read it: the shape behind a declared name. The
     /// types are zonked, so this needs no table — only the aliases.
-    fn shape(&self, ty: &Rc<Ty>) -> Rc<Ty> {
+    fn shape(&self, ty: &Arc<Ty>) -> Arc<Ty> {
         unfold(self.aliases, ty)
     }
 
@@ -828,7 +845,7 @@ impl Check<'_> {
         Some(effective_conditions(&raw))
     }
 
-    fn presence_at(&self, ty: &Rc<Ty>, path: &[String]) -> Option<Presence> {
+    fn presence_at(&self, ty: &Arc<Ty>, path: &[String]) -> Option<Presence> {
         let (name, below) = path.split_first()?;
         let shaped = self.shape(ty);
         let Ty::Struct(row) = &*shaped else {
@@ -966,7 +983,7 @@ impl Check<'_> {
     /// tested *field's* presence is the column rule's fresh variable, which
     /// absence can settle without a word — so an absent field is compatible,
     /// and the arm demanding it is the unreachable arm the checks report.
-    fn compatible(&self, ty: &Rc<Ty>, cell: &Cell) -> bool {
+    fn compatible(&self, ty: &Arc<Ty>, cell: &Cell) -> bool {
         let ty = self.shape(ty);
         match cell {
             Cell::Literal(Literal::Fixed(value)) => {
@@ -1077,7 +1094,7 @@ impl Check<'_> {
     fn whole(
         &self,
         rows: &[Vec<Cell>],
-        ty: &Rc<Ty>,
+        ty: &Arc<Ty>,
         later: &[Col],
         q: &[Cell],
         walk: &Walk,
@@ -1110,7 +1127,7 @@ impl Check<'_> {
     fn lengths(
         &self,
         rows: &[Vec<Cell>],
-        ty: &Rc<Ty>,
+        ty: &Arc<Ty>,
         later: &[Col],
         q: &[Cell],
         walk: &Walk,
@@ -1198,7 +1215,7 @@ impl Check<'_> {
     fn widened(
         &self,
         rows: &[Vec<Cell>],
-        ty: &Rc<Ty>,
+        ty: &Arc<Ty>,
         later: &[Col],
         q: &[Cell],
         walk: &Walk,
@@ -1207,7 +1224,7 @@ impl Check<'_> {
             ty.fields()
                 .expect("struct cells are created only for a struct-compatible column"),
         );
-        let mut named: Vec<(String, Presence, Rc<Ty>)> = struct_row
+        let mut named: Vec<(String, Presence, Arc<Ty>)> = struct_row
             .labels
             .iter()
             .map(|(name, field)| (name.clone(), field.presence.clone(), field.ty.clone()))
@@ -1219,7 +1236,7 @@ impl Check<'_> {
             if let Cell::Struct { fields, .. } = cell {
                 for (name, _) in fields {
                     if !named.iter().any(|(known, _, _)| known == name) {
-                        named.push((name.clone(), Presence::Absent, Rc::new(Ty::default())));
+                        named.push((name.clone(), Presence::Absent, Arc::new(Ty::default())));
                     }
                 }
             }
@@ -1311,7 +1328,7 @@ impl Check<'_> {
         &self,
         rows: &[Vec<Cell>],
         presence: &Presence,
-        ty: &Rc<Ty>,
+        ty: &Arc<Ty>,
         later: &[Col],
         q: &[Cell],
         walk: &Walk,
@@ -1437,7 +1454,7 @@ impl Check<'_> {
     fn shape_column(
         &self,
         rows: &[Vec<Cell>],
-        ty: &Rc<Ty>,
+        ty: &Arc<Ty>,
         later: &[Col],
         q: &[Cell],
         walk: &Walk,
@@ -1623,7 +1640,7 @@ impl Check<'_> {
                 })
                 .collect()
         };
-        let ask = |sub: &Cell, name: &str, ty: &Rc<Ty>| -> Option<Vec<Option<Witness>>> {
+        let ask = |sub: &Cell, name: &str, ty: &Arc<Ty>| -> Option<Vec<Option<Witness>>> {
             let mut cols = vec![Col::Whole(ty.clone())];
             cols.extend(later.iter().cloned());
             let mut sub_q = vec![sub.clone()];
@@ -1651,7 +1668,7 @@ impl Check<'_> {
             // universe: each case a value may be, and whatever an open rest
             // still allows.
             _ => {
-                let universe: Vec<(&String, &Rc<Ty>)> = row
+                let universe: Vec<(&String, &Arc<Ty>)> = row
                     .labels
                     .iter()
                     .filter(|(_, case)| may_be_present(&case.presence))
@@ -1789,7 +1806,7 @@ mod tests {
         let (_, mut out, mut inferred) = test_support::inferred(src, Trace::Off);
         let initial = check(&out.program, &inferred);
         assert!(initial.errors.is_empty(), "{initial:#?}");
-        corrupt_scrutinee(&mut out.program, Rc::new(Ty::Nat));
+        corrupt_scrutinee(&mut out.program, Arc::new(Ty::Nat));
         inferred
             .semantics_mut()
             .store
@@ -1810,7 +1827,7 @@ mod tests {
         assert!(initial.errors.is_empty(), "{initial:#?}");
         corrupt_scrutinee(
             &mut out.program,
-            Rc::new(Ty::Struct(Row::of(Rest::Undecided))),
+            Arc::new(Ty::Struct(Row::of(Rest::Undecided))),
         );
         inferred
             .semantics_mut()
@@ -1825,7 +1842,7 @@ mod tests {
 
     /// Replace the solved type of the sole match scrutinee in the fixtures
     /// above.
-    fn corrupt_scrutinee(program: &mut Program, ty: Rc<Ty>) {
+    fn corrupt_scrutinee(program: &mut Program, ty: Arc<Ty>) {
         let definition = program.terms.values_mut().next().unwrap();
         let TermKind::Fn { body, .. } = &mut definition.value.kind else {
             panic!("function fixture")

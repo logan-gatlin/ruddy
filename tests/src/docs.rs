@@ -22,7 +22,7 @@ fn names_are_a_single_safe_segment() {
     assert!(!valid_name("a/b"));
     assert!(!valid_name("a\\b"));
     assert!(!valid_name("../../etc/passwd"));
-    assert!(!valid_name("a.hc"));
+    assert!(!valid_name("a.rud"));
     assert!(!valid_name(&"x".repeat(65)));
 }
 
@@ -42,45 +42,45 @@ fn a_rejected_name_never_becomes_a_path() {
 /// one segment and cannot be [`valid_name`]. What it may never be is anything
 /// that could climb out of the document it is joined to.
 #[test]
-fn a_file_path_is_a_relative_hc_path_and_nothing_else() {
+fn a_file_path_is_a_relative_rud_path_and_nothing_else() {
     // The shapes a module's file really takes: beside its parent, or inside the
     // directory its parent's name spells.
-    assert!(valid_file_path("main.hc"));
-    assert!(valid_file_path("Math.hc"));
-    assert!(valid_file_path("Math/Vec.hc"));
-    assert!(valid_file_path("Math/Vec/module.hc"));
-    assert!(valid_file_path("regress-42_b.hc"));
+    assert!(valid_file_path("main.rud"));
+    assert!(valid_file_path("Math.rud"));
+    assert!(valid_file_path("Math/Vec.rud"));
+    assert!(valid_file_path("Math/Vec/module.rud"));
+    assert!(valid_file_path("regress-42_b.rud"));
 
     // Everything that could reach outside the document's directory.
     assert!(!valid_file_path(".."));
-    assert!(!valid_file_path("../main.hc"));
-    assert!(!valid_file_path("Math/../../main.hc"));
-    assert!(!valid_file_path("./main.hc"));
-    assert!(!valid_file_path("/etc/passwd.hc"));
-    assert!(!valid_file_path("/main.hc"));
-    assert!(!valid_file_path("Math//Vec.hc"));
-    assert!(!valid_file_path("Math/.hc"));
-    assert!(!valid_file_path("main.hc/"));
-    assert!(!valid_file_path("C:\\main.hc"));
+    assert!(!valid_file_path("../main.rud"));
+    assert!(!valid_file_path("Math/../../main.rud"));
+    assert!(!valid_file_path("./main.rud"));
+    assert!(!valid_file_path("/etc/passwd.rud"));
+    assert!(!valid_file_path("/main.rud"));
+    assert!(!valid_file_path("Math//Vec.rud"));
+    assert!(!valid_file_path("Math/.rud"));
+    assert!(!valid_file_path("main.rud/"));
+    assert!(!valid_file_path("C:\\main.rud"));
 
-    // A file of a bundle is a `.hc` file. Anything else in the directory is
+    // A file of a bundle is a `.rud` file. Anything else in the directory is
     // somebody's stray note, and the page has no business writing one.
     assert!(!valid_file_path(""));
     assert!(!valid_file_path("main"));
     assert!(!valid_file_path("main.rs"));
-    assert!(!valid_file_path(".hc"));
+    assert!(!valid_file_path(".rud"));
 
     // And a path long enough to be a filesystem's problem rather than a
     // module's is refused rather than truncated.
     assert!(valid_file_path(&format!(
-        "{}/{}.hc",
+        "{}/{}.rud",
         "a".repeat(62),
-        "b".repeat(62)
+        "b".repeat(61)
     )));
     assert!(!valid_file_path(&format!(
-        "{}/{}.hc",
-        "a".repeat(63),
-        "b".repeat(63)
+        "{}/{}.rud",
+        "a".repeat(62),
+        "b".repeat(62)
     )));
 }
 
@@ -91,9 +91,9 @@ fn a_file_path_is_a_relative_hc_path_and_nothing_else() {
 fn a_document_round_trips_through_the_disk() {
     let root = scratch("round-trip");
     let files = [
-        file("main.hc", "module Math\n"),
-        file("Math.hc", "module Vec\nlet double = fn x => x\n"),
-        file("Math/Vec.hc", "let zero = 0n\n"),
+        file("main.rud", "module Math\n"),
+        file("Math.rud", "module Vec\nlet double = fn x => x\n"),
+        file("Math/Vec.rud", "let zero = 0n\n"),
     ];
     let dependencies = IndexMap::from([("base".into(), "../base".into())]);
     let run = RunConfig {
@@ -104,7 +104,7 @@ fn a_document_round_trips_through_the_disk() {
         "demo",
         "configured",
         "1.2.3",
-        "main.hc",
+        "main.rud",
         &run,
         &Default::default(),
         &dependencies,
@@ -116,7 +116,7 @@ fn a_document_round_trips_through_the_disk() {
     assert_eq!(doc.name, "demo");
     assert_eq!(doc.bundle_name, "configured");
     assert_eq!(doc.version, "1.2.3");
-    assert_eq!(doc.root, "main.hc");
+    assert_eq!(doc.root, "main.rud");
     assert_eq!(doc.run, run);
     assert_eq!(doc.std, StdConfig::default());
     assert!(matches!(
@@ -132,9 +132,9 @@ fn a_document_round_trips_through_the_disk() {
     assert_eq!(
         back,
         [
-            ("main.hc", "module Math\n"),
-            ("Math.hc", "module Vec\nlet double = fn x => x\n"),
-            ("Math/Vec.hc", "let zero = 0n\n"),
+            ("main.rud", "module Math\n"),
+            ("Math.rud", "module Vec\nlet double = fn x => x\n"),
+            ("Math/Vec.rud", "let zero = 0n\n"),
         ]
     );
     assert!(doc.modified_ms > 0);
@@ -151,11 +151,11 @@ fn the_reserved_std_alias_is_never_persisted_as_a_declared_dependency() {
         "demo",
         "demo",
         "0.1.0",
-        "main.hc",
+        "main.rud",
         &RunConfig::default(),
         &StdConfig::default(),
         &dependencies,
-        &[file("main.hc", "")],
+        &[file("main.rud", "")],
     )
     .unwrap_err();
     assert_eq!(found.kind(), std::io::ErrorKind::InvalidInput);
@@ -163,10 +163,10 @@ fn the_reserved_std_alias_is_never_persisted_as_a_declared_dependency() {
     assert!(!root.join("demo").exists());
 
     std::fs::create_dir_all(root.join("demo")).unwrap();
-    std::fs::write(root.join("demo/main.hc"), "").unwrap();
+    std::fs::write(root.join("demo/main.rud"), "").unwrap();
     std::fs::write(
         root.join("demo/Ruddy.toml"),
-        "name = \"demo\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nstd = \"../standard\"\n",
+        "name = \"demo\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\nstd = \"../standard\"\n",
     )
     .unwrap();
     let found = read(&root, "demo").unwrap_err();
@@ -182,11 +182,11 @@ fn the_configured_root_is_ordered_before_other_files() {
         "demo",
         "demo",
         "0.1.0",
-        "start.hc",
+        "start.rud",
         &RunConfig::default(),
         &Default::default(),
         &IndexMap::new(),
-        &[file("main.hc", ""), file("start.hc", "")],
+        &[file("main.rud", ""), file("start.rud", "")],
     )
     .unwrap();
 
@@ -196,7 +196,7 @@ fn the_configured_root_is_ordered_before_other_files() {
             .iter()
             .map(|file| file.path.as_str())
             .collect::<Vec<_>>(),
-        ["start.hc", "main.hc"]
+        ["start.rud", "main.rud"]
     );
 }
 
@@ -212,13 +212,13 @@ fn a_write_deletes_a_file_dropped_from_the_set() {
         "demo",
         "demo",
         "0.1.0",
-        "main.hc",
+        "main.rud",
         &RunConfig::default(),
         &Default::default(),
         &IndexMap::new(),
         &[
-            file("main.hc", "module Math\n"),
-            file("Math.hc", "let double = fn x => x\n"),
+            file("main.rud", "module Math\n"),
+            file("Math.rud", "let double = fn x => x\n"),
         ],
     )
     .expect("the document is written");
@@ -228,18 +228,18 @@ fn a_write_deletes_a_file_dropped_from_the_set() {
         "demo",
         "demo",
         "0.1.0",
-        "main.hc",
+        "main.rud",
         &RunConfig::default(),
         &Default::default(),
         &IndexMap::new(),
-        &[file("main.hc", "")],
+        &[file("main.rud", "")],
     )
     .expect("the document is written again");
 
     let doc = read(&root, "demo").expect("the document is read back");
     let paths: Vec<&str> = doc.files.iter().map(|file| file.path.as_str()).collect();
-    assert_eq!(paths, ["main.hc"]);
-    assert!(!root.join("demo").join("Math.hc").exists());
+    assert_eq!(paths, ["main.rud"]);
+    assert!(!root.join("demo").join("Math.rud").exists());
 
     delete(&root, "demo").expect("the document is deleted");
     assert!(!root.join("demo").exists());
@@ -257,7 +257,7 @@ fn scratch(name: &str) -> PathBuf {
 #[test]
 fn standard_library_configuration_round_trips_and_defaults_to_installed() {
     let root = scratch("std-configuration");
-    let files = [file("main.hc", "")];
+    let files = [file("main.rud", "")];
     for configuration in [
         StdConfig::Disabled,
         StdConfig::Dependency(DependencySpec::from("../custom-std")),
@@ -267,7 +267,7 @@ fn standard_library_configuration_round_trips_and_defaults_to_installed() {
             "demo",
             "demo",
             "0.1.0",
-            "main.hc",
+            "main.rud",
             &RunConfig::default(),
             &configuration,
             &IndexMap::new(),
@@ -284,7 +284,7 @@ fn standard_library_configuration_round_trips_and_defaults_to_installed() {
     );
     std::fs::write(
         root.join("demo/Ruddy.toml"),
-        "name = \"demo\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\n",
+        "name = \"demo\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\n",
     )
     .unwrap();
     assert_eq!(read(&root, "demo").unwrap().std, StdConfig::Default);

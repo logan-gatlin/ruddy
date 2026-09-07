@@ -1443,6 +1443,7 @@ impl Parser {
     /// to whatever definition follows; when nothing does, they are the
     /// complaint, reported over themselves.
     fn stmt(&mut self) -> Option<Stmt> {
+        crate::cancellation::checkpoint();
         let attributes = self.attributes()?;
         let kind = match self.peek().map(|tok| &tok.tracked) {
             Some(Kind::Let) => self.let_stmt(),
@@ -2362,6 +2363,7 @@ impl Parser {
     /// The pipeline is the loosest expression operator and associates left:
     /// `x |> f |> g` is `g (f x)`.
     fn expr(&mut self) -> Option<Expr> {
+        crate::cancellation::checkpoint();
         let left = self.pipeline()?;
         if let Some(operator) = self.eat_if(&Kind::Assign) {
             let Some(right) = self.expr() else {

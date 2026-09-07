@@ -2,7 +2,7 @@
 //! retain their original evidence convention. Ordinary inference checks each
 //! generated call under the platform handlers and requires a pure result.
 
-use std::{collections::HashMap, fmt, rc::Rc};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 use crate::artifact::{Artifact, DeclaredType, Presence, Rest, Row, Type};
 
@@ -16,7 +16,7 @@ pub(super) struct Adapters {
 #[derive(Clone)]
 struct View<'a> {
     ty: &'a Type,
-    args: Rc<Vec<View<'a>>>,
+    args: Arc<Vec<View<'a>>>,
 }
 
 struct Quoted<'a>(&'a str);
@@ -161,7 +161,7 @@ fn fields<'a>(
                     };
                     view = resolved(View {
                         ty: &declaration.scheme.body,
-                        args: Rc::new(args.iter().map(|arg| view.child(arg)).collect()),
+                        args: Arc::new(args.iter().map(|arg| view.child(arg)).collect()),
                     });
                 }
                 match view.ty {
@@ -266,7 +266,7 @@ impl Graph {
             0,
             View {
                 ty: root,
-                args: Rc::default(),
+                args: Arc::default(),
             },
         )];
         let mut aliases = HashMap::new();
@@ -307,7 +307,7 @@ impl Graph {
                         aliases.insert(key, id);
                         child(View {
                             ty: &decl.scheme.body,
-                            args: Rc::new(arguments),
+                            args: Arc::new(arguments),
                         })
                     };
                     Plan::Alias {
@@ -318,7 +318,7 @@ impl Graph {
                 Type::Arrow(_, result, row) => {
                     let fields = fields(row, view.clone(), declarations);
                     let open = !matches!(fields.rest, Rest::Closed);
-                    let handlers = include_str!("node-handler.hc")
+                    let handlers = include_str!("node-handler.rud")
                         .lines()
                         .filter(|line| {
                             open || fields.labels.iter().any(|(label, presence, _)| {
@@ -743,7 +743,7 @@ pub(super) fn compile(
         return Ok(None);
     }
     let prelude = match platform {
-        Platform::Node => include_str!("node-platform.hc"),
+        Platform::Node => include_str!("node-platform.rud"),
         Platform::Web => "",
     };
     let prelude = format!("{prelude}\n{ARRAY_HELPERS}");

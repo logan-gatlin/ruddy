@@ -88,7 +88,7 @@ Existing arrays remain persistent and immutable. A future mutable buffer could
 return a copied snapshot; elements must still satisfy escape checks. Zero-copy
 freezing needs an additional account of surviving mutable aliases and is not
 required for this ergonomics-focused investigation.
-[Array interface](../../std/array.hc),
+[Array interface](../../std/array.rud),
 [JavaScript representation](../../src/backend/js.rs)
 
 ## References and validation

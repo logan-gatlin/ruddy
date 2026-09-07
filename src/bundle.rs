@@ -33,7 +33,7 @@ use crate::{
 };
 
 /// The extension every file of a bundle wears.
-const EXTENSION: &str = "hc";
+const EXTENSION: &str = "rud";
 
 /// The file a module's directory holds its own body in, when its body is not
 /// beside the directory instead.
@@ -45,14 +45,27 @@ const CONDITION_KEY: &str = "if";
 /// Where a bundle's files come from.
 ///
 /// One method, because that is the whole of what loading needs: nothing here
-/// lists a directory — an orphan `.hc` file no module declares is ignored — and
+/// lists a directory — an orphan `.rud` file no module declares is ignored — and
 /// nothing writes.
 pub trait Files {
     /// The contents of `path` in the caller's logical source tree, always
     /// `/`-separated, or `None` when there is no such file. Module files use
     /// the same coordinate space as the configured root: a root at
-    /// `src/main.hc` looks for `src/Math.hc`.
+    /// `src/main.rud` looks for `src/Math.rud`.
     fn read(&self, path: &str) -> Option<String>;
+
+    /// A source-backed driver may supply its per-file syntax query here.
+    fn cached_syntax(&self, _path: &str, _id: FileID) -> Option<Syntax> {
+        None
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Syntax {
+    pub tokens: Vec<Token>,
+    pub lex_errors: Vec<token::Error>,
+    pub stmts: Vec<Stmt>,
+    pub parse_errors: Vec<parse::Error>,
 }
 
 /// [`Files`] over a real directory.
@@ -90,6 +103,9 @@ pub struct Output {
     pub stmts: Vec<Stmt>,
     /// Root first, then depth-first in declaration order.
     pub loaded: Vec<Loaded>,
+    /// File-module declaration names and the source files selected for them.
+    /// Kept even when the selected file is empty or has no parsed statements.
+    pub module_files: std::collections::HashMap<Span, FileID>,
     pub errors: Vec<Error>,
 }
 
@@ -170,7 +186,7 @@ struct Loader<'a> {
     fs: &'a dyn Files,
     /// Directory of the configured root, including its trailing `/`. Module
     /// paths are relative to this point even when the caller names the root as
-    /// `src/main.hc` rather than rooting its [`Files`] there first.
+    /// `src/main.rud` rather than rooting its [`Files`] there first.
     directory: String,
     environment: &'a Environment,
     out: Output,
@@ -240,6 +256,7 @@ pub fn load(
         out: Output {
             stmts: Vec::new(),
             loaded: Vec::new(),
+            module_files: std::collections::HashMap::new(),
             errors: Vec::new(),
         },
     };
@@ -256,29 +273,42 @@ impl Loader<'_> {
     /// that: a module's file is looked for before it is read, and the two ways
     /// that can go wrong are complaints of their own.
     fn file(&mut self, path: &str) -> Vec<Stmt> {
+        crate::cancellation::checkpoint();
         let source = self.fs.read(path).unwrap_or_default();
         let id = self
             .files
             .register_new_file(path.to_string(), source.clone());
 
         let started = Instant::now();
-        let lexed = token::lex(&source, id);
-        let lex_micros = started.elapsed().as_micros() as u64;
-
-        let started = Instant::now();
-        let parsed = parse::parse(lexed.tokens.clone());
-        let parse_micros = started.elapsed().as_micros() as u64;
-
+        let (syntax, lex_micros, parse_micros) =
+            if let Some(syntax) = self.fs.cached_syntax(path, id) {
+                (syntax, 0, started.elapsed().as_micros() as u64)
+            } else {
+                let lexed = token::lex(&source, id);
+                let lex_micros = started.elapsed().as_micros() as u64;
+                let started = Instant::now();
+                let parsed = parse::parse(lexed.tokens.clone());
+                (
+                    Syntax {
+                        tokens: lexed.tokens,
+                        lex_errors: lexed.errors,
+                        stmts: parsed.stmts,
+                        parse_errors: parsed.errors,
+                    },
+                    lex_micros,
+                    started.elapsed().as_micros() as u64,
+                )
+            };
         self.out.loaded.push(Loaded {
             id,
             path: path.to_string(),
-            tokens: lexed.tokens,
-            lex_errors: lexed.errors,
-            parse_errors: parsed.errors,
+            tokens: syntax.tokens,
+            lex_errors: syntax.lex_errors,
+            parse_errors: syntax.parse_errors,
             lex_micros,
             parse_micros,
         });
-        parsed.stmts
+        syntax.stmts
     }
 
     /// Drop every definition in `stmts` whose guard does not hold, fill in the
@@ -292,8 +322,8 @@ impl Loader<'_> {
     /// `at` is the logical module path of the statements being walked, which is
     /// also the file path a module under them is looked for at: an inline
     /// module contributes a directory component exactly as a file module does,
-    /// so `module B` inside `module A = ... end` is looked for at `A/B.hc` and
-    /// never at `B.hc`.
+    /// so `module B` inside `module A = ... end` is looked for at `A/B.rud` and
+    /// never at `B.rud`.
     fn splice(&mut self, stmts: &mut Vec<Stmt>, at: &mut Vec<String>) {
         stmts.retain(|stmt| self.holds(stmt));
         for stmt in stmts {
@@ -342,21 +372,26 @@ impl Loader<'_> {
         {
             return Vec::new();
         }
-        match (
+        let selected = match (
             self.fs.read(&beside).is_some(),
             self.fs.read(&inside).is_some(),
         ) {
-            (true, false) => self.file(&beside),
-            (false, true) => self.file(&inside),
+            (true, false) => beside,
+            (false, true) => inside,
             (true, true) => {
                 self.error(at, ErrorKind::ModuleFileAmbiguous { beside, inside });
-                Vec::new()
+                return Vec::new();
             }
             (false, false) => {
                 self.error(at, ErrorKind::ModuleFileMissing { beside, inside });
-                Vec::new()
+                return Vec::new();
             }
-        }
+        };
+        let body = self.file(&selected);
+        self.out
+            .module_files
+            .insert(at, self.out.loaded.last().expect("file just loaded").id);
+        body
     }
 
     /// Whether `stmt` is to be compiled: it carries no `@if`, or the

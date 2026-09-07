@@ -19,7 +19,7 @@ use tempfile::TempDir;
 
 fn project() -> TempDir {
     let directory = tempfile::tempdir().expect("a temporary project");
-    fs::write(directory.path().join("main.hc"), "let id = fn x => x\n").expect("write the root");
+    fs::write(directory.path().join("main.rud"), "let id = fn x => x\n").expect("write the root");
     directory
 }
 
@@ -35,9 +35,9 @@ fn disable_std(directory: &Path) {
 
 fn write_project(directory: &Path, name: &str, version: &str, dependencies: &[(&str, &str)]) {
     fs::create_dir_all(directory).unwrap();
-    fs::write(directory.join("main.hc"), "let value = 0n\n").unwrap();
+    fs::write(directory.join("main.rud"), "let value = 0n\n").unwrap();
     let mut manifest = format!(
-        "name = {name:?}\nversion = {version:?}\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n"
+        "name = {name:?}\nversion = {version:?}\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\n"
     );
     for (dependency, path) in dependencies {
         manifest.push_str(&format!("{dependency} = {path:?}\n"));
@@ -51,9 +51,9 @@ fn executable_project(directory: &Path, source: &str, target: Option<&str>) {
         .map(|target| format!("target = {target:?}\n"))
         .unwrap_or_default();
     fs::write(directory.join("Ruddy.toml"), format!(
-        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"executable\"\nroot = \"main.hc\"\n{target}[dependencies]\nstd = false\n"
+        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"executable\"\nroot = \"main.rud\"\n{target}[dependencies]\nstd = false\n"
     )).unwrap();
-    fs::write(directory.join("main.hc"), source).unwrap();
+    fs::write(directory.join("main.rud"), source).unwrap();
 }
 
 fn prepare_execution(directory: &Path) {
@@ -63,9 +63,9 @@ fn prepare_execution(directory: &Path) {
         manifest.replace("kind = \"library\"", "kind = \"executable\""),
     )
     .unwrap();
-    let source = fs::read_to_string(directory.join("main.hc")).unwrap();
+    let source = fs::read_to_string(directory.join("main.rud")).unwrap();
     fs::write(
-        directory.join("main.hc"),
+        directory.join("main.rud"),
         format!("{source}\nlet main = fn _ => ()\n"),
     )
     .unwrap();
@@ -84,10 +84,7 @@ fn executable_main_drains_console_output_and_saturates_exit_codes() {
          end",
         None,
     );
-    let standard = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("std");
+    let standard = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let manifest = fs::read_to_string(directory.path().join("Ruddy.toml")).unwrap();
     fs::write(
         directory.path().join("Ruddy.toml"),
@@ -196,7 +193,7 @@ fn executable_can_use_a_dependency_function_with_a_named_never_result() {
     let project = tempfile::tempdir().unwrap();
     let dependency = project.path().join("dep");
     write_project(&dependency, "dep", "1.0.0", &[]);
-    fs::write(dependency.join("main.hc"), "type Never = |\neffect Process = { exit: Nat -> Never }\nlet stop : () -> Never + !Process = fn _ => !Process.exit 17n").unwrap();
+    fs::write(dependency.join("main.rud"), "type Never = |\neffect Process = { exit: Nat -> Never }\nlet stop : () -> Never + !Process = fn _ => !Process.exit 17n").unwrap();
     let app = project.path().join("app");
     executable_project(&app, "let main = dep::stop", None);
     let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
@@ -344,7 +341,7 @@ fn entry_adapter_avoids_extern_only_dependency_name_collisions() {
     let dependency = project.path().join("dep");
     write_project(&dependency, "ruddy-entry", "0.0.0", &[]);
     fs::write(
-        dependency.join("main.hc"),
+        dependency.join("main.rud"),
         "extern write : String = \"'dependency'\"",
     )
     .unwrap();
@@ -381,10 +378,10 @@ fn error(directory: &TempDir) -> String {
 
 #[test]
 fn inference_diagnostics_keep_structured_parity_across_real_consumers() {
-    let source = include_str!("../diagnostics/inference/rigid-field-struct.hc");
+    let source = include_str!("../diagnostics/inference/rigid-field-struct.rud");
     let directory = tempfile::tempdir().unwrap();
     write_project(directory.path(), "diagnostics", "0.1.0", &[]);
-    fs::write(directory.path().join("main.hc"), source).unwrap();
+    fs::write(directory.path().join("main.rud"), source).unwrap();
 
     let failure = compile(directory.path()).expect_err("the fixture does not type-check");
     let [cli] = failure.diagnostics() else {
@@ -499,7 +496,7 @@ fn std_manifest_forms_are_strict_and_contextual() {
         fs::write(
             directory.path().join("Ruddy.toml"),
             format!(
-                "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = {setting}\n"
+                "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = {setting}\n"
             ),
         )
         .unwrap();
@@ -510,7 +507,7 @@ fn std_manifest_forms_are_strict_and_contextual() {
 
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\nstd = false\n[dependencies]\n",
     )
     .unwrap();
     let found = error(&directory);
@@ -526,10 +523,10 @@ fn bundled_std_installer_first_install_does_not_require_gnu_mv_flags() {
     let source = root.path().join("source");
     let home = root.path().join("home");
     let bin = root.path().join("bin");
-    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(source.join("std")).unwrap();
     fs::create_dir_all(&bin).unwrap();
     fs::write(source.join("Ruddy.toml"), "manifest").unwrap();
-    fs::write(source.join("lib.hc"), "").unwrap();
+    fs::write(source.join("std/lib.rud"), "").unwrap();
 
     let real_mv = String::from_utf8(
         Command::new("sh")
@@ -580,15 +577,16 @@ fn bundled_std_installer_replaces_only_source_files() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("source");
     let home = root.path().join("home");
-    fs::create_dir_all(source.join("Nested")).unwrap();
-    fs::create_dir_all(source.join("build")).unwrap();
+    fs::create_dir_all(source.join("std/Nested")).unwrap();
+    fs::create_dir_all(source.join("std/build")).unwrap();
     fs::create_dir_all(home.join("std")).unwrap();
     fs::write(source.join("Ruddy.toml"), "manifest").unwrap();
-    fs::write(source.join("lib.hc"), "").unwrap();
-    fs::write(source.join("Nested/module.hc"), "let value = 0n\n").unwrap();
-    fs::write(source.join("build/app.artifact"), "artifact").unwrap();
+    fs::write(source.join("std/lib.rud"), "").unwrap();
+    fs::write(source.join("std/Nested/module.rud"), "let value = 0n\n").unwrap();
+    fs::write(source.join("std/build/app.artifact"), "artifact").unwrap();
     fs::write(source.join("notes.txt"), "notes").unwrap();
-    fs::write(home.join("std/old.hc"), "old").unwrap();
+    fs::write(source.join("unrelated.rud"), "not standard library source").unwrap();
+    fs::write(home.join("std/old.rud"), "old").unwrap();
 
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -609,13 +607,14 @@ fn bundled_std_installer_replaces_only_source_files() {
         fs::read_to_string(home.join("std/Ruddy.toml")).unwrap(),
         "manifest"
     );
-    assert!(home.join("std/lib.hc").is_file());
-    assert!(home.join("std/Nested/module.hc").is_file());
-    assert!(!home.join("std/old.hc").exists());
-    assert!(!home.join("std/build").exists());
+    assert!(home.join("std/std/lib.rud").is_file());
+    assert!(home.join("std/std/Nested/module.rud").is_file());
+    assert!(!home.join("std/old.rud").exists());
+    assert!(!home.join("std/std/build").exists());
     assert!(!home.join("std/notes.txt").exists());
+    assert!(!home.join("std/unrelated.rud").exists());
 
-    fs::remove_file(source.join("lib.hc")).unwrap();
+    fs::remove_file(source.join("std/lib.rud")).unwrap();
     let output = Command::new(script)
         .arg(&source)
         .env("RUDDY_HOME", &home)
@@ -623,7 +622,32 @@ fn bundled_std_installer_replaces_only_source_files() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(home.join("std/Nested/module.hc").is_file());
+    assert!(home.join("std/std/Nested/module.rud").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn bundled_std_installer_installs_repository_manifest_and_compilable_sources() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let output = Command::new(repository.join("scripts/install-std.sh"))
+        .arg(repository)
+        .env("RUDDY_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let installed = home.path().join("std");
+    assert_eq!(
+        fs::read(installed.join("Ruddy.toml")).unwrap(),
+        fs::read(repository.join("Ruddy.toml")).unwrap()
+    );
+    assert!(installed.join("std/lib.rud").is_file());
+    assert!(!installed.join("std/Ruddy.toml").exists());
+    check_project(&installed).expect("the installed standard library compiles");
 }
 
 #[cfg(target_os = "linux")]
@@ -635,13 +659,13 @@ fn bundled_std_installer_releases_lock_when_old_tree_cleanup_fails() {
     let source = root.path().join("source");
     let home = root.path().join("home");
     let bin = root.path().join("bin");
-    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(source.join("std")).unwrap();
     fs::create_dir_all(home.join("std")).unwrap();
     fs::create_dir_all(&bin).unwrap();
     fs::write(source.join("Ruddy.toml"), "new").unwrap();
-    fs::write(source.join("lib.hc"), "new main").unwrap();
+    fs::write(source.join("std/lib.rud"), "new main").unwrap();
     fs::write(home.join("std/Ruddy.toml"), "old").unwrap();
-    fs::write(home.join("std/lib.hc"), "old main").unwrap();
+    fs::write(home.join("std/lib.rud"), "old main").unwrap();
 
     let real_rm = String::from_utf8(
         Command::new("sh")
@@ -710,14 +734,14 @@ fn bundled_std_installer_discovery_failure_preserves_existing_installation() {
     let source = root.path().join("source");
     let home = root.path().join("home");
     let bin = root.path().join("bin");
-    fs::create_dir_all(source.join("Nested")).unwrap();
+    fs::create_dir_all(source.join("std/Nested")).unwrap();
     fs::create_dir_all(home.join("std")).unwrap();
     fs::create_dir_all(&bin).unwrap();
     fs::write(source.join("Ruddy.toml"), "new").unwrap();
-    fs::write(source.join("lib.hc"), "new main").unwrap();
-    fs::write(source.join("Nested/module.hc"), "new nested").unwrap();
+    fs::write(source.join("std/lib.rud"), "new main").unwrap();
+    fs::write(source.join("std/Nested/module.rud"), "new nested").unwrap();
     fs::write(home.join("std/Ruddy.toml"), "old").unwrap();
-    fs::write(home.join("std/lib.hc"), "old main").unwrap();
+    fs::write(home.join("std/lib.rud"), "old main").unwrap();
 
     let real_find = String::from_utf8(
         Command::new("sh")
@@ -759,7 +783,7 @@ fn bundled_std_installer_discovery_failure_preserves_existing_installation() {
         "old"
     );
     assert_eq!(
-        fs::read_to_string(home.join("std/lib.hc")).unwrap(),
+        fs::read_to_string(home.join("std/lib.rud")).unwrap(),
         "old main"
     );
     assert!(fs::read_dir(&home).unwrap().all(|entry| {
@@ -780,11 +804,11 @@ fn bundled_std_installer_reports_missing_exchange_capability_before_copying() {
     let source = root.path().join("source");
     let home = root.path().join("home");
     let bin = root.path().join("bin");
-    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(source.join("std")).unwrap();
     fs::create_dir_all(home.join("std")).unwrap();
     fs::create_dir_all(&bin).unwrap();
     fs::write(source.join("Ruddy.toml"), "new").unwrap();
-    fs::write(source.join("lib.hc"), "").unwrap();
+    fs::write(source.join("std/lib.rud"), "").unwrap();
     fs::write(home.join("std/Ruddy.toml"), "old").unwrap();
     let fake_mv = bin.join("mv");
     fs::write(&fake_mv, "#!/bin/sh\necho 'minimal mv'\n").unwrap();
@@ -840,10 +864,10 @@ fn bundled_std_installer_never_hides_an_existing_installation() {
     let source = root.path().join("source");
     let home = root.path().join("home");
     let barrier = root.path().join("commit-barrier");
-    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(source.join("std")).unwrap();
     fs::create_dir_all(home.join("std")).unwrap();
     fs::write(source.join("Ruddy.toml"), "new").unwrap();
-    fs::write(source.join("lib.hc"), "").unwrap();
+    fs::write(source.join("std/lib.rud"), "").unwrap();
     fs::write(home.join("std/Ruddy.toml"), "old").unwrap();
 
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -902,10 +926,10 @@ fn bundled_std_installer_interruption_preserves_existing_installation() {
     let source = root.path().join("source");
     let home = root.path().join("home");
     let barrier = root.path().join("commit-barrier");
-    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(source.join("std")).unwrap();
     fs::create_dir_all(home.join("std")).unwrap();
     fs::write(source.join("Ruddy.toml"), "new").unwrap();
-    fs::write(source.join("lib.hc"), "").unwrap();
+    fs::write(source.join("std/lib.rud"), "").unwrap();
     fs::write(home.join("std/Ruddy.toml"), "old").unwrap();
 
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -957,12 +981,12 @@ fn bundled_std_installer_resolves_symlinked_metacharacter_source_roots() {
     let source = root.path().join("source[odd]*?");
     let source_link = root.path().join("source-link");
     let home = root.path().join("home");
-    fs::create_dir_all(source.join("Nested")).unwrap();
-    fs::create_dir_all(source.join("build")).unwrap();
+    fs::create_dir_all(source.join("std/Nested")).unwrap();
+    fs::create_dir_all(source.join("std/build")).unwrap();
     fs::write(source.join("Ruddy.toml"), "manifest").unwrap();
-    fs::write(source.join("lib.hc"), "main").unwrap();
-    fs::write(source.join("Nested/module.hc"), "nested").unwrap();
-    fs::write(source.join("build/generated.hc"), "generated").unwrap();
+    fs::write(source.join("std/lib.rud"), "main").unwrap();
+    fs::write(source.join("std/Nested/module.rud"), "nested").unwrap();
+    fs::write(source.join("std/build/generated.rud"), "generated").unwrap();
     symlink(&source, &source_link).unwrap();
 
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -980,12 +1004,15 @@ fn bundled_std_installer_resolves_symlinked_metacharacter_source_roots() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(fs::read_to_string(home.join("std/lib.hc")).unwrap(), "main");
     assert_eq!(
-        fs::read_to_string(home.join("std/Nested/module.hc")).unwrap(),
+        fs::read_to_string(home.join("std/std/lib.rud")).unwrap(),
+        "main"
+    );
+    assert_eq!(
+        fs::read_to_string(home.join("std/std/Nested/module.rud")).unwrap(),
         "nested"
     );
-    assert!(!home.join("std/build").exists());
+    assert!(!home.join("std/std/build").exists());
 }
 
 #[cfg(target_os = "linux")]
@@ -999,9 +1026,9 @@ fn bundled_std_installer_serializes_concurrent_first_installs() {
     let home = root.path().join("home");
     let barrier = root.path().join("first-barrier");
     for (source, contents) in [(&first, "first"), (&second, "second")] {
-        fs::create_dir_all(source).unwrap();
+        fs::create_dir_all(source.join("std")).unwrap();
         fs::write(source.join("Ruddy.toml"), contents).unwrap();
-        fs::write(source.join("lib.hc"), contents).unwrap();
+        fs::write(source.join("std/lib.rud"), contents).unwrap();
     }
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -1053,10 +1080,10 @@ fn bundled_std_installer_preserves_a_stale_lock_for_manual_recovery() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("source");
     let home = root.path().join("home");
-    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(source.join("std")).unwrap();
     fs::create_dir_all(home.join(".std.install.lock")).unwrap();
     fs::write(source.join("Ruddy.toml"), "manifest").unwrap();
-    fs::write(source.join("lib.hc"), "main").unwrap();
+    fs::write(source.join("std/lib.rud"), "main").unwrap();
     fs::write(home.join(".std.install.lock/owner"), "999999999\n").unwrap();
 
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1097,7 +1124,7 @@ fn bundled_std_installer_preserves_a_stale_lock_for_manual_recovery() {
         "{}",
         String::from_utf8_lossy(&retry.stderr)
     );
-    assert!(home.join("std/lib.hc").is_file());
+    assert!(home.join("std/std/lib.rud").is_file());
 }
 
 #[cfg(target_os = "linux")]
@@ -1110,10 +1137,10 @@ fn bundled_std_installer_never_reaps_a_new_owner_after_waiting() {
     let home = root.path().join("home");
     let lock = home.join(".std.install.lock");
     let barrier = root.path().join("lock-wait-barrier");
-    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(source.join("std")).unwrap();
     fs::create_dir_all(&lock).unwrap();
     fs::write(source.join("Ruddy.toml"), "manifest").unwrap();
-    fs::write(source.join("lib.hc"), "main").unwrap();
+    fs::write(source.join("std/lib.rud"), "main").unwrap();
     fs::write(lock.join("owner"), "stale owner\n").unwrap();
 
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1160,10 +1187,10 @@ fn bundled_std_installer_does_not_reap_an_empty_lock() {
     let source = root.path().join("source");
     let home = root.path().join("home");
     let lock = home.join(".std.install.lock");
-    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(source.join("std")).unwrap();
     fs::create_dir_all(&lock).unwrap();
     fs::write(source.join("Ruddy.toml"), "manifest").unwrap();
-    fs::write(source.join("lib.hc"), "main").unwrap();
+    fs::write(source.join("std/lib.rud"), "main").unwrap();
     fs::write(lock.join("owner"), "").unwrap();
     fs::write(lock.join("candidate.abandoned"), "999999 abandoned\n").unwrap();
 
@@ -1197,11 +1224,11 @@ fn bundled_std_installer_cleans_a_probe_interrupted_during_creation() {
     let source = root.path().join("source");
     let home = root.path().join("home");
     let bin = root.path().join("bin");
-    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(source.join("std")).unwrap();
     fs::create_dir_all(home.join("std")).unwrap();
     fs::create_dir_all(&bin).unwrap();
     fs::write(source.join("Ruddy.toml"), "new").unwrap();
-    fs::write(source.join("lib.hc"), "new").unwrap();
+    fs::write(source.join("std/lib.rud"), "new").unwrap();
     fs::write(home.join("std/Ruddy.toml"), "old").unwrap();
     let real_mktemp = String::from_utf8(
         Command::new("sh")
@@ -1291,7 +1318,7 @@ fn automatic_std_environment_child() {
     let mode = std::env::var("RUDDY_TEST_STD_MODE").unwrap();
     let root = PathBuf::from(std::env::var_os("RUDDY_TEST_STD_ROOT").unwrap()).join(&mode);
     fs::create_dir_all(&root).unwrap();
-    fs::write(root.join("main.hc"), "let main = 0n\n").unwrap();
+    fs::write(root.join("main.rud"), "let main = 0n\n").unwrap();
 
     match mode.as_str() {
         "default" | "relative" => {
@@ -1302,7 +1329,7 @@ fn automatic_std_environment_child() {
             fs::write(standard.join("build/sentinel"), "keep").unwrap();
             fs::write(
                 root.join("Ruddy.toml"),
-                "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\n",
+                "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\n",
             )
             .unwrap();
 
@@ -1339,7 +1366,7 @@ fn automatic_std_environment_child() {
             write_project(&root.join("standard"), "std", "2.0.0", &[]);
             fs::write(
                 root.join("Ruddy.toml"),
-                "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = \"standard\"\n",
+                "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = \"standard\"\n",
             )
             .unwrap();
             assert_eq!(compile(&root).unwrap().header().identity.name, "app");
@@ -1347,7 +1374,7 @@ fn automatic_std_environment_child() {
         "disabled" => {
             fs::write(
                 root.join("Ruddy.toml"),
-                "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
+                "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\n",
             )
             .unwrap();
             assert_eq!(compile(&root).unwrap().header().identity.name, "app");
@@ -1385,14 +1412,14 @@ fn automatic_std_graph_child() {
     write_project(&dedup.join("dep"), "dep", "1.0.0", &[]);
     fs::write(
         dedup.join("dep/Ruddy.toml"),
-        "name = \"dep\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\n",
+        "name = \"dep\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\n",
     )
     .unwrap();
     fs::create_dir_all(&dedup).unwrap();
-    fs::write(dedup.join("main.hc"), "let main = 0n\n").unwrap();
+    fs::write(dedup.join("main.rud"), "let main = 0n\n").unwrap();
     fs::write(
         dedup.join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\ndep = \"dep\"\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\ndep = \"dep\"\n",
     )
     .unwrap();
     let graph = ruddy_cli::compile_graph(&dedup).unwrap();
@@ -1424,13 +1451,13 @@ fn automatic_std_graph_child() {
     write_project(&versions.join("dep"), "dep", "1.0.0", &[]);
     fs::write(
         versions.join("dep/Ruddy.toml"),
-        "name = \"dep\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = \"../std2\"\n",
+        "name = \"dep\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = \"../std2\"\n",
     )
     .unwrap();
-    fs::write(versions.join("main.hc"), "let main = 0n\n").unwrap();
+    fs::write(versions.join("main.rud"), "let main = 0n\n").unwrap();
     fs::write(
         versions.join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\ndep = \"dep\"\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\ndep = \"dep\"\n",
     )
     .unwrap();
     let graph = ruddy_cli::compile_graph(&versions).unwrap();
@@ -1444,7 +1471,7 @@ fn automatic_std_graph_child() {
 
     fs::write(
         versions.join("std2/Ruddy.toml"),
-        "name = \"std\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
+        "name = \"std\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
     let found = compile(&versions).unwrap_err().to_string();
@@ -1455,16 +1482,16 @@ fn automatic_std_graph_child() {
 
     let cycle = root.join("cycle");
     fs::create_dir_all(&cycle).unwrap();
-    fs::write(cycle.join("main.hc"), "let main = 0n\n").unwrap();
+    fs::write(cycle.join("main.rud"), "let main = 0n\n").unwrap();
     fs::write(
         cycle.join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\n",
     )
     .unwrap();
     fs::write(
         standard.join("Ruddy.toml"),
         format!(
-            "name = \"std\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\napp = {{ path = {:?} }}\n",
+            "name = \"std\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\napp = {{ path = {:?} }}\n",
             cycle
         ),
     )
@@ -1483,14 +1510,14 @@ fn configured_std_is_injected_first_and_is_source_visible() {
         &[],
     );
     fs::write(
-        directory.path().join("standard/main.hc"),
+        directory.path().join("standard/main.rud"),
         "module prelude =\n  let answer = 42n\nend\n",
     )
     .unwrap();
-    fs::write(directory.path().join("main.hc"), "let main = answer\n").unwrap();
+    fs::write(directory.path().join("main.rud"), "let main = answer\n").unwrap();
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = { path = \"standard\", bundle = \"foundation\" }\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = { path = \"standard\", bundle = \"foundation\" }\n",
     )
     .unwrap();
 
@@ -1518,10 +1545,10 @@ fn configured_std_is_injected_first_and_is_source_visible() {
 #[test]
 fn disabled_std_does_not_open_an_implicit_prelude() {
     let directory = project();
-    fs::write(directory.path().join("main.hc"), "let main = answer\n").unwrap();
+    fs::write(directory.path().join("main.rud"), "let main = answer\n").unwrap();
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
     let found = error(&directory);
@@ -1534,7 +1561,7 @@ fn duplicate_std_settings_have_a_focused_error() {
     let directory = project();
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nstd = \"vendor/std\"\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\nstd = \"vendor/std\"\n",
     )
     .unwrap();
     let error = error(&directory);
@@ -1553,7 +1580,7 @@ fn manifest_dependencies_reach_the_artifact_in_declaration_order() {
     );
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nzeta = \"zeta\"\nalpha = \"alpha\"\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\nzeta = \"zeta\"\nalpha = \"alpha\"\n",
     )
     .expect("write the manifest");
 
@@ -1582,18 +1609,18 @@ fn direct_dependency_exports_resolve_and_keep_their_artifact_owner() {
     let dependency = directory.path().join("std");
     write_project(&dependency, "std", "0.1.0", &[]);
     fs::write(
-        dependency.join("main.hc"),
+        dependency.join("main.rud"),
         "module Nested =\n  type Number = Nat\n  effect Read = { get: {} -> Nat }\n  extern runtime : Nat = \"host.runtime\"\n  let foo = 1n\nend\n",
     )
     .unwrap();
     fs::write(
-        directory.path().join("main.hc"),
+        directory.path().join("main.rud"),
         "let value : std::Nested::Number = std::Nested::foo\nlet imported = std::Nested::runtime\nlet operation = std::Nested::!Read.get\n",
     )
     .unwrap();
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = \"std\"\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = \"std\"\n",
     )
     .unwrap();
 
@@ -1619,15 +1646,15 @@ fn detailed_dependencies_alias_hyphenated_bundle_identities() {
     let directory = project();
     let dependency = directory.path().join("http-core");
     write_project(&dependency, "http-core", "1.0.0", &[]);
-    fs::write(dependency.join("main.hc"), "let status = 200n\n").unwrap();
+    fs::write(dependency.join("main.rud"), "let status = 200n\n").unwrap();
     fs::write(
-        directory.path().join("main.hc"),
+        directory.path().join("main.rud"),
         "let main = http_core::status\n",
     )
     .unwrap();
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nhttp_core = { bundle = \"http-core\", path = \"http-core\" }\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\nhttp_core = { bundle = \"http-core\", path = \"http-core\" }\n",
     )
     .unwrap();
 
@@ -1653,7 +1680,7 @@ fn detailed_dependencies_alias_hyphenated_bundle_identities() {
 
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nhttp_core = { package = \"http-core\", path = \"http-core\" }\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\nhttp_core = { package = \"http-core\", path = \"http-core\" }\n",
     )
     .unwrap();
     let old_field_error = error(&directory);
@@ -1664,7 +1691,7 @@ fn detailed_dependencies_alias_hyphenated_bundle_identities() {
 
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nhttp-core = \"http-core\"\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\nhttp-core = \"http-core\"\n",
     )
     .unwrap();
     let error = error(&directory);
@@ -1679,7 +1706,7 @@ fn transitive_dependencies_are_linkable_but_not_source_visible() {
     let directory = project();
     write_project(&directory.path().join("base"), "base", "1.0.0", &[]);
     fs::write(
-        directory.path().join("base/main.hc"),
+        directory.path().join("base/main.rud"),
         "type Number = Nat\nlet foo : Number = 1n\n",
     )
     .unwrap();
@@ -1690,24 +1717,24 @@ fn transitive_dependencies_are_linkable_but_not_source_visible() {
         &[("base", "../base")],
     );
     fs::write(
-        directory.path().join("std/main.hc"),
+        directory.path().join("std/main.rud"),
         "let foo = base::foo\n",
     )
     .unwrap();
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = \"std\"\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = \"std\"\n",
     )
     .unwrap();
     fs::write(
-        directory.path().join("main.hc"),
+        directory.path().join("main.rud"),
         "let main : Nat = std::foo\n",
     )
     .unwrap();
     let built = compile(directory.path()).expect("direct export backed by transitive global");
     assert!(built.print().contains("std@1.0.0::foo"));
 
-    fs::write(directory.path().join("main.hc"), "let main = base::foo\n").unwrap();
+    fs::write(directory.path().join("main.rud"), "let main = base::foo\n").unwrap();
     let error = error(&directory);
     assert!(error.contains("[undefined-module] Error"), "{error}");
     assert!(error.contains("cannot find module `base`"), "{error}");
@@ -1719,11 +1746,11 @@ fn missing_dependency_paths_report_the_requested_namespace() {
     write_project(&directory.path().join("std"), "std", "1.0.0", &[]);
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = \"std\"\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = \"std\"\n",
     )
     .unwrap();
     fs::write(
-        directory.path().join("main.hc"),
+        directory.path().join("main.rud"),
         "let a = std::missing\nlet b : std::Missing = 1n\nlet c = std::!MissingEffect.op\nlet d = std::NoModule::x\n",
     )
     .unwrap();
@@ -1752,11 +1779,11 @@ fn a_local_module_cannot_shadow_a_direct_dependency_root() {
     write_project(&directory.path().join("std"), "std", "1.0.0", &[]);
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = \"std\"\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = \"std\"\n",
     )
     .unwrap();
     fs::write(
-        directory.path().join("main.hc"),
+        directory.path().join("main.rud"),
         "module std = let local = 1n end\nlet main = 0n\n",
     )
     .unwrap();
@@ -1770,13 +1797,13 @@ fn the_configured_root_is_resolved_relative_to_the_manifest() {
     let directory = project();
     fs::create_dir(directory.path().join("src")).expect("create source directory");
     fs::rename(
-        directory.path().join("main.hc"),
-        directory.path().join("src/app.hc"),
+        directory.path().join("main.rud"),
+        directory.path().join("src/app.rud"),
     )
     .expect("move the root");
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"src/app.hc\"\n[dependencies]\nstd = false\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"src/app.rud\"\n[dependencies]\nstd = false\n",
     )
     .expect("write the manifest");
 
@@ -1797,29 +1824,29 @@ fn nested_root_diagnostics_preserve_root_and_module_paths() {
     fs::create_dir(directory.path().join("src")).expect("create source directory");
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"src/app.hc\"\n[dependencies]\nstd = false\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"src/app.rud\"\n[dependencies]\nstd = false\n",
     )
     .expect("write the manifest");
     fs::write(
-        directory.path().join("src/app.hc"),
+        directory.path().join("src/app.rud"),
         "let bad : Nat = fn x => x\n",
     )
     .expect("write an invalid root");
 
     let root_error = error(&directory).replace('\\', "/");
-    assert!(root_error.contains("src/app.hc:1:"), "{root_error}");
+    assert!(root_error.contains("src/app.rud:1:"), "{root_error}");
 
-    fs::write(directory.path().join("src/app.hc"), "module Child\n").expect("replace the root");
+    fs::write(directory.path().join("src/app.rud"), "module Child\n").expect("replace the root");
     fs::write(
-        directory.path().join("src/Child.hc"),
+        directory.path().join("src/Child.rud"),
         "let bad : Nat = fn x => x\n",
     )
     .expect("write an invalid module");
 
     let module_error = error(&directory).replace('\\', "/");
-    assert!(module_error.contains("src/Child.hc:1:"), "{module_error}");
+    assert!(module_error.contains("src/Child.rud:1:"), "{module_error}");
 
-    fs::remove_file(directory.path().join("src/Child.hc")).expect("remove the module file");
+    fs::remove_file(directory.path().join("src/Child.rud")).expect("remove the module file");
     let missing = error(&directory).replace('\\', "/");
     assert!(missing.contains("[module-file-missing] Error"), "{missing}");
     assert!(missing.contains("this module needs a file"), "{missing}");
@@ -1828,15 +1855,15 @@ fn nested_root_diagnostics_preserve_root_and_module_paths() {
         "{missing}"
     );
     assert!(
-        missing.contains("create `src/Child.hc` or `src/Child/module.hc`"),
+        missing.contains("create `src/Child.rud` or `src/Child/module.rud`"),
         "{missing}",
     );
 
-    fs::write(directory.path().join("src/Child.hc"), "let beside = 1n\n")
+    fs::write(directory.path().join("src/Child.rud"), "let beside = 1n\n")
         .expect("write the beside candidate");
     fs::create_dir(directory.path().join("src/Child")).expect("create module directory");
     fs::write(
-        directory.path().join("src/Child/module.hc"),
+        directory.path().join("src/Child/module.rud"),
         "let inside = 1n\n",
     )
     .expect("write the inside candidate");
@@ -1848,7 +1875,7 @@ fn nested_root_diagnostics_preserve_root_and_module_paths() {
     );
     assert!(
         ambiguous
-            .contains("keep one of `src/Child.hc` or `src/Child/module.hc` and delete the other"),
+            .contains("keep one of `src/Child.rud` or `src/Child/module.rud` and delete the other"),
         "{ambiguous}",
     );
 }
@@ -1869,11 +1896,11 @@ fn the_manifest_is_required_and_must_be_valid_and_supported() {
             "missing field `root`",
         ),
         (
-            "name = 1\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
+            "name = 1\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\n",
             "invalid type",
         ),
         (
-            "name = \"app\"\nversion = 1\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
+            "name = \"app\"\nversion = 1\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\n",
             "invalid type",
         ),
         (
@@ -1882,36 +1909,36 @@ fn the_manifest_is_required_and_must_be_valid_and_supported() {
         ),
         ("[dependencies", "[manifest-invalid] Error"),
         (
-            "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\ntitle = \"app\"\n[dependencies]\nstd = false\n",
+            "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\ntitle = \"app\"\n[dependencies]\nstd = false\n",
             "unknown field `title`",
         ),
         (
-            "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[run]\njs = 1\n[dependencies]\nstd = false\n",
+            "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[run]\njs = 1\n[dependencies]\nstd = false\n",
             "invalid type",
         ),
         (
-            "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[run]\njs = \"node\"\nnative = \"app\"\n[dependencies]\nstd = false\n",
+            "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[run]\njs = \"node\"\nnative = \"app\"\n[dependencies]\nstd = false\n",
             "unknown field `native`",
         ),
         ("title = \"app\"\n", "unknown field `title`"),
         (
-            "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nbase = { source = \"base.artifact\" }\n",
+            "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\nbase = { source = \"base.artifact\" }\n",
             "unknown field `source`",
         ),
         (
-            "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nbase = { version = \"1.0.0\" }\n",
+            "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\nbase = { version = \"1.0.0\" }\n",
             "unknown field `version`",
         ),
         (
-            "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nbase = { version = 1, source = \"base.artifact\" }\n",
+            "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\nbase = { version = 1, source = \"base.artifact\" }\n",
             "unknown field `version`",
         ),
         (
-            "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nbase = { version = \"1.0.0\", source = 1 }\n",
+            "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\nbase = { version = \"1.0.0\", source = 1 }\n",
             "unknown field `version`",
         ),
         (
-            "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nbase = { version = \"1.0.0\", source = \"base.artifact\", registry = \"x\" }\n",
+            "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\nbase = { version = \"1.0.0\", source = \"base.artifact\", registry = \"x\" }\n",
             "unknown field `version`",
         ),
     ] {
@@ -1922,7 +1949,7 @@ fn the_manifest_is_required_and_must_be_valid_and_supported() {
 
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nbase = { git = [\"https://user:secret@example.test/repo\"] }\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\nbase = { git = [\"https://user:secret@example.test/repo\"] }\n",
     )
     .unwrap();
     let redacted = error(&directory);
@@ -1968,7 +1995,7 @@ fn git_dependency_manifest_validation_is_strict_and_contextual() {
             "unknown field `unknown`",
         ),
     ] {
-        fs::write(directory.path().join("Ruddy.toml"), format!("name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nbase = {specification}\n")).unwrap();
+        fs::write(directory.path().join("Ruddy.toml"), format!("name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\nbase = {specification}\n")).unwrap();
         let found = error(&directory);
         assert!(found.contains(expected), "`{expected}` in:\n{found}");
         if !expected.starts_with("unknown field") {
@@ -1979,7 +2006,7 @@ fn git_dependency_manifest_validation_is_strict_and_contextual() {
 
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nbase = { git = \"http://user:secret@example.test/repo?token=hidden\" }\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\nbase = { git = \"http://user:secret@example.test/repo?token=hidden\" }\n",
     )
     .unwrap();
     let redacted = error(&directory);
@@ -1992,7 +2019,7 @@ fn git_dependency_manifest_validation_is_strict_and_contextual() {
 
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nbase = { git = \"user:secret@example.test/repo\" }\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\nbase = { git = \"user:secret@example.test/repo\" }\n",
     )
     .unwrap();
     let malformed = error(&directory);
@@ -2010,8 +2037,8 @@ fn ambient_git_configuration_cannot_rewrite_https_to_an_unsafe_transport() {
     let home = parent.path().join("home");
     fs::create_dir_all(&app).unwrap();
     fs::create_dir_all(&home).unwrap();
-    fs::write(app.join("main.hc"), "let main = 0n\n").unwrap();
-    fs::write(app.join("Ruddy.toml"), "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nbase = { git = \"https://example.invalid/repository\" }\n").unwrap();
+    fs::write(app.join("main.rud"), "let main = 0n\n").unwrap();
+    fs::write(app.join("Ruddy.toml"), "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\nbase = { git = \"https://example.invalid/repository\" }\n").unwrap();
     let config = home.join("hostile.gitconfig");
     fs::write(
         &config,
@@ -2116,7 +2143,7 @@ fn ruddy_home_layout_child() {
 #[test]
 fn https_fetch_failures_are_contextual_and_do_not_create_a_lockfile() {
     let directory = project();
-    fs::write(directory.path().join("Ruddy.toml"), "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nbase = { git = \"https://127.0.0.1:9/repository\", branch = \"main\" }\n").unwrap();
+    fs::write(directory.path().join("Ruddy.toml"), "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\nbase = { git = \"https://127.0.0.1:9/repository\", branch = \"main\" }\n").unwrap();
     let found = error(&directory);
     assert!(found.contains("dependency `base`"), "{found}");
     assert!(
@@ -2159,7 +2186,7 @@ fn locked_cached_git_dependency_child() {
     fs::create_dir_all(&seed).unwrap();
     let repository = gix::init(&seed).unwrap();
     let manifest = repository
-        .write_blob(b"name = \"base\"\nversion = \"2.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n")
+        .write_blob(b"name = \"base\"\nversion = \"2.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\n")
         .unwrap()
         .detach();
     let source = repository.write_blob(b"let value = 2n\n").unwrap().detach();
@@ -2173,7 +2200,7 @@ fn locked_cached_git_dependency_child() {
                 },
                 gix::objs::tree::Entry {
                     mode: gix::objs::tree::EntryKind::Blob.into(),
-                    filename: "main.hc".into(),
+                    filename: "main.rud".into(),
                     oid: source,
                 },
             ],
@@ -2218,8 +2245,8 @@ fn locked_cached_git_dependency_child() {
     fs::create_dir_all(checkout.parent().unwrap()).unwrap();
     fs::rename(seed, &checkout).unwrap();
     fs::create_dir_all(&app).unwrap();
-    fs::write(app.join("main.hc"), "let main = base::value\n").unwrap();
-    fs::write(app.join("Ruddy.toml"), format!("name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nbase = {{ git = {url:?}, branch = \"main\" }}\n")).unwrap();
+    fs::write(app.join("main.rud"), "let main = base::value\n").unwrap();
+    fs::write(app.join("Ruddy.toml"), format!("name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\nbase = {{ git = {url:?}, branch = \"main\" }}\n")).unwrap();
     let uppercase = commit.to_ascii_uppercase();
     let lock = format!(
         "version = 1\n\n[[git]]\nurl = {url:?}\nbranch = \"main\"\ncommit = {uppercase:?}\n"
@@ -2239,20 +2266,20 @@ fn locked_cached_git_dependency_child() {
     // cross-process cache lock remains held for compilation.
     fs::write(
         checkout.join("Ruddy.toml"),
-        "name = \"poison\"\nversion = \"9.9.9\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
+        "name = \"poison\"\nversion = \"9.9.9\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
     fs::write(
-        checkout.join("main.hc"),
+        checkout.join("main.rud"),
         "mod injected\nlet value = injected::value\n",
     )
     .unwrap();
-    fs::write(checkout.join("injected.hc"), "let value = false\n").unwrap();
+    fs::write(checkout.join("injected.rud"), "let value = false\n").unwrap();
     let second = compile(&app).unwrap();
     assert_eq!(first, second);
-    assert!(!checkout.join("injected.hc").exists());
+    assert!(!checkout.join("injected.rud").exists());
     assert_eq!(
-        fs::read_to_string(checkout.join("main.hc")).unwrap(),
+        fs::read_to_string(checkout.join("main.rud")).unwrap(),
         "let value = 2n\n"
     );
     assert!(
@@ -2289,15 +2316,55 @@ fn locked_cached_git_dependency_child() {
     assert!(artifact.is_file());
     assert!(!checkout.join("build").exists());
 
+    // Editor sessions reuse acquired source selections and can abandon a new
+    // acquisition while another compiler holds the global cache lock.
+    let mut workspace = ruddy_cli::workspace::Workspace::new(app.clone());
+    workspace.refresh().unwrap();
+    let cache_lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(home.join("cache/git/cache.lock"))
+        .unwrap();
+    cache_lock.lock().unwrap();
+    let cancel = ruddy::cancellation::Cancellation::default();
+    let timer = cancel.clone();
+    let timer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        timer.cancel();
+    });
+    workspace.set_overlay(
+        &app.join("main.rud"),
+        Some("let main = base::value\nlet extra = false".into()),
+    );
+    assert!(
+        cancel.run(|| workspace.refresh()).unwrap().is_ok(),
+        "ordinary edits must not reacquire the Git cache lock"
+    );
+    timer.join().unwrap();
+    let mut fresh = ruddy_cli::workspace::Workspace::new(app.clone());
+    let cancel = ruddy::cancellation::Cancellation::default();
+    let timer = cancel.clone();
+    let timer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        timer.cancel();
+    });
+    let started = std::time::Instant::now();
+    assert!(cancel.run(|| fresh.refresh()).is_err());
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    timer.join().unwrap();
+    drop(cache_lock);
+    fresh.refresh().unwrap();
+    assert!(fresh.check_background().is_empty());
+
     // Cache provenance follows the canonical location, even when a local path
     // specification reaches an already-seeded checkout instead of a Git spec.
     let path_app = home.join("path-app");
     fs::create_dir(&path_app).unwrap();
-    fs::write(path_app.join("main.hc"), "let main = base::value\n").unwrap();
+    fs::write(path_app.join("main.rud"), "let main = base::value\n").unwrap();
     fs::write(
         path_app.join("Ruddy.toml"),
         format!(
-            "name = \"path-app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nbase = {{ path = {:?} }}\n",
+            "name = \"path-app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\nbase = {{ path = {:?} }}\n",
             checkout
         ),
     )
@@ -2318,7 +2385,7 @@ fn locked_cached_git_dependency_child() {
 #[test]
 fn exact_revisions_require_unambiguous_hex_prefixes_before_network_access() {
     let directory = project();
-    fs::write(directory.path().join("Ruddy.toml"), "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nbase = { git = \"https://127.0.0.1:9/repository\", rev = \"abc123\" }\n").unwrap();
+    fs::write(directory.path().join("Ruddy.toml"), "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\nbase = { git = \"https://127.0.0.1:9/repository\", rev = \"abc123\" }\n").unwrap();
     let found = error(&directory);
     assert!(found.contains("7 to 40 hexadecimal characters"), "{found}");
     assert!(!directory.path().join("Ruddy.lock").exists());
@@ -2329,7 +2396,7 @@ fn a_successful_build_removes_stale_git_entries_from_an_existing_lockfile() {
     let directory = project();
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
     fs::write(
@@ -2349,7 +2416,7 @@ fn abbreviated_revision_lock_entries_accept_the_matching_full_commit() {
     let directory = project();
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
     fs::write(
@@ -2365,7 +2432,7 @@ fn malformed_and_unsupported_lockfiles_are_diagnosed_without_replacement() {
     let directory = project();
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
     for (source, code) in [
@@ -2412,7 +2479,7 @@ fn manifest_bundle_identity_must_be_valid() {
     ] {
         fs::write(
             directory.path().join("Ruddy.toml"),
-            format!("name = {name:?}\nversion = {version:?}\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n"),
+            format!("name = {name:?}\nversion = {version:?}\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\n"),
         )
         .expect("replace the manifest");
         let found = error(&directory);
@@ -2423,11 +2490,11 @@ fn manifest_bundle_identity_must_be_valid() {
 #[test]
 fn dependency_projects_must_exist_compile_and_match_the_table_key() {
     let directory = project();
-    fs::write(directory.path().join("Ruddy.toml"), "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nbase = \"missing\"\n").unwrap();
+    fs::write(directory.path().join("Ruddy.toml"), "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\nbase = \"missing\"\n").unwrap();
     assert!(error(&directory).contains("dependency `base`"));
 
     write_project(&directory.path().join("child"), "other", "1.0.0", &[]);
-    fs::write(directory.path().join("Ruddy.toml"), "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nbase = \"child\"\n").unwrap();
+    fs::write(directory.path().join("Ruddy.toml"), "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\nbase = \"child\"\n").unwrap();
     let mismatch = error(&directory);
     assert!(
         mismatch.contains("[dependency-name-mismatch] Error")
@@ -2437,7 +2504,7 @@ fn dependency_projects_must_exist_compile_and_match_the_table_key() {
 
     write_project(&directory.path().join("child"), "base", "1.0.0", &[]);
     fs::write(
-        directory.path().join("child/main.hc"),
+        directory.path().join("child/main.rud"),
         "let bad : Nat = fn x => x\n",
     )
     .unwrap();
@@ -2484,7 +2551,7 @@ fn transitive_diamond_graphs_are_unique_dependency_first_and_direct_only() {
         ),
         (&app, "extern host : Nat = \"app.host\"\nlet value = 0n\n"),
     ] {
-        fs::write(project.join("main.hc"), declaration).unwrap();
+        fs::write(project.join("main.rud"), declaration).unwrap();
     }
 
     let graph = ruddy_cli::compile_graph(&app).unwrap();
@@ -2577,7 +2644,7 @@ fn dependency_effects_aliases_and_constructor_kinds_survive_import() {
     let app = root.path().join("app");
     write_project(&base, "base", "1.0.0", &[]);
     fs::write(
-        base.join("main.hc"),
+        base.join("main.rud"),
         "effect Read = { get: {} -> Nat }\n\
          type Cases 'r = #A Nat | ..'r\n\
          let read : {} -> Nat + !Read = fn _ => !Read.get {}\n",
@@ -2585,7 +2652,7 @@ fn dependency_effects_aliases_and_constructor_kinds_survive_import() {
     .unwrap();
     write_project(&middle, "middle", "1.0.0", &[("base", "../base")]);
     fs::write(
-        middle.join("main.hc"),
+        middle.join("main.rud"),
         "effect Console = base::!Read\n\
          effect Services = !Console\n\
          let read : {} -> Nat + !Services = base::read\n",
@@ -2598,7 +2665,7 @@ fn dependency_effects_aliases_and_constructor_kinds_survive_import() {
         &[("base", "../base"), ("middle", "../middle")],
     );
     fs::write(
-        app.join("main.hc"),
+        app.join("main.rud"),
         "type F = {} -> Nat + base::!Read\n\
          let direct : F = base::read\n\
          let linked : {} -> Nat + middle::!Services = middle::read\n",
@@ -2607,11 +2674,11 @@ fn dependency_effects_aliases_and_constructor_kinds_survive_import() {
     compile(&app)
         .expect("imported effects remain in declared types and aliases close transitively");
 
-    fs::write(app.join("main.hc"), "type Bad = base::Cases Nat\n").unwrap();
+    fs::write(app.join("main.rud"), "type Bad = base::Cases Nat\n").unwrap();
     let error = compile(&app).unwrap_err().to_string();
     assert!(error.contains("not-a-row"), "{error}");
 
-    fs::write(app.join("main.hc"), "type Bad = base::Cases (#A Nat)\n").unwrap();
+    fs::write(app.join("main.rud"), "type Bad = base::Cases (#A Nat)\n").unwrap();
     let error = compile(&app).unwrap_err().to_string();
     assert!(error.contains("repeated-row-field"), "{error}");
 }
@@ -2640,10 +2707,10 @@ fn imported_signature_types_participate_in_effect_identity() {
     let dep = root.path().join("dep");
     let app = root.path().join("app");
     write_project(&dep, "dep", "1.0.0", &[]);
-    fs::write(dep.join("main.hc"), "type A = Nat\ntype B = String\n").unwrap();
+    fs::write(dep.join("main.rud"), "type A = Nat\ntype B = String\n").unwrap();
     write_project(&app, "app", "1.0.0", &[("dep", "../dep")]);
     fs::write(
-        app.join("main.hc"),
+        app.join("main.rud"),
         "module X = effect Same = { op: dep::A -> {} } end\n\
          module Y = effect Same = { op: dep::B -> {} } end\n",
     )
@@ -2686,31 +2753,31 @@ fn bundle_and_compiler_failures_are_returned_as_cli_diagnostics() {
     let missing = tempfile::tempdir().unwrap();
     fs::write(
         missing.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"missing.hc\"\n[dependencies]\nstd = false\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"missing.rud\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
     let root_error = compile(missing.path())
         .expect_err("the configured root is missing")
         .to_string();
     assert!(
-        root_error.contains("[project-root-missing] Error") && root_error.contains("missing.hc"),
+        root_error.contains("[project-root-missing] Error") && root_error.contains("missing.rud"),
         "{root_error}"
     );
 
     let directory = project();
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
     fs::write(
-        directory.path().join("main.hc"),
+        directory.path().join("main.rud"),
         "let bad : Nat = fn x => x\n",
     )
     .unwrap();
     let compiler = error(&directory);
     assert!(compiler.contains("[type-mismatch] Error"), "{compiler}");
-    assert!(compiler.contains("main.hc:1:"), "{compiler}");
+    assert!(compiler.contains("main.rud:1:"), "{compiler}");
 
     let diagnostics = compile(directory.path()).expect_err("the program has a type error");
     assert_eq!(diagnostics.messages().len(), 1, "{diagnostics}");
@@ -2720,7 +2787,7 @@ fn bundle_and_compiler_failures_are_returned_as_cli_diagnostics() {
 fn frontend_errors_stop_compilation_without_parse_or_semantic_cascades() {
     let directory = project();
     write_project(directory.path(), "app", "1.0.0", &[]);
-    fs::write(directory.path().join("main.hc"), "let n = 1x\n").unwrap();
+    fs::write(directory.path().join("main.rud"), "let n = 1x\n").unwrap();
 
     let diagnostics = compile(directory.path()).expect_err("the joined name is invalid");
     assert_eq!(diagnostics.messages().len(), 1, "{diagnostics}");
@@ -2737,7 +2804,7 @@ fn frontend_errors_stop_compilation_without_parse_or_semantic_cascades() {
 #[test]
 fn rendering_without_color_has_no_ansi_and_omits_the_internal_phase() {
     let sources = [ruddy_cli::DiagnosticSource {
-        path: "main.hc",
+        path: "main.rud",
         source: "let n = 1x\n",
     }];
     let primary = ruddy_cli::DiagnosticLabel {
@@ -2817,7 +2884,7 @@ fn no_color_overrides_forced_cli_color() {
 fn no_color_child() {
     let directory = project();
     write_project(directory.path(), "app", "1.0.0", &[]);
-    fs::write(directory.path().join("main.hc"), "let n = 1x\n").unwrap();
+    fs::write(directory.path().join("main.rud"), "let n = 1x\n").unwrap();
     let rendered = error(&directory);
     assert!(!rendered.contains('\x1b'), "{rendered:?}");
     assert!(
@@ -2831,13 +2898,13 @@ fn compiler_diagnostics_treat_spans_as_byte_offsets() {
     let directory = project();
     write_project(directory.path(), "app", "1.0.0", &[]);
     fs::write(
-        directory.path().join("main.hc"),
+        directory.path().join("main.rud"),
         "let café = 1n\nlet bad : Nat = false\n",
     )
     .unwrap();
 
     let compiler = error(&directory);
-    assert!(compiler.contains("main.hc:2:11"), "{compiler}");
+    assert!(compiler.contains("main.rud:2:11"), "{compiler}");
     assert!(compiler.contains("2 │let bad : Nat = false"), "{compiler}");
 }
 
@@ -2869,7 +2936,7 @@ fn new_scaffolds_a_compilable_project_without_overwriting() {
     let scaffold_manifest = fs::read_to_string(destination.join("Ruddy.toml")).unwrap();
     assert_eq!(
         scaffold_manifest,
-        "name = \"my_app\"\nversion = \"0.1.0\"\nkind = \"executable\"\nroot = \"main.hc\"\ntarget = \"js\"\n\n[dependencies]\n"
+        "name = \"my_app\"\nversion = \"0.1.0\"\nkind = \"executable\"\nroot = \"main.rud\"\ntarget = \"js\"\n\n[dependencies]\n"
     );
     assert!(
         !scaffold_manifest
@@ -2877,7 +2944,7 @@ fn new_scaffolds_a_compilable_project_without_overwriting() {
             .any(|line| line.starts_with("std ="))
     );
     assert_eq!(
-        fs::read_to_string(destination.join("main.hc")).unwrap(),
+        fs::read_to_string(destination.join("main.rud")).unwrap(),
         "let main = fn _ => ()\n"
     );
     assert_eq!(
@@ -2909,7 +2976,7 @@ fn new_scaffolds_a_compilable_project_without_overwriting() {
             .contains("could not create project directory")
     );
     assert_eq!(
-        fs::read_to_string(destination.join("main.hc")).unwrap(),
+        fs::read_to_string(destination.join("main.rud")).unwrap(),
         "let main = fn _ => ()\n"
     );
 }
@@ -2938,7 +3005,7 @@ fn new_reports_git_initialization_failure_and_leaves_the_scaffold() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(destination.join("Ruddy.toml").is_file());
-    assert!(destination.join("main.hc").is_file());
+    assert!(destination.join("main.rud").is_file());
     assert!(destination.join(".gitignore").is_file());
 }
 
@@ -3039,8 +3106,8 @@ fn manifest_targets_select_root_javascript_output() {
     fs::write(
         app.join("Ruddy.toml"),
         manifest.replace(
-            "root = \"main.hc\"",
-            "root = \"main.hc\"\ntarget = \"artifact\"",
+            "root = \"main.rud\"",
+            "root = \"main.rud\"\ntarget = \"artifact\"",
         ),
     )
     .unwrap();
@@ -3084,8 +3151,8 @@ fn dependency_targets_do_not_select_backend_output_for_a_parent_build() {
     fs::write(
         dependency.join("Ruddy.toml"),
         manifest.replace(
-            "root = \"main.hc\"\n[dependencies]",
-            "root = \"main.hc\"\ntarget = \"js\"\n[dependencies]",
+            "root = \"main.rud\"\n[dependencies]",
+            "root = \"main.rud\"\ntarget = \"js\"\n[dependencies]",
         ),
     )
     .unwrap();
@@ -3102,8 +3169,8 @@ fn dependency_targets_do_not_select_backend_output_for_a_parent_build() {
     fs::write(
         app.join("Ruddy.toml"),
         manifest.replace(
-            "root = \"main.hc\"\n[dependencies]",
-            "root = \"main.hc\"\ntarget = \"js\"\n[dependencies]",
+            "root = \"main.rud\"\n[dependencies]",
+            "root = \"main.rud\"\ntarget = \"js\"\n[dependencies]",
         ),
     )
     .unwrap();
@@ -3119,7 +3186,7 @@ fn unsupported_manifest_targets_use_manifest_parse_diagnostics() {
         fs::write(
             directory.path().join("Ruddy.toml"),
             format!(
-                "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\ntarget = {target}\n[dependencies]\nstd = false\n"
+                "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\ntarget = {target}\n[dependencies]\nstd = false\n"
             ),
         )
         .unwrap();
@@ -3228,13 +3295,13 @@ fn run_builds_and_invokes_main_in_a_javascript_module() {
     .unwrap();
     let app = directory.path().join("app");
     write_project(&app, "app", "1.0.0", &[]);
-    fs::write(app.join("main.hc"), "let initialized = 1n\n").unwrap();
+    fs::write(app.join("main.rud"), "let initialized = 1n\n").unwrap();
     let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
     fs::write(
         app.join("Ruddy.toml"),
         manifest.replace(
-            "root = \"main.hc\"\n[dependencies]",
-            "root = \"main.hc\"\ntarget = \"js\"\n[dependencies]",
+            "root = \"main.rud\"\n[dependencies]",
+            "root = \"main.rud\"\ntarget = \"js\"\n[dependencies]",
         ),
     )
     .unwrap();
@@ -3271,8 +3338,8 @@ fn run_uses_the_configured_javascript_shell_runner() {
     fs::write(
         app.join("Ruddy.toml"),
         manifest.replace(
-            "root = \"main.hc\"\n[dependencies]",
-            "root = \"main.hc\"\ntarget = \"js\"\n\n[run]\njs = \"sh runner.sh marker.txt\"\n\n[dependencies]",
+            "root = \"main.rud\"\n[dependencies]",
+            "root = \"main.rud\"\ntarget = \"js\"\n\n[run]\njs = \"sh runner.sh marker.txt\"\n\n[dependencies]",
         ),
     )
     .unwrap();
@@ -3305,8 +3372,8 @@ fn configured_javascript_runner_failures_preserve_build_output() {
     fs::write(
         app.join("Ruddy.toml"),
         manifest.replace(
-            "root = \"main.hc\"\n[dependencies]",
-            "root = \"main.hc\"\ntarget = \"js\"\n\n[run]\njs = \"false\"\n\n[dependencies]",
+            "root = \"main.rud\"\n[dependencies]",
+            "root = \"main.rud\"\ntarget = \"js\"\n\n[run]\njs = \"false\"\n\n[dependencies]",
         ),
     )
     .unwrap();
@@ -3348,7 +3415,7 @@ fn run_uses_node_standard_globals() {
     let app = directory.path().join("runtime");
     write_project(&app, "runtime", "1.0.0", &[]);
     fs::write(
-        app.join("main.hc"),
+        app.join("main.rud"),
         "extern cwd : {} -> String = \"process.cwd\"\n\
          extern environment : {} = \"process.env\"\n\
          extern console_object : {} = \"console\"\n\
@@ -3368,8 +3435,8 @@ fn run_uses_node_standard_globals() {
     fs::write(
         app.join("Ruddy.toml"),
         manifest.replace(
-            "root = \"main.hc\"\n[dependencies]",
-            "root = \"main.hc\"\ntarget = \"js\"\n[dependencies]",
+            "root = \"main.rud\"\n[dependencies]",
+            "root = \"main.rud\"\ntarget = \"js\"\n[dependencies]",
         ),
     )
     .unwrap();
@@ -3384,7 +3451,7 @@ fn run_drains_queued_jobs_and_preserves_installed_files_on_runtime_failure() {
     let app = directory.path().join("queued");
     write_project(&app, "queued", "1.0.0", &[]);
     fs::write(
-        app.join("main.hc"),
+        app.join("main.rud"),
         "extern queue : ({} -> {}) -> {} = \"queueMicrotask\"\n\
          extern parse : String -> {} = \"JSON.parse\"\n\
          let queued = queue (fn _ => parse \"{\")\n",
@@ -3394,8 +3461,8 @@ fn run_drains_queued_jobs_and_preserves_installed_files_on_runtime_failure() {
     fs::write(
         app.join("Ruddy.toml"),
         manifest.replace(
-            "root = \"main.hc\"\n[dependencies]",
-            "root = \"main.hc\"\ntarget = \"js\"\n[dependencies]",
+            "root = \"main.rud\"\n[dependencies]",
+            "root = \"main.rud\"\ntarget = \"js\"\n[dependencies]",
         ),
     )
     .unwrap();
@@ -3555,7 +3622,7 @@ fn run_rejects_an_effectful_callback_through_a_polymorphic_extern_boundary() {
     let app = directory.path().join("polymorphic-callback");
     write_project(&app, "polymorphic-callback", "1.0.0", &[]);
     fs::write(
-        app.join("main.hc"),
+        app.join("main.rud"),
         "effect Tick = Nat -> Nat\n\
          extern run : fn('a) -> Nat = \"host.run\"\n\
          let result = handle run (fn n => !Tick n) with\n\
@@ -3567,8 +3634,8 @@ fn run_rejects_an_effectful_callback_through_a_polymorphic_extern_boundary() {
     fs::write(
         app.join("Ruddy.toml"),
         manifest.replace(
-            "root = \"main.hc\"\n[dependencies]",
-            "root = \"main.hc\"\ntarget = \"js\"\n[dependencies]",
+            "root = \"main.rud\"\n[dependencies]",
+            "root = \"main.rud\"\ntarget = \"js\"\n[dependencies]",
         ),
     )
     .unwrap();
@@ -3594,7 +3661,7 @@ fn run_reports_invalid_extern_expressions_with_javascript_source_locations() {
     let app = directory.path().join("missing");
     write_project(&app, "missing", "1.0.0", &[]);
     fs::write(
-        app.join("main.hc"),
+        app.join("main.rud"),
         "extern unavailable : Nat = \"ruddy_runtime.unavailable\"\n",
     )
     .unwrap();
@@ -3602,8 +3669,8 @@ fn run_reports_invalid_extern_expressions_with_javascript_source_locations() {
     fs::write(
         app.join("Ruddy.toml"),
         manifest.replace(
-            "root = \"main.hc\"\n[dependencies]",
-            "root = \"main.hc\"\ntarget = \"js\"\n[dependencies]",
+            "root = \"main.rud\"\n[dependencies]",
+            "root = \"main.rud\"\ntarget = \"js\"\n[dependencies]",
         ),
     )
     .unwrap();
@@ -3631,7 +3698,7 @@ fn check_compiles_without_build_output_and_reports_failures() {
     check_project(&app).unwrap();
     assert!(!app.join("build").exists());
 
-    fs::write(app.join("main.hc"), "let bad : Nat = false\n").unwrap();
+    fs::write(app.join("main.rud"), "let bad : Nat = false\n").unwrap();
     let error = check_project(&app).unwrap_err();
     assert!(!error.is_usage());
     assert_eq!(error.exit_code(), 1);
@@ -3651,21 +3718,21 @@ fn imported_array_aliases_cannot_cross_extern_boundaries() {
     fs::create_dir(&app).unwrap();
     fs::write(
         dependency.join("Ruddy.toml"),
-        "name = \"dep\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"lib.hc\"\n[dependencies]\nstd = false\n",
+        "name = \"dep\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"lib.rud\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
     fs::write(
-        dependency.join("lib.hc"),
+        dependency.join("lib.rud"),
         "type Carrier 'r = { name: String, ..'r }\ntype Numbers = Carrier { values: [Nat] }\n",
     )
     .unwrap();
     fs::write(
         app.join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\ndep = \"../dep\"\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\ndep = \"../dep\"\n",
     )
     .unwrap();
     fs::write(
-        app.join("main.hc"),
+        app.join("main.rud"),
         "extern values : dep::Numbers = \"host.values\"\n",
     )
     .unwrap();
@@ -3786,7 +3853,7 @@ fn dependency_artifacts_cache_child() {
     let app = root.join("app");
     write_project(&dep, "dep", "1.0.0", &[]);
     write_project(&app, "app", "0.1.0", &[("dep", "../dep")]);
-    fs::write(app.join("main.hc"), "let main = dep::value\n").unwrap();
+    fs::write(app.join("main.rud"), "let main = dep::value\n").unwrap();
     build_project(&app).unwrap();
 
     // One entry, for the dependency and under this compiler's stamp; the
@@ -3812,10 +3879,10 @@ fn dependency_artifacts_cache_child() {
     // same key that exports a different name is believed over the source.
     let other = root.join("other");
     write_project(&other, "dep", "1.0.0", &[]);
-    fs::write(other.join("main.hc"), "let renamed = 0n\n").unwrap();
+    fs::write(other.join("main.rud"), "let renamed = 0n\n").unwrap();
     let planted = compile(&other).unwrap().print();
     fs::write(&entry, &planted).unwrap();
-    fs::write(app.join("main.hc"), "let main = dep::renamed\n").unwrap();
+    fs::write(app.join("main.rud"), "let main = dep::renamed\n").unwrap();
     build_project(&app).unwrap();
 
     // Another compiler's directory is removed the moment this one stores
@@ -3841,10 +3908,10 @@ fn dependency_artifacts_cache_child() {
     // A change to the dependency's sources changes the key, so the planted
     // entry is left behind and the real dependency is compiled.
     fs::write(&entry, &planted).unwrap();
-    fs::write(dep.join("main.hc"), "let value = 1n\nlet more = 2n\n").unwrap();
+    fs::write(dep.join("main.rud"), "let value = 1n\nlet more = 2n\n").unwrap();
     let error = build_project(&app).unwrap_err().to_string();
     assert!(error.contains("renamed"), "{error}");
-    fs::write(app.join("main.hc"), "let main = dep::more\n").unwrap();
+    fs::write(app.join("main.rud"), "let main = dep::more\n").unwrap();
     build_project(&app).unwrap();
 
     // The target is part of the key: the same dependency built under a
@@ -3852,7 +3919,7 @@ fn dependency_artifacts_cache_child() {
     // build's artifact read back for a build its guards were not judged for.
     let lib = root.join("lib");
     write_project(&lib, "lib", "0.1.0", &[("dep", "../dep")]);
-    fs::write(lib.join("main.hc"), "let value = dep::more\n").unwrap();
+    fs::write(lib.join("main.rud"), "let value = dep::more\n").unwrap();
     build_project(&lib).unwrap();
     let entries = fs::read_dir(compilers[0].path()).unwrap().flatten().count();
     assert_eq!(entries, 2);
@@ -3866,7 +3933,7 @@ fn a_manifests_platform_is_judged_by_guards_and_defaults_to_node() {
     let directory = tempfile::tempdir().unwrap();
     write_project(directory.path(), "hosted", "1.0.0", &[]);
     fs::write(
-        directory.path().join("main.hc"),
+        directory.path().join("main.rud"),
         "@if {platform: \"web\"} let value = 1n\nlet uses = value\n",
     )
     .unwrap();
@@ -3905,7 +3972,7 @@ fn a_web_library_builds_and_a_web_executable_is_refused() {
     )
     .unwrap();
     fs::write(
-        directory.path().join("main.hc"),
+        directory.path().join("main.rud"),
         "@if {platform: \"web\"} let value = 1n\nlet main = fn _ => ()\n",
     )
     .unwrap();
@@ -3938,7 +4005,7 @@ fn a_dependency_is_compiled_for_the_root_builds_target() {
     let dependency = project.path().join("dep");
     write_project(&dependency, "dep", "1.0.0", &[]);
     fs::write(
-        dependency.join("main.hc"),
+        dependency.join("main.rud"),
         "type Never = |\n\
          effect Process = { exit: Nat -> Never }\n\
          @if {target: \"js\"} module js\n\
@@ -3946,7 +4013,7 @@ fn a_dependency_is_compiled_for_the_root_builds_target() {
          @if {target: \"artifact\"} let stop : () -> Never + !Process = fn _ => !Process.exit 3n\n",
     )
     .unwrap();
-    fs::write(dependency.join("js.hc"), "let code = 17n\n").unwrap();
+    fs::write(dependency.join("js.rud"), "let code = 17n\n").unwrap();
     // On its own the library is an artifact build: the `js` module is never
     // looked for and the artifact arm is the one compiled.
     let alone = compile(&dependency).unwrap();
@@ -3985,7 +4052,7 @@ fn private_file_modules_execute_without_exposing_javascript_exports() {
     )
     .unwrap();
     fs::write(
-        directory.path().join("main.hc"),
+        directory.path().join("main.rud"),
         "@private module Hidden\n\
          @private extern remember : Nat -> Nat = \"x => (globalThis.ruddyPrivateInit = x, x)\"\n\
          @private let initialized = remember 7n\n\
@@ -3997,7 +4064,7 @@ fn private_file_modules_execute_without_exposing_javascript_exports() {
     )
     .unwrap();
     fs::write(
-        directory.path().join("Hidden.hc"),
+        directory.path().join("Hidden.rud"),
         "module Nested = let answer = 42n end",
     )
     .unwrap();
@@ -4042,7 +4109,7 @@ fn private_main_is_rejected_for_every_executable_target() {
             assert!(error.contains("public root-module `main`"), "{error}");
         }
         fs::write(
-            directory.path().join("main.hc"),
+            directory.path().join("main.rud"),
             "@private let start = fn _ => ()\nlet main = start",
         )
         .unwrap();

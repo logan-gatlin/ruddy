@@ -18,7 +18,7 @@ const docKey = (name) => `ruddy-debug/doc/${name}`;
 /// The root file of every bundle, which the server decides and the page only
 /// has to agree with: `snapshot::ROOT`. A document without one still opens —
 /// the compiler says what is missing better than a refusal here would.
-const ROOT = "main.hc";
+const ROOT = "main.rud";
 
 const state = {
   doc: "demo",
@@ -903,7 +903,7 @@ el("overlay").addEventListener("mousedown", (event) => {
 //
 // A document is a bundle, so the editor holds one file of several. The strip
 // is the whole of that: which files there are, which one is on screen, and the
-// three things you can do to the set. `main.hc` gets no special treatment —
+// three things you can do to the set. `main.rud` gets no special treatment —
 // renaming or deleting it is allowed, and what happens is that the compiler
 // says the bundle has lost its root, which is a better teacher than a disabled
 // button.
@@ -974,15 +974,15 @@ function renderFiles() {
   const box = strip.querySelector(".fname");
   if (!box) return;
   box.focus();
-  // Select the module name and leave the `.hc` alone: renaming a file is
+  // Select the module name and leave the `.rud` alone: renaming a file is
   // almost always renaming the module it holds.
-  box.setSelectionRange(0, Math.max(0, box.value.length - ".hc".length));
+  box.setSelectionRange(0, Math.max(0, box.value.length - ".rud".length));
 }
 
 function nameBox(value) {
   return (
     `<span class="ftab editing">` +
-    `<input class="fname" spellcheck="false" autocomplete="off" placeholder="Name.hc" ` +
+    `<input class="fname" spellcheck="false" autocomplete="off" placeholder="Name.rud" ` +
     `value="${esc(value)}" size="${Math.max(8, value.length + 1)}" />` +
     `</span>`
   );
@@ -1011,7 +1011,7 @@ function commitRename(box) {
     state.notice = clash
       ? `this bundle already has a ${path}`
       : `${path || "a file"} is not a path a file can have: ` +
-        "letters, digits, `_` and `-`, `/` between folders, ending in `.hc`";
+        "letters, digits, `_` and `-`, `/` between folders, ending in `.rud`";
     app.emit("status");
     return;
   }
@@ -1096,14 +1096,14 @@ function showFile(span) {
 
 /// The shape `docs::valid_file_path` accepts, checked where the name was typed:
 /// a relative `/`-separated path of segments drawn from a small alphabet,
-/// ending in `.hc`. The server refuses anything else with a 400, and a 400 the
+/// ending in `.rud`. The server refuses anything else with a 400, and a 400 the
 /// reader never sees is a file that silently did not appear.
 function validPath(path) {
-  if (!path.endsWith(".hc") || path.length > 128) return false;
+  if (!path.endsWith(".rud") || path.length > 128) return false;
   const segments = path.split("/");
   return segments.every((segment, i) => {
     const last = i === segments.length - 1;
-    const name = last ? segment.slice(0, -".hc".length) : segment;
+    const name = last ? segment.slice(0, -".rud".length) : segment;
     return /^[A-Za-z0-9_-]+$/.test(name);
   });
 }

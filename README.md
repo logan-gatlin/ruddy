@@ -1,6 +1,6 @@
 # Ruddy
 
-Ruddy is an early-stage functional language with structural types, type inference, algebraic effects, pattern matching, modules, and a JavaScript backend. This repository contains the compiler, CLI, standard library, browser debugger, and tree-sitter grammar.
+Ruddy is an early-stage functional language with structural types, type inference, algebraic effects, pattern matching, modules, and a JavaScript backend. This repository contains the compiler, CLI, standard library, browser debugger, language server, and tree-sitter grammar.
 
 ## Quick start
 
@@ -16,6 +16,36 @@ ruddy run
 ```
 
 Use `ruddy --help` to see all CLI commands. The standard library is installed under `$RUDDY_HOME/std`, or `~/.ruddy/std` when `RUDDY_HOME` is unset.
+
+The repository's `Ruddy.toml` defines the standard-library bundle, with `std/lib.rud` as its root source. Run `ruddy check` from the repository root to check it. The installer copies this manifest and the `std/` source directory into the installed bundle.
+
+## Editor support
+
+`just install` also installs `ruddy-ls`. Configure your editor to launch that
+command over stdio, with the directory containing `Ruddy.toml` as its workspace
+root. It provides diagnostics, hover, completion, and go-to-definition for `.rud`
+files. Unsaved local dependency buffers participate in analysis; Git dependencies
+and installed std retain source navigation.
+
+For Helix, add the server table and merge these keys into the existing Ruddy
+language entry from `just helix` ([Helix configuration](https://docs.helix-editor.com/languages.html)):
+
+```toml
+[language-server.ruddy]
+command = "ruddy-ls"
+
+[[language]]
+name = "ruddy"
+roots = ["Ruddy.toml"]
+language-servers = ["ruddy"]
+```
+
+The server analyzes the current buffer with recovery, prioritizes active-file
+checks, and completes project/backend checks while idle. It tracks source and
+manifest changes on disk, including missing module candidates, with a 500 ms poll
+of the files the loader actually requested. `Ruddy.toml` selects the root build
+configuration. See [the architecture and benchmark notes](docs/query-architecture.md)
+for query boundaries and reproducible performance measurements.
 
 ## Programs and libraries
 
@@ -41,7 +71,7 @@ kind must have no escaping effects.
 name = "hello"
 version = "0.1.0"
 kind = "executable"
-root = "main.hc"
+root = "main.rud"
 target = "js"
 
 [dependencies]

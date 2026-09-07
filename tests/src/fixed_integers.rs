@@ -156,7 +156,7 @@ fn fixed_integer_std_arithmetic_runs_exactly_through_imports_and_javascript() {
         .unwrap();
     let project = tempfile::tempdir().unwrap();
     fs::write(project.path().join("Ruddy.toml"), format!(
-        "name = \"fixed-test\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.hc\"\ntarget = \"js\"\n[dependencies]\nstd = {:?}\n", root.join("std")
+        "name = \"fixed-test\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.rud\"\ntarget = \"js\"\n[dependencies]\nstd = {:?}\n", root
     )).unwrap();
     let mut source = String::new();
     let mut assertions = Vec::new();
@@ -248,7 +248,7 @@ fn fixed_integer_std_arithmetic_runs_exactly_through_imports_and_javascript() {
     }
     source.push_str("let exact64 = std::nat::subtract64 9007199254740993n64 9007199254740992n64\nlet shown64 = std::nat::to_string64 18446744073709551615n64\nlet narrow = std::int::from_int8 255i\nlet wide = std::int::to_int8 -128i8\nlet to_nat64 = std::nat::to_nat64\nlet kept = (fn x => x) [9007199254740993n64]\nlet kept_first = match kept with | [value] => value | _ => 0n64 end\n");
     assertions.push("assert.equal(x.kept_first, 9007199254740993n); assert.equal(x.exact64, 1n); assert.equal(x.shown64, '18446744073709551615'); assert.equal(x.narrow, -1); assert.equal(x.wide, -128); assert.throws(() => x.to_nat64(18446744073709551615n), RangeError);".into());
-    fs::write(project.path().join("main.hc"), source).unwrap();
+    fs::write(project.path().join("main.rud"), source).unwrap();
     let artifact =
         ruddy_cli::build_project(project.path()).expect("fixed-width std consumer builds");
     let javascript = artifact.with_extension("js");
