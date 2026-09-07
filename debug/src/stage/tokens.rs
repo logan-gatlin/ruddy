@@ -130,6 +130,8 @@ pub fn label(kind: &Kind) -> &'static str {
         Kind::Real(_) => "Real",
         Kind::String(_) => "String",
         Kind::Boolean(_) => "Boolean",
+        Kind::LineComment(_) => "LineComment",
+        Kind::BlockComment(_) => "BlockComment",
         Kind::Invalid => "Invalid",
     }
 }
@@ -159,6 +161,7 @@ pub fn class(kind: &Kind) -> &'static str {
         Kind::EffectLabel(_) => "effect",
         Kind::Variable(_) => "variable",
         Kind::Attribute(_) => "attribute",
+        Kind::LineComment(_) | Kind::BlockComment(_) => "comment",
         Kind::Equal
         | Kind::FatArrow
         | Kind::Arrow

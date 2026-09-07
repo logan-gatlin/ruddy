@@ -13,9 +13,13 @@ cd hello
 ruddy check
 ruddy build
 ruddy run
+ruddy fmt
 ```
 
-Use `ruddy --help` to see all CLI commands. The standard library is installed under `$RUDDY_HOME/std`, or `~/.ruddy/std` when `RUDDY_HOME` is unset.
+Use `ruddy --help` to see all CLI commands. `ruddy fmt` rewrites a bundle's
+sources in one canonical style (`--check` only reports what would change,
+`--stdin` formats one file from standard input); a file with syntax errors is
+formatted around them, and they are reported. The standard library is installed under `$RUDDY_HOME/std`, or `~/.ruddy/std` when `RUDDY_HOME` is unset.
 
 The repository's `Ruddy.toml` defines the standard-library bundle, with `std/lib.rud` as its root source. Run `ruddy check` from the repository root to check it. The installer copies this manifest and the `std/` source directory into the installed bundle.
 
@@ -23,8 +27,8 @@ The repository's `Ruddy.toml` defines the standard-library bundle, with `std/lib
 
 `just install` also installs `ruddy-ls`. Configure your editor to launch that
 command over stdio, with the directory containing `Ruddy.toml` as its workspace
-root. It provides diagnostics, hover, completion, and go-to-definition for `.rud`
-files. Unsaved local dependency buffers participate in analysis; Git dependencies
+root. It provides diagnostics, hover, completion, go-to-definition, and
+document formatting for `.rud` files. Unsaved local dependency buffers participate in analysis; Git dependencies
 and installed std retain source navigation.
 
 For Helix, add the server table and merge these keys into the existing Ruddy

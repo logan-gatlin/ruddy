@@ -8,8 +8,8 @@ use std::{
 
 use ruddy::artifact::Artifact;
 use ruddy_cli::{
-    Lockfile, Outcome, build_project, check_project, clean_project, compile,
-    execute_javascript_module, new_project, run, run_project,
+    FormatReport, Lockfile, Outcome, build_project, check_project, clean_project, compile,
+    execute_javascript_module, format_paths, new_project, run, run_project,
 };
 use ruddy_debug::{
     snapshot::{ROOT as DEBUG_ROOT, compile as debug_compile},
@@ -4116,4 +4116,139 @@ fn private_main_is_rejected_for_every_executable_target() {
         check_project(directory.path()).expect("a public main may alias a private function");
         build_project(directory.path()).expect("the public main builds");
     }
+}
+
+/// A bundle with an unformatted root, a module file in a subfolder, a
+/// nested bundle that is not ours, and a file outside the source folder.
+fn unformatted_bundle() -> TempDir {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    fs::create_dir_all(root.join("src/Math")).unwrap();
+    fs::create_dir_all(root.join("src/vendor/dep")).unwrap();
+    fs::write(
+        root.join("Ruddy.toml"),
+        "name = \"app\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"src/main.rud\"\n[dependencies]\nstd = false\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/main.rud"), "module Math\nlet   x  =  1n\n").unwrap();
+    fs::write(root.join("src/Math/module.rud"), "let y = 2n\n").unwrap();
+    fs::write(
+        root.join("src/vendor/dep/Ruddy.toml"),
+        "name = \"dep\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/vendor/dep/main.rud"), "let   z  =  3n\n").unwrap();
+    fs::write(root.join("outside.rud"), "let   w  =  4n\n").unwrap();
+    directory
+}
+
+/// `ruddy fmt` with no paths formats the bundle's own sources: everything
+/// under the folder its root is in, minus any nested bundle, and nothing
+/// outside it. Run from a subfolder it finds the manifest above it.
+#[test]
+fn fmt_formats_the_enclosing_bundle_and_nothing_else() {
+    let directory = unformatted_bundle();
+    let root = directory.path();
+    let report = match run(["fmt"], root.join("src/Math")).unwrap() {
+        Outcome::Formatted(report) => report,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(report.changed, [root.join("src/main.rud")]);
+    assert_eq!(report.unchanged, [root.join("src/Math/module.rud")]);
+    assert!(report.errors.is_empty() && !report.failed() && !report.check);
+    assert_eq!(
+        fs::read_to_string(root.join("src/main.rud")).unwrap(),
+        "module Math\nlet x = 1n\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("src/vendor/dep/main.rud")).unwrap(),
+        "let   z  =  3n\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("outside.rud")).unwrap(),
+        "let   w  =  4n\n"
+    );
+    // Formatted once, formatted for good.
+    let again = format_paths(&[], root, false).unwrap();
+    assert!(again.changed.is_empty());
+    assert_eq!(again.unchanged.len(), 2);
+}
+
+/// `--check` writes nothing and fails when a file would change; explicit
+/// files and folders are formatted wherever they are.
+#[test]
+fn fmt_check_and_explicit_paths() {
+    let directory = unformatted_bundle();
+    let root = directory.path();
+    let before = fs::read_to_string(root.join("src/main.rud")).unwrap();
+    let report = match run(["f", "--check"], root).unwrap() {
+        Outcome::Formatted(report) => report,
+        other => panic!("{other:?}"),
+    };
+    assert!(report.check && report.failed());
+    assert_eq!(report.changed, [root.join("src/main.rud")]);
+    assert_eq!(
+        fs::read_to_string(root.join("src/main.rud")).unwrap(),
+        before
+    );
+
+    // A named folder is walked, but a bundle nested in it is still another
+    // bundle's; naming that bundle's folder itself formats it.
+    let report = format_paths(
+        &[PathBuf::from("outside.rud"), PathBuf::from("src/vendor")],
+        root,
+        false,
+    )
+    .unwrap();
+    assert_eq!(report.changed, [root.join("outside.rud")]);
+    let report = format_paths(&[PathBuf::from("src/vendor/dep")], root, false).unwrap();
+    assert_eq!(report.changed, [root.join("src/vendor/dep/main.rud")]);
+    assert_eq!(
+        fs::read_to_string(root.join("outside.rud")).unwrap(),
+        "let w = 4n\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("src/vendor/dep/main.rud")).unwrap(),
+        "let z = 3n\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("src/main.rud")).unwrap(),
+        before
+    );
+
+    let error = format_paths(&[PathBuf::from("missing.rud")], root, false).unwrap_err();
+    assert!(error.to_string().contains("could not find"), "{error}");
+    let nowhere = tempfile::tempdir().unwrap();
+    let error = format_paths(&[], nowhere.path(), false).unwrap_err();
+    assert!(error.to_string().contains("no `Ruddy.toml`"), "{error}");
+    assert!(error.to_string().contains("help:"), "{error}");
+    let usage = run(["fmt", "--stdin", "outside.rud"], root).unwrap_err();
+    assert!(usage.is_usage(), "{usage}");
+}
+
+/// A file with a syntax error is still written, formatted around the
+/// error, and the run fails with the error reported.
+#[test]
+fn fmt_formats_around_syntax_errors_and_reports_them() {
+    let directory = unformatted_bundle();
+    let root = directory.path();
+    fs::write(
+        root.join("src/main.rud"),
+        "let   a = 1n\nlet = broken\nlet   b = 2n\n",
+    )
+    .unwrap();
+    let report = match run(["fmt"], root).unwrap() {
+        Outcome::Formatted(report) => report,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(report.errors, [root.join("src/main.rud")]);
+    assert_eq!(report.diagnostics.len(), 1);
+    assert!(report.failed());
+    let rendered = report.diagnostics[0].render(false);
+    assert!(rendered.contains("main.rud"), "{rendered}");
+    assert_eq!(
+        fs::read_to_string(root.join("src/main.rud")).unwrap(),
+        "let a = 1n\nlet = broken\nlet b = 2n\n"
+    );
+    assert!(!FormatReport::default().failed());
 }

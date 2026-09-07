@@ -166,10 +166,9 @@ fn editor_can_initialize_open_hover_and_shutdown() {
     else {
         panic!("initialize response");
     };
-    assert_eq!(
-        response.response_result.unwrap()["capabilities"]["hoverProvider"],
-        true
-    );
+    let capabilities = response.response_result.unwrap()["capabilities"].clone();
+    assert_eq!(capabilities["hoverProvider"], true);
+    assert_eq!(capabilities["documentFormattingProvider"], true);
     client
         .sender
         .send(Message::Notification(Notification::new(
@@ -458,4 +457,40 @@ fn rapid_changes_publish_current_diagnostics_and_disk_creation_is_observed() {
         )))
         .unwrap();
     worker.join().unwrap();
+}
+
+/// Formatting is one edit over the whole buffer, or none when the buffer is
+/// already formatted; a buffer with a syntax error is formatted around it.
+#[test]
+fn editor_formats_the_whole_document() {
+    let edits = editor_request(
+        &[("main.rud", "let   value = 1n\nlet  other = 2n")],
+        "textDocument/formatting",
+        0,
+        0,
+    );
+    let edits = edits.as_array().unwrap();
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0]["newText"], "let value = 1n\nlet other = 2n\n");
+    assert_eq!(edits[0]["range"]["start"], json!({"line":0,"character":0}));
+    assert_eq!(edits[0]["range"]["end"], json!({"line":1,"character":15}));
+
+    let edits = editor_request(
+        &[("main.rud", "let value = 1n\n")],
+        "textDocument/formatting",
+        0,
+        0,
+    );
+    assert_eq!(edits, json!([]));
+
+    let edits = editor_request(
+        &[("main.rud", "let   value = 1n\nlet = \nlet  other = 2n")],
+        "textDocument/formatting",
+        0,
+        0,
+    );
+    assert_eq!(
+        edits[0]["newText"],
+        "let value = 1n\nlet =\nlet other = 2n\n"
+    );
 }

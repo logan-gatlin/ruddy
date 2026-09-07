@@ -6,6 +6,12 @@
 port := "7878"
 dev_dir := justfile_directory() / "debug/.dev"
 
+# The Ruddy sources `just fmt` keeps formatted: the standard library, the
+# backend's platform files, and the demo. The tree-sitter corpus and the
+# diagnostics fixtures are left alone, since their exact text is under test,
+# and so is the handler fragment the backend splices into generated code.
+ruddy_sources := "std demo.rud src/backend/node-platform.rud src/backend/node-entry.rud"
+
 _default:
     @just --list --unsorted
 
@@ -158,11 +164,14 @@ cov *args:
 clippy:
     cargo clippy --workspace --all-targets
 
+# Rust sources through rustfmt, Ruddy sources through `ruddy fmt`.
 fmt:
     cargo fmt --all
+    cargo run -q -p cli --bin ruddy -- fmt {{ruddy_sources}}
 
 fmt-check:
     cargo fmt --all -- --check
+    cargo run -q -p cli --bin ruddy -- fmt --check {{ruddy_sources}}
 
 # Drop the supervisor's scratch state (last good binary, build log).
 clean-dev:

@@ -1008,12 +1008,24 @@ pub enum Place {
 pub struct Output {
     pub stmts: Vec<Stmt>,
     pub errors: Vec<Error>,
+    /// Every comment in the stream, in source order. Split off before the
+    /// parser reads a token, so a comment may sit anywhere whitespace may;
+    /// the formatter is what reads them back.
+    pub comments: Vec<Token>,
+    /// Every region recovery dropped, in source order: the tokens of a
+    /// definition that failed to parse, a declaration a block refused, the
+    /// rest of a block after a stray statement. Nothing in `stmts` covers
+    /// them, so a formatter that prints the tree would lose them without
+    /// this; with it, each can be copied back verbatim.
+    pub skipped: Vec<Span>,
 }
 
 struct Parser {
     toks: Vec<Token>,
     pos: usize,
     errors: Vec<Error>,
+    /// The regions recovery has dropped so far; see [`Output::skipped`].
+    skipped: Vec<Span>,
     /// How far [`Parser::mismatched_closer`] has folded the token prefix into
     /// `scan_open`, so error-dense input scans each token once rather than
     /// rescanning the whole prefix at every error.
@@ -1058,12 +1070,19 @@ impl Annotation {
 }
 
 pub fn parse(toks: Vec<Token>) -> Output {
+    // The comments leave the stream here and nowhere deeper: every lookahead
+    // the parser does indexes the token list directly, and each of them would
+    // otherwise have to know to step over one.
+    let (comments, toks): (Vec<Token>, Vec<Token>) =
+        toks.into_iter().partition(|tok| tok.tracked.is_comment());
     let mut p = Parser::new(toks);
     let stmts = p.stmts(None);
 
     Output {
         stmts,
         errors: p.errors,
+        comments,
+        skipped: p.skipped,
     }
 }
 
@@ -1073,8 +1092,26 @@ impl Parser {
             toks,
             pos: 0,
             errors: Vec::new(),
+            skipped: Vec::new(),
             scan_pos: 0,
             scan_open: Vec::new(),
+        }
+    }
+
+    /// Record the tokens from `from` up to the cursor as a region recovery
+    /// dropped. Nothing is recorded for an empty region.
+    fn dropped_since(&mut self, from: usize) {
+        self.dropped(from, self.pos);
+    }
+
+    /// Record the tokens in `from..to` as a region recovery dropped.
+    fn dropped(&mut self, from: usize, to: usize) {
+        if let (Some(first), Some(last)) = (
+            self.toks.get(from),
+            to.checked_sub(1).and_then(|at| self.toks.get(at)),
+        ) && from < to
+        {
+            self.skipped.push(first.span.merge(last.span));
         }
     }
 
@@ -1433,6 +1470,7 @@ impl Parser {
                     if closing.is_none() && self.at(&Kind::End) {
                         self.advance();
                     }
+                    self.dropped_since(before);
                 }
             }
         }
@@ -2853,6 +2891,7 @@ impl Parser {
             }
         }
         let mut result = None;
+        let return_at = self.pos;
         if let Some(ret) = self.eat_if(&Kind::Return) {
             if self
                 .peek()
@@ -2865,7 +2904,7 @@ impl Parser {
                     // The value is where the complaint is. The rest of the
                     // block is read through so its `end` is found, and the
                     // definition around it is kept.
-                    None => self.skip_block(),
+                    None => self.skip_block(return_at),
                 }
             }
             if let Some(tok) = self.peek()
@@ -2883,7 +2922,8 @@ impl Parser {
                     tok.span,
                     ErrorKind::StatementAfterReturn { returned: ret.span },
                 );
-                self.skip_block();
+                let from = self.pos;
+                self.skip_block(from);
             }
         }
         let anchor = result
@@ -2922,12 +2962,15 @@ impl Parser {
         }
         let Some(mut stmt) = stmt else {
             self.recover();
+            self.dropped_since(before);
             return None;
         };
         // Metadata belongs to a top-level definition. Refused over the
         // attributes and dropped; the statement they were written on is kept.
         if let (Some(first), Some(last)) = (stmt.attributes.first(), stmt.attributes.last()) {
-            self.error(first.span.merge(last.span), ErrorKind::AttributeInBlock);
+            let span = first.span.merge(last.span);
+            self.error(span, ErrorKind::AttributeInBlock);
+            self.skipped.push(span);
             stmt.attributes.clear();
         }
         let keyword = match &stmt.kind {
@@ -2938,6 +2981,7 @@ impl Parser {
             StmtKind::Extern { .. } => "extern",
         };
         self.error(at, ErrorKind::DeclarationInBlock { keyword });
+        self.skipped.push(stmt.span);
         None
     }
 
@@ -2946,8 +2990,8 @@ impl Parser {
     /// than skipped token by token, so an `end` inside a nested form is not
     /// mistaken for the block's; and read with its complaints put back, since
     /// nothing in it was going to be kept.
-    fn skip_block(&mut self) {
-        let mark = self.errors.len();
+    fn skip_block(&mut self, from: usize) {
+        let mark = (self.errors.len(), self.skipped.len(), from);
         while self
             .peek()
             .is_some_and(|tok| !matches!(tok.tracked, Kind::End))
@@ -2960,7 +3004,11 @@ impl Parser {
             }
             self.block_stmt();
         }
-        self.errors.truncate(mark);
+        self.errors.truncate(mark.0);
+        // The whole of what was read is one dropped region, whatever the
+        // statements inside it recorded on their own.
+        self.skipped.truncate(mark.1);
+        self.dropped_since(mark.2);
     }
 
     /// `match <expr> with | <arm> (| <arm>)* end`, where an arm is

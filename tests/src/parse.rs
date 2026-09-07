@@ -3762,3 +3762,63 @@ fn malformed_metadata_values_get_the_ordinary_complaints() {
     assert_eq!(out.errors[0].span.start, src.find('_').expect("the `_`"));
     assert_eq!(out.stmts.len(), 1);
 }
+
+/// Comments are tokens now, and the parser never sees one: `parse` splits
+/// them off into a list of their own before reading the stream, so a comment
+/// may sit anywhere whitespace may.
+#[test]
+fn comments_are_partitioned_out_of_the_token_stream() {
+    let src = "let a = -- one\n (* two *) 1n\n-- three";
+    let out = parse(lex(src, FileID::GENERATED).tokens);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert_eq!(out.stmts.len(), 1);
+    let comments: Vec<String> = out.comments.iter().map(|c| c.tracked.to_string()).collect();
+    assert_eq!(comments, ["-- one", "(* two *)", "-- three"]);
+    assert_eq!(out.comments[1].span.start, 16);
+}
+
+/// Every region recovery drops is recorded, so a formatter can copy it back
+/// verbatim rather than silently losing it: a broken definition at file
+/// level, a broken binding in a block, a declaration a block refuses, and
+/// the rest of a block after a stray statement.
+#[test]
+fn recovery_records_every_region_it_drops() {
+    let src = "let a = 1n\nlet = 2n oops\nlet b = 3n";
+    let out = parse(lex(src, FileID::GENERATED).tokens);
+    assert_eq!(out.stmts.len(), 2);
+    let skipped: Vec<&str> = out
+        .skipped
+        .iter()
+        .map(|span| &src[span.start..span.end()])
+        .collect();
+    assert_eq!(skipped, ["let = 2n oops"]);
+
+    let src = "let a = do\n  let = 1n\n  type T = Nat\n  let b = 2n\n  return b\nend";
+    let out = parse(lex(src, FileID::GENERATED).tokens);
+    assert_eq!(out.stmts.len(), 1, "{:#?}", out.errors);
+    let skipped: Vec<&str> = out
+        .skipped
+        .iter()
+        .map(|span| &src[span.start..span.end()])
+        .collect();
+    assert_eq!(skipped, ["let = 1n", "type T = Nat"]);
+
+    let src = "let a = do\n  return 1n\n  let b = 2n\nend\nlet c = 3n";
+    let out = parse(lex(src, FileID::GENERATED).tokens);
+    assert_eq!(out.stmts.len(), 2, "{:#?}", out.errors);
+    let skipped: Vec<&str> = out
+        .skipped
+        .iter()
+        .map(|span| &src[span.start..span.end()])
+        .collect();
+    assert_eq!(skipped, ["let b = 2n"]);
+
+    let src = "@key\nlet a = do\n  @inner let b = 1n\n  return b\nend";
+    let out = parse(lex(src, FileID::GENERATED).tokens);
+    let skipped: Vec<&str> = out
+        .skipped
+        .iter()
+        .map(|span| &src[span.start..span.end()])
+        .collect();
+    assert_eq!(skipped, ["@inner"]);
+}
