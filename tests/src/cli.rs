@@ -1605,8 +1605,13 @@ fn direct_dependency_exports_resolve_and_keep_their_artifact_owner() {
     assert_eq!(built.lir().externs[0].name, "std@0.1.0::Nested::runtime");
     assert_eq!(built.lir().externs[0].target, "host.runtime");
     assert_eq!(built.header().values.len(), 3);
-    assert!(built.header().types.is_empty());
-    assert!(built.header().effects.is_empty());
+    assert_eq!(built.header().types.len(), 1);
+    assert_eq!(built.header().types[0].name, "std@0.1.0::Nested::Number");
+    assert!(!built.header().types[0].exported);
+    assert_eq!(built.header().effects.len(), 1);
+    assert_eq!(built.header().effects[0].name, "std@0.1.0::Nested::Read");
+    assert!(!built.header().effects[0].exported);
+    Artifact::try_parse(&printed).unwrap().validate().unwrap();
 }
 
 #[test]

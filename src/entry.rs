@@ -69,25 +69,6 @@ pub(crate) fn wrapper(
     dependencies: &[&Artifact],
     source: &str,
 ) -> Result<Artifact, Error> {
-    match compile_wrapper(artifact, dependencies, source) {
-        Ok(artifact) => Ok(artifact),
-        Err(error @ Error::MissingMain) => Err(error),
-        Err(error) => {
-            // Ruddy's empty sum is eliminated by an exhaustive empty match,
-            // rather than unified with unit. This keeps entry compatibility
-            // inside the ordinary type and pattern checkers even when main
-            // never returns.
-            let never = source.replace("program::main ()", "(match program::main () with end)");
-            compile_wrapper(artifact, dependencies, &never).map_err(|_| error)
-        }
-    }
-}
-
-fn compile_wrapper(
-    artifact: &Artifact,
-    dependencies: &[&Artifact],
-    source: &str,
-) -> Result<Artifact, Error> {
     let main = format!(
         "{}@{}::main",
         artifact.header().identity.name,
@@ -101,8 +82,75 @@ fn compile_wrapper(
     {
         return Err(Error::MissingMain);
     }
+    match compile_adapter(artifact, dependencies, source).map_err(Error::InvalidMain) {
+        Ok(artifact) => Ok(artifact),
+        Err(error) => {
+            // Ruddy's empty sum is eliminated by an exhaustive empty match,
+            // rather than unified with unit. This keeps entry compatibility
+            // inside the ordinary type and pattern checkers even when main
+            // never returns.
+            let never = source.replace("program::main ()", "(match program::main () with end)");
+            compile_adapter(artifact, dependencies, &never).map_err(|_| error)
+        }
+    }
+}
+
+/// Compile a generated host adapter without requiring a `main` export.
+pub(crate) fn compile_adapter(
+    artifact: &Artifact,
+    dependencies: &[&Artifact],
+    source: &str,
+) -> Result<Artifact, Vec<String>> {
     let mut interface = artifact.clone();
     interface.header.kind = Kind::Library;
+    // A linked artifact retains declarations from its implementation bundles.
+    // Reconstitute their semantic import views: they are available to inference
+    // but do not introduce source aliases or additional runtime dependencies.
+    let mut retained = std::collections::BTreeMap::new();
+    for name in interface
+        .header
+        .types
+        .iter()
+        .map(|ty| &ty.name)
+        .chain(interface.header.effects.iter().map(|effect| &effect.name))
+    {
+        let Some((owner, _)) = name.split_once("::") else {
+            continue;
+        };
+        let Some((name, version)) = owner.rsplit_once('@') else {
+            continue;
+        };
+        if std::iter::once(artifact)
+            .chain(dependencies.iter().copied())
+            .any(|a| a.header().identity.name == name && a.header().identity.version == version)
+        {
+            continue;
+        }
+        retained.entry(owner.to_string()).or_insert_with(|| {
+            let mut view = crate::artifact::empty();
+            view.header.identity.name = name.into();
+            view.header.identity.version = version.into();
+            view.header.kind = Kind::Library;
+            view
+        });
+    }
+    for (owner, view) in &mut retained {
+        let prefix = format!("{owner}::");
+        view.header.types = interface
+            .header
+            .types
+            .iter()
+            .filter(|ty| ty.name.starts_with(&prefix))
+            .cloned()
+            .collect();
+        view.header.effects = interface
+            .header
+            .effects
+            .iter()
+            .filter(|effect| effect.name.starts_with(&prefix))
+            .cloned()
+            .collect();
+    }
     let mut imports: Vec<_> = dependencies
         .iter()
         .filter(|dependency| dependency.header().identity != artifact.header().identity)
@@ -111,6 +159,10 @@ fn compile_wrapper(
             artifact: DependencyArtifact::Checked(artifact),
         })
         .collect();
+    imports.extend(retained.values().map(|artifact| Dependency {
+        alias: None,
+        artifact: DependencyArtifact::Checked(artifact),
+    }));
     imports.push(Dependency {
         alias: Some("program"),
         artifact: DependencyArtifact::Checked(&interface),
@@ -135,11 +187,13 @@ fn compile_wrapper(
         name.push_str("-entry");
     }
     let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
-    assert!(
-        parsed.errors.is_empty(),
-        "invalid compiler entry adapter: {:?}",
-        parsed.errors
-    );
+    if !parsed.errors.is_empty() {
+        return Err(parsed
+            .errors
+            .iter()
+            .map(|error| error.diagnostic().title)
+            .collect());
+    }
     compile::compile_with_dependencies(
         Mint::new(Bundle::new(&name, Version::new(0, 0, 0)).expect("valid internal bundle name")),
         parsed.stmts,
@@ -149,16 +203,14 @@ fn compile_wrapper(
     .map(|accepted| accepted.artifact().clone())
     .map_err(|partial| {
         let source = &partial.ir.source;
-        Error::InvalidMain(
-            partial
-                .errors
-                .iter()
-                .map(|error| match error {
-                    compile::Error::Ir(error) => error.diagnostic(source).title,
-                    compile::Error::Inference(error) => error.diagnostic(source).title,
-                    compile::Error::Patterns(error) => error.kind.to_string(),
-                })
-                .collect(),
-        )
+        partial
+            .errors
+            .iter()
+            .map(|error| match error {
+                compile::Error::Ir(error) => error.diagnostic(source).title,
+                compile::Error::Inference(error) => error.diagnostic(source).title,
+                compile::Error::Patterns(error) => error.kind.to_string(),
+            })
+            .collect()
     })
 }

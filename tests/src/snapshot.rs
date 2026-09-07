@@ -3728,10 +3728,10 @@ fn every_stage_reports_on_a_source_using_effects() {
                   effect Console = !Log + !IO\n\
                   type Logger = Nat -> Nat + !Log\n\
                   type Runner 'e = (Nat -> Nat + ..'e) -> Nat + ..'e\n\
-                  let greet : () -> Nat + !Log = fn _ => do let _ = !Log.write 1n return 0n end\n\
+                  @private let greet : () -> Nat + !Log = fn _ => do let _ = !Log.write 1n return 0n end\n\
                   let quiet : () -> Nat = fn _ =>\n\
                     handle greet () with | !Log.write s => () | return x => x end\n\
-                  let loud : () -> Nat + !IO = fn _ =>\n\
+                  @private let loud : () -> Nat + !IO = fn _ =>\n\
                     handle greet () with | !Log.write s => !IO.print s end\n\
                   let choose = fn v => match v with | #A x => x | _ => 0n end\n";
     let snapshot = snapshot(source);

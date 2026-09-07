@@ -8,7 +8,7 @@ use crate::artifact::{
 };
 use esparse::Item;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     error, fmt,
 };
 
@@ -16,6 +16,10 @@ use std::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     Entry(crate::entry::Error),
+    Export {
+        name: String,
+        message: String,
+    },
     /// The backend only accepts a linked root artifact.
     Unlinked,
     /// A header value has no corresponding runtime global or extern.
@@ -34,6 +38,9 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Entry(error) => error.fmt(f),
+            Self::Export { name, message } => {
+                write!(f, "export `{name}` is not callable by the host: {message}")
+            }
             Self::Unlinked => f.write_str("the JavaScript backend requires a linked artifact"),
             Self::UnresolvedPublicValue(name) => {
                 write!(f, "public value `{name}` has no runtime definition")
@@ -61,29 +68,69 @@ struct ExportNode {
     children: BTreeMap<String, ExportNode>,
 }
 
+/// Platform handlers available to host calls into the root bundle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Platform {
+    #[default]
+    Node,
+    Web,
+}
+
 /// Generate a complete modern ECMAScript module from a linked artifact.
 pub fn generate(artifact: &Artifact) -> Result<String, Error> {
+    generate_for_platform(artifact, Platform::Node)
+}
+
+/// Generate root host exports using only the selected platform's handlers.
+pub fn generate_for_platform(artifact: &Artifact, platform: Platform) -> Result<String, Error> {
+    if !artifact.header().dependencies.is_empty() {
+        return Err(Error::Unlinked);
+    }
+    let mut prepared = None;
+    let mut entry = None;
     if artifact.header().kind == crate::artifact::Kind::Executable {
-        if !artifact.header().dependencies.is_empty() {
-            return Err(Error::Unlinked);
+        if platform == Platform::Web {
+            return Err(Error::Export {
+                name: "main".into(),
+                message: "web executables are not supported yet".into(),
+            });
         }
         let adapter = entry_adapter(artifact)?;
-        let invoke = adapter
+        entry = adapter
             .header()
             .values
             .iter()
             .find(|value| value.name.ends_with("::invoke"))
-            .expect("runtime adapter exports invoke")
-            .name
-            .clone();
+            .map(|value| value.name.clone());
         let mut library = artifact.clone();
         library.header.kind = crate::artifact::Kind::Library;
         let mut linked =
-            crate::link::link(&[library, adapter]).expect("two library artifacts link");
+            crate::link::link(&[library, adapter]).expect("entry adapter links to its root");
         linked.header = artifact.header().clone();
-        return Generator::new(&linked)?.generate_with_entry(Some(&invoke));
+        prepared = Some(linked);
     }
-    Generator::new(artifact)?.generate()
+    let mut exports = HashMap::new();
+    let root = prepared.as_ref().unwrap_or(artifact);
+    if let Some(host) = super::host::compile(root, &[], platform)? {
+        let mut library = root.clone();
+        library.header.kind = crate::artifact::Kind::Library;
+        let mut linked =
+            crate::link::link(&[library, host.artifact]).expect("host adapter links to its root");
+        linked.header = artifact.header().clone();
+        exports = host.exports;
+        prepared = Some(linked);
+    }
+    Generator::new(prepared.as_ref().unwrap_or(artifact), &exports, platform)?
+        .generate_with_entry(entry.as_deref())
+}
+
+/// Validate only the root's public host interface; dependencies retain effects.
+pub fn check_exports(
+    artifact: &Artifact,
+    dependencies: &[&Artifact],
+    platform: Platform,
+) -> Result<(), Error> {
+    super::host::compile(artifact, dependencies, platform).map(|_| ())
 }
 
 /// Check Node's root effect contract without emitting JavaScript.
@@ -100,32 +147,28 @@ fn entry_adapter(artifact: &Artifact) -> Result<Artifact, Error> {
 
 // The platform ABI is structural. These declarations describe the runtime's
 // supported interfaces independently of a project's choice of std bundle.
-const NODE_ENTRY: &str = r#"
-effect Console = { write: String -> (), write_error: String -> () }
-effect Process = { exit: Nat -> | }
-extern write : fn(String) -> () = "text => { process.stdout.write(text); }"
-extern write_error : fn(String) -> () = "text => { process.stderr.write(text); }"
-let invoke : () -> Nat = fn _ =>
-  handle do
-    let result : () = program::main ()
-    return result
-  end with
-  | !Console.write text => write text
-  | !Console.write_error text => write_error text
-  | !Process.exit code => raise code
-  | return _ => 0n
-  end
-"#;
+const NODE_ENTRY: &str = concat!(
+    include_str!("node-platform.hc"),
+    "let with_platform: (() -> 'a + !Console + !Process + !FileSystem) -> 'a = fn body => handle body () with\n",
+    include_str!("node-handler.hc"),
+    "end\n",
+    include_str!("node-entry.hc")
+);
 
 struct Generator<'a> {
     artifact: &'a Artifact,
     runtime_names: HashSet<&'a str>,
     extern_names: HashSet<&'a str>,
     exports: ExportNode,
+    platform_exports: bool,
 }
 
 impl<'a> Generator<'a> {
-    fn new(artifact: &'a Artifact) -> Result<Self, Error> {
+    fn new(
+        artifact: &'a Artifact,
+        host_exports: &HashMap<String, String>,
+        platform: Platform,
+    ) -> Result<Self, Error> {
         if !artifact.header().dependencies.is_empty() {
             return Err(Error::Unlinked);
         }
@@ -178,7 +221,7 @@ impl<'a> Generator<'a> {
             insert_export(
                 &mut exports,
                 &path,
-                &value.name,
+                host_exports.get(&value.name).unwrap_or(&value.name),
                 artifact
                     .lir()
                     .globals
@@ -193,6 +236,7 @@ impl<'a> Generator<'a> {
             runtime_names,
             extern_names,
             exports,
+            platform_exports: !host_exports.is_empty() && platform == Platform::Node,
         };
         generator.validate()?;
         Ok(generator)
@@ -224,15 +268,14 @@ impl<'a> Generator<'a> {
         Ok(())
     }
 
-    fn generate(&self) -> Result<String, Error> {
-        self.generate_with_entry(None)
-    }
-
     fn generate_with_entry(&self, entry: Option<&str>) -> Result<String, Error> {
         let mut out = String::new();
         out.push_str("// Generated by Ruddy.\n");
         out.push_str(RUNTIME);
         out.push_str(CPS_RUNTIME);
+        if entry.is_some() || self.platform_exports {
+            out.push_str(include_str!("node-fs.js"));
+        }
         out.push_str("const $f = [\n");
         for (id, function) in self.artifact.lir().functions.iter().enumerate() {
             out.push_str(&format!(

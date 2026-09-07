@@ -8,14 +8,14 @@ extern apply_pair : fn(fn(Nat, Nat) -> Nat, Nat, Nat) -> Nat = "host.applyPair"
 extern make_adder : fn(Nat) -> fn(Nat, Nat) -> Nat = "host.makeAdder"
 
 effect Tick = Nat -> Nat
-extern tick : fn(Nat) -> Nat + !Tick = "host.tick"
-extern run_tick : fn(fn(Nat) -> Nat + !Tick, Nat) -> Nat + !Tick = "host.runTick"
-extern run_returned_tick : fn(fn(Nat) -> (Nat -> Nat + !Tick), Nat, Nat) -> Nat + !Tick = "host.runReturnedTick"
+@private extern tick : fn(Nat) -> Nat + !Tick = "host.tick"
+@private extern run_tick : fn(fn(Nat) -> Nat + !Tick, Nat) -> Nat + !Tick = "host.runTick"
+@private extern run_returned_tick : fn(fn(Nat) -> (Nat -> Nat + !Tick), Nat, Nat) -> Nat + !Tick = "host.runReturnedTick"
 
 effect Needed = () -> Nat
 effect Spare = Nat -> Nat
-extern invoke_conditional_shared : fn(fn(()) -> Nat + !Needed (when 'needed) + ..'effects) -> Nat + !Needed + ..'effects = "host.invokeConditionalShared"
-let run_conditional_shared : () -> Nat + !Needed + ..'effects =
+@private extern invoke_conditional_shared : fn(fn(()) -> Nat + !Needed (when 'needed) + ..'effects) -> Nat + !Needed + ..'effects = "host.invokeConditionalShared"
+@private let run_conditional_shared : () -> Nat + !Needed + ..'effects =
   fn _ => do let needed = !Needed () return invoke_conditional_shared (fn _ => needed) end
 
 type Loop = () -> Loop

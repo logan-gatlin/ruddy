@@ -14,7 +14,7 @@ let apply = fn f n => f n
 let higher = fn n => match n with | 0.0 => 0.0 | _ => apply higher (n - 1.0) end
 
 effect Step = Real -> Real
-let through_effect = fn n => match n with
+@private let through_effect = fn n => match n with
   | 0.0 => 0.0
   | _ => !Step (through_effect (n - 1.0))
 end

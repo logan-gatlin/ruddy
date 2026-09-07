@@ -569,7 +569,9 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
             return None;
         }
         let started = Instant::now();
-        let out = guard("js", &mut panicked, || ruddy::backend::js::generate(linked));
+        let out = guard("js", &mut panicked, || {
+            ruddy::backend::js::generate_for_platform(linked, output.platform.backend())
+        });
         js_panicked = out.is_none();
         micros.js = started.elapsed().as_micros() as u64;
         match out {
@@ -578,6 +580,7 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
                 let message = error.to_string();
                 let code = match error {
                     ruddy::backend::js::Error::Entry(_) => "unsupported-entry-effects",
+                    ruddy::backend::js::Error::Export { .. } => "unsupported-export-effects",
                     _ => "javascript-generation",
                 };
                 diagnostics.push(raw("js", code, message.clone(), None));

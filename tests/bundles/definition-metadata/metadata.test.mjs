@@ -33,7 +33,6 @@ test("metadata leaves no trace in the generated module", async () => {
     "Notes",
     "add",
     "left",
-    "logged",
     "pair",
     "quiet",
     "right",

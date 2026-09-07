@@ -88,6 +88,50 @@ observing returned Promise rejections. There is no runtime notification reporter
 
 ## Library exports and initialization
 
+A JavaScript root bundle's public values form a host interface. The host supplies
+ordinary arguments, never Ruddy evidence. The compiler generates pure adapters
+for outgoing callables using the selected platform's handlers. Node supplies
+Console, Process, and FileSystem, with the same operation behavior as `main`.
+An exported Process exit drains output and terminates the process; it never
+returns an exit code to its host caller. Web libraries receive no Node handlers.
+
+This applies to root exports in both libraries and executables, including
+imported aliases, module members, curried and returned functions, and callable
+fields in records, tagged values, and arrays. Each callable invocation installs
+its own applicable platform handlers. Recursive outgoing types use recursive
+adapters: every returned callable captures the actual returned function and
+receives handlers on its next invocation. Unsupported exports are rejected by
+both `check` and `build`, with the public name in the diagnostic, including
+unsupported effects reached through recursive results or container fields.
+
+For example, a root export with type `Printer` can be called repeatedly by its
+JavaScript host without supplying evidence:
+
+```ruddy
+type Printer = String -> Printer + std::!Console
+let printer : Printer = fn text => do
+  let _ = std::console::print text
+  return printer
+end
+```
+
+```javascript
+const next = await app.printer("first");
+await next("second");
+```
+
+The generated host type has the same recursive structure with handled outgoing
+effect rows removed. Wrapping does not invoke a callable, and repeated or
+overlapping calls preserve ordinary closure state. JavaScript function identity
+between independently created wrappers is not guaranteed.
+
+Only the host interface is adapted. Artifact schemes retain their source effects
+for Ruddy consumers, and dependency bundles are not checked as host roots.
+Internal calls and private definitions keep their original evidence convention,
+so local handlers can override platform effects. A public helper that requires
+a custom handler must be made private or exposed through a function that handles
+that effect. Root initialization must still discharge its own effects.
+
 The compiler computes conservative suspension summaries while compiling each
 bundle and persists them separately from source types, including the producer
 proofs used by global reads. Artifact validation checks synchronous indirect
@@ -104,7 +148,8 @@ calls. A callback explicitly declared synchronous by an extern is a separate
 trusted foreign contract, with a runtime guard against suspension.
 
 Global initializers run through the same driver in dependency and declaration
-order. JS module readiness waits for initialization to succeed. Executable
+order, followed by initialization of the root's host adapters. JS module readiness
+waits for initialization to succeed. Executable
 `main` runs once afterward, and Console output and Process exit retain their
 platform behavior, including output draining.
 
