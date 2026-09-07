@@ -1,4 +1,5 @@
 /target
+/build/
 /debug/.dev
 /debug/scratch
 /.claude/specs

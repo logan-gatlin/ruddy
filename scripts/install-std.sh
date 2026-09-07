@@ -4,12 +4,12 @@
 # completed on the same filesystem.
 set -euo pipefail
 
-source_input=${1:?usage: install-std.sh SOURCE}
+source_input=${1:?usage: install-std.sh REPOSITORY_ROOT}
 if ! source=$(cd -P -- "$source_input" 2>/dev/null && pwd); then
   printf 'standard-library source %q is not a directory\n' "$source_input" >&2
   exit 1
 fi
-if [[ ! -f "$source/Ruddy.toml" || ! -f "$source/lib.hc" ]]; then
+if [[ ! -f "$source/Ruddy.toml" || ! -f "$source/std/lib.hc" ]]; then
   printf 'standard-library source %q is not a Ruddy standard-library project\n' "$source_input" >&2
   exit 1
 fi
@@ -155,10 +155,10 @@ staging_assigned=true
 # Discover into a regular file first: bash does not propagate a process
 # substitution's status, so `while ... < <(find ...)` could commit the files
 # emitted before a failed find and silently replace a complete installation.
-# Running find from the resolved source root also makes ./build a literal path,
+# Running find from the resolved source root also makes ./std/build a literal path,
 # even when the caller's path contains find pattern metacharacters.
 source_files=$staging/.source-files
-(cd -- "$source" && find . -path ./build -prune -o -type f -name '*.hc' -print0) >"$source_files"
+(cd -- "$source" && find ./std -path ./std/build -prune -o -type f -name '*.hc' -print0) >"$source_files"
 cp -- "$source/Ruddy.toml" "$staging/Ruddy.toml"
 while IFS= read -r -d '' file; do
   relative=${file#./}

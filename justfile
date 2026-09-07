@@ -138,7 +138,7 @@ build:
 install:
     cargo install --locked --path "{{justfile_directory()}}/cli"
     cargo install --locked --path "{{justfile_directory()}}/lsp" --bin ruddy-ls
-    "{{justfile_directory()}}/scripts/install-std.sh" "{{justfile_directory()}}/std"
+    "{{justfile_directory()}}/scripts/install-std.sh" "{{justfile_directory()}}"
 
 # Line and branch coverage for the compiler library. Branch coverage is a
 # nightly-only rustc feature, hence `+nightly`.

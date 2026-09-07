@@ -2,10 +2,7 @@ use std::{fs, path::Path, process::Command};
 
 fn project(source: &str, platform: &str) -> tempfile::TempDir {
     let project = tempfile::tempdir().unwrap();
-    let standard = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("std");
+    let standard = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     fs::write(project.path().join("Ruddy.toml"), format!(
         "name = \"host-test\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.hc\"\ntarget = \"js\"\nplatform = {platform:?}\n\n[dependencies]\nstd = {standard:?}\n"
     )).unwrap();
@@ -372,10 +369,7 @@ end
     );
     let dependency = project.path().join("dep");
     fs::create_dir(&dependency).unwrap();
-    let standard = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("std");
+    let standard = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     fs::write(dependency.join("Ruddy.toml"), format!("name = \"dep\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"lib.hc\"\n[dependencies]\nstd = {standard:?}\n")).unwrap();
     fs::write(dependency.join("lib.hc"), "@private type Printer = String -> Printer + std::!Console\nlet printer : Printer = fn text => do let _ = std::console::print text return printer end").unwrap();
     let manifest = project.path().join("Ruddy.toml");

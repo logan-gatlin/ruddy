@@ -123,7 +123,7 @@ fn run_bundle(fixture: &str, script: &str) {
         project.path().join("Ruddy.toml"),
         format!(
             "name = \"{fixture}\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\ntarget = \"js\"\n\n[run]\njs = \"node {script}\"\n\n[dependencies]\nstd = {:?}\n",
-            root.join("std")
+            root
         ),
     )
     .unwrap();

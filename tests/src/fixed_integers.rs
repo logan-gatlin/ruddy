@@ -156,7 +156,7 @@ fn fixed_integer_std_arithmetic_runs_exactly_through_imports_and_javascript() {
         .unwrap();
     let project = tempfile::tempdir().unwrap();
     fs::write(project.path().join("Ruddy.toml"), format!(
-        "name = \"fixed-test\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.hc\"\ntarget = \"js\"\n[dependencies]\nstd = {:?}\n", root.join("std")
+        "name = \"fixed-test\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.hc\"\ntarget = \"js\"\n[dependencies]\nstd = {:?}\n", root
     )).unwrap();
     let mut source = String::new();
     let mut assertions = Vec::new();

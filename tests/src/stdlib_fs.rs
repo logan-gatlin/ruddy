@@ -32,10 +32,7 @@ end
 
 fn project(source: &str) -> tempfile::TempDir {
     let project = tempfile::tempdir().unwrap();
-    let standard = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("std");
+    let standard = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     fs::write(
         project.path().join("Ruddy.toml"),
         format!(

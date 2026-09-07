@@ -17,6 +17,8 @@ ruddy run
 
 Use `ruddy --help` to see all CLI commands. The standard library is installed under `$RUDDY_HOME/std`, or `~/.ruddy/std` when `RUDDY_HOME` is unset.
 
+The repository's `Ruddy.toml` defines the standard-library bundle, with `std/lib.hc` as its root source. Run `ruddy check` from the repository root to check it. The installer copies this manifest and the `std/` source directory into the installed bundle.
+
 ## Editor support
 
 `just install` also installs `ruddy-ls`. Configure your editor to launch that

@@ -84,10 +84,7 @@ fn executable_main_drains_console_output_and_saturates_exit_codes() {
          end",
         None,
     );
-    let standard = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("std");
+    let standard = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let manifest = fs::read_to_string(directory.path().join("Ruddy.toml")).unwrap();
     fs::write(
         directory.path().join("Ruddy.toml"),
@@ -526,10 +523,10 @@ fn bundled_std_installer_first_install_does_not_require_gnu_mv_flags() {
     let source = root.path().join("source");
     let home = root.path().join("home");
     let bin = root.path().join("bin");
-    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(source.join("std")).unwrap();
     fs::create_dir_all(&bin).unwrap();
     fs::write(source.join("Ruddy.toml"), "manifest").unwrap();
-    fs::write(source.join("lib.hc"), "").unwrap();
+    fs::write(source.join("std/lib.hc"), "").unwrap();
 
     let real_mv = String::from_utf8(
         Command::new("sh")
@@ -580,14 +577,15 @@ fn bundled_std_installer_replaces_only_source_files() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("source");
     let home = root.path().join("home");
-    fs::create_dir_all(source.join("Nested")).unwrap();
-    fs::create_dir_all(source.join("build")).unwrap();
+    fs::create_dir_all(source.join("std/Nested")).unwrap();
+    fs::create_dir_all(source.join("std/build")).unwrap();
     fs::create_dir_all(home.join("std")).unwrap();
     fs::write(source.join("Ruddy.toml"), "manifest").unwrap();
-    fs::write(source.join("lib.hc"), "").unwrap();
-    fs::write(source.join("Nested/module.hc"), "let value = 0n\n").unwrap();
-    fs::write(source.join("build/app.artifact"), "artifact").unwrap();
+    fs::write(source.join("std/lib.hc"), "").unwrap();
+    fs::write(source.join("std/Nested/module.hc"), "let value = 0n\n").unwrap();
+    fs::write(source.join("std/build/app.artifact"), "artifact").unwrap();
     fs::write(source.join("notes.txt"), "notes").unwrap();
+    fs::write(source.join("unrelated.hc"), "not standard library source").unwrap();
     fs::write(home.join("std/old.hc"), "old").unwrap();
 
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -609,13 +607,14 @@ fn bundled_std_installer_replaces_only_source_files() {
         fs::read_to_string(home.join("std/Ruddy.toml")).unwrap(),
         "manifest"
     );
-    assert!(home.join("std/lib.hc").is_file());
-    assert!(home.join("std/Nested/module.hc").is_file());
+    assert!(home.join("std/std/lib.hc").is_file());
+    assert!(home.join("std/std/Nested/module.hc").is_file());
     assert!(!home.join("std/old.hc").exists());
-    assert!(!home.join("std/build").exists());
+    assert!(!home.join("std/std/build").exists());
     assert!(!home.join("std/notes.txt").exists());
+    assert!(!home.join("std/unrelated.hc").exists());
 
-    fs::remove_file(source.join("lib.hc")).unwrap();
+    fs::remove_file(source.join("std/lib.hc")).unwrap();
     let output = Command::new(script)
         .arg(&source)
         .env("RUDDY_HOME", &home)
@@ -623,7 +622,32 @@ fn bundled_std_installer_replaces_only_source_files() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(home.join("std/Nested/module.hc").is_file());
+    assert!(home.join("std/std/Nested/module.hc").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn bundled_std_installer_installs_repository_manifest_and_compilable_sources() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let output = Command::new(repository.join("scripts/install-std.sh"))
+        .arg(repository)
+        .env("RUDDY_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let installed = home.path().join("std");
+    assert_eq!(
+        fs::read(installed.join("Ruddy.toml")).unwrap(),
+        fs::read(repository.join("Ruddy.toml")).unwrap()
+    );
+    assert!(installed.join("std/lib.hc").is_file());
+    assert!(!installed.join("std/Ruddy.toml").exists());
+    check_project(&installed).expect("the installed standard library compiles");
 }
 
 #[cfg(target_os = "linux")]
@@ -635,11 +659,11 @@ fn bundled_std_installer_releases_lock_when_old_tree_cleanup_fails() {
     let source = root.path().join("source");
     let home = root.path().join("home");
     let bin = root.path().join("bin");
-    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(source.join("std")).unwrap();
     fs::create_dir_all(home.join("std")).unwrap();
     fs::create_dir_all(&bin).unwrap();
     fs::write(source.join("Ruddy.toml"), "new").unwrap();
-    fs::write(source.join("lib.hc"), "new main").unwrap();
+    fs::write(source.join("std/lib.hc"), "new main").unwrap();
     fs::write(home.join("std/Ruddy.toml"), "old").unwrap();
     fs::write(home.join("std/lib.hc"), "old main").unwrap();
 
@@ -710,12 +734,12 @@ fn bundled_std_installer_discovery_failure_preserves_existing_installation() {
     let source = root.path().join("source");
     let home = root.path().join("home");
     let bin = root.path().join("bin");
-    fs::create_dir_all(source.join("Nested")).unwrap();
+    fs::create_dir_all(source.join("std/Nested")).unwrap();
     fs::create_dir_all(home.join("std")).unwrap();
     fs::create_dir_all(&bin).unwrap();
     fs::write(source.join("Ruddy.toml"), "new").unwrap();
-    fs::write(source.join("lib.hc"), "new main").unwrap();
-    fs::write(source.join("Nested/module.hc"), "new nested").unwrap();
+    fs::write(source.join("std/lib.hc"), "new main").unwrap();
+    fs::write(source.join("std/Nested/module.hc"), "new nested").unwrap();
     fs::write(home.join("std/Ruddy.toml"), "old").unwrap();
     fs::write(home.join("std/lib.hc"), "old main").unwrap();
 
@@ -780,11 +804,11 @@ fn bundled_std_installer_reports_missing_exchange_capability_before_copying() {
     let source = root.path().join("source");
     let home = root.path().join("home");
     let bin = root.path().join("bin");
-    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(source.join("std")).unwrap();
     fs::create_dir_all(home.join("std")).unwrap();
     fs::create_dir_all(&bin).unwrap();
     fs::write(source.join("Ruddy.toml"), "new").unwrap();
-    fs::write(source.join("lib.hc"), "").unwrap();
+    fs::write(source.join("std/lib.hc"), "").unwrap();
     fs::write(home.join("std/Ruddy.toml"), "old").unwrap();
     let fake_mv = bin.join("mv");
     fs::write(&fake_mv, "#!/bin/sh\necho 'minimal mv'\n").unwrap();
@@ -840,10 +864,10 @@ fn bundled_std_installer_never_hides_an_existing_installation() {
     let source = root.path().join("source");
     let home = root.path().join("home");
     let barrier = root.path().join("commit-barrier");
-    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(source.join("std")).unwrap();
     fs::create_dir_all(home.join("std")).unwrap();
     fs::write(source.join("Ruddy.toml"), "new").unwrap();
-    fs::write(source.join("lib.hc"), "").unwrap();
+    fs::write(source.join("std/lib.hc"), "").unwrap();
     fs::write(home.join("std/Ruddy.toml"), "old").unwrap();
 
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -902,10 +926,10 @@ fn bundled_std_installer_interruption_preserves_existing_installation() {
     let source = root.path().join("source");
     let home = root.path().join("home");
     let barrier = root.path().join("commit-barrier");
-    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(source.join("std")).unwrap();
     fs::create_dir_all(home.join("std")).unwrap();
     fs::write(source.join("Ruddy.toml"), "new").unwrap();
-    fs::write(source.join("lib.hc"), "").unwrap();
+    fs::write(source.join("std/lib.hc"), "").unwrap();
     fs::write(home.join("std/Ruddy.toml"), "old").unwrap();
 
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -957,12 +981,12 @@ fn bundled_std_installer_resolves_symlinked_metacharacter_source_roots() {
     let source = root.path().join("source[odd]*?");
     let source_link = root.path().join("source-link");
     let home = root.path().join("home");
-    fs::create_dir_all(source.join("Nested")).unwrap();
-    fs::create_dir_all(source.join("build")).unwrap();
+    fs::create_dir_all(source.join("std/Nested")).unwrap();
+    fs::create_dir_all(source.join("std/build")).unwrap();
     fs::write(source.join("Ruddy.toml"), "manifest").unwrap();
-    fs::write(source.join("lib.hc"), "main").unwrap();
-    fs::write(source.join("Nested/module.hc"), "nested").unwrap();
-    fs::write(source.join("build/generated.hc"), "generated").unwrap();
+    fs::write(source.join("std/lib.hc"), "main").unwrap();
+    fs::write(source.join("std/Nested/module.hc"), "nested").unwrap();
+    fs::write(source.join("std/build/generated.hc"), "generated").unwrap();
     symlink(&source, &source_link).unwrap();
 
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -980,12 +1004,15 @@ fn bundled_std_installer_resolves_symlinked_metacharacter_source_roots() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(fs::read_to_string(home.join("std/lib.hc")).unwrap(), "main");
     assert_eq!(
-        fs::read_to_string(home.join("std/Nested/module.hc")).unwrap(),
+        fs::read_to_string(home.join("std/std/lib.hc")).unwrap(),
+        "main"
+    );
+    assert_eq!(
+        fs::read_to_string(home.join("std/std/Nested/module.hc")).unwrap(),
         "nested"
     );
-    assert!(!home.join("std/build").exists());
+    assert!(!home.join("std/std/build").exists());
 }
 
 #[cfg(target_os = "linux")]
@@ -999,9 +1026,9 @@ fn bundled_std_installer_serializes_concurrent_first_installs() {
     let home = root.path().join("home");
     let barrier = root.path().join("first-barrier");
     for (source, contents) in [(&first, "first"), (&second, "second")] {
-        fs::create_dir_all(source).unwrap();
+        fs::create_dir_all(source.join("std")).unwrap();
         fs::write(source.join("Ruddy.toml"), contents).unwrap();
-        fs::write(source.join("lib.hc"), contents).unwrap();
+        fs::write(source.join("std/lib.hc"), contents).unwrap();
     }
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -1053,10 +1080,10 @@ fn bundled_std_installer_preserves_a_stale_lock_for_manual_recovery() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("source");
     let home = root.path().join("home");
-    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(source.join("std")).unwrap();
     fs::create_dir_all(home.join(".std.install.lock")).unwrap();
     fs::write(source.join("Ruddy.toml"), "manifest").unwrap();
-    fs::write(source.join("lib.hc"), "main").unwrap();
+    fs::write(source.join("std/lib.hc"), "main").unwrap();
     fs::write(home.join(".std.install.lock/owner"), "999999999\n").unwrap();
 
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1097,7 +1124,7 @@ fn bundled_std_installer_preserves_a_stale_lock_for_manual_recovery() {
         "{}",
         String::from_utf8_lossy(&retry.stderr)
     );
-    assert!(home.join("std/lib.hc").is_file());
+    assert!(home.join("std/std/lib.hc").is_file());
 }
 
 #[cfg(target_os = "linux")]
@@ -1110,10 +1137,10 @@ fn bundled_std_installer_never_reaps_a_new_owner_after_waiting() {
     let home = root.path().join("home");
     let lock = home.join(".std.install.lock");
     let barrier = root.path().join("lock-wait-barrier");
-    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(source.join("std")).unwrap();
     fs::create_dir_all(&lock).unwrap();
     fs::write(source.join("Ruddy.toml"), "manifest").unwrap();
-    fs::write(source.join("lib.hc"), "main").unwrap();
+    fs::write(source.join("std/lib.hc"), "main").unwrap();
     fs::write(lock.join("owner"), "stale owner\n").unwrap();
 
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1160,10 +1187,10 @@ fn bundled_std_installer_does_not_reap_an_empty_lock() {
     let source = root.path().join("source");
     let home = root.path().join("home");
     let lock = home.join(".std.install.lock");
-    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(source.join("std")).unwrap();
     fs::create_dir_all(&lock).unwrap();
     fs::write(source.join("Ruddy.toml"), "manifest").unwrap();
-    fs::write(source.join("lib.hc"), "main").unwrap();
+    fs::write(source.join("std/lib.hc"), "main").unwrap();
     fs::write(lock.join("owner"), "").unwrap();
     fs::write(lock.join("candidate.abandoned"), "999999 abandoned\n").unwrap();
 
@@ -1197,11 +1224,11 @@ fn bundled_std_installer_cleans_a_probe_interrupted_during_creation() {
     let source = root.path().join("source");
     let home = root.path().join("home");
     let bin = root.path().join("bin");
-    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(source.join("std")).unwrap();
     fs::create_dir_all(home.join("std")).unwrap();
     fs::create_dir_all(&bin).unwrap();
     fs::write(source.join("Ruddy.toml"), "new").unwrap();
-    fs::write(source.join("lib.hc"), "new").unwrap();
+    fs::write(source.join("std/lib.hc"), "new").unwrap();
     fs::write(home.join("std/Ruddy.toml"), "old").unwrap();
     let real_mktemp = String::from_utf8(
         Command::new("sh")
