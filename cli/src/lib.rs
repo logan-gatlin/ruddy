@@ -25,6 +25,7 @@ use ruddy::{
 use serde::{Deserialize, Serialize};
 
 mod cache;
+pub mod workspace;
 
 pub use cache::fingerprint;
 
@@ -2449,12 +2450,17 @@ fn load_manifest(directory: &Path, sandbox: Option<&Path>) -> Result<Manifest, C
         )
         .with_note(error.to_string())
     })?;
-    let manifest: Manifest = toml::from_str(&source).map_err(|error| {
+    parse_manifest(directory, &source)
+}
+
+fn parse_manifest(directory: &Path, source: &str) -> Result<Manifest, CompileError> {
+    let path = directory.join(MANIFEST);
+    let manifest: Manifest = toml::from_str(source).map_err(|error| {
         CompileError::report(
             "manifest-invalid",
             format!("`{}` contains invalid project settings", path.display()),
         )
-        .with_note(toml_error_note(&source, &error))
+        .with_note(toml_error_note(source, &error))
         .with_help("fix the named field in `Ruddy.toml` and try again")
     })?;
     // The JavaScript backend's entry adapter and epilogue are Node's: they

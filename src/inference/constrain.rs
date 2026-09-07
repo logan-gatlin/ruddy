@@ -1,6 +1,6 @@
 //! Pass one: generation. See [`Constrain`].
 
-use std::{collections::HashMap, rc::Rc};
+use std::sync::Arc;
 
 use indexmap::IndexMap;
 
@@ -57,22 +57,6 @@ pub struct Constrain<'a> {
     /// per entry is minted wherever an operation is referred to or an effect
     /// is handled, and the operation signatures are opened over them.
     pub effect_params: &'a IndexMap<Symbol, Vec<ParamKind>>,
-    /// Declaration spans keyed by the source-resolved identity. Kept apart
-    /// from structural row keys because equivalent same-named interfaces are
-    /// allowed to coalesce semantically.
-    pub effect_declaration_spans: &'a IndexMap<Symbol, Anchor>,
-    /// Compilation-local operation-value provenance. It mirrors only value
-    /// flow (call results and struct fields), never semantic type identity.
-    pub term_effect_provenance: HashMap<Anchor, super::EffectProvenance>,
-    /// Provenance published by nested values before solving can publish their
-    /// semantic schemes.
-    pub local_effect_provenance: HashMap<Symbol, super::EffectProvenance>,
-    /// Parameter placeholders used to preserve higher-order value flow.
-    pub binding_effect_provenance: HashMap<Symbol, super::EffectProvenance>,
-    /// Exact sources performed by each callable body currently being walked.
-    /// A nested closure gets its own entry, so merely constructing or returning
-    /// that closure cannot make the enclosing callable appear to invoke it.
-    pub callable_effect_scopes: Vec<Vec<super::EffectSource>>,
     /// The effects the place being walked allows, and whether a `fn` encloses
     /// it.
     ///
@@ -92,7 +76,7 @@ pub struct Constrain<'a> {
     /// clears it, and a nested `handle`'s *body* keeps whatever it was handed,
     /// because the outer handler is still on the stack while the inner one
     /// runs.
-    pub answer: Option<Rc<Ty>>,
+    pub answer: Option<Arc<Ty>>,
     /// Syntactic conjunction of qualifying arm conditions enclosing the walk.
     /// It is recorded on nested annotations for their post-solve contract
     /// check; generation never asks whether it is satisfiable.
@@ -110,7 +94,7 @@ pub struct Constrain<'a> {
 /// Insertion-ordered, because a third reader publishes it: [`Output::operations`](crate::inference::Output::operations)
 /// hands the same table on to [`lir`](crate::lir), and a map whose order came
 /// out of a hash would print differently from one run to the next.
-pub type Operations = IndexMap<(Symbol, ir::OperationSelector), (Rc<Ty>, Rc<Ty>)>;
+pub type Operations = IndexMap<(Symbol, ir::OperationSelector), (Arc<Ty>, Arc<Ty>)>;
 
 /// Where a term sits, as far as effects are concerned: what may be performed
 /// there, and whether a `fn` encloses it.
@@ -179,7 +163,7 @@ type Cover = Option<IndexMap<usize, Formula>>;
 /// conjunction — and a disjunction with that in it is [`Formula::True`], so a
 /// column with one emits nothing, exactly as R6 says.
 fn collect_presence_paths(
-    ty: &Rc<Ty>,
+    ty: &Arc<Ty>,
     prefix: &mut super::PresencePath,
     found: &mut Vec<(super::PresencePath, Presence)>,
 ) {
@@ -194,7 +178,7 @@ fn collect_presence_paths(
     }
 }
 
-pub(super) fn structural_presence_paths(ty: &Rc<Ty>) -> Vec<(super::PresencePath, Presence)> {
+pub(super) fn structural_presence_paths(ty: &Arc<Ty>) -> Vec<(super::PresencePath, Presence)> {
     let mut found = Vec::new();
     collect_presence_paths(ty, &mut Vec::new(), &mut found);
     found
@@ -303,8 +287,8 @@ impl Constrain<'_> {
     fn checks(
         &mut self,
         span: Anchor,
-        actual: &Rc<Ty>,
-        expected: &Rc<Ty>,
+        actual: &Arc<Ty>,
+        expected: &Arc<Ty>,
         origin: ConstraintOrigin,
         expected_subject: Subject,
         expected_span: Option<Anchor>,
@@ -345,17 +329,18 @@ impl Constrain<'_> {
 
     /// Infer a type for `term` and write it into `term.ty`.
     pub(super) fn infer_term(&mut self, term: &mut Term) {
+        crate::cancellation::checkpoint();
         let span = term.at;
         term.ty = match &mut term.kind {
             // The error term absorbs: it unifies with anything, so the one
             // diagnostic lowering already reported stays the only one.
-            TermKind::Error => Rc::new(Ty::default()),
-            TermKind::Natural(_) => Rc::new(Ty::plain(Ty::Nat)),
-            TermKind::Fixed(value) => Rc::new(Ty::plain(Ty::Fixed(value.kind()))),
-            TermKind::Integer(_) => Rc::new(Ty::plain(Ty::Int)),
-            TermKind::Real(_) => Rc::new(Ty::plain(Ty::Real)),
-            TermKind::String(_) => Rc::new(Ty::plain(Ty::String)),
-            TermKind::Boolean(_) => Rc::new(Ty::plain(Ty::Boolean)),
+            TermKind::Error => Arc::new(Ty::default()),
+            TermKind::Natural(_) => Arc::new(Ty::plain(Ty::Nat)),
+            TermKind::Fixed(value) => Arc::new(Ty::plain(Ty::Fixed(value.kind()))),
+            TermKind::Integer(_) => Arc::new(Ty::plain(Ty::Int)),
+            TermKind::Real(_) => Arc::new(Ty::plain(Ty::Real)),
+            TermKind::String(_) => Arc::new(Ty::plain(Ty::String)),
+            TermKind::Boolean(_) => Arc::new(Ty::plain(Ty::Boolean)),
             TermKind::Unary {
                 op: crate::ir::UnaryOp::Allocate,
                 value,
@@ -363,7 +348,7 @@ impl Constrain<'_> {
                 self.infer_term(value);
                 let region = self.table.fresh_region();
                 self.mutation(span, region.clone());
-                Rc::new(Ty::Mut(region, value.ty.clone()))
+                Arc::new(Ty::Mut(region, value.ty.clone()))
             }
             TermKind::Unary {
                 op: crate::ir::UnaryOp::Read,
@@ -373,7 +358,7 @@ impl Constrain<'_> {
                 let element = self.table.fresh_type_for(Subject::Term);
                 self.check_term(
                     value,
-                    &Rc::new(Ty::Mut(region.clone(), element.clone())),
+                    &Arc::new(Ty::Mut(region.clone(), element.clone())),
                     Subject::Context,
                     None,
                 );
@@ -389,7 +374,7 @@ impl Constrain<'_> {
                 let element = self.table.fresh_type_for(Subject::Term);
                 self.check_term(
                     left,
-                    &Rc::new(Ty::Mut(region.clone(), element.clone())),
+                    &Arc::new(Ty::Mut(region.clone(), element.clone())),
                     Subject::Context,
                     None,
                 );
@@ -400,12 +385,12 @@ impl Constrain<'_> {
             TermKind::Unary { op, value } => match op {
                 crate::ir::UnaryOp::Allocate | crate::ir::UnaryOp::Read => unreachable!(),
                 crate::ir::UnaryOp::Neg => {
-                    let real = Rc::new(Ty::plain(Ty::Real));
+                    let real = Arc::new(Ty::plain(Ty::Real));
                     self.check_term(value, &real, Subject::Context, None);
                     real
                 }
                 crate::ir::UnaryOp::Not => {
-                    let boolean = Rc::new(Ty::plain(Ty::Boolean));
+                    let boolean = Arc::new(Ty::plain(Ty::Boolean));
                     self.check_term(value, &boolean, Subject::Context, None);
                     boolean
                 }
@@ -421,7 +406,7 @@ impl Constrain<'_> {
                     | crate::ir::BinaryOp::Or
                     | crate::ir::BinaryOp::Xor => Ty::Boolean,
                 };
-                let ty = Rc::new(Ty::plain(core));
+                let ty = Arc::new(Ty::plain(core));
                 self.check_term(left, &ty, Subject::Context, None);
                 self.check_term(right, &ty, Subject::Context, None);
                 ty
@@ -516,13 +501,6 @@ impl Constrain<'_> {
                 let required = std::mem::replace(&mut self.out, outer);
 
                 self.table.level -= 1;
-                let value_effect_provenance = self
-                    .term_effect_provenance
-                    .get(&value.at)
-                    .cloned()
-                    .unwrap_or_default();
-                self.local_effect_provenance
-                    .insert(name.anchored, value_effect_provenance);
                 // And polymorphically in the body, where the scheme exists.
                 // Nothing is put back afterwards: a symbol is unique, so the
                 // name a nested `let` binds can never be one anything outside
@@ -535,7 +513,7 @@ impl Constrain<'_> {
 
                 self.table
                     .local_names
-                    .insert(name.anchored, Rc::from(self.mint.name(name.anchored)));
+                    .insert(name.anchored, Arc::from(self.mint.name(name.anchored)));
                 self.emit(
                     name.at,
                     ConstraintOrigin::Binding,
@@ -546,11 +524,6 @@ impl Constrain<'_> {
                         level,
                         promised,
                         rigids,
-                        effect_provenance: self
-                            .local_effect_provenance
-                            .get(&name.anchored)
-                            .cloned()
-                            .unwrap_or_default(),
                         initializer_effects,
                         ambient: self.ambient.row.clone(),
                         inside: self.ambient.inside,
@@ -558,11 +531,6 @@ impl Constrain<'_> {
                         body: rest,
                     },
                 );
-                // What the expression evaluates to is what its body evaluates
-                // to; the value is what the name is, not what the `let` is.
-                if let Some(provenance) = self.term_effect_provenance.get(&body.at).cloned() {
-                    self.term_effect_provenance.insert(span, provenance);
-                }
                 body.ty.clone()
             }
             TermKind::Apply { func, arg } => {
@@ -579,41 +547,6 @@ impl Constrain<'_> {
                 // belong.
                 self.table.aim(opened, at, arg.at);
                 let applied = func.ty.clone();
-                let func_provenance = self
-                    .term_effect_provenance
-                    .get(&func.at)
-                    .cloned()
-                    .unwrap_or_default();
-                let arg_provenance = self
-                    .term_effect_provenance
-                    .get(&arg.at)
-                    .cloned()
-                    .unwrap_or_default();
-                let resolved_func = match func_provenance.argument {
-                    Some(symbol) => func_provenance.substitute(symbol, &arg_provenance),
-                    None => func_provenance,
-                };
-                let effect_origins = match &resolved_func.value_parameter {
-                    Some(parameter) => vec![super::EffectSource::Parameter {
-                        symbol: parameter.symbol,
-                        path: parameter.path.clone(),
-                    }],
-                    None => resolved_func.callable.clone(),
-                };
-                if let Some(scope) = self.callable_effect_scopes.last_mut() {
-                    for source in &effect_origins {
-                        if !scope.contains(source) {
-                            scope.push(source.clone());
-                        }
-                    }
-                }
-                // A symbolic callable's returned value remains symbolic too:
-                // subsequent projections and invocations resolve this path
-                // against the exact argument. Merely obtaining the result does
-                // not add that result's callable origin to `effect_origins`.
-                if let Some(result) = resolved_func.call_result() {
-                    self.term_effect_provenance.insert(span, result);
-                }
                 // Through a name, so that something annotated `Endo` is
                 // applied as the arrow it stands for. The arrow the arm then
                 // works with is the unfolded one, which is the only shape a
@@ -677,7 +610,7 @@ impl Constrain<'_> {
                         let param = self.table.fresh_type_for(Subject::Parameter);
                         let result = self.table.fresh_type_for(Subject::Context);
                         let does = Row::of(self.table.fresh_row_for(Subject::PerformedEffects));
-                        let wanted = Rc::new(Ty::plain(Ty::Arrow(
+                        let wanted = Arc::new(Ty::plain(Ty::Arrow(
                             param.clone(),
                             result.clone(),
                             does.clone(),
@@ -717,7 +650,7 @@ impl Constrain<'_> {
                     ConstraintKind::Performs {
                         performed,
                         ambient: self.ambient.row.clone(),
-                        effect_origins,
+                        effect_origins: Vec::new(),
                         ambient_label_spans: self.ambient.label_spans.clone(),
                         inside: self.ambient.inside,
                     },
@@ -733,11 +666,6 @@ impl Constrain<'_> {
                 let param = self.table.fresh_type_for(Subject::Parameter);
                 let does = Row::of(self.table.fresh_row_for(Subject::AmbientEffects));
                 self.env.insert(arg.anchored, Binding::Mono(param.clone()));
-                self.binding_effect_provenance.insert(
-                    arg.anchored,
-                    super::EffectProvenance::parameter(arg.anchored),
-                );
-                self.callable_effect_scopes.push(Vec::new());
                 let outer = self.enter(Ambient {
                     row: does.clone(),
                     inside: true,
@@ -753,26 +681,13 @@ impl Constrain<'_> {
                 self.infer_term(body);
                 self.answer = held;
                 self.leave(outer);
-                let callable = self
-                    .callable_effect_scopes
-                    .pop()
-                    .expect("function effect scope");
-                let result = self
-                    .term_effect_provenance
-                    .get(&body.at)
-                    .cloned()
-                    .unwrap_or_default();
-                self.term_effect_provenance.insert(
-                    span,
-                    super::EffectProvenance::function(callable.clone(), arg.anchored, result),
-                );
                 let external = Row::of(self.table.fresh_row_for(Subject::AmbientEffects));
                 self.emit(
                     span,
                     ConstraintOrigin::Binding,
                     ConstraintSubjects::one(Subject::AmbientEffects),
                     ConstraintKind::Isolate {
-                        effect_origins: callable,
+                        effect_origins: Vec::new(),
                         input: param.clone(),
                         output: body.ty.clone(),
                         internal: does,
@@ -781,7 +696,7 @@ impl Constrain<'_> {
                     },
                 );
                 self.table.level -= 1;
-                Rc::new(Ty::Arrow(param, body.ty.clone(), external))
+                Arc::new(Ty::Arrow(param, body.ty.clone(), external))
             }
             // An operation is an ordinary value of its declared signature, with
             // the effect's own label as the row of its outermost arrow, closed.
@@ -813,20 +728,7 @@ impl Constrain<'_> {
                     .collect(),
                     rest: Rest::Closed,
                 };
-                if let Some((interface, declaration_span)) = self
-                    .effect_ids
-                    .get(&effect.anchored)
-                    .zip(self.effect_declaration_spans.get(&effect.anchored))
-                {
-                    let origin = super::EffectOrigin {
-                        symbol: effect.anchored,
-                        interface: interface.clone(),
-                        declaration_at: *declaration_span,
-                    };
-                    self.term_effect_provenance
-                        .insert(span, super::EffectProvenance::origin(origin));
-                }
-                Rc::new(Ty::plain(Ty::Arrow(from, to, does)))
+                Arc::new(Ty::plain(Ty::Arrow(from, to, does)))
             }
             TermKind::Handle { body, handler } => self.handle(body, handler),
             // `raise` does not return, so its own type is a fresh variable
@@ -851,24 +753,16 @@ impl Constrain<'_> {
             }
             TermKind::Struct { fields, spread } => {
                 let mut tys = IndexMap::new();
-                let mut provenance_fields = IndexMap::new();
                 for (name, field) in fields.iter_mut() {
                     self.infer_term(&mut field.value);
-                    if let Some(value) = self.term_effect_provenance.get(&field.value.at).cloned() {
-                        provenance_fields.insert(name.clone(), value);
-                    }
                     tys.insert(name.clone(), RowField::present(field.value.ty.clone()));
-                }
-                let provenance = super::EffectProvenance::from_fields(provenance_fields);
-                if provenance != super::EffectProvenance::default() {
-                    self.term_effect_provenance.insert(span, provenance);
                 }
                 match spread {
                     // A literal's fields are all there, and are all it has:
                     // the tail is closed. Openness belongs to demands, not to
                     // values. Nothing of its own beside them, which is what
                     // makes a struct a struct rather than a shape of its own.
-                    None => Rc::new(Ty::Struct(Row {
+                    None => Arc::new(Ty::Struct(Row {
                         labels: tys,
                         rest: Rest::Closed,
                     })),
@@ -896,11 +790,11 @@ impl Constrain<'_> {
                                 (name.clone(), RowField { presence, ty })
                             })
                             .collect();
-                        let demand = Rc::new(Ty::Struct(Row {
+                        let demand = Arc::new(Ty::Struct(Row {
                             labels: shadowed,
                             rest: rest.clone(),
                         }));
-                        let result = Rc::new(Ty::Struct(Row { labels: tys, rest }));
+                        let result = Arc::new(Ty::Struct(Row { labels: tys, rest }));
                         // One subject, because one side of this ever reaches
                         // a reader: the demand is fresh variables and cannot
                         // conflict with anything, so a complaint is always
@@ -924,7 +818,7 @@ impl Constrain<'_> {
             // such; a plain one is an element.
             TermKind::Array(items) => {
                 let element = self.table.fresh_type_for(Subject::Term);
-                let array = Rc::new(Ty::Array(element.clone()));
+                let array = Arc::new(Ty::Array(element.clone()));
                 for item in items {
                     match item.spread {
                         Some(dots) => {
@@ -951,10 +845,10 @@ impl Constrain<'_> {
                         self.infer_term(payload);
                         payload.ty.clone()
                     }
-                    None => Rc::new(Ty::unit()),
+                    None => Arc::new(Ty::unit()),
                 };
                 let rest = self.table.fresh_row_for(Subject::Term);
-                let ty = Rc::new(Ty::plain(Ty::Sum(Row {
+                let ty = Arc::new(Ty::plain(Ty::Sum(Row {
                     labels: [(name.anchored.clone(), RowField::present(carried))]
                         .into_iter()
                         .collect(),
@@ -974,13 +868,6 @@ impl Constrain<'_> {
             // definition polymorphic in everything but the field it reads.
             TermKind::Project { base, field } => {
                 self.infer_term(base);
-                if let Some(provenance) = self
-                    .term_effect_provenance
-                    .get(&base.at)
-                    .and_then(|provenance| provenance.projected(field.anchored.clone()))
-                {
-                    self.term_effect_provenance.insert(span, provenance);
-                }
                 let result = self.table.fresh_type_for(Subject::ProjectionResult);
                 self.emit(
                     field.at,
@@ -1011,7 +898,7 @@ impl Constrain<'_> {
                 let result = self.table.fresh_type_for(Subject::MatchResult);
                 let mut qualifying = None;
                 let expected = match arms.is_empty() {
-                    true => Rc::new(Ty::plain(Ty::Sum(Row {
+                    true => Arc::new(Ty::plain(Ty::Sum(Row {
                         labels: IndexMap::new(),
                         rest: Rest::Closed,
                     }))),
@@ -1167,7 +1054,7 @@ impl Constrain<'_> {
     /// come straight off the declaration and `Ans` appears in neither. `Ans` is
     /// what the `return` arm gives, or the handled expression's own type where
     /// none was written, and it is what the whole expression comes to.
-    fn handle(&mut self, body: &mut Term, handler: &mut ir::Handler) -> Rc<Ty> {
+    fn handle(&mut self, body: &mut Term, handler: &mut ir::Handler) -> Arc<Ty> {
         let answer = self.table.fresh_type_for(Subject::HandlerAnswer);
         // One instantiation of each handled effect's parameters, shared by
         // the label the body is handled under and every arm of that effect:
@@ -1188,7 +1075,7 @@ impl Constrain<'_> {
             .collect();
         let extended = Row {
             labels: discharged,
-            rest: Rest::More(Rc::new(self.ambient.row.clone())),
+            rest: Rest::More(Arc::new(self.ambient.row.clone())),
         };
         // What the ambient may not stand for: an effect this handler already
         // discharges. A row that acquired one would name it twice, which is
@@ -1341,7 +1228,7 @@ impl Constrain<'_> {
         columns: &Columns,
         path: &mut Vec<ir::Step>,
         entries: &[(usize, Col)],
-    ) -> (Rc<Ty>, Cover) {
+    ) -> (Arc<Ty>, Cover) {
         let mut binds: Vec<(usize, Anchored<Symbol>)> = Vec::new();
         let mut primitives: Vec<Ty> = Vec::new();
         let mut tags: IndexMap<&str, Vec<(usize, Col)>> = IndexMap::new();
@@ -1452,7 +1339,7 @@ impl Constrain<'_> {
         // off the matrix rather than tracked down the recursion, so this and
         // the lowering checks answer from one place.
         let open = columns.matrix.open(path);
-        let mut demands: Vec<Rc<Ty>> = Vec::new();
+        let mut demands: Vec<Arc<Ty>> = Vec::new();
         // The demand's own fields, and what each sub-column covers per arm:
         // the two halves the covered set is built from, kept out here because
         // a column with no struct entry has neither and still has to answer.
@@ -1475,7 +1362,7 @@ impl Constrain<'_> {
                 true => self.table.fresh_row_for(Subject::PatternDemand),
                 false => Rest::Closed,
             };
-            let ty = Rc::new(Ty::plain(Ty::Sum(Row {
+            let ty = Arc::new(Ty::plain(Ty::Sum(Row {
                 labels: labels.clone(),
                 rest: rest.clone(),
             })));
@@ -1489,7 +1376,7 @@ impl Constrain<'_> {
         if !primitives.is_empty() {
             exact = false;
             qualifies = false;
-            demands.extend(primitives.into_iter().map(|core| Rc::new(Ty::plain(core))));
+            demands.extend(primitives.into_iter().map(|core| Arc::new(Ty::plain(core))));
         }
         // An array's elements are of one type, so every element pattern of
         // every arm — wherever it sits among them — constrains the one element
@@ -1498,7 +1385,7 @@ impl Constrain<'_> {
             path.push(ir::Step::Element);
             let (element, _) = self.position(columns, path, &elements);
             path.pop();
-            let ty = Rc::new(Ty::Array(element));
+            let ty = Arc::new(Ty::Array(element));
             for binder in rests {
                 self.env.insert(binder.anchored, Binding::Mono(ty.clone()));
             }
@@ -1544,7 +1431,7 @@ impl Constrain<'_> {
                 true => Rest::Closed,
                 false => self.table.fresh_row_for(Subject::PatternDemand),
             };
-            let ty = Rc::new(Ty::Struct(Row {
+            let ty = Arc::new(Ty::Struct(Row {
                 labels: named.clone(),
                 rest,
             }));
@@ -1587,14 +1474,14 @@ impl Constrain<'_> {
                             let field = match columns.matrix.handled(earlier, path, name) {
                                 true => RowField {
                                     presence: Presence::Absent,
-                                    ty: Rc::new(Ty::default()),
+                                    ty: Arc::new(Ty::default()),
                                 },
                                 false => field.clone(),
                             };
                             (name.clone(), field)
                         })
                         .collect();
-                    Rc::new(Ty::plain(Ty::Sum(Row {
+                    Arc::new(Ty::plain(Ty::Sum(Row {
                         labels: refined,
                         rest: rest.clone(),
                     })))
@@ -1621,7 +1508,7 @@ impl Constrain<'_> {
     pub(super) fn check_term(
         &mut self,
         term: &mut Term,
-        expected: &Rc<Ty>,
+        expected: &Arc<Ty>,
         expected_subject: Subject,
         expected_span: Option<Anchor>,
     ) {
@@ -1640,11 +1527,6 @@ impl Constrain<'_> {
                 let level = self.table.level;
                 let internal = Row::of(self.table.fresh_row_for(Subject::AmbientEffects));
                 self.env.insert(arg.anchored, Binding::Mono(from.clone()));
-                self.binding_effect_provenance.insert(
-                    arg.anchored,
-                    super::EffectProvenance::parameter(arg.anchored),
-                );
-                self.callable_effect_scopes.push(Vec::new());
                 let outer = self.enter(Ambient {
                     row: internal.clone(),
                     inside: true,
@@ -1655,25 +1537,12 @@ impl Constrain<'_> {
                 self.check_term(body, &to, expected_subject, expected_span);
                 self.answer = held;
                 self.leave(outer);
-                let callable = self
-                    .callable_effect_scopes
-                    .pop()
-                    .expect("checked function effect scope");
-                let result = self
-                    .term_effect_provenance
-                    .get(&body.at)
-                    .cloned()
-                    .unwrap_or_default();
-                self.term_effect_provenance.insert(
-                    term.at,
-                    super::EffectProvenance::function(callable.clone(), arg.anchored, result),
-                );
                 self.emit(
                     term.at,
                     ConstraintOrigin::ApplicationEffects,
                     ConstraintSubjects::one(Subject::AmbientEffects),
                     ConstraintKind::Isolate {
-                        effect_origins: callable,
+                        effect_origins: Vec::new(),
                         input: from,
                         output: to,
                         internal,
@@ -1707,17 +1576,9 @@ impl Constrain<'_> {
                     .all(|field| matches!(field.presence, Presence::Present))
                 && same_field_set(fields, &row.labels) =>
             {
-                let mut provenance_fields = IndexMap::new();
                 for (name, field) in fields.iter_mut() {
                     let want = row.labels[name].ty.clone();
                     self.check_term(&mut field.value, &want, expected_subject, expected_span);
-                    if let Some(value) = self.term_effect_provenance.get(&field.value.at).cloned() {
-                        provenance_fields.insert(name.clone(), value);
-                    }
-                }
-                let provenance = super::EffectProvenance::from_fields(provenance_fields);
-                if provenance != super::EffectProvenance::default() {
-                    self.term_effect_provenance.insert(term.at, provenance);
                 }
                 term.ty = expected.clone();
             }
@@ -1764,7 +1625,7 @@ impl Constrain<'_> {
                     // no term here to push into — and worded with the tag's own
                     // span, which is the whole of what the reader wrote.
                     None => {
-                        let carried = Rc::new(Ty::unit());
+                        let carried = Arc::new(Ty::unit());
                         self.checks(
                             name.at,
                             &carried,
@@ -1800,7 +1661,7 @@ impl Constrain<'_> {
     /// other, which is exactly the let/lambda distinction. A name a nested
     /// `let` bound is the polymorphic case with the scheme still to come, so
     /// the copy is asked for rather than made.
-    fn lookup(&mut self, span: Anchor, symbol: Symbol) -> Rc<Ty> {
+    fn lookup(&mut self, span: Anchor, symbol: Symbol) -> Arc<Ty> {
         // Indexed rather than looked up. A lambda's argument is bound where the
         // walk enters its body; a nested `let`'s name is bound before its own
         // value is walked; a top-level definition is bound before any body
@@ -1814,28 +1675,14 @@ impl Constrain<'_> {
             .cloned()
             .expect("every name the lowering kept is bound before it is read")
         {
-            Binding::Mono(ty) => {
-                if let Some(provenance) = self.binding_effect_provenance.get(&symbol).cloned() {
-                    self.term_effect_provenance.insert(span, provenance);
-                }
-                ty
-            }
-            Binding::Poly(scheme) => {
-                if *scheme.effect_provenance != super::EffectProvenance::default() {
-                    self.term_effect_provenance
-                        .insert(span, (*scheme.effect_provenance).clone());
-                }
-                self.table.instantiate_local(span, symbol, &scheme)
-            }
+            Binding::Mono(ty) => ty,
+            Binding::Poly(scheme) => self.table.instantiate_local(span, symbol, &scheme),
             // The scheme is not written yet, so the walk says what this use is
             // rather than what it has: a fresh copy of whatever the enclosing
             // [`ConstraintKind::Let`] publishes. Which keeps the invariant this
             // pass is built on — nothing here reads the table — over the one
             // construct that would otherwise have to wait for a solve.
             Binding::Local => {
-                if let Some(provenance) = self.local_effect_provenance.get(&symbol).cloned() {
-                    self.term_effect_provenance.insert(span, provenance);
-                }
                 let ty = self.table.fresh_type_for(Subject::Instance);
                 // The scheme does not exist yet, but its possible store batch
                 // still has a source position. Reserve an inert slot now; the
@@ -1870,7 +1717,7 @@ impl Constrain<'_> {
 
 impl Constrain<'_> {
     /// Require access to the cell region at this expression.
-    fn mutation(&mut self, span: Anchor, region: Rc<Ty>) {
+    fn mutation(&mut self, span: Anchor, region: Arc<Ty>) {
         let performed = Row {
             labels: [(
                 crate::types::mutation_effect().row_key(),
@@ -1911,7 +1758,7 @@ impl Constrain<'_> {
                     let rest = self.table.fresh_row_for(Subject::Instance);
                     let row = Row::of(rest);
                     self.table.forbid(&row, shape, lacks);
-                    Assigned::Ty(Rc::new(match shape {
+                    Assigned::Ty(Arc::new(match shape {
                         Shape::Struct => Ty::Struct(row),
                         Shape::Sum => Ty::Sum(row),
                         Shape::Effect => Ty::effects_argument(row),
@@ -1925,8 +1772,8 @@ impl Constrain<'_> {
 /// The payload an effect label carries: its arguments, in order, as the
 /// positional struct a tuple is. An effect without parameters carries the
 /// unit tuple, as every label once did.
-pub(crate) fn argument_tuple(args: &[Assigned]) -> Rc<Ty> {
-    Rc::new(Ty::Struct(Row {
+pub(crate) fn argument_tuple(args: &[Assigned]) -> Arc<Ty> {
+    Arc::new(Ty::Struct(Row {
         labels: args
             .iter()
             .enumerate()

@@ -1,6 +1,6 @@
 //! Tests for [`ruddy::inference`].
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use indexmap::IndexMap;
 use ruddy::{
@@ -20,10 +20,10 @@ fn dummy_mint() -> Mint {
     Mint::new(Bundle::new("test", Version::new(0, 0, 0)).expect("valid bundle"))
 }
 
-fn semantic_named(symbol: Symbol, args: Vec<Rc<Ty>>) -> Rc<Ty> {
-    Rc::new(Ty::Named {
+fn semantic_named(symbol: Symbol, args: Vec<Arc<Ty>>) -> Arc<Ty> {
+    Arc::new(Ty::Named {
         symbol,
-        name: Rc::from("Named"),
+        name: Arc::from("Named"),
         args: args.into(),
     })
 }
@@ -51,7 +51,7 @@ fn infer_src(src: &str) -> (Mint, ir::Output, inference::Output) {
 /// for, and what comes out is what solving everything again would have said.
 #[test]
 fn a_group_is_reused_when_nothing_it_reads_changed() {
-    use ruddy::inference::{GroupMemo, infer_with_memo};
+    use ruddy::inference::Session;
     // Lexed under a registered file, as a bundle's files are: a generated
     // span is numbered absolutely on purpose, and this test is about an edit
     // above a definition leaving the definition's anchors alone.
@@ -73,18 +73,18 @@ fn a_group_is_reused_when_nothing_it_reads_changed() {
                  let twice = fn f => fn y => f (f y)\n\
                  let use = twice id { n: 1n }\n\
                  let apart = fn p => p.field\n";
-    let mut memo = GroupMemo::default();
+    let mut memo = Session::default();
 
     let (mint, out) = lowered(before);
-    let first = infer_with_memo(&mint, &out.program, inference::Trace::Complete, &mut memo);
+    let first = memo.infer(&mint, &out.program, inference::Trace::Complete);
     assert!(first.errors().is_empty(), "{:#?}", first.errors());
-    assert_eq!((memo.hits(), memo.misses()), (0, 4));
+    assert_eq!((memo.reused_groups(), memo.solved_groups()), (0, 4));
 
     // Only `use` was edited, and only `use` is solved again: `id` and `twice`
     // read nothing that changed, and `apart` reads nothing at all.
     let (mint, out) = lowered(after);
-    let second = infer_with_memo(&mint, &out.program, inference::Trace::Complete, &mut memo);
-    assert_eq!((memo.hits(), memo.misses()), (3, 5));
+    let second = memo.infer(&mint, &out.program, inference::Trace::Complete);
+    assert_eq!((memo.reused_groups(), memo.solved_groups()), (3, 5));
     let plain = inference::infer(&mint, &out.program, inference::Trace::Complete);
     assert_eq!(
         format!("{:?}", second.semantics()),
@@ -106,10 +106,10 @@ fn a_group_is_reused_when_nothing_it_reads_changed() {
                         let use = twice id { n: 1n }\n\
                         let apart = fn p => p.field\n";
     let (mint, out) = lowered(renamed_body);
-    infer_with_memo(&mint, &out.program, inference::Trace::Complete, &mut memo);
-    // `id` changed and so did what it publishes, since its provenance names
-    // new steps; `use` reads that and follows. `twice` and `apart` stand.
-    assert_eq!((memo.hits(), memo.misses()), (5, 7));
+    memo.infer(&mint, &out.program, inference::Trace::Complete);
+    // `id` changes its evidence, but keeps its interface. The consumer
+    // follows the refreshed evidence without repeating its solve.
+    assert_eq!((memo.reused_groups(), memo.solved_groups()), (6, 6));
 }
 
 /// Ordinary compilation keeps no replay data, and a debugger keeps all of it;
@@ -910,7 +910,7 @@ fn term_decl<'a>(mint: &Mint, out: &'a ir::Output, name: &str) -> &'a Decl<Term>
 
 /// The type of every term in a definition's body, outermost first — the set
 /// the debugger paints onto the IR tab as badges.
-fn body_tys(term: &Term) -> Vec<Rc<Ty>> {
+fn body_tys(term: &Term) -> Vec<Arc<Ty>> {
     let mut out = vec![term.ty.clone()];
     match &term.kind {
         TermKind::Unary { value, .. } => out.extend(body_tys(value)),
@@ -976,7 +976,7 @@ fn body_tys(term: &Term) -> Vec<Rc<Ty>> {
 }
 
 fn body_types(term: &Term) -> Vec<String> {
-    body_tys(term).iter().map(Rc::<Ty>::to_string).collect()
+    body_tys(term).iter().map(Arc::<Ty>::to_string).collect()
 }
 
 /// Whether a type still names one of the solver's variables anywhere 'inside
@@ -2230,10 +2230,10 @@ fn alias_row_opening_is_total_for_every_semantic_argument_exit() {
     let (mint, _, output) = inferred("type RowId 'r = { ..'r }");
     let symbol = symbol_named(&mint, output.semantics().aliases().keys().copied(), "RowId");
     let named = |arg: Option<Ty>| {
-        Rc::new(Ty::Named {
+        Arc::new(Ty::Named {
             symbol,
-            name: Rc::from("RowId"),
-            args: arg.into_iter().map(Rc::new).collect::<Vec<_>>().into(),
+            name: Arc::from("RowId"),
+            args: arg.into_iter().map(Arc::new).collect::<Vec<_>>().into(),
         })
     };
 
@@ -2260,7 +2260,7 @@ fn alias_row_opening_is_total_for_every_semantic_argument_exit() {
         Some(Rest::More(more)) if matches!(more.rest, Rest::Undecided)
     ));
     let mut aliases = output.semantics().aliases().clone();
-    aliases.insert(symbol, Scheme::new(1, Rc::new(Ty::Bound(0))));
+    aliases.insert(symbol, Scheme::new(1, Arc::new(Ty::Bound(0))));
     assert!(matches!(
         &*inference::unfold(&aliases, &named(None)),
         Ty::Undecided
@@ -2269,9 +2269,9 @@ fn alias_row_opening_is_total_for_every_semantic_argument_exit() {
         symbol,
         Scheme::new(
             1,
-            Rc::new(Ty::Struct(Row {
+            Arc::new(Ty::Struct(Row {
                 labels: Default::default(),
-                rest: Rest::More(Rc::new(Row::of(Rest::Bound(0)))),
+                rest: Rest::More(Arc::new(Row::of(Rest::Bound(0)))),
             })),
         ),
     );
@@ -2297,74 +2297,77 @@ fn alias_cycle_keys_cover_every_semantic_shape_and_absorb_growth() {
     let a = symbol_named(&mint, output.semantics().aliases().keys().copied(), "A");
     let row_id = symbol_named(&mint, output.semantics().aliases().keys().copied(), "RowId");
     let row_a = symbol_named(&mint, output.semantics().aliases().keys().copied(), "RowA");
-    let named = |symbol, args: Vec<Rc<Ty>>| {
-        Rc::new(Ty::Named {
+    let named = |symbol, args: Vec<Arc<Ty>>| {
+        Arc::new(Ty::Named {
             symbol,
-            name: Rc::from("shown"),
+            name: Arc::from("shown"),
             args: args.into(),
         })
     };
     let field = |presence, ty| ruddy::types::RowField { presence, ty };
 
-    let nested = Rc::new(Row {
+    let nested = Arc::new(Row {
         labels: [(
             "rigid-rest".into(),
-            field(Presence::Present, Rc::new(Ty::Int)),
+            field(Presence::Present, Arc::new(Ty::Int)),
         )]
         .into_iter()
         .collect(),
         rest: Rest::Rigid {
             id: 4,
-            name: Rc::from("r"),
+            name: Arc::from("r"),
         },
     });
-    let sum = Rc::new(Ty::Sum(Row {
+    let sum = Arc::new(Ty::Sum(Row {
         labels: [(
             "bound-rest".into(),
-            field(Presence::Absent, Rc::new(Ty::Real)),
+            field(Presence::Absent, Arc::new(Ty::Real)),
         )]
         .into_iter()
         .collect(),
         rest: Rest::Bound(3),
     }));
-    let undecided_rest = Rc::new(Ty::Struct(Row {
+    let undecided_rest = Arc::new(Ty::Struct(Row {
         labels: Default::default(),
         rest: Rest::Undecided,
     }));
-    let complex = Rc::new(Ty::Arrow(
-        Rc::new(Ty::Struct(Row {
+    let complex = Arc::new(Ty::Arrow(
+        Arc::new(Ty::Struct(Row {
             labels: [
-                ("nat".into(), field(Presence::Present, Rc::new(Ty::Nat))),
+                ("nat".into(), field(Presence::Present, Arc::new(Ty::Nat))),
                 (
                     "string".into(),
-                    field(Presence::Absent, Rc::new(Ty::String)),
+                    field(Presence::Absent, Arc::new(Ty::String)),
                 ),
                 (
                     "boolean".into(),
-                    field(Presence::Var(1), Rc::new(Ty::Boolean)),
+                    field(Presence::Var(1), Arc::new(Ty::Boolean)),
                 ),
-                ("var".into(), field(Presence::Bound(2), Rc::new(Ty::Var(5)))),
+                (
+                    "var".into(),
+                    field(Presence::Bound(2), Arc::new(Ty::Var(5))),
+                ),
                 (
                     "rigid".into(),
                     field(
                         Presence::Undecided,
-                        Rc::new(Ty::Rigid {
+                        Arc::new(Ty::Rigid {
                             id: 6,
-                            name: Rc::from("a"),
+                            name: Arc::from("a"),
                         }),
                     ),
                 ),
                 (
                     "bound".into(),
-                    field(Presence::Present, Rc::new(Ty::Bound(7))),
+                    field(Presence::Present, Arc::new(Ty::Bound(7))),
                 ),
                 (
                     "unknown".into(),
-                    field(Presence::Present, Rc::new(Ty::Undecided)),
+                    field(Presence::Present, Arc::new(Ty::Undecided)),
                 ),
                 (
                     "named".into(),
-                    field(Presence::Present, named(id, vec![Rc::new(Ty::Nat)])),
+                    field(Presence::Present, named(id, vec![Arc::new(Ty::Nat)])),
                 ),
                 ("sum".into(), field(Presence::Present, sum)),
                 (
@@ -2376,7 +2379,7 @@ fn alias_cycle_keys_cover_every_semantic_shape_and_absorb_growth() {
             .collect(),
             rest: Rest::More(nested.clone()),
         })),
-        Rc::new(Ty::Struct(Row::closed())),
+        Arc::new(Ty::Struct(Row::closed())),
         Row {
             labels: Default::default(),
             // Sharing this nested row with the argument row exercises identity
@@ -2398,7 +2401,7 @@ fn alias_cycle_keys_cover_every_semantic_shape_and_absorb_growth() {
     // local source lowering would reject it before inference.
     aliases.insert(
         a,
-        Scheme::new(1, named(id, vec![named(a, vec![Rc::new(Ty::Bound(0))])])),
+        Scheme::new(1, named(id, vec![named(a, vec![Arc::new(Ty::Bound(0))])])),
     );
     assert!(matches!(
         &*inference::unfold(&aliases, &named(a, vec![complex])),
@@ -2407,7 +2410,7 @@ fn alias_cycle_keys_cover_every_semantic_shape_and_absorb_growth() {
 
     // Repeating a forwarding constructor is valid while its whole argument is
     // getting smaller, even much deeper than the declaration table.
-    let mut deep = Rc::new(Ty::Nat);
+    let mut deep = Arc::new(Ty::Nat);
     for _ in 0..512 {
         deep = named(id, vec![deep]);
     }
@@ -2441,10 +2444,10 @@ fn alias_cycle_keys_cover_every_semantic_shape_and_absorb_growth() {
             1,
             named(
                 grow,
-                vec![Rc::new(Ty::Struct(Row {
+                vec![Arc::new(Ty::Struct(Row {
                     labels: [(
                         "next".into(),
-                        field(Presence::Present, Rc::new(Ty::Bound(0))),
+                        field(Presence::Present, Arc::new(Ty::Bound(0))),
                     )]
                     .into_iter()
                     .collect(),
@@ -2454,7 +2457,7 @@ fn alias_cycle_keys_cover_every_semantic_shape_and_absorb_growth() {
         ),
     );
     assert!(matches!(
-        &*inference::unfold(&aliases, &named(grow, vec![Rc::new(Ty::Nat)])),
+        &*inference::unfold(&aliases, &named(grow, vec![Arc::new(Ty::Nat)])),
         Ty::Undecided
     ));
 
@@ -2465,7 +2468,7 @@ fn alias_cycle_keys_cover_every_semantic_shape_and_absorb_growth() {
     let forward = mint
         .global(None, Namespace::Types, "Forward")
         .expect("a fresh forwarding type");
-    aliases.insert(forward, Scheme::new(1, Rc::new(Ty::Bound(0))));
+    aliases.insert(forward, Scheme::new(1, Arc::new(Ty::Bound(0))));
     aliases.insert(
         grow,
         Scheme::new(
@@ -2474,10 +2477,10 @@ fn alias_cycle_keys_cover_every_semantic_shape_and_absorb_growth() {
                 forward,
                 vec![named(
                     grow,
-                    vec![Rc::new(Ty::Struct(Row {
+                    vec![Arc::new(Ty::Struct(Row {
                         labels: [(
                             "next".into(),
-                            field(Presence::Present, Rc::new(Ty::Bound(0))),
+                            field(Presence::Present, Arc::new(Ty::Bound(0))),
                         )]
                         .into_iter()
                         .collect(),
@@ -2488,7 +2491,7 @@ fn alias_cycle_keys_cover_every_semantic_shape_and_absorb_growth() {
         ),
     );
     assert!(matches!(
-        &*inference::unfold(&aliases, &named(grow, vec![Rc::new(Ty::Nat)])),
+        &*inference::unfold(&aliases, &named(grow, vec![Arc::new(Ty::Nat)])),
         Ty::Undecided
     ));
 
@@ -2505,7 +2508,7 @@ fn alias_cycle_keys_cover_every_semantic_shape_and_absorb_growth() {
     let mut aliases = IndexMap::new();
     aliases.insert(
         row,
-        Scheme::new(1, Rc::new(Ty::Struct(Row::of(Rest::Bound(0))))),
+        Scheme::new(1, Arc::new(Ty::Struct(Row::of(Rest::Bound(0))))),
     );
     aliases.insert(
         recursive,
@@ -2515,8 +2518,8 @@ fn alias_cycle_keys_cover_every_semantic_shape_and_absorb_growth() {
                 row,
                 vec![named(
                     recursive,
-                    vec![Rc::new(Ty::Struct(Row {
-                        labels: [("x".into(), field(Presence::Present, Rc::new(Ty::Bound(0))))]
+                    vec![Arc::new(Ty::Struct(Row {
+                        labels: [("x".into(), field(Presence::Present, Arc::new(Ty::Bound(0))))]
                             .into_iter()
                             .collect(),
                         rest: Rest::Closed,
@@ -2528,7 +2531,7 @@ fn alias_cycle_keys_cover_every_semantic_shape_and_absorb_growth() {
     assert!(matches!(
         &*inference::unfold(
             &aliases,
-            &named(recursive, vec![Rc::new(Ty::Nat)])
+            &named(recursive, vec![Arc::new(Ty::Nat)])
         ),
         Ty::Struct(Row {
             rest: Rest::More(more),
@@ -2566,36 +2569,36 @@ fn transitive_forwarding_bodies_do_not_spend_growth_fuel() {
     let missing = mint.global(None, Namespace::Types, "Missing").unwrap();
     let absent = mint.global(None, Namespace::Types, "Absent").unwrap();
     let mut aliases = IndexMap::new();
-    aliases.insert(id, Scheme::new(1, Rc::new(Ty::Bound(0))));
+    aliases.insert(id, Scheme::new(1, Arc::new(Ty::Bound(0))));
     aliases.insert(
         nested,
         Scheme::new(
             1,
-            semantic_named(id, vec![semantic_named(id, vec![Rc::new(Ty::Bound(0))])]),
+            semantic_named(id, vec![semantic_named(id, vec![Arc::new(Ty::Bound(0))])]),
         ),
     );
     aliases.insert(
         left,
-        Scheme::new(1, semantic_named(right, vec![Rc::new(Ty::Bound(0))])),
+        Scheme::new(1, semantic_named(right, vec![Arc::new(Ty::Bound(0))])),
     );
     aliases.insert(
         right,
-        Scheme::new(1, semantic_named(left, vec![Rc::new(Ty::Bound(0))])),
+        Scheme::new(1, semantic_named(left, vec![Arc::new(Ty::Bound(0))])),
     );
     aliases.insert(
         missing,
-        Scheme::new(1, semantic_named(absent, vec![Rc::new(Ty::Bound(0))])),
+        Scheme::new(1, semantic_named(absent, vec![Arc::new(Ty::Bound(0))])),
     );
     assert!(matches!(
-        &*inference::unfold(&aliases, &semantic_named(nested, vec![Rc::new(Ty::Nat)])),
+        &*inference::unfold(&aliases, &semantic_named(nested, vec![Arc::new(Ty::Nat)])),
         Ty::Nat
     ));
     assert!(matches!(
-        &*inference::unfold(&aliases, &semantic_named(left, vec![Rc::new(Ty::Nat)])),
+        &*inference::unfold(&aliases, &semantic_named(left, vec![Arc::new(Ty::Nat)])),
         Ty::Undecided
     ));
     assert!(matches!(
-        &*inference::unfold(&aliases, &semantic_named(missing, vec![Rc::new(Ty::Nat)])),
+        &*inference::unfold(&aliases, &semantic_named(missing, vec![Arc::new(Ty::Nat)])),
         Ty::Undecided
     ));
 }
@@ -2610,9 +2613,9 @@ fn nested_row_identity_forwarding_neither_spends_fuel_nor_uses_alias_count() {
     let mut aliases = IndexMap::new();
     aliases.insert(
         id,
-        Scheme::new(1, Rc::new(Ty::Struct(Row::of(Rest::Bound(0))))),
+        Scheme::new(1, Arc::new(Ty::Struct(Row::of(Rest::Bound(0))))),
     );
-    let empty = Rc::new(Ty::unit());
+    let empty = Arc::new(Ty::unit());
     let nested = semantic_named(id, vec![semantic_named(id, vec![empty])]);
     let opened = inference::unfold(&aliases, &nested);
     let Ty::Struct(row) = &*opened else {
@@ -2640,16 +2643,16 @@ fn alias_unfolding_opens_deep_semantic_bodies_on_a_small_stack() {
             let layer = mint
                 .global(None, Namespace::Types, "Layer")
                 .expect("a nested name");
-            let mut body = Rc::new(Ty::Bound(0));
+            let mut body = Arc::new(Ty::Bound(0));
             for depth in 0..30_000 {
                 body = match depth % 3 {
-                    0 => Rc::new(Ty::Arrow(Rc::new(Ty::Nat), body, Row::closed())),
-                    1 => Rc::new(Ty::Named {
+                    0 => Arc::new(Ty::Arrow(Arc::new(Ty::Nat), body, Row::closed())),
+                    1 => Arc::new(Ty::Named {
                         symbol: layer,
-                        name: Rc::from("Layer"),
+                        name: Arc::from("Layer"),
                         args: vec![body].into(),
                     }),
-                    _ => Rc::new(Ty::Struct(Row {
+                    _ => Arc::new(Ty::Struct(Row {
                         labels: [(
                             "payload".into(),
                             RowField {
@@ -2665,7 +2668,7 @@ fn alias_unfolding_opens_deep_semantic_bodies_on_a_small_stack() {
             }
             let mut aliases = IndexMap::new();
             aliases.insert(alias, Scheme::new(1, body));
-            let use_ = semantic_named(alias, vec![Rc::new(Ty::Nat)]);
+            let use_ = semantic_named(alias, vec![Arc::new(Ty::Nat)]);
             let opened = inference::unfold(&aliases, &use_);
             assert!(!matches!(&*opened, Ty::Undecided));
         })
@@ -2682,11 +2685,11 @@ fn alias_unfolding_is_linear_and_stack_safe_for_deep_forwarding() {
         .spawn(|| {
             let (mint, _, output) = inferred("type Id 'a = 'a");
             let id = symbol_named(&mint, output.semantics().aliases().keys().copied(), "Id");
-            let mut deep = Rc::new(Ty::Nat);
+            let mut deep = Arc::new(Ty::Nat);
             for _ in 0..30_000 {
-                deep = Rc::new(Ty::Named {
+                deep = Arc::new(Ty::Named {
                     symbol: id,
-                    name: Rc::from("Id"),
+                    name: Arc::from("Id"),
                     args: vec![deep].into(),
                 });
             }
@@ -2711,7 +2714,7 @@ fn deep_more_identity_is_linear_and_stack_safe() {
             let id = mint
                 .global(None, Namespace::Types, "Id")
                 .expect("an identity symbol");
-            let aliases = IndexMap::from([(id, Scheme::new(1, Rc::new(Ty::Bound(0))))]);
+            let aliases = IndexMap::from([(id, Scheme::new(1, Arc::new(Ty::Bound(0))))]);
             let mut row = Row::closed();
             for index in (0..30_000).rev() {
                 let name = match index % 3 {
@@ -2723,15 +2726,15 @@ fn deep_more_identity_is_linear_and_stack_safe() {
                         name,
                         RowField {
                             presence: Presence::Present,
-                            ty: Rc::new(Ty::Nat),
+                            ty: Arc::new(Ty::Nat),
                         },
                     )]
                     .into_iter()
                     .collect(),
-                    rest: Rest::More(Rc::new(row)),
+                    rest: Rest::More(Arc::new(row)),
                 };
             }
-            let deep = semantic_named(id, vec![Rc::new(Ty::Struct(row))]);
+            let deep = semantic_named(id, vec![Arc::new(Ty::Struct(row))]);
             let opened = inference::unfold(&aliases, &deep);
             assert!(matches!(&*opened, Ty::Struct(_)));
         })
@@ -2760,14 +2763,14 @@ fn recursive_goal_comparison_ignores_two_absent_payloads() {
 #[test]
 fn structural_presence_paths_stop_at_absent_payloads() {
     let nested = |name: &str| {
-        Rc::new(Ty::Struct(Row {
-            labels: [(name.into(), RowField::present(Rc::new(Ty::Nat)))]
+        Arc::new(Ty::Struct(Row {
+            labels: [(name.into(), RowField::present(Arc::new(Ty::Nat)))]
                 .into_iter()
                 .collect(),
             rest: Rest::Closed,
         }))
     };
-    let ty = Rc::new(Ty::Struct(Row {
+    let ty = Arc::new(Ty::Struct(Row {
         labels: [
             (
                 "absent".into(),
@@ -2824,14 +2827,14 @@ fn growing_alias_cycles_retain_only_linear_path_state() {
             let add = mint
                 .global(None, Namespace::Types, "Add")
                 .expect("a row-adding alias");
-            let added = Rc::new(Ty::Struct(Row {
-                labels: [("finite".into(), RowField::present(Rc::new(Ty::Nat)))]
+            let added = Arc::new(Ty::Struct(Row {
+                labels: [("finite".into(), RowField::present(Arc::new(Ty::Nat)))]
                     .into_iter()
                     .collect(),
                 rest: Rest::Closed,
             }));
             let finite = IndexMap::from([
-                (forward, Scheme::new(1, Rc::new(Ty::Bound(0)))),
+                (forward, Scheme::new(1, Arc::new(Ty::Bound(0)))),
                 (add, Scheme::new(0, semantic_named(forward, vec![added]))),
             ]);
             assert!(matches!(
@@ -2842,10 +2845,10 @@ fn growing_alias_cycles_retain_only_linear_path_state() {
                 .global(None, Namespace::Types, "Empty")
                 .expect("an empty forwarding alias");
             let empty_aliases = IndexMap::from([
-                (forward, Scheme::new(1, Rc::new(Ty::Bound(0)))),
+                (forward, Scheme::new(1, Arc::new(Ty::Bound(0)))),
                 (
                     empty,
-                    Scheme::new(0, semantic_named(forward, vec![Rc::new(Ty::unit())])),
+                    Scheme::new(0, semantic_named(forward, vec![Arc::new(Ty::unit())])),
                 ),
             ]);
             assert!(matches!(
@@ -2856,18 +2859,21 @@ fn growing_alias_cycles_retain_only_linear_path_state() {
             let mut aliases = IndexMap::new();
             for (index, symbol) in symbols.iter().copied().enumerate() {
                 let next = symbols[(index + 1) % ALIASES];
-                let added = Rc::new(Ty::Struct(Row {
+                let added = Arc::new(Ty::Struct(Row {
                     labels: IndexMap::new(),
-                    rest: Rest::More(Rc::new(Row {
-                        labels: [(format!("field{index}"), RowField::present(Rc::new(Ty::Nat)))]
-                            .into_iter()
-                            .collect(),
+                    rest: Rest::More(Arc::new(Row {
+                        labels: [(
+                            format!("field{index}"),
+                            RowField::present(Arc::new(Ty::Nat)),
+                        )]
+                        .into_iter()
+                        .collect(),
                         rest: Rest::Bound(0),
                     })),
                 }));
                 aliases.insert(symbol, Scheme::new(1, semantic_named(next, vec![added])));
             }
-            let root = semantic_named(symbols[0], vec![Rc::new(Ty::unit())]);
+            let root = semantic_named(symbols[0], vec![Arc::new(Ty::unit())]);
             assert!(matches!(
                 &*inference::unfold(&aliases, &root),
                 Ty::Undecided
@@ -3664,15 +3670,15 @@ fn malformed_non_nominal_recursive_growth_is_absorbed() {
     // Put the previous argument below every composite position the imported
     // growth check must walk. It reaches the bound argument through an arrow,
     // another named application, and that application's struct argument.
-    let descendant = Rc::new(Ty::Struct(Row {
-        labels: [("x".into(), field(Rc::new(Ty::Bound(0))))]
+    let descendant = Arc::new(Ty::Struct(Row {
+        labels: [("x".into(), field(Arc::new(Ty::Bound(0))))]
             .into_iter()
             .collect(),
         rest: Rest::Closed,
     }));
     let nested = semantic_named(symbol, vec![descendant]);
-    let wrapped = Rc::new(Ty::Arrow(
-        Rc::new(Ty::Nat),
+    let wrapped = Arc::new(Ty::Arrow(
+        Arc::new(Ty::Nat),
         nested,
         Row {
             labels: Default::default(),
@@ -3689,7 +3695,7 @@ fn malformed_non_nominal_recursive_growth_is_absorbed() {
             relevant: vec![false],
             scheme: Scheme::new(
                 1,
-                Rc::new(Ty::Struct(Row {
+                Arc::new(Ty::Struct(Row {
                     labels: [("next".into(), field(recursive))].into_iter().collect(),
                     rest: Rest::Closed,
                 })),
@@ -3737,9 +3743,9 @@ fn malformed_nominal_cross_alias_growth_is_absorbed() {
         rest: Rest::Closed,
     };
     for symbol in [a, b] {
-        let argument = Rc::new(Ty::Arrow(
-            Rc::new(Ty::Bound(0)),
-            Rc::new(Ty::Bound(0)),
+        let argument = Arc::new(Ty::Arrow(
+            Arc::new(Ty::Bound(0)),
+            Arc::new(Ty::Bound(0)),
             pure(),
         ));
         lowered.program.external_types.insert(
@@ -3751,7 +3757,7 @@ fn malformed_nominal_cross_alias_growth_is_absorbed() {
                 relevant: vec![true],
                 scheme: Scheme::new(
                     1,
-                    Rc::new(Ty::Struct(Row {
+                    Arc::new(Ty::Struct(Row {
                         labels: [(
                             "next".into(),
                             RowField::present(semantic_named(symbol, vec![argument])),
@@ -3800,8 +3806,8 @@ fn malformed_mixed_class_cross_alias_growth_is_absorbed() {
     lowered.program.types.shift_remove(&a);
     lowered.program.types.shift_remove(&b);
 
-    let wrapped = Rc::new(Ty::Struct(Row {
-        labels: [("x".into(), RowField::present(Rc::new(Ty::Bound(0))))]
+    let wrapped = Arc::new(Ty::Struct(Row {
+        labels: [("x".into(), RowField::present(Arc::new(Ty::Bound(0))))]
             .into_iter()
             .collect(),
         rest: Rest::Closed,
@@ -3815,7 +3821,7 @@ fn malformed_mixed_class_cross_alias_growth_is_absorbed() {
             relevant: vec![false],
             scheme: Scheme::new(
                 1,
-                Rc::new(Ty::Struct(Row {
+                Arc::new(Ty::Struct(Row {
                     labels: [(
                         "next".into(),
                         RowField::present(semantic_named(a, vec![wrapped])),
@@ -3837,10 +3843,10 @@ fn malformed_mixed_class_cross_alias_growth_is_absorbed() {
             relevant: vec![true],
             scheme: Scheme::new(
                 1,
-                Rc::new(Ty::Struct(Row {
+                Arc::new(Ty::Struct(Row {
                     labels: [(
                         "next".into(),
-                        RowField::present(semantic_named(b, vec![Rc::new(Ty::Bound(0))])),
+                        RowField::present(semantic_named(b, vec![Arc::new(Ty::Bound(0))])),
                     )]
                     .into_iter()
                     .collect(),
@@ -3885,8 +3891,8 @@ fn malformed_recursive_growth_is_still_reflexive() {
     let symbol = symbol_named(&mint, lowered.program.types.keys().copied(), "A");
     lowered.program.types.shift_remove(&symbol);
 
-    let argument = Rc::new(Ty::Struct(Row {
-        labels: [("x".into(), RowField::present(Rc::new(Ty::Bound(0))))]
+    let argument = Arc::new(Ty::Struct(Row {
+        labels: [("x".into(), RowField::present(Arc::new(Ty::Bound(0))))]
             .into_iter()
             .collect(),
         rest: Rest::Closed,
@@ -3900,7 +3906,7 @@ fn malformed_recursive_growth_is_still_reflexive() {
             relevant: vec![false],
             scheme: Scheme::new(
                 1,
-                Rc::new(Ty::Struct(Row {
+                Arc::new(Ty::Struct(Row {
                     labels: [(
                         "next".into(),
                         RowField::present(semantic_named(symbol, vec![argument])),
@@ -6755,24 +6761,28 @@ fn structural_result_families_cover_arrows_sums_names_and_absence() {
 
 #[test]
 fn package_rebuilding_places_result_packages_inside_composed_row_tails() {
-    let result = Rc::new(Ty::Struct(Row {
+    let result = Arc::new(Ty::Struct(Row {
         labels: [(
             "hidden".to_string(),
             RowField {
                 presence: Presence::Bound(0),
-                ty: Rc::new(Ty::Nat),
+                ty: Arc::new(Ty::Nat),
             },
         )]
         .into_iter()
         .collect(),
         rest: Rest::Closed,
     }));
-    let body = Rc::new(Ty::Struct(Row {
+    let body = Arc::new(Ty::Struct(Row {
         labels: IndexMap::new(),
-        rest: Rest::More(Rc::new(Row {
+        rest: Rest::More(Arc::new(Row {
             labels: [(
                 "producer".to_string(),
-                RowField::present(Rc::new(Ty::Arrow(Rc::new(Ty::Nat), result, Row::closed()))),
+                RowField::present(Arc::new(Ty::Arrow(
+                    Arc::new(Ty::Nat),
+                    result,
+                    Row::closed(),
+                ))),
             )]
             .into_iter()
             .collect(),
@@ -6823,8 +6833,8 @@ fn structural_families_are_stack_safe_at_thirty_thousand_layers() {
                 .global(None, Namespace::Terms, "family")
                 .expect("a definition symbol");
             let leaf = |name: &str| {
-                Rc::new(Ty::Struct(Row {
-                    labels: [(name.to_string(), RowField::present(Rc::new(Ty::Nat)))]
+                Arc::new(Ty::Struct(Row {
+                    labels: [(name.to_string(), RowField::present(Arc::new(Ty::Nat)))]
                         .into_iter()
                         .collect(),
                     rest: Rest::Closed,
@@ -6834,20 +6844,20 @@ fn structural_families_are_stack_safe_at_thirty_thousand_layers() {
             let mut right = leaf("right");
             for depth in 0..DEPTH {
                 let wrap = |inner| match depth % 4 {
-                    0 => Rc::new(Ty::Struct(Row {
+                    0 => Arc::new(Ty::Struct(Row {
                         labels: [("next".to_string(), RowField::present(inner))]
                             .into_iter()
                             .collect(),
                         rest: Rest::Closed,
                     })),
                     1 => semantic_named(layer, vec![inner]),
-                    2 => Rc::new(Ty::Sum(Row {
+                    2 => Arc::new(Ty::Sum(Row {
                         labels: [("Next".to_string(), RowField::present(inner))]
                             .into_iter()
                             .collect(),
                         rest: Rest::Closed,
                     })),
-                    _ => Rc::new(Ty::Arrow(Rc::new(Ty::Nat), inner, Row::closed())),
+                    _ => Arc::new(Ty::Arrow(Arc::new(Ty::Nat), inner, Row::closed())),
                 };
                 left = wrap(left);
                 right = wrap(right);
@@ -6883,7 +6893,7 @@ fn structural_families_are_stack_safe_at_thirty_thousand_layers() {
             assert!(row.labels.contains_key("right"));
 
             // Keep destruction of the deliberately deep inputs outside this
-            // bounded-stack assertion. Their traversal, not Rc destruction, is
+            // bounded-stack assertion. Their traversal, not Arc destruction, is
             // the behavior this regression isolates.
             std::mem::forget((family, cursor, left, right));
         })
@@ -9439,9 +9449,9 @@ fn local_and_imported_alias_callback_tails_keep_exact_relations() {
             relevant: vec![true],
             scheme: Scheme::new(
                 1,
-                Rc::new(Ty::Arrow(
-                    Rc::new(Ty::unit()),
-                    Rc::new(Ty::unit()),
+                Arc::new(Ty::Arrow(
+                    Arc::new(Ty::unit()),
+                    Arc::new(Ty::unit()),
                     Row::of(Rest::Bound(0)),
                 )),
             ),

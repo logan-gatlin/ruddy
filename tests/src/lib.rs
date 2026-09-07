@@ -37,3 +37,6 @@ mod token;
 mod tracking;
 mod types;
 mod ui;
+
+mod analysis;
+mod lsp;

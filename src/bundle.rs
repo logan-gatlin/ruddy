@@ -53,6 +53,19 @@ pub trait Files {
     /// the same coordinate space as the configured root: a root at
     /// `src/main.hc` looks for `src/Math.hc`.
     fn read(&self, path: &str) -> Option<String>;
+
+    /// A source-backed driver may supply its per-file syntax query here.
+    fn cached_syntax(&self, _path: &str, _id: FileID) -> Option<Syntax> {
+        None
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Syntax {
+    pub tokens: Vec<Token>,
+    pub lex_errors: Vec<token::Error>,
+    pub stmts: Vec<Stmt>,
+    pub parse_errors: Vec<parse::Error>,
 }
 
 /// [`Files`] over a real directory.
@@ -256,29 +269,42 @@ impl Loader<'_> {
     /// that: a module's file is looked for before it is read, and the two ways
     /// that can go wrong are complaints of their own.
     fn file(&mut self, path: &str) -> Vec<Stmt> {
+        crate::cancellation::checkpoint();
         let source = self.fs.read(path).unwrap_or_default();
         let id = self
             .files
             .register_new_file(path.to_string(), source.clone());
 
         let started = Instant::now();
-        let lexed = token::lex(&source, id);
-        let lex_micros = started.elapsed().as_micros() as u64;
-
-        let started = Instant::now();
-        let parsed = parse::parse(lexed.tokens.clone());
-        let parse_micros = started.elapsed().as_micros() as u64;
-
+        let (syntax, lex_micros, parse_micros) =
+            if let Some(syntax) = self.fs.cached_syntax(path, id) {
+                (syntax, 0, started.elapsed().as_micros() as u64)
+            } else {
+                let lexed = token::lex(&source, id);
+                let lex_micros = started.elapsed().as_micros() as u64;
+                let started = Instant::now();
+                let parsed = parse::parse(lexed.tokens.clone());
+                (
+                    Syntax {
+                        tokens: lexed.tokens,
+                        lex_errors: lexed.errors,
+                        stmts: parsed.stmts,
+                        parse_errors: parsed.errors,
+                    },
+                    lex_micros,
+                    started.elapsed().as_micros() as u64,
+                )
+            };
         self.out.loaded.push(Loaded {
             id,
             path: path.to_string(),
-            tokens: lexed.tokens,
-            lex_errors: lexed.errors,
-            parse_errors: parsed.errors,
+            tokens: syntax.tokens,
+            lex_errors: syntax.lex_errors,
+            parse_errors: syntax.parse_errors,
             lex_micros,
             parse_micros,
         });
-        parsed.stmts
+        syntax.stmts
     }
 
     /// Drop every definition in `stmts` whose guard does not hold, fill in the

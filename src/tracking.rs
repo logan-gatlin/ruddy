@@ -180,6 +180,9 @@ impl<T> Tracked<T> {
 }
 
 impl NodeId {
+    pub(crate) fn bits(self) -> u64 {
+        self.0
+    }
     /// The node of what no definition wrote. See [`Anchor::GENERATED`].
     pub const GENERATED: NodeId = NodeId(u64::MAX);
 

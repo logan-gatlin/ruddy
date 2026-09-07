@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    rc::Rc,
+    sync::Arc,
 };
 
 use indexmap::{IndexMap, IndexSet};
@@ -411,14 +411,14 @@ pub enum Formula {
     Atom(Atom),
     /// Logically transparent constraint owned by the package at this zero-based
     /// preorder in the enclosing scheme body.
-    Owned(u32, Rc<Formula>),
-    Not(Rc<Formula>),
-    And(Rc<Formula>, Rc<Formula>),
-    Or(Rc<Formula>, Rc<Formula>),
+    Owned(u32, Arc<Formula>),
+    Not(Arc<Formula>),
+    And(Arc<Formula>, Arc<Formula>),
+    Or(Arc<Formula>, Arc<Formula>),
     /// `a = b` — both there or neither.
-    Iff(Rc<Formula>, Rc<Formula>),
+    Iff(Arc<Formula>, Arc<Formula>),
     /// `a != b` — exactly one of them there.
-    Xor(Rc<Formula>, Rc<Formula>),
+    Xor(Arc<Formula>, Arc<Formula>),
 }
 
 impl PartialEq for Formula {
@@ -503,7 +503,7 @@ pub struct Scheme {
     /// Presence positions opened as abstract producer-owned identities rather
     /// than flexible caller-chosen variables.
     existentials: IndexSet<u32>,
-    body: Rc<Ty>,
+    body: Arc<Ty>,
     /// What has to hold of the presences this scheme quantifies. A constrained
     /// scheme in the HM(X) sense: instantiating one conjoins this, with fresh
     /// variables substituted for the bound ones, into the constraint store.
@@ -531,15 +531,15 @@ pub enum Ty {
     /// The third position is [`Shape::Effect`]'s only home, the way
     /// [`Ty::Sum`] is [`Shape::Sum`]'s: "may perform these effects" is not a
     /// property of every type, so there is nowhere else for the row to live.
-    Arrow(Rc<Ty>, Rc<Ty>, Row),
+    Arrow(Arc<Ty>, Arc<Ty>, Row),
     /// A producer-owned existential value. The wrapper marks the exact
     /// annotation result boundary at which hidden presence identities are
     /// opened; it is otherwise representation-transparent.
-    Package(Rc<Ty>),
+    Package(Arc<Ty>),
     /// An immutable homogeneous array.
-    Array(Rc<Ty>),
+    Array(Arc<Ty>),
     /// A cell with a fixed region and invariant element type.
-    Mut(Rc<Ty>, Rc<Ty>),
+    Mut(Arc<Ty>, Arc<Ty>),
     /// A structural record and its true field-row tail.
     Struct(Row),
     /// The cases a value may be: a row of labels, each with a presence, and a
@@ -595,7 +595,7 @@ pub enum Ty {
     /// what a type carrying it says.
     Rigid {
         id: u32,
-        name: Rc<str>,
+        name: Arc<str>,
     },
     /// A declared type, held as the name it was written as rather than as what
     /// it stands for, applied to whatever it was given.
@@ -650,14 +650,14 @@ pub enum Ty {
     /// every diagnostic in the compiler.
     Named {
         symbol: Symbol,
-        name: Rc<str>,
+        name: Arc<str>,
         /// What the declaration was applied to, in order. Empty for one that
         /// takes nothing, which is every declaration the language had before
         /// type constructors.
         ///
-        /// `Rc<[_]>` rather than `Vec`: a type is cloned on nearly every step
+        /// `Arc<[_]>` rather than `Vec`: a type is cloned on nearly every step
         /// the solver takes, and the arguments should not be copied with it.
-        args: Rc<[Rc<Ty>]>,
+        args: Arc<[Arc<Ty>]>,
     },
     #[default]
     Undecided,
@@ -690,7 +690,7 @@ pub enum Rest {
     /// sum's cases, and rigid for the same reason and on the same terms.
     Rigid {
         id: u32,
-        name: Rc<str>,
+        name: Arc<str>,
     },
     /// A failure abandoned the question, or a reporter froze it. Absorbs, the
     /// way [`Ty::Undecided`] does.
@@ -699,7 +699,7 @@ pub enum Rest {
     /// past them: a sum's row parameter handed a written sum, or a tail variable
     /// waiting to be spliced in. Flattened by the one function that resolves a
     /// row, so no reader ever sees the chain.
-    More(Rc<Row>),
+    More(Arc<Row>),
 }
 
 /// One label: whether it is there, and what it holds when it is. A field of
@@ -716,7 +716,7 @@ pub enum Rest {
 #[derive(Debug, Clone)]
 pub struct RowField {
     pub presence: Presence,
-    pub ty: Rc<Ty>,
+    pub ty: Arc<Ty>,
 }
 
 /// Whether one label is there.
@@ -757,8 +757,8 @@ pub enum Presence {
 /// three can share one table and one numbering without ever being confused.
 #[derive(Debug, Clone)]
 pub enum Assigned {
-    Ty(Rc<Ty>),
-    Row(Rc<Row>),
+    Ty(Arc<Ty>),
+    Row(Arc<Row>),
     Presence(Presence),
 }
 
@@ -813,10 +813,10 @@ impl Assigned {
     /// would be a parameter used at two sorts, which nothing can write — so
     /// rather than a rule for it there is a type that says nothing, which
     /// absorbs the way every other unanswerable type does.
-    pub fn as_ty(&self) -> Rc<Ty> {
+    pub fn as_ty(&self) -> Arc<Ty> {
         match self {
             Assigned::Ty(ty) => ty.clone(),
-            Assigned::Row(_) | Assigned::Presence(_) => Rc::new(Ty::Undecided),
+            Assigned::Row(_) | Assigned::Presence(_) => Arc::new(Ty::Undecided),
         }
     }
 
@@ -873,8 +873,8 @@ impl Assigned {
     /// minted for.
     pub fn variable(&self, var: TyVar) -> Self {
         match self {
-            Assigned::Ty(_) => Assigned::Ty(Rc::new(Ty::Var(var))),
-            Assigned::Row(_) => Assigned::Row(Rc::new(Row::of(Rest::Var(var)))),
+            Assigned::Ty(_) => Assigned::Ty(Arc::new(Ty::Var(var))),
+            Assigned::Row(_) => Assigned::Row(Arc::new(Row::of(Rest::Var(var)))),
             Assigned::Presence(_) => Assigned::Presence(Presence::Var(var)),
         }
     }
@@ -884,14 +884,14 @@ impl Assigned {
     /// downstream of it.
     pub fn undecided(&self) -> Self {
         match self {
-            Assigned::Ty(_) => Assigned::Ty(Rc::new(Ty::default())),
-            Assigned::Row(_) => Assigned::Row(Rc::new(Row::of(Rest::Undecided))),
+            Assigned::Ty(_) => Assigned::Ty(Arc::new(Ty::default())),
+            Assigned::Row(_) => Assigned::Row(Arc::new(Row::of(Rest::Undecided))),
             Assigned::Presence(_) => Assigned::Presence(Presence::Undecided),
         }
     }
 }
 
-fn take_row_children(row: &mut Row, types: &mut Vec<Rc<Ty>>, rows: &mut Vec<Rc<Row>>) {
+fn take_row_children(row: &mut Row, types: &mut Vec<Arc<Ty>>, rows: &mut Vec<Arc<Row>>) {
     types.extend(
         std::mem::take(&mut row.labels)
             .into_values()
@@ -902,26 +902,26 @@ fn take_row_children(row: &mut Row, types: &mut Vec<Rc<Ty>>, rows: &mut Vec<Rc<R
     }
 }
 
-fn take_ty_children(ty: &mut Ty, types: &mut Vec<Rc<Ty>>, rows: &mut Vec<Rc<Row>>) {
+fn take_ty_children(ty: &mut Ty, types: &mut Vec<Arc<Ty>>, rows: &mut Vec<Arc<Row>>) {
     match ty {
         Ty::Arrow(from, to, effects) => {
-            types.push(std::mem::replace(from, Rc::new(Ty::Undecided)));
-            types.push(std::mem::replace(to, Rc::new(Ty::Undecided)));
+            types.push(std::mem::replace(from, Arc::new(Ty::Undecided)));
+            types.push(std::mem::replace(to, Arc::new(Ty::Undecided)));
             take_row_children(effects, types, rows);
         }
         Ty::Package(body) => {
-            types.push(std::mem::replace(body, Rc::new(Ty::Undecided)));
+            types.push(std::mem::replace(body, Arc::new(Ty::Undecided)));
         }
         Ty::Mut(region, element) => {
-            types.push(std::mem::replace(region, Rc::new(Ty::Undecided)));
-            types.push(std::mem::replace(element, Rc::new(Ty::Undecided)));
+            types.push(std::mem::replace(region, Arc::new(Ty::Undecided)));
+            types.push(std::mem::replace(element, Arc::new(Ty::Undecided)));
         }
         Ty::Array(element) => {
-            types.push(std::mem::replace(element, Rc::new(Ty::Undecided)));
+            types.push(std::mem::replace(element, Arc::new(Ty::Undecided)));
         }
         Ty::Struct(row) | Ty::Sum(row) => take_row_children(row, types, rows),
         Ty::Named { args, .. } => {
-            types.extend(std::mem::replace(args, Rc::from([])).iter().cloned());
+            types.extend(std::mem::replace(args, Arc::from([])).iter().cloned());
         }
         Ty::Nat
         | Ty::Int
@@ -936,10 +936,10 @@ fn take_ty_children(ty: &mut Ty, types: &mut Vec<Rc<Ty>>, rows: &mut Vec<Rc<Row>
     }
 }
 
-fn discard_semantic_children(types: &mut Vec<Rc<Ty>>, rows: &mut Vec<Rc<Row>>) {
+fn discard_semantic_children(types: &mut Vec<Arc<Ty>>, rows: &mut Vec<Arc<Row>>) {
     loop {
         while let Some(row) = rows.pop() {
-            if let Ok(mut row) = Rc::try_unwrap(row) {
+            if let Ok(mut row) = Arc::try_unwrap(row) {
                 take_row_children(&mut row, types, rows);
                 // The recursive owners have been removed, so Row::drop sees an
                 // empty shell and does constant-depth work.
@@ -947,7 +947,7 @@ fn discard_semantic_children(types: &mut Vec<Rc<Ty>>, rows: &mut Vec<Rc<Row>>) {
             }
         }
         let Some(ty) = types.pop() else { break };
-        if let Ok(mut ty) = Rc::try_unwrap(ty) {
+        if let Ok(mut ty) = Arc::try_unwrap(ty) {
             take_ty_children(&mut ty, types, rows);
             // Every recursive owner was replaced above. Its ordinary Drop is
             // therefore constant-depth and can release scalar fields.
@@ -979,7 +979,7 @@ impl Drop for Row {
 /// Declared names and rigid spellings are diagnostic data, not identities:
 /// their symbols and minted ids are. The explicit work list keeps deeply nested
 /// alias arguments and [`Rest::More`] chains off the native stack.
-pub fn same_finite_syntax(left: &Rc<Ty>, right: &Rc<Ty>) -> bool {
+pub fn same_finite_syntax(left: &Arc<Ty>, right: &Arc<Ty>) -> bool {
     let mut unlimited = usize::MAX;
     same_finite_syntax_metered(left, right, &mut unlimited).unwrap_or(false)
 }
@@ -988,8 +988,8 @@ pub fn same_finite_syntax(left: &Rc<Ty>, right: &Rc<Ty>) -> bool {
 /// inspected consumes one unit; `None` means the caller's work allowance was
 /// exhausted before equality was decided.
 pub(crate) fn same_finite_syntax_metered(
-    left: &Rc<Ty>,
-    right: &Rc<Ty>,
+    left: &Arc<Ty>,
+    right: &Arc<Ty>,
     work_left: &mut usize,
 ) -> Option<bool> {
     enum Pair<'a> {
@@ -1164,7 +1164,7 @@ impl Ty {
     /// is what a bare `A -> B` means and what the printer writes as nothing at
     /// all. Every position that builds an arrow with no effects to put on it
     /// goes through here rather than spelling the empty row again.
-    pub fn pure(from: Rc<Ty>, to: Rc<Ty>) -> Self {
+    pub fn pure(from: Arc<Ty>, to: Arc<Ty>) -> Self {
         Ty::Arrow(from, to, Row::closed())
     }
 }
@@ -1200,7 +1200,7 @@ impl Ty {
     /// fields and a sum's cases — so two such arguments unify as effect rows,
     /// are forbidden labels in effect nouns, and print as a row of effects.
     pub fn effects_argument(row: Row) -> Self {
-        Self::Arrow(Rc::new(Self::unit()), Rc::new(Self::unit()), row)
+        Self::Arrow(Arc::new(Self::unit()), Arc::new(Self::unit()), row)
     }
 
     /// The row this is an effects argument of, if it is one. See
@@ -1218,7 +1218,7 @@ impl Ty {
     }
 
     /// The element type inside an array, if this is one.
-    pub fn element(&self) -> Option<&Rc<Ty>> {
+    pub fn element(&self) -> Option<&Arc<Ty>> {
         let mut ty = self;
         while let Ty::Package(body) = ty {
             ty = body;
@@ -1298,7 +1298,7 @@ impl RowField {
     /// A label that is definitely there: what a struct literal's fields are,
     /// what a written `name: Ty` field lowers to, and what the one case a tag
     /// literal names is.
-    pub fn present(ty: Rc<Ty>) -> Self {
+    pub fn present(ty: Arc<Ty>) -> Self {
         Self {
             presence: Presence::Present,
             ty,
@@ -1321,7 +1321,7 @@ impl Scheme {
     /// holds no presence variable — lowering refuses a `when` there for the
     /// reason it refuses a `..` — so there is nothing for it to quantify or to
     /// require.
-    pub fn new(count: u32, body: Rc<Ty>) -> Self {
+    pub fn new(count: u32, body: Arc<Ty>) -> Self {
         Self {
             count,
             presences: 0,
@@ -1333,7 +1333,7 @@ impl Scheme {
 
     /// [`new`](Self::new) with the presences a definition's generalization
     /// quantified, and what it requires of them.
-    pub fn constrained(count: u32, presences: u32, body: Rc<Ty>, formula: Formula) -> Self {
+    pub fn constrained(count: u32, presences: u32, body: Arc<Ty>, formula: Formula) -> Self {
         debug_assert!(presences <= count);
         Self {
             count,
@@ -1349,7 +1349,7 @@ impl Scheme {
         count: u32,
         presences: u32,
         existentials: IndexSet<u32>,
-        body: Rc<Ty>,
+        body: Arc<Ty>,
         formula: Formula,
     ) -> Self {
         debug_assert!(presences <= count);
@@ -1359,7 +1359,7 @@ impl Scheme {
         // its existential slots structurally bare; reseal those slots at the
         // alias boundary rather than retaining the source package's identity.
         let body = match existential_outside_package(&body, &existentials) {
-            true => Rc::new(Ty::Package(body)),
+            true => Arc::new(Ty::Package(body)),
             false => body,
         };
         let formula = partition_package_formula(&body, &existentials, formula);
@@ -1393,7 +1393,7 @@ impl Scheme {
         self.presences
     }
 
-    pub fn body(&self) -> &Rc<Ty> {
+    pub fn body(&self) -> &Arc<Ty> {
         &self.body
     }
 
@@ -1406,9 +1406,9 @@ impl Scheme {
 /// Whether an existential bound occurrence has not yet been resealed by a
 /// package. The walk includes composed row tails because imported and inferred
 /// rows may retain their finite shape in `Rest::More`.
-fn existential_outside_package(body: &Rc<Ty>, existentials: &IndexSet<u32>) -> bool {
+fn existential_outside_package(body: &Arc<Ty>, existentials: &IndexSet<u32>) -> bool {
     enum Work {
-        Ty(Rc<Ty>, bool),
+        Ty(Arc<Ty>, bool),
         Row(Row, bool),
     }
     let mut work = vec![Work::Ty(body.clone(), false)];
@@ -1454,12 +1454,12 @@ fn existential_outside_package(body: &Rc<Ty>, existentials: &IndexSet<u32>) -> b
 /// existential atoms. Package numbers are stable structural preorder; a
 /// conjunct involving a universal or multiple owners stays scheme-wide.
 fn partition_package_formula(
-    body: &Rc<Ty>,
+    body: &Arc<Ty>,
     existentials: &IndexSet<u32>,
     formula: Formula,
 ) -> Formula {
     enum Work {
-        Ty(Rc<Ty>, Option<u32>),
+        Ty(Arc<Ty>, Option<u32>),
         Row(Row, Option<u32>),
     }
     let mut slot_owners = HashMap::new();
@@ -1570,7 +1570,7 @@ impl Formula {
     /// Mark a constraint with its exact package owner. Ownership is metadata;
     /// propositional operations deliberately treat this wrapper transparently.
     pub fn owned(owner: u32, formula: Formula) -> Self {
-        Formula::Owned(owner, Rc::new(formula))
+        Formula::Owned(owner, Arc::new(formula))
     }
 
     /// The formula naming one solver variable.
@@ -1598,11 +1598,11 @@ impl Formula {
             return Formula::True;
         }
         if let Formula::Not(inner) = &mut self {
-            let inner = std::mem::replace(inner, Rc::new(Formula::True));
+            let inner = std::mem::replace(inner, Arc::new(Formula::True));
             drop(self);
-            return Rc::try_unwrap(inner).unwrap_or_else(|shared| (*shared).clone());
+            return Arc::try_unwrap(inner).unwrap_or_else(|shared| (*shared).clone());
         }
-        Formula::Not(Rc::new(self))
+        Formula::Not(Arc::new(self))
     }
 
     /// Both, with the constants folded away — which is what makes "says
@@ -1622,7 +1622,7 @@ impl Formula {
         if matches!(other, Formula::True) {
             return self;
         }
-        Formula::And(Rc::new(self), Rc::new(other))
+        Formula::And(Arc::new(self), Arc::new(other))
     }
 
     /// Either, folded the same way.
@@ -1641,17 +1641,17 @@ impl Formula {
         if matches!(other, Formula::False) {
             return self;
         }
-        Formula::Or(Rc::new(self), Rc::new(other))
+        Formula::Or(Arc::new(self), Arc::new(other))
     }
 
     /// Both or neither: what `a = b` says.
     pub fn iff(self, other: Self) -> Self {
-        Formula::Iff(Rc::new(self), Rc::new(other))
+        Formula::Iff(Arc::new(self), Arc::new(other))
     }
 
     /// Exactly one: what `a != b` says.
     pub fn xor(self, other: Self) -> Self {
-        Formula::Xor(Rc::new(self), Rc::new(other))
+        Formula::Xor(Arc::new(self), Arc::new(other))
     }
 
     /// Every one of them, left to right.
@@ -1857,17 +1857,17 @@ impl Formula {
 
 impl Drop for Formula {
     fn drop(&mut self) {
-        fn take_children(formula: &mut Formula, pending: &mut Vec<Rc<Formula>>) {
+        fn take_children(formula: &mut Formula, pending: &mut Vec<Arc<Formula>>) {
             match formula {
                 Formula::Owned(_, inner) | Formula::Not(inner) => {
-                    pending.push(std::mem::replace(inner, Rc::new(Formula::True)));
+                    pending.push(std::mem::replace(inner, Arc::new(Formula::True)));
                 }
                 Formula::And(left, right)
                 | Formula::Or(left, right)
                 | Formula::Iff(left, right)
                 | Formula::Xor(left, right) => {
-                    pending.push(std::mem::replace(left, Rc::new(Formula::True)));
-                    pending.push(std::mem::replace(right, Rc::new(Formula::True)));
+                    pending.push(std::mem::replace(left, Arc::new(Formula::True)));
+                    pending.push(std::mem::replace(right, Arc::new(Formula::True)));
                 }
                 Formula::True | Formula::False | Formula::Atom(_) => {}
             }
@@ -1876,7 +1876,7 @@ impl Drop for Formula {
         let mut pending = Vec::new();
         take_children(self, &mut pending);
         while let Some(formula) = pending.pop() {
-            if let Ok(mut formula) = Rc::try_unwrap(formula) {
+            if let Ok(mut formula) = Arc::try_unwrap(formula) {
                 take_children(&mut formula, &mut pending);
                 drop(formula);
             }
@@ -1884,7 +1884,7 @@ impl Drop for Formula {
     }
 }
 
-/// Release an owned formula without recursively dropping its `Rc` tree.
+/// Release an owned formula without recursively dropping its `Arc` tree.
 pub(crate) fn drop_formula_iterative(root: Formula) {
     drop(root);
 }

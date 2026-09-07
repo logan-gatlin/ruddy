@@ -53,6 +53,10 @@ dev:
 debug *args:
     cargo run -p ruddy-debug -- --port {{port}} {{args}}
 
+# Run the language server over stdio.
+lsp:
+    cargo run -p ruddy-lsp
+
 # Regenerate the tree-sitter parser and run its corpus tests.
 grammar *args:
     #!/usr/bin/env bash
@@ -133,6 +137,7 @@ build:
 # library under RUDDY_HOME (or ~/.ruddy when RUDDY_HOME is unset or empty).
 install:
     cargo install --locked --path "{{justfile_directory()}}/cli"
+    cargo install --locked --path "{{justfile_directory()}}/lsp"
     "{{justfile_directory()}}/scripts/install-std.sh" "{{justfile_directory()}}/std"
 
 # Line and branch coverage for the compiler library. Branch coverage is a

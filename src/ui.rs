@@ -1838,6 +1838,16 @@ fn listed(names: &[String]) -> String {
     }
 }
 
+impl patterns::Error {
+    pub fn diagnostic(&self, source: &SourceMap) -> Diagnostic {
+        Diagnostic::new(
+            self.kind.code(),
+            self.kind.to_string(),
+            source.span(self.at),
+        )
+    }
+}
+
 impl patterns::ErrorKind {
     /// A stable, greppable name for this kind of error — the codes the same
     /// checks had when they ran at lowering, so a reporter keyed on one keeps
@@ -4538,7 +4548,7 @@ mod tests {
 
     use crate::tracking::Anchor;
 
-    use std::rc::Rc;
+    use std::sync::Arc;
 
     use crate::{
         inference::{self, Constraint, ConstraintKind, Effect, ErrorKind as TypeError},
@@ -4550,7 +4560,7 @@ mod tests {
     /// shows it in. `~` is "must unify with".
     #[test]
     fn a_constraint_reads_as_what_it_demands() {
-        let nat = Rc::new(Ty::plain(Ty::Nat));
+        let nat = Arc::new(Ty::plain(Ty::Nat));
         let span = Anchor::GENERATED;
 
         let equal = Constraint {
@@ -4564,7 +4574,7 @@ mod tests {
             ),
             kind: ConstraintKind::Equal {
                 expected: nat.clone(),
-                actual: Rc::new(Ty::plain(Ty::Var(0))),
+                actual: Arc::new(Ty::plain(Ty::Var(0))),
             },
         };
         assert_eq!(equal.to_string(), "Nat ~ ?0");
@@ -4581,7 +4591,7 @@ mod tests {
         assert_eq!(
             Effect::Bound {
                 var: 3,
-                value: Assigned::Ty(Rc::new(Ty::plain(Ty::Nat))),
+                value: Assigned::Ty(Arc::new(Ty::plain(Ty::Nat))),
                 by: inference::ReasonId::synthetic(0),
                 because: None,
             }
@@ -4624,7 +4634,7 @@ mod tests {
             Row {
                 labels: [(
                     "x".to_string(),
-                    RowField::present(Rc::new(Ty::plain(Ty::Nat)))
+                    RowField::present(Arc::new(Ty::plain(Ty::Nat)))
                 )]
                 .into_iter()
                 .collect(),
@@ -4639,7 +4649,7 @@ mod tests {
             (Rest::Var(4), "?4"),
             (Rest::Bound(0), "'a"),
             (Rest::Undecided, "?"),
-            (Rest::More(Rc::new(Row::closed())), "∅"),
+            (Rest::More(Arc::new(Row::closed())), "∅"),
         ] {
             assert_eq!(rest.to_string(), printed);
         }
@@ -4659,8 +4669,8 @@ mod tests {
         // A binding prints as the value, whichever sort it is, so the Solve tab's
         // one column serves all three.
         for (value, printed) in [
-            (Assigned::Ty(Rc::new(Ty::plain(Ty::Nat))), "?2 := Nat"),
-            (Assigned::Row(Rc::new(Row::closed())), "?2 := ∅"),
+            (Assigned::Ty(Arc::new(Ty::plain(Ty::Nat))), "?2 := Nat"),
+            (Assigned::Row(Arc::new(Row::closed())), "?2 := ∅"),
             (Assigned::Presence(Presence::Absent), "?2 := absent"),
         ] {
             assert_eq!(
@@ -4684,7 +4694,7 @@ mod tests {
     /// scheme the `let` publishes requires of its presences.
     #[test]
     fn the_scoping_constraints_read_as_what_they_do() {
-        let nat = Rc::new(Ty::plain(Ty::Nat));
+        let nat = Arc::new(Ty::plain(Ty::Nat));
         let mut mint = Mint::new(Bundle::new("test", Version::new(0, 1, 0)).expect("valid bundle"));
         let symbol = mint.local(None, Namespace::Terms, "x");
 
@@ -4700,7 +4710,6 @@ mod tests {
                 level: 2,
                 promised: Formula::True,
                 rigids: Vec::new(),
-                effect_provenance: Default::default(),
                 initializer_effects: Row::closed(),
                 ambient: Row::closed(),
                 inside: true,
@@ -4718,7 +4727,6 @@ mod tests {
             level: 2,
             promised: Formula::var(0).xor(Formula::var(1)),
             rigids: Vec::new(),
-            effect_provenance: Default::default(),
             initializer_effects: Row::closed(),
             ambient: Row::closed(),
             inside: true,
@@ -4732,7 +4740,7 @@ mod tests {
 
         let use_site = ConstraintKind::Instance {
             symbol,
-            ty: Rc::new(Ty::plain(Ty::Var(4))),
+            ty: Arc::new(Ty::plain(Ty::Var(4))),
             requirement: 0,
         };
         assert_eq!(use_site.code(), "instance");

@@ -1058,9 +1058,14 @@ fn every_stage_reports_on_the_demo() {
             assert!(!stage.summary.is_empty());
             continue;
         }
-        // The demo contains deliberate syntax mistakes. Tokens and the
-        // recovery AST remain inspectable, but no semantic stage receives that
-        // recovery tree; every stage that depends on lowering reports a skip.
+        // Recovery remains visible through semantic stages; lowering still
+        // requires a fully accepted program.
+        if matches!(stage.id, "lir" | "artifact" | "entry" | "linked" | "js") {
+            assert_eq!(stage.status, Status::Skipped, "{}", stage.id);
+            assert!(stage.nodes.is_empty(), "a skipped stage rendered rows");
+            assert!(!stage.summary.is_empty(), "{} counted nothing", stage.id);
+            continue;
+        }
         if matches!(
             stage.id,
             "externs"
@@ -1070,16 +1075,10 @@ fn every_stage_reports_on_the_demo() {
                 | "types"
                 | "presence"
                 | "patterns"
-                | "lir"
-                | "artifact"
-                | "entry"
-                | "linked"
-                | "js"
                 | "symbols"
                 | "types-ir"
         ) {
-            assert_eq!(stage.status, Status::Skipped, "{}", stage.id);
-            assert!(stage.nodes.is_empty(), "a skipped stage rendered rows");
+            assert_eq!(stage.status, Status::Partial, "{}", stage.id);
             assert!(!stage.summary.is_empty(), "{} counted nothing", stage.id);
             continue;
         }
@@ -1257,17 +1256,14 @@ fn diagnostics_are_reported_in_source_order() {
         .iter()
         .map(|diagnostic| diagnostic.code)
         .collect();
-    assert_eq!(
-        codes,
-        [
-            "attribute-needs-name",
-            "number-joined-to-name",
-            "expected-name"
-        ]
-    );
-    // The demo also contains semantic mistakes, but frontend gating keeps
-    // those recovery trees out of lowering and therefore out of this list.
-    assert!(!codes.contains(&"undefined-term"), "{codes:?}");
+    for code in [
+        "attribute-needs-name",
+        "number-joined-to-name",
+        "expected-name",
+        "undefined-term",
+    ] {
+        assert!(codes.contains(&code), "{codes:?}");
+    }
 
     // Where the reader would look for them: the file first, then the offset
     // inside it, since a bundle's diagnostics come from more than one file.
@@ -1571,7 +1567,7 @@ fn a_missing_match_end_points_to_the_match_without_repeating_the_fix() {
 }
 
 #[test]
-fn frontend_errors_keep_reader_advice_and_skip_semantic_debugger_stages() {
+fn frontend_errors_keep_reader_advice_and_recovered_semantic_stages() {
     let snapshot = snapshot("let n = 1x\n");
     let [diagnostic] = snapshot.diagnostics.as_slice() else {
         panic!("expected one diagnostic: {:#?}", snapshot.diagnostics);
@@ -1611,7 +1607,12 @@ fn frontend_errors_keep_reader_advice_and_skip_semantic_debugger_stages() {
             .iter()
             .find(|stage| stage.id == id)
             .unwrap_or_else(|| panic!("{id} is registered"));
-        assert_eq!(stage.status, Status::Skipped, "{id}: {stage:#?}");
+        let expected = if matches!(id, "lir" | "artifact" | "entry" | "linked" | "js") {
+            Status::Skipped
+        } else {
+            Status::Partial
+        };
+        assert_eq!(stage.status, expected, "{id}: {stage:#?}");
     }
 }
 
@@ -2554,14 +2555,14 @@ fn a_missing_module_file_reaches_the_strip() {
         })
     );
 
-    // The loader's recovery AST remains inspectable, but a missing module is
-    // a frontend error and its incomplete tree never reaches semantic phases.
+    // Missing modules preserve the current recovery tree for semantic tooling.
+    // Its unresolved names remain explicit; backend lowering stays gated.
     let ast = stage_named(&snapshot, "ast");
     assert!(!ast.nodes.is_empty(), "{ast:#?}");
     let ir = stage_named(&snapshot, "ir");
-    assert_eq!(ir.status, Status::Skipped, "{ir:#?}");
+    assert_eq!(ir.status, Status::Partial, "{ir:#?}");
     let types = stage_named(&snapshot, "types");
-    assert_eq!(types.status, Status::Skipped, "{types:#?}");
+    assert_eq!(types.status, Status::Partial, "{types:#?}");
 }
 
 #[test]
@@ -3882,4 +3883,16 @@ fn extern_values_reach_every_import_and_artifact_view() {
             artifact.text
         );
     }
+}
+
+#[test]
+fn recovered_buffers_keep_semantics_and_requested_solver_traces() {
+    let snapshot = snapshot("let good = fn x => x\nlet broken =");
+    assert!(snapshot.panic.is_none());
+    assert!(!snapshot.diagnostics.is_empty());
+    for id in ["types", "constraints", "solve"] {
+        let stage = stage_named(&snapshot, id);
+        assert_eq!(stage.status, Status::Partial);
+    }
+    assert_eq!(stage_named(&snapshot, "lir").status, Status::Skipped);
 }

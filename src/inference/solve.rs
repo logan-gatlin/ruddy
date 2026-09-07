@@ -3,7 +3,7 @@
 use std::{
     collections::{HashMap, HashSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
-    rc::Rc,
+    sync::Arc,
 };
 
 use indexmap::{IndexMap, IndexSet};
@@ -49,8 +49,8 @@ enum Tail {
     /// [`rebuild`](Rowed::rebuild) can put the arrow back together — they are
     /// what the goal that failed did *not* decide, so they stand as they were.
     Effects {
-        from: Rc<Ty>,
-        to: Rc<Ty>,
+        from: Arc<Ty>,
+        to: Arc<Ty>,
         rest: Rest,
     },
 }
@@ -69,7 +69,7 @@ enum Tail {
 /// of what the reader wrote.
 #[derive(Clone, Copy)]
 struct Rowed<'a> {
-    ty: &'a Rc<Ty>,
+    ty: &'a Arc<Ty>,
     labels: &'a IndexMap<String, RowField>,
     tail: &'a Tail,
 }
@@ -91,7 +91,7 @@ impl Tail {
 
     /// The a variable variable this tail is, if it is one: its spelling and
     /// its id. What a label demanded of it is refused by name.
-    fn rigid(&self) -> Option<(Rc<str>, u32)> {
+    fn rigid(&self) -> Option<(Arc<str>, u32)> {
         match self {
             Tail::Fields(Rest::Rigid { id, name })
             | Tail::Cases(Rest::Rigid { id, name })
@@ -155,7 +155,7 @@ impl Tail {
         let rest = match self {
             Tail::Fields(rest) | Tail::Cases(rest) | Tail::Effects { rest, .. } => rest,
         };
-        Assigned::Row(Rc::new(Row {
+        Assigned::Row(Arc::new(Row {
             labels,
             rest: rest.clone(),
         }))
@@ -181,20 +181,20 @@ impl<'a> Rowed<'a> {
     /// complaint names: the whole type, so that a base printed beside a missing
     /// field reads as the type the reader wrote rather than as the labels the
     /// solver was looking at.
-    fn rebuild(&self, labels: IndexMap<String, RowField>) -> Rc<Ty> {
+    fn rebuild(&self, labels: IndexMap<String, RowField>) -> Arc<Ty> {
         match self.tail {
-            Tail::Fields(rest) => Rc::new(Ty::Struct(Row {
+            Tail::Fields(rest) => Arc::new(Ty::Struct(Row {
                 labels,
                 rest: rest.clone(),
             })),
-            Tail::Cases(rest) => Rc::new(Ty::Sum(Row {
+            Tail::Cases(rest) => Arc::new(Ty::Sum(Row {
                 labels,
                 rest: rest.clone(),
             })),
             // The arrow with its effect row replaced: what the reader wrote,
             // said as far as the solve has got. The two sides stay as they are,
             // since the goal that failed was about the effects alone.
-            Tail::Effects { from, to, rest } => Rc::new(Ty::Arrow(
+            Tail::Effects { from, to, rest } => Arc::new(Ty::Arrow(
                 from.clone(),
                 to.clone(),
                 Row {
@@ -213,11 +213,10 @@ impl<'a> Rowed<'a> {
 /// One value rather than seven arguments, because it is one thing: a nested
 /// binding's whole scoping, read off the constraint that recorded it.
 struct Scoping<'a> {
-    bound: &'a Rc<Ty>,
+    bound: &'a Arc<Ty>,
     level: u32,
     promised: &'a Formula,
     rigids: &'a [u32],
-    effect_provenance: &'a super::EffectProvenance,
     initializer_effects: &'a Row,
     ambient: &'a Row,
     inside: bool,
@@ -234,8 +233,8 @@ struct Rollback {
 
 #[derive(Clone)]
 struct SolveRow {
-    ty: Rc<Ty>,
-    labels: Rc<IndexMap<String, RowField>>,
+    ty: Arc<Ty>,
+    labels: Arc<IndexMap<String, RowField>>,
     tail: Tail,
 }
 
@@ -258,7 +257,7 @@ struct SolveLabel {
 }
 
 enum SolveWork {
-    Ty(Rc<Ty>, Rc<Ty>, u32),
+    Ty(Arc<Ty>, Arc<Ty>, u32),
     Labels(SolveRow, SolveRow, u32),
     Label {
         name: String,
@@ -269,8 +268,8 @@ enum SolveWork {
         depth: u32,
     },
     FinishCongruent {
-        lhs: Rc<Ty>,
-        rhs: Rc<Ty>,
+        lhs: Arc<Ty>,
+        rhs: Arc<Ty>,
         depth: u32,
         reported: usize,
         rollback: Option<Rollback>,
@@ -325,7 +324,7 @@ pub struct Solve<'a> {
     /// answers questions it was never asked. Compared with [`Table::alike`]
     /// rather than by identity, since unfolding rebuilds an argument each round
     /// rather than passing the same allocation on. See [`Solve::unfold`].
-    pub assumed: Vec<(Rc<Ty>, Rc<Ty>)>,
+    pub assumed: Vec<(Arc<Ty>, Arc<Ty>)>,
     /// The scheme each nested `let` currently in scope published, for as long
     /// as its body is being solved. [`Constrain`](super::Constrain)'s
     /// environment, about the one kind of name generation could not decide.
@@ -420,8 +419,8 @@ impl Solve<'_> {
                             self.table.region_rigids.insert(id);
                             self.unify(
                                 span,
-                                &Rc::new(Ty::Var(var)),
-                                &Rc::new(Ty::Rigid {
+                                &Arc::new(Ty::Var(var)),
+                                &Arc::new(Ty::Rigid {
                                     id,
                                     name: "local region".into(),
                                 }),
@@ -449,7 +448,6 @@ impl Solve<'_> {
                     level,
                     promised,
                     rigids,
-                    effect_provenance,
                     initializer_effects,
                     ambient,
                     inside,
@@ -463,7 +461,6 @@ impl Solve<'_> {
                         level: *level,
                         promised,
                         rigids,
-                        effect_provenance,
                         initializer_effects,
                         ambient,
                         inside: *inside,
@@ -505,8 +502,8 @@ impl Solve<'_> {
                         span,
                         Rule::Performs,
                         Goal::Row {
-                            expected: Rc::new(required.clone()),
-                            actual: Rc::new(available.clone()),
+                            expected: Arc::new(required.clone()),
+                            actual: Arc::new(available.clone()),
                         },
                         Effect::Decomposed,
                     );
@@ -636,9 +633,9 @@ impl Solve<'_> {
         &mut self,
         field_span: Anchor,
         base_span: Anchor,
-        base: &Rc<Ty>,
+        base: &Arc<Ty>,
         field: &str,
-        result: &Rc<Ty>,
+        result: &Arc<Ty>,
     ) {
         let base = self.table.resolve(base);
         let exposed = super::unfold(self.aliases, &base);
@@ -665,7 +662,7 @@ impl Solve<'_> {
                     },
                 );
                 let goal = Goal::Type {
-                    expected: Rc::new(Ty::unit()),
+                    expected: Arc::new(Ty::unit()),
                     actual: exposed.clone(),
                 };
                 self.fail(
@@ -677,7 +674,7 @@ impl Solve<'_> {
                 );
             }
             _ => {
-                let want = Rc::new(Ty::Struct(Row {
+                let want = Arc::new(Ty::Struct(Row {
                     labels: [(field.to_string(), RowField::present(result.clone()))]
                         .into_iter()
                         .collect(),
@@ -708,9 +705,9 @@ impl Solve<'_> {
         &mut self,
         span: Anchor,
         operand_span: Anchor,
-        operand: &Rc<Ty>,
-        demand: &Rc<Ty>,
-        result: &Rc<Ty>,
+        operand: &Arc<Ty>,
+        demand: &Arc<Ty>,
+        result: &Arc<Ty>,
     ) {
         let operand = self.table.resolve(operand);
         let exposed = super::unfold(self.aliases, &operand);
@@ -746,12 +743,12 @@ impl Solve<'_> {
     fn not_a_struct(
         &mut self,
         span: Anchor,
-        exposed: Rc<Ty>,
+        exposed: Arc<Ty>,
         demand: super::StructDemand,
-        result: &Rc<Ty>,
+        result: &Arc<Ty>,
     ) {
         let goal = Goal::Type {
-            expected: Rc::new(Ty::unit()),
+            expected: Arc::new(Ty::unit()),
             actual: exposed.clone(),
         };
         let error = Error::new(
@@ -777,8 +774,8 @@ impl Solve<'_> {
     fn matched(
         &mut self,
         span: Anchor,
-        scrutinee: &Rc<Ty>,
-        result: &Rc<Ty>,
+        scrutinee: &Arc<Ty>,
+        result: &Arc<Ty>,
         arms: &[GuardedArm],
         store_end: usize,
     ) {
@@ -868,7 +865,7 @@ impl Solve<'_> {
         self.guard = None;
         self.guard_reasons.clear();
         self.active_refinement = enclosing_refinement;
-        let body_types: Vec<Rc<Ty>> = arms
+        let body_types: Vec<Arc<Ty>> = arms
             .iter()
             .map(|arm| match &arm.result.kind {
                 ConstraintKind::Equal { actual, .. } => actual.clone(),
@@ -906,7 +903,7 @@ impl Solve<'_> {
     /// finite union gets one fresh result presence; constructors, tails and payloads
     /// remain ordinary structural types and are checked by the unifications
     /// that follow.
-    pub(super) fn family_type(&mut self, types: &[Rc<Ty>]) -> Rc<Ty> {
+    pub(super) fn family_type(&mut self, types: &[Arc<Ty>]) -> Arc<Ty> {
         self.family_type_with(types)
     }
 
@@ -915,25 +912,25 @@ impl Solve<'_> {
     /// walk must not borrow the native call stack for each one. `unfolding`
     /// remains a path stack: `PopUnfolding` runs immediately after the expanded
     /// child, before any sibling is visited.
-    fn family_type_with(&mut self, types: &[Rc<Ty>]) -> Rc<Ty> {
+    fn family_type_with(&mut self, types: &[Arc<Ty>]) -> Arc<Ty> {
         /// Stable semantic hashes for the duration of this family walk. Family
         /// construction mints variables and records lacks conditions, but does
         /// not bind an existing variable, so a resolved node cannot change
         /// underneath this cache. Retaining the node also prevents allocator
         /// address reuse from turning the pointer memo into the wrong answer.
         struct Fingerprints {
-            types: HashMap<*const Ty, (Rc<Ty>, u64)>,
+            types: HashMap<*const Ty, (Arc<Ty>, u64)>,
         }
 
         enum FingerprintWork {
-            Type(Rc<Ty>),
-            Arrow(*const Ty, Rc<Ty>),
-            Package(*const Ty, Rc<Ty>),
-            Array(*const Ty, Rc<Ty>),
-            Mut(*const Ty, Rc<Ty>),
-            Struct(*const Ty, Rc<Ty>),
-            Sum(*const Ty, Rc<Ty>),
-            Named(*const Ty, Rc<Ty>, Symbol, usize),
+            Type(Arc<Ty>),
+            Arrow(*const Ty, Arc<Ty>),
+            Package(*const Ty, Arc<Ty>),
+            Array(*const Ty, Arc<Ty>),
+            Mut(*const Ty, Arc<Ty>),
+            Struct(*const Ty, Arc<Ty>),
+            Sum(*const Ty, Arc<Ty>),
+            Named(*const Ty, Arc<Ty>, Symbol, usize),
             Row(Row),
             FinishRow {
                 fields: Vec<(String, Presence, bool)>,
@@ -952,7 +949,7 @@ impl Solve<'_> {
             /// Hash every fact [`Table::alike`] compares. Hash matches only
             /// select candidates; `alike` still makes the coinductive decision,
             /// so collisions can cost work but cannot change it.
-            fn ty(&mut self, table: &Table, ty: &Rc<Ty>) -> u64 {
+            fn ty(&mut self, table: &Table, ty: &Arc<Ty>) -> u64 {
                 fn tagged(tag: u8, parts: impl IntoIterator<Item = u64>) -> u64 {
                     let mut hash = DefaultHasher::new();
                     tag.hash(&mut hash);
@@ -988,7 +985,7 @@ impl Solve<'_> {
                     match next {
                         FingerprintWork::Type(ty) => {
                             let ty = table.resolve(&ty);
-                            let key = Rc::as_ptr(&ty);
+                            let key = Arc::as_ptr(&ty);
                             if let Some((_, hash)) = self.types.get(&key) {
                                 values.push(*hash);
                                 continue;
@@ -1177,7 +1174,7 @@ impl Solve<'_> {
         }
 
         enum Work {
-            Type(Vec<Rc<Ty>>),
+            Type(Vec<Arc<Ty>>),
             Row(Vec<Row>),
             PopUnfolding(Vec<u64>),
             Arrow,
@@ -1185,7 +1182,7 @@ impl Solve<'_> {
             Sum,
             Named {
                 symbol: Symbol,
-                name: Rc<str>,
+                name: Arc<str>,
                 arguments: usize,
             },
             RowNext(RowState),
@@ -1198,7 +1195,7 @@ impl Solve<'_> {
         let _ = types
             .first()
             .expect("a structural family has a contributor");
-        let mut unfolding: Vec<Vec<Rc<Ty>>> = Vec::new();
+        let mut unfolding: Vec<Vec<Arc<Ty>>> = Vec::new();
         let mut fingerprints = Fingerprints::new();
         let mut assumptions: HashMap<Vec<u64>, Vec<usize>> = HashMap::new();
         let mut work = vec![Work::Type(types.to_vec())];
@@ -1211,7 +1208,7 @@ impl Solve<'_> {
         while let Some(next) = work.pop() {
             match next {
                 Work::Type(types) => {
-                    let resolved: Vec<Rc<Ty>> =
+                    let resolved: Vec<Arc<Ty>> =
                         types.iter().map(|ty| self.table.resolve(ty)).collect();
                     let mut symbols = Vec::new();
                     let mut other_concrete = false;
@@ -1297,7 +1294,7 @@ impl Solve<'_> {
                         }
                         Ty::Named { symbol, name, args } => {
                             let arguments = args.len();
-                            let merged: Vec<Vec<Rc<Ty>>> = (0..arguments)
+                            let merged: Vec<Vec<Arc<Ty>>> = (0..arguments)
                                 .map(|at| {
                                     resolved
                                         .iter()
@@ -1317,7 +1314,7 @@ impl Solve<'_> {
                                 work.push(Work::Type(xs));
                             }
                         }
-                        other => type_values.push(Rc::new(other.clone())),
+                        other => type_values.push(Arc::new(other.clone())),
                     }
                 }
                 Work::Row(rows) => {
@@ -1352,15 +1349,15 @@ impl Solve<'_> {
                     let effects = row_values.pop().expect("family arrow effects");
                     let to = type_values.pop().expect("family arrow result");
                     let from = type_values.pop().expect("family arrow parameter");
-                    type_values.push(Rc::new(Ty::Arrow(from, to, effects)));
+                    type_values.push(Arc::new(Ty::Arrow(from, to, effects)));
                 }
                 Work::Struct => {
                     let row = row_values.pop().expect("family struct row");
-                    type_values.push(Rc::new(Ty::Struct(row)));
+                    type_values.push(Arc::new(Ty::Struct(row)));
                 }
                 Work::Sum => {
                     let row = row_values.pop().expect("family sum row");
-                    type_values.push(Rc::new(Ty::Sum(row)));
+                    type_values.push(Arc::new(Ty::Sum(row)));
                 }
                 Work::Named {
                     symbol,
@@ -1372,7 +1369,7 @@ impl Solve<'_> {
                         args.push(type_values.pop().expect("family named argument"));
                     }
                     args.reverse();
-                    type_values.push(Rc::new(Ty::Named {
+                    type_values.push(Arc::new(Ty::Named {
                         symbol,
                         name,
                         args: args.into(),
@@ -1396,7 +1393,7 @@ impl Solve<'_> {
                         continue;
                     }
                     let name = state.names[state.at].clone();
-                    let payloads: Vec<Rc<Ty>> = state
+                    let payloads: Vec<Arc<Ty>> = state
                         .maps
                         .iter()
                         .filter_map(|labels| labels.get(&name))
@@ -1410,7 +1407,7 @@ impl Solve<'_> {
                             name,
                             RowField {
                                 presence: self.table.fresh_match_family_presence(),
-                                ty: Rc::new(Ty::default()),
+                                ty: Arc::new(Ty::default()),
                             },
                         );
                         state.at += 1;
@@ -1445,7 +1442,7 @@ impl Solve<'_> {
     /// same variable as one on the scrutinee, publish that sharing directly in
     /// the type. This is a fixed match-end boundary, not feedback: it only
     /// folds an already entailed alias and never creates another constraint.
-    fn alias_result_presences(&mut self, span: Anchor, result: &Rc<Ty>, scrutinee: &Rc<Ty>) {
+    fn alias_result_presences(&mut self, span: Anchor, result: &Arc<Ty>, scrutinee: &Arc<Ty>) {
         if !self.table.store_satisfiable() {
             return;
         }
@@ -1561,8 +1558,8 @@ impl Solve<'_> {
         let want = self.table.canon(performed);
         let have = self.table.canon(ambient);
         let goal = Goal::Row {
-            expected: Rc::new(want.clone()),
-            actual: Rc::new(have.clone()),
+            expected: Arc::new(want.clone()),
+            actual: Arc::new(have.clone()),
         };
         let refused: Vec<_> = want
             .labels
@@ -1601,7 +1598,7 @@ impl Solve<'_> {
                         effect: effect.clone(),
                     },
                 };
-                let abandoned = [Assigned::Row(Rc::new(want.clone()))];
+                let abandoned = [Assigned::Row(Arc::new(want.clone()))];
                 self.fail(
                     span,
                     Rule::Performs,
@@ -1634,7 +1631,7 @@ impl Solve<'_> {
         // as the arrow it would be the effects of, which is what a complaint
         // about a shared label would quote. Nothing above lets one through:
         // the labels that could clash were ruled on already.
-        let unit = || Rc::new(Ty::unit());
+        let unit = || Arc::new(Ty::unit());
         let (left, right) = (
             Tail::Effects {
                 from: unit(),
@@ -1652,12 +1649,12 @@ impl Solve<'_> {
         let (have_labels, _) = have.into_parts();
         let expected = SolveRow {
             ty: want_ty,
-            labels: Rc::new(opened_labels),
+            labels: Arc::new(opened_labels),
             tail: left,
         };
         let actual = SolveRow {
             ty: have_ty,
-            labels: Rc::new(have_labels),
+            labels: Arc::new(have_labels),
             tail: right,
         };
         for field in self.labels(span, expected, actual) {
@@ -1681,7 +1678,7 @@ impl Solve<'_> {
     /// own, and a failure there is reported as the effect-argument clash it
     /// is — with the failure the arguments met with kept as its cause — rather
     /// than as a mismatch between two tuples nobody wrote.
-    fn effect_arguments(&mut self, span: Anchor, label: &str, want: &Rc<Ty>, have: &Rc<Ty>) {
+    fn effect_arguments(&mut self, span: Anchor, label: &str, want: &Arc<Ty>, have: &Arc<Ty>) {
         let effect = crate::types::EffectId::parse_row_key(label)
             .map_or(label, |(name, _)| name)
             .to_string();
@@ -1745,7 +1742,6 @@ impl Solve<'_> {
             level,
             promised,
             rigids,
-            effect_provenance,
             initializer_effects,
             ambient,
             inside,
@@ -1758,8 +1754,8 @@ impl Solve<'_> {
         // R23's closing rule, said about a nested binding on the same terms: a
         // `let` in the middle of a body is generalized exactly as one at the
         // top of a file is.
-        let initializer = Rc::new(Ty::Arrow(
-            Rc::new(Ty::unit()),
+        let initializer = Arc::new(Ty::Arrow(
+            Arc::new(Ty::unit()),
             bound.clone(),
             initializer_effects.clone(),
         ));
@@ -1801,7 +1797,7 @@ impl Solve<'_> {
             rigids,
             self.table
                 .binding_name(symbol)
-                .unwrap_or_else(|| Rc::from("local binding")),
+                .unwrap_or_else(|| Arc::from("local binding")),
             binding_span,
             self.errors,
         );
@@ -1823,10 +1819,8 @@ impl Solve<'_> {
             self.table
                 .scheme_provenance(bound, scheme.body(), &subst, scheme.count())
         };
-        self.schemes.insert(
-            symbol,
-            ExplainedScheme::local(scheme, provenance, effect_provenance.clone()),
-        );
+        self.schemes
+            .insert(symbol, ExplainedScheme::local(scheme, provenance));
         self.run(body);
         self.schemes.remove(&symbol);
     }
@@ -1838,7 +1832,7 @@ impl Solve<'_> {
     /// diagnostic: generation emits this only for a name it bound itself, and
     /// the constraint sits inside the body of the `let` that bound it, so a
     /// symbol with no scheme in scope cannot arise.
-    fn instance(&mut self, span: Anchor, symbol: Symbol, ty: &Rc<Ty>, requirement: usize) {
+    fn instance(&mut self, span: Anchor, symbol: Symbol, ty: &Arc<Ty>, requirement: usize) {
         let scheme = self.schemes[&symbol].clone();
         // At the level of the use site, which is where the table is: a copy is
         // as new as the place it was made, whatever the scheme was generalized
@@ -1895,7 +1889,7 @@ impl Solve<'_> {
     ///    [`Solve::unwrapped`].
     /// 4. Everything else is [`Solve::fielded`]: the labels and the constructor, in the
     ///    order it gives.
-    fn unify(&mut self, span: Anchor, expected: &Rc<Ty>, actual: &Rc<Ty>) {
+    fn unify(&mut self, span: Anchor, expected: &Arc<Ty>, actual: &Arc<Ty>) {
         let lhs = self.table.resolve(expected);
         let rhs = self.table.resolve(actual);
         self.unify_direct(span, lhs, rhs);
@@ -1909,7 +1903,7 @@ impl Solve<'_> {
     /// frame per enclosing constructor. A row that needs the full label rule,
     /// or a name that needs unfolding, falls back only at that node; recursive
     /// payload goals immediately enter this trampoline again.
-    fn unify_direct(&mut self, span: Anchor, lhs: Rc<Ty>, rhs: Rc<Ty>) {
+    fn unify_direct(&mut self, span: Anchor, lhs: Arc<Ty>, rhs: Arc<Ty>) {
         let original_depth = self.depth;
         let mut congruences = 0usize;
         // Every recursive type goal stays in this invocation's work list, so
@@ -1918,10 +1912,11 @@ impl Solve<'_> {
         // An indexed assumption is necessarily a pair of named types. Keep its
         // arguments alongside the index so the growth check can consume the
         // structural data directly instead of rechecking that invariant.
-        type Arguments = (Rc<[Rc<Ty>]>, Rc<[Rc<Ty>]>);
+        type Arguments = (Arc<[Arc<Ty>]>, Arc<[Arc<Ty>]>);
         let mut assumption_arguments: HashMap<usize, Arguments> = HashMap::new();
         let mut work = vec![SolveWork::Ty(lhs, rhs, original_depth)];
         while let Some(part) = work.pop() {
+            crate::cancellation::checkpoint();
             // Each trampoline item is one solver rule candidate. Preserve the
             // reads used to expose its goal, but discard them if the candidate
             // is a zero-step equality rather than lending them to its sibling.
@@ -1937,7 +1932,7 @@ impl Solve<'_> {
                     match (&*lhs, &*rhs) {
                         (Ty::Package(_), Ty::Package(_)) => {
                             self.step(span, Rule::Same, goal, Effect::Decomposed);
-                            if Rc::ptr_eq(&lhs, &rhs) {
+                            if Arc::ptr_eq(&lhs, &rhs) {
                                 let opened = self.table.open_package(span, &lhs);
                                 work.push(SolveWork::Ty(opened.clone(), opened, depth + 1));
                             } else {
@@ -2035,7 +2030,7 @@ impl Solve<'_> {
                             let (have_labels, have_rest) = have.into_parts();
                             let left = SolveRow {
                                 ty: lhs.clone(),
-                                labels: Rc::new(want_labels),
+                                labels: Arc::new(want_labels),
                                 tail: Tail::Effects {
                                     from: from.clone(),
                                     to: to.clone(),
@@ -2044,7 +2039,7 @@ impl Solve<'_> {
                             };
                             let right = SolveRow {
                                 ty: rhs.clone(),
-                                labels: Rc::new(have_labels),
+                                labels: Arc::new(have_labels),
                                 tail: Tail::Effects {
                                     from: other.clone(),
                                     to: result.clone(),
@@ -2075,8 +2070,8 @@ impl Solve<'_> {
                                 && matches!(others.rest, Rest::Closed) => {}
                         (Ty::Struct(fields), Ty::Struct(others)) => {
                             let (want, have) = (self.table.canon(fields), self.table.canon(others));
-                            let expected = Rc::new(Ty::Struct(want.clone()));
-                            let actual = Rc::new(Ty::Struct(have.clone()));
+                            let expected = Arc::new(Ty::Struct(want.clone()));
+                            let actual = Arc::new(Ty::Struct(have.clone()));
                             self.step(
                                 span,
                                 Rule::Struct,
@@ -2088,12 +2083,12 @@ impl Solve<'_> {
                             work.push(SolveWork::Labels(
                                 SolveRow {
                                     ty: lhs,
-                                    labels: Rc::new(want_labels),
+                                    labels: Arc::new(want_labels),
                                     tail: Tail::Fields(want_rest),
                                 },
                                 SolveRow {
                                     ty: rhs,
-                                    labels: Rc::new(have_labels),
+                                    labels: Arc::new(have_labels),
                                     tail: Tail::Fields(have_rest),
                                 },
                                 depth + 1,
@@ -2101,8 +2096,8 @@ impl Solve<'_> {
                         }
                         (Ty::Sum(cases), Ty::Sum(others)) => {
                             let (want, have) = (self.table.canon(cases), self.table.canon(others));
-                            let expected = Rc::new(Ty::Sum(want.clone()));
-                            let actual = Rc::new(Ty::Sum(have.clone()));
+                            let expected = Arc::new(Ty::Sum(want.clone()));
+                            let actual = Arc::new(Ty::Sum(have.clone()));
                             self.step(
                                 span,
                                 Rule::Sum,
@@ -2114,12 +2109,12 @@ impl Solve<'_> {
                             work.push(SolveWork::Labels(
                                 SolveRow {
                                     ty: lhs,
-                                    labels: Rc::new(want_labels),
+                                    labels: Arc::new(want_labels),
                                     tail: Tail::Cases(want_rest),
                                 },
                                 SolveRow {
                                     ty: rhs,
-                                    labels: Rc::new(have_labels),
+                                    labels: Arc::new(have_labels),
                                     tail: Tail::Cases(have_rest),
                                 },
                                 depth + 1,
@@ -2315,7 +2310,7 @@ impl Solve<'_> {
     /// recursive group may permute arguments. A mere permutation is not growth;
     /// every old argument must still occur and one must occur strictly below a
     /// root before this can be the malformed-growth guard.
-    fn embeds_arguments(&self, earlier: &[Rc<Ty>], later: &[Rc<Ty>]) -> Option<bool> {
+    fn embeds_arguments(&self, earlier: &[Arc<Ty>], later: &[Arc<Ty>]) -> Option<bool> {
         let mut proper = false;
         for old in earlier.iter() {
             if later.iter().any(|new| self.table.alike(old, new)) {
@@ -2336,15 +2331,16 @@ impl Solve<'_> {
     /// Whether `needle` occurs strictly below `root` as a complete semantic
     /// type. This is an explicit walk because imported type arguments are public
     /// artifact data and may be much deeper than the native stack.
-    fn argument_contains_descendant(&self, root: &Rc<Ty>, needle: &Rc<Ty>) -> bool {
+    fn argument_contains_descendant(&self, root: &Arc<Ty>, needle: &Arc<Ty>) -> bool {
         enum Work {
-            Ty(Rc<Ty>),
+            Ty(Arc<Ty>),
             Row(Row),
         }
 
         let mut work = vec![Work::Ty(root.clone())];
         let mut first = true;
         while let Some(part) = work.pop() {
+            crate::cancellation::checkpoint();
             match part {
                 Work::Ty(ty) => {
                     let ty = self.table.resolve(&ty);
@@ -2426,7 +2422,7 @@ impl Solve<'_> {
     /// Either way the two halves are one goal, so a failure in one abandons the
     /// other: a row tail bound inconsistently with its labels
     /// beside it is a type nothing can be. See [`Solve::abandon`].
-    fn types(&mut self, span: Anchor, goal: Goal, lhs: &Rc<Ty>, rhs: &Rc<Ty>) -> bool {
+    fn types(&mut self, span: Anchor, goal: Goal, lhs: &Arc<Ty>, rhs: &Arc<Ty>) -> bool {
         match (&**lhs, &**rhs) {
             (Ty::Var(var), _) => {
                 let var = *var;
@@ -2488,10 +2484,10 @@ impl Solve<'_> {
         &mut self,
         span: Anchor,
         goal: Goal,
-        name: Rc<str>,
+        name: Arc<str>,
         id: u32,
         sense: Sense,
-        found: &Rc<Ty>,
+        found: &Arc<Ty>,
     ) -> bool {
         let error = Error::new(
             span,
@@ -2507,7 +2503,7 @@ impl Solve<'_> {
         false
     }
 
-    fn mismatch(&mut self, span: Anchor, goal: Goal, lhs: &Rc<Ty>, rhs: &Rc<Ty>) -> bool {
+    fn mismatch(&mut self, span: Anchor, goal: Goal, lhs: &Arc<Ty>, rhs: &Arc<Ty>) -> bool {
         let error = Error::new(
             span,
             ErrorKind::Mismatch {
@@ -2641,8 +2637,8 @@ impl Solve<'_> {
             // about: it stands for what the two sides allow beyond the labels
             // named, which is a row and nothing else.
             Shape::Effect => Tail::Effects {
-                from: Rc::new(Ty::unit()),
-                to: Rc::new(Ty::unit()),
+                from: Arc::new(Ty::unit()),
+                to: Arc::new(Ty::unit()),
                 rest: self.table.fresh_row(),
             },
         }
@@ -2676,8 +2672,8 @@ impl Solve<'_> {
     /// binding the flattened row rather than its bare end is what makes that a
     /// fact about the callers instead of something this has to be told.
     fn rests(&mut self, span: Anchor, lhs: &Rest, rhs: &Rest, shape: Shape) {
-        let want = Rc::new(self.table.canon(&Row::of(lhs.clone())));
-        let have = Rc::new(self.table.canon(&Row::of(rhs.clone())));
+        let want = Arc::new(self.table.canon(&Row::of(lhs.clone())));
+        let have = Arc::new(self.table.canon(&Row::of(rhs.clone())));
         let goal = Goal::Row {
             expected: want.clone(),
             actual: have.clone(),
@@ -2747,7 +2743,7 @@ impl Solve<'_> {
     /// Label types and whatever is left of the tail stay live: those are not
     /// decided by the failing goal's siblings, and later knowledge about them
     /// is knowledge the reader wants.
-    fn frozen(&self, row: Rowed<'_>) -> Rc<Ty> {
+    fn frozen(&self, row: Rowed<'_>) -> Arc<Ty> {
         let labels = row
             .labels
             .iter()
@@ -2783,7 +2779,7 @@ impl Solve<'_> {
         actual: Rowed<'_>,
         want: &RowField,
         have: &RowField,
-    ) -> Option<(Rc<Ty>, Rc<Ty>)> {
+    ) -> Option<(Arc<Ty>, Arc<Ty>)> {
         let shape = expected.shape();
         let p1 = self.table.presence_of(&want.presence);
         let p2 = self.table.presence_of(&have.presence);
@@ -3060,8 +3056,8 @@ impl Solve<'_> {
                 Side::Actual => (value.clone(), tail.bare()),
             };
             let goal = Goal::Row {
-                expected: Rc::new(expected.as_row()),
-                actual: Rc::new(actual.as_row()),
+                expected: Arc::new(expected.as_row()),
+                actual: Arc::new(actual.as_row()),
             };
             // Not a second label rule: what the extras are was decided above,
             // and this is the act of putting them somewhere. A variable takes
@@ -3202,7 +3198,7 @@ impl Solve<'_> {
         // presence and relate it to the arm's view under the premise.
         let value = match (self.guard.is_some(), value) {
             (true, Assigned::Ty(ty)) => Assigned::Ty(self.guarded_type(span, &ty)),
-            (true, Assigned::Row(row)) => Assigned::Row(Rc::new(self.guarded_row(span, &row))),
+            (true, Assigned::Row(row)) => Assigned::Row(Arc::new(self.guarded_row(span, &row))),
             // Direct presence equality is intercepted by `presences`, so a
             // guarded assignment never has a presence value to abstract. The
             // fallback is also the ordinary, unguarded assignment path.
@@ -3273,9 +3269,9 @@ impl Solve<'_> {
         self.bound_step(span, Rule::Bind, goal, var, value, None);
     }
 
-    fn guarded_type(&mut self, span: Anchor, ty: &Rc<Ty>) -> Rc<Ty> {
+    fn guarded_type(&mut self, span: Anchor, ty: &Arc<Ty>) -> Arc<Ty> {
         enum Work {
-            Type(Rc<Ty>),
+            Type(Arc<Ty>),
             Row(Row),
             Fields {
                 pending: std::vec::IntoIter<(String, RowField)>,
@@ -3294,7 +3290,7 @@ impl Solve<'_> {
             Sum,
             Named {
                 symbol: Symbol,
-                name: Rc<str>,
+                name: Arc<str>,
                 count: usize,
             },
         }
@@ -3303,6 +3299,7 @@ impl Solve<'_> {
         let mut types = Vec::new();
         let mut rows = Vec::new();
         while let Some(part) = work.pop() {
+            crate::cancellation::checkpoint();
             match part {
                 Work::Type(ty) => {
                     let ty = self.table.resolve(&ty);
@@ -3329,7 +3326,7 @@ impl Solve<'_> {
                             });
                             work.extend(args.iter().rev().cloned().map(Work::Type));
                         }
-                        other => types.push(Rc::new(other.clone())),
+                        other => types.push(Arc::new(other.clone())),
                     }
                 }
                 Work::Row(row) => {
@@ -3365,7 +3362,7 @@ impl Solve<'_> {
                                 name,
                                 RowField {
                                     presence,
-                                    ty: Rc::new(Ty::Undecided),
+                                    ty: Arc::new(Ty::Undecided),
                                 },
                             );
                             work.push(Work::Fields {
@@ -3405,15 +3402,15 @@ impl Solve<'_> {
                     let effects = rows.pop().expect("guarded arrow effects");
                     let to = types.pop().expect("guarded arrow result");
                     let from = types.pop().expect("guarded arrow parameter");
-                    types.push(Rc::new(Ty::Arrow(from, to, effects)));
+                    types.push(Arc::new(Ty::Arrow(from, to, effects)));
                 }
                 Work::Struct => {
                     let row = rows.pop().expect("guarded struct row");
-                    types.push(Rc::new(Ty::Struct(row)));
+                    types.push(Arc::new(Ty::Struct(row)));
                 }
                 Work::Sum => {
                     let row = rows.pop().expect("guarded sum row");
-                    types.push(Rc::new(Ty::Sum(row)));
+                    types.push(Arc::new(Ty::Sum(row)));
                 }
                 Work::Named {
                     symbol,
@@ -3422,7 +3419,7 @@ impl Solve<'_> {
                 } => {
                     let split = types.len() - count;
                     let args: Vec<_> = types.drain(split..).collect();
-                    types.push(Rc::new(Ty::Named {
+                    types.push(Arc::new(Ty::Named {
                         symbol,
                         name,
                         args: args.into(),
@@ -3434,7 +3431,7 @@ impl Solve<'_> {
     }
 
     fn guarded_row(&mut self, span: Anchor, row: &Row) -> Row {
-        let guarded = self.guarded_type(span, &Rc::new(Ty::Struct(row.clone())));
+        let guarded = self.guarded_type(span, &Arc::new(Ty::Struct(row.clone())));
         guarded.fields().cloned().unwrap_or_default()
     }
 
@@ -3527,35 +3524,35 @@ impl Solve<'_> {
     /// [`recover`](Self::recover) over a type: its constructor, and then the fields it
     /// carries. A composite is abandoned by abandoning what it is made of —
     /// the goal that would have decided `?1 -> ?2` decided neither half.
-    fn recover_ty(&mut self, span: Anchor, ty: &Rc<Ty>, because: ReasonId) {
+    fn recover_ty(&mut self, span: Anchor, ty: &Arc<Ty>, because: ReasonId) {
         self.recover_parts(span, Some(ty.clone()), None, because);
     }
 
     /// [`recover`](Self::recover) over a sum's cases: every label, and then the
     /// tail saying what else the row might have had.
     fn recover_row(&mut self, span: Anchor, row: &Row, because: ReasonId) {
-        self.recover_parts(span, None, Some(Rc::new(row.clone())), because);
+        self.recover_parts(span, None, Some(Arc::new(row.clone())), because);
     }
 
     /// Iterative recovery for imported semantic graphs. A failure can abandon
     /// a value whose artifact contains 30,000 arrows, names, rows, or field
     /// payloads; recovery still has to settle every variable and presence in
     /// it without borrowing the native call stack from the malformed input.
-    /// Rc identities and variable identities are visited once. This matters
+    /// Arc identities and variable identities are visited once. This matters
     /// for compact artifacts whose two children repeatedly share the same
     /// node: walking their expanded tree would make failure recovery
     /// exponential even though the artifact itself is small.
     fn recover_parts(
         &mut self,
         span: Anchor,
-        ty: Option<Rc<Ty>>,
-        row: Option<Rc<Row>>,
+        ty: Option<Arc<Ty>>,
+        row: Option<Arc<Row>>,
         because: ReasonId,
     ) {
         enum Work {
-            Type(Rc<Ty>),
-            Row(Rc<Row>),
-            Presence(Presence, Option<Rc<Ty>>),
+            Type(Arc<Ty>),
+            Row(Arc<Row>),
+            Presence(Presence, Option<Arc<Ty>>),
             Rest(Rest),
         }
 
@@ -3576,9 +3573,10 @@ impl Solve<'_> {
             work.push(Work::Type(ty));
         }
         while let Some(part) = work.pop() {
+            crate::cancellation::checkpoint();
             let fresh = match &part {
-                Work::Type(ty) => types.insert(Rc::as_ptr(ty) as usize),
-                Work::Row(row) => rows.insert(Rc::as_ptr(row) as usize),
+                Work::Type(ty) => types.insert(Arc::as_ptr(ty) as usize),
+                Work::Row(row) => rows.insert(Arc::as_ptr(row) as usize),
                 Work::Presence(_, _) | Work::Rest(_) => true,
             };
             if !fresh {
@@ -3605,13 +3603,13 @@ impl Solve<'_> {
                             work.push(Work::Type(inner.clone()));
                         }
                         Slot::Unbound => {
-                            self.settle(span, *var, Assigned::Ty(Rc::new(Ty::Undecided)), because)
+                            self.settle(span, *var, Assigned::Ty(Arc::new(Ty::Undecided)), because)
                         }
                         Slot::Bound { .. } => {}
                     },
                     Ty::Var(_) => {}
                     Ty::Arrow(from, to, effects) => {
-                        work.push(Work::Row(Rc::new(effects.clone())));
+                        work.push(Work::Row(Arc::new(effects.clone())));
                         work.push(Work::Type(to.clone()));
                         work.push(Work::Type(from.clone()));
                     }
@@ -3621,7 +3619,7 @@ impl Solve<'_> {
                         work.push(Work::Type(region.clone()));
                         work.push(Work::Type(element.clone()));
                     }
-                    Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(Rc::new(row.clone()))),
+                    Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(Arc::new(row.clone()))),
                     Ty::Named { args, .. } => {
                         work.extend(args.iter().rev().cloned().map(Work::Type));
                     }
@@ -3701,7 +3699,7 @@ impl Solve<'_> {
                             Slot::Unbound => self.settle(
                                 span,
                                 var,
-                                Assigned::Row(Rc::new(Row::of(Rest::Undecided))),
+                                Assigned::Row(Arc::new(Row::of(Rest::Undecided))),
                                 because,
                             ),
                             Slot::Bound { .. } => {}
@@ -3749,11 +3747,11 @@ impl Solve<'_> {
     fn settle(&mut self, span: Anchor, var: TyVar, value: Assigned, because: ReasonId) {
         let goal = match &value {
             Assigned::Ty(ty) => Goal::Type {
-                expected: Rc::new(Ty::plain(Ty::Var(var))),
+                expected: Arc::new(Ty::plain(Ty::Var(var))),
                 actual: ty.clone(),
             },
             Assigned::Row(row) => Goal::Row {
-                expected: Rc::new(Row::of(Rest::Var(var))),
+                expected: Arc::new(Row::of(Rest::Var(var))),
                 actual: row.clone(),
             },
             Assigned::Presence(presence) => Goal::Presence {
@@ -3850,18 +3848,18 @@ impl Solve<'_> {
 /// What a broken rigid rest turned out to be, quoted in its own reading: the
 /// sum that refused it, or the arrow that would have carried the effects. The
 /// sense rides along so the wording can follow it.
-fn rest_found(row: &Row, shape: Shape) -> (Sense, Rc<Ty>) {
+fn rest_found(row: &Row, shape: Shape) -> (Sense, Arc<Ty>) {
     match shape {
-        Shape::Struct => (Sense::Fields, Rc::new(Ty::plain(Ty::Struct(row.clone())))),
-        Shape::Sum => (Sense::Cases, Rc::new(Ty::plain(Ty::Sum(row.clone())))),
+        Shape::Struct => (Sense::Fields, Arc::new(Ty::plain(Ty::Struct(row.clone())))),
+        Shape::Sum => (Sense::Cases, Arc::new(Ty::plain(Ty::Sum(row.clone())))),
         Shape::Effect => (Sense::Effects, row_ty(row)),
     }
 }
 
-fn row_ty(row: &Row) -> Rc<Ty> {
-    Rc::new(Ty::plain(Ty::Arrow(
-        Rc::new(Ty::unit()),
-        Rc::new(Ty::unit()),
+fn row_ty(row: &Row) -> Arc<Ty> {
+    Arc::new(Ty::plain(Ty::Arrow(
+        Arc::new(Ty::unit()),
+        Arc::new(Ty::unit()),
         row.clone(),
     )))
 }

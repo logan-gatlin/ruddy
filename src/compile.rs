@@ -227,10 +227,30 @@ fn compile_with(
     // declarations; the program every later phase reads is the one with
     // those written in.
     inference.apply_types(&mut ir.program);
+    let patterns = patterns::check(&ir.program, &inference);
+    accept(
+        mint,
+        ir,
+        inference,
+        patterns,
+        artifact_dependencies,
+        imported_summaries,
+    )
+}
+
+/// Finish the coherent frontend snapshot shared by batch and editor drivers.
+#[allow(clippy::result_large_err)]
+pub(crate) fn accept(
+    mint: Mint,
+    mut ir: ir::Output,
+    inference: inference::Output,
+    patterns: patterns::Output,
+    artifact_dependencies: Vec<artifact::Dependency>,
+    imported_summaries: std::collections::HashMap<String, lir::Suspension>,
+) -> Result<AcceptedProgram, PartialCompilation> {
     if inference.errors().is_empty() {
         ir.errors.extend(externs::review(inference.semantics()));
     }
-    let patterns = patterns::check(&ir.program, &inference);
     let mut errors = Vec::new();
     errors.extend(ir.errors.iter().cloned().map(Error::Ir));
     errors.extend(inference.errors().iter().cloned().map(Error::Inference));

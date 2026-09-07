@@ -1,6 +1,6 @@
 //! Tests for [`ruddy::patterns`].
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use ruddy::{
     inference,
@@ -453,13 +453,13 @@ fn nested_presence_paths_are_translated_for_arm_guards() {
         panic!("nested struct fixture")
     };
     let inner = inner.clone();
-    field.ty = Rc::new(Ty::Struct(Row {
+    field.ty = Arc::new(Ty::Struct(Row {
         labels: Default::default(),
-        rest: Rest::More(Rc::new(inner)),
+        rest: Rest::More(Arc::new(inner)),
     }));
-    scrutinee.ty = Rc::new(Ty::Struct(Row {
+    scrutinee.ty = Arc::new(Ty::Struct(Row {
         labels: Default::default(),
-        rest: Rest::More(Rc::new(outer)),
+        rest: Rest::More(Arc::new(outer)),
     }));
     let checks = patterns::check(&out.program, &inferred);
     assert!(checks.errors.is_empty(), "{checks:#?}");
@@ -753,7 +753,7 @@ fn an_empty_match_over_an_open_sum_is_skipped() {
         panic!("the body is an empty match");
     };
     let row = Row::of(Rest::Bound(0));
-    scrutinee.ty = Rc::new(Ty::plain(Ty::Sum(row)));
+    scrutinee.ty = Arc::new(Ty::plain(Ty::Sum(row)));
 
     let checks = patterns::check(&out.program, &inferred);
     assert!(checks.errors.is_empty(), "{:#?}", checks.errors);

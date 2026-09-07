@@ -289,17 +289,9 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     let dependencies_valid = !diagnostics
         .iter()
         .any(|diagnostic| diagnostic.stage == "dependencies");
-    let frontend_clean = loaded.as_ref().is_some_and(|loaded| {
-        loaded.errors.is_empty()
-            && loaded
-                .loaded
-                .iter()
-                .all(|file| file.lex_errors.is_empty() && file.parse_errors.is_empty())
-    });
-
     let mut built = loaded
         .as_ref()
-        .filter(|_| frontend_clean && dependencies_valid)
+        .filter(|_| dependencies_valid)
         .and_then(|loaded| {
             let started = Instant::now();
             let out = guard("ir", &mut panicked, || {

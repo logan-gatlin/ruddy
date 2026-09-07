@@ -16,7 +16,7 @@ pub struct Extern {
     pub symbol: Symbol,
     /// The semantic type the adapter implements. Its scheme was instantiated
     /// during review, so lowering never needs to interpret a scheme here.
-    pub ty: std::rc::Rc<crate::types::Ty>,
+    pub ty: std::sync::Arc<crate::types::Ty>,
     /// The complete target-neutral conversion decision, made after inference.
     pub conversion: Conversion,
     pub target: String,
@@ -157,7 +157,7 @@ pub(crate) fn plan(semantics: &inference::Semantics) -> ExternPlan {
 
 fn conversion(
     abi: &ir::ExternType,
-    ty: &std::rc::Rc<Ty>,
+    ty: &std::sync::Arc<Ty>,
     aliases: &indexmap::IndexMap<Symbol, crate::types::Scheme>,
 ) -> Result<Conversion, ir::Error> {
     Ok(match &abi.anchored {
@@ -228,9 +228,9 @@ fn conversion(
 }
 
 fn exposed(
-    ty: &std::rc::Rc<Ty>,
+    ty: &std::sync::Arc<Ty>,
     aliases: &indexmap::IndexMap<Symbol, crate::types::Scheme>,
-) -> std::rc::Rc<Ty> {
+) -> std::sync::Arc<Ty> {
     let mut exposed = inference::unfold(aliases, ty);
     while let Ty::Package(body) = &*exposed {
         exposed = inference::unfold(aliases, body);
@@ -239,9 +239,9 @@ fn exposed(
 }
 
 fn arrow(
-    ty: &std::rc::Rc<Ty>,
+    ty: &std::sync::Arc<Ty>,
     aliases: &indexmap::IndexMap<Symbol, crate::types::Scheme>,
-) -> (std::rc::Rc<Ty>, std::rc::Rc<Ty>) {
+) -> (std::sync::Arc<Ty>, std::sync::Arc<Ty>) {
     let exposed = exposed(ty, aliases);
     let Ty::Arrow(from, to, _) = &*exposed else {
         panic!("reviewed extern ABI and semantic type agree on function shape")

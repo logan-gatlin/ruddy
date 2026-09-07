@@ -63,7 +63,7 @@ pub struct BundleHash(u64);
 ///
 /// Ordered, so that it can key an ordered collection, but the order is the
 /// fingerprint's and means nothing; what wants source order asks the program.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::SalsaValue)]
 pub struct Symbol {
     bundle: BundleHash,
     path: u64,
@@ -118,7 +118,7 @@ struct Data {
 /// are fingerprints of their paths, so two mints of one bundle minting the same
 /// declarations hand out the same symbols; what a mint holds beyond that is
 /// the names behind them and the count of locals at each path.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Mint {
     bundle: Bundle,
     names: IndexSet<String>,
@@ -285,6 +285,30 @@ impl Namespace {
 }
 
 impl Mint {
+    /// A read-only name snapshot for one query. Keep owner/module paths, but
+    /// avoid retaining the complete source mint for every edited definition.
+    pub(crate) fn project(&self, symbols: impl IntoIterator<Item = Symbol>) -> Self {
+        let mut projected = Self::new(self.bundle.clone());
+        let mut work: Vec<_> = symbols.into_iter().collect();
+        while let Some(symbol) = work.pop() {
+            if projected.symbols.contains_key(&symbol) {
+                continue;
+            }
+            let Some(data) = self.symbols.get(&symbol) else {
+                continue;
+            };
+            let mut data = data.clone();
+            data.name = Name(projected.names.insert_full(self.name(symbol).to_owned()).0 as u32);
+            work.extend(data.owner);
+            work.extend(data.parent.map(Module::symbol));
+            projected.symbols.insert(symbol, data);
+            if let Some(name) = self.external.get(&symbol) {
+                projected.external.insert(symbol, name.clone());
+            }
+        }
+        projected
+    }
+
     pub fn new(bundle: Bundle) -> Self {
         Self {
             bundle,

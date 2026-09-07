@@ -2,7 +2,7 @@
 
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
-    rc::Rc,
+    sync::Arc,
 };
 
 use indexmap::{IndexMap, IndexSet};
@@ -612,15 +612,17 @@ fn broad_semantic_scheme_converts_to_artifact_linearly() {
                 format!("slot{index}"),
                 types::RowField {
                     presence: types::Presence::Bound(index),
-                    ty: Rc::new(types::Ty::Nat),
+                    ty: Arc::new(types::Ty::Nat),
                 },
             )
         })
         .collect();
-    let body = Rc::new(types::Ty::Package(Rc::new(types::Ty::Struct(types::Row {
-        labels,
-        rest: types::Rest::Closed,
-    }))));
+    let body = Arc::new(types::Ty::Package(Arc::new(types::Ty::Struct(
+        types::Row {
+            labels,
+            rest: types::Rest::Closed,
+        },
+    ))));
     let formula = types::Formula::any((0..WIDTH).map(types::Formula::bound));
     let scheme = types::Scheme::existential(
         WIDTH,
@@ -1077,7 +1079,7 @@ fn building_translates_every_compiler_semantic_variant() {
         .next()
         .expect("source has declared types");
     mint.register_external(type_symbol, "dependency@1.0.0::OpenCases");
-    let compiler_plain = |core| Rc::new(types::Ty::plain(core));
+    let compiler_plain = |core| Arc::new(types::Ty::plain(core));
     let compiler_field = |presence, core| types::RowField {
         presence,
         ty: compiler_plain(core),
@@ -1106,7 +1108,7 @@ fn building_translates_every_compiler_semantic_variant() {
             types::Presence::Bound(2),
             types::Ty::Rigid {
                 id: 3,
-                name: Rc::from("rigid"),
+                name: Arc::from("rigid"),
             },
         ),
     );
@@ -1137,7 +1139,7 @@ fn building_translates_every_compiler_semantic_variant() {
             types::Presence::Present,
             types::Ty::Named {
                 symbol: type_symbol,
-                name: Rc::from("OpenCases"),
+                name: Arc::from("OpenCases"),
                 args: vec![compiler_plain(types::Ty::Undecided)].into(),
             },
         ),
@@ -1152,10 +1154,10 @@ fn building_translates_every_compiler_semantic_variant() {
         labels: inner_labels,
         rest: types::Rest::Rigid {
             id: 5,
-            name: Rc::from("effects"),
+            name: Arc::from("effects"),
         },
     };
-    let effects = types::Row::of(types::Rest::More(Rc::new(inner_row)));
+    let effects = types::Row::of(types::Rest::More(Arc::new(inner_row)));
     fields.insert(
         "arrow".to_string(),
         compiler_field(
@@ -1167,19 +1169,19 @@ fn building_translates_every_compiler_semantic_variant() {
             ),
         ),
     );
-    let body = Rc::new(types::Ty::Struct(types::Row {
+    let body = Arc::new(types::Ty::Struct(types::Row {
         labels: fields,
         rest: types::Rest::Closed,
     }));
     let formula = types::Formula::Iff(
-        Rc::new(types::Formula::False),
-        Rc::new(types::Formula::Xor(
-            Rc::new(types::Formula::Atom(types::Atom::Var(6))),
-            Rc::new(types::Formula::And(
-                Rc::new(types::Formula::True),
-                Rc::new(types::Formula::Or(
-                    Rc::new(types::Formula::Atom(types::Atom::Bound(0))),
-                    Rc::new(types::Formula::Not(Rc::new(types::Formula::False))),
+        Arc::new(types::Formula::False),
+        Arc::new(types::Formula::Xor(
+            Arc::new(types::Formula::Atom(types::Atom::Var(6))),
+            Arc::new(types::Formula::And(
+                Arc::new(types::Formula::True),
+                Arc::new(types::Formula::Or(
+                    Arc::new(types::Formula::Atom(types::Atom::Bound(0))),
+                    Arc::new(types::Formula::Not(Arc::new(types::Formula::False))),
                 )),
             )),
         )),
@@ -1446,9 +1448,9 @@ fn deep_formula_conversion_and_artifact_writing_are_stack_safe() {
                 .or(types::Formula::True.iff(types::Formula::False))
                 .xor(types::Formula::var(10));
             for _ in 0..DEPTH {
-                formula = types::Formula::Not(Rc::new(formula));
+                formula = types::Formula::Not(Arc::new(formula));
             }
-            let scheme = types::Scheme::constrained(1, 1, Rc::new(types::Ty::Nat), formula);
+            let scheme = types::Scheme::constrained(1, 1, Arc::new(types::Ty::Nat), formula);
             let artifact = exporting(&mint, &scheme);
             let printed = artifact.print();
             assert!(printed.contains("(not"));
@@ -1472,41 +1474,41 @@ fn deep_semantic_artifact_building_is_stack_safe_in_every_position() {
                 .global(None, Namespace::Types, "Layer")
                 .expect("a type symbol");
 
-            let mut arrow = Rc::new(types::Ty::Nat);
-            let mut named = Rc::new(types::Ty::Nat);
-            let mut payload = Rc::new(types::Ty::Nat);
+            let mut arrow = Arc::new(types::Ty::Nat);
+            let mut named = Arc::new(types::Ty::Nat);
+            let mut payload = Arc::new(types::Ty::Nat);
             let mut more = types::Row::closed();
             for index in 0..DEPTH {
-                arrow = Rc::new(types::Ty::Arrow(
-                    Rc::new(types::Ty::Nat),
+                arrow = Arc::new(types::Ty::Arrow(
+                    Arc::new(types::Ty::Nat),
                     arrow,
                     types::Row::closed(),
                 ));
-                named = Rc::new(types::Ty::Named {
+                named = Arc::new(types::Ty::Named {
                     symbol: layer,
                     name: "Layer".into(),
                     args: vec![named].into(),
                 });
-                payload = Rc::new(types::Ty::Struct(types::Row {
+                payload = Arc::new(types::Ty::Struct(types::Row {
                     labels: [(format!("field{index}"), types::RowField::present(payload))]
                         .into_iter()
                         .collect(),
                     rest: types::Rest::Closed,
                 }));
-                more = types::Row::of(types::Rest::More(Rc::new(more)));
+                more = types::Row::of(types::Rest::More(Arc::new(more)));
             }
-            let body = Rc::new(types::Ty::Struct(types::Row {
+            let body = Arc::new(types::Ty::Struct(types::Row {
                 labels: [
                     ("arrow".into(), types::RowField::present(arrow)),
                     ("named".into(), types::RowField::present(named)),
                     ("payload".into(), types::RowField::present(payload)),
                     (
                         "more".into(),
-                        types::RowField::present(Rc::new(types::Ty::Sum(more))),
+                        types::RowField::present(Arc::new(types::Ty::Sum(more))),
                     ),
                     (
                         "boolean".into(),
-                        types::RowField::present(Rc::new(types::Ty::Boolean)),
+                        types::RowField::present(Arc::new(types::Ty::Boolean)),
                     ),
                 ]
                 .into_iter()
