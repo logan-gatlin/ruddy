@@ -1961,7 +1961,8 @@ fn deep_and_multiple_effect_boundaries_remain_bounded_and_counted() {
                 explanation
                     .full_facts
                     .iter()
-                    .any(|fact| fact.payload == P::EffectDeclaration)
+                    .any(|fact| fact.payload == P::EffectDeclaration),
+                "missing declaration for {error:#?}"
             );
             explanation
                 .contradiction
@@ -3147,6 +3148,9 @@ fn a_printer_reports_a_writer_that_refuses_it() {
             promised: Formula::var(0),
             rigids: Vec::new(),
             effect_provenance: Default::default(),
+            initializer_effects: Row::closed(),
+            ambient: Row::closed(),
+            inside: true,
             value: Vec::new(),
             body: Vec::new(),
         },
@@ -3873,6 +3877,9 @@ fn no_two_kinds_of_constraint_are_coded_the_same() {
             promised: Formula::True,
             rigids: Vec::new(),
             effect_provenance: Default::default(),
+            initializer_effects: Row::closed(),
+            ambient: Row::closed(),
+            inside: true,
             value: Vec::new(),
             body: Vec::new(),
         },

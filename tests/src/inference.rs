@@ -1301,19 +1301,17 @@ fn a_failed_occurs_check_is_a_rule_of_its_own() {
             // walked so that the body could have named it; `?1` is `f`, and
             // `?2` is the row the lambda's own arrow carries.
             "bind  ?3 -> ?4 + ..?5 ~ ?1 => ?1 := ?3 -> ?4 + ..?5",
-            // Only the argument asks `f` to be its own parameter.
             "occurs  ?3 ~ ?3 -> ?4 + ..?5 => this type would have to contain itself",
             "recover  ?3 ~ ? => ?3 := ?",
             "recover  ?4 ~ ? => ?4 := ?",
             "recover  ?5 ~ ? => ?5 := ?",
-            // The application still opens what calling `f` may perform into
-            // the ambient, and an abandoned row absorbs whatever it meets.
             "performs  ? ~ ?2 => replaced by the goals below",
             "  absorb  ? ~ ?2 => no change",
             "  recover  ?2 ~ ? => ?2 := ?",
-            // And the definition is what its body turned out to be, which is
-            // the last thing every unannotated definition says.
-            "bind  ?0 ~ ?1 -> ?4 + ..?2 => ?0 := ?1 -> ?4 + ..?2",
+            "performs  ? ~ ?6 => replaced by the goals below",
+            "  absorb  ? ~ ?6 => no change",
+            "  recover  ?6 ~ ? => ?6 := ?",
+            "bind  ?0 ~ ?1 -> ?4 + ..?6 => ?0 := ?1 -> ?4 + ..?6",
         ]
     );
     // No step claims to have bound anything by the rule that failed. The bind
@@ -2150,11 +2148,9 @@ fn unfolding_a_declared_type_is_a_rule_of_its_own() {
             // declarations mean the same thing.
             "unfold  b ~ a => replaced by the goals below",
             "  struct  { n: b } ~ { n: a } => replaced by the goals below",
-            // Which is the first question again, one field in. Three steps,
-            // not five: the goal is remembered while what it broke into is
-            // open, so the second `b` and `a` are recognized as the first ones
-            // and not as two more copies to unfold.
             "    assume  b ~ a => no change",
+            "performs  ?0 ~ ∅ => replaced by the goals below",
+            "  bind  ?0 ~ ∅ => ?0 := ∅",
         ]
     );
 }
@@ -2893,10 +2889,12 @@ fn the_solve_is_recorded_rule_by_rule() {
     assert_eq!(
         steps(&mint, &output, "fst"),
         [
-            "struct  { x: ?0, ..?1 } ~ { x: Nat } => replaced by the goals below",
-            "  bind  ?1 ~ ∅ => ?1 := ∅",
-            "  bind  ?0 ~ Nat => ?0 := Nat",
+            "struct  { x: ?1, ..?2 } ~ { x: Nat } => replaced by the goals below",
+            "  bind  ?2 ~ ∅ => ?2 := ∅",
+            "  bind  ?1 ~ Nat => ?1 := Nat",
             "prim  Nat ~ Nat => no change",
+            "performs  ?0 ~ ∅ => replaced by the goals below",
+            "  bind  ?0 ~ ∅ => ?0 := ∅",
         ]
     );
 
@@ -2909,6 +2907,8 @@ fn the_solve_is_recorded_rule_by_rule() {
         [
             "struct  { x: Nat } ~ { x: Nat } => replaced by the goals below",
             "  prim  Nat ~ Nat => no change",
+            "performs  ?0 ~ ∅ => replaced by the goals below",
+            "  bind  ?0 ~ ∅ => ?0 := ∅",
         ]
     );
 
@@ -2949,7 +2949,7 @@ fn closing_a_row_from_both_sides_agrees_with_itself() {
     );
     let taken = steps(&mint, &output, "h");
     assert!(
-        taken.contains(&"  bind  ∅ ~ ?4 => ?4 := ∅".to_string()),
+        taken.contains(&"  bind  ∅ ~ ?5 => ?5 := ∅".to_string()),
         "{taken:#?}"
     );
     assert!(
@@ -3311,14 +3311,14 @@ fn a_recursion_at_a_fixed_argument_still_comes_back_round() {
         steps(&mint, &output, "f"),
         [
             "unfold  Grove ~ Forest => replaced by the goals below",
-            "  struct  { head: Wood Nat, tail: Grove } ~ { head: Tree Nat, tail: Forest } \
-             => replaced by the goals below",
+            "  struct  { head: Wood Nat, tail: Grove } ~ { head: Tree Nat, tail: Forest } => replaced by the goals below",
             "    unfold  Wood Nat ~ Tree Nat => replaced by the goals below",
-            "      struct  { value: Nat, kids: Grove } ~ { value: Nat, kids: Forest } \
-             => replaced by the goals below",
+            "      struct  { value: Nat, kids: Grove } ~ { value: Nat, kids: Forest } => replaced by the goals below",
             "        prim  Nat ~ Nat => no change",
             "        assume  Grove ~ Forest => no change",
             "    assume  Grove ~ Forest => no change",
+            "performs  ?0 ~ ∅ => replaced by the goals below",
+            "  bind  ?0 ~ ∅ => ?0 := ∅",
         ]
     );
 }
@@ -3350,18 +3350,13 @@ fn an_assumption_is_read_against_what_has_since_been_decided() {
     assert_eq!(
         steps(&mint, &output, "q")[..9],
         [
-            "unfold  Tree { x when ?0: Nat } ~ Wood { x: Nat } => replaced by the goals below",
-            "  struct  { value: { x when ?0: Nat }, kids: Forest } ~ { value: { x: Nat }, kids: Grove } \
-         => replaced by the goals below",
-            "    struct  { x when ?0: Nat } ~ { x: Nat } => replaced by the goals below",
-            // Here is where the argument stops being a question.
-            "      bind  ?0 ~ present => ?0 := present",
+            "unfold  Tree { x when ?1: Nat } ~ Wood { x: Nat } => replaced by the goals below",
+            "  struct  { value: { x when ?1: Nat }, kids: Forest } ~ { value: { x: Nat }, kids: Grove } => replaced by the goals below",
+            "    struct  { x when ?1: Nat } ~ { x: Nat } => replaced by the goals below",
+            "      bind  ?1 ~ present => ?1 := present",
             "      prim  Nat ~ Nat => no change",
             "    unfold  Forest ~ Grove => replaced by the goals below",
-            "      struct  { head: Tree { x: Nat }, tail: Forest } ~ \
-         { head: Wood { x: Nat }, tail: Grove } => replaced by the goals below",
-            // And here is the goal on the stack, recognized through the binding
-            // that has happened since it was pushed.
+            "      struct  { head: Tree { x: Nat }, tail: Forest } ~ { head: Wood { x: Nat }, tail: Grove } => replaced by the goals below",
             "        assume  Tree { x: Nat } ~ Wood { x: Nat } => no change",
             "        assume  Forest ~ Grove => no change",
         ]
@@ -4411,12 +4406,11 @@ fn a_presence_against_itself_is_already_the_same_presence() {
             "  same  ?1 ~ ?1 => no change",
             "  same  ?0 ~ ?0 => no change",
             "  prim  Nat ~ Nat => no change",
-            // The recursive call opens what `f` may perform — nothing, since
-            // the annotation carries no `+` — into the ambient the annotation
-            // already closed.
-            "performs  ∅ ~ ∅ => replaced by the goals below",
-            "  bind  ?2 ~ ∅ => ?2 := ∅",
+            "performs  ∅ ~ ?2 => replaced by the goals below",
+            "  bind  ?3 ~ ?2 => ?3 := ?2",
             "prim  Nat ~ Nat => no change",
+            "performs  ?2 ~ ∅ => replaced by the goals below",
+            "  bind  ?2 ~ ∅ => ?2 := ∅",
         ]
     );
 }
@@ -5090,7 +5084,7 @@ fn a_sums_tail_is_decided_as_a_row() {
     let (mint, _, output) = inferred("let f : (#A Nat | ..'r) -> Nat = fn p => f p");
     let taken = steps(&mint, &output, "f");
     assert!(
-        taken.contains(&"  bind  ?0 ~ 'r => ?0 := 'r".to_string()),
+        taken.contains(&"  bind  ?1 ~ 'r => ?1 := 'r".to_string()),
         "{taken:#?}"
     );
 
@@ -5266,11 +5260,10 @@ fn a_nested_let_is_generalized() {
     assert_eq!(scheme(&mint, &output, "pair"), "{ a: Nat, b: () }");
 }
 
-/// There is no value restriction: a binding whose value is not a function
-/// generalizes like any other. This language has nothing mutable for the
-/// restriction to protect.
+/// A pure initializer can generalize even when its value is not a function.
+/// The restriction depends on immediate effects, not expression shape.
 #[test]
-fn a_nested_let_generalizes_whatever_its_value_is() {
+fn a_nested_let_generalizes_a_pure_aggregate() {
     let (mint, _, output) = inferred(
         "let e = do let box = { it: fn x => x } return { a: box.it 1n, b: box.it {} } end",
     );
@@ -5494,11 +5487,12 @@ fn a_nested_let_is_said_as_two_constraint_kinds() {
         panic!("expected a let constraint");
     };
     assert_eq!(*level, 1);
-    assert!(
+    assert_eq!(
         value
             .iter()
-            .all(|constraint| constraint.kind.code() == "equal"),
-        "{value:#?}"
+            .map(|constraint| constraint.kind.code())
+            .collect::<Vec<_>>(),
+        ["isolate", "equal"]
     );
     let codes: Vec<&str> = body
         .iter()
@@ -10924,4 +10918,20 @@ fn variable_metadata_uses_semantic_subjects_for_narrow_mint_sites() {
             "missing metadata {expected:?}: {subjects:?}"
         );
     }
+}
+
+#[test]
+fn mutation_region_kinds_are_retained_on_operation_instances() {
+    let (_, _, output) = inferred(
+        "effect Access 'r = { read: mut 'r Nat -> Nat }
+        let inspect = fn cell => !Access.read cell",
+    );
+    assert!(
+        output
+            .diagnostics()
+            .variables()
+            .values()
+            .flatten()
+            .any(|meta| meta.sort == inference::VarSort::Region)
+    );
 }

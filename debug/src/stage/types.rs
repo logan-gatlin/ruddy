@@ -212,6 +212,10 @@ fn ownership_metadata(scheme: &Scheme) -> (u32, Vec<u32>) {
                     parts.push(Part::Ty(body));
                 }
                 Ty::Array(element) => parts.push(Part::Ty(element)),
+                Ty::Mut(region, element) => {
+                    parts.push(Part::Ty(element));
+                    parts.push(Part::Ty(region));
+                }
                 Ty::Arrow(from, to, effects) => {
                     parts.push(Part::Row(effects));
                     parts.push(Part::Ty(to));
@@ -472,6 +476,10 @@ fn relevant_parameters(aliases: &IndexMap<Symbol, Scheme>) -> HashMap<Symbol, Ha
                     }
                     Ty::Package(body) => work.push(Work::Ty(body)),
                     Ty::Array(element) => work.push(Work::Ty(element)),
+                    Ty::Mut(region, element) => {
+                        work.push(Work::Ty(element));
+                        work.push(Work::Ty(region));
+                    }
                     Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(row)),
                     Ty::Nat
                     | Ty::Int
@@ -548,6 +556,10 @@ fn names_in(ty: &Ty, relevant: &HashMap<Symbol, HashSet<usize>>, out: &mut Vec<S
                 }
                 Ty::Package(body) => work.push(Work::Ty(body)),
                 Ty::Array(element) => work.push(Work::Ty(element)),
+                Ty::Mut(region, element) => {
+                    work.push(Work::Ty(element));
+                    work.push(Work::Ty(region));
+                }
                 Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(row)),
                 Ty::Nat
                 | Ty::Int

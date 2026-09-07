@@ -141,6 +141,8 @@ pub enum Prec {
     /// `fn a => body` — the body extends as far right as it can, so a lambda
     /// needs parentheses anywhere anything may follow it.
     Lambda,
+    /// `cell := value`, associating to the right.
+    Assignment,
     /// `value |> function`.
     Pipeline,
     /// `left or right`.
@@ -569,6 +571,9 @@ impl fmt::Display for Kind {
             Kind::And => f.write_str("and"),
             Kind::Or => f.write_str("or"),
             Kind::Xor => f.write_str("xor"),
+            Kind::Mut => f.write_str("mut"),
+            Kind::Tilde => f.write_str("~"),
+            Kind::Assign => f.write_str(":="),
             Kind::Not => f.write_str("not"),
             Kind::Module => f.write_str("module"),
             Kind::Equal => f.write_str("="),
@@ -1962,6 +1967,7 @@ impl fmt::Display for Sense {
             // What a `when` puts on a label, said as the reader's own word for
             // it rather than as "a presence variable": they wrote `when a`, and
             // the variable behind it is the compiler's business.
+            Sense::Region => "a region",
             Sense::Presence => "a presence",
         })
     }
@@ -2090,6 +2096,7 @@ impl Grouped for Ty {
         match unpackaged(self) {
             Ty::Arrow(..) => Prec::Arrow,
             Ty::Sum(_) => Prec::Sum,
+            Ty::Mut(..) => Prec::Apply,
             Ty::Named { args, .. } if !args.is_empty() => Prec::Apply,
             _ => Prec::Atom,
         }
@@ -2148,6 +2155,12 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                 }
                 match ty {
                     Ty::Package(body) => work.push(SemanticJob::Ty(body, false)),
+                    Ty::Mut(region, element) => {
+                        f.write_str("mut ")?;
+                        work.push(SemanticJob::Applied(element));
+                        work.push(SemanticJob::Text(" "));
+                        work.push(SemanticJob::Ty(region, false));
+                    }
                     Ty::Array(element) => {
                         f.write_str("[")?;
                         work.push(SemanticJob::Text("]"));
@@ -2683,6 +2696,7 @@ impl Rule {
             Rule::Same => "same",
             Rule::Congruent => "congruent",
             Rule::Bind => "bind",
+            Rule::Mut => "mut",
             Rule::Array => "array",
             Rule::Occurs => "occurs",
             // The shape is not part of these two codes, only of their wording,
@@ -2719,6 +2733,7 @@ impl fmt::Display for Rule {
                 "the same declared type on both sides, and it keeps what it takes: argument against argument",
             ),
             Rule::Bind => f.write_str("a variable takes the type it is against"),
+            Rule::Mut => f.write_str("two cells: region and invariant element types must agree"),
             Rule::Array => f.write_str("two arrays: element type against element type"),
             Rule::Occurs => {
                 f.write_str("the variable is inside the type it is against, so no finite type fits")
@@ -2807,6 +2822,7 @@ impl ConstraintKind {
     /// rather than with prose that may be reworded.
     pub fn code(&self) -> &'static str {
         match self {
+            ConstraintKind::Isolate { .. } => "isolate",
             ConstraintKind::Project { .. } => "project",
             ConstraintKind::Spread { .. } => "spread",
             ConstraintKind::Equal { .. } => "equal",
@@ -2830,6 +2846,9 @@ impl fmt::Display for Constraint {
 impl fmt::Display for ConstraintKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ConstraintKind::Isolate {
+                internal, external, ..
+            } => write!(f, "isolate {internal} into {external}"),
             ConstraintKind::Project {
                 base,
                 field,
@@ -2948,6 +2967,7 @@ fn type_description(description: inference::TypeDescription) -> &'static str {
         T::Function => "a function",
         T::Struct => "a struct",
         T::TaggedValue => "a tagged value",
+        T::Mut => "a mutable cell",
         T::Array => "an array",
         T::DeclaredType => "a declared type",
         T::Undecided => "another type",
@@ -3461,6 +3481,7 @@ impl inference::Error {
                         .related(source.span(*declared), DECLARED_HERE);
                 }
                 diagnostic = match sense {
+                    Sense::Region => diagnostic.help("use an explicit region variable, such as `mut 'r Nat`"),
                     Sense::Type => diagnostic
                         .help("return or pass through the annotated value instead of replacing its type")
                         .help("or change the annotation to name the concrete type the body uses"),
@@ -3964,9 +3985,25 @@ pub fn write_binary(
     right: &impl Grouped,
     prec: Prec,
 ) -> fmt::Result {
-    write_grouped(f, left.prec() < prec, left)?;
+    write_grouped(
+        f,
+        if prec == Prec::Assignment {
+            left.prec() <= prec
+        } else {
+            left.prec() < prec
+        },
+        left,
+    )?;
     write!(f, " {op} ")?;
-    write_grouped(f, right.prec() <= prec, right)
+    write_grouped(
+        f,
+        if prec == Prec::Assignment {
+            right.prec() < prec
+        } else {
+            right.prec() <= prec
+        },
+        right,
+    )
 }
 
 pub fn write_apply(
@@ -4639,6 +4676,9 @@ mod tests {
                 promised: Formula::True,
                 rigids: Vec::new(),
                 effect_provenance: Default::default(),
+                initializer_effects: Row::closed(),
+                ambient: Row::closed(),
+                inside: true,
                 value: Vec::new(),
                 body: Vec::new(),
             },
@@ -4654,6 +4694,9 @@ mod tests {
             promised: Formula::var(0).xor(Formula::var(1)),
             rigids: Vec::new(),
             effect_provenance: Default::default(),
+            initializer_effects: Row::closed(),
+            ambient: Row::closed(),
+            inside: true,
             value: Vec::new(),
             body: Vec::new(),
         };

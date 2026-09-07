@@ -150,6 +150,9 @@ pub fn opcode(op: &Op) -> &'static str {
     match op {
         Op::Const(_) => "const",
         Op::Neg(_) => "neg",
+        Op::Allocate(_) => "allocate",
+        Op::Read(_) => "read",
+        Op::Write { .. } => "write",
         Op::Not(_) => "not",
         Op::And { .. } => "and",
         Op::Or { .. } => "or",
@@ -329,6 +332,9 @@ fn operation(output: &Output, labels: &Labels, generated: bool, op: &Op) -> Stri
     match op {
         Op::Const(value) => format!("const {}", literal(value)),
         Op::Neg(value) => format!("neg %{value}"),
+        Op::Allocate(value) => format!("mut %{value}"),
+        Op::Read(value) => format!("~%{value}"),
+        Op::Write { left, right } => format!("%{left} := %{right}"),
         Op::Not(value) => format!("not %{value}"),
         Op::And { left, right } => format!("and %{left}, %{right}"),
         Op::Or { left, right } => format!("or %{left}, %{right}"),

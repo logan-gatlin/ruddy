@@ -273,6 +273,8 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
             label: match op {
                 ruddy::parse::UnaryOp::Neg => "Neg",
                 ruddy::parse::UnaryOp::Not => "Not",
+                ruddy::parse::UnaryOp::Allocate => "Allocate",
+                ruddy::parse::UnaryOp::Read => "Read",
             }
             .into(),
             ..node
@@ -280,6 +282,7 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
         .child(expr_node(ids, value)),
         ExprKind::Binary { op, left, right } => Node {
             label: match op {
+                ruddy::parse::BinaryOp::Write => "Write",
                 ruddy::parse::BinaryOp::Add => "Add",
                 ruddy::parse::BinaryOp::Sub => "Sub",
                 ruddy::parse::BinaryOp::Mul => "Mul",
@@ -867,6 +870,12 @@ fn type_node(ids: &mut Ids, ty: &Type) -> Node {
             ..node
         }
         .children(elements.iter().map(|element| type_node(ids, element))),
+        TypeKind::Mut(region, element) => Node {
+            label: "Mut".into(),
+            ..node
+        }
+        .child(type_node(ids, region))
+        .child(type_node(ids, element)),
         TypeKind::Array(element) => Node {
             label: "Array".into(),
             ..node

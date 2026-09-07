@@ -7,6 +7,8 @@
 //! malformed input. Use [`try_parse`] at trust boundaries. This is an internal
 //! v1 format, not a compatibility promise.
 
+mod regions;
+
 use std::{collections::HashMap, error::Error, fmt};
 
 use indexmap::IndexMap;
@@ -551,6 +553,7 @@ pub struct Parameter {
 /// The role a parameter has in its declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sense {
+    Region,
     Type,
     Fields,
     Cases,
@@ -666,6 +669,7 @@ pub enum Type {
     Arrow(Box<Type>, Box<Type>, Row),
     Package(Box<Type>),
     Array(Box<Type>),
+    Mut(Box<Type>, Box<Type>),
     Struct(Row),
     Sum(Row),
     Var(u32),
@@ -780,6 +784,10 @@ fn semantic_eq(root: SemanticPair<'_>) -> bool {
                 }
                 (Type::Package(left), Type::Package(right)) => {
                     pending.push(SemanticPair::Type(left, right));
+                }
+                (Type::Mut(a, b), Type::Mut(c, d)) => {
+                    pending.push(SemanticPair::Type(a, c));
+                    pending.push(SemanticPair::Type(b, d));
                 }
                 (Type::Array(left), Type::Array(right)) => {
                     pending.push(SemanticPair::Type(left, right));
@@ -905,6 +913,7 @@ enum CloneWork<'a> {
     Arrow,
     Package,
     Array,
+    Mut,
     Struct,
     Sum,
     Named {
@@ -942,6 +951,11 @@ fn clone_semantic(root: SemanticRef<'_>) -> (Vec<Type>, Vec<Row>) {
                 Type::Array(element) => {
                     work.push(CloneWork::Array);
                     work.push(CloneWork::Semantic(SemanticRef::Type(element)));
+                }
+                Type::Mut(region, element) => {
+                    work.push(CloneWork::Mut);
+                    work.push(CloneWork::Semantic(SemanticRef::Type(element)));
+                    work.push(CloneWork::Semantic(SemanticRef::Type(region)));
                 }
                 Type::Struct(row) => {
                     work.push(CloneWork::Struct);
@@ -1012,6 +1026,11 @@ fn clone_semantic(root: SemanticRef<'_>) -> (Vec<Type>, Vec<Row>) {
             CloneWork::Array => {
                 let element = types.pop().expect("cloned array element");
                 types.push(Type::Array(Box::new(element)));
+            }
+            CloneWork::Mut => {
+                let element = types.pop().expect("cell element");
+                let region = types.pop().expect("cell region");
+                types.push(Type::Mut(Box::new(region), Box::new(element)));
             }
             CloneWork::Struct => {
                 types.push(Type::Struct(rows.pop().expect("cloned struct row")));
@@ -1084,6 +1103,16 @@ fn drain_type(value: &mut Type, pending: &mut Vec<SemanticOwned>) {
             body.as_mut(),
             Type::Undecided,
         ))),
+        Type::Mut(region, element) => {
+            pending.push(SemanticOwned::Type(std::mem::replace(
+                region.as_mut(),
+                Type::Undecided,
+            )));
+            pending.push(SemanticOwned::Type(std::mem::replace(
+                element.as_mut(),
+                Type::Undecided,
+            )));
+        }
         Type::Array(element) => pending.push(SemanticOwned::Type(std::mem::replace(
             element.as_mut(),
             Type::Undecided,
@@ -1329,6 +1358,7 @@ pub(crate) fn build_lowered(
                     .iter()
                     .map(|param| Parameter {
                         sense: match &param.kind {
+                            types::ParamKind::Region { .. } => Sense::Region,
                             types::ParamKind::Type { .. } => Sense::Type,
                             types::ParamKind::Fields { .. } => Sense::Fields,
                             types::ParamKind::Cases { .. } => Sense::Cases,
@@ -1353,6 +1383,7 @@ pub(crate) fn build_lowered(
                     .iter()
                     .map(|param| Parameter {
                         sense: match param.kind {
+                            types::ParamKind::Region { .. } => Sense::Region,
                             types::ParamKind::Type { .. } => Sense::Type,
                             types::ParamKind::Fields { .. } => Sense::Fields,
                             types::ParamKind::Cases { .. } => Sense::Cases,
@@ -1609,6 +1640,7 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
         Arrow,
         Package,
         Array,
+        Mut,
         Struct,
         Sum,
         Named {
@@ -1665,6 +1697,11 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
                     work.push(Work::Array);
                     work.push(Work::Ty(element));
                 }
+                types::Ty::Mut(region, element) => {
+                    work.push(Work::Mut);
+                    work.push(Work::Ty(element));
+                    work.push(Work::Ty(region));
+                }
                 types::Ty::Struct(row) => {
                     work.push(Work::Struct);
                     work.push(Work::Row(row));
@@ -1719,6 +1756,11 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
             Work::Array => {
                 let element = tys.pop().expect("artifact array element");
                 tys.push(Type::Array(Box::new(element)));
+            }
+            Work::Mut => {
+                let element = tys.pop().expect("cell element");
+                let region = tys.pop().expect("cell region");
+                tys.push(Type::Mut(Box::new(region), Box::new(element)));
             }
             Work::Struct => {
                 let row = rows.pop().expect("artifact struct row");
@@ -1938,6 +1980,12 @@ fn op(mint: &Mint, value: &lir::Op) -> Op {
         Source::Const(value) => Op::Const(literal(value)),
         Source::Neg(value) => Op::Neg(*value),
         Source::Not(value) => Op::Not(*value),
+        Source::Allocate(value) => Op::Allocate(*value),
+        Source::Read(value) => Op::Read(*value),
+        Source::Write { left, right } => Op::Write {
+            left: *left,
+            right: *right,
+        },
         Source::And { left, right } => Op::And {
             left: *left,
             right: *right,
@@ -2329,6 +2377,7 @@ pub mod text {
         L(vec![
             A("param".into()),
             A(match value.sense {
+                Sense::Region => "region",
                 Sense::Type => "type",
                 Sense::Fields => "fields",
                 Sense::Cases => "cases",
@@ -2452,6 +2501,13 @@ pub mod text {
                             out.push_str("(package ");
                             work.push(Work::Text(")"));
                             work.push(Work::Ty(body));
+                        }
+                        Type::Mut(region, element) => {
+                            out.push_str("(mut ");
+                            work.push(Work::Text(")"));
+                            work.push(Work::Ty(element));
+                            work.push(Work::Text(" "));
+                            work.push(Work::Ty(region));
                         }
                         Type::Array(element) => {
                             out.push_str("(array ");
@@ -3031,6 +3087,9 @@ pub mod text {
 
         fn artifact(self, value: S) -> Result<Artifact, ParseError> {
             let mut artifact = self.read_artifact(value);
+            if let Err(error) = super::regions::validate(&artifact.header) {
+                self.fail(error);
+            }
             match self.error.into_inner() {
                 Some(error) => {
                     discard_artifact(&mut artifact);
@@ -3293,6 +3352,7 @@ pub mod text {
             let mut value = self.exact(self.list(value, "param"), 3, "param");
             Parameter {
                 sense: match self.atom(self.take(&mut value)).as_str() {
+                    "region" => Sense::Region,
                     "type" => Sense::Type,
                     "fields" => Sense::Fields,
                     "cases" => Sense::Cases,
@@ -3426,7 +3486,11 @@ pub mod text {
                                 self.fail("type bound is outside the type quantifier space");
                             }
                         }
-                        Type::Package(inner) => parts.push(Part::Ty(inner)),
+                        Type::Package(inner) | Type::Array(inner) => parts.push(Part::Ty(inner)),
+                        Type::Mut(region, element) => {
+                            parts.push(Part::Ty(region));
+                            parts.push(Part::Ty(element));
+                        }
                         Type::Arrow(from, to, row) => {
                             parts.push(Part::Row(row));
                             parts.push(Part::Ty(to));
@@ -3589,6 +3653,11 @@ pub mod text {
                             parts.push(Part::Ty(to, owner));
                             parts.push(Part::Ty(from, owner));
                         }
+                        Type::Mut(region, element) => {
+                            parts.push(Part::Ty(region, owner));
+                            parts.push(Part::Ty(element, owner));
+                        }
+                        Type::Array(inner) => parts.push(Part::Ty(inner, owner)),
                         Type::Struct(row) | Type::Sum(row) => {
                             parts.push(Part::Row(row, owner));
                         }
@@ -3733,6 +3802,7 @@ pub mod text {
                 BuildArrow,
                 BuildPackage,
                 BuildArray,
+                BuildMut,
                 BuildStruct,
                 BuildSum,
                 BuildNamed { name: String, count: usize },
@@ -3775,6 +3845,14 @@ pub mod text {
                                         let body = self.exact(values, 1, "package").remove(0);
                                         tasks.push(Task::BuildPackage);
                                         tasks.push(Task::Ty(body));
+                                    }
+                                    "mut" => {
+                                        let mut values = self.exact(values, 2, "mut");
+                                        let region = self.take(&mut values);
+                                        let element = self.take(&mut values);
+                                        tasks.push(Task::BuildMut);
+                                        tasks.push(Task::Ty(element));
+                                        tasks.push(Task::Ty(region));
                                     }
                                     "array" => {
                                         let element = self.exact(values, 1, "array").remove(0);
@@ -3887,6 +3965,11 @@ pub mod text {
                     Task::BuildPackage => {
                         let body = tys.pop().expect("package body");
                         tys.push(Type::Package(Box::new(body)));
+                    }
+                    Task::BuildMut => {
+                        let element = tys.pop().expect("cell element");
+                        let region = tys.pop().expect("cell region");
+                        tys.push(Type::Mut(Box::new(region), Box::new(element)));
                     }
                     Task::BuildArray => {
                         let element = tys.pop().expect("array element");

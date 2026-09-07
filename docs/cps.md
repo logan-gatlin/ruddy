@@ -150,3 +150,7 @@ artifact S-expression. Validation checks destinations, entry kinds, closed
 block environments, argument and capture layouts, and required metadata before
 the linker or backend consumes untrusted artifacts. Compiler stamps include the
 JS driver source so changes invalidate cached artifacts.
+
+Mutable cells use the same sequential CPS execution and survive suspension.
+See [mutable cells](mutability.md) for region inference, the cell representation,
+and the trusted foreign state contract.

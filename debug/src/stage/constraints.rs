@@ -117,6 +117,7 @@ fn rows(ids: &mut Ids, cx: &Cx, constraints: &[Constraint]) -> Vec<Node> {
                 | ConstraintKind::Equal { .. }
                 | ConstraintKind::Instance { .. }
                 | ConstraintKind::Performs { .. }
+                | ConstraintKind::Isolate { .. }
                 | ConstraintKind::CallbackCoverage { .. } => node,
             }
         })
@@ -142,6 +143,7 @@ fn counted(constraints: &[Constraint]) -> usize {
             | ConstraintKind::Equal { .. }
             | ConstraintKind::Instance { .. }
             | ConstraintKind::Performs { .. }
+            | ConstraintKind::Isolate { .. }
             | ConstraintKind::CallbackCoverage { .. } => 1,
         })
         .sum()

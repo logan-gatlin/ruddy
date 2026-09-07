@@ -484,6 +484,12 @@ fn ordinary(value: &lower::Op) -> Op {
         Source::Const(value) => Op::Const(value.clone()),
         Source::Neg(value) => Op::Neg(*value),
         Source::Not(value) => Op::Not(*value),
+        Source::Allocate(value) => Op::Allocate(*value),
+        Source::Read(value) => Op::Read(*value),
+        Source::Write { left, right } => Op::Write {
+            left: *left,
+            right: *right,
+        },
         Source::And { left, right } => Op::And {
             left: *left,
             right: *right,

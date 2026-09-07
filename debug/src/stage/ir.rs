@@ -286,6 +286,8 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
             label: match op {
                 ruddy::ir::UnaryOp::Neg => "Neg",
                 ruddy::ir::UnaryOp::Not => "Not",
+                ruddy::ir::UnaryOp::Allocate => "Allocate",
+                ruddy::ir::UnaryOp::Read => "Read",
             }
             .into(),
             ..node
@@ -293,6 +295,7 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
         .child(term_node(ids, cx, mint, value, trace)),
         TermKind::Binary { op, left, right } => Node {
             label: match op {
+                ruddy::ir::BinaryOp::Write => "Write",
                 ruddy::ir::BinaryOp::Add => "Add",
                 ruddy::ir::BinaryOp::Sub => "Sub",
                 ruddy::ir::BinaryOp::Mul => "Mul",
@@ -773,7 +776,7 @@ fn annotation_node(ids: &mut Ids, cx: &Cx, mint: &Mint, annotation: &Annotation)
 /// be able to call it two different things.
 fn stands_for_variable(variable: &Variable) -> String {
     let written = match variable.sense {
-        Sense::Type => format!("'{}", variable.name),
+        Sense::Type | Sense::Region => format!("'{}", variable.name),
         Sense::Fields | Sense::Cases | Sense::Effects => format!("..'{}", variable.name),
         Sense::Presence => format!("when '{}", variable.name),
     };
@@ -924,6 +927,12 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type, scope: &[Variable])
             label: "Prim".into(),
             ..node
         },
+        TypeKind::Mut(region, element) => Node {
+            label: "Mut".into(),
+            ..node
+        }
+        .child(type_node(ids, cx, mint, region, scope))
+        .child(type_node(ids, cx, mint, element, scope)),
         TypeKind::Array(element) => Node {
             label: "Array".into(),
             ..node

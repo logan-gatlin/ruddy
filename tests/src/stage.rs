@@ -561,7 +561,7 @@ fn branch_refinement_is_coherent_across_the_debugger_tabs() {
         .filter(|node| {
             matches!(
                 node.label.as_str(),
-                "equal" | "let" | "instance" | "match" | "performs" | "use-site"
+                "equal" | "let" | "instance" | "match" | "performs" | "use-site" | "isolate"
             )
         })
         .count();

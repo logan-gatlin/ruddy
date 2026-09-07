@@ -1215,3 +1215,15 @@ fn both_trees_render_metadata_the_same_way() {
         assert_eq!(ir, expected, "lowered: {source:?}");
     }
 }
+
+#[test]
+fn mutation_syntax_round_trips_with_assignment_grouping() {
+    let source = "let copy = fn a => fn b => a := b := ~a\nlet cell = fn x => mut x";
+    let (ast, ir) = printed(source);
+    assert_eq!(ast_of(&ast), ast);
+    assert_eq!(printed(&ir).1, ir);
+    let source = "let update = fn a => fn b => fn c => (a := b) := c";
+    let (ast, _) = printed(source);
+    assert!(ast.contains("(a := b) := c"));
+    assert_eq!(ast_of(&ast), ast);
+}

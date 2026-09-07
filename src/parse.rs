@@ -229,12 +229,15 @@ pub type Expr = Tracked<ExprKind>;
 
 #[derive(Debug, Clone, Copy)]
 pub enum UnaryOp {
+    Allocate,
+    Read,
     Neg,
     Not,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum BinaryOp {
+    Write,
     Add,
     Sub,
     Mul,
@@ -610,6 +613,7 @@ pub enum TypeKind {
     Tuple(Vec<Type>),
     /// `[T]` — the type of an immutable homogeneous array.
     Array(Box<Type>),
+    Mut(Box<Type>, Box<Type>),
     Ident {
         name: Path,
     },
@@ -2349,6 +2353,27 @@ impl Parser {
     /// The pipeline is the loosest expression operator and associates left:
     /// `x |> f |> g` is `g (f x)`.
     fn expr(&mut self) -> Option<Expr> {
+        let left = self.pipeline()?;
+        if let Some(operator) = self.eat_if(&Kind::Assign) {
+            let Some(right) = self.expr() else {
+                return self.expected_related(
+                    Expected::Value,
+                    Some(Related {
+                        span: operator.span,
+                        kind: RelatedKind::Operator,
+                    }),
+                );
+            };
+            return Some(left.span.merge(right.span).track(ExprKind::Binary {
+                op: BinaryOp::Write,
+                left: Box::new(left),
+                right: Box::new(right),
+            }));
+        }
+        Some(left)
+    }
+
+    fn pipeline(&mut self) -> Option<Expr> {
         let mut value = self.boolean_or()?;
         while let Some(operator) = self.eat_if(&Kind::PipeForward) {
             let function = match self.boolean_or() {
@@ -2439,6 +2464,8 @@ impl Parser {
         let op = match self.peek().map(|token| &token.tracked) {
             Some(Kind::Minus) => UnaryOp::Neg,
             Some(Kind::Not) => UnaryOp::Not,
+            Some(Kind::Mut) => UnaryOp::Allocate,
+            Some(Kind::Tilde) => UnaryOp::Read,
             _ => return self.application(),
         };
         let start = self.advance().expect("just peeked a unary operator").span;
@@ -4039,6 +4066,7 @@ impl Parser {
             Some(tok) if matches!(
                 tok.tracked,
                 Kind::Identifier(_)
+                    | Kind::Mut
                     | Kind::Variable(_)
                     | Kind::LeftBrace
                     | Kind::LeftBracket
@@ -4064,6 +4092,15 @@ impl Parser {
         let span = tok.span;
         match &tok.tracked {
             Kind::LeftBrace => self.struct_type(),
+            Kind::Mut => {
+                self.advance();
+                let region = self.type_atom()?;
+                let element = self.type_atom()?;
+                Some(
+                    span.merge(element.span)
+                        .track(TypeKind::Mut(Box::new(region), Box::new(element))),
+                )
+            }
             Kind::LeftBracket => self.array_type(),
             Kind::LeftParen => self.paren_type(),
             // A name, or a path ending in one: `Math::Pair` is as much a type

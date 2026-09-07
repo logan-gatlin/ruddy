@@ -564,6 +564,7 @@ inference_id!(ReasonId);
 /// never changes type equality or user-facing type notation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VarSort {
+    Region,
     Type,
     Row,
     Presence,
@@ -884,6 +885,7 @@ pub enum Rule {
     Bind,
     /// Two homogeneous arrays: compare their element types.
     Array,
+    Mut,
     /// A variable against a type that contains it. The occurs check fired, so
     /// the binding [`Rule::Bind`] would have made was not made — a rule of its
     /// own rather than a `Bind` that failed, because a reader shown "a variable
@@ -902,7 +904,9 @@ pub enum Rule {
     /// The shape rides along for the wording, as it does on [`Rule::Presence`]:
     /// the rule is one rule, and a reader watching two sums be decided should
     /// still be read to in cases.
-    Overlap { shape: Shape },
+    Overlap {
+        shape: Shape,
+    },
     /// Two identical primitives.
     Prim,
     /// Two arrows, taken apart into argument, result and effects.
@@ -940,7 +944,9 @@ pub enum Rule {
     /// and [`Rule::Sum`] are — except that the two differ in one noun rather
     /// than in a sentence, so the shape is carried here and the wording reads
     /// it. A reader watching a sum be decided is told about its cases.
-    Presence { shape: Shape },
+    Presence {
+        shape: Shape,
+    },
     /// A declared type replaced by what it stands for, so that a goal about a
     /// name becomes a goal about a shape. What names are for: a type is equal
     /// to another by how it unfolds, never by what it is called.
@@ -1193,6 +1199,16 @@ impl Subject {
 
 #[derive(Debug, Clone)]
 pub enum ConstraintKind {
+    /// Publish a function's effects after checking whether its state is private.
+    Isolate {
+        /// Operations and callees contributing to this body's effect boundary.
+        effect_origins: Vec<EffectSource>,
+        input: Rc<Ty>,
+        output: Rc<Ty>,
+        internal: Row,
+        external: Row,
+        level: u32,
+    },
     /// Read one field from a base. The operation stays distinct from ordinary
     /// equality so a known non-struct can be diagnosed at the base.
     Project {
@@ -1252,6 +1268,9 @@ pub enum ConstraintKind {
         /// Operation values produced by the bound expression, kept outside its
         /// semantic scheme while the solver publishes that scheme.
         effect_provenance: EffectProvenance,
+        initializer_effects: Row,
+        ambient: Row,
+        inside: bool,
         /// What the value requires, including that it match the annotation when
         /// one was written. Solved first, at `level`.
         value: Vec<Constraint>,
@@ -2402,6 +2421,7 @@ pub enum TypeDescription {
     Struct,
     TaggedValue,
     Array,
+    Mut,
     DeclaredType,
     Undecided,
 }
@@ -2825,6 +2845,7 @@ enum ProvenanceShape {
 enum ProvenanceTy {
     Leaf,
     Array,
+    Mut,
     Arrow,
     Package,
     Struct,
@@ -2963,6 +2984,7 @@ struct PackageGuarantee {
 /// of the program's aliases.
 #[derive(Debug, Clone, Default)]
 struct Signatures {
+    effect_kinds: HashMap<String, Vec<ParamKind>>,
     /// Source spellings for bindings whose nested generalization may report
     /// an escape.
     binding_names: HashMap<Symbol, Rc<str>>,
@@ -3169,6 +3191,7 @@ struct Table {
     /// here. A rigid belongs to one annotation, and an annotation to one
     /// definition, so a table only ever meets its own.
     rigids: HashMap<u32, Anchor>,
+    region_rigids: HashSet<u32>,
     /// The rigids already reported as escaping. One mistake said once: a
     /// variable that reaches two schemes it does not belong to is still one
     /// annotation to rewrite. See [`ErrorKind::RigidEscapes`].
@@ -3993,6 +4016,7 @@ fn describe_type(ty: &Rc<Ty>) -> TypeDescription {
         Ty::Struct(..) => TypeDescription::Struct,
         Ty::Sum(..) => TypeDescription::TaggedValue,
         Ty::Array(..) => TypeDescription::Array,
+        Ty::Mut(..) => TypeDescription::Mut,
         Ty::Named { .. } => TypeDescription::DeclaredType,
         Ty::Bound(_) | Ty::Var(_) | Ty::Rigid { .. } | Ty::Undecided => TypeDescription::Undecided,
         Ty::Package(_) => unreachable!("packages were removed iteratively"),
@@ -4123,6 +4147,18 @@ impl MismatchFingerprints {
                                 None,
                             ));
                             pending.push(MismatchFingerprintWork::Type(inner.clone()));
+                            continue;
+                        }
+                        Ty::Mut(region, element) => {
+                            pending.push(MismatchFingerprintWork::Finish(
+                                key,
+                                ty.clone(),
+                                15,
+                                2,
+                                None,
+                            ));
+                            pending.push(MismatchFingerprintWork::Type(element.clone()));
+                            pending.push(MismatchFingerprintWork::Type(region.clone()));
                             continue;
                         }
                         Ty::Array(element) => {
@@ -5282,9 +5318,10 @@ fn attach_ordinary_explanations(
             Some(ContradictionKind::UnhandledEffect | ContradictionKind::EffectNotAllowed)
         ) && let Some(row) = &row
             && let Some((constraint, origin)) = constraint_slice.iter().rev().find_map(|id| {
-                let ConstraintKind::Performs { effect_origins, .. } = &constraints.get(id)?.kind
-                else {
-                    return None;
+                let effect_origins = match &constraints.get(id)?.kind {
+                    ConstraintKind::Performs { effect_origins, .. }
+                    | ConstraintKind::Isolate { effect_origins, .. } => effect_origins,
+                    _ => return None,
                 };
                 effect_origins.iter().find_map(|source| {
                     let EffectSource::Origin(origin) = source else {
@@ -6069,6 +6106,11 @@ impl Fingerprint {
                         self.word(0x07);
                         work.push(inner);
                     }
+                    Ty::Mut(region, element) => {
+                        self.word(0x10);
+                        work.push(element);
+                        work.push(region);
+                    }
                     Ty::Array(inner) => {
                         self.word(0x08);
                         work.push(inner);
@@ -6248,6 +6290,20 @@ fn declarations(mint: &Mint, program: &Program) -> (Rc<Signatures>, GroupResult)
     let mut table = Table::new(
         Symbol::GENERATED,
         Rc::new(Signatures {
+            effect_kinds: program
+                .effect_ids
+                .iter()
+                .map(|(symbol, id)| {
+                    (
+                        id.row_key(),
+                        program
+                            .effect_params
+                            .get(symbol)
+                            .cloned()
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect(),
             binding_names,
             params,
             nominal,
@@ -6645,6 +6701,7 @@ fn declarations(mint: &Mint, program: &Program) -> (Rc<Signatures>, GroupResult)
     // a fact about the lowered program that nothing here changes.
     drop(signatures);
     let Signatures {
+        effect_kinds,
         binding_names,
         params,
         nominal,
@@ -6652,6 +6709,7 @@ fn declarations(mint: &Mint, program: &Program) -> (Rc<Signatures>, GroupResult)
     } = Rc::try_unwrap(std::mem::take(&mut table.signatures))
         .unwrap_or_else(|shared| (*shared).clone());
     let signatures = Rc::new(Signatures {
+        effect_kinds,
         binding_names,
         params,
         nominal,
@@ -7487,6 +7545,7 @@ impl Table {
 
     fn constraint_reason_for(&mut self, id: ConstraintId, kind: &ConstraintKind) -> ReasonId {
         let roots: Vec<&Rc<Ty>> = match kind {
+            ConstraintKind::Isolate { input, output, .. } => vec![input, output],
             ConstraintKind::Project { base, result, .. } => vec![base, result],
             ConstraintKind::Spread {
                 operand, result, ..
@@ -7738,6 +7797,11 @@ impl Table {
         var
     }
 
+    /// An inferred identity used by cell types and mutation effects.
+    fn fresh_region(&mut self) -> Rc<Ty> {
+        Rc::new(Ty::Var(self.mint(VarSort::Region, Subject::Term)))
+    }
+
     /// A variable standing for a whole type: an unconstrained type
     /// of its own, so that binding it takes whatever it is against entire.
     fn fresh_type_for(&mut self, subject: Subject) -> Rc<Ty> {
@@ -7965,6 +8029,10 @@ impl Table {
                             work.push(Work::Ty(to.clone(), result.clone()));
                             work.push(Work::Ty(from.clone(), other.clone()));
                         }
+                        (Ty::Mut(a, b), Ty::Mut(c, d)) => {
+                            work.push(Work::Ty(a.clone(), c.clone()));
+                            work.push(Work::Ty(b.clone(), d.clone()));
+                        }
                         (Ty::Array(element), Ty::Array(other)) => {
                             work.push(Work::Ty(element.clone(), other.clone()));
                         }
@@ -8128,6 +8196,18 @@ impl Table {
                         visited_tys.push(ty.clone());
                         match &*ty {
                             Ty::Package(body) => work.push((Part::Ty(body.clone()), trace, route)),
+                            Ty::Mut(region, element) => {
+                                for child in [element, region] {
+                                    work.push((
+                                        Part::Ty(child.clone()),
+                                        trace,
+                                        Route {
+                                            containment: true,
+                                            ..route
+                                        },
+                                    ));
+                                }
+                            }
                             Ty::Array(element) => work.push((
                                 Part::Ty(element.clone()),
                                 trace,
@@ -8365,6 +8445,10 @@ impl Table {
                         Ty::Var(var) => found.push(*var),
                         Ty::Package(body) => work.push(Work::Ty(body.clone())),
                         Ty::Array(element) => work.push(Work::Ty(element.clone())),
+                        Ty::Mut(region, element) => {
+                            work.push(Work::Ty(element.clone()));
+                            work.push(Work::Ty(region.clone()));
+                        }
                         Ty::Arrow(from, to, effects) => {
                             work.push(Work::Row(effects.clone()));
                             work.push(Work::Ty(to.clone()));
@@ -8468,6 +8552,10 @@ impl Table {
                         }
                         Ty::Package(body) => work.push(Work::Ty(body.clone())),
                         Ty::Array(element) => work.push(Work::Ty(element.clone())),
+                        Ty::Mut(region, element) => {
+                            work.push(Work::Ty(element.clone()));
+                            work.push(Work::Ty(region.clone()));
+                        }
                         Ty::Struct(row) => work.push(Work::Row(row.clone(), Shape::Struct)),
                         Ty::Sum(row) => work.push(Work::Row(row.clone(), Shape::Sum)),
                         Ty::Named { symbol, args, .. } => {
@@ -9156,6 +9244,10 @@ impl Table {
                         }
                         Ty::Package(body) => work.push(Work::Ty(body.clone())),
                         Ty::Array(element) => work.push(Work::Ty(element.clone())),
+                        Ty::Mut(region, element) => {
+                            work.push(Work::Ty(element.clone()));
+                            work.push(Work::Ty(region.clone()));
+                        }
                         Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(row.clone())),
                         Ty::Named { args, .. } => {
                             work.extend(args.iter().rev().cloned().map(Work::Ty));
@@ -9226,6 +9318,10 @@ impl Table {
                 Work::Ty(ty) => match &*ty {
                     Ty::Package(_) => {} // a nested owner
                     Ty::Array(element) => work.push(Work::Ty(element.clone())),
+                    Ty::Mut(region, element) => {
+                        work.push(Work::Ty(element.clone()));
+                        work.push(Work::Ty(region.clone()));
+                    }
                     Ty::Arrow(from, to, effects) => {
                         work.push(Work::Row(effects.clone()));
                         work.push(Work::Ty(to.clone()));
@@ -9325,6 +9421,7 @@ impl Table {
                         Ty::Arrow(..) => ProvenanceTy::Arrow,
                         Ty::Package(..) => ProvenanceTy::Package,
                         Ty::Array(..) => ProvenanceTy::Array,
+                        Ty::Mut(..) => ProvenanceTy::Mut,
                         Ty::Struct(..) => ProvenanceTy::Struct,
                         Ty::Sum(..) => ProvenanceTy::Sum,
                         Ty::Named { args, .. } => ProvenanceTy::Named(args.len()),
@@ -9341,6 +9438,9 @@ impl Table {
                             Opened::Row(effects.clone(), ty.clone()),
                         ],
                         Ty::Package(body) => vec![Opened::Ty(body.clone())],
+                        Ty::Mut(region, element) => {
+                            vec![Opened::Ty(region.clone()), Opened::Ty(element.clone())]
+                        }
                         Ty::Array(element) => vec![Opened::Ty(element.clone())],
                         Ty::Struct(row) | Ty::Sum(row) => {
                             vec![Opened::Row(self.canon(row), ty.clone())]
@@ -9424,6 +9524,82 @@ impl Table {
         }
     }
 
+    fn region_bounds(&self, root: &Rc<Ty>) -> HashSet<u32> {
+        enum Work<'a> {
+            Ty(&'a Ty),
+            Region(&'a Ty),
+            Row(&'a Row, bool),
+        }
+        let mut regions = HashSet::new();
+        let mut work = vec![Work::Ty(root)];
+        while let Some(part) = work.pop() {
+            match part {
+                Work::Region(Ty::Bound(index)) => {
+                    regions.insert(*index);
+                }
+                Work::Region(_) => {}
+                Work::Ty(ty) => match ty {
+                    Ty::Mut(region, element) => {
+                        work.push(Work::Region(region));
+                        work.push(Work::Ty(element));
+                    }
+                    Ty::Package(body) | Ty::Array(body) => work.push(Work::Ty(body)),
+                    Ty::Arrow(from, to, row) => {
+                        work.push(Work::Ty(from));
+                        work.push(Work::Ty(to));
+                        work.push(Work::Row(row, true));
+                    }
+                    Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(row, false)),
+                    Ty::Named { symbol, args, .. } => {
+                        for (index, arg) in args.iter().enumerate() {
+                            if self
+                                .signatures
+                                .params
+                                .get(symbol)
+                                .and_then(|kinds| kinds.get(index))
+                                .is_some_and(|kind| kind.sense() == Sense::Region)
+                            {
+                                work.push(Work::Region(arg));
+                            } else {
+                                work.push(Work::Ty(arg));
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                Work::Row(row, effects) => {
+                    if let Rest::More(more) = &row.rest {
+                        work.push(Work::Row(more, effects));
+                    }
+                    for (name, field) in &row.labels {
+                        if matches!(field.presence, Presence::Absent) {
+                            continue;
+                        }
+                        if effects && let Ty::Struct(args) = &*field.ty {
+                            for (index, arg) in args.labels.values().enumerate() {
+                                let region = name == &crate::types::mutation_effect().row_key()
+                                    || self
+                                        .signatures
+                                        .effect_kinds
+                                        .get(name)
+                                        .and_then(|kinds| kinds.get(index))
+                                        .is_some_and(|kind| kind.sense() == Sense::Region);
+                                work.push(if region {
+                                    Work::Region(&arg.ty)
+                                } else {
+                                    Work::Ty(&arg.ty)
+                                });
+                            }
+                        } else {
+                            work.push(Work::Ty(&field.ty));
+                        }
+                    }
+                }
+            }
+        }
+        regions
+    }
+
     fn instantiate_scoped(
         &mut self,
         span: Anchor,
@@ -9431,6 +9607,7 @@ impl Table {
         coherent: Option<(Symbol, IndexSet<u32>)>,
     ) -> Rc<Ty> {
         let scheme = &explained.scheme;
+        let regions = self.region_bounds(scheme.body());
         // One fresh variable per position the scheme bound, handed over as a
         // bare type: which sort each one is, is decided where it lands, since
         // that is what a scheme records. See [`Assigned::as_row`]. A presence
@@ -9481,7 +9658,16 @@ impl Table {
                             .provenance
                             .quantified
                             .get(at as usize)
-                            .map_or(VarSort::Type, |slot| slot.sort),
+                            .map_or_else(
+                                || {
+                                    if regions.contains(&at) {
+                                        VarSort::Region
+                                    } else {
+                                        VarSort::Type
+                                    }
+                                },
+                                |slot| slot.sort,
+                            ),
                         Subject::Instance,
                         explained
                             .provenance
@@ -9540,6 +9726,10 @@ impl Table {
                         work.push(Work::Ty(body.clone(), false));
                     }
                     Ty::Array(element) => work.push(Work::Ty(element.clone(), false)),
+                    Ty::Mut(region, element) => {
+                        work.push(Work::Ty(element.clone(), false));
+                        work.push(Work::Ty(region.clone(), false));
+                    }
                     Ty::Arrow(from, to, effects) => {
                         work.push(Work::Row(effects.clone()));
                         work.push(Work::Ty(to.clone(), false));
@@ -9721,6 +9911,10 @@ impl Table {
                     match &*ty {
                         Ty::Package(body) => work.push(Work::Ty(body.clone())),
                         Ty::Array(element) => work.push(Work::Ty(element.clone())),
+                        Ty::Mut(region, element) => {
+                            work.push(Work::Ty(element.clone()));
+                            work.push(Work::Ty(region.clone()));
+                        }
                         Ty::Arrow(a, b, effects) => {
                             work.push(Work::Effects(effects.clone()));
                             work.push(Work::Ty(b.clone()));
@@ -9932,6 +10126,10 @@ impl Table {
                     match &*ty {
                         Ty::Package(body) => work.push(Work::Ty(body.clone())),
                         Ty::Array(element) => work.push(Work::Ty(element.clone())),
+                        Ty::Mut(region, element) => {
+                            work.push(Work::Ty(element.clone()));
+                            work.push(Work::Ty(region.clone()));
+                        }
                         Ty::Rigid { id, name } => {
                             found.entry(*id).or_insert_with(|| name.clone());
                         }
@@ -10109,6 +10307,10 @@ impl Table {
                     match &*ty {
                         Ty::Package(body) => work.push(Work::Ty(body.clone())),
                         Ty::Array(element) => work.push(Work::Ty(element.clone())),
+                        Ty::Mut(region, element) => {
+                            work.push(Work::Ty(element.clone()));
+                            work.push(Work::Ty(region.clone()));
+                        }
                         Ty::Arrow(from, to, effects) => {
                             work.push(Work::Row(effects.clone(), true));
                             work.push(Work::Ty(to.clone()));
@@ -10267,6 +10469,13 @@ impl Table {
                             Ty::Package(body) => {
                                 (ProvenanceTy::Package, vec![Work::Ty(body.clone(), None)])
                             }
+                            Ty::Mut(region, element) => (
+                                ProvenanceTy::Mut,
+                                vec![
+                                    Work::Ty(region.clone(), None),
+                                    Work::Ty(element.clone(), None),
+                                ],
+                            ),
                             Ty::Array(element) => {
                                 (ProvenanceTy::Array, vec![Work::Ty(element.clone(), None)])
                             }
@@ -10387,6 +10596,13 @@ impl Table {
                         Ty::Package(body) => (
                             ProvenanceTy::Package,
                             vec![Published::Ty(body.clone(), None, None)],
+                        ),
+                        Ty::Mut(region, element) => (
+                            ProvenanceTy::Mut,
+                            vec![
+                                Published::Ty(region.clone(), None, None),
+                                Published::Ty(element.clone(), None, None),
+                            ],
                         ),
                         Ty::Array(element) => (
                             ProvenanceTy::Array,
@@ -10765,11 +10981,21 @@ impl Table {
                     match &*ty {
                         Ty::Package(body) => work.push(Work::Ty(body.clone())),
                         Ty::Array(element) => work.push(Work::Ty(element.clone())),
+                        Ty::Mut(region, element) => {
+                            work.push(Work::Ty(element.clone()));
+                            work.push(Work::Ty(region.clone()));
+                        }
                         Ty::Var(var) if !presences => self.quantify_var(*var, subst, level),
                         Ty::Rigid { id, .. } if !presences => {
                             let next = subst.next();
                             subst.rigids.entry(*id).or_insert(next);
-                            subst.rigid_sorts.entry(*id).or_insert(VarSort::Type);
+                            subst.rigid_sorts.entry(*id).or_insert(
+                                if self.region_rigids.contains(id) {
+                                    VarSort::Region
+                                } else {
+                                    VarSort::Type
+                                },
+                            );
                         }
                         Ty::Arrow(from, to, effects) => {
                             work.push(Work::Row(effects.clone()));
@@ -10845,6 +11071,7 @@ impl Table {
             Arrow,
             Package,
             Array,
+            Mut,
             Struct,
             Sum,
             Named {
@@ -10873,7 +11100,11 @@ impl Table {
                                 .get(var)
                                 .map_or(Ty::Var(*var), |at| Ty::Bound(*at)),
                         )),
-                        Ty::Rigid { id, .. } => types.push(Rc::new(Ty::Bound(subst.rigids[id]))),
+                        Ty::Rigid { id, .. } => types.push(match subst.rigids.get(id) {
+                            Some(index) => Rc::new(Ty::Bound(*index)),
+                            None if self.region_rigids.contains(id) => ty.clone(),
+                            None => panic!("a quantified type rigid must have a binder"),
+                        }),
                         Ty::Arrow(from, to, effects) => {
                             work.push(Work::Arrow);
                             work.push(Work::Row(effects.clone()));
@@ -10887,6 +11118,11 @@ impl Table {
                         Ty::Array(element) => {
                             work.push(Work::Array);
                             work.push(Work::Ty(element.clone()));
+                        }
+                        Ty::Mut(region, element) => {
+                            work.push(Work::Mut);
+                            work.push(Work::Ty(element.clone()));
+                            work.push(Work::Ty(region.clone()));
                         }
                         Ty::Struct(row) => {
                             work.push(Work::Struct);
@@ -10955,6 +11191,11 @@ impl Table {
                 Work::Array => {
                     let element = types.pop().expect("zonked array element");
                     types.push(Rc::new(Ty::Array(element)));
+                }
+                Work::Mut => {
+                    let element = types.pop().expect("cell element");
+                    let region = types.pop().expect("cell region");
+                    types.push(Rc::new(Ty::Mut(region, element)));
                 }
                 Work::Struct => {
                     let row = rows.pop().expect("zonked struct row");
@@ -11279,6 +11520,10 @@ fn collect_owned_existentials(body: &Rc<Ty>, abstract_: &HashSet<TyVar>) -> Inde
             Work::Ty(ty) => match &*ty {
                 Ty::Package(_) => {} // belongs to the nested package
                 Ty::Array(element) => work.push(Work::Ty(element.clone())),
+                Ty::Mut(region, element) => {
+                    work.push(Work::Ty(element.clone()));
+                    work.push(Work::Ty(region.clone()));
+                }
                 Ty::Arrow(from, to, effects) => {
                     work.push(Work::Row(effects.clone()));
                     work.push(Work::Ty(to.clone()));
@@ -11315,6 +11560,7 @@ fn substitute_presence_vars(root: &Rc<Ty>, renames: &HashMap<TyVar, Presence>) -
         Arrow,
         Package,
         Array,
+        Mut,
         Struct,
         Sum,
         Named(Symbol, Rc<str>, usize),
@@ -11339,6 +11585,11 @@ fn substitute_presence_vars(root: &Rc<Ty>, renames: &HashMap<TyVar, Presence>) -
                 Ty::Array(element) => {
                     work.push(Work::Array);
                     work.push(Work::Ty(element.clone()));
+                }
+                Ty::Mut(region, element) => {
+                    work.push(Work::Mut);
+                    work.push(Work::Ty(element.clone()));
+                    work.push(Work::Ty(region.clone()));
                 }
                 Ty::Struct(row) => {
                     work.push(Work::Struct);
@@ -11393,6 +11644,11 @@ fn substitute_presence_vars(root: &Rc<Ty>, renames: &HashMap<TyVar, Presence>) -
             Work::Array => {
                 let element = types.pop().unwrap();
                 types.push(Rc::new(Ty::Array(element)));
+            }
+            Work::Mut => {
+                let element = types.pop().expect("cell element");
+                let region = types.pop().expect("cell region");
+                types.push(Rc::new(Ty::Mut(region, element)));
             }
             Work::Struct => types.push(Rc::new(Ty::Struct(rows.pop().unwrap()))),
             Work::Sum => types.push(Rc::new(Ty::Sum(rows.pop().unwrap()))),
@@ -11477,6 +11733,12 @@ fn semantic_variances(aliases: &IndexMap<Symbol, Scheme>) -> HashMap<(Symbol, u3
                             }
                             Ty::Package(body) => work.push(Work::Ty(body.clone(), positive)),
                             Ty::Array(element) => work.push(Work::Ty(element.clone(), positive)),
+                            Ty::Mut(region, element) => {
+                                work.push(Work::Ty(element.clone(), positive));
+                                work.push(Work::Ty(region.clone(), positive));
+                                work.push(Work::Ty(element.clone(), !positive));
+                                work.push(Work::Ty(region.clone(), !positive));
+                            }
                             Ty::Struct(row) | Ty::Sum(row) => {
                                 work.push(Work::Row(row.clone(), positive))
                             }
@@ -11568,6 +11830,12 @@ fn package_positive_presences(
                     }
                     Ty::Package(inner) => work.push(Scan::Ty(inner.clone(), positive, owner)),
                     Ty::Array(element) => work.push(Scan::Ty(element.clone(), positive, owner)),
+                    Ty::Mut(region, element) => {
+                        work.push(Scan::Ty(element.clone(), positive, owner));
+                        work.push(Scan::Ty(region.clone(), positive, owner));
+                        work.push(Scan::Ty(element.clone(), !positive, owner));
+                        work.push(Scan::Ty(region.clone(), !positive, owner));
+                    }
                     Ty::Struct(row) | Ty::Sum(row) => {
                         work.push(Scan::Row(row.clone(), positive, owner))
                     }
@@ -11630,6 +11898,7 @@ fn package_positive_presences(
         Arrow(bool),
         Package(bool),
         Array(bool),
+        Mut(bool),
         Struct(bool),
         Sum(bool),
         Named(bool, Symbol, Rc<str>, usize),
@@ -11653,6 +11922,11 @@ fn package_positive_presences(
                     Ty::Package(inner) => {
                         work.push(Build::Package(wrap));
                         work.push(Build::Ty(inner.clone()));
+                    }
+                    Ty::Mut(region, element) => {
+                        work.push(Build::Mut(wrap));
+                        work.push(Build::Ty(element.clone()));
+                        work.push(Build::Ty(region.clone()));
                     }
                     Ty::Array(element) => {
                         work.push(Build::Array(wrap));
@@ -11739,6 +12013,16 @@ fn package_positive_presences(
                     value
                 });
             }
+            Build::Mut(wrap) => {
+                let element = types.pop().unwrap();
+                let region = types.pop().unwrap();
+                let value = Rc::new(Ty::Mut(region, element));
+                types.push(if wrap {
+                    Rc::new(Ty::Package(value))
+                } else {
+                    value
+                });
+            }
             Build::Array(wrap) => {
                 let value = Rc::new(Ty::Array(types.pop().unwrap()));
                 types.push(if wrap {
@@ -11805,6 +12089,7 @@ fn shift(ty: &Rc<Ty>, by: u32) -> Rc<Ty> {
         Arrow,
         Package,
         Array,
+        Mut,
         Struct,
         Sum,
         Named(Symbol, Rc<str>, usize),
@@ -11830,6 +12115,11 @@ fn shift(ty: &Rc<Ty>, by: u32) -> Rc<Ty> {
                 Ty::Array(element) => {
                     work.push(Work::Array);
                     work.push(Work::Ty(element.clone()));
+                }
+                Ty::Mut(region, element) => {
+                    work.push(Work::Mut);
+                    work.push(Work::Ty(element.clone()));
+                    work.push(Work::Ty(region.clone()));
                 }
                 Ty::Struct(row) => {
                     work.push(Work::Struct);
@@ -11876,6 +12166,11 @@ fn shift(ty: &Rc<Ty>, by: u32) -> Rc<Ty> {
             Work::Array => {
                 let element = types.pop().expect("shifted array element");
                 types.push(Rc::new(Ty::Array(element)));
+            }
+            Work::Mut => {
+                let element = types.pop().expect("cell element");
+                let region = types.pop().expect("cell region");
+                types.push(Rc::new(Ty::Mut(region, element)));
             }
             Work::Struct => types.push(Rc::new(Ty::Struct(rows.pop().expect("shifted struct")))),
             Work::Sum => types.push(Rc::new(Ty::Sum(rows.pop().expect("shifted sum")))),
@@ -12010,7 +12305,7 @@ fn extern_annotation_sources(
     for variable in &annotation.variables {
         let name = format!("'{}", variable.name);
         match variable.sense {
-            Sense::Type => {
+            Sense::Type | Sense::Region => {
                 if let Some(ty) = tails.types.get(&variable.name)
                     && let Some(identity) = type_variable_identity(ty)
                 {
@@ -12068,6 +12363,10 @@ fn extern_annotation_sources(
             }
             (ir::TypeKind::Array(element), Ty::Array(lowered)) => {
                 work.push((element, lowered.clone()));
+            }
+            (ir::TypeKind::Mut(region, element), Ty::Mut(lowered_region, lowered_element)) => {
+                work.push((region, lowered_region.clone()));
+                work.push((element, lowered_element.clone()));
             }
             (
                 ir::TypeKind::Arrow { from, to, effects },
@@ -12181,9 +12480,12 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
     let mut rigids = Vec::new();
     for variable in &annotation.variables {
         table.rigids.insert(variable.id, variable.at);
+        if variable.sense == Sense::Region {
+            table.region_rigids.insert(variable.id);
+        }
         let name: Rc<str> = variable.name.as_str().into();
         match variable.sense {
-            Sense::Type => {
+            Sense::Type | Sense::Region => {
                 at.insert(variable.id, at.len() as u32);
                 rigids.push(variable.id);
                 tails.types.insert(
@@ -12300,6 +12602,7 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
             .filter_map(|variable| {
                 let sort = match variable.sense {
                     Sense::Type => VarSort::Type,
+                    Sense::Region => VarSort::Region,
                     Sense::Fields | Sense::Cases | Sense::Effects => VarSort::Row,
                     Sense::Presence => return None,
                 };
@@ -12414,6 +12717,10 @@ fn lower_scoped(
             lower_scoped(mint, table, tails, from, boundaries),
             lower_scoped(mint, table, tails, to, boundaries),
             effect_row(mint, table, tails, effects, boundaries),
+        ),
+        TypeKind::Mut(region, element) => Ty::Mut(
+            lower_scoped(mint, table, tails, region, boundaries),
+            lower_scoped(mint, table, tails, element, boundaries),
         ),
         TypeKind::Array(element) => {
             Ty::Array(lower_scoped(mint, table, tails, element, boundaries))
@@ -12902,6 +13209,7 @@ fn substitute_type(
         Arrow,
         Package,
         Array,
+        Mut,
         Struct,
         Sum,
         Named {
@@ -12932,6 +13240,11 @@ fn substitute_type(
                 Ty::Array(element) => {
                     work.push(Work::Array);
                     work.push(Work::Ty(element));
+                }
+                Ty::Mut(region, element) => {
+                    work.push(Work::Mut);
+                    work.push(Work::Ty(element));
+                    work.push(Work::Ty(region));
                 }
                 Ty::Struct(row) => {
                     work.push(Work::Struct);
@@ -12981,6 +13294,11 @@ fn substitute_type(
             Work::Array => {
                 let element = types.pop().expect("array substitution postorder");
                 types.push(Rc::new(Ty::Array(element)));
+            }
+            Work::Mut => {
+                let element = types.pop().expect("cell element");
+                let region = types.pop().expect("cell region");
+                types.push(Rc::new(Ty::Mut(region, element)));
             }
             Work::Struct => {
                 let row = rows.pop().expect("struct substitution postorder");

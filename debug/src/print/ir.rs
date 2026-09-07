@@ -130,6 +130,9 @@ impl fmt::Display for Show<'_, Program> {
         // `type` declaration may name an effect in an arrow it writes, and an
         // operation's signature may name a type declared below it.
         for (symbol, decl) in &self.node.effects {
+            if self.node.effect_ids.get(symbol) == Some(&ruddy::types::mutation_effect()) {
+                continue;
+            }
             if !first {
                 f.write_str("\n")?;
             }
@@ -355,6 +358,10 @@ impl Grouped for Show<'_, TermKind> {
             TermKind::Match { .. } | TermKind::Handle { .. } | TermKind::Let { .. } => Prec::Apply,
             TermKind::Raise(_) => Prec::Lambda,
             TermKind::Binary {
+                op: ruddy::ir::BinaryOp::Write,
+                ..
+            } => Prec::Assignment,
+            TermKind::Binary {
                 op: ruddy::ir::BinaryOp::Or,
                 ..
             } => Prec::Or,
@@ -504,7 +511,7 @@ impl Grouped for Show<'_, TypeKind> {
             // A row of effects binds as a sum does: same labels, same tail,
             // same brackets around it.
             TypeKind::Sum { .. } | TypeKind::Effects(_) => Prec::Sum,
-            TypeKind::Apply { .. } => Prec::Apply,
+            TypeKind::Apply { .. } | TypeKind::Mut(..) => Prec::Apply,
             TypeKind::Struct { .. }
             | TypeKind::Array(_)
             | TypeKind::Ident(_)
@@ -532,11 +539,14 @@ impl fmt::Display for Show<'_, TermKind> {
                 match op {
                     ruddy::ir::UnaryOp::Neg => "-",
                     ruddy::ir::UnaryOp::Not => "not ",
+                    ruddy::ir::UnaryOp::Allocate => "mut ",
+                    ruddy::ir::UnaryOp::Read => "~",
                 },
                 &self.show(&**value),
             ),
             TermKind::Binary { op, left, right } => {
                 let (symbol, prec) = match op {
+                    ruddy::ir::BinaryOp::Write => (":=", Prec::Assignment),
                     ruddy::ir::BinaryOp::Add => ("+", Prec::Addition),
                     ruddy::ir::BinaryOp::Sub => ("-", Prec::Addition),
                     ruddy::ir::BinaryOp::Mul => ("*", Prec::Multiplication),
@@ -755,6 +765,12 @@ impl fmt::Display for Show<'_, TypeKind> {
                 )
             }
             TypeKind::Prim(prim) => f.write_str(prim.name()),
+            TypeKind::Mut(region, element) => write!(
+                f,
+                "mut {} ({})",
+                self.show(&**region),
+                self.show(&**element)
+            ),
             TypeKind::Array(element) => write!(f, "[{}]", self.show(&**element)),
             TypeKind::Arrow { from, to, effects } => {
                 let row = self.effect_row(effects);
