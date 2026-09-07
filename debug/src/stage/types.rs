@@ -326,6 +326,7 @@ fn walk_locals(term: &Term, out: &mut Vec<Anchored<Symbol>>) {
         | TermKind::Ident(_)
         | TermKind::Natural(_)
         | TermKind::Integer(_)
+        | TermKind::Fixed(_)
         | TermKind::Real(_)
         | TermKind::String(_)
         | TermKind::Boolean(_)
@@ -482,6 +483,7 @@ fn relevant_parameters(aliases: &IndexMap<Symbol, Scheme>) -> HashMap<Symbol, Ha
                     }
                     Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(row)),
                     Ty::Nat
+                    | Ty::Fixed(_)
                     | Ty::Int
                     | Ty::Real
                     | Ty::String
@@ -562,6 +564,7 @@ fn names_in(ty: &Ty, relevant: &HashMap<Symbol, HashSet<usize>>, out: &mut Vec<S
                 }
                 Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(row)),
                 Ty::Nat
+                | Ty::Fixed(_)
                 | Ty::Int
                 | Ty::Real
                 | Ty::String

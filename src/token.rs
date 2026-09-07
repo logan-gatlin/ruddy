@@ -156,6 +156,7 @@ pub enum Kind {
     Natural(u64),
     /// A signed 64-bit integer literal, written with an `i` suffix.
     Integer(i64),
+    Fixed(crate::types::FixedLiteral),
     /// A canonical numeric field after a projection dot or in a structural
     /// field-label position. Kept distinct from a suffixless real so `pair.0`
     /// and `{0: value}` name field `"0"` without changing ordinary numeric
@@ -183,7 +184,9 @@ pub struct Error {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
     /// A character that begins no token at all.
-    InvalidCharacter { character: char },
+    InvalidCharacter {
+        character: char,
+    },
     /// `#` was not followed by an identifier-shaped (or quoted) tag name.
     MalformedTag,
     /// `!` was not followed by an identifier-shaped effect name.
@@ -195,19 +198,28 @@ pub enum ErrorKind {
     /// A number ran directly into identifier characters, as in `1thing`.
     NumberFollowedByName,
     /// A whole-number suffix was attached to a decimal, as in `1.5n`.
-    DecimalWithWholeSuffix { suffix: char },
+    DecimalWithWholeSuffix {
+        suffix: char,
+    },
     /// A structural numeric field used something other than decimal digits.
     MalformedNumericField,
     /// A natural literal too large for [`Kind::Natural`] to hold.
     NaturalTooLarge,
+    /// A natural literal was written with a minus sign.
+    NegativeNatural,
     /// An integer literal too large for [`Kind::Integer`] to hold.
     IntegerTooLarge,
+    FixedOutOfRange {
+        kind: crate::types::FixedInt,
+    },
     /// A real literal outside the finite range of [`Kind::Real`].
     RealTooLarge,
     /// A numeric field too large for [`Kind::NumericField`] to hold.
     NumericFieldTooLarge,
     /// A string escape the language does not define.
-    UnknownStringEscape { escape: char },
+    UnknownStringEscape {
+        escape: char,
+    },
     /// A string reached a line boundary or the end of input before its quote.
     MissingClosingQuote,
     /// A block comment reached the end of input with a `(*` still unmatched
@@ -255,6 +267,17 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
             // token, the way whitespace does not.
             '-' => {
                 chars.next();
+                // An adjacent sign belongs to the whole numeric lexeme,
+                // including malformed literals and the minimum signed value.
+                if chars.peek().is_some_and(|(_, ch)| ch.is_ascii_digit()) {
+                    let literal = format!("-{}", number(&mut chars));
+                    let span = file_id.span(start, literal.len());
+                    match numeric(&literal) {
+                        Ok(kind) => tokens.push(span.track(kind)),
+                        Err(kind) => invalid(span, kind, &mut tokens, &mut errors),
+                    }
+                    continue;
+                }
                 match chars.peek() {
                     Some(&(_, '>')) => {
                         chars.next();
@@ -830,7 +853,40 @@ fn numeric_field(literal: &str) -> Result<Kind, ErrorKind> {
         .map_err(|_| ErrorKind::NumericFieldTooLarge)
 }
 
+fn fixed_suffix(literal: &str) -> Option<(crate::types::FixedInt, &str)> {
+    crate::types::FixedInt::ALL.into_iter().find_map(|kind| {
+        literal
+            .strip_suffix(kind.suffix())
+            .map(|digits| (kind, digits))
+    })
+}
+
 fn numeric(literal: &str) -> Result<Kind, ErrorKind> {
+    if let Some((kind, digits)) = fixed_suffix(literal) {
+        if !digits
+            .strip_prefix('-')
+            .unwrap_or(digits)
+            .bytes()
+            .all(|ch| ch.is_ascii_digit() || ch == b'.')
+        {
+            return Err(ErrorKind::NumberFollowedByName);
+        }
+        if digits.contains('.') {
+            return Err(ErrorKind::DecimalWithWholeSuffix {
+                suffix: if kind.signed() { 'i' } else { 'n' },
+            });
+        }
+        if !kind.signed() && digits.starts_with('-') {
+            return Err(ErrorKind::NegativeNatural);
+        }
+        return digits
+            .parse()
+            .ok()
+            .and_then(|value| crate::types::FixedLiteral::new(kind, value))
+            .map(Kind::Fixed)
+            .ok_or(ErrorKind::FixedOutOfRange { kind });
+    }
+
     #[derive(Clone, Copy)]
     enum Suffix {
         Integer,
@@ -847,13 +903,21 @@ fn numeric(literal: &str) -> Result<Kind, ErrorKind> {
 
     // If removing a possible suffix does not leave only the numeric spelling,
     // the suffix-like character was merely the end of an attached name.
-    if !digits.bytes().all(|c| c.is_ascii_digit() || c == b'.') {
+    if !digits
+        .strip_prefix('-')
+        .unwrap_or(digits)
+        .bytes()
+        .all(|c| c.is_ascii_digit() || c == b'.')
+    {
         return Err(ErrorKind::NumberFollowedByName);
     }
     if let Some(suffix) = suffix_char.filter(|_| digits.contains('.')) {
         return Err(ErrorKind::DecimalWithWholeSuffix { suffix });
     }
 
+    if matches!(suffix, Some(Suffix::Natural)) && digits.starts_with('-') {
+        return Err(ErrorKind::NegativeNatural);
+    }
     match suffix {
         Some(Suffix::Natural) => digits
             .parse()

@@ -19,16 +19,131 @@ use crate::symbol::Symbol;
 /// [`Ty::Struct`], so there is no primitive for it to name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Prim {
-    /// The type of unsigned 64-bit integer literals.
+    /// The target-sized natural number type.
     Nat,
-    /// The type of signed 64-bit integers.
+    /// The target-sized signed integer type.
     Int,
+    Fixed(FixedInt),
     /// The type of 64-bit floating-point numbers.
     Real,
     /// The type of UTF-8 text.
     String,
     /// The type with the values true and false.
     Boolean,
+}
+
+/// A target-independent integer width and signedness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum FixedInt {
+    Nat8,
+    Nat16,
+    Nat32,
+    Nat64,
+    Int8,
+    Int16,
+    Int32,
+    Int64,
+}
+
+impl FixedInt {
+    pub const ALL: [Self; 8] = [
+        Self::Nat8,
+        Self::Nat16,
+        Self::Nat32,
+        Self::Nat64,
+        Self::Int8,
+        Self::Int16,
+        Self::Int32,
+        Self::Int64,
+    ];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Nat8 => "Nat8",
+            Self::Nat16 => "Nat16",
+            Self::Nat32 => "Nat32",
+            Self::Nat64 => "Nat64",
+            Self::Int8 => "Int8",
+            Self::Int16 => "Int16",
+            Self::Int32 => "Int32",
+            Self::Int64 => "Int64",
+        }
+    }
+    pub const fn suffix(self) -> &'static str {
+        match self {
+            Self::Nat8 => "n8",
+            Self::Nat16 => "n16",
+            Self::Nat32 => "n32",
+            Self::Nat64 => "n64",
+            Self::Int8 => "i8",
+            Self::Int16 => "i16",
+            Self::Int32 => "i32",
+            Self::Int64 => "i64",
+        }
+    }
+    pub const fn bits(self) -> u32 {
+        match self {
+            Self::Nat8 | Self::Int8 => 8,
+            Self::Nat16 | Self::Int16 => 16,
+            Self::Nat32 | Self::Int32 => 32,
+            Self::Nat64 | Self::Int64 => 64,
+        }
+    }
+    pub const fn signed(self) -> bool {
+        matches!(self, Self::Int8 | Self::Int16 | Self::Int32 | Self::Int64)
+    }
+    pub const fn min(self) -> i128 {
+        if self.signed() {
+            -(1i128 << (self.bits() - 1))
+        } else {
+            0
+        }
+    }
+    pub const fn max(self) -> i128 {
+        (1i128 << (self.bits() - self.signed() as u32)) - 1
+    }
+}
+
+/// A range-checked literal. Artifacts validate the same bounds as source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "FixedLiteralData")]
+pub struct FixedLiteral {
+    kind: FixedInt,
+    value: i128,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FixedLiteralData {
+    kind: FixedInt,
+    value: i128,
+}
+
+impl TryFrom<FixedLiteralData> for FixedLiteral {
+    type Error = &'static str;
+    fn try_from(data: FixedLiteralData) -> Result<Self, Self::Error> {
+        Self::new(data.kind, data.value).ok_or("fixed-width literal out of range")
+    }
+}
+
+impl FixedLiteral {
+    pub fn new(kind: FixedInt, value: i128) -> Option<Self> {
+        (kind.min()..=kind.max())
+            .contains(&value)
+            .then_some(Self { kind, value })
+    }
+    pub fn kind(self) -> FixedInt {
+        self.kind
+    }
+    pub fn value(self) -> i128 {
+        self.value
+    }
+}
+
+impl std::fmt::Display for FixedLiteral {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}{}", self.value, self.kind.suffix())
+    }
 }
 
 pub type TyVar = u32;
@@ -401,6 +516,7 @@ pub struct Scheme {
 pub enum Ty {
     Nat,
     Int,
+    Fixed(FixedInt),
     Real,
     String,
     Boolean,
@@ -809,6 +925,7 @@ fn take_ty_children(ty: &mut Ty, types: &mut Vec<Rc<Ty>>, rows: &mut Vec<Rc<Row>
         }
         Ty::Nat
         | Ty::Int
+        | Ty::Fixed(_)
         | Ty::Real
         | Ty::String
         | Ty::Boolean
@@ -931,6 +1048,7 @@ pub(crate) fn same_finite_syntax_metered(
                     continue;
                 }
                 match (left, right) {
+                    (Ty::Fixed(left), Ty::Fixed(right)) if left == right => {}
                     (Ty::Nat, Ty::Nat)
                     | (Ty::Int, Ty::Int)
                     | (Ty::Real, Ty::Real)
@@ -1056,6 +1174,7 @@ impl From<Prim> for Ty {
         match value {
             Prim::Nat => Ty::Nat,
             Prim::Int => Ty::Int,
+            Prim::Fixed(kind) => Ty::Fixed(kind),
             Prim::Real => Ty::Real,
             Prim::String => Ty::String,
             Prim::Boolean => Ty::Boolean,
@@ -1791,6 +1910,14 @@ impl Prim {
     pub const ALL: &'static [Prim] = &[
         Prim::Nat,
         Prim::Int,
+        Prim::Fixed(FixedInt::Nat8),
+        Prim::Fixed(FixedInt::Nat16),
+        Prim::Fixed(FixedInt::Nat32),
+        Prim::Fixed(FixedInt::Nat64),
+        Prim::Fixed(FixedInt::Int8),
+        Prim::Fixed(FixedInt::Int16),
+        Prim::Fixed(FixedInt::Int32),
+        Prim::Fixed(FixedInt::Int64),
         Prim::Real,
         Prim::String,
         Prim::Boolean,
@@ -1803,6 +1930,7 @@ impl Prim {
         match self {
             Prim::Nat => "Nat",
             Prim::Int => "Int",
+            Prim::Fixed(kind) => kind.name(),
             Prim::Real => "Real",
             Prim::String => "String",
             Prim::Boolean => "Boolean",

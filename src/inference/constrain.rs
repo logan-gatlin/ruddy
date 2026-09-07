@@ -351,6 +351,7 @@ impl Constrain<'_> {
             // diagnostic lowering already reported stays the only one.
             TermKind::Error => Rc::new(Ty::default()),
             TermKind::Natural(_) => Rc::new(Ty::plain(Ty::Nat)),
+            TermKind::Fixed(value) => Rc::new(Ty::plain(Ty::Fixed(value.kind()))),
             TermKind::Integer(_) => Rc::new(Ty::plain(Ty::Int)),
             TermKind::Real(_) => Rc::new(Ty::plain(Ty::Real)),
             TermKind::String(_) => Rc::new(Ty::plain(Ty::String)),
@@ -1385,6 +1386,7 @@ impl Constrain<'_> {
                         exacts = true;
                     }
                     ir::PatternKind::Natural(_) => primitives.push(Ty::Nat),
+                    ir::PatternKind::Fixed(value) => primitives.push(Ty::Fixed(value.kind())),
                     ir::PatternKind::Integer(_) => primitives.push(Ty::Int),
                     ir::PatternKind::Real(_) => primitives.push(Ty::Real),
                     ir::PatternKind::String(_) => primitives.push(Ty::String),

@@ -254,6 +254,10 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
             label: "Integer".into(),
             ..node
         },
+        TermKind::Fixed(_) => Node {
+            label: "Fixed".into(),
+            ..node
+        },
         TermKind::Real(_) => Node {
             label: "Real".into(),
             ..node
@@ -632,6 +636,10 @@ fn pattern_node(ids: &mut Ids, cx: &Cx, mint: &Mint, pattern: &Pattern) -> Node 
         },
         PatternKind::Integer(_) => Node {
             label: "Integer".into(),
+            ..node
+        },
+        PatternKind::Fixed(_) => Node {
+            label: "Fixed".into(),
             ..node
         },
         PatternKind::Real(_) => Node {

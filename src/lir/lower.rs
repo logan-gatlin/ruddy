@@ -380,10 +380,11 @@ pub enum End {
 /// so everything a scheme quantified is [`Rep::Any`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rep {
-    /// An unsigned 64-bit integer.
+    /// A target-sized natural number.
     Nat,
-    /// A signed 64-bit integer.
+    /// A target-sized signed integer.
     Int,
+    Fixed(crate::types::FixedInt),
     /// A 64-bit floating-point number.
     Real,
     String,
@@ -960,6 +961,7 @@ fn cell(pattern: &Pattern) -> Cell {
         PatternKind::Bind(name) => Cell::Wild(Some(name.anchored)),
         PatternKind::Wildcard => Cell::Wild(None),
         PatternKind::Natural(value) => Cell::Prim(Literal::Natural(*value)),
+        PatternKind::Fixed(value) => Cell::Prim(Literal::Fixed(*value)),
         PatternKind::Integer(value) => Cell::Prim(Literal::Integer(*value)),
         PatternKind::Real(value) => Cell::Prim(Literal::Real(*value)),
         PatternKind::String(value) => Cell::Prim(Literal::String(value.clone())),
@@ -1936,6 +1938,7 @@ impl Lower<'_> {
         match &*ty {
             Ty::Nat => Rep::Nat,
             Ty::Int => Rep::Int,
+            Ty::Fixed(kind) => Rep::Fixed(*kind),
             Ty::Real => Rep::Real,
             Ty::String => Rep::String,
             Ty::Boolean => Rep::Boolean,
@@ -2888,6 +2891,12 @@ impl Lower<'_> {
                 rep,
                 Op::Const(Literal::Natural(*value)),
             ),
+            TermKind::Fixed(value) => self.emit(
+                body,
+                self.span(span),
+                rep,
+                Op::Const(Literal::Fixed(*value)),
+            ),
             TermKind::Integer(value) => self.emit(
                 body,
                 self.span(span),
@@ -3748,7 +3757,9 @@ impl Lower<'_> {
             .iter()
             .any(|line| matches!(line.cells[0], Cell::Tag { .. }));
         match &*ty {
-            Ty::Nat | Ty::Int | Ty::Real | Ty::String | Ty::Boolean if primitives => {
+            Ty::Nat | Ty::Int | Ty::Fixed(_) | Ty::Real | Ty::String | Ty::Boolean
+                if primitives =>
+            {
                 self.switch_prim(col.temp, matrix, tree, body)
             }
             Ty::Sum(row) if tags => {
@@ -3949,9 +3960,9 @@ impl Lower<'_> {
         .under(cols)
     }
 
-    /// A primitive position: one case per literal written, and the rest. Only
-    /// Boolean has a finite universe, so only a switch listing both `false`
-    /// and `true` can omit its fallback.
+    /// A primitive position: one case per literal written, and the rest.
+    /// Booleans and fixed-width integers can list their entire domain and
+    /// omit the fallback. Literal values are distinct and range-checked.
     fn switch_prim(&mut self, temp: Temp, matrix: Matrix, tree: &Tree, body: &mut Body) -> Temp {
         let mut listed: Vec<Literal> = Vec::new();
         for line in &matrix.lines {
@@ -3983,9 +3994,19 @@ impl Lower<'_> {
         let wilds = narrow(None);
         let boolean_complete =
             listed.contains(&Literal::Boolean(false)) && listed.contains(&Literal::Boolean(true));
-        let fallback = if boolean_complete {
-            // The wildcard rows remain in each listed case for tests in later
-            // columns, but there is no Boolean value left for a default arm.
+        let fixed_complete = match listed.first() {
+            Some(Literal::Fixed(value)) => {
+                listed.len() as u128 == (1u128 << value.kind().bits())
+                    && listed.iter().all(|literal| {
+                        matches!(literal,
+                        Literal::Fixed(other) if other.kind() == value.kind())
+                    })
+            }
+            _ => false,
+        };
+        let fallback = if boolean_complete || fixed_complete {
+            // Wildcard rows remain in each case for tests in later columns,
+            // but no scalar value remains for a default arm.
             None
         } else {
             assert!(

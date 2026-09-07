@@ -1061,11 +1061,12 @@ module.exports = grammar({
     type_variable: _ => new RegExp(VARIABLE.source, 'u'),
 
     /**
-     * A numeric literal: suffixless reals (including decimals), or 64-bit
-     * integers and naturals marked with `i` and `n`. The broad trailing word
+     * A numeric literal: suffixless reals (including decimals), or target-sized
+     * integers and naturals marked with `i` and `n`, optionally followed
+     * by a fixed width (8, 16, 32, or 64). The broad trailing word
      * is intentional: the lexer diagnoses `1x` as one malformed literal.
      */
-    natural: _ => new RegExp(/[0-9]+(?:\.[0-9]+)?[\p{Alphabetic}\p{N}_]*/.source, 'u'),
+    natural: _ => new RegExp(/-?[0-9]+(?:\.[0-9]+)?[\p{Alphabetic}\p{N}_]*/.source, 'u'),
 
     /** A decimal positional field in a projection or structural label. */
     numeric_field: _ => /[0-9]+/,

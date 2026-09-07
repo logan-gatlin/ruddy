@@ -262,6 +262,7 @@ pub const METADATA_DEPTH_LIMIT: usize = 32;
 pub enum DataKind {
     Natural(u64),
     Integer(i64),
+    Fixed(crate::types::FixedLiteral),
     Real(f64),
     String(String),
     Boolean(bool),
@@ -550,6 +551,7 @@ pub enum TermKind {
     /// nothing for the mint to hand out.
     Natural(u64),
     Integer(i64),
+    Fixed(crate::types::FixedLiteral),
     Real(f64),
     String(String),
     Boolean(bool),
@@ -636,6 +638,7 @@ pub type Pattern = Anchored<PatternKind>;
 pub enum Literal {
     Natural(u64),
     Integer(i64),
+    Fixed(crate::types::FixedLiteral),
     Real(f64),
     String(String),
     Boolean(bool),
@@ -645,6 +648,7 @@ impl PartialEq for Literal {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Natural(a), Self::Natural(b)) => a == b,
+            (Self::Fixed(a), Self::Fixed(b)) => a == b,
             (Self::Integer(a), Self::Integer(b)) => a == b,
             (Self::Real(a), Self::Real(b)) => a.to_bits() == b.to_bits(),
             (Self::String(a), Self::String(b)) => a == b,
@@ -660,6 +664,7 @@ impl Hash for Literal {
         std::mem::discriminant(self).hash(state);
         match self {
             Self::Natural(value) => value.hash(state),
+            Self::Fixed(value) => value.hash(state),
             Self::Integer(value) => value.hash(state),
             // Equality compares a real's representation, including the sign
             // of zero, so hashing must do the same.
@@ -699,6 +704,7 @@ pub enum PatternKind {
     },
     Natural(u64),
     Integer(i64),
+    Fixed(crate::types::FixedLiteral),
     Real(f64),
     String(String),
     Boolean(bool),
@@ -1229,6 +1235,7 @@ fn declaration_variances(
                             | Ty::Undecided
                             | Ty::Nat
                             | Ty::Int
+                            | Ty::Fixed(_)
                             | Ty::Real
                             | Ty::String
                             | Ty::Boolean => {}
@@ -3705,6 +3712,7 @@ fn type_contains_array(
                 }
                 Ty::Nat
                 | Ty::Int
+                | Ty::Fixed(_)
                 | Ty::Real
                 | Ty::String
                 | Ty::Boolean
@@ -3807,6 +3815,7 @@ fn imported_syntax(
     let tracked = match ty {
         artifact::Type::Nat => TypeKind::Prim(Prim::Nat),
         artifact::Type::Int => TypeKind::Prim(Prim::Int),
+        artifact::Type::Fixed(kind) => TypeKind::Prim(Prim::Fixed(*kind)),
         artifact::Type::Real => TypeKind::Prim(Prim::Real),
         artifact::Type::String => TypeKind::Prim(Prim::String),
         artifact::Type::Boolean => TypeKind::Prim(Prim::Boolean),
@@ -4089,6 +4098,7 @@ fn clamp_bounds(ty: Rc<Ty>, count: usize, presences: usize) -> Rc<Ty> {
             Work::Ty(value) => match value {
                 Ty::Nat => types.push(Rc::new(Ty::Nat)),
                 Ty::Int => types.push(Rc::new(Ty::Int)),
+                Ty::Fixed(kind) => types.push(Rc::new(Ty::Fixed(*kind))),
                 Ty::Real => types.push(Rc::new(Ty::Real)),
                 Ty::String => types.push(Rc::new(Ty::String)),
                 Ty::Boolean => types.push(Rc::new(Ty::Boolean)),
@@ -4284,6 +4294,7 @@ fn drop_type_iterative(root: Rc<Ty>) {
                     }
                     Ty::Nat
                     | Ty::Int
+                    | Ty::Fixed(_)
                     | Ty::Real
                     | Ty::String
                     | Ty::Boolean
@@ -4453,6 +4464,7 @@ fn import_type(
             Work::Ty(value, is_effect_row) => match value {
                 artifact::Type::Nat => types.push(Rc::new(Ty::Nat)),
                 artifact::Type::Int => types.push(Rc::new(Ty::Int)),
+                artifact::Type::Fixed(kind) => types.push(Rc::new(Ty::Fixed(*kind))),
                 artifact::Type::Real => types.push(Rc::new(Ty::Real)),
                 artifact::Type::String => types.push(Rc::new(Ty::String)),
                 artifact::Type::Boolean => types.push(Rc::new(Ty::Boolean)),
@@ -5427,6 +5439,7 @@ impl RegularType<'_> {
                 Work::Type(ty, args, supplied_as_effects, instantiation) => match ty {
                     Ty::Nat => values.push(self.atom("Nat")),
                     Ty::Int => values.push(self.atom("Int")),
+                    Ty::Fixed(kind) => values.push(self.atom(kind.name())),
                     Ty::Real => values.push(self.atom("Real")),
                     Ty::String => values.push(self.atom("String")),
                     Ty::Boolean => values.push(self.atom("Boolean")),
@@ -6494,6 +6507,7 @@ fn rekey_term(
         | TermKind::Operation { .. }
         | TermKind::Ident(_)
         | TermKind::Natural(_)
+        | TermKind::Fixed(_)
         | TermKind::Integer(_)
         | TermKind::Real(_)
         | TermKind::String(_)
@@ -6786,6 +6800,7 @@ impl<'a> Follow<'a> {
                     }
                     Ty::Nat
                     | Ty::Int
+                    | Ty::Fixed(_)
                     | Ty::Real
                     | Ty::String
                     | Ty::Boolean
@@ -6964,6 +6979,7 @@ fn erase_circular(term: &mut Term, looping: &IndexSet<Symbol>, out: &mut Vec<Anc
         TermKind::Operation { .. }
         | TermKind::Ident(_)
         | TermKind::Natural(_)
+        | TermKind::Fixed(_)
         | TermKind::Integer(_)
         | TermKind::Real(_)
         | TermKind::String(_)
@@ -7036,6 +7052,7 @@ fn nested<'a>(term: &'a Term, out: &mut HashMap<Symbol, &'a Term>) {
         TermKind::Operation { .. }
         | TermKind::Ident(_)
         | TermKind::Natural(_)
+        | TermKind::Fixed(_)
         | TermKind::Integer(_)
         | TermKind::Real(_)
         | TermKind::String(_)
@@ -7104,6 +7121,7 @@ impl Chain<'_> {
             | TermKind::Handle { .. }
             | TermKind::Raise(_)
             | TermKind::Operation { .. }
+            | TermKind::Fixed(_)
             | TermKind::Natural(_) | TermKind::Integer(_) | TermKind::Real(_) | TermKind::String(_) | TermKind::Boolean(_)
             | TermKind::Error => Stands::Shape,
         }
@@ -7123,6 +7141,7 @@ fn refuter(pattern: &Pattern) -> Option<(Anchor, Refuter)> {
             fields.values().find_map(|field| refuter(&field.value))
         }
         PatternKind::Natural(value) => literal(Literal::Natural(*value)),
+        PatternKind::Fixed(value) => literal(Literal::Fixed(*value)),
         PatternKind::Integer(value) => literal(Literal::Integer(*value)),
         PatternKind::Real(value) => literal(Literal::Real(*value)),
         PatternKind::String(value) => literal(Literal::String(value.clone())),
@@ -7176,6 +7195,7 @@ fn calm(pattern: &Pattern) -> Option<Calm> {
         PatternKind::Tag { .. }
         | PatternKind::Array { .. }
         | PatternKind::Natural(_)
+        | PatternKind::Fixed(_)
         | PatternKind::Integer(_)
         | PatternKind::Real(_)
         | PatternKind::String(_)
@@ -7192,6 +7212,7 @@ fn pattern_binders(pattern: &Pattern, out: &mut Vec<Anchored<Symbol>>) {
         PatternKind::Wildcard
         | PatternKind::Unit
         | PatternKind::Natural(_)
+        | PatternKind::Fixed(_)
         | PatternKind::Integer(_)
         | PatternKind::Real(_)
         | PatternKind::String(_)
@@ -7312,6 +7333,7 @@ fn mat(pattern: &Pattern) -> Mat {
                 .collect(),
         ),
         PatternKind::Natural(value) => Mat::Literal(Literal::Natural(*value)),
+        PatternKind::Fixed(value) => Mat::Literal(Literal::Fixed(*value)),
         PatternKind::Integer(value) => Mat::Literal(Literal::Integer(*value)),
         PatternKind::Real(value) => Mat::Literal(Literal::Real(*value)),
         PatternKind::String(value) => Mat::Literal(Literal::String(value.clone())),
@@ -7378,6 +7400,7 @@ impl Matrix {
                 }
             }
             PatternKind::Natural(value) => self.collect_literal(path, Literal::Natural(*value)),
+            PatternKind::Fixed(value) => self.collect_literal(path, Literal::Fixed(*value)),
             PatternKind::Integer(value) => self.collect_literal(path, Literal::Integer(*value)),
             PatternKind::Real(value) => self.collect_literal(path, Literal::Real(*value)),
             PatternKind::String(value) => {
@@ -7633,6 +7656,7 @@ fn pattern_names(pattern: &parse::Pattern, out: &mut Vec<TrackedString>) {
         // nothing for a duplicate check, anywhere, to ever meet.
         parse::PatternKind::Wildcard
         | parse::PatternKind::Natural(_)
+        | parse::PatternKind::Fixed(_)
         | parse::PatternKind::Integer(_)
         | parse::PatternKind::Real(_)
         | parse::PatternKind::String(_)
@@ -7836,6 +7860,7 @@ pub(crate) fn references(term: &Term, out: &mut Vec<Symbol>) {
         // of the graph a group is read off.
         TermKind::Operation { .. }
         | TermKind::Natural(_)
+        | TermKind::Fixed(_)
         | TermKind::Integer(_)
         | TermKind::Real(_)
         | TermKind::String(_)
@@ -8554,6 +8579,7 @@ fn annotations(term: &mut Term, out: &mut impl FnMut(&mut Type)) {
         TermKind::Operation { .. }
         | TermKind::Ident(_)
         | TermKind::Natural(_)
+        | TermKind::Fixed(_)
         | TermKind::Integer(_)
         | TermKind::Real(_)
         | TermKind::String(_)
@@ -8790,6 +8816,7 @@ fn row_summaries(
                     }
                     Ty::Nat
                     | Ty::Int
+                    | Ty::Fixed(_)
                     | Ty::Real
                     | Ty::String
                     | Ty::Boolean
@@ -9591,6 +9618,7 @@ impl Builder<'_> {
         }
         let kind = match data.tracked {
             parse::DataKind::Natural(value) => DataKind::Natural(value),
+            parse::DataKind::Fixed(value) => DataKind::Fixed(value),
             parse::DataKind::Integer(value) => DataKind::Integer(value),
             parse::DataKind::Real(value) => DataKind::Real(value),
             parse::DataKind::String(value) => DataKind::String(value),
@@ -11681,6 +11709,7 @@ impl Builder<'_> {
                 None => TermKind::Error.at(self.anchor(span)),
             },
             ExprKind::Natural(value) => TermKind::Natural(value).at(self.anchor(span)),
+            ExprKind::Fixed(value) => TermKind::Fixed(value).at(self.anchor(span)),
             ExprKind::Integer(value) => TermKind::Integer(value).at(self.anchor(span)),
             ExprKind::Real(value) => TermKind::Real(value).at(self.anchor(span)),
             ExprKind::String(value) => TermKind::String(value).at(self.anchor(span)),
@@ -12868,6 +12897,7 @@ impl Builder<'_> {
             // stays out of the duplicate-binder check.
             parse::PatternKind::Wildcard => here.anchor(PatternKind::Wildcard),
             parse::PatternKind::Natural(value) => here.anchor(PatternKind::Natural(value)),
+            parse::PatternKind::Fixed(value) => here.anchor(PatternKind::Fixed(value)),
             parse::PatternKind::Integer(value) => here.anchor(PatternKind::Integer(value)),
             parse::PatternKind::Real(value) => here.anchor(PatternKind::Real(value)),
             parse::PatternKind::String(value) => here.anchor(PatternKind::String(value)),

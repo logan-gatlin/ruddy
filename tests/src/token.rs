@@ -274,7 +274,7 @@ fn numeric_projection_fields_reject_number_forms() {
 #[test]
 fn lexes_real_number_operators() {
     assert!(matches!(
-        kinds("-1 + 2 * 3 / 4")[..],
+        kinds("- 1 + 2 * 3 / 4")[..],
         [
             Kind::Minus,
             Kind::Real(_),
@@ -1120,4 +1120,51 @@ fn an_unclosed_block_comment_is_one_invalid_lexeme() {
             "{src:?}"
         );
     }
+}
+
+#[test]
+fn signed_literals_include_the_sign_and_preserve_real_negative_zero() {
+    for (source, expected) in [("-1.5", -1.5f64), ("-0", -0.0), ("-0.0", -0.0)] {
+        let lexed = lex(source, FileID::GENERATED);
+        assert!(lexed.errors.is_empty());
+        assert!(
+            matches!(lexed.tokens[0].tracked, Kind::Real(value) if value.to_bits() == expected.to_bits())
+        );
+        assert_eq!(lexed.tokens[0].span.width, source.len());
+        assert_eq!(lexed.tokens.len(), 1);
+    }
+    assert!(matches!(
+        kinds("-9223372036854775808i")[..],
+        [Kind::Integer(i64::MIN)]
+    ));
+    assert!(matches!(kinds("-0i")[..], [Kind::Integer(0)]));
+    assert!(matches!(
+        kinds("f -1i")[..],
+        [Kind::Identifier(_), Kind::Integer(-1)]
+    ));
+    assert!(matches!(
+        kinds("1 - 2")[..],
+        [Kind::Real(_), Kind::Minus, Kind::Real(_)]
+    ));
+    assert!(matches!(kinds("1-2")[..], [Kind::Real(_), Kind::Real(value)] if value == -2.0));
+    for (source, expected) in [
+        ("-1n", ErrorKind::NegativeNatural),
+        ("-0n", ErrorKind::NegativeNatural),
+        ("-0n8", ErrorKind::NegativeNatural),
+        ("-1n64", ErrorKind::NegativeNatural),
+        ("-9223372036854775809i", ErrorKind::IntegerTooLarge),
+        ("-1.5i", ErrorKind::DecimalWithWholeSuffix { suffix: 'i' }),
+        ("-1.5n", ErrorKind::DecimalWithWholeSuffix { suffix: 'n' }),
+        ("-1thing", ErrorKind::NumberFollowedByName),
+    ] {
+        let lexed = lex(source, FileID::GENERATED);
+        assert_eq!(lexed.errors.len(), 1, "{source}");
+        assert_eq!(lexed.errors[0].kind, expected, "{source}");
+        assert_eq!(lexed.errors[0].span.width, source.len());
+        assert!(matches!(lexed.tokens[..], [ref token] if matches!(token.tracked, Kind::Invalid)));
+    }
+    assert_eq!(
+        errors(&format!("-1{}", "0".repeat(400)))[0].kind,
+        ErrorKind::RealTooLarge
+    );
 }

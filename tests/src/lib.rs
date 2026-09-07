@@ -15,6 +15,7 @@ mod cli;
 mod compile;
 mod docs;
 mod entry;
+mod fixed_integers;
 mod host_exports;
 mod inference;
 mod ir;

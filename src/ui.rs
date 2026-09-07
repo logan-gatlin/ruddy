@@ -329,7 +329,9 @@ impl token::ErrorKind {
             token::ErrorKind::NumberFollowedByName => "number-joined-to-name",
             token::ErrorKind::DecimalWithWholeSuffix { .. } => "decimal-marked-whole",
             token::ErrorKind::MalformedNumericField => "invalid-field-number",
+            token::ErrorKind::NegativeNatural => "negative-natural",
             token::ErrorKind::NaturalTooLarge => "whole-number-too-large",
+            token::ErrorKind::FixedOutOfRange { .. } => "fixed-integer-out-of-range",
             token::ErrorKind::IntegerTooLarge => "integer-too-large",
             token::ErrorKind::RealTooLarge => "number-too-large",
             token::ErrorKind::NumericFieldTooLarge => "field-number-too-large",
@@ -396,15 +398,30 @@ impl token::Error {
             )
             .label("this is not a field number")
             .help("remove the suffix or decimal part"),
+            E::NegativeNatural => Diagnostic::new(
+                self.kind.code(), "a natural literal cannot have a minus sign", self.span,
+            ).help("remove the minus sign or use an integer suffix (`i`, `i8`, `i16`, `i32`, or `i64`)"),
             E::NaturalTooLarge => Diagnostic::new(
                 self.kind.code(),
                 "this whole number is too large",
                 self.span,
             )
             .help("the largest allowed value is `18446744073709551615n`"),
+            E::FixedOutOfRange { kind } => Diagnostic::new(
+                self.kind.code(),
+                format!("this literal is outside the range of `{}`", kind.name()),
+                self.span,
+            )
+            .help(format!(
+                "allowed values run from `{}{}` to `{}{}`",
+                kind.min(),
+                kind.suffix(),
+                kind.max(),
+                kind.suffix()
+            )),
             E::IntegerTooLarge => {
                 Diagnostic::new(self.kind.code(), "this integer is too large", self.span)
-                    .help("the largest allowed value is `9223372036854775807i`")
+                    .help("allowed values run from `-9223372036854775808i` to `9223372036854775807i`")
             }
             E::RealTooLarge => {
                 Diagnostic::new(self.kind.code(), "this number is too large", self.span)
@@ -609,6 +626,7 @@ impl fmt::Display for Kind {
             Kind::Identifier(name) => f.write_str(name),
             Kind::Underscore => f.write_str("_"),
             Kind::Natural(value) => write!(f, "{value}n"),
+            Kind::Fixed(value) => write!(f, "{value}"),
             Kind::Integer(value) => write!(f, "{value}i"),
             Kind::NumericField(value) => write!(f, "{value}"),
             Kind::Real(value) => write!(f, "{value}"),
@@ -907,6 +925,7 @@ impl Grouped for parse::PatternKind {
             parse::PatternKind::Ident { .. }
             | parse::PatternKind::Wildcard
             | parse::PatternKind::Natural(_)
+            | parse::PatternKind::Fixed(_)
             | parse::PatternKind::Integer(_)
             | parse::PatternKind::Real(_)
             | parse::PatternKind::String(_)
@@ -929,6 +948,7 @@ impl fmt::Display for parse::PatternKind {
             parse::PatternKind::Ident { name } => f.write_str(&name.tracked),
             parse::PatternKind::Wildcard => f.write_str("_"),
             parse::PatternKind::Natural(value) => write!(f, "{value}n"),
+            parse::PatternKind::Fixed(value) => write!(f, "{value}"),
             parse::PatternKind::Integer(value) => write!(f, "{value}i"),
             parse::PatternKind::Real(value) => write!(f, "{value}"),
             parse::PatternKind::String(value) => write_string(f, value),
@@ -1036,6 +1056,7 @@ impl fmt::Display for ir::Witness {
             ir::Witness::Natural(value) => write!(f, "{value}n"),
             ir::Witness::Literal(value) => match value {
                 ir::Literal::Natural(value) => write!(f, "{value}n"),
+                ir::Literal::Fixed(value) => write!(f, "{value}"),
                 ir::Literal::Integer(value) => write!(f, "{value}i"),
                 ir::Literal::Real(value) => write!(f, "{value}"),
                 ir::Literal::String(value) => write_string(f, value),
@@ -1787,6 +1808,7 @@ impl fmt::Display for SourceLiteral<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
             ir::Literal::Natural(value) => write!(f, "{value}n"),
+            ir::Literal::Fixed(value) => write!(f, "{value}"),
             ir::Literal::Integer(value) => write!(f, "{value}i"),
             ir::Literal::Real(value) => write!(f, "{value:?}"),
             ir::Literal::String(value) => write_string(f, value),
@@ -2168,6 +2190,7 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                     }
                     Ty::Nat => f.write_str(Prim::Nat.name())?,
                     Ty::Int => f.write_str(Prim::Int.name())?,
+                    Ty::Fixed(kind) => f.write_str(kind.name())?,
                     Ty::Real => f.write_str(Prim::Real.name())?,
                     Ty::String => f.write_str(Prim::String.name())?,
                     Ty::Boolean => f.write_str(Prim::Boolean.name())?,
@@ -3974,7 +3997,9 @@ pub fn write_pipeline(
 /// Render a unary numeric operator.
 pub fn write_unary(f: &mut fmt::Formatter<'_>, op: &str, value: &impl Grouped) -> fmt::Result {
     f.write_str(op)?;
-    write_grouped(f, value.prec() < Prec::Unary, value)
+    // Keep operator negation distinct from a signed literal, and never
+    // join two minus signs into the start of a line comment.
+    write_grouped(f, op == "-" || value.prec() < Prec::Unary, value)
 }
 
 /// Render a left-associative numeric binary operator.

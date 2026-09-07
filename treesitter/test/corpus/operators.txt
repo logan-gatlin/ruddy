@@ -11,8 +11,7 @@ let value = -1 + 2 * 3 - 4 / 5
     (identifier)
     (addition
       (addition
-        (unary_expression
-          (natural))
+        (natural)
         (multiplication
           (natural)
           (natural)))

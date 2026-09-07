@@ -126,7 +126,7 @@ fn pipeline_lowers_as_an_application() {
 
 #[test]
 fn real_number_operators_lower_to_native_instructions() {
-    let printed = listing("let value = -1 + 2 - 3 * 4 / 5");
+    let printed = listing("let value = - 1 + 2 - 3 * 4 / 5");
     for op in ["neg", "add", "sub", "mul", "div"] {
         assert!(printed.contains(op), "{op} missing from:\n{printed}");
     }
@@ -373,7 +373,7 @@ fn every_representation_comes_off_the_solved_type() {
     assert!(section(source, "global i").contains(": fn = closure i#1"));
     // The polymorphic identity's argument is held as anything at all.
     assert!(section(source, "fn i(").starts_with("fn i(%5: any;"));
-    assert!(section(source, "fn int(").contains(": int64;"));
+    assert!(section(source, "fn int(").contains(": int;"));
     assert!(section(source, "fn real(").contains(": real64;"));
     assert!(section(source, "fn string(").contains(": string;"));
     assert!(section(source, "fn boolean(").contains(": boolean;"));

@@ -184,7 +184,8 @@ pub fn opcode(op: &Op) -> &'static str {
 pub fn rep(rep: Rep) -> &'static str {
     match rep {
         Rep::Nat => "nat",
-        Rep::Int => "int64",
+        Rep::Int => "int",
+        Rep::Fixed(kind) => kind.suffix(),
         Rep::Real => "real64",
         Rep::String => "string",
         Rep::Boolean => "boolean",
@@ -321,6 +322,7 @@ fn literal(value: &Literal) -> String {
     match value {
         Literal::Natural(value) => format!("{value}n"),
         Literal::Integer(value) => format!("{value}i"),
+        Literal::Fixed(value) => format!("{value}"),
         Literal::Real(value) => value.to_string(),
         Literal::String(value) => crate::print::string(value),
         Literal::Boolean(value) => value.to_string(),

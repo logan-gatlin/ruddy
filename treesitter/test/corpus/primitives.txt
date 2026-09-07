@@ -70,3 +70,37 @@ let u = \\b
   (let_definition
     (identifier)
     (string)))
+
+================================================================================
+Fixed-width signed literals remain atoms in arguments and patterns
+================================================================================
+
+let value : Int8 = -128i8
+let result = f -128i8 127i8
+let choose = fn x => match x with | -128i8 => 255n8 | _ => 0n8 end
+let largest : Nat64 = 18446744073709551615n64
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (annotation (identifier))
+    (natural))
+  (let_definition
+    (identifier)
+    (application
+      (application (identifier) (natural))
+      (natural)))
+  (let_definition
+    (identifier)
+    (function
+      (identifier)
+      (match_expression
+        (identifier)
+        (match_arm (natural) (natural))
+        (match_arm (wildcard) (natural)))))
+  (let_definition
+    (identifier)
+    (annotation (identifier))
+    (natural)))

@@ -966,6 +966,7 @@ fn body_tys(term: &Term) -> Vec<Rc<Ty>> {
         | TermKind::Ident(_)
         | TermKind::Natural(_)
         | TermKind::Integer(_)
+        | TermKind::Fixed(_)
         | TermKind::Real(_)
         | TermKind::String(_)
         | TermKind::Boolean(_)

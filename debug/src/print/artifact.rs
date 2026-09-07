@@ -54,6 +54,7 @@ impl fmt::Display for Shown<'_> {
         match self.0 {
             Data::Natural(value) => write!(f, "{value}n"),
             Data::Integer(value) => write!(f, "{value}i"),
+            Data::Fixed(value) => write!(f, "{value}"),
             Data::Real(value) => write!(f, "{value}"),
             Data::String(value) => f.write_str(&string(value)),
             Data::Boolean(value) => write!(f, "{value}"),

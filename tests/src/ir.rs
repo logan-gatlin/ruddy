@@ -3355,6 +3355,7 @@ fn references_of(term: &Term, out: &mut Vec<Symbol>) {
         }
         TermKind::Natural(_)
         | TermKind::Integer(_)
+        | TermKind::Fixed(_)
         | TermKind::Real(_)
         | TermKind::String(_)
         | TermKind::Boolean(_)
