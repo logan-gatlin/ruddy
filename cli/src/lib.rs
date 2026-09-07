@@ -33,7 +33,7 @@ mod git;
 pub use git::{LOCKFILE, LockedGit, LockedSelector, Lockfile, ruddy_home};
 
 const MANIFEST: &str = "Ruddy.toml";
-const ROOT: &str = "main.hc";
+const ROOT: &str = "main.rud";
 const GITIGNORE: &str = ".gitignore";
 const BUILD_DIRECTORY: &str = "build";
 const NODE_PACKAGE: &[u8] = b"{\"type\":\"module\"}\n";
@@ -222,7 +222,7 @@ pub fn new_project(path: impl AsRef<Path>) -> Result<(), CliError> {
     write_new_file(
         &manifest,
         &format!(
-            "name = {name:?}\nversion = {INITIAL_VERSION:?}\nkind = \"executable\"\nroot = \"main.hc\"\ntarget = \"js\"\n\n[dependencies]\n"
+            "name = {name:?}\nversion = {INITIAL_VERSION:?}\nkind = \"executable\"\nroot = \"main.rud\"\ntarget = \"js\"\n\n[dependencies]\n"
         ),
     )?;
     write_new_file(&root, "let main = fn _ => ()\n")?;
@@ -2123,7 +2123,7 @@ fn compile_one(
             "project-root-invalid",
             "`root` must name a Ruddy source file",
         )
-        .with_help("set `root` to a file such as `main.hc`"));
+        .with_help("set `root` to a file such as `main.rud`"));
     };
     let source_directory = manifest.root.parent().unwrap_or(Path::new(""));
     let root = directory.join(&manifest.root);

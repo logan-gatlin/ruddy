@@ -9,14 +9,14 @@ fn editor_request(
     character: u32,
 ) -> serde_json::Value {
     let tree = tempfile::tempdir().unwrap();
-    std::fs::write(tree.path().join("Ruddy.toml"), "name = \"editor\"\nversion = \"0.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false").unwrap();
+    std::fs::write(tree.path().join("Ruddy.toml"), "name = \"editor\"\nversion = \"0.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false").unwrap();
     for (path, text) in files {
         let path = tree.path().join(path);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, text).unwrap();
     }
     let root = format!("file://{}/", tree.path().display());
-    let uri = format!("{root}main.hc");
+    let uri = format!("{root}main.rud");
     let (server, client) = Connection::memory();
     let worker = std::thread::spawn(move || ruddy_lsp::serve(server).unwrap());
     let request = |id: i32, method: &str, params| {
@@ -46,7 +46,7 @@ fn editor_request(
             json!({}),
         )))
         .unwrap();
-    client.sender.send(Message::Notification(Notification::new("textDocument/didOpen".into(), json!({"textDocument":{"uri":uri,"languageId":"ruddy","version":1,"text":files.iter().find(|(path, _)| *path == "main.hc").unwrap().1}})))).unwrap();
+    client.sender.send(Message::Notification(Notification::new("textDocument/didOpen".into(), json!({"textDocument":{"uri":uri,"languageId":"ruddy","version":1,"text":files.iter().find(|(path, _)| *path == "main.rud").unwrap().1}})))).unwrap();
     let mut result = request(
         2,
         method,
@@ -70,7 +70,10 @@ fn editor_request(
 #[test]
 fn editor_type_completions_do_not_claim_to_be_classes() {
     let items = editor_request(
-        &[("main.hc", "type Person = { name: String }\nlet value : Per")],
+        &[(
+            "main.rud",
+            "type Person = { name: String }\nlet value : Per",
+        )],
         "textDocument/completion",
         1,
         15,
@@ -91,12 +94,12 @@ fn editor_type_completions_do_not_claim_to_be_classes() {
 #[test]
 fn editor_module_declarations_navigate_to_the_loaded_file() {
     for (target, body) in [
-        ("Child.hc", "let value = 1n"),
-        ("Child/module.hc", ""),
-        ("Child/module.hc", "// empty module\n"),
+        ("Child.rud", "let value = 1n"),
+        ("Child/module.rud", ""),
+        ("Child/module.rud", "// empty module\n"),
     ] {
         let result = editor_request(
-            &[("main.hc", "module Child"), (target, body)],
+            &[("main.rud", "module Child"), (target, body)],
             "textDocument/definition",
             0,
             8,
@@ -109,26 +112,26 @@ fn editor_module_declarations_navigate_to_the_loaded_file() {
     }
     let result = editor_request(
         &[
-            ("main.hc", "module Parent = module Child end"),
-            ("Parent/Child.hc", ""),
+            ("main.rud", "module Parent = module Child end"),
+            ("Parent/Child.rud", ""),
         ],
         "textDocument/definition",
         0,
         24,
     );
-    assert_eq!(result["uri"], "Parent/Child.hc");
+    assert_eq!(result["uri"], "Parent/Child.rud");
 }
 
 #[test]
 fn editor_module_navigation_does_not_guess_missing_or_ambiguous_files() {
     for files in [
-        vec![("main.hc", "module Child")],
+        vec![("main.rud", "module Child")],
         vec![
-            ("main.hc", "module Child"),
-            ("Child.hc", ""),
-            ("Child/module.hc", ""),
+            ("main.rud", "module Child"),
+            ("Child.rud", ""),
+            ("Child/module.rud", ""),
         ],
-        vec![("main.hc", "module Child = end"), ("Child.hc", "")],
+        vec![("main.rud", "module Child = end"), ("Child.rud", "")],
     ] {
         assert!(editor_request(&files, "textDocument/definition", 0, 8).is_null());
     }
@@ -137,12 +140,15 @@ fn editor_module_navigation_does_not_guess_missing_or_ambiguous_files() {
 #[test]
 fn editor_can_initialize_open_hover_and_shutdown() {
     let tree = tempfile::tempdir().unwrap();
-    std::fs::write(tree.path().join("Ruddy.toml"), "name = \"editor\"\nversion = \"0.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false").unwrap();
-    std::fs::write(tree.path().join("main.hc"), "let value = 1n").unwrap();
+    std::fs::write(tree.path().join("Ruddy.toml"), "name = \"editor\"\nversion = \"0.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false").unwrap();
+    std::fs::write(tree.path().join("main.rud"), "let value = 1n").unwrap();
     let root = format!("file://{}", tree.path().display());
     #[cfg(unix)]
-    std::os::unix::fs::symlink(tree.path().join("main.hc"), tree.path().join("open.hc")).unwrap();
-    let uri = format!("{root}/{}", if cfg!(unix) { "open.hc" } else { "main.hc" });
+    std::os::unix::fs::symlink(tree.path().join("main.rud"), tree.path().join("open.rud")).unwrap();
+    let uri = format!(
+        "{root}/{}",
+        if cfg!(unix) { "open.rud" } else { "main.rud" }
+    );
     let (server, client) = Connection::memory();
     let worker = std::thread::spawn(move || ruddy_lsp::serve(server).unwrap());
     client
@@ -296,10 +302,10 @@ fn positions_use_utf16_and_respect_crlf() {
 #[test]
 fn rapid_changes_publish_current_diagnostics_and_disk_creation_is_observed() {
     let tree = tempfile::tempdir().unwrap();
-    std::fs::write(tree.path().join("Ruddy.toml"), "name = \"editor\"\nversion = \"0.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false").unwrap();
-    std::fs::write(tree.path().join("main.hc"), "module Added\nlet value = 1n").unwrap();
+    std::fs::write(tree.path().join("Ruddy.toml"), "name = \"editor\"\nversion = \"0.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false").unwrap();
+    std::fs::write(tree.path().join("main.rud"), "module Added\nlet value = 1n").unwrap();
     let root = format!("file://{}", tree.path().display());
-    let uri = format!("{root}/main.hc");
+    let uri = format!("{root}/main.rud");
     let (server, client) = Connection::memory();
     let worker = std::thread::spawn(move || ruddy_lsp::serve(server).unwrap());
     client
@@ -372,8 +378,8 @@ fn rapid_changes_publish_current_diagnostics_and_disk_creation_is_observed() {
         }
     }
     // No client watched-file notification: the server tracks the loader's
-    // missing candidates, including the competing Added/module.hc form.
-    std::fs::write(tree.path().join("Added.hc"), "let answer : Nat = false").unwrap();
+    // missing candidates, including the competing Added/module.rud form.
+    std::fs::write(tree.path().join("Added.rud"), "let answer : Nat = false").unwrap();
     loop {
         if let Message::Notification(notification) = client
             .receiver
@@ -391,7 +397,7 @@ fn rapid_changes_publish_current_diagnostics_and_disk_creation_is_observed() {
             }
         }
     }
-    let added_uri = format!("{root}/Added.hc");
+    let added_uri = format!("{root}/Added.rud");
     loop {
         if let Message::Notification(notification) = client
             .receiver
@@ -409,7 +415,7 @@ fn rapid_changes_publish_current_diagnostics_and_disk_creation_is_observed() {
             break;
         }
     }
-    std::fs::write(tree.path().join("Added.hc"), "let answer = 1n").unwrap();
+    std::fs::write(tree.path().join("Added.rud"), "let answer = 1n").unwrap();
     loop {
         if let Message::Notification(notification) = client
             .receiver

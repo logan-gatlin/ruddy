@@ -4,9 +4,9 @@ fn project(source: &str, platform: &str) -> tempfile::TempDir {
     let project = tempfile::tempdir().unwrap();
     let standard = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     fs::write(project.path().join("Ruddy.toml"), format!(
-        "name = \"host-test\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.hc\"\ntarget = \"js\"\nplatform = {platform:?}\n\n[dependencies]\nstd = {standard:?}\n"
+        "name = \"host-test\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.rud\"\ntarget = \"js\"\nplatform = {platform:?}\n\n[dependencies]\nstd = {standard:?}\n"
     )).unwrap();
-    fs::write(project.path().join("main.hc"), source).unwrap();
+    fs::write(project.path().join("main.rud"), source).unwrap();
     project
 }
 
@@ -106,9 +106,9 @@ let read = fn _ => handle ask () with | dep::!Ask.get _ => "handled" end
     );
     let dependency = project.path().join("dep");
     fs::create_dir(&dependency).unwrap();
-    fs::write(dependency.join("Ruddy.toml"), "name = \"dep\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"lib.hc\"\ntarget = \"js\"\n[dependencies]\nstd = false\n").unwrap();
+    fs::write(dependency.join("Ruddy.toml"), "name = \"dep\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"lib.rud\"\ntarget = \"js\"\n[dependencies]\nstd = false\n").unwrap();
     fs::write(
-        dependency.join("lib.hc"),
+        dependency.join("lib.rud"),
         "effect Ask = { get: () -> String }\nlet read = fn _ => !Ask.get ()",
     )
     .unwrap();
@@ -370,8 +370,8 @@ end
     let dependency = project.path().join("dep");
     fs::create_dir(&dependency).unwrap();
     let standard = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-    fs::write(dependency.join("Ruddy.toml"), format!("name = \"dep\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"lib.hc\"\n[dependencies]\nstd = {standard:?}\n")).unwrap();
-    fs::write(dependency.join("lib.hc"), "@private type Printer = String -> Printer + std::!Console\nlet printer : Printer = fn text => do let _ = std::console::print text return printer end").unwrap();
+    fs::write(dependency.join("Ruddy.toml"), format!("name = \"dep\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"lib.rud\"\n[dependencies]\nstd = {standard:?}\n")).unwrap();
+    fs::write(dependency.join("lib.rud"), "@private type Printer = String -> Printer + std::!Console\nlet printer : Printer = fn text => do let _ = std::console::print text return printer end").unwrap();
     let manifest = project.path().join("Ruddy.toml");
     fs::write(
         &manifest,

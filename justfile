@@ -94,6 +94,9 @@ helix:
     echo "built $runtime/grammars/ruddy.so"
 
     cp "$grammar"/queries/*.scm "$runtime/queries/ruddy/"
+    # Helix reads the class suffix on local definitions. Its locals engine
+    # treats Tree-sitter's bare capture as a discard, so omit that companion.
+    sed 's/@local\.definition / /g' "$grammar/queries/locals.scm" > "$runtime/queries/ruddy/locals.scm"
     echo "copied $(ls "$grammar"/queries/*.scm | wc -l) queries to $runtime/queries/ruddy"
 
     # Appended rather than written: `languages.toml` is the editor's own file
@@ -109,7 +112,7 @@ helix:
     name = "ruddy"
     scope = "source.ruddy"
     injection-regex = "ruddy"
-    file-types = ["hc"]
+    file-types = ["rud"]
     indent = { tab-width = 2, unit = "  " }
     grammar = "ruddy"
 
@@ -120,7 +123,7 @@ helix:
         echo "appended the ruddy language to $languages"
     fi
 
-    echo "open a .hc file, or check with: hx --health ruddy"
+    echo "open a .rud file, or check with: hx --health ruddy"
 
 # Everything CI would run.
 check: fmt-check clippy test

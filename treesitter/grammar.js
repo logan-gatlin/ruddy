@@ -1,5 +1,5 @@
 /**
- * @file Tree-sitter grammar for ruddy (`.hc`)
+ * @file Tree-sitter grammar for ruddy (`.rud`)
  *
  * Mirrors `src/token.rs` and `src/parse.rs`. Where the two could disagree,
  * `src/parse.rs` is the source of truth: every rule below is named after the

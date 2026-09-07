@@ -157,7 +157,7 @@ fn collect(dir: &Path, files: &mut Vec<PathBuf>) {
         }
         if path.is_dir() {
             collect(&path, files);
-        } else if name == "Ruddy.toml" || name == "Ruddy.lock" || name.ends_with(".hc") {
+        } else if name == "Ruddy.toml" || name == "Ruddy.lock" || name.ends_with(".rud") {
             files.push(path);
         }
     }

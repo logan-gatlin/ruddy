@@ -13,7 +13,7 @@ use ruddy_debug::{
     },
 };
 
-const DEMO: &str = include_str!("../../demo.hc");
+const DEMO: &str = include_str!("../../demo.rud");
 
 fn clean_demo() -> &'static str {
     DEMO.split_once("\nlet bad = @")
@@ -26,8 +26,8 @@ fn clean_demo() -> &'static str {
 /// its parent's name spells.
 const NESTED: &[(&str, &str)] = &[
     (ROOT, "module Math\nlet four = Math::double 2n\n"),
-    ("Math.hc", "module Vec\nlet double = fn x => x\n"),
-    ("Math/Vec.hc", "let zero = 0n\n"),
+    ("Math.rud", "module Vec\nlet double = fn x => x\n"),
+    ("Math/Vec.rud", "let zero = 0n\n"),
 ];
 
 /// One snippet, compiled as the whole of a bundle's root file.
@@ -245,7 +245,8 @@ fn nodes(stage: &Stage) -> Vec<&Node> {
 #[test]
 fn compile_requests_without_dependencies_remain_compatible() {
     let request: CompileRequest =
-        serde_json::from_str(r#"{"files":[{"path":"main.hc","source":""}],"revision":4}"#).unwrap();
+        serde_json::from_str(r#"{"files":[{"path":"main.rud","source":""}],"revision":4}"#)
+            .unwrap();
     assert_eq!(request.name, "demo");
     assert_eq!(request.version, "0.1.0");
     assert_eq!(request.std, StdConfig::Default);
@@ -355,10 +356,10 @@ fn custom_standard_library_is_source_visible_rendered_and_sandboxed() {
     let standard = scratch.join("std-next");
     fs::create_dir_all(&app).unwrap();
     fs::create_dir_all(&standard).unwrap();
-    fs::write(standard.join("main.hc"), "let answer = 42n\n").unwrap();
+    fs::write(standard.join("main.rud"), "let answer = 42n\n").unwrap();
     fs::write(
         standard.join("Ruddy.toml"),
-        "name = \"std\"\nversion = \"2.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
+        "name = \"std\"\nversion = \"2.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
     let request = CompileRequest {
@@ -416,10 +417,10 @@ fn a_remembered_dependency_graph_follows_edits_to_its_sources() {
     let standard = scratch.join("std-next");
     fs::create_dir_all(&app).unwrap();
     fs::create_dir_all(&standard).unwrap();
-    fs::write(standard.join("main.hc"), "let answer = 42n\n").unwrap();
+    fs::write(standard.join("main.rud"), "let answer = 42n\n").unwrap();
     fs::write(
         standard.join("Ruddy.toml"),
-        "name = \"std\"\nversion = \"2.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
+        "name = \"std\"\nversion = \"2.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
     let request = CompileRequest {
@@ -443,7 +444,7 @@ fn a_remembered_dependency_graph_follows_edits_to_its_sources() {
         assert!(built.diagnostics.is_empty(), "{:#?}", built.diagnostics);
     }
 
-    fs::write(standard.join("main.hc"), "let renamed = 42n\n").unwrap();
+    fs::write(standard.join("main.rud"), "let renamed = 42n\n").unwrap();
     let stale = compile_at(&request, 3, &scratch);
     assert!(
         stale
@@ -495,10 +496,10 @@ fn installed_standard_library_child() {
     let standard = home.join("std");
     fs::create_dir_all(&app).unwrap();
     fs::create_dir_all(&standard).unwrap();
-    fs::write(standard.join("main.hc"), "let installed = 1n\n").unwrap();
+    fs::write(standard.join("main.rud"), "let installed = 1n\n").unwrap();
     fs::write(
         standard.join("Ruddy.toml"),
-        "name = \"std\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
+        "name = \"std\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
     let request = CompileRequest {
@@ -551,10 +552,10 @@ fn saved_dependency_projects_supply_artifact_identity_and_gate_lir() {
     let base = scratch.path().join("base");
     fs::create_dir_all(&app).unwrap();
     fs::create_dir_all(&base).unwrap();
-    fs::write(base.join("main.hc"), "let base = 0n\n").unwrap();
+    fs::write(base.join("main.rud"), "let base = 0n\n").unwrap();
     fs::write(
         base.join("Ruddy.toml"),
-        "name = \"base\"\nversion = \"2.3.4\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
+        "name = \"base\"\nversion = \"2.3.4\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
     let mut dependencies = IndexMap::new();
@@ -617,7 +618,7 @@ fn saved_dependency_projects_supply_artifact_identity_and_gate_lir() {
             .any(|field| field.name == "imported values" && field.value == "1")
     );
 
-    fs::write(base.join("main.hc"), "let bad : Nat = fn x => x\n").unwrap();
+    fs::write(base.join("main.rud"), "let bad : Nat = fn x => x\n").unwrap();
     let failed = compile_at(&request, 1, scratch.path());
     assert_eq!(failed.diagnostics[0].stage, "dependencies");
     assert_eq!(failed.diagnostics[0].code, "type-mismatch");
@@ -658,7 +659,7 @@ fn saved_dependency_projects_supply_artifact_identity_and_gate_lir() {
     );
 
     fs::write(
-        base.join("main.hc"),
+        base.join("main.rud"),
         "let one : Nat = false\nlet two : String = 2n\n",
     )
     .unwrap();
@@ -682,11 +683,11 @@ fn dependencies_tab_correlates_same_bundle_versions_by_request_alias() {
     ] {
         let path = scratch.path().join(directory);
         fs::create_dir_all(&path).unwrap();
-        fs::write(path.join("main.hc"), source).unwrap();
+        fs::write(path.join("main.rud"), source).unwrap();
         fs::write(
             path.join("Ruddy.toml"),
             format!(
-                "name = \"lib\"\nversion = \"{version}\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n"
+                "name = \"lib\"\nversion = \"{version}\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\n"
             ),
         )
         .unwrap();
@@ -760,17 +761,17 @@ fn transitive_detailed_dependency_manifests_are_validated_and_compiled() {
     }
     fs::write(
         scratch.path().join("shared/Ruddy.toml"),
-        "name = \"shared-package\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
+        "name = \"shared-package\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
-    fs::write(scratch.path().join("shared/main.hc"), "let value = 1n\n").unwrap();
+    fs::write(scratch.path().join("shared/main.rud"), "let value = 1n\n").unwrap();
     fs::write(
         scratch.path().join("base/Ruddy.toml"),
-        "name = \"base\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n[dependencies.shared]\nbundle = \"shared-package\"\npath = \"../shared\"\n",
+        "name = \"base\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\n[dependencies.shared]\nbundle = \"shared-package\"\npath = \"../shared\"\n",
     )
     .unwrap();
     fs::write(
-        scratch.path().join("base/main.hc"),
+        scratch.path().join("base/main.rud"),
         "let value = shared::value\n",
     )
     .unwrap();
@@ -807,10 +808,10 @@ fn failed_graph_validation_is_reported_for_the_dependency_build() {
     fs::create_dir_all(scratch.path().join("base")).unwrap();
     fs::write(
         scratch.path().join("base/Ruddy.toml"),
-        "name = \"base\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nmissing = \"../../outside\"\n",
+        "name = \"base\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\nmissing = \"../../outside\"\n",
     )
     .unwrap();
-    fs::write(scratch.path().join("base/main.hc"), "let base = 0n\n").unwrap();
+    fs::write(scratch.path().join("base/main.rud"), "let base = 0n\n").unwrap();
     let request = dependency_request(IndexMap::from([
         ("base".into(), "../base".into()),
         ("alias".into(), "../base".into()),
@@ -837,12 +838,12 @@ fn dependency_roots_cannot_be_absolute_or_escape_the_scratch_folder() {
     let scratch = outer.path().join("scratch");
     fs::create_dir_all(scratch.join("app")).unwrap();
     fs::create_dir_all(scratch.join("base")).unwrap();
-    let outside = outer.path().join("outside.hc");
+    let outside = outer.path().join("outside.rud");
     fs::write(&outside, "let outside = 0n\n").unwrap();
 
     for root in [
         outside.display().to_string(),
-        "../../outside.hc".to_string(),
+        "../../outside.rud".to_string(),
     ] {
         fs::write(
             scratch.join("base/Ruddy.toml"),
@@ -875,8 +876,8 @@ fn symlinked_dependency_manifests_are_confined_to_the_scratch_folder() {
     let base = scratch.join("base");
     fs::create_dir_all(scratch.join("app")).unwrap();
     fs::create_dir_all(&base).unwrap();
-    fs::write(base.join("main.hc"), "let base = 0n\n").unwrap();
-    let manifest = "name = \"base\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n";
+    fs::write(base.join("main.rud"), "let base = 0n\n").unwrap();
+    let manifest = "name = \"base\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\n";
     let outside = outer.path().join("outside.toml");
     fs::write(&outside, manifest).unwrap();
     std::os::unix::fs::symlink(&outside, base.join("Ruddy.toml")).unwrap();
@@ -924,13 +925,13 @@ fn symlinked_dependency_modules_cannot_escape_the_scratch_folder() {
     fs::create_dir_all(scratch.join("base")).unwrap();
     fs::write(
         scratch.join("base/Ruddy.toml"),
-        "name = \"base\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
+        "name = \"base\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
-    fs::write(scratch.join("base/main.hc"), "module Escape\n").unwrap();
-    let outside = outer.path().join("Escape.hc");
+    fs::write(scratch.join("base/main.rud"), "module Escape\n").unwrap();
+    let outside = outer.path().join("Escape.rud");
     fs::write(&outside, "let escaped = 0n\n").unwrap();
-    std::os::unix::fs::symlink(&outside, scratch.join("base/Escape.hc")).unwrap();
+    std::os::unix::fs::symlink(&outside, scratch.join("base/Escape.rud")).unwrap();
 
     let snapshot = compile_at(
         &dependency_request(IndexMap::from([("base".into(), "../base".into())])),
@@ -959,7 +960,7 @@ fn types_stage_walks_deep_imported_aliases_on_a_small_stack() {
             fs::create_dir_all(scratch.path().join("dep")).unwrap();
             fs::write(
                 scratch.path().join("dep/Ruddy.toml"),
-                "name = \"dep\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
+                "name = \"dep\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\n",
             )
             .unwrap();
             let mut source = String::new();
@@ -973,7 +974,7 @@ fn types_stage_walks_deep_imported_aliases_on_a_small_stack() {
                     }
                 ));
             }
-            fs::write(scratch.path().join("dep/main.hc"), source).unwrap();
+            fs::write(scratch.path().join("dep/main.rud"), source).unwrap();
 
             let snapshot = compile_at(
                 &dependency_request(IndexMap::from([("dep".into(), "../dep".into())])),
@@ -2427,15 +2428,15 @@ fn a_nested_debugger_root_resolves_module_files_beside_its_root() {
             platform: None,
             name: "demo".into(),
             version: "0.1.0".into(),
-            root: "src/main.hc".into(),
+            root: "src/main.rud".into(),
             document: "demo".into(),
             files: vec![
                 FileSpec {
-                    path: "src/main.hc".into(),
+                    path: "src/main.rud".into(),
                     source: "module Math\n".into(),
                 },
                 FileSpec {
-                    path: "src/Math.hc".into(),
+                    path: "src/Math.rud".into(),
                     source: "let four = 4n\n".into(),
                 },
             ],
@@ -2456,7 +2457,7 @@ fn a_nested_debugger_root_resolves_module_files_beside_its_root() {
             .iter()
             .map(|file| file.path.as_str())
             .collect::<Vec<_>>(),
-        ["src/main.hc", "src/Math.hc"]
+        ["src/main.rud", "src/Math.rud"]
     );
 }
 
@@ -2482,8 +2483,8 @@ fn a_bundle_lists_every_file_the_loader_read() {
         files,
         [
             (ROOT, NESTED[0].1.len()),
-            ("Math.hc", NESTED[1].1.len()),
-            ("Math/Vec.hc", NESTED[2].1.len()),
+            ("Math.rud", NESTED[1].1.len()),
+            ("Math/Vec.rud", NESTED[2].1.len()),
         ]
     );
     // Each with what the page turns an offset in it into a line and a column.
@@ -2499,7 +2500,7 @@ fn a_bundle_lists_every_file_the_loader_read() {
 /// worse than revealing nothing.
 #[test]
 fn a_span_from_a_module_file_names_that_file() {
-    let snapshot = bundle(&[(ROOT, "module Math\n"), ("Math.hc", "let double = nope\n")]);
+    let snapshot = bundle(&[(ROOT, "module Math\n"), ("Math.rud", "let double = nope\n")]);
 
     // Every token of a file's row is a span in that file, which is the whole of
     // what the index has to get right.
@@ -2543,7 +2544,7 @@ fn a_missing_module_file_reaches_the_strip() {
     assert_eq!(diagnostic.code, "module-file-missing");
     assert_eq!(diagnostic.message, "this module needs a file");
     assert_eq!(diagnostic.label, "no file was found for this module");
-    assert_eq!(diagnostic.help, ["create `Math.hc` or `Math/module.hc`"]);
+    assert_eq!(diagnostic.help, ["create `Math.rud` or `Math/module.rud`"]);
     assert_eq!(diagnostic.notes.len(), 1);
     // At the name, which is what the file's path was spelled from.
     let at = root.find("Math").expect("the declaration");
@@ -2570,8 +2571,8 @@ fn two_module_files_explain_how_to_choose_one() {
     let root = "module Math\n";
     let snapshot = bundle(&[
         (ROOT, root),
-        ("Math.hc", "let beside = 1n\n"),
-        ("Math/module.hc", "let inside = 2n\n"),
+        ("Math.rud", "let beside = 1n\n"),
+        ("Math/module.rud", "let inside = 2n\n"),
     ]);
     let [diagnostic] = snapshot.diagnostics.as_slice() else {
         panic!("expected one error: {:#?}", snapshot.diagnostics);
@@ -2584,7 +2585,7 @@ fn two_module_files_explain_how_to_choose_one() {
     );
     assert_eq!(
         diagnostic.help,
-        ["keep one of `Math.hc` or `Math/module.hc` and delete the other"]
+        ["keep one of `Math.rud` or `Math/module.rud` and delete the other"]
     );
 }
 
@@ -2594,7 +2595,7 @@ fn two_module_files_explain_how_to_choose_one() {
 /// so, rather than leaving the reader with a blank page and no reason for it.
 #[test]
 fn a_request_without_a_root_file_is_told_so() {
-    let snapshot = bundle(&[("Math.hc", "let double = fn x => x\n")]);
+    let snapshot = bundle(&[("Math.rud", "let double = fn x => x\n")]);
     let codes: Vec<&str> = snapshot
         .diagnostics
         .iter()
@@ -2609,11 +2610,11 @@ fn a_request_without_a_root_file_is_told_so() {
     assert_eq!(missing.stage, "bundle");
     assert_eq!(
         missing.message,
-        "this document needs its root file `main.hc`"
+        "this document needs its root file `main.rud`"
     );
     assert_eq!(
         missing.help,
-        ["create `main.hc` or choose another root file"]
+        ["create `main.rud` or choose another root file"]
     );
     // Nowhere to point at: there is no file for the missing one to be missing
     // from.

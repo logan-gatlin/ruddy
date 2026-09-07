@@ -46,7 +46,7 @@ thread_local! {
 /// The root file of every document, by convention. Its path and the bundle
 /// identity are supplied separately from source, just as a project manifest
 /// supplies them to the command-line driver.
-pub const ROOT: &str = "main.hc";
+pub const ROOT: &str = "main.rud";
 
 /// The [`Files`] a request is: whatever the page has in its editor, and nothing
 /// off the disk.

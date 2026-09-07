@@ -1,6 +1,6 @@
 //! Scratch documents: the bundles you keep around while debugging.
 //!
-//! A document is a directory under `debug/scratch/<doc>/` holding plain `.hc`
+//! A document is a directory under `debug/scratch/<doc>/` holding plain `.rud`
 //! files and a `Ruddy.toml` project manifest. The configured root and the
 //! rest are whatever its modules name. The page keeps a recovery copy in
 //! `localStorage`; this is the durable one. Saved manifests share the CLI's
@@ -21,7 +21,7 @@ use crate::{
     wire::{DependencySpec, Doc, DocMeta, FileSpec, RunConfig, StdConfig},
 };
 
-const EXTENSION: &str = "hc";
+const EXTENSION: &str = "rud";
 pub const MANIFEST: &str = "Ruddy.toml";
 const DEFAULT_VERSION: &str = "0.1.0";
 
@@ -91,7 +91,7 @@ fn segment(name: &str) -> bool {
 ///
 /// A module's file path mirrors its logical path, so this is more than one
 /// segment and cannot be [`valid_name`]. What it must still be is a relative,
-/// `/`-separated path of segments the alphabet above allows, ending in `.hc`,
+/// `/`-separated path of segments the alphabet above allows, ending in `.rud`,
 /// with nothing in it that could climb out of the directory it is joined to: no
 /// empty segment, no `.`, no `..`, no leading or trailing `/`, and no leading
 /// drive or root of any other shape a platform might read.
@@ -142,7 +142,7 @@ pub fn list(root: &Path) -> io::Result<Vec<DocMeta>> {
     for entry in fs::read_dir(root)? {
         let entry = entry?;
         let meta = entry.metadata()?;
-        // Directories only: a document is a bundle now, and a flat `.hc` file
+        // Directories only: a document is a bundle now, and a flat `.rud` file
         // left over from before is neither read nor migrated.
         if !meta.is_dir() {
             continue;
@@ -191,7 +191,7 @@ pub fn read(root: &Path, name: &str) -> io::Result<Doc> {
 
 /// Replace a document's contents with `files`.
 ///
-/// Every file in the request is written and every `.hc` file on disk that is
+/// Every file in the request is written and every `.rud` file on disk that is
 /// not in it is deleted, so what comes back from [`read`] is what was sent. A
 /// file the page renamed is a write and a delete rather than a move, which is
 /// the same thing from here and one fewer operation to get wrong.
@@ -331,10 +331,10 @@ pub fn delete(root: &Path, name: &str) -> io::Result<()> {
     }
 }
 
-/// Create the scratch directory, seeding it from the repository's `demo.hc` the
+/// Create the scratch directory, seeding it from the repository's `demo.rud` the
 /// first time so a fresh checkout opens onto something worth compiling.
 ///
-/// A flat `debug/scratch/*.hc` from before documents were directories is left
+/// A flat `debug/scratch/*.rud` from before documents were directories is left
 /// exactly where it is: the scratch directory is gitignored working state, and
 /// a migration that guessed which snippets were bundles would be a worse answer
 /// than leaving them alone.
@@ -356,8 +356,8 @@ pub fn ensure(root: &Path, seed: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Every `.hc` file under `dir`, with its path relative to the document root.
-/// Anything else in the directory — a stray file, a directory holding no `.hc`
+/// Every `.rud` file under `dir`, with its path relative to the document root.
+/// Anything else in the directory — a stray file, a directory holding no `.rud`
 /// at all — is ignored rather than reported, the way an orphan module file is.
 fn collect(dir: &Path, prefix: &str) -> io::Result<Vec<FileSpec>> {
     let mut files = Vec::new();

@@ -9,7 +9,7 @@ if ! source=$(cd -P -- "$source_input" 2>/dev/null && pwd); then
   printf 'standard-library source %q is not a directory\n' "$source_input" >&2
   exit 1
 fi
-if [[ ! -f "$source/Ruddy.toml" || ! -f "$source/std/lib.hc" ]]; then
+if [[ ! -f "$source/Ruddy.toml" || ! -f "$source/std/lib.rud" ]]; then
   printf 'standard-library source %q is not a Ruddy standard-library project\n' "$source_input" >&2
   exit 1
 fi
@@ -158,7 +158,7 @@ staging_assigned=true
 # Running find from the resolved source root also makes ./std/build a literal path,
 # even when the caller's path contains find pattern metacharacters.
 source_files=$staging/.source-files
-(cd -- "$source" && find ./std -path ./std/build -prune -o -type f -name '*.hc' -print0) >"$source_files"
+(cd -- "$source" && find ./std -path ./std/build -prune -o -type f -name '*.rud' -print0) >"$source_files"
 cp -- "$source/Ruddy.toml" "$staging/Ruddy.toml"
 while IFS= read -r -d '' file; do
   relative=${file#./}

@@ -62,7 +62,7 @@ fn build_src(src: &str) -> (Mint, Output) {
 /// about anchors staying put has to lex under a real file id.
 fn build_file(src: &str) -> Output {
     let mut files = FileManager::new();
-    let id = files.register_new_file("test.hc".into(), src.into());
+    let id = files.register_new_file("test.rud".into(), src.into());
     let parsed = parse::parse(lex(src, id).tokens);
     assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
     build(&mut dummy_mint(), parsed.stmts)

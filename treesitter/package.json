@@ -1,7 +1,7 @@
 {
   "name": "tree-sitter-ruddy",
   "version": "0.1.0",
-  "description": "tree-sitter grammar for ruddy (.hc)",
+  "description": "tree-sitter grammar for ruddy (.rud)",
   "private": true,
   "main": "grammar.js",
   "files": [

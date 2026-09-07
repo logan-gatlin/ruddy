@@ -182,12 +182,12 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
     // Loading can refuse either spelling of a module file.
     for kind in [
         BundleError::ModuleFileMissing {
-            beside: "Math.hc".to_string(),
-            inside: "Math/module.hc".to_string(),
+            beside: "Math.rud".to_string(),
+            inside: "Math/module.rud".to_string(),
         },
         BundleError::ModuleFileAmbiguous {
-            beside: "Math.hc".to_string(),
-            inside: "Math/module.hc".to_string(),
+            beside: "Math.rud".to_string(),
+            inside: "Math/module.rud".to_string(),
         },
     ] {
         all.push(("bundle", kind.code(), kind.to_string()));
@@ -1014,7 +1014,7 @@ fn imported_contracts_fall_back_to_local_authoritative_uses() {
 
 #[test]
 fn ordinary_mismatch_explanations_keep_full_and_abridged_causal_evidence() {
-    let source = include_str!("../diagnostics/inference/repeated-calls.hc");
+    let source = include_str!("../diagnostics/inference/repeated-calls.rud");
     let (_, first) = inference_fixture_errors(source);
     let (map, second) = inference_fixture_errors(source);
     let [first] = first.as_slice() else {
@@ -1073,12 +1073,12 @@ fn ordinary_mismatch_explanations_keep_full_and_abridged_causal_evidence() {
 fn pivots_name_repeated_inputs_branches_and_anonymous_shared_values_once() {
     let cases = [
         (
-            include_str!("../diagnostics/inference/repeated-calls.hc"),
+            include_str!("../diagnostics/inference/repeated-calls.rud"),
             inference::ExplanationPivotKind::FunctionInput,
             "`Input`",
         ),
         (
-            include_str!("../diagnostics/inference/branches.hc"),
+            include_str!("../diagnostics/inference/branches.rud"),
             inference::ExplanationPivotKind::BranchResult,
             "`Result`",
         ),
@@ -1134,7 +1134,7 @@ fn pivot_labels_avoid_visible_source_names_without_solver_spelling() {
 #[test]
 fn unrelated_whole_path_facts_do_not_create_a_false_pivot() {
     let (_, errors) =
-        inference_fixture_errors(include_str!("../diagnostics/inference/non-function.hc"));
+        inference_fixture_errors(include_str!("../diagnostics/inference/non-function.rud"));
     let explanation = errors[0].explanation.as_ref().unwrap();
     assert!(explanation.full_facts.len() >= explanation.abridged.len());
     assert!(explanation.pivot.is_none());
@@ -1143,7 +1143,7 @@ fn unrelated_whole_path_facts_do_not_create_a_false_pivot() {
 #[test]
 fn a_failure_without_two_grounded_facts_has_no_pivot() {
     let (map, errors) =
-        inference_fixture_errors(include_str!("../diagnostics/inference/non-function.hc"));
+        inference_fixture_errors(include_str!("../diagnostics/inference/non-function.rud"));
     let explanation = errors[0].explanation.as_ref().unwrap();
     assert_eq!(explanation.abridged.len(), 1);
     assert!(explanation.pivot.is_none());
@@ -1360,7 +1360,7 @@ fn recursive_failure_path_excludes_siblings_and_recovers_for_the_next_error() {
 
 #[test]
 fn row_explanations_keep_both_source_sides_and_normalize_solver_direction() {
-    let projection = include_str!("../diagnostics/inference/projection-closed-later.hc");
+    let projection = include_str!("../diagnostics/inference/projection-closed-later.rud");
     let (_, errors) = inference_fixture_errors(projection);
     let [error] = errors.as_slice() else {
         panic!("projection closed by a later use must have one error");
@@ -1390,12 +1390,12 @@ fn row_explanations_keep_both_source_sides_and_normalize_solver_direction() {
 
     for (source, introduction, forbidden) in [
         (
-            include_str!("../diagnostics/inference/repeated-field-struct.hc"),
+            include_str!("../diagnostics/inference/repeated-field-struct.rud"),
             110..119,
             104..109,
         ),
         (
-            include_str!("../diagnostics/inference/repeated-field-sum.hc"),
+            include_str!("../diagnostics/inference/repeated-field-sum.rud"),
             109..116,
             103..108,
         ),
@@ -1442,7 +1442,7 @@ fn row_explanations_keep_both_source_sides_and_normalize_solver_direction() {
     }
 
     let (_, errors) = inference_fixture_errors(include_str!(
-        "../diagnostics/inference/repeated-field-effect.hc"
+        "../diagnostics/inference/repeated-field-effect.rud"
     ));
     let [effect_error] = errors.as_slice() else {
         panic!("repeated effect fixture must have one error: {errors:#?}");
@@ -1633,11 +1633,11 @@ fn effect_boundaries_keep_source_causal_paths_and_repairs() {
             K::UnhandledEffect,
         ),
         (
-            include_str!("../diagnostics/inference/unhandled-effect.hc"),
+            include_str!("../diagnostics/inference/unhandled-effect.rud"),
             K::UnhandledEffect,
         ),
         (
-            include_str!("../diagnostics/inference/effect-not-allowed.hc"),
+            include_str!("../diagnostics/inference/effect-not-allowed.rud"),
             K::EffectNotAllowed,
         ),
         (
@@ -2040,7 +2040,7 @@ fn a_lone_projection_does_not_invent_closed_row_evidence() {
 
 #[test]
 fn a_function_argument_mismatch_is_not_called_a_non_function_callee() {
-    let source = include_str!("../diagnostics/inference/function-argument.hc");
+    let source = include_str!("../diagnostics/inference/function-argument.rud");
     let (map, errors) = inference_fixture_errors(source);
     let [error] = errors.as_slice() else {
         panic!("function argument fixture must produce one mismatch: {errors:#?}");
@@ -2077,123 +2077,123 @@ fn inference_source_corpus_matches_abridged_structured_goldens() {
     let fixtures = [
         (
             "not-a-struct",
-            include_str!("../diagnostics/inference/not-a-struct.hc"),
+            include_str!("../diagnostics/inference/not-a-struct.rud"),
         ),
         (
             "spread-not-a-struct",
-            include_str!("../diagnostics/inference/spread-not-a-struct.hc"),
+            include_str!("../diagnostics/inference/spread-not-a-struct.rud"),
         ),
         (
             "type-mismatch",
-            include_str!("../diagnostics/inference/type-mismatch.hc"),
+            include_str!("../diagnostics/inference/type-mismatch.rud"),
         ),
         (
             "effect-argument-mismatch",
-            include_str!("../diagnostics/inference/effect-argument-mismatch.hc"),
+            include_str!("../diagnostics/inference/effect-argument-mismatch.rud"),
         ),
         (
             "recursive-type",
-            include_str!("../diagnostics/inference/recursive-type.hc"),
+            include_str!("../diagnostics/inference/recursive-type.rud"),
         ),
         (
             "missing-field",
-            include_str!("../diagnostics/inference/missing-field.hc"),
+            include_str!("../diagnostics/inference/missing-field.rud"),
         ),
         (
             "extra-field-struct",
-            include_str!("../diagnostics/inference/extra-field-struct.hc"),
+            include_str!("../diagnostics/inference/extra-field-struct.rud"),
         ),
         (
             "extra-field-sum",
-            include_str!("../diagnostics/inference/extra-field-sum.hc"),
+            include_str!("../diagnostics/inference/extra-field-sum.rud"),
         ),
         (
             "rigid-broken",
-            include_str!("../diagnostics/inference/rigid-broken.hc"),
+            include_str!("../diagnostics/inference/rigid-broken.rud"),
         ),
         (
             "rigid-broken-effect-closure",
-            include_str!("../diagnostics/inference/rigid-broken-effect-closure.hc"),
+            include_str!("../diagnostics/inference/rigid-broken-effect-closure.rud"),
         ),
         (
             "rigid-field-struct",
-            include_str!("../diagnostics/inference/rigid-field-struct.hc"),
+            include_str!("../diagnostics/inference/rigid-field-struct.rud"),
         ),
         (
             "rigid-field-sum",
-            include_str!("../diagnostics/inference/rigid-field-sum.hc"),
+            include_str!("../diagnostics/inference/rigid-field-sum.rud"),
         ),
         (
             "rigid-field-effect",
-            include_str!("../diagnostics/inference/rigid-field-effect.hc"),
+            include_str!("../diagnostics/inference/rigid-field-effect.rud"),
         ),
         (
             "rigid-escapes",
-            include_str!("../diagnostics/inference/rigid-escapes.hc"),
+            include_str!("../diagnostics/inference/rigid-escapes.rud"),
         ),
         (
             "repeated-field-struct",
-            include_str!("../diagnostics/inference/repeated-field-struct.hc"),
+            include_str!("../diagnostics/inference/repeated-field-struct.rud"),
         ),
         (
             "repeated-field-sum",
-            include_str!("../diagnostics/inference/repeated-field-sum.hc"),
+            include_str!("../diagnostics/inference/repeated-field-sum.rud"),
         ),
         (
             "repeated-field-effect",
-            include_str!("../diagnostics/inference/repeated-field-effect.hc"),
+            include_str!("../diagnostics/inference/repeated-field-effect.rud"),
         ),
         (
             "presence-required",
-            include_str!("../diagnostics/inference/presence-required.hc"),
+            include_str!("../diagnostics/inference/presence-required.rud"),
         ),
         (
             "presence-impossible",
-            include_str!("../diagnostics/inference/presence-impossible.hc"),
+            include_str!("../diagnostics/inference/presence-impossible.rud"),
         ),
         (
             "clause-impossible",
-            include_str!("../diagnostics/inference/clause-impossible.hc"),
+            include_str!("../diagnostics/inference/clause-impossible.rud"),
         ),
         (
             "annotation-allows-more",
-            include_str!("../diagnostics/inference/annotation-allows-more.hc"),
+            include_str!("../diagnostics/inference/annotation-allows-more.rud"),
         ),
         (
             "unhandled-effect",
-            include_str!("../diagnostics/inference/unhandled-effect.hc"),
+            include_str!("../diagnostics/inference/unhandled-effect.rud"),
         ),
         (
             "effect-not-allowed",
-            include_str!("../diagnostics/inference/effect-not-allowed.hc"),
+            include_str!("../diagnostics/inference/effect-not-allowed.rud"),
         ),
         (
             "callback-effects-not-covered",
-            include_str!("../diagnostics/inference/callback-effects-not-covered.hc"),
+            include_str!("../diagnostics/inference/callback-effects-not-covered.rud"),
         ),
         (
             "polymorphic-extern-boundary",
-            include_str!("../diagnostics/inference/polymorphic-extern-boundary.hc"),
+            include_str!("../diagnostics/inference/polymorphic-extern-boundary.rud"),
         ),
         (
             "repeated-calls",
-            include_str!("../diagnostics/inference/repeated-calls.hc"),
+            include_str!("../diagnostics/inference/repeated-calls.rud"),
         ),
         (
             "branches",
-            include_str!("../diagnostics/inference/branches.hc"),
+            include_str!("../diagnostics/inference/branches.rud"),
         ),
         (
             "non-function",
-            include_str!("../diagnostics/inference/non-function.hc"),
+            include_str!("../diagnostics/inference/non-function.rud"),
         ),
         (
             "cross-definition",
-            include_str!("../diagnostics/inference/cross-definition.hc"),
+            include_str!("../diagnostics/inference/cross-definition.rud"),
         ),
         (
             "long-alias",
-            include_str!("../diagnostics/inference/long-alias.hc"),
+            include_str!("../diagnostics/inference/long-alias.rud"),
         ),
     ];
 
@@ -5039,8 +5039,8 @@ fn the_bundle_phase_words_and_codes_its_refusals() {
     let missing = ruddy::bundle::Error {
         span,
         kind: BundleError::ModuleFileMissing {
-            beside: "Math.hc".to_string(),
-            inside: "Math/module.hc".to_string(),
+            beside: "Math.rud".to_string(),
+            inside: "Math/module.rud".to_string(),
         },
     };
     let diagnostic = missing.diagnostic();
@@ -5051,15 +5051,15 @@ fn the_bundle_phase_words_and_codes_its_refusals() {
         diagnostic.primary.message,
         "no file was found for this module"
     );
-    assert_eq!(diagnostic.help, ["create `Math.hc` or `Math/module.hc`"]);
+    assert_eq!(diagnostic.help, ["create `Math.rud` or `Math/module.rud`"]);
     assert_eq!(diagnostic.notes.len(), 1);
     assert!(diagnostic.related.is_empty());
 
     let ambiguous = ruddy::bundle::Error {
         span,
         kind: BundleError::ModuleFileAmbiguous {
-            beside: "Math.hc".to_string(),
-            inside: "Math/module.hc".to_string(),
+            beside: "Math.rud".to_string(),
+            inside: "Math/module.rud".to_string(),
         },
     };
     let diagnostic = ambiguous.diagnostic();
@@ -5071,7 +5071,7 @@ fn the_bundle_phase_words_and_codes_its_refusals() {
     );
     assert_eq!(
         diagnostic.help,
-        ["keep one of `Math.hc` or `Math/module.hc` and delete the other"]
+        ["keep one of `Math.rud` or `Math/module.rud` and delete the other"]
     );
     assert_eq!(diagnostic.notes.len(), 1);
 }
@@ -5307,7 +5307,7 @@ fn applied_effect_complaints_name_the_effect_and_the_repair() {
 #[test]
 fn an_argument_clash_renders_the_applications_and_its_cause() {
     let (map, errors) = inference_fixture_errors(include_str!(
-        "../diagnostics/inference/effect-argument-mismatch.hc"
+        "../diagnostics/inference/effect-argument-mismatch.rud"
     ));
     let [error] = errors.as_slice() else {
         panic!("{errors:#?}");

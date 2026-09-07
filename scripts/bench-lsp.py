@@ -33,11 +33,11 @@ def benchmark(directory):
     dep = tree / 'dep'
     root.mkdir()
     dep.mkdir()
-    manifest = 'name = "{}"\nversion = "0.0.0"\nkind = "library"\nroot = "main.hc"\n[dependencies]\nstd = false\n'
+    manifest = 'name = "{}"\nversion = "0.0.0"\nkind = "library"\nroot = "main.rud"\n[dependencies]\nstd = false\n'
     (dep / 'Ruddy.toml').write_text(manifest.format('dep'))
     (root / 'Ruddy.toml').write_text(manifest.format('root') + 'dep = "../dep"\n')
-    corpus = {dep / 'main.hc': module(True), root / 'main.hc': '\n'.join([f'module M{i}' for i in range(98)] + ['let selected = M0::compute0 { value: 1.0, label: "x" }', 'let dependency = dep::compute0 selected']) + '\n'}
-    corpus.update({root / f'M{i}.hc': module() for i in range(98)})
+    corpus = {dep / 'main.rud': module(True), root / 'main.rud': '\n'.join([f'module M{i}' for i in range(98)] + ['let selected = M0::compute0 { value: 1.0, label: "x" }', 'let dependency = dep::compute0 selected']) + '\n'}
+    corpus.update({root / f'M{i}.rud': module() for i in range(98)})
     assert sum((len(text.splitlines()) for text in corpus.values())) == 10000
     for path, text in corpus.items():
         path.write_text(text)
@@ -78,7 +78,7 @@ def benchmark(directory):
     send({'id': 1, 'method': 'initialize', 'params': {'rootUri': root.as_uri(), 'capabilities': {}}})
     receive(lambda msg: msg.get('id') == 1)
     send({'method': 'initialized', 'params': {}})
-    active = root / 'M0.hc'
+    active = root / 'M0.rud'
     uri = active.as_uri()
     original = corpus[active]
     send({'method': 'textDocument/didOpen', 'params': {'textDocument': {'uri': uri, 'languageId': 'ruddy', 'version': 1, 'text': original}}})
@@ -92,7 +92,7 @@ def benchmark(directory):
     rss = []
     request = 2
     for i in range(iterations):
-        next_active = root / f'M{i % 98}.hc'
+        next_active = root / f'M{i % 98}.rud'
         if next_active != active:
             send({'method': 'textDocument/didClose', 'params': {'textDocument': {'uri': uri}}})
             active = next_active
@@ -123,9 +123,9 @@ def benchmark(directory):
         status = pathlib.Path(f'/proc/{proc.pid}/status').read_text()
         rss.append(int(next((line.split()[1] for line in status.splitlines() if line.startswith('VmRSS:')))) * 1024)
     receive(lambda msg: msg.get('method') == 'textDocument/publishDiagnostics' and msg['params'].get('uri') == uri and (msg['params'].get('version') == version))
-    widened = corpus[dep / 'main.hc'].replace('let normalize = fn value => value', 'let normalize = fn value => value + 0.0')
+    widened = corpus[dep / 'main.rud'].replace('let normalize = fn value => value', 'let normalize = fn value => value + 0.0')
     start = time.perf_counter()
-    send({'method': 'textDocument/didOpen', 'params': {'textDocument': {'uri': (dep / 'main.hc').as_uri(), 'languageId': 'ruddy', 'version': 1, 'text': widened}}})
+    send({'method': 'textDocument/didOpen', 'params': {'textDocument': {'uri': (dep / 'main.rud').as_uri(), 'languageId': 'ruddy', 'version': 1, 'text': widened}}})
     send({'id': request, 'method': 'textDocument/hover', 'params': {'textDocument': {'uri': uri}, 'position': {'line': 6, 'character': 20}}})
     wide_hover = None
     wide_diagnostics = []

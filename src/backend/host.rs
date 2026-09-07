@@ -318,7 +318,7 @@ impl Graph {
                 Type::Arrow(_, result, row) => {
                     let fields = fields(row, view.clone(), declarations);
                     let open = !matches!(fields.rest, Rest::Closed);
-                    let handlers = include_str!("node-handler.hc")
+                    let handlers = include_str!("node-handler.rud")
                         .lines()
                         .filter(|line| {
                             open || fields.labels.iter().any(|(label, presence, _)| {
@@ -743,7 +743,7 @@ pub(super) fn compile(
         return Ok(None);
     }
     let prelude = match platform {
-        Platform::Node => include_str!("node-platform.hc"),
+        Platform::Node => include_str!("node-platform.rud"),
         Platform::Web => "",
     };
     let prelude = format!("{prelude}\n{ARRAY_HELPERS}");

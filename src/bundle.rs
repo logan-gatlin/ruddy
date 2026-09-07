@@ -33,7 +33,7 @@ use crate::{
 };
 
 /// The extension every file of a bundle wears.
-const EXTENSION: &str = "hc";
+const EXTENSION: &str = "rud";
 
 /// The file a module's directory holds its own body in, when its body is not
 /// beside the directory instead.
@@ -45,13 +45,13 @@ const CONDITION_KEY: &str = "if";
 /// Where a bundle's files come from.
 ///
 /// One method, because that is the whole of what loading needs: nothing here
-/// lists a directory — an orphan `.hc` file no module declares is ignored — and
+/// lists a directory — an orphan `.rud` file no module declares is ignored — and
 /// nothing writes.
 pub trait Files {
     /// The contents of `path` in the caller's logical source tree, always
     /// `/`-separated, or `None` when there is no such file. Module files use
     /// the same coordinate space as the configured root: a root at
-    /// `src/main.hc` looks for `src/Math.hc`.
+    /// `src/main.rud` looks for `src/Math.rud`.
     fn read(&self, path: &str) -> Option<String>;
 
     /// A source-backed driver may supply its per-file syntax query here.
@@ -186,7 +186,7 @@ struct Loader<'a> {
     fs: &'a dyn Files,
     /// Directory of the configured root, including its trailing `/`. Module
     /// paths are relative to this point even when the caller names the root as
-    /// `src/main.hc` rather than rooting its [`Files`] there first.
+    /// `src/main.rud` rather than rooting its [`Files`] there first.
     directory: String,
     environment: &'a Environment,
     out: Output,
@@ -322,8 +322,8 @@ impl Loader<'_> {
     /// `at` is the logical module path of the statements being walked, which is
     /// also the file path a module under them is looked for at: an inline
     /// module contributes a directory component exactly as a file module does,
-    /// so `module B` inside `module A = ... end` is looked for at `A/B.hc` and
-    /// never at `B.hc`.
+    /// so `module B` inside `module A = ... end` is looked for at `A/B.rud` and
+    /// never at `B.rud`.
     fn splice(&mut self, stmts: &mut Vec<Stmt>, at: &mut Vec<String>) {
         stmts.retain(|stmt| self.holds(stmt));
         for stmt in stmts {

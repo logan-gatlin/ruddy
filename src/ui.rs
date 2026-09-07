@@ -1144,7 +1144,7 @@ impl bundle::Error {
     /// in-memory reporters keep the loader's bundle-relative spellings.
     pub fn diagnostic_in(&self, directory: &FsPath) -> Diagnostic {
         let path = |candidate: &str| directory.join(candidate).display().to_string();
-        let convention = "a module written without a body uses either `Name.hc` or `Name/module.hc`, and exactly one of them must exist";
+        let convention = "a module written without a body uses either `Name.rud` or `Name/module.rud`, and exactly one of them must exist";
         match &self.kind {
             bundle::ErrorKind::ModuleFileMissing { beside, inside } => {
                 Diagnostic::new(self.kind.code(), "this module needs a file", self.span)

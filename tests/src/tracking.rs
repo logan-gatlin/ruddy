@@ -18,7 +18,7 @@ fn a_span_with_nowhere_to_point_points_at_generated_code() {
 
 #[test]
 fn merging_covers_both_spans_whichever_order_they_arrive_in() {
-    let file = FileManager::new().register_new_file("a.hc".into(), "let x = 1n".into());
+    let file = FileManager::new().register_new_file("a.rud".into(), "let x = 1n".into());
     let first = file.span(0, 3);
     let second = file.span(6, 3);
 
@@ -61,12 +61,12 @@ fn a_new_file_manager_already_knows_the_generated_file() {
 #[test]
 fn registering_hands_back_an_id_that_reads_the_file_again() {
     let mut files = FileManager::new();
-    let first = files.register_new_file("a.hc".into(), "let a = 1n".into());
-    let second = files.register_new_file("b.hc".into(), "let b = 2n".into());
+    let first = files.register_new_file("a.rud".into(), "let a = 1n".into());
+    let second = files.register_new_file("b.rud".into(), "let b = 2n".into());
 
     assert_ne!(first, second);
     assert!(!first.is_generated() && !second.is_generated());
-    assert_eq!(files.get_file(first).path, "a.hc");
+    assert_eq!(files.get_file(first).path, "a.rud");
     assert_eq!(files.get_file(second).content, "let b = 2n");
 }
 
@@ -75,7 +75,7 @@ fn registering_hands_back_an_id_that_reads_the_file_again() {
 fn a_file_id_from_nowhere_cannot_be_read() {
     // Ids are minted by one manager and mean nothing to another.
     let mut other = FileManager::new();
-    let stranger = FileManager::new().register_new_file("a.hc".into(), String::new());
+    let stranger = FileManager::new().register_new_file("a.rud".into(), String::new());
 
     other.get_file(stranger);
 }

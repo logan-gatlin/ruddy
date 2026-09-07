@@ -71,7 +71,7 @@ fn run_assertions(project: &Path, script: &str) -> std::path::PathBuf {
     generated
 }
 
-const FILES: &[&str] = &["Ruddy.toml", "main.hc", "Math.hc", "runtime.test.mjs"];
+const FILES: &[&str] = &["Ruddy.toml", "main.rud", "Math.rud", "runtime.test.mjs"];
 
 #[test]
 fn generated_javascript_passes_the_node_runtime_suite() {
@@ -122,7 +122,7 @@ fn run_bundle(fixture: &str, script: &str) {
     fs::write(
         project.path().join("Ruddy.toml"),
         format!(
-            "name = \"{fixture}\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\ntarget = \"js\"\n\n[run]\njs = \"node {script}\"\n\n[dependencies]\nstd = {:?}\n",
+            "name = \"{fixture}\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\ntarget = \"js\"\n\n[run]\njs = \"node {script}\"\n\n[dependencies]\nstd = {:?}\n",
             root
         ),
     )
@@ -173,13 +173,13 @@ fn cps_execution_preserves_results_without_growing_the_host_stack() {
 fn cps_handlers_resume_after_foreign_promise_completion() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("bundles/cps");
     let project = tempfile::tempdir().unwrap();
-    fs::copy(root.join("async.hc"), project.path().join("main.hc")).unwrap();
+    fs::copy(root.join("async.rud"), project.path().join("main.rud")).unwrap();
     fs::copy(
         root.join("async.test.mjs"),
         project.path().join("async.test.mjs"),
     )
     .unwrap();
-    fs::write(project.path().join("Ruddy.toml"), "name = \"async-test\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\ntarget = \"js\"\n[dependencies]\nstd = false\n").unwrap();
+    fs::write(project.path().join("Ruddy.toml"), "name = \"async-test\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\ntarget = \"js\"\n[dependencies]\nstd = false\n").unwrap();
     run_assertions(project.path(), "async.test.mjs");
 }
 
@@ -189,8 +189,8 @@ fn independently_built_cps_bundles_suspend_in_order_and_resume_callers() {
     let project = tempfile::tempdir().unwrap();
     let dependency = project.path().join("dep");
     fs::create_dir(&dependency).unwrap();
-    fs::copy(fixture.join("dependency.hc"), dependency.join("main.hc")).unwrap();
-    fs::write(dependency.join("Ruddy.toml"), "name = \"dep\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\ntarget = \"js\"\n[dependencies]\nstd = false\n").unwrap();
+    fs::copy(fixture.join("dependency.rud"), dependency.join("main.rud")).unwrap();
+    fs::write(dependency.join("Ruddy.toml"), "name = \"dep\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\ntarget = \"js\"\n[dependencies]\nstd = false\n").unwrap();
     let portable = build_project(&dependency).expect("dependency builds before the caller exists");
     let text = fs::read_to_string(&portable).unwrap();
     let artifact = ruddy::artifact::Artifact::try_parse(&text)
@@ -204,21 +204,21 @@ fn independently_built_cps_bundles_suspend_in_order_and_resume_callers() {
             .iter()
             .any(|f| f.suspension == ruddy::lir::Suspension::MaySuspend)
     );
-    fs::copy(fixture.join("main.hc"), project.path().join("main.hc")).unwrap();
+    fs::copy(fixture.join("main.rud"), project.path().join("main.rud")).unwrap();
     fs::copy(
         fixture.join("multibundle.test.mjs"),
         project.path().join("multibundle.test.mjs"),
     )
     .unwrap();
-    fs::write(project.path().join("Ruddy.toml"), "name = \"root\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\ntarget = \"js\"\n[dependencies]\nstd = false\ndep = \"./dep\"\n").unwrap();
+    fs::write(project.path().join("Ruddy.toml"), "name = \"root\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\ntarget = \"js\"\n[dependencies]\nstd = false\ndep = \"./dep\"\n").unwrap();
     run_assertions(project.path(), "multibundle.test.mjs");
 }
 
 #[test]
 fn executable_main_waits_for_async_initialization_and_preserves_process_exit() {
     let project = tempfile::tempdir().unwrap();
-    fs::write(project.path().join("Ruddy.toml"), "name = \"async-main\"\nversion = \"1.0.0\"\nkind = \"executable\"\nroot = \"main.hc\"\ntarget = \"js\"\n[dependencies]\nstd = false\n").unwrap();
-    fs::write(project.path().join("main.hc"), r#"
+    fs::write(project.path().join("Ruddy.toml"), "name = \"async-main\"\nversion = \"1.0.0\"\nkind = \"executable\"\nroot = \"main.rud\"\ntarget = \"js\"\n[dependencies]\nstd = false\n").unwrap();
+    fs::write(project.path().join("main.rud"), r#"
         effect Console = { write: String -> (), write_error: String -> () }
         effect Process = { exit: Nat -> | }
         @async
@@ -246,8 +246,8 @@ fn executable_main_waits_for_async_initialization_and_preserves_process_exit() {
 #[test]
 fn async_initialization_does_not_assimilate_ordinary_thenable_data() {
     let project = tempfile::tempdir().unwrap();
-    fs::write(project.path().join("Ruddy.toml"), "name = \"async-data\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\ntarget = \"js\"\n[dependencies]\nstd = false\n").unwrap();
-    fs::write(project.path().join("main.hc"), r#"
+    fs::write(project.path().join("Ruddy.toml"), "name = \"async-data\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\ntarget = \"js\"\n[dependencies]\nstd = false\n").unwrap();
+    fs::write(project.path().join("main.rud"), r#"
         @async
         extern wait : () -> () = "() => Promise.resolve(null)"
         extern data : () -> { "then": Nat } = "() => ({ get then() { globalThis.inspected++; return () => {}; } })"

@@ -148,11 +148,11 @@ fn entry_adapter(artifact: &Artifact) -> Result<Artifact, Error> {
 // The platform ABI is structural. These declarations describe the runtime's
 // supported interfaces independently of a project's choice of std bundle.
 const NODE_ENTRY: &str = concat!(
-    include_str!("node-platform.hc"),
+    include_str!("node-platform.rud"),
     "let with_platform: (() -> 'a + !Console + !Process + !FileSystem) -> 'a = fn body => handle body () with\n",
-    include_str!("node-handler.hc"),
+    include_str!("node-handler.rud"),
     "end\n",
-    include_str!("node-entry.hc")
+    include_str!("node-entry.rud")
 );
 
 struct Generator<'a> {

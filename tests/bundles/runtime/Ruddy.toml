@@ -1,7 +1,7 @@
 name = "runtime-tests"
 kind = "library"
 version = "1.0.0"
-root = "main.hc"
+root = "main.rud"
 target = "js"
 
 [run]

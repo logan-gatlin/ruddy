@@ -1,6 +1,6 @@
 # tree-sitter-ruddy
 
-The tree-sitter grammar for ruddy — the `.hc` files the `ruddy` compiler
+The tree-sitter grammar for ruddy — the `.rud` files the `ruddy` compiler
 library parses, the command-line driver in `cli/src/main.rs` compiles, and the
 debugger edits. It exists so that editors can colour, fold and navigate a
 source file without running the compiler.
@@ -15,7 +15,7 @@ repository's `CLAUDE.md`.
 | Path | What it is |
 | --- | --- |
 | `grammar.js` | The grammar. The file to edit. |
-| `tree-sitter.json` | Grammar metadata: the `hc` extension, and where the queries live. |
+| `tree-sitter.json` | Grammar metadata: the `rud` extension, and where the queries live. |
 | `queries/highlights.scm` | What each node is painted as. |
 | `queries/locals.scm` | Scopes, what binds in them, and what a name may resolve to. |
 | `queries/folds.scm` | The forms worth folding away. |
@@ -35,12 +35,12 @@ Or, by hand, from this directory:
 npx tree-sitter generate            # rebuild src/ from grammar.js
 npx tree-sitter test                # run test/corpus
 npx tree-sitter test -u             # rewrite the expected trees — read the diff
-npx tree-sitter parse ../demo.hc    # the whole demo, as a tree
-npx tree-sitter highlight ../demo.hc
-npx tree-sitter query queries/highlights.scm ../demo.hc
+npx tree-sitter parse ../demo.rud    # the whole demo, as a tree
+npx tree-sitter highlight ../demo.rud
+npx tree-sitter query queries/highlights.scm ../demo.rud
 ```
 
-`demo.hc` ends with three deliberately broken definitions, so a parse of it is
+`demo.rud` ends with three deliberately broken definitions, so a parse of it is
 expected to report errors on those lines and nowhere else.
 
 Adding a corpus test: write the source and leave `(source_file)` as the expected
@@ -94,6 +94,12 @@ language entry to `~/.config/helix/languages.toml` — unless one naming `ruddy`
 is already there, in which case it leaves the file alone. Re-running it after
 `just grammar` reinstalls the parser and the queries.
 
+The installer adapts `locals.scm` for Helix: references take their color from
+captures such as `local.definition.variable.parameter`. The bare definition
+captures used by Tree-sitter's highlight tests are removed during installation,
+because Helix interprets them as discards. Use `just helix` rather than copying
+this query unchanged. Restart Helix after updating the queries.
+
 `hx --health ruddy` should report a tree-sitter parser and highlight queries.
 There are no textobject or indent queries, so those two stay unticked.
 
@@ -106,7 +112,7 @@ path is what needs fixing.
 With `nvim-treesitter` installed:
 
 ```lua
-vim.filetype.add({ extension = { hc = "ruddy" } })
+vim.filetype.add({ extension = { rud = "ruddy" } })
 
 require("nvim-treesitter.parsers").get_parser_configs().ruddy = {
   install_info = {

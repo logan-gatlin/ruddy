@@ -7,7 +7,7 @@ use ruddy::{
 
 fn program(text: &str) -> (Mint, ir::Program) {
     let mut files = ruddy::tracking::FileManager::new();
-    let file = files.register_new_file("main.hc".into(), text.into());
+    let file = files.register_new_file("main.rud".into(), text.into());
     let parsed = parse::parse(token::lex(text, file).tokens);
     assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
     let mut mint = Mint::new(Bundle::new("queries", Version::new(0, 0, 0)).unwrap());
@@ -70,34 +70,34 @@ fn unchanged_interfaces_reuse_callers_and_refresh_explanations() {
 #[test]
 fn current_broken_buffers_keep_unaffected_definitions() {
     let mut host = ruddy::analysis::Host::default();
-    host.set_file("main.hc", Some("let good = 1n\nlet broken =".into()));
+    host.set_file("main.rud", Some("let good = 1n\nlet broken =".into()));
     let bundle = Bundle::new("editor", Version::new(0, 0, 0)).unwrap();
     let analysis = host.analyze(
         bundle,
-        "main.hc",
+        "main.rud",
         &ruddy::bundle::Environment::new([("target", "js"), ("platform", "node")]),
     );
     assert!(!analysis.diagnostics.is_empty());
-    assert_eq!(analysis.hover("main.hc", 5).unwrap().ty, "Nat");
+    assert_eq!(analysis.hover("main.rud", 5).unwrap().ty, "Nat");
 }
 
 #[test]
 fn hover_and_navigation_follow_current_expression_bindings() {
     let mut host = ruddy::analysis::Host::default();
     host.set_file(
-        "main.hc",
+        "main.rud",
         Some("let id = fn x => x\nlet use = id 1n".into()),
     );
     let analysis = host.analyze(
         Bundle::new("editor", Version::new(0, 0, 0)).unwrap(),
-        "main.hc",
+        "main.rud",
         &ruddy::bundle::Environment::new([]),
     );
     assert!(analysis.diagnostics.is_empty());
-    let target = analysis.definition("main.hc", 29).unwrap();
+    let target = analysis.definition("main.rud", 29).unwrap();
     assert_eq!(target.start, 4);
-    assert!(analysis.hover("main.hc", 29).unwrap().ty.contains("Nat"));
-    let local = analysis.definition("main.hc", 17).unwrap();
+    assert!(analysis.hover("main.rud", 29).unwrap().ty.contains("Nat"));
+    let local = analysis.definition("main.rud", 17).unwrap();
     assert_eq!(local.start, 12);
 }
 
@@ -106,13 +106,13 @@ fn completion_uses_lexical_scope_and_known_record_fields() {
     let mut host = ruddy::analysis::Host::default();
     let text =
         "let record = { count: 1n, label: \"x\" }\nlet use = fn item => item\nlet field = record.";
-    host.set_file("main.hc", Some(text.into()));
+    host.set_file("main.rud", Some(text.into()));
     let analysis = host.analyze(
         Bundle::new("editor", Version::new(0, 0, 0)).unwrap(),
-        "main.hc",
+        "main.rud",
         &ruddy::bundle::Environment::new([]),
     );
-    let fields = analysis.completions("main.hc", text.len());
+    let fields = analysis.completions("main.rud", text.len());
     assert_eq!(
         fields
             .iter()
@@ -120,9 +120,9 @@ fn completion_uses_lexical_scope_and_known_record_fields() {
             .collect::<Vec<_>>(),
         ["count", "label"]
     );
-    let names = analysis.completions("main.hc", text.find("=> item").unwrap() + 5);
+    let names = analysis.completions("main.rud", text.find("=> item").unwrap() + 5);
     assert!(names.iter().any(|item| item.label == "item"));
-    let outside = analysis.completions("main.hc", 0);
+    let outside = analysis.completions("main.rud", 0);
     assert!(!outside.iter().any(|item| item.label == "item"));
 }
 
@@ -196,19 +196,19 @@ fn unrelated_declaration_edits_do_not_repeat_value_inference() {
 fn unsaved_dependency_interfaces_flow_without_lowering() {
     let mut dependency = ruddy::analysis::Host::default();
     let mut root = ruddy::analysis::Host::default();
-    root.set_file("main.hc", Some("let answer = dep::value".into()));
+    root.set_file("main.rud", Some("let answer = dep::value".into()));
     let environment = ruddy::bundle::Environment::new([]);
     for (source, expected) in [("let value = 1n", "Nat"), ("let value = false", "Boolean")] {
-        dependency.set_file("main.hc", Some(source.into()));
+        dependency.set_file("main.rud", Some(source.into()));
         let analysis = dependency.analyze(
             Bundle::new("dep", Version::new(0, 0, 0)).unwrap(),
-            "main.hc",
+            "main.rud",
             &environment,
         );
         let interface = analysis.interface();
         let analysis = root.analyze_with_interfaces(
             Bundle::new("root", Version::new(0, 0, 0)).unwrap(),
-            "main.hc",
+            "main.rud",
             &environment,
             &[ir::InterfaceImport {
                 alias: "dep",
@@ -221,7 +221,7 @@ fn unsaved_dependency_interfaces_flow_without_lowering() {
             "{:?}",
             analysis.diagnostics
         );
-        assert_eq!(analysis.hover("main.hc", 5).unwrap().ty, expected);
+        assert_eq!(analysis.hover("main.rud", 5).unwrap().ty, expected);
     }
 }
 
@@ -232,40 +232,40 @@ fn workspace_tracks_unsaved_local_dependencies_and_navigation() {
     let root = tree.path().join("root");
     std::fs::create_dir_all(&dep).unwrap();
     std::fs::create_dir_all(&root).unwrap();
-    std::fs::write(dep.join("Ruddy.toml"), "name = \"dep\"\nversion = \"0.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n").unwrap();
-    std::fs::write(root.join("Ruddy.toml"), "name = \"root\"\nversion = \"0.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\ndep = \"../dep\"\n").unwrap();
-    std::fs::write(dep.join("main.hc"), "let value = 1n").unwrap();
-    std::fs::write(root.join("main.hc"), "let answer = dep::value").unwrap();
+    std::fs::write(dep.join("Ruddy.toml"), "name = \"dep\"\nversion = \"0.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\n").unwrap();
+    std::fs::write(root.join("Ruddy.toml"), "name = \"root\"\nversion = \"0.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\ndep = \"../dep\"\n").unwrap();
+    std::fs::write(dep.join("main.rud"), "let value = 1n").unwrap();
+    std::fs::write(root.join("main.rud"), "let answer = dep::value").unwrap();
     let mut workspace = ruddy_cli::workspace::Workspace::new(root.clone());
     workspace.refresh().unwrap();
-    let (project, logical) = workspace.file(&root.join("main.hc")).unwrap();
+    let (project, logical) = workspace.file(&root.join("main.rud")).unwrap();
     assert_eq!(project.analysis.hover(logical, 5).unwrap().ty, "Nat");
-    let (target, span) = workspace.definition(&root.join("main.hc"), 19).unwrap();
-    assert_eq!(target, dep.join("main.hc"));
+    let (target, span) = workspace.definition(&root.join("main.rud"), 19).unwrap();
+    assert_eq!(target, dep.join("main.rud"));
     assert_eq!(span.start, 4);
-    workspace.set_overlay(&dep.join("main.hc"), Some("let value = false".into()));
+    workspace.set_overlay(&dep.join("main.rud"), Some("let value = false".into()));
     workspace.refresh().unwrap();
-    let (project, logical) = workspace.file(&root.join("main.hc")).unwrap();
+    let (project, logical) = workspace.file(&root.join("main.rud")).unwrap();
     assert_eq!(project.analysis.hover(logical, 5).unwrap().ty, "Boolean");
 }
 
 #[test]
 fn qualified_completion_uses_imported_source_names() {
     let mut dep = ruddy::analysis::Host::default();
-    dep.set_file("main.hc", Some("let value = 1n".into()));
+    dep.set_file("main.rud", Some("let value = 1n".into()));
     let environment = ruddy::bundle::Environment::new([]);
     let dep = dep
         .analyze(
             Bundle::new("dependency", Version::new(0, 0, 0)).unwrap(),
-            "main.hc",
+            "main.rud",
             &environment,
         )
         .interface();
     let mut root = ruddy::analysis::Host::default();
-    root.set_file("main.hc", Some("let answer = lib::va".into()));
+    root.set_file("main.rud", Some("let answer = lib::va".into()));
     let root = root.analyze_with_interfaces(
         Bundle::new("root", Version::new(0, 0, 0)).unwrap(),
-        "main.hc",
+        "main.rud",
         &environment,
         &[ir::InterfaceImport {
             alias: "lib",
@@ -274,7 +274,7 @@ fn qualified_completion_uses_imported_source_names() {
         &[&dep],
     );
     assert!(
-        root.completions("main.hc", 20)
+        root.completions("main.rud", 20)
             .iter()
             .any(|item| item.label == "value")
     );
@@ -315,10 +315,10 @@ fn equivalent_effect_origins_refresh_without_reinferring_callers() {
 
 fn editor_source(text: &str) -> ruddy::analysis::Analysis {
     let mut host = ruddy::analysis::Host::default();
-    host.set_file("main.hc", Some(text.into()));
+    host.set_file("main.rud", Some(text.into()));
     host.analyze(
         Bundle::new("editor", Version::new(0, 0, 0)).unwrap(),
-        "main.hc",
+        "main.rud",
         &ruddy::bundle::Environment::new([]),
     )
 }
@@ -342,7 +342,7 @@ fn completion_understands_annotations_effect_qualifiers_and_pattern_binders() {
         ),
     ] {
         let analysis = editor_source(text);
-        let items = analysis.completions("main.hc", text.len());
+        let items = analysis.completions("main.rud", text.len());
         assert!(
             items.iter().any(|item| item.label == expected),
             "{text}: {items:?}"
@@ -353,20 +353,20 @@ fn completion_understands_annotations_effect_qualifiers_and_pattern_binders() {
 #[test]
 fn active_file_requests_and_background_completion_share_one_revision() {
     let mut host = ruddy::analysis::Host::default();
-    host.set_file("main.hc", Some("module Other\nlet value = 1n".into()));
+    host.set_file("main.rud", Some("module Other\nlet value = 1n".into()));
     host.set_file(
-        "Other.hc",
+        "Other.rud",
         Some("let identity = fn x => x\nlet problem : Nat = false".into()),
     );
-    host.focus(Some("main.hc"));
+    host.focus(Some("main.rud"));
     let mut analysis = host.analyze(
         Bundle::new("editor", Version::new(0, 0, 0)).unwrap(),
-        "main.hc",
+        "main.rud",
         &ruddy::bundle::Environment::new([]),
     );
     assert!(analysis.diagnostics.is_empty());
     assert_eq!(host.solved_groups(), 1);
-    host.request_file(&mut analysis, "Other.hc");
+    host.request_file(&mut analysis, "Other.rud");
     assert!(!analysis.diagnostics.is_empty());
     let count = host.solved_groups();
     host.complete(&mut analysis);
@@ -381,14 +381,14 @@ fn navigation_follows_written_type_and_effect_references() {
     let analysis = editor_source(source);
     assert_eq!(
         analysis
-            .definition("main.hc", source.find("Item ->").unwrap())
+            .definition("main.rud", source.find("Item ->").unwrap())
             .unwrap()
             .start,
         5
     );
     assert_eq!(
         analysis
-            .definition("main.hc", source.find("!Log =").unwrap() + 1)
+            .definition("main.rud", source.find("!Log =").unwrap() + 1)
             .unwrap()
             .start,
         source.find("Log =").unwrap()
@@ -441,16 +441,16 @@ fn file_candidates_configuration_and_moved_diagnostics_use_current_inputs() {
         (original.to_owned(), None, Some("let answer = false"), "web"),
         (original.to_owned(), None, None, "node"),
     ] {
-        host.set_file("main.hc", Some(main.clone()));
-        host.set_file("Added.hc", added.map(str::to_owned));
-        host.set_file("Added/module.hc", competing.map(str::to_owned));
+        host.set_file("main.rud", Some(main.clone()));
+        host.set_file("Added.rud", added.map(str::to_owned));
+        host.set_file("Added/module.rud", competing.map(str::to_owned));
         let environment = ruddy::bundle::Environment::new([("platform", platform)]);
-        let updated = host.analyze(identity.clone(), "main.hc", &environment);
+        let updated = host.analyze(identity.clone(), "main.rud", &environment);
         let mut fresh = ruddy::analysis::Host::default();
-        fresh.set_file("main.hc", Some(main));
-        fresh.set_file("Added.hc", added.map(str::to_owned));
-        fresh.set_file("Added/module.hc", competing.map(str::to_owned));
-        let fresh = fresh.analyze(identity.clone(), "main.hc", &environment);
+        fresh.set_file("main.rud", Some(main));
+        fresh.set_file("Added.rud", added.map(str::to_owned));
+        fresh.set_file("Added/module.rud", competing.map(str::to_owned));
+        let fresh = fresh.analyze(identity.clone(), "main.rud", &environment);
         assert_eq!(updated.diagnostics, fresh.diagnostics);
         assert_eq!(updated.interface(), fresh.interface());
     }
@@ -507,9 +507,9 @@ fn repairing_an_annotated_body_keeps_its_caller_contract() {
 #[test]
 fn invalid_manifest_revisions_do_not_keep_old_workspace_semantics() {
     let tree = tempfile::tempdir().unwrap();
-    let manifest = "name = \"editor\"\nversion = \"0.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false";
+    let manifest = "name = \"editor\"\nversion = \"0.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false";
     std::fs::write(tree.path().join("Ruddy.toml"), manifest).unwrap();
-    std::fs::write(tree.path().join("main.hc"), "let value = 1n").unwrap();
+    std::fs::write(tree.path().join("main.rud"), "let value = 1n").unwrap();
     let mut workspace = ruddy_cli::workspace::Workspace::new(tree.path().to_path_buf());
     workspace.refresh().unwrap();
     assert!(workspace.check_background().is_empty());
@@ -518,10 +518,10 @@ fn invalid_manifest_revisions_do_not_keep_old_workspace_semantics() {
         Some("not valid toml".into()),
     );
     assert!(workspace.refresh().is_err());
-    assert!(workspace.file(&tree.path().join("main.hc")).is_none());
+    assert!(workspace.file(&tree.path().join("main.rud")).is_none());
     workspace.set_overlay(&tree.path().join("Ruddy.toml"), None);
     workspace.refresh().unwrap();
-    assert!(workspace.file(&tree.path().join("main.hc")).is_some());
+    assert!(workspace.file(&tree.path().join("main.rud")).is_some());
 }
 
 #[test]
@@ -547,11 +547,11 @@ fn reordered_fields_refresh_cached_diagnostic_evidence() {
     let mut host = ruddy::analysis::Host::default();
     let bundle = Bundle::new("editor", Version::new(0, 0, 0)).unwrap();
     let environment = ruddy::bundle::Environment::new([]);
-    host.set_file("main.hc", Some(before.into()));
-    host.analyze(bundle.clone(), "main.hc", &environment);
+    host.set_file("main.rud", Some(before.into()));
+    host.analyze(bundle.clone(), "main.rud", &environment);
     let count = host.solved_groups();
-    host.set_file("main.hc", Some(after.into()));
-    let updated = host.analyze(bundle, "main.hc", &environment);
+    host.set_file("main.rud", Some(after.into()));
+    let updated = host.analyze(bundle, "main.rud", &environment);
     let fresh = editor_source(after);
     assert_eq!(host.solved_groups() - count, 1);
     assert!(!updated.diagnostics.is_empty());
@@ -562,16 +562,16 @@ fn reordered_fields_refresh_cached_diagnostic_evidence() {
 fn incomplete_annotations_complete_in_their_module_scope() {
     let mut host = ruddy::analysis::Host::default();
     let child = "type Person = { name: String }\nlet value : Per";
-    host.set_file("main.hc", Some("module Child".into()));
-    host.set_file("Child.hc", Some(child.into()));
+    host.set_file("main.rud", Some("module Child".into()));
+    host.set_file("Child.rud", Some(child.into()));
     let analysis = host.analyze(
         Bundle::new("editor", Version::new(0, 0, 0)).unwrap(),
-        "main.hc",
+        "main.rud",
         &ruddy::bundle::Environment::new([]),
     );
     assert!(
         analysis
-            .completions("Child.hc", child.len())
+            .completions("Child.rud", child.len())
             .iter()
             .any(|item| item.label == "Person")
     );
@@ -579,7 +579,7 @@ fn incomplete_annotations_complete_in_their_module_scope() {
     let analysis = editor_source(inline);
     assert!(
         analysis
-            .completions("main.hc", inline.find("Per end").unwrap() + 3)
+            .completions("main.rud", inline.find("Per end").unwrap() + 3)
             .iter()
             .any(|item| item.label == "Person")
     );
@@ -593,21 +593,21 @@ fn symlinked_document_paths_share_unsaved_source_identity() {
     std::fs::create_dir(&real).unwrap();
     let link = tree.path().join("link");
     std::os::unix::fs::symlink(&real, &link).unwrap();
-    std::fs::write(real.join("Ruddy.toml"), "name = \"editor\"\nversion = \"0.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false").unwrap();
-    std::fs::write(real.join("main.hc"), "let value = 1n").unwrap();
+    std::fs::write(real.join("Ruddy.toml"), "name = \"editor\"\nversion = \"0.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false").unwrap();
+    std::fs::write(real.join("main.rud"), "let value = 1n").unwrap();
     let mut workspace = ruddy_cli::workspace::Workspace::new(link.clone());
-    workspace.focus(&link.join("main.hc"));
+    workspace.focus(&link.join("main.rud"));
     workspace.set_overlay(
-        &link.join("main.hc"),
+        &link.join("main.rud"),
         Some("module Added\nlet value = Added::answer".into()),
     );
-    workspace.set_overlay(&link.join("Added.hc"), Some("let answer = false".into()));
+    workspace.set_overlay(&link.join("Added.rud"), Some("let answer = false".into()));
     workspace.refresh().unwrap();
-    let (project, logical) = workspace.file(&link.join("main.hc")).unwrap();
+    let (project, logical) = workspace.file(&link.join("main.rud")).unwrap();
     assert_eq!(project.analysis.hover(logical, 17).unwrap().ty, "Boolean");
     assert!(project.analysis.diagnostics.is_empty());
-    assert!(workspace.file(&real.join("Added.hc")).is_some());
-    assert!(workspace.definition(&link.join("main.hc"), 31).is_some());
+    assert!(workspace.file(&real.join("Added.rud")).is_some());
+    assert!(workspace.definition(&link.join("main.rud"), 31).is_some());
 }
 
 #[test]
@@ -618,12 +618,12 @@ fn hover_includes_extern_declaration_names() {
     assert!(analysis.diagnostics.is_empty());
     assert!(
         analysis
-            .hover("main.hc", text.find("local").unwrap() + 1)
+            .hover("main.rud", text.find("local").unwrap() + 1)
             .is_some()
     );
     assert!(
         analysis
-            .hover("main.hc", text.find("add").unwrap() + 1)
+            .hover("main.rud", text.find("add").unwrap() + 1)
             .is_some(),
         "extern declaration names need hover types just like let declarations"
     );
@@ -646,7 +646,7 @@ fn hover_includes_type_effect_and_module_declarations() {
     ] {
         let start = text.find(name).unwrap();
         let hover = analysis
-            .hover("main.hc", start)
+            .hover("main.rud", start)
             .unwrap_or_else(|| panic!("missing hover for {name}"));
         assert_eq!(hover.span.start, start);
         assert_eq!(hover.span.width, name.len());

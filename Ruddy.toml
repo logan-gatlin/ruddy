@@ -1,7 +1,7 @@
 name = "std"
 kind = "library"
 version = "0.1.0"
-root = "std/lib.hc"
+root = "std/lib.rud"
 
 [dependencies]
 std = false

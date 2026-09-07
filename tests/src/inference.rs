@@ -57,7 +57,7 @@ fn a_group_is_reused_when_nothing_it_reads_changed() {
     // above a definition leaving the definition's anchors alone.
     let lowered = |src: &str| {
         let mut files = ruddy::tracking::FileManager::new();
-        let id = files.register_new_file("memo.hc".into(), src.into());
+        let id = files.register_new_file("memo.rud".into(), src.into());
         let parsed = parse::parse(lex(src, id).tokens);
         assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
         let mut mint = dummy_mint();

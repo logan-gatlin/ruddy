@@ -44,7 +44,7 @@ fn main() -> ExitCode {
     let repo = crate_dir.parent().unwrap_or(&crate_dir).to_path_buf();
     let scratch = crate_dir.join("scratch");
 
-    if let Err(err) = docs::ensure(&scratch, &repo.join("demo.hc")) {
+    if let Err(err) = docs::ensure(&scratch, &repo.join("demo.rud")) {
         eprintln!("error: could not prepare {}: {err}", scratch.display());
         return ExitCode::FAILURE;
     }
