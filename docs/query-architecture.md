@@ -49,7 +49,9 @@ traces, while its backend stages retain this acceptance requirement.
 The protocol router remains responsive while the analysis worker runs. New
 document versions cancel obsolete work; requests interrupt idle background work.
 Cancellation checks occur during parsing, IR construction, inference, lowering,
-and between Varisat scheduler steps. The small vendored Varisat patch is described
+and between Varisat scheduler steps. Git acquisition runs on a separate thread
+with the same cancellation signal; the editor can abandon its wait even during a
+blocked network read. Git cache-lock acquisition also checks cancellation. The small vendored Varisat patch is described
 in [its maintenance note](../vendor/varisat/RUDDY.md). A revision barrier prevents
 obsolete diagnostic publication. Open documents receive versioned diagnostics;
 background checks also publish and clear diagnostics for unopened reachable files.
@@ -60,7 +62,10 @@ The workspace driver acquires sources, manifests, dependency selection, and the
 root build configuration outside Salsa queries. Overlays apply across reachable
 local dependencies. Git dependencies and installed std are analyzed from source
 for navigation. The existing CLI artifact cache remains in use; Salsa caches are
-in-memory and are not persisted.
+in-memory and are not persisted. Successfully acquired Git selections survive
+ordinary edits and are reconsidered when their specification or root lock inputs
+change. Document identity resolves existing symlink prefixes, including for
+new unsaved files; watcher paths retain the loader's original spelling.
 
 The driver records every requested disk input, including absent and competing
 module candidates, manifests, and the root lockfile. The server polls these exact
@@ -102,7 +107,9 @@ The Linux benchmark creates exactly 10,000 source lines: a root, 98 module files
 and a local path dependency. It includes structural records, handled structural
 effects, function application, and mutually recursive groups. Std is disabled;
 dependencies are already on disk and no downloads are involved. The corpus hash
-and individual request samples are recorded with the results.
+and individual request samples are recorded with the results. Generated projects
+are retained under `.scratch/salsa-query-architecture/benchmarks/`, in a new directory for each run; the
+JSON result includes `benchmark_project`. They are not deleted after measurement.
 
 Cold time includes server startup and initialization through the first active-file
 diagnostics. After initial whole-project checking populates the cache, ordinary

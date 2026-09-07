@@ -584,3 +584,28 @@ fn incomplete_annotations_complete_in_their_module_scope() {
             .any(|item| item.label == "Person")
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn symlinked_document_paths_share_unsaved_source_identity() {
+    let tree = tempfile::tempdir().unwrap();
+    let real = tree.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = tree.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    std::fs::write(real.join("Ruddy.toml"), "name = \"editor\"\nversion = \"0.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false").unwrap();
+    std::fs::write(real.join("main.hc"), "let value = 1n").unwrap();
+    let mut workspace = ruddy_cli::workspace::Workspace::new(link.clone());
+    workspace.focus(&link.join("main.hc"));
+    workspace.set_overlay(
+        &link.join("main.hc"),
+        Some("module Added\nlet value = Added::answer".into()),
+    );
+    workspace.set_overlay(&link.join("Added.hc"), Some("let answer = false".into()));
+    workspace.refresh().unwrap();
+    let (project, logical) = workspace.file(&link.join("main.hc")).unwrap();
+    assert_eq!(project.analysis.hover(logical, 17).unwrap().ty, "Boolean");
+    assert!(project.analysis.diagnostics.is_empty());
+    assert!(workspace.file(&real.join("Added.hc")).is_some());
+    assert!(workspace.definition(&link.join("main.hc"), 31).is_some());
+}

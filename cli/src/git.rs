@@ -3,7 +3,7 @@ use std::{
     env, fs,
     fs::{File, OpenOptions},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use serde::{Deserialize, Serialize};
@@ -375,7 +375,16 @@ fn acquire_cache_lock(home: &Path) -> Result<File, CompileError> {
             .with_note(error.to_string())
             .with_help("check that the cache folder is writable")
         })?;
-    fs2::FileExt::lock_exclusive(&file).map_err(|error| {
+    let locked = loop {
+        ruddy::cancellation::checkpoint();
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            result => break result,
+        }
+    };
+    locked.map_err(|error| {
         CompileError::report(
             "git-cache-unavailable",
             format!(
@@ -551,10 +560,12 @@ fn clone_to(
         // unadvertised objects. All tags are needed for tag-only revisions.
         Ok(remote.with_fetch_tags(gix::remote::fetch::Tags::All))
     });
+    let cancellation = ruddy::cancellation::Cancellation::current();
     let result = (|| {
         let (mut checkout, _) =
-            prepare.fetch_then_checkout(gix::progress::Discard, &AtomicBool::new(false))?;
-        let (repo, _) = checkout.main_worktree(gix::progress::Discard, &AtomicBool::new(false))?;
+            prepare.fetch_then_checkout(gix::progress::Discard, cancellation.signal())?;
+        let (repo, _) = checkout.main_worktree(gix::progress::Discard, cancellation.signal())?;
+        ruddy::cancellation::checkpoint();
         if let Some(commit) = locked {
             checkout_commit(&repo, commit)?;
         }
@@ -730,15 +741,18 @@ fn checkout_commit(repo: &gix::Repository, commit: &str) -> Result<(), Box<dyn s
     let mut progress = gix::progress::Discard;
     let files = progress.add_child("checkout");
     let bytes = progress.add_child("bytes");
+    let cancellation = ruddy::cancellation::Cancellation::current();
     gix::worktree::state::checkout(
         &mut index,
         workdir,
         repo.objects.clone().into_arc()?,
         &files,
         &bytes,
-        &AtomicBool::new(false),
+        cancellation.signal(),
         options,
     )?;
+    // gix may report an interrupted checkout as Ok; do not publish its partial index.
+    ruddy::cancellation::checkpoint();
     index.write(Default::default())?;
     repo.reference(
         "HEAD",

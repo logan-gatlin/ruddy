@@ -1,6 +1,6 @@
 # Salsa query architecture and responsive LSP
 
-Status: Implemented; final sustained measurements and implementation review in progress.
+Status: Implemented and reviewed; performance criteria met. See `progress.md` for validation and the remaining coverage-target gap.
 
 ## Objective
 

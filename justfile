@@ -150,7 +150,7 @@ cov *args:
     eval "$(cargo +"$coverage_toolchain" llvm-cov show-env --branch --sh)"
     cargo +"$coverage_toolchain" llvm-cov clean
     RUSTUP_TOOLCHAIN="$coverage_toolchain" just test
-    cargo +"$coverage_toolchain" llvm-cov report --ignore-filename-regex '/(tests|debug|cli)/src/|/rustlib/' {{args}}
+    cargo +"$coverage_toolchain" llvm-cov report --ignore-filename-regex '/(tests|debug|cli|lsp)/src/|/vendor/|/rustlib/' {{args}}
 
 clippy:
     cargo clippy --workspace --all-targets

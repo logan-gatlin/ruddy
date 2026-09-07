@@ -27,7 +27,7 @@ def module(dependency=False):
 
 def percentile(samples):
     return round(sorted(samples)[max(0, int(len(samples) * 0.95 + 0.999) - 1)], 3)
-with tempfile.TemporaryDirectory(prefix='ruddy-lsp-bench-') as directory:
+def benchmark(directory):
     tree = pathlib.Path(directory)
     root = tree / 'root'
     dep = tree / 'dep'
@@ -145,4 +145,10 @@ with tempfile.TemporaryDirectory(prefix='ruddy-lsp-bench-') as directory:
     send({'method': 'exit', 'params': None})
     proc.stdin.close()
     proc.wait(timeout=10)
-    print(json.dumps({'machine': platform.platform(), 'cpu': next((line.split(':', 1)[1].strip() for line in pathlib.Path('/proc/cpuinfo').read_text().splitlines() if line.startswith('model name')), ''), 'profile': 'release', 'corpus_lines': 10000, 'corpus_sha256': digest, 'dependencies': 'one local path dependency; std disabled; no downloads', 'iterations': iterations, 'samples_ms': timings, 'cold_ms': round(cold, 3), 'initial_background_ms': round(initial_background, 3), 'interface_edit_ms': {'hover': round(wide_hover, 3), 'background': round(wide_diagnostics[-1], 3)}, 'p95_ms': {key: percentile(values) for key, values in timings.items()}, 'rss_peak_mib': round(peak_rss / 1048576, 2), 'rss_max_mib': round(max(rss) / 1048576, 2), 'rss_first_mib': round(rss[0] / 1048576, 2), 'rss_last_mib': round(rss[-1] / 1048576, 2)}, indent=2))
+    print(json.dumps({'machine': platform.platform(), 'cpu': next((line.split(':', 1)[1].strip() for line in pathlib.Path('/proc/cpuinfo').read_text().splitlines() if line.startswith('model name')), ''), 'profile': 'release', 'benchmark_project': str(tree), 'corpus_lines': 10000, 'corpus_sha256': digest, 'dependencies': 'one local path dependency; std disabled; no downloads', 'iterations': iterations, 'samples_ms': timings, 'cold_ms': round(cold, 3), 'initial_background_ms': round(initial_background, 3), 'interface_edit_ms': {'hover': round(wide_hover, 3), 'background': round(wide_diagnostics[-1], 3)}, 'p95_ms': {key: percentile(values) for key, values in timings.items()}, 'rss_peak_mib': round(peak_rss / 1048576, 2), 'rss_max_mib': round(max(rss) / 1048576, 2), 'rss_first_mib': round(rss[0] / 1048576, 2), 'rss_last_mib': round(rss[-1] / 1048576, 2)}, indent=2))
+
+# Retain every generated workspace for manual inspection and editor testing.
+# A new directory per run avoids overwriting edits made to an earlier corpus.
+projects = pathlib.Path(__file__).resolve().parents[1] / '.scratch' / 'salsa-query-architecture' / 'benchmarks'
+projects.mkdir(parents=True, exist_ok=True)
+benchmark(tempfile.mkdtemp(prefix='workspace-', dir=projects))

@@ -8,7 +8,9 @@ fn editor_can_initialize_open_hover_and_shutdown() {
     std::fs::write(tree.path().join("Ruddy.toml"), "name = \"editor\"\nversion = \"0.0.0\"\nkind = \"library\"\nroot = \"main.hc\"\n[dependencies]\nstd = false").unwrap();
     std::fs::write(tree.path().join("main.hc"), "let value = 1n").unwrap();
     let root = format!("file://{}", tree.path().display());
-    let uri = format!("{root}/main.hc");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(tree.path().join("main.hc"), tree.path().join("open.hc")).unwrap();
+    let uri = format!("{root}/{}", if cfg!(unix) { "open.hc" } else { "main.hc" });
     let (server, client) = Connection::memory();
     let worker = std::thread::spawn(move || ruddy_lsp::serve(server).unwrap());
     client
@@ -37,7 +39,7 @@ fn editor_can_initialize_open_hover_and_shutdown() {
             json!({}),
         )))
         .unwrap();
-    client.sender.send(Message::Notification(Notification::new("textDocument/didOpen".into(), json!({"textDocument":{"uri":uri,"languageId":"ruddy","version":1,"text":"let value = false"}})))).unwrap();
+    client.sender.send(Message::Notification(Notification::new("textDocument/didOpen".into(), json!({"textDocument":{"uri":uri,"languageId":"ruddy","version":1,"text":"let value = false\nlet use = value"}})))).unwrap();
     client
         .sender
         .send(Message::Request(Request::new(
@@ -57,6 +59,28 @@ fn editor_can_initialize_open_hover_and_shutdown() {
                     .as_str()
                     .unwrap()
                     .contains("Boolean")
+            );
+            break;
+        }
+    }
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            4.into(),
+            "textDocument/definition".into(),
+            json!({"textDocument":{"uri":uri},"position":{"line":1,"character":12}}),
+        )))
+        .unwrap();
+    loop {
+        if let Message::Response(response) = client
+            .receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+        {
+            assert_eq!(
+                response.response_result.unwrap()["uri"],
+                uri,
+                "navigation preserves the open buffer URI"
             );
             break;
         }

@@ -1,19 +1,36 @@
 //! Cooperative cancellation across syntax, lowering, inference, and SAT work.
-use std::{cell::RefCell, panic::AssertUnwindSafe};
+use std::{
+    cell::RefCell,
+    panic::AssertUnwindSafe,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 #[derive(Debug, Clone, Default)]
-pub struct Cancellation(salsa::CancellationToken);
+pub struct Cancellation(Arc<AtomicBool>);
 
 thread_local! {
     static ACTIVE: RefCell<Option<Cancellation>> = const { RefCell::new(None) };
 }
 
 impl Cancellation {
+    /// Share the current work's cancellation with an acquisition thread.
+    pub fn current() -> Self {
+        ACTIVE.with(|active| active.borrow().clone().unwrap_or_default())
+    }
+
+    /// Cancellation signal for blocking libraries that accept an atomic flag.
+    pub fn signal(&self) -> &AtomicBool {
+        &self.0
+    }
+
     pub fn cancel(&self) {
-        self.0.cancel();
+        self.0.store(true, Ordering::Release);
     }
     pub fn is_cancelled(&self) -> bool {
-        self.0.is_cancelled()
+        self.0.load(Ordering::Acquire)
     }
 
     /// Run one revision's work. Cancellation abandons incomplete query results;

@@ -15,8 +15,16 @@ pub struct ProjectAnalysis {
     build: Build,
 }
 
+struct GitSelection {
+    specification: DependencySpec,
+    checkout: PathBuf,
+    used: bool,
+}
+
 pub struct Workspace {
     root: PathBuf,
+    git_selections: Vec<GitSelection>,
+    lock_source: Option<String>,
     focus: Option<PathBuf>,
     overlays: HashMap<PathBuf, String>,
     hosts: HashMap<PathBuf, Host>,
@@ -28,6 +36,8 @@ impl Workspace {
     pub fn new(root: PathBuf) -> Self {
         Self {
             root: fs::canonicalize(&root).unwrap_or_else(|_| normalize(&root)),
+            git_selections: Vec::new(),
+            lock_source: None,
             focus: None,
             overlays: HashMap::new(),
             hosts: HashMap::new(),
@@ -37,12 +47,12 @@ impl Workspace {
     }
 
     pub fn focus(&mut self, path: &Path) {
-        self.focus = Some(normalize(path));
+        self.focus = Some(file_identity(path));
     }
 
     /// Closing a buffer removes the overlay; the next refresh reads disk.
     pub fn set_overlay(&mut self, path: &Path, text: Option<String>) {
-        let path = normalize(path);
+        let path = file_identity(path);
         match text {
             Some(text) => {
                 self.overlays.insert(path, text);
@@ -58,7 +68,7 @@ impl Workspace {
         self.observed
             .borrow_mut()
             .insert(normalize(path), disk.clone());
-        self.overlays.get(&normalize(path)).cloned().or(disk)
+        self.overlays.get(&file_identity(path)).cloned().or(disk)
     }
 
     fn manifest(&self, directory: &Path) -> Result<Manifest, CompileError> {
@@ -76,7 +86,14 @@ impl Workspace {
     pub fn refresh(&mut self) -> Result<(), CompileError> {
         self.projects.clear();
         self.observed.borrow_mut().clear();
-        self.read(&self.root.join("Ruddy.lock"));
+        let lock_source = self.read(&self.root.join("Ruddy.lock"));
+        if self.lock_source != lock_source {
+            self.git_selections.clear();
+            self.lock_source = lock_source;
+        }
+        for selection in &mut self.git_selections {
+            selection.used = false;
+        }
         let build = self.manifest(&self.root)?.build();
         let mut resolver = None;
         let mut active = Vec::new();
@@ -94,8 +111,62 @@ impl Workspace {
             .collect();
         self.hosts
             .retain(|directory, _| reachable.contains(directory));
+        self.git_selections.retain(|selection| selection.used);
         self.projects = projects;
         Ok(())
+    }
+
+    fn resolve_git(
+        &mut self,
+        specification: &DependencySpec,
+        resolver: &mut Option<git::Resolver>,
+    ) -> Result<PathBuf, CompileError> {
+        if let Some(selection) = self.git_selections.iter_mut().find(|selection| {
+            &selection.specification == specification && selection.checkout.is_dir()
+        }) {
+            selection.used = true;
+            return Ok(selection.checkout.clone());
+        }
+        // Acquisition owns its resolver and advisory lock. A blocked network
+        // read cannot hold up the editor: cancellation drops this receiver while
+        // the acquisition thread observes the same signal and releases its lock.
+        let mut acquisition = match resolver.take() {
+            Some(resolver) => resolver,
+            None => git::Resolver::new(&self.root)?,
+        };
+        let specification_owned = specification.clone();
+        let cancellation = ruddy::cancellation::Cancellation::current();
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let result = cancellation.run(|| {
+                let result = acquisition.resolve(&specification_owned);
+                (acquisition, result)
+            });
+            let _ = send.send(result);
+        });
+        let checkout = loop {
+            ruddy::cancellation::checkpoint();
+            match receive.recv_timeout(std::time::Duration::from_millis(10)) {
+                Ok(Ok((returned, result))) => {
+                    *resolver = Some(returned);
+                    break result?;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                _ => {
+                    ruddy::cancellation::checkpoint();
+                    return Err(CompileError::report(
+                        "git-acquisition-failed",
+                        "Git dependency acquisition stopped",
+                    ));
+                }
+            }
+        };
+        self.git_selections.push(GitSelection {
+            specification: specification.clone(),
+            checkout: checkout.clone(),
+            used: true,
+        });
+        Ok(checkout)
     }
 
     fn visit(
@@ -128,26 +199,16 @@ impl Workspace {
         active.push(directory.clone());
         let manifest = self.manifest(&directory)?;
         let identity = configured_identity(&manifest.name, &manifest.version)?;
-        let mut specifications = Vec::new();
-        match &manifest.dependencies.std {
-            StdConfig::Default => specifications.push((
-                "std".to_owned(),
-                DependencySpec::Path(ruddy_home()?.join("std")),
-            )),
-            StdConfig::Disabled => {}
-            StdConfig::Dependency(specification) => {
-                specifications.push(("std".to_owned(), specification.clone()))
-            }
-        }
-        specifications.extend(
+        let specifications = dependency_specs(
+            &manifest.dependencies.std,
             manifest
                 .dependencies
                 .declared
                 .iter()
                 .map(|(alias, spec)| (alias.clone(), spec.clone())),
-        );
+        )?;
         let mut dependencies = Vec::new();
-        for (alias, spec) in specifications {
+        for (alias, spec, _installed_default) in specifications {
             if !source_identifier(&alias) {
                 return Err(invalid_dependency_alias(&alias));
             }
@@ -155,20 +216,16 @@ impl Workspace {
             let child = if let Some(path) = spec.path() {
                 normalize(&directory.join(path))
             } else {
-                if resolver.is_none() {
-                    *resolver = Some(git::Resolver::new(&self.root)?);
-                }
-                resolver.as_mut().unwrap().resolve(&spec)?
+                self.resolve_git(&spec, resolver)?
             };
             let expected = spec.bundle(&alias);
             let child_manifest = self.manifest(&child)?;
             if child_manifest.name != expected {
-                return Err(CompileError::report(
-                    "dependency-name-mismatch",
-                    format!(
-                        "dependency `{alias}` expects `{expected}`, found `{}`",
-                        child_manifest.name
-                    ),
+                return Err(dependency_name_mismatch(
+                    &alias,
+                    expected,
+                    &child_manifest.name,
+                    &child.join(MANIFEST),
                 ));
             }
             if child_manifest.kind == Kind::Executable {
@@ -220,7 +277,7 @@ impl Workspace {
                 self.observed
                     .borrow_mut()
                     .insert(path.clone(), disk.clone());
-                self.overlays.get(&path).cloned().or(disk)
+                self.overlays.get(&file_identity(&path)).cloned().or(disk)
             }
         }
         let sources = Sources {
@@ -359,13 +416,13 @@ impl Workspace {
     }
 
     pub fn request_file(&mut self, path: &Path) -> bool {
-        let path = normalize(path);
+        let path = file_identity(path);
         for project in &mut self.projects {
             let logical = project
                 .analysis
                 .sources
                 .keys()
-                .find(|logical| normalize(&project.source_directory.join(logical)) == path)
+                .find(|logical| file_identity(&project.source_directory.join(logical)) == path)
                 .cloned();
             if let Some(logical) = logical {
                 return self
@@ -379,13 +436,13 @@ impl Workspace {
     }
 
     pub fn file(&self, path: &Path) -> Option<(&ProjectAnalysis, &str)> {
-        let path = normalize(path);
+        let path = file_identity(path);
         self.projects.iter().find_map(|project| {
             project
                 .analysis
                 .sources
                 .keys()
-                .find(|logical| normalize(&project.source_directory.join(logical)) == path)
+                .find(|logical| file_identity(&project.source_directory.join(logical)) == path)
                 .map(|logical| (project, logical.as_str()))
         })
     }
@@ -423,4 +480,23 @@ pub fn normalize(path: &Path) -> PathBuf {
         }
     }
     result
+}
+
+/// Canonical identity for documents, including an unsaved suffix whose nearest
+/// existing ancestor may be a symlink. Watchers keep the loader's original paths.
+pub fn file_identity(path: &Path) -> PathBuf {
+    let path = normalize(path);
+    let mut existing = path.as_path();
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(mut canonical) = fs::canonicalize(existing) {
+            canonical.extend(missing.into_iter().rev());
+            return canonical;
+        }
+        let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
+            return path;
+        };
+        missing.push(name);
+        existing = parent;
+    }
 }

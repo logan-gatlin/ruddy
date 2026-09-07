@@ -3,7 +3,7 @@
 use crossbeam_channel::Sender;
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use ruddy::{analysis::CompletionKind, cancellation::Cancellation, tracking::Span};
-use ruddy_cli::workspace::{Workspace, normalize};
+use ruddy_cli::workspace::{Workspace, file_identity};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -82,7 +82,9 @@ pub fn serve(connection: Connection) -> Result<()> {
                 }
                 Message::Request(request) => {
                     schedule.pending.insert(request.id.clone());
-                    if let Some((token, None)) = &schedule.active {
+                    if let Some((token, active)) = &schedule.active
+                        && (active.is_none() || request.method == "shutdown")
+                    {
                         token.cancel();
                     }
                 }
@@ -300,7 +302,12 @@ impl Worker {
                 }
             }
             "textDocument/didClose" => {
-                if let Some(path) = path {
+                if let Some(path) = path
+                    && self.documents.get(&path).is_some_and(|document| {
+                        params.pointer("/textDocument/uri").and_then(Value::as_str)
+                            == Some(document.uri.as_str())
+                    })
+                {
                     if let Some(document) = self.documents.remove(&path) {
                         self.sender.send(Message::Notification(Notification::new(
                             "textDocument/publishDiagnostics".into(),
@@ -417,8 +424,9 @@ impl Worker {
             }).collect()),
             "textDocument/definition" => self.workspace.definition(&path, at).and_then(|(path, span)| {
                 let (target, logical) = self.workspace.file(&path)?;
-                let uri = Url::from_file_path(path).ok()?;
-                Some(json!({"uri":uri.as_str(),"range":range(&target.analysis.sources[logical],span)}))
+                let uri = self.documents.get(&file_identity(&path)).map(|document| document.uri.clone())
+                    .or_else(|| Url::from_file_path(path).ok().map(|uri| uri.to_string()))?;
+                Some(json!({"uri":uri,"range":range(&target.analysis.sources[logical],span)}))
             }).unwrap_or(Value::Null),
             _ => Value::Null,
         })
@@ -452,7 +460,7 @@ impl Worker {
             let mut current = HashSet::new();
             for project in &self.workspace.projects {
                 for (logical, text) in &project.analysis.sources {
-                    let path = normalize(&project.source_directory.join(logical));
+                    let path = file_identity(&project.source_directory.join(logical));
                     if self.documents.contains_key(&path) {
                         continue;
                     }
@@ -510,7 +518,7 @@ fn file_path(uri: &str) -> Option<PathBuf> {
         .ok()?
         .to_file_path()
         .ok()
-        .map(|path| normalize(&path))
+        .map(|path| file_identity(&path))
 }
 
 /// Convert negotiated UTF-16 positions to compiler byte offsets.

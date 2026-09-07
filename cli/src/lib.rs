@@ -1463,6 +1463,24 @@ where
     I: IntoIterator<Item = (A, DependencySpec)>,
     A: Into<String>,
 {
+    let specifications = dependency_specs(
+        std,
+        dependencies
+            .into_iter()
+            .map(|(alias, spec)| (alias.into(), spec)),
+    )?;
+    compile_sandboxed_dependency_specs_inner(
+        specifications,
+        project.as_ref(),
+        sandbox.as_ref(),
+        build,
+    )
+}
+
+fn dependency_specs(
+    std: &StdConfig,
+    dependencies: impl IntoIterator<Item = (String, DependencySpec)>,
+) -> Result<Vec<(String, DependencySpec, bool)>, CompileError> {
     let mut specifications = Vec::new();
     match std {
         StdConfig::Default => {
@@ -1477,7 +1495,6 @@ where
         }
     }
     for (alias, specification) in dependencies {
-        let alias = alias.into();
         if alias == "std" {
             return Err(CompileError::report(
                 "dependency-alias-reserved",
@@ -1487,12 +1504,7 @@ where
         }
         specifications.push((alias, specification, false));
     }
-    compile_sandboxed_dependency_specs_inner(
-        specifications,
-        project.as_ref(),
-        sandbox.as_ref(),
-        build,
-    )
+    Ok(specifications)
 }
 
 fn compile_sandboxed_dependency_specs_inner<I>(
@@ -1802,26 +1814,14 @@ impl GraphCompiler {
         // Synthesize std before declared dependencies for deterministic graph,
         // header, and source-import order. Each visited manifest makes this
         // decision independently, including path and Git dependencies.
-        let mut dependencies = Vec::with_capacity(manifest.dependencies.declared.len() + 1);
-        match &manifest.dependencies.std {
-            StdConfig::Default => {
-                let specification = ruddy_home()
-                    .map(|home| DependencySpec::Path(home.join("std")))
-                    .map_err(default_std_error)?;
-                dependencies.push(("std".to_string(), specification, true));
-            }
-            StdConfig::Disabled => {}
-            StdConfig::Dependency(specification) => {
-                dependencies.push(("std".to_string(), specification.clone(), false));
-            }
-        }
-        dependencies.extend(
+        let dependencies = dependency_specs(
+            &manifest.dependencies.std,
             manifest
                 .dependencies
                 .declared
                 .iter()
-                .map(|(alias, specification)| (alias.clone(), specification.clone(), false)),
-        );
+                .map(|(alias, spec)| (alias.clone(), spec.clone())),
+        )?;
 
         let mut dependency_artifacts = Vec::with_capacity(dependencies.len());
         let mut dependency_indices = Vec::with_capacity(dependencies.len());

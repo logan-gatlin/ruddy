@@ -2289,6 +2289,46 @@ fn locked_cached_git_dependency_child() {
     assert!(artifact.is_file());
     assert!(!checkout.join("build").exists());
 
+    // Editor sessions reuse acquired source selections and can abandon a new
+    // acquisition while another compiler holds the global cache lock.
+    let mut workspace = ruddy_cli::workspace::Workspace::new(app.clone());
+    workspace.refresh().unwrap();
+    let cache_lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(home.join("cache/git/cache.lock"))
+        .unwrap();
+    cache_lock.lock().unwrap();
+    let cancel = ruddy::cancellation::Cancellation::default();
+    let timer = cancel.clone();
+    let timer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        timer.cancel();
+    });
+    workspace.set_overlay(
+        &app.join("main.hc"),
+        Some("let main = base::value\nlet extra = false".into()),
+    );
+    assert!(
+        cancel.run(|| workspace.refresh()).unwrap().is_ok(),
+        "ordinary edits must not reacquire the Git cache lock"
+    );
+    timer.join().unwrap();
+    let mut fresh = ruddy_cli::workspace::Workspace::new(app.clone());
+    let cancel = ruddy::cancellation::Cancellation::default();
+    let timer = cancel.clone();
+    let timer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        timer.cancel();
+    });
+    let started = std::time::Instant::now();
+    assert!(cancel.run(|| fresh.refresh()).is_err());
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    timer.join().unwrap();
+    drop(cache_lock);
+    fresh.refresh().unwrap();
+    assert!(fresh.check_background().is_empty());
+
     // Cache provenance follows the canonical location, even when a local path
     // specification reaches an already-seeded checkout instead of a Git spec.
     let path_app = home.join("path-app");
