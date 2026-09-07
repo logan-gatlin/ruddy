@@ -890,3 +890,100 @@ fn a_newline_before_then_does_not_break_a_conditional() {
         "let c = if a then b else c end\n"
     );
 }
+
+#[test]
+fn raw_strings_keep_their_trailing_spaces_and_end_their_lines() {
+    assert_eq!(
+        fmt("let r = \\\\a \nlet s = \\\\b  \n           \\\\c "),
+        "let r = \\\\a \nlet s = \\\\b  \n\\\\c \n"
+    );
+    assert_eq!(
+        fmt("let a = [\n  \\\\a\n  , 1n\n]"),
+        "let a = [\n  \\\\a\n  ,\n  1n,\n]\n"
+    );
+    assert_eq!(
+        fmt("let t = (\\\\a\n, 1n)"),
+        "let t = (\n  \\\\a\n  ,\n  1n,\n)\n"
+    );
+}
+
+#[test]
+fn effect_rows_print_their_marks_and_paths() {
+    assert_eq!(
+        fmt(
+            "type T = Nat -> Nat + \\Sys::!Log + Sys::!Ask Nat + ..'e\ntype U = Nat -> Nat + \\!IO"
+        ),
+        "type T = Nat -> Nat + \\Sys::!Log + Sys::!Ask Nat + ..'e\ntype U = Nat -> Nat + \\!IO\n"
+    );
+}
+
+#[test]
+fn shorthand_arms_keep_the_parentheses_that_hand_back_a_bar() {
+    assert_eq!(
+        fmt(
+            "let m = fn | #A => (fn x => fn | #C => 3n) | #D => 4n\nlet m2 = fn | #A => (raise fn | #C => 3n) | #D => 4n\nlet m3 = fn | #A => (fn x => x) | #D => 4n"
+        ),
+        "let m = fn | #A => (fn x => fn | #C => 3n) | #D => 4n\nlet m2 = fn | #A => (raise fn | #C => 3n) | #D => 4n\nlet m3 = fn | #A => fn x => x | #D => 4n\n"
+    );
+    assert_eq!(
+        fmt(
+            "let a = fn v => match v with\n| #A => fn x => do\n  let y = x\n  return y\nend\n| #B => 0n\nend"
+        ),
+        "let a = fn v => match v with\n| #A => fn x => do\n  let y = x\n  return y\nend\n| #B => 0n\nend\n"
+    );
+}
+
+#[test]
+fn comments_inside_copied_regions_and_empty_blocks() {
+    // A comment inside a dropped region is part of the copy.
+    assert_eq!(
+        fmt_lossy("let bad = ) -- c\n oops\n\n  more\nlet   ok = 1n"),
+        "let bad = ) -- c\n oops\n\n  more\nlet ok = 1n\n"
+    );
+    assert_eq!(
+        fmt("let x = do\n  (* c *)\nend"),
+        "let x = do\n  (* c *)\nend\n"
+    );
+    assert_eq!(
+        fmt("(*\n  a\n\n  b\n*)\nlet x = 1n"),
+        "(*\n  a\n\n  b\n*)\nlet x = 1n\n"
+    );
+    assert_eq!(
+        fmt("let s = {\n  (* c *)\n  a: 1n }\nextern f : (fn(Nat) -> Nat\n  -- c\n) = \"x\""),
+        "let s = {\n  (* c *)\n  a: 1n,\n}\nextern f: (fn(Nat) -> Nat\n  -- c\n) = \"x\"\n"
+    );
+    assert_eq!(
+        fmt("let x = do\n  let a = 1n -- c\n  -- d\n  return a\nend"),
+        "let x = do\n  let a = 1n -- c\n  -- d\n  return a\nend\n"
+    );
+}
+
+/// A refused signature inside an `effect` makes the whole declaration
+/// opaque, and a broken binding anywhere inside an expression makes only
+/// its own block opaque.
+#[test]
+fn errors_inside_nested_blocks_stay_local() {
+    assert_eq!(
+        fmt_lossy("effect E = { get:   Nat }\nlet   a = 1n"),
+        "effect E = { get:   Nat }\nlet a = 1n\n"
+    );
+    let source = "let   x = {\n  a: do let b = ) return 1n end,\n  ..do let c = ) return 2n end\n}\nlet   y = (do let b = ) return 1n end, [do let c = ) return 2n end])\nlet   z = #Some (do let d = ) return 3n end)\nlet   w = fn | #A => do let e = ) return 4n end\nlet   v = match do let f = ) return 5n end with | _ => do let g = ) return 6n end end\nlet   u = if do let h = ) return true end then 1n else 2n end\nlet   t = handle do let i = ) return 7n end with | !Log s => do let j = ) return 8n end end\nlet   s = raise do let k = ) return 9n end\nlet   r = do\n  let inner = do let l = ) return 10n end\n  return inner\nend\nlet   q = do\n  let m = ) oops\n  return 1n\nend\n";
+    let text = fmt_lossy(source);
+    for name in ["x", "y", "z", "w", "v", "u", "t", "s", "r", "q"] {
+        assert!(text.contains(&format!("let {name} = ")), "{text}");
+    }
+    assert!(text.contains("let b = )"));
+    assert!(text.contains("  let m = ) oops\n  return 1n\n"));
+    // A one-line copied region is measured like any text.
+    assert_eq!(
+        fmt_lossy("let p = do let bad = ) return 1n end"),
+        "let p = do let bad = ) return 1n end\n"
+    );
+    let long = "a".repeat(80);
+    assert_eq!(
+        fmt_lossy(&format!(
+            "let p = do let bad = ) {long} let ok = 1n return ok end"
+        )),
+        format!("let p = do\n  let bad = ) {long}\n  let ok = 1n\n  return ok\nend\n")
+    );
+}

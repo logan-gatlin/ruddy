@@ -263,9 +263,7 @@ pub fn format_parsed(source: &str, parsed: &parse::Output, lex_errors: &[token::
     let mut doc = printer.file(&parsed.stmts, file);
     propagate_breaks(&mut doc);
     let mut text = print(&doc);
-    while text.ends_with('\n') {
-        text.pop();
-    }
+    text.truncate(text.trim_end_matches('\n').len());
     if !text.is_empty() {
         text.push('\n');
     }
@@ -465,24 +463,17 @@ fn fits<'d>(mut next: Vec<Cmd<'d>>, rest: &[Cmd<'d>], width: usize, must_be_flat
                 mode,
                 doc: first,
             }),
+            // A copied region of more than one line breaks the groups around
+            // it, so only a one-line one is ever measured.
             Doc::Verbatim(lines) => {
                 remaining -= lines.first().map_or(0, |(_, line)| width_of(line)) as isize;
                 if remaining < 0 {
                     return false;
                 }
-                if lines.len() > 1 {
-                    return true;
-                }
             }
-            Doc::BlockComment(comment) => {
-                if comment.contains('\n') {
-                    return true;
-                }
-                remaining -= (width_of(comment) + 4) as isize;
-                if remaining < 0 {
-                    return false;
-                }
-            }
+            // A block comment printed as one is on a line of its own or
+            // spans lines, and either way the line being measured ends.
+            Doc::BlockComment(_) => return true,
         }
     }
 }
@@ -499,11 +490,19 @@ fn print(doc: &Doc) -> String {
         doc,
     }];
 
-    fn newline(out: &mut String, column: &mut usize, suffixes: &mut Vec<String>, indent: usize) {
+    fn newline(
+        out: &mut String,
+        column: &mut usize,
+        suffixes: &mut Vec<String>,
+        indent: usize,
+        preserve: bool,
+    ) {
         for suffix in suffixes.drain(..) {
             write_suffix(out, column, &suffix);
         }
-        while out.ends_with(' ') {
+        // Trailing spaces are never wanted, except on a raw string's line,
+        // where they are the string's.
+        while !preserve && out.ends_with(' ') {
             out.pop();
         }
         out.push('\n');
@@ -512,6 +511,7 @@ fn print(doc: &Doc) -> String {
     }
 
     while let Some(Cmd { indent, mode, doc }) = stack.pop() {
+        let after_raw = pending_newline.is_some();
         if let Some(at) = pending_newline
             && !matches!(
                 doc,
@@ -528,7 +528,7 @@ fn print(doc: &Doc) -> String {
                     | Doc::LineSuffix(_)
             )
         {
-            newline(&mut out, &mut column, &mut suffixes, at);
+            newline(&mut out, &mut column, &mut suffixes, at, true);
             pending_newline = None;
         }
         match doc {
@@ -546,18 +546,18 @@ fn print(doc: &Doc) -> String {
                     column += 1;
                 }
                 Mode::Break => {
-                    newline(&mut out, &mut column, &mut suffixes, indent);
+                    newline(&mut out, &mut column, &mut suffixes, indent, after_raw);
                     pending_newline = None;
                 }
             },
             Doc::SoftLine => {
                 if mode == Mode::Break {
-                    newline(&mut out, &mut column, &mut suffixes, indent);
+                    newline(&mut out, &mut column, &mut suffixes, indent, after_raw);
                     pending_newline = None;
                 }
             }
             Doc::HardLine => {
-                newline(&mut out, &mut column, &mut suffixes, indent);
+                newline(&mut out, &mut column, &mut suffixes, indent, after_raw);
                 pending_newline = None;
             }
             Doc::BreakParent => {}
@@ -743,6 +743,7 @@ fn print(doc: &Doc) -> String {
                             } else {
                                 indent + relative
                             },
+                            after_raw,
                         );
                     }
                     out.push_str(line);
@@ -752,7 +753,7 @@ fn print(doc: &Doc) -> String {
             Doc::Raw(lines) => {
                 for (at, line) in lines.iter().enumerate() {
                     if at > 0 {
-                        newline(&mut out, &mut column, &mut suffixes, indent);
+                        newline(&mut out, &mut column, &mut suffixes, indent, true);
                     }
                     out.push_str(line);
                     column += width_of(line);
@@ -763,7 +764,7 @@ fn print(doc: &Doc) -> String {
                 let available = WIDTH.saturating_sub(indent + 3);
                 for (at, line) in reflow(lines, available).into_iter().enumerate() {
                     if at > 0 {
-                        newline(&mut out, &mut column, &mut suffixes, indent);
+                        newline(&mut out, &mut column, &mut suffixes, indent, after_raw);
                     }
                     let line = if line.is_empty() {
                         "--".to_string()
@@ -787,6 +788,7 @@ fn print(doc: &Doc) -> String {
                             } else {
                                 indent + relative
                             },
+                            after_raw,
                         );
                     }
                     out.push_str(line);
@@ -798,8 +800,8 @@ fn print(doc: &Doc) -> String {
     for suffix in suffixes.drain(..) {
         write_suffix(&mut out, &mut column, &suffix);
     }
-    while out.ends_with(' ') {
-        out.pop();
+    if pending_newline.is_none() {
+        out.truncate(out.trim_end_matches(' ').len());
     }
     out
 }
@@ -1097,11 +1099,11 @@ impl<'a> Printer<'a> {
 
     /// Whether the source has a whole blank line in `from..to`.
     fn blank_line_between(&self, from: usize, to: usize) -> bool {
-        if from >= to {
+        let Some(gap) = self.source.get(from..to) else {
             return false;
-        }
+        };
         let mut seen_newline = false;
-        for c in self.source[from..to].chars() {
+        for c in gap.chars() {
             match c {
                 '\n' if seen_newline => return true,
                 '\n' => seen_newline = true,
@@ -1338,8 +1340,13 @@ impl<'a> Printer<'a> {
     /// The comments at the end of a block, in front of its closer: a line
     /// break, then each on a line of its own.
     fn dangling_docs(&self, span: Span) -> Doc {
+        concat(self.dangling_parts(span))
+    }
+
+    /// [`dangling_docs`](Self::dangling_docs) as the parts it is made of.
+    fn dangling_parts(&self, span: Span) -> Vec<Doc> {
         let Some(comments) = self.dangling.get(&span) else {
-            return nil();
+            return Vec::new();
         };
         let mut parts = Vec::new();
         let mut at = 0;
@@ -1364,7 +1371,7 @@ impl<'a> Printer<'a> {
             }
             parts.push(Doc::LineComments(run));
         }
-        concat(parts)
+        parts
     }
 
     fn with_comments(&self, span: Span, doc: Doc) -> Doc {
@@ -1506,19 +1513,13 @@ impl<'a> Printer<'a> {
     fn file(&self, stmts: &[Stmt], file: Span) -> Doc {
         let items = self.items(stmts, None, file);
         let mut parts = self.list(&items, 0, Doc::HardLine);
-        let dangling = self.dangling_docs(file);
-        if parts.is_empty() {
-            // Nothing but comments: the break in front of the first is not
-            // wanted, since there is nothing for it to separate from.
-            if let Doc::Concat(mut docs) = dangling {
-                if matches!(docs.first(), Some(Doc::HardLine)) {
-                    docs.remove(0);
-                }
-                return concat(docs);
-            }
-            return dangling;
+        let mut dangling = self.dangling_parts(file);
+        // Nothing but comments: the break in front of the first is not
+        // wanted, since there is nothing for it to separate from.
+        if parts.is_empty() && !dangling.is_empty() {
+            dangling.remove(0);
         }
-        parts.push(dangling);
+        parts.extend(dangling);
         concat(parts)
     }
 
@@ -1972,7 +1973,7 @@ impl<'a> Printer<'a> {
                     self.expr_in(value, parens),
                 ])
             }
-            ExprKind::Binary { op, .. } => {
+            ExprKind::Binary { .. } => {
                 let level = prec(expr);
                 let symbol = |op: &BinaryOp| match op {
                     BinaryOp::Write => ":=",
@@ -1984,14 +1985,16 @@ impl<'a> Printer<'a> {
                     BinaryOp::Or => "or",
                     BinaryOp::Xor => "xor",
                 };
-                if matches!(op, BinaryOp::Write) {
-                    let ExprKind::Binary { left, right, .. } = &expr.tracked else {
-                        unreachable!("matched a binary expression")
-                    };
+                if let ExprKind::Binary {
+                    op: BinaryOp::Write,
+                    left,
+                    right,
+                } = &expr.tracked
+                {
                     let signal = self.newline_between(left.span.end(), right.span.start);
                     let mut rest = vec![Doc::Line];
                     rest.extend(self.leading_docs(right.span));
-                    rest.push(text(":= "));
+                    rest.push(text(format!("{} ", symbol(&BinaryOp::Write))));
                     rest.push(self.expr_after(right, prec(right) < level));
                     let doc = concat(vec![
                         self.expr_in(left, prec(left) <= level),
@@ -2847,13 +2850,13 @@ impl<'a> Printer<'a> {
                 EffectLabel::Written { args, when } => (args, when.as_deref(), false),
                 EffectLabel::Absent { args } => (args, None, true),
             };
-            let mut doc = Vec::new();
-            // An absent label's span covers its `\`, so the mark is written
-            // back only when the source did not already put it there.
-            if absent && !self.slice(path.name.span).starts_with('\\') {
-                doc.push(text("\\"));
-            }
-            doc.push(self.effect_label(path));
+            // An absent label's key spans from its `\` through its name,
+            // path included, so it is copied whole.
+            let mut doc = vec![if absent {
+                text(self.slice(path.name.span))
+            } else {
+                self.effect_label(path)
+            }];
             for arg in args {
                 doc.push(Doc::Space);
                 doc.push(self.ty_in(arg, ui::type_prec(&arg.tracked) < Prec::Atom));
