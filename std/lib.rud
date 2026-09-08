@@ -19,7 +19,7 @@ effect FileSystem = {
   remove_file: String -> Result () fs::Error,
   remove_dir: String -> Result () fs::Error,
   rename: { source: String, destination: String } -> Result () fs::Error,
-  copy_file: { source: String, destination: String } -> Result () fs::Error
+  copy_file: { source: String, destination: String } -> Result () fs::Error,
 }
 
 module fs

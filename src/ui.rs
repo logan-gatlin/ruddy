@@ -181,6 +181,116 @@ pub enum Prec {
     Atom,
 }
 
+/// How tightly a written expression binds, for whoever prints the parse tree
+/// back as source. One table for the debugger's printer and the formatter, so
+/// the two cannot come to disagree about where a parenthesis goes.
+pub fn expr_prec(kind: &parse::ExprKind) -> Prec {
+    use parse::{BinaryOp, ExprKind};
+    match kind {
+        // The body runs as far right as it can, so anything appended after
+        // a bare lambda would be read as part of it.
+        ExprKind::Function { .. } | ExprKind::MatchFunction { .. } => Prec::Lambda,
+        // Self-delimiting on the right — the `end` closes it — so it may
+        // head an application and be projected from; but it is not an
+        // application *argument* by grammar, so an argument position
+        // brackets it. Below `Atom` is exactly that split.
+        ExprKind::If { .. }
+        | ExprKind::Match { .. }
+        | ExprKind::Handle { .. }
+        | ExprKind::Do { .. } => Prec::Apply,
+        // The body runs as far right as it can, so anything appended after
+        // a `raise` would be read as part of what it carries.
+        ExprKind::Raise(_) => Prec::Lambda,
+        ExprKind::Pipe { .. } => Prec::Pipeline,
+        ExprKind::Binary { op, .. } => match op {
+            BinaryOp::Write => Prec::Assignment,
+            BinaryOp::Or => Prec::Or,
+            BinaryOp::Xor => Prec::Xor,
+            BinaryOp::And => Prec::And,
+            BinaryOp::Add | BinaryOp::Sub => Prec::Addition,
+            BinaryOp::Mul | BinaryOp::Div => Prec::Multiplication,
+        },
+        ExprKind::Unary { .. } => Prec::Unary,
+        // A tag carrying something groups as the application it reads as:
+        // anything appended to `#A x` would be read as applying the
+        // case rather than as a second argument to it. Carrying nothing it
+        // is not a word but a word still waiting for one, so it groups
+        // below an application — see [`Prec::Tag`].
+        ExprKind::Tag {
+            payload: Some(_), ..
+        } => Prec::Apply,
+        ExprKind::Tag { payload: None, .. } => Prec::Tag,
+        ExprKind::Apply { .. } => Prec::Apply,
+        // Self-delimiting: each ends at a token of its own, so nothing that
+        // follows can be drawn into it. An operation is written like a
+        // projection and closes itself the same way.
+        ExprKind::Project { .. }
+        | ExprKind::Operation { .. }
+        | ExprKind::Struct { .. }
+        | ExprKind::Tuple(_)
+        | ExprKind::Array(_)
+        | ExprKind::Ident { .. }
+        | ExprKind::Natural(_)
+        | ExprKind::Integer(_)
+        | ExprKind::Fixed(_)
+        | ExprKind::Real(_)
+        | ExprKind::String(_)
+        | ExprKind::Boolean(_)
+        | ExprKind::Unit => Prec::Atom,
+    }
+}
+
+/// Whether a written expression's surface spelling ends in a numeric
+/// projection; see [`Grouped::ends_in_numeric_projection`].
+pub fn expr_ends_in_numeric_projection(kind: &parse::ExprKind) -> bool {
+    matches!(
+        kind,
+        parse::ExprKind::Project { field, .. } if canonical_tuple_index(&field.tracked).is_some()
+    )
+}
+
+/// [`expr_prec`]'s twin for a written type.
+pub fn type_prec(kind: &parse::TypeKind) -> Prec {
+    use parse::TypeKind;
+    match kind {
+        TypeKind::Arrow { .. } => Prec::Arrow,
+        // A row of effects binds as a sum does: it is written with the same
+        // labels and the same tail, and needs the same brackets around it.
+        TypeKind::Sum { .. } | TypeKind::Effects(_) => Prec::Sum,
+        TypeKind::Apply { .. } | TypeKind::Mut(..) => Prec::Apply,
+        TypeKind::Struct { .. }
+        | TypeKind::Tuple(_)
+        | TypeKind::Array(_)
+        | TypeKind::Ident { .. }
+        | TypeKind::Variable { .. }
+        | TypeKind::Hole
+        | TypeKind::Unit => Prec::Atom,
+    }
+}
+
+/// [`expr_prec`]'s twin for a written pattern.
+pub fn pattern_prec(kind: &parse::PatternKind) -> Prec {
+    use parse::PatternKind;
+    match kind {
+        PatternKind::Tag {
+            payload: Some(_), ..
+        } => Prec::Apply,
+        PatternKind::Tag { payload: None, .. } => Prec::Tag,
+        PatternKind::Ident { .. }
+        | PatternKind::Wildcard
+        | PatternKind::Natural(_)
+        | PatternKind::Integer(_)
+        | PatternKind::Fixed(_)
+        | PatternKind::Real(_)
+        | PatternKind::String(_)
+        | PatternKind::Boolean(_)
+        | PatternKind::Unit
+        | PatternKind::Struct { .. }
+        | PatternKind::Tuple(_)
+        | PatternKind::Array { .. } => Prec::Atom,
+    }
+}
+
 /// Renders a symbol as `bundle::module::name`. Kept separate from [`Symbol`]
 /// because printing one needs the mint that made it; [`Mint::path`] is how one
 /// is made.
@@ -632,6 +742,10 @@ impl fmt::Display for Kind {
             Kind::Real(value) => write!(f, "{value}"),
             Kind::String(value) => write_string(f, value),
             Kind::Boolean(value) => write!(f, "{value}"),
+            // The delimiters are written back on, as a string's quotes are:
+            // the text alone would re-lex as code.
+            Kind::LineComment(text) => write!(f, "--{text}"),
+            Kind::BlockComment(text) => write!(f, "(*{text}*)"),
             // Invalid input is never printed as source: its original spelling
             // remains in the file and its diagnostic owns the explanation.
             Kind::Invalid => f.write_str("<invalid>"),

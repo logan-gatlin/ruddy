@@ -30,99 +30,17 @@ struct Ast<'a, T>(&'a T);
 
 impl Grouped for Ast<'_, TypeKind> {
     fn prec(&self) -> Prec {
-        match self.0 {
-            TypeKind::Arrow { .. } => Prec::Arrow,
-            // A row of effects binds as a sum does: it is written with the same
-            // labels and the same tail, and needs the same brackets around it.
-            TypeKind::Sum { .. } | TypeKind::Effects(_) => Prec::Sum,
-            TypeKind::Apply { .. } | TypeKind::Mut(..) => Prec::Apply,
-            TypeKind::Struct { .. }
-            | TypeKind::Tuple(_)
-            | TypeKind::Array(_)
-            | TypeKind::Ident { .. }
-            | TypeKind::Variable { .. }
-            | TypeKind::Hole
-            | TypeKind::Unit => Prec::Atom,
-        }
+        ruddy::ui::type_prec(self.0)
     }
 }
 
 impl Grouped for Ast<'_, ExprKind> {
     fn prec(&self) -> Prec {
-        match self.0 {
-            // The body runs as far right as it can, so anything appended after
-            // a bare lambda would be read as part of it.
-            ExprKind::Function { .. } | ExprKind::MatchFunction { .. } => Prec::Lambda,
-            // Self-delimiting on the right — the `end` closes it — so it may
-            // head an application and be projected from; but it is not an
-            // application *argument* by grammar, so an argument position
-            // brackets it. Below `Atom` is exactly that split.
-            ExprKind::If { .. }
-            | ExprKind::Match { .. }
-            | ExprKind::Handle { .. }
-            | ExprKind::Do { .. } => Prec::Apply,
-            // The body runs as far right as it can, so anything appended after
-            // a `raise` would be read as part of what it carries.
-            ExprKind::Raise(_) => Prec::Lambda,
-            ExprKind::Pipe { .. } => Prec::Pipeline,
-            ExprKind::Binary {
-                op: ruddy::parse::BinaryOp::Write,
-                ..
-            } => Prec::Assignment,
-            ExprKind::Binary {
-                op: ruddy::parse::BinaryOp::Or,
-                ..
-            } => Prec::Or,
-            ExprKind::Binary {
-                op: ruddy::parse::BinaryOp::Xor,
-                ..
-            } => Prec::Xor,
-            ExprKind::Binary {
-                op: ruddy::parse::BinaryOp::And,
-                ..
-            } => Prec::And,
-            ExprKind::Binary {
-                op: ruddy::parse::BinaryOp::Add | ruddy::parse::BinaryOp::Sub,
-                ..
-            } => Prec::Addition,
-            ExprKind::Binary { .. } => Prec::Multiplication,
-            ExprKind::Unary { .. } => Prec::Unary,
-            // A tag carrying something groups as the application it reads as:
-            // anything appended to `#A x` would be read as applying the
-            // case rather than as a second argument to it. Carrying nothing it
-            // is not a word but a word still waiting for one, so it groups
-            // below an application — see [`Prec::Tag`].
-            ExprKind::Tag {
-                payload: Some(_), ..
-            } => Prec::Apply,
-            ExprKind::Tag { payload: None, .. } => Prec::Tag,
-            ExprKind::Apply { .. } => Prec::Apply,
-            // Self-delimiting: each ends at a token of its own, so nothing that
-            // follows can be drawn into it.
-            // An operation is written like a projection and closes itself the
-            // same way.
-            ExprKind::Project { .. }
-            | ExprKind::Operation { .. }
-            | ExprKind::Struct { .. }
-            | ExprKind::Tuple(_)
-            | ExprKind::Array(_)
-            | ExprKind::Ident { .. }
-            | ExprKind::Natural(_)
-            | ExprKind::Integer(_)
-            | ExprKind::Fixed(_)
-            | ExprKind::Real(_)
-            | ExprKind::String(_)
-            | ExprKind::Boolean(_)
-            | ExprKind::Unit => Prec::Atom,
-        }
+        ruddy::ui::expr_prec(self.0)
     }
 
     fn ends_in_numeric_projection(&self) -> bool {
-        matches!(
-            self.0,
-            ExprKind::Project { field, .. }
-                if ruddy::ui::canonical_tuple_index(&field.tracked).is_some()
-        )
+        ruddy::ui::expr_ends_in_numeric_projection(self.0)
     }
 }
 
@@ -666,24 +584,7 @@ impl fmt::Display for Ast<'_, ExprKind> {
 
 impl Grouped for Ast<'_, PatternKind> {
     fn prec(&self) -> Prec {
-        match self.0 {
-            PatternKind::Tag {
-                payload: Some(_), ..
-            } => Prec::Apply,
-            PatternKind::Tag { payload: None, .. } => Prec::Tag,
-            PatternKind::Ident { .. }
-            | PatternKind::Wildcard
-            | PatternKind::Natural(_)
-            | PatternKind::Integer(_)
-            | PatternKind::Fixed(_)
-            | PatternKind::Real(_)
-            | PatternKind::String(_)
-            | PatternKind::Boolean(_)
-            | PatternKind::Unit
-            | PatternKind::Struct { .. }
-            | PatternKind::Tuple(_)
-            | PatternKind::Array { .. } => Prec::Atom,
-        }
+        ruddy::ui::pattern_prec(self.0)
     }
 }
 

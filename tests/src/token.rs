@@ -777,11 +777,11 @@ fn consecutive_raw_string_lines_join_with_newlines() {
 fn anything_but_whitespace_between_raw_string_lines_keeps_them_apart() {
     assert!(matches!(
         &kinds("\\\\a\n-- between\n\\\\b")[..],
-        [Kind::String(a), Kind::String(b)] if a == "a" && b == "b"
+        [Kind::String(a), Kind::LineComment(_), Kind::String(b)] if a == "a" && b == "b"
     ));
     assert!(matches!(
         &kinds("\\\\a\n(* between *) \\\\b")[..],
-        [Kind::String(a), Kind::String(b)] if a == "a" && b == "b"
+        [Kind::String(a), Kind::BlockComment(_), Kind::String(b)] if a == "a" && b == "b"
     ));
     assert!(matches!(
         &kinds("\\\\a\n, \\\\b")[..],
@@ -994,18 +994,21 @@ fn a_sigil_followed_by_a_non_identifier_word_is_rejected() {
     assert!(out.errors.is_empty());
 }
 
-/// `--` opens a line comment. It carries no token, the way whitespace does
-/// not, and needs no newline to close it: the end of input closes it too.
+/// `--` opens a line comment. It is one token carrying the rest of the line,
+/// and needs no newline to close it: the end of input closes it too.
 #[test]
 fn line_comments_swallow_to_the_end_of_the_line() {
-    assert!(matches!(kinds("-- a whole line")[..], []));
+    assert!(
+        matches!(&kinds("-- a whole line")[..], [Kind::LineComment(text)] if text == " a whole line")
+    );
     assert!(matches!(
         kinds("let x = 1n -- trailing")[..],
         [
             Kind::Let,
             Kind::Identifier(_),
             Kind::Equal,
-            Kind::Natural(1)
+            Kind::Natural(1),
+            Kind::LineComment(_)
         ]
     ));
     assert!(matches!(
@@ -1015,6 +1018,7 @@ fn line_comments_swallow_to_the_end_of_the_line() {
             Kind::Identifier(_),
             Kind::Equal,
             Kind::Natural(1),
+            Kind::LineComment(_),
             Kind::Let,
             Kind::Identifier(_),
             Kind::Equal,
@@ -1029,7 +1033,7 @@ fn line_comments_swallow_to_the_end_of_the_line() {
 /// beats two dots. So `-->` is a comment, never a minus before an arrow.
 #[test]
 fn a_double_minus_is_a_comment_not_two_minuses() {
-    assert!(matches!(kinds("-->")[..], []));
+    assert!(matches!(&kinds("-->")[..], [Kind::LineComment(text)] if text == ">"));
     assert!(matches!(
         kinds("A - B")[..],
         [Kind::Identifier(_), Kind::Minus, Kind::Identifier(_)]
@@ -1040,19 +1044,24 @@ fn a_double_minus_is_a_comment_not_two_minuses() {
     ));
 }
 
-/// `(*` and `*)` delimit a block comment. Like a line comment it carries no
+/// `(*` and `*)` delimit a block comment. Like a line comment it is one
 /// token, but unlike one it may run across lines: only `*)` closes it.
 #[test]
 fn block_comments_swallow_everything_between_their_delimiters() {
-    assert!(matches!(kinds("(**)")[..], []));
-    assert!(matches!(kinds("(* a block comment *)")[..], []));
-    assert!(matches!(kinds("(*\nspans\nlines\n*)")[..], []));
+    assert!(matches!(&kinds("(**)")[..], [Kind::BlockComment(text)] if text.is_empty()));
+    assert!(
+        matches!(&kinds("(* a block comment *)")[..], [Kind::BlockComment(text)] if text == " a block comment ")
+    );
+    assert!(
+        matches!(&kinds("(*\nspans\nlines\n*)")[..], [Kind::BlockComment(text)] if text == "\nspans\nlines\n")
+    );
     assert!(matches!(
         kinds("let x = (* inline *) 1n")[..],
         [
             Kind::Let,
             Kind::Identifier(_),
             Kind::Equal,
+            Kind::BlockComment(_),
             Kind::Natural(1)
         ]
     ));
@@ -1070,6 +1079,7 @@ fn block_comments_swallow_everything_between_their_delimiters() {
             Kind::LeftParen,
             Kind::Real(_),
             Kind::Comma,
+            Kind::BlockComment(_),
             Kind::Real(_),
             Kind::RightParen,
         ]
@@ -1081,11 +1091,14 @@ fn block_comments_swallow_everything_between_their_delimiters() {
 /// comment — so an inner close alone does not end the whole thing.
 #[test]
 fn block_comments_nest() {
-    assert!(matches!(kinds("(* (* *) *)")[..], []));
-    assert!(matches!(kinds("(* (* (* *) *) *)")[..], []));
+    assert!(matches!(&kinds("(* (* *) *)")[..], [Kind::BlockComment(text)] if text == " (* *) "));
+    assert!(
+        matches!(&kinds("(* (* (* *) *) *)")[..], [Kind::BlockComment(text)] if text == " (* (* *) *) ")
+    );
     assert!(matches!(
         kinds("(* (* *) still inside *) let x = 1n")[..],
         [
+            Kind::BlockComment(_),
             Kind::Let,
             Kind::Identifier(_),
             Kind::Equal,
@@ -1167,4 +1180,97 @@ fn signed_literals_include_the_sign_and_preserve_real_negative_zero() {
         errors(&format!("-1{}", "0".repeat(400)))[0].kind,
         ErrorKind::RealTooLarge
     );
+}
+
+/// A comment is a token now: the formatter needs its text and its place,
+/// and everything else skips it. The text is the inside of the comment —
+/// after the `--`, or between the `(*` and the `*)` — the way a string
+/// token carries its decoded contents rather than its quotes.
+#[test]
+fn comments_are_tokens_that_carry_their_inner_text() {
+    let out = lex(
+        "let a = 1 -- note\n(* block *) let b = 2",
+        FileID::GENERATED,
+    );
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let kinds: Vec<String> = out
+        .tokens
+        .iter()
+        .map(|token| match &token.tracked {
+            Kind::LineComment(text) => format!("line:{text}"),
+            Kind::BlockComment(text) => format!("block:{text}"),
+            other => other.to_string(),
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "let",
+            "a",
+            "=",
+            "1",
+            "line: note",
+            "block: block ",
+            "let",
+            "b",
+            "=",
+            "2"
+        ]
+    );
+    let comment = &out.tokens[4];
+    assert_eq!((comment.span.start, comment.span.width), (10, 7));
+    let block = &out.tokens[5];
+    assert_eq!((block.span.start, block.span.width), (18, 11));
+}
+
+/// A line comment ends at the newline and never eats it; a CRLF line keeps
+/// the `\r` out of the text.
+#[test]
+fn a_line_comment_stops_at_the_newline_and_drops_a_carriage_return() {
+    let out = lex("-- one\r\n-- two\n--", FileID::GENERATED);
+    let texts: Vec<&str> = out
+        .tokens
+        .iter()
+        .map(|token| match &token.tracked {
+            Kind::LineComment(text) => text.as_str(),
+            _ => panic!("{:?}", token.tracked),
+        })
+        .collect();
+    assert_eq!(texts, [" one", " two", ""]);
+}
+
+/// A nesting block comment is one token, and one that never closes is still
+/// the one invalid lexeme it always was.
+#[test]
+fn block_comments_nest_and_an_unclosed_one_is_invalid() {
+    let out = lex("(* a (* b *) c *) x", FileID::GENERATED);
+    assert!(matches!(&out.tokens[0].tracked, Kind::BlockComment(text) if text == " a (* b *) c "));
+    assert!(matches!(&out.tokens[1].tracked, Kind::Identifier(name) if name == "x"));
+    assert_eq!(errors("(* open")[0].kind, ErrorKind::MissingClosingComment);
+    assert!(matches!(tokens_of("(* open")[..], [Kind::Invalid]));
+}
+
+/// The numeric-field rule reads the token before the digits; a comment in
+/// between is not a token in that sense, so `p. (* c *) 0` is still a
+/// projection and `{ (* c *) 0: x }` still names a field.
+#[test]
+fn comments_do_not_disturb_the_numeric_field_rule() {
+    let kinds = kinds("p. (* c *) 0 { (* c *) 0: x } (1, -- c\n 2)");
+    let fields: Vec<bool> = kinds
+        .iter()
+        .filter_map(|kind| match kind {
+            Kind::NumericField(_) => Some(true),
+            Kind::Real(_) => Some(false),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(fields, [true, true, false, false]);
+}
+
+/// Every token prints as it was written, comments included, so a printed
+/// stream re-lexes to the one it was printed from.
+#[test]
+fn comment_tokens_print_with_their_delimiters() {
+    assert_eq!(Kind::LineComment(" note".into()).to_string(), "-- note");
+    assert_eq!(Kind::BlockComment(" b ".into()).to_string(), "(* b *)");
 }

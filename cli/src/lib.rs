@@ -5,7 +5,7 @@ use std::{
     ffi::{OsStr, OsString},
     fmt, fs,
     fs::OpenOptions,
-    io::{self, IsTerminal as _, Write as _},
+    io::{self, IsTerminal as _, Read as _, Write as _},
     ops::Range,
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
@@ -25,6 +25,7 @@ use ruddy::{
 use serde::{Deserialize, Serialize};
 
 mod cache;
+pub mod lsp;
 pub mod workspace;
 
 pub use cache::fingerprint;
@@ -68,6 +69,21 @@ enum Command {
     Check,
     /// Build and execute a JavaScript-targeted project.
     Run,
+    /// Serve the language server over standard input and output.
+    Lsp,
+    /// Format Ruddy source files in place.
+    #[command(alias = "f")]
+    Fmt {
+        /// Files or folders to format. With none, every source of the
+        /// bundle the current folder belongs to.
+        paths: Vec<PathBuf>,
+        /// Write nothing; list the files that would change and fail if any.
+        #[arg(long)]
+        check: bool,
+        /// Format standard input to standard output.
+        #[arg(long, conflicts_with_all = ["paths", "check"])]
+        stdin: bool,
+    },
 }
 
 /// The successful filesystem action performed by [`run`].
@@ -83,6 +99,39 @@ pub enum Outcome {
     Checked(PathBuf),
     /// This JavaScript module was built and executed successfully.
     Ran(PathBuf),
+    /// The language server ran until its client asked it to exit.
+    Served,
+    /// Source files were formatted, or checked.
+    Formatted(FormatReport),
+    /// Standard input was formatted: the text to write to standard output,
+    /// and the syntax errors it was formatted around.
+    FormattedStdin {
+        text: String,
+        diagnostics: Vec<CompileDiagnostic>,
+    },
+}
+
+/// What `ruddy fmt` did to a set of files.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FormatReport {
+    /// The files rewritten — or, under `--check`, the files that would be.
+    pub changed: Vec<PathBuf>,
+    /// The files that were already formatted.
+    pub unchanged: Vec<PathBuf>,
+    /// The files with lexical or syntactic errors, formatted around them.
+    pub errors: Vec<PathBuf>,
+    /// The diagnostics of those files, rendered for the terminal.
+    pub diagnostics: Vec<CompileDiagnostic>,
+    /// Whether this was a `--check` run.
+    pub check: bool,
+}
+
+impl FormatReport {
+    /// Whether the run should fail: a check that found unformatted files,
+    /// or any file with syntax errors.
+    pub fn failed(&self) -> bool {
+        (self.check && !self.changed.is_empty()) || !self.errors.is_empty()
+    }
 }
 
 /// A user-facing command-line or filesystem failure.
@@ -109,6 +158,11 @@ impl CliError {
             usage: false,
             exit_code: 1,
         }
+    }
+
+    fn with_help_text(mut self, help: &str) -> Self {
+        self.rendered.push_str(&format!("\nhelp: {help}"));
+        self
     }
 
     fn clap(error: clap::Error) -> Self {
@@ -172,7 +226,167 @@ where
             Ok(Outcome::Checked(current_directory.to_path_buf()))
         }
         Command::Run => run_project(current_directory).map(Outcome::Ran),
+        Command::Lsp => {
+            let (connection, threads) = lsp_server::Connection::stdio();
+            lsp::serve(connection)
+                .map_err(|error| CliError::one(format!("language server: {error}")))?;
+            threads
+                .join()
+                .map_err(|error| CliError::one(format!("language server: {error}")))?;
+            Ok(Outcome::Served)
+        }
+        Command::Fmt {
+            paths,
+            check,
+            stdin: true,
+        } => {
+            debug_assert!(paths.is_empty() && !check);
+            let mut source = String::new();
+            io::stdin().read_to_string(&mut source).map_err(|error| {
+                CliError::one(format!("could not read standard input: {error}"))
+            })?;
+            let (text, diagnostics) = format_source(&source, Path::new("<stdin>"));
+            Ok(Outcome::FormattedStdin { text, diagnostics })
+        }
+        Command::Fmt { paths, check, .. } => {
+            format_paths(&paths, current_directory, check).map(Outcome::Formatted)
+        }
     }
+}
+
+/// Format `paths` in place, or check them. With no paths, the sources of
+/// the bundle `current_directory` belongs to: every `.rud` under the folder
+/// its manifest's `root` is in, minus any folder with a manifest of its own,
+/// which is another bundle's. Dependencies are never followed.
+pub fn format_paths(
+    paths: &[PathBuf],
+    current_directory: impl AsRef<Path>,
+    check: bool,
+) -> Result<FormatReport, CliError> {
+    let current_directory = current_directory.as_ref();
+    let files = if paths.is_empty() {
+        let bundle = enclosing_bundle(current_directory)?;
+        let manifest =
+            load_manifest(&bundle, None).map_err(|error| CliError::one(error.to_string()))?;
+        let root = bundle.join(&manifest.root);
+        let source_directory = root.parent().unwrap_or(&bundle).to_path_buf();
+        let mut files = Vec::new();
+        collect_sources(&source_directory, false, &mut files)?;
+        files
+    } else {
+        let mut files = Vec::new();
+        for path in paths {
+            let path = current_directory.join(path);
+            if path.is_dir() {
+                collect_sources(&path, false, &mut files)?;
+            } else if path.is_file() {
+                files.push(path);
+            } else {
+                return Err(CliError::one(format!(
+                    "could not find `{}`",
+                    path.display()
+                )));
+            }
+        }
+        files
+    };
+    let mut report = FormatReport {
+        check,
+        ..FormatReport::default()
+    };
+    for path in files {
+        let source = fs::read_to_string(&path).map_err(|error| {
+            CliError::one(format!("could not read `{}`: {error}", path.display()))
+        })?;
+        let (text, diagnostics) = format_source(&source, &path);
+        if !diagnostics.is_empty() {
+            report.errors.push(path.clone());
+            report.diagnostics.extend(diagnostics);
+        }
+        if text == source {
+            report.unchanged.push(path);
+            continue;
+        }
+        if !check {
+            replace_file(&path, text.as_bytes())?;
+        }
+        report.changed.push(path);
+    }
+    Ok(report)
+}
+
+/// Format one source, with its syntax errors as diagnostics naming `path`.
+fn format_source(source: &str, path: &Path) -> (String, Vec<CompileDiagnostic>) {
+    let mut files = FileManager::new();
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let id = files.register_new_file(name, source.to_string());
+    let formatted = ruddy::format::format(source, id);
+    let directory = path.parent().unwrap_or(Path::new(""));
+    let diagnostics = source_diagnostics(
+        &mut files,
+        syntax_diagnostics(&formatted.lex_errors, &formatted.parse_errors),
+        directory,
+    );
+    (formatted.text, diagnostics)
+}
+
+/// The folder of the bundle `directory` is in: the nearest folder at or
+/// above it with a manifest.
+fn enclosing_bundle(directory: &Path) -> Result<PathBuf, CliError> {
+    let directory = fs::canonicalize(directory).map_err(|error| {
+        CliError::one(format!(
+            "could not resolve folder `{}`: {error}",
+            directory.display()
+        ))
+    })?;
+    let mut at = Some(directory.as_path());
+    while let Some(folder) = at {
+        if folder.join(MANIFEST).is_file() {
+            return Ok(folder.to_path_buf());
+        }
+        at = folder.parent();
+    }
+    Err(CliError::one(format!(
+        "no `{MANIFEST}` found in `{}` or any folder above it",
+        directory.display()
+    ))
+    .with_help_text("run inside a bundle, or name the files to format"))
+}
+
+/// Every `.rud` file under `directory`, in path order. A folder holding a
+/// manifest of its own is another bundle's and is skipped — unless it is
+/// the one asked for, which `nested` says.
+fn collect_sources(
+    directory: &Path,
+    nested: bool,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), CliError> {
+    if nested && directory.join(MANIFEST).is_file() {
+        return Ok(());
+    }
+    let unreadable = |error: io::Error| {
+        CliError::one(format!(
+            "could not read folder `{}`: {error}",
+            directory.display()
+        ))
+    };
+    let mut entries: Vec<PathBuf> = fs::read_dir(directory)
+        .map_err(unreadable)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<_, _>>()
+        .map_err(unreadable)?;
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            collect_sources(&path, true, files)?;
+        } else if path.extension().is_some_and(|extension| extension == "rud") {
+            files.push(path);
+        }
+    }
+    Ok(())
 }
 
 /// Create a new Ruddy project without replacing an existing path.
@@ -2179,27 +2393,19 @@ fn compile_one(
     if frontend_errors != 0 {
         let mut diagnostics = Vec::with_capacity(frontend_errors);
         for file in &loaded.loaded {
-            let mut source_errors: Vec<(&'static str, ui::Diagnostic)> = file
-                .lex_errors
-                .iter()
-                .map(|error| ("lex", error.diagnostic()))
-                .chain(
-                    file.parse_errors
-                        .iter()
-                        .map(|error| ("parse", error.diagnostic())),
-                )
-                .chain(
-                    loaded
-                        .errors
-                        .iter()
-                        .filter(|error| error.span.file_id == file.id)
-                        .map(|error| ("bundle", error.diagnostic_in(source_directory))),
-                )
-                .collect();
-            source_errors.sort_by_key(|(_, error)| error.primary.span.start);
-            diagnostics.extend(source_errors.iter().map(|(stage, error)| {
-                source_diagnostic(&mut files, stage, error, source_directory)
-            }));
+            let mut source_errors = syntax_diagnostics(&file.lex_errors, &file.parse_errors);
+            source_errors.extend(
+                loaded
+                    .errors
+                    .iter()
+                    .filter(|error| error.span.file_id == file.id)
+                    .map(|error| ("bundle", error.diagnostic_in(source_directory))),
+            );
+            diagnostics.extend(source_diagnostics(
+                &mut files,
+                source_errors,
+                source_directory,
+            ));
         }
         return Err(CompileError::from_diagnostics(diagnostics));
     }
@@ -2616,6 +2822,36 @@ pub fn render_diagnostic_with_advice(
         .to_owned()
 }
 
+/// The diagnostics of one file's lexical and syntactic errors, each with the
+/// phase that found it.
+fn syntax_diagnostics(
+    lex_errors: &[ruddy::token::Error],
+    parse_errors: &[ruddy::parse::Error],
+) -> Vec<(&'static str, ui::Diagnostic)> {
+    lex_errors
+        .iter()
+        .map(|error| ("lex", error.diagnostic()))
+        .chain(
+            parse_errors
+                .iter()
+                .map(|error| ("parse", error.diagnostic())),
+        )
+        .collect()
+}
+
+/// One file's diagnostics, rendered in source order.
+fn source_diagnostics(
+    files: &mut FileManager,
+    mut errors: Vec<(&'static str, ui::Diagnostic)>,
+    source_directory: &Path,
+) -> Vec<CompileDiagnostic> {
+    errors.sort_by_key(|(_, error)| error.primary.span.start);
+    errors
+        .iter()
+        .map(|(stage, error)| source_diagnostic(files, stage, error, source_directory))
+        .collect()
+}
+
 fn source_diagnostic(
     files: &mut FileManager,
     stage: &'static str,
@@ -2712,7 +2948,7 @@ fn diagnostic(
 /// Keep redirected output plain while respecting the conventional overrides.
 /// The debugger asks [`render_diagnostic`] for colour explicitly because its
 /// destination is a browser rather than this process's standard error stream.
-fn stderr_color() -> bool {
+pub fn stderr_color() -> bool {
     if std::env::var_os("NO_COLOR").is_some()
         || std::env::var_os("CLICOLOR").is_some_and(|value| value == "0")
     {

@@ -4,6 +4,7 @@ pub mod bundle;
 pub mod compile;
 pub mod entry;
 pub mod externs;
+pub mod format;
 pub mod inference;
 pub mod ir;
 pub mod link;

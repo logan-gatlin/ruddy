@@ -297,13 +297,17 @@ version = "0.1.0"
 dependencies = [
  "ariadne",
  "clap",
+ "crossbeam-channel",
  "fs2",
  "gix",
  "indexmap",
+ "lsp-server",
  "ruddy",
  "serde",
+ "serde_json",
  "toml",
  "twox-hash",
+ "url",
  "windows-sys 0.61.2",
 ]
 
@@ -2665,18 +2669,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ruddy-lsp"
-version = "0.1.0"
-dependencies = [
- "cli",
- "crossbeam-channel",
- "lsp-server",
- "ruddy",
- "serde_json",
- "url",
-]
-
-[[package]]
 name = "ruddy-tests"
 version = "0.1.0"
 dependencies = [
@@ -2687,7 +2679,6 @@ dependencies = [
  "regex",
  "ruddy",
  "ruddy-debug",
- "ruddy-lsp",
  "serde_json",
  "tempfile",
  "toml",

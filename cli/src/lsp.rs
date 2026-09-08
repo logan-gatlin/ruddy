@@ -1,9 +1,9 @@
-//! LSP transport and newest-revision scheduling. Input handling runs separately
+//! The language server: LSP transport and newest-revision scheduling. Input handling runs separately
 //! from analysis; only a current revision may publish diagnostics.
+use crate::workspace::{Workspace, file_identity};
 use crossbeam_channel::Sender;
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use ruddy::{analysis::CompletionKind, cancellation::Cancellation, tracking::Span};
-use ruddy_cli::workspace::{Workspace, file_identity};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -37,7 +37,7 @@ pub fn serve(connection: Connection) -> Result<()> {
     let params = connection.initialize(json!({
         "positionEncoding": "utf-16",
         "textDocumentSync": {"openClose":true,"change":2,"save":{"includeText":false}},
-        "hoverProvider":true,"definitionProvider":true,
+        "hoverProvider":true,"definitionProvider":true,"documentFormattingProvider":true,
         "completionProvider":{"triggerCharacters":[".",":","!"]}
     }))?;
     let root = params
@@ -362,7 +362,10 @@ impl Worker {
         }
         let supported = matches!(
             request.method.as_str(),
-            "textDocument/hover" | "textDocument/completion" | "textDocument/definition"
+            "textDocument/hover"
+                | "textDocument/completion"
+                | "textDocument/definition"
+                | "textDocument/formatting"
         );
         if !supported {
             self.sender.send(Message::Response(Response::new_err(
@@ -411,6 +414,19 @@ impl Worker {
             return Ok(Value::Null);
         };
         let source = &project.analysis.sources[logical];
+        // Formatting is whole-document and positionless: one edit replacing
+        // everything, or none when the buffer is already formatted. Syntax
+        // errors are formatted around, as the command line does.
+        if request.method == "textDocument/formatting" {
+            let formatted = ruddy::format::format(source, ruddy::tracking::FileID::GENERATED);
+            if formatted.text == *source {
+                return Ok(Value::Array(Vec::new()));
+            }
+            return Ok(json!([{
+                "range": {"start": position(source, 0), "end": position(source, source.len())},
+                "newText": formatted.text,
+            }]));
+        }
         let at = request
             .params
             .get("position")
@@ -506,7 +522,7 @@ impl Worker {
 }
 
 fn diagnostics_for(
-    project: &ruddy_cli::workspace::ProjectAnalysis,
+    project: &crate::workspace::ProjectAnalysis,
     logical: &str,
     text: &str,
 ) -> Vec<Value> {

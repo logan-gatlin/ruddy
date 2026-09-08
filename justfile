@@ -6,6 +6,14 @@
 port := "7878"
 dev_dir := justfile_directory() / "debug/.dev"
 
+# The Ruddy sources `just fmt` keeps formatted: the standard library and the
+# backend's platform files. The tree-sitter corpus and the diagnostics
+# fixtures are left alone, since their exact text is under test; so is the
+# handler fragment the backend splices into generated code, which is not a
+# file; and so is the debugger's demo, which ends in deliberate syntax errors
+# that a format run rightly reports.
+ruddy_sources := "std src/backend/node-platform.rud src/backend/node-entry.rud"
+
 _default:
     @just --list --unsorted
 
@@ -55,7 +63,7 @@ debug *args:
 
 # Run the language server over stdio.
 lsp:
-    cargo run -p ruddy-lsp --bin ruddy-ls
+    cargo run -p cli --bin ruddy -- lsp
 
 # Regenerate the tree-sitter parser and run its corpus tests.
 grammar *args:
@@ -136,11 +144,10 @@ test *args:
 build:
     cargo build --workspace
 
-# Build and install the CLI and language server, then replace the bundled standard
-# library under RUDDY_HOME (or ~/.ruddy when RUDDY_HOME is unset or empty).
+# Build and install the CLI, language server included, then replace the bundled
+# standard library under RUDDY_HOME (or ~/.ruddy when RUDDY_HOME is unset or empty).
 install:
     cargo install --locked --path "{{justfile_directory()}}/cli"
-    cargo install --locked --path "{{justfile_directory()}}/lsp" --bin ruddy-ls
     "{{justfile_directory()}}/scripts/install-std.sh" "{{justfile_directory()}}"
 
 # Line and branch coverage for the compiler library. Branch coverage is a
@@ -158,11 +165,14 @@ cov *args:
 clippy:
     cargo clippy --workspace --all-targets
 
+# Rust sources through rustfmt, Ruddy sources through `ruddy fmt`.
 fmt:
     cargo fmt --all
+    cargo run -q -p cli --bin ruddy -- fmt {{ruddy_sources}}
 
 fmt-check:
     cargo fmt --all -- --check
+    cargo run -q -p cli --bin ruddy -- fmt --check {{ruddy_sources}}
 
 # Drop the supervisor's scratch state (last good binary, build log).
 clean-dev:

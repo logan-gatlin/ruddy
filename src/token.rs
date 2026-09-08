@@ -169,10 +169,29 @@ pub enum Kind {
     String(String),
     /// One of the two boolean values.
     Boolean(bool),
+    /// `-- text` — a line comment, carrying the text after its `--` up to
+    /// but not including the newline that ends it. A token rather than
+    /// whitespace because the formatter needs to know where every comment
+    /// was and what it said; every other reader of the stream skips it. The
+    /// `--` is not part of the text, the way a string's quotes are not part
+    /// of its value.
+    LineComment(String),
+    /// `(* text *)` — a block comment, carrying everything between its
+    /// delimiters, nested comments included verbatim. A token for the reason
+    /// [`LineComment`](Kind::LineComment) is one.
+    BlockComment(String),
     /// A lexeme the lexer diagnosed. Keeping its place in the token stream lets
     /// the parser recover without inventing a second complaint for the same
     /// source text.
     Invalid,
+}
+
+impl Kind {
+    /// Whether this token is a comment: something the formatter reads and
+    /// every other consumer of the stream steps over.
+    pub const fn is_comment(&self) -> bool {
+        matches!(self, Kind::LineComment(_) | Kind::BlockComment(_))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -264,8 +283,7 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
             }
             // `->` wins over the standalone minus, and `--` wins over both:
             // the longer lexeme decides before the shorter one is assumed,
-            // the way `..` and `=>` already are. A line comment carries no
-            // token, the way whitespace does not.
+            // the way `..` and `=>` already are.
             '-' => {
                 chars.next();
                 // An adjacent sign belongs to the whole numeric lexeme,
@@ -286,7 +304,12 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                     }
                     Some(&(_, '-')) => {
                         chars.next();
-                        line_comment(&mut chars);
+                        let (text, width) = line_comment(&mut chars);
+                        tokens.push(
+                            file_id
+                                .span(start, width + 2)
+                                .track(Kind::LineComment(text)),
+                        );
                     }
                     _ => tokens.push(file_id.span(start, 1).track(Kind::Minus)),
                 }
@@ -471,9 +494,10 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
             // ahead of `=` is.
             '(' if matches!(chars.clone().nth(1), Some((_, '*'))) => {
                 let (result, width) = block_comment(&mut chars);
-                if let Err(kind) = result {
-                    let span = file_id.span(start, width);
-                    invalid(span, kind, &mut tokens, &mut errors);
+                let span = file_id.span(start, width);
+                match result {
+                    Ok(text) => tokens.push(span.track(Kind::BlockComment(text))),
+                    Err(kind) => invalid(span, kind, &mut tokens, &mut errors),
                 }
             }
             '(' => {
@@ -538,7 +562,7 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
             // than a valid field followed by surprising extra tokens.
             c if c.is_ascii_digit()
                 && numeric_field_position(&tokens, &delimiters)
-                && tokens.last().is_some_and(|tok| {
+                && last_non_comment(&tokens).is_some_and(|tok| {
                     errors
                         .last()
                         .is_none_or(|error| error.span.start < tok.span.start)
@@ -721,15 +745,24 @@ fn raw_string(chars: &mut Peekable<CharIndices<'_>>) -> (String, usize) {
 }
 
 /// Consume a `--` line comment's remaining text, up to but not including the
-/// newline that ends it, or the end of input. Carries no token, the way
-/// whitespace does not — the line itself is the only delimiter it needs.
-fn line_comment(chars: &mut Peekable<CharIndices<'_>>) {
+/// newline that ends it, or the end of input, as the text and its width. The
+/// line itself is the only delimiter it needs. A `\r` in front of the newline
+/// is the line ending's and not the comment's, so it is counted and dropped.
+fn line_comment(chars: &mut Peekable<CharIndices<'_>>) -> (String, usize) {
+    let mut text = String::new();
+    let mut width = 0;
     while let Some(&(_, c)) = chars.peek() {
         if c == '\n' {
             break;
         }
         chars.next();
+        width += c.len_utf8();
+        text.push(c);
     }
+    if text.ends_with('\r') {
+        text.pop();
+    }
+    (text, width)
 }
 
 /// Consume a `(* ... *)` block comment, from its opening `(*` onward.
@@ -737,15 +770,16 @@ fn line_comment(chars: &mut Peekable<CharIndices<'_>>) {
 /// A `(*` inside the comment reopens the count, and only the `*)` that
 /// matches it closes that nesting rather than the outer one, so
 /// `(* (* *) *)` is one comment rather than a comment followed by stray text.
-/// Carries no token, the way [`string`]'s caller does carry one: a comment
-/// has no value to keep, only a width to have consumed.
-fn block_comment(chars: &mut Peekable<CharIndices<'_>>) -> (Result<(), ErrorKind>, usize) {
+/// What comes back is the text between the outer delimiters — the nested
+/// ones included, verbatim — and the width of the whole lexeme.
+fn block_comment(chars: &mut Peekable<CharIndices<'_>>) -> (Result<String, ErrorKind>, usize) {
     let (_, open) = chars.next().expect("the caller peeked the opening `(`");
     debug_assert_eq!(open, '(');
     let (_, star) = chars.next().expect("the caller peeked the opening `*`");
     debug_assert_eq!(star, '*');
     let mut depth = 1u32;
     let mut width = 2;
+    let mut text = String::new();
 
     while depth > 0 {
         let Some(&(_, c)) = chars.peek() else {
@@ -753,21 +787,28 @@ fn block_comment(chars: &mut Peekable<CharIndices<'_>>) -> (Result<(), ErrorKind
         };
         chars.next();
         width += c.len_utf8();
+        text.push(c);
         match c {
             '(' if matches!(chars.peek(), Some(&(_, '*'))) => {
                 chars.next();
                 width += 1;
+                text.push('*');
                 depth += 1;
             }
             '*' if matches!(chars.peek(), Some(&(_, ')'))) => {
                 chars.next();
                 width += 1;
                 depth -= 1;
+                if depth > 0 {
+                    text.push(')');
+                }
             }
             _ => {}
         }
     }
-    (Ok(()), width)
+    // The closing `*` was pushed before it was recognized.
+    text.pop();
+    (Ok(text), width)
 }
 
 fn word(chars: &mut Peekable<CharIndices<'_>>) -> String {
@@ -836,12 +877,19 @@ fn number(chars: &mut Peekable<CharIndices<'_>>) -> String {
 /// the first field and every brace-level field after a comma. A backslash is
 /// included for an absent struct-type field.
 fn numeric_field_position(tokens: &[Token], delimiters: &[Delimiter]) -> bool {
-    let Some(previous) = tokens.last() else {
+    let Some(previous) = last_non_comment(tokens) else {
         return false;
     };
     matches!(previous.tracked, Kind::Dot | Kind::LeftBrace)
         || (matches!(previous.tracked, Kind::Comma | Kind::Backslash)
             && delimiters.last() == Some(&Delimiter::Brace))
+}
+
+/// The last token that is not a comment: what the numeric-field rule reads,
+/// since a comment between `.` and `0` is not a token in the sense that rule
+/// means.
+fn last_non_comment(tokens: &[Token]) -> Option<&Token> {
+    tokens.iter().rev().find(|tok| !tok.tracked.is_comment())
 }
 
 fn numeric_field(literal: &str) -> Result<Kind, ErrorKind> {
