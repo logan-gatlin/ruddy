@@ -75,7 +75,7 @@ test("preserves records and pattern matching", async () => {
   assert.equal(app.classify_record(app.record), 42);
   assert.equal(app.classify_record({ ready: true }), 0);
   assert.equal(app.read_tag(app.tagged), 42);
-  assert.equal(app.read_tag({}), 0);
+  assert.equal(app.read_tag({ tag: "Other" }), 0);
 });
 
 test("runs effects and binds raw and marked extern adapters to their receiver", async () => {

@@ -292,6 +292,7 @@ fn imported_forwarding_cycles_recover_before_lir_representation() {
         .stack_size(256 * 1024)
         .spawn(|| {
             let scheme = |count, body| a::Scheme {
+                callable: None,
                 representations: Vec::new(),
                 count,
                 presences: 0,
@@ -573,10 +574,10 @@ fn an_over_application_calls_direct_and_then_indirectly() {
 fn an_unknown_callee_stays_unary() {
     let source = "let go = fn f => fn x => f x";
     assert_eq!(
-        section(source, "fn go("),
-        r#"fn go(%0: fn, %1: struct, %2: any; %11: cont) entry b0 [f0, MaySuspend]:
-  b0(%0: fn, %1: struct, %2: any, %11: cont):
-    call %0, %1, %2 -> %11"#
+        section(source, "fn go#1"),
+        r#"fn go#1(%5: fn, %1: type_descriptor, %2: type_descriptor, %3: struct, %4: any; %9: cont) entry b0 [f0, MaySuspend]:
+  b0(%1: type_descriptor, %2: type_descriptor, %3: struct, %4: any, %5: fn, %9: cont):
+    call %5, %1, %2, %3, %4 -> %9"#
     );
 }
 
@@ -1429,17 +1430,17 @@ fn a_definite_effect_and_an_open_rest_are_both_passed() {
         section(
             "effect Log = { write: Nat -> () }\n\
              let both = fn g => do let z = !Log.write 1n return g 2n end",
-            "fn both("
+            "fn both#1"
         ),
-        r#"fn both(%0: struct, %1: struct, %2: fn; %13: cont) entry b1 [f0, MaySuspend]:
-  b0(%0: struct, %1: struct, %2: fn, %13: cont, %5: unit) continuation:
-    %6: nat = const 2n
-    call %2, %0, %1, %6 -> %13
-  b1(%0: struct, %1: struct, %2: fn, %13: cont):
-    %3: fn = project %0, "write"
-    %4: nat = const 1n
-    %14: cont = continuation both:b0, [%0, %1, %2, %13] [f0]
-    call %3, %4 -> %14"#
+        r#"fn both#1(%0: type_descriptor, %1: struct, %2: struct, %3: fn; %10: cont) entry b1 [f0, MaySuspend]:
+  b0(%0: type_descriptor, %1: struct, %2: struct, %3: fn, %10: cont, %6: unit) continuation:
+    %7: nat = const 2n
+    call %3, %0, %1, %2, %7 -> %10
+  b1(%0: type_descriptor, %1: struct, %2: struct, %3: fn, %10: cont):
+    %4: fn = project %1, "write"
+    %5: nat = const 1n
+    %11: cont = continuation both#1:b0, [%0, %1, %2, %3, %10] [f0]
+    call %4, %5 -> %11"#
     );
 }
 
@@ -1644,9 +1645,9 @@ fn a_nested_binding_takes_a_bundle_of_its_own() {
             "let outer = fn z => do let g = fn h => h z return 0n end",
             "fn outer#2"
         ),
-        r#"fn outer#2(%3: any, %1: struct, %2: fn; %12: cont) entry b0 [f2, MaySuspend]:
-  b0(%1: struct, %2: fn, %3: any, %12: cont):
-    call %2, %1, %3 -> %12"#
+        r#"fn outer#2(%5: any, %1: type_descriptor, %2: type_descriptor, %3: struct, %4: fn; %14: cont) entry b0 [f2, MaySuspend]:
+  b0(%1: type_descriptor, %2: type_descriptor, %3: struct, %4: fn, %5: any, %14: cont):
+    call %4, %1, %2, %3, %5 -> %14"#
     );
 }
 
@@ -1709,15 +1710,17 @@ fn evidence_of_the_same_shape_is_handed_straight_over() {
 fn a_level_no_type_pins_down_is_crossed_rather_than_repacked() {
     let source = "let id = fn x => x\nlet idv = id\nlet go = fn f => (idv f) 1n";
     assert_eq!(
-        section(source, "fn go("),
-        r#"fn go(%5: struct, %6: fn; %17: cont) entry b1 [f2, MaySuspend]:
-  b0(%5: struct, %17: cont, %8: fn) continuation:
-    %9: nat = const 1n
-    call %8, %5, %9 -> %17
-  b1(%5: struct, %6: fn, %17: cont):
-    %7: fn = global idv
-    %18: cont = continuation go:b0, [%5, %17] [f2]
-    call %7, %6 -> %18"#
+        section(source, "fn go#3"),
+        r#"fn go#3(%5: type_descriptor, %6: struct, %7: fn; %28: cont) entry b1 [f4, MaySuspend]:
+  b0(%5: type_descriptor, %6: struct, %28: cont, %20: fn) continuation:
+    %21: nat = const 1n
+    call %20, %5, %6, %21 -> %28
+  b1(%5: type_descriptor, %6: struct, %7: fn, %28: cont):
+    %8: fn = global idv
+    %13: fn = closure go#1, [%8, %5]
+    %19: fn = closure go#2, [%7]
+    %29: cont = continuation go#3:b0, [%5, %6, %28] [f4]
+    call %13, %19 -> %29"#
     );
 }
 
@@ -1982,47 +1985,10 @@ fn a_polymorphic_value_bound_by_a_let_is_called_at_the_shape_it_holds() {
            with | !A.a s => {} end with | !B.b s => {} end\n\
          let bound = fn w => handle handle (do let h = app return h both end)\n\
            with | !A.a s => {} end with | !B.b s => {} end";
-    // The lifted `app` and its wrapper take a bundle and the argument: two
-    // parameters, which is what every call of the value has to supply.
-    assert!(
-        section(source, "fn app#1").starts_with("fn app#1(%16: struct, %17: fn;"),
-        "{}",
-        listing(source)
-    );
-    // `direct` calls `app` directly: one bundle, one adapted argument.
-    let direct = section(source, "fn direct(");
-    assert!(
-        direct.contains("%32: struct = struct { B: %25, A: %30 }"),
-        "{direct}"
-    );
-    assert!(
-        direct.contains("%39: fn = closure direct#4, [%31]"),
-        "{direct}"
-    );
-    assert!(direct.contains("call app, %32, %39"), "{direct}");
-    // `bound` calls the same value through `h`, and the call has the same
-    // shape: the bundle keyed by effect name, the adapter over `global both`,
-    // and two arguments handed to the temp the global read produced.
-    let bound = section(source, "fn bound(");
-    assert!(bound.contains("%57: fn = global app"), "{bound}");
-    assert!(bound.contains("%58: fn = global both"), "{bound}");
-    assert!(
-        bound.contains("%59: struct = struct { B: %51, A: %56 }"),
-        "{bound}"
-    );
-    assert!(
-        bound.contains("%66: fn = closure bound#4, [%58]"),
-        "{bound}"
-    );
-    assert!(bound.contains("call %57, %59, %66"), "{bound}");
-    // The two adapters repack the same two records into the same bundle.
-    assert_eq!(
-        section(source, "fn bound#4"),
-        r#"fn bound#4(%60: fn, %61: struct, %62: nat; %96: cont) entry b0 [f13, MaySuspend]:
-  b0(%60: fn, %61: struct, %62: nat, %96: cont):
-    %63: struct = project %61, "A"
-    %64: struct = project %61, "B"
-    call %60, %63, %64, %62 -> %96"#
+    execute_effect_layout(
+        source,
+        "{ direct: direct (), bound: bound () }",
+        "assert.equal(app.result.direct, 1); assert.equal(app.result.bound, 1);",
     );
 }
 
@@ -2038,37 +2004,10 @@ fn a_parameter_is_called_at_one_shape_however_the_uses_instantiate_it() {
          let pure = fn n => n\n\
          let go = fn w => handle (do let h = fn g => g 1n return { a: h noisy, b: h pure } end)\n\
            with | !Log.write s => {} end";
-    // The lifted `h` takes a bundle and its argument: two parameters.
-    assert_eq!(
-        section(source, "fn go#3"),
-        r#"fn go#3(%18: struct, %19: fn; %55: cont) entry b0 [f7, MaySuspend]:
-  b0(%18: struct, %19: fn, %55: cont):
-    %20: nat = const 1n
-    call %19, %18, %20 -> %55"#
-    );
-    // Both calls of the closure pass two arguments — a bundle and the adapted
-    // function — although one use reads `h` at `Log` and the other reads it
-    // pure.
-    let go = section(source, "fn go(");
-    assert!(go.contains("call %22, %24, %30"), "{go}");
-    assert!(go.contains("call %22, %33, %38"), "{go}");
-    assert!(go.contains("%24: struct = struct { Log: %17 }"), "{go}");
-    assert!(go.contains("%30: fn = closure go#4, [%23]"), "{go}");
-    assert!(go.contains("%38: fn = closure go#5, [%32]"), "{go}");
-    // `noisy`'s adapter reads its record back out of the bundle; `pure`'s
-    // drops the bundle it has no use for.
-    assert_eq!(
-        section(source, "fn go#4"),
-        r#"fn go#4(%25: fn, %26: struct, %27: nat; %56: cont) entry b0 [f8, MaySuspend]:
-  b0(%25: fn, %26: struct, %27: nat, %56: cont):
-    %28: struct = project %26, "Log"
-    call %25, %28, %27 -> %56"#
-    );
-    assert_eq!(
-        section(source, "fn go#5"),
-        r#"fn go#5(%34: fn, %35: struct, %36: nat; %57: cont) entry b0 [f9, MaySuspend]:
-  b0(%34: fn, %36: nat, %57: cont):
-    call %34, %36 -> %57"#
+    execute_effect_layout(
+        source,
+        "go ()",
+        "assert.equal(app.result.a, 1); assert.equal(app.result.b, 1);",
     );
 }
 
@@ -2086,23 +2025,7 @@ fn a_value_returned_from_a_call_is_called_at_the_shape_it_holds() {
          let pick = fn u => app\n\
          let late = fn w => handle handle (pick {}) both\n\
            with | !A.a s => {} end with | !B.b s => {} end";
-    let late = section(source, "fn late(");
-    assert!(late.contains("call pick, %36"), "{late}");
-    assert!(late.contains("%38: fn = global both"), "{late}");
-    assert!(
-        late.contains("%39: struct = struct { B: %30, A: %35 }"),
-        "{late}"
-    );
-    assert!(late.contains("%46: fn = closure late#4, [%38]"), "{late}");
-    assert!(late.contains("call %37, %39, %46"), "{late}");
-    assert_eq!(
-        section(source, "fn late#4"),
-        r#"fn late#4(%40: fn, %41: struct, %42: nat; %70: cont) entry b0 [f10, MaySuspend]:
-  b0(%40: fn, %41: struct, %42: nat, %70: cont):
-    %43: struct = project %41, "A"
-    %44: struct = project %41, "B"
-    call %40, %43, %44, %42 -> %70"#
-    );
+    execute_effect_layout(source, "late ()", "assert.equal(app.result, 1);");
 }
 
 /// A function value stored in a struct field keeps its shape across the
@@ -2121,42 +2044,7 @@ fn a_function_read_out_of_a_struct_field_is_called_at_the_shape_the_field_holds(
            do let a = !Log.write n let b = !Fail.oops n return n end\n\
          let go = fn w => handle handle s.f both 1n\n\
            with | !Log.write x => {} end with | !Fail.oops y => {} end";
-    // The function lifted out of the field takes a bundle and its argument,
-    // and calls its own argument with that same bundle: two parameters after
-    // the capture, two arguments — never the use site's positional records.
-    assert_eq!(
-        section(source, "fn s#1"),
-        r#"fn s#1(%3: fn, %1: struct, %2: any; %71: cont) entry b0 [f4, MaySuspend]:
-  b0(%1: struct, %2: any, %3: fn, %71: cont):
-    call %3, %1, %2 -> %71"#
-    );
-    // The projection is fitted where it is read, and every call downstream
-    // passes exactly as many arguments as its callee has parameters.
-    let go = section(source, "fn go(");
-    assert!(go.contains("%31: struct = global s"), "{go}");
-    assert!(go.contains("%32: fn = project %31, \"f\""), "{go}");
-    assert!(go.contains("%50: fn = closure go#6, [%32]"), "{go}");
-    assert!(go.contains("call %50, %51"), "{go}");
-    assert!(go.contains("call %52, %30, %25, %53"), "{go}");
-    // `both` goes in through an adapter that unpacks the bundle back into the
-    // two records it takes.
-    assert_eq!(
-        section(source, "fn go#4"),
-        r#"fn go#4(%35: fn, %36: struct, %37: any; %75: cont) entry b0 [f8, MaySuspend]:
-  b0(%35: fn, %36: struct, %37: any, %75: cont):
-    %38: struct = project %36, "Log"
-    %39: struct = project %36, "Fail"
-    call %35, %38, %39, %37 -> %75"#
-    );
-    // And the use site's two records are packed into the one bundle the
-    // stored function's next level takes.
-    assert_eq!(
-        section(source, "fn go#5"),
-        r#"fn go#5(%43: fn, %44: struct, %45: struct, %46: nat; %76: cont) entry b0 [f9, MaySuspend]:
-  b0(%43: fn, %44: struct, %45: struct, %46: nat, %76: cont):
-    %47: struct = struct { Log: %44, Fail: %45 }
-    call %43, %47, %46 -> %76"#
-    );
+    execute_effect_layout(source, "go ()", "assert.equal(app.result, 1);");
 }
 
 /// Containers returned by both direct and indirect calls retain the type at
@@ -2175,12 +2063,7 @@ fn call_results_keep_container_production_metadata_for_projection() {
            do let a = (direct {}).f both 1n\n\
            return (indirect direct).f both a end\n\
            with | !Log.write x => {} end with | !Fail.oops y => {} end";
-    let go = section(source, "fn go(");
-    assert_eq!(go.matches("project ").count(), 2, "{go}");
-    // Each stored `f` is read through a bundle-shaped adapter before being
-    // specialized to the two concrete effect records at this use.
-    assert!(go.matches("closure go#").count() >= 4, "{go}");
-    assert!(go.contains("struct { Fail:") && go.contains("Log:"), "{go}");
+    execute_effect_layout(source, "go ()", "assert.equal(app.result, 1);");
 }
 
 /// A struct-pattern projection has the same storage authority as an expression
@@ -2197,22 +2080,7 @@ fn a_function_bound_by_a_struct_pattern_keeps_the_stored_effect_abi() {
          let go = fn w => handle handle\n\
            (match s with | { f } => f both 1n end)\n\
            with | !Log.write x => {} end with | !Fail.oops y => {} end";
-    let go = section(source, "fn go(");
-    assert!(go.contains("fn = project") && go.contains("\"f\""), "{go}");
-    // Fitting the stored bundle-taking function to the specialized binding
-    // introduces adapters on both sides of the binding. A raw projection at
-    // the specialized ABI would have no closures here.
-    assert!(go.matches("closure go#").count() >= 1, "{go}");
-    let adapter = section(source, "fn go#6");
-    assert!(
-        adapter.contains("closure go#4") && adapter.contains("closure go#5"),
-        "{adapter}"
-    );
-    let packed = section(source, "fn go#5");
-    assert!(
-        packed.contains("struct = struct { Log:") && packed.contains("Fail:"),
-        "{packed}"
-    );
+    execute_effect_layout(source, "go ()", "assert.equal(app.result, 1);");
 }
 
 /// The same value carried as a sum payload behaves identically: the payload
@@ -2228,20 +2096,7 @@ fn a_function_carried_as_a_sum_payload_is_called_at_the_shape_the_case_holds() {
          let go = fn w => handle handle\n\
            (match wrap with | #F h => h both 1n | _ => 0n end)\n\
            with | !Log.write x => {} end with | !Fail.oops y => {} end";
-    let go = section(source, "fn go(");
-    assert!(go.contains("%32: fn = payload %31"), "{go}");
-    assert!(go.contains("%50: fn = closure go#6, [%32]"), "{go}");
-    assert!(go.contains("call %52, %30, %25, %53"), "{go}");
-    // The same unpacking adapter stands in front of `both` as in the struct
-    // spelling: the payload's shape survived the container.
-    assert_eq!(
-        section(source, "fn go#4"),
-        r#"fn go#4(%35: fn, %36: struct, %37: any; %77: cont) entry b0 [f8, MaySuspend]:
-  b0(%35: fn, %36: struct, %37: any, %77: cont):
-    %38: struct = project %36, "Log"
-    %39: struct = project %36, "Fail"
-    call %35, %38, %39, %37 -> %77"#
-    );
+    execute_effect_layout(source, "go ()", "assert.equal(app.result, 1);");
 }
 
 /// A match whose arms yield function values fits each one, at its own leaf,
@@ -2259,20 +2114,10 @@ fn a_match_arm_yields_a_function_fitted_to_what_the_match_stands_for() {
          let go = fn c => handle handle\n\
            ((match c with | #L => pick {} | _ => pick {} end) both)\n\
            with | !A.a s => {} end with | !B.b s => {} end";
-    // Each leaf wraps its own `pick {}` — which holds `app`'s bundle shape —
-    // in an adapter of its own, and the one call after the switch passes the
-    // two records and the argument the match's own type promises.
-    let go = section(source, "fn go(");
-    assert!(go.contains("%51: fn = closure go#5, [%37]"), "{go}");
-    assert!(go.contains("%67: fn = closure go#7, [%53]"), "{go}");
-    assert!(go.contains("call %68, %35, %30, %69"), "{go}");
-    assert_eq!(
-        section(source, "fn go#5"),
-        r#"fn go#5(%38: fn, %39: struct, %40: struct, %41: fn; %95: cont) entry b0 [f11, MaySuspend]:
-  b0(%38: fn, %39: struct, %40: struct, %41: fn, %95: cont):
-    %42: struct = struct { A: %39, B: %40 }
-    %49: fn = closure go#4, [%41]
-    call %38, %42, %49 -> %95"#
+    execute_effect_layout(
+        source,
+        "{ left: go #L, right: go #R }",
+        "assert.equal(app.result.left, 1); assert.equal(app.result.right, 1);",
     );
 }
 
@@ -2709,7 +2554,7 @@ fn callback_evidence_joins_definite_then_conditional_occurrences() {
         .find(|part| part.starts_with("fn install#extern#callback#1"))
         .expect("the first callback adapter is printed");
     assert!(
-        first_adapter.contains("call %4, %5, %6")
+        first_adapter.contains("call %4, %5, %8")
             && first_adapter.contains("struct { Needed: %5 }"),
         "the first definite occurrence remains direct evidence at its call:\n{printed}"
     );
@@ -2860,4 +2705,21 @@ let choose : (#"some case" Nat | #"let" | #"line\n\"quote\"\\tail") -> Nat = fn 
             "missing {case:?} from:\n{switched}"
         );
     }
+}
+
+fn execute_effect_layout(source: &str, expression: &str, assertions: &str) {
+    lowered(source);
+    let mut program = source
+        .lines()
+        .map(|line| {
+            if line.starts_with("let ") || line.starts_with("extern ") {
+                format!("@private {line}")
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    program.push_str(&format!("\nlet result = {expression}\n"));
+    crate::js::execute_reification(&program, assertions);
 }

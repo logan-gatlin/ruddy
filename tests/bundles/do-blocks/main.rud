@@ -35,7 +35,7 @@ end
 let unit_block = fn seed => do
   let _ = mark seed
 end
-let ordered = fn seed => do
+let ordered: JsValue -> _ = fn seed => do
   let _ = mark 1n
   let _ = mark 2n
   let last = mark 3n
@@ -46,7 +46,7 @@ end
   let _ = !Log 20n
   return 30n
 end
-let handled = fn seed => handle logged () with
+let handled: JsValue -> _ = fn seed => handle logged () with
   | !Log n => do let _ = mark n end
   | return v => v
 end

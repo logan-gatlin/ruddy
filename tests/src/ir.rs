@@ -6624,6 +6624,7 @@ fn artifact_struct(labels: Vec<(String, a::RowField)>) -> a::Type {
 
 fn artifact_scheme(body: a::Type) -> a::Scheme {
     a::Scheme {
+        callable: None,
         representations: Vec::new(),
         count: 0,
         presences: 0,
@@ -6667,6 +6668,7 @@ fn recovered(dependency: a::UncheckedArtifact) -> (a::Artifact, Vec<a::RecoveryF
 fn imported_schemes_preserve_and_sanitize_existential_ownership() {
     let mut dependency = prelude_artifact("dep");
     dependency.header.values[0].scheme = a::Scheme {
+        callable: None,
         representations: Vec::new(),
         count: 1,
         presences: 1,
@@ -6710,6 +6712,7 @@ fn imported_schemes_preserve_and_sanitize_existential_ownership() {
 fn canonical_bundle_import_preserves_mixed_input_result_guarantee() {
     let mut dependency = prelude_artifact("dep");
     dependency.header.values[0].scheme = a::Scheme {
+        callable: None,
         representations: Vec::new(),
         count: 2,
         presences: 2,
@@ -7246,6 +7249,7 @@ fn imported_effect_row_keys_follow_canonical_identities_by_shape() {
                 relevant: true,
             }],
             scheme: a::Scheme {
+                callable: None,
                 representations: Vec::new(),
                 count: 1,
                 presences: 0,
@@ -7387,6 +7391,7 @@ fn legacy_operation_effects_get_fallback_identity_before_row_normalization() {
             relevant: true,
         }],
         scheme: a::Scheme {
+            callable: None,
             representations: Vec::new(),
             count: 1,
             presences: 0,
@@ -8056,6 +8061,7 @@ fn imported_presence_variables_keep_alpha_correlation_in_effect_identity() {
         name: format!("dep@1.0.0::{name}"),
         params: Vec::new(),
         scheme: a::Scheme {
+            callable: None,
             representations: Vec::new(),
             count: 2,
             presences: 2,
@@ -8184,6 +8190,7 @@ fn imported_bound_presences_are_local_to_each_scheme_instantiation() {
         name: format!("dep@1.0.0::{name}"),
         params: Vec::new(),
         scheme: a::Scheme {
+            callable: None,
             representations: Vec::new(),
             count: 1,
             presences: 1,
@@ -8242,6 +8249,7 @@ fn imported_presence_vars_use_a_disjoint_recovery_variant() {
         name: "dep@1.0.0::Carrier".into(),
         params: Vec::new(),
         scheme: a::Scheme {
+            callable: None,
             representations: Vec::new(),
             count: 1,
             presences: 1,
@@ -8515,6 +8523,7 @@ fn imported_structural_identity_respects_effect_and_case_parameter_senses() {
         name: format!("dep@1.0.0::{name}"),
         params,
         scheme: a::Scheme {
+            callable: None,
             representations: Vec::new(),
             count,
             presences: 0,
@@ -8737,6 +8746,7 @@ fn structural_rows_mask_inner_duplicates_and_preserve_ordinary_separator_labels(
         name: format!("dep@1.0.0::{name}"),
         params,
         scheme: a::Scheme {
+            callable: None,
             representations: Vec::new(),
             count,
             presences: 0,
@@ -8912,6 +8922,7 @@ fn absent_imported_payloads_do_not_create_visible_quantifiers_or_effect_counts()
         metadata: Default::default(),
         name: "dep@1.0.0::ghost".into(),
         scheme: a::Scheme {
+            callable: None,
             representations: Vec::new(),
             count: 1,
             presences: 0,
@@ -8940,6 +8951,7 @@ fn absent_imported_payloads_do_not_create_visible_quantifiers_or_effect_counts()
         metadata: Default::default(),
         name: "dep@1.0.0::nested".into(),
         scheme: a::Scheme {
+            callable: None,
             representations: Vec::new(),
             count: 1,
             presences: 1,
@@ -9119,6 +9131,7 @@ fn imported_interfaces_keep_applied_types_effects_and_alias_overlap_structural()
                     relevant: true,
                 }],
                 scheme: a::Scheme {
+                    callable: None,
                     representations: Vec::new(),
                     count: 1,
                     presences: 0,
@@ -9273,6 +9286,7 @@ fn imported_declared_types_exercise_every_semantic_identity_form() {
         name: format!("dep@1.0.0::{name}"),
         params: Vec::new(),
         scheme: a::Scheme {
+            callable: None,
             representations: Vec::new(),
             count,
             presences,
@@ -9619,6 +9633,7 @@ fn dependency_interfaces_import_every_semantic_form() {
         metadata: Default::default(),
         name: "dep@1.0.0::M::rich".to_string(),
         scheme: a::Scheme {
+            callable: None,
             representations: Vec::new(),
             count: 3,
             presences: 2,
@@ -9842,6 +9857,7 @@ fn dependency_interfaces_import_every_semantic_form() {
                         relevant: true,
                     }],
                     scheme: a::Scheme {
+                        callable: None,
                         representations: Vec::new(),
                         count: 1,
                         presences: 0,
@@ -9901,6 +9917,7 @@ fn dependency_interfaces_import_every_semantic_form() {
                         relevant: true,
                     }],
                     scheme: a::Scheme {
+                        callable: None,
                         representations: Vec::new(),
                         count: 1,
                         presences: 0,
@@ -10406,6 +10423,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
                 relevant: true,
             }],
             scheme: a::Scheme {
+                callable: None,
                 representations: Vec::new(),
                 count: 1,
                 presences: 0,
@@ -10427,6 +10445,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
                 relevant: true,
             }],
             scheme: a::Scheme {
+                callable: None,
                 representations: Vec::new(),
                 count: 1,
                 presences: 0,
@@ -10452,6 +10471,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
                 },
             ],
             scheme: a::Scheme {
+                callable: None,
                 representations: Vec::new(),
                 count: 2,
                 presences: 0,
@@ -10480,6 +10500,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
                 relevant: false,
             }],
             scheme: a::Scheme {
+                callable: None,
                 representations: Vec::new(),
                 count: 1,
                 presences: 0,
@@ -10498,6 +10519,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
                 relevant: true,
             }],
             scheme: a::Scheme {
+                callable: None,
                 representations: Vec::new(),
                 count: 1,
                 presences: 0,
@@ -10522,6 +10544,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
                 relevant: true,
             }],
             scheme: a::Scheme {
+                callable: None,
                 representations: Vec::new(),
                 count: 1,
                 presences: 0,
@@ -10550,6 +10573,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
                 },
             ],
             scheme: a::Scheme {
+                callable: None,
                 representations: Vec::new(),
                 count: 2,
                 presences: 0,
@@ -10571,6 +10595,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
                 relevant: true,
             }],
             scheme: a::Scheme {
+                callable: None,
                 representations: Vec::new(),
                 count: 1,
                 presences: 0,
@@ -10598,6 +10623,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
                 relevant: true,
             }],
             scheme: a::Scheme {
+                callable: None,
                 representations: Vec::new(),
                 count: 1,
                 presences: 0,
@@ -10625,6 +10651,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
                 relevant: true,
             }],
             scheme: a::Scheme {
+                callable: None,
                 representations: Vec::new(),
                 count: 1,
                 presences: 0,
@@ -10665,6 +10692,7 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::UncheckedArtifact {
                     relevant: true,
                 }],
                 scheme: a::Scheme {
+                    callable: None,
                     representations: Vec::new(),
                     count: 1,
                     presences: 0,
@@ -10725,6 +10753,7 @@ fn case_rows_artifact() -> a::UncheckedArtifact {
                 relevant: true,
             }],
             scheme: a::Scheme {
+                callable: None,
                 representations: Vec::new(),
                 count: 1,
                 presences: 0,
@@ -10759,6 +10788,7 @@ fn case_rows_artifact() -> a::UncheckedArtifact {
                 },
             ],
             scheme: a::Scheme {
+                callable: None,
                 representations: Vec::new(),
                 count: 2,
                 presences: 0,
@@ -10778,6 +10808,7 @@ fn case_rows_artifact() -> a::UncheckedArtifact {
             name: "dep@1.0.0::BrokenBare".into(),
             params: Vec::new(),
             scheme: a::Scheme {
+                callable: None,
                 representations: Vec::new(),
                 count: 1,
                 presences: 0,
@@ -10888,6 +10919,7 @@ fn malformed_named_applications_of_unequal_arity_are_not_congruent() {
             relevant: true,
         }],
         scheme: a::Scheme {
+            callable: None,
             representations: Vec::new(),
             count: 1,
             presences: 0,
@@ -10949,6 +10981,7 @@ fn malformed_nested_imported_applications_recover_during_effect_identity() {
                 relevant: true,
             }],
             scheme: a::Scheme {
+                callable: None,
                 representations: Vec::new(),
                 count: 1,
                 presences: 0,
@@ -11098,6 +11131,7 @@ fn imported_effect_identity_graph_is_stack_safe_and_absorbs_growing_types() {
                         relevant: true,
                     }],
                     scheme: a::Scheme {
+                        callable: None,
                         representations: Vec::new(),
                         count: 1,
                         presences: 0,
@@ -11168,6 +11202,7 @@ fn imported_recursive_instantiations_close_through_forwarding_aliases() {
             name: "dep@1.0.0::Id".into(),
             params: vec![parameter()],
             scheme: a::Scheme {
+                callable: None,
                 representations: Vec::new(),
                 count: 1,
                 presences: 0,
@@ -11182,6 +11217,7 @@ fn imported_recursive_instantiations_close_through_forwarding_aliases() {
             name: "dep@1.0.0::Loop".into(),
             params: vec![parameter()],
             scheme: a::Scheme {
+                callable: None,
                 representations: Vec::new(),
                 count: 1,
                 presences: 0,
@@ -11243,6 +11279,7 @@ fn a_finite_imported_rotation_longer_than_256_states_remains_exact() {
         name: "dep@1.0.0::Rotate".into(),
         params: parameters,
         scheme: a::Scheme {
+            callable: None,
             representations: Vec::new(),
             count: PARAMETERS as u32,
             presences: 0,
@@ -11373,6 +11410,7 @@ fn structurally_growing_imported_rotation_recovers_without_a_depth_cap() {
                 },
             ],
             scheme: a::Scheme {
+                callable: None,
                 representations: Vec::new(),
                 count: 2,
                 presences: 0,
@@ -11422,6 +11460,7 @@ fn structurally_growing_imported_rotation_recovers_without_a_depth_cap() {
                 relevant: true,
             }],
             scheme: a::Scheme {
+                callable: None,
                 representations: Vec::new(),
                 count: 1,
                 presences: 0,
@@ -11497,6 +11536,7 @@ fn sequential_imported_instantiations_do_not_exhaust_the_active_recursion_limit(
                 relevant: true,
             }],
             scheme: a::Scheme {
+                callable: None,
                 representations: Vec::new(),
                 count: 1,
                 presences: 0,
@@ -11747,6 +11787,7 @@ fn forwarded_field_addition_respects_outer_absent_shadowing() {
             relevant: true,
         }],
         scheme: a::Scheme {
+            callable: None,
             representations: Vec::new(),
             count: 1,
             presences: 0,
@@ -11862,6 +11903,7 @@ fn deep_field_summary_artifact(depth: usize, cycle: bool) -> a::UncheckedArtifac
                 name,
                 params,
                 scheme: a::Scheme {
+                    callable: None,
                     representations: Vec::new(),
                     count: u32::from(!cycle),
                     presences: 0,
@@ -12025,6 +12067,7 @@ fn deeply_nested_imported_semantics_are_preserved_on_a_small_stack() {
                 metadata: Default::default(),
                 name: "dep@1.0.0::deep_formula".into(),
                 scheme: a::Scheme {
+                    callable: None,
                     representations: Vec::new(),
                     count: 1,
                     presences: 1,
@@ -12037,6 +12080,7 @@ fn deeply_nested_imported_semantics_are_preserved_on_a_small_stack() {
                 metadata: Default::default(),
                 name: "dep@1.0.0::malformed_formula".into(),
                 scheme: a::Scheme {
+                    callable: None,
                     representations: Vec::new(),
                     count: 0,
                     presences: 0,
@@ -12143,6 +12187,7 @@ fn deeply_nested_imported_semantics_are_preserved_on_a_small_stack() {
 #[test]
 fn malformed_imported_scheme_bounds_recover_for_types_and_values() {
     let malformed = a::Scheme {
+        callable: None,
         representations: Vec::new(),
         count: 1,
         presences: 2,
@@ -12204,6 +12249,7 @@ fn malformed_imported_scheme_bounds_recover_for_types_and_values() {
             metadata: Default::default(),
             name: format!("dep@1.0.0::{name}"),
             scheme: a::Scheme {
+                callable: None,
                 representations: Vec::new(),
                 count: 2,
                 presences: 1,
@@ -12217,6 +12263,7 @@ fn malformed_imported_scheme_bounds_recover_for_types_and_values() {
         metadata: Default::default(),
         name: "dep@1.0.0::presence_as_row".into(),
         scheme: a::Scheme {
+            callable: None,
             representations: Vec::new(),
             count: 2,
             presences: 1,
@@ -12338,6 +12385,7 @@ fn imported_interfaces_discard_foreign_solver_local_ids_before_inference() {
             metadata: Default::default(),
             name: format!("dep@1.0.0::{name}"),
             scheme: a::Scheme {
+                callable: None,
                 representations: Vec::new(),
                 count: 0,
                 presences: 0,
@@ -12450,6 +12498,7 @@ fn arrow_effect_more_rows_use_one_canonical_form_in_both_directions() {
                 relevant: true,
             }],
             scheme: a::Scheme {
+                callable: None,
                 representations: Vec::new(),
                 count: 1,
                 presences: 0,
@@ -12593,6 +12642,7 @@ fn deep_equal_imported_types_unify_on_a_bounded_stack() {
                         relevant: true,
                     }],
                     scheme: a::Scheme {
+                        callable: None,
                         representations: Vec::new(),
                         count: 1,
                         presences: 0,
@@ -12662,6 +12712,7 @@ fn deep_equal_imported_types_unify_on_a_bounded_stack() {
                     metadata: Default::default(),
                     name: "dep@1.0.0::padding".into(),
                     scheme: a::Scheme {
+                        callable: None,
                         representations: Vec::new(),
                         count: 5_000,
                         presences: 0,
@@ -12745,6 +12796,7 @@ fn deep_alias_reentry_shares_one_congruence_transaction() {
                     relevant: true,
                 }],
                 scheme: a::Scheme {
+                    callable: None,
                     representations: Vec::new(),
                     count: 1,
                     presences: 0,
@@ -12791,6 +12843,7 @@ fn deep_alias_reentry_shares_one_congruence_transaction() {
                     metadata: Default::default(),
                     name: "dep@1.0.0::padding".into(),
                     scheme: a::Scheme {
+                        callable: None,
                         representations: Vec::new(),
                         count: 5_000,
                         presences: 0,
@@ -12863,6 +12916,7 @@ fn recursive_imported_alias_reentry_compares_malformed_arities() {
             name: "dep@1.0.0::A".into(),
             params: vec![parameter()],
             scheme: a::Scheme {
+                callable: None,
                 representations: Vec::new(),
                 count: 1,
                 presences: 0,
@@ -12877,6 +12931,7 @@ fn recursive_imported_alias_reentry_compares_malformed_arities() {
             name: "dep@1.0.0::B".into(),
             params: vec![parameter()],
             scheme: a::Scheme {
+                callable: None,
                 representations: Vec::new(),
                 count: 1,
                 presences: 0,
@@ -13221,6 +13276,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
                 relevant: true,
             }],
             scheme: a::Scheme {
+                callable: None,
                 representations: Vec::new(),
                 count: 1,
                 presences: 0,
@@ -13242,6 +13298,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
                 relevant: true,
             }],
             scheme: a::Scheme {
+                callable: None,
                 representations: Vec::new(),
                 count: 1,
                 presences: 0,
@@ -13260,6 +13317,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
                 relevant: true,
             }],
             scheme: a::Scheme {
+                callable: None,
                 representations: Vec::new(),
                 count: 1,
                 presences: 0,
@@ -13344,6 +13402,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
                 relevant: true,
             }],
             scheme: a::Scheme {
+                callable: None,
                 representations: Vec::new(),
                 count: 1,
                 presences: 0,
@@ -13365,6 +13424,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
                 relevant: true,
             }],
             scheme: a::Scheme {
+                callable: None,
                 representations: Vec::new(),
                 count: 1,
                 presences: 0,
@@ -13405,6 +13465,7 @@ fn imported_struct_aliases_are_valid_field_row_arguments() {
                 relevant: false,
             }],
             scheme: a::Scheme {
+                callable: None,
                 representations: Vec::new(),
                 count: 1,
                 presences: 0,

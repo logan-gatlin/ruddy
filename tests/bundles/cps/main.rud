@@ -10,7 +10,7 @@ end
 
 let left = fn n => match n with | 0.0 => 1.0 | _ => right (n - 1.0) end
 let right = fn n => match n with | 0.0 => 2.0 | _ => left (n - 1.0) end
-let apply = fn f n => f n
+@private let apply = fn f n => f n
 let higher = fn n => match n with | 0.0 => 0.0 | _ => apply higher (n - 1.0) end
 
 effect Step = Real -> Real

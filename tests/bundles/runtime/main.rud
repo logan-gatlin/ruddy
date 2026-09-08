@@ -24,7 +24,7 @@ extern run_loop : fn(Loop) -> Nat = "host.runLoop"
 
 let answer = Math::answer
 let identity = Math::identity
-let apply = fn f => fn x => f x
+let apply: (JsValue -> JsValue) -> JsValue -> JsValue = fn f => fn x => f x
 let captured = fn x => fn y => x + y
 let added = add 20n 2n
 let add_twenty = add 20n
@@ -47,12 +47,12 @@ let host_looped = run_loop host_loop
 let ruddy_loop : Loop = fn _ => ruddy_loop
 let ruddy_looped = run_loop ruddy_loop
 let record = { answer: answer, ready: true }
-let tagged = #Ready answer
-let read_tag = fn value => match value with
+let tagged: #Ready Nat = #Ready answer
+let read_tag: (#Ready Nat | #Other) -> Nat = fn value => match value with
   | #Ready payload => payload
   | _ => 0n
 end
-let classify_record = fn value => match value with
+let classify_record: { answer when 'present: Nat, ready: Boolean } -> Nat = fn value => match value with
   | { answer, ready } => answer
   | _ => 0n
 end

@@ -9484,7 +9484,7 @@ fn conditional_callback_failure_keeps_its_later_path_and_formula() {
 }
 
 #[test]
-fn extern_boundary_infers_row_evidence_and_reports_unsettled_presences() {
+fn extern_boundary_infers_row_evidence_and_preserves_optional_fields() {
     let (_, _, row) = infer_src("extern x : fn({ value: Nat, ..'fields }) -> () = \"host.x\"");
     assert!(row.errors().is_empty());
     assert_eq!(
@@ -9499,8 +9499,12 @@ fn extern_boundary_infers_row_evidence_and_reports_unsettled_presences() {
     );
     let (_, _, presence) =
         infer_src("extern x : fn({ value when 'present: Nat }) -> () = \"host.x\"");
+    assert!(presence.errors().is_empty(), "{:#?}", presence.errors());
+    let (_, _, exact) = infer_src(
+        "extern box: 'a -> Any = \"$anyUpcast\"\nlet exact: { value when 'present: Nat } -> Any = fn value => box value",
+    );
     assert!(
-        presence
+        exact
             .errors()
             .iter()
             .any(|error| error.kind.code() == "runtime-type-information")
@@ -9531,17 +9535,12 @@ fn async_boundary_metadata_preserves_alias_representation_checks() {
 }
 
 #[test]
-fn extern_boundary_aliases_preserve_presence_rejection_and_independent_demands() {
+fn extern_boundary_aliases_preserve_optional_cases_and_independent_demands() {
     let (_, lowered, output) = infer_src(
         "type Maybe 'r = #Nil | ..'r\nextern consume : fn(Maybe (#Some (when 'some) Nat)) -> () = \"host.consume\"",
     );
     assert!(lowered.errors.is_empty());
-    assert!(
-        output
-            .errors()
-            .iter()
-            .any(|error| error.kind.code() == "runtime-type-information")
-    );
+    assert!(output.errors().is_empty(), "{:#?}", output.errors());
     let (_, _, output) = infer_src("extern choose : fn('first, 'second) -> () = \"host.choose\"");
     assert!(output.errors().is_empty());
     assert_eq!(
@@ -10555,7 +10554,7 @@ fn sat_errors_link_directly_to_their_flipped_batches() {
 
 #[test]
 fn direct_boundary_errors_have_stable_ids_without_solve_steps() {
-    let (_, _, output) = infer_src("extern echo : fn('a) -> 'a = \"host.echo\"");
+    let (_, _, output) = infer_src("extern echo : fn('a) -> 'a = \"$anyUpcast\"");
     let [error] = output.errors() else {
         panic!("expected one boundary error: {:#?}", output.errors());
     };

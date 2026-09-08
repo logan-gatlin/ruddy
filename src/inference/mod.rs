@@ -222,6 +222,7 @@ impl Output {
     /// and its callers fix their evidence convention.
     pub(crate) fn reify(&mut self, reification: &crate::reification::Analysis) {
         let aliases = self.semantics.aliases.clone();
+        let requirements = reification.callables.graph.solve();
         let semantics = &mut self.semantics;
         for schemes in [
             &mut semantics.schemes,
@@ -229,6 +230,23 @@ impl Output {
             &mut semantics.locals,
         ] {
             for (symbol, scheme) in schemes {
+                if let Some(binding) = reification.callables.bindings.get(symbol) {
+                    let substitution =
+                        crate::reification::instantiate(&binding.ty, scheme.body(), &aliases);
+                    let parameters = substitution
+                        .iter()
+                        .filter_map(|(index, ty)| {
+                            crate::reification::parameter_index(ty).map(|p| (*index, p))
+                        })
+                        .collect();
+                    let callable = crate::reification::interface::Interface::export(
+                        &reification.callables.graph,
+                        binding.value,
+                        &parameters,
+                        &requirements,
+                    );
+                    *scheme = scheme.clone().with_callable(Some(callable));
+                }
                 if let Some(binding) = reification.bindings.get(symbol) {
                     let substitution =
                         crate::reification::instantiate(&binding.ty, scheme.body(), &aliases);
@@ -6035,6 +6053,7 @@ impl Fingerprint {
             self.word(*existential as u64);
         }
         self.debug(&scheme.representations());
+        self.debug(&scheme.callable());
         self.ty(scheme.body());
         self.formula(scheme.formula());
     }

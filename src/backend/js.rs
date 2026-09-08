@@ -67,7 +67,7 @@ impl error::Error for Error {}
 
 #[derive(Default)]
 struct ExportNode {
-    descriptor: Option<crate::reification::Descriptor>,
+    descriptor: Option<crate::reification::NativeTemplate>,
     adapter: Option<crate::externs::Callback>,
     value: Option<String>,
     children: BTreeMap<String, ExportNode>,
@@ -425,11 +425,35 @@ impl<'a> Generator<'a> {
                     crate::reification::Direction::FromJs => ", false)",
                 });
             }
+            Op::TypeProjection { descriptor, path } => {
+                out.push_str("$projectType(");
+                out.push_str(&v(*descriptor));
+                out.push_str(", ");
+                out.push_str(&serde_json::to_string(path).expect("descriptor path JSON"));
+                out.push(')');
+            }
             Op::TypeDescriptor {
                 template,
                 arguments,
             } => {
                 out.push_str("$instantiateType(");
+                out.push_str(
+                    &serde_json::to_string(template).expect("a descriptor is serializable"),
+                );
+                out.push_str(", [");
+                for (index, argument) in arguments.iter().enumerate() {
+                    if index != 0 {
+                        out.push_str(", ");
+                    }
+                    out.push_str(&v(*argument));
+                }
+                out.push_str("])");
+            }
+            Op::NativePlan {
+                template,
+                arguments,
+            } => {
+                out.push_str("$nativePlan(");
                 out.push_str(
                     &serde_json::to_string(template).expect("a descriptor is serializable"),
                 );
@@ -764,7 +788,7 @@ fn insert_export(
     node: &mut ExportNode,
     path: &[&str],
     qualified: &str,
-    descriptor: crate::reification::Descriptor,
+    descriptor: crate::reification::NativeTemplate,
     adapter: Option<crate::externs::Callback>,
 ) -> Result<(), Error> {
     let mut at = node;
@@ -793,12 +817,12 @@ fn emit_export_value(node: &ExportNode, binding: &str, out: &mut String) {
 
 fn emit_export_expression(node: &ExportNode, out: &mut String) {
     if let Some(value) = &node.value {
-        out.push_str("$convertType(");
+        out.push_str("$convertType($nativePlan(");
         out.push_str(
             &serde_json::to_string(node.descriptor.as_ref().expect("reviewed native export"))
                 .expect("descriptor JSON"),
         );
-        out.push_str(", ");
+        out.push_str(", []), ");
         out.push_str(if node.adapter.is_some() {
             "$callback($g["
         } else {
@@ -811,7 +835,7 @@ fn emit_export_expression(node: &ExportNode, out: &mut String) {
             string(callback_protocol(mode), out);
             out.push_str(", false");
         }
-        out.push_str("), true)");
+        out.push_str("), true, 0, true, true)");
     } else {
         out.push_str("$namespace([");
         for (i, (name, child)) in node.children.iter().enumerate() {

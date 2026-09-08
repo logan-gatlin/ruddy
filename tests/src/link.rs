@@ -62,6 +62,7 @@ fn artifact(
 
 fn scheme() -> a::Scheme {
     a::Scheme {
+        callable: None,
         representations: Vec::new(),
         count: 0,
         presences: 0,
@@ -181,6 +182,7 @@ fn links_every_item_and_relocates_calls_continuations_and_initializers() {
         &[],
         vec![continuation_function("dep-f", 2)],
         vec![a::Global {
+            type_interface: None,
             adapter: None,
             callable: None,
             name: "dep@1.0.0::value".into(),
@@ -192,6 +194,7 @@ fn links_every_item_and_relocates_calls_continuations_and_initializers() {
         &[("dep", "1.0.0")],
         vec![continuation_function("app-f", 2)],
         vec![a::Global {
+            type_interface: None,
             adapter: None,
             callable: None,
             name: "app@1.0.0::main".into(),
@@ -202,6 +205,7 @@ fn links_every_item_and_relocates_calls_continuations_and_initializers() {
     // An existential witness is a presence the value's package owns, so the
     // scheme quantifies one presence and its body packages a label wearing it.
     root.header.values[0].scheme = a::Scheme {
+        callable: None,
         representations: Vec::new(),
         count: 1,
         presences: 1,

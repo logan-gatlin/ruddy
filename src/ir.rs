@@ -4027,6 +4027,13 @@ fn import_scheme(
         .collect();
     Scheme::existential(count, presences, existentials, body, formula)
         .with_representations(scheme.representations.clone())
+        .with_callable(
+            scheme
+                .callable
+                .as_ref()
+                .filter(|callable| callable.validate(count, presences).is_ok())
+                .cloned(),
+        )
 }
 
 /// Replace bound positions a malformed imported interface did not declare with
@@ -5018,10 +5025,12 @@ enum SemanticRoot<'a> {
 /// alias argument interning and constructor-growth detection with operation
 /// identity processing, while retaining packages for the stricter runtime
 /// identity policy to inspect.
+pub(crate) type RepresentationGraph = Vec<(String, Vec<(String, usize)>)>;
+
 pub(crate) fn representation_graph(
     ty: &Arc<Ty>,
     aliases: &IndexMap<Symbol, Scheme>,
-) -> (usize, Vec<(String, Vec<(String, usize)>)>) {
+) -> (usize, RepresentationGraph) {
     let external_types = aliases
         .iter()
         .map(|(symbol, scheme)| {

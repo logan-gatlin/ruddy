@@ -4,6 +4,9 @@
 //! remain graph edges so constructing a recursive representation never unfolds
 //! the recursive type into an infinite tree.
 
+pub mod conventions;
+pub mod interface;
+
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     sync::Arc,
@@ -18,10 +21,81 @@ use crate::{
     types::{FixedInt, Presence, Rest, Row, Scheme, Ty, same_finite_syntax},
 };
 
+/// A constructor edge in an exact structural descriptor. Row remainders
+/// remove named fields rather than treating an open row as a record field.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Projection {
+    Element,
+    Argument,
+    Result,
+    Field(String),
+    Remainder(Vec<String>),
+}
+
+pub fn projection(
+    ty: &Arc<Ty>,
+    parameter: u32,
+    aliases: &IndexMap<Symbol, Scheme>,
+) -> Option<Vec<Projection>> {
+    let (template, parameters) = Descriptor::template(ty, aliases).ok()?;
+    let parameter = parameters.iter().position(|p| *p == parameter)? as u32;
+    let mut pending = std::collections::VecDeque::from([(0u32, Vec::new())]);
+    let mut seen = HashSet::new();
+    while let Some((at, path)) = pending.pop_front() {
+        if !seen.insert(at) {
+            continue;
+        }
+        let mut push = |child, step: Option<Projection>| {
+            let mut next = path.clone();
+            next.extend(step);
+            pending.push_back((child, next));
+        };
+        match &template.nodes[at as usize] {
+            Node::Parameter(p) if *p == parameter => return Some(path),
+            Node::Alias(child) => push(*child, None),
+            Node::Array(child) => push(*child, Some(Projection::Element)),
+            Node::Arrow([from, to]) => {
+                push(*from, Some(Projection::Argument));
+                push(*to, Some(Projection::Result));
+            }
+            Node::Struct(fields) | Node::Sum(fields) => {
+                for (name, child) in fields {
+                    push(*child, Some(Projection::Field(name.clone())));
+                }
+            }
+            Node::Extend([base, rest]) => {
+                push(*base, None);
+                let mut fields = BTreeSet::new();
+                let mut nodes = vec![*base];
+                let mut seen = HashSet::new();
+                while let Some(at) = nodes.pop() {
+                    if !seen.insert(at) {
+                        continue;
+                    }
+                    match &template.nodes[at as usize] {
+                        Node::Alias(child) => nodes.push(*child),
+                        Node::Extend(children) => nodes.extend(children),
+                        Node::Struct(names) | Node::Sum(names) => {
+                            fields.extend(names.iter().map(|(name, _)| name.clone()))
+                        }
+                        _ => {}
+                    }
+                }
+                push(
+                    *rest,
+                    Some(Projection::Remainder(fields.into_iter().collect())),
+                );
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 pub fn explain(scheme: &Scheme) -> Option<String> {
     (!scheme.representations().is_empty()).then(|| {
         format!(
-            "Uses runtime type information for {}. Ruddy supplies it at each instantiation.",
+            "Uses runtime type information for {}. Ruddy supplies it on the calls that need it.",
             scheme
                 .representations()
                 .iter()
@@ -51,9 +125,8 @@ pub fn parameter_index(ty: &Ty) -> Option<u32> {
     }
 }
 
-/// Evidence needed when a polymorphic binding is instantiated. Its resulting
-/// callable captures that evidence, so passing it through an ordinary
-/// higher-order parameter does not expose a second calling convention.
+/// Informational summary of the parameters mentioned by a callable interface.
+/// The per-arrow equations remain authoritative for invocation and lowering.
 #[derive(Debug, Clone)]
 pub struct Binding {
     pub ty: Arc<Ty>,
@@ -62,6 +135,7 @@ pub struct Binding {
 
 #[derive(Debug, Clone, Default)]
 pub struct Analysis {
+    pub callables: conventions::Plan,
     pub bindings: IndexMap<Symbol, Binding>,
 }
 
@@ -105,162 +179,99 @@ impl Analysis {
                 report(declaration.name_at, message);
             }
         }
-        for (symbol, declaration) in semantics.typed() {
-            let mut work = vec![(&declaration.value, self.bindings[symbol].parameters.clone())];
+        let solved = self.callables.graph.solve();
+        for declaration in semantics.typed().values() {
+            let mut work = vec![(&declaration.value, BTreeSet::new())];
             while let Some((term, available)) = work.pop() {
+                let flow = self.callables.occurrences[&term.at];
+                if solved[flow.evaluation as usize]
+                    .iter()
+                    .any(|need| !available.contains(&need.parameter))
+                {
+                    report(term.at, "this expression needs runtime type information for a type that is not available in its environment".into());
+                    // Report the outermost unsatisfied computation. Its
+                    // children share the same unavailable evidence.
+                    continue;
+                }
                 if let TermKind::Ident(target) = &term.kind
                     && let Some(binding) = self.bindings.get(target)
                 {
                     let supplied = instantiate(&binding.ty, &term.ty, aliases);
                     for parameter in &binding.parameters {
-                        let result = supplied.get(parameter)
-                            .ok_or_else(|| "cannot determine a required runtime type at this use".to_owned())
-                            .and_then(|ty| Descriptor::template(ty, aliases))
-                            .and_then(|(_, parameters)| {
-                                if parameters.iter().all(|parameter| available.contains(parameter)) { Ok(()) }
-                                else { Err("this expression needs runtime information for a type that is not available in its environment".into()) }
-                            });
-                        if let Err(message) = result {
+                        if let Some(ty) = supplied.get(parameter)
+                            && let Err(message) = Descriptor::template(ty, aliases)
+                        {
                             report(term.at, message);
                         }
                     }
                 }
-                if let TermKind::Let {
-                    name, value, body, ..
-                } = &term.kind
+                let mut nested = Vec::new();
+                children(term, &mut nested);
+                let mut available = available;
+                if let conventions::Shape::Arrow { needs, .. } =
+                    self.callables.graph.exposed(flow.value)
+                    && matches!(term.kind, TermKind::Fn { .. })
                 {
-                    let mut local = available.clone();
-                    local.extend(&self.bindings[&name.anchored].parameters);
-                    work.push((value, local));
-                    work.push((body, available));
-                } else {
-                    let mut nested = Vec::new();
-                    children(term, &mut nested);
-                    work.extend(nested.into_iter().map(|term| (term, available.clone())));
+                    available.extend(solved[*needs as usize].iter().map(|need| need.parameter));
                 }
+                work.extend(nested.into_iter().map(|term| (term, available.clone())));
             }
         }
         errors
     }
 
     pub fn infer(program: &Program, semantics: &inference::Semantics) -> Self {
-        let aliases = semantics.aliases();
-        let mut bindings = IndexMap::new();
-        for (symbol, scheme) in &program.external_schemes {
-            bindings.insert(
-                *symbol,
-                Binding {
-                    ty: scheme.body().clone(),
-                    parameters: scheme.representations().iter().copied().collect(),
-                },
-            );
-        }
-        for (symbol, declaration) in &program.externs {
-            let ty = semantics.externs()[symbol].body().clone();
-            let parameters = Intrinsic::recognize(&declaration.value.target.anchored, &ty, aliases)
-                .map(|intrinsic| parameters(&intrinsic.represented(&ty, aliases)))
-                .unwrap_or_else(|| {
-                    if declaration.value.array_intrinsic {
-                        BTreeSet::new()
-                    } else {
-                        native_parameters(&ty, aliases).unwrap_or_default()
+        let callables = conventions::Plan::infer(program, semantics);
+        let solved = callables.graph.solve();
+        // The legacy summary is derived from the callable interface. It is
+        // informational; lowering and evaluation checking use per-arrow rows.
+        let bindings = callables
+            .bindings
+            .iter()
+            .map(|(symbol, binding)| {
+                let mut parameters = BTreeSet::new();
+                let mut pending = vec![binding.value];
+                let mut seen = HashSet::new();
+                while let Some(shape) = pending.pop() {
+                    if !seen.insert(shape) {
+                        continue;
                     }
-                });
-            bindings.insert(*symbol, Binding { ty, parameters });
-        }
-        let mut bodies = Vec::new();
-        for (symbol, declaration) in semantics.typed() {
-            bindings.insert(
-                *symbol,
-                Binding {
-                    ty: declaration.value.ty.clone(),
-                    parameters: BTreeSet::new(),
-                },
-            );
-            bodies.push((*symbol, &declaration.value));
-            let mut work = vec![&declaration.value];
-            while let Some(term) = work.pop() {
-                if let TermKind::Let { name, value, .. } = &term.kind {
-                    bindings.insert(
-                        name.anchored,
-                        Binding {
-                            ty: value.ty.clone(),
-                            parameters: BTreeSet::new(),
-                        },
-                    );
-                    bodies.push((name.anchored, value));
-                }
-                children(term, &mut work);
-            }
-        }
-        if bindings
-            .values()
-            .all(|binding| binding.parameters.is_empty())
-        {
-            return Self { bindings };
-        }
-        // Every update adds a parameter from one finite, already-solved source
-        // type. Recursive calls transform demands, not source bodies or types.
-        loop {
-            let mut changed = false;
-            for (symbol, body) in &bodies {
-                let allowed = parameters(&bindings[symbol].ty);
-                let mut found = BTreeSet::new();
-                let mut work = vec![*body];
-                while let Some(term) = work.pop() {
-                    match &term.kind {
-                        TermKind::Ident(target) => {
-                            if let Some(binding) = bindings.get(target)
-                                && !binding.parameters.is_empty()
-                            {
-                                let supplied = instantiate(&binding.ty, &term.ty, aliases);
-                                for parameter in &binding.parameters {
-                                    if let Some(ty) = supplied.get(parameter) {
-                                        found.extend(parameters(ty));
-                                    }
-                                }
-                            }
+                    match &callables.graph.shapes[shape as usize] {
+                        conventions::Shape::Arrow {
+                            argument,
+                            result,
+                            needs,
+                        } => {
+                            parameters.extend(
+                                solved[*needs as usize]
+                                    .iter()
+                                    .filter(|need| need.port.is_none())
+                                    .map(|need| need.parameter),
+                            );
+                            pending.extend([*argument, *result]);
                         }
-                        TermKind::Let { value, body, .. } => {
-                            // A generalized local function supplies its own
-                            // parameters at instantiation. Captured outer types
-                            // are still owned by this enclosing computation.
-                            let local_parameters = parameters(&value.ty);
-                            let mut nested = vec![&**value];
-                            while let Some(inner) = nested.pop() {
-                                if let TermKind::Ident(target) = &inner.kind
-                                    && let Some(binding) = bindings.get(target)
-                                {
-                                    let supplied = instantiate(&binding.ty, &inner.ty, aliases);
-                                    for parameter in &binding.parameters {
-                                        if let Some(ty) = supplied.get(parameter) {
-                                            found.extend(
-                                                parameters(ty)
-                                                    .difference(&local_parameters)
-                                                    .copied(),
-                                            );
-                                        }
-                                    }
-                                }
-                                children(inner, &mut nested);
-                            }
-                            work.push(body);
-                            continue;
+                        conventions::Shape::Alias(child)
+                        | conventions::Shape::Array(child)
+                        | conventions::Shape::Cell(child) => pending.push(*child),
+                        conventions::Shape::Record(fields) | conventions::Shape::Sum(fields) => {
+                            pending.extend(fields.values())
                         }
                         _ => {}
                     }
-                    children(term, &mut work);
                 }
-                let binding = bindings.get_mut(symbol).expect("a collected binding");
-                let previous = binding.parameters.len();
-                binding.parameters.extend(found.intersection(&allowed));
-                changed |= previous != binding.parameters.len();
-            }
-            if !changed {
-                break;
-            }
+                (
+                    *symbol,
+                    Binding {
+                        ty: binding.ty.clone(),
+                        parameters,
+                    },
+                )
+            })
+            .collect();
+        Self {
+            bindings,
+            callables,
         }
-        Self { bindings }
     }
 
     pub fn parameters(&self, symbol: Symbol) -> Vec<u32> {
@@ -293,21 +304,8 @@ pub fn native_parameters(
                     .filter_map(|(name, child)| (name != "effects").then_some(*child)),
             ),
             "mut" => {}
-            "package" => {
-                let mut node = at;
-                let mut packages = HashSet::new();
-                while graph[node].0 == "package" && packages.insert(node) {
-                    node = graph[node].1[0].1;
-                }
-                if graph[node].0 != "arrow" {
-                    return Err(
-                        "runtime type information is unavailable for a hidden presence package"
-                            .into(),
-                    );
-                }
-                work.push(node);
-            }
-            _ => result.extend(Descriptor::from_graph(at, &graph)?.1),
+            "package" => work.extend(edges.iter().map(|(_, child)| *child)),
+            _ => result.extend(Descriptor::from_graph_policy(at, &graph, true)?.1),
         }
     }
     Ok(result)
@@ -457,11 +455,10 @@ fn children<'a>(term: &'a Term, work: &mut Vec<&'a Term>) {
         }
         TermKind::Array(items) => work.extend(items.iter().map(|item| &item.value)),
         TermKind::Project { base, .. } => work.push(base),
-        TermKind::Tag { payload, .. } => {
-            if let Some(payload) = payload {
-                work.push(payload);
-            }
-        }
+        TermKind::Tag {
+            payload: Some(payload),
+            ..
+        } => work.push(payload),
         TermKind::Match { scrutinee, arms } => {
             work.push(scrutinee);
             work.extend(arms.iter().map(|(_, body)| body));
@@ -600,6 +597,41 @@ pub enum Node {
     Parameter(u32),
 }
 
+/// A conversion shape can inspect optional fields without claiming an exact
+/// runtime identity for an abstract presence package.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeTemplate {
+    pub descriptor: Descriptor,
+    pub optional_fields: std::collections::BTreeMap<u32, BTreeSet<String>>,
+}
+
+impl NativeTemplate {
+    pub fn template(
+        ty: &Arc<Ty>,
+        aliases: &IndexMap<Symbol, Scheme>,
+    ) -> Result<(Self, Vec<u32>), String> {
+        let (root, graph) = crate::ir::representation_graph(ty, aliases);
+        Descriptor::from_graph_policy(root, &graph, true)
+    }
+
+    pub fn validate(&self, parameters: usize) -> Result<(), &'static str> {
+        self.descriptor.validate(parameters)?;
+        for (index, optional) in &self.optional_fields {
+            let Some(Node::Struct(fields)) = self.descriptor.nodes.get(*index as usize) else {
+                return Err("native optional fields require a record shape");
+            };
+            if optional
+                .iter()
+                .any(|name| !fields.iter().any(|(field, _)| field == name))
+            {
+                return Err("native optional field is absent from its record shape");
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Descriptor {
     pub fn of(ty: &Arc<Ty>, aliases: &IndexMap<Symbol, Scheme>) -> Result<Self, String> {
         let (descriptor, parameters) = Self::template(ty, aliases)?;
@@ -621,6 +653,16 @@ impl Descriptor {
         root: usize,
         graph: &[(String, Vec<(String, usize)>)],
     ) -> Result<(Self, Vec<u32>), String> {
+        let (template, parameters) = Self::from_graph_policy(root, graph, false)?;
+        Ok((template.descriptor, parameters))
+    }
+
+    fn from_graph_policy(
+        root: usize,
+        graph: &[(String, Vec<(String, usize)>)],
+        native: bool,
+    ) -> Result<(NativeTemplate, Vec<u32>), String> {
+        let mut optional_fields = std::collections::BTreeMap::<u32, BTreeSet<String>>::new();
         let mut parameters = Vec::new();
         let mut nodes = vec![Node::JsValue];
         let mut shared = HashMap::from([(root, 0u32)]);
@@ -649,6 +691,7 @@ impl Descriptor {
                 "Any" => Node::Any,
                 "JsValue" => Node::JsValue,
                 "Unit" => Node::Struct(Vec::new()),
+                "package" if native => Node::Alias(child(edge("body").expect("package body"))),
                 "array" => Node::Array(child(edge("element").expect("array graph edge"))),
                 "arrow" => {
                     let effects = &graph[edge("effects").expect("arrow effect graph edge")];
@@ -682,6 +725,16 @@ impl Descriptor {
                             "+" => fields
                                 .push((name.split_once(':').unwrap().1.to_string(), child(*node))),
                             "\\" => {}
+                            _ if native => {
+                                let name = name.split_once(':').unwrap().1.to_owned();
+                                if record {
+                                    optional_fields
+                                        .entry(at as u32)
+                                        .or_default()
+                                        .insert(name.clone());
+                                }
+                                fields.push((name, child(*node)));
+                            }
                             _ => {
                                 return Err(
                                     "runtime type information requires a settled field presence"
@@ -698,6 +751,9 @@ impl Descriptor {
                     };
                     if let Some(tail) = tail {
                         let index = nodes.len() as u32;
+                        if let Some(optional) = optional_fields.remove(&(at as u32)) {
+                            optional_fields.insert(index, optional);
+                        }
                         nodes.push(base);
                         Node::Extend([index, tail])
                     } else {
@@ -731,11 +787,24 @@ impl Descriptor {
             };
             nodes[at] = node;
         }
-        let descriptor = Self { nodes };
-        descriptor
-            .validate(parameters.len())
-            .map_err(str::to_owned)?;
-        Ok((descriptor, parameters))
+        // Hidden argument layouts use ascending semantic parameter indices.
+        // Graph traversal order must not change the slots of a returned native
+        // function, whose arguments arrive independently of this template.
+        let encountered = parameters.clone();
+        parameters.sort_unstable();
+        for node in &mut nodes {
+            if let Node::Parameter(slot) = node {
+                *slot = parameters
+                    .binary_search(&encountered[*slot as usize])
+                    .expect("collected descriptor parameter") as u32;
+            }
+        }
+        let template = NativeTemplate {
+            descriptor: Self { nodes },
+            optional_fields,
+        };
+        template.validate(parameters.len()).map_err(str::to_owned)?;
+        Ok((template, parameters))
     }
 
     /// Descriptors are public artifact data; validate references before codegen.

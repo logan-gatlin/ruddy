@@ -178,7 +178,9 @@ pub fn opcode(op: &Op) -> &'static str {
         Op::Callback { .. } => "callback",
         Op::NewTag => "new_tag",
         Op::Convert { .. } => "convert",
+        Op::TypeProjection { .. } => "type_projection",
         Op::TypeDescriptor { .. } => "type_descriptor",
+        Op::NativePlan { .. } => "native_plan",
         Op::Reflect { .. } => "reflect",
     }
 }
@@ -193,6 +195,7 @@ pub fn rep(rep: Rep) -> &'static str {
         Rep::String => "string",
         Rep::Boolean => "boolean",
         Rep::TypeDescriptor => "type_descriptor",
+        Rep::NativePlan => "native_plan",
         Rep::BoxedAny => "boxed_any",
         Rep::HostValue => "host_value",
         Rep::Unit => "unit",
@@ -418,10 +421,17 @@ fn operation(output: &Output, labels: &Labels, generated: bool, op: &Op) -> Stri
             value,
             direction,
         } => format!("convert {direction:?} %{descriptor}, %{value}"),
+        Op::TypeProjection { descriptor, path } => {
+            format!("type_projection %{descriptor}, {path:?}")
+        }
         Op::TypeDescriptor {
             template,
             arguments,
         } => format!("type_descriptor {template:?}, [{}]", temps(arguments)),
+        Op::NativePlan {
+            template,
+            arguments,
+        } => format!("native_plan {template:?}, [{}]", temps(arguments)),
         Op::Reflect {
             kind,
             descriptor,

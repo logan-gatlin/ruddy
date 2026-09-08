@@ -406,7 +406,7 @@ let text = match texts with | [first, ..] => first | _ => "failed" end
     );
 }
 
-fn execute_reification(source: &str, assertions: &str) {
+pub(crate) fn execute_reification(source: &str, assertions: &str) {
     let artifact = compiled(source);
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("reification.mjs");
@@ -1234,5 +1234,257 @@ fn signed_literals_run_in_arguments_patterns_and_metadata() {
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn reification_native_returned_functions_receive_descriptors_when_called() {
+    execute_reification(
+        r#"
+@private extern make: () -> ('a -> 'a) = "() => value => { if (!Array.isArray(value)) throw Error('native array expected'); return value; }"
+@private extern nested: () -> { apply: 'a -> 'a } = "() => ({ apply: value => { if (!Array.isArray(value)) throw Error('native array expected'); return value; } })"
+@private let direct = make ()
+@private let container = nested ()
+let direct_numbers = direct [4n, 9n]
+let direct_text = direct ["direct"]
+let nested_numbers = container.apply [12n, 19n]
+let nested_text = container.apply ["nested"]
+"#,
+        "assert.deepEqual(app.direct_numbers, [4, 9]); assert.deepEqual(app.direct_text, ['direct']); assert.deepEqual(app.nested_numbers, [12, 19]); assert.deepEqual(app.nested_text, ['nested']);",
+    );
+}
+
+#[test]
+fn reification_recursive_callable_adapters_are_finite() {
+    execute_reification(
+        r#"
+type Loop 'a = 'a -> Loop 'a
+@private extern box: 'a -> Any = "$anyUpcast"
+@private let loop: Loop 'a = fn value => do
+  let token = box value
+  return loop
+end
+@private let first = loop 1n
+@private let second = first 2n
+let completed = true
+"#,
+        "assert.equal(app.completed, true);",
+    );
+}
+
+#[test]
+fn reification_native_returned_functions_keep_independent_descriptor_order() {
+    execute_reification(
+        r#"
+@private extern make: () -> ({ first: 'a, second: 'b } -> { first: 'a, second: 'b }) = "() => value => { if (!Array.isArray(value.first) || typeof value.second !== 'string') throw Error('wrong native conversion'); return value; }"
+@private let apply = make ()
+let result = apply { first: [7n, 8n], second: "kept" }
+"#,
+        "assert.deepEqual(app.result.first, [7, 8]); assert.equal(app.result.second, 'kept');",
+    );
+}
+
+#[test]
+fn reification_generic_callable_payloads_seal_their_evidence_layout() {
+    execute_reification(
+        r#"
+type Option 'a = #Some 'a | #None
+@private extern box: 'a -> Any = "$anyUpcast"
+@private extern downcast: Any -> Option 'a = "$anyDowncast"
+@private let pack = fn value => box value
+@private let preserve = fn value => do let boxed = box value return value end
+@private let generic = fn value => do
+ let inner = fn next => do let boxed = box next let same = [value, next] return next end
+ return pack inner
+end
+@private let recover: Any -> Nat = fn token => do
+ let function: Option (Nat -> Nat) = downcast token
+ return match function with
+ | #Some call => call 42n
+ | #None => 0n
+end
+end
+@private let fixed: Nat -> Nat = preserve
+let direct = recover (pack fixed)
+let captured = recover (generic 7n)
+@private let closed: 'a -> (#Call 'a) = fn value => #Call value
+@private let aggregate = fn value => do
+ let inner = fn next => do let token = box next let same = [value, next] return next end
+ return pack { functions: [inner], tagged: closed inner }
+end
+@private let token = aggregate 8n
+@private let recovered: Option { functions: [Nat -> Nat], tagged: #Call (Nat -> Nat) } = downcast token
+let aggregate_result = match recovered with
+ | #Some { functions: [call], tagged: #Call other } => other (call 43n)
+ | _ => 0n
+end
+"#,
+        "assert.equal(app.direct, 42); assert.equal(app.captured, 42); assert.equal(app.aggregate_result, 43);",
+    );
+}
+
+#[test]
+fn reification_callable_profiles_survive_aggregate_patterns_and_joins() {
+    execute_reification(
+        r#"
+type Option 'a = #Some 'a | #None
+@private extern box: 'a -> Any = "$anyUpcast"
+@private extern downcast: Any -> Option 'a = "$anyDowncast"
+@private let reified = fn value => do let token = box value return value end
+@private let erased = fn value => value
+@private let functions = [erased, reified]
+@private let payload = #Function reified
+@private let record = { apply: reified }
+@private let choose = fn flag => match flag with | true => erased | false => reified end
+let from_array = match functions with | [first, second] => second (first 11n) | _ => 0n end
+let from_sum = match payload with | #Function apply => apply 12n end
+let from_record = match record with | { apply } => apply 13n end
+let from_join = (choose false) 14n
+"#,
+        "assert.equal(app.from_array, 11); assert.equal(app.from_sum, 12); assert.equal(app.from_record, 13); assert.equal(app.from_join, 14);",
+    );
+}
+
+#[test]
+fn reification_marked_native_currying_defers_independent_type_arguments() {
+    execute_reification(
+        r#"
+@private extern pair: fn('a, 'b) -> { first: 'a, second: 'b } = "(first, second) => { if (!Array.isArray(first) || !Array.isArray(second)) throw Error('native arrays expected'); return { first, second }; }"
+@private let first = pair [3n]
+let text = first ["text"]
+let flags = first [true]
+"#,
+        "assert.deepEqual(app.text.first, [3]); assert.deepEqual(app.text.second, ['text']); assert.deepEqual(app.flags.second, [true]);",
+    );
+}
+
+#[test]
+fn reification_native_generic_callable_conversion_uses_a_sealed_convention() {
+    execute_reification(
+        r#"
+@private extern native: 'a -> 'a = "value => value"
+@private extern box: 'a -> Any = "$anyUpcast"
+@private let make = fn value => do
+ let function = fn next => do let token = box next let same = [value, next] return next end
+ return native function
+end
+@private let apply = make [1n]
+let result = apply [2n, 3n]
+"#,
+        "assert.deepEqual(app.result, [2, 3]);",
+    );
+}
+
+#[test]
+fn reification_generic_selection_joins_both_value_profiles() {
+    execute_reification(
+        r#"
+@private extern box: 'a -> Any = "$anyUpcast"
+@private let choose = fn flag first second => match flag with | true => first | false => second end
+@private let erased = fn value => value
+@private let reified = fn value => do let token = box value return value end
+let first = (choose true erased reified) 21n
+let second = (choose false erased reified) 22n
+let reversed = (choose false reified erased) 23n
+"#,
+        "assert.equal(app.first, 21); assert.equal(app.second, 22); assert.equal(app.reversed, 23);",
+    );
+}
+
+#[test]
+fn reification_callback_adapters_extract_component_type_evidence() {
+    execute_reification(
+        r#"
+type Option 'a = #Some 'a | #None
+@private extern box: 'a -> Any = "$anyUpcast"
+@private extern downcast: Any -> Option 'a = "$anyDowncast"
+@private let apply = fn call value => call value
+@private let element = fn values => match values with | [value, ..] => box value | _ => box () end
+@private let consume = apply element
+@private let token = consume [37n]
+@private let recovered: Option Nat = downcast token
+let result = match recovered with | #Some n => n | #None => 0n end
+"#,
+        "assert.equal(app.result, 37);",
+    );
+}
+
+#[test]
+fn reification_mutable_callable_cells_share_their_storage_convention() {
+    execute_reification(
+        r#"
+@private extern box: 'a -> Any = "$anyUpcast"
+@private let run = fn initial => do
+ let cell = mut (fn value => value)
+ let assigned = cell := (fn value => do let token = box value return value end)
+ let from_cell = (~cell) initial
+ return assigned from_cell
+end
+let result = run 39n
+"#,
+        "assert.equal(app.result, 39);",
+    );
+}
+
+#[test]
+fn reification_callback_adapters_extract_record_evidence() {
+    execute_reification(
+        r#"
+type Option 'a = #Some 'a | #None
+@private extern box: 'a -> Any = "$anyUpcast"
+@private extern downcast: Any -> Option 'a = "$anyDowncast"
+@private let apply = fn call value => call value
+@private let field = fn record => box record.value
+@private let consume_field = apply field
+@private let a: Option Nat = downcast (consume_field {value: 43n})
+let first = match a with | #Some n => n | #None => 0n end
+"#,
+        "assert.equal(app.first, 43);",
+    );
+}
+
+#[test]
+fn reification_effect_payloads_preserve_callable_evidence() {
+    execute_reification(
+        r#"
+@private extern box: 'a -> Any = "$anyUpcast"
+effect Apply 'a = ('a -> 'a) -> 'a
+effect Get 'a = () -> ('a -> 'a)
+@private let run = fn value => handle !Apply (fn next => do let token = box next return next end) with
+ | !Apply call => call value
+end
+@private let returned = fn value => handle (!Get ()) value with
+ | !Get _ => fn next => do let token = box next return next end
+end
+@private let as_value = fn value => handle do
+ let perform = !Apply
+ return perform (fn next => do let token = box next return next end)
+end with | !Apply call => call value end
+let result = run 45n
+let second = returned 46n
+let third = as_value 47n
+"#,
+        "assert.equal(await app.result, 45); assert.equal(await app.second, 46); assert.equal(await app.third, 47);",
+    );
+}
+
+#[test]
+fn reification_callback_adapters_project_row_remainders_and_function_results() {
+    execute_reification(
+        r#"
+type Option 'a = #Some 'a | #None
+@private extern box: 'a -> Any = "$anyUpcast"
+@private extern downcast: Any -> Option 'a = "$anyDowncast"
+@private let apply = fn call value => call value
+@private let row: {head: Nat, ..'a} -> Any = fn record => box record
+@private let invoke: (() -> 'a) -> Any = fn call => box (call ())
+@private let consume_row = apply row
+@private let consume_function = apply invoke
+@private let a: Option {head: Nat, extra: String} = downcast (consume_row {head: 48n, extra: "rest"})
+@private let b: Option Nat = downcast (consume_function (fn _ => 49n))
+let first = match a with | #Some {head, extra} => head | #None => 0n end
+let second = match b with | #Some n => n | #None => 0n end
+"#,
+        "assert.equal(app.first, 48); assert.equal(app.second, 49);",
     );
 }

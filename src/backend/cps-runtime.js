@@ -96,7 +96,15 @@ function $drive(state) {
           const c = $fromHost(s.c);
           if (!c || !c[$closureMark]) throw new TypeError("not a Ruddy function");
           if (c.nativeType) {
-            const n = c.nativeType;
+            let n = c.nativeType;
+            if (n.slots && n.slots.length) {
+              const supplied = n.descriptor.arguments.slice();
+              n.slots.forEach((slot, index) => {
+                if (s.a[index] === undefined && supplied[slot] === undefined) throw new TypeError("missing runtime type information for native invocation");
+                if (s.a[index] !== undefined) supplied[slot] = s.a[index];
+              });
+              n = { ...n, descriptor: $nativePlan(n.descriptor.template, supplied) };
+            }
             const argument = $convertType(n.descriptor, s.a[s.a.length - 1], true, n.from);
             state.next = $raw(n.function, [argument], { conversion: n, parent: s.k }, s.h, "Immediate");
             break;

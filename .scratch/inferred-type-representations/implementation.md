@@ -1,153 +1,148 @@
-# Implementation work in progress
+# Inferred runtime representations: implementation
 
-Status: in-progress
+Status: implemented; repository coverage target remains unmet
 
 Worktree: `/var/home/dev/code/hc/ruddy-inferred-type-representations`
 Branch: `inferred-type-representations`
-Base/spec commit: `42f6558`
+Rebased main: `fdfc498` (effect rethrowing, PR59)
+Spec commit: `fc52816`
+Pre-rebase implementation checkpoint, rebased: `6332fe4`
 
-The spec is not implemented yet. Compiler changes are uncommitted and must not
-be presented as a finished feature. The current scheme-factory convention has
-an observable semantic bug. Keep the new failing execution tests until the
-underlying callable architecture is corrected; do not weaken their assertions.
+## Rebase
 
-## Existing work
+Fetched and rebased cleanly onto `refs/remotes/origin/main`. Use the full remote
+reference because a local branch named `origin/main` makes the shorthand
+ambiguous. The original main worktree is untouched. Backup branch
+`inferred-type-representations-before-effect-rebase` retains `09bc6b7`.
+No requirement or source syntax change was needed after the effect rebase.
 
-- Compiler-known `Any` and `JsValue`, intrinsic declarations in `std::any` and
-  `std::js`, distinct lowered descriptor/boxed/host representations.
-- Inferred scheme-level descriptor demand sets and forwarding through generic
-  bindings, published interfaces, hover/debug output, and artifacts.
-- Lowered descriptor, reflection, and conversion operations, with CPS/JS support.
-- Authentic opaque Any packages, structural graph equality, native array
-  snapshots, structural conversion, checked JsValue decoding, Promise/callback
-  adapter integration, and concrete JS root interface checking.
-- Behavioral tests for generic boxing/externs, recursive aliases and calls,
-  independent parameters, rows, imports, opaque transport, decoding, root
-  exports, and standard-library modules.
+## Implementation
 
-These pieces need integration with the corrected callable representation below.
-The passing tests do not establish that the complete feature is sound.
+`Any` and `JsValue` are builtin types. The standard `any` module exposes `upcast`
+and `downcast`; `js` exposes `decode` and structural `DecodeError`. Reflection
+uses compiler-recognized intrinsics with checked signatures. Authentic `Any`
+packages keep their descriptor and original payload in a runtime WeakMap;
+lookalikes cannot forge packages. Structural graph equality distinguishes primitive
+types and recursively compares arrays, records, sums, and supported pure functions.
+Aliases and allocation addresses do not establish user type identity.
 
-## Required callable rewrite
+`src/reification/conventions.rs` infers a finite graph of value shapes and
+per-arrow descriptor demands. Evaluation requirements are separate from invocation
+requirements. Incoming callbacks quantify demand ports. Profiles follow actual
+values through generalization, instantiation, partial application, captures,
+recursive groups, branches, aggregate construction and patterns. An erased generic
+identity retains its argument's profile without intrinsically needing descriptors.
 
-`src/lir/lower.rs::reified_value` currently moves the entire initializer into a
-factory called at each instantiation. A computation preceding a lambda, or the
-argument of a generalized partial application, consequently executes repeatedly
-instead of once. Unused generalized initializers can disappear entirely.
+`src/reification/interface.rs` publishes reachable finite shape graphs, normalized
+parameter slots, conditional ports and solved requirements. Semantic schemes share
+these immutable interfaces. Interfaces survive artifact imports and participate in
+semantic fingerprints. The old binding-wide fixed-point inference is removed;
+the retained flat `representations` vector is an informational summary.
 
-Both execution regressions now compile and fail for the actual semantic reason:
+`src/lir/lower/reification.rs` adapts callable layouts before ordinary type erasure.
+A source lambda receives its own arrow's descriptors, effect evidence and visible
+argument in that order. Initializers execute once in their actual lexical context.
+Creating an adapter captures values and descriptors; it never runs the adapted
+source body. Aggregate adapters preserve producer conventions through record
+fields, arrays, sum payloads and patterns. Component projections decompose an
+incoming compound descriptor where a callback needs a component. Effect adapters
+forward the caller's evidence instead of accidentally capturing ambient handlers.
 
-- `reification_generalized_initializers_preserve_eager_allocation_identity`
-- `reification_generalized_partial_application_evaluates_its_argument_once`
+Values crossing reflection, abstract native positions, effect operations or
+mutable callable storage use a canonical callable convention by capturing required
+evidence. Effect operation implementations still receive only their payload;
+this convention works across independently compiled perform and handler sites.
+No effect or region argument becomes a type descriptor merely because it appears
+in an effect row. Existing region and hidden-presence escape checks remain active.
 
-They allocate an opaque Any token during initialization and compare tokens
-captured by two instantiations through an ordinary JS identity comparison. Both
-comparisons must be true; both are currently false.
+Exact `TypeDescriptor`, `TypeProjection`, `Reflect`, `NativePlan` and `Convert`
+operations survive CPS lowering, artifact translation, linking and JS emission.
+Exact identity descriptors reject unavailable hidden information. Native plans
+have a separate conversion policy supporting existing optional record and package
+contracts, and can defer returned-function descriptors until invocation.
 
-Requirements currently exist only as binding/scheme parameter sets. `Ty::Arrow`
-has no latent requirement information, so every curried argument descriptor is
-required when its outer binding is referenced. This violates the spec. A local
-hoisting special case or rejecting generalized partial applications would not
-implement the promised behavior.
+Ordinary externs and concrete JS exports use recursive native conversion. Arrays
+are snapshots in both directions; sums use `{tag, value}`. Opaque host values and
+authentic packages retain identity. Generic extern adapters are compiled once.
+Marked argument groups retain earlier values and descriptors until the final
+call, preserving callback effect coverage and completion protocols. Conversion
+state survives Promise completion. Malformed typed input is a foreign contract
+failure; explicit decoding returns structured path/expected/message errors.
+See `docs/runtime-type-information.md` for the native constructor encodings.
 
-A semantic sidecar is a possible implementation organization, but it needs to
-be part of every semantic value occurrence and scheme, not a map from symbols
-to arrow depths. It must distinguish evaluation requirements, latent call
-requirements, and captured evidence. Its finite type-shape graph needs arrow
-requirements, argument/result shapes, aggregate members, recursive edges, and
-shape variables for ordinary type variables. Erased identity must preserve the
-shape of a callable (or aggregate of callables) through its shared input/output
-type variable without receiving descriptors itself.
+JS roots reject unresolved conversion or invocation requirements throughout
+nested/returned/recursive interfaces in both checking and building. Portable
+library and private generic interfaces remain permitted. Concrete annotations,
+including deliberate `JsValue` interfaces, supply host requirements.
 
-A second pass after ordinary inference must retain the actual binder and scheme
-instantiation links. Merely matching equal solved type trees does not recover
-all independent higher-order demand variables. Higher-order `apply` must
-quantify and propagate its callback's demands. Generalization must preserve
-ordinary value restriction and presence ownership; recursive groups need a
-finite joint constraint solution.
+Lowered globals retain the callable contract under which they were compiled.
+Artifact validation compares complete exported interfaces against that retained
+contract, including aliases, curried results and nested aggregates. It also checks
+bound indices, demand ports, graph references, descriptor operand representations,
+row-extension invariants and direct closure evidence arity. As with the existing
+typed executable artifact, this validates compiler contracts rather than proving
+arbitrary hand-written executable semantics.
 
-Lowering can reuse `lambda`, `indirect`, known calls, `held`/`holding`,
-`fits`/`fitted`, capture threading, and curry wrappers. Initializer evaluation
-must stay in `define`/`Let`; only lambda invocation receives hidden descriptor
-parameters. Fit callable conventions at higher-order and aggregate boundaries.
+Hover and diagnostics explain needs in prose. Source printers retain existing
+syntax. The debugger has a Runtime types tab for finite value shapes, per-arrow
+needs, demand ports and evaluation requirements, plus descriptor operations in its
+existing LIR/artifact views.
 
-Generic native adapters must also defer demands needed only by returned
-functions. Obtaining the raw result of `extern make: () -> ('a -> 'a)` does not
-yet require a descriptor for `'a`; invoking that result does. Boxed callable
-payloads need a canonical convention (for example, capturing supplied evidence
-when boxing) so an exact successful downcast cannot expose a different hidden
-argument layout.
+## Termination
 
-Publish the corrected metadata in schemes/artifacts and interface invalidation,
-and replace the current artifact initializer-factory-layout validator.
+The shared IR regular-type graph retains admitted aliases as finite back edges
+and rejects growing applications under existing rules. Shape construction follows
+finite source occurrences and graph nodes, closes active recursive paths, and
+keeps closed subgraphs erased instead of expanding shared alias DAGs.
 
-## Review fixes made
+Demand solving allocates no new types or graph nodes. It monotonically adds pairs
+from finite sets of parameter indices and demand ports. Substitution maps to
+finite free-parameter sets. Recursive definitions remain graph dependencies;
+they do not specialize or execute source bodies. Adapter generation reserves
+memo entries keyed by semantic type/profile pairs and capture layouts before
+visiting recursive children. Runtime equality uses graph-pair memoization;
+conversion uses an explicit work stack and cyclic-path checks.
 
-The standards/spec reviews also found finite-synthesis and descriptor-validation
-issues. These have received focused fixes:
+A source-to-artifact regression compiles 128 higher-order generic forwarding
+interfaces and a recursive descriptor on a 256 KiB stack, validates the printed
+artifact, and bounds artifact size. Existing deep alias, imported rotation and
+bounded-stack interface regressions also remain active.
 
-- Runtime descriptor synthesis now uses the existing IR `RegularType` graph
-  builder's argument interning, forwarding-alias normalization, and structural
-  growth detection, with packages retained for identity-policy inspection.
-- Native parameter discovery traverses the finite graph. Requirement
-  substitution memoizes structural alias identities and stops malformed growing
-  graph paths instead of repeatedly expanding finite syntax.
-- Artifact validation follows Alias and Extend dependencies to reject unguarded
-  cycles, primitive/mixed-kind extensions, and duplicate explicit row fields.
-- JS normalizes concrete Extend templates even when there are no parameters.
-- Added public artifact/import and generated-execution tests for these cases.
+## Tests and compatibility
 
-Remaining review concerns include the separate native graph builder in
-`src/backend/host.rs` and completeness of conversion/evidence validation. The
-new shared graph helper currently lives in `src/ir.rs`; consider extracting the
-common finite graph module when integrating native policy.
+Tests use the approved source-compilation, generated JS, artifact/import and
+export-diagnostic seams. Coverage includes eager initializer identity, independently
+typed curried calls, erased/reified callback joins, callable aggregate patterns,
+mutable callable cells, effect payloads/results/operation values, component
+evidence extraction, native callbacks, Promise completion, opaque transport,
+forgery rejection, recursive structural equality and malformed public artifacts.
 
-## Compatibility failures to resolve
+Eight previous effect-adapter tests now execute generated JavaScript while
+retaining their source programs, rather than asserting private temporary indices.
+They caught actual evidence-capture failures during integration. Existing fixture
+changes annotate deliberate concrete or JsValue host interfaces and replace
+observations of private arrays/sum symbols with the new native encodings. The
+array model test still checks all get results; it reads contents within Ruddy and
+crosses the snapshot boundary once per observation to avoid quadratic host copying.
 
-The first full `just test` run reported 1662 passed, 49 failed, 9 ignored in the
-main test crate. Its log is `/tmp/ruddy-reification-full.log`. That result predates
-some fixes and the new regression tests; it is not a current clean-suite result.
+## Review and validation
 
-Failures include:
+Spec review found missing effect payload conventions, weak artifact contract
+validation, and missing bounded-resource coverage/documentation. Regression tests
+and the changes above address these findings. Standards review requested the new
+debugger phase and shared adapter-key/capture installation helpers; both are added.
 
-- Native shape rejection added to raw inference rejects existing hidden/optional
-  presence package tests. Preserve ownership and existing supported ABI contracts;
-  do not simply relabel these tests as obsolete. A native conversion shape and an
-  exact structural identity descriptor have distinct policy needs.
-- Existing generic JS root fixtures require deliberate concrete interfaces or
-  JsValue annotations where that change is intended by the spec. Do not default
-  their types automatically.
-- Native sums/arrays change host-facing test expectations that currently inspect
-  private symbols/persistent array storage. Update only intentional ABI changes.
-- Existing callable/effect adapter, primitive/large-Nat, thenable-data, runtime,
-  CLI, debug/snapshot and standard-library regressions need investigation.
-- Two new primitives require updating the primitive spelling/count assertion.
+- `just test`: 1,824 passed, 9 ignored, no failures (1,751 in the main test crate).
+- `just cov`: the same complete suite passed; 96.12% line coverage and 88.50%
+  branch coverage. This does **not** meet CONTRIBUTING.md's 100% requirement.
+  The remaining coverage gap is explicitly outstanding; this is not a claim
+  of complete standards compliance.
+- `just clippy`: passed without warnings.
+- `just fmt-check`: passed.
+- `git diff --check`: passed.
 
-Some old tests were already adjusted in the working diff. Review those edits
-against the original test intent; do not use fixture changes to conceal a
-regression. The presence-package JS fixture changes deserve particular review.
-
-## Validation and next actions
-
-Use `CARGO_TARGET_DIR=/var/home/dev/code/hc/ruddy/target` to reuse build artifacts.
-All Rust tests must run via `just test`, never directly via Cargo.
-
-Latest completed checks during this work:
-
-- `cargo check --workspace --all-targets`: passed.
-- `just test reification_`: 14 passed, the two eager-initialization tests failed.
-- `just test reification_concrete_artifact`: passed (added after that focused run).
-- The expanded malformed descriptor artifact test passed.
-- Imported forwarding-recursion/growing-alias descriptor compilation test passed.
-
-`cargo fmt --all` and `git diff --check` passed. `just test ir::` matches both
-IR and LIR test names: 405 passed and the same two known LIR regressions failed
-(`callback_evidence_joins_definite_then_conditional_occurrences` and
-`existential_packages_are_transparent_to_container_lowering`). The affected IR
-graph tests passed, including the finite rotation longer than 256 states and
-small-stack imported-type tests. See `/tmp/ruddy-ir-test.log`.
-
-After the callable rewrite and compatibility fixes: rerun the relevant tests,
-full `just test`, required formatting/type/lint checks and `just cov`, repeat the
-spec/standards review, then commit the completed implementation on this branch.
-No implementation commit has been made yet.
+All Rust tests ran only through `just test`; `just cov` delegated its instrumented
+suite to that same recipe. Spec and standards reviewers verified the fixes to
+their concrete findings. An additional public artifact regression rejects changing
+a valid descriptor parameter index to another valid index, and generated JS tests
+exercise record-row remainder and function-result descriptor projections.

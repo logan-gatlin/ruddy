@@ -1680,3 +1680,20 @@ fn cps_debugger_views_expose_suspension_saved_environments_and_protocols() {
         );
     }
 }
+
+#[test]
+fn runtime_type_stage_shows_invocation_ports_and_evaluation() {
+    let output = stage(
+        "reification",
+        r#"
+@private extern box: 'a -> Any = "$anyUpcast"
+@private let apply = fn call value => call value
+@private let token = box 1n
+"#,
+    );
+    assert_eq!(output.status, Status::Ok);
+    let text = format!("{:?}", output.nodes);
+    assert!(text.contains("invocation needs"), "{text}");
+    assert!(text.contains("demand port"), "{text}");
+    assert!(text.contains("Evaluation"), "{text}");
+}

@@ -195,36 +195,57 @@ impl UncheckedArtifact {
             else {
                 continue;
             };
+            let nontrivial = |interface: &Option<crate::reification::interface::Interface>| {
+                interface.as_ref().is_some_and(|interface| {
+                    !matches!(
+                        interface.nodes.get(interface.root as usize),
+                        Some(crate::reification::interface::Node::Value)
+                    )
+                })
+            };
+            if global.type_interface != value.scheme.callable
+                && (nontrivial(&global.type_interface) || nontrivial(&value.scheme.callable))
+            {
+                return Err(ValidationError::new(
+                    "exported callable requirements disagree with the lowered evidence layout",
+                ));
+            }
             let initializer = &self.lir.functions[global.initializer as usize];
             let entry = &initializer.blocks[initializer.entry as usize];
-            let layout = if let End::Continue {
+            if let End::Continue {
                 value: returned, ..
             } = entry.end
-            {
-                entry
+                && let Some(instruction) = entry
                     .instrs
                     .iter()
                     .find(|instruction| instruction.temp == returned)
-                    .and_then(|instruction| {
-                        let Op::Closure { func, captures } = &instruction.op else {
-                            return None;
-                        };
-                        let parameters =
-                            &self.lir.functions[*func as usize].params[captures.len()..];
-                        (!parameters.is_empty()
-                            && parameters
+                && let Op::Closure { func, captures } = &instruction.op
+            {
+                let parameters = &self.lir.functions[*func as usize].params[captures.len()..];
+                let layout = parameters
+                    .iter()
+                    .take_while(|parameter| parameter.rep == Rep::TypeDescriptor)
+                    .count();
+                let required = value
+                    .scheme
+                    .callable
+                    .as_ref()
+                    .and_then(|interface| interface.nodes.get(interface.root as usize))
+                    .map_or(0, |node| match node {
+                        crate::reification::interface::Node::Arrow { requirements, .. } => {
+                            requirements
                                 .iter()
-                                .all(|parameter| parameter.rep == Rep::TypeDescriptor))
-                        .then_some(parameters.len())
-                    })
-                    .unwrap_or(0)
-            } else {
-                0
-            };
-            if layout != value.scheme.representations.len() {
-                return Err(ValidationError::new(
-                    "runtime representation requirements disagree with the exported evidence layout",
-                ));
+                                .map(|need| need.parameter)
+                                .collect::<std::collections::BTreeSet<_>>()
+                                .len()
+                        }
+                        _ => 0,
+                    });
+                if layout != required {
+                    return Err(ValidationError::new(
+                        "runtime representation requirements disagree with the exported evidence layout",
+                    ));
+                }
             }
         }
         // Text decoding is the single semantic translation implementation.
@@ -690,6 +711,7 @@ pub enum OperationSelector {
 /// index space: presences are `0..presences`, then types and rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scheme {
+    pub callable: Option<crate::reification::interface::Interface>,
     pub representations: Vec<u32>,
     pub count: u32,
     pub presences: u32,
@@ -1695,6 +1717,7 @@ fn scheme(mint: &Mint, value: &types::Scheme) -> Scheme {
     let mut existentials: Vec<_> = value.existentials().iter().copied().collect();
     existentials.sort_unstable();
     Scheme {
+        callable: value.callable().cloned(),
         representations: value.representations().to_vec(),
         count: value.count(),
         presences: value.presences(),
@@ -1957,6 +1980,7 @@ fn lower_lir(mint: &Mint, output: &lir::Output) -> Lir {
             .globals
             .iter()
             .map(|g| Global {
+                type_interface: g.type_interface.clone(),
                 adapter: g.adapter,
                 callable: g.callable,
                 name: qualified(mint, g.symbol),
@@ -2139,10 +2163,21 @@ fn op(mint: &Mint, value: &lir::Op) -> Op {
             callable: *callable,
             target: qualified(mint, *symbol),
         },
+        Source::TypeProjection { descriptor, path } => Op::TypeProjection {
+            descriptor: *descriptor,
+            path: path.clone(),
+        },
         Source::TypeDescriptor {
             template,
             arguments,
         } => Op::TypeDescriptor {
+            template: template.clone(),
+            arguments: arguments.clone(),
+        },
+        Source::NativePlan {
+            template,
+            arguments,
+        } => Op::NativePlan {
             template: template.clone(),
             arguments: arguments.clone(),
         },
@@ -2243,6 +2278,7 @@ fn rep(value: lir::Rep) -> Rep {
         lir::Rep::String => Rep::String,
         lir::Rep::Boolean => Rep::Boolean,
         lir::Rep::TypeDescriptor => Rep::TypeDescriptor,
+        lir::Rep::NativePlan => Rep::NativePlan,
         lir::Rep::BoxedAny => Rep::BoxedAny,
         lir::Rep::HostValue => Rep::HostValue,
         lir::Rep::Unit => Rep::Unit,
@@ -2580,6 +2616,12 @@ pub mod text {
                     )
                     .collect()),
             );
+        }
+        if let Some(callable) = &value.callable {
+            parts.push(L(vec![
+                A("callable".into()),
+                Q(serde_json::to_string(callable).expect("serializable callable interface")),
+            ]));
         }
         L(parts)
     }
@@ -3746,7 +3788,15 @@ pub mod text {
             }
         }
         fn read_scheme(&self, value: S) -> Scheme {
-            let value = self.list(value, "scheme");
+            let mut value = self.list(value, "scheme");
+            let callable = if value.last().is_some_and(|value| matches!(value, S::List(parts) if matches!(parts.first(), Some(S::Atom(tag)) if tag == "callable"))) {
+                let mut encoded = self.exact(self.list(value.pop().unwrap(), "callable"), 1, "callable");
+                let encoded = self.string(self.take(&mut encoded));
+                match serde_json::from_str::<crate::reification::interface::Interface>(&encoded) {
+                    Ok(callable) => Some(callable),
+                    Err(_) => { self.fail("invalid callable interface encoding"); None }
+                }
+            } else { None };
             let has_representations = value.len() == 6;
             let mut value = self.exact(value, if has_representations { 6 } else { 5 }, "scheme");
             let count = self.number(self.take(&mut value));
@@ -3777,6 +3827,11 @@ pub mod text {
                 {
                     self.fail("invalid runtime representation positions");
                 }
+            }
+            if let Some(callable) = &callable
+                && let Err(message) = callable.validate(count, presences)
+            {
+                self.fail(&message);
             }
             let formula = self.read_formula(self.take(&mut value));
             let body = self.read_ty(self.take(&mut value));
@@ -3941,6 +3996,7 @@ pub mod text {
                 }
             }
             Scheme {
+                callable,
                 representations,
                 count,
                 presences,
@@ -4337,6 +4393,7 @@ mod tests {
     fn validation_rejects_out_of_range_function_references() {
         let mut unchecked = artifact_with_target("host.value").to_unchecked();
         unchecked.lir.globals.push(Global {
+            type_interface: None,
             adapter: None,
             callable: None,
             name: "test@1::value".into(),
@@ -4351,6 +4408,7 @@ mod tests {
     fn recovery_discards_unrepairable_executable_data() {
         let mut unchecked = artifact_with_target("host.value").to_unchecked();
         unchecked.lir.globals.push(Global {
+            type_interface: None,
             adapter: None,
             callable: None,
             name: "test@1::value".into(),

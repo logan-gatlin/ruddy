@@ -2611,7 +2611,7 @@ fn transitive_diamond_graphs_are_unique_dependency_first_and_direct_only() {
     assert_eq!(path, app.join("build/app.artifact"));
     let linked = Artifact::try_parse(&fs::read_to_string(&path).unwrap()).unwrap();
     assert!(linked.header.dependencies.is_empty());
-    assert_eq!(linked.lir.globals.len(), 4);
+    assert_eq!(linked.lir.globals.len(), 8);
     assert_eq!(
         linked
             .lir
@@ -3089,6 +3089,7 @@ fn manifest_targets_select_root_javascript_output() {
     let app = directory.path().join("app");
     new_project(&app).unwrap();
     disable_std(&app);
+    fs::write(app.join("main.rud"), "let main: () -> () = fn _ => ()").unwrap();
 
     // Omission and an explicit library target retain artifact-only behavior.
     let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
@@ -3966,7 +3967,7 @@ fn a_web_library_builds_and_a_web_executable_is_refused() {
     .unwrap();
     fs::write(
         directory.path().join("main.rud"),
-        "@if {platform: \"web\"} let value = 1n\nlet main = fn _ => ()\n",
+        "@if {platform: \"web\"} let value = 1n\nlet main: () -> () = fn _ => ()\n",
     )
     .unwrap();
     let artifact = build_project(directory.path()).expect("a web library builds");
@@ -4052,7 +4053,7 @@ fn private_file_modules_execute_without_exposing_javascript_exports() {
          @private let helper = fn _ => Hidden::Nested::answer\n\
          module Visible = @private let hidden = 1n let shown = initialized end\n\
          let answer = helper ()\n\
-         let exposed = helper\n\
+         let exposed: () -> Nat = helper\n\
          @private let main = fn _ => ()",
     )
     .unwrap();

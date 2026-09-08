@@ -43,6 +43,10 @@ pub struct Param {
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Global {
+    /// Semantic descriptor positions under which this initializer was lowered.
+    /// This contract is independent of the exported name's declared interface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_interface: Option<crate::reification::interface::Interface>,
     pub adapter: Option<crate::externs::Callback>,
     pub callable: Option<crate::lir::Suspension>,
     pub name: String,
@@ -138,8 +142,16 @@ pub enum Op {
         value: Temp,
         direction: crate::reification::Direction,
     },
+    TypeProjection {
+        descriptor: Temp,
+        path: Vec<crate::reification::Projection>,
+    },
     TypeDescriptor {
         template: crate::reification::Descriptor,
+        arguments: Vec<Temp>,
+    },
+    NativePlan {
+        template: crate::reification::NativeTemplate,
         arguments: Vec<Temp>,
     },
     Reflect {
@@ -272,6 +284,7 @@ pub enum Rep {
     String,
     Boolean,
     TypeDescriptor,
+    NativePlan,
     BoxedAny,
     HostValue,
     /// The value with nothing in it: the empty struct.
@@ -311,7 +324,10 @@ impl Op {
             | Self::Reflect {
                 descriptor, value, ..
             } => vec![*descriptor, *value],
-            Self::TypeDescriptor { arguments, .. } => arguments.clone(),
+            Self::TypeProjection { descriptor, .. } => vec![*descriptor],
+            Self::TypeDescriptor { arguments, .. } | Self::NativePlan { arguments, .. } => {
+                arguments.clone()
+            }
             Self::Const(_) | Self::Extern { .. } | Self::Global { .. } | Self::NewTag => vec![],
             Self::Callback { value: v, .. }
             | Self::Neg(v)
@@ -448,8 +464,20 @@ pub(super) fn validate(lir: &Lir) -> Result<(), String> {
                 }
                 match &i.op {
                     Op::Convert { descriptor, .. } => {
-                        if available[descriptor] != Rep::TypeDescriptor {
+                        if !matches!(available[descriptor], Rep::TypeDescriptor | Rep::NativePlan) {
                             return error("foreign conversion requires a runtime type descriptor");
+                        }
+                    }
+                    Op::TypeProjection { descriptor, path } => {
+                        if available[descriptor] != Rep::TypeDescriptor
+                            || i.rep != Rep::TypeDescriptor
+                        {
+                            return error(
+                                "runtime type projection requires descriptor representations",
+                            );
+                        }
+                        if path.iter().any(|step| matches!(step, crate::reification::Projection::Remainder(fields) if fields.windows(2).any(|pair| pair[0] >= pair[1]))) {
+                            return error("runtime row projection fields must be unique and sorted");
                         }
                     }
                     Op::TypeDescriptor {
@@ -464,6 +492,21 @@ pub(super) fn validate(lir: &Lir) -> Result<(), String> {
                             return error("runtime type arguments require descriptors");
                         }
                         if i.rep != Rep::TypeDescriptor {
+                            return error("runtime type descriptor has the wrong representation");
+                        }
+                    }
+                    Op::NativePlan {
+                        template,
+                        arguments,
+                    } => {
+                        template.validate(arguments.len()).map_err(str::to_owned)?;
+                        if arguments
+                            .iter()
+                            .any(|argument| available[argument] != Rep::TypeDescriptor)
+                        {
+                            return error("runtime type arguments require descriptors");
+                        }
+                        if i.rep != Rep::NativePlan {
                             return error("runtime type descriptor has the wrong representation");
                         }
                     }

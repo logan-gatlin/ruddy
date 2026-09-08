@@ -281,7 +281,7 @@ fn async_initialization_does_not_assimilate_ordinary_thenable_data() {
     fs::write(project.path().join("main.rud"), r#"
         @async
         extern wait : () -> () = "() => Promise.resolve(null)"
-        extern data : () -> { "then": Nat } = "() => ({ get then() { globalThis.inspected++; return () => {}; } })"
+        extern data : () -> JsValue = "() => ({ get then() { globalThis.inspected++; return () => {}; } })"
         let value = do let _ = wait () return data () end
     "#).unwrap();
     fs::write(

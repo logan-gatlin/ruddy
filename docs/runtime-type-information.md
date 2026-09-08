@@ -1,10 +1,5 @@
 # Runtime type information and JavaScript
 
-Implementation is in progress. The current compiler has known callable
-initialization and compatibility failures; see
-[implementation status](../.scratch/inferred-type-representations/implementation.md).
-This document is not a declaration that the feature is ready.
-
 `Any` stores a Ruddy value together with its static structural type. Ordinary
 values keep their existing representation. `JsValue` instead stores an arbitrary
 JavaScript value, preserving its identity without claiming a Ruddy payload type.
@@ -29,13 +24,23 @@ extern identity: 'a -> 'a = "value => value"
 
 The compiler infers runtime representation requirements separately from effects.
 Portable schemes record them; a use supplies descriptors for its chosen types.
-Lowering abstracts a generalized binding over those descriptors and captures
-them in the resulting value. Higher-order arguments therefore retain their
-ordinary callable convention after instantiation. Local bindings, partial
-applications, and returned closures retain descriptors in the same way as other
-captures. Generic identity in Ruddy requires no descriptors. Native extern
-identity requires them to perform its conversions. Neither operation specializes
-a generic function's body for each source type.
+Each arrow receives only its inferred descriptor arguments, before its effect
+evidence and visible argument. Constructing a function does not call its body.
+Initializers execute once in their lexical environment; evidence needed by that
+execution must already be available there. Returned closures can capture evidence
+or receive it on a later call, as indicated by their own inferred interface.
+
+Higher-order interfaces quantify callback demands. Adapters reconcile different
+hidden argument layouts through aliases, aggregates, patterns and branches.
+When an abstract descriptor slot is used at a compound type, its constituent
+descriptors construct that slot; callback adapters can project component evidence.
+Values crossing `Any`, a generic native position, an effect operation or mutable
+callable storage seal their callable convention by capturing needed descriptors.
+This does not attach type identity to the value or execute its function body.
+
+Generic identity in Ruddy requires no descriptors. Native extern identity needs
+them for conversion. Neither operation specializes a generic function body for
+each source type.
 
 ## Native JavaScript conversion
 
@@ -43,14 +48,14 @@ Ordinary extern arguments and results use these encodings recursively:
 
 | Ruddy type | JavaScript representation |
 | --- | --- |
-| `Nat`, `Int` | Safe integer `number`, nonnegative for `Nat` |
+| `Nat`, `Int` | Integer `number`, nonnegative for `Nat` |
 | Fixed integers through 32 bits | Integer `number` in the declared range |
 | `Nat64`, `Int64` | `bigint` in the declared range |
 | `Real`, `String`, `Boolean` | `number`, `string`, `boolean` |
 | `[T]` | Native array with recursively converted elements |
 | Record or tuple | Object with named fields or numeric string keys |
 | Sum | `{ tag: "Case", value: payload }` |
-| `()` | Empty object; an incoming `undefined` also represents unit |
+| `()` | Empty object; typed native results use the existing void contract and discard their value |
 | `JsValue` | The original host value, without inspection |
 | `Any` | The original authentic opaque package |
 | Function | An adapter for the reviewed calling and completion convention |
@@ -80,7 +85,8 @@ let result: std::Result { values: [Nat] } std::js::DecodeError =
 
 `DecodeError` contains `path`, `expected`, and `message` strings. Decoding checks
 the requested structure and reconstructs Ruddy containers. Cyclic structural
-data and failed JavaScript observations return errors. Arbitrary functions can
+data and failed JavaScript observations return errors. Unlike the typed void
+contract, explicit decoding to unit checks for an empty object or `undefined`. Arbitrary functions can
 be retained as `JsValue`; decoding cannot prove their types or effects. An object
 that resembles an `Any` cannot fabricate an authentic package. Native conversion
 does not retain a value's former Ruddy type; opaque `Any` transport does.
@@ -111,14 +117,30 @@ representation requirements separately.
 
 ## Termination and persistence
 
-Demand propagation adds members only to finite parameter sets of already solved
-bindings. Recursive groups reach a finite fixed point. Descriptor synthesis
-memoizes structural graph nodes and admitted recursive alias applications;
-equality compares graph-node pairs coinductively. Runtime conversion uses an
-explicit work stack with cyclic-path detection. There is no instance search,
-user-defined descriptor execution, or recursive specialization.
+The compiler first constructs a finite graph of admitted semantic types. Alias
+back edges are memoized, and the existing rejection of growing recursive type
+applications remains in force. Callable shapes follow finite source occurrences;
+instantiation copies graph interfaces, never source bodies. Closed subgraphs
+remain erased rather than expanding a shared alias DAG into a tree.
 
-Artifacts carry requirements, descriptor graphs, and target-neutral reflection
-and conversion operations. Validation checks descriptor references, descriptor
-arguments, and exported evidence layouts. Requirements participate in published
-semantic interfaces and compiler cache stamps.
+Requirement solving adds pairs of parameter indices and demand ports to finite
+sets. Substitution maps indices to finite sets of free parameters, and dependencies
+are monotone edges. No solver step allocates new types or graph nodes, so recursive
+groups reach a fixed point. Adapter synthesis memoizes type/profile pairs and
+capture layouts before visiting recursive children. Descriptor equality compares
+graph-node pairs coinductively. Runtime conversion uses an explicit work stack
+with cyclic-path detection. There is no instance search or user-defined type code.
+
+Artifacts carry per-arrow interfaces, descriptor graphs, projections, and
+target-neutral reflection/conversion operations. Lowered globals retain their
+callable contracts across erasure, so validation can compare every published
+interface—including aliases and nested callables—with the convention used to
+compile its initializer. It also checks descriptor references, argument
+representations, bound positions, ports, and direct closure evidence arity.
+As with the existing typed executable artifact, validation checks compiler IR
+contracts; it is not a proof of arbitrary hand-written executable semantics.
+Requirements participate in semantic fingerprints and compiler cache stamps.
+
+The debugger's **Runtime types** tab shows value shapes, per-invocation needs,
+conditional demand ports, and evaluation requirements. The existing LIR and
+artifact views show their lowered descriptor operations.

@@ -26,7 +26,7 @@ fn clean_demo() -> &'static str {
 /// its parent's name spells.
 const NESTED: &[(&str, &str)] = &[
     (ROOT, "module Math\nlet four = Math::double 2n\n"),
-    ("Math.rud", "module Vec\nlet double = fn x => x\n"),
+    ("Math.rud", "module Vec\n@private let double = fn x => x\n"),
     ("Math/Vec.rud", "let zero = 0n\n"),
 ];
 
@@ -144,7 +144,7 @@ fn a_web_executable_is_refused_at_the_entry_stage() {
         serde_json::from_value(serde_json::json!({
             "name": "app", "version": "1.0.0", "kind": kind, "target": "js",
             "platform": "web", "root": ROOT, "std": false,
-            "files": [{"path": ROOT, "source": "let main = fn _ => ()\n"}],
+            "files": [{"path": ROOT, "source": "let main: () -> () = fn _ => ()\n"}],
         }))
         .unwrap()
     };
@@ -1039,6 +1039,7 @@ fn every_stage_reports_on_the_demo() {
             "constraints",
             "solve",
             "types",
+            "reification",
             "presence",
             "patterns",
             "lir",
@@ -1074,6 +1075,7 @@ fn every_stage_reports_on_the_demo() {
                 | "constraints"
                 | "solve"
                 | "types"
+                | "reification"
                 | "presence"
                 | "patterns"
                 | "symbols"
@@ -1109,6 +1111,7 @@ fn every_stage_reports_on_the_demo() {
             "Constraints",
             "Solve",
             "Types",
+            "Runtime types",
             "Presence",
             "Patterns",
             "LIR",
@@ -1336,7 +1339,7 @@ fn a_natural_reaches_every_stage() {
 /// contextual rather than a literal expression.
 #[test]
 fn a_numeric_field_is_coloured_as_a_number() {
-    let snapshot = snapshot("let first = fn p => p.0\n");
+    let snapshot = snapshot("@private let first = fn p => p.0\n");
     assert!(snapshot.diagnostics.is_empty());
 
     let field = nodes(
@@ -1410,7 +1413,7 @@ fn the_surface_prerequisites_reach_every_stage() {
 /// the definition ends with.
 #[test]
 fn rows_reach_every_stage() {
-    let source = "let f : { x when 'a: Nat, y: Nat, ..'r } -> Nat = fn p => p.y\n";
+    let source = "@private let f : { x when 'a: Nat, y: Nat, ..'r } -> Nat = fn p => p.y\n";
     let snapshot = snapshot(source);
     assert!(
         snapshot.diagnostics.is_empty(),
@@ -1664,7 +1667,7 @@ fn a_mixed_tail_carries_the_use_it_clashes_with() {
 /// why it is asserted here rather than left to the eye.
 #[test]
 fn inferred_types_reach_the_panels() {
-    let snapshot = snapshot("let id = fn x => x\n");
+    let snapshot = snapshot("@private let id = fn x => x\n");
     assert!(
         snapshot.diagnostics.is_empty(),
         "{:#?}",
@@ -1828,10 +1831,10 @@ fn the_types_tab_says_which_declarations_are_recursive() {
 #[test]
 fn the_types_tab_says_which_definitions_are_recursive() {
     let snapshot = snapshot(
-        "let loops = fn x => loops x\n\
-         let even = fn n => odd n\n\
-         let odd = fn n => even n\n\
-         let plain = fn x => x\n",
+        "@private let loops = fn x => loops x\n\
+         @private let even = fn n => odd n\n\
+         @private let odd = fn n => even n\n\
+         @private let plain = fn x => x\n",
     );
     assert!(
         snapshot.diagnostics.is_empty(),
@@ -2706,7 +2709,7 @@ fn a_solver_step_declares_what_it_added_to_the_state() {
 /// round to zero silently lost its chip.
 #[test]
 fn only_the_stages_that_own_a_phase_report_a_time() {
-    let clean = snapshot("let f = fn a => a\n");
+    let clean = snapshot("@private let f = fn a => a\n");
     let snapshot = snapshot("let bad : Nat = fn x => x\n");
     let ids = |timed: bool| -> Vec<&str> {
         snapshot
@@ -2739,6 +2742,7 @@ fn only_the_stages_that_own_a_phase_report_a_time() {
             "externs",
             "constraints",
             "solve",
+            "reification",
             "lir",
             "artifact",
             "entry",
@@ -3432,7 +3436,7 @@ fn a_nested_let_reaches_every_stage() {
 /// the absent entries in stride.
 #[test]
 fn every_stage_reports_on_explicit_absence() {
-    let source = "let f : { x: Nat, \\y, .. } -> Nat = fn a => a.x\n\
+    let source = "@private let f : { x: Nat, \\y, .. } -> Nat = fn a => a.x\n\
                   type NoErr 'r = #Ok Nat | \\#Err | ..'r\n\
                   let ok : NoErr (#Warn Nat) = #Ok 1n\n";
     let snapshot = snapshot(source);
@@ -3597,9 +3601,9 @@ fn a_match_and_a_pattern_let_reach_every_stage() {
 #[test]
 fn a_wildcard_reaches_every_stage() {
     let source = "let _ = 1n\n\
-                  let const = fn x _ => x\n\
-                  let use_y = fn p => do let { x: _, y } = p return y end\n\
-                  let f = fn e => match e with | #Some _ => 1n | _ => 0n end\n";
+                  @private let const = fn x _ => x\n\
+                  @private let use_y = fn p => do let { x: _, y } = p return y end\n\
+                  @private let f = fn e => match e with | #Some _ => 1n | _ => 0n end\n";
     let snapshot = snapshot(source);
     assert!(snapshot.panic.is_none());
     assert!(
@@ -3724,7 +3728,7 @@ fn every_stage_reports_on_a_source_using_effects() {
                     handle greet () with | !Log.write s => () | return x => x end\n\
                   @private let loud : () -> Nat + !IO = fn _ =>\n\
                     handle greet () with | !Log.write s => !IO.print s end\n\
-                  let choose = fn v => match v with | #A x => x | _ => 0n end\n";
+                  @private let choose = fn v => match v with | #A x => x | _ => 0n end\n";
     let snapshot = snapshot(source);
     assert!(snapshot.panic.is_none());
     for stage in &snapshot.stages {

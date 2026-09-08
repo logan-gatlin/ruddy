@@ -44,9 +44,11 @@ type Node = usize;
 pub(super) fn native_descriptor(
     root: &Type,
     declarations: &HashMap<&str, &DeclaredType>,
-) -> Result<crate::reification::Descriptor, String> {
+) -> Result<crate::reification::NativeTemplate, String> {
     use crate::reification::{Descriptor, Node as Runtime};
     let mut nodes = vec![Runtime::JsValue];
+    let mut optional_fields =
+        std::collections::BTreeMap::<u32, std::collections::BTreeSet<String>>::new();
     let mut work = vec![(
         0,
         View {
@@ -75,6 +77,7 @@ pub(super) fn native_descriptor(
             Type::Boolean => Runtime::Boolean,
             Type::Any => Runtime::Any,
             Type::JsValue => Runtime::JsValue,
+            Type::Package(inner) => Runtime::Alias(child(view.child(inner), path, incoming)),
             Type::Arrow(from, to, row) => {
                 let effects = fields(row, view.clone(), declarations);
                 if incoming
@@ -127,11 +130,7 @@ pub(super) fn native_descriptor(
             }
             Type::Struct(row) | Type::Sum(row) => {
                 let fields = fields(row, view.clone(), declarations);
-                if !matches!(fields.rest, Rest::Closed)
-                    || fields.labels.iter().any(|(_, presence, _)| {
-                        !matches!(presence, Presence::Present | Presence::Absent)
-                    })
-                {
+                if !matches!(fields.rest, Rest::Closed) {
                     return Err(format!(
                         "{path} needs runtime information for unresolved fields or cases; export a concrete type or JsValue wrapper"
                     ));
@@ -140,7 +139,15 @@ pub(super) fn native_descriptor(
                     .labels
                     .into_iter()
                     .filter(|(_, presence, _)| **presence != Presence::Absent)
-                    .map(|(name, _, ty)| {
+                    .map(|(name, presence, ty)| {
+                        if matches!(view.ty, Type::Struct(_))
+                            && !matches!(presence, Presence::Present | Presence::Absent)
+                        {
+                            optional_fields
+                                .entry(id as u32)
+                                .or_default()
+                                .insert(name.to_owned());
+                        }
                         (
                             name.to_owned(),
                             child(ty, format!("{path}.{name}"), incoming),
@@ -161,7 +168,10 @@ pub(super) fn native_descriptor(
             }
         };
     }
-    Ok(Descriptor { nodes })
+    Ok(crate::reification::NativeTemplate {
+        descriptor: Descriptor { nodes },
+        optional_fields,
+    })
 }
 
 #[derive(Clone)]

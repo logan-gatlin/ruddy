@@ -41,7 +41,7 @@ let read_file = std::fs::read_text
 let write_file = std::fs::write_text
 let exists = std::fs::exists
 let read_or_empty = fn path => std::result::unwrap_or "" (read_file path)
-let reader = fn _ => read_file
+let reader: () -> _ = fn _ => read_file
 module files = let read = read_or_empty end
 let print = std::console::print
 let capture_print = fn text => handle print text with
@@ -78,9 +78,12 @@ await app.print('host output');
 
 #[test]
 fn host_exports_reject_unsupported_effects_at_every_curried_arrow() {
-    for body in ["fn _ => !Ask.get ()", "fn _ => fn _ => !Ask.get ()"] {
+    for (body, signature) in [
+        ("fn _ => !Ask.get ()", "() -> String + !Ask"),
+        ("fn _ => fn _ => !Ask.get ()", "() -> () -> String + !Ask"),
+    ] {
         let project = project(
-            &format!("effect Ask = {{ get: () -> String }}\nlet read_file = {body}"),
+            &format!("effect Ask = {{ get: () -> String }}\nlet read_file: {signature} = {body}"),
             "node",
         );
         let error = ruddy_cli::check_project(project.path())
@@ -100,7 +103,7 @@ fn host_export_check_does_not_restrict_dependencies_or_private_definitions() {
     let project = project(
         r#"
 @private let ask = dep::read
-let read = fn _ => handle ask () with | dep::!Ask.get _ => "handled" end
+let read: () -> _ = fn _ => handle ask () with | dep::!Ask.get _ => "handled" end
 "#,
         "node",
     );
@@ -109,7 +112,7 @@ let read = fn _ => handle ask () with | dep::!Ask.get _ => "handled" end
     fs::write(dependency.join("Ruddy.toml"), "name = \"dep\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"lib.rud\"\ntarget = \"js\"\n[dependencies]\nstd = false\n").unwrap();
     fs::write(
         dependency.join("lib.rud"),
-        "effect Ask = { get: () -> String }\nlet read = fn _ => !Ask.get ()",
+        "effect Ask = { get: () -> String }\nlet read: () -> String + !Ask = fn _ => !Ask.get ()",
     )
     .unwrap();
     let manifest = project.path().join("Ruddy.toml");
@@ -141,7 +144,7 @@ fn host_exports_use_the_selected_platform() {
         error.contains("unsupported-export-effects") && error.contains("read_file"),
         "{error}"
     );
-    let pure = project("let identity = fn x => x", "web");
+    let pure = project("let identity: Nat -> Nat = fn x => x", "web");
     success(&run(pure.path(), "assert.equal(app.identity(42), 42);"));
     let js = fs::read_to_string(pure.path().join("build/host-test.js")).unwrap();
     assert!(!js.contains("node:fs") && !js.contains("process.stdout"));
@@ -176,10 +179,10 @@ fn host_exports_handle_callable_fields_and_reject_hidden_unsupported_effects() {
     let good = project(
         r#"
 let files = { read: std::fs::read_text, label: "files" }
-let factory = fn _ => { print: std::console::print }
-let tagged = #Printer std::console::print
+let factory: () -> _ = fn _ => { print: std::console::print }
+let tagged: #Printer (String -> () + std::!Console) = #Printer std::console::print
 let printers = [std::console::print]
-let optional = fn enable => if enable then #Printer std::console::print else #Empty end
+let optional: Boolean -> (#Printer (String -> () + std::!Console) | #Empty) = fn enable => if enable then #Printer std::console::print else #Empty end
 let pair = (std::console::print, 42n)
 "#,
         "node",
@@ -191,14 +194,12 @@ assert.equal(app.files.label, 'files');
 await app.files.read('missing');
 const writer = await app.factory({});
 await writer.print('field');
-const payload = Object.getOwnPropertySymbols(app.tagged).find(symbol => symbol.description === 'sum payload');
-await app.tagged[payload]('tagged');
-await app.printers.tail[0]('array');
+await app.tagged.value('tagged');
+await app.printers[0]('array');
 const empty = await app.optional(false);
-const tag = Object.getOwnPropertySymbols(empty).find(symbol => symbol.description === 'sum tag');
-assert.equal(empty[tag], 'Empty');
+assert.equal(empty.tag, 'Empty');
 const some = await app.optional(true);
-await some[payload]('optional');
+await some.value('optional');
 assert.equal(app.pair[1], 42);
 await app.pair[0]('tuple');
 "#,
@@ -228,7 +229,7 @@ fn host_exports_adapt_recursive_callables_and_preserve_returned_captures() {
   return make (std::nat::add count 1n)
 end
 let printer = make 0n
-let capture = fn _ => handle printer "local" with
+let capture: () -> _ = fn _ => handle printer "local" with
   | std::!Console.write text => raise text
   | std::!Console.write_error _ => ()
   | return _ => ""
@@ -307,9 +308,8 @@ end
     let output = run(
         project.path(),
         r#"
-const payload = Object.getOwnPropertySymbols(app.tree).find(symbol => symbol.description === 'sum payload');
-await app.tree[payload].print('root');
-await app.tree[payload].children.tail[1][payload].print('child');
+await app.tree.value.print('root');
+await app.tree.value.children[1].value.print('child');
 const [one, two] = await Promise.all([app.reader('one'), app.reader('two')]);
 assert.equal(one.text, 'first');
 assert.equal(two.text, 'second');
@@ -383,8 +383,7 @@ end
         r#"
 await (await app.printer('dependency'))('again');
 await app.fields.print('fields');
-const payload = Object.getOwnPropertySymbols(app.tagged).find(symbol => symbol.description === 'sum payload');
-await app.tagged[payload]('cases');
+await app.tagged.value('cases');
 await (await app.loop('effects'))('repeat');
 "#,
     );

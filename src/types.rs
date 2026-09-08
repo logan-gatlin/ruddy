@@ -502,6 +502,7 @@ impl std::hash::Hash for Formula {
 /// [`Ty`] be printed with no scheme beside it to ask.
 #[derive(Debug, Clone)]
 pub struct Scheme {
+    callable: Option<Arc<crate::reification::interface::Interface>>,
     representations: Vec<u32>,
     count: u32,
     presences: u32,
@@ -1322,6 +1323,18 @@ impl RowField {
 }
 
 impl Scheme {
+    pub fn callable(&self) -> Option<&crate::reification::interface::Interface> {
+        self.callable.as_deref()
+    }
+
+    pub fn with_callable(
+        mut self,
+        callable: Option<crate::reification::interface::Interface>,
+    ) -> Self {
+        self.callable = callable.map(Arc::new);
+        self
+    }
+
     /// Quantified type positions supplied as hidden runtime representations.
     pub fn representations(&self) -> &[u32] {
         &self.representations
@@ -1350,6 +1363,7 @@ impl Scheme {
     /// require.
     pub fn new(count: u32, body: Arc<Ty>) -> Self {
         Self {
+            callable: None,
             representations: Vec::new(),
             count,
             presences: 0,
@@ -1364,6 +1378,7 @@ impl Scheme {
     pub fn constrained(count: u32, presences: u32, body: Arc<Ty>, formula: Formula) -> Self {
         debug_assert!(presences <= count);
         Self {
+            callable: None,
             representations: Vec::new(),
             count,
             presences,
@@ -1393,6 +1408,7 @@ impl Scheme {
         };
         let formula = partition_package_formula(&body, &existentials, formula);
         Self {
+            callable: None,
             representations: Vec::new(),
             count,
             presences,

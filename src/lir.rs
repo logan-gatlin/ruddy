@@ -57,6 +57,8 @@ pub struct Param {
 }
 #[derive(Debug, Clone)]
 pub struct Global {
+    /// Callable descriptor convention retained across representation erasure.
+    pub type_interface: Option<crate::reification::interface::Interface>,
     pub adapter: Option<crate::externs::Callback>,
     pub callable: Option<Suspension>,
     pub symbol: Symbol,
@@ -152,8 +154,16 @@ pub enum Op {
         value: Temp,
         direction: crate::reification::Direction,
     },
+    TypeProjection {
+        descriptor: Temp,
+        path: Vec<crate::reification::Projection>,
+    },
     TypeDescriptor {
         template: crate::reification::Descriptor,
+        arguments: Vec<Temp>,
+    },
+    NativePlan {
+        template: crate::reification::NativeTemplate,
         arguments: Vec<Temp>,
     },
     Reflect {
@@ -288,6 +298,7 @@ pub enum Rep {
     String,
     Boolean,
     TypeDescriptor,
+    NativePlan,
     BoxedAny,
     HostValue,
     /// The value with nothing in it: the empty struct.
@@ -308,6 +319,14 @@ pub enum Rep {
 
 pub fn lower(accepted: &AcceptedProgram) -> Output {
     let mut output = control::lower(lower::lower(accepted));
+    for global in &mut output.globals {
+        global.type_interface = accepted
+            .semantics()
+            .schemes()
+            .get(&global.symbol)
+            .or_else(|| accepted.semantics().externs().get(&global.symbol))
+            .and_then(|scheme| scheme.callable().cloned());
+    }
     suspension::summarize(&mut output, accepted);
     output
 }
@@ -322,7 +341,10 @@ impl Op {
             | Self::Reflect {
                 descriptor, value, ..
             } => vec![*descriptor, *value],
-            Self::TypeDescriptor { arguments, .. } => arguments.clone(),
+            Self::TypeProjection { descriptor, .. } => vec![*descriptor],
+            Self::TypeDescriptor { arguments, .. } | Self::NativePlan { arguments, .. } => {
+                arguments.clone()
+            }
             Self::Const(_) | Self::Extern { .. } | Self::Global { .. } | Self::NewTag => vec![],
             Self::Callback { value: v, .. }
             | Self::Neg(v)
