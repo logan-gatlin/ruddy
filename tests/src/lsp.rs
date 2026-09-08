@@ -18,7 +18,7 @@ fn editor_request(
     let root = format!("file://{}/", tree.path().display());
     let uri = format!("{root}main.rud");
     let (server, client) = Connection::memory();
-    let worker = std::thread::spawn(move || ruddy_lsp::serve(server).unwrap());
+    let worker = std::thread::spawn(move || ruddy_cli::lsp::serve(server).unwrap());
     let request = |id: i32, method: &str, params| {
         client
             .sender
@@ -150,7 +150,7 @@ fn editor_can_initialize_open_hover_and_shutdown() {
         if cfg!(unix) { "open.rud" } else { "main.rud" }
     );
     let (server, client) = Connection::memory();
-    let worker = std::thread::spawn(move || ruddy_lsp::serve(server).unwrap());
+    let worker = std::thread::spawn(move || ruddy_cli::lsp::serve(server).unwrap());
     client
         .sender
         .send(Message::Request(Request::new(
@@ -277,23 +277,23 @@ fn editor_can_initialize_open_hover_and_shutdown() {
 fn positions_use_utf16_and_respect_crlf() {
     let source = "a😀z\r\nnext\n";
     assert_eq!(
-        ruddy_lsp::offset(source, &json!({"line":0,"character":3})),
+        ruddy_cli::lsp::offset(source, &json!({"line":0,"character":3})),
         Some(5)
     );
     assert_eq!(
-        ruddy_lsp::offset(source, &json!({"line":0,"character":2})),
+        ruddy_cli::lsp::offset(source, &json!({"line":0,"character":2})),
         None
     );
     assert_eq!(
-        ruddy_lsp::offset(source, &json!({"line":0,"character":999})),
+        ruddy_cli::lsp::offset(source, &json!({"line":0,"character":999})),
         Some(6)
     );
     assert_eq!(
-        ruddy_lsp::position(source, 5),
+        ruddy_cli::lsp::position(source, 5),
         json!({"line":0,"character":3})
     );
     assert_eq!(
-        ruddy_lsp::position(source, 8),
+        ruddy_cli::lsp::position(source, 8),
         json!({"line":1,"character":0})
     );
 }
@@ -306,7 +306,7 @@ fn rapid_changes_publish_current_diagnostics_and_disk_creation_is_observed() {
     let root = format!("file://{}", tree.path().display());
     let uri = format!("{root}/main.rud");
     let (server, client) = Connection::memory();
-    let worker = std::thread::spawn(move || ruddy_lsp::serve(server).unwrap());
+    let worker = std::thread::spawn(move || ruddy_cli::lsp::serve(server).unwrap());
     client
         .sender
         .send(Message::Request(Request::new(

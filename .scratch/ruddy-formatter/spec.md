@@ -148,7 +148,7 @@ trailing newline, never hard tabs.
 
 ## Integration
 
-- `ruddy-ls` gains whole-document `textDocument/formatting` only.
+- The language server gains whole-document `textDocument/formatting` only.
 - `just fmt` also runs `ruddy fmt` over the repository's Ruddy sources and
   `just fmt-check` runs `--check`, so `just check` enforces it.
   `treesitter/test/` and the diagnostics fixtures are excluded: their exact

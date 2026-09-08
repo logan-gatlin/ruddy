@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Generate a fixed 10,000-line source workspace and measure the stdio LSP.
-Run: python3 scripts/bench-lsp.py [target/release/ruddy-ls] [iterations=100]
+Run: python3 scripts/bench-lsp.py [target/release/ruddy] [iterations=100]
 No downloaded dependencies. Includes a source path dependency, structural
 records/effects, higher-order functions and mutually recursive groups.
 """
@@ -14,7 +14,7 @@ import sys
 import tempfile
 import threading
 import time
-binary = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else 'target/release/ruddy-ls').resolve()
+binary = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else 'target/release/ruddy').resolve()
 iterations = int(sys.argv[2]) if len(sys.argv) > 2 else 100
 
 def module(dependency=False):
@@ -43,7 +43,7 @@ def benchmark(directory):
         path.write_text(text)
     digest = hashlib.sha256(''.join(corpus.values()).encode()).hexdigest()
     start = time.perf_counter()
-    proc = subprocess.Popen([str(binary)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = subprocess.Popen([str(binary), 'lsp'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     inbox = queue.Queue()
     errors = []
 

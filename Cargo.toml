@@ -6,7 +6,7 @@ edition = "2024"
 autotests = false
 
 [workspace]
-members = ["cli", "debug", "esparse", "tests", "lsp"]
+members = ["cli", "debug", "esparse", "tests"]
 exclude = ["vendor/varisat"]
 
 [build-dependencies]

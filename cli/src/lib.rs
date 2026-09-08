@@ -25,6 +25,7 @@ use ruddy::{
 use serde::{Deserialize, Serialize};
 
 mod cache;
+pub mod lsp;
 pub mod workspace;
 
 pub use cache::fingerprint;
@@ -68,6 +69,8 @@ enum Command {
     Check,
     /// Build and execute a JavaScript-targeted project.
     Run,
+    /// Serve the language server over standard input and output.
+    Lsp,
     /// Format Ruddy source files in place.
     #[command(alias = "f")]
     Fmt {
@@ -96,6 +99,8 @@ pub enum Outcome {
     Checked(PathBuf),
     /// This JavaScript module was built and executed successfully.
     Ran(PathBuf),
+    /// The language server ran until its client asked it to exit.
+    Served,
     /// Source files were formatted, or checked.
     Formatted(FormatReport),
     /// Standard input was formatted: the text to write to standard output,
@@ -221,6 +226,15 @@ where
             Ok(Outcome::Checked(current_directory.to_path_buf()))
         }
         Command::Run => run_project(current_directory).map(Outcome::Ran),
+        Command::Lsp => {
+            let (connection, threads) = lsp_server::Connection::stdio();
+            lsp::serve(connection)
+                .map_err(|error| CliError::one(format!("language server: {error}")))?;
+            threads
+                .join()
+                .map_err(|error| CliError::one(format!("language server: {error}")))?;
+            Ok(Outcome::Served)
+        }
         Command::Fmt {
             paths,
             check,

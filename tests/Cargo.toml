@@ -14,5 +14,4 @@ regex = "1"
 serde_json = "1"
 tempfile = "3"
 toml = "0.9"
-ruddy-lsp = { path = "../lsp" }
 lsp-server = "0.10"

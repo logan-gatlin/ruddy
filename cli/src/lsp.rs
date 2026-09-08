@@ -1,9 +1,9 @@
-//! LSP transport and newest-revision scheduling. Input handling runs separately
+//! The language server: LSP transport and newest-revision scheduling. Input handling runs separately
 //! from analysis; only a current revision may publish diagnostics.
+use crate::workspace::{Workspace, file_identity};
 use crossbeam_channel::Sender;
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use ruddy::{analysis::CompletionKind, cancellation::Cancellation, tracking::Span};
-use ruddy_cli::workspace::{Workspace, file_identity};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -522,7 +522,7 @@ impl Worker {
 }
 
 fn diagnostics_for(
-    project: &ruddy_cli::workspace::ProjectAnalysis,
+    project: &crate::workspace::ProjectAnalysis,
     logical: &str,
     text: &str,
 ) -> Vec<Value> {

@@ -25,7 +25,7 @@ The repository's `Ruddy.toml` defines the standard-library bundle, with `std/lib
 
 ## Editor support
 
-`just install` also installs `ruddy-ls`. Configure your editor to launch that
+The language server is `ruddy lsp`. Configure your editor to launch that
 command over stdio, with the directory containing `Ruddy.toml` as its workspace
 root. It provides diagnostics, hover, completion, go-to-definition, and
 document formatting for `.rud` files. Unsaved local dependency buffers participate in analysis; Git dependencies
@@ -36,7 +36,8 @@ language entry from `just helix` ([Helix configuration](https://docs.helix-edito
 
 ```toml
 [language-server.ruddy]
-command = "ruddy-ls"
+command = "ruddy"
+args = ["lsp"]
 
 [[language]]
 name = "ruddy"

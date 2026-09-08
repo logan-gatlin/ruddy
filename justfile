@@ -63,7 +63,7 @@ debug *args:
 
 # Run the language server over stdio.
 lsp:
-    cargo run -p ruddy-lsp --bin ruddy-ls
+    cargo run -p cli --bin ruddy -- lsp
 
 # Regenerate the tree-sitter parser and run its corpus tests.
 grammar *args:
@@ -144,11 +144,10 @@ test *args:
 build:
     cargo build --workspace
 
-# Build and install the CLI and language server, then replace the bundled standard
-# library under RUDDY_HOME (or ~/.ruddy when RUDDY_HOME is unset or empty).
+# Build and install the CLI, language server included, then replace the bundled
+# standard library under RUDDY_HOME (or ~/.ruddy when RUDDY_HOME is unset or empty).
 install:
     cargo install --locked --path "{{justfile_directory()}}/cli"
-    cargo install --locked --path "{{justfile_directory()}}/lsp" --bin ruddy-ls
     "{{justfile_directory()}}/scripts/install-std.sh" "{{justfile_directory()}}"
 
 # Line and branch coverage for the compiler library. Branch coverage is a

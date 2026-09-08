@@ -1,6 +1,6 @@
 # Incremental analysis and the language server
 
-The compiler, CLI, debugger, and `ruddy-ls` use the same inference implementation.
+The compiler, CLI, debugger, and language server (`ruddy lsp`) use the same inference implementation.
 `inference::Session` owns a persistent Salsa database. `analysis::Host` adds source
 inputs, recovery, editor requests, and an accepted-state boundary for background
 lowering. The CLI can still compile once through `compile`; its command-line
@@ -99,8 +99,8 @@ effects, or opaque aliases has no measured justification from this workload.
 ## Reproducing the measurements
 
 ```sh
-cargo build --release -p ruddy-lsp
-python3 scripts/bench-lsp.py target/release/ruddy-ls 300
+cargo build --release -p cli
+python3 scripts/bench-lsp.py target/release/ruddy 300
 ```
 
 The Linux benchmark creates exactly 10,000 source lines: a root, 98 module files,
