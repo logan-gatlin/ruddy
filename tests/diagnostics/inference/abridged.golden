@@ -114,9 +114,12 @@ help: or keep it out of the `..` remainder
 note: 3 intermediate uses are omitted from this short explanation
 
 ## repeated-field-effect
-[repeated-field] `..` covers only the effects a type does not already name, and here it would have to cover `!Log`
-primary: effect `!Log` is already named outside `..`
-help: remove the repeated effect, or remove it from the remainder
+[repeated-field] effect `!Log` cannot be both named and included by `..`
+primary: this `..` remainder already follows named effect `!Log`
+related: this use introduces effect `!Log`
+help: remove effect `!Log` from the named side
+help: or keep it out of the `..` remainder
+note: 4 intermediate uses are omitted from this short explanation
 
 ## presence-required
 [presence-required] this value needs `x != y` among its fields, and it does not have that

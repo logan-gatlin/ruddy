@@ -1,0 +1,15 @@
+effect Log = { write: Nat -> () }
+effect Ask 'a = { get: () -> 'a }
+@private extern record : Nat -> () = "host.record"
+
+let run : () -> Nat = fn _ =>
+  handle
+    handle dep::forward (fn _ => do
+      let _ = !Log.write 1n
+      let _ = dep::silence (fn _ => !Log.write 99n)
+      let _ = !Log.write 2n
+      return !Ask.get ()
+    end) with | !Log.write n => record n end
+  with | !Ask.get _ => 42n end
+
+let pure : () -> Nat = fn _ => dep::silence (fn _ => 7n)

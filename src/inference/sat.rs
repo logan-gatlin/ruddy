@@ -195,6 +195,13 @@ fn unowned(mut formula: &Formula) -> &Formula {
 /// see. Deterministic throughout: the atom order fixes the literal order inside
 /// a product, and the products are sorted by it.
 pub fn project(formula: &Formula, keep: &[Atom]) -> Formula {
+    project_exact(formula, keep).unwrap_or(Formula::True)
+}
+
+/// Exact projection for decisions that may change a type. Exceeding the cube
+/// budget while eliminating atoms returns `None`, never an approximation that
+/// could be mistaken for a proof that a caller assignment remains admitted.
+pub fn project_exact(formula: &Formula, keep: &[Atom]) -> Option<Formula> {
     let mut named = Vec::new();
     formula.atoms(&mut named);
     let mut kept: Vec<Atom> = Vec::new();
@@ -204,17 +211,15 @@ pub fn project(formula: &Formula, keep: &[Atom]) -> Formula {
         }
     }
     let Some(cover) = eliminate(formula, &kept) else {
-        // More products than [`CUBES`] allows, so what comes back errs the one
-        // way it may: `true` says less about the kept atoms than the truth
-        // does, so a caller loses a complaint it might have made and never
-        // invents one. Where nothing was being eliminated the formula is
-        // already its own answer, and keeps everything it said.
+        // If no atom is eliminated, the original formula is already exact.
+        // Otherwise only the approximating `project` wrapper may fall back
+        // to `true`; callers needing proof must see that projection failed.
         return match named.len() == kept.len() {
-            true => formula.clone(),
-            false => Formula::True,
+            true => Some(formula.clone()),
+            false => None,
         };
     };
-    rebuild(&kept, minimized(&kept, cover))
+    Some(rebuild(&kept, minimized(&kept, cover)))
 }
 
 /// The products of `∃ dropped. formula` over `kept`, or `None` where there are

@@ -628,6 +628,33 @@ fn private_values_and_modules_are_bundle_local() {
 }
 
 #[test]
+fn rethrowing_signatures_round_trip_with_their_callback_remainders() {
+    let producer = accepted(include_str!("../bundles/rethrowing-imports/dependency.rud"));
+    let persisted = ruddy::artifact::Artifact::try_parse(&producer.artifact().print()).unwrap();
+    let consumer = accepted_with(
+        "effect Log = { write: Nat -> () }
+        effect Ask 'a = { get: () -> 'a }
+        let residual = fn action =>
+          handle dep::forward action with | !Log.write _ => () end
+        let forward = fn action => dep::forward action
+        let result : () -> Nat + !Ask Nat = fn _ => dep::silence (fn _ => do
+          let _ = !Log.write 1n
+          return !Ask.get ()
+        end)",
+        &persisted,
+    );
+    assert_eq!(
+        scheme(&consumer, "residual"),
+        "(() -> 'a + !Log + ..'b) -> 'a + ..'b"
+    );
+    assert_eq!(
+        scheme(&consumer, "forward"),
+        "(() -> 'a + !Log + ..'b) -> 'a + !Log + ..'b"
+    );
+    assert_eq!(scheme(&consumer, "result"), "() -> Nat + !Ask Nat");
+}
+
+#[test]
 fn private_types_and_effects_support_public_structural_signatures() {
     let producer = accepted(
         "@private type Hidden = Nat\n\

@@ -1,0 +1,89 @@
+effect Ask 'a = { get: () -> 'a }
+
+let answer : () -> Nat = fn _ =>
+  handle
+    handle !Ask.get () with
+      | !Ask.get _ => !Ask.get ()
+    end
+  with
+    | !Ask.get _ => 42n
+  end
+
+@private extern record : String -> () = "host.record"
+effect Exchange = { first: Real -> Real, second: Real -> Real }
+
+let ordered : () -> Real = fn _ =>
+  handle
+    handle do
+      let x = !Exchange.first 4.0
+      let _ = record "body"
+      return x * 2.0
+    end with
+      | !Exchange.first n => do
+          let _ = record "inner"
+          let x = !Exchange.second (n + 1.0)
+          let _ = record "resumed"
+          return x + 1.0
+        end
+      | !Exchange.second n => n
+    end
+  with
+    | !Exchange.first n => n
+    | !Exchange.second n => do
+        let _ = record "outer"
+        return n * 2.0
+      end
+  end
+
+@private let read = !Ask.get
+@private let helper = fn _ => read ()
+@private let decorate = fn action =>
+  handle action () with | !Ask.get _ => helper () end
+@private let make = fn _ =>
+  handle (fn _ => !Ask.get ()) with | !Ask.get _ => 7n end
+
+let invocation : () -> Nat = fn _ =>
+  handle decorate (make ()) with | !Ask.get _ => 42n end
+
+effect Log = { write: Nat -> () }
+@private let forward = fn action =>
+  handle action () with | !Log.write n => do
+    let _ = !Log.write n
+    return !Log.write n
+  end end
+
+let repeated : () -> Nat = fn _ =>
+  handle forward (fn _ => do
+    let _ = !Log.write 1n
+    let _ = !Log.write 2n
+    return 42n
+  end) with
+    | !Log.write _ => record "log"
+  end
+
+let abort : () -> Nat = fn _ =>
+  handle forward (fn _ => do
+    let _ = !Log.write 1n
+    let _ = record "unreachable"
+    return 0n
+  end) with
+    | !Log.write _ => raise 99n
+  end
+
+let additional : () -> Nat = fn _ =>
+  handle
+    handle forward (fn _ => do
+      let _ = !Log.write 1n
+      return !Ask.get ()
+    end) with | !Log.write _ => () end
+  with | !Ask.get _ => 42n end
+
+let returned : () -> Nat = fn _ =>
+  handle
+    handle !Ask.get () with
+      | !Ask.get _ => 7n
+      | return _ => !Ask.get ()
+    end
+  with
+    | !Ask.get _ => 42n
+  end

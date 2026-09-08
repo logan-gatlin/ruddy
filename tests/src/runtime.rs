@@ -155,6 +155,11 @@ fn do_blocks_evaluate_in_order_to_what_they_return() {
     run_bundle("do-blocks", "blocks.test.mjs");
 }
 
+#[test]
+fn rethrowing_arms_and_return_arms_use_surrounding_handlers() {
+    run_bundle("effect-rethrowing", "rethrowing.test.mjs");
+}
+
 /// Definition metadata compiled through the CLI's own path and read back by
 /// Node: every attribute form on every kind of definition, including a
 /// module whose body is another file, and a program that computes exactly
@@ -212,6 +217,32 @@ fn independently_built_cps_bundles_suspend_in_order_and_resume_callers() {
     .unwrap();
     fs::write(project.path().join("Ruddy.toml"), "name = \"root\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\ntarget = \"js\"\n[dependencies]\nstd = false\ndep = \"./dep\"\n").unwrap();
     run_assertions(project.path(), "multibundle.test.mjs");
+}
+
+#[test]
+fn rethrowing_survives_independent_artifacts_and_structural_aliases() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("bundles/rethrowing-imports");
+    let project = tempfile::tempdir().unwrap();
+    let dependency = project.path().join("dep");
+    fs::create_dir(&dependency).unwrap();
+    fs::copy(fixture.join("dependency.rud"), dependency.join("main.rud")).unwrap();
+    fs::write(dependency.join("Ruddy.toml"), "name = \"dep\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\ntarget = \"js\"\n[dependencies]\nstd = false\n").unwrap();
+    let (graph, _) = ruddy_cli::compile_dependency_graph([("dep", &dependency)])
+        .expect("forwarding library compiles independently of a host entry point");
+    let serialized = graph.projects[0].artifact.print();
+    let artifact = ruddy::artifact::Artifact::try_parse(&serialized)
+        .unwrap()
+        .validate()
+        .unwrap();
+    assert_eq!(artifact.header().values.len(), 2);
+    fs::copy(fixture.join("main.rud"), project.path().join("main.rud")).unwrap();
+    fs::copy(
+        fixture.join("imports.test.mjs"),
+        project.path().join("imports.test.mjs"),
+    )
+    .unwrap();
+    fs::write(project.path().join("Ruddy.toml"), "name = \"root\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\ntarget = \"js\"\n[dependencies]\nstd = false\ndep = \"./dep\"\n").unwrap();
+    run_assertions(project.path(), "imports.test.mjs");
 }
 
 #[test]

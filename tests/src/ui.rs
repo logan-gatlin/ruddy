@@ -1447,10 +1447,25 @@ fn row_explanations_keep_both_source_sides_and_normalize_solver_direction() {
     let [effect_error] = errors.as_slice() else {
         panic!("repeated effect fixture must have one error: {errors:#?}");
     };
-    assert!(
-        effect_error.explanation.is_none(),
-        "a repeated effect without an exact forbidden origin must not invent one: {effect_error:#?}"
+    let explanation = effect_error
+        .explanation
+        .as_ref()
+        .expect("repeated effect cause");
+    assert_eq!(
+        explanation.contradiction.kind,
+        inference::ContradictionKind::RepeatedLabel
     );
+    for payload in [
+        inference::ExplanationFactPayload::LabelIntroduction,
+        inference::ExplanationFactPayload::LabelForbidden,
+    ] {
+        assert!(
+            explanation
+                .abridged
+                .iter()
+                .any(|at| { explanation.full_facts[*at].payload == payload })
+        );
+    }
 
     // A genuinely deep tail-binding chain, rather than one wide row, keeps
     // provenance iterative and parents the original lack through every hop.
@@ -1521,9 +1536,9 @@ fn same_label_performs_facts_do_not_invent_repeated_endpoints() {
     let source = concat!(
         "effect Log = { write: Nat -> () }\n",
         "effect Tick = { tick: () -> () }\n",
-        "let bad = fn _ => handle !Log.write 1n with | !Log.write n =>\n",
-        "  (fn action => action ()) (fn _ => do let _ = !Tick.tick () return !Log.write n end)\n",
-        "end\n",
+        "let split : (() -> () + !Log + ..'r) -> (() -> () + ..'r) -> Nat = fn whole => fn rest => 0n\n",
+        "let bad = fn action => split action ",
+        "((fn callback => callback) (fn _ => do let _ = !Tick.tick () return !Log.write 0n end))\n",
     );
     let (map, errors) = inference_fixture_errors(source);
     let [error] = errors.as_slice() else {
@@ -1531,20 +1546,24 @@ fn same_label_performs_facts_do_not_invent_repeated_endpoints() {
     };
     let inference::ErrorKind::RepeatedField {
         introduction: Some(introduction),
-        forbidden,
+        forbidden: Some(forbidden),
         ..
     } = &error.kind
     else {
-        panic!("same-label intermediate must retain its exact origin: {error:#?}");
+        panic!("same-label intermediate must retain its exact origins: {error:#?}");
     };
-    assert_eq!(
-        map.span(introduction.at).start..map.span(introduction.at).end(),
-        197..209
-    );
-    assert!(forbidden.is_none());
+    let text_at = |at| {
+        let span = map.span(at);
+        &source[span.start..span.end()]
+    };
+    assert_eq!(text_at(introduction.at), "!Log.write 0n");
+    assert_eq!(text_at(forbidden.at), "action");
+    let explanation = error.explanation.as_ref().expect("repeated effect cause");
     assert!(
-        error.explanation.is_none(),
-        "an unrelated same-!Log Performs fact must not fabricate the missing endpoint: {error:#?}"
+        explanation
+            .abridged
+            .iter()
+            .all(|at| { text_at(explanation.full_facts[*at].at) != "!Tick.tick ()" })
     );
 }
 
