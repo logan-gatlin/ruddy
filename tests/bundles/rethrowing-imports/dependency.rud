@@ -1,0 +1,8 @@
+effect Log = { write: Nat -> () }
+effect Logging = !Log
+
+let forward : (() -> 'a + !Logging + ..'e) -> 'a + !Logging + ..'e = fn action =>
+  handle action () with | !Log.write n => !Log.write n end
+
+let silence = fn action =>
+  handle action () with | !Log.write _ => () end

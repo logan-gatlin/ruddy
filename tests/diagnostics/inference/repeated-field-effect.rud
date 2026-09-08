@@ -1,2 +1,3 @@
 effect Log = { write: Nat -> () }
-let bad = fn _ => handle !Log.write 1n with | !Log.write n => !Log.write n end
+let split : (() -> () + !Log + ..'r) -> (() -> () + ..'r) -> Nat = fn whole => fn rest => 0n
+let bad = fn action => split action (fn _ => !Log.write 0n)

@@ -3563,6 +3563,18 @@ impl Lower<'_> {
         let ret = handler.ret.as_ref();
         let block = self.child(self.span(handled.at), |low, inner| {
             let value = low.term(handled, inner);
+            // Only the handled computation sees these records. Return arms,
+            // like operation arms, execute in the surrounding environment.
+            for (name, previous) in held {
+                match previous {
+                    Some(temp) => {
+                        low.top().evidence.insert(name, temp);
+                    }
+                    None => {
+                        low.top().evidence.shift_remove(&name);
+                    }
+                }
+            }
             match ret {
                 Some(ret) => {
                     low.top().locals.insert(ret.binder.anchored, value);
@@ -3571,17 +3583,6 @@ impl Lower<'_> {
                 None => value,
             }
         });
-        for (name, previous) in held {
-            match previous {
-                Some(temp) => {
-                    self.top().evidence.insert(name, temp);
-                }
-                None => {
-                    self.top().evidence.shift_remove(&name);
-                }
-            }
-        }
-
         let rep = self.rep(&term.ty);
         self.emit(
             body,

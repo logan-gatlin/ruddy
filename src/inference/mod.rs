@@ -2767,6 +2767,8 @@ type Lacks = IndexMap<String, LacksEntry>;
 /// witness and abstract. The remaining semantic side tables are either read
 /// only during unification or have their own congruence rollback in [`Solve`].
 struct Known {
+    handler_presences: HashSet<TyVar>,
+    handler_absences: HashSet<TyVar>,
     vars: Vec<Slot>,
     /// [`Table::var_meta`] is append-only, so its snapshot is its length and
     /// putting it back is a truncate.
@@ -3069,6 +3071,11 @@ struct Fingerprint {
 
 #[derive(Default)]
 struct Table {
+    /// Optional ambient labels introduced during handler constraint generation.
+    /// An unused allowance is closed at generalization, like an unshared tail.
+    handler_presences: HashSet<TyVar>,
+    /// Closed handler allowances disappear, unlike written negative labels.
+    handler_absences: HashSet<TyVar>,
     /// What every identity minted here is scoped to. See [`inference_id!`].
     scope: Symbol,
     /// The declarations, shared with every other table. See [`Signatures`].
@@ -6968,6 +6975,7 @@ fn infer_group(
         // R23's closing rule, before anything is quantified: an effect
         // variable the solve learned nothing about links nothing, so it is
         // the empty row rather than a `..'b` the caller gets to choose.
+        table.close_handler_presences(&member.ty, 0);
         table.close_effects(&member.ty, 0);
         // Fold-back, next of everything generalization does: a presence
         // the store has already decided is no variable at all, so it is
@@ -7529,6 +7537,8 @@ impl Table {
     /// outermost open congruence rather than per binding or nominal depth.
     fn snapshot(&self) -> Known {
         Known {
+            handler_presences: self.handler_presences.clone(),
+            handler_absences: self.handler_absences.clone(),
             vars: self.vars.clone(),
             var_meta_len: self.var_meta.len(),
             levels: self.levels.clone(),
@@ -7546,6 +7556,8 @@ impl Table {
     /// one: a fresh variable reaches the rest of the solve only by being bound
     /// into something, and every binding made since is being undone here too.
     fn restore(&mut self, known: Known) {
+        self.handler_presences = known.handler_presences;
+        self.handler_absences = known.handler_absences;
         self.vars = known.vars;
         self.var_meta.truncate(known.var_meta_len);
         self.levels = known.levels;
@@ -7731,6 +7743,32 @@ impl Table {
         self.fresh_presence_for(Subject::Term)
     }
 
+    fn fresh_handler_presence(&mut self) -> Presence {
+        let presence = self.fresh_presence_for(Subject::AmbientEffects);
+        if let Presence::Var(var) = presence {
+            self.handler_presences.insert(var);
+        }
+        presence
+    }
+
+    /// Guarded assignments and match families give a presence fresh views.
+    /// Keep track of views originating in an inferred handler allowance so
+    /// generalization can minimize them together without minimizing a caller's
+    /// written or instantiated presences.
+    fn inherit_handler_presence<'a>(
+        &mut self,
+        target: &Presence,
+        sources: impl IntoIterator<Item = &'a Presence>,
+    ) {
+        if let Presence::Var(target) = target
+            && sources.into_iter().any(|source| {
+                matches!(self.presence_of(source), Presence::Var(var) if self.handler_presences.contains(&var))
+            })
+        {
+            self.handler_presences.insert(*target);
+        }
+    }
+
     fn fresh_presence_for(&mut self, subject: Subject) -> Presence {
         Presence::Var(self.mint(VarSort::Presence, subject))
     }
@@ -7819,6 +7857,9 @@ impl Table {
         let mut budget = self.vars.len();
         loop {
             for (name, field) in &row.labels {
+                if self.unused_handler_presence(&field.presence) {
+                    continue;
+                }
                 labels.entry(name.clone()).or_insert_with(|| field.clone());
             }
             let deeper = match &row.rest {
@@ -7891,6 +7932,32 @@ impl Table {
             presence = inner.clone();
         }
         presence
+    }
+
+    /// Follow aliases to distinguish a closed, inferred handler allowance
+    /// from an explicit negative label. Only the former disappears from rows.
+    fn unused_handler_presence(&self, presence: &Presence) -> bool {
+        if self.handler_absences.is_empty() {
+            return false;
+        }
+        let mut presence = presence;
+        let mut budget = self.vars.len();
+        while let Presence::Var(var) = presence {
+            let Slot::Bound {
+                value: Assigned::Presence(inner),
+                by,
+            } = &self.vars[*var as usize]
+            else {
+                return false;
+            };
+            self.note_binding_read(*by);
+            if self.handler_absences.contains(var) {
+                return true;
+            }
+            budget = budget.checked_sub(1).expect("a cycle in presence bindings");
+            presence = inner;
+        }
+        false
     }
 
     /// Whether two types are the same type as far as anything already decided
@@ -10197,6 +10264,159 @@ impl Table {
                 DefaultAssignment::EmptyRow,
                 Vec::new(),
             );
+        }
+    }
+
+    /// A handler's optional outer label is an allowance, not an inferred
+    /// operation. Minimize unshared allowances and their guarded views while
+    /// preserving every admitted assignment of caller-owned presences. A
+    /// conditional rethrow therefore survives; a guarded swallowing handler
+    /// does not publish a phantom effect just because its views have formulas.
+    fn close_handler_presences(&mut self, ty: &Arc<Ty>, level: u32) {
+        if self.handler_presences.is_empty() {
+            return;
+        }
+        let mut mentions = Vec::new();
+        self.mentions_ty(ty, &mut mentions);
+        let mut counted = IndexMap::<TyVar, usize>::new();
+        for var in mentions {
+            *counted.entry(var).or_default() += 1;
+        }
+        let mentioned = self.store_mentions();
+        let mut protected = HashSet::new();
+        // A presence in a callable's input belongs to its caller even if a
+        // match family gave it a fresh identity separate from the output.
+        let mut inputs = IndexSet::new();
+        let mut work = vec![ty.clone()];
+        while let Some(ty) = work.pop() {
+            let ty = self.resolve(&ty);
+            let row = match &*ty {
+                Ty::Arrow(from, to, row) => {
+                    self.presences_in(from, &mut inputs);
+                    work.push(to.clone());
+                    Some(row)
+                }
+                Ty::Struct(row) | Ty::Sum(row) => Some(row),
+                Ty::Package(ty) | Ty::Array(ty) => {
+                    work.push(ty.clone());
+                    None
+                }
+                Ty::Mut(region, ty) => {
+                    work.extend([region.clone(), ty.clone()]);
+                    None
+                }
+                Ty::Named { args, .. } => {
+                    work.extend(args.iter().cloned());
+                    None
+                }
+                _ => None,
+            };
+            if let Some(row) = row {
+                work.extend(
+                    self.canon(row)
+                        .labels
+                        .values()
+                        .filter(|field| {
+                            !matches!(self.presence_of(&field.presence), Presence::Absent)
+                        })
+                        .map(|field| field.ty.clone()),
+                );
+            }
+        }
+        protected.extend(inputs);
+        for (var, meta) in self.var_meta.iter().enumerate() {
+            let var = var as TyVar;
+            if meta.sort == VarSort::Presence
+                && !self.handler_presences.contains(&var)
+                && let Presence::Var(root) = self.presence_of(&Presence::Var(var))
+            {
+                protected.insert(root);
+            }
+        }
+        let mut candidates: Vec<_> = self
+            .handler_presences
+            .iter()
+            .copied()
+            .filter(|var| {
+                let count = counted.get(var).copied().unwrap_or_default();
+                count <= 1
+                    && (count == 1 || mentioned.contains(var))
+                    && matches!(self.vars[*var as usize], Slot::Unbound)
+                    && self.levels[*var as usize] >= level
+                    && !protected.contains(var)
+            })
+            .collect();
+        candidates.sort_unstable();
+        // Only close this binding's allowances and their formula-connected
+        // views. An earlier sibling's returned callback may still be waiting
+        // for its own generalization at the same level.
+        let eligible: HashSet<_> = candidates.iter().copied().collect();
+        let mut reachable: HashSet<_> = candidates
+            .iter()
+            .copied()
+            .filter(|var| counted.get(var) == Some(&1))
+            .collect();
+        let connections: Vec<Vec<_>> = self
+            .store
+            .batches
+            .iter()
+            .map(|batch| {
+                let mut atoms = Vec::new();
+                self.resolved(&batch.formula).atoms(&mut atoms);
+                atoms
+                    .into_iter()
+                    .filter_map(|atom| match atom {
+                        Atom::Var(var) if eligible.contains(&var) => Some(var),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        loop {
+            let before = reachable.len();
+            for connection in &connections {
+                if connection.iter().any(|var| reachable.contains(var)) {
+                    reachable.extend(connection.iter().copied());
+                }
+            }
+            if reachable.len() == before {
+                break;
+            }
+        }
+        candidates.retain(|var| reachable.contains(var));
+        if candidates.is_empty() {
+            return;
+        }
+        let mut known = self.known();
+        let mut keep = Vec::new();
+        known.atoms(&mut keep);
+        keep.retain(
+            |atom| !matches!(atom, Atom::Var(var) if candidates.binary_search(var).is_ok()),
+        );
+        let Some(admitted) = sat::project_exact(&known, &keep) else {
+            return;
+        };
+        for var in candidates {
+            let absent = known.substitute(&|atom| {
+                if atom == Atom::Var(var) {
+                    Formula::False
+                } else {
+                    Formula::Atom(atom)
+                }
+            });
+            if let Some(realized) = sat::project_exact(&absent, &keep)
+                && sat::entails(&admitted, &realized)
+            {
+                self.default_bind(
+                    var,
+                    Assigned::Presence(Presence::Absent),
+                    DefaultBinding::CloseEffects,
+                    DefaultAssignment::Absent,
+                    Vec::new(),
+                );
+                self.handler_absences.insert(var);
+                known = absent;
+            }
         }
     }
 

@@ -8112,26 +8112,235 @@ fn a_performed_effect_has_to_be_allowed_where_it_is_written() {
     );
 }
 
-/// Masking — re-performing, inside an arm, the effect that arm's own handler
-/// discharges — is refused by the lacks check, which is what a handler's
-/// extended ambient records against the row it was handed.
 #[test]
-fn re_performing_a_discharged_effect_is_refused() {
-    let (_, _, output) = infer_src(&format!(
-        "{EFFECTS}let mask = fn _ =>\n\
-           handle !Log.write 1n with | !Log.write s => !Log.write s end"
+fn rethrowing_retains_one_effect_and_an_outer_handler_discharges_it() {
+    let (mint, _, output) = inferred(&format!(
+        "{EFFECTS}let forward = fn _ =>\n\
+           handle !Log.write 1n with | !Log.write s => !Log.write s end\n\
+         let quiet = fn _ => handle forward () with | !Log.write _ => () end"
     ));
-    let [error] = output.errors() else {
-        panic!("{:#?}", output.errors());
-    };
-    assert_eq!(error.kind.code(), "repeated-field");
-    assert!(matches!(
-        error.kind,
-        ErrorKind::RepeatedField {
-            shape: Shape::Effect,
-            ..
-        }
+    assert_eq!(scheme(&mint, &output, "forward"), "'a -> () + !Log");
+    assert_eq!(scheme(&mint, &output, "quiet"), "'a -> ()");
+}
+
+#[test]
+fn rethrowing_does_not_make_nested_swallowing_forbid_an_outer_use() {
+    let (mint, _, output) = inferred(&format!(
+        "{EFFECTS}
+        let later = fn _ => do
+          let _ = handle !Log.write 1n with | !Log.write _ => () end
+          return !Log.write 2n
+        end
+        let around = fn after => do
+          let _ = handle !Log.write 1n with | !Log.write _ => () end
+          return after ()
+        end
+        let used = fn _ => around (fn _ => !Log.write 2n)
+        let paired = fn after =>
+          (handle !Log.write 1n with | !Log.write _ => () end, after ())
+        let pair_used = fn _ => paired (fn _ => !Log.write 2n)
+        let pair_pure : () -> ((), ()) = fn _ => paired (fn _ => ())"
     ));
+    assert_eq!(scheme(&mint, &output, "later"), "'a -> () + !Log");
+    assert_eq!(scheme(&mint, &output, "used"), "'a -> () + !Log");
+    assert_eq!(scheme(&mint, &output, "pair_used"), "'a -> ((), ()) + !Log");
+}
+
+#[test]
+fn rethrowing_preserves_generic_callback_remainders() {
+    let (mint, _, output) = inferred(&format!(
+        "{EFFECTS}
+        let forward = fn action =>
+          handle action () with | !Log.write n => !Log.write n end
+        let silence = fn action =>
+          handle action () with | !Log.write _ => () end
+        let declared : (() -> 'a + !Log + ..'e) -> 'a + !Log + ..'e = fn action =>
+          handle action () with | !Log.write n => !Log.write n end
+        let declared_silence : (() -> 'a + !Log + ..'e) -> 'a + ..'e = fn action =>
+          handle action () with | !Log.write _ => () end
+        let pure : () -> Nat = fn _ => silence (fn _ => 1n)
+        let annotated_pure : () -> Nat = fn _ => declared_silence (fn _ => 1n)
+        let logged = fn _ => forward (fn _ => !Log.write 1n)
+        let extra = fn _ => silence (fn _ => do
+          let _ = !Log.write 1n
+          return !IO.print 2n
+        end)
+        let both = fn _ => declared (fn _ => do
+          let _ = !Log.write 1n
+          return !IO.print 2n
+        end)
+        let allowed = fn _ => do
+          let _ = handle !Log.write 1n with | !Log.write _ => () end
+          return fn _ => !Log.write 2n
+        end"
+    ));
+    assert_eq!(
+        scheme(&mint, &output, "forward"),
+        "(() -> 'a + !Log + ..'b) -> 'a + !Log + ..'b"
+    );
+    assert_eq!(
+        scheme(&mint, &output, "silence"),
+        "(() -> 'a + !Log + ..'b) -> 'a + ..'b"
+    );
+    assert_eq!(scheme(&mint, &output, "pure"), "() -> Nat");
+    assert_eq!(scheme(&mint, &output, "extra"), "'a -> () + !IO");
+    assert_eq!(scheme(&mint, &output, "both"), "'a -> () + !Log + !IO");
+    assert_eq!(scheme(&mint, &output, "allowed"), "'a -> 'b -> () + !Log");
+}
+
+#[test]
+fn rethrowing_through_stored_parametric_operations_preserves_callback_effects() {
+    let (mint, _, output) = inferred(
+        "effect Ask 'a = { get: () -> 'a }
+        let read = !Ask.get
+        let helper = fn _ => read ()
+        let decorate = fn action =>
+          handle action () with | !Ask.get _ => helper () end
+        let make = fn _ =>
+          handle (fn _ => !Ask.get ()) with | !Ask.get _ => 7n end
+        let invocation : () -> Nat = fn _ =>
+          handle decorate (make ()) with | !Ask.get _ => 42n end",
+    );
+    assert_eq!(scheme(&mint, &output, "read"), "() -> 'a + !Ask 'a");
+    assert_eq!(scheme(&mint, &output, "helper"), "'a -> 'b + !Ask 'b");
+    assert_eq!(
+        scheme(&mint, &output, "decorate"),
+        "(() -> 'a + !Ask 'b + ..'c) -> 'a + !Ask 'b + ..'c"
+    );
+    assert_eq!(scheme(&mint, &output, "make"), "'a -> 'b -> 'c + !Ask 'c");
+}
+
+#[test]
+fn rethrowing_requires_an_outer_effect_allowance() {
+    for (definition, expected) in [
+        (
+            "let bad : () -> () = fn _ => handle !Log.write 1n with | !Log.write n => !Log.write n end",
+            "effect-not-allowed",
+        ),
+        (
+            "let bad = handle !Log.write 1n with | !Log.write n => !Log.write n end",
+            "unhandled-effect",
+        ),
+        (
+            "let bad : () -> () = fn _ => handle () with | !Log.write _ => () | return _ => !Log.write 1n end",
+            "effect-not-allowed",
+        ),
+    ] {
+        assert_eq!(
+            infer_codes(&format!("{EFFECTS}{definition}")),
+            [expected],
+            "{definition}"
+        );
+    }
+}
+
+#[test]
+fn rethrowing_keeps_one_coherent_application_of_each_constructor() {
+    assert_eq!(
+        infer_codes(
+            "effect Ask 'a = { get: () -> 'a }
+        let bad : () -> Nat + !Ask String = fn _ =>
+          handle do
+            let n : Nat = !Ask.get ()
+            return n
+          end with | !Ask.get _ => !Ask.get () end"
+        ),
+        ["effect-argument-mismatch"]
+    );
+}
+
+#[test]
+fn rethrowing_preserves_written_presence_formulas_and_negative_labels() {
+    let (mint, _, output) = inferred(&format!(
+        "{EFFECTS}
+        let conditional : (() -> 'a + !Log (when 'p)) -> 'a + !Log (when 'p) = fn after => do
+          let _ = handle !Log.write 1n with | !Log.write _ => () end
+          return after ()
+        end
+        let formula : (() -> 'a + !IO (when 'p)) -> 'a + !Log (when 'q) + !IO (when 'p) where 'p != 'q = fn after => do
+          let _ = handle !Log.write 1n with | !Log.write _ => () end
+          return after ()
+        end
+        let negative : () -> () + \\!Log + ..'e = fn _ =>
+          handle !Log.write 1n with | !Log.write _ => () end"
+    ));
+    assert_eq!(
+        scheme(&mint, &output, "conditional"),
+        "(() -> 'b + !Log (when 'a)) -> 'b + !Log (when 'a)"
+    );
+    assert_eq!(
+        scheme(&mint, &output, "formula"),
+        "(() -> 'c + !IO (when 'a)) -> 'c + !Log (when 'b) + !IO (when 'a) where 'a != 'b"
+    );
+    assert_eq!(scheme(&mint, &output, "negative"), "() -> () + ..'a");
+    assert_eq!(
+        infer_codes(&format!(
+            "{EFFECTS}let bad : () -> () + \\!Log + ..'e = fn _ => handle !Log.write 1n with | !Log.write n => !Log.write n end"
+        )),
+        ["effect-not-allowed"]
+    );
+}
+
+#[test]
+fn rethrowing_does_not_add_phantom_effects_to_guarded_swallowing() {
+    let (mint, _, output) = inferred(&format!(
+        "{EFFECTS}
+        let silent = fn v => match v with
+          | {{x}} => handle !Log.write 1n with | !Log.write _ => () end
+          | {{}} => ()
+        end
+        let choose = fn v => match v with
+          | {{x}} => (fn _ => handle !Log.write 1n with | !Log.write _ => () end)
+          | {{}} => (fn _ => ())
+        end
+        let actual = fn v => match v with
+          | {{x}} => handle !Log.write 1n with | !Log.write n => !Log.write n end
+          | {{}} => ()
+        end
+        let used = fn _ => actual {{x: 1n}}
+        let nested = fn v => match v with
+          | {{x}} => (fn _ => handle !Log.write 1n with | !Log.write n => !Log.write n end)
+          | {{}} => (fn _ => ())
+        end
+        let nested_used = fn _ => nested {{x: 1n}} ()"
+    ));
+    assert!(
+        !scheme(&mint, &output, "silent").contains("!Log"),
+        "{}",
+        scheme(&mint, &output, "silent")
+    );
+    assert!(
+        !scheme(&mint, &output, "choose").contains("!Log"),
+        "{}",
+        scheme(&mint, &output, "choose")
+    );
+    assert_eq!(scheme(&mint, &output, "used"), "'a -> () + !Log");
+    assert_eq!(scheme(&mint, &output, "nested_used"), "'a -> () + !Log");
+}
+
+#[test]
+fn rethrowing_generalization_preserves_sibling_callback_choices() {
+    let (mint, _, output) = inferred(&format!(
+        "{EFFECTS}
+        let choose = fn v => match v with
+          | {{x}} => (fn action =>
+              (handle !Log.write 1n with | !Log.write _ => () end, action ()))
+          | {{}} => do
+              let dummy = handle !Log.write 3n with | !Log.write _ => () end
+              return fn action => (dummy, action ())
+            end
+        end
+        let used = fn _ => choose {{x: 1n}} (fn _ => !Log.write 2n)
+        let other = fn _ => choose {{}} (fn _ => !Log.write 2n)
+        let pure : () -> ((), ()) = fn _ => choose {{x: 1n}} (fn _ => ())"
+    ));
+    assert_eq!(scheme(&mint, &output, "used"), "'a -> ((), ()) + !Log");
+    assert_eq!(
+        scheme(&mint, &output, "other"),
+        "'a -> ((), ()) + !Log",
+        "{}",
+        scheme(&mint, &output, "choose")
+    );
 }
 
 /// Presence works on an effect label exactly as it does on a sum's case, and

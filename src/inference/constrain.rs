@@ -1039,12 +1039,9 @@ impl Constrain<'_> {
     /// Walk `body` at a larger ambient, and every arm at the one the handler
     /// itself sits at.
     ///
-    /// R16, and the whole of it. A handler introduces no row of its own: like
-    /// every other term form it is checked *at* an ambient, and what it does is
-    /// hand its body `D | ..A` — the ambient extended with the effects it
-    /// discharges, each present. That the ambient must *lack* those is the
-    /// existing lacks condition, said here, and it is what refuses an arm
-    /// re-performing the effect its own handler discharges.
+    /// The body and ambient share the remainder beyond the handled labels.
+    /// Those labels are present in the body and independently allowed in the
+    /// ambient: handling an operation does not handle an arm's rethrow of it.
     ///
     /// The arms run where the `handle` was written rather than inside the
     /// computation, so they are walked at `A` itself — which is how a handler's
@@ -1073,14 +1070,40 @@ impl Constrain<'_> {
             .iter()
             .map(|(key, fresh)| (key.clone(), RowField::present(argument_tuple(fresh))))
             .collect();
+        let remainder = self.table.fresh_row_for(Subject::AmbientEffects);
+        let outside = Row {
+            labels: discharged
+                .iter()
+                .map(|(key, field)| {
+                    let presence = self.table.fresh_handler_presence();
+                    (
+                        key.clone(),
+                        RowField {
+                            presence,
+                            ty: field.ty.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            rest: remainder.clone(),
+        };
         let extended = Row {
             labels: discharged,
-            rest: Rest::More(Arc::new(self.ambient.row.clone())),
+            rest: remainder,
         };
-        // What the ambient may not stand for: an effect this handler already
-        // discharges. A row that acquired one would name it twice, which is
-        // exactly the masking R16 leaves refused.
+        // Both rows are ordinary unique-label rows. Only their common
+        // remainder lacks the handled constructors, never the outer ambient.
         self.table.note_lacks_row(&extended, Shape::Effect);
+        let effects = |row| Arc::new(Ty::Arrow(Arc::new(Ty::unit()), Arc::new(Ty::unit()), row));
+        self.emit(
+            body.at,
+            ConstraintOrigin::ContextualCheck,
+            ConstraintSubjects::pair(Subject::HandlerBody, Subject::AmbientEffects),
+            ConstraintKind::Equal {
+                expected: effects(outside),
+                actual: effects(self.ambient.row.clone()),
+            },
+        );
         let mut label_spans = self.ambient.label_spans.clone();
         label_spans.extend(
             handler
@@ -1096,17 +1119,6 @@ impl Constrain<'_> {
         });
         self.infer_term(body);
         self.leave(outer);
-
-        // The arms run in the outer row, but that row now has a lacks fact for
-        // every discharged effect. Retain the written labels as provenance
-        // while walking those arms so an overlap can point to both operations.
-        let previous_label_spans = self.ambient.label_spans.clone();
-        self.ambient.label_spans.extend(
-            handler
-                .discharges
-                .iter()
-                .map(|effect| (self.effect_ids[&effect.anchored].row_key(), effect.at)),
-        );
 
         // An arm answers the handler around it, whichever arm a `raise` inside
         // it is written in.
@@ -1170,7 +1182,6 @@ impl Constrain<'_> {
             }
         }
         self.answer = held;
-        self.ambient.label_spans = previous_label_spans;
         answer
     }
 

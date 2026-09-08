@@ -895,6 +895,32 @@ fn the_lir_tab_marks_the_evidence_it_plumbs_as_generated() {
     assert!(caught.span.is_some(), "{caught:#?}");
 }
 
+#[test]
+fn rethrowing_is_visible_through_the_debugger_pipeline() {
+    let snapshot = bundle(&[(
+        ROOT,
+        "effect Log = { write: Nat -> () }
+        @private let forward = fn _ =>
+          handle !Log.write 1n with | !Log.write n => !Log.write n end
+        let quiet = fn _ => handle forward () with | !Log.write _ => () end",
+    )]);
+    for id in ["constraints", "solve", "types", "lir", "artifact"] {
+        let stage = snapshot.stages.iter().find(|stage| stage.id == id).unwrap();
+        assert_eq!(stage.status, Status::Ok, "{id}: {stage:#?}");
+    }
+    let types = snapshot
+        .stages
+        .iter()
+        .find(|stage| stage.id == "types")
+        .unwrap();
+    let rows = flatten(&types.nodes);
+    assert!(
+        rows.iter().any(|row| row.text == "'a -> () + !Log"),
+        "{rows:#?}"
+    );
+    assert!(rows.iter().any(|row| row.text == "'a -> ()"), "{rows:#?}");
+}
+
 /// A temp is one temp everywhere it appears, so the tab lights every occurrence
 /// of `%17` in the whole listing rather than only the ones in a row's own
 /// function. That is the pattern it declares, and it is deliberately not the

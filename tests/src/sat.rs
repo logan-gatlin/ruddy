@@ -221,12 +221,19 @@ fn the_answer_is_what_bounds_a_projection() {
     // comes back still says everything it said.
     let parity = (1..10).fold(var(0), |sum, i| sum.xor(var(i)));
     assert_eq!(sat::project(&parity, &atoms(&parity)), parity);
+    assert_eq!(
+        sat::project_exact(&parity, &atoms(&parity)),
+        Some(parity.clone())
+    );
 
     // With something to eliminate there is no such shortcut, and the answer
     // errs the way that costs a missed complaint rather than an invented one.
     let spare = parity.clone().and(var(10).or(var(10).not()));
     let keep: Vec<Atom> = (0..10).map(Atom::Var).collect();
     assert!(sat::project(&spare, &keep).is_true());
+    // Type-changing decisions must distinguish budget exhaustion from a
+    // proven `true`; otherwise they could erase a required conditional effect.
+    assert!(sat::project_exact(&spare, &keep).is_none());
 
     // A caller's atom list is a set semantically. Repeats must neither inflate
     // cubes nor make the budget fallback mistake a complete projection for one

@@ -2904,8 +2904,8 @@ impl fmt::Display for Rule {
                 Shape::Sum => f.write_str(
                     "the rest of a sum cannot be a sum naming a case the sum already names",
                 ),
-                // The masking refusal: a handler already discharges these
-                // effects, so an arm re-performing one would name it twice.
+                // Written rows and tail substitutions still require one
+                // entry per effect constructor.
                 Shape::Effect => f.write_str(
                     "the rest of a function's effects cannot name an effect it already performs",
                 ),

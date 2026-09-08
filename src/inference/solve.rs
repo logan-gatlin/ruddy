@@ -239,6 +239,22 @@ struct SolveRow {
 }
 
 impl SolveRow {
+    /// Earlier work may expand a shared tail after this comparison is queued.
+    fn refresh(mut self, table: &Table) -> Self {
+        let row = table.canon(&Row {
+            labels: (*self.labels).clone(),
+            rest: self.tail.rest().clone(),
+        });
+        let (labels, remaining) = row.into_parts();
+        self.labels = Arc::new(labels);
+        match &mut self.tail {
+            Tail::Fields(rest) | Tail::Cases(rest) | Tail::Effects { rest, .. } => {
+                *rest = remaining;
+            }
+        }
+        self
+    }
+
     fn view(&self) -> Rowed<'_> {
         Rowed {
             ty: &self.ty,
@@ -272,7 +288,7 @@ enum SolveWork {
         rhs: Arc<Ty>,
         depth: u32,
         reported: usize,
-        rollback: Option<Rollback>,
+        rollback: Option<Box<Rollback>>,
     },
     FinishUnfold {
         assumption: Option<(Symbol, Symbol)>,
@@ -1189,6 +1205,7 @@ impl Solve<'_> {
             RowField {
                 state: RowState,
                 name: String,
+                presence: Presence,
             },
         }
 
@@ -1393,6 +1410,15 @@ impl Solve<'_> {
                         continue;
                     }
                     let name = state.names[state.at].clone();
+                    let presence = self.table.fresh_match_family_presence();
+                    self.table.inherit_handler_presence(
+                        &presence,
+                        state
+                            .maps
+                            .iter()
+                            .filter_map(|labels| labels.get(&name))
+                            .map(|field| &field.presence),
+                    );
                     let payloads: Vec<Arc<Ty>> = state
                         .maps
                         .iter()
@@ -1406,26 +1432,28 @@ impl Solve<'_> {
                         state.labels.insert(
                             name,
                             RowField {
-                                presence: self.table.fresh_match_family_presence(),
+                                presence,
                                 ty: Arc::new(Ty::default()),
                             },
                         );
                         state.at += 1;
                         work.push(Work::RowNext(state));
                     } else {
-                        work.push(Work::RowField { state, name });
+                        work.push(Work::RowField {
+                            state,
+                            name,
+                            presence,
+                        });
                         work.push(Work::Type(payloads));
                     }
                 }
-                Work::RowField { mut state, name } => {
+                Work::RowField {
+                    mut state,
+                    name,
+                    presence,
+                } => {
                     let ty = type_values.pop().expect("family row payload");
-                    state.labels.insert(
-                        name,
-                        RowField {
-                            presence: self.table.fresh_match_family_presence(),
-                            ty,
-                        },
-                    );
+                    state.labels.insert(name, RowField { presence, ty });
                     state.at += 1;
                     work.push(Work::RowNext(state));
                 }
@@ -1759,6 +1787,7 @@ impl Solve<'_> {
             bound.clone(),
             initializer_effects.clone(),
         ));
+        self.table.close_handler_presences(&initializer, level);
         self.table.close_effects(&initializer, level);
         let immediate = self.table.canon(initializer_effects);
         let pure = matches!(immediate.rest, Rest::Closed)
@@ -1986,15 +2015,17 @@ impl Solve<'_> {
                                 self.step(span, Rule::Same, goal, Effect::None);
                             } else {
                                 let reported = self.errors.len();
-                                let rollback = (congruences == 0).then(|| Rollback {
-                                    stepped: self.steps.len(),
-                                    stored: self.table.store.batches.len(),
-                                    traced: self
-                                        .refinements
-                                        .iter()
-                                        .map(|refinement| refinement.obligations.len())
-                                        .collect(),
-                                    known: self.table.snapshot(),
+                                let rollback = (congruences == 0).then(|| {
+                                    Box::new(Rollback {
+                                        stepped: self.steps.len(),
+                                        stored: self.table.store.batches.len(),
+                                        traced: self
+                                            .refinements
+                                            .iter()
+                                            .map(|refinement| refinement.obligations.len())
+                                            .collect(),
+                                        known: self.table.snapshot(),
+                                    })
                                 });
                                 congruences += 1;
                                 self.step(span, Rule::Congruent, goal, Effect::Decomposed);
@@ -2225,6 +2256,8 @@ impl Solve<'_> {
                 }
                 SolveWork::Labels(lhs, rhs, depth) => {
                     self.depth = depth;
+                    let lhs = lhs.refresh(self.table);
+                    let rhs = rhs.refresh(self.table);
                     work.extend(self.labels(span, lhs, rhs).into_iter().rev().map(|field| {
                         SolveWork::Label {
                             name: field.name,
@@ -3348,6 +3381,7 @@ impl Solve<'_> {
                             Presence::Undecided => Presence::Undecided,
                             resolved => {
                                 let shared = self.table.fresh_presence();
+                                self.table.inherit_handler_presence(&shared, [resolved]);
                                 self.guarded_presence(span, &shared, resolved);
                                 shared
                             }
