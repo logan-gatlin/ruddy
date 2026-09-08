@@ -1954,31 +1954,20 @@ fn extern_boundary_explanations_reach_the_debugger_with_cli_vocabulary() {
     );
     assert_eq!(explanation.full.len(), explanation.abridged.len());
 
-    let polymorphic = snapshot("extern run : fn('a) -> Nat = \"host.run\"\n");
-    let diagnostic = polymorphic
-        .diagnostics
-        .iter()
-        .find(|diagnostic| diagnostic.code == "polymorphic-extern-boundary")
-        .expect("polymorphic diagnostic");
-    let explanation = diagnostic
-        .inference_explanation
-        .as_ref()
-        .expect("polymorphic explanation on wire");
-    assert_eq!(
-        explanation.contradiction.kind,
-        "polymorphic-extern-boundary"
+    let polymorphic = snapshot("@private extern run : fn('a) -> Nat = \"host.run\"\n");
+    assert!(
+        polymorphic.diagnostics.is_empty(),
+        "{:#?}",
+        polymorphic.diagnostics
     );
-    assert_eq!(
-        explanation
-            .full
+    let unsupported = snapshot(
+        "effect Tick = Nat -> Nat\nextern run: 'a -> Nat = \"host.run\"\nlet value = run (fn n => !Tick n)\n",
+    );
+    assert!(
+        unsupported
+            .diagnostics
             .iter()
-            .map(|fact| fact.payload)
-            .collect::<Vec<_>>(),
-        [
-            "polymorphic-extern-leaf",
-            "extern-position",
-            "extern-declaration"
-        ]
+            .any(|diagnostic| diagnostic.code == "runtime-type-information")
     );
 }
 

@@ -467,6 +467,9 @@ fn rep(r: lower::Rep) -> Rep {
         lower::Rep::Real => Rep::Real,
         lower::Rep::String => Rep::String,
         lower::Rep::Boolean => Rep::Boolean,
+        lower::Rep::TypeDescriptor => Rep::TypeDescriptor,
+        lower::Rep::BoxedAny => Rep::BoxedAny,
+        lower::Rep::HostValue => Rep::HostValue,
         lower::Rep::Unit => Rep::Unit,
         lower::Rep::Struct => Rep::Struct,
         lower::Rep::Array => Rep::Array,
@@ -562,6 +565,31 @@ fn ordinary(value: &lower::Op) -> Op {
             callable: None,
             symbol: *symbol,
             name: name.clone(),
+        },
+        Source::TypeDescriptor {
+            template,
+            arguments,
+        } => Op::TypeDescriptor {
+            template: template.clone(),
+            arguments: arguments.clone(),
+        },
+        Source::Reflect {
+            kind,
+            descriptor,
+            value,
+        } => Op::Reflect {
+            kind: *kind,
+            descriptor: *descriptor,
+            value: *value,
+        },
+        Source::Convert {
+            descriptor,
+            value,
+            direction,
+        } => Op::Convert {
+            descriptor: *descriptor,
+            value: *value,
+            direction: *direction,
         },
         Source::NewTag => Op::NewTag,
         _ => unreachable!("control instructions are split before ordinary lowering"),

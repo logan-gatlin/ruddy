@@ -662,6 +662,8 @@ impl Solve<'_> {
             | Ty::Real
             | Ty::String
             | Ty::Boolean
+            | Ty::Any
+            | Ty::JsValue
             | Ty::Arrow(..)
             | Ty::Mut(..)
             | Ty::Sum(_) => {
@@ -734,6 +736,8 @@ impl Solve<'_> {
             | Ty::Real
             | Ty::String
             | Ty::Boolean
+            | Ty::Any
+            | Ty::JsValue
             | Ty::Arrow(..)
             | Ty::Array(_)
             | Ty::Mut(..)
@@ -1013,6 +1017,8 @@ impl Solve<'_> {
                                 Ty::Real => values.push(tagged(2, [])),
                                 Ty::String => values.push(tagged(3, [])),
                                 Ty::Boolean => values.push(tagged(4, [])),
+                                Ty::Any => values.push(tagged(50, [])),
+                                Ty::JsValue => values.push(tagged(51, [])),
                                 Ty::Var(var) | Ty::Bound(var) => {
                                     values.push(tagged(5, [u64::from(*var)]));
                                 }
@@ -2050,7 +2056,9 @@ impl Solve<'_> {
                         | (Ty::Int, Ty::Int)
                         | (Ty::Real, Ty::Real)
                         | (Ty::String, Ty::String)
-                        | (Ty::Boolean, Ty::Boolean) => {
+                        | (Ty::Boolean, Ty::Boolean)
+                        | (Ty::Any, Ty::Any)
+                        | (Ty::JsValue, Ty::JsValue) => {
                             self.step(span, Rule::Prim, goal, Effect::None);
                         }
                         (Ty::Arrow(from, to, effects), Ty::Arrow(other, result, performs)) => {
@@ -2405,6 +2413,8 @@ impl Solve<'_> {
                         | Ty::Real
                         | Ty::String
                         | Ty::Boolean
+                        | Ty::Any
+                        | Ty::JsValue
                         | Ty::Var(_)
                         | Ty::Rigid { .. }
                         | Ty::Bound(_)
@@ -3663,6 +3673,8 @@ impl Solve<'_> {
                     | Ty::Real
                     | Ty::String
                     | Ty::Boolean
+                    | Ty::Any
+                    | Ty::JsValue
                     | Ty::Bound(_)
                     | Ty::Rigid { .. }
                     | Ty::Undecided => {}

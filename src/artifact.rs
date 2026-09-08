@@ -186,6 +186,47 @@ impl UncheckedArtifact {
             return Err(ValidationError::new("artifact value name is empty"));
         }
         validate_executable_relationships(&self.lir)?;
+        for value in &self.header.values {
+            let Some(global) = self
+                .lir
+                .globals
+                .iter()
+                .find(|global| global.name == value.name)
+            else {
+                continue;
+            };
+            let initializer = &self.lir.functions[global.initializer as usize];
+            let entry = &initializer.blocks[initializer.entry as usize];
+            let layout = if let End::Continue {
+                value: returned, ..
+            } = entry.end
+            {
+                entry
+                    .instrs
+                    .iter()
+                    .find(|instruction| instruction.temp == returned)
+                    .and_then(|instruction| {
+                        let Op::Closure { func, captures } = &instruction.op else {
+                            return None;
+                        };
+                        let parameters =
+                            &self.lir.functions[*func as usize].params[captures.len()..];
+                        (!parameters.is_empty()
+                            && parameters
+                                .iter()
+                                .all(|parameter| parameter.rep == Rep::TypeDescriptor))
+                        .then_some(parameters.len())
+                    })
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            if layout != value.scheme.representations.len() {
+                return Err(ValidationError::new(
+                    "runtime representation requirements disagree with the exported evidence layout",
+                ));
+            }
+        }
         // Text decoding is the single semantic translation implementation.
         // Rendering this portable tree and decoding it again deliberately
         // routes hand-built data through the same stack-safe checks as a disk
@@ -649,6 +690,7 @@ pub enum OperationSelector {
 /// index space: presences are `0..presences`, then types and rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scheme {
+    pub representations: Vec<u32>,
     pub count: u32,
     pub presences: u32,
     /// Producer-owned presence positions. Each index is in `0..presences`.
@@ -669,6 +711,8 @@ pub enum Type {
     Real,
     String,
     Boolean,
+    Any,
+    JsValue,
     Arrow(Box<Type>, Box<Type>, Row),
     Package(Box<Type>),
     Array(Box<Type>),
@@ -765,6 +809,8 @@ fn semantic_eq(root: SemanticPair<'_>) -> bool {
                 | (Type::Real, Type::Real)
                 | (Type::String, Type::String)
                 | (Type::Boolean, Type::Boolean)
+                | (Type::Any, Type::Any)
+                | (Type::JsValue, Type::JsValue)
                 | (Type::Undecided, Type::Undecided) => {}
                 (Type::Var(left), Type::Var(right)) | (Type::Bound(left), Type::Bound(right))
                     if left == right => {}
@@ -943,6 +989,8 @@ fn clone_semantic(root: SemanticRef<'_>) -> (Vec<Type>, Vec<Row>) {
                 Type::Real => types.push(Type::Real),
                 Type::String => types.push(Type::String),
                 Type::Boolean => types.push(Type::Boolean),
+                Type::Any => types.push(Type::Any),
+                Type::JsValue => types.push(Type::JsValue),
                 Type::Arrow(from, to, effects) => {
                     work.push(CloneWork::Arrow);
                     work.push(CloneWork::Semantic(SemanticRef::Row(effects)));
@@ -1145,6 +1193,8 @@ fn drain_type(value: &mut Type, pending: &mut Vec<SemanticOwned>) {
         | Type::Real
         | Type::String
         | Type::Boolean
+        | Type::Any
+        | Type::JsValue
         | Type::Var(_)
         | Type::Bound(_)
         | Type::Rigid { .. }
@@ -1645,6 +1695,7 @@ fn scheme(mint: &Mint, value: &types::Scheme) -> Scheme {
     let mut existentials: Vec<_> = value.existentials().iter().copied().collect();
     existentials.sort_unstable();
     Scheme {
+        representations: value.representations().to_vec(),
         count: value.count(),
         presences: value.presences(),
         existentials,
@@ -1704,6 +1755,8 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
                 types::Ty::Real => tys.push(Type::Real),
                 types::Ty::String => tys.push(Type::String),
                 types::Ty::Boolean => tys.push(Type::Boolean),
+                types::Ty::Any => tys.push(Type::Any),
+                types::Ty::JsValue => tys.push(Type::JsValue),
                 types::Ty::Arrow(from, to, effects) => {
                     work.push(Work::Arrow);
                     work.push(Work::Row(effects));
@@ -2086,6 +2139,31 @@ fn op(mint: &Mint, value: &lir::Op) -> Op {
             callable: *callable,
             target: qualified(mint, *symbol),
         },
+        Source::TypeDescriptor {
+            template,
+            arguments,
+        } => Op::TypeDescriptor {
+            template: template.clone(),
+            arguments: arguments.clone(),
+        },
+        Source::Reflect {
+            kind,
+            descriptor,
+            value,
+        } => Op::Reflect {
+            kind: *kind,
+            descriptor: *descriptor,
+            value: *value,
+        },
+        Source::Convert {
+            descriptor,
+            value,
+            direction,
+        } => Op::Convert {
+            descriptor: *descriptor,
+            value: *value,
+            direction: *direction,
+        },
         Source::NewTag => Op::NewTag,
     }
 }
@@ -2164,6 +2242,9 @@ fn rep(value: lir::Rep) -> Rep {
         lir::Rep::Real => Rep::Real,
         lir::Rep::String => Rep::String,
         lir::Rep::Boolean => Rep::Boolean,
+        lir::Rep::TypeDescriptor => Rep::TypeDescriptor,
+        lir::Rep::BoxedAny => Rep::BoxedAny,
+        lir::Rep::HostValue => Rep::HostValue,
         lir::Rep::Unit => Rep::Unit,
         lir::Rep::Struct => Rep::Struct,
         lir::Rep::Array => Rep::Array,
@@ -2477,7 +2558,7 @@ pub mod text {
         ])
     }
     fn scheme(value: &Scheme) -> S {
-        L(vec![
+        let mut parts = vec![
             A("scheme".into()),
             A(value.count.to_string()),
             A(value.presences.to_string()),
@@ -2486,7 +2567,21 @@ pub mod text {
                 .collect()),
             formula(&value.formula),
             ty(&value.body),
-        ])
+        ];
+        if !value.representations.is_empty() {
+            parts.insert(
+                4,
+                L(std::iter::once(A("representations".into()))
+                    .chain(
+                        value
+                            .representations
+                            .iter()
+                            .map(|index| A(index.to_string())),
+                    )
+                    .collect()),
+            );
+        }
+        L(parts)
     }
     fn ty(value: &Type) -> S {
         enum Work<'a> {
@@ -2517,6 +2612,8 @@ pub mod text {
                         Type::Real => work.push(Work::Text("real")),
                         Type::String => work.push(Work::Text("string")),
                         Type::Boolean => work.push(Work::Text("boolean")),
+                        Type::Any => work.push(Work::Text("any")),
+                        Type::JsValue => work.push(Work::Text("js-value")),
                         Type::Arrow(from, to, row) => {
                             out.push_str("(arrow ");
                             work.push(Work::Text(")"));
@@ -3649,7 +3746,9 @@ pub mod text {
             }
         }
         fn read_scheme(&self, value: S) -> Scheme {
-            let mut value = self.exact(self.list(value, "scheme"), 5, "scheme");
+            let value = self.list(value, "scheme");
+            let has_representations = value.len() == 6;
+            let mut value = self.exact(value, if has_representations { 6 } else { 5 }, "scheme");
             let count = self.number(self.take(&mut value));
             let presences = self.number(self.take(&mut value));
             let mut encoded = self.list(self.take(&mut value), "existentials");
@@ -3664,6 +3763,20 @@ pub mod text {
                 || existentials.windows(2).any(|pair| pair[0] >= pair[1])
             {
                 self.fail("invalid existential presence positions");
+            }
+            let mut representations = Vec::new();
+            if has_representations {
+                let mut encoded = self.list(self.take(&mut value), "representations");
+                while !encoded.is_empty() {
+                    representations.push(self.number(self.take(&mut encoded)));
+                }
+                if representations
+                    .iter()
+                    .any(|index| *index < presences || *index >= count)
+                    || representations.windows(2).any(|pair| pair[0] >= pair[1])
+                {
+                    self.fail("invalid runtime representation positions");
+                }
             }
             let formula = self.read_formula(self.take(&mut value));
             let body = self.read_ty(self.take(&mut value));
@@ -3828,6 +3941,7 @@ pub mod text {
                 }
             }
             Scheme {
+                representations,
                 count,
                 presences,
                 existentials,
@@ -3875,6 +3989,8 @@ pub mod text {
                                 "real" => Type::Real,
                                 "string" => Type::String,
                                 "boolean" => Type::Boolean,
+                                "any" => Type::Any,
+                                "js-value" => Type::JsValue,
                                 "undecided" => Type::Undecided,
                                 _ => self.invalid("invalid type", Type::Undecided),
                             }),

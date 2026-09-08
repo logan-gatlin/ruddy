@@ -30,6 +30,10 @@ pub enum Prim {
     String,
     /// The type with the values true and false.
     Boolean,
+    /// A value packaged with its structural runtime type.
+    Any,
+    /// An opaque JavaScript value.
+    JsValue,
 }
 
 /// A target-independent integer width and signedness.
@@ -498,6 +502,7 @@ impl std::hash::Hash for Formula {
 /// [`Ty`] be printed with no scheme beside it to ask.
 #[derive(Debug, Clone)]
 pub struct Scheme {
+    representations: Vec<u32>,
     count: u32,
     presences: u32,
     /// Presence positions opened as abstract producer-owned identities rather
@@ -520,6 +525,10 @@ pub enum Ty {
     Real,
     String,
     Boolean,
+    /// A value packaged with its structural runtime type.
+    Any,
+    /// An opaque JavaScript value.
+    JsValue,
     /// `A -> B + E` — what it takes, what it gives back, and the effects
     /// calling it may perform.
     ///
@@ -929,6 +938,8 @@ fn take_ty_children(ty: &mut Ty, types: &mut Vec<Arc<Ty>>, rows: &mut Vec<Arc<Ro
         | Ty::Real
         | Ty::String
         | Ty::Boolean
+        | Ty::Any
+        | Ty::JsValue
         | Ty::Var(_)
         | Ty::Bound(_)
         | Ty::Rigid { .. }
@@ -1054,6 +1065,8 @@ pub(crate) fn same_finite_syntax_metered(
                     | (Ty::Real, Ty::Real)
                     | (Ty::String, Ty::String)
                     | (Ty::Boolean, Ty::Boolean)
+                    | (Ty::Any, Ty::Any)
+                    | (Ty::JsValue, Ty::JsValue)
                     | (Ty::Undecided, Ty::Undecided) => {}
                     (Ty::Var(left), Ty::Var(right)) | (Ty::Bound(left), Ty::Bound(right)) => {
                         if left != right {
@@ -1178,6 +1191,8 @@ impl From<Prim> for Ty {
             Prim::Real => Ty::Real,
             Prim::String => Ty::String,
             Prim::Boolean => Ty::Boolean,
+            Prim::Any => Ty::Any,
+            Prim::JsValue => Ty::JsValue,
         }
     }
 }
@@ -1307,6 +1322,18 @@ impl RowField {
 }
 
 impl Scheme {
+    /// Quantified type positions supplied as hidden runtime representations.
+    pub fn representations(&self) -> &[u32] {
+        &self.representations
+    }
+
+    pub fn with_representations(mut self, mut parameters: Vec<u32>) -> Self {
+        parameters.sort_unstable();
+        parameters.dedup();
+        self.representations = parameters;
+        self
+    }
+
     /// Close `body` over the type and row variables it binds, requiring nothing
     /// of its presences. Every [`Ty::Bound`] and [`Rest::Bound`] in `body`
     /// must be an index below `count`; opening one trusts that.
@@ -1323,6 +1350,7 @@ impl Scheme {
     /// require.
     pub fn new(count: u32, body: Arc<Ty>) -> Self {
         Self {
+            representations: Vec::new(),
             count,
             presences: 0,
             existentials: IndexSet::new(),
@@ -1336,6 +1364,7 @@ impl Scheme {
     pub fn constrained(count: u32, presences: u32, body: Arc<Ty>, formula: Formula) -> Self {
         debug_assert!(presences <= count);
         Self {
+            representations: Vec::new(),
             count,
             presences,
             existentials: IndexSet::new(),
@@ -1364,6 +1393,7 @@ impl Scheme {
         };
         let formula = partition_package_formula(&body, &existentials, formula);
         Self {
+            representations: Vec::new(),
             count,
             presences,
             existentials,
@@ -1921,6 +1951,8 @@ impl Prim {
         Prim::Real,
         Prim::String,
         Prim::Boolean,
+        Prim::Any,
+        Prim::JsValue,
     ];
 
     /// The spelling that denotes this primitive in source. Injective, and
@@ -1934,6 +1966,8 @@ impl Prim {
             Prim::Real => "Real",
             Prim::String => "String",
             Prim::Boolean => "Boolean",
+            Prim::Any => "Any",
+            Prim::JsValue => "JsValue",
         }
     }
 

@@ -62,6 +62,7 @@ fn artifact(
 
 fn scheme() -> a::Scheme {
     a::Scheme {
+        representations: Vec::new(),
         count: 0,
         presences: 0,
         existentials: Vec::new(),
@@ -201,6 +202,7 @@ fn links_every_item_and_relocates_calls_continuations_and_initializers() {
     // An existential witness is a presence the value's package owns, so the
     // scheme quantifies one presence and its body packages a label wearing it.
     root.header.values[0].scheme = a::Scheme {
+        representations: Vec::new(),
         count: 1,
         presences: 1,
         existentials: vec![0],

@@ -433,7 +433,7 @@ impl Worker {
             .and_then(|position| offset(source, position))
             .ok_or("invalid document position")?;
         Ok(match request.method.as_str() {
-            "textDocument/hover" => project.analysis.hover(logical, at).map(|hover| json!({"contents":{"kind":"markdown","value":format!("```ruddy\n{}\n```",hover.ty)},"range":range(source, hover.span)})).unwrap_or(Value::Null),
+            "textDocument/hover" => project.analysis.hover(logical, at).map(|hover| json!({"contents":{"kind":"markdown","value":format!("```ruddy\n{}\n```{}",hover.ty,hover.runtime_information.map(|note| format!("\n\n{note}")).unwrap_or_default())},"range":range(source, hover.span)})).unwrap_or(Value::Null),
             "textDocument/completion" => Value::Array(project.analysis.completions(logical, at).into_iter().map(|item| {
                 // LSP has no general type kind. Class and TypeParameter both
                 // misdescribe aliases and primitive types; name the category

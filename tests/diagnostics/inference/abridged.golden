@@ -165,13 +165,10 @@ help: list `!Fail` on this extern declaration
 help: or handle those effects before the callback returns to host code
 note: at extern parameter 1, the callback can perform `!Fail` without matching extern capability
 
-## polymorphic-extern-boundary
-[polymorphic-extern-boundary] host code needs one fixed kind of value at this extern position
-primary: this variable can produce differently shaped host values
-related: host code needs one fixed kind of value at this position
-related: this extern declaration owns the host boundary
-help: use a fixed type at this position
-help: or expose a concrete host-facing type and convert the value in Ruddy
+## runtime-type-information
+[runtime-type-information] runtime type information is unavailable for Nat -> Nat + !Tick + ..'a
+primary: this operation needs runtime information that is not available here
+help: supply a concrete supported type, or retain unknown JavaScript data as JsValue
 
 ## repeated-calls
 [type-mismatch] a natural number and a boolean cannot be the same type

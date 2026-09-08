@@ -1337,6 +1337,7 @@ impl ir::ErrorKind {
     /// have to re-inspect the variant to tell them apart.
     pub fn code(&self) -> &'static str {
         match self {
+            ir::ErrorKind::RuntimeTypeInformation { .. } => "runtime-type-information",
             ir::ErrorKind::ForeignProtocol { .. } => "foreign-protocol",
             ir::ErrorKind::ArrayInExtern => "array-in-extern",
             ir::ErrorKind::InvalidDependencyAlias { .. } => "invalid-dependency-alias",
@@ -1434,14 +1435,16 @@ impl ir::Error {
         let code = self.kind.code();
         let span = source.span(self.at);
         match &self.kind {
+            E::RuntimeTypeInformation { message } => Diagnostic::new(code, message.clone(), span)
+                .help("supply a concrete type at this use, or retain unknown JavaScript data as JsValue"),
             E::ForeignProtocol { message } => Diagnostic::new(self.kind.code(), message.clone(), source.span(self.at)),
             E::ArrayInExtern => Diagnostic::new(
                 code,
-                "arrays cannot cross an extern boundary yet",
+                "this runtime array intrinsic has an incompatible signature",
                 span,
             )
-            .label("this array uses Ruddy's private persistent representation")
-            .help("convert the value at a Ruddy boundary, or keep this function in Ruddy code"),
+            .label("compiler runtime intrinsics require their exact structural signature")
+            .help("use the standard array module, or declare an ordinary native JavaScript function"),
             E::ExecutableDependency { name } => Diagnostic::new(
                 code,
                 format!("executable bundle `{name}` cannot be a dependency"),
@@ -2318,6 +2321,8 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                     Ty::Real => f.write_str(Prim::Real.name())?,
                     Ty::String => f.write_str(Prim::String.name())?,
                     Ty::Boolean => f.write_str(Prim::Boolean.name())?,
+                    Ty::Any => f.write_str(Prim::Any.name())?,
+                    Ty::JsValue => f.write_str(Prim::JsValue.name())?,
                     Ty::Arrow(from, to, effects) => {
                         let shown = effect_row_shown(effects);
                         if shown {
@@ -3117,6 +3122,8 @@ fn type_description(description: inference::TypeDescription) -> &'static str {
         T::Mut => "a mutable cell",
         T::Array => "an array",
         T::DeclaredType => "a declared type",
+        T::Any => "a boxed value",
+        T::JsValue => "a JavaScript value",
         T::Undecided => "another type",
     }
 }
@@ -3489,6 +3496,10 @@ impl inference::Error {
             source.span(self.at),
         );
         match &self.kind {
+            E::RuntimeTypeInformation { .. } => {
+                diagnostic = diagnostic.label("this operation needs runtime information that is not available here").help("supply a concrete supported type, or retain unknown JavaScript data as JsValue");
+            }
+
             E::NotAStruct { demand, .. } => {
                 let (asked, undo) = match demand {
                     inference::StructDemand::Projection => {
@@ -3856,6 +3867,7 @@ impl inference::ErrorKind {
             inference::ErrorKind::CallbackEffectsNotCovered { .. } => {
                 "callback-effects-not-covered"
             }
+            inference::ErrorKind::RuntimeTypeInformation { .. } => "runtime-type-information",
             inference::ErrorKind::PolymorphicExternBoundary { .. } => "polymorphic-extern-boundary",
         }
     }
@@ -3865,6 +3877,7 @@ impl inference::ErrorKind {
 impl fmt::Display for inference::ErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            inference::ErrorKind::RuntimeTypeInformation { message } => f.write_str(message),
             inference::ErrorKind::NotAStruct { base, demand } => {
                 let asked = match demand {
                     inference::StructDemand::Projection => "read",

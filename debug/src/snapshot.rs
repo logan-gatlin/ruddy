@@ -573,6 +573,7 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
                 let code = match error {
                     ruddy::backend::js::Error::Entry(_) => "unsupported-entry-effects",
                     ruddy::backend::js::Error::Export { .. } => "unsupported-export-effects",
+                    ruddy::backend::js::Error::ExportType { .. } => "unsupported-export-type",
                     _ => "javascript-generation",
                 };
                 diagnostics.push(raw("js", code, message.clone(), None));
@@ -767,6 +768,8 @@ fn wire_explanation(
             T::Mut => "mut",
             T::Array => "array",
             T::DeclaredType => "declared-type",
+            T::Any => "any",
+            T::JsValue => "js-value",
             T::Undecided => "undecided",
         }
     }

@@ -47,6 +47,92 @@ fn built(source: &str) -> Artifact {
     .clone()
 }
 
+#[test]
+fn reification_artifacts_validate_descriptor_graphs_and_evidence_layouts() {
+    let artifact = built(
+        "extern box: 'a -> Any = \"$anyUpcast\"\nlet wrapped = box 1n\nlet identity = fn x => x",
+    );
+    let box_value = artifact
+        .header()
+        .values
+        .iter()
+        .find(|value| value.name.ends_with("::box"))
+        .unwrap();
+    assert_eq!(box_value.scheme.representations.len(), 1);
+    let identity = artifact
+        .header()
+        .values
+        .iter()
+        .find(|value| value.name.ends_with("::identity"))
+        .unwrap();
+    assert!(identity.scheme.representations.is_empty());
+    assert!(artifact::parse(&artifact.print()).validate().is_ok());
+    let mut changed = artifact.clone().to_unchecked();
+    changed
+        .header
+        .values
+        .iter_mut()
+        .find(|value| value.name.ends_with("::box"))
+        .unwrap()
+        .scheme
+        .representations
+        .clear();
+    assert!(
+        changed
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("evidence layout")
+    );
+    for nodes in [
+        vec![],
+        vec![ruddy::reification::Node::Alias(0)],
+        vec![ruddy::reification::Node::Array(1)],
+        vec![ruddy::reification::Node::Extend([0, 0])],
+        vec![
+            ruddy::reification::Node::Extend([1, 2]),
+            ruddy::reification::Node::Alias(0),
+            ruddy::reification::Node::Struct(vec![]),
+        ],
+        vec![
+            ruddy::reification::Node::Extend([1, 2]),
+            ruddy::reification::Node::Nat,
+            ruddy::reification::Node::Struct(vec![]),
+        ],
+        vec![
+            ruddy::reification::Node::Extend([1, 2]),
+            ruddy::reification::Node::Sum(vec![]),
+            ruddy::reification::Node::Struct(vec![]),
+        ],
+        vec![
+            ruddy::reification::Node::Extend([1, 2]),
+            ruddy::reification::Node::Struct(vec![("x".into(), 3)]),
+            ruddy::reification::Node::Struct(vec![("x".into(), 3)]),
+            ruddy::reification::Node::Nat,
+        ],
+        vec![ruddy::reification::Node::Parameter(0)],
+        vec![ruddy::reification::Node::Struct(vec![
+            ("x".into(), 0),
+            ("x".into(), 0),
+        ])],
+    ] {
+        let mut changed = artifact.clone().to_unchecked();
+        let descriptor = changed
+            .lir
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.blocks)
+            .flat_map(|block| &mut block.instrs)
+            .find_map(|instruction| match &mut instruction.op {
+                Op::TypeDescriptor { template, .. } => Some(template),
+                _ => None,
+            })
+            .unwrap();
+        descriptor.nodes = nodes;
+        assert!(changed.validate().is_err());
+    }
+}
+
 /// An artifact exporting one hand-built semantic scheme as its only value, for
 /// semantic states no source program can conveniently reach.
 fn exporting(mint: &Mint, scheme: &types::Scheme) -> Artifact {
@@ -226,6 +312,7 @@ fn model_artifact() -> Artifact {
             metadata: Default::default(),
             name: format!("bundle@1.0.0::value-{index}"),
             scheme: Scheme {
+                representations: Vec::new(),
                 count: 15,
                 presences: 7,
                 existentials: Vec::new(),
@@ -324,6 +411,7 @@ fn model_artifact() -> Artifact {
                         relevant: true,
                     }],
                     scheme: Scheme {
+                        representations: Vec::new(),
                         count: 1,
                         presences: 0,
                         existentials: Vec::new(),
@@ -341,6 +429,7 @@ fn model_artifact() -> Artifact {
                         relevant: true,
                     }],
                     scheme: Scheme {
+                        representations: Vec::new(),
                         count: 1,
                         presences: 0,
                         existentials: Vec::new(),
@@ -358,6 +447,7 @@ fn model_artifact() -> Artifact {
                         relevant: false,
                     }],
                     scheme: Scheme {
+                        representations: Vec::new(),
                         count: 2,
                         presences: 1,
                         existentials: Vec::new(),
@@ -375,6 +465,7 @@ fn model_artifact() -> Artifact {
                         relevant: true,
                     }],
                     scheme: Scheme {
+                        representations: Vec::new(),
                         count: 3,
                         presences: 2,
                         existentials: Vec::new(),
@@ -1559,6 +1650,7 @@ fn deeply_nested_artifact_semantics_decode_on_a_small_stack() {
                 metadata: Default::default(),
                 name: "deep@1::value".to_string(),
                 scheme: Scheme {
+                    representations: Vec::new(),
                     count: 0,
                     presences: 0,
                     existentials: Vec::new(),
@@ -1790,6 +1882,7 @@ fn recursive_artifact_ownership_clones_and_drops_on_a_small_stack() {
                         metadata: Default::default(),
                         name: "deep@1::value".into(),
                         scheme: Scheme {
+                            representations: Vec::new(),
                             count: 0,
                             presences: 0,
                             existentials: Vec::new(),
@@ -1803,6 +1896,7 @@ fn recursive_artifact_ownership_clones_and_drops_on_a_small_stack() {
                         name: "deep@1::Rows".into(),
                         params: Vec::new(),
                         scheme: Scheme {
+                            representations: Vec::new(),
                             count: 0,
                             presences: 0,
                             existentials: Vec::new(),
@@ -1836,6 +1930,7 @@ fn recursive_artifact_ownership_clones_and_drops_on_a_small_stack() {
                 metadata: Default::default(),
                 name: "deep@1::standalone".into(),
                 scheme: Scheme {
+                    representations: Vec::new(),
                     count: 0,
                     presences: 0,
                     existentials: Vec::new(),
@@ -1849,6 +1944,7 @@ fn recursive_artifact_ownership_clones_and_drops_on_a_small_stack() {
                 name: "deep@1::StandaloneType".into(),
                 params: Vec::new(),
                 scheme: Scheme {
+                    representations: Vec::new(),
                     count: 0,
                     presences: 0,
                     existentials: Vec::new(),

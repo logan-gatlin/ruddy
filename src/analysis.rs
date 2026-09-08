@@ -337,6 +337,7 @@ pub struct Analysis {
 pub struct Hover {
     pub span: Span,
     pub ty: String,
+    pub runtime_information: Option<String>,
 }
 
 impl Analysis {
@@ -499,12 +500,23 @@ impl Analysis {
         for (symbol, name_at) in declarations {
             let span = self.built.source.span(name_at);
             if self.contains(span, path, offset) {
-                return self.declaration_type(symbol).map(|ty| Hover { span, ty });
+                return self.declaration_type(symbol).map(|ty| Hover {
+                    span,
+                    ty,
+                    runtime_information: self
+                        .inferred
+                        .semantics()
+                        .schemes()
+                        .get(&symbol)
+                        .or_else(|| self.inferred.semantics().externs().get(&symbol))
+                        .and_then(crate::reification::explain),
+                });
             }
         }
         self.term_at(path, offset).map(|term| Hover {
             span: self.built.source.span(term.at),
             ty: term.ty.to_string(),
+            runtime_information: None,
         })
     }
 

@@ -147,6 +147,20 @@ pub enum End {
 
 #[derive(Debug, Clone)]
 pub enum Op {
+    Convert {
+        descriptor: Temp,
+        value: Temp,
+        direction: crate::reification::Direction,
+    },
+    TypeDescriptor {
+        template: crate::reification::Descriptor,
+        arguments: Vec<Temp>,
+    },
+    Reflect {
+        kind: crate::reification::Intrinsic,
+        descriptor: Temp,
+        value: Temp,
+    },
     Callback {
         value: Temp,
         mode: crate::externs::Callback,
@@ -273,6 +287,9 @@ pub enum Rep {
     Real,
     String,
     Boolean,
+    TypeDescriptor,
+    BoxedAny,
+    HostValue,
     /// The value with nothing in it: the empty struct.
     Unit,
     Struct,
@@ -299,6 +316,13 @@ impl Op {
     /// Values read by this instruction, in operand order.
     pub fn uses(&self) -> Vec<Temp> {
         match self {
+            Self::Convert {
+                descriptor, value, ..
+            }
+            | Self::Reflect {
+                descriptor, value, ..
+            } => vec![*descriptor, *value],
+            Self::TypeDescriptor { arguments, .. } => arguments.clone(),
             Self::Const(_) | Self::Extern { .. } | Self::Global { .. } | Self::NewTag => vec![],
             Self::Callback { value: v, .. }
             | Self::Neg(v)

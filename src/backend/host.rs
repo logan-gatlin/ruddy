@@ -38,6 +38,132 @@ impl<'a> View<'a> {
 
 type Node = usize;
 
+/// Build the native root contract from the portable interface, including
+/// incoming and nested callable positions. Effects are handled by Graph's
+/// generated wrappers; they never become runtime type identities here.
+pub(super) fn native_descriptor(
+    root: &Type,
+    declarations: &HashMap<&str, &DeclaredType>,
+) -> Result<crate::reification::Descriptor, String> {
+    use crate::reification::{Descriptor, Node as Runtime};
+    let mut nodes = vec![Runtime::JsValue];
+    let mut work = vec![(
+        0,
+        View {
+            ty: root,
+            args: Arc::default(),
+        },
+        String::from("value"),
+        false,
+    )];
+    let mut aliases = HashMap::new();
+    let projections = forwarding(declarations);
+    while let Some((id, view, path, incoming)) = work.pop() {
+        let view = resolved(view);
+        let mut child = |view, position: String, incoming| {
+            let index = nodes.len();
+            nodes.push(Runtime::JsValue);
+            work.push((index, view, position, incoming));
+            index as u32
+        };
+        nodes[id] = match view.ty {
+            Type::Nat => Runtime::Nat,
+            Type::Int => Runtime::Int,
+            Type::Fixed(kind) => Runtime::Fixed(*kind),
+            Type::Real => Runtime::Real,
+            Type::String => Runtime::String,
+            Type::Boolean => Runtime::Boolean,
+            Type::Any => Runtime::Any,
+            Type::JsValue => Runtime::JsValue,
+            Type::Arrow(from, to, row) => {
+                let effects = fields(row, view.clone(), declarations);
+                if incoming
+                    && (!matches!(effects.rest, Rest::Closed)
+                        || effects
+                            .labels
+                            .iter()
+                            .any(|(_, presence, _)| **presence != Presence::Absent))
+                {
+                    return Err(format!(
+                        "{path} has an effectful callback contract that cannot be supplied by a native JavaScript caller"
+                    ));
+                }
+                Runtime::Arrow([
+                    child(view.child(from), format!("{path} argument"), true),
+                    child(view.child(to), format!("{path} result"), incoming),
+                ])
+            }
+            Type::Array(inner) => Runtime::Array(child(
+                view.child(inner),
+                format!("{path} element"),
+                incoming,
+            )),
+            Type::Named { name, args } => {
+                let declaration = declarations
+                    .get(name.as_str())
+                    .ok_or_else(|| format!("cannot inspect exported type `{name}`"))?;
+                let arguments: Vec<_> = args.iter().map(|arg| view.child(arg)).collect();
+                let state = (
+                    name.clone(),
+                    incoming,
+                    arguments
+                        .iter()
+                        .map(|arg| key(arg.clone(), declarations, &projections))
+                        .collect::<Vec<_>>(),
+                );
+                Runtime::Alias(if let Some(&index) = aliases.get(&state) {
+                    index
+                } else {
+                    aliases.insert(state, id as u32);
+                    child(
+                        View {
+                            ty: &declaration.scheme.body,
+                            args: Arc::new(arguments),
+                        },
+                        path,
+                        incoming,
+                    )
+                })
+            }
+            Type::Struct(row) | Type::Sum(row) => {
+                let fields = fields(row, view.clone(), declarations);
+                if !matches!(fields.rest, Rest::Closed)
+                    || fields.labels.iter().any(|(_, presence, _)| {
+                        !matches!(presence, Presence::Present | Presence::Absent)
+                    })
+                {
+                    return Err(format!(
+                        "{path} needs runtime information for unresolved fields or cases; export a concrete type or JsValue wrapper"
+                    ));
+                }
+                let mut fields: Vec<_> = fields
+                    .labels
+                    .into_iter()
+                    .filter(|(_, presence, _)| **presence != Presence::Absent)
+                    .map(|(name, _, ty)| {
+                        (
+                            name.to_owned(),
+                            child(ty, format!("{path}.{name}"), incoming),
+                        )
+                    })
+                    .collect();
+                fields.sort_by(|a, b| a.0.cmp(&b.0));
+                if matches!(view.ty, Type::Struct(_)) {
+                    Runtime::Struct(fields)
+                } else {
+                    Runtime::Sum(fields)
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "{path} needs runtime type information unavailable to JavaScript; export a concrete instantiation or a JsValue wrapper"
+                ));
+            }
+        };
+    }
+    Ok(Descriptor { nodes })
+}
+
 #[derive(Clone)]
 enum Plan {
     Value,
@@ -665,6 +791,9 @@ pub(super) fn compile(
     dependencies: &[&Artifact],
     platform: Platform,
 ) -> Result<Option<Adapters>, Error> {
+    if root.header().kind == crate::artifact::Kind::Executable {
+        return Ok(None);
+    }
     let declarations: HashMap<_, _> = dependencies
         .iter()
         .copied()
@@ -713,6 +842,15 @@ pub(super) fn compile(
     }
     let mut definitions = Vec::new();
     for (index, value) in root.header().values.iter().enumerate() {
+        if !value.scheme.representations.is_empty() {
+            return Err(Error::ExportType { name: value.name.clone(), message: "this value requires runtime type information from its caller; export a concrete instantiation or a JsValue wrapper".into() });
+        }
+        native_descriptor(&value.scheme.body, &declarations).map_err(|message| {
+            Error::ExportType {
+                name: value.name.clone(),
+                message,
+            }
+        })?;
         let graph =
             Graph::build(&value.scheme.body, &declarations).map_err(|message| Error::Export {
                 name: value.name.clone(),

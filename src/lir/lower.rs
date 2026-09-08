@@ -151,6 +151,20 @@ pub struct Instr {
 /// What one instruction does.
 #[derive(Debug, Clone)]
 pub enum Op {
+    Convert {
+        descriptor: Temp,
+        value: Temp,
+        direction: crate::reification::Direction,
+    },
+    TypeDescriptor {
+        template: crate::reification::Descriptor,
+        arguments: Vec<Temp>,
+    },
+    Reflect {
+        kind: crate::reification::Intrinsic,
+        descriptor: Temp,
+        value: Temp,
+    },
     Callback {
         value: Temp,
         mode: crate::externs::Callback,
@@ -389,6 +403,9 @@ pub enum Rep {
     Real,
     String,
     Boolean,
+    TypeDescriptor,
+    BoxedAny,
+    HostValue,
     /// The value with nothing in it: the empty struct.
     Unit,
     Struct,
@@ -490,6 +507,7 @@ struct Recursive {
 #[derive(Default)]
 struct Frame {
     locals: IndexMap<Symbol, Temp>,
+    representations: IndexMap<u32, Temp>,
     /// Present on the frame of a directly let-bound local `fn`. The binding is
     /// recursive at the language level, but costs nothing here unless its body
     /// actually names itself.
@@ -748,6 +766,8 @@ enum FittedStage {
 /// The lowering itself: the program being read, everything emitted so far, and
 /// the stack of functions currently being built.
 struct Lower<'a> {
+    native_values: bool,
+    reification: crate::reification::Analysis,
     /// Where the program's anchors were written: the LIR keeps spans, for
     /// the backend and the debugger, and this is what it reads them from.
     source: &'a SourceMap,
@@ -806,6 +826,7 @@ pub fn lower(accepted: &AcceptedProgram) -> Output {
         accepted.source(),
         accepted.semantics(),
         accepted.externs(),
+        accepted.reification(),
     )
 }
 
@@ -815,8 +836,11 @@ fn lower_parts(
     source: &SourceMap,
     inference: &inference::Semantics,
     extern_plan: &crate::externs::ExternPlan,
+    reification: &crate::reification::Analysis,
 ) -> Output {
     let mut low = Lower {
+        native_values: true,
+        reification: reification.clone(),
         source,
         mint,
         program,
@@ -1168,6 +1192,281 @@ impl Body {
 }
 
 impl Lower<'_> {
+    fn representation_captures(&mut self, ty: &Arc<Ty>, body: &mut Body) -> Vec<Temp> {
+        if !self.native_values {
+            return Vec::new();
+        }
+        crate::reification::native_parameters(ty, self.inference.aliases())
+            .expect("reviewed native representation")
+            .into_iter()
+            .map(|parameter| self.representation(&Arc::new(Ty::Bound(parameter)), body))
+            .collect()
+    }
+
+    fn representation_params(&mut self, ty: &Arc<Ty>, params: &mut Vec<Param>) {
+        if !self.native_values {
+            return;
+        }
+        for parameter in crate::reification::native_parameters(ty, self.inference.aliases())
+            .expect("reviewed native representation")
+        {
+            let temp = self.fresh(Rep::TypeDescriptor);
+            self.top().representations.insert(parameter, temp);
+            params.push(Param {
+                temp,
+                rep: Rep::TypeDescriptor,
+            });
+        }
+    }
+
+    fn convert_value(
+        &mut self,
+        ty: &Arc<Ty>,
+        value: Temp,
+        direction: crate::reification::Direction,
+        body: &mut Body,
+    ) -> Temp {
+        if !self.native_values {
+            return value;
+        }
+        if matches!(&*unfold(self.inference.aliases(), ty), Ty::Mut(_, _)) {
+            return value;
+        }
+        let descriptor = self.representation(ty, body);
+        let rep = match direction {
+            crate::reification::Direction::ToJs => Rep::HostValue,
+            crate::reification::Direction::FromJs => self.rep(ty),
+        };
+        self.emit(
+            body,
+            Span::default(),
+            rep,
+            Op::Convert {
+                descriptor,
+                value,
+                direction,
+            },
+        )
+    }
+
+    fn representation(&mut self, ty: &Arc<Ty>, body: &mut Body) -> Temp {
+        if let Ty::Bound(parameter) = &**ty {
+            let at = self
+                .frames
+                .iter()
+                .rposition(|frame| frame.representations.contains_key(parameter))
+                .expect("accepted reflection has evidence for each type parameter");
+            return self.thread(at, self.frames[at].representations[parameter]);
+        }
+        let (template, parameters) =
+            crate::reification::Descriptor::template(ty, self.inference.aliases())
+                .expect("accepted reflection has a representable type");
+        let mut arguments = Vec::new();
+        for parameter in parameters {
+            let at = self
+                .frames
+                .iter()
+                .rposition(|frame| frame.representations.contains_key(&parameter))
+                .expect("accepted reflection has evidence for each type parameter");
+            arguments.push(self.thread(at, self.frames[at].representations[&parameter]));
+        }
+        self.emit(
+            body,
+            Span::default(),
+            Rep::TypeDescriptor,
+            Op::TypeDescriptor {
+                template,
+                arguments,
+            },
+        )
+    }
+
+    fn instantiate_binding(
+        &mut self,
+        symbol: Symbol,
+        ty: &Arc<Ty>,
+        value: Temp,
+        body: &mut Body,
+    ) -> Temp {
+        let Some(binding) = self.reification.bindings.get(&symbol).cloned() else {
+            return value;
+        };
+        if binding.parameters.is_empty() {
+            return value;
+        }
+        let supplied = crate::reification::instantiate(&binding.ty, ty, self.inference.aliases());
+        let args = binding
+            .parameters
+            .iter()
+            .map(|parameter| {
+                self.representation(
+                    supplied
+                        .get(parameter)
+                        .expect("a demanded type parameter has an instantiation"),
+                    body,
+                )
+            })
+            .collect();
+        let result = self.emit(
+            body,
+            Span::default(),
+            self.rep(ty),
+            Op::Call {
+                callee: Callee::Indirect(value),
+                args,
+            },
+        );
+        self.contain(result, &binding.ty);
+        self.fitted(ty, &binding.ty, result, body)
+    }
+
+    fn reified_value(&mut self, symbol: Symbol, value: &Term, body: &mut Body) -> Temp {
+        self.frames.push(Frame {
+            recursive: Some(Recursive {
+                symbol,
+                ty: value.ty.clone(),
+                temp: None,
+            }),
+            ..Frame::default()
+        });
+        let mut params = Vec::new();
+        for parameter in self.reification.parameters(symbol) {
+            let temp = self.fresh(Rep::TypeDescriptor);
+            self.top().representations.insert(parameter, temp);
+            params.push(Param {
+                temp,
+                rep: Rep::TypeDescriptor,
+            });
+        }
+        let mut lifted = Body::default();
+        let result = self.term(value, &mut lifted);
+        let mut frame = self
+            .frames
+            .pop()
+            .expect("the reification frame just pushed");
+        let captures = frame.captures.iter().map(|capture| capture.outer).collect();
+        let params = Self::with_captures(&frame, params);
+        let name = format!("{}#types", self.mint.name(symbol));
+        let id = self.slot(name.clone());
+        for instruction in &mut frame.prologue {
+            instruction.op = Op::Closure {
+                func: id,
+                captures: frame.captures.iter().map(|capture| capture.inner).collect(),
+            };
+        }
+        frame.prologue.append(&mut lifted.instrs);
+        lifted.instrs = frame.prologue;
+        self.fill(
+            id,
+            Function {
+                name,
+                params,
+                body: lifted.seal(Terminator {
+                    span: self.span(value.at),
+                    kind: End::Ret(result),
+                }),
+                span: self.span(value.at),
+            },
+        );
+        self.emit(
+            body,
+            self.span(value.at),
+            Rep::Fn,
+            Op::Closure { func: id, captures },
+        )
+    }
+
+    fn intrinsic_global(
+        &mut self,
+        symbol: Symbol,
+        name: &str,
+        ty: &Arc<Ty>,
+        kind: crate::reification::Intrinsic,
+    ) {
+        let id = self.slot(format!("{name}#reflection"));
+        let (from, to, _) = self.arrow(ty);
+        let descriptor = self.fresh(Rep::TypeDescriptor);
+        let argument = self.fresh(self.rep(&from));
+        let mut body = Body::default();
+        let value = self.emit(
+            &mut body,
+            Span::default(),
+            self.rep(&to),
+            Op::Reflect {
+                kind,
+                descriptor,
+                value: argument,
+            },
+        );
+        self.fill(
+            id,
+            Function {
+                name: self.labels[id].clone(),
+                params: vec![
+                    Param {
+                        temp: descriptor,
+                        rep: Rep::TypeDescriptor,
+                    },
+                    Param {
+                        temp: argument,
+                        rep: self.rep(&from),
+                    },
+                ],
+                body: body.seal(Terminator {
+                    span: Span::default(),
+                    kind: End::Ret(value),
+                }),
+                span: Span::default(),
+            },
+        );
+        let factory = self.slot(format!("{name}#types"));
+        let descriptor = self.fresh(Rep::TypeDescriptor);
+        let mut body = Body::default();
+        let value = self.emit(
+            &mut body,
+            Span::default(),
+            Rep::Fn,
+            Op::Closure {
+                func: id,
+                captures: vec![descriptor],
+            },
+        );
+        self.fill(
+            factory,
+            Function {
+                name: self.labels[factory].clone(),
+                params: vec![Param {
+                    temp: descriptor,
+                    rep: Rep::TypeDescriptor,
+                }],
+                body: body.seal(Terminator {
+                    span: Span::default(),
+                    kind: End::Ret(value),
+                }),
+                span: Span::default(),
+            },
+        );
+        let mut body = Body::default();
+        let value = self.emit(
+            &mut body,
+            Span::default(),
+            Rep::Fn,
+            Op::Closure {
+                func: factory,
+                captures: Vec::new(),
+            },
+        );
+        self.globals.push(Global {
+            symbol,
+            name: name.to_owned(),
+            body: body.seal(Terminator {
+                span: Span::default(),
+                kind: End::Ret(value),
+            }),
+            span: Span::default(),
+        });
+    }
+
     /// Where `at` was written, for the LIR that keeps positions.
     fn span(&self, at: Anchor) -> Span {
         self.source.span(at)
@@ -1185,6 +1484,11 @@ impl Lower<'_> {
             let symbol = entry.symbol;
             let name = self.mint.name(symbol).to_string();
             let ty = entry.ty.clone();
+            self.native_values = !self.program.externs[&symbol].value.array_intrinsic;
+            if let Some(intrinsic) = entry.intrinsic {
+                self.intrinsic_global(symbol, &name, &ty, intrinsic);
+                continue;
+            }
             externs.push(Extern {
                 symbol,
                 name: name.clone(),
@@ -1193,10 +1497,9 @@ impl Lower<'_> {
                 rep: self.rep(&ty),
             });
 
-            // Non-function imports already have the Ruddy representation and
-            // remain direct globals. Only functions need an initialized
-            // adapter in front of the raw host value.
-            if self.rep(&ty) == Rep::Fn {
+            // Native values, including non-callable imports, enter through
+            // the same reviewed conversion boundary.
+            if self.native_values || self.rep(&ty) == Rep::Fn {
                 self.stem = format!("{name}#extern");
                 self.serial = 0;
                 let mut body = Body::default();
@@ -1209,7 +1512,52 @@ impl Lower<'_> {
                         name: name.clone(),
                     },
                 );
-                let value = self.host_to_ruddy(&entry.conversion, &ty, raw, &mut body);
+                let parameters = self.reification.parameters(symbol);
+                let value = if parameters.is_empty() {
+                    self.host_to_ruddy(&entry.conversion, &ty, raw, &mut body)
+                } else {
+                    let captured_raw = self.fresh(self.rep(&ty));
+                    let mut params = vec![Param {
+                        temp: captured_raw,
+                        rep: self.rep(&ty),
+                    }];
+                    self.frames.push(Frame::default());
+                    for parameter in parameters {
+                        let temp = self.fresh(Rep::TypeDescriptor);
+                        self.top().representations.insert(parameter, temp);
+                        params.push(Param {
+                            temp,
+                            rep: Rep::TypeDescriptor,
+                        });
+                    }
+                    let mut factory_body = Body::default();
+                    let adapted =
+                        self.host_to_ruddy(&entry.conversion, &ty, captured_raw, &mut factory_body);
+                    self.frames.pop().expect("foreign representation factory");
+                    let name = format!("{name}#types");
+                    let factory = self.slot(name.clone());
+                    self.fill(
+                        factory,
+                        Function {
+                            name,
+                            params,
+                            body: factory_body.seal(Terminator {
+                                span: Span::default(),
+                                kind: End::Ret(adapted),
+                            }),
+                            span: Span::default(),
+                        },
+                    );
+                    self.emit(
+                        &mut body,
+                        Span::default(),
+                        Rep::Fn,
+                        Op::Closure {
+                            func: factory,
+                            captures: vec![raw],
+                        },
+                    )
+                };
                 self.globals.push(Global {
                     symbol,
                     name,
@@ -1221,6 +1569,7 @@ impl Lower<'_> {
                 });
             }
         }
+        self.native_values = true;
         externs
     }
 
@@ -1269,29 +1618,36 @@ impl Lower<'_> {
                     completion,
                     0,
                 );
+                let mut captures = vec![raw];
+                captures.extend(self.representation_captures(ty, body));
                 self.emit(
                     body,
                     Span::default(),
                     Rep::Fn,
-                    Op::Closure {
-                        func: id,
-                        captures: vec![raw],
-                    },
+                    Op::Closure { func: id, captures },
                 )
             }
             crate::externs::Conversion::OrdinaryFunction if self.rep(ty) == Rep::Fn => {
                 let id = self.ordinary_extern_level(ty.clone(), completion);
+                let mut captures = vec![raw];
+                if self.native_values {
+                    for parameter in
+                        crate::reification::native_parameters(ty, self.inference.aliases())
+                            .expect("reviewed native representation")
+                    {
+                        captures.push(self.representation(&Arc::new(Ty::Bound(parameter)), body));
+                    }
+                }
                 self.emit(
                     body,
                     Span::default(),
                     Rep::Fn,
-                    Op::Closure {
-                        func: id,
-                        captures: vec![raw],
-                    },
+                    Op::Closure { func: id, captures },
                 )
             }
-            crate::externs::Conversion::Value | crate::externs::Conversion::OrdinaryFunction => raw,
+            crate::externs::Conversion::Value | crate::externs::Conversion::OrdinaryFunction => {
+                self.convert_value(ty, raw, crate::reification::Direction::FromJs, body)
+            }
         }
     }
 
@@ -1326,6 +1682,18 @@ impl Lower<'_> {
             rep: Rep::Fn,
         }];
         self.frames.push(Frame::default());
+        if self.native_values {
+            for parameter in crate::reification::native_parameters(&ty, self.inference.aliases())
+                .expect("reviewed native representation")
+            {
+                let temp = self.fresh(Rep::TypeDescriptor);
+                self.top().representations.insert(parameter, temp);
+                params.push(Param {
+                    temp,
+                    rep: Rep::TypeDescriptor,
+                });
+            }
+        }
         self.evidence_params(&row, &mut params);
         let argument = self.fresh(self.rep(&from));
         params.push(Param {
@@ -1477,6 +1845,7 @@ impl Lower<'_> {
                 let id =
                     self.marked_callback(ty.clone(), parameters.clone(), *result.clone(), required);
                 let mut captures = vec![value];
+                captures.extend(self.representation_captures(ty, body));
                 captures.extend(evidence);
                 let value = self.emit(
                     body,
@@ -1499,6 +1868,7 @@ impl Lower<'_> {
                 let evidence = self.evidence_args(&required, available, body);
                 let id = self.ordinary_callback(ty.clone(), required);
                 let mut captures = vec![value];
+                captures.extend(self.representation_captures(ty, body));
                 captures.extend(evidence);
                 let value = self.emit(
                     body,
@@ -1517,7 +1887,7 @@ impl Lower<'_> {
                 )
             }
             crate::externs::Conversion::Value | crate::externs::Conversion::OrdinaryFunction => {
-                value
+                self.convert_value(ty, value, crate::reification::Direction::ToJs, body)
             }
         }
     }
@@ -1549,6 +1919,7 @@ impl Lower<'_> {
             rep: Rep::Fn,
         }];
         self.frames.push(Frame::default());
+        self.representation_params(&ty, &mut params);
         self.evidence_params(&available, &mut params);
         params.push(Param {
             temp: raw_argument,
@@ -1615,6 +1986,7 @@ impl Lower<'_> {
             rep: Rep::Fn,
         }];
         self.frames.push(Frame::default());
+        self.representation_params(&ty, &mut params);
         self.evidence_params(&available, &mut params);
         let mut raw_parameters = Vec::new();
         let mut arrows = Vec::new();
@@ -1720,6 +2092,26 @@ impl Lower<'_> {
         }
         let (from, to, row) = self.arrow(&ty);
         self.frames.push(Frame::default());
+        let mut descriptor_parameters =
+            crate::reification::native_parameters(&ty, self.inference.aliases())
+                .expect("reviewed native representation");
+        for ty in &carried_types {
+            descriptor_parameters.extend(
+                crate::reification::native_parameters(ty, self.inference.aliases())
+                    .expect("reviewed native representation"),
+            );
+        }
+        if !self.native_values {
+            descriptor_parameters.clear();
+        }
+        for parameter in &descriptor_parameters {
+            let temp = self.fresh(Rep::TypeDescriptor);
+            self.top().representations.insert(*parameter, temp);
+            params.push(Param {
+                temp,
+                rep: Rep::TypeDescriptor,
+            });
+        }
         self.evidence_params(&row, &mut params);
         let argument_rep = self.rep(&from);
         let argument = self.fresh(argument_rep);
@@ -1769,6 +2161,9 @@ impl Lower<'_> {
             );
             let mut captures = vec![raw];
             captures.extend(gathered);
+            for parameter in descriptor_parameters {
+                captures.push(self.representation(&Arc::new(Ty::Bound(parameter)), &mut body));
+            }
             self.emit(
                 &mut body,
                 Span::default(),
@@ -1817,7 +2212,7 @@ impl Lower<'_> {
         for symbol in order {
             let decl = &program.terms[symbol];
             let (fns, _) = nest(&decl.value);
-            if fns.is_empty() {
+            if fns.is_empty() || !self.reification.parameters(*symbol).is_empty() {
                 continue;
             }
             let levels: Vec<Level> = fns
@@ -1943,6 +2338,8 @@ impl Lower<'_> {
             Ty::Real => Rep::Real,
             Ty::String => Rep::String,
             Ty::Boolean => Rep::Boolean,
+            Ty::Any => Rep::BoxedAny,
+            Ty::JsValue => Rep::HostValue,
             Ty::Arrow(..) => Rep::Fn,
             Ty::Array(_) => Rep::Array,
             Ty::Mut(..) => Rep::Any,
@@ -2107,6 +2504,20 @@ impl Lower<'_> {
             known.wrappers.len() as u32
         });
 
+        if !self.reification.parameters(symbol).is_empty() {
+            let mut body = Body::default();
+            let value = self.reified_value(symbol, &decl.value, &mut body);
+            self.globals.push(Global {
+                symbol,
+                name,
+                body: body.seal(Terminator {
+                    span: self.span(decl.value.at),
+                    kind: End::Ret(value),
+                }),
+                span: self.span(decl.name_at),
+            });
+            return;
+        }
         let body = match self.known.get(&symbol).cloned() {
             Some(known) => {
                 self.uncurried(&known, &decl.value);
@@ -3083,11 +3494,15 @@ impl Lower<'_> {
                 // closure does not exist yet, so [`Lower::lambda`] gives the
                 // lifted body a way to reconstruct it instead of letting the
                 // name fall through to a bogus global read.
-                let temp = match &value.kind {
-                    TermKind::Fn { arg, body: inner } => {
-                        self.lambda(value, arg.anchored, inner, body, Some(name.anchored))
+                let temp = if !self.reification.parameters(name.anchored).is_empty() {
+                    self.reified_value(name.anchored, value, body)
+                } else {
+                    match &value.kind {
+                        TermKind::Fn { arg, body: inner } => {
+                            self.lambda(value, arg.anchored, inner, body, Some(name.anchored))
+                        }
+                        _ => self.term(value, body),
                     }
-                    _ => self.term(value, body),
                 };
                 self.top().locals.insert(name.anchored, temp);
                 self.term(rest, body)
@@ -3102,12 +3517,17 @@ impl Lower<'_> {
             // at the definition's type — so the read records that type for
             // whatever is later projected out.
             TermKind::Ident(symbol) => match self.local(*symbol) {
-                Some(temp) => temp,
+                Some(temp) => self.instantiate_binding(*symbol, &term.ty, temp, body),
                 None => {
+                    let binding_rep = if self.reification.parameters(*symbol).is_empty() {
+                        rep
+                    } else {
+                        Rep::Fn
+                    };
                     let temp = self.emit(
                         body,
                         self.span(span),
-                        rep,
+                        binding_rep,
                         Op::Global {
                             symbol: *symbol,
                             name: self.mint.name(*symbol).to_string(),
@@ -3132,6 +3552,9 @@ impl Lower<'_> {
                             debug_assert!(self.program.externs.contains_key(symbol));
                             term.ty.clone()
                         });
+                    if !self.reification.parameters(*symbol).is_empty() {
+                        return self.instantiate_binding(*symbol, &term.ty, temp, body);
+                    }
                     self.contain(temp, &have);
                     self.fitted(&term.ty, &have, temp, body)
                 }
@@ -3760,7 +4183,14 @@ impl Lower<'_> {
             .iter()
             .any(|line| matches!(line.cells[0], Cell::Tag { .. }));
         match &*ty {
-            Ty::Nat | Ty::Int | Ty::Fixed(_) | Ty::Real | Ty::String | Ty::Boolean
+            Ty::Nat
+            | Ty::Int
+            | Ty::Fixed(_)
+            | Ty::Real
+            | Ty::String
+            | Ty::Boolean
+            | Ty::Any
+            | Ty::JsValue
                 if primitives =>
             {
                 self.switch_prim(col.temp, matrix, tree, body)
@@ -4459,6 +4889,7 @@ mod tests {
             &out.source,
             inferred.semantics(),
             &plan,
+            &crate::reification::Analysis::infer(&out.program, inferred.semantics()),
         )
     }
 

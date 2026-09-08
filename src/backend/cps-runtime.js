@@ -4,6 +4,7 @@ const $abortMark = Symbol("Ruddy abort");
 const $wrapped = new WeakMap();
 const $exported = new WeakMap();
 const $hostFunctions = new WeakSet();
+const $promiseCallbacks = new WeakSet();
 let $active = null;
 const $closure = (f, a) => {
   const value = (...args) => $invoke(value, $f[f].suspends ? "Promise" : "Sync", args);
@@ -54,7 +55,7 @@ function $promise(state) {
 function $foreign(state, s) {
   const args = s.a.map(value => value && value[$closureMark] ? $callback(value, "Sync") : value);
   if (s.completion === "Immediate") {
-    state.next = $resume(s.k, $fromHost(s.c(...args)));
+    state.next = $resume(s.k, s.c(...args));
     return;
   }
   const token = { settled: false, calling: true };
@@ -62,7 +63,7 @@ function $foreign(state, s) {
     if (state.done) return;
     state.pending = false;
     if (token.failed) $finish(state, true, token.value);
-    else state.next = $resume(s.k, $fromHost(token.value));
+    else state.next = $resume(s.k, token.value);
   };
   const deliver = (failed, value) => {
     if (token.settled || state.done) return;
@@ -94,6 +95,12 @@ function $drive(state) {
         case "call": {
           const c = $fromHost(s.c);
           if (!c || !c[$closureMark]) throw new TypeError("not a Ruddy function");
+          if (c.nativeType) {
+            const n = c.nativeType;
+            const argument = $convertType(n.descriptor, s.a[s.a.length - 1], true, n.from);
+            state.next = $raw(n.function, [argument], { conversion: n, parent: s.k }, s.h, "Immediate");
+            break;
+          }
           let args = s.a;
           const count = $f[c.f].arity - c.a.length;
           // A source closure supplied through JS can implement a narrower
@@ -114,7 +121,10 @@ function $drive(state) {
           break;
         }
         case "resume":
-          if (s.k.root) $finish(state, false, s.value);
+          if (s.k.conversion) {
+            const n = s.k.conversion;
+            state.next = $resume(s.k.parent, $convertType(n.descriptor, s.value, false, n.to));
+          } else if (s.k.root) $finish(state, false, s.value);
           else state.next = $step(s.k.f, s.k.b, [...s.k.a, s.value], s.k.h);
           break;
         case "enter":
@@ -141,7 +151,7 @@ function $drive(state) {
 function $start(c, args, parent, allowSuspend = true, foreign = false) {
   const state = { done: false, pending: false, failed: false, base: parent, h: parent, allowSuspend };
   c = $fromHost(c);
-  const count = $f[c.f].arity - c.a.length;
+  const count = c.nativeType ? 1 : $f[c.f].arity - c.a.length;
   if (foreign) {
     args = args.slice(0, count);
     while (args.length < count) args.push(undefined);
@@ -151,7 +161,6 @@ function $start(c, args, parent, allowSuspend = true, foreign = false) {
     args = [...Array(count - 1).fill(null).map(() => $record([])), args[0]];
   } else args = [];
   args = args.map(value => {
-    value = $fromHost(value);
     if (value && value[$closureMark]) $hostFunctions.add(value);
     return value;
   });
@@ -165,6 +174,7 @@ function $callback(value, mode, foreign = true) {
   const key = mode + (foreign ? ":foreign" : ":source");
   if (modes.has(key)) return modes.get(key);
   const callback = (...args) => $invoke(value, mode, args, foreign);
+  if (mode === "Promise") $promiseCallbacks.add(callback);
   $wrapped.set(callback, value); modes.set(key, callback);
   return callback;
 }

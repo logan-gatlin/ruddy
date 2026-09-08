@@ -292,6 +292,7 @@ fn imported_forwarding_cycles_recover_before_lir_representation() {
         .stack_size(256 * 1024)
         .spawn(|| {
             let scheme = |count, body| a::Scheme {
+                representations: Vec::new(),
                 count,
                 presences: 0,
                 existentials: Vec::new(),
@@ -2582,7 +2583,7 @@ fn a_function_an_indirect_call_returns_is_called_in_turn() {
 }
 
 #[test]
-fn extern_values_are_imports_not_global_initializers() {
+fn extern_values_are_imported_once_and_converted_by_global_initializers() {
     let (output, labels) =
         lowered_labelled("extern answer : Nat = \"host\\n.answer\"\nlet next = answer");
     assert_eq!(output.externs.len(), 1);
@@ -2591,8 +2592,13 @@ fn extern_values_are_imports_not_global_initializers() {
     assert_eq!(external.target, "host\n.answer");
     assert_eq!((external.span.start, external.span.width), (22, 15));
     assert_eq!(external.rep, lir::Rep::Nat);
-    assert_eq!(output.globals.len(), 1, "externs have no initializer block");
-    assert_eq!(output.globals[0].name, "next");
+    assert_eq!(
+        output.globals.len(),
+        2,
+        "native imports have a conversion initializer"
+    );
+    assert_eq!(output.globals[0].name, "answer");
+    assert_eq!(output.globals[1].name, "next");
     let printed = print::lir::program(&output, &labels);
     assert!(
         printed.contains("extern answer: nat = \"host\\n.answer\""),

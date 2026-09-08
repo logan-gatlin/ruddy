@@ -519,12 +519,12 @@ fn array_alias_mismatches_point_to_the_element_types() {
 
 #[test]
 fn reserved_array_target_without_its_exact_signature_is_not_an_intrinsic() {
-    let (_, out, output) = infer_src("extern fake : 'a -> 'a = \"$arrayPush\"");
-    assert!(out.errors.is_empty(), "ir errors: {:#?}", out.errors);
-    assert!(matches!(
-        output.errors(),
-        [error] if matches!(error.kind, ErrorKind::PolymorphicExternBoundary { .. })
-    ));
+    let (_, out, _) = infer_src("extern fake : 'a -> 'a = \"$arrayPush\"");
+    assert!(
+        out.errors
+            .iter()
+            .any(|error| matches!(error.kind, ruddy::ir::ErrorKind::ArrayInExtern))
+    );
 }
 
 #[test]
@@ -9235,7 +9235,7 @@ fn an_extern_publishes_its_declared_scheme_and_instantiates_at_uses() {
 }
 
 #[test]
-fn polymorphic_extern_boundary_leaves_are_rejected_before_callback_instantiation() {
+fn generic_externs_infer_representations_and_reject_unrepresented_effectful_callbacks() {
     let source = "effect Tick = Nat -> Nat\n\
                   extern run : fn('a) -> Nat = \"host.run\"\n\
                   let called = handle run (fn n => !Tick n) with\n\
@@ -9246,35 +9246,34 @@ fn polymorphic_extern_boundary_leaves_are_rejected_before_callback_instantiation
     assert!(matches!(
         output.errors(),
         [ruddy::inference::Error {
-            kind: ruddy::inference::ErrorKind::PolymorphicExternBoundary { .. },
+            kind: ruddy::inference::ErrorKind::RuntimeTypeInformation { .. },
             ..
         }]
     ));
-    assert_eq!(
-        output.errors()[0].kind.code(),
-        "polymorphic-extern-boundary"
-    );
+    assert_eq!(output.errors()[0].kind.code(), "runtime-type-information");
     assert!(
         output.errors()[0]
             .kind
             .to_string()
-            .contains("one fixed kind of value")
+            .contains("runtime type information")
     );
 
-    // A forwarding alias does not make the representation any less
-    // polymorphic, including when the unsafe leaf is a host result.
-    let (_, lowered, output) = infer_src(
-        "type Identity 'a = 'a\n\
-         extern make : fn(Nat) -> Identity 'a = \"host.make\"",
+    // A result-only parameter remains an inferred requirement in a portable interface.
+    let (_, lowered, output) =
+        infer_src("type Identity 'a = 'a\nextern make : fn(Nat) -> Identity 'a = \"host.make\"");
+    assert!(lowered.errors.is_empty());
+    assert!(output.errors().is_empty(), "{:#?}", output.errors());
+    assert_eq!(
+        output
+            .semantics()
+            .externs()
+            .values()
+            .next()
+            .unwrap()
+            .representations()
+            .len(),
+        1
     );
-    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
-    assert!(matches!(
-        output.errors(),
-        [ruddy::inference::Error {
-            kind: ruddy::inference::ErrorKind::PolymorphicExternBoundary { .. },
-            ..
-        }]
-    ));
 }
 
 #[test]
@@ -9314,9 +9313,7 @@ fn extern_callback_coverage_uses_semantic_rows_and_aliases() {
 
 #[test]
 fn extern_boundary_errors_publish_exact_source_payloads_and_paths() {
-    use ruddy::inference::{
-        ContradictionKind, ErrorKind, ExplanationFactPayload as P, ExternVariableKind,
-    };
+    use ruddy::inference::{ContradictionKind, ErrorKind, ExplanationFactPayload as P};
 
     let (_, _, output) = infer_src(
         "effect Read = () -> ()\n\
@@ -9387,35 +9384,18 @@ fn extern_boundary_errors_publish_exact_source_payloads_and_paths() {
 
     let (_, _, output) =
         infer_src("type Identity 'a = 'a\nextern make : fn(Nat) -> Identity 'a = \"host.make\"");
-    let [error] = output.errors() else {
-        panic!("{:#?}", output.errors())
-    };
-    let ErrorKind::PolymorphicExternBoundary {
-        variable,
-        variable_kind,
-        position,
-        extern_name,
-        leaves,
-        callback_issues,
-    } = &error.kind
-    else {
-        panic!("{error:#?}")
-    };
-    assert_eq!(variable, "'a");
-    assert_eq!(*variable_kind, ExternVariableKind::Type);
-    assert!(position.contains("result"), "{position}");
-    assert_eq!(extern_name, "make");
-    assert_eq!(leaves.len(), 1);
-    assert!(callback_issues.is_empty());
-    let explanation = error
-        .explanation
-        .as_ref()
-        .expect("structured polymorphic cause");
+    assert!(output.errors().is_empty());
     assert_eq!(
-        explanation.contradiction.kind,
-        ContradictionKind::PolymorphicExternBoundary
+        output
+            .semantics()
+            .externs()
+            .values()
+            .next()
+            .unwrap()
+            .representations()
+            .len(),
+        1
     );
-    assert_eq!(explanation.full_facts.len(), 3);
 }
 
 #[test]
@@ -9469,16 +9449,10 @@ fn extern_boundary_aggregates_paths_and_retains_callback_evidence() {
     let [error] = output.errors() else {
         panic!("{:#?}", output.errors())
     };
-    let ErrorKind::PolymorphicExternBoundary {
-        leaves,
-        callback_issues,
-        ..
-    } = &error.kind
-    else {
+    let ErrorKind::CallbackEffectsNotCovered { issues, .. } = &error.kind else {
         panic!("{error:#?}")
     };
-    assert!(!leaves.is_empty());
-    assert_eq!(callback_issues.len(), 1);
+    assert_eq!(issues.len(), 1);
 }
 
 #[test]
@@ -9510,32 +9484,27 @@ fn conditional_callback_failure_keeps_its_later_path_and_formula() {
 }
 
 #[test]
-fn extern_boundary_reports_row_and_presence_kinds() {
-    use ruddy::inference::{ErrorKind, ExternVariableKind};
-    for (source, expected) in [
-        (
-            "extern x : fn({ value: Nat, ..'fields }) -> () = \"host.x\"",
-            ExternVariableKind::Row,
-        ),
-        (
-            "extern x : fn({ value when 'present: Nat }) -> () = \"host.x\"",
-            ExternVariableKind::Presence,
-        ),
-    ] {
-        let (_, lowered, output) = infer_src(source);
-        assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
-        let [error] = output.errors() else {
-            panic!("{:#?}", output.errors())
-        };
-        let ErrorKind::PolymorphicExternBoundary { leaves, .. } = &error.kind else {
-            panic!("{error:#?}")
-        };
-        assert!(
-            leaves.iter().any(|leaf| leaf.kind == expected),
-            "{leaves:#?}"
-        );
-        assert!(leaves.iter().all(|leaf| !leaf.position.is_empty()));
-    }
+fn extern_boundary_infers_row_evidence_and_reports_unsettled_presences() {
+    let (_, _, row) = infer_src("extern x : fn({ value: Nat, ..'fields }) -> () = \"host.x\"");
+    assert!(row.errors().is_empty());
+    assert_eq!(
+        row.semantics()
+            .externs()
+            .values()
+            .next()
+            .unwrap()
+            .representations()
+            .len(),
+        1
+    );
+    let (_, _, presence) =
+        infer_src("extern x : fn({ value when 'present: Nat }) -> () = \"host.x\"");
+    assert!(
+        presence
+            .errors()
+            .iter()
+            .any(|error| error.kind.code() == "runtime-type-information")
+    );
 }
 
 #[test]
@@ -9550,10 +9519,7 @@ fn async_boundary_metadata_preserves_alias_representation_checks() {
         ));
         assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
         assert!(
-            output.errors().iter().any(|e| matches!(
-                e.kind,
-                ruddy::inference::ErrorKind::PolymorphicExternBoundary { .. }
-            )),
+            output.errors().is_empty(),
             "{signature}: {:#?}",
             output.errors()
         );
@@ -9565,54 +9531,30 @@ fn async_boundary_metadata_preserves_alias_representation_checks() {
 }
 
 #[test]
-fn extern_boundary_alias_presence_and_multiple_variables_keep_exact_sources() {
-    use ruddy::inference::{ErrorKind, ExternVariableKind};
-
-    let maybe_source = "type Maybe 'r = #Nil | ..'r\n\
-         extern consume : fn(Maybe (#Some (when 'some) Nat)) -> () = \"host.consume\"";
-    let (_, lowered, output) = infer_src(maybe_source);
-    let map = &lowered.source;
-    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
-    let [error] = output.errors() else {
-        panic!("{:#?}", output.errors())
-    };
-    let ErrorKind::PolymorphicExternBoundary { leaves, .. } = &error.kind else {
-        panic!("{error:#?}")
-    };
-    let presence = leaves
-        .iter()
-        .find(|leaf| leaf.kind == ExternVariableKind::Presence)
-        .expect("presence from the row spliced through Maybe");
-    assert_eq!(presence.variable, "'some");
-    assert_eq!(
-        &maybe_source[map.span(presence.at).start
-            ..map.span(presence.at).start + map.span(presence.at).width],
-        "'some"
+fn extern_boundary_aliases_preserve_presence_rejection_and_independent_demands() {
+    let (_, lowered, output) = infer_src(
+        "type Maybe 'r = #Nil | ..'r\nextern consume : fn(Maybe (#Some (when 'some) Nat)) -> () = \"host.consume\"",
     );
-    assert!(presence.position.contains("`Some` presence"));
-
-    let variables_source = "extern choose : fn('first, 'second) -> () = \"host.choose\"";
-    let (_, lowered, output) = infer_src(variables_source);
-    let map = &lowered.source;
-    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
-    let [error] = output.errors() else {
-        panic!("{:#?}", output.errors())
-    };
-    let ErrorKind::PolymorphicExternBoundary { leaves, .. } = &error.kind else {
-        panic!("{error:#?}")
-    };
-    for (name, path) in [("'first", "parameter 1"), ("'second", "parameter 2")] {
-        let leaf = leaves
+    assert!(lowered.errors.is_empty());
+    assert!(
+        output
+            .errors()
             .iter()
-            .find(|leaf| leaf.variable == name)
-            .unwrap_or_else(|| panic!("missing {name}: {leaves:#?}"));
-        assert!(leaf.position.contains(path), "{}", leaf.position);
-        assert_eq!(
-            &variables_source
-                [map.span(leaf.at).start..map.span(leaf.at).start + map.span(leaf.at).width],
-            name
-        );
-    }
+            .any(|error| error.kind.code() == "runtime-type-information")
+    );
+    let (_, _, output) = infer_src("extern choose : fn('first, 'second) -> () = \"host.choose\"");
+    assert!(output.errors().is_empty());
+    assert_eq!(
+        output
+            .semantics()
+            .externs()
+            .values()
+            .next()
+            .unwrap()
+            .representations()
+            .len(),
+        2
+    );
 }
 
 #[test]
@@ -9684,7 +9626,7 @@ fn local_and_imported_alias_callback_tails_keep_exact_relations() {
 }
 
 #[test]
-fn polymorphic_leaf_and_callback_effect_tail_failures_share_one_error() {
+fn inferred_type_demands_do_not_hide_callback_effect_tail_failures() {
     use ruddy::inference::{ErrorKind, ExplanationFactPayload};
     let (_, lowered, output) = infer_src(
         "effect Fail = () -> ()\n\
@@ -9696,18 +9638,12 @@ fn polymorphic_leaf_and_callback_effect_tail_failures_share_one_error() {
     let [error] = output.errors() else {
         panic!("{:#?}", output.errors())
     };
-    let ErrorKind::PolymorphicExternBoundary {
-        leaves,
-        callback_issues,
-        ..
-    } = &error.kind
-    else {
+    let ErrorKind::CallbackEffectsNotCovered { issues, .. } = &error.kind else {
         panic!("{error:#?}")
     };
-    assert!(leaves.iter().any(|leaf| leaf.variable == "'value"));
-    assert_eq!(callback_issues.len(), 1);
-    assert_eq!(callback_issues[0].missing_effects.len(), 1);
-    assert!(!callback_issues[0].missing_tails.is_empty());
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0].missing_effects.len(), 1);
+    assert!(!issues[0].missing_tails.is_empty());
     let diagnostic = error.diagnostic(map);
     assert!(
         diagnostic

@@ -3644,11 +3644,8 @@ fn run_rejects_an_effectful_callback_through_a_polymorphic_extern_boundary() {
     let error = run_project(&app).unwrap_err();
     assert_eq!(error.exit_code(), 1);
     let rendered = error.to_string();
-    assert!(
-        rendered.contains("polymorphic-extern-boundary"),
-        "{rendered}"
-    );
-    assert!(rendered.contains("one fixed kind of value"), "{rendered}");
+    assert!(rendered.contains("runtime-type-information"), "{rendered}");
+    assert!(rendered.contains("runtime type information"), "{rendered}");
     assert!(
         !app.join("build/polymorphic-callback.js").exists(),
         "an unsound module reached execution"
@@ -3710,7 +3707,7 @@ fn check_compiles_without_build_output_and_reports_failures() {
 }
 
 #[test]
-fn imported_array_aliases_cannot_cross_extern_boundaries() {
+fn imported_array_aliases_cross_native_extern_boundaries() {
     let directory = tempfile::tempdir().unwrap();
     let dependency = directory.path().join("dep");
     let app = directory.path().join("app");
@@ -3737,11 +3734,7 @@ fn imported_array_aliases_cannot_cross_extern_boundaries() {
     )
     .unwrap();
 
-    let error = check_project(&app).expect_err("the private array representation must not leak");
-    assert!(
-        error.to_string().contains("[array-in-extern] Error"),
-        "{error}"
-    );
+    check_project(&app).expect("imported array aliases have a reviewed native conversion");
 }
 
 #[test]

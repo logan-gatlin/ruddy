@@ -11,6 +11,7 @@ pub mod link;
 pub mod lir;
 pub mod parse;
 pub mod patterns;
+pub mod reification;
 pub mod symbol;
 #[cfg(test)]
 pub(crate) mod test_support;
