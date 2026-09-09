@@ -49,12 +49,13 @@ traces, while its backend stages retain this acceptance requirement.
 The protocol router remains responsive while the analysis worker runs. New
 document versions cancel obsolete work; requests interrupt idle background work.
 Cancellation checks occur during parsing, IR construction, inference, lowering,
-and between Varisat scheduler steps. Git acquisition runs on a separate thread
-with the same cancellation signal; the editor can abandon its wait even during a
-blocked network read. Git cache-lock acquisition also checks cancellation. The small vendored Varisat patch is described
-in [its maintenance note](../vendor/varisat/RUDDY.md). A revision barrier prevents
-obsolete diagnostic publication. Open documents receive versioned diagnostics;
-background checks also publish and clear diagnostics for unopened reachable files.
+and during BatSat search through its native stop callback. Git acquisition runs
+on a separate thread with the same cancellation signal; the editor can abandon
+its wait even during a blocked network read. Git cache-lock acquisition also
+checks cancellation. Interrupted SAT searches unwind as cancelled queries without
+publishing a result. A revision barrier prevents obsolete diagnostic publication.
+Open documents receive versioned diagnostics; background checks also publish and
+clear diagnostics for unopened reachable files.
 
 ## Workspace inputs
 

@@ -7,12 +7,12 @@ autotests = false
 
 [workspace]
 members = ["cli", "debug", "esparse", "tests"]
-exclude = ["vendor/varisat"]
 
 [build-dependencies]
 twox-hash = { version = "2.1.3", default-features = false, features = ["xxhash3_64"] }
 
 [dependencies]
+batsat = "0.6.0"
 esparse = { path = "esparse" }
 indexmap = "2"
 salsa = { version = "0.28.2", default-features = false, features = ["macros", "inventory"] }
@@ -21,7 +21,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 twox-hash = { version = "2.1.3", default-features = false, features = ["xxhash3_64"] }
 unicode-width = "0.2"
-varisat = "0.2.2"
 
 # The debugger is served from a dev build. Optimizing the dependencies alone
 # — the SAT solver under inference, the JavaScript parser that validates
@@ -37,6 +36,3 @@ opt-level = 3
 # module to a few milliseconds in the debugger.
 [profile.dev.package.esparse]
 opt-level = 3
-
-[patch.crates-io]
-varisat = { path = "vendor/varisat" }

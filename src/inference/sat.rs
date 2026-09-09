@@ -5,7 +5,7 @@
 //! which is what an annotation's contract and generalization's fold-back both
 //! ask. And what is a model of one — which is where a witness comes from.
 //!
-//! All three go through `varisat`, encoded by Tseitin: a fresh variable per
+//! All three go through `batsat`, encoded by Tseitin: a fresh variable per
 //! connective, defined by the clauses that make it agree with the subformula
 //! under it. Rolling a solver of our own is out of scope and would be a poor
 //! trade — this is a decidable question with an off-the-shelf answer.
@@ -30,10 +30,13 @@
 
 use std::collections::HashMap;
 
-pub use varisat::Lit;
-use varisat::{ExtendFormula, Solver, Var};
+pub use batsat::Lit;
+use batsat::{Callbacks, Solver, SolverInterface, Var, lbool};
 
-use crate::types::{Atom, Formula};
+use crate::{
+    cancellation::Cancellation,
+    types::{Atom, Formula},
+};
 
 /// The most products [`project`] will collect before giving up on a formula.
 ///
@@ -79,19 +82,25 @@ type Cube = Vec<Option<bool>>;
 /// it is asked in. A batch rolled back is a guard never assumed again; a
 /// binding rolled back is simply not assumed next time. Nothing added is
 /// ever wrong later, which is what lets the clauses accumulate.
+#[derive(Default)]
 pub struct Incremental {
-    solver: Solver<'static>,
+    solver: Solver<SolverCallbacks>,
     atoms: HashMap<Atom, Var>,
-    next: usize,
+    clause: Vec<Lit>,
 }
 
-impl Default for Incremental {
-    fn default() -> Self {
-        Self {
-            solver: Solver::new(),
-            atoms: HashMap::new(),
-            next: 0,
-        }
+/// BatSat polls this token during search. Refresh it for every solve so an
+/// incremental solver follows the revision asking the current question.
+#[derive(Default)]
+struct SolverCallbacks(Cancellation);
+
+impl Callbacks for SolverCallbacks {
+    fn on_start(&mut self) {
+        self.0 = Cancellation::current();
+    }
+
+    fn stop(&self) -> bool {
+        self.0.is_cancelled()
     }
 }
 
@@ -120,29 +129,15 @@ pub fn model(formula: &Formula) -> Option<HashMap<Atom, bool>> {
     }
     let mut encoding = Incremental::default();
     let top = encoding.encode(formula);
-    encoding.solver.add_clause(&[top]);
-    let solved = encoding
-        .solver
-        .solve_with(crate::cancellation::checkpoint)
-        .expect("the solver is handed a finite formula and no assumptions");
-    if !solved {
+    encoding.add_clause(&[top]);
+    if !encoding.satisfiable(&[]) {
         return None;
-    }
-    let assignment = encoding
-        .solver
-        .model()
-        .expect("a solver that answered yes has a model");
-    let mut positive: Vec<Var> = Vec::new();
-    for lit in assignment {
-        if lit.is_positive() {
-            positive.push(lit.var());
-        }
     }
     Some(
         encoding
             .atoms
             .into_iter()
-            .map(|(atom, var)| (atom, positive.contains(&var)))
+            .map(|(atom, var)| (atom, encoding.solver.value_var(var) == lbool::TRUE))
             .collect(),
     )
 }
@@ -559,12 +554,11 @@ fn rebuild(atoms: &[Atom], mut cover: Vec<Cube>) -> Formula {
 impl Incremental {
     /// The literal standing for `atom`, minted on first mention.
     pub fn atom(&mut self, atom: Atom) -> Lit {
-        let next = self.next;
-        let var = *self.atoms.entry(atom).or_insert_with(|| {
-            self.next += 1;
-            Var::from_index(next)
-        });
-        Lit::from_var(var, true)
+        let var = *self
+            .atoms
+            .entry(atom)
+            .or_insert_with(|| self.solver.new_var_default());
+        Lit::new(var, true)
     }
 
     /// Every atom the solver has been told about, in no particular order.
@@ -576,7 +570,7 @@ impl Incremental {
     pub fn add_guarded(&mut self, formula: &Formula) -> Lit {
         let guard = self.fresh();
         let top = self.encode(formula);
-        self.solver.add_clause(&[!guard, top]);
+        self.add_clause(&[!guard, top]);
         guard
     }
 
@@ -584,17 +578,24 @@ impl Incremental {
     pub fn add_equivalence(&mut self, left: Atom, right: Atom) -> Lit {
         let guard = self.fresh();
         let (left, right) = (self.atom(left), self.atom(right));
-        self.solver.add_clause(&[!guard, !left, right]);
-        self.solver.add_clause(&[!guard, left, !right]);
+        self.add_clause(&[!guard, !left, right]);
+        self.add_clause(&[!guard, left, !right]);
         guard
     }
 
     /// Whether everything added so far has a model under `assumptions`.
     pub fn satisfiable(&mut self, assumptions: &[Lit]) -> bool {
-        self.solver.assume(assumptions);
-        self.solver
-            .solve_with(crate::cancellation::checkpoint)
-            .expect("the solver is handed finite clauses and assumptions")
+        crate::cancellation::checkpoint();
+        let answer = self.solver.solve_limited(assumptions);
+        // An interrupted search is neither SAT nor UNSAT. Let BatSat restore
+        // its search state, then abandon this query through the usual unwind.
+        crate::cancellation::checkpoint();
+        assert_ne!(
+            answer,
+            lbool::UNDEF,
+            "SAT search stopped without cancellation"
+        );
+        answer == lbool::TRUE
     }
 
     /// A literal that holds exactly when `formula` does, with the clauses that
@@ -613,12 +614,12 @@ impl Incremental {
             match part {
                 Work::Formula(Formula::True) => {
                     let lit = self.fresh();
-                    self.solver.add_clause(&[lit]);
+                    self.add_clause(&[lit]);
                     values.push(lit);
                 }
                 Work::Formula(Formula::False) => {
                     let lit = self.fresh();
-                    self.solver.add_clause(&[!lit]);
+                    self.add_clause(&[!lit]);
                     values.push(lit);
                 }
                 Work::Formula(Formula::Atom(atom)) => {
@@ -662,26 +663,26 @@ impl Incremental {
                     let out = self.fresh();
                     match kind {
                         0 => {
-                            self.solver.add_clause(&[!out, left]);
-                            self.solver.add_clause(&[!out, right]);
-                            self.solver.add_clause(&[out, !left, !right]);
+                            self.add_clause(&[!out, left]);
+                            self.add_clause(&[!out, right]);
+                            self.add_clause(&[out, !left, !right]);
                         }
                         1 => {
-                            self.solver.add_clause(&[out, !left]);
-                            self.solver.add_clause(&[out, !right]);
-                            self.solver.add_clause(&[!out, left, right]);
+                            self.add_clause(&[out, !left]);
+                            self.add_clause(&[out, !right]);
+                            self.add_clause(&[!out, left, right]);
                         }
                         2 => {
-                            self.solver.add_clause(&[!out, !left, right]);
-                            self.solver.add_clause(&[!out, left, !right]);
-                            self.solver.add_clause(&[out, left, right]);
-                            self.solver.add_clause(&[out, !left, !right]);
+                            self.add_clause(&[!out, !left, right]);
+                            self.add_clause(&[!out, left, !right]);
+                            self.add_clause(&[out, left, right]);
+                            self.add_clause(&[out, !left, !right]);
                         }
                         _ => {
-                            self.solver.add_clause(&[!out, left, right]);
-                            self.solver.add_clause(&[!out, !left, !right]);
-                            self.solver.add_clause(&[out, !left, right]);
-                            self.solver.add_clause(&[out, left, !right]);
+                            self.add_clause(&[!out, left, right]);
+                            self.add_clause(&[!out, !left, !right]);
+                            self.add_clause(&[out, !left, right]);
+                            self.add_clause(&[out, left, !right]);
                         }
                     }
                     values.push(out);
@@ -694,8 +695,15 @@ impl Incremental {
     /// One more solver variable, standing for a connective rather than for an
     /// atom: nothing reads it back, so it goes into no map.
     fn fresh(&mut self) -> Lit {
-        let var = Var::from_index(self.next);
-        self.next += 1;
-        Lit::from_var(var, true)
+        Lit::new(self.solver.new_var_default(), true)
+    }
+
+    /// BatSat sorts and simplifies clauses in place; keep one scratch buffer
+    /// for the small Tseitin clauses. A contradiction is retained by the solver
+    /// and reported by the next solve.
+    fn add_clause(&mut self, clause: &[Lit]) {
+        self.clause.clear();
+        self.clause.extend_from_slice(clause);
+        self.solver.add_clause_reuse(&mut self.clause);
     }
 }
