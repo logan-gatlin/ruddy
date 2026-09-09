@@ -1,3 +1,3 @@
 type DecodeError = { path: String, expected: String, message: String }
 
-extern decode: JsValue -> Result 'a DecodeError = "$jsDecode"
+extern decode: ForeignValue -> Result 'a DecodeError = "$ffiDecode"

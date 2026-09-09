@@ -16,6 +16,7 @@ pub struct Interface {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Node {
     Value,
+    Lazy,
     Sealed,
     Parameter(u32),
     Array(u32),
@@ -92,6 +93,7 @@ impl Interface {
         while let Some((source, target)) = pending.pop() {
             let copied = match graph.exposed(source) {
                 Shape::Value | Shape::Alias(_) => Node::Value,
+                Shape::Lazy => Node::Lazy,
                 Shape::Sealed => Node::Sealed,
                 Shape::Parameter(index) => parameters
                     .get(index)
@@ -195,7 +197,7 @@ impl Interface {
                 continue;
             }
             match &self.nodes[id as usize] {
-                Node::Value | Node::Sealed => {}
+                Node::Value | Node::Lazy | Node::Sealed => {}
                 Node::Parameter(p) => {
                     if !valid_parameter(*p) {
                         return Err("invalid callable shape parameter".into());
@@ -271,6 +273,7 @@ impl Interface {
         for (id, source) in self.nodes.iter().enumerate() {
             let shape = match source {
                 Node::Value => Shape::Value,
+                Node::Lazy => Shape::Lazy,
                 Node::Sealed => Shape::Sealed,
                 Node::Parameter(p) => Shape::Parameter(*p),
                 Node::Array(element) => Shape::Array(nodes[*element as usize]),

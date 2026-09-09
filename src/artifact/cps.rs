@@ -530,7 +530,7 @@ pub(super) fn validate(lir: &Lir) -> Result<(), String> {
                             crate::reification::Intrinsic::Decode
                                 if available[value] != Rep::HostValue || i.rep != Rep::Sum =>
                             {
-                                return error("decoding requires JsValue and returns Result");
+                                return error("decoding requires ForeignValue and returns Result");
                             }
                             _ => {}
                         }

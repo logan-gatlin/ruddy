@@ -769,7 +769,7 @@ fn wire_explanation(
             T::Array => "array",
             T::DeclaredType => "declared-type",
             T::Any => "any",
-            T::JsValue => "js-value",
+            T::ForeignValue => "foreign-value",
             T::Undecided => "undecided",
         }
     }

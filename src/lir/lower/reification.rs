@@ -182,6 +182,28 @@ impl Lower<'_> {
         body: &mut Body,
         adapters: &mut Vec<ReifiedAdapter>,
     ) -> Temp {
+        if matches!(
+            self.reification.callables.graph.exposed(want_shape),
+            CallableShape::Lazy
+        ) || matches!(
+            self.reification.callables.graph.exposed(have_shape),
+            CallableShape::Lazy
+        ) {
+            // Unobserved components are forwarded with the convention supplied
+            // by the caller. No code in this function inspects their layout.
+            let value = self.fitted(want, have, temp, body);
+            self.callable_held[value as usize] = Some(
+                if matches!(
+                    self.reification.callables.graph.exposed(want_shape),
+                    CallableShape::Lazy
+                ) {
+                    have_shape
+                } else {
+                    want_shape
+                },
+            );
+            return value;
+        }
         if matches!(self.rep(want), Rep::Struct | Rep::Array | Rep::Sum)
             && self.rep(want) == self.rep(have)
             && (want_shape != have_shape || !same_finite_syntax(want, have))

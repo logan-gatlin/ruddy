@@ -535,6 +535,7 @@ struct Frame {
     /// The handler identity a `raise` written here throws to. Set on the frame
     /// the `handle` is being lowered in, for as long as its arms are.
     raise_tag: Option<Temp>,
+    raise_result: Option<(Arc<Ty>, crate::reification::conventions::ShapeId)>,
     captures: Vec<Capture>,
     caught: HashMap<Temp, Temp>,
 }
@@ -2257,7 +2258,7 @@ impl Lower<'_> {
             Ty::String => Rep::String,
             Ty::Boolean => Rep::Boolean,
             Ty::Any => Rep::BoxedAny,
-            Ty::JsValue => Rep::HostValue,
+            Ty::ForeignValue => Rep::HostValue,
             Ty::Arrow(..) => Rep::Fn,
             Ty::Array(_) => Rep::Array,
             Ty::Mut(..) => Rep::Any,
@@ -3579,6 +3580,16 @@ impl Lower<'_> {
             } => self.handle(term, handled, handler, body),
             TermKind::Raise(value) => {
                 let temp = self.term(value, body);
+                let (want, expected) = self
+                    .frames
+                    .iter()
+                    .rev()
+                    .find_map(|frame| frame.raise_result.clone())
+                    .expect("a raised value has a handler result convention");
+                let have = self.holding(temp, &value.ty);
+                let offered =
+                    self.callable_held[temp as usize].unwrap_or(self.callable_shape(value.at));
+                let temp = self.reified_fitted(&want, expected, &have, offered, temp, body);
                 let tag = self.raise_tag();
                 body.stop(Terminator {
                     span: self.span(span),
@@ -3995,6 +4006,11 @@ impl Lower<'_> {
         let span = term.at;
         let tag = self.emit(body, Span::default(), Rep::Any, Op::NewTag);
         let held_tag = self.top().raise_tag.replace(tag);
+        let result_shape = self.callable_shape(term.at);
+        let held_result = self
+            .top()
+            .raise_result
+            .replace((term.ty.clone(), result_shape));
         let mut records: Vec<(String, Temp)> = Vec::new();
         for effect in &handler.discharges {
             let name = self.program.effect_ids[&effect.anchored].row_key();
@@ -4015,6 +4031,7 @@ impl Lower<'_> {
             records.push((name, record));
         }
         self.top().raise_tag = held_tag;
+        self.top().raise_result = held_result;
 
         let held: Vec<(String, Option<Temp>)> = records
             .iter()
@@ -4038,13 +4055,17 @@ impl Lower<'_> {
                     }
                 }
             }
-            match ret {
+            let (value, source) = match ret {
                 Some(ret) => {
                     low.top().locals.insert(ret.binder.anchored, value);
-                    low.term(&ret.body, inner)
+                    (low.term(&ret.body, inner), &*ret.body)
                 }
-                None => value,
-            }
+                None => (value, handled),
+            };
+            let have = low.holding(value, &source.ty);
+            let offered =
+                low.callable_held[value as usize].unwrap_or(low.callable_shape(source.at));
+            low.reified_fitted(&term.ty, result_shape, &have, offered, value, inner)
         });
         let rep = self.rep(&term.ty);
         self.emit(
@@ -4246,7 +4267,7 @@ impl Lower<'_> {
             | Ty::String
             | Ty::Boolean
             | Ty::Any
-            | Ty::JsValue
+            | Ty::ForeignValue
                 if primitives =>
             {
                 self.switch_prim(col.temp, matrix, tree, body)

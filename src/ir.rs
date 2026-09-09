@@ -1240,7 +1240,7 @@ fn declaration_variances(
                             | Ty::String
                             | Ty::Boolean
                             | Ty::Any
-                            | Ty::JsValue => {}
+                            | Ty::ForeignValue => {}
                         }
                     }
                     Semantic::Row(row, positive) => {
@@ -3783,7 +3783,7 @@ fn imported_syntax(
         artifact::Type::String => TypeKind::Prim(Prim::String),
         artifact::Type::Boolean => TypeKind::Prim(Prim::Boolean),
         artifact::Type::Any => TypeKind::Prim(Prim::Any),
-        artifact::Type::JsValue => TypeKind::Prim(Prim::JsValue),
+        artifact::Type::ForeignValue => TypeKind::Prim(Prim::ForeignValue),
         artifact::Type::Bound(index) => match params.get(*index as usize) {
             Some(symbol) => TypeKind::Param {
                 symbol: *symbol,
@@ -4076,7 +4076,7 @@ fn clamp_bounds(ty: Arc<Ty>, count: usize, presences: usize) -> Arc<Ty> {
                 Ty::String => types.push(Arc::new(Ty::String)),
                 Ty::Boolean => types.push(Arc::new(Ty::Boolean)),
                 Ty::Any => types.push(Arc::new(Ty::Any)),
-                Ty::JsValue => types.push(Arc::new(Ty::JsValue)),
+                Ty::ForeignValue => types.push(Arc::new(Ty::ForeignValue)),
                 Ty::Bound(index) if (*index as usize) < count && (*index as usize) >= presences => {
                     types.push(Arc::new(Ty::Bound(*index)))
                 }
@@ -4274,7 +4274,7 @@ fn drop_type_iterative(root: Arc<Ty>) {
                     | Ty::String
                     | Ty::Boolean
                     | Ty::Any
-                    | Ty::JsValue
+                    | Ty::ForeignValue
                     | Ty::Var(_)
                     | Ty::Bound(_)
                     | Ty::Rigid { .. }
@@ -4446,7 +4446,7 @@ fn import_type(
                 artifact::Type::String => types.push(Arc::new(Ty::String)),
                 artifact::Type::Boolean => types.push(Arc::new(Ty::Boolean)),
                 artifact::Type::Any => types.push(Arc::new(Ty::Any)),
-                artifact::Type::JsValue => types.push(Arc::new(Ty::JsValue)),
+                artifact::Type::ForeignValue => types.push(Arc::new(Ty::ForeignValue)),
                 artifact::Type::Bound(index) => types.push(Arc::new(Ty::Bound(*index))),
                 artifact::Type::Var(_)
                 | artifact::Type::Rigid { .. }
@@ -5462,7 +5462,7 @@ impl RegularType<'_> {
             Row(&'a crate::types::Row, Vec<usize>, bool, bool, usize),
             Named(Symbol, Vec<usize>, bool),
             Apply(Symbol, usize, bool),
-            FinishNamed(usize, Symbol),
+            FinishNamed(usize, Symbol, usize, usize),
             Make(String, Vec<String>),
             EffectCase(String, usize),
             Canonical(usize),
@@ -5481,6 +5481,12 @@ impl RegularType<'_> {
         // their body's interned node directly, so a fresh `Id a = a`
         // placeholder does not make `Loop (Id a)` a new instantiation forever.
         let mut referenced_placeholders = HashSet::new();
+        // Runtime type graphs reuse completed acyclic aliases only when their
+        // expansion allocated no presence identities. Aliases with fresh
+        // presences, or back edges into unfinished scopes, keep their existing
+        // per-instantiation namespaces.
+        let mut completed_named = HashMap::new();
+        let mut back_edges = 0usize;
 
         while let Some(part) = work.pop() {
             match part {
@@ -5518,7 +5524,7 @@ impl RegularType<'_> {
                     Ty::String => values.push(self.atom("String")),
                     Ty::Boolean => values.push(self.atom("Boolean")),
                     Ty::Any => values.push(self.atom("Any")),
-                    Ty::JsValue => values.push(self.atom("JsValue")),
+                    Ty::ForeignValue => values.push(self.atom("ForeignValue")),
                     Ty::Bound(index) if instantiation == usize::MAX => {
                         values.push(self.atom(format!("param:{index}")))
                     }
@@ -5595,7 +5601,12 @@ impl RegularType<'_> {
                 }
                 Work::Named(symbol, args, supplied_as_effects) => {
                     let key = (symbol, args.clone(), supplied_as_effects);
+                    if let Some(id) = completed_named.get(&key) {
+                        values.push(*id);
+                        continue;
+                    }
                     if let Some(id) = self.named.get(&key) {
+                        back_edges += 1;
                         referenced_placeholders.insert(*id);
                         values.push(*id);
                         continue;
@@ -5640,7 +5651,12 @@ impl RegularType<'_> {
                             .pop();
                         values.push(id);
                     } else {
-                        work.push(Work::FinishNamed(id, symbol));
+                        work.push(Work::FinishNamed(
+                            id,
+                            symbol,
+                            presence_scope.next_alpha,
+                            back_edges,
+                        ));
                         let instantiation = presence_scope.instantiation();
                         work.push(Work::Type(
                             decl.scheme.body(),
@@ -5650,7 +5666,7 @@ impl RegularType<'_> {
                         ));
                     }
                 }
-                Work::FinishNamed(id, symbol) => {
+                Work::FinishNamed(id, symbol, presences, back_edges_before) => {
                     let body = values.pop().expect("named body postorder is balanced");
                     let completed: Vec<_> = self
                         .named
@@ -5672,6 +5688,12 @@ impl RegularType<'_> {
                     };
                     for key in completed {
                         self.named.remove(&key);
+                        if self.retain_packages
+                            && presence_scope.next_alpha == presences
+                            && back_edges == back_edges_before
+                        {
+                            completed_named.insert(key, result);
+                        }
                     }
                     active_instantiations
                         .get_mut(&symbol)
@@ -6900,7 +6922,7 @@ impl<'a> Follow<'a> {
                     | Ty::String
                     | Ty::Boolean
                     | Ty::Any
-                    | Ty::JsValue
+                    | Ty::ForeignValue
                     | Ty::Arrow(..)
                     | Ty::Mut(..)
                     | Ty::Array(_)
@@ -8950,7 +8972,7 @@ fn row_summaries(
                     | Ty::String
                     | Ty::Boolean
                     | Ty::Any
-                    | Ty::JsValue
+                    | Ty::ForeignValue
                     | Ty::Arrow(..)
                     | Ty::Mut(..)
                     | Ty::Array(_)

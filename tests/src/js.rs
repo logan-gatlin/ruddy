@@ -452,10 +452,10 @@ fn reification_checked_decoding_reports_nested_paths_and_retains_opaque_values()
         r#"
 type Result 'a 'e = #Some 'a | #Error 'e
 type DecodeError = { path: String, expected: String, message: String }
-@private extern decode: JsValue -> Result 'a DecodeError = "$jsDecode"
-extern unknown: JsValue = "({ items: [1, 2, 3] })"
-extern invalid: JsValue = "({ items: [1, 'bad'] })"
-extern cyclic: JsValue = "(() => { const a = []; a.push(a); return a; })()"
+@private extern decode: ForeignValue -> Result 'a DecodeError = "$ffiDecode"
+extern unknown: ForeignValue = "({ items: [1, 2, 3] })"
+extern invalid: ForeignValue = "({ items: [1, 'bad'] })"
+extern cyclic: ForeignValue = "(() => { const a = []; a.push(a); return a; })()"
 let decoded: Result { items: [Nat] } DecodeError = decode unknown
 let value = match decoded with | #Some r => match r.items with | [n, ..] => n | _ => 0n end | #Error _ => 0n end
 let failed: Result { items: [Nat] } DecodeError = decode invalid
@@ -561,9 +561,9 @@ let box = fn value => upcast value"#,
     execute_reification(
         r#"
 @private extern upcast: 'a -> Any = "$anyUpcast"
-let dynamic: JsValue -> Any = fn value => upcast value
+let dynamic: ForeignValue -> Any = fn value => upcast value
 let native: [Nat] -> [Nat] = fn value => value
-let identity: JsValue -> JsValue = fn value => value
+let identity: ForeignValue -> ForeignValue = fn value => value
 "#,
         "const value = {}; assert.equal(app.identity(value), value); assert.deepEqual(app.native([1, 2]), [1, 2]); for (const value of [null, undefined, Symbol('s'), () => {}, 123n, {}]) assert.equal(app.identity(value), value); assert.throws(() => app.native([1, 'bad']), /Nat/);",
     );
@@ -578,11 +578,11 @@ type Result 'a 'e = #Some 'a | #Error 'e
 type DecodeError = { path: String, expected: String, message: String }
 @private extern upcast: 'a -> Any = "$anyUpcast"
 @private extern downcast: Any -> Option 'a = "$anyDowncast"
-@private extern decode: JsValue -> Result 'a DecodeError = "$jsDecode"
+@private extern decode: ForeignValue -> Result 'a DecodeError = "$ffiDecode"
 @private extern store: Any -> () = "value => { globalThis.savedAny = value; }"
 @private extern load: () -> Any = "() => globalThis.savedAny"
 @private extern forged: () -> Any = "() => ({ descriptor: 'Nat', value: 42 })"
-@private extern unknown: JsValue = "({ descriptor: 'Nat', value: 42 })"
+@private extern unknown: ForeignValue = "({ descriptor: 'Nat', value: 42 })"
 @private let stored = store (upcast [19n])
 @private let returned: Option [Nat] = downcast (load stored)
 let result = match returned with | #Some [n] => n | _ => 0n end
@@ -599,7 +599,7 @@ let bad: () -> Any = fn _ => forged ()
 #[test]
 fn public_generate_is_deterministic_and_emits_nested_esm_exports() {
     let artifact = compiled(
-        "module Math =\n  let answer = 42n\n  let identity: JsValue -> JsValue = fn x => x\nend\nlet ready = true\n",
+        "module Math =\n  let answer = 42n\n  let identity: ForeignValue -> ForeignValue = fn x => x\nend\nlet ready = true\n",
     );
     let first = js::generate(&artifact).unwrap();
     let second = js::generate(&artifact).unwrap();
@@ -843,7 +843,8 @@ fn generation_rejects_unlinked_and_internally_inconsistent_artifacts() {
         ))
     );
 
-    let mut bad_function = compiled("let identity: JsValue -> JsValue = fn x => x").to_unchecked();
+    let mut bad_function =
+        compiled("let identity: ForeignValue -> ForeignValue = fn x => x").to_unchecked();
     let closure = bad_function.lir.functions[bad_function.lir.globals[0].initializer as usize]
         .blocks
         .iter_mut()
@@ -1465,6 +1466,138 @@ let second = returned 46n
 let third = as_value 47n
 "#,
         "assert.equal(await app.result, 45); assert.equal(await app.second, 46); assert.equal(await app.third, 47);",
+    );
+}
+
+#[test]
+fn reification_raised_callables_join_normal_and_return_arm_conventions() {
+    execute_reification(
+        r#"
+@private extern box: 'a -> Any = "$anyUpcast"
+effect Get = () -> Nat
+@private let choose = fn abort => handle
+  do let n = !Get () return fn next => next end
+with | !Get _ => match abort with
+  | true => raise (fn next => do let token = box next return next end)
+  | false => 0n
+end end
+@private let opposite = fn abort => handle !Get () with
+ | !Get _ => match abort with
+   | true => raise (fn next => next)
+   | false => 0n
+ end
+ | return _ => fn next => do let token = box next return next end
+end
+let raised = choose true 12n
+let normal = choose false 13n
+let erased = opposite true 14n
+let returned = opposite false 15n
+effect Inner = () -> Nat
+@private let nested = fn _ => handle
+  do let n = !Get () return {call: fn next => next} end
+with | !Get _ => handle
+  do let n = !Inner () return raise {call: fn next => do let token = box next return next end} end
+with | !Inner _ => 0n end end
+let nested_result = (nested ()).call 16n
+"#,
+        "assert.equal(app.raised, 12); assert.equal(app.normal, 13); assert.equal(app.erased, 14); assert.equal(app.returned, 15); assert.equal(app.nested_result, 16);",
+    );
+}
+
+#[test]
+fn reification_deferred_components_preserve_independent_imported_callable_profiles() {
+    let producer = compiled(
+        r#"
+type Leaf 'a = {call: 'a -> 'a}
+type Pair 'a = {left: Leaf 'a, right: Leaf 'a}
+let forward: Pair 'a -> Pair 'a = fn value => value
+let select: Pair 'a -> ('a -> 'a) = fn value => value.right.call
+"#,
+    );
+    let producer = artifact::parse(&producer.print()).validate().unwrap();
+    let source = r#"
+@private extern box: 'a -> Any = "$anyUpcast"
+@private let reified = fn value => do let token = box value return value end
+@private let erased = fn value => value
+@private let first = dep::forward {left: {call: reified}, right: {call: erased}}
+@private let second = dep::forward {left: {call: erased}, right: {call: reified}}
+let a = first.left.call 51n
+let b = (dep::select first) 52n
+let c = second.left.call 53n
+let d = (dep::select second) 54n
+"#;
+    let parsed = parse::parse(token::lex(source, ruddy::tracking::FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+    let consumer = compile::compile_with_dependencies(
+        Mint::new(Bundle::new("consumer", Version::new(1, 0, 0)).unwrap()),
+        parsed.stmts,
+        &[compile::Dependency {
+            alias: Some("dep"),
+            artifact: compile::DependencyArtifact::Checked(&producer),
+        }],
+        inference::Trace::Off,
+    )
+    .unwrap_or_else(|failed| panic!("{:?}", failed.errors));
+    let linked = ruddy::link::link(&[producer, consumer.artifact().clone()]).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("consumer.mjs");
+    fs::write(&path, js::generate(&linked).unwrap()).unwrap();
+    let probe = format!(
+        "import assert from 'node:assert/strict'; import * as app from {}; assert.equal(app.a, 51); assert.equal(app.b, 52); assert.equal(app.c, 53); assert.equal(app.d, 54);",
+        serde_json::to_string(path.to_str().unwrap()).unwrap()
+    );
+    let output = Command::new("node")
+        .args(["--input-type=module", "--eval", &probe])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn reification_native_callable_adapters_do_not_retain_discarded_conversions() {
+    let artifact = compiled(
+        r#"
+@private extern native: () -> {f: Nat -> Nat} = "() => ({f: (globalThis.savedHostFunction ??= (n => n))})"
+let fetch: () -> {f: Nat -> Nat} = fn _ => native ()
+"#,
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("adapters.mjs");
+    fs::write(&path, js::generate(&artifact).unwrap()).unwrap();
+    let probe = format!(
+        r#"import assert from 'node:assert/strict';
+import * as app from {};
+const references = [];
+for (let i = 0; i < 1000; i++) {{
+  const f = app.fetch().f;
+  assert.equal(f(i), i);
+  references.push(new WeakRef(f));
+}}
+// WeakRef targets survive their creation job. Collect in later jobs, while
+// keeping the source host function alive throughout the probe.
+for (let i = 0; i < 5; i++) {{
+  await new Promise(resolve => setImmediate(resolve));
+  global.gc();
+}}
+assert.equal(globalThis.savedHostFunction(12), 12);
+assert.ok(references.filter(ref => ref.deref() === undefined).length > 900,
+  'discarded native conversions must be collectible while their host function lives');
+assert.equal(app.fetch().f(17), 17);
+"#,
+        serde_json::to_string(path.to_str().unwrap()).unwrap()
+    );
+    let output = Command::new("node")
+        .args(["--expose-gc", "--input-type=module", "--eval", &probe])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

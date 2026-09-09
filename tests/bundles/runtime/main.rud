@@ -24,7 +24,7 @@ extern run_loop : fn(Loop) -> Nat = "host.runLoop"
 
 let answer = Math::answer
 let identity = Math::identity
-let apply: (JsValue -> JsValue) -> JsValue -> JsValue = fn f => fn x => f x
+let apply: (ForeignValue -> ForeignValue) -> ForeignValue -> ForeignValue = fn f => fn x => f x
 let captured = fn x => fn y => x + y
 let added = add 20n 2n
 let add_twenty = add 20n

@@ -1,8 +1,12 @@
-# Runtime type information and JavaScript
+# Runtime type information and foreign values
 
 `Any` stores a Ruddy value together with its static structural type. Ordinary
-values keep their existing representation. `JsValue` instead stores an arbitrary
-JavaScript value, preserving its identity without claiming a Ruddy payload type.
+values keep their existing representation. `ForeignValue` stores an opaque value
+from the active backend's foreign environment, preserving its identity without
+claiming a Ruddy payload type. The `ffi` module exposes checked decoding into an
+inferred Ruddy type. Each backend defines its supported values and conversions;
+this does not imply cross-backend transport or identical conversion capabilities.
+On the JavaScript backend, `ForeignValue` can hold any JavaScript value.
 
 ```ruddy
 let stored: Any = std::any::upcast [1n, 2n]
@@ -56,14 +60,14 @@ Ordinary extern arguments and results use these encodings recursively:
 | Record or tuple | Object with named fields or numeric string keys |
 | Sum | `{ tag: "Case", value: payload }` |
 | `()` | Empty object; typed native results use the existing void contract and discard their value |
-| `JsValue` | The original host value, without inspection |
+| `ForeignValue` | The original host value, without inspection |
 | `Any` | The original authentic opaque package |
 | Function | An adapter for the reviewed calling and completion convention |
 
 Conversions copy array storage in both directions, including nested arrays.
 Mutating a native argument cannot mutate the original persistent array; retaining
 and later mutating a returned native array cannot mutate the imported snapshot.
-Records are reconstructed from their declared fields. Opaque `JsValue`, `Any`,
+Records are reconstructed from their declared fields. Opaque `ForeignValue`, `Any`,
 and the established explicit mutable-cell ABI retain their identity.
 
 Compiler-recognized persistent-array intrinsics retain their internal ABI. Their
@@ -78,16 +82,16 @@ and completion rules still apply; a descriptor supplies no effect handler.
 For untrusted or unknown data, use checked decoding instead:
 
 ```ruddy
-extern input: JsValue = "({ values: [1, 2, 3] })"
-let result: std::Result { values: [Nat] } std::js::DecodeError =
-  std::js::decode input
+extern input: ForeignValue = "({ values: [1, 2, 3] })"
+let result: std::Result { values: [Nat] } std::ffi::DecodeError =
+  std::ffi::decode input
 ```
 
 `DecodeError` contains `path`, `expected`, and `message` strings. Decoding checks
 the requested structure and reconstructs Ruddy containers. Cyclic structural
 data and failed JavaScript observations return errors. Unlike the typed void
 contract, explicit decoding to unit checks for an empty object or `undefined`. Arbitrary functions can
-be retained as `JsValue`; decoding cannot prove their types or effects. An object
+be retained as `ForeignValue`; decoding cannot prove their types or effects. An object
 that resembles an `Any` cannot fabricate an authentic package. Native conversion
 does not retain a value's former Ruddy type; opaque `Any` transport does.
 
@@ -96,11 +100,11 @@ does not retain a value's former Ruddy type; opaque `Any` transport does.
 Portable libraries may export unresolved requirements. JavaScript-visible roots
 must have concrete native interfaces, including nested functions and containers.
 Both checking and building reject unresolved requirements. Export a concrete
-wrapper, or deliberately use `JsValue`:
+wrapper, or deliberately use `ForeignValue`:
 
 ```ruddy
 @private let box = fn value => std::any::upcast value
-let receive: JsValue -> Any = fn value => box value
+let receive: ForeignValue -> Any = fn value => box value
 ```
 
 The compiler does not default an unknown type or inspect values to guess a type.
@@ -122,6 +126,21 @@ back edges are memoized, and the existing rejection of growing recursive type
 applications remains in force. Callable shapes follow finite source occurrences;
 instantiation copies graph interfaces, never source bodies. Closed subgraphs
 remain erased rather than expanding a shared alias DAG into a tree.
+Completed acyclic aliases are also memoized when expansion creates no fresh
+presence identities; aliases that own presences retain separate instantiations.
+
+Ordinary callable interfaces reveal one structural layer when a source use
+inspects a value. Unobserved components preserve the supplied convention, with
+independent variables for different fields; artifacts retain those variables.
+This keeps unused and forwarded generic alias DAGs compact. Recursive binding
+groups still allocate their complete port skeletons before forward references
+instantiate them. Native interfaces have fixed requirements and share completed
+structural subgraphs without merging independently quantified demand ports.
+
+Raised values and normal handler returns are adapted to the same result
+convention. Native function adapters cache recursive back edges with weak
+descriptor keys, so a live host function does not retain discarded conversion
+plans and wrappers.
 
 Requirement solving adds pairs of parameter indices and demand ports to finite
 sets. Substitution maps indices to finite sets of free parameters, and dependencies

@@ -1478,3 +1478,32 @@ fn reification_graphs_and_forwarding_use_bounded_stack_and_artifact_space() {
             assert!(ruddy::artifact::parse(&printed).validate().is_ok());
         }).unwrap().join().expect("finite descriptor and callable graphs use bounded stack");
 }
+
+#[test]
+fn reification_shared_generic_aliases_do_not_expand_unused_callable_fields() {
+    let mut source = String::from("type N0 'a = 'a -> 'a\n");
+    for level in 1..=24 {
+        source.push_str(&format!(
+            "type N{level} 'a = {{left: N{} 'a, right: N{} 'a}}\n",
+            level - 1,
+            level - 1
+        ));
+    }
+    source.push_str("@private let ignore: N24 'a -> () = fn _ => ()\nlet result = ()\n");
+    source.push_str("let forward: N24 'a -> N24 'a = fn value => value\n");
+    source.push_str(&format!(
+        "let select: N24 'a -> ('a -> 'a) = fn value => value{}\n",
+        ".left".repeat(24)
+    ));
+    source.push_str("extern native: () -> N24 'a = \"() => ({})\"\n");
+    let program = accepted(&source);
+    assert!(
+        program.reification().callables.graph.shapes.len() < 1000,
+        "unused generic alias DAGs must not expand into callable trees"
+    );
+    assert!(
+        ruddy::artifact::parse(&program.artifact().print())
+            .validate()
+            .is_ok()
+    );
+}

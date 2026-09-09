@@ -268,8 +268,8 @@ fn reification_standard_modules_compile_decode_and_downcast_across_artifacts() {
     fs::write(
         project.path().join("main.rud"),
         r#"
-@private extern unknown: JsValue = "({ tag: 'Some', value: [21, 22] })"
-@private let decoded: std::Result (std::Option [Nat]) std::js::DecodeError = std::js::decode unknown
+@private extern unknown: ForeignValue = "({ tag: 'Some', value: [21, 22] })"
+@private let decoded: std::Result (std::Option [Nat]) std::ffi::DecodeError = std::ffi::decode unknown
 @private let boxed = std::any::upcast [23n]
 @private let recovered: std::Option [Nat] = std::any::downcast boxed
 let a = match decoded with | #Some (#Some [n, ..]) => n | _ => 0n end

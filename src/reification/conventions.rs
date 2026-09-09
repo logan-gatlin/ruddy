@@ -23,6 +23,10 @@ pub type NeedId = u32;
 #[derive(Debug, Clone)]
 pub enum Shape {
     Value,
+    /// An unobserved component forwards its caller's callable convention.
+    /// Inspecting the value reveals one structural layer; distinct positions
+    /// retain independent variables without expanding a shared type DAG.
+    Lazy,
     /// A value crossing reflection has a canonical, descriptor-free callable
     /// convention, including any callable carried by an abstract parameter.
     Sealed,
@@ -80,6 +84,9 @@ pub struct Requirement {
 pub struct Graph {
     pub shapes: Vec<Shape>,
     pub needs: Vec<Needs>,
+    /// Recursive definitions allocate their ports before any forward use can
+    /// instantiate them. Ordinary definitions reveal components on demand.
+    eager: bool,
 }
 
 impl Graph {
@@ -98,7 +105,15 @@ impl Graph {
     /// Build a finite callable-shape skeleton from the compiler's regular type
     /// graph. Scalar identity and effects remain in the ordinary semantic type.
     pub fn skeleton(&mut self, ty: &Arc<Ty>, aliases: &IndexMap<Symbol, Scheme>) -> ShapeId {
-        self.skeleton_with(ty, aliases, false)
+        self.skeleton_with(ty, aliases, false, !self.eager)
+    }
+
+    fn reveal(&mut self, id: ShapeId, ty: &Arc<Ty>, aliases: &IndexMap<Symbol, Scheme>) {
+        let id = self.exposed_id(id);
+        if matches!(self.shapes[id as usize], Shape::Lazy) {
+            let revealed = self.skeleton(ty, aliases);
+            self.shapes[id as usize] = Shape::Alias(revealed);
+        }
     }
 
     fn skeleton_with(
@@ -106,8 +121,12 @@ impl Graph {
         ty: &Arc<Ty>,
         aliases: &IndexMap<Symbol, Scheme>,
         native: bool,
+        shallow: bool,
     ) -> ShapeId {
-        let (root, graph) = crate::ir::representation_graph(ty, aliases);
+        let (mut root, graph) = crate::ir::representation_graph(ty, aliases);
+        while graph[root].0 == "package" {
+            root = graph[root].1[0].1;
+        }
         // Closed value types have no hidden descriptor slots, even when their
         // expanded callable tree is exponentially larger than its alias DAG.
         // Keep that entire region erased instead of expanding redundant ports.
@@ -138,14 +157,15 @@ impl Graph {
             Leave(usize),
         }
         let mut active = HashMap::new();
-        let mut native_arguments = Vec::new();
         let root_shape = self.shape(Shape::Value);
         let mut work = vec![Work::Enter(root, root_shape)];
         while let Some(next) = work.pop() {
             let (at, target) = match next {
                 Work::Enter(at, target) => (at, target),
                 Work::Leave(at) => {
-                    active.remove(&at);
+                    if !native {
+                        active.remove(&at);
+                    }
                     continue;
                 }
             };
@@ -166,7 +186,17 @@ impl Graph {
                         Shape::Parameter(index.parse().expect("bound graph parameter"))
                     });
                 }
+                if shallow {
+                    return output.shape(if relevant[source] {
+                        Shape::Lazy
+                    } else {
+                        Shape::Value
+                    });
+                }
                 let id = output.shape(Shape::Value);
+                if native {
+                    active.insert(source, id);
+                }
                 work.push(Work::Enter(source, id));
                 id
             };
@@ -177,10 +207,11 @@ impl Graph {
             };
             let shape = match label.as_str() {
                 "arrow" => {
-                    let argument = child(self, edge("from").expect("arrow argument"));
-                    if native {
-                        native_arguments.push(argument);
-                    }
+                    let argument = if native {
+                        self.shape(Shape::Sealed)
+                    } else {
+                        child(self, edge("from").expect("arrow argument"))
+                    };
                     let result = child(self, edge("to").expect("arrow result"));
                     let mut parameters = BTreeSet::new();
                     let mut seen = HashSet::new();
@@ -256,9 +287,6 @@ impl Graph {
                 _ => Shape::Value,
             };
             self.shapes[target as usize] = shape;
-        }
-        for argument in native_arguments {
-            self.shapes[argument as usize] = Shape::Sealed;
         }
         root_shape
     }
@@ -339,6 +367,8 @@ impl Graph {
             ) {
                 (Shape::Alias(next), _) => work.push((next, offered, joining)),
                 (_, Shape::Alias(next)) => work.push((expected, next, joining)),
+                (Shape::Lazy, _) => self.shapes[expected as usize] = Shape::Alias(offered),
+                (_, Shape::Lazy) => self.shapes[offered as usize] = Shape::Alias(expected),
                 (Shape::Sealed, Shape::Parameter(_)) => {
                     self.shapes[offered as usize] = Shape::Sealed
                 }
@@ -677,6 +707,7 @@ impl Graph {
                             }
                         }
                         Shape::Value => Shape::Value,
+                        Shape::Lazy => Shape::Lazy,
                         Shape::Sealed => Shape::Sealed,
                         Shape::Alias(inner) => {
                             Shape::Alias(shape(self, inner, since.0, &mut shapes, &mut work))
@@ -807,6 +838,7 @@ impl Plan {
             plan: Self::default(),
             aliases: semantics.aliases(),
             universe: BTreeSet::new(),
+            raised: None,
         };
         for declaration in semantics.typed().values() {
             let mut work = vec![&declaration.value];
@@ -876,7 +908,10 @@ impl Plan {
                         planner.plan.graph.shapes.len(),
                         planner.plan.graph.needs.len(),
                     );
-                    let value = planner.plan.graph.skeleton_with(ty, planner.aliases, true);
+                    let value = planner
+                        .plan
+                        .graph
+                        .skeleton_with(ty, planner.aliases, true, false);
                     planner.plan.bindings.insert(
                         *symbol,
                         Binding {
@@ -890,6 +925,7 @@ impl Plan {
             }
         }
         for group in &program.groups {
+            planner.plan.graph.eager = group.recursive;
             let since = (
                 planner.plan.graph.shapes.len(),
                 planner.plan.graph.needs.len(),
@@ -925,6 +961,7 @@ impl Plan {
                 }
             }
         }
+        planner.plan.graph.eager = false;
         planner.plan
     }
 }
@@ -933,6 +970,7 @@ struct Planner<'a> {
     plan: Plan,
     aliases: &'a IndexMap<Symbol, Scheme>,
     universe: BTreeSet<u32>,
+    raised: Option<ShapeId>,
 }
 
 impl Planner<'_> {
@@ -942,7 +980,10 @@ impl Planner<'_> {
 
     fn seed(&mut self, symbol: Symbol, ty: &Arc<Ty>, demands: BTreeSet<u32>) {
         let since = (self.plan.graph.shapes.len(), self.plan.graph.needs.len());
-        let value = self.plan.graph.skeleton(ty, self.aliases);
+        let value = self
+            .plan
+            .graph
+            .skeleton_with(ty, self.aliases, false, false);
         for needs in &mut self.plan.graph.needs[since.1..] {
             needs.port = None;
             needs.variable = false;
@@ -1111,6 +1152,15 @@ impl Planner<'_> {
             TermKind::Let {
                 name, value, body, ..
             } => {
+                let outer = self.plan.graph.eager;
+                let mut pending = vec![value.as_ref()];
+                while let Some(term) = pending.pop() {
+                    if matches!(term.kind, TermKind::Ident(symbol) if symbol == name.anchored) {
+                        self.plan.graph.eager = true;
+                        break;
+                    }
+                    super::children(term, &mut pending);
+                }
                 let since = (self.plan.graph.shapes.len(), self.plan.graph.needs.len());
                 let placeholder = self.plan.graph.skeleton(&value.ty, self.aliases);
                 self.plan.bindings.insert(
@@ -1130,6 +1180,7 @@ impl Planner<'_> {
                     .get_mut(&name.anchored)
                     .unwrap()
                     .generalized = true;
+                self.plan.graph.eager = outer;
                 let body = self.term(body);
                 Flow {
                     value: body.value,
@@ -1210,11 +1261,12 @@ impl Planner<'_> {
                 }
             }
             TermKind::Match { scrutinee, arms } => {
+                let scrutinee_type = scrutinee.ty.clone();
                 let scrutinee = self.term(scrutinee);
                 let value = self.plan.graph.skeleton(&term.ty, self.aliases);
                 let mut evaluations = vec![scrutinee.evaluation];
                 for (pattern, body) in arms {
-                    self.pattern(pattern, scrutinee.value);
+                    self.pattern(pattern, scrutinee.value, &scrutinee_type);
                     let body = self.term(body);
                     self.plan.graph.join(value, body.value);
                     evaluations.push(body.evaluation);
@@ -1222,6 +1274,16 @@ impl Planner<'_> {
                 Flow {
                     value,
                     evaluation: self.plan.graph.union(evaluations),
+                }
+            }
+            TermKind::Raise(value) => {
+                let raised = self.term(value);
+                if let Some(target) = self.raised {
+                    self.plan.graph.join(target, raised.value);
+                }
+                Flow {
+                    value: self.plan.graph.skeleton(&term.ty, self.aliases),
+                    evaluation: raised.evaluation,
                 }
             }
             TermKind::Handle { body, handler } => {
@@ -1244,6 +1306,7 @@ impl Planner<'_> {
                 } else {
                     self.plan.graph.join(value, body.value);
                 }
+                let outer = self.raised.replace(value);
                 for arm in &handler.arms {
                     let sealed = self.plan.graph.shape(Shape::Sealed);
                     self.plan.bindings.insert(
@@ -1260,6 +1323,7 @@ impl Planner<'_> {
                     evaluations.push(self.plan.graph.sealing(flow.value));
                     self.plan.graph.supply(sealed, flow.value);
                 }
+                self.raised = outer;
                 Flow {
                     value,
                     evaluation: self.plan.graph.union(evaluations),
@@ -1278,11 +1342,17 @@ impl Planner<'_> {
                 }
             }
         };
+        self.plan.graph.reveal(flow.value, &term.ty, self.aliases);
         self.plan.occurrences.insert(term.at, flow);
         flow
     }
 
-    fn pattern(&mut self, pattern: &ir::Pattern, value: ShapeId) {
+    fn pattern(&mut self, pattern: &ir::Pattern, value: ShapeId, ty: &Arc<Ty>) {
+        self.plan.graph.reveal(value, ty, self.aliases);
+        let mut ty = inference::unfold(self.aliases, ty);
+        while let Ty::Package(inner) = &*ty {
+            ty = inference::unfold(self.aliases, inner);
+        }
         match &pattern.anchored {
             ir::PatternKind::Bind(name) => {
                 self.plan.bindings.insert(
@@ -1298,8 +1368,11 @@ impl Planner<'_> {
             ir::PatternKind::Struct { fields, .. } => {
                 if let Shape::Record(members) = self.plan.graph.exposed(value).clone() {
                     for (name, field) in fields {
-                        if let Some(member) = members.get(name) {
-                            self.pattern(&field.value, *member);
+                        if let Some(member) = members.get(name)
+                            && let Ty::Struct(row) = &*ty
+                            && let Some(field_ty) = super::flattened(row).labels.get(name)
+                        {
+                            self.pattern(&field.value, *member, &field_ty.ty);
                         }
                     }
                 }
@@ -1310,8 +1383,10 @@ impl Planner<'_> {
             } => {
                 if let Shape::Sum(members) = self.plan.graph.exposed(value)
                     && let Some(member) = members.get(&name.anchored).copied()
+                    && let Ty::Sum(row) = &*ty
+                    && let Some(field) = super::flattened(row).labels.get(&name.anchored)
                 {
-                    self.pattern(payload, member);
+                    self.pattern(payload, member, &field.ty);
                 }
             }
             ir::PatternKind::Array {
@@ -1332,7 +1407,9 @@ impl Planner<'_> {
                 }
                 if let Shape::Array(element) = self.plan.graph.exposed(value).clone() {
                     for pattern in before.iter().chain(after) {
-                        self.pattern(pattern, element);
+                        if let Ty::Array(element_ty) = &*ty {
+                            self.pattern(pattern, element, element_ty);
+                        }
                     }
                 }
             }
@@ -1347,7 +1424,7 @@ pub fn native_invocation_parameters(
     aliases: &IndexMap<Symbol, Scheme>,
 ) -> BTreeSet<u32> {
     let mut graph = Graph::default();
-    let root = graph.skeleton_with(ty, aliases, true);
+    let root = graph.skeleton_with(ty, aliases, true, false);
     match graph.exposed(root) {
         Shape::Arrow { needs, .. } => graph.needs[*needs as usize].direct.clone(),
         _ => BTreeSet::new(),

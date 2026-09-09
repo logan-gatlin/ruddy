@@ -1,53 +1,53 @@
-let len: [JsValue] -> Nat = std::array::len
-let push: [JsValue] -> JsValue -> [JsValue] = std::array::push
-let prepend: [JsValue] -> JsValue -> [JsValue] = std::array::prepend
-let concat: [JsValue] -> [JsValue] -> [JsValue] = std::array::concat
-let get_or: [JsValue] -> Nat -> JsValue -> JsValue = fn arr i fallback => match std::array::get arr i with
+let len: [ForeignValue] -> Nat = std::array::len
+let push: [ForeignValue] -> ForeignValue -> [ForeignValue] = std::array::push
+let prepend: [ForeignValue] -> ForeignValue -> [ForeignValue] = std::array::prepend
+let concat: [ForeignValue] -> [ForeignValue] -> [ForeignValue] = std::array::concat
+let get_or: [ForeignValue] -> Nat -> ForeignValue -> ForeignValue = fn arr i fallback => match std::array::get arr i with
   | #Some value => value
   | #None => fallback
 end
-let set_or: [JsValue] -> Nat -> JsValue -> [JsValue] = fn arr i value => match std::array::set arr i value with
+let set_or: [ForeignValue] -> Nat -> ForeignValue -> [ForeignValue] = fn arr i value => match std::array::set arr i value with
   | #Some updated => updated
   | #None => arr
 end
-let slice_or: [JsValue] -> Nat -> Nat -> [JsValue] = fn arr from to => match std::array::slice arr from to with
+let slice_or: [ForeignValue] -> Nat -> Nat -> [ForeignValue] = fn arr from to => match std::array::slice arr from to with
   | #Some part => part
   | #None => []
 end
-let slice_ok: [JsValue] -> Nat -> Nat -> Boolean = fn arr from to => match std::array::slice arr from to with
+let slice_ok: [ForeignValue] -> Nat -> Nat -> Boolean = fn arr from to => match std::array::slice arr from to with
   | #Some _ => true
   | #None => false
 end
-let pop_last: [JsValue] -> JsValue -> JsValue = fn arr fallback => match std::array::pop arr with
+let pop_last: [ForeignValue] -> ForeignValue -> ForeignValue = fn arr fallback => match std::array::pop arr with
   | #Some (last, _) => last
   | #None => fallback
 end
-let pop_rest: [JsValue] -> [JsValue] = fn arr => match std::array::pop arr with
+let pop_rest: [ForeignValue] -> [ForeignValue] = fn arr => match std::array::pop arr with
   | #Some (_, rest) => rest
   | #None => arr
 end
-let pop_ok: [JsValue] -> Boolean = fn arr => match std::array::pop arr with
+let pop_ok: [ForeignValue] -> Boolean = fn arr => match std::array::pop arr with
   | #Some _ => true
   | #None => false
 end
-let empty: [JsValue] = []
-let count: [JsValue] -> Nat = fn arr => match arr with
+let empty: [ForeignValue] = []
+let count: [ForeignValue] -> Nat = fn arr => match arr with
   | [] => 0n
   | [_, ..rest] => std::nat::add 1n (count rest)
 end
-let last_or: [JsValue] -> JsValue -> JsValue = fn arr fallback => match arr with
+let last_or: [ForeignValue] -> ForeignValue -> ForeignValue = fn arr fallback => match arr with
   | [.., last] => last
   | [] => fallback
 end
-let ends: [JsValue] -> [JsValue] = fn arr => match arr with
+let ends: [ForeignValue] -> [ForeignValue] = fn arr => match arr with
   | [first, .., last] => [first, last]
   | [..] => []
 end
-let init_of: [JsValue] -> [JsValue] = fn arr => match arr with
+let init_of: [ForeignValue] -> [ForeignValue] = fn arr => match arr with
   | [..init, _] => init
   | [] => []
 end
-let middle: [JsValue] -> [JsValue] = fn arr => match arr with
+let middle: [ForeignValue] -> [ForeignValue] = fn arr => match arr with
   | [_, ..inner, _] => inner
   | [..] => []
 end
@@ -58,14 +58,14 @@ let describe = fn arr => match arr with
   | [x] => "one"
   | [_, _, ..] => "many"
 end
-let wrap: [JsValue] -> [JsValue] = fn arr => [..arr, ..arr]
-let around: [JsValue] -> JsValue -> [JsValue] = fn arr x => [x, ..arr, x]
-let copy: [JsValue] -> [JsValue] = fn arr => [..arr]
-let none: [JsValue] -> [JsValue] = fn arr => [..arr, ..[]]
+let wrap: [ForeignValue] -> [ForeignValue] = fn arr => [..arr, ..arr]
+let around: [ForeignValue] -> ForeignValue -> [ForeignValue] = fn arr x => [x, ..arr, x]
+let copy: [ForeignValue] -> [ForeignValue] = fn arr => [..arr]
+let none: [ForeignValue] -> [ForeignValue] = fn arr => [..arr, ..[]]
 
 -- Read every element inside Ruddy so the differential test takes one native
 -- snapshot per observation rather than crossing the ABI once per element.
-let contents: [JsValue] -> [JsValue] = fn arr => do
+let contents: [ForeignValue] -> [ForeignValue] = fn arr => do
  let scan = fn index => match std::array::get arr index with
   | #None => []
   | #Some value => [value, ..scan (std::nat::add index 1n)]

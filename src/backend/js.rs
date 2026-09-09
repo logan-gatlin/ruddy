@@ -474,7 +474,7 @@ impl<'a> Generator<'a> {
                 out.push_str(match kind {
                     crate::reification::Intrinsic::Upcast => "$anyUpcast(",
                     crate::reification::Intrinsic::Downcast => "$anyDowncast(",
-                    crate::reification::Intrinsic::Decode => "$jsDecode(",
+                    crate::reification::Intrinsic::Decode => "$ffiDecode(",
                 });
                 out.push_str(&v(*descriptor));
                 out.push_str(", ");

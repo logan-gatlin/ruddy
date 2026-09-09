@@ -734,7 +734,7 @@ pub enum Type {
     String,
     Boolean,
     Any,
-    JsValue,
+    ForeignValue,
     Arrow(Box<Type>, Box<Type>, Row),
     Package(Box<Type>),
     Array(Box<Type>),
@@ -832,7 +832,7 @@ fn semantic_eq(root: SemanticPair<'_>) -> bool {
                 | (Type::String, Type::String)
                 | (Type::Boolean, Type::Boolean)
                 | (Type::Any, Type::Any)
-                | (Type::JsValue, Type::JsValue)
+                | (Type::ForeignValue, Type::ForeignValue)
                 | (Type::Undecided, Type::Undecided) => {}
                 (Type::Var(left), Type::Var(right)) | (Type::Bound(left), Type::Bound(right))
                     if left == right => {}
@@ -1012,7 +1012,7 @@ fn clone_semantic(root: SemanticRef<'_>) -> (Vec<Type>, Vec<Row>) {
                 Type::String => types.push(Type::String),
                 Type::Boolean => types.push(Type::Boolean),
                 Type::Any => types.push(Type::Any),
-                Type::JsValue => types.push(Type::JsValue),
+                Type::ForeignValue => types.push(Type::ForeignValue),
                 Type::Arrow(from, to, effects) => {
                     work.push(CloneWork::Arrow);
                     work.push(CloneWork::Semantic(SemanticRef::Row(effects)));
@@ -1216,7 +1216,7 @@ fn drain_type(value: &mut Type, pending: &mut Vec<SemanticOwned>) {
         | Type::String
         | Type::Boolean
         | Type::Any
-        | Type::JsValue
+        | Type::ForeignValue
         | Type::Var(_)
         | Type::Bound(_)
         | Type::Rigid { .. }
@@ -1779,7 +1779,7 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
                 types::Ty::String => tys.push(Type::String),
                 types::Ty::Boolean => tys.push(Type::Boolean),
                 types::Ty::Any => tys.push(Type::Any),
-                types::Ty::JsValue => tys.push(Type::JsValue),
+                types::Ty::ForeignValue => tys.push(Type::ForeignValue),
                 types::Ty::Arrow(from, to, effects) => {
                     work.push(Work::Arrow);
                     work.push(Work::Row(effects));
@@ -2655,7 +2655,7 @@ pub mod text {
                         Type::String => work.push(Work::Text("string")),
                         Type::Boolean => work.push(Work::Text("boolean")),
                         Type::Any => work.push(Work::Text("any")),
-                        Type::JsValue => work.push(Work::Text("js-value")),
+                        Type::ForeignValue => work.push(Work::Text("foreign-value")),
                         Type::Arrow(from, to, row) => {
                             out.push_str("(arrow ");
                             work.push(Work::Text(")"));
@@ -4046,7 +4046,7 @@ pub mod text {
                                 "string" => Type::String,
                                 "boolean" => Type::Boolean,
                                 "any" => Type::Any,
-                                "js-value" => Type::JsValue,
+                                "foreign-value" => Type::ForeignValue,
                                 "undecided" => Type::Undecided,
                                 _ => self.invalid("invalid type", Type::Undecided),
                             }),

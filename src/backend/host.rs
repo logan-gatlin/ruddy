@@ -46,7 +46,7 @@ pub(super) fn native_descriptor(
     declarations: &HashMap<&str, &DeclaredType>,
 ) -> Result<crate::reification::NativeTemplate, String> {
     use crate::reification::{Descriptor, Node as Runtime};
-    let mut nodes = vec![Runtime::JsValue];
+    let mut nodes = vec![Runtime::ForeignValue];
     let mut optional_fields =
         std::collections::BTreeMap::<u32, std::collections::BTreeSet<String>>::new();
     let mut work = vec![(
@@ -64,7 +64,7 @@ pub(super) fn native_descriptor(
         let view = resolved(view);
         let mut child = |view, position: String, incoming| {
             let index = nodes.len();
-            nodes.push(Runtime::JsValue);
+            nodes.push(Runtime::ForeignValue);
             work.push((index, view, position, incoming));
             index as u32
         };
@@ -76,7 +76,7 @@ pub(super) fn native_descriptor(
             Type::String => Runtime::String,
             Type::Boolean => Runtime::Boolean,
             Type::Any => Runtime::Any,
-            Type::JsValue => Runtime::JsValue,
+            Type::ForeignValue => Runtime::ForeignValue,
             Type::Package(inner) => Runtime::Alias(child(view.child(inner), path, incoming)),
             Type::Arrow(from, to, row) => {
                 let effects = fields(row, view.clone(), declarations);
@@ -132,7 +132,7 @@ pub(super) fn native_descriptor(
                 let fields = fields(row, view.clone(), declarations);
                 if !matches!(fields.rest, Rest::Closed) {
                     return Err(format!(
-                        "{path} needs runtime information for unresolved fields or cases; export a concrete type or JsValue wrapper"
+                        "{path} needs runtime information for unresolved fields or cases; export a concrete type or ForeignValue wrapper"
                     ));
                 }
                 let mut fields: Vec<_> = fields
@@ -163,7 +163,7 @@ pub(super) fn native_descriptor(
             }
             _ => {
                 return Err(format!(
-                    "{path} needs runtime type information unavailable to JavaScript; export a concrete instantiation or a JsValue wrapper"
+                    "{path} needs runtime type information unavailable to JavaScript; export a concrete instantiation or a ForeignValue wrapper"
                 ));
             }
         };
@@ -853,7 +853,7 @@ pub(super) fn compile(
     let mut definitions = Vec::new();
     for (index, value) in root.header().values.iter().enumerate() {
         if !value.scheme.representations.is_empty() {
-            return Err(Error::ExportType { name: value.name.clone(), message: "this value requires runtime type information from its caller; export a concrete instantiation or a JsValue wrapper".into() });
+            return Err(Error::ExportType { name: value.name.clone(), message: "this value requires runtime type information from its caller; export a concrete instantiation or a ForeignValue wrapper".into() });
         }
         native_descriptor(&value.scheme.body, &declarations).map_err(|message| {
             Error::ExportType {

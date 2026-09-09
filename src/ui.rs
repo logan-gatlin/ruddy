@@ -1436,7 +1436,7 @@ impl ir::Error {
         let span = source.span(self.at);
         match &self.kind {
             E::RuntimeTypeInformation { message } => Diagnostic::new(code, message.clone(), span)
-                .help("supply a concrete type at this use, or retain unknown JavaScript data as JsValue"),
+                .help("supply a concrete type at this use, or retain unknown foreign data as ForeignValue"),
             E::ForeignProtocol { message } => Diagnostic::new(self.kind.code(), message.clone(), source.span(self.at)),
             E::ArrayInExtern => Diagnostic::new(
                 code,
@@ -2322,7 +2322,7 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                     Ty::String => f.write_str(Prim::String.name())?,
                     Ty::Boolean => f.write_str(Prim::Boolean.name())?,
                     Ty::Any => f.write_str(Prim::Any.name())?,
-                    Ty::JsValue => f.write_str(Prim::JsValue.name())?,
+                    Ty::ForeignValue => f.write_str(Prim::ForeignValue.name())?,
                     Ty::Arrow(from, to, effects) => {
                         let shown = effect_row_shown(effects);
                         if shown {
@@ -3123,7 +3123,7 @@ fn type_description(description: inference::TypeDescription) -> &'static str {
         T::Array => "an array",
         T::DeclaredType => "a declared type",
         T::Any => "a boxed value",
-        T::JsValue => "a JavaScript value",
+        T::ForeignValue => "a foreign value",
         T::Undecided => "another type",
     }
 }
@@ -3497,7 +3497,7 @@ impl inference::Error {
         );
         match &self.kind {
             E::RuntimeTypeInformation { .. } => {
-                diagnostic = diagnostic.label("this operation needs runtime information that is not available here").help("supply a concrete supported type, or retain unknown JavaScript data as JsValue");
+                diagnostic = diagnostic.label("this operation needs runtime information that is not available here").help("supply a concrete supported type, or retain unknown foreign data as ForeignValue");
             }
 
             E::NotAStruct { demand, .. } => {

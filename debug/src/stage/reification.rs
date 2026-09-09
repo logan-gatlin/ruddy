@@ -27,6 +27,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     }
     for (index, shape) in plan.graph.shapes.iter().enumerate() {
         let text = match shape {
+            Shape::Lazy => "unobserved component; forwards the supplied callable convention".into(),
             Shape::Arrow {
                 argument,
                 result,

@@ -2473,7 +2473,7 @@ pub enum TypeDescription {
     Text,
     Boolean,
     Any,
-    JsValue,
+    ForeignValue,
     Function,
     Struct,
     TaggedValue,
@@ -4075,7 +4075,7 @@ fn describe_type(ty: &Arc<Ty>) -> TypeDescription {
         Ty::String => TypeDescription::Text,
         Ty::Boolean => TypeDescription::Boolean,
         Ty::Any => TypeDescription::Any,
-        Ty::JsValue => TypeDescription::JsValue,
+        Ty::ForeignValue => TypeDescription::ForeignValue,
         Ty::Arrow(..) => TypeDescription::Function,
         Ty::Struct(..) => TypeDescription::Struct,
         Ty::Sum(..) => TypeDescription::TaggedValue,
@@ -4187,7 +4187,7 @@ impl MismatchFingerprints {
                         Ty::String => values.push(tagged(3, [])),
                         Ty::Boolean => values.push(tagged(4, [])),
                         Ty::Any => values.push(tagged(50, [])),
-                        Ty::JsValue => values.push(tagged(51, [])),
+                        Ty::ForeignValue => values.push(tagged(51, [])),
                         Ty::Var(id) => values.push(tagged(5, [u64::from(*id)])),
                         Ty::Bound(id) => values.push(tagged(6, [u64::from(*id)])),
                         Ty::Rigid { id, .. } => values.push(tagged(7, [u64::from(*id)])),
@@ -4635,7 +4635,7 @@ fn smallest_incompatible_counted_with_mask(
             | (Ty::String, Ty::String)
             | (Ty::Boolean, Ty::Boolean)
             | (Ty::Any, Ty::Any)
-            | (Ty::JsValue, Ty::JsValue)
+            | (Ty::ForeignValue, Ty::ForeignValue)
             | (Ty::Bound(_), Ty::Bound(_))
             | (Ty::Var(_), Ty::Var(_))
             | (Ty::Rigid { .. }, Ty::Rigid { .. })
@@ -6076,7 +6076,7 @@ impl Fingerprint {
                     Ty::String => self.word(0x04),
                     Ty::Boolean => self.word(0x05),
                     Ty::Any => self.word(0x30),
-                    Ty::JsValue => self.word(0x31),
+                    Ty::ForeignValue => self.word(0x31),
                     Ty::Arrow(from, to, effects) => {
                         self.word(0x06);
                         work.push(to);
@@ -8117,7 +8117,7 @@ impl Table {
                         | (Ty::String, Ty::String)
                         | (Ty::Boolean, Ty::Boolean)
                         | (Ty::Any, Ty::Any)
-                        | (Ty::JsValue, Ty::JsValue)
+                        | (Ty::ForeignValue, Ty::ForeignValue)
                         | (Ty::Undecided, Ty::Undecided) => {}
                         (Ty::Var(x), Ty::Var(y)) => same &= x == y,
                         (Ty::Rigid { id: x, .. }, Ty::Rigid { id: y, .. }) => same &= x == y,
@@ -8359,7 +8359,7 @@ impl Table {
                             | Ty::String
                             | Ty::Boolean
                             | Ty::Any
-                            | Ty::JsValue
+                            | Ty::ForeignValue
                             | Ty::Bound(_)
                             | Ty::Rigid { .. }
                             | Ty::Undecided => {}
@@ -8565,7 +8565,7 @@ impl Table {
                         | Ty::String
                         | Ty::Boolean
                         | Ty::Any
-                        | Ty::JsValue
+                        | Ty::ForeignValue
                         | Ty::Bound(_)
                         | Ty::Rigid { .. }
                         | Ty::Undecided => {}
@@ -8693,7 +8693,7 @@ impl Table {
                         | Ty::String
                         | Ty::Boolean
                         | Ty::Any
-                        | Ty::JsValue
+                        | Ty::ForeignValue
                         | Ty::Var(_)
                         | Ty::Bound(_)
                         | Ty::Rigid { .. }
@@ -9365,7 +9365,7 @@ impl Table {
                         | Ty::String
                         | Ty::Boolean
                         | Ty::Any
-                        | Ty::JsValue
+                        | Ty::ForeignValue
                         | Ty::Var(_)
                         | Ty::Bound(_)
                         | Ty::Rigid { .. }

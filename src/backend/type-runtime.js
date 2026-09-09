@@ -209,7 +209,7 @@ const $convertType = ($descriptor, $value, $outgoing, $rootIndex = 0, $callable 
         case "String": $valid = typeof $input === "string"; break;
         case "Boolean": $valid = typeof $input === "boolean"; break;
         case "Any": $valid = $anyPackages.has($input); break;
-        case "JsValue": break;
+        case "ForeignValue": break;
         default: $valid = false;
       }
       if (!$valid) $fail($path, $node);
@@ -230,11 +230,16 @@ const $convertType = ($descriptor, $value, $outgoing, $rootIndex = 0, $callable 
       if (typeof $input !== "function") $fail($path, "Function");
       const [$from, $to] = $node.Arrow;
       let $adapters = $convertedFunctions.get($input);
-      if (!$adapters) { $adapters = []; $convertedFunctions.set($input, $adapters); }
-      const $existing = $adapters.find($entry => $entry.descriptor === $descriptor && $entry.index === $shapeIndex && $entry.outgoing === $outgoing && $entry.hostExport === $hostExport);
-      if ($existing) { $put($existing.value); continue; }
+      // A live host function must not keep every short-lived conversion plan
+      // alive. The descriptor and its adapter may be collected together.
+      if (!$adapters) { $adapters = new WeakMap(); $convertedFunctions.set($input, $adapters); }
+      let $positions = $adapters.get($descriptor);
+      if (!$positions) { $positions = new Map(); $adapters.set($descriptor, $positions); }
+      const $key = $shapeIndex + ":" + $outgoing + ":" + $hostExport;
+      const $existing = $positions.get($key);
+      if ($existing) { $put($existing); continue; }
       const $remember = $value => {
-        $adapters.push({ descriptor: $descriptor, index: $shapeIndex, outgoing: $outgoing, hostExport: $hostExport, value: $value });
+        $positions.set($key, $value);
         $put($value);
       };
       if ($outgoing) {
@@ -300,7 +305,7 @@ const $convertType = ($descriptor, $value, $outgoing, $rootIndex = 0, $callable 
   return $root.value;
 };
 
-const $jsDecode = ($descriptor, $value) => {
+const $ffiDecode = ($descriptor, $value) => {
   try { return $sum("Some", $convertType($descriptor, $value, false, 0, false)); }
   catch ($error) {
     const $failure = $conversionErrors.get($error) || { path: "$", expected: "readable native data", message: "JavaScript observation failed" };

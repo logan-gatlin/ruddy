@@ -160,7 +160,7 @@ impl Analysis {
             let binding = &self.bindings[symbol];
             if matches!(
                 declaration.value.target.anchored.as_str(),
-                "$anyUpcast" | "$anyDowncast" | "$jsDecode"
+                "$anyUpcast" | "$anyDowncast" | "$ffiDecode"
             ) && Intrinsic::recognize(&declaration.value.target.anchored, &binding.ty, aliases)
                 .is_none()
             {
@@ -503,7 +503,7 @@ impl Intrinsic {
             return None;
         }
         match target {
-            "$jsDecode" if matches!(&**from, Ty::JsValue) => {
+            "$ffiDecode" if matches!(&**from, Ty::ForeignValue) => {
                 let result = inference::unfold(aliases, to);
                 let Ty::Sum(row) = &*result else {
                     return None;
@@ -587,7 +587,7 @@ pub enum Node {
     String,
     Boolean,
     Any,
-    JsValue,
+    ForeignValue,
     Array(u32),
     Arrow([u32; 2]),
     Extend([u32; 2]),
@@ -664,7 +664,7 @@ impl Descriptor {
     ) -> Result<(NativeTemplate, Vec<u32>), String> {
         let mut optional_fields = std::collections::BTreeMap::<u32, BTreeSet<String>>::new();
         let mut parameters = Vec::new();
-        let mut nodes = vec![Node::JsValue];
+        let mut nodes = vec![Node::ForeignValue];
         let mut shared = HashMap::from([(root, 0u32)]);
         let mut work = vec![(0, root)];
         while let Some((at, source)) = work.pop() {
@@ -672,7 +672,7 @@ impl Descriptor {
             let mut child = |source: usize| {
                 *shared.entry(source).or_insert_with(|| {
                     let index = nodes.len() as u32;
-                    nodes.push(Node::JsValue);
+                    nodes.push(Node::ForeignValue);
                     work.push((index as usize, source));
                     index
                 })
@@ -689,7 +689,7 @@ impl Descriptor {
                 "String" => Node::String,
                 "Boolean" => Node::Boolean,
                 "Any" => Node::Any,
-                "JsValue" => Node::JsValue,
+                "ForeignValue" => Node::ForeignValue,
                 "Unit" => Node::Struct(Vec::new()),
                 "package" if native => Node::Alias(child(edge("body").expect("package body"))),
                 "array" => Node::Array(child(edge("element").expect("array graph edge"))),

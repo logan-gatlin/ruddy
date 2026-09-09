@@ -18,8 +18,8 @@ No requirement or source syntax change was needed after the effect rebase.
 
 ## Implementation
 
-`Any` and `JsValue` are builtin types. The standard `any` module exposes `upcast`
-and `downcast`; `js` exposes `decode` and structural `DecodeError`. Reflection
+`Any` and `ForeignValue` are builtin types. The standard `any` module exposes `upcast`
+and `downcast`; `ffi` exposes `decode` and structural `DecodeError`. Reflection
 uses compiler-recognized intrinsics with checked signatures. Authentic `Any`
 packages keep their descriptor and original payload in a runtime WeakMap;
 lookalikes cannot forge packages. Structural graph equality distinguishes primitive
@@ -73,7 +73,7 @@ See `docs/runtime-type-information.md` for the native constructor encodings.
 JS roots reject unresolved conversion or invocation requirements throughout
 nested/returned/recursive interfaces in both checking and building. Portable
 library and private generic interfaces remain permitted. Concrete annotations,
-including deliberate `JsValue` interfaces, supply host requirements.
+including deliberate `ForeignValue` interfaces, supply host requirements.
 
 Lowered globals retain the callable contract under which they were compiled.
 Artifact validation compares complete exported interfaces against that retained
@@ -120,7 +120,7 @@ forgery rejection, recursive structural equality and malformed public artifacts.
 Eight previous effect-adapter tests now execute generated JavaScript while
 retaining their source programs, rather than asserting private temporary indices.
 They caught actual evidence-capture failures during integration. Existing fixture
-changes annotate deliberate concrete or JsValue host interfaces and replace
+changes annotate deliberate concrete or ForeignValue host interfaces and replace
 observations of private arrays/sum symbols with the new native encodings. The
 array model test still checks all get results; it reads contents within Ruddy and
 crosses the snapshot boundary once per observation to avoid quadratic host copying.
@@ -146,3 +146,35 @@ suite to that same recipe. Spec and standards reviewers verified the fixes to
 their concrete findings. An additional public artifact regression rejects changing
 a valid descriptor parameter index to another valid index, and generated JS tests
 exercise record-row remainder and function-result descriptor projections.
+
+## Review follow-up
+
+The subsequent defect review identified three issues in `36338dd`:
+
+- Raised callables lost their result convention. Inference now joins raised
+  values into the lexical handler result, and lowering adapts both raised and
+  normally returned values to that convention. Execution regressions cover
+  both convention directions, return arms, nested handlers, and record payloads.
+- Native callback caching retained every conversion descriptor while its host
+  function lived. The cache now uses weak descriptor keys and constant-time
+  position lookup. An execution regression keeps the host function alive while
+  verifying that discarded exported adapters are collectible.
+- Generic alias DAGs expanded into callable trees. Ordinary definitions now
+  reveal structural components at their uses; portable interfaces and lowering
+  preserve unobserved components without conflating independent fields. Native
+  interfaces share completed subgraphs. Semantic graph construction also caches
+  completed acyclic aliases when doing so cannot share fresh presence identities.
+  Recursive definitions retain eager port allocation for forward references.
+
+The exact 16-level unused-alias review reproducer now allocates 10 shapes and
+compiles in approximately 13 ms in a local debug-build probe, versus 524,292
+shapes and approximately six seconds before the fix. The permanent regression
+uses 24 levels and additionally compiles forwarding, projection, and native
+interfaces, then round-trips the artifact. A separate-compilation execution
+regression checks independent erased and reified fields through imported helpers.
+
+Follow-up validation: `just test` passed 1,828 tests with 9 ignored; `just clippy`,
+`just fmt-check`, and `git diff --check` passed without warnings or changes.
+`just cov` passed the same complete suite and reported 96.13% line coverage and
+88.46% branch coverage. The repository-wide 100% coverage requirement remains
+unmet, as it was before this follow-up.

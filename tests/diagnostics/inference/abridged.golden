@@ -168,7 +168,7 @@ note: at extern parameter 1, the callback can perform `!Fail` without matching e
 ## runtime-type-information
 [runtime-type-information] this expression needs runtime type information for a type that is not available in its environment
 primary: this operation needs runtime information that is not available here
-help: supply a concrete supported type, or retain unknown JavaScript data as JsValue
+help: supply a concrete supported type, or retain unknown foreign data as ForeignValue
 
 ## repeated-calls
 [type-mismatch] a natural number and a boolean cannot be the same type
