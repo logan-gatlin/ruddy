@@ -78,11 +78,11 @@ const $fsByteList = bytes => {
 };
 const $fsByteBuffer = bytes => {
   let length = 0;
-  for (let rest = bytes; rest[$tag] === "Cons"; rest = rest[$payload]["1"]) length++;
+  for (let rest = bytes; rest.tag === "Cons"; rest = rest.value["1"]) length++;
   const buffer = new Uint8Array(length);
   let index = 0;
-  for (let rest = bytes; rest[$tag] === "Cons"; rest = rest[$payload]["1"]) {
-    buffer[index++] = rest[$payload]["0"];
+  for (let rest = bytes; rest.tag === "Cons"; rest = rest.value["1"]) {
+    buffer[index++] = rest.value["0"];
   }
   return buffer;
 };

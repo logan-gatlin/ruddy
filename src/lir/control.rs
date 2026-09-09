@@ -42,6 +42,7 @@ pub(super) fn lower(source: lower::Output) -> Output {
             &mut next,
         ));
         globals.push(Global {
+            type_interface: None,
             adapter: None,
             callable: None,
             symbol: global.symbol,
@@ -467,6 +468,10 @@ fn rep(r: lower::Rep) -> Rep {
         lower::Rep::Real => Rep::Real,
         lower::Rep::String => Rep::String,
         lower::Rep::Boolean => Rep::Boolean,
+        lower::Rep::TypeDescriptor => Rep::TypeDescriptor,
+        lower::Rep::NativePlan => Rep::NativePlan,
+        lower::Rep::BoxedAny => Rep::BoxedAny,
+        lower::Rep::HostValue => Rep::HostValue,
         lower::Rep::Unit => Rep::Unit,
         lower::Rep::Struct => Rep::Struct,
         lower::Rep::Array => Rep::Array,
@@ -562,6 +567,42 @@ fn ordinary(value: &lower::Op) -> Op {
             callable: None,
             symbol: *symbol,
             name: name.clone(),
+        },
+        Source::TypeProjection { descriptor, path } => Op::TypeProjection {
+            descriptor: *descriptor,
+            path: path.clone(),
+        },
+        Source::TypeDescriptor {
+            template,
+            arguments,
+        } => Op::TypeDescriptor {
+            template: template.clone(),
+            arguments: arguments.clone(),
+        },
+        Source::NativePlan {
+            template,
+            arguments,
+        } => Op::NativePlan {
+            template: template.clone(),
+            arguments: arguments.clone(),
+        },
+        Source::Reflect {
+            kind,
+            descriptor,
+            value,
+        } => Op::Reflect {
+            kind: *kind,
+            descriptor: *descriptor,
+            value: *value,
+        },
+        Source::Convert {
+            descriptor,
+            value,
+            direction,
+        } => Op::Convert {
+            descriptor: *descriptor,
+            value: *value,
+            direction: *direction,
         },
         Source::NewTag => Op::NewTag,
         _ => unreachable!("control instructions are split before ordinary lowering"),

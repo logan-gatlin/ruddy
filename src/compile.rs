@@ -69,6 +69,7 @@ pub enum DependencyArtifact<'a> {
 /// The coherent program that has passed every checking phase.
 #[derive(Debug)]
 pub struct AcceptedProgram {
+    reification: crate::reification::Analysis,
     mint: Mint,
     ir: ir::Output,
     inference: inference::Output,
@@ -79,6 +80,9 @@ pub struct AcceptedProgram {
 }
 
 impl AcceptedProgram {
+    pub fn reification(&self) -> &crate::reification::Analysis {
+        &self.reification
+    }
     pub(crate) fn imported_suspension(&self, name: &str) -> Option<lir::Suspension> {
         self.imported_summaries.get(name).copied()
     }
@@ -264,12 +268,14 @@ pub(crate) fn accept(
             errors,
         });
     }
+    let reification = inference.semantics().reification().clone();
     let externs = externs::plan(inference.semantics());
     // Construct the accepted proof before producing the artifact: lowering can
     // only consume that proof. The artifact is then retained in the same
     // coherent result, so the public compile seam runs all the way to the
     // validated target-neutral persistence boundary.
     let mut accepted = AcceptedProgram {
+        reification,
         mint,
         ir,
         inference,

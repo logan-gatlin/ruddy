@@ -131,15 +131,475 @@ fn compiled(source: &str) -> Artifact {
     assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
     let bundle = Bundle::new("app", Version::new(1, 0, 0)).unwrap();
     compile::compile(Mint::new(bundle), parsed.stmts, inference::Trace::Off)
-        .unwrap_or_else(|partial| panic!("{partial:#?}"))
+        .unwrap_or_else(|partial| panic!("{:#?}", partial.errors))
         .artifact()
         .clone()
 }
 
 #[test]
+fn reification_preserves_the_boxed_type_instead_of_the_javascript_numeric_representation() {
+    let artifact = compiled(
+        r#"
+type Option 'a = #Some 'a | #None
+@private extern upcast: 'a -> Any = "$anyUpcast"
+@private extern downcast: Any -> Option 'a = "$anyDowncast"
+let boxed = upcast 42n
+let natural: Option Nat = downcast boxed
+let integer: Option Int = downcast boxed
+let recovered = match natural with | #Some n => n | #None => 0n end
+let rejected = match integer with | #Some _ => false | #None => true end
+"#,
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("any.mjs");
+    fs::write(&path, js::generate(&artifact).unwrap()).unwrap();
+    let probe = format!(
+        "import assert from 'node:assert/strict'; import * as app from {}; assert.equal(app.recovered, 42); assert.equal(app.rejected, true);",
+        serde_json::to_string(path.to_str().unwrap()).unwrap()
+    );
+    let output = Command::new("node")
+        .args(["--input-type=module", "--eval", &probe])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn reification_concrete_artifact_row_extensions_normalize_before_identity_comparison() {
+    let mut artifact = compiled(
+        r#"
+type Option 'a = #Some 'a | #None
+@private extern box: 'a -> Any = "$anyUpcast"
+@private extern unbox: Any -> Option 'a = "$anyDowncast"
+@private let saved = box { left: 1n, right: 2n }
+@private let restored: Option { left: Nat, right: Nat } = unbox saved
+let matched = match restored with | #Some _ => true | #None => false end
+"#,
+    )
+    .to_unchecked();
+    let descriptor = artifact.lir.functions.iter_mut()
+        .flat_map(|f| &mut f.blocks).flat_map(|b| &mut b.instrs)
+        .find_map(|instruction| match &mut instruction.op {
+            artifact::Op::TypeDescriptor { template, arguments } if arguments.is_empty()
+                && matches!(&template.nodes[0], ruddy::reification::Node::Struct(fields) if fields.len() == 2) => Some(template),
+            _ => None,
+        }).unwrap();
+    let ruddy::reification::Node::Struct(fields) = descriptor.nodes[0].clone() else {
+        unreachable!()
+    };
+    let base = descriptor.nodes.len() as u32;
+    descriptor.nodes[0] = ruddy::reification::Node::Extend([base, base + 1]);
+    descriptor
+        .nodes
+        .push(ruddy::reification::Node::Struct(vec![fields[0].clone()]));
+    descriptor
+        .nodes
+        .push(ruddy::reification::Node::Struct(vec![fields[1].clone()]));
+    let artifact = artifact
+        .validate()
+        .expect("a concrete guarded row extension is valid");
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("rows.mjs");
+    fs::write(&path, js::generate(&artifact).unwrap()).unwrap();
+    let output = Command::new("node").args(["--input-type=module", "--eval", &format!(
+        "import assert from 'node:assert/strict'; import * as app from {}; assert.equal(app.matched, true);",
+        serde_json::to_string(path.to_str().unwrap()).unwrap(),
+    )]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn reification_generalized_initializers_preserve_eager_allocation_identity() {
+    execute_reification(
+        r#"
+@private extern box: 'a -> Any = "$anyUpcast"
+@private extern same: Any -> Any -> Boolean = "a => b => a === b"
+@private let make: 'a -> { boxed: Any, token: Any } = do
+  let token = box 1n
+  return fn x => { boxed: box x, token: token }
+end
+@private let first = make 2n
+@private let second = make false
+let shared = same first.token second.token
+"#,
+        "assert.equal(app.shared, true);",
+    );
+}
+
+#[test]
+fn reification_generalized_partial_application_evaluates_its_argument_once() {
+    execute_reification(
+        r#"
+@private extern box: 'a -> Any = "$anyUpcast"
+@private extern same: Any -> Any -> Boolean = "a => b => a === b"
+@private let pair = fn token => fn x => { boxed: box x, token: token }
+@private let partial = pair (box 1n)
+@private let first = partial 2n
+@private let second = partial false
+let shared = same first.token second.token
+"#,
+        "assert.equal(app.shared, true);",
+    );
+}
+
+#[test]
+fn reification_generic_boxing_helpers_and_higher_order_calls_preserve_each_instantiation() {
+    let artifact = compiled(
+        r#"
+type Option 'a = #Some 'a | #None
+@private extern upcast: 'a -> Any = "$anyUpcast"
+@private extern downcast: Any -> Option 'a = "$anyDowncast"
+@private let box: 'a -> Any = fn value => upcast value
+@private let apply = fn f => fn x => f x
+@private let forward = fn value => apply box value
+@private let first: Option Nat = downcast (forward 17n)
+let second: Option String = downcast (forward "seventeen")
+let number = match first with | #Some n => n | #None => 0n end
+let text = match second with | #Some s => s | #None => "failed" end
+"#,
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("generic-any.mjs");
+    fs::write(&path, js::generate(&artifact).unwrap()).unwrap();
+    let probe = format!(
+        "import assert from 'node:assert/strict'; import * as app from {}; assert.equal(app.number, 17); assert.equal(app.text, 'seventeen');",
+        serde_json::to_string(path.to_str().unwrap()).unwrap()
+    );
+    let output = Command::new("node")
+        .args(["--input-type=module", "--eval", &probe])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn reification_survives_artifact_import_and_separate_compilation() {
+    let producer = compiled(
+        "type Option 'a = #Some 'a | #None\nextern box: 'a -> Any = \"$anyUpcast\"\nextern unbox: Any -> Option 'a = \"$anyDowncast\"\nlet wrap = fn x => box x",
+    );
+    let producer = artifact::parse(&producer.print())
+        .validate()
+        .expect("the producer artifact round trips");
+    let source = "let first: dep::Option Nat = dep::unbox (dep::wrap 23n)\nlet result = match first with | #Some n => n | #None => 0n end";
+    let mut files = FileManager::new();
+    let file = files.register_new_file("consumer.rud".into(), source.into());
+    let parsed = parse::parse(token::lex(source, file).tokens);
+    let consumer = compile::compile_with_dependencies(
+        Mint::new(Bundle::new("consumer", Version::new(1, 0, 0)).unwrap()),
+        parsed.stmts,
+        &[compile::Dependency {
+            alias: Some("dep"),
+            artifact: compile::DependencyArtifact::Checked(&producer),
+        }],
+        inference::Trace::Off,
+    )
+    .unwrap_or_else(|partial| panic!("{:#?}", partial.errors));
+    let linked = ruddy::link::link(&[producer, consumer.artifact().clone()]).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("consumer.mjs");
+    fs::write(&path, js::generate(&linked).unwrap()).unwrap();
+    let probe = format!(
+        "import assert from 'node:assert/strict'; import * as app from {}; assert.equal(app.result, 23);",
+        serde_json::to_string(path.to_str().unwrap()).unwrap()
+    );
+    let output = Command::new("node")
+        .args(["--input-type=module", "--eval", &probe])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn reification_imported_recursive_descriptors_close_forwarding_arguments_and_reject_growth() {
+    let original = compiled("type Id 'a = 'a\ntype Loop 'a = { next: Loop 'a }\nlet ready = true");
+    for growing in [false, true] {
+        let mut changed = original.clone().to_unchecked();
+        let alias = changed
+            .header
+            .types
+            .iter_mut()
+            .find(|ty| ty.name.ends_with("::Loop"))
+            .unwrap();
+        let artifact::Type::Struct(row) = &mut alias.scheme.body else {
+            panic!("Loop record")
+        };
+        let artifact::Type::Named { args, .. } = &mut row.labels[0].1.ty else {
+            panic!("recursive application")
+        };
+        args[0] = if growing {
+            artifact::Type::Array(Box::new(artifact::Type::Bound(0)))
+        } else {
+            artifact::Type::Named {
+                name: "app@1.0.0::Id".into(),
+                args: vec![artifact::Type::Bound(0)],
+            }
+        };
+        let producer = changed
+            .validate()
+            .expect("a structurally checked portable alias graph");
+        let source = "@private extern box: 'a -> Any = \"$anyUpcast\"\nlet wrap: dep::Loop Nat -> Any = fn x => box x";
+        let mut files = FileManager::new();
+        let file = files.register_new_file("consumer.rud".into(), source.into());
+        let parsed = parse::parse(token::lex(source, file).tokens);
+        let result = compile::compile_with_dependencies(
+            Mint::new(Bundle::new("consumer", Version::new(1, 0, 0)).unwrap()),
+            parsed.stmts,
+            &[compile::Dependency {
+                alias: Some("dep"),
+                artifact: compile::DependencyArtifact::Checked(&producer),
+            }],
+            inference::Trace::Off,
+        );
+        if growing {
+            let failed = result.expect_err("a growing imported runtime identity is rejected");
+            assert!(format!("{:?}", failed.errors).contains("RuntimeTypeInformation"));
+        } else {
+            let accepted = result.unwrap_or_else(|failed| panic!("{:?}", failed.errors));
+            assert!(accepted.artifact().print().len() < 30_000);
+        }
+    }
+}
+
+#[test]
+fn reification_generic_extern_identity_converts_native_arrays_in_both_directions() {
+    let artifact = compiled(
+        r#"
+@private extern id: 'a -> 'a = "a => { if (!Array.isArray(a)) throw Error('expected a native array'); return a; }"
+let original = [31n, 47n]
+let returned = id original
+let result = match returned with | [first, second] => first | _ => 0n end
+let texts = id ["native", "array"]
+let text = match texts with | [first, ..] => first | _ => "failed" end
+"#,
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("native-array.mjs");
+    fs::write(&path, js::generate(&artifact).unwrap()).unwrap();
+    let probe = format!(
+        "import assert from 'node:assert/strict'; import * as app from {}; assert.equal(app.result, 31); assert.equal(app.text, 'native');",
+        serde_json::to_string(path.to_str().unwrap()).unwrap()
+    );
+    let output = Command::new("node")
+        .args(["--input-type=module", "--eval", &probe])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+pub(crate) fn execute_reification(source: &str, assertions: &str) {
+    let artifact = compiled(source);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("reification.mjs");
+    fs::write(&path, js::generate(&artifact).unwrap()).unwrap();
+    let probe = format!(
+        "import assert from 'node:assert/strict'; import * as app from {}; {assertions}",
+        serde_json::to_string(path.to_str().unwrap()).unwrap()
+    );
+    let output = Command::new("node")
+        .args(["--input-type=module", "--eval", &probe])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn reification_native_arrays_are_recursive_snapshots_with_delayed_completion() {
+    execute_reification(
+        r#"
+extern change: fn({ items: [[Nat]] }) -> { items: [[Nat]] } = "a => { globalThis.ruddySavedArray = a.items; a.items[0][0] = 7; return a; }"
+extern mutate: fn() -> () = "() => { globalThis.ruddySavedArray[0][0] = 99; }"
+@async
+@private extern delayed: 'a -> 'a = "async a => a"
+let original = { items: [[3n]] }
+let result = change original
+let changed = mutate ()
+let later = delayed [11n]
+let original_value = match original.items with | [[n]] => n | _ => 0n end
+let imported_value = match result.items with | [[n]] => n | _ => 0n end
+let delayed_value = match later with | [n] => n | _ => 0n end
+"#,
+        "assert.equal(app.original_value, 3); assert.equal(app.imported_value, 7); assert.equal(app.delayed_value, 11);",
+    );
+}
+
+#[test]
+fn reification_checked_decoding_reports_nested_paths_and_retains_opaque_values() {
+    execute_reification(
+        r#"
+type Result 'a 'e = #Some 'a | #Error 'e
+type DecodeError = { path: String, expected: String, message: String }
+@private extern decode: ForeignValue -> Result 'a DecodeError = "$ffiDecode"
+extern unknown: ForeignValue = "({ items: [1, 2, 3] })"
+extern invalid: ForeignValue = "({ items: [1, 'bad'] })"
+extern cyclic: ForeignValue = "(() => { const a = []; a.push(a); return a; })()"
+let decoded: Result { items: [Nat] } DecodeError = decode unknown
+let value = match decoded with | #Some r => match r.items with | [n, ..] => n | _ => 0n end | #Error _ => 0n end
+let failed: Result { items: [Nat] } DecodeError = decode invalid
+let path = match failed with | #Some _ => "failed" | #Error error => error.path end
+let cycle: Result [[Nat]] DecodeError = decode cyclic
+let rejected = match cycle with | #Some _ => false | #Error _ => true end
+"#,
+        "assert.equal(app.value, 1); assert.equal(app.path, '$.items[1]'); assert.equal(app.rejected, true);",
+    );
+}
+
+#[test]
+fn reification_local_helpers_independent_parameters_and_partial_application() {
+    execute_reification(
+        r#"
+type Option 'a = #Some 'a | #None
+@private extern upcast: 'a -> Any = "$anyUpcast"
+@private extern downcast: Any -> Option 'a = "$anyDowncast"
+@private let pair = fn a b => (upcast a, upcast b)
+@private let first = pair 5n
+let both = first "second"
+@private let local = fn x => do let box = fn value => upcast value return (box x, box "local") end
+let boxed = local 9n
+let number: Option Nat = downcast both.0
+let text: Option String = downcast boxed.1
+let result = match number with | #Some n => n | #None => 0n end
+let label = match text with | #Some s => s | #None => "failed" end
+"#,
+        "assert.equal(app.result, 5); assert.equal(app.label, 'local');",
+    );
+}
+
+#[test]
+fn reification_structural_rows_recursive_aliases_and_callable_payloads() {
+    execute_reification(
+        r#"
+type Option 'a = #Some 'a | #None
+type Left = #Cons (Nat, Left) | #Nil
+type Right = #Cons (Nat, Right) | #Nil
+@private extern upcast: 'a -> Any = "$anyUpcast"
+@private extern downcast: Any -> Option 'a = "$anyDowncast"
+@private let row: { value: 'a, ..'rest } -> Any = fn r => upcast r
+@private let data: Left = #Cons (6n, #Nil)
+@private let boxed = upcast data
+@private let recovered: Option Right = downcast boxed
+let recursive = match recovered with | #Some (#Cons (n, _)) => n | _ => 0n end
+@private let record: Option { value: Nat, name: String } = downcast (row { value: 7n, name: "seven" })
+let field = match record with | #Some r => r.name | #None => "failed" end
+@private extern identity: 'a -> 'a = "a => a"
+@private let function: Nat -> Nat = identity (fn n => n)
+let called = function 8n
+@private let roundtrip: Option (Nat -> Nat) = downcast (upcast function)
+let boxed_function = match roundtrip with | #Some f => f 9n | #None => 0n end
+"#,
+        "assert.equal(app.recursive, 6); assert.equal(app.field, 'seven'); assert.equal(app.called, 8); assert.equal(app.boxed_function, 9);",
+    );
+}
+
+#[test]
+fn reification_recursive_generic_functions_and_captured_descriptors() {
+    execute_reification(
+        r#"
+type Option 'a = #Some 'a | #None
+@private extern upcast: 'a -> Any = "$anyUpcast"
+@private extern downcast: Any -> Option 'a = "$anyDowncast"
+@private extern dec: Nat -> Nat = "n => n - 1"
+@private let recur = fn value n => match n with | 0n => upcast value | _ => other value (dec n) end
+@private let other = fn value n => recur value n
+@private let closure: 'a -> (() -> Any) = fn value => fn unit => upcast value
+@private let local = fn value => do
+  let again = fn x n => match n with | 0n => upcast x | _ => again x 0n end
+  return again value 1n
+end
+@private let first: Option Nat = downcast (recur 12n 20000n)
+@private let second: Option String = downcast ((closure "captured") ())
+@private let third: Option Nat = downcast (local 14n)
+let a = match first with | #Some n => n | #None => 0n end
+let b = match second with | #Some s => s | #None => "failed" end
+let c = match third with | #Some n => n | #None => 0n end
+"#,
+        "assert.equal(app.a, 12); assert.equal(app.b, 'captured'); assert.equal(app.c, 14);",
+    );
+}
+
+#[test]
+fn reification_js_exports_require_concrete_interfaces() {
+    for source in [
+        r#"@private extern upcast: 'a -> Any = "$anyUpcast"
+let box = fn value => upcast value"#,
+        "let identity = fn value => value",
+        "let nested = { factory: fn x => fn y => (x, y) }",
+        "let callbacks = [fn value => value]",
+    ] {
+        let artifact = compiled(source);
+        assert!(!artifact.header().values.is_empty());
+        let error = js::check_exports(&artifact, &[], js::Platform::Node).unwrap_err();
+        assert!(
+            error.to_string().contains("runtime type information"),
+            "{error}"
+        );
+        assert!(js::generate(&artifact).is_err());
+    }
+    execute_reification(
+        r#"
+@private extern upcast: 'a -> Any = "$anyUpcast"
+let dynamic: ForeignValue -> Any = fn value => upcast value
+let native: [Nat] -> [Nat] = fn value => value
+let identity: ForeignValue -> ForeignValue = fn value => value
+"#,
+        "const value = {}; assert.equal(app.identity(value), value); assert.deepEqual(app.native([1, 2]), [1, 2]); for (const value of [null, undefined, Symbol('s'), () => {}, 123n, {}]) assert.equal(app.identity(value), value); assert.throws(() => app.native([1, 'bad']), /Nat/);",
+    );
+}
+
+#[test]
+fn reification_opaque_transport_preserves_payloads_and_rejects_forgeries() {
+    execute_reification(
+        r#"
+type Option 'a = #Some 'a | #None
+type Result 'a 'e = #Some 'a | #Error 'e
+type DecodeError = { path: String, expected: String, message: String }
+@private extern upcast: 'a -> Any = "$anyUpcast"
+@private extern downcast: Any -> Option 'a = "$anyDowncast"
+@private extern decode: ForeignValue -> Result 'a DecodeError = "$ffiDecode"
+@private extern store: Any -> () = "value => { globalThis.savedAny = value; }"
+@private extern load: () -> Any = "() => globalThis.savedAny"
+@private extern forged: () -> Any = "() => ({ descriptor: 'Nat', value: 42 })"
+@private extern unknown: ForeignValue = "({ descriptor: 'Nat', value: 42 })"
+@private let stored = store (upcast [19n])
+@private let returned: Option [Nat] = downcast (load stored)
+let result = match returned with | #Some [n] => n | _ => 0n end
+@private let checked: Result Any DecodeError = decode unknown
+let rejected = match checked with | #Error _ => true | #Some _ => false end
+@private let width: Option Int8 = downcast (upcast 1n8)
+let different_width = match width with | #None => true | #Some _ => false end
+let bad: () -> Any = fn _ => forged ()
+"#,
+        "assert.equal(app.result, 19); assert.equal(app.rejected, true); assert.equal(app.different_width, true); assert.throws(() => app.bad({}), /Any/);",
+    );
+}
+
+#[test]
 fn public_generate_is_deterministic_and_emits_nested_esm_exports() {
     let artifact = compiled(
-        "module Math =\n  let answer = 42n\n  let identity = fn x => x\nend\nlet ready = true\n",
+        "module Math =\n  let answer = 42n\n  let identity: ForeignValue -> ForeignValue = fn x => x\nend\nlet ready = true\n",
     );
     let first = js::generate(&artifact).unwrap();
     let second = js::generate(&artifact).unwrap();
@@ -162,10 +622,10 @@ fn generated_module_executes_values_functions_records_and_sums_in_node() {
     }
     let artifact = compiled(
         "let answer = 42n\n\
-         let apply = fn f => fn x => f x\n\
-         let identity = fn n => n\n\
+         let apply: (Nat -> Nat) -> Nat -> Nat = fn f => fn x => f x\n\
+         let identity: Nat -> Nat = fn n => n\n\
          let record = { value: answer }\n\
-         let tagged = #Ready answer\n",
+         let tagged: #Ready Nat = #Ready answer\n",
     );
     let module = js::generate(&artifact).unwrap();
     let directory = tempfile::tempdir().unwrap();
@@ -197,17 +657,17 @@ fn generated_module_erases_existential_packages_around_structs() {
         return;
     }
     let artifact = compiled(
-        "let build: Nat ->\n\
+        "@private let build: Nat ->\n\
          { left when 'p: Nat, also when 'p: Nat, right when 'q: Nat }\n\
          where 'p != 'q = fn n => { left: n, also: n }\n\
-         extern choose: Nat ->\n\
+         @private let choose: Nat ->\n\
          { left when 'p: Nat, also when 'p: Nat, right when 'q: Nat }\n\
-         where 'p != 'q = \"host.choose\"\n\
-         let built = build 7n\n\
+         where 'p != 'q = fn n => { left: n, also: n }\n\
+         @private let built = build 7n\n\
+         let built_left = built.left\n\
          let projected = (choose 8n).also\n\
          let matched = match choose 9n with\n\
          | { left, .. } => left\n\
-         | { right, .. } => right\n\
          end\n",
     );
     let module = js::generate(&artifact).unwrap();
@@ -216,7 +676,7 @@ fn generated_module_erases_existential_packages_around_structs() {
     fs::write(&path, module).unwrap();
 
     let probe = format!(
-        "globalThis.host = {{ choose: n => n === 9 ? {{ right: n }} : {{ left: n, also: n }} }}; const app = await import({}); console.log(JSON.stringify([app.built.left, app.projected, app.matched]));",
+        "globalThis.host = {{ choose: n => n === 9 ? {{ right: n }} : {{ left: n, also: n }} }}; const app = await import({}); console.log(JSON.stringify([app.built_left, app.projected, app.matched]));",
         serde_json::to_string(path.to_str().unwrap()).unwrap()
     );
     let output = Command::new("node")
@@ -285,15 +745,18 @@ fn generated_runtime_preserves_arithmetic_switch_record_effect_and_literal_seman
          let classify_nat = fn n => match n with | 0.0 => \"zero\" | 1.0 => \"one\" | _ => \"other\" end\n\
          let classify_int = fn n => match n with | 0.0 => \"zero\" | _ => \"other\" end\n\
          let classify_real = fn n => match n with | 0.0 => \"positive zero\" | _ => \"other\" end\n\
-         let unpack = fn value => match value with | #Value n => n | #Empty => 0n | _ => 99n end\n\
+         @private let unpack = fn value => match value with | #Value n => n | #Empty => 0n | _ => 99n end\n\
          let payload = unpack (#Value 8n)\n\
          let tag_fallback = unpack #Other\n\
-         let shape = fn value => match value with | { x } => 1n | { x, .. } => 2n | _ => 3n end\n\
+         @private let shape = fn value => match value with | { x } => 1n | { x, .. } => 2n | _ => 3n end\n\
+         let shape_first = shape { x: 4n }\n\
+         let shape_more = shape { x: 4n, y: 5n }\n\
+         let shape_other = shape { y: 5n }\n\
          let merged = { left: 1n, right: 2n }\n\
          effect Bump = Real -> Real\n\
          let bump = fn n => handle !Bump n with | !Bump value => value + 1.0 end\n\
          effect Read = { get: () -> Nat }\n\
-         let read = fn _ => handle !Read.get () with | !Read.get _ => 42n end\n\
+         let read: () -> Nat = fn _ => handle !Read.get () with | !Read.get _ => 42n end\n\
          effect Plus = { apply: Real -> Real }\n\
          effect Times = { apply: Real -> Real }\n\
          @private let calculate : Real -> Real + !Plus + !Times = fn n => do let x = !Plus.apply n return !Times.apply x end\n\
@@ -320,7 +783,7 @@ fn generated_runtime_preserves_arithmetic_switch_record_effect_and_literal_seman
     );
     fs::write(&path, module).unwrap();
     let probe = format!(
-        "const app = await import({}); const values = [app.nat_sub, app.int_div, Object.is(app.int_negative_zero, -0), Number.isFinite(app.real_div), app.real_literal, app.classify_nat(-0), app.classify_nat(7), app.classify_int(app.int_negative_zero), app.classify_real(0), app.classify_real(-0), app.payload, app.tag_fallback, app.shape({{x: 4}}), app.shape({{x: 4, y: 5}}), app.shape({{y: 5}}), app.merged.left + app.merged.right, await app.bump(4), await app.read(null), await app.calculated(4), await app.asked(4)]; console.log(JSON.stringify(values));",
+        "const app = await import({}); const values = [app.nat_sub, app.int_div, Object.is(app.int_negative_zero, -0), Number.isFinite(app.real_div), app.real_literal, app.classify_nat(-0), app.classify_nat(7), app.classify_int(app.int_negative_zero), app.classify_real(0), app.classify_real(-0), app.payload, app.tag_fallback, app.shape_first, app.shape_more, app.shape_other, app.merged.left + app.merged.right, await app.bump(4), await app.read({{}}), await app.calculated(4), await app.asked(4)]; console.log(JSON.stringify(values));",
         serde_json::to_string(path.to_str().unwrap()).unwrap()
     );
     let output = Command::new("node")
@@ -380,7 +843,8 @@ fn generation_rejects_unlinked_and_internally_inconsistent_artifacts() {
         ))
     );
 
-    let mut bad_function = compiled("let identity = fn x => x").to_unchecked();
+    let mut bad_function =
+        compiled("let identity: ForeignValue -> ForeignValue = fn x => x").to_unchecked();
     let closure = bad_function.lir.functions[bad_function.lir.globals[0].initializer as usize]
         .blocks
         .iter_mut()
@@ -518,7 +982,7 @@ fn metadata_changes_neither_schemes_nor_generated_javascript() {
          type Pair 'a = { first: 'a, second: 'a }\n\
          effect Log = Nat -> ()\n\
          extern sqrt : Real -> Real = \"Math.sqrt\"\n\
-         let pair = fn x => { first: x, second: x }\n\
+         let pair: Nat -> { first: Nat, second: Nat } = fn x => { first: x, second: x }\n\
          let (a, b) = (1n, 2n)\n",
     );
     let annotated = compiled(
@@ -526,7 +990,7 @@ fn metadata_changes_neither_schemes_nor_generated_javascript() {
          @shape (1n, 2n) type Pair 'a = { first: 'a, second: 'a }\n\
          @level #Debug effect Log = Nat -> ()\n\
          @host { from: \"math\" } extern sqrt : Real -> Real = \"Math.sqrt\"\n\
-         @test @tags [\"a\", \"b\"] let pair = fn x => { first: x, second: x }\n\
+         @test @tags [\"a\", \"b\"] let pair: Nat -> { first: Nat, second: Nat } = fn x => { first: x, second: x }\n\
          @k let (a, b) = (1n, 2n)\n",
     );
     assert_eq!(
@@ -567,7 +1031,7 @@ fn metadata_changes_neither_schemes_nor_generated_javascript() {
 fn mutation_factories_preserve_freshness_aliases_and_assignment_results() {
     let artifact = compiled(
         "@private let counter = fn _ => do let cell = mut 0 return fn _ => cell := ~cell + 1 end
-        let run = fn _ => do
+        let run: () -> _ = fn _ => do
           let first = counter ()
           let second = counter ()
           let _ = first ()
@@ -603,7 +1067,7 @@ fn mutation_factories_preserve_freshness_aliases_and_assignment_results() {
 #[test]
 fn mutation_operands_execute_once_in_target_then_value_order() {
     let artifact = compiled(
-        "let run = fn _ => do
+        "let run: () -> _ = fn _ => do
         let order = mut 0
         let a = mut 0
         let b = mut 0
@@ -631,17 +1095,17 @@ fn mutation_operands_execute_once_in_target_then_value_order() {
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap().trim(),
-        "{\"order\":123,\"a\":9,\"b\":9,\"result\":9}"
+        "{\"a\":9,\"b\":9,\"order\":123,\"result\":9}"
     );
 }
 
 #[test]
 fn mutation_survives_foreign_aliases_callbacks_and_suspension() {
     let artifact = compiled(
-        "extern alias: mut 'r Real -> mut 'r Real = \"host.alias\"
+        "@private extern alias: mut 'r Real -> mut 'r Real = \"host.alias\"
         @private extern update: mut 'r Real -> () + !mut 'r = \"host.update\"
         @private @async extern later: (() -> Real + !mut 'r) -> Real + !mut 'r = \"host.later\"
-        let run = fn _ => do
+        let run: () -> _ = fn _ => do
           let cell = mut 1
           let same = alias cell
           let _ = update same
@@ -667,19 +1131,19 @@ fn mutation_survives_foreign_aliases_callbacks_and_suspension() {
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap().trim(),
-        "{\"result\":5,\"read\":5}"
+        "{\"read\":5,\"result\":5}"
     );
 }
 
 #[test]
 fn mutation_composes_with_effect_polymorphism_and_stack_safe_recursion() {
     let artifact = compiled(
-        "let apply = fn f => fn x => f x
+        "@private let apply = fn f => fn x => f x
         @private let loop = fn pair => match pair.1 with
           | 0 => ~pair.0
           | _ => do let _ = pair.0 := ~pair.0 + 1 return loop (pair.0, pair.1 - 1) end
         end
-        let run = fn _ => do
+        let run: () -> _ = fn _ => do
           let cell = mut 0
           let _ = apply (fn _ => cell := 1) ()
           return loop (cell, 20000)
@@ -707,9 +1171,9 @@ fn mutation_composes_with_effect_polymorphism_and_stack_safe_recursion() {
 #[test]
 fn mutation_keeps_arrays_persistent_and_conditional_effects_callable() {
     let artifact = compiled(
-        "let invoke: (() -> Real + !mut 'r (when 'p)) -> Real + !mut 'r (when 'p) = fn f => f ()
+        "@private let invoke: (() -> Real + !mut 'r (when 'p)) -> Real + !mut 'r (when 'p) = fn f => f ()
         let first = fn array => match array with | [x, ..] => x | [] => 0 end
-        let run = fn _ => do
+        let run: () -> _ = fn _ => do
           let cell = mut [1, 2]
           let original = ~cell
           let _ = cell := [3, 4]
@@ -735,7 +1199,7 @@ fn mutation_keeps_arrays_persistent_and_conditional_effects_callable() {
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap().trim(),
-        "{\"original\":1,\"changed\":3}"
+        "{\"changed\":3,\"original\":1}"
     );
 }
 
@@ -771,5 +1235,389 @@ fn signed_literals_run_in_arguments_patterns_and_metadata() {
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn reification_native_returned_functions_receive_descriptors_when_called() {
+    execute_reification(
+        r#"
+@private extern make: () -> ('a -> 'a) = "() => value => { if (!Array.isArray(value)) throw Error('native array expected'); return value; }"
+@private extern nested: () -> { apply: 'a -> 'a } = "() => ({ apply: value => { if (!Array.isArray(value)) throw Error('native array expected'); return value; } })"
+@private let direct = make ()
+@private let container = nested ()
+let direct_numbers = direct [4n, 9n]
+let direct_text = direct ["direct"]
+let nested_numbers = container.apply [12n, 19n]
+let nested_text = container.apply ["nested"]
+"#,
+        "assert.deepEqual(app.direct_numbers, [4, 9]); assert.deepEqual(app.direct_text, ['direct']); assert.deepEqual(app.nested_numbers, [12, 19]); assert.deepEqual(app.nested_text, ['nested']);",
+    );
+}
+
+#[test]
+fn reification_recursive_callable_adapters_are_finite() {
+    execute_reification(
+        r#"
+type Loop 'a = 'a -> Loop 'a
+@private extern box: 'a -> Any = "$anyUpcast"
+@private let loop: Loop 'a = fn value => do
+  let token = box value
+  return loop
+end
+@private let first = loop 1n
+@private let second = first 2n
+let completed = true
+"#,
+        "assert.equal(app.completed, true);",
+    );
+}
+
+#[test]
+fn reification_native_returned_functions_keep_independent_descriptor_order() {
+    execute_reification(
+        r#"
+@private extern make: () -> ({ first: 'a, second: 'b } -> { first: 'a, second: 'b }) = "() => value => { if (!Array.isArray(value.first) || typeof value.second !== 'string') throw Error('wrong native conversion'); return value; }"
+@private let apply = make ()
+let result = apply { first: [7n, 8n], second: "kept" }
+"#,
+        "assert.deepEqual(app.result.first, [7, 8]); assert.equal(app.result.second, 'kept');",
+    );
+}
+
+#[test]
+fn reification_generic_callable_payloads_seal_their_evidence_layout() {
+    execute_reification(
+        r#"
+type Option 'a = #Some 'a | #None
+@private extern box: 'a -> Any = "$anyUpcast"
+@private extern downcast: Any -> Option 'a = "$anyDowncast"
+@private let pack = fn value => box value
+@private let preserve = fn value => do let boxed = box value return value end
+@private let generic = fn value => do
+ let inner = fn next => do let boxed = box next let same = [value, next] return next end
+ return pack inner
+end
+@private let recover: Any -> Nat = fn token => do
+ let function: Option (Nat -> Nat) = downcast token
+ return match function with
+ | #Some call => call 42n
+ | #None => 0n
+end
+end
+@private let fixed: Nat -> Nat = preserve
+let direct = recover (pack fixed)
+let captured = recover (generic 7n)
+@private let closed: 'a -> (#Call 'a) = fn value => #Call value
+@private let aggregate = fn value => do
+ let inner = fn next => do let token = box next let same = [value, next] return next end
+ return pack { functions: [inner], tagged: closed inner }
+end
+@private let token = aggregate 8n
+@private let recovered: Option { functions: [Nat -> Nat], tagged: #Call (Nat -> Nat) } = downcast token
+let aggregate_result = match recovered with
+ | #Some { functions: [call], tagged: #Call other } => other (call 43n)
+ | _ => 0n
+end
+"#,
+        "assert.equal(app.direct, 42); assert.equal(app.captured, 42); assert.equal(app.aggregate_result, 43);",
+    );
+}
+
+#[test]
+fn reification_callable_profiles_survive_aggregate_patterns_and_joins() {
+    execute_reification(
+        r#"
+type Option 'a = #Some 'a | #None
+@private extern box: 'a -> Any = "$anyUpcast"
+@private extern downcast: Any -> Option 'a = "$anyDowncast"
+@private let reified = fn value => do let token = box value return value end
+@private let erased = fn value => value
+@private let functions = [erased, reified]
+@private let payload = #Function reified
+@private let record = { apply: reified }
+@private let choose = fn flag => match flag with | true => erased | false => reified end
+let from_array = match functions with | [first, second] => second (first 11n) | _ => 0n end
+let from_sum = match payload with | #Function apply => apply 12n end
+let from_record = match record with | { apply } => apply 13n end
+let from_join = (choose false) 14n
+"#,
+        "assert.equal(app.from_array, 11); assert.equal(app.from_sum, 12); assert.equal(app.from_record, 13); assert.equal(app.from_join, 14);",
+    );
+}
+
+#[test]
+fn reification_marked_native_currying_defers_independent_type_arguments() {
+    execute_reification(
+        r#"
+@private extern pair: fn('a, 'b) -> { first: 'a, second: 'b } = "(first, second) => { if (!Array.isArray(first) || !Array.isArray(second)) throw Error('native arrays expected'); return { first, second }; }"
+@private let first = pair [3n]
+let text = first ["text"]
+let flags = first [true]
+"#,
+        "assert.deepEqual(app.text.first, [3]); assert.deepEqual(app.text.second, ['text']); assert.deepEqual(app.flags.second, [true]);",
+    );
+}
+
+#[test]
+fn reification_native_generic_callable_conversion_uses_a_sealed_convention() {
+    execute_reification(
+        r#"
+@private extern native: 'a -> 'a = "value => value"
+@private extern box: 'a -> Any = "$anyUpcast"
+@private let make = fn value => do
+ let function = fn next => do let token = box next let same = [value, next] return next end
+ return native function
+end
+@private let apply = make [1n]
+let result = apply [2n, 3n]
+"#,
+        "assert.deepEqual(app.result, [2, 3]);",
+    );
+}
+
+#[test]
+fn reification_generic_selection_joins_both_value_profiles() {
+    execute_reification(
+        r#"
+@private extern box: 'a -> Any = "$anyUpcast"
+@private let choose = fn flag first second => match flag with | true => first | false => second end
+@private let erased = fn value => value
+@private let reified = fn value => do let token = box value return value end
+let first = (choose true erased reified) 21n
+let second = (choose false erased reified) 22n
+let reversed = (choose false reified erased) 23n
+"#,
+        "assert.equal(app.first, 21); assert.equal(app.second, 22); assert.equal(app.reversed, 23);",
+    );
+}
+
+#[test]
+fn reification_callback_adapters_extract_component_type_evidence() {
+    execute_reification(
+        r#"
+type Option 'a = #Some 'a | #None
+@private extern box: 'a -> Any = "$anyUpcast"
+@private extern downcast: Any -> Option 'a = "$anyDowncast"
+@private let apply = fn call value => call value
+@private let element = fn values => match values with | [value, ..] => box value | _ => box () end
+@private let consume = apply element
+@private let token = consume [37n]
+@private let recovered: Option Nat = downcast token
+let result = match recovered with | #Some n => n | #None => 0n end
+"#,
+        "assert.equal(app.result, 37);",
+    );
+}
+
+#[test]
+fn reification_mutable_callable_cells_share_their_storage_convention() {
+    execute_reification(
+        r#"
+@private extern box: 'a -> Any = "$anyUpcast"
+@private let run = fn initial => do
+ let cell = mut (fn value => value)
+ let assigned = cell := (fn value => do let token = box value return value end)
+ let from_cell = (~cell) initial
+ return assigned from_cell
+end
+let result = run 39n
+"#,
+        "assert.equal(app.result, 39);",
+    );
+}
+
+#[test]
+fn reification_callback_adapters_extract_record_evidence() {
+    execute_reification(
+        r#"
+type Option 'a = #Some 'a | #None
+@private extern box: 'a -> Any = "$anyUpcast"
+@private extern downcast: Any -> Option 'a = "$anyDowncast"
+@private let apply = fn call value => call value
+@private let field = fn record => box record.value
+@private let consume_field = apply field
+@private let a: Option Nat = downcast (consume_field {value: 43n})
+let first = match a with | #Some n => n | #None => 0n end
+"#,
+        "assert.equal(app.first, 43);",
+    );
+}
+
+#[test]
+fn reification_effect_payloads_preserve_callable_evidence() {
+    execute_reification(
+        r#"
+@private extern box: 'a -> Any = "$anyUpcast"
+effect Apply 'a = ('a -> 'a) -> 'a
+effect Get 'a = () -> ('a -> 'a)
+@private let run = fn value => handle !Apply (fn next => do let token = box next return next end) with
+ | !Apply call => call value
+end
+@private let returned = fn value => handle (!Get ()) value with
+ | !Get _ => fn next => do let token = box next return next end
+end
+@private let as_value = fn value => handle do
+ let perform = !Apply
+ return perform (fn next => do let token = box next return next end)
+end with | !Apply call => call value end
+let result = run 45n
+let second = returned 46n
+let third = as_value 47n
+"#,
+        "assert.equal(await app.result, 45); assert.equal(await app.second, 46); assert.equal(await app.third, 47);",
+    );
+}
+
+#[test]
+fn reification_raised_callables_join_normal_and_return_arm_conventions() {
+    execute_reification(
+        r#"
+@private extern box: 'a -> Any = "$anyUpcast"
+effect Get = () -> Nat
+@private let choose = fn abort => handle
+  do let n = !Get () return fn next => next end
+with | !Get _ => match abort with
+  | true => raise (fn next => do let token = box next return next end)
+  | false => 0n
+end end
+@private let opposite = fn abort => handle !Get () with
+ | !Get _ => match abort with
+   | true => raise (fn next => next)
+   | false => 0n
+ end
+ | return _ => fn next => do let token = box next return next end
+end
+let raised = choose true 12n
+let normal = choose false 13n
+let erased = opposite true 14n
+let returned = opposite false 15n
+effect Inner = () -> Nat
+@private let nested = fn _ => handle
+  do let n = !Get () return {call: fn next => next} end
+with | !Get _ => handle
+  do let n = !Inner () return raise {call: fn next => do let token = box next return next end} end
+with | !Inner _ => 0n end end
+let nested_result = (nested ()).call 16n
+"#,
+        "assert.equal(app.raised, 12); assert.equal(app.normal, 13); assert.equal(app.erased, 14); assert.equal(app.returned, 15); assert.equal(app.nested_result, 16);",
+    );
+}
+
+#[test]
+fn reification_deferred_components_preserve_independent_imported_callable_profiles() {
+    let producer = compiled(
+        r#"
+type Leaf 'a = {call: 'a -> 'a}
+type Pair 'a = {left: Leaf 'a, right: Leaf 'a}
+let forward: Pair 'a -> Pair 'a = fn value => value
+let select: Pair 'a -> ('a -> 'a) = fn value => value.right.call
+"#,
+    );
+    let producer = artifact::parse(&producer.print()).validate().unwrap();
+    let source = r#"
+@private extern box: 'a -> Any = "$anyUpcast"
+@private let reified = fn value => do let token = box value return value end
+@private let erased = fn value => value
+@private let first = dep::forward {left: {call: reified}, right: {call: erased}}
+@private let second = dep::forward {left: {call: erased}, right: {call: reified}}
+let a = first.left.call 51n
+let b = (dep::select first) 52n
+let c = second.left.call 53n
+let d = (dep::select second) 54n
+"#;
+    let parsed = parse::parse(token::lex(source, ruddy::tracking::FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+    let consumer = compile::compile_with_dependencies(
+        Mint::new(Bundle::new("consumer", Version::new(1, 0, 0)).unwrap()),
+        parsed.stmts,
+        &[compile::Dependency {
+            alias: Some("dep"),
+            artifact: compile::DependencyArtifact::Checked(&producer),
+        }],
+        inference::Trace::Off,
+    )
+    .unwrap_or_else(|failed| panic!("{:?}", failed.errors));
+    let linked = ruddy::link::link(&[producer, consumer.artifact().clone()]).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("consumer.mjs");
+    fs::write(&path, js::generate(&linked).unwrap()).unwrap();
+    let probe = format!(
+        "import assert from 'node:assert/strict'; import * as app from {}; assert.equal(app.a, 51); assert.equal(app.b, 52); assert.equal(app.c, 53); assert.equal(app.d, 54);",
+        serde_json::to_string(path.to_str().unwrap()).unwrap()
+    );
+    let output = Command::new("node")
+        .args(["--input-type=module", "--eval", &probe])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn reification_native_callable_adapters_do_not_retain_discarded_conversions() {
+    let artifact = compiled(
+        r#"
+@private extern native: () -> {f: Nat -> Nat} = "() => ({f: (globalThis.savedHostFunction ??= (n => n))})"
+let fetch: () -> {f: Nat -> Nat} = fn _ => native ()
+"#,
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("adapters.mjs");
+    fs::write(&path, js::generate(&artifact).unwrap()).unwrap();
+    let probe = format!(
+        r#"import assert from 'node:assert/strict';
+import * as app from {};
+const references = [];
+for (let i = 0; i < 1000; i++) {{
+  const f = app.fetch().f;
+  assert.equal(f(i), i);
+  references.push(new WeakRef(f));
+}}
+// WeakRef targets survive their creation job. Collect in later jobs, while
+// keeping the source host function alive throughout the probe.
+for (let i = 0; i < 5; i++) {{
+  await new Promise(resolve => setImmediate(resolve));
+  global.gc();
+}}
+assert.equal(globalThis.savedHostFunction(12), 12);
+assert.ok(references.filter(ref => ref.deref() === undefined).length > 900,
+  'discarded native conversions must be collectible while their host function lives');
+assert.equal(app.fetch().f(17), 17);
+"#,
+        serde_json::to_string(path.to_str().unwrap()).unwrap()
+    );
+    let output = Command::new("node")
+        .args(["--expose-gc", "--input-type=module", "--eval", &probe])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn reification_callback_adapters_project_row_remainders_and_function_results() {
+    execute_reification(
+        r#"
+type Option 'a = #Some 'a | #None
+@private extern box: 'a -> Any = "$anyUpcast"
+@private extern downcast: Any -> Option 'a = "$anyDowncast"
+@private let apply = fn call value => call value
+@private let row: {head: Nat, ..'a} -> Any = fn record => box record
+@private let invoke: (() -> 'a) -> Any = fn call => box (call ())
+@private let consume_row = apply row
+@private let consume_function = apply invoke
+@private let a: Option {head: Nat, extra: String} = downcast (consume_row {head: 48n, extra: "rest"})
+@private let b: Option Nat = downcast (consume_function (fn _ => 49n))
+let first = match a with | #Some {head, extra} => head | #None => 0n end
+let second = match b with | #Some n => n | #None => 0n end
+"#,
+        "assert.equal(app.first, 48); assert.equal(app.second, 49);",
     );
 }

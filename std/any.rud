@@ -1,0 +1,2 @@
+extern upcast: 'a -> Any = "$anyUpcast"
+extern downcast: Any -> Option 'a = "$anyDowncast"

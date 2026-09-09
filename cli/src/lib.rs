@@ -1585,7 +1585,14 @@ pub fn compile_graph(directory: impl AsRef<Path>) -> Result<CompiledGraph, Compi
             .collect();
         ruddy::backend::js::check_exports(&root.artifact, &dependencies, build.platform.backend())
             .map_err(|error| {
-                CompileError::report("unsupported-export-effects", error.to_string())
+                CompileError::report(
+                    if matches!(error, ruddy::backend::js::Error::ExportType { .. }) {
+                        "unsupported-export-type"
+                    } else {
+                        "unsupported-export-effects"
+                    },
+                    error.to_string(),
+                )
             })?;
     }
     if let Some(resolver) = &compiler.resolver {

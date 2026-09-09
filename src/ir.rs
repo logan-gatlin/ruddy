@@ -1238,7 +1238,9 @@ fn declaration_variances(
                             | Ty::Fixed(_)
                             | Ty::Real
                             | Ty::String
-                            | Ty::Boolean => {}
+                            | Ty::Boolean
+                            | Ty::Any
+                            | Ty::ForeignValue => {}
                         }
                     }
                     Semantic::Row(row, positive) => {
@@ -1418,6 +1420,9 @@ pub struct Error {
 
 #[derive(Debug, Clone)]
 pub enum ErrorKind {
+    RuntimeTypeInformation {
+        message: String,
+    },
     /// Invalid or inapplicable foreign completion metadata.
     ForeignProtocol {
         message: String,
@@ -1426,8 +1431,7 @@ pub enum ErrorKind {
     ExecutableDependency {
         name: String,
     },
-    /// Arrays have a private persistent representation and cannot cross a
-    /// user-authored host boundary in this release.
+    /// A reserved array runtime intrinsic has an incompatible signature.
     ArrayInExtern,
     /// A dependency alias cannot be written as a source path component.
     InvalidDependencyAlias {
@@ -3274,8 +3278,17 @@ pub fn build_with_interfaces(
                     &annotation.ty,
                     &program.types,
                 );
-                if !runtime_array_primitive
-                    && type_contains_array(&annotation.ty, &program.types, &program.external_types)
+                if matches!(
+                    target.tracked.as_str(),
+                    "$arrayLen"
+                        | "$arrayGet"
+                        | "$arraySet"
+                        | "$arrayPush"
+                        | "$arrayConcat"
+                        | "$arraySlice"
+                        | "$arrayPrepend"
+                        | "$arrayPop"
+                ) && !runtime_array_primitive
                 {
                     b.error_at(annotation.ty.at, ErrorKind::ArrayInExtern);
                 }
@@ -3691,128 +3704,6 @@ fn array_intrinsic_signature(
     }
 }
 
-fn type_contains_array(
-    root: &Type,
-    declarations: &IndexMap<Symbol, Decl<Type>>,
-    external: &IndexMap<Symbol, ExternalType>,
-) -> bool {
-    enum Work<'a> {
-        Ir(&'a Type),
-        Semantic(Arc<Ty>),
-        SemanticRow(Arc<crate::types::Row>),
-    }
-
-    fn push_alias<'a>(
-        symbol: Symbol,
-        declarations: &'a IndexMap<Symbol, Decl<Type>>,
-        external: &IndexMap<Symbol, ExternalType>,
-        expanded: &mut HashSet<Symbol>,
-        work: &mut Vec<Work<'a>>,
-    ) {
-        if !expanded.insert(symbol) {
-            return;
-        }
-        if let Some(declaration) = declarations.get(&symbol) {
-            work.push(Work::Ir(&declaration.value));
-        } else if let Some(declaration) = external.get(&symbol) {
-            work.push(Work::Semantic(declaration.scheme.body().clone()));
-        }
-    }
-
-    let mut work = vec![Work::Ir(root)];
-    let mut expanded = HashSet::new();
-    let mut expanded_rows = HashSet::new();
-    // Rows cloned out of by-value semantic constructors need to stay alive:
-    // otherwise the allocator may reuse an address and make the cycle guard
-    // mistake a later sibling for a row it has already visited.
-    let mut visited_rows = Vec::new();
-    while let Some(part) = work.pop() {
-        match part {
-            Work::Ir(ty) => match &ty.anchored {
-                TypeKind::Mut(region, element) => {
-                    work.push(Work::Ir(region));
-                    work.push(Work::Ir(element));
-                }
-                TypeKind::Array(_) => return true,
-                TypeKind::Arrow { from, to, .. } => {
-                    work.push(Work::Ir(to));
-                    work.push(Work::Ir(from));
-                }
-                TypeKind::Apply { head, args, .. } => {
-                    work.extend(args.iter().map(Work::Ir));
-                    push_alias(*head, declarations, external, &mut expanded, &mut work);
-                }
-                TypeKind::Ident(symbol) => {
-                    push_alias(*symbol, declarations, external, &mut expanded, &mut work);
-                }
-                TypeKind::Struct { fields, .. } => {
-                    work.extend(fields.values().filter_map(|field| match field {
-                        TypeField::Written { value, .. } => Some(Work::Ir(value)),
-                        TypeField::Absent { .. } => None,
-                    }));
-                }
-                TypeKind::Sum { cases, .. } => {
-                    work.extend(cases.values().filter_map(|case| match case {
-                        SumCase::Written { payload, .. } => payload.as_ref().map(Work::Ir),
-                        SumCase::Absent { .. } => None,
-                    }));
-                }
-                TypeKind::Param { .. }
-                | TypeKind::Prim(_)
-                | TypeKind::Effects(_)
-                | TypeKind::Var(_)
-                | TypeKind::Hole
-                | TypeKind::Error => {}
-            },
-            Work::Semantic(ty) => match &*ty {
-                Ty::Mut(region, element) => {
-                    work.push(Work::Semantic(region.clone()));
-                    work.push(Work::Semantic(element.clone()));
-                }
-                Ty::Array(_) => return true,
-                Ty::Arrow(from, to, effects) => {
-                    work.push(Work::SemanticRow(Arc::new(effects.clone())));
-                    work.push(Work::Semantic(to.clone()));
-                    work.push(Work::Semantic(from.clone()));
-                }
-                Ty::Package(body) => work.push(Work::Semantic(body.clone())),
-                Ty::Struct(row) | Ty::Sum(row) => {
-                    work.push(Work::SemanticRow(Arc::new(row.clone())))
-                }
-                Ty::Named { symbol, args, .. } => {
-                    work.extend(args.iter().cloned().map(Work::Semantic));
-                    push_alias(*symbol, declarations, external, &mut expanded, &mut work);
-                }
-                Ty::Nat
-                | Ty::Int
-                | Ty::Fixed(_)
-                | Ty::Real
-                | Ty::String
-                | Ty::Boolean
-                | Ty::Var(_)
-                | Ty::Bound(_)
-                | Ty::Rigid { .. }
-                | Ty::Undecided => {}
-            },
-            Work::SemanticRow(row) => {
-                if !expanded_rows.insert(Arc::as_ptr(&row) as usize) {
-                    continue;
-                }
-                visited_rows.push(row.clone());
-                work.extend(
-                    row.labels
-                        .values()
-                        .map(|field| Work::Semantic(field.ty.clone())),
-                );
-                if let Rest::More(more) = &row.rest {
-                    work.push(Work::SemanticRow(more.clone()));
-                }
-            }
-        }
-    }
-    false
-}
-
 fn dependency_path(dependency: &artifact::Header, qualified: &str) -> Option<Vec<String>> {
     let prefix = format!(
         "{}@{}::",
@@ -3891,6 +3782,8 @@ fn imported_syntax(
         artifact::Type::Real => TypeKind::Prim(Prim::Real),
         artifact::Type::String => TypeKind::Prim(Prim::String),
         artifact::Type::Boolean => TypeKind::Prim(Prim::Boolean),
+        artifact::Type::Any => TypeKind::Prim(Prim::Any),
+        artifact::Type::ForeignValue => TypeKind::Prim(Prim::ForeignValue),
         artifact::Type::Bound(index) => match params.get(*index as usize) {
             Some(symbol) => TypeKind::Param {
                 symbol: *symbol,
@@ -4133,6 +4026,14 @@ fn import_scheme(
         .filter(|index| *index < presences)
         .collect();
     Scheme::existential(count, presences, existentials, body, formula)
+        .with_representations(scheme.representations.clone())
+        .with_callable(
+            scheme
+                .callable
+                .as_ref()
+                .filter(|callable| callable.validate(count, presences).is_ok())
+                .cloned(),
+        )
 }
 
 /// Replace bound positions a malformed imported interface did not declare with
@@ -4174,6 +4075,8 @@ fn clamp_bounds(ty: Arc<Ty>, count: usize, presences: usize) -> Arc<Ty> {
                 Ty::Real => types.push(Arc::new(Ty::Real)),
                 Ty::String => types.push(Arc::new(Ty::String)),
                 Ty::Boolean => types.push(Arc::new(Ty::Boolean)),
+                Ty::Any => types.push(Arc::new(Ty::Any)),
+                Ty::ForeignValue => types.push(Arc::new(Ty::ForeignValue)),
                 Ty::Bound(index) if (*index as usize) < count && (*index as usize) >= presences => {
                     types.push(Arc::new(Ty::Bound(*index)))
                 }
@@ -4370,6 +4273,8 @@ fn drop_type_iterative(root: Arc<Ty>) {
                     | Ty::Real
                     | Ty::String
                     | Ty::Boolean
+                    | Ty::Any
+                    | Ty::ForeignValue
                     | Ty::Var(_)
                     | Ty::Bound(_)
                     | Ty::Rigid { .. }
@@ -4540,6 +4445,8 @@ fn import_type(
                 artifact::Type::Real => types.push(Arc::new(Ty::Real)),
                 artifact::Type::String => types.push(Arc::new(Ty::String)),
                 artifact::Type::Boolean => types.push(Arc::new(Ty::Boolean)),
+                artifact::Type::Any => types.push(Arc::new(Ty::Any)),
+                artifact::Type::ForeignValue => types.push(Arc::new(Ty::ForeignValue)),
                 artifact::Type::Bound(index) => types.push(Arc::new(Ty::Bound(*index))),
                 artifact::Type::Var(_)
                 | artifact::Type::Rigid { .. }
@@ -5106,6 +5013,98 @@ struct RegularType<'a> {
     /// and re-encoding an isomorphic argument graph on every turn.
     interned: HashMap<(String, Vec<(String, usize)>), usize>,
     named: HashMap<(Symbol, Vec<usize>, bool), usize>,
+    retain_packages: bool,
+}
+
+enum SemanticRoot<'a> {
+    Named(Symbol, Vec<usize>),
+    Type(&'a Ty, Vec<usize>),
+}
+
+/// The finite structural graph used by runtime representation planning. Share
+/// alias argument interning and constructor-growth detection with operation
+/// identity processing, while retaining packages for the stricter runtime
+/// identity policy to inspect.
+pub(crate) type RepresentationGraph = Vec<(String, Vec<(String, usize)>)>;
+
+pub(crate) fn representation_graph(
+    ty: &Arc<Ty>,
+    aliases: &IndexMap<Symbol, Scheme>,
+) -> (usize, RepresentationGraph) {
+    let external_types = aliases
+        .iter()
+        .map(|(symbol, scheme)| {
+            (
+                *symbol,
+                ExternalType {
+                    params: Vec::new(),
+                    relevant: Vec::new(),
+                    scheme: scheme.clone(),
+                    unresolved: None,
+                },
+            )
+        })
+        .collect();
+    let mut arena = CanonicalArena::default();
+    let mut graph = RegularType {
+        types: &IndexMap::new(),
+        external_types: &external_types,
+        effect_interfaces: &HashMap::new(),
+        arena: &mut arena,
+        created: Vec::new(),
+        interned: HashMap::new(),
+        named: HashMap::new(),
+        retain_packages: true,
+    };
+    let root = graph.semantic_work(
+        SemanticRoot::Type(ty, Vec::new()),
+        &mut CanonicalPresenceScope::default(),
+    );
+    let root = graph.finish(root);
+    (
+        root,
+        arena
+            .nodes
+            .into_iter()
+            .map(|node| {
+                (
+                    match node.label {
+                        RegularLabel::Ordinary(label) => label,
+                        _ => "?".into(),
+                    },
+                    node.edges,
+                )
+            })
+            .collect(),
+    )
+}
+
+/// Structural memo identity for following solved instantiations. A malformed
+/// growing recursive application has no finite runtime contract to substitute.
+pub(crate) fn representation_key(
+    ty: &Arc<Ty>,
+    aliases: &IndexMap<Symbol, Scheme>,
+) -> Option<String> {
+    let (root, graph) = representation_graph(ty, aliases);
+    let mut seen = HashSet::new();
+    let mut work = vec![root];
+    while let Some(at) = work.pop() {
+        if !seen.insert(at) {
+            continue;
+        }
+        if graph[at].0 == "growing-runtime-type" {
+            return None;
+        }
+        work.extend(graph[at].1.iter().map(|(_, child)| *child));
+    }
+    let nodes = graph
+        .into_iter()
+        .map(|(label, edges)| RegularNode {
+            label: RegularLabel::Ordinary(label),
+            edges,
+        })
+        .collect::<Vec<_>>();
+    Some(encode_regular_graph(&nodes, root))
 }
 
 impl RegularType<'_> {
@@ -5391,7 +5390,8 @@ impl RegularType<'_> {
                     } else {
                         // Imported semantic trees have their own iterative
                         // continuation walk and share this graph's named memo.
-                        let id = self.semantic_work(symbol, args, presence_scope);
+                        let id =
+                            self.semantic_work(SemanticRoot::Named(symbol, args), presence_scope);
                         values.push(id);
                     }
                 }
@@ -5452,8 +5452,7 @@ impl RegularType<'_> {
     /// embedding rejects only an active constructor-growing application.
     fn semantic_work(
         &mut self,
-        symbol: Symbol,
-        args: Vec<usize>,
+        root: SemanticRoot<'_>,
         presence_scope: &mut CanonicalPresenceScope,
     ) -> usize {
         use crate::types::{Presence, Rest};
@@ -5463,7 +5462,7 @@ impl RegularType<'_> {
             Row(&'a crate::types::Row, Vec<usize>, bool, bool, usize),
             Named(Symbol, Vec<usize>, bool),
             Apply(Symbol, usize, bool),
-            FinishNamed(usize, Symbol),
+            FinishNamed(usize, Symbol, usize, usize),
             Make(String, Vec<String>),
             EffectCase(String, usize),
             Canonical(usize),
@@ -5471,7 +5470,10 @@ impl RegularType<'_> {
             Argument(Vec<usize>, u32),
         }
 
-        let mut work = vec![Work::Named(symbol, args, false)];
+        let mut work = vec![match root {
+            SemanticRoot::Named(symbol, args) => Work::Named(symbol, args, false),
+            SemanticRoot::Type(ty, args) => Work::Type(ty, args, false, usize::MAX),
+        }];
         let mut values = Vec::new();
         let mut active_instantiations: HashMap<Symbol, Vec<Vec<usize>>> = HashMap::new();
         // A placeholder only has to survive when an in-progress recursive edge
@@ -5479,6 +5481,12 @@ impl RegularType<'_> {
         // their body's interned node directly, so a fresh `Id a = a`
         // placeholder does not make `Loop (Id a)` a new instantiation forever.
         let mut referenced_placeholders = HashSet::new();
+        // Runtime type graphs reuse completed acyclic aliases only when their
+        // expansion allocated no presence identities. Aliases with fresh
+        // presences, or back edges into unfinished scopes, keep their existing
+        // per-instantiation namespaces.
+        let mut completed_named = HashMap::new();
+        let mut back_edges = 0usize;
 
         while let Some(part) = work.pop() {
             match part {
@@ -5515,9 +5523,17 @@ impl RegularType<'_> {
                     Ty::Real => values.push(self.atom("Real")),
                     Ty::String => values.push(self.atom("String")),
                     Ty::Boolean => values.push(self.atom("Boolean")),
+                    Ty::Any => values.push(self.atom("Any")),
+                    Ty::ForeignValue => values.push(self.atom("ForeignValue")),
+                    Ty::Bound(index) if instantiation == usize::MAX => {
+                        values.push(self.atom(format!("param:{index}")))
+                    }
                     Ty::Bound(index) => values.push(self.argument(&args, *index)),
                     Ty::Var(_) | Ty::Rigid { .. } | Ty::Undecided => values.push(self.atom("?")),
                     Ty::Package(body) => {
+                        if self.retain_packages {
+                            work.push(Work::Make("package".into(), vec!["body".into()]));
+                        }
                         work.push(Work::Type(body, args, supplied_as_effects, instantiation));
                     }
                     Ty::Mut(region, element) => {
@@ -5585,7 +5601,12 @@ impl RegularType<'_> {
                 }
                 Work::Named(symbol, args, supplied_as_effects) => {
                     let key = (symbol, args.clone(), supplied_as_effects);
+                    if let Some(id) = completed_named.get(&key) {
+                        values.push(*id);
+                        continue;
+                    }
                     if let Some(id) = self.named.get(&key) {
+                        back_edges += 1;
                         referenced_placeholders.insert(*id);
                         values.push(*id);
                         continue;
@@ -5595,7 +5616,11 @@ impl RegularType<'_> {
                             .iter()
                             .any(|ancestor| Self::grows(&self.arena.nodes, ancestor, &args))
                     }) {
-                        values.push(self.atom("?"));
+                        values.push(self.atom(if self.retain_packages {
+                            "growing-runtime-type"
+                        } else {
+                            "?"
+                        }));
                         continue;
                     }
                     active_instantiations
@@ -5606,7 +5631,11 @@ impl RegularType<'_> {
                     self.named.insert(key, id);
                     // Import installs a real or qualified recovery declaration
                     // for every type symbol reachable from an artifact.
-                    let decl = &self.external_types[&symbol];
+                    let Some(decl) = self.external_types.get(&symbol) else {
+                        values.push(self.atom("?"));
+                        active_instantiations.get_mut(&symbol).unwrap().pop();
+                        continue;
+                    };
                     if let Some(name) = &decl.unresolved {
                         let edges = args
                             .iter()
@@ -5622,7 +5651,12 @@ impl RegularType<'_> {
                             .pop();
                         values.push(id);
                     } else {
-                        work.push(Work::FinishNamed(id, symbol));
+                        work.push(Work::FinishNamed(
+                            id,
+                            symbol,
+                            presence_scope.next_alpha,
+                            back_edges,
+                        ));
                         let instantiation = presence_scope.instantiation();
                         work.push(Work::Type(
                             decl.scheme.body(),
@@ -5632,7 +5666,7 @@ impl RegularType<'_> {
                         ));
                     }
                 }
-                Work::FinishNamed(id, symbol) => {
+                Work::FinishNamed(id, symbol, presences, back_edges_before) => {
                     let body = values.pop().expect("named body postorder is balanced");
                     let completed: Vec<_> = self
                         .named
@@ -5654,6 +5688,12 @@ impl RegularType<'_> {
                     };
                     for key in completed {
                         self.named.remove(&key);
+                        if self.retain_packages
+                            && presence_scope.next_alpha == presences
+                            && back_edges == back_edges_before
+                        {
+                            completed_named.insert(key, result);
+                        }
                     }
                     active_instantiations
                         .get_mut(&symbol)
@@ -5701,7 +5741,11 @@ impl RegularType<'_> {
                             work.push(Work::Atom(if fields { "Unit" } else { "closed" }.into()))
                         }
                         Rest::Bound(index) => {
-                            work.push(Work::Argument(args.clone(), *index));
+                            work.push(if instantiation == usize::MAX {
+                                Work::Atom(format!("param:{index}"))
+                            } else {
+                                Work::Argument(args.clone(), *index)
+                            });
                         }
                         Rest::Var(_) | Rest::Rigid { .. } | Rest::Undecided => {
                             work.push(Work::Atom("?".into()))
@@ -6258,6 +6302,7 @@ impl<'a> EffectCanonicalizer<'a> {
                         created: Vec::new(),
                         interned: HashMap::new(),
                         named: HashMap::new(),
+                        retain_packages: false,
                     };
                     let params = graph.parameters(count);
                     let root = graph.source(
@@ -6876,6 +6921,8 @@ impl<'a> Follow<'a> {
                     | Ty::Real
                     | Ty::String
                     | Ty::Boolean
+                    | Ty::Any
+                    | Ty::ForeignValue
                     | Ty::Arrow(..)
                     | Ty::Mut(..)
                     | Ty::Array(_)
@@ -8924,6 +8971,8 @@ fn row_summaries(
                     | Ty::Real
                     | Ty::String
                     | Ty::Boolean
+                    | Ty::Any
+                    | Ty::ForeignValue
                     | Ty::Arrow(..)
                     | Ty::Mut(..)
                     | Ty::Array(_)

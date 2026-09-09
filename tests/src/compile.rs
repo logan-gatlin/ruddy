@@ -1085,3 +1085,425 @@ fn mutation_region_kinds_forward_from_imported_effects() {
         .unwrap();
     assert_eq!(copy.params[0].sense, ruddy::artifact::Sense::Region);
 }
+
+#[test]
+fn reification_callable_interfaces_separate_initialization_and_curried_demands() {
+    use ruddy::reification::conventions::Shape;
+    let source = r#"
+extern box: 'a -> Any = "$anyUpcast"
+let pair = fn first => fn second => (box first, box second)
+let partial = pair 1n
+let erased = fn value => value
+let apply = fn callback => fn value => callback value
+let dynamic = apply box
+let pure = apply (fn value => value)
+let token = box 1n
+let select: ('a -> Any) -> ('a -> Any) -> ('a -> Any) = fn first => fn second => second
+let use_selector: (('a -> Any) -> ('a -> Any) -> ('a -> Any)) -> ('a -> Any) =
+  fn selector => selector box (fn _ => token)
+let selected = use_selector select
+let first: 'a -> 'a -> 'a = fn left => fn right => left
+let retained = first (fn _ => token) box
+"#;
+    let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
+    let accepted = compile::compile(
+        Mint::new(Bundle::new("tests", Version::new(0, 1, 0)).unwrap()),
+        parsed.stmts,
+        inference::Trace::Off,
+    )
+    .unwrap_or_else(|failed| panic!("{:?}", failed.errors));
+    let plan = &accepted.reification().callables;
+    let requirements = plan.graph.solve();
+    let binding = |name| {
+        plan.bindings
+            .iter()
+            .find(|(symbol, _)| accepted.mint().name(**symbol) == name)
+            .map(|(symbol, binding)| (*symbol, binding))
+            .unwrap()
+    };
+    let (_, pair) = binding("pair");
+    let Shape::Arrow {
+        needs: first,
+        result,
+        ..
+    } = plan.graph.exposed(pair.value)
+    else {
+        panic!("pair function")
+    };
+    let Shape::Arrow { needs: second, .. } = plan.graph.exposed(*result) else {
+        panic!("curried result")
+    };
+    assert_eq!(requirements[*first as usize].len(), 1);
+    assert_eq!(requirements[*second as usize].len(), 1);
+    assert_ne!(
+        requirements[*first as usize],
+        requirements[*second as usize]
+    );
+    for name in ["erased", "apply"] {
+        let (_, binding) = binding(name);
+        let Shape::Arrow { needs, .. } = plan.graph.exposed(binding.value) else {
+            panic!("function")
+        };
+        assert!(
+            requirements[*needs as usize].is_empty(),
+            "{name} needs no evidence on its first invocation"
+        );
+    }
+    let (_, apply) = binding("apply");
+    let Shape::Arrow { result, .. } = plan.graph.exposed(apply.value) else {
+        unreachable!()
+    };
+    let Shape::Arrow { needs, .. } = plan.graph.exposed(*result) else {
+        unreachable!()
+    };
+    assert!(
+        requirements[*needs as usize]
+            .iter()
+            .all(|need| need.port.is_some())
+    );
+    assert!(
+        !requirements[*needs as usize].is_empty(),
+        "higher-order call needs remain quantified"
+    );
+    for (name, demanded) in [
+        ("dynamic", true),
+        ("pure", false),
+        ("selected", false),
+        ("retained", false),
+    ] {
+        let (symbol, binding) = binding(name);
+        let Shape::Arrow { needs, .. } = plan.graph.exposed(binding.value) else {
+            panic!("returned function")
+        };
+        assert_eq!(
+            !requirements[*needs as usize].is_empty(),
+            demanded,
+            "{name}: {:?}",
+            requirements[*needs as usize]
+        );
+        let initializer = &accepted.semantics().typed()[&symbol].value;
+        assert!(requirements[plan.occurrences[&initializer.at].evaluation as usize].is_empty());
+    }
+    let (symbol, partial) = binding("partial");
+    let initializer = &accepted.semantics().typed()[&symbol].value;
+    let flow = plan.occurrences[&initializer.at];
+    assert!(
+        requirements[flow.evaluation as usize].is_empty(),
+        "constructing a partial application does not require its future argument's type"
+    );
+    let Shape::Arrow { needs, .. } = plan.graph.exposed(partial.value) else {
+        panic!("partial function")
+    };
+    assert_eq!(requirements[*needs as usize].len(), 1);
+}
+
+#[test]
+fn reification_callable_interfaces_solve_polymorphic_recursive_groups() {
+    use ruddy::reification::conventions::Shape;
+    let source = r#"
+extern box: 'a -> Any = "$anyUpcast"
+let left: 'a -> Any = fn value => right [value]
+let right: 'a -> Any = fn value => match true with
+  | true => box value
+  | false => left [value]
+end
+"#;
+    let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
+    let accepted = compile::compile(
+        Mint::new(Bundle::new("tests", Version::new(0, 1, 0)).unwrap()),
+        parsed.stmts,
+        inference::Trace::Off,
+    )
+    .unwrap_or_else(|failed| panic!("{:?}", failed.errors));
+    let plan = &accepted.reification().callables;
+    let requirements = plan.graph.solve();
+    for name in ["left", "right"] {
+        let (_, binding) = plan
+            .bindings
+            .iter()
+            .find(|(symbol, _)| accepted.mint().name(**symbol) == name)
+            .unwrap();
+        let Shape::Arrow {
+            argument, needs, ..
+        } = plan.graph.exposed(binding.value)
+        else {
+            panic!("recursive function")
+        };
+        assert!(
+            matches!(
+                plan.graph.exposed(*argument),
+                Shape::Parameter(_) | Shape::Sealed
+            ),
+            "{name}: recursive instantiation must not change the declared argument shape"
+        );
+        assert_eq!(
+            requirements[*needs as usize].len(),
+            1,
+            "{name}: recursive evidence reaches every member"
+        );
+        assert!(
+            requirements[*needs as usize]
+                .iter()
+                .all(|need| need.port.is_none()),
+            "{name}: known boxing needs are mandatory"
+        );
+    }
+}
+
+#[test]
+fn reification_callable_interfaces_defer_native_returned_functions() {
+    use ruddy::reification::conventions::Shape;
+    let source = r#"
+extern make: () -> ('a -> 'a) = "() => value => value"
+extern nested: () -> { functions: ['a -> 'a] } = "() => ({ functions: [value => value] })"
+let direct = make ()
+let indirect = nested ()
+"#;
+    let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
+    let accepted = compile::compile(
+        Mint::new(Bundle::new("tests", Version::new(0, 1, 0)).unwrap()),
+        parsed.stmts,
+        inference::Trace::Off,
+    )
+    .unwrap_or_else(|failed| panic!("{:?}", failed.errors));
+    let plan = &accepted.reification().callables;
+    let requirements = plan.graph.solve();
+    for name in ["make", "nested"] {
+        let (_, binding) = plan
+            .bindings
+            .iter()
+            .find(|(symbol, _)| accepted.mint().name(**symbol) == name)
+            .unwrap();
+        let Shape::Arrow { needs, .. } = plan.graph.exposed(binding.value) else {
+            panic!("foreign function")
+        };
+        assert!(
+            requirements[*needs as usize].is_empty(),
+            "{name}: obtaining a function does not call it"
+        );
+    }
+    for name in ["direct", "indirect"] {
+        let (symbol, binding) = plan
+            .bindings
+            .iter()
+            .find(|(symbol, _)| accepted.mint().name(**symbol) == name)
+            .unwrap();
+        let initializer = &accepted.semantics().typed()[symbol].value;
+        assert!(
+            requirements[plan.occurrences[&initializer.at].evaluation as usize].is_empty(),
+            "{name}: initialization needs no future argument descriptor"
+        );
+        let value = if name == "indirect" {
+            let Shape::Record(fields) = plan.graph.exposed(binding.value) else {
+                panic!("returned record")
+            };
+            let Shape::Array(element) = plan.graph.exposed(fields["functions"]) else {
+                panic!("returned array")
+            };
+            *element
+        } else {
+            binding.value
+        };
+        let Shape::Arrow { needs, .. } = plan.graph.exposed(value) else {
+            panic!("returned function")
+        };
+        assert_eq!(
+            requirements[*needs as usize].len(),
+            1,
+            "{name}: native invocation converts its argument and result"
+        );
+        assert!(
+            requirements[*needs as usize]
+                .iter()
+                .all(|need| need.port.is_none())
+        );
+    }
+}
+
+#[test]
+fn reification_callable_interfaces_follow_array_values_and_evaluation() {
+    use ruddy::reification::conventions::Shape;
+    let source = r#"
+extern box: 'a -> Any = "$anyUpcast"
+let array_box = fn value => [box value]
+let through_spread = fn value => [..array_box value]
+let return_rest = fn callbacks => match callbacks with
+  | [_, ..rest] => rest
+  | [] => callbacks
+end
+let retained = return_rest [fn value => box value, box]
+"#;
+    let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
+    let accepted = compile::compile(
+        Mint::new(Bundle::new("tests", Version::new(0, 1, 0)).unwrap()),
+        parsed.stmts,
+        inference::Trace::Off,
+    )
+    .unwrap_or_else(|failed| panic!("{:?}", failed.errors));
+    let plan = &accepted.reification().callables;
+    let requirements = plan.graph.solve();
+    for name in ["array_box", "through_spread"] {
+        let (_, binding) = plan
+            .bindings
+            .iter()
+            .find(|(symbol, _)| accepted.mint().name(**symbol) == name)
+            .unwrap();
+        let Shape::Arrow { needs, .. } = plan.graph.exposed(binding.value) else {
+            panic!("function")
+        };
+        assert_eq!(
+            requirements[*needs as usize].len(),
+            1,
+            "{name}: array construction executes its elements and spreads"
+        );
+    }
+    let (_, binding) = plan
+        .bindings
+        .iter()
+        .find(|(symbol, _)| accepted.mint().name(**symbol) == "retained")
+        .unwrap();
+    let Shape::Array(element) = plan.graph.exposed(binding.value) else {
+        panic!("array result")
+    };
+    let Shape::Arrow { needs, .. } = plan.graph.exposed(*element) else {
+        panic!("callable elements")
+    };
+    assert_eq!(
+        requirements[*needs as usize].len(),
+        1,
+        "rest patterns preserve callable elements"
+    );
+    assert!(
+        requirements[*needs as usize]
+            .iter()
+            .all(|need| need.port.is_none())
+    );
+}
+
+#[test]
+fn reification_callable_interfaces_survive_separate_compilation() {
+    use ruddy::reification::conventions::Shape;
+    let producer = exported(
+        r#"
+extern box: 'a -> Any = "$anyUpcast"
+let apply = fn callback => fn value => callback value
+let identity = fn value => value
+"#,
+    );
+    let imported = accepted_with(
+        r#"
+let dynamic = dep::apply dep::box
+let erased = dep::apply (fn value => value)
+let forwarded = dep::identity dep::box
+"#,
+        &producer,
+    );
+    let plan = &imported.reification().callables;
+    let solved = plan.graph.solve();
+    for (name, demanded) in [("dynamic", true), ("erased", false), ("forwarded", true)] {
+        let (_, binding) = plan
+            .bindings
+            .iter()
+            .find(|(symbol, _)| imported.mint().name(**symbol) == name)
+            .unwrap();
+        let Shape::Arrow { needs, .. } = plan.graph.exposed(binding.value) else {
+            panic!("imported callable result")
+        };
+        assert_eq!(
+            !solved[*needs as usize].is_empty(),
+            demanded,
+            "{name}: imports preserve higher-order requirements and value forwarding"
+        );
+        assert!(
+            solved[*needs as usize]
+                .iter()
+                .all(|need| need.port.is_none())
+        );
+    }
+}
+
+#[test]
+fn reification_recursive_callable_interfaces_preserve_forwarded_profiles() {
+    use ruddy::reification::conventions::Shape;
+    let program = accepted(
+        r#"
+extern box: 'a -> Any = "$anyUpcast"
+let token = box 1n
+let left: ('a -> Any) -> ('a -> Any) = fn callback => right callback
+let right: ('a -> Any) -> ('a -> Any) = fn callback => match true with
+  | true => callback
+  | false => left callback
+end
+let erased = left (fn _ => token)
+let dynamic = left box
+"#,
+    );
+    let plan = &program.reification().callables;
+    let solved = plan.graph.solve();
+    for (name, demanded) in [("erased", false), ("dynamic", true)] {
+        let (_, binding) = plan
+            .bindings
+            .iter()
+            .find(|(symbol, _)| program.mint().name(**symbol) == name)
+            .unwrap();
+        let Shape::Arrow { needs, .. } = plan.graph.exposed(binding.value) else {
+            panic!("forwarded callback")
+        };
+        assert_eq!(
+            !solved[*needs as usize].is_empty(),
+            demanded,
+            "{name}: mutually recursive forwarding preserves the supplied profile"
+        );
+        assert!(
+            solved[*needs as usize]
+                .iter()
+                .all(|need| need.port.is_none())
+        );
+    }
+}
+
+#[test]
+fn reification_graphs_and_forwarding_use_bounded_stack_and_artifact_space() {
+    std::thread::Builder::new().name("runtime-type-graphs".into()).stack_size(256 * 1024)
+        .spawn(|| {
+            let mut source = String::from("@private extern box: 'a -> Any = \"$anyUpcast\"\nlet apply = fn call value => call value\nlet forward0 = apply box\n");
+            for at in 1..128 {
+                source.push_str(&format!("let forward{at} = fn value => forward{} value\n", at - 1));
+            }
+            source.push_str("type Recursive 'a = #End | #Next ('a, Recursive 'a)\nlet recursive: Recursive Nat = #Next (1n, #End)\nlet token = forward127 recursive\n");
+            let program = accepted(&source);
+            let artifact = program.artifact();
+            let printed = artifact.print();
+            assert!(printed.len() < 4_000_000, "finite forwarding must not expand source bodies");
+            assert!(ruddy::artifact::parse(&printed).validate().is_ok());
+        }).unwrap().join().expect("finite descriptor and callable graphs use bounded stack");
+}
+
+#[test]
+fn reification_shared_generic_aliases_do_not_expand_unused_callable_fields() {
+    let mut source = String::from("type N0 'a = 'a -> 'a\n");
+    for level in 1..=24 {
+        source.push_str(&format!(
+            "type N{level} 'a = {{left: N{} 'a, right: N{} 'a}}\n",
+            level - 1,
+            level - 1
+        ));
+    }
+    source.push_str("@private let ignore: N24 'a -> () = fn _ => ()\nlet result = ()\n");
+    source.push_str("let forward: N24 'a -> N24 'a = fn value => value\n");
+    source.push_str(&format!(
+        "let select: N24 'a -> ('a -> 'a) = fn value => value{}\n",
+        ".left".repeat(24)
+    ));
+    source.push_str("extern native: () -> N24 'a = \"() => ({})\"\n");
+    let program = accepted(&source);
+    assert!(
+        program.reification().callables.graph.shapes.len() < 1000,
+        "unused generic alias DAGs must not expand into callable trees"
+    );
+    assert!(
+        ruddy::artifact::parse(&program.artifact().print())
+            .validate()
+            .is_ok()
+    );
+}

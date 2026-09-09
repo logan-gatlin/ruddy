@@ -113,13 +113,8 @@ fn inference_error_kinds(span: Anchor) -> Vec<TypeError> {
             extern_name: "install".into(),
             issues: Vec::new(),
         },
-        TypeError::PolymorphicExternBoundary {
-            variable: "'a".into(),
-            variable_kind: ruddy::inference::ExternVariableKind::Type,
-            position: "extern parameter 1".into(),
-            extern_name: "run".into(),
-            leaves: Vec::new(),
-            callback_issues: Vec::new(),
+        TypeError::RuntimeTypeInformation {
+            message: "runtime type information is unavailable for this type".into(),
         },
     ]
 }
@@ -2191,8 +2186,8 @@ fn inference_source_corpus_matches_abridged_structured_goldens() {
             include_str!("../diagnostics/inference/callback-effects-not-covered.rud"),
         ),
         (
-            "polymorphic-extern-boundary",
-            include_str!("../diagnostics/inference/polymorphic-extern-boundary.rud"),
+            "runtime-type-information",
+            include_str!("../diagnostics/inference/runtime-type-information.rud"),
         ),
         (
             "repeated-calls",

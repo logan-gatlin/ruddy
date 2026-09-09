@@ -18,6 +18,7 @@ pub mod linked;
 pub mod lir;
 pub mod patterns;
 pub mod presence;
+pub mod reification;
 pub mod solve;
 pub mod symbols;
 pub mod tokens;
@@ -284,6 +285,15 @@ pub const REGISTRY: &[Spec] = &[
         scoped: true,
         annotates: None,
         build: Build::Panel(types::build),
+    },
+    Spec {
+        id: "reification",
+        title: "Runtime types",
+        view: View::Tree,
+        highlight: None,
+        scoped: false,
+        annotates: None,
+        build: Build::Panel(reification::build),
     },
     Spec {
         id: "presence",

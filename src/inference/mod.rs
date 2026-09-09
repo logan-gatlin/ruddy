@@ -146,6 +146,7 @@ pub type Operations = IndexMap<(Symbol, ir::OperationSelector), (Arc<Ty>, Arc<Ty
 /// it.
 #[derive(Debug, Clone)]
 pub struct Semantics {
+    reification: crate::reification::Analysis,
     pub(crate) aliases: IndexMap<Symbol, Scheme>,
     pub(crate) operations: Operations,
     /// Each effect alias's row over its own parameters, unexpanded, for the
@@ -217,6 +218,56 @@ pub struct DiagnosticView<'a> {
 }
 
 impl Output {
+    /// Publish inferred representation requirements before the accepted artifact
+    /// and its callers fix their evidence convention.
+    pub(crate) fn reify(&mut self, reification: &crate::reification::Analysis) {
+        let aliases = self.semantics.aliases.clone();
+        let requirements = reification.callables.graph.solve();
+        let semantics = &mut self.semantics;
+        for schemes in [
+            &mut semantics.schemes,
+            &mut semantics.externs,
+            &mut semantics.locals,
+        ] {
+            for (symbol, scheme) in schemes {
+                if let Some(binding) = reification.callables.bindings.get(symbol) {
+                    let substitution =
+                        crate::reification::instantiate(&binding.ty, scheme.body(), &aliases);
+                    let parameters = substitution
+                        .iter()
+                        .filter_map(|(index, ty)| {
+                            crate::reification::parameter_index(ty).map(|p| (*index, p))
+                        })
+                        .collect();
+                    let callable = crate::reification::interface::Interface::export(
+                        &reification.callables.graph,
+                        binding.value,
+                        &parameters,
+                        &requirements,
+                    );
+                    *scheme = scheme.clone().with_callable(Some(callable));
+                }
+                if let Some(binding) = reification.bindings.get(symbol) {
+                    let substitution =
+                        crate::reification::instantiate(&binding.ty, scheme.body(), &aliases);
+                    let parameters = binding
+                        .parameters
+                        .iter()
+                        .filter_map(|parameter| {
+                            substitution
+                                .get(parameter)
+                                .and_then(|ty| crate::reification::parameter_index(ty))
+                        })
+                        .collect();
+                    *scheme = scheme.clone().with_representations(parameters);
+                }
+            }
+        }
+        for (symbol, reviewed) in &mut semantics.reviewed_externs {
+            reviewed.scheme = semantics.externs[symbol].clone();
+        }
+    }
+
     /// The accepted semantic facts.
     pub fn semantics(&self) -> &Semantics {
         &self.semantics
@@ -263,6 +314,9 @@ impl Output {
 }
 
 impl Semantics {
+    pub fn reification(&self) -> &crate::reification::Analysis {
+        &self.reification
+    }
     /// What each `type` declaration stands for: the semantic type its body
     /// denotes, one step deep. A name inside a body stays a [`Ty::Named`] and
     /// is looked up here again, which is how a declaration that names itself
@@ -2418,6 +2472,8 @@ pub enum TypeDescription {
     RealNumber,
     Text,
     Boolean,
+    Any,
+    ForeignValue,
     Function,
     Struct,
     TaggedValue,
@@ -2472,14 +2528,23 @@ pub enum StructDemand {
 
 #[derive(Debug, Clone)]
 pub enum ErrorKind {
+    RuntimeTypeInformation {
+        message: String,
+    },
     /// A value whose outer type is known not to be a struct was asked for its
     /// fields — read one at a time, or spread all at once.
-    NotAStruct { base: Arc<Ty>, demand: StructDemand },
+    NotAStruct {
+        base: Arc<Ty>,
+        demand: StructDemand,
+    },
     /// Two types that had to be equal are not. `expected` is the side the
     /// context demanded — an annotation, a function's parameter, or the arrow
     /// shape a call site needs — and `actual` is what the term turned out to
     /// be.
-    Mismatch { expected: Arc<Ty>, actual: Arc<Ty> },
+    Mismatch {
+        expected: Arc<Ty>,
+        actual: Arc<Ty>,
+    },
     /// Two applications of one effect met and their arguments at one
     /// position could not be made equal: one computation would be using
     /// incompatible versions of the effect. The failure the arguments met
@@ -2633,7 +2698,9 @@ pub enum ErrorKind {
     /// it away. A clause with no model at all is
     /// [`ErrorKind::ClauseImpossible`] instead: blaming the definition for it
     /// would be blaming a body that may do nothing with the type whatever.
-    PresenceImpossible { formula: String },
+    PresenceImpossible {
+        formula: String,
+    },
     /// An annotation whose `where` clause nothing can satisfy on its own
     /// terms — `where a and not a`, which forbids every value at once.
     ///
@@ -2642,7 +2709,9 @@ pub enum ErrorKind {
     /// definition is what leaves it without a model; here nothing outside the
     /// clause is involved, and a complaint that mentioned the definition would
     /// be asserting something untrue of it.
-    ClauseImpossible { formula: String },
+    ClauseImpossible {
+        formula: String,
+    },
     /// An annotation whose `where` clause allows more than the definition
     /// under it does — `where a or b` over a body that needs `a`.
     ///
@@ -2651,7 +2720,10 @@ pub enum ErrorKind {
     /// definition cannot serve. Refused at the annotation, which is the line
     /// the reader has to change: both formulas are carried so the complaint can
     /// show what was promised beside what is needed.
-    AnnotationAllows { allowed: String, required: String },
+    AnnotationAllows {
+        allowed: String,
+        required: String,
+    },
     /// An effect performed where nothing could ever handle it: a definition's
     /// value is computed outside every handler, so an effect performed there
     /// has no one to answer it.
@@ -2659,12 +2731,16 @@ pub enum ErrorKind {
     /// [`ErrorKind::NotAllowed`]'s other reading, and the two are split because
     /// they send the reader to different places: here there is no function to
     /// widen and the fix is to wrap the value in one, or in a handler.
-    Unhandled { effect: String },
+    Unhandled {
+        effect: String,
+    },
     /// An effect performed inside a function whose own row does not allow it.
     ///
     /// The ordinary refusal, and the reason an effect row is worth having: the
     /// function says what calling it may do, and this would do more.
-    NotAllowed { effect: String },
+    NotAllowed {
+        effect: String,
+    },
     /// A foreign callback requires evidence the containing host call cannot carry.
     CallbackEffectsNotCovered {
         missing_effects: Vec<String>,
@@ -3998,6 +4074,8 @@ fn describe_type(ty: &Arc<Ty>) -> TypeDescription {
         Ty::Real => TypeDescription::RealNumber,
         Ty::String => TypeDescription::Text,
         Ty::Boolean => TypeDescription::Boolean,
+        Ty::Any => TypeDescription::Any,
+        Ty::ForeignValue => TypeDescription::ForeignValue,
         Ty::Arrow(..) => TypeDescription::Function,
         Ty::Struct(..) => TypeDescription::Struct,
         Ty::Sum(..) => TypeDescription::TaggedValue,
@@ -4108,6 +4186,8 @@ impl MismatchFingerprints {
                         Ty::Real => values.push(tagged(2, [])),
                         Ty::String => values.push(tagged(3, [])),
                         Ty::Boolean => values.push(tagged(4, [])),
+                        Ty::Any => values.push(tagged(50, [])),
+                        Ty::ForeignValue => values.push(tagged(51, [])),
                         Ty::Var(id) => values.push(tagged(5, [u64::from(*id)])),
                         Ty::Bound(id) => values.push(tagged(6, [u64::from(*id)])),
                         Ty::Rigid { id, .. } => values.push(tagged(7, [u64::from(*id)])),
@@ -4554,6 +4634,8 @@ fn smallest_incompatible_counted_with_mask(
             | (Ty::Real, Ty::Real)
             | (Ty::String, Ty::String)
             | (Ty::Boolean, Ty::Boolean)
+            | (Ty::Any, Ty::Any)
+            | (Ty::ForeignValue, Ty::ForeignValue)
             | (Ty::Bound(_), Ty::Bound(_))
             | (Ty::Var(_), Ty::Var(_))
             | (Ty::Rigid { .. }, Ty::Rigid { .. })
@@ -5970,6 +6052,8 @@ impl Fingerprint {
         for existential in scheme.existentials() {
             self.word(*existential as u64);
         }
+        self.debug(&scheme.representations());
+        self.debug(&scheme.callable());
         self.ty(scheme.body());
         self.formula(scheme.formula());
     }
@@ -5991,6 +6075,8 @@ impl Fingerprint {
                     Ty::Real => self.word(0x03),
                     Ty::String => self.word(0x04),
                     Ty::Boolean => self.word(0x05),
+                    Ty::Any => self.word(0x30),
+                    Ty::ForeignValue => self.word(0x31),
                     Ty::Arrow(from, to, effects) => {
                         self.word(0x06);
                         work.push(to);
@@ -6307,9 +6393,15 @@ fn declarations(mint: &Mint, program: &Program) -> (Arc<Signatures>, GroupResult
         // four exact intrinsic signatures, so the element variable is safely
         // representation-polymorphic here regardless of the declaring
         // bundle's source-controlled name.
-        let runtime_array_primitive = decl.value.array_intrinsic;
+        let runtime_array_primitive = decl.value.array_intrinsic
+            || crate::reification::Intrinsic::recognize(
+                &decl.value.target.anchored,
+                lowered.scheme.body(),
+                &aliases,
+            )
+            .is_some();
         let ExternBoundaryReview {
-            leaves,
+            leaves: _,
             mut coverage,
         } = if clause_valid && !runtime_array_primitive {
             extern_boundary_review(
@@ -6323,6 +6415,7 @@ fn declarations(mint: &Mint, program: &Program) -> (Arc<Signatures>, GroupResult
         } else {
             ExternBoundaryReview::default()
         };
+        let leaves: Vec<PolymorphicExternLeaf> = Vec::new();
         for constraint in &mut coverage {
             constraint.id = table.constraint_id();
             constraint.reason = table.constraint_reason(constraint.id);
@@ -7197,6 +7290,7 @@ fn assemble(
         })
         .collect();
     let semantics = Semantics {
+        reification: crate::reification::Analysis::default(),
         aliases,
         operations,
         effect_aliases,
@@ -7230,10 +7324,35 @@ fn assemble(
             recovery_facts: Vec::new(),
         },
     };
-    Output {
+    let mut output = Output {
         semantics,
         diagnostics,
+    };
+    if output.errors().is_empty() {
+        let requirements = crate::reification::Analysis::infer(program, output.semantics());
+        output.reify(&requirements);
+        output.semantics.reification = requirements.clone();
+        for (index, error) in requirements
+            .review(program, output.semantics())
+            .into_iter()
+            .enumerate()
+        {
+            let ir::ErrorKind::RuntimeTypeInformation { message } = error.kind else {
+                unreachable!("representation review reports representation errors")
+            };
+            output.diagnostics.errors.push(Error {
+                id: ErrorId {
+                    scope: Symbol::GENERATED,
+                    index: index as u32,
+                },
+                cause: ErrorCause::Direct,
+                at: error.at,
+                kind: ErrorKind::RuntimeTypeInformation { message },
+                explanation: None,
+            });
+        }
     }
+    output
 }
 
 /// Record the first batch that left the store without a model, and say so where
@@ -7997,6 +8116,8 @@ impl Table {
                         | (Ty::Real, Ty::Real)
                         | (Ty::String, Ty::String)
                         | (Ty::Boolean, Ty::Boolean)
+                        | (Ty::Any, Ty::Any)
+                        | (Ty::ForeignValue, Ty::ForeignValue)
                         | (Ty::Undecided, Ty::Undecided) => {}
                         (Ty::Var(x), Ty::Var(y)) => same &= x == y,
                         (Ty::Rigid { id: x, .. }, Ty::Rigid { id: y, .. }) => same &= x == y,
@@ -8237,6 +8358,8 @@ impl Table {
                             | Ty::Real
                             | Ty::String
                             | Ty::Boolean
+                            | Ty::Any
+                            | Ty::ForeignValue
                             | Ty::Bound(_)
                             | Ty::Rigid { .. }
                             | Ty::Undecided => {}
@@ -8441,6 +8564,8 @@ impl Table {
                         | Ty::Real
                         | Ty::String
                         | Ty::Boolean
+                        | Ty::Any
+                        | Ty::ForeignValue
                         | Ty::Bound(_)
                         | Ty::Rigid { .. }
                         | Ty::Undecided => {}
@@ -8567,6 +8692,8 @@ impl Table {
                         | Ty::Real
                         | Ty::String
                         | Ty::Boolean
+                        | Ty::Any
+                        | Ty::ForeignValue
                         | Ty::Var(_)
                         | Ty::Bound(_)
                         | Ty::Rigid { .. }
@@ -9237,6 +9364,8 @@ impl Table {
                         | Ty::Real
                         | Ty::String
                         | Ty::Boolean
+                        | Ty::Any
+                        | Ty::ForeignValue
                         | Ty::Var(_)
                         | Ty::Bound(_)
                         | Ty::Rigid { .. }
@@ -11473,6 +11602,9 @@ impl Table {
     /// it spells `a`.
     fn zonk_error(&self, kind: &ErrorKind, subst: &mut Subst) -> ErrorKind {
         match kind {
+            ErrorKind::RuntimeTypeInformation { message } => ErrorKind::RuntimeTypeInformation {
+                message: message.clone(),
+            },
             ErrorKind::NotAStruct { base, demand } => ErrorKind::NotAStruct {
                 base: self.close(base, subst),
                 demand: *demand,

@@ -19,6 +19,7 @@ pub struct Extern {
     pub ty: std::sync::Arc<crate::types::Ty>,
     /// The complete target-neutral conversion decision, made after inference.
     pub conversion: Conversion,
+    pub intrinsic: Option<crate::reification::Intrinsic>,
     pub target: String,
     pub target_at: Anchor,
     pub declaration_at: Anchor,
@@ -139,6 +140,11 @@ pub(crate) fn plan(semantics: &inference::Semantics) -> ExternPlan {
                     Extern {
                         symbol: *symbol,
                         ty: reviewed.scheme.body().clone(),
+                        intrinsic: crate::reification::Intrinsic::recognize(
+                            &reviewed.target,
+                            reviewed.scheme.body(),
+                            semantics.aliases(),
+                        ),
                         conversion: conversion(
                             &reviewed.abi,
                             reviewed.scheme.body(),

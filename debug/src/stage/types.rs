@@ -85,6 +85,15 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                 node = node.at(cx.source.span(span));
             }
             node = with_symbol(node, cx, mint, symbol);
+            if let Some(note) = output
+                .schemes()
+                .get(&symbol)
+                .or_else(|| output.externs().get(&symbol))
+                .and_then(ruddy::reification::explain)
+            {
+                node = node.child(Node::new(ids.next(), "runtime type information", note));
+            }
+
             // A declaration's parameters print as `a`, `b` in the meaning
             // above, because that is what they are once the body is lowered.
             // Which is unreadable on its own: these rows are what map each
@@ -185,7 +194,8 @@ fn raw_types(output: &ruddy::inference::Semantics) -> String {
             let (packages, owners) = ownership_metadata(scheme);
             let _ = writeln!(
                 out,
-                "  {symbol:?}: {scheme}  # packages={packages}, owned={owners:?}"
+                "  {symbol:?}: {scheme}  # packages={packages}, owned={owners:?}, representations={:?}",
+                scheme.representations()
             );
         }
         out.push('\n');
@@ -488,6 +498,8 @@ fn relevant_parameters(aliases: &IndexMap<Symbol, Scheme>) -> HashMap<Symbol, Ha
                     | Ty::Real
                     | Ty::String
                     | Ty::Boolean
+                    | Ty::Any
+                    | Ty::ForeignValue
                     | Ty::Var(_)
                     | Ty::Rigid { .. }
                     | Ty::Undecided => {}
@@ -569,6 +581,8 @@ fn names_in(ty: &Ty, relevant: &HashMap<Symbol, HashSet<usize>>, out: &mut Vec<S
                 | Ty::Real
                 | Ty::String
                 | Ty::Boolean
+                | Ty::Any
+                | Ty::ForeignValue
                 | Ty::Var(_)
                 | Ty::Bound(_)
                 | Ty::Rigid { .. }

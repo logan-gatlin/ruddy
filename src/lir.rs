@@ -57,6 +57,8 @@ pub struct Param {
 }
 #[derive(Debug, Clone)]
 pub struct Global {
+    /// Callable descriptor convention retained across representation erasure.
+    pub type_interface: Option<crate::reification::interface::Interface>,
     pub adapter: Option<crate::externs::Callback>,
     pub callable: Option<Suspension>,
     pub symbol: Symbol,
@@ -147,6 +149,28 @@ pub enum End {
 
 #[derive(Debug, Clone)]
 pub enum Op {
+    Convert {
+        descriptor: Temp,
+        value: Temp,
+        direction: crate::reification::Direction,
+    },
+    TypeProjection {
+        descriptor: Temp,
+        path: Vec<crate::reification::Projection>,
+    },
+    TypeDescriptor {
+        template: crate::reification::Descriptor,
+        arguments: Vec<Temp>,
+    },
+    NativePlan {
+        template: crate::reification::NativeTemplate,
+        arguments: Vec<Temp>,
+    },
+    Reflect {
+        kind: crate::reification::Intrinsic,
+        descriptor: Temp,
+        value: Temp,
+    },
     Callback {
         value: Temp,
         mode: crate::externs::Callback,
@@ -273,6 +297,10 @@ pub enum Rep {
     Real,
     String,
     Boolean,
+    TypeDescriptor,
+    NativePlan,
+    BoxedAny,
+    HostValue,
     /// The value with nothing in it: the empty struct.
     Unit,
     Struct,
@@ -291,6 +319,14 @@ pub enum Rep {
 
 pub fn lower(accepted: &AcceptedProgram) -> Output {
     let mut output = control::lower(lower::lower(accepted));
+    for global in &mut output.globals {
+        global.type_interface = accepted
+            .semantics()
+            .schemes()
+            .get(&global.symbol)
+            .or_else(|| accepted.semantics().externs().get(&global.symbol))
+            .and_then(|scheme| scheme.callable().cloned());
+    }
     suspension::summarize(&mut output, accepted);
     output
 }
@@ -299,6 +335,16 @@ impl Op {
     /// Values read by this instruction, in operand order.
     pub fn uses(&self) -> Vec<Temp> {
         match self {
+            Self::Convert {
+                descriptor, value, ..
+            }
+            | Self::Reflect {
+                descriptor, value, ..
+            } => vec![*descriptor, *value],
+            Self::TypeProjection { descriptor, .. } => vec![*descriptor],
+            Self::TypeDescriptor { arguments, .. } | Self::NativePlan { arguments, .. } => {
+                arguments.clone()
+            }
             Self::Const(_) | Self::Extern { .. } | Self::Global { .. } | Self::NewTag => vec![],
             Self::Callback { value: v, .. }
             | Self::Neg(v)

@@ -186,6 +186,68 @@ impl UncheckedArtifact {
             return Err(ValidationError::new("artifact value name is empty"));
         }
         validate_executable_relationships(&self.lir)?;
+        for value in &self.header.values {
+            let Some(global) = self
+                .lir
+                .globals
+                .iter()
+                .find(|global| global.name == value.name)
+            else {
+                continue;
+            };
+            let nontrivial = |interface: &Option<crate::reification::interface::Interface>| {
+                interface.as_ref().is_some_and(|interface| {
+                    !matches!(
+                        interface.nodes.get(interface.root as usize),
+                        Some(crate::reification::interface::Node::Value)
+                    )
+                })
+            };
+            if global.type_interface != value.scheme.callable
+                && (nontrivial(&global.type_interface) || nontrivial(&value.scheme.callable))
+            {
+                return Err(ValidationError::new(
+                    "exported callable requirements disagree with the lowered evidence layout",
+                ));
+            }
+            let initializer = &self.lir.functions[global.initializer as usize];
+            let entry = &initializer.blocks[initializer.entry as usize];
+            if let End::Continue {
+                value: returned, ..
+            } = entry.end
+                && let Some(instruction) = entry
+                    .instrs
+                    .iter()
+                    .find(|instruction| instruction.temp == returned)
+                && let Op::Closure { func, captures } = &instruction.op
+            {
+                let parameters = &self.lir.functions[*func as usize].params[captures.len()..];
+                let layout = parameters
+                    .iter()
+                    .take_while(|parameter| parameter.rep == Rep::TypeDescriptor)
+                    .count();
+                let required = value
+                    .scheme
+                    .callable
+                    .as_ref()
+                    .and_then(|interface| interface.nodes.get(interface.root as usize))
+                    .map_or(0, |node| match node {
+                        crate::reification::interface::Node::Arrow { requirements, .. } => {
+                            requirements
+                                .iter()
+                                .map(|need| need.parameter)
+                                .collect::<std::collections::BTreeSet<_>>()
+                                .len()
+                        }
+                        _ => 0,
+                    });
+                if layout != required {
+                    return Err(ValidationError::new(
+                        "runtime representation requirements disagree with the exported evidence layout",
+                    ));
+                }
+            }
+        }
         // Text decoding is the single semantic translation implementation.
         // Rendering this portable tree and decoding it again deliberately
         // routes hand-built data through the same stack-safe checks as a disk
@@ -649,6 +711,8 @@ pub enum OperationSelector {
 /// index space: presences are `0..presences`, then types and rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scheme {
+    pub callable: Option<crate::reification::interface::Interface>,
+    pub representations: Vec<u32>,
     pub count: u32,
     pub presences: u32,
     /// Producer-owned presence positions. Each index is in `0..presences`.
@@ -669,6 +733,8 @@ pub enum Type {
     Real,
     String,
     Boolean,
+    Any,
+    ForeignValue,
     Arrow(Box<Type>, Box<Type>, Row),
     Package(Box<Type>),
     Array(Box<Type>),
@@ -765,6 +831,8 @@ fn semantic_eq(root: SemanticPair<'_>) -> bool {
                 | (Type::Real, Type::Real)
                 | (Type::String, Type::String)
                 | (Type::Boolean, Type::Boolean)
+                | (Type::Any, Type::Any)
+                | (Type::ForeignValue, Type::ForeignValue)
                 | (Type::Undecided, Type::Undecided) => {}
                 (Type::Var(left), Type::Var(right)) | (Type::Bound(left), Type::Bound(right))
                     if left == right => {}
@@ -943,6 +1011,8 @@ fn clone_semantic(root: SemanticRef<'_>) -> (Vec<Type>, Vec<Row>) {
                 Type::Real => types.push(Type::Real),
                 Type::String => types.push(Type::String),
                 Type::Boolean => types.push(Type::Boolean),
+                Type::Any => types.push(Type::Any),
+                Type::ForeignValue => types.push(Type::ForeignValue),
                 Type::Arrow(from, to, effects) => {
                     work.push(CloneWork::Arrow);
                     work.push(CloneWork::Semantic(SemanticRef::Row(effects)));
@@ -1145,6 +1215,8 @@ fn drain_type(value: &mut Type, pending: &mut Vec<SemanticOwned>) {
         | Type::Real
         | Type::String
         | Type::Boolean
+        | Type::Any
+        | Type::ForeignValue
         | Type::Var(_)
         | Type::Bound(_)
         | Type::Rigid { .. }
@@ -1645,6 +1717,8 @@ fn scheme(mint: &Mint, value: &types::Scheme) -> Scheme {
     let mut existentials: Vec<_> = value.existentials().iter().copied().collect();
     existentials.sort_unstable();
     Scheme {
+        callable: value.callable().cloned(),
+        representations: value.representations().to_vec(),
         count: value.count(),
         presences: value.presences(),
         existentials,
@@ -1704,6 +1778,8 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
                 types::Ty::Real => tys.push(Type::Real),
                 types::Ty::String => tys.push(Type::String),
                 types::Ty::Boolean => tys.push(Type::Boolean),
+                types::Ty::Any => tys.push(Type::Any),
+                types::Ty::ForeignValue => tys.push(Type::ForeignValue),
                 types::Ty::Arrow(from, to, effects) => {
                     work.push(Work::Arrow);
                     work.push(Work::Row(effects));
@@ -1904,6 +1980,7 @@ fn lower_lir(mint: &Mint, output: &lir::Output) -> Lir {
             .globals
             .iter()
             .map(|g| Global {
+                type_interface: g.type_interface.clone(),
                 adapter: g.adapter,
                 callable: g.callable,
                 name: qualified(mint, g.symbol),
@@ -2086,6 +2163,42 @@ fn op(mint: &Mint, value: &lir::Op) -> Op {
             callable: *callable,
             target: qualified(mint, *symbol),
         },
+        Source::TypeProjection { descriptor, path } => Op::TypeProjection {
+            descriptor: *descriptor,
+            path: path.clone(),
+        },
+        Source::TypeDescriptor {
+            template,
+            arguments,
+        } => Op::TypeDescriptor {
+            template: template.clone(),
+            arguments: arguments.clone(),
+        },
+        Source::NativePlan {
+            template,
+            arguments,
+        } => Op::NativePlan {
+            template: template.clone(),
+            arguments: arguments.clone(),
+        },
+        Source::Reflect {
+            kind,
+            descriptor,
+            value,
+        } => Op::Reflect {
+            kind: *kind,
+            descriptor: *descriptor,
+            value: *value,
+        },
+        Source::Convert {
+            descriptor,
+            value,
+            direction,
+        } => Op::Convert {
+            descriptor: *descriptor,
+            value: *value,
+            direction: *direction,
+        },
         Source::NewTag => Op::NewTag,
     }
 }
@@ -2164,6 +2277,10 @@ fn rep(value: lir::Rep) -> Rep {
         lir::Rep::Real => Rep::Real,
         lir::Rep::String => Rep::String,
         lir::Rep::Boolean => Rep::Boolean,
+        lir::Rep::TypeDescriptor => Rep::TypeDescriptor,
+        lir::Rep::NativePlan => Rep::NativePlan,
+        lir::Rep::BoxedAny => Rep::BoxedAny,
+        lir::Rep::HostValue => Rep::HostValue,
         lir::Rep::Unit => Rep::Unit,
         lir::Rep::Struct => Rep::Struct,
         lir::Rep::Array => Rep::Array,
@@ -2477,7 +2594,7 @@ pub mod text {
         ])
     }
     fn scheme(value: &Scheme) -> S {
-        L(vec![
+        let mut parts = vec![
             A("scheme".into()),
             A(value.count.to_string()),
             A(value.presences.to_string()),
@@ -2486,7 +2603,27 @@ pub mod text {
                 .collect()),
             formula(&value.formula),
             ty(&value.body),
-        ])
+        ];
+        if !value.representations.is_empty() {
+            parts.insert(
+                4,
+                L(std::iter::once(A("representations".into()))
+                    .chain(
+                        value
+                            .representations
+                            .iter()
+                            .map(|index| A(index.to_string())),
+                    )
+                    .collect()),
+            );
+        }
+        if let Some(callable) = &value.callable {
+            parts.push(L(vec![
+                A("callable".into()),
+                Q(serde_json::to_string(callable).expect("serializable callable interface")),
+            ]));
+        }
+        L(parts)
     }
     fn ty(value: &Type) -> S {
         enum Work<'a> {
@@ -2517,6 +2654,8 @@ pub mod text {
                         Type::Real => work.push(Work::Text("real")),
                         Type::String => work.push(Work::Text("string")),
                         Type::Boolean => work.push(Work::Text("boolean")),
+                        Type::Any => work.push(Work::Text("any")),
+                        Type::ForeignValue => work.push(Work::Text("foreign-value")),
                         Type::Arrow(from, to, row) => {
                             out.push_str("(arrow ");
                             work.push(Work::Text(")"));
@@ -3649,7 +3788,17 @@ pub mod text {
             }
         }
         fn read_scheme(&self, value: S) -> Scheme {
-            let mut value = self.exact(self.list(value, "scheme"), 5, "scheme");
+            let mut value = self.list(value, "scheme");
+            let callable = if value.last().is_some_and(|value| matches!(value, S::List(parts) if matches!(parts.first(), Some(S::Atom(tag)) if tag == "callable"))) {
+                let mut encoded = self.exact(self.list(value.pop().unwrap(), "callable"), 1, "callable");
+                let encoded = self.string(self.take(&mut encoded));
+                match serde_json::from_str::<crate::reification::interface::Interface>(&encoded) {
+                    Ok(callable) => Some(callable),
+                    Err(_) => { self.fail("invalid callable interface encoding"); None }
+                }
+            } else { None };
+            let has_representations = value.len() == 6;
+            let mut value = self.exact(value, if has_representations { 6 } else { 5 }, "scheme");
             let count = self.number(self.take(&mut value));
             let presences = self.number(self.take(&mut value));
             let mut encoded = self.list(self.take(&mut value), "existentials");
@@ -3664,6 +3813,25 @@ pub mod text {
                 || existentials.windows(2).any(|pair| pair[0] >= pair[1])
             {
                 self.fail("invalid existential presence positions");
+            }
+            let mut representations = Vec::new();
+            if has_representations {
+                let mut encoded = self.list(self.take(&mut value), "representations");
+                while !encoded.is_empty() {
+                    representations.push(self.number(self.take(&mut encoded)));
+                }
+                if representations
+                    .iter()
+                    .any(|index| *index < presences || *index >= count)
+                    || representations.windows(2).any(|pair| pair[0] >= pair[1])
+                {
+                    self.fail("invalid runtime representation positions");
+                }
+            }
+            if let Some(callable) = &callable
+                && let Err(message) = callable.validate(count, presences)
+            {
+                self.fail(&message);
             }
             let formula = self.read_formula(self.take(&mut value));
             let body = self.read_ty(self.take(&mut value));
@@ -3828,6 +3996,8 @@ pub mod text {
                 }
             }
             Scheme {
+                callable,
+                representations,
                 count,
                 presences,
                 existentials,
@@ -3875,6 +4045,8 @@ pub mod text {
                                 "real" => Type::Real,
                                 "string" => Type::String,
                                 "boolean" => Type::Boolean,
+                                "any" => Type::Any,
+                                "foreign-value" => Type::ForeignValue,
                                 "undecided" => Type::Undecided,
                                 _ => self.invalid("invalid type", Type::Undecided),
                             }),
@@ -4221,6 +4393,7 @@ mod tests {
     fn validation_rejects_out_of_range_function_references() {
         let mut unchecked = artifact_with_target("host.value").to_unchecked();
         unchecked.lir.globals.push(Global {
+            type_interface: None,
             adapter: None,
             callable: None,
             name: "test@1::value".into(),
@@ -4235,6 +4408,7 @@ mod tests {
     fn recovery_discards_unrepairable_executable_data() {
         let mut unchecked = artifact_with_target("host.value").to_unchecked();
         unchecked.lir.globals.push(Global {
+            type_interface: None,
             adapter: None,
             callable: None,
             name: "test@1::value".into(),

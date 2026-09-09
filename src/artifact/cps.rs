@@ -43,6 +43,10 @@ pub struct Param {
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Global {
+    /// Semantic descriptor positions under which this initializer was lowered.
+    /// This contract is independent of the exported name's declared interface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_interface: Option<crate::reification::interface::Interface>,
     pub adapter: Option<crate::externs::Callback>,
     pub callable: Option<crate::lir::Suspension>,
     pub name: String,
@@ -133,6 +137,28 @@ pub enum End {
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub enum Op {
+    Convert {
+        descriptor: Temp,
+        value: Temp,
+        direction: crate::reification::Direction,
+    },
+    TypeProjection {
+        descriptor: Temp,
+        path: Vec<crate::reification::Projection>,
+    },
+    TypeDescriptor {
+        template: crate::reification::Descriptor,
+        arguments: Vec<Temp>,
+    },
+    NativePlan {
+        template: crate::reification::NativeTemplate,
+        arguments: Vec<Temp>,
+    },
+    Reflect {
+        kind: crate::reification::Intrinsic,
+        descriptor: Temp,
+        value: Temp,
+    },
     Callback {
         value: Temp,
         mode: crate::externs::Callback,
@@ -257,6 +283,10 @@ pub enum Rep {
     Real,
     String,
     Boolean,
+    TypeDescriptor,
+    NativePlan,
+    BoxedAny,
+    HostValue,
     /// The value with nothing in it: the empty struct.
     Unit,
     Struct,
@@ -288,6 +318,16 @@ impl Op {
     /// Values read by this instruction, in operand order.
     pub fn uses(&self) -> Vec<Temp> {
         match self {
+            Self::Convert {
+                descriptor, value, ..
+            }
+            | Self::Reflect {
+                descriptor, value, ..
+            } => vec![*descriptor, *value],
+            Self::TypeProjection { descriptor, .. } => vec![*descriptor],
+            Self::TypeDescriptor { arguments, .. } | Self::NativePlan { arguments, .. } => {
+                arguments.clone()
+            }
             Self::Const(_) | Self::Extern { .. } | Self::Global { .. } | Self::NewTag => vec![],
             Self::Callback { value: v, .. }
             | Self::Neg(v)
@@ -423,6 +463,78 @@ pub(super) fn validate(lir: &Lir) -> Result<(), String> {
                     return error("instruction uses an unavailable temporary");
                 }
                 match &i.op {
+                    Op::Convert { descriptor, .. } => {
+                        if !matches!(available[descriptor], Rep::TypeDescriptor | Rep::NativePlan) {
+                            return error("foreign conversion requires a runtime type descriptor");
+                        }
+                    }
+                    Op::TypeProjection { descriptor, path } => {
+                        if available[descriptor] != Rep::TypeDescriptor
+                            || i.rep != Rep::TypeDescriptor
+                        {
+                            return error(
+                                "runtime type projection requires descriptor representations",
+                            );
+                        }
+                        if path.iter().any(|step| matches!(step, crate::reification::Projection::Remainder(fields) if fields.windows(2).any(|pair| pair[0] >= pair[1]))) {
+                            return error("runtime row projection fields must be unique and sorted");
+                        }
+                    }
+                    Op::TypeDescriptor {
+                        template,
+                        arguments,
+                    } => {
+                        template.validate(arguments.len()).map_err(str::to_owned)?;
+                        if arguments
+                            .iter()
+                            .any(|argument| available[argument] != Rep::TypeDescriptor)
+                        {
+                            return error("runtime type arguments require descriptors");
+                        }
+                        if i.rep != Rep::TypeDescriptor {
+                            return error("runtime type descriptor has the wrong representation");
+                        }
+                    }
+                    Op::NativePlan {
+                        template,
+                        arguments,
+                    } => {
+                        template.validate(arguments.len()).map_err(str::to_owned)?;
+                        if arguments
+                            .iter()
+                            .any(|argument| available[argument] != Rep::TypeDescriptor)
+                        {
+                            return error("runtime type arguments require descriptors");
+                        }
+                        if i.rep != Rep::NativePlan {
+                            return error("runtime type descriptor has the wrong representation");
+                        }
+                    }
+                    Op::Reflect {
+                        kind,
+                        descriptor,
+                        value,
+                    } => {
+                        if available[descriptor] != Rep::TypeDescriptor {
+                            return error("reflection requires a runtime type descriptor");
+                        }
+                        match kind {
+                            crate::reification::Intrinsic::Upcast if i.rep != Rep::BoxedAny => {
+                                return error("boxing requires an Any result");
+                            }
+                            crate::reification::Intrinsic::Downcast
+                                if available[value] != Rep::BoxedAny || i.rep != Rep::Sum =>
+                            {
+                                return error("downcasting requires Any and returns Option");
+                            }
+                            crate::reification::Intrinsic::Decode
+                                if available[value] != Rep::HostValue || i.rep != Rep::Sum =>
+                            {
+                                return error("decoding requires ForeignValue and returns Result");
+                            }
+                            _ => {}
+                        }
+                    }
                     Op::Closure { func, captures } => {
                         let Some(target) = usize::try_from(*func)
                             .ok()

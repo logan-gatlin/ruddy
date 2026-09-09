@@ -20,6 +20,8 @@
 //! onto either without a second round of lowering, but no code is generated and
 //! no LIR is ever run.
 
+mod reification;
+
 use std::{collections::HashMap, sync::Arc};
 
 use indexmap::IndexMap;
@@ -151,6 +153,28 @@ pub struct Instr {
 /// What one instruction does.
 #[derive(Debug, Clone)]
 pub enum Op {
+    Convert {
+        descriptor: Temp,
+        value: Temp,
+        direction: crate::reification::Direction,
+    },
+    TypeProjection {
+        descriptor: Temp,
+        path: Vec<crate::reification::Projection>,
+    },
+    TypeDescriptor {
+        template: crate::reification::Descriptor,
+        arguments: Vec<Temp>,
+    },
+    NativePlan {
+        template: crate::reification::NativeTemplate,
+        arguments: Vec<Temp>,
+    },
+    Reflect {
+        kind: crate::reification::Intrinsic,
+        descriptor: Temp,
+        value: Temp,
+    },
     Callback {
         value: Temp,
         mode: crate::externs::Callback,
@@ -389,6 +413,10 @@ pub enum Rep {
     Real,
     String,
     Boolean,
+    TypeDescriptor,
+    NativePlan,
+    BoxedAny,
+    HostValue,
     /// The value with nothing in it: the empty struct.
     Unit,
     Struct,
@@ -490,6 +518,7 @@ struct Recursive {
 #[derive(Default)]
 struct Frame {
     locals: IndexMap<Symbol, Temp>,
+    representations: IndexMap<u32, Temp>,
     /// Present on the frame of a directly let-bound local `fn`. The binding is
     /// recursive at the language level, but costs nothing here unless its body
     /// actually names itself.
@@ -506,6 +535,7 @@ struct Frame {
     /// The handler identity a `raise` written here throws to. Set on the frame
     /// the `handle` is being lowered in, for as long as its arms are.
     raise_tag: Option<Temp>,
+    raise_result: Option<(Arc<Ty>, crate::reification::conventions::ShapeId)>,
     captures: Vec<Capture>,
     caught: HashMap<Temp, Temp>,
 }
@@ -607,7 +637,6 @@ struct Between {
     base_ty: Arc<Ty>,
     start: usize,
     drop: usize,
-    ty: Arc<Ty>,
 }
 
 /// A whole value, at the temp holding it.
@@ -668,6 +697,7 @@ struct Matrix {
 /// what every arm's value is fitted to on the way out — and where the match
 /// was written.
 struct Tree<'a> {
+    callable: crate::reification::conventions::ShapeId,
     arms: &'a [(Pattern, Term)],
     rep: Rep,
     ty: Arc<Ty>,
@@ -748,6 +778,11 @@ enum FittedStage {
 /// The lowering itself: the program being read, everything emitted so far, and
 /// the stack of functions currently being built.
 struct Lower<'a> {
+    native_values: bool,
+    reification: crate::reification::Analysis,
+    requirements: Vec<std::collections::BTreeSet<crate::reification::conventions::Requirement>>,
+    callable_held: Vec<Option<crate::reification::conventions::ShapeId>>,
+    erased_callable: crate::reification::conventions::ShapeId,
     /// Where the program's anchors were written: the LIR keeps spans, for
     /// the backend and the debugger, and this is what it reads them from.
     source: &'a SourceMap,
@@ -806,6 +841,7 @@ pub fn lower(accepted: &AcceptedProgram) -> Output {
         accepted.source(),
         accepted.semantics(),
         accepted.externs(),
+        accepted.reification(),
     )
 }
 
@@ -815,8 +851,20 @@ fn lower_parts(
     source: &SourceMap,
     inference: &inference::Semantics,
     extern_plan: &crate::externs::ExternPlan,
+    reification: &crate::reification::Analysis,
 ) -> Output {
+    let mut reification = reification.clone();
+    let requirements = reification.callables.graph.solve();
+    let erased_callable = reification
+        .callables
+        .graph
+        .shape(crate::reification::conventions::Shape::Value);
     let mut low = Lower {
+        native_values: true,
+        reification,
+        requirements,
+        callable_held: Vec::new(),
+        erased_callable,
         source,
         mint,
         program,
@@ -1168,6 +1216,208 @@ impl Body {
 }
 
 impl Lower<'_> {
+    fn representation_captures(&mut self, ty: &Arc<Ty>, body: &mut Body) -> Vec<Temp> {
+        if !self.native_values {
+            return Vec::new();
+        }
+        crate::reification::native_parameters(ty, self.inference.aliases())
+            .expect("reviewed native representation")
+            .into_iter()
+            .map(|parameter| self.representation(&Arc::new(Ty::Bound(parameter)), body))
+            .collect()
+    }
+
+    fn representation_params(&mut self, ty: &Arc<Ty>, params: &mut Vec<Param>) {
+        if !self.native_values {
+            return;
+        }
+        for parameter in crate::reification::native_parameters(ty, self.inference.aliases())
+            .expect("reviewed native representation")
+        {
+            let temp = self.fresh(Rep::TypeDescriptor);
+            self.top().representations.insert(parameter, temp);
+            params.push(Param {
+                temp,
+                rep: Rep::TypeDescriptor,
+            });
+        }
+    }
+
+    fn convert_value(
+        &mut self,
+        ty: &Arc<Ty>,
+        value: Temp,
+        direction: crate::reification::Direction,
+        body: &mut Body,
+    ) -> Temp {
+        if !self.native_values {
+            return value;
+        }
+        if matches!(&*unfold(self.inference.aliases(), ty), Ty::Mut(_, _)) {
+            return value;
+        }
+        let descriptor = {
+            let (template, parameters) =
+                crate::reification::NativeTemplate::template(ty, self.inference.aliases())
+                    .expect("reviewed native conversion shape");
+            let arguments = parameters
+                .into_iter()
+                .map(|parameter| {
+                    if let Some(owner) = self
+                        .frames
+                        .iter()
+                        .rposition(|frame| frame.representations.contains_key(&parameter))
+                    {
+                        self.thread(owner, self.frames[owner].representations[&parameter])
+                    } else {
+                        self.absent_representation(body)
+                    }
+                })
+                .collect();
+            self.emit(
+                body,
+                Span::default(),
+                Rep::NativePlan,
+                Op::NativePlan {
+                    template,
+                    arguments,
+                },
+            )
+        };
+        let rep = match direction {
+            crate::reification::Direction::ToJs => Rep::HostValue,
+            crate::reification::Direction::FromJs => self.rep(ty),
+        };
+        self.emit(
+            body,
+            Span::default(),
+            rep,
+            Op::Convert {
+                descriptor,
+                value,
+                direction,
+            },
+        )
+    }
+
+    fn representation(&mut self, ty: &Arc<Ty>, body: &mut Body) -> Temp {
+        if let Ty::Bound(parameter) = &**ty {
+            let at = self
+                .frames
+                .iter()
+                .rposition(|frame| frame.representations.contains_key(parameter))
+                .expect("accepted reflection has evidence for each type parameter");
+            return self.thread(at, self.frames[at].representations[parameter]);
+        }
+        let (template, parameters) =
+            crate::reification::Descriptor::template(ty, self.inference.aliases())
+                .expect("accepted reflection has a representable type");
+        let mut arguments = Vec::new();
+        for parameter in parameters {
+            let at = self
+                .frames
+                .iter()
+                .rposition(|frame| frame.representations.contains_key(&parameter))
+                .expect("accepted reflection has evidence for each type parameter");
+            arguments.push(self.thread(at, self.frames[at].representations[&parameter]));
+        }
+        self.emit(
+            body,
+            Span::default(),
+            Rep::TypeDescriptor,
+            Op::TypeDescriptor {
+                template,
+                arguments,
+            },
+        )
+    }
+
+    fn instantiate_binding(
+        &mut self,
+        symbol: Symbol,
+        term: &Term,
+        value: Temp,
+        body: &mut Body,
+    ) -> Temp {
+        let Some(binding) = self.reification.callables.bindings.get(&symbol).cloned() else {
+            return value;
+        };
+        let desired = self.callable_shape(term.at);
+        let have = self.held[value as usize]
+            .clone()
+            .unwrap_or(binding.ty.clone());
+        let held = self.callable_held[value as usize].unwrap_or(binding.value);
+        self.contain(value, &have);
+        self.hold(value, &have);
+        self.reified_fitted(&term.ty, desired, &have, held, value, body)
+    }
+
+    fn intrinsic_global(
+        &mut self,
+        symbol: Symbol,
+        name: &str,
+        ty: &Arc<Ty>,
+        kind: crate::reification::Intrinsic,
+    ) {
+        let id = self.slot(format!("{name}#reflection"));
+        let (from, to, row) = self.arrow(ty);
+        let shape = self.reification.callables.bindings[&symbol].value;
+        self.frames.push(Frame::default());
+        let mut params = Vec::new();
+        self.callable_params(shape, &mut params);
+        self.evidence_params(&row, &mut params);
+        let argument = self.fresh(self.rep(&from));
+        params.push(Param {
+            temp: argument,
+            rep: self.rep(&from),
+        });
+        let mut body = Body::default();
+        let descriptor =
+            self.representation(&kind.represented(ty, self.inference.aliases()), &mut body);
+        let value = self.emit(
+            &mut body,
+            Span::default(),
+            self.rep(&to),
+            Op::Reflect {
+                kind,
+                descriptor,
+                value: argument,
+            },
+        );
+        self.frames.pop().expect("intrinsic invocation frame");
+        self.fill(
+            id,
+            Function {
+                name: self.labels[id].clone(),
+                params,
+                body: body.seal(Terminator {
+                    span: Span::default(),
+                    kind: End::Ret(value),
+                }),
+                span: Span::default(),
+            },
+        );
+        let mut body = Body::default();
+        let value = self.emit(
+            &mut body,
+            Span::default(),
+            Rep::Fn,
+            Op::Closure {
+                func: id,
+                captures: Vec::new(),
+            },
+        );
+        self.globals.push(Global {
+            symbol,
+            name: name.to_owned(),
+            body: body.seal(Terminator {
+                span: Span::default(),
+                kind: End::Ret(value),
+            }),
+            span: Span::default(),
+        });
+    }
+
     /// Where `at` was written, for the LIR that keeps positions.
     fn span(&self, at: Anchor) -> Span {
         self.source.span(at)
@@ -1185,6 +1435,11 @@ impl Lower<'_> {
             let symbol = entry.symbol;
             let name = self.mint.name(symbol).to_string();
             let ty = entry.ty.clone();
+            self.native_values = !self.program.externs[&symbol].value.array_intrinsic;
+            if let Some(intrinsic) = entry.intrinsic {
+                self.intrinsic_global(symbol, &name, &ty, intrinsic);
+                continue;
+            }
             externs.push(Extern {
                 symbol,
                 name: name.clone(),
@@ -1193,10 +1448,9 @@ impl Lower<'_> {
                 rep: self.rep(&ty),
             });
 
-            // Non-function imports already have the Ruddy representation and
-            // remain direct globals. Only functions need an initialized
-            // adapter in front of the raw host value.
-            if self.rep(&ty) == Rep::Fn {
+            // Native values, including non-callable imports, enter through
+            // the same reviewed conversion boundary.
+            if self.native_values || self.rep(&ty) == Rep::Fn {
                 self.stem = format!("{name}#extern");
                 self.serial = 0;
                 let mut body = Body::default();
@@ -1221,6 +1475,7 @@ impl Lower<'_> {
                 });
             }
         }
+        self.native_values = true;
         externs
     }
 
@@ -1261,6 +1516,7 @@ impl Lower<'_> {
                     raw,
                     Vec::new(),
                     Vec::new(),
+                    std::collections::BTreeSet::new(),
                     ty.clone(),
                     arity,
                     *nullary,
@@ -1269,29 +1525,27 @@ impl Lower<'_> {
                     completion,
                     0,
                 );
+                let captures = vec![raw];
                 self.emit(
                     body,
                     Span::default(),
                     Rep::Fn,
-                    Op::Closure {
-                        func: id,
-                        captures: vec![raw],
-                    },
+                    Op::Closure { func: id, captures },
                 )
             }
             crate::externs::Conversion::OrdinaryFunction if self.rep(ty) == Rep::Fn => {
                 let id = self.ordinary_extern_level(ty.clone(), completion);
+                let captures = vec![raw];
                 self.emit(
                     body,
                     Span::default(),
                     Rep::Fn,
-                    Op::Closure {
-                        func: id,
-                        captures: vec![raw],
-                    },
+                    Op::Closure { func: id, captures },
                 )
             }
-            crate::externs::Conversion::Value | crate::externs::Conversion::OrdinaryFunction => raw,
+            crate::externs::Conversion::Value | crate::externs::Conversion::OrdinaryFunction => {
+                self.convert_value(ty, raw, crate::reification::Direction::FromJs, body)
+            }
         }
     }
 
@@ -1326,6 +1580,19 @@ impl Lower<'_> {
             rep: Rep::Fn,
         }];
         self.frames.push(Frame::default());
+        if self.native_values {
+            for parameter in crate::reification::conventions::native_invocation_parameters(
+                &ty,
+                self.inference.aliases(),
+            ) {
+                let temp = self.fresh(Rep::TypeDescriptor);
+                self.top().representations.insert(parameter, temp);
+                params.push(Param {
+                    temp,
+                    rep: Rep::TypeDescriptor,
+                });
+            }
+        }
         self.evidence_params(&row, &mut params);
         let argument = self.fresh(self.rep(&from));
         params.push(Param {
@@ -1477,6 +1744,7 @@ impl Lower<'_> {
                 let id =
                     self.marked_callback(ty.clone(), parameters.clone(), *result.clone(), required);
                 let mut captures = vec![value];
+                captures.extend(self.representation_captures(ty, body));
                 captures.extend(evidence);
                 let value = self.emit(
                     body,
@@ -1499,6 +1767,7 @@ impl Lower<'_> {
                 let evidence = self.evidence_args(&required, available, body);
                 let id = self.ordinary_callback(ty.clone(), required);
                 let mut captures = vec![value];
+                captures.extend(self.representation_captures(ty, body));
                 captures.extend(evidence);
                 let value = self.emit(
                     body,
@@ -1517,7 +1786,7 @@ impl Lower<'_> {
                 )
             }
             crate::externs::Conversion::Value | crate::externs::Conversion::OrdinaryFunction => {
-                value
+                self.convert_value(ty, value, crate::reification::Direction::ToJs, body)
             }
         }
     }
@@ -1549,6 +1818,7 @@ impl Lower<'_> {
             rep: Rep::Fn,
         }];
         self.frames.push(Frame::default());
+        self.representation_params(&ty, &mut params);
         self.evidence_params(&available, &mut params);
         params.push(Param {
             temp: raw_argument,
@@ -1615,6 +1885,7 @@ impl Lower<'_> {
             rep: Rep::Fn,
         }];
         self.frames.push(Frame::default());
+        self.representation_params(&ty, &mut params);
         self.evidence_params(&available, &mut params);
         let mut raw_parameters = Vec::new();
         let mut arrows = Vec::new();
@@ -1697,6 +1968,7 @@ impl Lower<'_> {
         _outer_raw: Temp,
         carried: Vec<Rep>,
         carried_types: Vec<Arc<Ty>>,
+        carried_descriptors: std::collections::BTreeSet<u32>,
         ty: Arc<Ty>,
         arity: usize,
         nullary: bool,
@@ -1720,6 +1992,30 @@ impl Lower<'_> {
         }
         let (from, to, row) = self.arrow(&ty);
         self.frames.push(Frame::default());
+        for parameter in &carried_descriptors {
+            let temp = self.fresh(Rep::TypeDescriptor);
+            params.push(Param {
+                temp,
+                rep: Rep::TypeDescriptor,
+            });
+            self.top().representations.insert(*parameter, temp);
+        }
+        let mut descriptor_parameters =
+            crate::reification::conventions::native_invocation_parameters(
+                &ty,
+                self.inference.aliases(),
+            );
+        if !self.native_values {
+            descriptor_parameters.clear();
+        }
+        for parameter in &descriptor_parameters {
+            let temp = self.fresh(Rep::TypeDescriptor);
+            self.top().representations.insert(*parameter, temp);
+            params.push(Param {
+                temp,
+                rep: Rep::TypeDescriptor,
+            });
+        }
         self.evidence_params(&row, &mut params);
         let argument_rep = self.rep(&from);
         let argument = self.fresh(argument_rep);
@@ -1733,6 +2029,8 @@ impl Lower<'_> {
         }
 
         let value = if step + 1 == arity {
+            // Callback adapters need the effect evidence of the final marked
+            // arrow. Retain both values and earlier type evidence until here.
             let gathered = gathered
                 .into_iter()
                 .zip(carried_types.iter().chain(std::iter::once(&from)))
@@ -1755,10 +2053,15 @@ impl Lower<'_> {
             next_carried.push(argument_rep);
             let mut next_types = carried_types;
             next_types.push(from);
+            let captured_descriptors: std::collections::BTreeSet<_> = carried_descriptors
+                .union(&descriptor_parameters)
+                .copied()
+                .collect();
             let next = self.marked_extern_level(
                 raw,
                 next_carried,
                 next_types,
+                captured_descriptors.clone(),
                 to.clone(),
                 arity,
                 false,
@@ -1769,6 +2072,9 @@ impl Lower<'_> {
             );
             let mut captures = vec![raw];
             captures.extend(gathered);
+            for parameter in captured_descriptors {
+                captures.push(self.representation(&Arc::new(Ty::Bound(parameter)), &mut body));
+            }
             self.emit(
                 &mut body,
                 Span::default(),
@@ -1817,7 +2123,14 @@ impl Lower<'_> {
         for symbol in order {
             let decl = &program.terms[symbol];
             let (fns, _) = nest(&decl.value);
-            if fns.is_empty() {
+            if fns.is_empty()
+                || self
+                    .reification
+                    .callables
+                    .bindings
+                    .get(symbol)
+                    .is_some_and(|binding| self.callable_demands(binding.value))
+            {
                 continue;
             }
             let levels: Vec<Level> = fns
@@ -1866,6 +2179,7 @@ impl Lower<'_> {
         let temp = self.temps;
         self.temps += 1;
         self.reps.push(rep);
+        self.callable_held.push(None);
         self.held.push(None);
         temp
     }
@@ -1883,7 +2197,7 @@ impl Lower<'_> {
     /// gives its member — so a read out of the container has to know that
     /// type, not whatever type a use instantiates the container to.
     fn contain(&mut self, temp: Temp, ty: &Arc<Ty>) {
-        if matches!(self.rep(ty), Rep::Struct | Rep::Sum) {
+        if matches!(self.rep(ty), Rep::Struct | Rep::Sum | Rep::Array) {
             self.held[temp as usize] = Some(ty.clone());
         }
     }
@@ -1943,6 +2257,8 @@ impl Lower<'_> {
             Ty::Real => Rep::Real,
             Ty::String => Rep::String,
             Ty::Boolean => Rep::Boolean,
+            Ty::Any => Rep::BoxedAny,
+            Ty::ForeignValue => Rep::HostValue,
             Ty::Arrow(..) => Rep::Fn,
             Ty::Array(_) => Rep::Array,
             Ty::Mut(..) => Rep::Any,
@@ -2810,6 +3126,7 @@ impl Lower<'_> {
                     // A capture is the same value under a new name, so it holds
                     // the very shape the value it stands for does.
                     self.held[inner as usize] = shape;
+                    self.callable_held[inner as usize] = self.callable_held[carried as usize];
                     let frame = &mut self.frames[at];
                     frame.caught.insert(carried, inner);
                     frame.captures.push(Capture {
@@ -2886,7 +3203,7 @@ impl Lower<'_> {
         crate::cancellation::checkpoint();
         let span = term.at;
         let rep = self.rep(&term.ty);
-        match &term.kind {
+        let value = match &term.kind {
             TermKind::Natural(value) => self.emit(
                 body,
                 self.span(span),
@@ -2920,6 +3237,79 @@ impl Lower<'_> {
                 rep,
                 Op::Const(Literal::Boolean(*value)),
             ),
+            TermKind::Unary {
+                op: crate::ir::UnaryOp::Allocate,
+                value,
+            } => {
+                let initial = self.term(value, body);
+                let Ty::Mut(_, element) = &*self.erased(&term.ty) else {
+                    unreachable!()
+                };
+                let have = self.holding(initial, &value.ty);
+                let storage = self.callable_element(self.callable_shape(term.at));
+                let offered =
+                    self.callable_held[initial as usize].unwrap_or(self.callable_shape(value.at));
+                let initial = self.reified_fitted(element, storage, &have, offered, initial, body);
+                let cell = self.emit(body, self.span(span), rep, Op::Allocate(initial));
+                self.held[cell as usize] = Some(term.ty.clone());
+                cell
+            }
+            TermKind::Unary {
+                op: crate::ir::UnaryOp::Read,
+                value,
+            } => {
+                let cell = self.term(value, body);
+                let authority = self.holding(cell, &value.ty);
+                let have = match &*self.erased(&authority) {
+                    Ty::Mut(_, inner) => inner.clone(),
+                    _ => term.ty.clone(),
+                };
+                let stored = self.callable_element(
+                    self.callable_held[cell as usize].unwrap_or(self.callable_shape(value.at)),
+                );
+                let read = self.emit(body, self.span(span), self.rep(&have), Op::Read(cell));
+                self.reified_fitted(
+                    &term.ty,
+                    self.callable_shape(term.at),
+                    &have,
+                    stored,
+                    read,
+                    body,
+                )
+            }
+            TermKind::Binary {
+                op: crate::ir::BinaryOp::Write,
+                left,
+                right,
+            } => {
+                let cell = self.term(left, body);
+                let value = self.term(right, body);
+                let authority = self.holding(cell, &left.ty);
+                let want = match &*self.erased(&authority) {
+                    Ty::Mut(_, inner) => inner.clone(),
+                    _ => term.ty.clone(),
+                };
+                let stored = self.callable_element(
+                    self.callable_held[cell as usize].unwrap_or(self.callable_shape(left.at)),
+                );
+                let have = self.holding(value, &right.ty);
+                let offered =
+                    self.callable_held[value as usize].unwrap_or(self.callable_shape(right.at));
+                let value = self.reified_fitted(&want, stored, &have, offered, value, body);
+                let assigned = self.emit(
+                    body,
+                    self.span(span),
+                    rep,
+                    Op::Write {
+                        left: cell,
+                        right: value,
+                    },
+                );
+                self.hold(assigned, &want);
+                self.contain(assigned, &want);
+                self.callable_held[assigned as usize] = Some(stored);
+                assigned
+            }
             TermKind::Unary { op, value } => {
                 let value = self.term(value, body);
                 let op = match op {
@@ -2964,7 +3354,10 @@ impl Lower<'_> {
                         .member_of(&term.ty, name)
                         .unwrap_or_else(|| field.value.ty.clone());
                     let have = self.holding(temp, &field.value.ty);
-                    let temp = self.fitted(&want, &have, temp, body);
+                    let expected = self.callable_member(self.callable_shape(term.at), name);
+                    let offered = self.callable_held[temp as usize]
+                        .unwrap_or(self.callable_shape(field.value.at));
+                    let temp = self.reified_fitted(&want, expected, &have, offered, temp, body);
                     entries.insert(FieldKey::named(name.clone()), temp);
                 }
                 let temp = match spread {
@@ -3002,11 +3395,25 @@ impl Lower<'_> {
                                     Op::Array(run),
                                 ));
                             }
-                            pieces.push(self.fitted(&term.ty, &have, temp, body));
+                            let offered = self.callable_held[temp as usize]
+                                .unwrap_or(self.callable_shape(item.value.at));
+                            pieces.push(self.reified_fitted(
+                                &term.ty,
+                                self.callable_shape(term.at),
+                                &have,
+                                offered,
+                                temp,
+                                body,
+                            ));
                         }
                         None => {
                             let target = want.clone().unwrap_or_else(|| item.value.ty.clone());
-                            values.push(self.fitted(&target, &have, temp, body));
+                            let expected = self.callable_element(self.callable_shape(term.at));
+                            let offered = self.callable_held[temp as usize]
+                                .unwrap_or(self.callable_shape(item.value.at));
+                            values.push(
+                                self.reified_fitted(&target, expected, &have, offered, temp, body),
+                            );
                         }
                     }
                 }
@@ -3047,7 +3454,24 @@ impl Lower<'_> {
                     },
                 );
                 self.contain(read, &have);
-                self.fitted(&term.ty, &have, read, body)
+                let profile =
+                    self.callable_held[temp as usize].unwrap_or(self.callable_shape(base.at));
+                let member = match self.reification.callables.graph.exposed(profile) {
+                    crate::reification::conventions::Shape::Record(fields) => fields
+                        .get(&field.anchored)
+                        .copied()
+                        .unwrap_or(self.erased_callable),
+                    _ => self.erased_callable,
+                };
+                self.callable_held[read as usize] = Some(member);
+                self.reified_fitted(
+                    &term.ty,
+                    self.callable_shape(term.at),
+                    &have,
+                    member,
+                    read,
+                    body,
+                )
             }
             TermKind::Tag { name, payload } => {
                 let payload = payload.as_ref().map(|written| {
@@ -3056,7 +3480,11 @@ impl Lower<'_> {
                         .member_of(&term.ty, &name.anchored)
                         .unwrap_or_else(|| written.ty.clone());
                     let have = self.holding(temp, &written.ty);
-                    self.fitted(&want, &have, temp, body)
+                    let expected =
+                        self.callable_member(self.callable_shape(term.at), &name.anchored);
+                    let offered = self.callable_held[temp as usize]
+                        .unwrap_or(self.callable_shape(written.at));
+                    self.reified_fitted(&want, expected, &have, offered, temp, body)
                 });
                 let temp = self.emit(
                     body,
@@ -3102,12 +3530,13 @@ impl Lower<'_> {
             // at the definition's type — so the read records that type for
             // whatever is later projected out.
             TermKind::Ident(symbol) => match self.local(*symbol) {
-                Some(temp) => temp,
+                Some(temp) => self.instantiate_binding(*symbol, term, temp, body),
                 None => {
+                    let binding_rep = rep;
                     let temp = self.emit(
                         body,
                         self.span(span),
-                        rep,
+                        binding_rep,
                         Op::Global {
                             symbol: *symbol,
                             name: self.mint.name(*symbol).to_string(),
@@ -3132,6 +3561,9 @@ impl Lower<'_> {
                             debug_assert!(self.program.externs.contains_key(symbol));
                             term.ty.clone()
                         });
+                    if self.reification.callables.bindings.contains_key(symbol) {
+                        return self.instantiate_binding(*symbol, term, temp, body);
+                    }
                     self.contain(temp, &have);
                     self.fitted(&term.ty, &have, temp, body)
                 }
@@ -3148,6 +3580,16 @@ impl Lower<'_> {
             } => self.handle(term, handled, handler, body),
             TermKind::Raise(value) => {
                 let temp = self.term(value, body);
+                let (want, expected) = self
+                    .frames
+                    .iter()
+                    .rev()
+                    .find_map(|frame| frame.raise_result.clone())
+                    .expect("a raised value has a handler result convention");
+                let have = self.holding(temp, &value.ty);
+                let offered =
+                    self.callable_held[temp as usize].unwrap_or(self.callable_shape(value.at));
+                let temp = self.reified_fitted(&want, expected, &have, offered, temp, body);
                 let tag = self.raise_tag();
                 body.stop(Terminator {
                     span: self.span(span),
@@ -3158,7 +3600,11 @@ impl Lower<'_> {
             // R2 keeps this out of reach: a name that did not resolve is one of
             // lowering's own errors, and LIR runs only where there were none.
             TermKind::Error => panic!("LIR runs only on programs with no errors"),
+        };
+        if self.callable_held[value as usize].is_none() {
+            self.callable_held[value as usize] = Some(self.callable_shape(term.at));
         }
+        value
     }
 
     /// One source `fn`, lifted: a top-level function taking its captures, then
@@ -3187,11 +3633,16 @@ impl Lower<'_> {
             }),
             ..Frame::default()
         });
+        let shape = self.callable_shape(term.at);
+        let (argument_shape, _) = self.callable_children(shape);
         let mut params = Vec::new();
+        self.callable_params(shape, &mut params);
         self.evidence_params(&row, &mut params);
         let rep = self.rep(&from);
         let temp = self.fresh(rep);
         self.hold(temp, &from);
+        self.contain(temp, &from);
+        self.callable_held[temp as usize] = Some(argument_shape);
         self.top().locals.insert(arg, temp);
         params.push(Param { temp, rep });
 
@@ -3239,6 +3690,7 @@ impl Lower<'_> {
         // The closure holds the shape of the very type the `fn` was compiled
         // against, wherever a binding or a return carries it from here.
         self.hold(closure, &term.ty);
+        self.callable_held[closure as usize] = Some(shape);
         closure
     }
 
@@ -3385,8 +3837,18 @@ impl Lower<'_> {
         };
         let (from, to, declared) = self.arrow(&shape);
         let (_, _, used) = self.arrow(callee_ty);
-        let mut args = self.evidence_args(&declared, &used, body);
-        args.push(self.fitted(&from, &apply.arg.ty, arg, body));
+        let profile = self.callable_held[callee as usize].unwrap_or(self.erased_callable);
+        let (arg_profile, result_profile) = self.callable_children(profile);
+        let mut args = self.callable_args(profile, body);
+        args.extend(self.evidence_args(&declared, &used, body));
+        args.push(self.reified_fitted(
+            &from,
+            arg_profile,
+            &apply.arg.ty,
+            self.callable_shape(apply.arg.at),
+            arg,
+            body,
+        ));
         let rep = self.rep(&apply.node.ty);
         let value = self.emit(
             body,
@@ -3405,10 +3867,15 @@ impl Lower<'_> {
         // level pins a function shape down, fit it to what this node stands
         // for; where it does not — an `any` nothing decided — the value is
         // taken as this use reads it, which is all there is to go on.
-        match self.rep(&to) == Rep::Fn {
-            true => self.fitted(&apply.node.ty, &to, value, body),
-            false => value,
-        }
+        self.callable_held[value as usize] = Some(result_profile);
+        self.reified_fitted(
+            &apply.node.ty,
+            self.callable_shape(apply.node.at),
+            &to,
+            result_profile,
+            value,
+            body,
+        )
     }
 
     /// Performing an operation: read the implementation the handler passed down
@@ -3434,6 +3901,10 @@ impl Lower<'_> {
         );
         let first = applies[0];
         let arg = self.term(first.arg, body);
+        let have = self.holding(arg, &first.arg.ty);
+        let offered = self.callable_held[arg as usize].unwrap_or(self.callable_shape(first.arg.at));
+        let (from, _, _) = self.arrow(&head.ty);
+        let arg = self.reified_fitted(&from, self.erased_callable, &have, offered, arg, body);
         let rep = self.rep(&first.node.ty);
         // The implementation the record holds is an ordinary closure of the
         // operation's declared arrow, so no evidence goes with the call.
@@ -3446,6 +3917,9 @@ impl Lower<'_> {
                 args: vec![arg],
             },
         );
+        self.hold(value, &first.node.ty);
+        self.contain(value, &first.node.ty);
+        self.callable_held[value as usize] = Some(self.erased_callable);
         self.spun(value, &first.node.ty, &applies[1..], body)
     }
 
@@ -3532,6 +4006,11 @@ impl Lower<'_> {
         let span = term.at;
         let tag = self.emit(body, Span::default(), Rep::Any, Op::NewTag);
         let held_tag = self.top().raise_tag.replace(tag);
+        let result_shape = self.callable_shape(term.at);
+        let held_result = self
+            .top()
+            .raise_result
+            .replace((term.ty.clone(), result_shape));
         let mut records: Vec<(String, Temp)> = Vec::new();
         for effect in &handler.discharges {
             let name = self.program.effect_ids[&effect.anchored].row_key();
@@ -3552,6 +4031,7 @@ impl Lower<'_> {
             records.push((name, record));
         }
         self.top().raise_tag = held_tag;
+        self.top().raise_result = held_result;
 
         let held: Vec<(String, Option<Temp>)> = records
             .iter()
@@ -3575,13 +4055,17 @@ impl Lower<'_> {
                     }
                 }
             }
-            match ret {
+            let (value, source) = match ret {
                 Some(ret) => {
                     low.top().locals.insert(ret.binder.anchored, value);
-                    low.term(&ret.body, inner)
+                    (low.term(&ret.body, inner), &*ret.body)
                 }
-                None => value,
-            }
+                None => (value, handled),
+            };
+            let have = low.holding(value, &source.ty);
+            let offered =
+                low.callable_held[value as usize].unwrap_or(low.callable_shape(source.at));
+            low.reified_fitted(&term.ty, result_shape, &have, offered, value, inner)
         });
         let rep = self.rep(&term.ty);
         self.emit(
@@ -3609,8 +4093,22 @@ impl Lower<'_> {
         let rep = self.rep(&payload);
         let temp = self.fresh(rep);
         self.top().locals.insert(arm.binder.anchored, temp);
+        self.hold(temp, &payload);
+        self.contain(temp, &payload);
+        self.callable_held[temp as usize] = Some(self.erased_callable);
         let mut lifted = Body::default();
         let value = self.term(&arm.body, &mut lifted);
+        let have = self.holding(value, &arm.body.ty);
+        let offered =
+            self.callable_held[value as usize].unwrap_or(self.callable_shape(arm.body.at));
+        let value = self.reified_fitted(
+            &arm.body.ty,
+            self.erased_callable,
+            &have,
+            offered,
+            value,
+            &mut lifted,
+        );
         let frame = self.frames.pop().expect("the frame just pushed");
         let lifted = lifted.seal(Terminator {
             span: self.span(arm.body.at),
@@ -3666,6 +4164,7 @@ impl Lower<'_> {
             .and_then(|symbol| self.inference.promises().get(&symbol).cloned())
             .unwrap_or(Formula::True);
         let tree = Tree {
+            callable: self.callable_shape(term.at),
             arms,
             rep,
             ty: term.ty.clone(),
@@ -3728,7 +4227,8 @@ impl Lower<'_> {
         let value = self.term(arm, body);
         self.assumed = outer;
         let have = self.holding(value, &arm.ty);
-        self.fitted(&tree.ty, &have, value, body)
+        let offered = self.callable_held[value as usize].unwrap_or(self.callable_shape(arm.at));
+        self.reified_fitted(&tree.ty, tree.callable, &have, offered, value, body)
     }
 
     /// One whole position. A column any arm reaches into fields at is widened
@@ -3760,7 +4260,14 @@ impl Lower<'_> {
             .iter()
             .any(|line| matches!(line.cells[0], Cell::Tag { .. }));
         match &*ty {
-            Ty::Nat | Ty::Int | Ty::Fixed(_) | Ty::Real | Ty::String | Ty::Boolean
+            Ty::Nat
+            | Ty::Int
+            | Ty::Fixed(_)
+            | Ty::Real
+            | Ty::String
+            | Ty::Boolean
+            | Ty::Any
+            | Ty::ForeignValue
                 if primitives =>
             {
                 self.switch_prim(col.temp, matrix, tree, body)
@@ -3896,7 +4403,6 @@ impl Lower<'_> {
                     base_ty: ty.clone(),
                     start: *start,
                     drop: *drop,
-                    ty: ty.clone(),
                 })
             }))
             .collect();
@@ -4098,7 +4604,11 @@ impl Lower<'_> {
                         let rep = low.rep(&have);
                         let read = low.emit(inner, tree.span, rep, Op::Payload(temp));
                         low.contain(read, &have);
-                        let held = low.fitted(&payload_ty, &have, read, inner);
+                        let profile =
+                            low.callable_held[temp as usize].unwrap_or(low.erased_callable);
+                        low.callable_held[read as usize] = Some(low.callable_member(profile, name));
+                        low.hold(read, &have);
+                        let held = read;
                         let cols = vec![Col::Value(Value {
                             temp: held,
                             ty: payload_ty.clone(),
@@ -4332,7 +4842,9 @@ impl Lower<'_> {
         };
         let temp = self.emit(body, tree.span, self.rep(&have), op);
         self.contain(temp, &have);
-        let temp = self.fitted(&col.ty, &have, temp, body);
+        self.hold(temp, &have);
+        let profile = self.callable_held[col.base as usize].unwrap_or(self.erased_callable);
+        self.callable_held[temp as usize] = Some(self.callable_element(profile));
         let read = vec![Col::Value(Value {
             temp,
             ty: col.ty.clone(),
@@ -4363,7 +4875,7 @@ impl Lower<'_> {
             },
         );
         self.contain(temp, &authority);
-        let temp = self.fitted(&col.ty, &authority, temp, body);
+        self.callable_held[temp as usize] = self.callable_held[col.base as usize];
         self.tree(matrix.consumed(temp), tree, body)
     }
 
@@ -4391,7 +4903,9 @@ impl Lower<'_> {
             },
         );
         self.contain(temp, &have);
-        let temp = self.fitted(&col.ty, &have, temp, body);
+        self.hold(temp, &have);
+        let profile = self.callable_held[col.base as usize].unwrap_or(self.erased_callable);
+        self.callable_held[temp as usize] = Some(self.callable_member(profile, &col.name));
         let read = vec![Col::Value(Value {
             temp,
             ty: col.ty.clone(),
@@ -4459,6 +4973,7 @@ mod tests {
             &out.source,
             inferred.semantics(),
             &plan,
+            &crate::reification::Analysis::infer(&out.program, inferred.semantics()),
         )
     }
 

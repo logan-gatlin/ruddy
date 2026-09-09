@@ -51,6 +51,8 @@ module option
 module result
 module list
 module array
+module any
+module ffi
 module function
 module tuple
 module ordering

@@ -156,8 +156,8 @@ let boolean_results = {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(
-        String::from_utf8(output.stdout).unwrap().trim(),
-        r#"["ruddy",5,true,"42","7","1.5","true",true,true,true,"u",2,"udd","ruddy","ruddy  ","  ruddy","ruddy","RUDDY","haha","rubdy","rubby","007","700",{"added":42,"subtracted":0,"divided":3,"clamped":10,"converted":3,"zero":true},{"subtracted":-3,"divided":-3,"remainder":-3,"absolute":7,"converted":3},{"added":3.5,"divided":3.5,"square_root":3,"rounded":4,"nan":true,"finite":true,"negative_zero_equal":false},{"negated":false,"both":false,"either":true,"exclusive":true,"equal":true,"implies":false}]"#
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::from_str::<serde_json::Value>(r#"["ruddy",5,true,"42","7","1.5","true",true,true,true,"u",2,"udd","ruddy","ruddy  ","  ruddy","ruddy","RUDDY","haha","rubdy","rubby","007","700",{"added":42,"subtracted":0,"divided":3,"clamped":10,"converted":3,"zero":true},{"subtracted":-3,"divided":-3,"remainder":-3,"absolute":7,"converted":3},{"added":3.5,"divided":3.5,"square_root":3,"rounded":4,"nan":true,"finite":true,"negative_zero_equal":false},{"negated":false,"both":false,"either":true,"exclusive":true,"equal":true,"implies":false}]"#).unwrap()
     );
 }
 
@@ -189,9 +189,9 @@ let filtered_option = std::option::filter (fn value => std::nat::greater_than va
 let option_kept = std::option::is_some filtered_option
 let option_row_fallback = std::option::some_or "fallback" (#Error "ignored")
 
-let mapped_error = std::result::map_error std::str::to_uppercase (#Error "bad")
+let mapped_error: std::Result Nat String = std::result::map_error std::str::to_uppercase (#Error "bad")
 let error_text = match mapped_error with | #Some _ => "ok" | #Error error => error end
-let recovered = std::result::or_else (fn error => #Some (std::str::len error)) mapped_error
+let recovered: std::Result Nat String = std::result::or_else (fn error => #Some (std::str::len error)) mapped_error
 let recovered_value = std::result::unwrap_or 0n recovered
 let error_row_fallback = std::result::error_or "fallback" (#None)
 
@@ -253,7 +253,42 @@ let angle = std::real::round (std::real::radians_to_degrees std::real::pi)
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(
-        String::from_utf8(output.stdout).unwrap().trim(),
-        r#"[42,true,"fallback","BAD",3,"fallback",9,4,true,3,42,42,3,42,42,{"first":2,"second":"RUDDY","projected":42},"greater","less","less","less",true,"u","dy","udd","ddy","a-b-c","yddur",1000,1,180]"#
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::from_str::<serde_json::Value>(r#"[42,true,"fallback","BAD",3,"fallback",9,4,true,3,42,42,3,42,42,{"first":2,"second":"RUDDY","projected":42},"greater","less","less","less",true,"u","dy","udd","ddy","a-b-c","yddur",1000,1,180]"#).unwrap()
+    );
+}
+
+#[test]
+fn reification_standard_modules_compile_decode_and_downcast_across_artifacts() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap();
+    let project = tempfile::tempdir().unwrap();
+    fs::write(project.path().join("Ruddy.toml"), format!("name = \"any-test\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.rud\"\ntarget = \"js\"\n[dependencies]\nstd = {:?}\n", root)).unwrap();
+    fs::write(
+        project.path().join("main.rud"),
+        r#"
+@private extern unknown: ForeignValue = "({ tag: 'Some', value: [21, 22] })"
+@private let decoded: std::Result (std::Option [Nat]) std::ffi::DecodeError = std::ffi::decode unknown
+@private let boxed = std::any::upcast [23n]
+@private let recovered: std::Option [Nat] = std::any::downcast boxed
+let a = match decoded with | #Some (#Some [n, ..]) => n | _ => 0n end
+let b = match recovered with | #Some [n] => n | _ => 0n end
+"#,
+    )
+    .unwrap();
+    let artifact = ruddy_cli::build_project(project.path()).unwrap();
+    let probe = format!(
+        "import assert from 'node:assert/strict'; import {{ pathToFileURL }} from 'node:url'; const app = await import(pathToFileURL({}).href); assert.equal(app.a, 21); assert.equal(app.b, 23);",
+        serde_json::to_string(artifact.with_extension("js").to_str().unwrap()).unwrap()
+    );
+    let output = Command::new("node")
+        .args(["--input-type=module", "--eval", &probe])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }

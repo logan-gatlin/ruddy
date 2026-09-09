@@ -22,11 +22,7 @@ const seeded = (seed) => () => {
 };
 
 const build = (values) => values.reduce((arr, value) => app.push(arr)(value), app.empty);
-const contents = async (arr) => {
-  const out = [];
-  for (let i = 0; i < app.len(arr); i += 1) out.push(await app.get_or(arr)(i)(-1));
-  return out;
-};
+const contents = async (arr) => await app.contents(arr);
 const same = async (arr, model, what) => {
   assert.equal(app.len(arr), model.length, `${what}: length`);
   assert.deepEqual(await contents(arr), model, `${what}: contents`);
