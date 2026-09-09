@@ -373,3 +373,85 @@ fn an_incremental_solver_answers_under_assumptions() {
     assert!(!solver.satisfiable(&[a, !a]));
     assert_eq!(solver.atoms().count(), 3);
 }
+
+/// Check model polarity and completeness independently of which satisfying
+/// assignment the solver chooses, including atoms left unconstrained by a branch.
+#[test]
+fn models_satisfy_every_two_atom_truth_table() {
+    for table in 0u32..16 {
+        let formula = Formula::any((0..4).filter(|row| table & (1 << row) != 0).map(|row| {
+            Formula::all((0..2).map(|at| {
+                if row & (1 << at) != 0 {
+                    var(at)
+                } else {
+                    var(at).not()
+                }
+            }))
+        }));
+        let model = sat::model(&formula);
+        assert_eq!(model.is_some(), table != 0);
+        if let Some(model) = model {
+            assert_eq!(model.len(), atoms(&formula).len());
+            assert!(formula.eval(&|atom| model[&atom]), "{formula}: {model:?}");
+        }
+    }
+}
+
+#[test]
+fn incremental_search_cancels_after_encoding_and_accepts_a_new_revision() {
+    use ruddy::cancellation::Cancellation;
+    use std::{sync::mpsc, time::Duration};
+
+    // Finish encoding before starting the cancellable work: only the solver's
+    // search hook can interrupt this pigeonhole contradiction.
+    let mut solver = sat::Incremental::default();
+    let mut guards = Vec::new();
+    for pigeon in 0..20 {
+        guards.push(solver.add_guarded(&Formula::any((0..19).map(|hole| var(pigeon * 19 + hole)))));
+        for other in 0..pigeon {
+            for hole in 0..19 {
+                guards.push(
+                    solver.add_guarded(
+                        &var(pigeon * 19 + hole)
+                            .not()
+                            .or(var(other * 19 + hole).not()),
+                    ),
+                );
+            }
+        }
+    }
+    let cancellation = Cancellation::default();
+    let worker_token = cancellation.clone();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result = worker_token.run(|| {
+            started_tx.send(()).unwrap();
+            solver.satisfiable(&guards)
+        });
+        done_tx.send(result.is_err()).unwrap();
+
+        // Retained clauses are usable under a fresh token, with the guards
+        // disabled. The cancelled revision must not poison later questions.
+        let mut disabled: Vec<_> = guards.iter().map(|guard| !*guard).collect();
+        assert!(
+            Cancellation::default()
+                .run(|| solver.satisfiable(&disabled))
+                .unwrap()
+        );
+        let a = solver.atom(Atom::Var(0));
+        disabled.extend([a, !a]);
+        assert!(!solver.satisfiable(&disabled));
+        disabled.pop();
+        assert!(solver.satisfiable(&disabled));
+    });
+    started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    std::thread::sleep(Duration::from_millis(30));
+    cancellation.cancel();
+    assert!(
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("SAT search stops")
+    );
+    worker.join().unwrap();
+}
