@@ -64,6 +64,59 @@ fn a_definition_is_printed_on_one_line_when_it_fits() {
 }
 
 #[test]
+fn discard_bindings_preserve_their_written_form() {
+    assert_eq!(fmt("_  =  tick ()"), "_ = tick ()\n");
+    assert_eq!(fmt("_ : Nat = 1n"), "_: Nat = 1n\n");
+    assert_eq!(fmt("let  _  =  tick ()"), "let _ = tick ()\n");
+    assert_eq!(fmt("let _ : Nat = 1n"), "let _: Nat = 1n\n");
+    assert_eq!(
+        fmt("_=first () _=second () let _=third ()"),
+        "_ = first ()\n_ = second ()\nlet _ = third ()\n"
+    );
+    assert_eq!(
+        fmt("module M = _=first () let _=second () end"),
+        "module M = _ = first () let _ = second () end\n"
+    );
+    assert_eq!(
+        fmt("let result = do _=first () let _=second () return 3n end"),
+        "let result = do _ = first () let _ = second () return 3n end\n"
+    );
+    assert_eq!(
+        fmt("_=do\n_=first ()\nlet _=second ()\nend"),
+        "_ = do\n  _ = first ()\n  let _ = second ()\nend\n"
+    );
+}
+
+#[test]
+fn discard_binding_attributes_keep_their_comments() {
+    assert_eq!(fmt("@a @b _=tick ()"), "@a\n@b\n_ = tick ()\n");
+    let source = "@doc \"effects\"\n-- about the discard\n_ = tick ()\nmodule M =\n  @a\n  (* before the discard *)\n  _ = tock ()\nend\n";
+    assert_eq!(fmt(source), source);
+}
+
+#[test]
+fn discard_binding_comments_survive_formatting() {
+    assert_eq!(
+        fmt("-- before\n_ = tick () -- after\n"),
+        "-- before\n_ = tick () -- after\n"
+    );
+    assert_eq!(
+        fmt("_ (* between *) = (* body *) tick ()"),
+        "_ (* between *) = (* body *) tick ()\n"
+    );
+    assert_eq!(
+        fmt("_ -- between\n= tick ()"),
+        "_ = -- between\n  tick ()\n"
+    );
+    assert_eq!(
+        fmt("_ (* pattern *) : Nat (* type *) = 1n"),
+        "_ (* pattern *): Nat (* type *) = 1n\n"
+    );
+    let source = "let result = do\n  -- before\n  _ =\n    -- body\n    tick ()\n  -- after\nend\n";
+    assert_eq!(fmt(source), source);
+}
+
+#[test]
 fn blank_lines_between_definitions_are_kept_but_collapsed() {
     assert_eq!(
         fmt("let a = 1n\n\n\n\nlet b = 2n\nlet c = 3n\n"),

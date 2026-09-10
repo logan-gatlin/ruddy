@@ -1024,6 +1024,10 @@ struct Parser {
     toks: Vec<Token>,
     pos: usize,
     errors: Vec<Error>,
+    /// A let or extern annotation ends at its initializer's `=`. In that
+    /// context `Box _ = value` contains a type hole; after a type or effect
+    /// declaration's body, the same `_ =` begins the next statement.
+    type_before_value: bool,
     /// The regions recovery has dropped so far; see [`Output::skipped`].
     skipped: Vec<Span>,
     /// How far [`Parser::mismatched_closer`] has folded the token prefix into
@@ -1092,6 +1096,7 @@ impl Parser {
             toks,
             pos: 0,
             errors: Vec::new(),
+            type_before_value: false,
             skipped: Vec::new(),
             scan_pos: 0,
             scan_open: Vec::new(),
@@ -1247,12 +1252,27 @@ impl Parser {
         )
     }
 
+    /// A discarded binding with its `let` omitted. Looking past `_` keeps
+    /// ordinary misplaced values such as `f _` on their existing diagnosis.
+    fn at_discard_stmt(&self) -> bool {
+        self.at_wildcard()
+            && matches!(
+                self.toks.get(self.pos + 1).map(|tok| &tok.tracked),
+                Some(Kind::Equal | Kind::Colon)
+            )
+    }
+
     /// Report the `_` at the cursor as one that discards nothing here, and
     /// fail — [`unexpected`](Self::unexpected) with the R9 wording in place of
     /// the generic one. The caller says which position tripped; the meaning is
     /// the same in all of them.
     fn wildcard<T>(&mut self, place: Place) -> Option<T> {
-        let span = self.peek().expect("the caller peeked an underscore").span;
+        // This `_` belongs to the invalid name or field just diagnosed.
+        // Consume it so recovery cannot mistake it for a new `_ =` binding.
+        let span = self
+            .advance()
+            .expect("the caller peeked an underscore")
+            .span;
         self.error(span, ErrorKind::Wildcard { place });
         None
     }
@@ -1484,7 +1504,7 @@ impl Parser {
         crate::cancellation::checkpoint();
         let attributes = self.attributes()?;
         let kind = match self.peek().map(|tok| &tok.tracked) {
-            Some(Kind::Let) => self.let_stmt(),
+            Some(Kind::Let | Kind::Underscore) => self.let_stmt(),
             Some(Kind::Extern) => self.extern_stmt(),
             Some(Kind::Type) => self.type_stmt(),
             Some(Kind::Effect) => self.effect_stmt(),
@@ -1548,7 +1568,7 @@ impl Parser {
         if self.at_data() {
             return self.data().map(Some);
         }
-        if self.at_computation() {
+        if self.at_computation() && !self.at_discard_stmt() {
             let span = self.peek().expect("the cursor is on a token").span;
             self.error(span, ErrorKind::MetadataNotLiteral);
             return None;
@@ -2169,7 +2189,10 @@ impl Parser {
     /// desugared ordinary annotation; ABI nodes never introduce rank of their
     /// own.
     fn extern_annotation(&mut self) -> Option<(Annotation, ExternType)> {
-        let (ty, abi) = self.extern_type(true)?;
+        let previous = std::mem::replace(&mut self.type_before_value, true);
+        let parsed = self.extern_type(true);
+        self.type_before_value = previous;
+        let (ty, abi) = parsed?;
         let clause = match self.eat_keyword("where") {
             Some(kw) => Some(self.where_clause(kw.span, true)?),
             None => None,
@@ -2317,8 +2340,10 @@ impl Parser {
     /// it the definition's type is whatever is inferred for its body. What is
     /// bound is a pattern — a bare name being the ordinary case, and a struct
     /// pattern taking the value apart into several definitions at once.
+    /// When the pattern is the single `_`, the `let` may be omitted.
     fn let_stmt(&mut self) -> Option<Tracked<StmtKind>> {
-        let kw = self.advance().expect("the caller peeked `let`");
+        let start = self.peek().expect("the caller peeked `let` or `_`").span;
+        self.eat_if(&Kind::Let);
         let pattern = self.pattern()?;
         let ty = match self.eat_if(&Kind::Colon) {
             Some(_) => Some(self.annotation(true)?),
@@ -2327,7 +2352,7 @@ impl Parser {
         self.eat(&Kind::Equal)?;
         let expr = self.expr()?;
         let body = expr.span.track(expr);
-        let span = kw.span.merge(body.span);
+        let span = start.merge(body.span);
         Some(span.track(StmtKind::Let {
             pattern: Box::new(pattern),
             ty,
@@ -2366,16 +2391,18 @@ impl Parser {
     /// Whether the next token can begin an atomic expression — used to decide
     /// when to stop gathering application arguments.
     ///
-    /// [`Kind::Let`] is deliberately not one, though [`atom`](Self::atom)
-    /// reads one: an application stops in front of a nested `let`, so
-    /// `let a = 1 let b = 2` is two definitions rather than `a` applied to
-    /// one, and a `let` handed to a function is written in parentheses.
+    /// [`Kind::Let`] is deliberately not one: an application stops in front
+    /// of the next binding, so `let a = 1 let b = 2` is two definitions.
     ///
     /// [`Kind::Underscore`] is one, though no expression can ever be made of
     /// it: `f _` is somebody reaching for a discard where a value goes, and
     /// stopping in front of it would leave the complaint to whatever comes
-    /// after the application instead of pointing at the `_` itself.
+    /// after the application instead of pointing at the `_` itself. A `_ =`
+    /// or `_ :` instead begins the next discarded binding.
     fn at_expr_atom(&self) -> bool {
+        if self.at_discard_stmt() {
+            return false;
+        }
         matches!(
             self.peek(),
             Some(tok) if matches!(
@@ -2710,6 +2737,11 @@ impl Parser {
                         spread: previous.span,
                     },
                 };
+                // The invalid field belongs to this struct, even when its
+                // `_ :` could otherwise begin a discarded binding in recovery.
+                if self.at_wildcard() {
+                    self.advance();
+                }
                 self.error(span, kind);
                 return None;
             }
@@ -2871,11 +2903,11 @@ impl Parser {
     ///
     /// The statements are read by [`block_stmt`](Self::block_stmt) up to the
     /// `return` or the `end`. A `let`'s value ends in front of the next
-    /// `let`, the `return`, or the `end` of its own accord, since none of the
-    /// three begins an atom. The `return`'s value is a full expression and
-    /// extends as far right as it can, the way a `fn` body does, which is why
-    /// the `return` is last: anything written after it would be read as part
-    /// of what it carries. A statement that follows one anyway is refused
+    /// `let`, a discarded binding's `_`, the `return`, or the `end`, since
+    /// none begins an application argument. The `return`'s value is a full
+    /// expression and extends as far right as a `fn` body does. The `return`
+    /// is last because anything after it would be read as part of what it
+    /// carries. A statement that follows one anyway is refused
     /// where it begins, and the rest of the block is read through to its
     /// `end` and dropped, so one mistake is one complaint. Anything else after
     /// the value is the missing `end`, and is reported as that.
@@ -2908,15 +2940,16 @@ impl Parser {
                 }
             }
             if let Some(tok) = self.peek()
-                && matches!(
-                    tok.tracked,
-                    Kind::Let
-                        | Kind::Return
-                        | Kind::Type
-                        | Kind::Effect
-                        | Kind::Module
-                        | Kind::Extern
-                )
+                && (self.at_discard_stmt()
+                    || matches!(
+                        tok.tracked,
+                        Kind::Let
+                            | Kind::Return
+                            | Kind::Type
+                            | Kind::Effect
+                            | Kind::Module
+                            | Kind::Extern
+                    ))
             {
                 self.error(
                     tok.span,
@@ -3528,7 +3561,10 @@ impl Parser {
     /// `when`s of that type bound. Which of them it actually names is
     /// [`ir`](crate::ir)'s to check.
     fn annotation(&mut self, defined: bool) -> Option<Annotation> {
-        let ty = self.type_expr()?;
+        let previous = std::mem::replace(&mut self.type_before_value, defined);
+        let parsed = self.type_expr();
+        self.type_before_value = previous;
+        let ty = parsed?;
         let clause = match self.eat_keyword("where") {
             Some(kw) => Some(self.where_clause(kw.span, defined)?),
             None => None,
@@ -4120,14 +4156,15 @@ impl Parser {
     /// counterpart of [`at_expr_atom`](Self::at_expr_atom), and what decides
     /// where an application stops. `_` is one because it *is* a type now: the
     /// hole, which a type application may be given as an argument like any
-    /// other atom.
+    /// other atom. Outside an initializer's annotation, `_ =` or `_ :`
+    /// begins the next discarded binding instead.
     fn at_type_atom(&self) -> bool {
         // `where` ends a written type rather than continuing it. It is an
         // ordinary identifier everywhere else — the one position that reads it
         // is this one, which is what "contextual" means here — so a type
         // application stops in front of one instead of taking it as another
         // argument.
-        if self.at_keyword("where") {
+        if self.at_keyword("where") || (!self.type_before_value && self.at_discard_stmt()) {
             return false;
         }
         matches!(
@@ -4316,16 +4353,18 @@ impl Parser {
             // An attribute begins the next definition as surely as its
             // keyword does, and skipping it would lose that definition's
             // metadata without a word.
-            if matches!(
-                tok.tracked,
-                Kind::Let
-                    | Kind::Extern
-                    | Kind::Type
-                    | Kind::Effect
-                    | Kind::Module
-                    | Kind::End
-                    | Kind::Attribute(_)
-            ) {
+            if self.at_discard_stmt()
+                || matches!(
+                    tok.tracked,
+                    Kind::Let
+                        | Kind::Extern
+                        | Kind::Type
+                        | Kind::Effect
+                        | Kind::Module
+                        | Kind::End
+                        | Kind::Attribute(_)
+                )
+            {
                 break;
             }
             self.advance();

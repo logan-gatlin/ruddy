@@ -343,8 +343,7 @@ let return = 1
   (let_definition
     (ERROR)
     (natural)
-    (ERROR
-      (identifier))
+    (ERROR)
     (natural)))
 
 ================================================================================

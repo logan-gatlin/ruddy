@@ -188,6 +188,7 @@
 
 ; ── the wildcard and the hole ────────────────────────────────────────────────
 
+; A discard statement's `_` remains a wildcard, with or without `let`.
 (wildcard) @variable.builtin
 (hole) @type.builtin
 

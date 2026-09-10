@@ -51,3 +51,24 @@ test("effects performed by a block's statements reach the handler in order", asy
   assert.equal(await app.handled(0), 30);
   assert.deepEqual(log, [10, 20]);
 });
+
+test("discard shortcuts and longhand run in the same order", async () => {
+  log.length = 0;
+  const expected = app.ordered(0);
+  const expectedLog = [...log];
+  log.length = 0;
+  assert.equal(app.ordered_shortcut(0), expected);
+  assert.deepEqual(log, expectedLog);
+  assert.deepEqual(fields(app.unit_shortcut(9)), {});
+  assert.deepEqual(log, [...expectedLog, 9]);
+  assert.equal(app.mutated_shortcut(0), 2);
+});
+
+test("discard shortcuts preserve handled effects", async () => {
+  log.length = 0;
+  const expected = await app.handled(0);
+  const expectedLog = [...log];
+  log.length = 0;
+  assert.equal(await app.handled_shortcut(0), expected);
+  assert.deepEqual(log, expectedLog);
+});

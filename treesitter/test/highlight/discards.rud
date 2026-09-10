@@ -1,0 +1,28 @@
+-- Both spellings are wildcard definitions and bind no name. Type names,
+-- operation names, attributes, and references keep their existing captures.
+
+@startup
+-- <- @attribute
+_ = !Log.write "ready"
+-- <- @variable.builtin
+--^ @operator
+--       ^^^^^ @function
+
+_ : Result = initialize ()
+-- <- @variable.builtin
+--  ^^^^^^ @type
+
+module Boot =
+  @startup _ = initialize ()
+--^^^^^^^^ @attribute
+--         ^ @variable.builtin
+end
+
+let run = fn value => do
+  _ = value
+--^ @variable.builtin
+--    ^^^^^ @variable.parameter
+  _ : Result = initialize ()
+--^ @variable.builtin
+--    ^^^^^^ @type
+end

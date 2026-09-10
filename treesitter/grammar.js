@@ -121,6 +121,13 @@ module.exports = grammar({
     // read `Parser::clause_stmt` does, spelled as a conflict.
     [$._clause, $.clause_comparison],
     [$._effect_operation_signature, $._type],
+    // After a type or effect label, `_` can be a type hole or the next
+    // discard's head. Keep both readings until its `=` or `:` decides.
+    [$.effect_case],
+    [$.absent_effect],
+    [$.effect_alias],
+    [$.sum_case],
+    [$._type_application, $.type_application],
   ],
 
   rules: {
@@ -291,10 +298,16 @@ module.exports = grammar({
       ')',
     ),
 
-    /** `let <pattern> [: <annotation>] = <expr>` */
+    /**
+     * `let <pattern> [: <annotation>] = <expr>`, or the discard shorthand
+     * `_ [: <annotation>] = <expr>`. Both spellings keep the same definition
+     * and wildcard nodes, so discards never introduce a local name.
+     */
     let_definition: $ => seq(
-      'let',
-      field('pattern', $._pattern),
+      choice(
+        seq('let', field('pattern', $._pattern)),
+        field('pattern', $.wildcard),
+      ),
       optional(seq(':', field('type', $.annotation))),
       '=',
       field('body', $._expression),
@@ -580,10 +593,9 @@ module.exports = grammar({
     )),
 
     /**
-     * `do <let>* [return <expr>] end` — bindings, each in scope for the rest
-     * of the block, and the value the block ends with. Only a `let` may be
-     * written in a block: `parse.rs` refuses every other definition at its
-     * keyword, and so does this.
+     * `do <let-or-discard>* [return <expr>] end` — bindings and discards,
+     * and the value the block ends with. Other definitions are refused at
+     * their keyword, the way `parse.rs` refuses them.
      */
     do_block: $ => seq(
       'do',

@@ -186,7 +186,7 @@ effect IO = { print: Nat -> () }
 effect Console = !Log + !IO
 
 let greet: () -> Nat + !Log = fn _ => do
-  let _ = !Log 1
+  _ = !Log 1
   return 0
 end
 
