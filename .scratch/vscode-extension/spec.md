@@ -50,3 +50,6 @@ to the Marketplace. This supersedes the website-distribution items above: docs
 builds must not package or host a VSIX. Keep the local `just vscode-install` flow.
 Marketplace account setup and publication are not yet configured; document source
 installation until the actual publisher identity and listing exist.
+
+The user confirmed the Marketplace publisher ID is `lgatlin`; the extension ID
+is `lgatlin.ruddy`. Marketplace publication remains pending.

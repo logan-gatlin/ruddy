@@ -3,7 +3,7 @@
   "displayName": "Ruddy",
   "description": "Tree-sitter highlighting and language server support for Ruddy.",
   "version": "0.1.0",
-  "publisher": "ruddy-lang",
+  "publisher": "lgatlin",
   "license": "UNLICENSED",
   "repository": { "type": "git", "url": "https://github.com/logan-gatlin/ruddy.git" },
   "engines": { "vscode": "^1.96.0", "node": ">=20" },

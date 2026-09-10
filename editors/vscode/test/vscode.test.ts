@@ -7,7 +7,7 @@ export async function run(): Promise<void> {
   const standalone = await vscode.workspace.openTextDocument(vscode.Uri.file(path.join(root, 'standalone/file.rud')));
   await vscode.window.showTextDocument(standalone);
   assert.equal(standalone.languageId, 'ruddy');
-  await vscode.extensions.getExtension('ruddy-lang.ruddy')!.activate();
+  await vscode.extensions.getExtension('lgatlin.ruddy')!.activate();
   const tokens = await vscode.commands.executeCommand<vscode.SemanticTokens>('vscode.provideDocumentSemanticTokens', standalone.uri);
   assert.ok(tokens && tokens.data.length > 0, 'standalone files have bundled Tree-sitter highlighting');
   console.log('PASS standalone highlighting in the VS Code extension host');
