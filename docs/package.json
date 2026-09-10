@@ -4,8 +4,9 @@
   "type": "module",
   "scripts": {
     "clean": "node --eval \"require('node:fs').rmSync('_site', { recursive: true, force: true })\"",
-    "build": "npm run clean && eleventy",
-    "dev": "npm run clean && eleventy --serve",
+    "build:extension": "npm --prefix ../editors/vscode ci && npm --prefix ../editors/vscode run package -- --out ruddy.vsix",
+    "build": "npm run clean && npm run build:extension && eleventy",
+    "dev": "npm run clean && npm run build:extension && eleventy --serve",
     "test": "node --test lib/*.test.js",
     "deploy": "wrangler deploy",
     "deploy:check": "wrangler deploy --dry-run"

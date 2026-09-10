@@ -6,7 +6,17 @@ through `ruddy lsp`.
 
 ## Install
 
-In VS Code, run **Extensions: Install from VSIX…** and select `ruddy-0.1.0.vsix`.
+From a Ruddy checkout, `just vscode-install` regenerates and checks the grammar,
+builds the extension, and installs it with `code --install-extension --force`.
+The `code` command must be on PATH. An alternative executable can be selected
+with `just vscode-install code-insiders`. Use `just vscode` to build the VSIX
+without installing it; this writes `editors/vscode/ruddy.vsix`.
+
+The [website download page](https://ruddy.logan.md/download.html) provides a
+prebuilt VSIX and a one-line download/install command.
+
+In VS Code, run **Extensions: Install from VSIX…** and select the downloaded or
+locally built `.vsix` file.
 Highlighting works immediately, including standalone files and Restricted Mode.
 It uses VS Code semantic tokens, enabled by default for Ruddy. If you override
 `editor.semanticHighlighting.enabled` to `false`, highlighting is disabled;

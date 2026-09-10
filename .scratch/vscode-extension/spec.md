@@ -29,3 +29,16 @@ Implementation note: highlighting tests exposed a pre-existing Tree-sitter bug
 where nested block comments on separate lines consumed following definitions.
 The grammar fix and regression corpus case are included so bundled highlighting
 handles these valid programs correctly.
+
+## CLI installation follow-up
+
+The user requested a separate `just` command to build and install the grammar,
+plus a convenient one-line extension install command on the website in `docs/`.
+
+- `just vscode-install` regenerates/tests the grammar, packages the extension,
+  and installs it through VS Code's CLI; an optional editor executable supports
+  alternate installations. `just vscode` remains packaging-only.
+- Website builds include a freshly packaged VSIX at `downloads/ruddy.vsix`.
+- The download page documents a single-line `curl` plus `code --install-extension`
+  command, a direct VSIX link, prerequisites, and the separate CLI requirement for
+  LSP features. Publishing uses the existing docs deployment workflow.

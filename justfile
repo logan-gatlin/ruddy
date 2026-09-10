@@ -68,7 +68,11 @@ lsp:
 # Build the locally installable VS Code extension (requires Node.js and npm).
 vscode:
     npm --prefix "{{justfile_directory()}}/editors/vscode" ci
-    npm --prefix "{{justfile_directory()}}/editors/vscode" run package
+    npm --prefix "{{justfile_directory()}}/editors/vscode" run package -- --out ruddy.vsix
+
+# Rebuild the grammar and install the highlighting/LSP extension into VS Code.
+vscode-install editor="code": grammar vscode
+    "{{editor}}" --install-extension "{{justfile_directory()}}/editors/vscode/ruddy.vsix" --force
 
 # Regenerate the tree-sitter parser and run its corpus tests.
 grammar *args:

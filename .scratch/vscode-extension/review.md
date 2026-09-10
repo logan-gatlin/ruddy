@@ -51,3 +51,24 @@ Standards: 0 findings, no worst issue. Spec: 0 findings, no worst issue.
 - `npm run package`: produced `editors/vscode/ruddy-0.1.0.vsix` (about 264 KB).
 - The trusted/untrusted integration tests also passed with
   `RUDDY_TEST_EXTENSION_PATH` pointing to the extracted VSIX.
+
+## CLI installation follow-up
+
+Baseline: `09b16556db283bbc545d581d145bc01af5797299`.
+
+### Standards
+
+No findings. The docs follow the writing guide, and the recipes compose grammar
+validation and packaging without introducing direct Rust test invocations.
+
+### Spec
+
+No findings. The install recipe, stable artifact filename, website build, direct
+download link, and one-line command agree with the follow-up requirements.
+
+Validation: website build and all eight docs tests passed; `just vscode-install`
+installed into an isolated real VS Code profile. Downloading the generated site's
+VSIX over local HTTP and installing it through the documented CLI flow also
+succeeded (`ruddy-lang.ruddy@0.1.0`). The public site was not deployed.
+
+Standards: 0 findings, no worst issue. Spec: 0 findings, no worst issue.
