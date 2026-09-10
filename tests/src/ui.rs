@@ -50,6 +50,8 @@ fn inference_error_kinds(span: Anchor) -> Vec<TypeError> {
             }),
         },
         TypeError::Recursive,
+        TypeError::SatTermLimit { max_terms: 256 },
+        TypeError::InvalidMaxSatTerms,
         TypeError::MissingField {
             shape: Shape::Struct,
             base: nat.clone(),
@@ -638,7 +640,7 @@ fn every_inference_error_exposes_a_complete_structured_diagnostic() {
     let use_span = map.record(Symbol::GENERATED, 0, Span::generated(4, 5));
     let declared = map.record(Symbol::GENERATED, 0, Span::generated(1, 2));
     let kinds = inference_error_kinds(declared);
-    assert_eq!(kinds.len(), 18);
+    assert_eq!(kinds.len(), 20);
 
     for kind in kinds {
         let diagnostic = inference::Error::new(use_span, kind).diagnostic(&map);
@@ -680,6 +682,9 @@ fn inference_diagnostic_prose_avoids_solver_jargon() {
             .collect::<Vec<_>>()
             .join(" ")
             .to_ascii_lowercase();
+        // The documented resource-control attribute must retain its literal
+        // spelling so the reader can apply the suggested repair.
+        let prose = prose.replace("@max_sat_terms", "attribute");
         let words: HashSet<_> = prose
             .split(|character: char| !character.is_ascii_alphabetic())
             .filter(|word| !word.is_empty())
@@ -2096,6 +2101,14 @@ fn inference_source_corpus_matches_abridged_structured_goldens() {
         (
             "spread-not-a-struct",
             include_str!("../diagnostics/inference/spread-not-a-struct.rud"),
+        ),
+        (
+            "sat-term-limit",
+            include_str!("../diagnostics/inference/sat-term-limit.rud"),
+        ),
+        (
+            "invalid-max-sat-terms",
+            include_str!("../diagnostics/inference/invalid-max-sat-terms.rud"),
         ),
         (
             "type-mismatch",

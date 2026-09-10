@@ -2528,6 +2528,12 @@ pub enum StructDemand {
 
 #[derive(Debug, Clone)]
 pub enum ErrorKind {
+    /// Projection exceeded this definition's configured product-term budget.
+    SatTermLimit {
+        max_terms: usize,
+    },
+    /// The compiler-owned attribute requires a natural that fits `usize`.
+    InvalidMaxSatTerms,
     RuntimeTypeInformation {
         message: String,
     },
@@ -3147,6 +3153,10 @@ struct Fingerprint {
 
 #[derive(Default)]
 struct Table {
+    /// Projection budgets and failures belong to definitions, including their
+    /// nested bindings. A recursive group shares a table but not a budget.
+    sat_term_limits: HashMap<Symbol, usize>,
+    sat_term_failures: HashSet<Symbol>,
     /// Optional ambient labels introduced during handler constraint generation.
     /// An unused allowance is closed at generalization, like an unshared tail.
     handler_presences: HashSet<TyVar>,
@@ -6911,6 +6921,24 @@ fn infer_group(
         };
         let reported = errors.len();
         let published = locals.len();
+        if let Some(attribute) = decl.metadata.get("max_sat_terms") {
+            let limit = match attribute.value.anchored {
+                ir::DataKind::Natural(value) => usize::try_from(value).ok(),
+                _ => None,
+            };
+            match limit {
+                Some(limit) => {
+                    table.sat_term_limits.insert(scoped.symbol, limit);
+                }
+                None => errors.push(Error {
+                    id: table.error_id(),
+                    cause: ErrorCause::Direct,
+                    at: attribute.value.at,
+                    kind: ErrorKind::InvalidMaxSatTerms,
+                    explanation: None,
+                }),
+            }
+        }
 
         let generated_end = table.store.batches.len();
         Solve {
@@ -6973,6 +7001,7 @@ fn infer_group(
     // level leaves free is a [`Ty::Var`] the enclosing binder still owns.
     for (at, member) in solved.into_iter().enumerate() {
         let symbol = member.scoped.symbol;
+        table.definition = Some(symbol);
         let (from, to) = (bounds[at], bounds[at + 1]);
         let decl = &mut typed[&symbol];
 
@@ -7096,6 +7125,19 @@ fn infer_group(
         // scheme's own clause is deliberately not this: see
         // [`Semantics::promises`].
         promises.insert(symbol, table.promised(&subst));
+        // Projection may fail while solving a nested binding or while checking
+        // and generalizing this member. Report once, on its source definition.
+        if table.sat_term_failures.contains(&symbol) {
+            errors.push(Error {
+                id: table.error_id(),
+                cause: ErrorCause::Direct,
+                at: decl.name_at,
+                kind: ErrorKind::SatTermLimit {
+                    max_terms: table.max_sat_terms(),
+                },
+                explanation: None,
+            });
+        }
         // And the same for what it complained about, which is why this
         // waits until the group is solved rather than running where the
         // error was reported: a variable in a payload may have been solved
@@ -7477,6 +7519,28 @@ impl Table {
             scope,
             signatures,
             ..Default::default()
+        }
+    }
+
+    fn max_sat_terms(&self) -> usize {
+        self.definition
+            .and_then(|symbol| self.sat_term_limits.get(&symbol).copied())
+            .unwrap_or(sat::DEFAULT_MAX_TERMS)
+    }
+
+    /// Failed projection is recorded for a diagnostic on the owning definition.
+    /// Recovery may finish typing, but no failed projection is a proof.
+    fn project(&mut self, formula: &Formula, keep: &[Atom]) -> Option<Formula> {
+        let definition = self.definition.unwrap_or(self.scope);
+        if self.sat_term_failures.contains(&definition) {
+            return None;
+        }
+        match sat::project(formula, keep, self.max_sat_terms()) {
+            Ok(formula) => Some(formula),
+            Err(_) => {
+                self.sat_term_failures.insert(definition);
+                None
+            }
         }
     }
 
@@ -9191,7 +9255,7 @@ impl Table {
     /// prevents `E -> Q` from becoming `true` merely because `E` belongs to the
     /// enclosing value rather than the local annotation.
     fn disagreement(
-        &self,
+        &mut self,
         promised: &Formula,
         names: &[(String, Presence)],
         guard: &Formula,
@@ -9238,12 +9302,12 @@ impl Table {
         //
         // Projection supplies those existential quantifiers. With no producer
         // witnesses this reduces to the old universal contract check.
-        let admitted = sat::project(&allowed, &check_atoms);
-        let realized = sat::project(&allowed.clone().and(body.clone()), &check_atoms);
+        let admitted = self.project(&allowed, &check_atoms)?;
+        let realized = self.project(&allowed.clone().and(body.clone()), &check_atoms)?;
         if sat::entails(&admitted, &realized) {
             return None;
         }
-        let required = sat::project(&guard.and(body), &promised_atoms);
+        let required = self.project(&guard.and(body), &promised_atoms)?;
         // Both halves are quoted in the names the reader wrote, which means
         // looking each one up by the presence it decides — as the solve now has
         // it, not as the annotation minted it. A variable unified with another
@@ -9254,7 +9318,7 @@ impl Table {
             shape: None,
         });
         Some((
-            crate::ui::in_labels(&sat::project(&promised, &promised_atoms), &named.labels),
+            crate::ui::in_labels(&self.project(&promised, &promised_atoms)?, &named.labels),
             crate::ui::in_labels(&required, &named.labels),
         ))
     }
@@ -10522,7 +10586,7 @@ impl Table {
         keep.retain(
             |atom| !matches!(atom, Atom::Var(var) if candidates.binary_search(var).is_ok()),
         );
-        let Some(admitted) = sat::project_exact(&known, &keep) else {
+        let Some(admitted) = self.project(&known, &keep) else {
             return;
         };
         for var in candidates {
@@ -10533,7 +10597,7 @@ impl Table {
                     Formula::Atom(atom)
                 }
             });
-            if let Some(realized) = sat::project_exact(&absent, &keep)
+            if let Some(realized) = self.project(&absent, &keep)
                 && sat::entails(&admitted, &realized)
             {
                 self.default_bind(
@@ -11094,14 +11158,14 @@ impl Table {
     /// Silent once something has already flipped the store: the cascade rule.
     /// A `where false` on every scheme downstream of one contradiction is the
     /// same mistake said in as many places as the program has definitions.
-    fn required(&self, ty: &Arc<Ty>) -> Formula {
+    fn required(&mut self, ty: &Arc<Ty>) -> Formula {
         self.required_given(ty, &Formula::True)
     }
 
     /// What a type generalized inside a reachable arm requires while that arm's
     /// premise holds. Conjoining the premise before projection prevents
     /// existential elimination from turning `E -> Q(local)` into `true`.
-    fn required_given(&self, ty: &Arc<Ty>, premise: &Formula) -> Formula {
+    fn required_given(&mut self, ty: &Arc<Ty>, premise: &Formula) -> Formula {
         if self.unsat {
             return Formula::True;
         }
@@ -11109,7 +11173,8 @@ impl Table {
         self.presences_in(ty, &mut presences);
         let atoms: Vec<Atom> = presences.into_iter().map(Atom::Var).collect();
         let needed = self.component(&atoms).and(self.resolved(premise));
-        sat::project(&needed, &atoms)
+        // `true` is recovery only: the owning definition will report the failure.
+        self.project(&needed, &atoms).unwrap_or(Formula::True)
     }
 
     /// What the store says about every presence variable `subst` numbered, in
@@ -11674,6 +11739,10 @@ impl Table {
             // their formulas were already worded, at the moment the variables
             // in them still had labels to be named by. There is nothing here
             // for a later substitution to improve.
+            ErrorKind::SatTermLimit { max_terms } => ErrorKind::SatTermLimit {
+                max_terms: *max_terms,
+            },
+            ErrorKind::InvalidMaxSatTerms => ErrorKind::InvalidMaxSatTerms,
             ErrorKind::PresenceRequired { formula, shape } => ErrorKind::PresenceRequired {
                 formula: formula.clone(),
                 shape: *shape,

@@ -1839,7 +1839,9 @@ impl Solve<'_> {
         let (scheme, subst) = self.table.generalize(bound, level, required);
         self.table.level = level - 1;
         self.locals.insert(symbol, scheme.clone());
-        let provenance = if self.errors.len() != error_start {
+        let provenance = if self.errors.len() != error_start
+            || self.table.sat_term_failures.contains(&self.definition)
+        {
             SchemeProvenance::default()
         } else if let Some(annotation_span) = self.table.authoritative_spans.get(&symbol).copied() {
             self.table.authoritative_provenance(
