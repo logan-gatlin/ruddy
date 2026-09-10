@@ -467,13 +467,13 @@ fn a_remembered_dependency_graph_follows_edits_to_its_sources() {
 }
 
 #[test]
-fn installed_standard_library_is_the_only_trusted_external_local_root() {
+fn default_standard_library_uses_git_cache_and_local_overrides_remain_sandboxed() {
     let outer = tempfile::tempdir().unwrap();
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--ignored",
             "--exact",
-            "snapshot::installed_standard_library_child",
+            "snapshot::cached_standard_library_child",
         ])
         .env("RUDDY_HOME", outer.path().join("home"))
         .env("RUDDY_TEST_STD_SCRATCH", outer.path().join("scratch"))
@@ -488,20 +488,13 @@ fn installed_standard_library_is_the_only_trusted_external_local_root() {
 }
 
 #[test]
-#[ignore = "run in isolation with a dedicated installed standard library"]
-fn installed_standard_library_child() {
+#[ignore = "run in isolation with a dedicated cached standard library"]
+fn cached_standard_library_child() {
     let home = std::path::PathBuf::from(std::env::var_os("RUDDY_HOME").unwrap());
     let scratch = std::path::PathBuf::from(std::env::var_os("RUDDY_TEST_STD_SCRATCH").unwrap());
     let app = scratch.join("app");
-    let standard = home.join("std");
     fs::create_dir_all(&app).unwrap();
-    fs::create_dir_all(&standard).unwrap();
-    fs::write(standard.join("main.rud"), "let installed = 1n\n").unwrap();
-    fs::write(
-        standard.join("Ruddy.toml"),
-        "name = \"std\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.rud\"\n[dependencies]\nstd = false\n",
-    )
-    .unwrap();
+    let standard = crate::git_fixture::cache_std(&home, "let installed = 1n\n");
     let request = CompileRequest {
         kind: ruddy::artifact::Kind::Library,
         target: None,
@@ -525,16 +518,16 @@ fn installed_standard_library_child() {
         .iter()
         .find(|stage| stage.id == "dependencies")
         .unwrap();
-    assert_eq!(dependencies.nodes[0].children[0].text, "std@0.1.0");
+    assert_eq!(dependencies.nodes[0].children[0].text, "std@1.0.0");
     assert!(
         dependencies.nodes[0].children[0]
             .fields
             .iter()
-            .any(|field| field.name == "source" && field.value == "installed default")
+            .any(|field| field.name == "source"
+                && field.value == format!("git {}", ruddy_cli::DEFAULT_STD_GIT))
     );
 
-    // Trust is attached to the Default setting, not merely to the path: the
-    // same external tree named as a custom dependency remains sandboxed.
+    // A local override receives no exception, even if it names a cache folder.
     let custom = CompileRequest {
         std: StdConfig::Dependency(DependencySpec::Path(standard)),
         ..request

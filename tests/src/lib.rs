@@ -41,3 +41,8 @@ mod ui;
 
 mod analysis;
 mod lsp;
+
+mod git_fixture;
+
+#[cfg(unix)]
+mod git_transport;

@@ -37,7 +37,7 @@ const state = {
   /// Runtime configuration is not used by snapshots, but is preserved when
   /// debugger documents are loaded and saved.
   run: {},
-  /// Standard library: null uses the installed default, false disables it,
+  /// Standard library: null uses the default Git source, false disables it,
   /// and a dependency specification selects a custom source.
   std: null,
   /// Last custom standard-library source, retained while std is off so "on"

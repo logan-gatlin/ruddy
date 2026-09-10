@@ -1,5 +1,5 @@
 [package]
-name = "ruddy"
+name = "ruddy-compiler"
 version = "0.1.0"
 edition = "2024"
 # `tests/` is the workspace's test crate, not this package's integration tests.

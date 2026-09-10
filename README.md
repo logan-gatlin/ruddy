@@ -19,9 +19,14 @@ ruddy fmt
 Use `ruddy --help` to see all CLI commands. `ruddy fmt` rewrites a bundle's
 sources in one canonical style (`--check` only reports what would change,
 `--stdin` formats one file from standard input); a file with syntax errors is
-formatted around them, and they are reported. The standard library is installed under `$RUDDY_HOME/std`, or `~/.ruddy/std` when `RUDDY_HOME` is unset.
+formatted around them, and they are reported. The standard library is fetched automatically from `https://github.com/logan-gatlin/ruddy.git` and shared through the Git cache under `$RUDDY_HOME/cache/git` (normally `~/.ruddy/cache/git`).
 
-The repository's `Ruddy.toml` defines the standard-library bundle, with `std/lib.rud` as its root source. Run `ruddy check` from the repository root to check it. The installer copies this manifest and the `std/` source directory into the installed bundle.
+Git dependencies use depth-one clones over Git protocol v2.
+Full commit hashes fetch the pinned commit directly; abbreviated revisions may require more history to resolve.
+Cached source selections are shared across projects, including projects without a lockfile.
+To refresh a cached branch or tag, remove its selection from `$RUDDY_HOME/cache/git/selections` and remove the project's `Ruddy.lock`; existing lockfiles keep their pinned revisions.
+
+The repository's `Ruddy.toml` defines the standard-library bundle, with `std/lib.rud` as its root source. Run `ruddy check` from the repository root to check it.
 
 ## Editor support
 
@@ -29,7 +34,7 @@ The language server is `ruddy lsp`. Configure your editor to launch that
 command over stdio, with the directory containing `Ruddy.toml` as its workspace
 root. It provides diagnostics, hover, completion, go-to-definition, and
 document formatting for `.rud` files. Unsaved local dependency buffers participate in analysis; Git dependencies
-and installed std retain source navigation.
+and cached std retain source navigation.
 
 For Helix, add the server table and merge these keys into the existing Ruddy
 language entry from `just helix` ([Helix configuration](https://docs.helix-editor.com/languages.html)):
@@ -201,6 +206,8 @@ just dev         # serve the live-reloading debugger on :7878
 just grammar     # regenerate and test the tree-sitter parser
 just cov         # measure compiler coverage (nightly Rust)
 ```
+
+The HTTPS Git transport tests require Git, Python 3, and OpenSSL.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for project conventions. Run tests through `just test`, not `cargo test`.
 

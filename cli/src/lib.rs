@@ -35,6 +35,8 @@ pub use git::{LOCKFILE, LockedGit, LockedSelector, Lockfile, ruddy_home};
 
 const MANIFEST: &str = "Ruddy.toml";
 const ROOT: &str = "main.rud";
+pub const DEFAULT_STD_GIT: &str = "https://github.com/logan-gatlin/ruddy.git";
+
 const GITIGNORE: &str = ".gitignore";
 const BUILD_DIRECTORY: &str = "build";
 const NODE_PACKAGE: &[u8] = b"{\"type\":\"module\"}\n";
@@ -1215,7 +1217,7 @@ pub type ManifestDependency = DependencySpec;
 /// disables standard library injection, and dependency syntax selects an override.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum StdConfig {
-    /// Resolve `std` from `$RUDDY_HOME/std` (or `$HOME/.ruddy/std`).
+    /// Resolve `std` from the default Git repository through the shared cache.
     #[default]
     Default,
     /// Do not inject a standard-library dependency for this project.
@@ -1225,7 +1227,7 @@ pub enum StdConfig {
 }
 
 impl StdConfig {
-    /// Whether this setting is the omitted, default-installed standard library.
+    /// Whether this setting is the omitted, default Git standard library.
     pub const fn is_default(&self) -> bool {
         matches!(self, Self::Default)
     }
@@ -1509,8 +1511,6 @@ pub enum ProjectSource {
     Local,
     /// A non-root project inside Ruddy's immutable global Git cache.
     GitCache,
-    /// The implicitly selected standard library installed under Ruddy home.
-    InstalledStd,
 }
 
 /// One successfully compiled project in a dependency graph.
@@ -1670,9 +1670,7 @@ where
 /// Resolve a debugger project's implicit standard library and declarations,
 /// compiling every one of them for `build`, the project's own.
 ///
-/// Custom local roots remain inside `sandbox`. The only extra trusted tree is
-/// the exact canonical `$RUDDY_HOME/std` root when `std` is defaulted; a custom
-/// specification that happens to use the same alias receives no exception.
+/// Local roots remain inside `sandbox`; Git dependencies use the shared cache.
 pub fn compile_sandboxed_project_dependencies<I, A>(
     std: &StdConfig,
     dependencies: I,
@@ -1705,9 +1703,14 @@ fn dependency_specs(
     let mut specifications = Vec::new();
     match std {
         StdConfig::Default => {
-            let specification = ruddy_home()
-                .map(|home| DependencySpec::Path(home.join("std")))
-                .map_err(default_std_error)?;
+            let specification = DependencySpec::Detailed(DependencyDetail {
+                bundle: None,
+                path: None,
+                git: Some(DEFAULT_STD_GIT.into()),
+                branch: None,
+                tag: None,
+                rev: None,
+            });
             specifications.push(("std".to_string(), specification, true));
         }
         StdConfig::Disabled => {}
@@ -1759,7 +1762,7 @@ where
     };
     let mut direct = Vec::new();
     let mut paths = Vec::new();
-    for (alias, specification, installed_default) in dependencies {
+    for (alias, specification, default_std) in dependencies {
         specification.validate().map_err(|error| {
             dependency_error(
                 &alias,
@@ -1779,21 +1782,15 @@ where
             .unwrap_or_else(|| PathBuf::from(specification.git().unwrap_or("<source>")));
         let contextualize = |error| {
             let error = dependency_error(&alias, &expected, &declared, &project, error);
-            if installed_default {
+            if default_std {
                 default_std_error(error)
             } else {
                 error
             }
         };
         let directory = if let Some(path) = specification.path() {
-            if installed_default {
-                let directory = canonical_project(&project.join(path)).map_err(&contextualize)?;
-                compiler.installed_std_roots.push(directory.clone());
-                directory
-            } else {
-                canonical_project_in(&project.join(path), compiler.sandbox.as_deref())
-                    .map_err(&contextualize)?
-            }
+            canonical_project_in(&project.join(path), compiler.sandbox.as_deref())
+                .map_err(&contextualize)?
         } else {
             let path = compiler
                 .resolver
@@ -1810,7 +1807,6 @@ where
             compiler
                 .git_roots
                 .iter()
-                .chain(compiler.installed_std_roots.iter())
                 .find(|root| directory.starts_with(root))
                 .map(PathBuf::as_path)
                 .or(compiler.sandbox.as_deref()),
@@ -1823,7 +1819,7 @@ where
                 &manifest.name,
                 &directory.join(MANIFEST),
             );
-            return Err(if installed_default {
+            return Err(if default_std {
                 default_std_error(error)
             } else {
                 error
@@ -1936,7 +1932,6 @@ struct GraphCompiler {
     root: Option<PathBuf>,
     git_cache_root: Option<PathBuf>,
     git_roots: Vec<PathBuf>,
-    installed_std_roots: Vec<PathBuf>,
     completed: HashMap<PathBuf, usize>,
     identities: HashMap<(String, String), PathBuf>,
     active: Vec<(PathBuf, String)>,
@@ -1961,7 +1956,6 @@ impl Default for GraphCompiler {
             root: None,
             git_cache_root: git::canonical_checkouts_root(),
             git_roots: Vec::new(),
-            installed_std_roots: Vec::new(),
             completed: HashMap::new(),
             identities: HashMap::new(),
             active: Vec::new(),
@@ -2000,11 +1994,6 @@ impl GraphCompiler {
         let boundary = self
             .git_roots
             .iter()
-            .chain(
-                self.installed_std_roots
-                    .iter()
-                    .filter(|_| self.sandbox.is_some()),
-            )
             .find(|root| directory.starts_with(root))
             .cloned()
             .or_else(|| self.sandbox.clone());
@@ -2046,13 +2035,13 @@ impl GraphCompiler {
 
         let mut dependency_artifacts = Vec::with_capacity(dependencies.len());
         let mut dependency_indices = Vec::with_capacity(dependencies.len());
-        for (alias, specification, installed_default) in &dependencies {
+        for (alias, specification, default_std) in &dependencies {
             let expected = specification.bundle(alias).to_string();
             if let Err(error) = specification.validate() {
                 self.active.pop();
                 let error =
                     dependency_error(alias, &expected, Path::new("<source>"), &directory, error);
-                return Err(if *installed_default {
+                return Err(if *default_std {
                     default_std_error(error)
                 } else {
                     error
@@ -2067,27 +2056,7 @@ impl GraphCompiler {
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| PathBuf::from(specification.git().unwrap_or("<source>")));
             let child = if let Some(path) = specification.path() {
-                // The installed default is the one narrowly trusted tree in a
-                // sandboxed build. Configured path overrides remain confined to
-                // the declaring project's existing boundary.
-                let candidate = directory.join(path);
-                let child = canonical_project_in(
-                    &candidate,
-                    if *installed_default {
-                        None
-                    } else {
-                        boundary.as_deref()
-                    },
-                );
-                if *installed_default {
-                    child.inspect(|child| {
-                        if !self.installed_std_roots.contains(child) {
-                            self.installed_std_roots.push(child.clone());
-                        }
-                    })
-                } else {
-                    child
-                }
+                canonical_project_in(&directory.join(path), boundary.as_deref())
             } else {
                 self.resolver
                     .as_mut()
@@ -2107,7 +2076,7 @@ impl GraphCompiler {
             }
             .map_err(|error: CompileError| {
                 let error = dependency_error(alias, &expected, &declared, &directory, error);
-                if *installed_default {
+                if *default_std {
                     default_std_error(error)
                 } else {
                     error
@@ -2116,17 +2085,12 @@ impl GraphCompiler {
             let child_boundary = self
                 .git_roots
                 .iter()
-                .chain(
-                    self.installed_std_roots
-                        .iter()
-                        .filter(|_| self.sandbox.is_some()),
-                )
                 .find(|root| child.starts_with(root))
                 .map(PathBuf::as_path)
                 .or(self.sandbox.as_deref());
             let child_manifest = load_manifest(&child, child_boundary).map_err(|error| {
                 let error = dependency_error(alias, &expected, &declared, &directory, error);
-                if *installed_default {
+                if *default_std {
                     default_std_error(error)
                 } else {
                     error
@@ -2145,7 +2109,7 @@ impl GraphCompiler {
                     declared.display(),
                     directory.join(MANIFEST).display()
                 ));
-                return Err(if *installed_default {
+                return Err(if *default_std {
                     default_std_error(error)
                 } else {
                     error
@@ -2161,7 +2125,7 @@ impl GraphCompiler {
                 .visit(child, Some((alias.clone(), declared.clone())))
                 .map_err(|error| {
                     let error = dependency_error(alias, &expected, &declared, &directory, error);
-                    if *installed_default {
+                    if *default_std {
                         default_std_error(error)
                     } else {
                         error
@@ -2227,12 +2191,6 @@ impl GraphCompiler {
             source: if self.root.as_ref() == Some(&directory) {
                 ProjectSource::Local
             } else if self
-                .installed_std_roots
-                .iter()
-                .any(|root| directory.starts_with(root))
-            {
-                ProjectSource::InstalledStd
-            } else if self
                 .git_roots
                 .iter()
                 .any(|root| directory.starts_with(root))
@@ -2294,7 +2252,7 @@ fn canonical_project_in(directory: &Path, sandbox: Option<&Path>) -> Result<Path
 
 fn default_std_error(error: CompileError) -> CompileError {
     error.map_diagnostics(|diagnostic| {
-        diagnostic.with_help("install the Ruddy standard library in `$RUDDY_HOME/std`, configure `[dependencies].std` to use another project, or set it to `false`")
+        diagnostic.with_help("check access to `https://github.com/logan-gatlin/ruddy.git`, configure `[dependencies].std` to use another project, or set it to `false`")
     })
 }
 

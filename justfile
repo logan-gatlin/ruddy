@@ -63,7 +63,7 @@ debug *args:
 
 # Run the language server over stdio.
 lsp:
-    cargo run -p cli --bin ruddy -- lsp
+    cargo run -p ruddy --bin ruddy -- lsp
 
 # Regenerate the tree-sitter parser and run its corpus tests.
 grammar *args:
@@ -144,11 +144,17 @@ test *args:
 build:
     cargo build --workspace
 
-# Build and install the CLI, language server included, then replace the bundled
-# standard library under RUDDY_HOME (or ~/.ruddy when RUDDY_HOME is unset or empty).
+# Serve the documentation locally with live reload.
+docs:
+    npm --prefix "{{justfile_directory()}}/docs" run dev
+
+# Build the documentation and deploy it to ruddy.logan.md.
+deploy:
+    npm --prefix "{{justfile_directory()}}/docs" run deploy
+
+# Build and install the CLI, including the language server.
 install:
     cargo install --locked --path "{{justfile_directory()}}/cli"
-    "{{justfile_directory()}}/scripts/install-std.sh" "{{justfile_directory()}}"
 
 # Line and branch coverage for the compiler library. Branch coverage is a
 # nightly-only rustc feature, hence `+nightly`.
@@ -168,11 +174,11 @@ clippy:
 # Rust sources through rustfmt, Ruddy sources through `ruddy fmt`.
 fmt:
     cargo fmt --all
-    cargo run -q -p cli --bin ruddy -- fmt {{ruddy_sources}}
+    cargo run -q -p ruddy --bin ruddy -- fmt {{ruddy_sources}}
 
 fmt-check:
     cargo fmt --all -- --check
-    cargo run -q -p cli --bin ruddy -- fmt --check {{ruddy_sources}}
+    cargo run -q -p ruddy --bin ruddy -- fmt --check {{ruddy_sources}}
 
 # Drop the supervisor's scratch state (last good binary, build log).
 clean-dev:

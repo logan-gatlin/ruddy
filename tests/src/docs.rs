@@ -255,7 +255,7 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 #[test]
-fn standard_library_configuration_round_trips_and_defaults_to_installed() {
+fn standard_library_configuration_round_trips_and_defaults_to_git() {
     let root = scratch("std-configuration");
     let files = [file("main.rud", "")];
     for configuration in [

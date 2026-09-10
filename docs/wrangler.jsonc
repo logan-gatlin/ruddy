@@ -1,0 +1,22 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "ruddy-docs",
+  "main": "./worker.js",
+  "account_id": "c216acfea53d12fc55a49b23a3e3bf62",
+  "compatibility_date": "2026-09-09",
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [
+    { "pattern": "ruddy.logan.md", "custom_domain": true }
+  ],
+  "build": {
+    "command": "npm run build"
+  },
+  "assets": {
+    "binding": "ASSETS",
+    "run_worker_first": ["/info/refs", "/git-upload-pack", "//info/refs", "//git-upload-pack"],
+    "directory": "./_site",
+    "html_handling": "auto-trailing-slash",
+    "not_found_handling": "none"
+  }
+}

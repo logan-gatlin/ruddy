@@ -6,8 +6,8 @@ publish = false
 
 [dependencies]
 gix = { version = "0.85.0", default-features = false, features = ["sha1"] }
-ruddy = { path = ".." }
-ruddy-cli = { package = "cli", path = "../cli" }
+ruddy = { package = "ruddy-compiler", path = ".." }
+ruddy-cli = { package = "ruddy", path = "../cli" }
 ruddy-debug = { path = "../debug" }
 indexmap = "2"
 regex = "1"

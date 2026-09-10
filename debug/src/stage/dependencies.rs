@@ -98,7 +98,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             &mut ids,
             cx,
             "std",
-            "installed default".to_string(),
+            format!("git {}", ruddy_cli::DEFAULT_STD_GIT),
             None,
         )),
         StdConfig::Disabled => {}

@@ -48,7 +48,7 @@ pub struct CompileRequest {
     /// Every file of the active bundle. A request without its configured root
     /// is told so rather than compiled.
     pub files: Vec<FileSpec>,
-    /// Implicit standard-library configuration. Omission uses the installed std.
+    /// Implicit standard-library configuration. Omission uses the default Git source.
     #[serde(default, skip_serializing_if = "StdConfig::is_default")]
     pub std: StdConfig,
     /// Dependency project specifications keyed by source module alias.

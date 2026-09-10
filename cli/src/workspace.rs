@@ -208,7 +208,7 @@ impl Workspace {
                 .map(|(alias, spec)| (alias.clone(), spec.clone())),
         )?;
         let mut dependencies = Vec::new();
-        for (alias, spec, _installed_default) in specifications {
+        for (alias, spec, _default_std) in specifications {
             if !source_identifier(&alias) {
                 return Err(invalid_dependency_alias(&alias));
             }

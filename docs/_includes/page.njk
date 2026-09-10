@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ title }}{% if title != "Ruddy" %} · Ruddy{% endif %}</title>
+    <link rel="stylesheet" href="{{ '/assets/style.css' | relativeUrl(page.url) }}">
+    <script src="{{ '/assets/copy-code.js' | relativeUrl(page.url) }}" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#content">Skip to content</a>
+    <header>
+      <nav aria-label="Documentation">
+        <a href="{{ '/index.html' | relativeUrl(page.url) }}"{% if page.url == '/index.html' %} aria-current="page"{% endif %}>Home</a>
+        <a href="{{ '/download.html' | relativeUrl(page.url) }}"{% if page.url == '/download.html' %} aria-current="page"{% endif %}>Download</a>
+        <a href="{{ '/dictionary.html' | relativeUrl(page.url) }}"{% if page.url == '/dictionary.html' %} aria-current="page"{% endif %}>Dictionary</a>
+      </nav>
+    </header>
+    <main id="content">
+      {{ content | safe }}
+    </main>
+  </body>
+</html>

@@ -100,7 +100,7 @@ pub fn compile(
 /// Everything about a request that decides which graph it gets, before any
 /// file is read: the configuration, the build its dependencies are compiled
 /// for, where it is resolved from, and the environment that locates the
-/// installed standard library.
+/// shared Git cache.
 fn key(
     std: &StdConfig,
     dependencies: &IndexMap<String, DependencySpec>,

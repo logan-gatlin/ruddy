@@ -187,7 +187,22 @@ impl Resolver {
             self.cache_lock = Some(acquire_cache_lock(home)?);
         }
         clean_stale_temporary_checkouts(home, url, selector)?;
-        let locked = self.locked.get(&key).cloned();
+        let selection = git_cache(home)
+            .join("selections")
+            .join(cache_key(url, selector));
+        let locked = self.locked.get(&key).cloned().or_else(|| {
+            let commit = fs::read_to_string(&selection).ok()?;
+            let commit = commit.trim().to_ascii_lowercase();
+            validate_full_commit(&commit).ok()?;
+            if let GitSelector::Rev(revision) = selector
+                && !commit.starts_with(&revision.to_ascii_lowercase())
+            {
+                return None;
+            }
+            checkout_path(home, url, selector, &commit)
+                .is_dir()
+                .then_some(commit)
+        });
         let (checkout, commit) = if let Some(commit) = locked {
             let checkout = checkout_path(home, url, selector, &commit);
             if checkout.exists() && restore_checkout(&checkout, &commit).is_ok() {
@@ -209,6 +224,10 @@ impl Resolver {
         } else {
             clone_unlocked(home, url, selector)?
         };
+        fs::create_dir_all(selection.parent().expect("selection parent"))
+            .map_err(|error| cache_error("could not create Git selections cache", error))?;
+        crate::replace_file(&selection, commit.as_bytes())
+            .map_err(|error| cache_error("could not save cached Git selection", error))?;
         self.resolved.insert(key, commit);
         Ok(checkout)
     }
@@ -500,6 +519,13 @@ fn clone_to(
     locked: Option<&str>,
     destination: &Path,
 ) -> Result<(), CompileError> {
+    // Initialize here so CLI, language-server, and library callers all use the
+    // pure Rust provider before gix creates its HTTPS client.
+    static TLS_PROVIDER: std::sync::Once = std::sync::Once::new();
+    TLS_PROVIDER.call_once(|| {
+        // An embedding application may already have installed a provider.
+        let _ = rustls_rustcrypto::provider().install_default();
+    });
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent).map_err(|error| {
             CompileError::report(
@@ -523,6 +549,20 @@ fn clone_to(
         )
         .with_note(redact_git_cause(error.to_string(), url))
     })?;
+    prepare = prepare.with_in_memory_config_overrides(["protocol.version=2"]);
+    // Supply an explicit mapping so gix does not perform discovery before
+    // configure_remote has validated the URL and Git protocol version.
+    prepare = prepare.with_fetch_options(gix::remote::ref_map::Options {
+        extra_refspecs: vec![
+            gix::refspec::parse("HEAD".into(), gix::refspec::parse::Operation::Fetch)
+                .expect("static refspec")
+                .to_owned(),
+        ],
+        ..Default::default()
+    });
+    prepare = prepare.with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(
+        std::num::NonZeroU32::new(1).unwrap(),
+    ));
     if locked.is_none() {
         prepare = match selector {
             GitSelector::Branch(value) => prepare
@@ -546,7 +586,17 @@ fn clone_to(
             GitSelector::Default | GitSelector::Rev(_) => prepare,
         };
     }
-    prepare = prepare.configure_remote(move |remote| {
+    let revision = locked.map(str::to_owned).or_else(|| match selector {
+        GitSelector::Rev(revision) => Some(revision.to_ascii_lowercase()),
+        _ => None,
+    });
+    let pinned = revision.clone();
+    let selected_ref = match selector {
+        GitSelector::Branch(branch) => format!("+refs/heads/{branch}:refs/remotes/origin/{branch}"),
+        GitSelector::Tag(tag) => format!("+refs/tags/{tag}:refs/tags/{tag}"),
+        _ => "+HEAD:refs/remotes/origin/default".to_string(),
+    };
+    prepare = prepare.configure_remote(move |mut remote| {
         let effective = remote
             .url(gix::remote::Direction::Fetch)
             .ok_or("Git remote has no fetch URL")?;
@@ -555,10 +605,34 @@ fn clone_to(
                 "Git configuration rewrote the dependency URL to a non-HTTPS address".into(),
             );
         }
-        // Fetch only normally advertised branch and tag refs. In particular,
-        // never request a lock's raw object ID: many servers reject wants for
-        // unadvertised objects. All tags are needed for tag-only revisions.
-        Ok(remote.with_fetch_tags(gix::remote::fetch::Tags::All))
+        // gix 0.85's v1 request ordering can make servers ignore the depth.
+        // Check the Git handshake before downloading any objects.
+        let (_, handshake) = remote
+            .connect(gix::remote::Direction::Fetch)?
+            .ref_map(gix::progress::Discard, Default::default())?;
+        if handshake.server_protocol_version != gix::protocol::transport::Protocol::V2 {
+            return Err("Git dependencies require protocol version 2 for shallow fetching".into());
+        }
+        remote.replace_refspecs([selected_ref.as_str()], gix::remote::Direction::Fetch)?;
+        if let Some(revision) = &pinned {
+            if revision.len() == 40 {
+                // Fetch the pinned commit itself, even when its branch has advanced.
+                remote.replace_refspecs(
+                    [format!("+{revision}:refs/ruddy/pinned").as_str()],
+                    gix::remote::Direction::Fetch,
+                )?;
+            } else {
+                // Abbreviations must be resolved locally against advertised history.
+                remote.replace_refspecs(
+                    [
+                        "+refs/heads/*:refs/remotes/origin/*",
+                        "+refs/tags/*:refs/tags/*",
+                    ],
+                    gix::remote::Direction::Fetch,
+                )?;
+            }
+        }
+        Ok(remote.with_fetch_tags(gix::remote::fetch::Tags::None))
     });
     let cancellation = ruddy::cancellation::Cancellation::current();
     let result = (|| {
@@ -566,8 +640,33 @@ fn clone_to(
             prepare.fetch_then_checkout(gix::progress::Discard, cancellation.signal())?;
         let (repo, _) = checkout.main_worktree(gix::progress::Discard, cancellation.signal())?;
         ruddy::cancellation::checkpoint();
-        if let Some(commit) = locked {
-            checkout_commit(&repo, commit)?;
+        if let Some(revision) = &revision {
+            // A short revision may lie behind a branch tip. Deepen only until
+            // it can be resolved; never silently substitute a newer commit.
+            let mut depth = 1_u32;
+            while repo.rev_parse_single(revision.as_str()).is_err() && repo.is_shallow() {
+                ruddy::cancellation::checkpoint();
+                if depth == i32::MAX as u32 {
+                    break;
+                }
+                depth = depth.saturating_mul(2).min(i32::MAX as u32);
+                let remote = repo.find_remote("origin")?;
+                remote
+                    .connect(gix::remote::Direction::Fetch)?
+                    .prepare_fetch(gix::progress::Discard, Default::default())?
+                    .with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(
+                        std::num::NonZeroU32::new(depth).unwrap(),
+                    ))
+                    .receive(gix::progress::Discard, cancellation.signal())?;
+            }
+            let commit = repo
+                .rev_parse_single(revision.as_str())?
+                .object()?
+                .peel_to_commit()?
+                .id
+                .to_hex()
+                .to_string();
+            checkout_commit(&repo, &commit)?;
         }
         Ok::<_, Box<dyn std::error::Error>>(())
     })();
@@ -754,11 +853,26 @@ fn checkout_commit(repo: &gix::Repository, commit: &str) -> Result<(), Box<dyn s
     // gix may report an interrupted checkout as Ok; do not publish its partial index.
     ruddy::cancellation::checkpoint();
     index.write(Default::default())?;
-    repo.reference(
-        "HEAD",
-        commit.id,
-        gix::refs::transaction::PreviousValue::Any,
-        "ruddy checkout",
+    // Cache maintenance must work without a configured Git user identity.
+    let committer = gix::actor::Signature {
+        name: "Ruddy".into(),
+        email: "cache@ruddy.invalid".into(),
+        time: gix::date::Time::now_utc(),
+    };
+    repo.edit_references_as(
+        [gix::refs::transaction::RefEdit {
+            name: "HEAD".try_into()?,
+            deref: false,
+            change: gix::refs::transaction::Change::Update {
+                log: gix::refs::transaction::LogChange {
+                    message: "ruddy checkout".into(),
+                    ..Default::default()
+                },
+                expected: gix::refs::transaction::PreviousValue::Any,
+                new: gix::refs::Target::Object(commit.id),
+            },
+        }],
+        Some(committer.to_ref(&mut Default::default())),
     )?;
     Ok(())
 }
