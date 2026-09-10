@@ -1,0 +1,8 @@
+**
+!package.json
+!README.md
+!language-configuration.json
+!dist/extension.cjs
+!dist/*.wasm
+!dist/*.scm
+!dist/THIRD_PARTY_LICENSES.txt

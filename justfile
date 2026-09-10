@@ -65,6 +65,11 @@ debug *args:
 lsp:
     cargo run -p ruddy --bin ruddy -- lsp
 
+# Build the locally installable VS Code extension (requires Node.js and npm).
+vscode:
+    npm --prefix "{{justfile_directory()}}/editors/vscode" ci
+    npm --prefix "{{justfile_directory()}}/editors/vscode" run package
+
 # Regenerate the tree-sitter parser and run its corpus tests.
 grammar *args:
     #!/usr/bin/env bash
