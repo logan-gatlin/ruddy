@@ -50,3 +50,28 @@ let handled: ForeignValue -> _ = fn seed => handle logged () with
   | !Log n => do let _ = mark n end
   | return v => v
 end
+
+let unit_shortcut = fn seed => do
+  _ = mark seed
+end
+let ordered_shortcut: ForeignValue -> _ = fn seed => do
+  _ = mark 1n
+  let _ = mark 2n
+  let last = mark 3n
+  return last
+end
+@private let logged_shortcut : () -> Nat + !Log = fn _ => do
+  _ = !Log 10n
+  let _ = !Log 20n
+  return 30n
+end
+let handled_shortcut: ForeignValue -> _ = fn seed => handle logged_shortcut () with
+  | !Log n => do _ = mark n end
+  | return v => v
+end
+let mutated_shortcut = fn seed => do
+  let cell = mut seed
+  _ : Nat = cell := 1n
+  let _ = cell := 2n
+  return ~cell
+end

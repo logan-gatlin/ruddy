@@ -20,7 +20,8 @@ first and its value second, exactly once, before storing. In a chain, targets
 are evaluated from left to right and writes complete from right to left.
 `mut` and `~` have unary precedence; application and projection bind more
 tightly. Write `f (~cell)` to pass a read to a function. Discard a write with
-`let _ = cell := value`; blocks still require bindings and a final `return`.
+`_ = cell := value` or `let _ = cell := value`. A block may end with
+`return expr` to produce a value; without it, the block produces `()`.
 
 ## Types, effects, and regions
 
@@ -65,7 +66,7 @@ let make = fn value => mut value
 let use = fn _ => do
   let first = make 1n
   let second = make "two"
-  let _ = first := 3n
+  _ = first := 3n
   return { number: ~first, text: ~second }
 end
 ```

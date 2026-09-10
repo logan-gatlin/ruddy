@@ -237,6 +237,66 @@ fn a_block_is_typed_by_its_return_and_carries_every_statements_effects() {
     assert_eq!(codes(&partial), ["type-mismatch"]);
 }
 
+#[test]
+fn discard_spellings_have_the_same_types_effects_and_definition_positions() {
+    for discard in ["let _", "_"] {
+        let source = format!(
+            "effect Log = {{ write: Nat -> () }}
+             {discard} = 1n
+             {discard} : Nat = 2n
+             module Nested =
+               {discard} = 3n
+               {discard} : Nat = 4n
+               let value = 5n
+             end
+             let nested = Nested::value
+             let logged : () -> Nat + !Log = fn _ => do
+               {discard} = !Log.write 1n
+               let _ = !Log.write 2n
+               return 3n
+             end
+             let unit : () -> () + !Log = fn _ => do {discard} = !Log.write 4n end
+             let mutated = fn _ => do
+               let cell = mut 0n
+               {discard} : Nat = cell := 5n
+               return ~cell
+             end"
+        );
+        let program = accepted(&source);
+        assert_eq!(scheme(&program, "nested"), "Nat");
+        assert_eq!(scheme(&program, "logged"), "() -> Nat + !Log");
+        assert_eq!(scheme(&program, "unit"), "() -> () + !Log");
+        assert_eq!(scheme(&program, "mutated"), "'a -> Nat");
+    }
+}
+
+#[test]
+fn discard_spellings_enforce_the_same_annotations_and_effect_allowances() {
+    for discard in ["let _", "_"] {
+        for statement in [
+            format!("{discard} : Nat = true"),
+            format!("module Nested = {discard} : Nat = true end"),
+            format!("let local = do {discard} : Nat = true end"),
+        ] {
+            assert_eq!(codes(&rejected(&statement)), ["type-mismatch"]);
+        }
+        for (statement, expected) in [
+            (format!("{discard} = !Log.write 1n"), "unhandled-effect"),
+            (
+                format!("module Nested = {discard} = !Log.write 1n end"),
+                "unhandled-effect",
+            ),
+            (
+                format!("let pure : () -> () = fn _ => do {discard} = !Log.write 1n end"),
+                "effect-not-allowed",
+            ),
+        ] {
+            let source = format!("effect Log = {{ write: Nat -> () }}\n{statement}");
+            assert_eq!(codes(&rejected(&source)), [expected]);
+        }
+    }
+}
+
 /// Compile one source to the artifact another compilation may depend on.
 fn exported(source: &str) -> ruddy::artifact::UncheckedArtifact {
     accepted(source).artifact().to_unchecked()

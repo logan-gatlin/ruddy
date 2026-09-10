@@ -2538,6 +2538,168 @@ fn a_wildcard_parses_in_every_pattern_position() {
     }
 }
 
+#[test]
+fn discard_shortcuts_parse_as_wildcard_lets() {
+    for (source, canonical) in [
+        ("_=f 1n", "let _ = f 1n"),
+        ("_ : Nat = f 1n", "let _ : Nat = f 1n"),
+        ("@test _ = f 1n", "@test let _ = f 1n"),
+        ("@doc #Hidden _ = f 1n", "@doc #Hidden let _ = f 1n"),
+        (
+            "module M = @test _ = f 1n let _ = f 2n _ : Nat = f 3n end",
+            "module M = @test let _ = f 1n let _ = f 2n let _ : Nat = f 3n end",
+        ),
+        (
+            "let main = fn _ => do _ = !Log 1n let _ = !Log 2n _ = !Log 3n end",
+            "let main = fn _ => do let _ = !Log 1n let _ = !Log 2n let _ = !Log 3n end",
+        ),
+        (
+            "_ = do _ = do _ = f 1n return 2n end return 3n end",
+            "let _ = do let _ = do let _ = f 1n return 2n end return 3n end",
+        ),
+        ("_ (* discarded *) = f 1n", "let _ = f 1n"),
+    ] {
+        assert_eq!(parse_one(source), canonical, "{source}");
+    }
+
+    let source = "@test _ = f 1n";
+    let out = parse(lex(source, FileID::GENERATED).tokens);
+    let stmt = &out.stmts[0];
+    let StmtKind::Let { pattern, body, .. } = &stmt.kind else {
+        panic!("a discarded let");
+    };
+    assert!(matches!(pattern.tracked, PatternKind::Wildcard));
+    assert_eq!(stmt.span.start, source.find('_').unwrap());
+    assert_eq!(stmt.span.end(), source.len());
+    assert_eq!(pattern.span.start, stmt.span.start);
+    assert_eq!(pattern.span.width, 1);
+    assert_eq!(body.span.start, source.find("f 1n").unwrap());
+}
+
+/// Discards end preceding expressions and declaration types, including a
+/// tag without a payload and an effect label without type arguments.
+#[test]
+fn discard_shortcuts_separate_adjacent_statements_without_newlines() {
+    for preceding in [
+        "let value = f 1n",
+        "let value = #Done",
+        "let value = #Some 1n",
+        "let value = fn _ => f 1n",
+        "let value = 1n |> f",
+        "let value = cell := 1n",
+        "let value = if true then 1n else 2n end",
+        "let value = match x with | _ => 1n end",
+        "let value = handle f () with | return x => x end",
+        "type T = Box",
+        "type T = Box _",
+        "type T = #Done",
+        "type T = #Some _",
+        "type T = Nat -> Box",
+        "type T = !Log",
+        "type T = Nat -> Nat + !Log",
+        "effect E",
+        "effect E = !Log",
+        "effect E = !Log _",
+        "effect E = Nat -> Nat",
+        "module M",
+        "module M = end",
+        "extern value : Box _ = \"host.value\"",
+    ] {
+        for discard in ["_ = f 2n", "_ : Nat = f 2n", "_ (* next *) = f 2n"] {
+            let source = format!("{preceding} {discard}");
+            let out = parse(lex(&source, FileID::GENERATED).tokens);
+            assert!(out.errors.is_empty(), "{source}: {:#?}", out.errors);
+            assert_eq!(out.stmts.len(), 2, "{source}: {:#?}", out.stmts);
+            assert_eq!(
+                print::ast::stmt(&out.stmts[0]).to_string(),
+                parse_one(preceding)
+            );
+            assert_eq!(
+                print::ast::stmt(&out.stmts[1]).to_string(),
+                parse_one(discard)
+            );
+        }
+    }
+}
+
+/// An annotation's final hole belongs to its type; the `=` after it is
+/// the initializer, so it must not be mistaken for another statement.
+#[test]
+fn discard_shortcuts_preserve_type_holes_before_initializers() {
+    for source in [
+        "let value : Box _ = x",
+        "let _ : Box _ = x",
+        "let _ : #Some _ = x",
+        "let _ : Nat -> Nat + !Log _ = f",
+        "extern value : Box _ = \"host.value\"",
+        "extern value : fn(Nat) -> Box _ = \"host.value\"",
+    ] {
+        assert_eq!(parse_one(source), source);
+        if let Some(shortcut) = source.strip_prefix("let ").filter(|s| s.starts_with('_')) {
+            assert_eq!(parse_one(shortcut), source);
+        }
+    }
+    assert_eq!(
+        parse_one("_ : { x when 'p: Nat } where 'p = { x: 1n }"),
+        "let _ : { x when 'p: Nat } where 'p = { x: 1n }"
+    );
+}
+
+#[test]
+fn recovery_resumes_at_discard_shortcuts() {
+    for broken in ["let = 0n", "_ =", "let x : = 0n", "extern x : = \"x\""] {
+        for (open, close) in [
+            ("", ""),
+            ("module M = ", " end"),
+            ("let block = do ", " end"),
+        ] {
+            let source = format!("{open}{broken} _ = 1n let kept = 2n{close}");
+            let out = parse(lex(&source, FileID::GENERATED).tokens);
+            assert_eq!(out.errors.len(), 1, "{source}: {:#?}", out.errors);
+            let recovered = out
+                .stmts
+                .iter()
+                .map(|stmt| print::ast::stmt(stmt).to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(
+                recovered,
+                format!("{open}let _ = 1n let kept = 2n{close}"),
+                "{source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn discard_shortcuts_obey_statement_position_restrictions() {
+    for source in [
+        "let block = do return 1n _ = f 2n end",
+        "let block = do return 1n _ : Nat = f 2n end",
+    ] {
+        let out = parse(lex(source, FileID::GENERATED).tokens);
+        assert_eq!(out.errors.len(), 1, "{source}: {:#?}", out.errors);
+        assert!(matches!(
+            out.errors[0].kind,
+            ErrorKind::StatementAfterReturn { .. }
+        ));
+        assert_eq!(out.errors[0].span.start, source.find('_').unwrap());
+    }
+    for source in [
+        "let block = do @test _ = f 1n end",
+        "let value = (_ = f 1n)",
+        "let value = fn x => _ = f x",
+        "let value = { x: _ = f 1n }",
+        "named = f 1n",
+        "(_, _) = pair",
+        "_",
+        "_ 1n",
+    ] {
+        let out = parse(lex(source, FileID::GENERATED).tokens);
+        assert!(!out.errors.is_empty(), "{source} parsed without an error");
+    }
+}
+
 /// `fn _ => e` is legal — the argument is taken and thrown away — and so is
 /// any mix of `_` with names. The printed form re-parses to the same tree.
 #[test]

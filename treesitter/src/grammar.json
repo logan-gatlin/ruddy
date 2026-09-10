@@ -748,16 +748,34 @@
       "type": "SEQ",
       "members": [
         {
-          "type": "STRING",
-          "value": "let"
-        },
-        {
-          "type": "FIELD",
-          "name": "pattern",
-          "content": {
-            "type": "SYMBOL",
-            "name": "_pattern"
-          }
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SEQ",
+              "members": [
+                {
+                  "type": "STRING",
+                  "value": "let"
+                },
+                {
+                  "type": "FIELD",
+                  "name": "pattern",
+                  "content": {
+                    "type": "SYMBOL",
+                    "name": "_pattern"
+                  }
+                }
+              ]
+            },
+            {
+              "type": "FIELD",
+              "name": "pattern",
+              "content": {
+                "type": "SYMBOL",
+                "name": "wildcard"
+              }
+            }
+          ]
         },
         {
           "type": "CHOICE",
@@ -4509,6 +4527,22 @@
     [
       "_effect_operation_signature",
       "_type"
+    ],
+    [
+      "effect_case"
+    ],
+    [
+      "absent_effect"
+    ],
+    [
+      "effect_alias"
+    ],
+    [
+      "sum_case"
+    ],
+    [
+      "_type_application",
+      "type_application"
     ]
   ],
   "precedences": [],

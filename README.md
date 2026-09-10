@@ -84,10 +84,16 @@ target = "js"
 
 ```text
 let main = fn _ => do
-  let _ = std::console::print "Hello!"
+  _ = std::console::print "Hello!"
   return ()
 end
 ```
+
+`_ = expr` is shorthand for `let _ = expr`: it evaluates the expression and
+discards its result. Both forms work at file level, inside inline modules,
+and in `do` blocks, with the same effect rules. The shortcut also accepts
+type annotations (`_ : Nat = expr`) and attributes wherever `let` does.
+The formatter preserves either spelling.
 
 Generated executable JS calls `main` once under the Node runtime handlers.
 Run it with `ruddy run` or directly with Node. `run` requires an executable

@@ -3430,6 +3430,41 @@ fn a_nested_let_reaches_every_stage() {
     assert_eq!(local.text, "Nat -> Nat");
 }
 
+#[test]
+fn discard_shortcuts_reach_the_debugger_as_lets_with_their_written_ranges() {
+    let source = "_ = 1n\nmodule Nested = _ : Nat = 2n end\n\
+                  let value = do _ = 3n let _ = 4n return 5n end";
+    let snapshot = snapshot(source);
+    assert!(snapshot.panic.is_none());
+    assert!(
+        snapshot.diagnostics.is_empty(),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+    for id in ["ast", "ir", "types", "constraints", "solve", "lir", "js"] {
+        assert_eq!(stage_named(&snapshot, id).status, Status::Ok, "{id}");
+    }
+    let ast = stage_named(&snapshot, "ast");
+    for (written, printed) in [
+        ("_ = 1n", "let _ = 1n"),
+        ("_ : Nat = 2n", "let _ : Nat = 2n"),
+        ("_ = 3n", "let _ = 3n"),
+        ("let _ = 4n", "let _ = 4n"),
+    ] {
+        let node = nodes(ast)
+            .into_iter()
+            .find(|node| node.label == "Let" && node.text == printed)
+            .unwrap_or_else(|| panic!("the AST has no {printed}: {:#?}", ast.nodes));
+        let start = source.find(written).unwrap();
+        assert_eq!(node.span, at([start, start + written.len()]));
+        let wildcard = &node.children[0];
+        assert_eq!(wildcard.label, "Wildcard");
+        let start = start + written.find('_').unwrap();
+        assert_eq!(wildcard.span, at([start, start + 1]));
+        assert!(wildcard.symbol.is_none());
+    }
+}
+
 /// Every tab renders a program using explicit absence without error: the
 /// Tokens tab shows the backslash like any other punctuation token, the AST
 /// and IR tabs render `\y` and `\#Err` as written, and the type tabs take

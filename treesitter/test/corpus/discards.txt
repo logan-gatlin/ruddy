@@ -1,0 +1,424 @@
+================================================================================
+Discards are wildcard definitions, with optional annotations
+================================================================================
+
+_ = !Log.write 1n
+_ : () = flush ()
+_ : { x when 'a: Nat } -> {} where 'a = fn value => {}
+_ : _ = 2n
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (wildcard)
+    (application
+      (operation
+        (effect_label)
+        (identifier))
+      (natural)))
+  (let_definition
+    (wildcard)
+    (annotation
+      (unit))
+    (application
+      (identifier)
+      (unit)))
+  (let_definition
+    (wildcard)
+    (annotation
+      (function_type
+        (struct_type
+          (struct_type_field
+            (identifier)
+            (when_clause
+              (type_variable))
+            (identifier)))
+        (struct_type))
+      (where_clause
+        (type_variable)))
+    (function
+      (identifier)
+      (struct_expression)))
+  (let_definition
+    (wildcard)
+    (annotation
+      (hole))
+    (natural)))
+
+================================================================================
+Discard boundaries do not need newlines
+================================================================================
+
+let first = f () _ = !Log first _ : () = !Log.flush () let last = 2n
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (application
+      (identifier)
+      (unit)))
+  (let_definition
+    (wildcard)
+    (application
+      (operation
+        (effect_label))
+      (identifier)))
+  (let_definition
+    (wildcard)
+    (annotation
+      (unit))
+    (application
+      (operation
+        (effect_label)
+        (identifier))
+      (unit)))
+  (let_definition
+    (identifier)
+    (natural)))
+
+================================================================================
+Attributes may precede discards at top level and in inline modules
+================================================================================
+
+@startup _ = initialize ()
+module Boot =
+  @startup "log" _ : () = !Log "ready"
+  _ = start ()
+end
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (attribute
+    (attribute_key))
+  (let_definition
+    (wildcard)
+    (application
+      (identifier)
+      (unit)))
+  (module_definition
+    (identifier)
+    (attribute
+      (attribute_key)
+      (string))
+    (let_definition
+      (wildcard)
+      (annotation
+        (unit))
+      (application
+        (operation
+          (effect_label))
+        (string)))
+    (let_definition
+      (wildcard)
+      (application
+        (identifier)
+        (unit)))))
+
+================================================================================
+Blocks sequence discards and bindings before their result
+================================================================================
+
+let run = fn _ => do
+  let first = f ()
+  _ = !Log first
+  _ : () = flush ()
+  let last = g ()
+  return last
+end
+let unit = do _ = 1n _ = 2n end
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (function
+      (wildcard)
+      (do_block
+        (let_definition
+          (identifier)
+          (application
+            (identifier)
+            (unit)))
+        (let_definition
+          (wildcard)
+          (application
+            (operation
+              (effect_label))
+            (identifier)))
+        (let_definition
+          (wildcard)
+          (annotation
+            (unit))
+          (application
+            (identifier)
+            (unit)))
+        (let_definition
+          (identifier)
+          (application
+            (identifier)
+            (unit)))
+        (identifier))))
+  (let_definition
+    (identifier)
+    (do_block
+      (let_definition
+        (wildcard)
+        (natural))
+      (let_definition
+        (wildcard)
+        (natural)))))
+
+================================================================================
+Discards accept full expressions and nested blocks
+================================================================================
+
+_ = fn _ => do _ = !Log "inside" end
+_ = do
+  _ = if true then !Log "yes" else !Log "no" end
+  _ = do _ = !Log "nested" end
+end
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (wildcard)
+    (function
+      (wildcard)
+      (do_block
+        (let_definition
+          (wildcard)
+          (application
+            (operation
+              (effect_label))
+            (string))))))
+  (let_definition
+    (wildcard)
+    (do_block
+      (let_definition
+        (wildcard)
+        (if_expression
+          (boolean)
+          (application
+            (operation
+              (effect_label))
+            (string))
+          (application
+            (operation
+              (effect_label))
+            (string))))
+      (let_definition
+        (wildcard)
+        (do_block
+          (let_definition
+            (wildcard)
+            (application
+              (operation
+                (effect_label))
+              (string))))))))
+
+================================================================================
+Discards follow type and effect declarations without becoming type holes
+================================================================================
+
+type Name = Nat _ = initialize ()
+type PairOfNats = Pair Nat Nat _ : () = flush ()
+type Case = #Ready _ = initialize ()
+type Cases = #Ready Nat _ = initialize ()
+type Effects = !Log _ = initialize ()
+type AppliedEffects = !Ask Nat _ = initialize ()
+type AbsentEffects = \!Log _ = initialize ()
+effect Alias = !Log _ = initialize ()
+effect AppliedAlias = !Ask Nat _ = initialize ()
+effect Read = () -> Nat _ = initialize ()
+type Inferred = Pair _ let next = 1n
+let inferred : Box _ = value
+extern foreign : Box _ = "host.value"
+_ : Box _ = value
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (type_definition
+    (identifier)
+    (annotation
+      (identifier)))
+  (let_definition
+    (wildcard)
+    (application
+      (identifier)
+      (unit)))
+  (type_definition
+    (identifier)
+    (annotation
+      (type_application
+        (identifier)
+        (identifier)
+        (identifier))))
+  (let_definition
+    (wildcard)
+    (annotation
+      (unit))
+    (application
+      (identifier)
+      (unit)))
+  (type_definition
+    (identifier)
+    (annotation
+      (sum_type
+        (sum_case
+          (tag)))))
+  (let_definition
+    (wildcard)
+    (application
+      (identifier)
+      (unit)))
+  (type_definition
+    (identifier)
+    (annotation
+      (sum_type
+        (sum_case
+          (tag)
+          (identifier)))))
+  (let_definition
+    (wildcard)
+    (application
+      (identifier)
+      (unit)))
+  (type_definition
+    (identifier)
+    (annotation
+      (effect_type
+        (effect_case
+          (effect_label)))))
+  (let_definition
+    (wildcard)
+    (application
+      (identifier)
+      (unit)))
+  (type_definition
+    (identifier)
+    (annotation
+      (effect_type
+        (effect_case
+          (effect_label)
+          (identifier)))))
+  (let_definition
+    (wildcard)
+    (application
+      (identifier)
+      (unit)))
+  (type_definition
+    (identifier)
+    (annotation
+      (effect_type
+        (absent_effect
+          (effect_label)))))
+  (let_definition
+    (wildcard)
+    (application
+      (identifier)
+      (unit)))
+  (effect_definition
+    (identifier)
+    (effect_alias_union
+      (effect_alias
+        (effect_label))))
+  (let_definition
+    (wildcard)
+    (application
+      (identifier)
+      (unit)))
+  (effect_definition
+    (identifier)
+    (effect_alias_union
+      (effect_alias
+        (effect_label)
+        (identifier))))
+  (let_definition
+    (wildcard)
+    (application
+      (identifier)
+      (unit)))
+  (effect_definition
+    (identifier)
+    (function_type
+      (unit)
+      (identifier)))
+  (let_definition
+    (wildcard)
+    (application
+      (identifier)
+      (unit)))
+  (type_definition
+    (identifier)
+    (annotation
+      (type_application
+        (identifier)
+        (hole))))
+  (let_definition
+    (identifier)
+    (natural))
+  (let_definition
+    (identifier)
+    (annotation
+      (type_application
+        (identifier)
+        (hole)))
+    (identifier))
+  (extern_definition
+    (identifier)
+    (extern_annotation
+      (type_application
+        (identifier)
+        (hole)))
+    (string))
+  (let_definition
+    (wildcard)
+    (annotation
+      (type_application
+        (identifier)
+        (hole)))
+    (identifier)))
+
+================================================================================
+A discard cannot follow a block's return
+================================================================================
+
+let value = do return 1n _ = !Log "late" end
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (do_block
+      (ERROR
+        (natural))
+      (let_definition
+        (wildcard)
+        (application
+          (operation
+            (effect_label))
+          (string))))))
+
+================================================================================
+A wildcard still cannot be used as an expression
+================================================================================
+
+let value = f (_)
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (application
+      (identifier)
+      (unit
+        (ERROR)))))

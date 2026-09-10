@@ -4344,7 +4344,7 @@ fn block_errors_say_what_a_block_allows() {
     assert_eq!(declaration.code, "declaration-in-block");
     assert_eq!(
         declaration.title,
-        "a `do` block can only hold `let` definitions"
+        "a `do` block can only hold `let` definitions and `_ =` discards"
     );
     assert_eq!(declaration.primary.span, Span::generated(3, 4));
     assert_eq!(

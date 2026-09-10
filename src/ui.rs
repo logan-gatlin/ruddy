@@ -979,7 +979,7 @@ impl parse::Error {
             .help("write it as the last thing in a `do ... end` block, or leave the `return` out"),
             parse::ErrorKind::DeclarationInBlock { keyword } => Diagnostic::new(
                 "declaration-in-block",
-                "a `do` block can only hold `let` definitions",
+                "a `do` block can only hold `let` definitions and `_ =` discards",
                 self.span,
             )
             .label(format!("a `{keyword}` cannot be written inside a block"))

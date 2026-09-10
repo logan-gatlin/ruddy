@@ -1538,18 +1538,19 @@ impl<'a> Printer<'a> {
     }
 
     /// The span of the keyword a statement begins with, after its
-    /// attributes: what a comment between them attaches to.
-    fn keyword_span(&self, stmt: &Stmt) -> Span {
+    /// attributes: what a comment between them attaches to. The `_ =`
+    /// shorthand has no keyword; its pattern takes those comments instead.
+    fn keyword_span(&self, stmt: &Stmt) -> Option<Span> {
         let keyword = self.source[stmt.span.start..]
             .split(|c: char| !c.is_alphabetic())
             .next()
             .unwrap_or("");
-        stmt.span.file_id.span(stmt.span.start, keyword.len())
+        (!keyword.is_empty()).then(|| stmt.span.file_id.span(stmt.span.start, keyword.len()))
     }
 
     fn stmt_skeleton(&self, stmt: &Stmt) -> Skel {
         let mut kids: Vec<Skel> = stmt.attributes.iter().map(attribute_skeleton).collect();
-        kids.push(Skel::leaf(self.keyword_span(stmt)));
+        kids.extend(self.keyword_span(stmt).map(Skel::leaf));
         let mut closer = false;
         match &stmt.kind {
             StmtKind::Extern {
@@ -1614,7 +1615,9 @@ impl<'a> Printer<'a> {
             parts.push(Doc::HardLine);
         }
         // A comment between the attributes and the keyword stays there.
-        parts.extend(self.leading_docs(self.keyword_span(stmt)));
+        if let Some(keyword) = self.keyword_span(stmt) {
+            parts.extend(self.leading_docs(keyword));
+        }
         parts.push(match &stmt.kind {
             StmtKind::Extern {
                 name,
@@ -1640,7 +1643,11 @@ impl<'a> Printer<'a> {
                 ]))
             }
             StmtKind::Let { pattern, ty, body } => {
-                let mut header = vec![text("let "), self.pattern(pattern)];
+                let mut header = Vec::new();
+                if stmt.span.start < pattern.span.start {
+                    header.push(text("let "));
+                }
+                header.push(self.pattern(pattern));
                 let mut header_end = pattern.span.end();
                 let mut header_signal = false;
                 if let Some(ty) = ty {
