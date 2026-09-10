@@ -7,6 +7,7 @@ pub type Token = Tracked<Kind>;
 #[derive(Debug, Clone)]
 pub enum Kind {
     Let,
+    Using,
     /// `extern`, declaring a target-provided top-level value.
     Extern,
     /// `do`, opening a `do <stmts> [return <expr>] end` block. The `end`
@@ -541,6 +542,7 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                     "not" => Kind::Not,
                     "mut" => Kind::Mut,
                     "module" => Kind::Module,
+                    "using" => Kind::Using,
                     "true" => Kind::Boolean(true),
                     "false" => Kind::Boolean(false),
                     // `return` is deliberately absent: it heads a handler arm

@@ -905,15 +905,15 @@ impl Analysis {
             let start = before
                 .rfind(|ch: char| !(ch.is_alphanumeric() || ch == '_' || ch == ':'))
                 .map_or(0, |at| at + before[at..].chars().next().unwrap().len_utf8());
-            let mut components = before[start..].split("::");
-            let first = components.next()?;
-            let mut parent = modules
+            let components: Vec<_> = before[start..].split("::").collect();
+            let file = self
+                .paths
                 .iter()
-                .find_map(|module| self.built.names.module(*module, first))?;
-            for component in components {
-                parent = self.built.names.module(Some(parent), component)?;
-            }
-            Some(parent)
+                .find(|(_, known)| known.as_str() == path)
+                .map(|(file, _)| *file)?;
+            self.built
+                .names
+                .resolve_module_path(&self.mint, module, file, offset, &components)
         });
         let type_context = !effect_context
             && (self.written_types(path).iter().any(|ty| {
@@ -935,36 +935,55 @@ impl Analysis {
             );
         }
         let visible: Vec<_> = match qualified {
-            Some(Some(module)) => vec![Some(module)],
+            Some(Some(module)) => vec![module],
             Some(None) => Vec::new(),
             None => modules,
         };
         // Iterate outer scopes first: inner declarations shadow them when the
         // final candidate list is deduplicated.
+        let mut names = Vec::new();
         for module in visible.into_iter().rev() {
-            for (namespace, name, symbol) in self.built.names.globals(module) {
-                let kind = match namespace {
-                    Namespace::Terms if !type_context && !effect_context => CompletionKind::Value,
-                    Namespace::Types if type_context => CompletionKind::Type,
-                    Namespace::Effects if effect_context => CompletionKind::Effect,
-                    _ => continue,
-                };
-                let ty = self
-                    .inferred
-                    .semantics()
-                    .schemes()
-                    .get(&symbol)
-                    .or_else(|| self.inferred.semantics().externs().get(&symbol))
-                    .or_else(|| self.built.program.external_schemes.get(&symbol))
-                    .map(|scheme| scheme.body().clone());
-                candidates.push((name.to_owned(), ty, kind));
+            if qualified.is_none() {
+                names.extend(self.built.names.lexical_names(module));
+            } else {
+                names.extend(
+                    self.built
+                        .names
+                        .globals(module)
+                        .map(|(namespace, name, symbol)| (namespace, name, Some(symbol))),
+                );
+                names.extend(
+                    self.built
+                        .names
+                        .modules(module)
+                        .map(|(name, module)| (Namespace::Modules, name, Some(module.symbol()))),
+                );
             }
-            candidates.extend(
-                self.built
-                    .names
-                    .modules(module)
-                    .map(|(name, _)| (name.to_owned(), None, CompletionKind::Module)),
-            );
+        }
+        if qualified.is_none()
+            && let Some((file, _)) = self.paths.iter().find(|(_, known)| known.as_str() == path)
+        {
+            names.extend(self.built.names.local_import_names(*file, offset));
+        }
+        for (namespace, name, symbol) in names {
+            let kind = match namespace {
+                Namespace::Terms if !type_context && !effect_context => CompletionKind::Value,
+                Namespace::Types if type_context => CompletionKind::Type,
+                Namespace::Effects if effect_context => CompletionKind::Effect,
+                Namespace::Modules => CompletionKind::Module,
+                _ => continue,
+            };
+            let ty = symbol
+                .and_then(|symbol| {
+                    self.inferred
+                        .semantics()
+                        .schemes()
+                        .get(&symbol)
+                        .or_else(|| self.inferred.semantics().externs().get(&symbol))
+                        .or_else(|| self.built.program.external_schemes.get(&symbol))
+                })
+                .map(|scheme| scheme.body().clone());
+            candidates.push((name.to_owned(), ty, kind));
         }
         if qualified.is_none() && !type_context && !effect_context {
             for term in self.terms_in(path).flat_map(|(_, decl)| decl.value.walk()) {

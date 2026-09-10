@@ -116,6 +116,7 @@ impl fmt::Display for TrackedString {
 
 #[derive(Debug, Clone)]
 pub enum StmtKind {
+    Using(UseTree),
     /// `extern answer : Nat = "host.answer"` — a target-supplied value.
     ///
     /// Its annotation is required because there is no Ruddy body to infer from,
@@ -193,6 +194,59 @@ pub enum StmtKind {
         name: TrackedString,
         body: Option<Vec<Stmt>>,
     },
+}
+
+/// One branch of a lexical import, retaining groups for formatting.
+#[derive(Debug, Clone)]
+pub struct UseTree {
+    pub span: Span,
+    pub prefix: Vec<TrackedString>,
+    pub kind: UseKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum UseKind {
+    Name { alias: Option<TrackedString> },
+    Glob,
+    Group(Vec<UseTree>),
+}
+
+impl fmt::Display for UseTree {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, segment) in self.prefix.iter().enumerate() {
+            if index > 0 {
+                f.write_str("::")?;
+            }
+            f.write_str(&segment.tracked)?;
+        }
+        match &self.kind {
+            UseKind::Name { alias } => {
+                if let Some(alias) = alias {
+                    write!(f, " as {}", alias.tracked)?;
+                }
+            }
+            UseKind::Glob => {
+                if !self.prefix.is_empty() {
+                    f.write_str("::")?;
+                }
+                f.write_str("*")?;
+            }
+            UseKind::Group(children) => {
+                if !self.prefix.is_empty() {
+                    f.write_str("::")?;
+                }
+                f.write_str("{")?;
+                for (index, child) in children.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{child}")?;
+                }
+                f.write_str("}")?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The four deliberately disjoint surface forms of an effect declaration.
@@ -287,12 +341,8 @@ pub enum ExprKind {
     /// `do <stmt>* [return <expr>] end` — names given values for the length
     /// of one expression, one after another.
     ///
-    /// The statements are [`StmtKind::Let`]s and nothing else: the parser
-    /// refuses every other kind at its keyword and drops it — see
-    /// [`ErrorKind::DeclarationInBlock`] — so what reaches lowering is a run
-    /// of bindings. A statement here binds its name for the rest of the block
-    /// rather than for the file, so the two share their grammar and not a line
-    /// of their meaning.
+    /// Statements are local bindings or lexical imports. Both take effect
+    /// sequentially and remain visible through the rest of this block.
     ///
     /// The block's value is what its `return` carries, and `()` when there is
     /// no `return`. Nothing records which of the two was written when the
@@ -1321,6 +1371,7 @@ impl Parser {
             Kind::Xor => Expected::Keyword("xor"),
             Kind::Not => Expected::Keyword("not"),
             Kind::Module => Expected::Keyword("module"),
+            Kind::Using => Expected::Keyword("using"),
             Kind::Equal => Expected::Punctuation("="),
             Kind::FatArrow => Expected::Punctuation("=>"),
             Kind::Arrow => Expected::Punctuation("->"),
@@ -1509,6 +1560,7 @@ impl Parser {
             Some(Kind::Type) => self.type_stmt(),
             Some(Kind::Effect) => self.effect_stmt(),
             Some(Kind::Module) => self.module_stmt(),
+            Some(Kind::Using) => self.using_stmt(),
             _ => match (attributes.first(), attributes.last()) {
                 (Some(first), Some(last)) => {
                     self.error(
@@ -1524,6 +1576,56 @@ impl Parser {
             attributes,
             kind: kind.tracked,
             span: kind.span,
+        })
+    }
+
+    fn using_stmt(&mut self) -> Option<Tracked<StmtKind>> {
+        let keyword = self.advance()?;
+        let tree = self.use_tree()?;
+        Some(keyword.span.merge(tree.span).track(StmtKind::Using(tree)))
+    }
+
+    fn use_tree(&mut self) -> Option<UseTree> {
+        let start = self.peek()?.span;
+        let mut prefix = Vec::new();
+        loop {
+            if self.at(&Kind::LeftBrace) || self.at(&Kind::Star) {
+                break;
+            }
+            prefix.push(self.ident()?);
+            if self.eat_if(&Kind::ColonColon).is_none() {
+                break;
+            }
+        }
+        let suffix =
+            prefix.is_empty() || matches!(self.toks[self.pos - 1].tracked, Kind::ColonColon);
+        let kind = if suffix && self.eat_if(&Kind::Star).is_some() {
+            UseKind::Glob
+        } else if suffix && self.eat_if(&Kind::LeftBrace).is_some() {
+            let mut children = Vec::new();
+            while !self.at(&Kind::RightBrace) {
+                children.push(self.use_tree()?);
+                if self.eat_if(&Kind::Comma).is_none() {
+                    break;
+                }
+            }
+            self.eat(&Kind::RightBrace)?;
+            UseKind::Group(children)
+        } else {
+            let alias = if matches!(self.peek().map(|t| &t.tracked), Some(Kind::Identifier(s)) if s == "as")
+            {
+                self.advance();
+                Some(self.ident()?)
+            } else {
+                None
+            };
+            UseKind::Name { alias }
+        };
+        let end = self.toks[self.pos - 1].span;
+        Some(UseTree {
+            span: start.merge(end),
+            prefix,
+            kind,
         })
     }
 
@@ -2947,6 +3049,7 @@ impl Parser {
                             | Kind::Return
                             | Kind::Type
                             | Kind::Effect
+                            | Kind::Using
                             | Kind::Module
                             | Kind::Extern
                     ))
@@ -2980,7 +3083,7 @@ impl Parser {
     }
 
     /// One statement of a block, read by [`stmt`](Self::stmt), the file's
-    /// reader. Every kind but `let` is refused at its keyword and dropped,
+    /// reader. Every kind but `let` and `using` is refused and dropped,
     /// and a statement that fails to parse is skipped to the next `let` or
     /// the `end`, the way a broken definition is at file level; either way
     /// the block goes on.
@@ -3007,7 +3110,7 @@ impl Parser {
             stmt.attributes.clear();
         }
         let keyword = match &stmt.kind {
-            StmtKind::Let { .. } => return Some(stmt),
+            StmtKind::Let { .. } | StmtKind::Using(_) => return Some(stmt),
             StmtKind::Type { .. } => "type",
             StmtKind::Effect { .. } => "effect",
             StmtKind::Module { .. } => "module",
@@ -4360,6 +4463,7 @@ impl Parser {
                         | Kind::Extern
                         | Kind::Type
                         | Kind::Effect
+                        | Kind::Using
                         | Kind::Module
                         | Kind::End
                         | Kind::Attribute(_)

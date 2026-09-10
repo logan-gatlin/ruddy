@@ -172,6 +172,7 @@ impl fmt::Display for Ast<'_, DataKind> {
 impl fmt::Display for Ast<'_, StmtKind> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
+            StmtKind::Using(tree) => write!(f, "using {tree}"),
             StmtKind::Extern {
                 name,
                 ty,

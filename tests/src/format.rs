@@ -1040,3 +1040,24 @@ fn errors_inside_nested_blocks_stay_local() {
         format!("let p = do\n  let bad = ) {long}\n  let ok = 1n\n  return ok\nend\n")
     );
 }
+
+#[test]
+fn using_groups_and_comments_survive_formatting() {
+    assert_eq!(
+        fmt("using A::{self as a,x,B::{*,y as z}}"),
+        "using A::{self as a, x, B::{*, y as z}}\n"
+    );
+    let source = "using A::{\n  x, -- kept\n  (* nested (* note *) *) y as z\n}\nlet value = x\n";
+    let output = fmt(source);
+    assert!(output.contains("-- kept"));
+    assert!(output.contains("(* nested (* note *) *)"));
+    for source in [
+        "using A *",
+        "using A {x}",
+        "using A::",
+        "using A::{x",
+        "using A as",
+    ] {
+        assert!(formatted(source).has_errors(), "{source}");
+    }
+}

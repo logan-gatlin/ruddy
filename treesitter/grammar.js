@@ -98,6 +98,7 @@ module.exports = grammar({
       'not',
       'mut',
       'module',
+      'using',
       'true',
       'false',
     ],
@@ -150,6 +151,7 @@ module.exports = grammar({
         $.type_definition,
         $.effect_definition,
         $.module_definition,
+        $.using_statement,
       ),
     ),
 
@@ -234,6 +236,17 @@ module.exports = grammar({
      * body may be empty — `module A = end` declares a module with nothing in
      * it and is legal.
      */
+    using_statement: $ => seq('using', $.use_tree),
+
+    use_tree: $ => choice(
+      seq($.identifier, optional(choice(
+        seq('as', field('alias', $.identifier)),
+        seq('::', $.use_tree),
+      ))),
+      '*',
+      seq('{', optional(seq(sepBy1(',', $.use_tree), optional(','))), '}'),
+    ),
+
     module_definition: $ => seq(
       'module',
       field('name', $.identifier),
@@ -599,7 +612,7 @@ module.exports = grammar({
      */
     do_block: $ => seq(
       'do',
-      repeat(field('statement', $.let_definition)),
+      repeat(field('statement', choice($.let_definition, $.using_statement))),
       optional(seq('return', field('value', $._expression))),
       'end',
     ),

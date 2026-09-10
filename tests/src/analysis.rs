@@ -653,3 +653,51 @@ fn hover_includes_type_effect_and_module_declarations() {
         assert!(hover.ty.contains(expected), "{name}: {}", hover.ty);
     }
 }
+
+#[test]
+fn using_completion_obeys_lexical_imports_and_strict_module_members() {
+    for (text, expected) in [
+        (
+            "module M = let value = 1n end using M::value as renamed let y = rena",
+            "renamed",
+        ),
+        (
+            "module M = let value = 1n end using M as m let y = m::val",
+            "value",
+        ),
+        ("let value = 1n let y = bundle::val", "value"),
+        (
+            "module M = let value = 1n end let y = do using M::value as renamed return rena end",
+            "renamed",
+        ),
+        (
+            "module M = type T = Nat end using M::T as Number let y: Num",
+            "Number",
+        ),
+    ] {
+        let analysis = editor_source(text);
+        let offset = if text.ends_with(" end") {
+            text.len() - 4
+        } else {
+            text.len()
+        };
+        let completions = analysis.completions("main.rud", offset);
+        assert!(
+            completions.iter().any(|item| item.label == expected),
+            "{text}: {completions:?}"
+        );
+    }
+    for text in [
+        "module M = let value = 1n end module A = using M::value as renamed end let y = A::rena",
+        "module M = let value = 1n end let y = do using M::value as renamed return renamed end let z = rena",
+    ] {
+        let analysis = editor_source(text);
+        assert!(
+            !analysis
+                .completions("main.rud", text.len())
+                .iter()
+                .any(|item| item.label == "renamed"),
+            "{text}"
+        );
+    }
+}

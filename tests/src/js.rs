@@ -1621,3 +1621,14 @@ let second = match b with | #Some n => n | #None => 0n end
         "assert.equal(app.first, 48); assert.equal(app.second, 49);",
     );
 }
+
+#[test]
+fn using_aliases_execute_without_becoming_javascript_exports() {
+    execute_reification(
+        "@private module Source = let value = 42n end
+         using Source::{self as source, value as imported}
+         let answer = imported
+         let local = do using source::value as inner return inner end",
+        "assert.equal(app.answer, 42); assert.equal(app.local, 42); assert.deepEqual(Object.keys(app).sort(), ['answer', 'local']);",
+    );
+}

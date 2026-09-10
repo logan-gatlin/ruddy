@@ -93,6 +93,7 @@ pub fn label(kind: &Kind) -> &'static str {
         Kind::Mut => "Mut",
         Kind::Tilde => "Read",
         Kind::Assign => "Assign",
+        Kind::Using => "Using",
         Kind::Module => "Module",
         Kind::Equal => "Equal",
         Kind::FatArrow => "FatArrow",

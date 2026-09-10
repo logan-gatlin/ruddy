@@ -1553,6 +1553,7 @@ impl<'a> Printer<'a> {
         kids.extend(self.keyword_span(stmt).map(Skel::leaf));
         let mut closer = false;
         match &stmt.kind {
+            StmtKind::Using(tree) => kids.push(Skel::verbatim(tree.span)),
             StmtKind::Extern {
                 ty, abi, target, ..
             } => {
@@ -1747,6 +1748,15 @@ impl<'a> Printer<'a> {
                         concat(header)
                     }
                 }
+            }
+            StmtKind::Using(tree) => {
+                let source = self.slice(tree.span);
+                let body = if source.contains("--") || source.contains("(*") {
+                    self.verbatim(tree.span)
+                } else {
+                    text(tree.to_string())
+                };
+                concat(vec![text("using "), body])
             }
             StmtKind::Module { name, body } => {
                 let mut parts = vec![text("module "), text(name.tracked.clone())];

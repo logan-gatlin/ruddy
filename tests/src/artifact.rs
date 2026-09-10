@@ -2957,3 +2957,20 @@ fn reification_artifacts_reject_changed_published_callable_contracts() {
         }
     }
 }
+
+#[test]
+fn using_statements_leave_canonical_bundle_artifacts_unchanged() {
+    let declarations =
+        "module Source = type Count = Nat effect E let value = 42n end let answer = Source::value";
+    let original = built(declarations);
+    let imported = built(&format!(
+        "using Source::{{self as source, Count as Number, E as Signal, value as number}}\n{declarations}\nusing Source::*"
+    ));
+    assert_eq!(original.print(), imported.print());
+    assert!(
+        Artifact::try_parse(&imported.print())
+            .unwrap()
+            .validate()
+            .is_ok()
+    );
+}
