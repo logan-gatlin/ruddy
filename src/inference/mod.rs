@@ -8735,15 +8735,17 @@ impl Table {
                                                 .map(|(shape, labels)| (shape, labels.clone()))
                                         })
                                     });
-                                if let Some((shape, labels)) = demand {
-                                    // Fields are carried only by structs. Using
-                                    // `cases` here erased precisely the row a
-                                    // Fields parameter's declaration forbade.
+                                if let Some((sense, labels)) = demand {
                                     let resolved = self.resolve(arg);
-                                    let row = match (shape, &*resolved) {
-                                        (Shape::Struct, Ty::Struct(row))
-                                        | (Shape::Sum | Shape::Effect, Ty::Sum(row)) => row.clone(),
-                                        _ => Row::of(Rest::Undecided),
+                                    let (row, shape) = match (sense, &*resolved) {
+                                        (Sense::Row, Ty::Struct(row)) => {
+                                            (row.clone(), Shape::Struct)
+                                        }
+                                        (Sense::Row, Ty::Sum(row)) => (row.clone(), Shape::Sum),
+                                        (Sense::Effects, Ty::Sum(row)) => {
+                                            (row.clone(), Shape::Effect)
+                                        }
+                                        _ => (Row::of(Rest::Undecided), Shape::Struct),
                                     };
                                     self.forbid(&row, shape, &labels);
                                 }
@@ -12649,7 +12651,7 @@ fn extern_annotation_sources(
                     sources.insert(identity, variable.at, name);
                 }
             }
-            Sense::Fields | Sense::Cases | Sense::Effects => {
+            Sense::Row | Sense::Effects => {
                 if let Some(rest) = tails.rows.get(&variable.name)
                     && let Some(identity) = row_variable_identity(rest)
                 {
@@ -12836,7 +12838,7 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
             // Every row sort has an explicit rest.
             // from the same map: which row a use splices into was fixed where
             // the variable's sense was, so the two senses lower the same way.
-            Sense::Fields | Sense::Cases | Sense::Effects => {
+            Sense::Row | Sense::Effects => {
                 at.insert(variable.id, at.len() as u32);
                 rigids.push(variable.id);
                 let rest = Rest::Rigid {
@@ -12940,7 +12942,7 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
                 let sort = match variable.sense {
                     Sense::Type => VarSort::Type,
                     Sense::Region => VarSort::Region,
-                    Sense::Fields | Sense::Cases | Sense::Effects => VarSort::Row,
+                    Sense::Row | Sense::Effects => VarSort::Row,
                     Sense::Presence => return None,
                 };
                 Some((variable.id, sort))

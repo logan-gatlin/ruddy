@@ -163,13 +163,13 @@ impl Validator<'_> {
                             work.push(Work::Ty(to, Some(Sense::Type)));
                             work.push(Work::Row(row, Sense::Effects));
                         }
-                        Type::Struct(row) => work.push(Work::Row(row, Sense::Fields)),
+                        Type::Struct(row) => work.push(Work::Row(row, Sense::Row)),
                         Type::Sum(row) => work.push(Work::Row(
                             row,
                             if sense == Some(Sense::Effects) {
                                 Sense::Effects
                             } else {
-                                Sense::Cases
+                                Sense::Row
                             },
                         )),
                         Type::Named { name, args } => {

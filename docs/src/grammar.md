@@ -236,6 +236,27 @@ For example, an open struct type accepts a contact with additional fields:
 let email: { email: String, .. } -> String = fn contact => contact.email
 ```
 
+Struct fields and sum cases share a row kind. A parameter used as a row tail
+accepts the underlying row of either a struct or a sum, including through type aliases:
+
+```ruddy
+type Sum 'r = | ..'r
+type Struct 'r = { ..'r }
+type Choice = Sum { a: (), b: () }
+type Product = Struct (#A () | #B ())
+type Both 'r = { product: { ..'r }, choice: | ..'r }
+```
+
+`Choice` means `#a () | #b ()`, and `Product` means `{ A: (), B: () }`.
+Labels, payload types, presence conditions, and open tails are preserved.
+In `Both`, the struct and sum share the same row, so constraints from either use
+apply to both. A row must exclude every label already named beside any of its uses.
+Empty structs and empty sums supply the same empty row.
+
+Struct and sum values remain distinct types. Row extraction happens at row
+parameters; it does not convert values. A parameter cannot stand for both a
+whole type and a row, and effect rows remain a separate kind.
+
 A [presence variable](dictionary.md#presence-variable) controls whether a field, case, or effect is present.
 A `where` clause constrains those variables with `not`, `and`, `or`, `=`, and `!=`, in that order from tightest to loosest grouping.
 Semicolons separate multiple constraints, and parentheses group them.

@@ -619,8 +619,7 @@ pub struct Parameter {
 pub enum Sense {
     Region,
     Type,
-    Fields,
-    Cases,
+    Row,
     Effects,
 }
 
@@ -1455,8 +1454,7 @@ pub fn interface(
                         sense: match &param.kind {
                             types::ParamKind::Region { .. } => Sense::Region,
                             types::ParamKind::Type { .. } => Sense::Type,
-                            types::ParamKind::Fields { .. } => Sense::Fields,
-                            types::ParamKind::Cases { .. } => Sense::Cases,
+                            types::ParamKind::Row { .. } => Sense::Row,
                             types::ParamKind::Effects { .. } => Sense::Effects,
                         },
                         lacks: param.kind.lacks().iter().cloned().collect(),
@@ -1480,8 +1478,7 @@ pub fn interface(
                         sense: match param.kind {
                             types::ParamKind::Region { .. } => Sense::Region,
                             types::ParamKind::Type { .. } => Sense::Type,
-                            types::ParamKind::Fields { .. } => Sense::Fields,
-                            types::ParamKind::Cases { .. } => Sense::Cases,
+                            types::ParamKind::Row { .. } => Sense::Row,
                             types::ParamKind::Effects { .. } => Sense::Effects,
                         },
                         lacks: param.kind.lacks().iter().cloned().collect(),
@@ -2524,8 +2521,7 @@ pub mod text {
             A(match value.sense {
                 Sense::Region => "region",
                 Sense::Type => "type",
-                Sense::Fields => "fields",
-                Sense::Cases => "cases",
+                Sense::Row => "row",
                 Sense::Effects => "effects",
             }
             .into()),
@@ -3535,8 +3531,7 @@ pub mod text {
                 sense: match self.atom(self.take(&mut value)).as_str() {
                     "region" => Sense::Region,
                     "type" => Sense::Type,
-                    "fields" => Sense::Fields,
-                    "cases" => Sense::Cases,
+                    "row" | "fields" | "cases" => Sense::Row,
                     "effects" => Sense::Effects,
                     _ => self.invalid("invalid parameter sense", Sense::Type),
                 },

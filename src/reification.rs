@@ -860,7 +860,7 @@ impl Descriptor {
                                 | (Head::Parameter, Head::Row(kind, fields)) => {
                                     Head::Row(*kind, fields.clone())
                                 }
-                                (Head::Row(a, xs), Head::Row(b, ys)) if a == b => {
+                                (Head::Row(a, xs), Head::Row(_, ys)) => {
                                     if !xs.is_disjoint(ys) {
                                         return Err("duplicate runtime row field");
                                     }
