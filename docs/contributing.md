@@ -58,8 +58,6 @@ npm run dev
 
 The preview reloads after edits and is available at the URL printed by Eleventy, normally `http://localhost:8080`.
 The command `npm run build` creates a clean static website in `docs/_site/`, ready to serve from a domain root or subdirectory.
-Both `npm run build` and `npm run dev` install the extension's build dependencies and package its bundled grammar and language client into `downloads/ruddy.vsix` in the generated site.
-The first extension build downloads Tree-sitter's WASM compiler toolchain; website visitors only download the finished VSIX.
 Language documentation lives in `docs/src/`; only Markdown files marked `doc: true` become pages.
 Relative `.md` links become `.html` links, and headings receive anchors compatible with the dictionary links.
 The shared layout is `_includes/page.njk`, and the stylesheet is `assets/style.css`.

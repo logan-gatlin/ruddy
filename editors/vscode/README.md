@@ -12,9 +12,6 @@ The `code` command must be on PATH. An alternative executable can be selected
 with `just vscode-install code-insiders`. Use `just vscode` to build the VSIX
 without installing it; this writes `editors/vscode/ruddy.vsix`.
 
-The [website download page](https://ruddy.logan.md/download.html) provides a
-prebuilt VSIX and a one-line download/install command.
-
 In VS Code, run **Extensions: Install from VSIX…** and select the downloaded or
 locally built `.vsix` file.
 Highlighting works immediately, including standalone files and Restricted Mode.

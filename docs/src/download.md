@@ -18,15 +18,14 @@ cargo install --git https://ruddy.logan.md --locked ruddy
 ## Install the VS Code extension
 
 The Ruddy extension provides syntax highlighting and connects to the installed Ruddy CLI for diagnostics, completion, hover, go-to-definition, and formatting.
-The following command downloads and installs the extension on Linux or macOS, with `curl` and the [VS Code `code` command](https://code.visualstudio.com/docs/configure/command-line) available:
+From a [Ruddy source checkout](https://github.com/logan-gatlin/ruddy), the following command builds and installs the extension with Node.js, npm, `just`, and the [VS Code `code` command](https://code.visualstudio.com/docs/configure/command-line) available:
 
 ```sh
-curl -fL https://ruddy.logan.md/downloads/ruddy.vsix -o ruddy.vsix && code --install-extension ./ruddy.vsix --force
+just vscode-install
 ```
 
-The command saves `ruddy.vsix` in the current directory; the file can be deleted after installation.
-Running the command again installs the latest version served by this website.
-Alternatively, the [extension download](downloads/ruddy.vsix) can be installed through **Extensions: Install from VSIX…** in VS Code on any supported desktop platform.
+The command regenerates the grammar, builds the extension, and installs it into VS Code.
+The command `just vscode` builds `editors/vscode/ruddy.vsix` without installing it; that file can also be installed through **Extensions: Install from VSIX…** in VS Code.
 On macOS, **Shell Command: Install 'code' command in PATH** in the Command Palette enables the CLI command.
 
 Highlighting works without the Ruddy CLI.

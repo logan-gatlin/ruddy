@@ -42,3 +42,11 @@ plus a convenient one-line extension install command on the website in `docs/`.
 - The download page documents a single-line `curl` plus `code --install-extension`
   command, a direct VSIX link, prerequisites, and the separate CLI requirement for
   LSP features. Publishing uses the existing docs deployment workflow.
+
+## Distribution correction
+
+The user rejected bundling the extension with the website and asked how to publish
+to the Marketplace. This supersedes the website-distribution items above: docs
+builds must not package or host a VSIX. Keep the local `just vscode-install` flow.
+Marketplace account setup and publication are not yet configured; document source
+installation until the actual publisher identity and listing exist.

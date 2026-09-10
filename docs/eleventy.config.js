@@ -42,7 +42,6 @@ export default function (eleventyConfig) {
     path.posix.relative(path.posix.dirname(current), target),
   );
   eleventyConfig.addPassthroughCopy({ assets: "assets" });
-  eleventyConfig.addPassthroughCopy({ [path.resolve("../editors/vscode/ruddy.vsix")]: "downloads/ruddy.vsix" });
 
   return {
     dir: { input: "src", output: "_site", includes: "../_includes" },
