@@ -122,7 +122,7 @@ impl fmt::Display for Ast<'_, DataKind> {
             DataKind::Fixed(value) => write!(f, "{value}"),
             DataKind::Real(value) => write!(f, "{value}"),
             DataKind::String(value) => f.write_str(&string(value)),
-            DataKind::Boolean(value) => write!(f, "{value}"),
+            DataKind::Bool(value) => write!(f, "{value}"),
             DataKind::Unit => f.write_str("()"),
             DataKind::Tuple(elements) => {
                 write_tuple(f, elements.iter().map(|element| Ast(&element.tracked)))
@@ -329,6 +329,9 @@ impl fmt::Display for Ast<'_, Where> {
 /// spell the same effect four ways.
 fn labelled(path: &Path) -> String {
     let mut out = String::new();
+    if path.absolute.is_some() {
+        out.push_str("::");
+    }
     for module in &path.modules {
         out.push_str(&module.tracked);
         out.push_str("::");
@@ -576,7 +579,7 @@ impl fmt::Display for Ast<'_, ExprKind> {
             ExprKind::Fixed(value) => write!(f, "{value}"),
             ExprKind::Real(value) => write!(f, "{value}"),
             ExprKind::String(value) => f.write_str(&string(value)),
-            ExprKind::Boolean(value) => write!(f, "{value}"),
+            ExprKind::Bool(value) => write!(f, "{value}"),
             ExprKind::Unit => f.write_str("()"),
         }
     }
@@ -598,7 +601,7 @@ impl fmt::Display for Ast<'_, PatternKind> {
             PatternKind::Fixed(value) => write!(f, "{value}"),
             PatternKind::Real(value) => write!(f, "{value}"),
             PatternKind::String(value) => f.write_str(&string(value)),
-            PatternKind::Boolean(value) => write!(f, "{value}"),
+            PatternKind::Bool(value) => write!(f, "{value}"),
             PatternKind::Unit => f.write_str("()"),
             PatternKind::Tag { name, payload } => write_tag(
                 f,

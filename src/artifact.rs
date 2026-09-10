@@ -576,7 +576,7 @@ pub enum Data {
     Fixed(crate::types::FixedLiteral),
     Real(f64),
     String(String),
-    Boolean(bool),
+    Bool(bool),
     Array(Vec<Data>),
     Struct(IndexMap<String, Data>),
     Tag { name: String, payload: Box<Data> },
@@ -590,7 +590,7 @@ impl PartialEq for Data {
             (Self::Integer(a), Self::Integer(b)) => a == b,
             (Self::Real(a), Self::Real(b)) => a.to_bits() == b.to_bits(),
             (Self::String(a), Self::String(b)) => a == b,
-            (Self::Boolean(a), Self::Boolean(b)) => a == b,
+            (Self::Bool(a), Self::Bool(b)) => a == b,
             (Self::Array(a), Self::Array(b)) => a == b,
             (Self::Struct(a), Self::Struct(b)) => a == b,
             (
@@ -732,7 +732,7 @@ pub enum Type {
     Fixed(crate::types::FixedInt),
     Real,
     String,
-    Boolean,
+    Bool,
     Any,
     ForeignValue,
     Arrow(Box<Type>, Box<Type>, Row),
@@ -830,7 +830,7 @@ fn semantic_eq(root: SemanticPair<'_>) -> bool {
                 | (Type::Int, Type::Int)
                 | (Type::Real, Type::Real)
                 | (Type::String, Type::String)
-                | (Type::Boolean, Type::Boolean)
+                | (Type::Bool, Type::Bool)
                 | (Type::Any, Type::Any)
                 | (Type::ForeignValue, Type::ForeignValue)
                 | (Type::Undecided, Type::Undecided) => {}
@@ -1010,7 +1010,7 @@ fn clone_semantic(root: SemanticRef<'_>) -> (Vec<Type>, Vec<Row>) {
                 Type::Fixed(kind) => types.push(Type::Fixed(*kind)),
                 Type::Real => types.push(Type::Real),
                 Type::String => types.push(Type::String),
-                Type::Boolean => types.push(Type::Boolean),
+                Type::Bool => types.push(Type::Bool),
                 Type::Any => types.push(Type::Any),
                 Type::ForeignValue => types.push(Type::ForeignValue),
                 Type::Arrow(from, to, effects) => {
@@ -1214,7 +1214,7 @@ fn drain_type(value: &mut Type, pending: &mut Vec<SemanticOwned>) {
         | Type::Fixed(_)
         | Type::Real
         | Type::String
-        | Type::Boolean
+        | Type::Bool
         | Type::Any
         | Type::ForeignValue
         | Type::Var(_)
@@ -1585,7 +1585,7 @@ fn data(value: &ir::Data) -> Data {
         ir::DataKind::Integer(value) => Data::Integer(*value),
         ir::DataKind::Real(value) => Data::Real(*value),
         ir::DataKind::String(value) => Data::String(value.clone()),
-        ir::DataKind::Boolean(value) => Data::Boolean(*value),
+        ir::DataKind::Bool(value) => Data::Bool(*value),
         ir::DataKind::Array(items) => Data::Array(items.iter().map(data).collect()),
         ir::DataKind::Struct(fields) => Data::Struct(
             fields
@@ -1777,7 +1777,7 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
                 types::Ty::Fixed(kind) => tys.push(Type::Fixed(*kind)),
                 types::Ty::Real => tys.push(Type::Real),
                 types::Ty::String => tys.push(Type::String),
-                types::Ty::Boolean => tys.push(Type::Boolean),
+                types::Ty::Bool => tys.push(Type::Bool),
                 types::Ty::Any => tys.push(Type::Any),
                 types::Ty::ForeignValue => tys.push(Type::ForeignValue),
                 types::Ty::Arrow(from, to, effects) => {
@@ -2210,7 +2210,7 @@ fn literal(value: &ir::Literal) -> Literal {
         ir::Literal::Integer(value) => Literal::Integer(*value),
         ir::Literal::Real(value) => Literal::Real(value.to_bits()),
         ir::Literal::String(value) => Literal::String(value.clone()),
-        ir::Literal::Boolean(value) => Literal::Boolean(*value),
+        ir::Literal::Bool(value) => Literal::Bool(*value),
     }
 }
 fn end(e: &lir::End) -> End {
@@ -2276,7 +2276,7 @@ fn rep(value: lir::Rep) -> Rep {
         lir::Rep::Fixed(kind) => Rep::Fixed(kind),
         lir::Rep::Real => Rep::Real,
         lir::Rep::String => Rep::String,
-        lir::Rep::Boolean => Rep::Boolean,
+        lir::Rep::Bool => Rep::Bool,
         lir::Rep::TypeDescriptor => Rep::TypeDescriptor,
         lir::Rep::NativePlan => Rep::NativePlan,
         lir::Rep::BoxedAny => Rep::BoxedAny,
@@ -2477,7 +2477,7 @@ pub mod text {
             Data::Integer(value) => L(vec![A("int".into()), A(value.to_string())]),
             Data::Real(value) => L(vec![A("real".into()), A(value.to_string())]),
             Data::String(value) => L(vec![A("string".into()), Q(value.clone())]),
-            Data::Boolean(value) => L(vec![A("bool".into()), A(value.to_string())]),
+            Data::Bool(value) => L(vec![A("bool".into()), A(value.to_string())]),
             Data::Array(items) => L(std::iter::once(A("array".into()))
                 .chain(items.iter().map(data))
                 .collect()),
@@ -2653,7 +2653,7 @@ pub mod text {
                         Type::Fixed(kind) => work.push(Work::Text(kind.suffix())),
                         Type::Real => work.push(Work::Text("real")),
                         Type::String => work.push(Work::Text("string")),
-                        Type::Boolean => work.push(Work::Text("boolean")),
+                        Type::Bool => work.push(Work::Text("boolean")),
                         Type::Any => work.push(Work::Text("any")),
                         Type::ForeignValue => work.push(Work::Text("foreign-value")),
                         Type::Arrow(from, to, row) => {
@@ -3471,7 +3471,7 @@ pub mod text {
                 "int" => Data::Integer(self.number(self.exact(values, 1, "int").remove(0))),
                 "real" => Data::Real(self.number(self.exact(values, 1, "real").remove(0))),
                 "string" => Data::String(self.string(self.exact(values, 1, "string").remove(0))),
-                "bool" => Data::Boolean(self.boolean(self.exact(values, 1, "bool").remove(0))),
+                "bool" => Data::Bool(self.boolean(self.exact(values, 1, "bool").remove(0))),
                 "array" => Data::Array(
                     values
                         .into_iter()
@@ -4044,7 +4044,7 @@ pub mod text {
                                 "i64" => Type::Fixed(crate::types::FixedInt::Int64),
                                 "real" => Type::Real,
                                 "string" => Type::String,
-                                "boolean" => Type::Boolean,
+                                "boolean" => Type::Bool,
                                 "any" => Type::Any,
                                 "foreign-value" => Type::ForeignValue,
                                 "undecided" => Type::Undecided,

@@ -400,11 +400,11 @@ module.exports = grammar({
     // `Sys::Inner::!Log` and `Sys::Inner::zero` are the same up to the sigil,
     // and a parser that guessed at the first `::` would have to take the guess
     // back at the last one.
-    _module_prefix: $ => repeat1(seq(field('module', $.identifier), '::')),
+    _module_prefix: $ => repeat1(prec(1, seq(field('module', $.identifier), '::'))),
 
     /**
-     * `Math::double`, `Math::Vec::zero` — a name and the modules it is reached
-     * through.
+     * `Math::double`, `Math::Vec::zero`, or `::root_name` — a name and the
+     * modules it is reached through. A leading `::` starts at the bundle root.
      *
      * Only the qualified form is a node: a bare name is an [`identifier`] and
      * stays one, so every position that takes a path writes the choice out.
@@ -412,15 +412,22 @@ module.exports = grammar({
      * precedence to say — a path is an atom, so `Math::mk 1 2` applies
      * `Math::mk` and `Math::p.x` projects `x` out of `Math::p`.
      */
-    path: $ => seq($._module_prefix, field('name', $.identifier)),
+    path: $ => choice(
+      seq($._module_prefix, field('name', $.identifier)),
+      seq('::', optional($._module_prefix), field('name', $.identifier)),
+    ),
 
     /**
-     * `Sys::!Log` — the same, for the sigilled label of an effect.
+     * `Sys::!Log` or `::Sys::!Log` — the same, for the sigilled label of an
+     * effect.
      *
      * The segments come before the `!`: the path qualifies the whole label,
      * not the name inside it.
      */
-    effect_path: $ => seq($._module_prefix, field('name', $.effect_label)),
+    effect_path: $ => choice(
+      seq($._module_prefix, field('name', $.effect_label)),
+      seq('::', optional($._module_prefix), field('name', $.effect_label)),
+    ),
 
     // ── Expressions ───────────────────────────────────────────────────────
 

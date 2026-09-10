@@ -1,0 +1,3 @@
+effect Halt 'a = 'a -> |
+effect Ask 'a = () -> 'a
+effect Advise 'a = 'a -> ()

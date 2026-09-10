@@ -761,7 +761,7 @@ fn wire_explanation(
             T::Integer => "integer",
             T::RealNumber => "real-number",
             T::Text => "text",
-            T::Boolean => "boolean",
+            T::Bool => "boolean",
             T::Function => "function",
             T::Struct => "struct",
             T::TaggedValue => "tagged-value",

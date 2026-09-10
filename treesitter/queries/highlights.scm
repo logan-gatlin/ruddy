@@ -68,7 +68,7 @@
 
 ; The primitive types; see `types::Prim::ALL`.
 ((identifier) @type.builtin
-  (#any-of? @type.builtin "Nat" "Int" "Nat8" "Nat16" "Nat32" "Nat64" "Int8" "Int16" "Int32" "Int64" "Real" "String" "Boolean"))
+  (#any-of? @type.builtin "Nat" "Int" "Nat8" "Nat16" "Nat32" "Nat64" "Int8" "Int16" "Int32" "Int64" "Real" "String" "Bool"))
 
 ; `'a` — a declaration's parameter, a variable of the annotation it is written
 ; in, and the presences a `where` clause is written about. One capture for all

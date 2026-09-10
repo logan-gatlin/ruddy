@@ -313,7 +313,7 @@ pub enum Op {
         fallback: Option<Box<Block>>,
     },
     /// Dispatch on a primitive value. The fallback is absent only when the
-    /// listed Boolean cases cover both possible values; every other primitive
+    /// listed Bool cases cover both possible values; every other primitive
     /// type has values beyond its listed literals.
     SwitchPrim {
         on: Temp,
@@ -412,7 +412,7 @@ pub enum Rep {
     /// A 64-bit floating-point number.
     Real,
     String,
-    Boolean,
+    Bool,
     TypeDescriptor,
     NativePlan,
     BoxedAny,
@@ -1014,7 +1014,7 @@ fn cell(pattern: &Pattern) -> Cell {
         PatternKind::Integer(value) => Cell::Prim(Literal::Integer(*value)),
         PatternKind::Real(value) => Cell::Prim(Literal::Real(*value)),
         PatternKind::String(value) => Cell::Prim(Literal::String(value.clone())),
-        PatternKind::Boolean(value) => Cell::Prim(Literal::Boolean(*value)),
+        PatternKind::Bool(value) => Cell::Prim(Literal::Bool(*value)),
         PatternKind::Unit => Cell::Struct {
             fields: Vec::new(),
             exact: true,
@@ -2256,7 +2256,7 @@ impl Lower<'_> {
             Ty::Fixed(kind) => Rep::Fixed(*kind),
             Ty::Real => Rep::Real,
             Ty::String => Rep::String,
-            Ty::Boolean => Rep::Boolean,
+            Ty::Bool => Rep::Bool,
             Ty::Any => Rep::BoxedAny,
             Ty::ForeignValue => Rep::HostValue,
             Ty::Arrow(..) => Rep::Fn,
@@ -3231,12 +3231,9 @@ impl Lower<'_> {
                 rep,
                 Op::Const(Literal::String(value.clone())),
             ),
-            TermKind::Boolean(value) => self.emit(
-                body,
-                self.span(span),
-                rep,
-                Op::Const(Literal::Boolean(*value)),
-            ),
+            TermKind::Bool(value) => {
+                self.emit(body, self.span(span), rep, Op::Const(Literal::Bool(*value)))
+            }
             TermKind::Unary {
                 op: crate::ir::UnaryOp::Allocate,
                 value,
@@ -4265,7 +4262,7 @@ impl Lower<'_> {
             | Ty::Fixed(_)
             | Ty::Real
             | Ty::String
-            | Ty::Boolean
+            | Ty::Bool
             | Ty::Any
             | Ty::ForeignValue
                 if primitives =>
@@ -4502,7 +4499,7 @@ impl Lower<'_> {
             .collect();
         let wilds = narrow(None);
         let boolean_complete =
-            listed.contains(&Literal::Boolean(false)) && listed.contains(&Literal::Boolean(true));
+            listed.contains(&Literal::Bool(false)) && listed.contains(&Literal::Bool(true));
         let fixed_complete = match listed.first() {
             Some(Literal::Fixed(value)) => {
                 listed.len() as u128 == (1u128 << value.kind().bits())

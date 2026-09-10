@@ -221,7 +221,7 @@ fn reification_generalized_initializers_preserve_eager_allocation_identity() {
     execute_reification(
         r#"
 @private extern box: 'a -> Any = "$anyUpcast"
-@private extern same: Any -> Any -> Boolean = "a => b => a === b"
+@private extern same: Any -> Any -> Bool = "a => b => a === b"
 @private let make: 'a -> { boxed: Any, token: Any } = do
   let token = box 1n
   return fn x => { boxed: box x, token: token }
@@ -239,7 +239,7 @@ fn reification_generalized_partial_application_evaluates_its_argument_once() {
     execute_reification(
         r#"
 @private extern box: 'a -> Any = "$anyUpcast"
-@private extern same: Any -> Any -> Boolean = "a => b => a === b"
+@private extern same: Any -> Any -> Bool = "a => b => a === b"
 @private let pair = fn token => fn x => { boxed: box x, token: token }
 @private let partial = pair (box 1n)
 @private let first = partial 2n

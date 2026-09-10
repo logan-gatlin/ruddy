@@ -1,5 +1,11 @@
-let write = !Console.write
-let write_error = !Console.write_error
+let print = !Console.write
+let eprint = !Console.write_error
 
-let print = fn text => write (str::concat text "\n")
-let print_error = fn text => write_error (str::concat text "\n")
+let println = fn text => print (str::concat text "\n")
+let eprintln = fn text => eprint (str::concat text "\n")
+
+let consume = function::make_consumer print
+let econsume = function::make_consumer eprint
+
+let consumeln = function::make_consumer println
+let econsumeln = function::make_consumer eprintln

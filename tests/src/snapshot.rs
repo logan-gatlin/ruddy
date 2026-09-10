@@ -2049,7 +2049,7 @@ fn a_type_error_is_a_diagnostic() {
         "the shared diagnostic prose and debugger account must agree"
     );
 
-    let projection = snapshot("let value = { x: 1n }\nlet bad : Boolean = value.x\n");
+    let projection = snapshot("let value = { x: 1n }\nlet bad : Bool = value.x\n");
     let projection = projection.diagnostics[0]
         .inference_explanation
         .as_ref()

@@ -1,5 +1,5 @@
-  | !Console.write text => write text
-  | !Console.write_error text => write_error text
+  | !IO.write text => write text
+  | !IO.write_error text => write_error text
   | !Process.exit code => match host_exit code with end
   | !FileSystem.read_bytes request => read_bytes request
   | !FileSystem.write_bytes request => write_bytes request

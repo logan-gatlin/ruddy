@@ -195,7 +195,7 @@ fn editor_can_initialize_open_hover_and_shutdown() {
                 response.response_result.unwrap()["contents"]["value"]
                     .as_str()
                     .unwrap()
-                    .contains("Boolean")
+                    .contains("Bool")
             );
             break;
         }
@@ -356,7 +356,7 @@ fn rapid_changes_publish_current_diagnostics_and_disk_creation_is_observed() {
                     response.response_result.unwrap()["contents"]["value"]
                         .as_str()
                         .unwrap()
-                        .contains("Boolean")
+                        .contains("Bool")
                 );
                 hover = true;
             }

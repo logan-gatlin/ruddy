@@ -193,7 +193,7 @@ fn rich(ty: Type) -> Type {
 
 fn row(rest: Rest) -> Row {
     Row {
-        labels: vec![("label".to_string(), field(Presence::Present, Type::Boolean))],
+        labels: vec![("label".to_string(), field(Presence::Present, Type::Bool))],
         rest,
     }
 }
@@ -287,7 +287,7 @@ fn model_artifact() -> Artifact {
         rich(Type::Int),
         rich(Type::Real),
         rich(Type::String),
-        rich(Type::Boolean),
+        rich(Type::Bool),
         rich(Type::Arrow(
             Box::new(plain(Type::Var(7))),
             Box::new(plain(Type::Bound(8))),
@@ -334,7 +334,7 @@ fn model_artifact() -> Artifact {
         Op::Const(Literal::Integer(i64::MIN)),
         Op::Const(Literal::Real(f64::NAN.to_bits())),
         Op::Const(Literal::String("quote \" and newline\n".to_string())),
-        Op::Const(Literal::Boolean(true)),
+        Op::Const(Literal::Bool(true)),
         Op::Neg(1),
         Op::Not(2),
         Op::And { left: 1, right: 2 },
@@ -378,7 +378,7 @@ fn model_artifact() -> Artifact {
         Rep::Int,
         Rep::Real,
         Rep::String,
-        Rep::Boolean,
+        Rep::Bool,
         Rep::Unit,
         Rep::Struct,
         Rep::Sum,
@@ -1200,7 +1200,7 @@ fn building_translates_every_compiler_semantic_variant() {
     );
     fields.insert(
         "boolean".to_string(),
-        compiler_field(types::Presence::Absent, types::Ty::Boolean),
+        compiler_field(types::Presence::Absent, types::Ty::Bool),
     );
     fields.insert(
         "var".to_string(),
@@ -1612,7 +1612,7 @@ fn deep_semantic_artifact_building_is_stack_safe_in_every_position() {
                     ),
                     (
                         "boolean".into(),
-                        types::RowField::present(Arc::new(types::Ty::Boolean)),
+                        types::RowField::present(Arc::new(types::Ty::Bool)),
                     ),
                 ]
                 .into_iter()
@@ -2568,10 +2568,10 @@ fn metadata_data_compares_by_representation() {
         }
     );
     assert_ne!(
-        Data::Array(vec![Data::Boolean(true)]),
-        Data::Array(vec![Data::Boolean(false)])
+        Data::Array(vec![Data::Bool(true)]),
+        Data::Array(vec![Data::Bool(false)])
     );
-    assert_ne!(Data::String("a".into()), Data::Boolean(true));
+    assert_ne!(Data::String("a".into()), Data::Bool(true));
 }
 
 #[test]

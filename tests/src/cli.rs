@@ -77,10 +77,10 @@ fn executable_main_drains_console_output_and_saturates_exit_codes() {
     executable_project(
         directory.path(),
         "let main = fn _ => do\n\
-           let _ = std::console::print \"hello\"\n\
-           let _ = std::console::write_error \"goodbye\"\n\
+           let _ = std::io::print \"hello\"\n\
+           let _ = std::io::eprint \"goodbye\"\n\
            let _ = std::process::exit 999n\n\
-           return std::console::print \"unreachable\"\n\
+           return std::io::print \"unreachable\"\n\
          end",
         None,
     );
@@ -2162,7 +2162,7 @@ fn new_scaffolds_a_compilable_project_without_overwriting() {
     let scaffold_manifest = fs::read_to_string(destination.join("Ruddy.toml")).unwrap();
     assert_eq!(
         scaffold_manifest,
-        "name = \"my_app\"\nversion = \"0.1.0\"\nkind = \"executable\"\nroot = \"main.rud\"\ntarget = \"js\"\n\n[dependencies]\n"
+        "name = \"my_app\"\nversion = \"0.1.0\"\nkind = \"executable\"\nroot = \"src/main.rud\"\ntarget = \"js\"\n\n[dependencies]\n"
     );
     assert!(
         !scaffold_manifest
@@ -2170,7 +2170,7 @@ fn new_scaffolds_a_compilable_project_without_overwriting() {
             .any(|line| line.starts_with("std ="))
     );
     assert_eq!(
-        fs::read_to_string(destination.join("main.rud")).unwrap(),
+        fs::read_to_string(destination.join("src/main.rud")).unwrap(),
         "let main = fn _ => ()\n"
     );
     assert_eq!(
@@ -2202,7 +2202,7 @@ fn new_scaffolds_a_compilable_project_without_overwriting() {
             .contains("could not create project directory")
     );
     assert_eq!(
-        fs::read_to_string(destination.join("main.rud")).unwrap(),
+        fs::read_to_string(destination.join("src/main.rud")).unwrap(),
         "let main = fn _ => ()\n"
     );
 }
@@ -2231,7 +2231,7 @@ fn new_reports_git_initialization_failure_and_leaves_the_scaffold() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(destination.join("Ruddy.toml").is_file());
-    assert!(destination.join("main.rud").is_file());
+    assert!(destination.join("src/main.rud").is_file());
     assert!(destination.join(".gitignore").is_file());
 }
 
@@ -2315,7 +2315,7 @@ fn manifest_targets_select_root_javascript_output() {
     let app = directory.path().join("app");
     new_project(&app).unwrap();
     disable_std(&app);
-    fs::write(app.join("main.rud"), "let main: () -> () = fn _ => ()").unwrap();
+    fs::write(app.join("src/main.rud"), "let main: () -> () = fn _ => ()").unwrap();
 
     // Omission and an explicit library target retain artifact-only behavior.
     let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
@@ -2333,8 +2333,8 @@ fn manifest_targets_select_root_javascript_output() {
     fs::write(
         app.join("Ruddy.toml"),
         manifest.replace(
-            "root = \"main.rud\"",
-            "root = \"main.rud\"\ntarget = \"artifact\"",
+            "root = \"src/main.rud\"",
+            "root = \"src/main.rud\"\ntarget = \"artifact\"",
         ),
     )
     .unwrap();
@@ -2922,7 +2922,7 @@ fn check_compiles_without_build_output_and_reports_failures() {
     check_project(&app).unwrap();
     assert!(!app.join("build").exists());
 
-    fs::write(app.join("main.rud"), "let bad : Nat = false\n").unwrap();
+    fs::write(app.join("src/main.rud"), "let bad : Nat = false\n").unwrap();
     let error = check_project(&app).unwrap_err();
     assert!(!error.is_usage());
     assert_eq!(error.exit_code(), 1);

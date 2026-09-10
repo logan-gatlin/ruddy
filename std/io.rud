@@ -1,0 +1,13 @@
+effect IO = { write: String -> (), write_error: String -> () }
+
+let print = !IO.write
+let eprint = !IO.write_error
+
+let println = fn text => print (str::concat text "\n")
+let eprintln = fn text => eprint (str::concat text "\n")
+
+let consumer = function::make_consumer print
+let econsumer = function::make_consumer eprint
+
+let consumerln = function::make_consumer println
+let econsumerln = function::make_consumer eprintln

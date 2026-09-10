@@ -29,7 +29,7 @@ pub enum Prim {
     /// The type of UTF-8 text.
     String,
     /// The type with the values true and false.
-    Boolean,
+    Bool,
     /// A value packaged with its structural runtime type.
     Any,
     /// An opaque JavaScript value.
@@ -525,7 +525,7 @@ pub enum Ty {
     Fixed(FixedInt),
     Real,
     String,
-    Boolean,
+    Bool,
     /// A value packaged with its structural runtime type.
     Any,
     /// An opaque JavaScript value.
@@ -938,7 +938,7 @@ fn take_ty_children(ty: &mut Ty, types: &mut Vec<Arc<Ty>>, rows: &mut Vec<Arc<Ro
         | Ty::Fixed(_)
         | Ty::Real
         | Ty::String
-        | Ty::Boolean
+        | Ty::Bool
         | Ty::Any
         | Ty::ForeignValue
         | Ty::Var(_)
@@ -1065,7 +1065,7 @@ pub(crate) fn same_finite_syntax_metered(
                     | (Ty::Int, Ty::Int)
                     | (Ty::Real, Ty::Real)
                     | (Ty::String, Ty::String)
-                    | (Ty::Boolean, Ty::Boolean)
+                    | (Ty::Bool, Ty::Bool)
                     | (Ty::Any, Ty::Any)
                     | (Ty::ForeignValue, Ty::ForeignValue)
                     | (Ty::Undecided, Ty::Undecided) => {}
@@ -1191,7 +1191,7 @@ impl From<Prim> for Ty {
             Prim::Fixed(kind) => Ty::Fixed(kind),
             Prim::Real => Ty::Real,
             Prim::String => Ty::String,
-            Prim::Boolean => Ty::Boolean,
+            Prim::Bool => Ty::Bool,
             Prim::Any => Ty::Any,
             Prim::ForeignValue => Ty::ForeignValue,
         }
@@ -1966,7 +1966,7 @@ impl Prim {
         Prim::Fixed(FixedInt::Int64),
         Prim::Real,
         Prim::String,
-        Prim::Boolean,
+        Prim::Bool,
         Prim::Any,
         Prim::ForeignValue,
     ];
@@ -1981,7 +1981,7 @@ impl Prim {
             Prim::Fixed(kind) => kind.name(),
             Prim::Real => "Real",
             Prim::String => "String",
-            Prim::Boolean => "Boolean",
+            Prim::Bool => "Bool",
             Prim::Any => "Any",
             Prim::ForeignValue => "ForeignValue",
         }

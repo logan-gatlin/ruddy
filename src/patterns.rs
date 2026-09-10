@@ -212,7 +212,7 @@ enum Mode {
 enum Scalar {
     Infinite(InfiniteScalar),
     Fixed(crate::types::FixedInt),
-    Boolean,
+    Bool,
 }
 
 #[derive(Clone, Copy)]
@@ -453,7 +453,7 @@ fn walk_under(check: &Check, term: &Term, assumed: &Formula, out: &mut Output) {
         | TermKind::Integer(_)
         | TermKind::Real(_)
         | TermKind::String(_)
-        | TermKind::Boolean(_)
+        | TermKind::Bool(_)
         | TermKind::Error => {}
     }
 }
@@ -489,7 +489,7 @@ fn cell(pattern: &Pattern) -> Cell {
         PatternKind::Integer(value) => Cell::Literal(Literal::Integer(*value)),
         PatternKind::Real(value) => Cell::Literal(Literal::Real(*value)),
         PatternKind::String(value) => Cell::Literal(Literal::String(value.clone())),
-        PatternKind::Boolean(value) => Cell::Literal(Literal::Boolean(*value)),
+        PatternKind::Bool(value) => Cell::Literal(Literal::Bool(*value)),
         // `()` and `{}` are one pattern: the exact struct naming no fields.
         PatternKind::Unit => Cell::Struct {
             fields: Vec::new(),
@@ -995,7 +995,7 @@ impl Check<'_> {
                     | (Literal::Integer(_), Ty::Int)
                     | (Literal::Real(_), Ty::Real)
                     | (Literal::String(_), Ty::String)
-                    | (Literal::Boolean(_), Ty::Boolean)
+                    | (Literal::Bool(_), Ty::Bool)
             ),
             Cell::Tag { name, payload } => match &*ty {
                 Ty::Sum(row) => {
@@ -1471,7 +1471,7 @@ impl Check<'_> {
                 q,
                 walk,
             ),
-            Ty::Boolean => self.scalars(rows, Scalar::Boolean, later, q, walk),
+            Ty::Bool => self.scalars(rows, Scalar::Bool, later, q, walk),
             Ty::Sum(row) => self.cases(rows, &flat(row), later, q, walk),
             // Unit, an arrow, a quantified variable, the undecided type:
             // nothing tests it — compatibility said so, and the widening
@@ -1533,12 +1533,12 @@ impl Check<'_> {
                 }
 
                 let core = match core {
-                    Scalar::Boolean => {
+                    Scalar::Bool => {
                         // There are no boolean values other than true and
                         // false. They were each considered above if written,
                         // but ask both so an empty matrix has the same finite
                         // universe.
-                        for value in [Literal::Boolean(false), Literal::Boolean(true)] {
+                        for value in [Literal::Bool(false), Literal::Bool(true)] {
                             if let Some(wits) = ask(&value) {
                                 return Some(wits);
                             }

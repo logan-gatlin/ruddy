@@ -35,7 +35,7 @@ A [literal](dictionary.md#literal) writes a value directly in source code.
 | Fixed-width natural number | `255n8`, `42n64` | `Nat8`, `Nat64` |
 | Fixed-width integer | `-2i8`, `42i64` | `Int8`, `Int64` |
 | String | `"Hello"` | `String` |
-| Boolean | `true`, `false` | `Boolean` |
+| Bool | `true`, `false` | `Bool` |
 | [Unit](dictionary.md#unit) | `()` or `{}` | `()` |
 
 The fixed-width suffixes support widths of `8`, `16`, `32`, and `64`.
@@ -124,12 +124,12 @@ The following table lists expression operators from tightest to loosest grouping
 | --- | --- | --- |
 | `value.field` | Field access | Left |
 | `function argument` | Function call | Left |
-| `-`, `not`, `mut`, `~` before an expression | Negation, Boolean negation, [mutable cell](dictionary.md#mutable-cell) creation, mutable cell reading | Right |
+| `-`, `not`, `mut`, `~` before an expression | Negation, Bool negation, [mutable cell](dictionary.md#mutable-cell) creation, mutable cell reading | Right |
 | `*`, `/` | Real multiplication and division | Left |
 | `+`, `-` | Real addition and subtraction | Left |
-| `and` | Boolean conjunction | Left |
-| `xor` | Boolean exclusive disjunction | Left |
-| `or` | Boolean disjunction | Left |
+| `and` | Bool conjunction | Left |
+| `xor` | Bool exclusive disjunction | Left |
+| `or` | Bool disjunction | Left |
 | `\|>` | Pass the left value to the right function | Left |
 | `:=` | Cell assignment | Right |
 
@@ -148,12 +148,12 @@ For example, a block can print a message before returning a status:
 
 ```ruddy
 let notify = fn message => do
-  _ = std::console::print message
+  _ = std::io::print message
   return #Sent
 end
 ```
 
-An `if` expression requires a Boolean condition, a `then` expression, an `else` expression, and `end`.
+An `if` expression requires a Bool condition, a `then` expression, an `else` expression, and `end`.
 An `else if` chain shares one final `end`.
 For example, a condition selects a status message:
 
@@ -305,7 +305,8 @@ Reading and writing cells are tracked by the effect `!mut 'r`.
 A [module](dictionary.md#module) groups names under a shared name.
 An inline module uses `module Name =`, its contents, and `end`.
 The form `module name` loads the module from a separate file.
-A path uses `::` between module names, as in `std::console::print`; effect paths put `!` before the final effect name, as in `std::!Console.write`.
+A path uses `::` between module names, as in `std::io::print`; effect paths put `!` before the final effect name, as in `std::io::!IO.write`.
+Paths normally resolve their first name from the surrounding lexical scope. A leading `::` starts at the bundle root instead, so `::std::io::println` names the same definition in every nested scope.
 For example, an inline module groups application defaults:
 
 ```ruddy

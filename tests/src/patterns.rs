@@ -84,7 +84,7 @@ fn witness_of(checks: &patterns::Output) -> String {
         .expect("an unhandled-values complaint carries the witness")
 }
 
-/// Lowering supplies both Boolean cases for every conditional, so the normal
+/// Lowering supplies both Bool cases for every conditional, so the normal
 /// pattern checker sees an exhaustive match and has no conditional-specific
 /// exception to make. Else-if produces one exhaustive report per condition.
 #[test]
@@ -335,7 +335,7 @@ fn an_array_pattern_over_another_shape_is_skipped() {
 #[test]
 fn tuple_patterns_are_exact_and_split_nested_fields_exhaustively() {
     let (_, checks) = clean(
-        "let choose : (Boolean, Nat) -> Nat = fn value => match value with \
+        "let choose : (Bool, Nat) -> Nat = fn value => match value with \
          | (true, n) => n | (false, n) => n end",
     );
     let report = sole_report(&checks);

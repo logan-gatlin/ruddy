@@ -296,7 +296,7 @@ pub enum Rep {
     /// A 64-bit floating-point number.
     Real,
     String,
-    Boolean,
+    Bool,
     TypeDescriptor,
     NativePlan,
     BoxedAny,

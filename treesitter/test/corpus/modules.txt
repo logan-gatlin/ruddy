@@ -86,6 +86,43 @@ let z = A::B::x
       (identifier))))
 
 ================================================================================
+A leading double colon makes value, type, and effect paths absolute
+================================================================================
+
+let print = ::std::console::println
+
+let value : ::std::types::String = text
+
+let write = ::std::!Console.println value
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (path
+      (identifier)
+      (identifier)
+      (identifier)))
+  (let_definition
+    (identifier)
+    (annotation
+      (path
+        (identifier)
+        (identifier)
+        (identifier)))
+    (identifier))
+  (let_definition
+    (identifier)
+    (application
+      (operation
+        (effect_path
+          (identifier)
+          (effect_label))
+        (identifier))
+      (identifier))))
+
+================================================================================
 A path is an atom, so application and projection close over it
 ================================================================================
 

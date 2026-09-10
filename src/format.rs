@@ -2391,7 +2391,7 @@ impl<'a> Printer<'a> {
             ExprKind::Fixed(value) => text(value.to_string()),
             ExprKind::Real(_) => text(normalize_real(self.slice(expr.span))),
             ExprKind::String(_) => self.string(expr.span),
-            ExprKind::Boolean(value) => text(value.to_string()),
+            ExprKind::Bool(value) => text(value.to_string()),
             ExprKind::Unit => self.empty("(", expr.span, ")"),
         }
     }
@@ -2495,6 +2495,9 @@ impl<'a> Printer<'a> {
 
     fn path(&self, path: &Path) -> Doc {
         let mut out = String::new();
+        if path.absolute.is_some() {
+            out.push_str("::");
+        }
         for module in &path.modules {
             out.push_str(&module.tracked);
             out.push_str("::");
@@ -2506,6 +2509,9 @@ impl<'a> Printer<'a> {
     /// An effect label with the path in front of it: `Sys::!Log`.
     fn effect_label(&self, path: &Path) -> Doc {
         let mut out = String::new();
+        if path.absolute.is_some() {
+            out.push_str("::");
+        }
         for module in &path.modules {
             out.push_str(&module.tracked);
             out.push_str("::");
@@ -2533,7 +2539,7 @@ impl<'a> Printer<'a> {
             PatternKind::Fixed(value) => text(value.to_string()),
             PatternKind::Real(_) => text(normalize_real(self.slice(pattern.span))),
             PatternKind::String(_) => self.string(pattern.span),
-            PatternKind::Boolean(value) => text(value.to_string()),
+            PatternKind::Bool(value) => text(value.to_string()),
             PatternKind::Unit => self.empty("(", pattern.span, ")"),
             PatternKind::Struct { fields, rest } => {
                 let mut entries: Vec<(Span, Doc)> = fields
@@ -2953,7 +2959,7 @@ impl<'a> Printer<'a> {
             DataKind::Fixed(value) => text(value.to_string()),
             DataKind::Real(_) => text(normalize_real(self.slice(data.span))),
             DataKind::String(_) => self.string(data.span),
-            DataKind::Boolean(value) => text(value.to_string()),
+            DataKind::Bool(value) => text(value.to_string()),
             DataKind::Unit => self.empty("(", data.span, ")"),
             DataKind::Tuple(elements) => {
                 let signal =
@@ -3285,7 +3291,7 @@ fn expr_children(expr: &Expr) -> Vec<&Expr> {
         | ExprKind::Fixed(_)
         | ExprKind::Real(_)
         | ExprKind::String(_)
-        | ExprKind::Boolean(_)
+        | ExprKind::Bool(_)
         | ExprKind::Unit => Vec::new(),
     }
 }

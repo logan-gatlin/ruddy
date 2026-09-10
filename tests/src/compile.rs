@@ -1017,7 +1017,7 @@ fn mutation_isolation_respects_pure_annotations_and_other_effects() {
         let uses = fn _ => do let a = factory 1n let b = factory true return (~a, ~b) end");
     assert_eq!(scheme(&program, "local"), "() -> Nat");
     assert_eq!(scheme(&program, "logged"), "() -> Nat + !Log");
-    assert_eq!(scheme(&program, "uses"), "'a -> (Nat, Boolean)");
+    assert_eq!(scheme(&program, "uses"), "'a -> (Nat, Bool)");
 }
 
 #[test]
@@ -1031,7 +1031,7 @@ fn mutation_value_restriction_preserves_pure_factories_and_shared_unknowns() {
         return (pure (~number), pure (~truth))
       end",
     );
-    assert_eq!(scheme(&program, "run"), "'a -> (Nat, Boolean)");
+    assert_eq!(scheme(&program, "run"), "'a -> (Nat, Bool)");
     for source in [
         "let bad = fn _ => do let box = { cell: mut (fn x => x) } let { cell: alias } = box let _ = (~box.cell) 1n return (~alias) true end",
         "let bad = fn _ => do let cell = mut (fn x => x) let use = fn x => (~cell) x let _ = use 1n return use true end",

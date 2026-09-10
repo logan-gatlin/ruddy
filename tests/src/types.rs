@@ -74,7 +74,7 @@ fn finite_semantic_syntax_equality_compares_every_identity_and_position() {
     let ty = |ty| Arc::new(ty);
     let same = |left, right| same_finite_syntax(&ty(left), &ty(right));
 
-    for primitive in [Ty::Nat, Ty::Int, Ty::Real, Ty::String, Ty::Boolean] {
+    for primitive in [Ty::Nat, Ty::Int, Ty::Real, Ty::String, Ty::Bool] {
         assert!(same(primitive.clone(), primitive));
     }
     assert!(same(Ty::Undecided, Ty::Undecided));
@@ -328,12 +328,12 @@ fn distinct_primitives_are_spelled_differently() {
     assert_eq!(Prim::Int.name(), "Int");
     assert_eq!(Prim::Real.name(), "Real");
     assert_eq!(Prim::String.name(), "String");
-    assert_eq!(Prim::Boolean.name(), "Boolean");
+    assert_eq!(Prim::Bool.name(), "Bool");
     assert!(matches!(Ty::from(Prim::Nat), Ty::Nat));
     assert!(matches!(Ty::from(Prim::Int), Ty::Int));
     assert!(matches!(Ty::from(Prim::Real), Ty::Real));
     assert!(matches!(Ty::from(Prim::String), Ty::String));
-    assert!(matches!(Ty::from(Prim::Boolean), Ty::Boolean));
+    assert!(matches!(Ty::from(Prim::Bool), Ty::Bool));
 }
 
 /// Unit is one type with one spelling. A second way to build it would be a

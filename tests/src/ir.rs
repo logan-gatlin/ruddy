@@ -148,12 +148,12 @@ fn if_expressions_lower_to_boolean_matches() {
     let TermKind::Match { scrutinee, arms } = term_value(&mint, &out, "choose") else {
         panic!("an if lowers to a match");
     };
-    assert!(matches!(scrutinee.kind, TermKind::Boolean(true)));
+    assert!(matches!(scrutinee.kind, TermKind::Bool(true)));
     assert_eq!(arms.len(), 2);
-    assert!(matches!(arms[0].0.anchored, PatternKind::Boolean(true)));
+    assert!(matches!(arms[0].0.anchored, PatternKind::Bool(true)));
     assert_eq!(arms[0].0.at, scrutinee.at);
     assert!(matches!(arms[0].1.kind, TermKind::Natural(1)));
-    assert!(matches!(arms[1].0.anchored, PatternKind::Boolean(false)));
+    assert!(matches!(arms[1].0.anchored, PatternKind::Bool(false)));
     assert_eq!(arms[1].0.at, scrutinee.at);
     assert!(matches!(arms[1].1.kind, TermKind::Natural(2)));
 
@@ -168,10 +168,10 @@ fn if_expressions_lower_to_boolean_matches() {
     else {
         panic!("the else-if lowers in the false branch");
     };
-    assert!(matches!(scrutinee.kind, TermKind::Boolean(false)));
+    assert!(matches!(scrutinee.kind, TermKind::Bool(false)));
     assert_eq!(nested.len(), 2);
-    assert!(matches!(nested[0].0.anchored, PatternKind::Boolean(true)));
-    assert!(matches!(nested[1].0.anchored, PatternKind::Boolean(false)));
+    assert!(matches!(nested[0].0.anchored, PatternKind::Bool(true)));
+    assert!(matches!(nested[1].0.anchored, PatternKind::Bool(false)));
 }
 
 #[test]
@@ -3354,7 +3354,7 @@ fn references_of(term: &Term, out: &mut Vec<Symbol>) {
         | TermKind::Fixed(_)
         | TermKind::Real(_)
         | TermKind::String(_)
-        | TermKind::Boolean(_)
+        | TermKind::Bool(_)
         | TermKind::Error => {}
     }
 }
@@ -5955,7 +5955,7 @@ fn presence_ownership_is_inferred_from_polarity_and_result_boundaries() {
         }
     }
 
-    let source = "let choose : Nat -> Boolean -> { x when 'p: Nat } = fn n => fn b => { x: n }";
+    let source = "let choose : Nat -> Bool -> { x when 'p: Nat } = fn n => fn b => { x: n }";
     let (mint, out) = built(source);
     let annotation = annotation_of(&mint, &out, "choose");
     let PresenceOwnership::Existential { boundary } = annotation.variables[0].ownership else {
@@ -6326,6 +6326,37 @@ fn an_unqualified_name_walks_outward_and_the_inner_one_wins() {
     assert_eq!(names("w"), term_symbol(&mint, &out, "x"));
 }
 
+/// A path beginning with `::` starts at the bundle root instead of walking out
+/// from its lexical scope. The unprefixed spelling keeps the ordinary walk.
+#[test]
+fn an_absolute_path_resolves_from_the_bundle_root() {
+    let src = "module std =\n  module console =\n    let println = 1n\n  end\nend\n\
+               module nested =\n  module std =\n    module console =\n      let println = 2n\n    end\n  end\n\
+  let absolute = ::std::console::println\n\
+  let relative = std::console::println\nend";
+    let (mint, out) = built(src);
+    let named = |path: &str| {
+        out.program
+            .terms
+            .keys()
+            .copied()
+            .find(|symbol| mint.path(*symbol).to_string() == path)
+            .unwrap_or_else(|| panic!("no term at {path}"))
+    };
+    let resolved = |name: &str| {
+        let TermKind::Ident(symbol) = term_value(&mint, &out, name) else {
+            panic!("{name} is not given as a name");
+        };
+        *symbol
+    };
+
+    assert_eq!(resolved("absolute"), named("test::std::console::println"));
+    assert_eq!(
+        resolved("relative"),
+        named("test::nested::std::console::println")
+    );
+}
+
 /// A sibling module's names are not in scope: reaching one unqualified is the
 /// undefined term it is, because the walk goes outward and never sideways.
 #[test]
@@ -6407,9 +6438,9 @@ fn a_repeated_module_is_a_duplicate() {
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
 }
 
-/// A path's first segment resolves by R9's walk, so a segment naming no module
-/// anywhere out to the root is reported as the undefined module it is — at the
-/// segment, not at the name after it.
+/// A relative path's first segment resolves by R9's walk, so a segment naming
+/// no module anywhere out to the root is reported as the undefined module it
+/// is — at the segment, not at the name after it.
 #[test]
 fn an_undefined_first_segment_is_reported_at_the_segment() {
     let src = "let a = Nope::x";
@@ -7853,7 +7884,7 @@ fn recovery_signatures_keep_every_normalized_source_form_structural() {
                effect Alias = !IO\n\
                effect Probe = {\n\
                  record: Record { extra: String } -> (),\n\
-                 choice: Choice (#Other Boolean) -> (),\n\
+                 choice: Choice (#Other Bool) -> (),\n\
                  runner: Runner (!IO) -> (),\n\
                  anonymous: (() -> () + !IO (when _)) -> (),\n\
                  named: (() -> () + !IO (when 'p)) -> (),\n\
@@ -9298,7 +9329,7 @@ fn imported_declared_types_exercise_every_semantic_identity_form() {
     let mut types = vec![
         declared("Int", artifact_type(a::Type::Int)),
         declared("Real", artifact_type(a::Type::Real)),
-        declared("Boolean", artifact_type(a::Type::Boolean)),
+        declared("Bool", artifact_type(a::Type::Bool)),
         declared("Var", artifact_type(a::Type::Var(7))),
         declared(
             "Rigid",
@@ -9313,7 +9344,7 @@ fn imported_declared_types_exercise_every_semantic_identity_form() {
             "Arrow",
             artifact_type(a::Type::Arrow(
                 Box::new(artifact_type(a::Type::Int)),
-                Box::new(artifact_type(a::Type::Boolean)),
+                Box::new(artifact_type(a::Type::Bool)),
                 a::Row {
                     labels: vec![(
                         "IO\u{1f}run:{}->{}".into(),
@@ -9400,7 +9431,7 @@ fn imported_declared_types_exercise_every_semantic_identity_form() {
         },
     };
     let src = "effect Probe = { inspect: {\n\
-                 int: dep::Int, real: dep::Real, boolean: dep::Boolean,\n\
+                 int: dep::Int, real: dep::Real, boolean: dep::Bool,\n\
                  variable: dep::Var, rigid: dep::Rigid, unknown: dep::Undecided,\n\
                  bound: dep::Bound, arrow: dep::Arrow,\n\
                  fields: dep::Fields, presences: dep::RowPresences,\n\
@@ -9648,7 +9679,7 @@ fn dependency_interfaces_import_every_semantic_form() {
         ("int", a::Type::Int),
         ("real", a::Type::Real),
         ("string", a::Type::String),
-        ("boolean", a::Type::Boolean),
+        ("boolean", a::Type::Bool),
         ("var", a::Type::Var(0)),
         ("bound", a::Type::Bound(0)),
         ("undecided", a::Type::Undecided),
@@ -10217,7 +10248,7 @@ fn extern_boundary_metadata_keeps_source_anchors_after_resolution() {
 fn extern_abi_retains_resolved_arity_callback_nesting_and_effects() {
     let (_, output) = build_src(
         "effect Log = { write: () -> () }\n\
-         extern schedule : fn((fn(Nat, String) -> Boolean + !Log), Nat) -> (fn() -> String) + !Log = \"host.schedule\"",
+         extern schedule : fn((fn(Nat, String) -> Bool + !Log), Nat) -> (fn() -> String) + !Log = \"host.schedule\"",
     );
     assert!(output.errors.is_empty(), "{:#?}", output.errors);
     let external = &output.program.externs.first().unwrap().1.value;
@@ -11351,7 +11382,7 @@ fn a_finite_imported_rotation_longer_than_256_states_remains_exact() {
     };
     dependency.header.types = std::iter::once(rotate)
         .chain(ring("StringRing", a::Type::String))
-        .chain(ring("BooleanRing", a::Type::Boolean))
+        .chain(ring("BooleanRing", a::Type::Bool))
         .chain([
             alias("Strings", "StringRing"),
             alias("Booleans", "BooleanRing"),

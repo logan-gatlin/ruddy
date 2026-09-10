@@ -207,7 +207,7 @@ const $convertType = ($descriptor, $value, $outgoing, $rootIndex = 0, $callable 
         case "Int": $valid = Number.isInteger($input); break;
         case "Real": $valid = typeof $input === "number"; break;
         case "String": $valid = typeof $input === "string"; break;
-        case "Boolean": $valid = typeof $input === "boolean"; break;
+        case "Bool": $valid = typeof $input === "boolean"; break;
         case "Any": $valid = $anyPackages.has($input); break;
         case "ForeignValue": break;
         default: $valid = false;

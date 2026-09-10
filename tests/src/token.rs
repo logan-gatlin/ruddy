@@ -294,13 +294,13 @@ fn lexes_boolean_operators() {
         kinds("not true and false or true xor false")[..],
         [
             Kind::Not,
-            Kind::Boolean(true),
+            Kind::Bool(true),
             Kind::And,
-            Kind::Boolean(false),
+            Kind::Bool(false),
             Kind::Or,
-            Kind::Boolean(true),
+            Kind::Bool(true),
             Kind::Xor,
-            Kind::Boolean(false),
+            Kind::Bool(false),
         ]
     ));
 }

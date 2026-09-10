@@ -1,3 +1,6 @@
+type Result 'some 'error = #Some 'some | #Error 'error
+type Fallible 'error 'rest = #Error 'error | ..'rest
+
 let map: ('a -> 'b + ..'effects) -> Result 'a 'error -> Result 'b 'error + ..'effects =
   fn function result => match result with
   | #Some value => #Some (function value)
@@ -29,12 +32,12 @@ let or_else:
   | #Error error => fallback error
   end
 
-let is_ok: Result 'some 'error -> Boolean = fn result => match result with
+let is_ok: Result 'some 'error -> Bool = fn result => match result with
 | #Some _ => true
 | #Error _ => false
 end
 
-let is_error: Result 'some 'error -> Boolean = fn result => match result with
+let is_error: Result 'some 'error -> Bool = fn result => match result with
 | #Some _ => false
 | #Error _ => true
 end
@@ -49,7 +52,7 @@ let error_or: 'error -> (#Error 'error | ..'rest) -> 'error = fn fallback value 
 | _ => fallback
 end
 
-let is_error_case: (#Error 'error | ..'rest) -> Boolean = fn value => match value with
+let is_error_case: (#Error 'error | ..'rest) -> Bool = fn value => match value with
 | #Error _ => true
 | _ => false
 end

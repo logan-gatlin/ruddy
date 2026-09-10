@@ -282,7 +282,7 @@ pub enum Rep {
     /// A 64-bit floating-point number.
     Real,
     String,
-    Boolean,
+    Bool,
     TypeDescriptor,
     NativePlan,
     BoxedAny,
@@ -311,7 +311,7 @@ pub enum Literal {
     Fixed(crate::types::FixedLiteral),
     Real(u64),
     String(String),
-    Boolean(bool),
+    Bool(bool),
 }
 
 impl Op {

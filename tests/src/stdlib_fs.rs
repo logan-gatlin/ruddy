@@ -1,7 +1,7 @@
 use std::{fs, path::Path, process::Command};
 
 const ASSERTIONS: &str = r#"
-extern assert: fn(Boolean, String) -> () = "(ok, message) => { if (!ok) throw new Error(message); }"
+extern assert: fn(Bool, String) -> () = "(ok, message) => { if (!ok) throw new Error(message); }"
 extern crash: String -> | = "message => { throw new Error(message); }"
 let fail = fn message => match crash message with end
 let expect: std::Result 'a std::fs::Error -> 'a = fn result => match result with
@@ -276,54 +276,54 @@ let main = fn _ => handle do
     let _ = expect (std::fs::copy_file "virtual" "destination")
     return assert (std::str::equal (expect (std::fs::read_text "virtual")) "virtual contents") "Local read"
   end with
-  | std::!FileSystem.read_bytes _ => do
+  | std::fs::!FileSystem.read_bytes _ => do
       let _ = pause ()
       return #Some [0n8, 255n8, 128n8]
     end
-  | std::!FileSystem.write_bytes request => do
+  | std::fs::!FileSystem.write_bytes request => do
       let _ = assert (std::str::equal request.path "virtual") "Named binary write path"
       return match request.bytes with
         | [0n8, 255n8] => #Some ()
         | _ => fail "Named binary write bytes"
       end
     end
-  | std::!FileSystem.append_bytes request => do
+  | std::fs::!FileSystem.append_bytes request => do
       let _ = assert (std::str::equal request.path "virtual") "Named binary append path"
       return match request.bytes with
         | [128n8] => #Some ()
         | _ => fail "Named binary append bytes"
       end
     end
-  | std::!FileSystem.read_text _ => do
+  | std::fs::!FileSystem.read_text _ => do
       let _ = pause ()
       return #Some "virtual contents"
     end
-  | std::!FileSystem.write_text request => do
+  | std::fs::!FileSystem.write_text request => do
       let _ = assert (std::str::equal request.path "virtual") "Named write path"
       let _ = assert (std::str::equal request.text "contents") "Named write text"
       return #Some ()
     end
-  | std::!FileSystem.append_text request => do
+  | std::fs::!FileSystem.append_text request => do
       let _ = assert (std::str::equal request.text "contents") "Named append text"
       return #Some ()
     end
-  | std::!FileSystem.rename request => do
+  | std::fs::!FileSystem.rename request => do
       let _ = assert (std::str::equal request.source "virtual") "Named rename source"
       let _ = assert (std::str::equal request.destination "destination") "Named rename destination"
       return #Some ()
     end
-  | std::!FileSystem.copy_file request => do
+  | std::fs::!FileSystem.copy_file request => do
       let _ = assert (std::str::equal request.destination "destination") "Named copy destination"
       return #Some ()
     end
-  | std::!FileSystem.exists _ => #Some true
-  | std::!FileSystem.read_dir _ => #Some []
-  | std::!FileSystem.metadata _ => #Some { kind: #File, size: 0n }
-  | std::!FileSystem.symlink_metadata _ => #Some { kind: #File, size: 0n }
-  | std::!FileSystem.create_dir _ => #Some ()
-  | std::!FileSystem.create_dir_all _ => #Some ()
-  | std::!FileSystem.remove_file _ => #Some ()
-  | std::!FileSystem.remove_dir _ => #Some ()
+  | std::fs::!FileSystem.exists _ => #Some true
+  | std::fs::!FileSystem.read_dir _ => #Some []
+  | std::fs::!FileSystem.metadata _ => #Some { kind: #File, size: 0n }
+  | std::fs::!FileSystem.symlink_metadata _ => #Some { kind: #File, size: 0n }
+  | std::fs::!FileSystem.create_dir _ => #Some ()
+  | std::fs::!FileSystem.create_dir_all _ => #Some ()
+  | std::fs::!FileSystem.remove_file _ => #Some ()
+  | std::fs::!FileSystem.remove_dir _ => #Some ()
   end
 "#,
     );

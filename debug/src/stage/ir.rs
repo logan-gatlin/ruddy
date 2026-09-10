@@ -266,8 +266,8 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
             label: "String".into(),
             ..node
         },
-        TermKind::Boolean(_) => Node {
-            label: "Boolean".into(),
+        TermKind::Bool(_) => Node {
+            label: "Bool".into(),
             ..node
         },
         TermKind::Array(items) => Node {
@@ -650,8 +650,8 @@ fn pattern_node(ids: &mut Ids, cx: &Cx, mint: &Mint, pattern: &Pattern) -> Node 
             label: "String".into(),
             ..node
         },
-        PatternKind::Boolean(_) => Node {
-            label: "Boolean".into(),
+        PatternKind::Bool(_) => Node {
+            label: "Bool".into(),
             ..node
         },
         PatternKind::Unit => Node {

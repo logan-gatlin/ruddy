@@ -311,7 +311,7 @@ impl fmt::Display for Show<'_, DataKind> {
             DataKind::Fixed(value) => write!(f, "{value}"),
             DataKind::Real(value) => write!(f, "{value}"),
             DataKind::String(value) => f.write_str(&string(value)),
-            DataKind::Boolean(value) => write!(f, "{value}"),
+            DataKind::Bool(value) => write!(f, "{value}"),
             DataKind::Array(items) => {
                 f.write_str("[")?;
                 for (index, item) in items.iter().enumerate() {
@@ -399,7 +399,7 @@ impl Grouped for Show<'_, TermKind> {
             | TermKind::Fixed(_)
             | TermKind::Real(_)
             | TermKind::String(_)
-            | TermKind::Boolean(_)
+            | TermKind::Bool(_)
             | TermKind::Error => Prec::Atom,
         }
     }
@@ -429,7 +429,7 @@ impl Grouped for Show<'_, PatternKind> {
             | PatternKind::Fixed(_)
             | PatternKind::Real(_)
             | PatternKind::String(_)
-            | PatternKind::Boolean(_)
+            | PatternKind::Bool(_)
             | PatternKind::Unit
             | PatternKind::Struct { .. }
             | PatternKind::Array { .. } => Prec::Atom,
@@ -453,7 +453,7 @@ impl fmt::Display for Show<'_, PatternKind> {
             PatternKind::Fixed(value) => write!(f, "{value}"),
             PatternKind::Real(value) => write!(f, "{value}"),
             PatternKind::String(value) => f.write_str(&string(value)),
-            PatternKind::Boolean(value) => write!(f, "{value}"),
+            PatternKind::Bool(value) => write!(f, "{value}"),
             PatternKind::Unit => f.write_str("()"),
             PatternKind::Tag { name, payload } => write_tag(
                 f,
@@ -538,7 +538,7 @@ impl fmt::Display for Show<'_, TermKind> {
             TermKind::Fixed(value) => write!(f, "{value}"),
             TermKind::Real(value) => write!(f, "{value}"),
             TermKind::String(value) => f.write_str(&string(value)),
-            TermKind::Boolean(value) => write!(f, "{value}"),
+            TermKind::Bool(value) => write!(f, "{value}"),
             TermKind::Unary { op, value } => write_unary(
                 f,
                 match op {

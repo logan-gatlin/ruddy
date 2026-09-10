@@ -28,6 +28,38 @@ let original_len = std::array::len original
 let pushed_len = std::array::len pushed
 let words = std::array::push [] "array"
 let first_word = match std::array::get words 0n with | #Some value => value | #None => "none" end
+let mapped = std::array::map (std::nat::add 1n) original
+let mapped_boundary = match std::array::get mapped 32n with | #Some value => value | #None => 999n end
+let folded = std::array::fold std::nat::add 0n original
+let folded_words = std::array::fold std::str::concat "" ["map", "-", "fold"]
+let filtered = std::array::filter (fn value => std::nat::is_zero (std::nat::remainder value 2n)) [1n, 2n, 3n, 4n]
+let filter_mapped = std::array::filter_map (fn value => if std::nat::greater_than value 2n then #Some (std::str::from_nat value) else #None end) [1n, 2n, 3n, 4n]
+let flat_mapped = std::array::flat_map (fn value => [value, value]) [1n, 2n, 3n]
+let found = match std::array::find (fn value => std::nat::greater_than value 2n) [1n, 2n, 3n, 4n] with | #Some value => value | #None => 0n end
+let found_index = match std::array::find_index (std::nat::equal 3n) [1n, 2n, 3n, 4n] with | #Some value => value | #None => 99n end
+let has_large = std::array::any (fn value => std::nat::greater_than value 3n) [1n, 2n, 3n, 4n]
+let all_positive = std::array::all (fn value => std::nat::greater_than value 0n) [1n, 2n, 3n, 4n]
+let reversed = std::array::reverse [1n, 2n, 3n, 4n]
+let zipped = std::array::zip [1n, 2n, 3n] ["a", "b"]
+let enumerated = std::array::enumerate ["a", "b"]
+let partitioned = std::array::partition (fn value => std::nat::greater_than value 2n) [1n, 2n, 3n, 4n]
+let folded_right = std::array::fold_right (fn value state => std::str::concat state value) "" ["a", "b", "c"]
+let reduced = match std::array::reduce std::nat::add [1n, 2n, 3n, 4n] with | #Some value => value | #None => 0n end
+let reduced_empty = match std::array::reduce std::nat::add [] with | #Some _ => false | #None => true end
+let traversed_option: std::Option [Nat] = std::array::traverse_option (fn value => if std::nat::is_zero value then #None else #Some (std::nat::add value 1n) end) [1n, 2n, 3n]
+let traversed_option_total = match traversed_option with | #Some values => std::array::fold std::nat::add 0n values | #None => 0n end
+let traversed_result: std::Result [String] String = std::array::traverse_result (fn value => if std::str::is_empty value then #Error "empty" else #Some (std::str::to_uppercase value) end) ["ok", ""]
+let traversed_error = match traversed_result with | #Some _ => "none" | #Error error => error end
+let tried_option: std::Option Nat = std::array::try_fold_option (fn state value => #Some (std::nat::add state value)) 0n [1n, 2n, 3n]
+let tried_option_total = std::option::unwrap_or 0n tried_option
+let tried_result: std::Result Nat String = std::array::try_fold_result (fn state value => if std::nat::is_zero value then #Error "zero" else #Some (std::nat::add state value) end) 0n [1n, 2n, 0n, 4n]
+let tried_error = match tried_result with | #Some _ => "none" | #Error error => error end
+let option_values: [std::Option Nat] = [#Some 2n, #Some 3n]
+let sequenced_option: std::Option [Nat] = std::array::sequence_option option_values
+let sequenced_total = match sequenced_option with | #Some values => std::array::fold std::nat::add 0n values | #None => 0n end
+let result_values: [std::Result Nat String] = [#Some 2n, #Error "stop", #Some 3n]
+let sequenced_result: std::Result [Nat] String = std::array::sequence_result result_values
+let sequenced_error = match sequenced_result with | #Some _ => "none" | #Error error => error end
 "#,
     )
     .unwrap();
@@ -40,7 +72,7 @@ let first_word = match std::array::get words 0n with | #Some value => value | #N
         return;
     }
     let probe = format!(
-        "import {{ pathToFileURL }} from 'node:url'; const x = await import(pathToFileURL({}).href); console.log(JSON.stringify([x.original_first,x.changed_first,x.boundary,x.out_of_bounds,x.pushed_last,x.original_len,x.pushed_len,x.first_word]));",
+        "import {{ pathToFileURL }} from 'node:url'; const x = await import(pathToFileURL({}).href); console.log(JSON.stringify([x.original_first,x.changed_first,x.boundary,x.out_of_bounds,x.pushed_last,x.original_len,x.pushed_len,x.first_word,x.mapped_boundary,x.folded,x.folded_words,x.filtered,x.filter_mapped,x.flat_mapped,x.found,x.found_index,x.has_large,x.all_positive,x.reversed,x.zipped,x.enumerated,x.partitioned[0],x.partitioned[1],x.folded_right,x.reduced,x.reduced_empty,x.traversed_option_total,x.traversed_error,x.tried_option_total,x.tried_error,x.sequenced_total,x.sequenced_error]));",
         serde_json::to_string(javascript.to_str().unwrap()).unwrap()
     );
     let output = Command::new("node")
@@ -54,7 +86,75 @@ let first_word = match std::array::get words 0n with | #Some value => value | #N
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap().trim(),
-        "[0,99,32,true,33,33,34,\"array\"]"
+        "[0,99,32,true,33,33,34,\"array\",33,528,\"map-fold\",[2,4],[\"3\",\"4\"],[1,1,2,2,3,3],3,2,true,true,[4,3,2,1],[{\"0\":1,\"1\":\"a\"},{\"0\":2,\"1\":\"b\"}],[{\"0\":0,\"1\":\"a\"},{\"0\":1,\"1\":\"b\"}],[3,4],[1,2],\"cba\",10,true,9,\"empty\",6,\"zero\",5,\"stop\"]"
+    );
+}
+
+#[test]
+fn mutable_cell_utilities_compile_and_run_through_the_javascript_boundary() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the workspace root");
+    let project = tempfile::tempdir().expect("a temporary cell-utility project");
+    fs::write(
+        project.path().join("Ruddy.toml"),
+        format!(
+            "name = \"cell-test\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.rud\"\ntarget = \"js\"\n\n[dependencies]\nstd = {:?}\n",
+            root
+        ),
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("main.rud"),
+        r#"@private let exercise = fn _ => do
+  let left = std::cell::new 1n
+  let right = std::cell::new 2n
+  let initial = std::cell::get left
+  let set_value = std::cell::set left 3n
+  let replaced = std::cell::replace left 4n
+  let updated = std::cell::update (fn value => std::nat::add value 1n) left
+  _ = std::cell::swap left right
+  return {
+    initial: initial,
+    set_value: set_value,
+    replaced: replaced,
+    updated: updated,
+    left: std::cell::get left,
+    right: std::cell::get right,
+  }
+end
+
+let cell_results = exercise ()
+"#,
+    )
+    .unwrap();
+
+    let artifact = ruddy_cli::build_project(project.path()).expect("the cell consumer builds");
+    let javascript = artifact.with_extension("js");
+    assert!(javascript.is_file());
+
+    if Command::new("node").arg("--version").output().is_err() {
+        return;
+    }
+    let probe = format!(
+        "import {{ pathToFileURL }} from 'node:url'; const x = await import(pathToFileURL({}).href); console.log(JSON.stringify({{...x.cell_results}}));",
+        serde_json::to_string(javascript.to_str().unwrap()).unwrap()
+    );
+    let output = Command::new("node")
+        .args(["--input-type=module", "--eval", &probe])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::from_str::<serde_json::Value>(
+            r#"{"initial":1,"set_value":3,"replaced":3,"updated":5,"left":2,"right":5}"#
+        )
+        .unwrap()
     );
 }
 
@@ -195,12 +295,10 @@ let recovered: std::Result Nat String = std::result::or_else (fn error => #Some 
 let recovered_value = std::result::unwrap_or 0n recovered
 let error_row_fallback = std::result::error_or "fallback" (#None)
 
-let numbers: std::List Nat = #Cons (1n, #Cons (2n, #Cons (3n, #None)))
-let mapped_numbers = std::list::map (std::nat::add 1n) numbers
-let list_total = std::list::fold_left std::nat::add 0n mapped_numbers
-let reversed_head = std::option::unwrap_or 0n (std::list::head (std::list::reverse mapped_numbers))
-let list_has_three = std::list::contains std::nat::equal 3n mapped_numbers
-let found = std::option::unwrap_or 0n (std::list::find (fn value => std::nat::greater_than value 2n) mapped_numbers)
+let characters: [String] = std::str::chars "abc"
+let parts: [String] = std::str::split "a,b,c" ","
+let empty_joined = std::str::join "," []
+let singleton_joined = std::str::join "," ["only"]
 
 let composed = std::function::compose (std::nat::multiply 2n) (std::nat::add 1n) 20n
 let piped = std::function::pipe 41n (std::nat::add 1n)
@@ -212,7 +310,7 @@ let tuple_mapped = std::tuple::map_both (std::nat::add 1n) std::str::to_uppercas
 let tuple_first = std::tuple::first { 0: 42n, 1: false, 2: "extra" }
 let tuple_result = { first: tuple_mapped.0, second: tuple_mapped.1, projected: tuple_first }
 
-let reversed_order = ordering_name (std::ordering::reverse (std::nat::compare 1n 2n))
+let reversed_order = ordering_name (std::order::reverse (std::nat::compare 1n 2n))
 let compared_string = ordering_name (std::str::compare "a" "b")
 let compared_boolean = ordering_name (std::boolean::compare false true)
 let compared_real = ordering_name (std::real::compare (std::real::negate 0) 0)
@@ -240,7 +338,7 @@ let angle = std::real::round (std::real::radians_to_degrees std::real::pi)
         return;
     }
     let probe = format!(
-        "import {{ pathToFileURL }} from 'node:url'; const x = await import(pathToFileURL({}).href); console.log(JSON.stringify([x.option_value,x.option_kept,x.option_row_fallback,x.error_text,x.recovered_value,x.error_row_fallback,x.list_total,x.reversed_head,x.list_has_three,x.found,x.composed,x.piped,x.flipped,x.curried,x.uncurried,{{...x.tuple_result}},x.reversed_order,x.compared_string,x.compared_boolean,x.compared_real,x.blank,x.safe_char,x.stripped,x.bounded,x.open_bounded,x.split_joined,x.reversed_string,x.trig,x.logarithm,x.angle]));",
+        "import {{ pathToFileURL }} from 'node:url'; const x = await import(pathToFileURL({}).href); console.log(JSON.stringify([x.option_value,x.option_kept,x.option_row_fallback,x.error_text,x.recovered_value,x.error_row_fallback,x.characters,x.parts,x.empty_joined,x.singleton_joined,x.composed,x.piped,x.flipped,x.curried,x.uncurried,{{...x.tuple_result}},x.reversed_order,x.compared_string,x.compared_boolean,x.compared_real,x.blank,x.safe_char,x.stripped,x.bounded,x.open_bounded,x.split_joined,x.reversed_string,x.trig,x.logarithm,x.angle]));",
         serde_json::to_string(javascript.to_str().unwrap()).unwrap()
     );
     let output = Command::new("node")
@@ -254,7 +352,7 @@ let angle = std::real::round (std::real::radians_to_degrees std::real::pi)
     );
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
-        serde_json::from_str::<serde_json::Value>(r#"[42,true,"fallback","BAD",3,"fallback",9,4,true,3,42,42,3,42,42,{"first":2,"second":"RUDDY","projected":42},"greater","less","less","less",true,"u","dy","udd","ddy","a-b-c","yddur",1000,1,180]"#).unwrap()
+        serde_json::from_str::<serde_json::Value>(r#"[42,true,"fallback","BAD",3,"fallback",["a","b","c"],["a","b","c"],"","only",42,42,3,42,42,{"first":2,"second":"RUDDY","projected":42},"greater","less","less","less",true,"u","dy","udd","ddy","a-b-c","yddur",1000,1,180]"#).unwrap()
     );
 }
 

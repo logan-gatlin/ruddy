@@ -198,7 +198,7 @@ fn unsaved_dependency_interfaces_flow_without_lowering() {
     let mut root = ruddy::analysis::Host::default();
     root.set_file("main.rud", Some("let answer = dep::value".into()));
     let environment = ruddy::bundle::Environment::new([]);
-    for (source, expected) in [("let value = 1n", "Nat"), ("let value = false", "Boolean")] {
+    for (source, expected) in [("let value = 1n", "Nat"), ("let value = false", "Bool")] {
         dependency.set_file("main.rud", Some(source.into()));
         let analysis = dependency.analyze(
             Bundle::new("dep", Version::new(0, 0, 0)).unwrap(),
@@ -246,7 +246,7 @@ fn workspace_tracks_unsaved_local_dependencies_and_navigation() {
     workspace.set_overlay(&dep.join("main.rud"), Some("let value = false".into()));
     workspace.refresh().unwrap();
     let (project, logical) = workspace.file(&root.join("main.rud")).unwrap();
-    assert_eq!(project.analysis.hover(logical, 5).unwrap().ty, "Boolean");
+    assert_eq!(project.analysis.hover(logical, 5).unwrap().ty, "Bool");
 }
 
 #[test]
@@ -604,7 +604,7 @@ fn symlinked_document_paths_share_unsaved_source_identity() {
     workspace.set_overlay(&link.join("Added.rud"), Some("let answer = false".into()));
     workspace.refresh().unwrap();
     let (project, logical) = workspace.file(&link.join("main.rud")).unwrap();
-    assert_eq!(project.analysis.hover(logical, 17).unwrap().ty, "Boolean");
+    assert_eq!(project.analysis.hover(logical, 17).unwrap().ty, "Bool");
     assert!(project.analysis.diagnostics.is_empty());
     assert!(workspace.file(&real.join("Added.rud")).is_some());
     assert!(workspace.definition(&link.join("main.rud"), 31).is_some());

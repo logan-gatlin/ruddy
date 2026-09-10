@@ -501,7 +501,7 @@ fn a_label_may_be_called_when() {
     );
 }
 
-/// `when` and `where` are contextual, but Boolean operators are reserved
+/// `when` and `where` are contextual, but Bool operators are reserved
 /// wherever an expression may appear.
 #[test]
 fn only_non_operator_clause_keywords_are_contextual() {
@@ -1805,7 +1805,7 @@ fn every_position_that_can_fail_reports_before_it_does() {
         "type X = (Nat",
         "type X = #A (when)",
         "let x : !E (when) = value",
-        // Boolean-clause operators and grouping after each has committed.
+        // Bool-clause operators and grouping after each has committed.
         "let x : Nat where ; = value",
         "type X = Nat where 'a or",
         "type X = Nat where 'a and",
@@ -1855,6 +1855,7 @@ fn paths_propagate_formatter_failures() {
             .track(name.to_string())
     };
     let qualified = Path {
+        absolute: None,
         modules: vec![segment("Module")],
         name: segment("value"),
     };
@@ -3344,6 +3345,20 @@ fn paths_parse_in_expression_and_type_positions() {
         parse_one("type T = Math::Pair Nat Nat"),
         "type T = Math::Pair Nat Nat"
     );
+}
+
+/// A leading `::` is retained as part of a path in every naming position, so
+/// parsing and formatting cannot turn an absolute lookup back into a lexical one.
+#[test]
+fn absolute_paths_round_trip_in_every_naming_position() {
+    for source in [
+        "let a = ::std::io::println",
+        "let a : ::std::types::String = value",
+        "let a = ::std::io::!IO.println value",
+        "let f : () -> () + ::std::io::!IO = value",
+    ] {
+        assert_eq!(parse_one(source), source);
+    }
 }
 
 /// `::` binds tighter than application and than projection, which is what makes

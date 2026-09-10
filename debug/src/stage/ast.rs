@@ -507,8 +507,8 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
             label: "String".into(),
             ..node
         },
-        ExprKind::Boolean(_) => Node {
-            label: "Boolean".into(),
+        ExprKind::Bool(_) => Node {
+            label: "Bool".into(),
             ..node
         },
         ExprKind::Unit => Node {
@@ -572,8 +572,8 @@ fn pattern_node(ids: &mut Ids, pattern: &Pattern) -> Node {
             label: "String".into(),
             ..node
         },
-        PatternKind::Boolean(_) => Node {
-            label: "Boolean".into(),
+        PatternKind::Bool(_) => Node {
+            label: "Bool".into(),
             ..node
         },
         PatternKind::Unit => Node {

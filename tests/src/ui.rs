@@ -912,10 +912,10 @@ fn annotated_row_rigid_reopens_as_a_row_and_keeps_contract_provenance() {
 
 #[test]
 fn authoritative_provenance_uses_the_owning_annotation() {
-    let source = "let outer : Nat -> Nat = fn value => do let inner : Boolean -> Boolean = fn flag => flag return value end\nlet bad = outer false";
+    let source = "let outer : Nat -> Nat = fn value => do let inner : Bool -> Bool = fn flag => flag return value end\nlet bad = outer false";
     let (map, facts) = explained_facts(source);
     let outer = source.find("Nat -> Nat").unwrap();
-    let inner = source.find("Boolean -> Boolean").unwrap();
+    let inner = source.find("Bool -> Bool").unwrap();
     assert!(
         facts.iter().any(|fact| map.span(fact.at).start == outer),
         "{facts:#?}"
@@ -1078,7 +1078,7 @@ fn pivots_name_repeated_inputs_branches_and_anonymous_shared_values_once() {
             "`Result`",
         ),
         (
-            "let value = { x: 1n }\nlet bad : Boolean = value.x",
+            "let value = { x: 1n }\nlet bad : Bool = value.x",
             inference::ExplanationPivotKind::ProjectedField,
             "`Field`",
         ),
@@ -2071,7 +2071,7 @@ fn a_function_argument_mismatch_is_not_called_a_non_function_callee() {
         ),
         (
             inference::TypeDescription::NaturalNumber,
-            inference::TypeDescription::Boolean,
+            inference::TypeDescription::Bool,
         )
     );
     assert!(
@@ -2769,7 +2769,7 @@ fn every_fixed_token_prints_as_the_spelling_it_lexes_from() {
         TokenKind::Integer(42),
         TokenKind::Real(1.25),
         TokenKind::String("quote\" slash\\ newline\n carriage\r tab\t".to_string()),
-        TokenKind::Boolean(true),
+        TokenKind::Bool(true),
     ] {
         let printed = kind.to_string();
         let out = token::lex(&printed, FileID::GENERATED);
@@ -2790,7 +2790,7 @@ fn literal_patterns_print_as_written() {
             parse::PatternKind::String("a\nstring".to_string()),
             "\"a\\nstring\"",
         ),
-        (parse::PatternKind::Boolean(false), "false"),
+        (parse::PatternKind::Bool(false), "false"),
     ] {
         assert_eq!(pattern.to_string(), printed);
     }
@@ -4055,7 +4055,7 @@ fn a_witness_renders_in_source_syntax() {
         (ir::Literal::Integer(-4), "-4i"),
         (ir::Literal::Real(1.5), "1.5"),
         (ir::Literal::String("x".to_string()), "\"x\""),
-        (ir::Literal::Boolean(true), "true"),
+        (ir::Literal::Bool(true), "true"),
     ] {
         assert_eq!(ir::Witness::Literal(literal).to_string(), printed);
     }

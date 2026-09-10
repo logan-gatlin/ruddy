@@ -367,7 +367,7 @@ fn every_representation_comes_off_the_solved_type() {
                   let int : Int -> Int = fn x => x\n\
                   let real : Real -> Real = fn x => x\n\
                   let string : String -> String = fn x => x\n\
-                  let boolean : Boolean -> Boolean = fn x => x";
+                  let boolean : Bool -> Bool = fn x => x";
     assert!(section(source, "global n").contains("%0: nat = const 1n"));
     assert!(section(source, "global u").contains(": unit = struct {}"));
     assert!(section(source, "global s").contains(": struct = struct { x:"));
@@ -1074,7 +1074,7 @@ fn a_complete_boolean_and_typed_wildcards_take_both_dispatch_paths() {
     assert!(boolean.contains("branch_prim"), "{boolean}");
     assert!(!boolean.contains("else =>"), "{boolean}");
 
-    for primitive in ["Nat", "Int", "Real", "String", "Boolean"] {
+    for primitive in ["Nat", "Int", "Real", "String", "Bool"] {
         let printed = section(
             &format!("let f : {primitive} -> {primitive} = fn x => match x with | y => y end"),
             "fn f(",

@@ -2565,7 +2565,7 @@
     "fields": {
       "module": {
         "multiple": true,
-        "required": true,
+        "required": false,
         "types": [
           {
             "type": "identifier",
@@ -5434,7 +5434,7 @@
     "fields": {
       "module": {
         "multiple": true,
-        "required": true,
+        "required": false,
         "types": [
           {
             "type": "identifier",

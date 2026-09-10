@@ -856,7 +856,7 @@ impl Fingerprint {
                     self.word(19);
                     self.debug(value);
                 }
-                T::Boolean(value) => {
+                T::Bool(value) => {
                     self.word(20);
                     self.word(*value as u64);
                 }

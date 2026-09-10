@@ -86,6 +86,37 @@ th { background: var(--muted); }
 li + li { margin-top: 0.35rem; }
 blockquote { margin-left: 0; padding-left: 1rem; border-left: 3px solid var(--border); }
 
+.editor-tabs { margin: 1.5rem 0; }
+.editor-tab-list {
+  display: flex;
+  gap: 0.25rem;
+  border-bottom: 1px solid var(--border);
+}
+.editor-tab-list button {
+  margin-bottom: -1px;
+  padding: 0.55rem 1rem;
+  border: 1px solid transparent;
+  border-radius: 4px 4px 0 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.editor-tab-list button:hover { background: var(--muted); }
+.editor-tab-list button[aria-selected="true"] {
+  border-color: var(--border);
+  border-bottom-color: var(--muted);
+  background: var(--muted);
+}
+.editor-tabs [role="tabpanel"] {
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-top: 0;
+}
+.editor-tabs [role="tabpanel"] > :first-child { margin-top: 0; }
+.editor-tabs [role="tabpanel"] > :last-child { margin-bottom: 0; }
+
 .skip-link { position: absolute; top: -5rem; }
 .skip-link:focus { top: 0.25rem; background: var(--muted); padding: 0.25rem 0.5rem; }
 

@@ -59,7 +59,7 @@ pub enum DataKind {
     Fixed(crate::types::FixedLiteral),
     Real(f64),
     String(String),
-    Boolean(bool),
+    Bool(bool),
     /// `()`. Lowering makes it the empty struct, as it does the expression.
     Unit,
     /// `(a, b)` — one or more values with a comma; lowering numbers them as it
@@ -77,9 +77,10 @@ pub enum DataKind {
     },
 }
 
-/// A name, and the modules it is reached through: `Math::Vec::zero`.
+/// A name, and the modules it is reached through: `Math::Vec::zero`, or
+/// `::Math::Vec::zero` when reached from the bundle root.
 ///
-/// A bare name is a path with no segments, which is what makes this the one
+/// A bare name is a relative path with no segments, which is what makes this the one
 /// node every naming position holds — a term, a type, and the sigilled label of
 /// an effect. The segments are the modules to walk, outermost first; `name` is
 /// the thing itself, and what namespace it lives in is decided by the position
@@ -89,6 +90,9 @@ pub enum DataKind {
 /// applies `Math::mk` and `Math::p.x` projects `x` out of `Math::p`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Path {
+    /// The leading `::`, when this path starts at the bundle root rather than
+    /// resolving its first segment from the surrounding lexical scope.
+    pub absolute: Option<Span>,
     /// The modules to walk, outermost first. Empty for a bare name.
     pub modules: Vec<TrackedString>,
     pub name: TrackedString,
@@ -395,7 +399,7 @@ pub enum ExprKind {
     Fixed(crate::types::FixedLiteral),
     Real(f64),
     String(String),
-    Boolean(bool),
+    Bool(bool),
     Unit,
 }
 
@@ -503,7 +507,7 @@ pub enum PatternKind {
     Fixed(crate::types::FixedLiteral),
     Real(f64),
     String(String),
-    Boolean(bool),
+    Bool(bool),
     /// `()`: matches unit, binds nothing.
     Unit,
     /// `{ f, g: <pattern>, ... }` — reach into a struct's fields. A bare field
@@ -1043,10 +1047,9 @@ impl Path {
     /// Where the whole path was written: the first segment, when there is one,
     /// through the name at the end.
     pub fn span(&self) -> Span {
-        match self.modules.first() {
-            Some(first) => first.span.merge(self.name.span),
-            None => self.name.span,
-        }
+        self.absolute
+            .or_else(|| self.modules.first().map(|first| first.span))
+            .map_or(self.name.span, |start| start.merge(self.name.span))
     }
 }
 
@@ -1055,6 +1058,9 @@ impl Path {
 /// whoever shows one writes the `!` back on.
 impl fmt::Display for Path {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.absolute.is_some() {
+            f.write_str("::")?;
+        }
         for module in &self.modules {
             write!(f, "{}::", module.tracked)?;
         }
@@ -1445,7 +1451,7 @@ impl Parser {
     /// where it was and the caller reads whatever it really is.
     fn effect(&mut self) -> Option<Path> {
         let mark = self.pos;
-        let modules = self.path_modules();
+        let (absolute, modules) = self.path_modules();
         let name = match self.peek() {
             Some(tok) => match &tok.tracked {
                 Kind::EffectLabel(name) => tok.span.track(name.clone()),
@@ -1460,7 +1466,11 @@ impl Parser {
             }
         };
         self.advance();
-        Some(Path { modules, name })
+        Some(Path {
+            absolute,
+            modules,
+            name,
+        })
     }
 
     /// A run of statements: the whole file, or the body of an inline module.
@@ -1587,7 +1597,7 @@ impl Parser {
                     | Kind::Fixed(_)
                     | Kind::Integer(_)
                     | Kind::Real(_)
-                    | Kind::Boolean(_)
+                    | Kind::Bool(_)
                     | Kind::LeftParen
                     | Kind::LeftBracket
                     | Kind::LeftBrace
@@ -1651,9 +1661,9 @@ impl Parser {
                 self.advance();
                 Some(span.track(DataKind::Real(value)))
             }
-            &Kind::Boolean(value) => {
+            &Kind::Bool(value) => {
                 self.advance();
-                Some(span.track(DataKind::Boolean(value)))
+                Some(span.track(DataKind::Bool(value)))
             }
             Kind::LeftParen => self.data_paren(),
             Kind::LeftBracket => self.data_array(),
@@ -1934,10 +1944,12 @@ impl Parser {
         )
     }
 
-    /// The `<module>::` prefix of a path at the cursor, consumed. Empty when
-    /// nothing there is one, which is what makes a bare name a path with no
-    /// segments rather than a second kind of node.
-    fn path_modules(&mut self) -> Vec<TrackedString> {
+    /// The optional root mark and `<module>::` prefix of a path at the cursor,
+    /// consumed. The modules are empty when nothing there is one, which is what
+    /// makes a bare name a path with no segments rather than a second kind of
+    /// node.
+    fn path_modules(&mut self) -> (Option<Span>, Vec<TrackedString>) {
+        let absolute = self.eat_if(&Kind::ColonColon).map(|token| token.span);
         let mut modules = Vec::new();
         while matches!(
             self.peek().map(|tok| &tok.tracked),
@@ -1949,14 +1961,20 @@ impl Parser {
             modules.push(self.ident().expect("the loop peeked a name"));
             self.advance();
         }
-        modules
+        (absolute, modules)
     }
 
-    /// Where the `<module>::` prefix starting at `at` ends. Read without
+    /// Where the `[::]<module>::` prefix starting at `at` ends. Read without
     /// consuming anything, so a position that has to know what a run of names
     /// is *leading to* — a row of effects, told from a type by the sigil on its
     /// first label — can look past it.
     fn past_modules(&self, mut at: usize) -> usize {
+        if matches!(
+            self.toks.get(at).map(|tok| &tok.tracked),
+            Some(Kind::ColonColon)
+        ) {
+            at += 1;
+        }
         while matches!(
             self.toks.get(at).map(|tok| &tok.tracked),
             Some(Kind::Identifier(_))
@@ -1969,13 +1987,17 @@ impl Parser {
         at
     }
 
-    /// `<module>::<module>::<name>` — a path, and the one node every naming
+    /// `[::]<module>::<module>::<name>` — a path, and the one node every naming
     /// position holds. A bare name is one with no segments, which is why there
     /// is nothing else to read here.
     fn path(&mut self) -> Option<Path> {
-        let modules = self.path_modules();
+        let (absolute, modules) = self.path_modules();
         let name = self.ident()?;
-        Some(Path { modules, name })
+        Some(Path {
+            absolute,
+            modules,
+            name,
+        })
     }
 
     /// Whether an effect label — path and all — begins at `at`.
@@ -2408,12 +2430,13 @@ impl Parser {
             Some(tok) if matches!(
                 tok.tracked,
                 Kind::Identifier(_)
+                    | Kind::ColonColon
                     | Kind::Natural(_)
                     | Kind::Fixed(_)
                     | Kind::Integer(_)
                     | Kind::Real(_)
                     | Kind::String(_)
-                    | Kind::Boolean(_)
+                    | Kind::Bool(_)
                     | Kind::Tag(_)
                     | Kind::EffectLabel(_)
                     | Kind::Fn
@@ -2474,7 +2497,7 @@ impl Parser {
         Some(value)
     }
 
-    /// Boolean disjunction is the loosest Boolean operator, followed by xor
+    /// Bool disjunction is the loosest Bool operator, followed by xor
     /// and conjunction. All three associate left.
     fn boolean_or(&mut self) -> Option<Expr> {
         self.binary(Self::boolean_xor, &[(Kind::Or, BinaryOp::Or)])
@@ -2677,15 +2700,15 @@ impl Parser {
                 self.advance();
                 Some(span.track(ExprKind::String(value)))
             }
-            &Kind::Boolean(value) => {
+            &Kind::Bool(value) => {
                 self.advance();
-                Some(span.track(ExprKind::Boolean(value)))
+                Some(span.track(ExprKind::Bool(value)))
             }
             // A name, or a path ending in one — and, since `::` binds tighter
             // than everything, a path ending in an effect label is an operation
             // rather than a name: `Sys::!Log.write` is read here, where a bare
             // `!Log.write` is read by the arm above.
-            Kind::Identifier(_) => match self.at_effect_label(self.pos) {
+            Kind::Identifier(_) | Kind::ColonColon => match self.at_effect_label(self.pos) {
                 true => self.operation_expr(),
                 false => {
                     let name = self.path()?;
@@ -3268,7 +3291,7 @@ impl Parser {
                     | Kind::Integer(_)
                     | Kind::Real(_)
                     | Kind::String(_)
-                    | Kind::Boolean(_)
+                    | Kind::Bool(_)
                     | Kind::Tag(_)
                     | Kind::LeftBrace
                     | Kind::LeftBracket
@@ -3335,9 +3358,9 @@ impl Parser {
                 self.advance();
                 Some(span.track(PatternKind::String(value)))
             }
-            &Kind::Boolean(value) => {
+            &Kind::Bool(value) => {
                 self.advance();
-                Some(span.track(PatternKind::Boolean(value)))
+                Some(span.track(PatternKind::Bool(value)))
             }
             Kind::LeftBrace => self.struct_pattern(),
             Kind::LeftBracket => self.array_pattern(),
@@ -3949,6 +3972,7 @@ impl Parser {
                 // entry underlines the absence mark along with the label it
                 // marks — the rule a struct's absent field keeps.
                 let key = Path {
+                    absolute: name.absolute,
                     name: slash.span.merge(name.name.span).track(name.name.tracked),
                     modules: name.modules,
                 };
@@ -4172,6 +4196,7 @@ impl Parser {
             Some(tok) if matches!(
                 tok.tracked,
                 Kind::Identifier(_)
+                    | Kind::ColonColon
                     | Kind::Mut
                     | Kind::Variable(_)
                     | Kind::LeftBrace
@@ -4211,7 +4236,7 @@ impl Parser {
             Kind::LeftParen => self.paren_type(),
             // A name, or a path ending in one: `Math::Pair` is as much a type
             // atom as `Pair` is, and may head an application like any other.
-            Kind::Identifier(_) => {
+            Kind::Identifier(_) | Kind::ColonColon => {
                 let name = self.path()?;
                 let span = name.span();
                 Some(span.track(TypeKind::Ident { name }))

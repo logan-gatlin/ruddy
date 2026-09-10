@@ -1,0 +1,2 @@
+type Never = |
+type Consumer 't 'effects = 't -> Consumer 't 'effects + ..'effects

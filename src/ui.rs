@@ -235,7 +235,7 @@ pub fn expr_prec(kind: &parse::ExprKind) -> Prec {
         | ExprKind::Fixed(_)
         | ExprKind::Real(_)
         | ExprKind::String(_)
-        | ExprKind::Boolean(_)
+        | ExprKind::Bool(_)
         | ExprKind::Unit => Prec::Atom,
     }
 }
@@ -283,7 +283,7 @@ pub fn pattern_prec(kind: &parse::PatternKind) -> Prec {
         | PatternKind::Fixed(_)
         | PatternKind::Real(_)
         | PatternKind::String(_)
-        | PatternKind::Boolean(_)
+        | PatternKind::Bool(_)
         | PatternKind::Unit
         | PatternKind::Struct { .. }
         | PatternKind::Tuple(_)
@@ -741,7 +741,7 @@ impl fmt::Display for Kind {
             Kind::NumericField(value) => write!(f, "{value}"),
             Kind::Real(value) => write!(f, "{value}"),
             Kind::String(value) => write_string(f, value),
-            Kind::Boolean(value) => write!(f, "{value}"),
+            Kind::Bool(value) => write!(f, "{value}"),
             // The delimiters are written back on, as a string's quotes are:
             // the text alone would re-lex as code.
             Kind::LineComment(text) => write!(f, "--{text}"),
@@ -1043,7 +1043,7 @@ impl Grouped for parse::PatternKind {
             | parse::PatternKind::Integer(_)
             | parse::PatternKind::Real(_)
             | parse::PatternKind::String(_)
-            | parse::PatternKind::Boolean(_)
+            | parse::PatternKind::Bool(_)
             | parse::PatternKind::Unit
             | parse::PatternKind::Struct { .. }
             | parse::PatternKind::Tuple(_)
@@ -1066,7 +1066,7 @@ impl fmt::Display for parse::PatternKind {
             parse::PatternKind::Integer(value) => write!(f, "{value}i"),
             parse::PatternKind::Real(value) => write!(f, "{value}"),
             parse::PatternKind::String(value) => write_string(f, value),
-            parse::PatternKind::Boolean(value) => write!(f, "{value}"),
+            parse::PatternKind::Bool(value) => write!(f, "{value}"),
             parse::PatternKind::Unit => f.write_str("()"),
             parse::PatternKind::Tuple(elements) => {
                 write_tuple(f, elements.iter().map(|element| &element.tracked))
@@ -1174,7 +1174,7 @@ impl fmt::Display for ir::Witness {
                 ir::Literal::Integer(value) => write!(f, "{value}i"),
                 ir::Literal::Real(value) => write!(f, "{value}"),
                 ir::Literal::String(value) => write_string(f, value),
-                ir::Literal::Boolean(value) => write!(f, "{value}"),
+                ir::Literal::Bool(value) => write!(f, "{value}"),
             },
             ir::Witness::Tag { name, payload } => write_tag(f, name, None, payload.as_deref()),
             // A field held to be present with any value at all prints
@@ -1929,7 +1929,7 @@ impl fmt::Display for SourceLiteral<'_> {
             ir::Literal::Integer(value) => write!(f, "{value}i"),
             ir::Literal::Real(value) => write!(f, "{value:?}"),
             ir::Literal::String(value) => write_string(f, value),
-            ir::Literal::Boolean(value) => write!(f, "{value}"),
+            ir::Literal::Bool(value) => write!(f, "{value}"),
         }
     }
 }
@@ -2320,7 +2320,7 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                     Ty::Fixed(kind) => f.write_str(kind.name())?,
                     Ty::Real => f.write_str(Prim::Real.name())?,
                     Ty::String => f.write_str(Prim::String.name())?,
-                    Ty::Boolean => f.write_str(Prim::Boolean.name())?,
+                    Ty::Bool => f.write_str(Prim::Bool.name())?,
                     Ty::Any => f.write_str(Prim::Any.name())?,
                     Ty::ForeignValue => f.write_str(Prim::ForeignValue.name())?,
                     Ty::Arrow(from, to, effects) => {
@@ -3115,7 +3115,7 @@ fn type_description(description: inference::TypeDescription) -> &'static str {
         T::Integer => "an integer",
         T::RealNumber => "a real number",
         T::Text => "text",
-        T::Boolean => "a boolean",
+        T::Bool => "a boolean",
         T::Function => "a function",
         T::Struct => "a struct",
         T::TaggedValue => "a tagged value",

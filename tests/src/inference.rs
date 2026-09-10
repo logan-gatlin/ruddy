@@ -320,13 +320,10 @@ fn struct_spreads_keep_every_field_they_do_not_name() {
     assert_eq!(scheme(&mint, &output, "copy"), "{ a: Nat, b: String }");
     assert_eq!(
         scheme(&mint, &output, "ext"),
-        "{ d: Boolean, a: Nat, b: String }"
+        "{ d: Bool, a: Nat, b: String }"
     );
     assert_eq!(scheme(&mint, &output, "upd"), "{ a: Nat, b: String }");
-    assert_eq!(
-        scheme(&mint, &output, "retyped"),
-        "{ a: Boolean, b: String }"
-    );
+    assert_eq!(scheme(&mint, &output, "retyped"), "{ a: Bool, b: String }");
     assert_eq!(scheme(&mint, &output, "several"), "{ a: Real, b: Nat }");
     assert_eq!(scheme(&mint, &output, "computed"), "{ a: Nat, b: String }");
     assert_eq!(scheme(&mint, &output, "unit"), "{ x: Nat }");
@@ -334,7 +331,7 @@ fn struct_spreads_keep_every_field_they_do_not_name() {
     assert_eq!(scheme(&mint, &output, "swapped"), "(Nat, String)");
     assert_eq!(
         scheme(&mint, &output, "gapped"),
-        "{ 3: Boolean, 0: Nat, 1: Nat }"
+        "{ 3: Bool, 0: Nat, 1: Nat }"
     );
     assert_eq!(scheme(&mint, &output, "exact"), "{ a: Nat, b: String }");
 }
@@ -359,7 +356,7 @@ fn a_struct_spread_of_an_open_value_keeps_its_rest_and_replaces_by_name() {
     );
     assert_eq!(scheme(&mint, &output, "copy"), "{ ..'a } -> { ..'a }");
     assert_eq!(scheme(&mint, &output, "added"), "{ a: Nat, b: String }");
-    assert_eq!(scheme(&mint, &output, "replaced"), "{ a: Nat, b: Boolean }");
+    assert_eq!(scheme(&mint, &output, "replaced"), "{ a: Nat, b: Bool }");
     assert_eq!(
         scheme(&mint, &output, "kept"),
         "{ a when 'a: 'b, b: 'c, ..'d } -> 'c"
@@ -394,7 +391,7 @@ fn a_struct_spread_keeps_an_annotated_rest_whether_or_not_it_named_the_field() {
     );
     assert_eq!(
         scheme(&mint, &output, "used"),
-        "({ x: Nat, y: Boolean }, { x: Nat, y: Boolean })"
+        "({ x: Nat, y: Bool }, { x: Nat, y: Bool })"
     );
 }
 
@@ -583,7 +580,7 @@ fn a_consumer_cannot_choose_an_existential_field_presence() {
 #[test]
 fn one_existential_package_keeps_shared_label_identity() {
     inferred(
-        "extern make: Nat -> Boolean ->\n\
+        "extern make: Nat -> Bool ->\n\
          { x when 'p: Nat, also when 'p: Nat, y when 'q: Nat }\n\
          where 'p != 'q = \"host.make\"\n\
          let value = make 1n true\n\
@@ -617,7 +614,7 @@ fn separate_alias_views_do_not_share_existential_witnesses() {
 #[test]
 fn separate_partial_application_calls_do_not_share_existential_witnesses() {
     let (_, _, output) = infer_src(
-        "extern make: Nat -> Boolean ->\n\
+        "extern make: Nat -> Bool ->\n\
          { x when 'p: Nat, also when 'p: Nat, y when 'q: Nat }\n\
          where 'p != 'q = \"host.make\"\n\
          let partial = make 1n\n\
@@ -774,14 +771,14 @@ fn real_number_operators_accept_only_reals() {
 #[test]
 fn boolean_operators_accept_only_booleans() {
     let (mint, _, output) = inferred("let value = not true and false xor true or false");
-    assert_eq!(scheme(&mint, &output, "value"), "Boolean");
+    assert_eq!(scheme(&mint, &output, "value"), "Bool");
 
     for source in ["let bad = not 1", "let bad = true and 1"] {
         let (_, _, output) = infer_src(source);
         assert_eq!(output.errors().len(), 1, "{source}: {:#?}", output.errors());
         assert_eq!(
             output.errors()[0].kind.to_string(),
-            "type mismatch: expected `Boolean`, found `Real`"
+            "type mismatch: expected `Bool`, found `Real`"
         );
     }
 }
@@ -793,13 +790,13 @@ fn conditionals_require_a_boolean_and_unify_their_branches() {
          let id = fn p => if p then p else false end",
     );
     assert_eq!(scheme(&mint, &output, "n"), "Nat");
-    assert_eq!(scheme(&mint, &output, "id"), "Boolean -> Boolean");
+    assert_eq!(scheme(&mint, &output, "id"), "Bool -> Bool");
 
     let (_, _, output) = infer_src("let bad = if 1n then 2n else 3n end");
     assert_eq!(output.errors().len(), 1, "{:#?}", output.errors());
     assert_eq!(
         output.errors()[0].kind.to_string(),
-        "type mismatch: expected `Boolean`, found `Nat`"
+        "type mismatch: expected `Bool`, found `Nat`"
     );
 
     let (_, _, output) = infer_src("let bad = if true then 1n else false end");
@@ -807,7 +804,7 @@ fn conditionals_require_a_boolean_and_unify_their_branches() {
     let message = output.errors()[0].kind.to_string();
     assert!(message.contains("type mismatch"), "{message}");
     assert!(
-        message.contains("Nat") && message.contains("Boolean"),
+        message.contains("Nat") && message.contains("Bool"),
         "{message}"
     );
 }
@@ -819,14 +816,14 @@ fn every_primitive_is_a_distinct_type() {
          let int : Int -> Int = fn x => x\n\
          let real : Real -> Real = fn x => x\n\
          let string : String -> String = fn x => x\n\
-         let boolean : Boolean -> Boolean = fn x => x",
+         let boolean : Bool -> Bool = fn x => x",
     );
     for (name, ty) in [
         ("nat", "Nat -> Nat"),
         ("int", "Int -> Int"),
         ("real", "Real -> Real"),
         ("string", "String -> String"),
-        ("boolean", "Boolean -> Boolean"),
+        ("boolean", "Bool -> Bool"),
     ] {
         assert_eq!(scheme(&mint, &output, name), ty);
     }
@@ -969,7 +966,7 @@ fn body_tys(term: &Term) -> Vec<Arc<Ty>> {
         | TermKind::Fixed(_)
         | TermKind::Real(_)
         | TermKind::String(_)
-        | TermKind::Boolean(_)
+        | TermKind::Bool(_)
         | TermKind::Error => {}
     }
     out
@@ -1154,13 +1151,13 @@ fn tuple_literals_types_and_numeric_projections_infer_as_positional_structs() {
         "let pair : (Nat, String) = (1n, \"two\")\n\
          let first = pair.0\n\
          let second = pair.1\n\
-         let singleton : (Boolean,) = (true,)",
+         let singleton : (Bool,) = (true,)",
     );
 
     assert_eq!(scheme(&mint, &output, "pair"), "(Nat, String)");
     assert_eq!(scheme(&mint, &output, "first"), "Nat");
     assert_eq!(scheme(&mint, &output, "second"), "String");
-    assert_eq!(scheme(&mint, &output, "singleton"), "(Boolean,)");
+    assert_eq!(scheme(&mint, &output, "singleton"), "(Bool,)");
 }
 
 #[test]
@@ -2341,7 +2338,7 @@ fn alias_cycle_keys_cover_every_semantic_shape_and_absorb_growth() {
                 ),
                 (
                     "boolean".into(),
-                    field(Presence::Var(1), Arc::new(Ty::Boolean)),
+                    field(Presence::Var(1), Arc::new(Ty::Bool)),
                 ),
                 (
                     "var".into(),
@@ -6332,7 +6329,7 @@ fn both_booleans_fully_handle_a_case_before_the_catch_all() {
          let f = fn e => match e with\n\
          | #A false => 1n | #A true => 2n | rest => keep rest end",
     );
-    assert_eq!(scheme(&mint, &output, "f"), "#A Boolean | ..'a -> Nat");
+    assert_eq!(scheme(&mint, &output, "f"), "#A Bool | ..'a -> Nat");
 }
 
 #[test]
@@ -8817,6 +8814,17 @@ fn the_written_examples_are_refused_where_they_go_wrong() {
     assert_eq!(output.errors()[0].kind.code(), "rigid-escapes");
 }
 
+/// Discarding a value does not publish its type, so a caller-owned choice may
+/// flow into `_` without escaping the annotation that owns it.
+#[test]
+fn a_discard_does_not_publish_a_caller_choice() {
+    let source = "let discard : ('a -> 'b) -> 'a -> () = fn function value => do\n\
+                  \x20 _ = function value\n\
+                  \x20 return () end";
+    let (_, _, output) = inferred(source);
+    assert!(output.errors().is_empty(), "{:#?}", output.errors());
+}
+
 /// Caller-owned type, remainder, case, and effect choices retain a short
 /// structured route from the exact annotation declaration to the body use.
 #[test]
@@ -10018,10 +10026,10 @@ fn an_extern_can_publish_a_non_function_scheme() {
 /// unification. Their source spelling is recovered only when the type prints.
 #[test]
 fn quoted_struct_fields_keep_their_identity_and_types() {
-    let source = r###"let identity : { "field name": Nat, "let": String, "line\n\"quote\"\\tail": Boolean } -> { "field name": Nat, "let": String, "line\n\"quote\"\\tail": Boolean } = fn value => value
+    let source = r###"let identity : { "field name": Nat, "let": String, "line\n\"quote\"\\tail": Bool } -> { "field name": Nat, "let": String, "line\n\"quote\"\\tail": Bool } = fn value => value
 let projected = (identity { "let": "ok", "line\n\"quote\"\\tail": true, "field name": 1n })."field name""###;
     let (mint, out, output) = inferred(source);
-    let record = r###"{ "field name": Nat, "let": String, "line\n\"quote\"\\tail": Boolean }"###;
+    let record = r###"{ "field name": Nat, "let": String, "line\n\"quote\"\\tail": Bool }"###;
     assert_eq!(
         scheme(&mint, &output, "identity"),
         format!("{record} -> {record}")
@@ -10705,7 +10713,7 @@ fn equality_constraints_preserve_expected_then_actual_side_ordering() {
         unreachable!()
     };
     assert!(matches!(&**expected, Ty::Nat));
-    assert!(matches!(&**actual, Ty::Boolean));
+    assert!(matches!(&**actual, Ty::Bool));
 }
 
 #[test]
@@ -10831,7 +10839,7 @@ fn replaced_and_guarded_batches_keep_referentially_integral_reason_roots() {
 
 #[test]
 fn zero_step_rules_and_recovery_components_do_not_contaminate_later_steps() {
-    let (_, _, output) = infer_src("let bad : {} -> Boolean = fn x => do let {} = x return 1n end");
+    let (_, _, output) = infer_src("let bad : {} -> Bool = fn x => do let {} = x return 1n end");
     let failure = output
         .diagnostics()
         .steps()
@@ -10952,9 +10960,8 @@ fn recovery_names_the_failure_or_absorption_that_requested_it() {
 
 #[test]
 fn raise_result_has_its_own_semantic_subject() {
-    let (_, _, output) = infer_src(
-        "effect Fail = { abort: Nat -> Boolean }\nlet f = fn unit => raise Fail.abort 1n",
-    );
+    let (_, _, output) =
+        infer_src("effect Fail = { abort: Nat -> Bool }\nlet f = fn unit => raise Fail.abort 1n");
     assert!(
         output
             .diagnostics()
@@ -10999,7 +11006,7 @@ fn published_reason_links_never_reach_rolled_back_origins() {
     let (_, _, output) = infer_src(
         "type Box 'a = { value: 'a, next: Box 'a }\n\
          let bad : Box Nat -> Nat = fn x =>\n\
-         \x20 do let wrong : Box Boolean = x return 1n end",
+         \x20 do let wrong : Box Bool = x return 1n end",
     );
     assert!(
         output

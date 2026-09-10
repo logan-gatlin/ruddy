@@ -1,0 +1,16 @@
+let print = io::print
+let eprint = io::eprint
+
+let println = io::println
+let eprintln = io::eprintln
+
+let drop = fn _ => ()
+
+effect IO = io::!IO
+effect FileSystem = fs::!FileSystem
+
+type Option 't = #Some 't | #None
+type Maybe 't = #Nil | ..'t
+type Result 'some 'error = #Some 'some | #Error 'error
+type Fallible 'error 'rest = #Error 'error | ..'rest
+type Order = #Less | #Equal | #Greater

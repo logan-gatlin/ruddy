@@ -661,7 +661,7 @@ impl Solve<'_> {
             | Ty::Fixed(_)
             | Ty::Real
             | Ty::String
-            | Ty::Boolean
+            | Ty::Bool
             | Ty::Any
             | Ty::ForeignValue
             | Ty::Arrow(..)
@@ -735,7 +735,7 @@ impl Solve<'_> {
             | Ty::Fixed(_)
             | Ty::Real
             | Ty::String
-            | Ty::Boolean
+            | Ty::Bool
             | Ty::Any
             | Ty::ForeignValue
             | Ty::Arrow(..)
@@ -1016,7 +1016,7 @@ impl Solve<'_> {
                                 Ty::Fixed(kind) => values.push(tagged(30, [*kind as u64])),
                                 Ty::Real => values.push(tagged(2, [])),
                                 Ty::String => values.push(tagged(3, [])),
-                                Ty::Boolean => values.push(tagged(4, [])),
+                                Ty::Bool => values.push(tagged(4, [])),
                                 Ty::Any => values.push(tagged(50, [])),
                                 Ty::ForeignValue => values.push(tagged(51, [])),
                                 Ty::Var(var) | Ty::Bound(var) => {
@@ -2056,7 +2056,7 @@ impl Solve<'_> {
                         | (Ty::Int, Ty::Int)
                         | (Ty::Real, Ty::Real)
                         | (Ty::String, Ty::String)
-                        | (Ty::Boolean, Ty::Boolean)
+                        | (Ty::Bool, Ty::Bool)
                         | (Ty::Any, Ty::Any)
                         | (Ty::ForeignValue, Ty::ForeignValue) => {
                             self.step(span, Rule::Prim, goal, Effect::None);
@@ -2412,7 +2412,7 @@ impl Solve<'_> {
                         | Ty::Fixed(_)
                         | Ty::Real
                         | Ty::String
-                        | Ty::Boolean
+                        | Ty::Bool
                         | Ty::Any
                         | Ty::ForeignValue
                         | Ty::Var(_)
@@ -3672,7 +3672,7 @@ impl Solve<'_> {
                     | Ty::Fixed(_)
                     | Ty::Real
                     | Ty::String
-                    | Ty::Boolean
+                    | Ty::Bool
                     | Ty::Any
                     | Ty::ForeignValue
                     | Ty::Bound(_)

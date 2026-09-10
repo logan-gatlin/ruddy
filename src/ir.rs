@@ -265,7 +265,7 @@ pub enum DataKind {
     Fixed(crate::types::FixedLiteral),
     Real(f64),
     String(String),
-    Boolean(bool),
+    Bool(bool),
     Array(Vec<Data>),
     /// Fields by decoded label, in written order, each with where its label
     /// was written. Unit and tuples are here too: the empty struct, and the
@@ -554,7 +554,7 @@ pub enum TermKind {
     Fixed(crate::types::FixedLiteral),
     Real(f64),
     String(String),
-    Boolean(bool),
+    Bool(bool),
     /// A name that did not resolve. Lowering stays total so that one typo
     /// produces one error rather than a cascade from a dropped definition.
     Error,
@@ -641,7 +641,7 @@ pub enum Literal {
     Fixed(crate::types::FixedLiteral),
     Real(f64),
     String(String),
-    Boolean(bool),
+    Bool(bool),
 }
 
 impl PartialEq for Literal {
@@ -652,7 +652,7 @@ impl PartialEq for Literal {
             (Self::Integer(a), Self::Integer(b)) => a == b,
             (Self::Real(a), Self::Real(b)) => a.to_bits() == b.to_bits(),
             (Self::String(a), Self::String(b)) => a == b,
-            (Self::Boolean(a), Self::Boolean(b)) => a == b,
+            (Self::Bool(a), Self::Bool(b)) => a == b,
             _ => false,
         }
     }
@@ -670,7 +670,7 @@ impl Hash for Literal {
             // of zero, so hashing must do the same.
             Self::Real(value) => value.to_bits().hash(state),
             Self::String(value) => value.hash(state),
-            Self::Boolean(value) => value.hash(state),
+            Self::Bool(value) => value.hash(state),
         }
     }
 }
@@ -707,7 +707,7 @@ pub enum PatternKind {
     Fixed(crate::types::FixedLiteral),
     Real(f64),
     String(String),
-    Boolean(bool),
+    Bool(bool),
     Unit,
     /// `[a, ..rest, b]`: the elements before the rest counted from the front,
     /// the ones after it from the back, and the rest — when written — the
@@ -1238,7 +1238,7 @@ fn declaration_variances(
                             | Ty::Fixed(_)
                             | Ty::Real
                             | Ty::String
-                            | Ty::Boolean
+                            | Ty::Bool
                             | Ty::Any
                             | Ty::ForeignValue => {}
                         }
@@ -2571,7 +2571,7 @@ pub(crate) enum Step {
 /// universes the matrix checks draw values from — usefulness in the sense of
 /// Maranget (JFP 2007), with each tag position's universe being its listed
 /// cases when no arm is irrefutable there, its listed cases plus "anything
-/// else" when one is, Boolean's universe being `false` and `true`, and every
+/// else" when one is, Bool's universe being `false` and `true`, and every
 /// other primitive's universe being infinite.
 ///
 /// Syntactic throughout: built from the normalized patterns and consulting no
@@ -3781,7 +3781,7 @@ fn imported_syntax(
         artifact::Type::Fixed(kind) => TypeKind::Prim(Prim::Fixed(*kind)),
         artifact::Type::Real => TypeKind::Prim(Prim::Real),
         artifact::Type::String => TypeKind::Prim(Prim::String),
-        artifact::Type::Boolean => TypeKind::Prim(Prim::Boolean),
+        artifact::Type::Bool => TypeKind::Prim(Prim::Bool),
         artifact::Type::Any => TypeKind::Prim(Prim::Any),
         artifact::Type::ForeignValue => TypeKind::Prim(Prim::ForeignValue),
         artifact::Type::Bound(index) => match params.get(*index as usize) {
@@ -4074,7 +4074,7 @@ fn clamp_bounds(ty: Arc<Ty>, count: usize, presences: usize) -> Arc<Ty> {
                 Ty::Fixed(kind) => types.push(Arc::new(Ty::Fixed(*kind))),
                 Ty::Real => types.push(Arc::new(Ty::Real)),
                 Ty::String => types.push(Arc::new(Ty::String)),
-                Ty::Boolean => types.push(Arc::new(Ty::Boolean)),
+                Ty::Bool => types.push(Arc::new(Ty::Bool)),
                 Ty::Any => types.push(Arc::new(Ty::Any)),
                 Ty::ForeignValue => types.push(Arc::new(Ty::ForeignValue)),
                 Ty::Bound(index) if (*index as usize) < count && (*index as usize) >= presences => {
@@ -4272,7 +4272,7 @@ fn drop_type_iterative(root: Arc<Ty>) {
                     | Ty::Fixed(_)
                     | Ty::Real
                     | Ty::String
-                    | Ty::Boolean
+                    | Ty::Bool
                     | Ty::Any
                     | Ty::ForeignValue
                     | Ty::Var(_)
@@ -4444,7 +4444,7 @@ fn import_type(
                 artifact::Type::Fixed(kind) => types.push(Arc::new(Ty::Fixed(*kind))),
                 artifact::Type::Real => types.push(Arc::new(Ty::Real)),
                 artifact::Type::String => types.push(Arc::new(Ty::String)),
-                artifact::Type::Boolean => types.push(Arc::new(Ty::Boolean)),
+                artifact::Type::Bool => types.push(Arc::new(Ty::Bool)),
                 artifact::Type::Any => types.push(Arc::new(Ty::Any)),
                 artifact::Type::ForeignValue => types.push(Arc::new(Ty::ForeignValue)),
                 artifact::Type::Bound(index) => types.push(Arc::new(Ty::Bound(*index))),
@@ -5522,7 +5522,7 @@ impl RegularType<'_> {
                     Ty::Fixed(kind) => values.push(self.atom(kind.name())),
                     Ty::Real => values.push(self.atom("Real")),
                     Ty::String => values.push(self.atom("String")),
-                    Ty::Boolean => values.push(self.atom("Boolean")),
+                    Ty::Bool => values.push(self.atom("Bool")),
                     Ty::Any => values.push(self.atom("Any")),
                     Ty::ForeignValue => values.push(self.atom("ForeignValue")),
                     Ty::Bound(index) if instantiation == usize::MAX => {
@@ -6628,7 +6628,7 @@ fn rekey_term(
         | TermKind::Integer(_)
         | TermKind::Real(_)
         | TermKind::String(_)
-        | TermKind::Boolean(_)
+        | TermKind::Bool(_)
         | TermKind::Error => {}
     }
 }
@@ -6920,7 +6920,7 @@ impl<'a> Follow<'a> {
                     | Ty::Fixed(_)
                     | Ty::Real
                     | Ty::String
-                    | Ty::Boolean
+                    | Ty::Bool
                     | Ty::Any
                     | Ty::ForeignValue
                     | Ty::Arrow(..)
@@ -7102,7 +7102,7 @@ fn erase_circular(term: &mut Term, looping: &IndexSet<Symbol>, out: &mut Vec<Anc
         | TermKind::Integer(_)
         | TermKind::Real(_)
         | TermKind::String(_)
-        | TermKind::Boolean(_)
+        | TermKind::Bool(_)
         | TermKind::Error => {}
     }
 }
@@ -7175,7 +7175,7 @@ fn nested<'a>(term: &'a Term, out: &mut HashMap<Symbol, &'a Term>) {
         | TermKind::Integer(_)
         | TermKind::Real(_)
         | TermKind::String(_)
-        | TermKind::Boolean(_)
+        | TermKind::Bool(_)
         | TermKind::Error => {}
     }
 }
@@ -7241,7 +7241,7 @@ impl Chain<'_> {
             | TermKind::Raise(_)
             | TermKind::Operation { .. }
             | TermKind::Fixed(_)
-            | TermKind::Natural(_) | TermKind::Integer(_) | TermKind::Real(_) | TermKind::String(_) | TermKind::Boolean(_)
+            | TermKind::Natural(_) | TermKind::Integer(_) | TermKind::Real(_) | TermKind::String(_) | TermKind::Bool(_)
             | TermKind::Error => Stands::Shape,
         }
     }
@@ -7264,7 +7264,7 @@ fn refuter(pattern: &Pattern) -> Option<(Anchor, Refuter)> {
         PatternKind::Integer(value) => literal(Literal::Integer(*value)),
         PatternKind::Real(value) => literal(Literal::Real(*value)),
         PatternKind::String(value) => literal(Literal::String(value.clone())),
-        PatternKind::Boolean(value) => literal(Literal::Boolean(*value)),
+        PatternKind::Bool(value) => literal(Literal::Bool(*value)),
         // Length is no part of an array's type, so naming any element is a
         // test a value can fail; the lone rest names none and cannot.
         PatternKind::Array {
@@ -7318,7 +7318,7 @@ fn calm(pattern: &Pattern) -> Option<Calm> {
         | PatternKind::Integer(_)
         | PatternKind::Real(_)
         | PatternKind::String(_)
-        | PatternKind::Boolean(_) => None,
+        | PatternKind::Bool(_) => None,
     }
 }
 
@@ -7335,7 +7335,7 @@ fn pattern_binders(pattern: &Pattern, out: &mut Vec<Anchored<Symbol>>) {
         | PatternKind::Integer(_)
         | PatternKind::Real(_)
         | PatternKind::String(_)
-        | PatternKind::Boolean(_) => {}
+        | PatternKind::Bool(_) => {}
         PatternKind::Tag { payload, .. } => {
             if let Some(payload) = payload {
                 pattern_binders(payload, out);
@@ -7456,7 +7456,7 @@ fn mat(pattern: &Pattern) -> Mat {
         PatternKind::Integer(value) => Mat::Literal(Literal::Integer(*value)),
         PatternKind::Real(value) => Mat::Literal(Literal::Real(*value)),
         PatternKind::String(value) => Mat::Literal(Literal::String(value.clone())),
-        PatternKind::Boolean(value) => Mat::Literal(Literal::Boolean(*value)),
+        PatternKind::Bool(value) => Mat::Literal(Literal::Bool(*value)),
         PatternKind::Array {
             before,
             rest,
@@ -7525,7 +7525,7 @@ impl Matrix {
             PatternKind::String(value) => {
                 self.collect_literal(path, Literal::String(value.clone()))
             }
-            PatternKind::Boolean(value) => self.collect_literal(path, Literal::Boolean(*value)),
+            PatternKind::Bool(value) => self.collect_literal(path, Literal::Bool(*value)),
             // Every element, from either end, is the one element position;
             // see [`Step::Element`]. The rest binds the array between the
             // elements rather than any element, so it opens nothing here.
@@ -7671,15 +7671,15 @@ impl Matrix {
                     if tests
                         .literals
                         .iter()
-                        .all(|literal| matches!(literal, Literal::Boolean(_)))
+                        .all(|literal| matches!(literal, Literal::Bool(_)))
                     {
-                        // Boolean is the one finite scalar universe. Asking
+                        // Bool is the one finite scalar universe. Asking
                         // both values — not merely the values written in an
                         // arm — is what makes `false | true` total and a
                         // single boolean literal partial.
                         [false, true].into_iter().any(|value| {
                             self.useful(
-                                &specialize_literal(rows, &Literal::Boolean(value)),
+                                &specialize_literal(rows, &Literal::Bool(value)),
                                 later,
                                 &q[1..],
                             )
@@ -7779,7 +7779,7 @@ fn pattern_names(pattern: &parse::Pattern, out: &mut Vec<TrackedString>) {
         | parse::PatternKind::Integer(_)
         | parse::PatternKind::Real(_)
         | parse::PatternKind::String(_)
-        | parse::PatternKind::Boolean(_)
+        | parse::PatternKind::Bool(_)
         | parse::PatternKind::Unit => {}
         parse::PatternKind::Tag { payload, .. } => {
             if let Some(payload) = payload {
@@ -8012,7 +8012,7 @@ impl Term {
                 | TermKind::Integer(_)
                 | TermKind::Real(_)
                 | TermKind::String(_)
-                | TermKind::Boolean(_)
+                | TermKind::Bool(_)
                 | TermKind::Error => {}
             }
             Some(term)
@@ -8734,7 +8734,7 @@ fn annotations(term: &mut Term, out: &mut impl FnMut(&mut Type)) {
         | TermKind::Integer(_)
         | TermKind::Real(_)
         | TermKind::String(_)
-        | TermKind::Boolean(_)
+        | TermKind::Bool(_)
         | TermKind::Error => {}
     }
 }
@@ -8970,7 +8970,7 @@ fn row_summaries(
                     | Ty::Fixed(_)
                     | Ty::Real
                     | Ty::String
-                    | Ty::Boolean
+                    | Ty::Bool
                     | Ty::Any
                     | Ty::ForeignValue
                     | Ty::Arrow(..)
@@ -9784,7 +9784,7 @@ impl Builder<'_> {
             parse::DataKind::Integer(value) => DataKind::Integer(value),
             parse::DataKind::Real(value) => DataKind::Real(value),
             parse::DataKind::String(value) => DataKind::String(value),
-            parse::DataKind::Boolean(value) => DataKind::Boolean(value),
+            parse::DataKind::Bool(value) => DataKind::Bool(value),
             parse::DataKind::Unit => DataKind::Struct(IndexMap::new()),
             parse::DataKind::Tuple(elements) => DataKind::Struct(
                 elements
@@ -10455,8 +10455,8 @@ impl Builder<'_> {
             .and_then(|prelude| self.global_in(Some(prelude), namespace, name))
     }
 
-    /// [`outward`](Self::outward) about modules, which is how a path's first
-    /// segment is resolved. A direct child module of the configured std
+    /// [`outward`](Self::outward) about modules, which is how a relative path's
+    /// first segment is resolved. A direct child module of the configured std
     /// prelude is the final fallback.
     fn module_outward(&self, name: &str) -> Option<Module> {
         let mut at = self.module;
@@ -10479,15 +10479,20 @@ impl Builder<'_> {
     /// Which module a path's segments name: `Some(None)` for a bare name, whose
     /// segments are none at all.
     ///
-    /// R10 in one loop. The first segment resolves by the R9 walk; every later
-    /// one strictly inside the module the previous one named, with no outward
-    /// step, because a path says where to look and a walk would let it mean
-    /// somewhere else.
+    /// R10 in one loop. A relative first segment resolves by the R9 walk; an
+    /// absolute one resolves at the bundle root. Every later segment resolves
+    /// strictly inside the module the previous one named, with no outward step,
+    /// because a path says where to look and a walk would let it mean somewhere
+    /// else.
     fn segments(&mut self, path: &parse::Path) -> Option<Option<Module>> {
         let mut at: Option<Module> = None;
         for (index, segment) in path.modules.iter().enumerate() {
-            let found = match index {
-                0 => self.module_outward(&segment.tracked),
+            let found = match (path.absolute.is_some(), index) {
+                (true, 0) => self
+                    .modules
+                    .get(&(None, segment.tracked.clone()))
+                    .map(|&(module, _)| module),
+                (false, 0) => self.module_outward(&segment.tracked),
                 _ => self
                     .modules
                     .get(&(at, segment.tracked.clone()))
@@ -10510,16 +10515,18 @@ impl Builder<'_> {
 
     /// The symbol `path` names in `namespace`, or why it names none.
     ///
-    /// A bare name is looked for among the locals first and then by R9's walk;
-    /// a qualified one strictly inside the module its segments named. Only
+    /// A relative bare name is looked for among the locals first and then by
+    /// R9's walk; an absolute bare name only at the bundle root. A path with
+    /// segments looks strictly inside the module those segments named. Only
     /// terms have locals, so only they are asked about them.
     fn find(&mut self, path: &parse::Path, namespace: Namespace) -> Result<Symbol, Missing> {
         let Some(module) = self.segments(path) else {
             return Err(Missing::Segment);
         };
-        let found = match module {
-            Some(module) => self.global_in(Some(module), namespace, &path.name.tracked),
-            None => self
+        let found = match (path.absolute.is_some(), module) {
+            (_, Some(module)) => self.global_in(Some(module), namespace, &path.name.tracked),
+            (true, None) => self.global_in(None, namespace, &path.name.tracked),
+            (false, None) => self
                 .local(namespace, &path.name.tracked)
                 .or_else(|| self.outward(namespace, &path.name.tracked)),
         };
@@ -11870,7 +11877,7 @@ impl Builder<'_> {
             ExprKind::Integer(value) => TermKind::Integer(value).at(self.anchor(span)),
             ExprKind::Real(value) => TermKind::Real(value).at(self.anchor(span)),
             ExprKind::String(value) => TermKind::String(value).at(self.anchor(span)),
-            ExprKind::Boolean(value) => TermKind::Boolean(value).at(self.anchor(span)),
+            ExprKind::Bool(value) => TermKind::Bool(value).at(self.anchor(span)),
             ExprKind::Unary { op, value } => TermKind::Unary {
                 op: match op {
                     parse::UnaryOp::Neg => UnaryOp::Neg,
@@ -11989,7 +11996,7 @@ impl Builder<'_> {
             ExprKind::Do { stmts, result } => self.block(span, stmts.into_iter(), result),
             ExprKind::Match { scrutinee, arms } => self.match_term(span, *scrutinee, arms),
             // A conditional is surface syntax for the ordinary exhaustive
-            // Boolean match. Keeping the desugaring here means inference,
+            // Bool match. Keeping the desugaring here means inference,
             // coverage checking, pattern compilation, and LIR all use their
             // existing match paths; no conditional reaches the IR.
             ExprKind::If {
@@ -12000,11 +12007,11 @@ impl Builder<'_> {
                 let pattern_span = predicate.span;
                 let arms = vec![
                     parse::Arm {
-                        pattern: pattern_span.track(parse::PatternKind::Boolean(true)),
+                        pattern: pattern_span.track(parse::PatternKind::Bool(true)),
                         body: *consequent,
                     },
                     parse::Arm {
-                        pattern: pattern_span.track(parse::PatternKind::Boolean(false)),
+                        pattern: pattern_span.track(parse::PatternKind::Bool(false)),
                         body: *alternative,
                     },
                 ];
@@ -13058,7 +13065,7 @@ impl Builder<'_> {
             parse::PatternKind::Integer(value) => here.anchor(PatternKind::Integer(value)),
             parse::PatternKind::Real(value) => here.anchor(PatternKind::Real(value)),
             parse::PatternKind::String(value) => here.anchor(PatternKind::String(value)),
-            parse::PatternKind::Boolean(value) => here.anchor(PatternKind::Boolean(value)),
+            parse::PatternKind::Bool(value) => here.anchor(PatternKind::Bool(value)),
             parse::PatternKind::Unit => here.anchor(PatternKind::Unit),
             // A bare tag keeps its `None`: what it constrains the payload to —
             // unit — is said where the type is built rather than written into

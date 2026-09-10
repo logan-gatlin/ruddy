@@ -74,7 +74,7 @@ pub(super) fn native_descriptor(
             Type::Fixed(kind) => Runtime::Fixed(*kind),
             Type::Real => Runtime::Real,
             Type::String => Runtime::String,
-            Type::Boolean => Runtime::Boolean,
+            Type::Bool => Runtime::Bool,
             Type::Any => Runtime::Any,
             Type::ForeignValue => Runtime::ForeignValue,
             Type::Package(inner) => Runtime::Alias(child(view.child(inner), path, incoming)),

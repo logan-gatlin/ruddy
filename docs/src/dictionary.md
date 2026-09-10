@@ -15,6 +15,17 @@ References are omitted when no such page exists.
 
 `[Topic](topic.md)`
 
+## Command-line interface
+A tool controlled by commands entered in a terminal, abbreviated CLI.
+Ruddy's CLI creates, checks, builds, runs, and formats projects through the `ruddy` command.
+
+[Hello world](hello-world.md)
+
+## Standard library
+The library available by default as `std`, providing common types and functions such as console output.
+
+[Hello world](hello-world.md#write-the-greeting)
+
 ## Definition
 A top-level `let`, `type`, `effect`, `extern`, or `module` that defines a value, type, effect, foreign value, or module, respectively.
 The shorthand `_ = expression` is also a definition, equivalent to `let _ = expression`.
@@ -61,7 +72,7 @@ A name written in source code to refer to a value, type, effect, or module.
 [Grammar](grammar.md#source-layout-and-names)
 
 ## Literal
-A value written directly in source code, such as a number, string, or Boolean.
+A value written directly in source code, such as a number, string, or Bool.
 
 [Grammar](grammar.md#literals)
 
