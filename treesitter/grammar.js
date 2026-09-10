@@ -1131,9 +1131,11 @@ module.exports = grammar({
       '(*',
       repeat(choice(
         $.block_comment,
-        /[\s\S]/,
+        // Consume comment whitespace here instead of skipping it as extras;
+        // skipping can introduce phantom nested comments across newlines.
+        token.immediate(/[\s\S]/),
       )),
-      '*)',
+      token.immediate('*)'),
     ),
   },
 });

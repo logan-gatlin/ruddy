@@ -1,0 +1,63 @@
+{
+  "name": "ruddy",
+  "displayName": "Ruddy",
+  "description": "Tree-sitter highlighting and language server support for Ruddy.",
+  "version": "0.1.0",
+  "publisher": "lgatlin",
+  "license": "UNLICENSED",
+  "repository": { "type": "git", "url": "https://github.com/logan-gatlin/ruddy.git" },
+  "engines": { "vscode": "^1.96.0", "node": ">=20" },
+  "categories": ["Programming Languages"],
+  "extensionKind": ["workspace"],
+  "main": "./dist/extension.cjs",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "Highlighting is available. The Ruddy executable only runs in trusted workspaces.",
+      "restrictedConfigurations": ["ruddy.server.path"]
+    },
+    "virtualWorkspaces": false
+  },
+  "contributes": {
+    "languages": [{ "id": "ruddy", "aliases": ["Ruddy", "ruddy"], "extensions": [".rud"], "configuration": "./language-configuration.json" }],
+    "commands": [{ "command": "ruddy.restartServer", "title": "Ruddy: Restart Language Server" }],
+    "configuration": {
+      "title": "Ruddy",
+      "properties": {
+        "ruddy.server.path": {
+          "type": "string", "default": "ruddy", "scope": "machine-overridable",
+          "description": "Ruddy executable (not a shell command). Uses PATH by default; relative paths resolve from the project workspace folder. On remote workspaces this path is on the remote host."
+        }
+      }
+    },
+    "configurationDefaults": { "[ruddy]": { "editor.semanticHighlighting.enabled": true, "editor.tabSize": 2 } },
+    "semanticTokenTypes": [
+      { "id": "ruddyTag", "superType": "enumMember", "description": "Ruddy sum tag." },
+      { "id": "ruddyAttribute", "superType": "decorator", "description": "Ruddy metadata attribute." },
+      { "id": "ruddyPunctuation", "superType": "operator", "description": "Ruddy delimiter or bracket." }
+    ],
+    "semanticTokenScopes": [{ "language": "ruddy", "scopes": {
+      "ruddyTag": ["entity.name.tag"], "ruddyAttribute": ["entity.other.attribute-name"],
+      "ruddyPunctuation": ["punctuation"], "namespace": ["entity.name.namespace"],
+      "keyword": ["keyword.control"], "comment": ["comment"], "string": ["string"],
+      "number": ["constant.numeric"], "type": ["entity.name.type"], "type.defaultLibrary": ["support.type"],
+      "variable": ["variable.other.readwrite"], "parameter": ["variable.parameter"],
+      "function": ["entity.name.function"], "property": ["variable.other.property"], "operator": ["keyword.operator"]
+    }}]
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test:unit": "tsx --test test/highlighting.test.ts",
+    "test:integration": "node scripts/test-vscode.mjs && node scripts/test-vscode.mjs --untrusted",
+    "test": "npm run typecheck && npm run build && npm run test:unit && npm run test:integration",
+    "vscode:prepublish": "npm run typecheck && npm run build",
+    "package": "vsce package --no-dependencies --skip-license"
+  },
+  "dependencies": { "vscode-languageclient": "9.0.1", "web-tree-sitter": "0.26.12" },
+  "devDependencies": {
+    "@types/node": "^22.0.0", "@types/vscode": "1.96.0", "@vscode/test-electron": "3.1.0",
+    "@vscode/vsce": "3.9.2", "esbuild": "0.28.2", "tree-sitter-cli": "0.26.12",
+    "tsx": "^4.20.0", "typescript": "5.9.3"
+  }
+}

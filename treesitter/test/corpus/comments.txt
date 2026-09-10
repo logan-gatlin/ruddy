@@ -37,3 +37,21 @@ let z = 3
   (let_definition
     (identifier)
     (natural)))
+
+================================================================================
+Nested block comments on separate lines end before the following definition
+================================================================================
+
+(* outer
+ (* inner *)
+*)
+let z = 3
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (block_comment
+    (block_comment))
+  (let_definition
+    (identifier)
+    (natural)))

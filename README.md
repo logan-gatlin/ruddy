@@ -30,6 +30,11 @@ The repository's `Ruddy.toml` defines the standard-library bundle, with `std/lib
 
 ## Editor support
 
+The [VS Code extension](editors/vscode/README.md) bundles Tree-sitter syntax
+highlighting and connects to `ruddy lsp`. Run `just vscode-install` to rebuild the
+grammar and install the extension, or `just vscode` to package it without
+installing. See its README for installation and development instructions.
+
 The language server is `ruddy lsp`. Configure your editor to launch that
 command over stdio, with the directory containing `Ruddy.toml` as its workspace
 root. It provides diagnostics, hover, completion, go-to-definition, and

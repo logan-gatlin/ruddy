@@ -4492,15 +4492,21 @@
                 "name": "block_comment"
               },
               {
-                "type": "PATTERN",
-                "value": "[\\s\\S]"
+                "type": "IMMEDIATE_TOKEN",
+                "content": {
+                  "type": "PATTERN",
+                  "value": "[\\s\\S]"
+                }
               }
             ]
           }
         },
         {
-          "type": "STRING",
-          "value": "*)"
+          "type": "IMMEDIATE_TOKEN",
+          "content": {
+            "type": "STRING",
+            "value": "*)"
+          }
         }
       ]
     }
