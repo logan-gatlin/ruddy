@@ -361,6 +361,49 @@ pub struct Solve<'a> {
     pub generated_end: usize,
 }
 
+/// What [`Solve::enter`] set aside, for [`Solve::leave`] to put back.
+struct Entered {
+    constraint: Option<super::ConstraintId>,
+    reason: Option<ReasonId>,
+    lacks_origin: Option<super::RowFactOrigin>,
+}
+
+/// Work a run could not finish when it reached it, because the type it reads
+/// was still a variable: done at the end of the run, once everything after it
+/// has had its say. See [`Solve::finish_waiting`].
+enum Waiting<'c> {
+    /// An arm opening a hidden type: its openings from `next` on are still
+    /// to do, and its constraints after them.
+    Arm {
+        level: u32,
+        opens: &'c [Constraint],
+        constraints: &'c [Constraint],
+        next: usize,
+    },
+    /// A term checked against a hidden type, whose own constraints are
+    /// solved: whether it is packaged or passes through is what its type,
+    /// once known, decides. `constraint` is the introduction, for what
+    /// finishing it records.
+    Fit {
+        constraint: &'c Constraint,
+        fit: Fit,
+    },
+}
+
+/// The end of an introduction, after the term's own constraints: fitting
+/// `actual`, the term's type, to `opened`, the package's body at the witness,
+/// or passing it through when it is already the package; then the witness.
+struct Fit {
+    package: Arc<Ty>,
+    name: Arc<str>,
+    witness: Arc<Ty>,
+    actual: Arc<Ty>,
+    opened: Arc<Ty>,
+    /// The term's level, which the fit is unified at, and the level outside.
+    level: u32,
+    outer: u32,
+}
+
 impl Solve<'_> {
     /// Solve everything generation asked for, in the order it was asked.
     /// Every constraint is an equality, and rows are why that is enough: a
@@ -368,43 +411,72 @@ impl Solve<'_> {
     /// nothing has to wait for a later round to know what its base is.
     pub fn run(&mut self, constraints: &[Constraint]) {
         self.table.enter_solver_scope();
+        let mut waiting = Vec::new();
         for constraint in constraints {
-            // Resolution performed while publishing/generalizing the previous
-            // constraint is not an input to this one.
-            self.table.begin_solver_act();
-            let previous = self.constraint.replace(constraint.id);
-            let previous_reason = self.constraint_reason.replace(constraint.reason);
-            let span = constraint.at;
-            let source = matches!(
-                constraint.origin,
-                super::ConstraintOrigin::ApplicationArgument
-                    | super::ConstraintOrigin::ContextualCheck
-                    | super::ConstraintOrigin::MatchScrutinee
-                    | super::ConstraintOrigin::HandlerArm
-                    | super::ConstraintOrigin::HandlerReturn
-                    | super::ConstraintOrigin::HandlerFallback
-            )
-            .then(|| {
-                constraint
-                    .subjects
-                    .secondary
-                    .zip(constraint.subjects.secondary_span)
-            })
-            .flatten()
-            .unwrap_or((
-                constraint.subjects.primary,
-                constraint.subjects.primary_span.unwrap_or(span),
-            ));
-            let previous_lacks_origin =
-                self.table
-                    .active_lacks_origin
-                    .replace(super::RowFactOrigin {
-                        constraint: constraint.id,
-                        reason: constraint.reason,
-                        origin: constraint.origin,
-                        subject: source.0,
-                        at: source.1,
-                    });
+            let entered = self.enter(constraint);
+            self.solve(constraint, &mut waiting);
+            self.leave(entered);
+        }
+        self.finish_waiting(waiting);
+        self.table.leave_solver_scope();
+    }
+
+    /// Take up one constraint: what the steps and errors solving it record
+    /// are attributed to it until [`Solve::leave`].
+    fn enter(&mut self, constraint: &Constraint) -> Entered {
+        // Resolution performed while publishing/generalizing the previous
+        // constraint is not an input to this one.
+        self.table.begin_solver_act();
+        let span = constraint.at;
+        let source = matches!(
+            constraint.origin,
+            super::ConstraintOrigin::ApplicationArgument
+                | super::ConstraintOrigin::ContextualCheck
+                | super::ConstraintOrigin::MatchScrutinee
+                | super::ConstraintOrigin::HandlerArm
+                | super::ConstraintOrigin::HandlerReturn
+                | super::ConstraintOrigin::HandlerFallback
+        )
+        .then(|| {
+            constraint
+                .subjects
+                .secondary
+                .zip(constraint.subjects.secondary_span)
+        })
+        .flatten()
+        .unwrap_or((
+            constraint.subjects.primary,
+            constraint.subjects.primary_span.unwrap_or(span),
+        ));
+        Entered {
+            constraint: self.constraint.replace(constraint.id),
+            reason: self.constraint_reason.replace(constraint.reason),
+            lacks_origin: self
+                .table
+                .active_lacks_origin
+                .replace(super::RowFactOrigin {
+                    constraint: constraint.id,
+                    reason: constraint.reason,
+                    origin: constraint.origin,
+                    subject: source.0,
+                    at: source.1,
+                }),
+        }
+    }
+
+    fn leave(&mut self, entered: Entered) {
+        self.constraint = entered.constraint;
+        self.constraint_reason = entered.reason;
+        self.table.active_lacks_origin = entered.lacks_origin;
+        self.table.end_solver_act();
+    }
+
+    /// Solve one constraint. An arm that opens a hidden type whose type is
+    /// not known yet is not solved but put on `waiting`, for the end of the
+    /// run it was asked in.
+    fn solve<'c>(&mut self, constraint: &'c Constraint, waiting: &mut Vec<Waiting<'c>>) {
+        let span = constraint.at;
+        {
             match &constraint.kind {
                 ConstraintKind::Isolate {
                     input,
@@ -465,11 +537,20 @@ impl Solve<'_> {
                     declared,
                     opened,
                 } => self.open_hidden(span, hidden, *binder, name, *declared, opened),
-                ConstraintKind::Scoped { level, constraints } => {
-                    let outer = self.table.level;
-                    self.table.level = *level;
-                    self.run(constraints);
-                    self.table.level = outer;
+                ConstraintKind::Scoped {
+                    level,
+                    opens,
+                    constraints,
+                } => {
+                    let mut arm = Waiting::Arm {
+                        level: *level,
+                        opens,
+                        constraints,
+                        next: 0,
+                    };
+                    if !self.attempt(&mut arm) {
+                        waiting.push(arm);
+                    }
                 }
                 ConstraintKind::Introduce {
                     package,
@@ -478,15 +559,32 @@ impl Solve<'_> {
                     level,
                     fit,
                     constraints,
-                } => self.introduce(
-                    span,
-                    package,
-                    name,
-                    witness,
-                    *level,
-                    fit.as_ref(),
-                    constraints,
-                ),
+                } => {
+                    let outer = self.table.level;
+                    self.table.level = *level;
+                    self.run(constraints);
+                    self.table.level = outer;
+                    match fit {
+                        Some((actual, opened)) => {
+                            let mut fit = Waiting::Fit {
+                                constraint,
+                                fit: Fit {
+                                    package: package.clone(),
+                                    name: name.clone(),
+                                    witness: witness.clone(),
+                                    actual: actual.clone(),
+                                    opened: opened.clone(),
+                                    level: *level,
+                                    outer,
+                                },
+                            };
+                            if !self.attempt(&mut fit) {
+                                waiting.push(fit);
+                            }
+                        }
+                        None => self.witness(span, package, name, witness, outer),
+                    }
+                }
                 ConstraintKind::Let {
                     symbol,
                     bound,
@@ -665,12 +763,106 @@ impl Solve<'_> {
                     }
                 }
             }
-            self.constraint = previous;
-            self.constraint_reason = previous_reason;
-            self.table.active_lacks_origin = previous_lacks_origin;
-            self.table.end_solver_act();
         }
-        self.table.leave_solver_scope();
+    }
+
+    /// Whether a type is one nothing has decided yet.
+    fn unknown(&mut self, ty: &Arc<Ty>) -> bool {
+        let resolved = self.table.resolve(ty);
+        matches!(&*self.table.unfolded(self.aliases, &resolved), Ty::Var(_))
+    }
+
+    /// Do what is waiting, as far as it can be done: true once it is done,
+    /// false where it reads a type that is still a variable, which leaves it
+    /// waiting. An arm opens what its `hide` patterns open, from the first not
+    /// yet opened, and runs its constraints after the last; an introduction
+    /// fits its term once the term's type is known.
+    fn attempt(&mut self, waiting: &mut Waiting<'_>) -> bool {
+        match waiting {
+            Waiting::Arm {
+                level,
+                opens,
+                constraints,
+                next,
+            } => {
+                while let Some(open) = opens.get(*next) {
+                    let ConstraintKind::Open { hidden, .. } = &open.kind else {
+                        unreachable!("an arm's openings are open constraints")
+                    };
+                    if self.unknown(hidden) {
+                        return false;
+                    }
+                    let entered = self.enter(open);
+                    self.solve(open, &mut Vec::new());
+                    self.leave(entered);
+                    *next += 1;
+                }
+                self.scoped(*level, constraints);
+                true
+            }
+            Waiting::Fit { constraint, fit } => {
+                if self.unknown(&fit.actual) {
+                    return false;
+                }
+                let entered = self.enter(constraint);
+                self.fit(constraint.at, fit, false);
+                self.leave(entered);
+                true
+            }
+        }
+    }
+
+    /// An arm's constraints, at the arm's level.
+    fn scoped(&mut self, level: u32, constraints: &[Constraint]) {
+        let outer = self.table.level;
+        self.table.level = level;
+        self.run(constraints);
+        self.table.level = outer;
+    }
+
+    /// What a run left waiting, now that everything else in it has been
+    /// solved: each is tried again while any makes progress. What is still
+    /// waiting at the end is finished on what is known: an arm opens its
+    /// type anyway, which says at its `hide` that nothing decided it; a term
+    /// whose type nothing decided passes through as a value of the package.
+    fn finish_waiting(&mut self, mut waiting: Vec<Waiting<'_>>) {
+        while !waiting.is_empty() {
+            let mut still = Vec::new();
+            let mut progressed = false;
+            for mut item in waiting {
+                if self.attempt(&mut item) {
+                    progressed = true;
+                } else {
+                    still.push(item);
+                }
+            }
+            if !progressed {
+                for item in still {
+                    match item {
+                        Waiting::Arm {
+                            level,
+                            opens,
+                            constraints,
+                            next,
+                        } => {
+                            for open in &opens[next..] {
+                                let entered = self.enter(open);
+                                self.solve(open, &mut Vec::new());
+                                self.leave(entered);
+                            }
+                            self.scoped(level, constraints);
+                        }
+                        Waiting::Fit { constraint, fit } => {
+                            let entered = self.enter(constraint);
+                            self.fit(constraint.at, &fit, true);
+                            self.leave(entered);
+                        }
+                    }
+                }
+                return;
+            }
+            waiting = still;
+        }
     }
 
     /// Solve a field projection after exposing only the base's outer constructor.
@@ -2708,42 +2900,47 @@ impl Solve<'_> {
         }
     }
 
-    /// A term packaging under a hidden type: its own constraints are solved
-    /// one level in, a term that could not be pushed into is fitted to the
-    /// opened body — or passed through, when it already is a value of the
-    /// package — and the witness is then read. A witness still mentioning a
-    /// variable minted inside the term is one nothing chose: the term and its
-    /// context together said nothing about the hidden type, and the compiler
-    /// invents none.
-    #[allow(clippy::too_many_arguments)]
-    fn introduce(
+    /// The end of a term's introduction under a hidden type, its own
+    /// constraints solved: a term that could not be pushed into is fitted to
+    /// the opened body — or passed through, when it already is a value of the
+    /// package, or when nothing has decided its type and the run is over,
+    /// since then the package is the one type it is known to have — and the
+    /// witness is then read.
+    fn fit(&mut self, span: Anchor, fit: &Fit, undecided: bool) {
+        let resolved = self.table.resolve(&fit.actual);
+        let shape = self.table.unfolded(self.aliases, &resolved);
+        match &*shape {
+            // Already a value of a hidden type: it passes through as it
+            // is, and no witness is chosen here — it has one of its own.
+            Ty::Hidden { .. } => {
+                self.unify(span, &fit.package, &fit.actual);
+                return;
+            }
+            Ty::Var(_) if undecided => {
+                self.unify(span, &fit.package, &fit.actual);
+                return;
+            }
+            _ => {
+                self.table.level = fit.level;
+                self.unify(span, &fit.opened, &fit.actual);
+                self.table.level = fit.outer;
+            }
+        }
+        self.witness(span, &fit.package, &fit.name, &fit.witness, fit.outer);
+    }
+
+    /// The witness a term was packaged under, read once the term is fitted.
+    /// A witness still mentioning a variable minted inside the term is one
+    /// nothing chose: the term and its context together said nothing about
+    /// the hidden type, and the compiler invents none.
+    fn witness(
         &mut self,
         span: Anchor,
         package: &Arc<Ty>,
         name: &Arc<str>,
         witness: &Arc<Ty>,
-        level: u32,
-        fit: Option<&(Arc<Ty>, Arc<Ty>)>,
-        constraints: &[Constraint],
+        outer: u32,
     ) {
-        let outer = self.table.level;
-        self.table.level = level;
-        self.run(constraints);
-        if let Some((actual, opened)) = fit {
-            let resolved = self.table.resolve(actual);
-            let shape = self.table.unfolded(self.aliases, &resolved);
-            match &*shape {
-                // Already a value of a hidden type: it passes through as it
-                // is, and no witness is chosen here — it has one of its own.
-                Ty::Hidden { .. } => {
-                    self.table.level = outer;
-                    self.unify(span, package, actual);
-                    return;
-                }
-                _ => self.unify(span, opened, actual),
-            }
-        }
-        self.table.level = outer;
         let resolved = self.table.resolve(witness);
         let goal = Goal::Type {
             expected: package.clone(),

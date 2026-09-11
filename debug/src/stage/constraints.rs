@@ -84,8 +84,12 @@ fn rows(ids: &mut Ids, cx: &Cx, constraints: &[Constraint]) -> Vec<Node> {
                 ConstraintKind::Let { value, body, .. } => node
                     .children(rows(ids, cx, value))
                     .children(rows(ids, cx, body)),
-                ConstraintKind::Scoped { constraints, .. }
-                | ConstraintKind::Introduce { constraints, .. } => {
+                ConstraintKind::Scoped {
+                    opens, constraints, ..
+                } => node
+                    .children(rows(ids, cx, opens))
+                    .children(rows(ids, cx, constraints)),
+                ConstraintKind::Introduce { constraints, .. } => {
                     node.children(rows(ids, cx, constraints))
                 }
                 ConstraintKind::Match { arms, .. } => node.children(
@@ -137,8 +141,10 @@ fn counted(constraints: &[Constraint]) -> usize {
         .iter()
         .map(|constraint| match &constraint.kind {
             ConstraintKind::Let { value, body, .. } => 1 + counted(value) + counted(body),
-            ConstraintKind::Scoped { constraints, .. }
-            | ConstraintKind::Introduce { constraints, .. } => 1 + counted(constraints),
+            ConstraintKind::Scoped {
+                opens, constraints, ..
+            } => 1 + counted(opens) + counted(constraints),
+            ConstraintKind::Introduce { constraints, .. } => 1 + counted(constraints),
             ConstraintKind::Match { arms, .. } => {
                 1 + arms
                     .iter()

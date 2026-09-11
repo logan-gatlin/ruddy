@@ -103,8 +103,10 @@ pub(super) struct Expected<'a> {
     pub span: Option<Anchor>,
 }
 
-/// One `hide` pattern's opening, waiting to become [`ConstraintKind::Open`].
+/// One `hide` pattern's opening, waiting to become [`ConstraintKind::Open`]
+/// in the scope of the arm it belongs to.
 pub struct Open {
+    arm: usize,
     hidden: Arc<Ty>,
     binder: u32,
     name: Arc<str>,
@@ -1311,16 +1313,23 @@ impl Constrain<'_> {
         for (arm, id, name, declared, payload) in hidden {
             self.table.rigids.insert(id, declared);
             self.table.scoped_rigids.insert(id, self.table.level);
+            // Before the openings the payload holds: an inner one reads a
+            // type this one's opening makes known.
+            let at = self.opens.len();
             self.opening += 1;
             let (opened, _) = self.position(columns, path, &[(arm, Col::Pattern(payload))]);
             self.opening -= 1;
-            self.opens.push(Open {
-                hidden: ty.clone(),
-                binder: id,
-                name,
-                declared,
-                opened,
-            });
+            self.opens.insert(
+                at,
+                Open {
+                    arm,
+                    hidden: ty.clone(),
+                    binder: id,
+                    name,
+                    declared,
+                    opened,
+                },
+            );
         }
         for (arm, binder) in binds {
             let view = match &listed {
@@ -1551,9 +1560,11 @@ impl Constrain<'_> {
             Subject::MatchScrutinee,
         );
         // Now that the scrutinee's type reaches every position, each
-        // `hide` pattern may open its own.
+        // `hide` pattern may open its own: in the scope of its arm, whose
+        // constraints are solved once the openings are.
+        let mut arm_opens: Vec<Vec<Constraint>> = arms.iter().map(|_| Vec::new()).collect();
         for open in std::mem::take(&mut self.opens) {
-            self.emit(
+            let constraint = self.constraint(
                 open.declared,
                 ConstraintOrigin::Pattern,
                 ConstraintSubjects::pair(Subject::MatchScrutinee, Subject::PatternDemand),
@@ -1565,13 +1576,16 @@ impl Constrain<'_> {
                     opened: open.opened,
                 },
             );
+            arm_opens[open.arm].push(constraint);
         }
 
         match qualifying {
             Some((raw, premise_reason)) => {
                 let effective = effective_conditions(&raw);
                 let mut guarded = Vec::with_capacity(arms.len());
-                for (((pattern, body), raw), effective) in arms.iter_mut().zip(raw).zip(effective) {
+                for ((((pattern, body), raw), effective), opens) in
+                    arms.iter_mut().zip(raw).zip(effective).zip(arm_opens)
+                {
                     // The arm is a scope in the generated constraint
                     // tree. Store batches emitted while walking it are
                     // held inert in their source-order slots and travel
@@ -1582,7 +1596,21 @@ impl Constrain<'_> {
                     let enclosing = std::mem::replace(&mut self.presence_guard, combined);
                     self.arm_body(body, known);
                     self.presence_guard = enclosing;
-                    let constraints = std::mem::replace(&mut self.out, outer);
+                    let mut constraints = std::mem::replace(&mut self.out, outer);
+                    // An arm opening a hidden type has its constraints
+                    // solved at the arm's own level, after its openings.
+                    if ir::opens_hidden(pattern) {
+                        constraints = vec![self.constraint(
+                            body.at,
+                            ConstraintOrigin::MatchArm,
+                            ConstraintSubjects::one(Subject::MatchArm),
+                            ConstraintKind::Scoped {
+                                level: self.table.level,
+                                opens,
+                                constraints,
+                            },
+                        )];
+                    }
                     let requirements = self.defer_requirements(required);
                     let mut arm_result = self.constraint(
                         body.at,
@@ -1619,7 +1647,7 @@ impl Constrain<'_> {
             // A mixed tag/literal column keeps the old flat equality
             // constraints exactly.
             None => {
-                for (pattern, body) in arms.iter_mut() {
+                for ((pattern, body), opens) in arms.iter_mut().zip(arm_opens) {
                     // An arm opening a hidden type has its
                     // constraints solved at the arm's own level, so
                     // what the solver mints for the body is as deep
@@ -1648,6 +1676,7 @@ impl Constrain<'_> {
                             ConstraintSubjects::one(Subject::MatchArm),
                             ConstraintKind::Scoped {
                                 level: self.table.level,
+                                opens,
                                 constraints,
                             },
                         );

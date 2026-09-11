@@ -183,15 +183,25 @@ const $mirror = ($descriptor, $value) => {
   return $descriptor;
 };
 const $typeOf = $mirror;
+// A Ruddy function implemented here: it is handed the value as it is and
+// hands back what it makes, with nothing converted in either direction.
+const $nativeType = { nodes: [{ Arrow: [1, 1] }, "ForeignValue"] };
+const $native = $function => {
+  const $value = $argument => $invoke($value, "Sync", [$argument]);
+  $value[$closureMark] = true;
+  $value.nativeType = { descriptor: $nativeType, from: 1, to: 1, function: $function, slots: [] };
+  return $value;
+};
 // A function of one value handed back unchanged: what an established equality
 // of two mirrors supplies in each direction. It converts nothing, so it keeps
 // the value's identity as well as its type.
-const $passThroughType = { nodes: [{ Arrow: [1, 1] }, "ForeignValue"] };
-const $passThrough = () => {
-  const $value = $argument => $invoke($value, "Sync", [$argument]);
-  $value[$closureMark] = true;
-  $value.nativeType = { descriptor: $passThroughType, from: 1, to: 1, function: $x => $x, slots: [] };
-  return $value;
+const $passThrough = () => $native($x => $x);
+// A mirror of one node of a mirror's graph: the field, element, or payload
+// type, authentic because the whole was.
+const $mirrorAt = ($of, $index) => {
+  const $part = $typeAt($of, $index);
+  $mirrors.add($part);
+  return $part;
 };
 const $sameMirror = ($descriptor, $pair) => $sameType($pair["0"], $pair["1"])
   ? $sum("Some", $record([["forward", $passThrough()], ["backward", $passThrough()]]))
@@ -217,6 +227,63 @@ const $describe = ($descriptor, $mirror) => {
     return $sum("Variable", $n.HiddenBound);
   };
   return $record([["root", 0], ["nodes", $array($mirror.nodes.map($node))]]);
+};
+// A mirror's outermost structure as `std::reflect::Shape`: typed views whose
+// operations read and make values of the mirrored type. The mirror proves
+// the type, so the operations convert nothing; they only take values apart
+// and put them together.
+const $shape = ($descriptor, $of) => {
+  const $node = $of.nodes[$typeIndex($of, 0)];
+  const $typed = $name => $sum($name, $record([["read", $passThrough()], ["make", $passThrough()]]));
+  if (typeof $node === "string") {
+    return $node === "Any" ? $sum("Any", undefined) : $node === "ForeignValue" ? $sum("Foreign", undefined) : $typed($node);
+  }
+  if ("Fixed" in $node) return $typed($node.Fixed);
+  if ("Array" in $node) {
+    return $sum("Array", $record([["element", $mirrorAt($of, $node.Array)], ["read", $passThrough()], ["make", $passThrough()]]));
+  }
+  if ("Struct" in $node) {
+    const $fields = $node.Struct.map(([$name, $index]) => {
+      const $field = $mirrorAt($of, $index);
+      return $record([
+        ["name", $name], ["mirror", $field], ["presence", $sum("Required", undefined)],
+        ["read", $native($value => $sum("Some", $value[$name]))],
+        ["bind", $native($value => $record([["record", $of], ["name", $name], ["mirror", $field], ["value", $value]]))],
+      ]);
+    });
+    // A binding is accepted on what it proves, not where it came from: an
+    // equivalent mirror of this record and of the field it names.
+    const $build = $native($bindings => {
+      const $bound = new Map();
+      for (const $binding of $arrayValues($bindings)) {
+        const $name = $binding.name, $field = $node.Struct.find(([$known]) => $known === $name);
+        const $reject = $reason => $sum("Error", $sum($reason, $name));
+        if (!$sameType($binding.record, $of)) return $reject("Foreign");
+        if (!$field) return $reject("Unknown");
+        if (!$sameType($binding.mirror, $typeAt($of, $field[1]))) return $reject("Mismatched");
+        if ($bound.has($name)) return $reject("Duplicate");
+        $bound.set($name, $binding.value);
+      }
+      const $missing = $node.Struct.find(([$name]) => !$bound.has($name));
+      if ($missing) return $sum("Error", $sum("Missing", $missing[0]));
+      return $sum("Some", $record($node.Struct.map(([$name]) => [$name, $bound.get($name)])));
+    });
+    return $sum("Record", $record([["mirror", $of], ["fields", $array($fields)], ["build", $build]]));
+  }
+  if ("Sum" in $node) {
+    const $cases = $node.Sum.map(([$name, $index]) => $record([
+      ["name", $name], ["mirror", $mirrorAt($of, $index)],
+      ["project", $native($value => $value[$tag] === $name
+        ? $sum("Some", $value[$payload] === undefined ? $record([]) : $value[$payload])
+        : $sum("None", undefined))],
+      ["inject", $sum("Some", $native($value => $sum($name, $value)))],
+    ]));
+    return $sum("Sum", $record([["mirror", $of], ["cases", $array($cases)]]));
+  }
+  if ("Arrow" in $node) return $sum("Function", $describe($of, $of));
+  if ("Hidden" in $node) return $sum("Hidden", $describe($of, $of));
+  if ("Mirror" in $node) return $sum("Mirror", $describe($of, $of));
+  throw new TypeError("unknown runtime type node");
 };
 const $anyUpcast = ($descriptor, $value) => {
   if (!$descriptor) throw new TypeError("missing runtime type information for Any");

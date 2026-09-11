@@ -216,3 +216,27 @@ end
 
 Inside the arm, a mirror the pattern bound is evidence for the opened type, so
 `std::reflect::type_of value` and generic foreign calls on `value` work there.
+
+`reflect::shape : Mirror 'a -> Shape 'a` gives a mirror's outermost structure
+as typed views. Primitive cases carry `read : 'a -> Nat` and `make : Nat -> 'a`
+and their like, so a generic library converts without a cast; `#Array`,
+`#Record`, and `#Sum` carry views whose parts each hide their own type:
+
+```ruddy
+type SomeField 'record = hide 'field => {
+  name: String,
+  mirror: Mirror 'field,
+  presence: Presence,
+  read: 'record -> Option 'field,
+  bind: 'field -> Binding 'record,
+}
+```
+
+Opening a field with `hide 'f { mirror, read, bind, .. }` gives one scoped type
+shared by the mirror, what `read` observes, and what `bind` accepts, so a
+generic printer, validator, or decoder can work on a field's value and hand a
+new one back without knowing the field's type. A record view's `build` takes
+such bindings and rejects a missing, duplicate, unknown, or mismatched field,
+or one bound for another record. A sum case's `project` observes its payload
+and `inject` makes the case; functions, hidden types, mirrors, `Any`, and
+foreign values are described only.

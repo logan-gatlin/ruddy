@@ -188,6 +188,7 @@ impl Analysis {
                     | "$typeOf"
                     | "$describe"
                     | "$sameMirror"
+                    | "$shape"
             ) && Intrinsic::recognize(&declaration.value.target.anchored, &binding.ty, aliases)
                 .is_none()
             {
@@ -538,7 +539,17 @@ pub enum Intrinsic {
     /// `(Mirror 'a, Mirror 'b) -> Option { forward, backward }`: exact
     /// structural equality of two mirrors, with identity functions on success.
     Same,
+    /// `Mirror 'a -> Shape 'a`: the mirror's outermost structure as typed
+    /// views, whose operations read and make values of the mirrored type.
+    Shape,
 }
+
+/// The cases of `std::reflect::Shape`, which `$shape` builds at runtime: a
+/// declaration naming the intrinsic must have exactly these.
+pub const SHAPE_CASES: [&str; 21] = [
+    "Nat", "Int", "Real", "String", "Bool", "Nat8", "Nat16", "Nat32", "Nat64", "Int8", "Int16",
+    "Int32", "Int64", "Array", "Record", "Sum", "Function", "Hidden", "Mirror", "Any", "Foreign",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Direction {
@@ -614,6 +625,24 @@ impl Intrinsic {
             "$typeOf" => match (&**from, &**to) {
                 (Ty::Bound(argument), Ty::Mirror(inner)) if matches!(&**inner, Ty::Bound(mirrored) if mirrored == argument) => {
                     Some(Self::TypeOf)
+                }
+                _ => None,
+            },
+            "$shape" => match (&**from, &**to) {
+                (Ty::Mirror(inner), Ty::Named { args, .. })
+                    if let Ty::Bound(mirrored) = &**inner
+                        && matches!(&**args, [arg] if matches!(&**arg, Ty::Bound(index) if index == mirrored)) =>
+                {
+                    let result = inference::unfold(aliases, to);
+                    let Ty::Sum(row) = &*result else {
+                        return None;
+                    };
+                    let row = flattened(row);
+                    (row.labels.len() == SHAPE_CASES.len()
+                        && SHAPE_CASES
+                            .iter()
+                            .all(|name| row.labels.contains_key(*name)))
+                    .then_some(Self::Shape)
                 }
                 _ => None,
             },
@@ -702,7 +731,7 @@ impl Intrinsic {
                 Ty::Mirror(inner) => Some(inner.clone()),
                 _ => unreachable!("a reviewed mirror intrinsic returns a mirror"),
             },
-            Self::Describe | Self::Same => None,
+            Self::Describe | Self::Same | Self::Shape => None,
         }
     }
 }

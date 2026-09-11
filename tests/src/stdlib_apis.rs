@@ -370,3 +370,155 @@ assert.equal((await app.decode_mirror({ nodes: ['Nat'] })).tag, 'Error');
 "#,
     );
 }
+
+#[test]
+fn reflect_shapes_print_and_rebuild_values() {
+    let project = project(
+        r##"
+type Role = #Admin | #User Nat
+type Person = { name: String, age: Nat, tags: [String], role: Role }
+type Other = { name: String }
+type Box = hide 'a => { value: 'a }
+let concat = std::str::concat
+@private
+let join: [String] -> String = fn parts => match parts with
+| [] => ""
+| [only] => only
+| [head, ..tail] => concat head (concat ", " (join tail))
+end
+@private
+let print: Mirror 'a -> 'a -> String = fn mirror value => match std::reflect::shape mirror with
+| #Nat { read, make } => std::str::from_nat (read value)
+| #Int { read, make } => std::str::from_int (read value)
+| #Real { read, make } => std::str::from_real (read value)
+| #String { read, make } => concat "\"" (concat (read value) "\"")
+| #Bool { read, make } => std::str::from_boolean (read value)
+| #Array view => match view with
+  | hide 'element { element, read, make } =>
+    concat "[" (concat (join (std::array::map (print element) (read value))) "]")
+  end
+| #Record view => concat "{" (concat (join (std::array::map (fn field => match field with
+    | hide 'field { name, mirror, read, bind, presence } => match read value with
+      | #Some inner => concat name (concat ": " (print mirror inner))
+      | #None => concat name ": absent"
+      end
+    end) view.fields)) "}")
+| #Sum view => match std::array::filter_map (fn case => match case with
+    | hide 'payload { name, mirror, project, inject } => match project value with
+      | #Some payload => #Some (concat "#" (concat name (concat " " (print mirror payload))))
+      | #None => #None
+      end
+    end) view.cases with
+  | [text, ..] => text
+  | [] => "?"
+  end
+| #Function description => "<function>"
+| #Hidden description => "<hidden>"
+| #Mirror description => "<mirror>"
+| #Any => "<any>"
+| #Foreign => "<foreign>"
+| _ => "<fixed>"
+end
+let person_mirror: Mirror Person = std::reflect::mirror ()
+let role_mirror: Mirror Role = std::reflect::mirror ()
+@private
+let ada = { name: "Ada", age: 36n, tags: ["x", "y"], role: #User 3n }
+let printed = print person_mirror ada
+let printed_unit = print (std::reflect::type_of ()) ()
+@private
+let identity: Nat -> Nat = fn x => x
+let printed_function = print (std::reflect::type_of identity) identity
+let boxed: Box = { value: 1n }
+let printed_hidden = print (std::reflect::type_of boxed) boxed
+let printed_mirror = print (std::reflect::type_of person_mirror) person_mirror
+let any = std::any::upcast 1n
+let printed_any = print (std::reflect::type_of any) any
+@private
+extern host: ForeignValue = "1"
+let printed_foreign = print (std::reflect::type_of host) host
+@private
+let bindings_of: Mirror 'a -> 'a -> [std::reflect::Binding 'a] = fn mirror value =>
+  match std::reflect::shape mirror with
+  | #Record view => std::array::filter_map (fn field => match field with
+      | hide 'field { read, bind, .. } => match read value with
+        | #Some inner => #Some (bind inner)
+        | #None => #None
+        end
+      end) view.fields
+  | _ => []
+  end
+@private
+let build_with: Mirror 'a -> [std::reflect::Binding 'a] -> String = fn mirror bindings =>
+  match std::reflect::shape mirror with
+  | #Record view => match view.build bindings with
+    | #Some rebuilt => concat "built " (print mirror rebuilt)
+    | #Error (#Missing name) => concat "missing " name
+    | #Error (#Duplicate name) => concat "duplicate " name
+    | #Error (#Unknown name) => concat "unknown " name
+    | #Error (#Foreign name) => concat "foreign " name
+    | #Error (#Mismatched name) => concat "mismatched " name
+    end
+  | _ => "not a record"
+  end
+let all = bindings_of person_mirror ada
+let rebuilt = build_with person_mirror all
+let missing = build_with person_mirror (match all with | [_, ..rest] => rest | [] => [] end)
+let duplicated = build_with person_mirror (std::array::concat all all)
+let other_mirror: Mirror Other = std::reflect::mirror ()
+let string_mirror: Mirror String = std::reflect::mirror ()
+extern reown: fn(std::reflect::Binding Person, Mirror Other) -> std::reflect::Binding Person = "(binding, record) => ({ ...binding, record })"
+extern retype: fn(std::reflect::Binding Person, Mirror String) -> std::reflect::Binding Person = "(binding, mirror) => ({ ...binding, mirror })"
+extern rename: fn(std::reflect::Binding Person, String) -> std::reflect::Binding Person = "(binding, name) => ({ ...binding, name })"
+let first = match all with | [head, ..] => [head] | [] => [] end
+let foreign = build_with person_mirror (std::array::map (fn binding => reown binding other_mirror) first)
+let mismatched = build_with person_mirror (std::array::map (fn binding => retype binding string_mirror) first)
+let unknown = build_with person_mirror (std::array::map (fn binding => rename binding "nope") first)
+@private
+let make_admin: Mirror Role -> Option Role = fn mirror => match std::reflect::shape mirror with
+| #Sum view => match std::array::filter_map (fn case => match case with
+    | hide 'payload { name, mirror, inject, .. } =>
+      match (name, inject, std::reflect::same (std::reflect::type_of ()) mirror) with
+      | ("Admin", #Some make, #Some { forward, .. }) => #Some (make (forward ()))
+      | _ => #None
+      end
+    end) view.cases with
+  | [role, ..] => #Some role
+  | [] => #None
+  end
+| _ => #None
+end
+let admin = match make_admin role_mirror with | #Some role => print role_mirror role | #None => "none" end
+@private
+let reversed: Mirror 'a -> 'a -> 'a = fn mirror value => match std::reflect::shape mirror with
+| #Array view => match view with
+  | hide 'element { read, make, .. } => make (std::array::reverse (read value))
+  end
+| _ => value
+end
+let tags_mirror: Mirror [String] = std::reflect::mirror ()
+let backwards = reversed tags_mirror ada.tags
+"##,
+        "node",
+        "library",
+    );
+    run(
+        project.path(),
+        r#"
+assert.equal(app.printed, '{age: 36, name: "Ada", role: #User 3, tags: ["x", "y"]}');
+assert.equal(app.printed_unit, '{}');
+assert.equal(app.printed_function, '<function>');
+assert.equal(app.printed_hidden, '<hidden>');
+assert.equal(app.printed_mirror, '<mirror>');
+assert.equal(app.printed_any, '<any>');
+assert.equal(app.printed_foreign, '<foreign>');
+assert.equal(app.rebuilt, 'built {age: 36, name: "Ada", role: #User 3, tags: ["x", "y"]}');
+assert.equal(app.missing, 'missing age');
+assert.equal(app.duplicated, 'duplicate age');
+assert.equal(app.foreign, 'foreign age');
+assert.equal(app.mismatched, 'mismatched age');
+assert.equal(app.unknown, 'unknown nope');
+assert.equal(app.admin, '#Admin {}');
+assert.deepEqual(app.backwards, ['y', 'x']);
+"#,
+    );
+}

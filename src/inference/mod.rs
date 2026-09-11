@@ -1418,6 +1418,12 @@ pub enum ConstraintKind {
     /// and may be bound to it. See [`Table::scoped_rigids`].
     Scoped {
         level: u32,
+        /// The arm's `hide` patterns' openings, outermost first: each an
+        /// [`ConstraintKind::Open`]. Solved before the constraints, once the
+        /// types they open are known; an arm whose scrutinee's type is still
+        /// a variable waits for the constraints after it — the call the arm
+        /// is an argument of, above all — to settle it.
+        opens: Vec<Constraint>,
         constraints: Vec<Constraint>,
     },
     /// A term checked against the hidden type `package`, packaging under

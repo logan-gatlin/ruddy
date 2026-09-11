@@ -1,6 +1,6 @@
 # 04 Shapes, typed views, bindings, and builders
 
-Status: open
+Status: resolved
 Type: task
 Blocked by: 03
 

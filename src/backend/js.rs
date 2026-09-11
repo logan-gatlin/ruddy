@@ -487,6 +487,7 @@ impl<'a> Generator<'a> {
                     crate::reification::Intrinsic::TypeOf => "$typeOf(",
                     crate::reification::Intrinsic::Describe => "$describe(",
                     crate::reification::Intrinsic::Same => "$sameMirror(",
+                    crate::reification::Intrinsic::Shape => "$shape(",
                 });
                 out.push_str(&v(*descriptor));
                 out.push_str(", ");

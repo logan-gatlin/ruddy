@@ -2979,21 +2979,22 @@ fn hidden_types_round_trip_through_artifact_text() {
 
 #[test]
 fn reflection_artifacts_validate_mirror_intrinsics() {
-    let artifact = built(
+    let artifact = built(&format!(
         r#"
-type Option 'a = #Some 'a | #None
-type Description = { root: Nat, nodes: [Node] }
-type Node = #Nat | #Record [{ name: String, node: Nat }]
+{}
 @private extern mirror: () -> Mirror 'a = "$mirror"
 @private extern type_of: 'a -> Mirror 'a = "$typeOf"
 @private extern describe: Mirror 'a -> Description = "$describe"
-@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option {{ forward: 'a -> 'b, backward: 'b -> 'a }} = "$sameMirror"
+@private extern shape: Mirror 'a -> Shape 'a = "$shape"
 let of_nat: Mirror Nat = mirror ()
 let of_value = type_of "text"
 let described = describe of_nat
 let compared = same_pair (of_nat, of_value)
+let shaped = shape of_nat
 "#,
-    );
+        crate::inference::SHAPE_SOURCE
+    ));
     assert!(artifact::parse(&artifact.print()).validate().is_ok());
     use ruddy::reification::Intrinsic;
     for (kind, corruption) in [
@@ -3004,6 +3005,8 @@ let compared = same_pair (of_nat, of_value)
         (Intrinsic::Same, 0),
         (Intrinsic::Same, 1),
         (Intrinsic::Same, 2),
+        (Intrinsic::Shape, 0),
+        (Intrinsic::Shape, 1),
     ] {
         let mut changed = artifact.clone().to_unchecked();
         let block = changed

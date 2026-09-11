@@ -3110,9 +3110,15 @@ impl fmt::Display for ConstraintKind {
             } => write!(f, "open {hidden} as '{name} -> {opened}"),
             // A header, like a `let`'s: the constraints it scopes are rows of
             // their own.
-            ConstraintKind::Scoped { level, constraints } => write!(
+            ConstraintKind::Scoped {
+                level,
+                opens,
+                constraints,
+            } => write!(
                 f,
-                "scoped at level {level} over {} constraint{}",
+                "scoped at level {level} over {} opening{} and {} constraint{}",
+                opens.len(),
+                if opens.len() == 1 { "" } else { "s" },
                 constraints.len(),
                 if constraints.len() == 1 { "" } else { "s" }
             ),

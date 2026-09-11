@@ -546,6 +546,11 @@ pub(super) fn validate(lir: &Lir) -> Result<(), String> {
                             {
                                 return error("describing requires a mirror and yields a struct");
                             }
+                            crate::reification::Intrinsic::Shape
+                                if available[value] != Rep::TypeDescriptor || i.rep != Rep::Sum =>
+                            {
+                                return error("a shape requires a mirror and yields a sum");
+                            }
                             crate::reification::Intrinsic::Same
                                 if available[value] != Rep::Struct || i.rep != Rep::Sum =>
                             {
