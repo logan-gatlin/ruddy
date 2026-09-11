@@ -11097,3 +11097,132 @@ fn mutation_region_kinds_are_retained_on_operation_instances() {
             .any(|meta| meta.sort == inference::VarSort::Region)
     );
 }
+
+/// A broad disjunction reaches the product budget without making the test
+/// spend minutes minimizing an exponential cover of fully fixed assignments.
+fn sat_choices(name: &str, terms: usize, attribute: &str) -> String {
+    let fields = (0..terms)
+        .map(|i| format!("f{i} when 'p{i}: Nat"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let clause = (0..terms)
+        .map(|i| format!("'p{i}"))
+        .collect::<Vec<_>>()
+        .join(" or ");
+    format!(
+        "extern require : {{ {fields} }} -> {{}} where {clause} = \"host.require\"\n{attribute}\nlet {name} = fn value => require value"
+    )
+}
+
+#[test]
+fn sat_term_limit_defaults_to_256_and_can_be_raised() {
+    inferred(&sat_choices("fits", 256, ""));
+    let source = sat_choices("large", 257, "");
+    let (_, lowered, output) = infer_src(&source);
+    assert!(lowered.errors.is_empty(), "{:?}", lowered.errors);
+    assert_eq!(output.errors().len(), 1, "{:?}", output.errors());
+    assert!(matches!(
+        output.errors()[0].kind,
+        ErrorKind::SatTermLimit { max_terms: 256 }
+    ));
+    assert!(
+        output.errors()[0]
+            .kind
+            .to_string()
+            .contains("@max_sat_terms <nat>")
+    );
+    inferred(&sat_choices("large", 257, "@max_sat_terms 512n"));
+}
+
+#[test]
+fn sat_term_override_is_local_and_applies_to_nested_bindings() {
+    let body = "fn value => match value with | {x} => {} | {y} => {} end";
+    inferred(&format!("@max_sat_terms 2n\nlet fits = {body}"));
+    let (_, _, output) = infer_src(&format!(
+        "@max_sat_terms 1n\nlet small = do let nested = {body} return nested end\nlet normal = {body}"
+    ));
+    assert_eq!(output.errors().len(), 1, "{:?}", output.errors());
+    assert!(matches!(
+        output.errors()[0].kind,
+        ErrorKind::SatTermLimit { max_terms: 1 }
+    ));
+}
+
+#[test]
+fn sat_term_override_requires_a_natural() {
+    for value in ["", "-1", "2", "true", "\"512\"", "{}", "[]", "1.5"] {
+        let (_, lowered, output) = infer_src(&format!("@max_sat_terms {value}\nlet value = ()"));
+        assert!(lowered.errors.is_empty(), "{value}: {:?}", lowered.errors);
+        assert_eq!(output.errors().len(), 1, "{value}: {:?}", output.errors());
+        assert!(matches!(
+            output.errors()[0].kind,
+            ErrorKind::InvalidMaxSatTerms
+        ));
+    }
+}
+
+#[test]
+fn sat_term_limits_are_separate_within_a_recursive_group() {
+    let annotated = "@max_sat_terms 1n\nlet f : { x when 'a: Nat, y when 'b: Nat } -> {} where 'a != 'b = fn v => g v";
+    let matching = "@max_sat_terms 2n\nlet g = fn v => match v with | {x} => {} | {y} => f v end";
+    for source in [
+        format!("{annotated}\n{matching}"),
+        format!("{matching}\n{annotated}"),
+    ] {
+        let (mint, lowered, output) = infer_src(&source);
+        assert!(lowered.errors.is_empty(), "{:?}", lowered.errors);
+        assert_eq!(output.errors().len(), 1, "{:?}", output.errors());
+        let error = &output.errors()[0];
+        assert!(matches!(
+            error.kind,
+            ErrorKind::SatTermLimit { max_terms: 1 }
+        ));
+        let f = lowered
+            .program
+            .terms
+            .iter()
+            .find(|(symbol, _)| mint.name(**symbol) == "f")
+            .unwrap()
+            .1;
+        assert_eq!(error.at, f.name_at);
+    }
+}
+
+#[test]
+fn sat_term_override_reaches_discarded_and_destructured_initializers() {
+    let body = "fn value => match value with | {x} => {} | {y} => {} end";
+    for binding in [
+        format!("let _ = {body}"),
+        format!("let {{f}} = {{f: {body}}}"),
+    ] {
+        let (_, _, output) = infer_src(&format!("@max_sat_terms 1n\n{binding}"));
+        assert!(
+            output
+                .errors()
+                .iter()
+                .any(|error| matches!(error.kind, ErrorKind::SatTermLimit { max_terms: 1 })),
+            "{:?}",
+            output.errors()
+        );
+        inferred(&format!("@max_sat_terms 2n\n{binding}"));
+    }
+}
+
+#[test]
+fn sat_term_override_edits_invalidate_cached_inference() {
+    let source =
+        "@max_sat_terms 1n\nlet choose = fn value => match value with | {x} => {} | {y} => {} end";
+    let parsed = parse::parse(lex(source, FileID::GENERATED).tokens);
+    let mut mint = dummy_mint();
+    let mut lowered = ir::build(&mut mint, parsed.stmts);
+    let mut session = inference::Session::default();
+    let before = session.infer(&mint, &lowered.program, inference::Trace::Off);
+    assert!(matches!(
+        before.errors()[0].kind,
+        ErrorKind::SatTermLimit { max_terms: 1 }
+    ));
+    let declaration = lowered.program.terms.values_mut().next().unwrap();
+    declaration.metadata["max_sat_terms"].value.anchored = ir::DataKind::Natural(2);
+    let after = session.infer(&mint, &lowered.program, inference::Trace::Off);
+    assert!(after.errors().is_empty(), "{:?}", after.errors());
+}

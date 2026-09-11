@@ -205,8 +205,8 @@ pub struct Decl<T> {
     /// its body rather than by the definition.
     pub params: Vec<Param>,
     /// What the attributes in front of the definition said. Empty for the
-    /// ordinary definition with none, and for the hidden definitions a
-    /// pattern makes: those have no name another bundle could read it under.
+    /// ordinary definition with none. Hidden definitions made by a pattern carry
+    /// only inference controls such as `max_sat_terms`.
     pub metadata: Metadata,
     pub value: T,
 }
@@ -13346,7 +13346,7 @@ impl Builder<'_> {
     ///
     /// The statement's metadata goes to every name the pattern binds: it was
     /// written about the definition, and the names are what a reader of the
-    /// artifact can find it under. The hidden definitions carry none.
+    /// artifact can find it under. Hidden definitions carry only inference controls.
     fn destructure_stmt(
         &mut self,
         calm: Calm,
@@ -13355,6 +13355,15 @@ impl Builder<'_> {
         metadata: &Metadata,
         out: &mut IndexMap<Symbol, Decl<Term>>,
     ) {
+        // Resource controls must also reach the definitions that evaluate the
+        // initializer, even when the source binds a pattern or discards it.
+        let hidden_metadata = || {
+            metadata
+                .iter()
+                .filter(|(key, _)| key.as_str() == "max_sat_terms")
+                .map(|(key, attribute)| (key.clone(), attribute.clone()))
+                .collect()
+        };
         match calm {
             Calm::Bind(name) => {
                 out.insert(
@@ -13381,7 +13390,7 @@ impl Builder<'_> {
                         name_at: span,
                         annotation,
                         params: Vec::new(),
-                        metadata: Metadata::new(),
+                        metadata: hidden_metadata(),
                         value,
                     },
                 );
@@ -13395,7 +13404,7 @@ impl Builder<'_> {
                             name_at: span,
                             annotation: Some(annotation),
                             params: Vec::new(),
-                            metadata: Metadata::new(),
+                            metadata: hidden_metadata(),
                             value,
                         },
                     );
@@ -13414,7 +13423,7 @@ impl Builder<'_> {
                             name_at: span,
                             annotation: Some(unit),
                             params: Vec::new(),
-                            metadata: Metadata::new(),
+                            metadata: hidden_metadata(),
                             value,
                         },
                     );
@@ -13429,7 +13438,7 @@ impl Builder<'_> {
                             name_at: span,
                             annotation: Some(annotation),
                             params: Vec::new(),
-                            metadata: Metadata::new(),
+                            metadata: hidden_metadata(),
                             value,
                         },
                     );
@@ -13444,10 +13453,10 @@ impl Builder<'_> {
                 }
                 None => {
                     // A named rest is a name the reader wrote, and carries the
-                    // metadata; the nameless one is hidden and carries none.
+                    // metadata; the nameless one carries only inference controls.
                     let carried = match &name {
                         Some(_) => metadata.clone(),
-                        None => Metadata::new(),
+                        None => hidden_metadata(),
                     };
                     let name = name.unwrap_or_else(|| self.fresh("%array", span));
                     out.insert(
@@ -13479,7 +13488,7 @@ impl Builder<'_> {
                             name_at: span,
                             annotation: Some(annotation),
                             params: Vec::new(),
-                            metadata: Metadata::new(),
+                            metadata: hidden_metadata(),
                             value,
                         },
                     );
@@ -13503,7 +13512,7 @@ impl Builder<'_> {
                             name_at: span,
                             annotation,
                             params: Vec::new(),
-                            metadata: Metadata::new(),
+                            metadata: hidden_metadata(),
                             value,
                         },
                     );

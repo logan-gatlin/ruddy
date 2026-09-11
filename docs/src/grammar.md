@@ -325,6 +325,27 @@ For example, an attribute can record a version on a value:
 let retry_limit = 3n
 ```
 
+Row formula projection collects at most 256 product terms by default. Exceeding
+that limit is a compilation error. Set `@max_sat_terms <nat>` on a value
+definition to use a different maximum for each projection while checking that
+definition, including its nested bindings and annotations:
+
+```ruddy
+@max_sat_terms 1024n
+let choose = fn value => match value with
+  | {left} => left
+  | {right} => right
+end
+```
+
+The value must be a natural literal (with the `n` suffix) that fits the
+compiler's address size. The maximum is inclusive, can be raised or lowered,
+and does not change the budget of other definitions or called functions.
+A zero maximum permits no product terms, including the empty product for
+`always`. Terms are counted during projection, before minimization; this is
+independent of the size of the printed `where` clause. A larger maximum may
+require more compilation time and memory.
+
 A [foreign value](dictionary.md#foreign-value) uses `extern name: Type = "target expression"` and requires an explicit type.
 Within an `extern` type, `fn(A, B) -> R` describes a foreign function that receives two arguments in one call.
 Ruddy code still calls it as `function a b`.

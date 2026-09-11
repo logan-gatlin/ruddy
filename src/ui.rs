@@ -3736,6 +3736,15 @@ impl inference::Error {
                         ));
                 }
             }
+            E::SatTermLimit { .. } => {
+                diagnostic = diagnostic
+                    .label("this definition exceeds its product-term limit")
+                    .help("add or increase `@max_sat_terms <nat>` before this definition, for example `@max_sat_terms 1024n`");
+            }
+            E::InvalidMaxSatTerms => {
+                diagnostic = diagnostic.label("expected a natural number")
+                    .help("write `@max_sat_terms 1024n` before the definition; the value must fit the compiler's address size");
+            }
             E::PresenceRequired { .. } => {
                 diagnostic = diagnostic
                     .label("this value does not meet the required combination")
@@ -3858,6 +3867,8 @@ impl inference::ErrorKind {
             inference::ErrorKind::RigidField { .. } => "rigid-field",
             inference::ErrorKind::RigidEscapes { .. } => "rigid-escapes",
             inference::ErrorKind::RepeatedField { .. } => "repeated-field",
+            inference::ErrorKind::SatTermLimit { .. } => "sat-term-limit",
+            inference::ErrorKind::InvalidMaxSatTerms => "invalid-max-sat-terms",
             inference::ErrorKind::PresenceRequired { .. } => "presence-required",
             inference::ErrorKind::PresenceImpossible { .. } => "presence-impossible",
             inference::ErrorKind::ClauseImpossible { .. } => "clause-impossible",
@@ -4000,6 +4011,14 @@ impl fmt::Display for inference::ErrorKind {
             // variables the compiler gave them: what has to change is the value
             // on this line, and the labels of this shape are the whole of what
             // they can change about it.
+            inference::ErrorKind::SatTermLimit { max_terms } => write!(
+                f,
+                "checking this definition needs more than {max_terms} product term{}; override the limit with `@max_sat_terms <nat>` on this definition",
+                if *max_terms == 1 { "" } else { "s" }
+            ),
+            inference::ErrorKind::InvalidMaxSatTerms => f.write_str(
+                "`@max_sat_terms` requires a natural number that fits the compiler's address size",
+            ),
             inference::ErrorKind::PresenceRequired { formula, shape } => match shape {
                 Some(shape) => write!(
                     f,

@@ -38,16 +38,16 @@ use crate::{
     types::{Atom, Formula},
 };
 
-/// The most products [`project`] will collect before giving up on a formula.
-///
-/// A bound on the *answer* rather than on the question, which is the whole
-/// difference between this and counting atoms. Projection is genuinely hard —
-/// the parity of ten presences has five hundred prime implicants and no shorter
-/// spelling — so something has to stop, and what stops here is a `where` clause
-/// nobody could read. A formula naming any number of atoms whose answer is
-/// small is answered exactly; one whose answer is this large had outrun the
-/// page before it outran the budget.
-const CUBES: usize = 256;
+/// Default maximum number of product terms collected by projection.
+/// Definitions may override this with `@max_sat_terms <nat>`. Exhaustion is
+/// an error, even when the input itself has a compact non-product spelling.
+pub const DEFAULT_MAX_TERMS: usize = 256;
+
+/// Projection could not finish within its product-term budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TermLimitExceeded {
+    pub max_terms: usize,
+}
 
 /// The most rows the exact minimizer will expand a cover into.
 ///
@@ -189,14 +189,11 @@ fn unowned(mut formula: &Formula) -> &Formula {
 /// recognized first because those are what a reader wrote and what R12 asks to
 /// see. Deterministic throughout: the atom order fixes the literal order inside
 /// a product, and the products are sorted by it.
-pub fn project(formula: &Formula, keep: &[Atom]) -> Formula {
-    project_exact(formula, keep).unwrap_or(Formula::True)
-}
-
-/// Exact projection for decisions that may change a type. Exceeding the cube
-/// budget while eliminating atoms returns `None`, never an approximation that
-/// could be mistaken for a proof that a caller assignment remains admitted.
-pub fn project_exact(formula: &Formula, keep: &[Atom]) -> Option<Formula> {
+pub fn project(
+    formula: &Formula,
+    keep: &[Atom],
+    max_terms: usize,
+) -> Result<Formula, TermLimitExceeded> {
     let mut named = Vec::new();
     formula.atoms(&mut named);
     let mut kept: Vec<Atom> = Vec::new();
@@ -205,20 +202,12 @@ pub fn project_exact(formula: &Formula, keep: &[Atom]) -> Option<Formula> {
             kept.push(atom);
         }
     }
-    let Some(cover) = eliminate(formula, &kept) else {
-        // If no atom is eliminated, the original formula is already exact.
-        // Otherwise only the approximating `project` wrapper may fall back
-        // to `true`; callers needing proof must see that projection failed.
-        return match named.len() == kept.len() {
-            true => Some(formula.clone()),
-            false => None,
-        };
-    };
-    Some(rebuild(&kept, minimized(&kept, cover)))
+    let cover = eliminate(formula, &kept, max_terms).ok_or(TermLimitExceeded { max_terms })?;
+    Ok(rebuild(&kept, minimized(&kept, cover)))
 }
 
 /// The products of `∃ dropped. formula` over `kept`, or `None` where there are
-/// more of them than [`CUBES`] allows.
+/// more of them than `max_terms` allows.
 ///
 /// One solver call per product, and the product is read off the model rather
 /// than counted out of a table. The model says how the formula was satisfied;
@@ -228,7 +217,7 @@ pub fn project_exact(formula: &Formula, keep: &[Atom]) -> Option<Formula> {
 /// the eliminated literals into one the formula holds under. Blocking it and
 /// asking again walks the answer a product at a time, so a formula whose answer
 /// is twenty products takes twenty calls however many atoms it names.
-fn eliminate(formula: &Formula, kept: &[Atom]) -> Option<Vec<Cube>> {
+fn eliminate(formula: &Formula, kept: &[Atom], max_terms: usize) -> Option<Vec<Cube>> {
     let mut cover: Vec<Cube> = Vec::new();
     // What is left to account for: everything no product found so far covers.
     let mut left = Formula::True;
@@ -249,7 +238,7 @@ fn eliminate(formula: &Formula, kept: &[Atom]) -> Option<Vec<Cube>> {
                 cube[at] = Some(there);
             }
         }
-        if cover.len() == CUBES {
+        if cover.len() == max_terms {
             return None;
         }
         left = left.and(product(kept, &cube).not());

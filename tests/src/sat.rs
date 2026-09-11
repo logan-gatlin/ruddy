@@ -119,13 +119,21 @@ fn every_connective_is_encoded() {
 fn the_canonical_form_is_the_shape_a_reader_wrote() {
     let canonical = |formula: Formula| -> String {
         let keep = atoms(&formula);
-        sat::project(&formula, &keep).to_string()
+        sat::project(&formula, &keep, sat::DEFAULT_MAX_TERMS)
+            .unwrap()
+            .to_string()
     };
 
     assert_eq!(canonical(var(0).xor(var(1))), "?0 != ?1");
     assert_eq!(canonical(var(0).iff(var(1))), "?0 = ?1");
     assert_eq!(
-        sat::project(&var(0).xor(var(1)), &[Atom::Var(1), Atom::Var(0)],).to_string(),
+        sat::project(
+            &var(0).xor(var(1)),
+            &[Atom::Var(1), Atom::Var(0)],
+            sat::DEFAULT_MAX_TERMS
+        )
+        .unwrap()
+        .to_string(),
         "?1 != ?0"
     );
     // The long way round comes out the same: the special cases are decided by
@@ -167,14 +175,30 @@ fn the_canonical_form_is_the_shape_a_reader_wrote() {
 fn projection_eliminates_what_it_does_not_keep() {
     // `a and b`, with `b` eliminated, is `a`: there is a `b` for every `a`.
     let formula = var(0).and(var(1));
-    assert_eq!(sat::project(&formula, &[Atom::Var(0)]).to_string(), "?0");
+    assert_eq!(
+        sat::project(&formula, &[Atom::Var(0)], sat::DEFAULT_MAX_TERMS)
+            .unwrap()
+            .to_string(),
+        "?0"
+    );
     // `a != b`, with `b` eliminated, says nothing about `a` at all.
     let formula = var(0).xor(var(1));
-    assert!(sat::project(&formula, &[Atom::Var(0)]).is_true());
+    assert!(
+        sat::project(&formula, &[Atom::Var(0)], sat::DEFAULT_MAX_TERMS)
+            .unwrap()
+            .is_true()
+    );
     // And an atom the formula never names cannot be kept into existence.
-    assert!(sat::project(&Formula::True, &[Atom::Var(9)]).is_true());
+    assert!(
+        sat::project(&Formula::True, &[Atom::Var(9)], sat::DEFAULT_MAX_TERMS)
+            .unwrap()
+            .is_true()
+    );
     // The formula nothing satisfies projects to itself, whatever is kept.
-    assert_eq!(sat::project(&Formula::any([]), &[]), Formula::False);
+    assert_eq!(
+        sat::project(&Formula::any([]), &[], sat::DEFAULT_MAX_TERMS).unwrap(),
+        Formula::False
+    );
 }
 
 /// How many atoms a formula names is not what makes it hard, so it is not what
@@ -185,20 +209,33 @@ fn a_wide_projection_is_answered_exactly() {
     // Every one of them there. One product, and keeping only the first is `?0`
     // rather than a shrug: the others are eliminated, not lost.
     let wide = Formula::all((0..34).map(var));
-    assert_eq!(sat::project(&wide, &atoms(&wide)), wide);
-    assert_eq!(sat::project(&wide, &[Atom::Var(0)]).to_string(), "?0");
+    assert_eq!(
+        sat::project(&wide, &atoms(&wide), sat::DEFAULT_MAX_TERMS).unwrap(),
+        wide
+    );
+    assert_eq!(
+        sat::project(&wide, &[Atom::Var(0)], sat::DEFAULT_MAX_TERMS)
+            .unwrap()
+            .to_string(),
+        "?0"
+    );
 
     // Any one of them there, which is thirty-four products and two to the
     // thirty-four rows. The old walk counted the rows.
     let any = Formula::any((0..34).map(var));
-    assert_eq!(sat::project(&any, &atoms(&any)), any);
+    assert_eq!(
+        sat::project(&any, &atoms(&any), sat::DEFAULT_MAX_TERMS).unwrap(),
+        any
+    );
 
     // Exactly one of them there — what an exact match over thirty-four fields
     // writes — read down to what it says about the first two, which is what R10
     // quotes at an annotation whose clause covers only those.
     let one = exactly_one(34);
     assert_eq!(
-        sat::project(&one, &[Atom::Var(0), Atom::Var(1)]).to_string(),
+        sat::project(&one, &[Atom::Var(0), Atom::Var(1)], sat::DEFAULT_MAX_TERMS)
+            .unwrap()
+            .to_string(),
         "not ?0 or not ?1"
     );
 
@@ -206,45 +243,49 @@ fn a_wide_projection_is_answered_exactly() {
     // names widens nothing.
     let keep: Vec<Atom> = (0..34).map(Atom::Var).collect();
     assert_eq!(
-        sat::project(&var(0).and(var(1)), &keep).to_string(),
+        sat::project(&var(0).and(var(1)), &keep, sat::DEFAULT_MAX_TERMS)
+            .unwrap()
+            .to_string(),
         "?0 and ?1"
     );
 }
 
-/// What bounds a projection is the size of its answer and not the size of its
-/// question — the one formula here whose answer really is exponential is the
-/// only one given up on.
+/// The budget applies even when no variables are eliminated. Raising it
+/// restores an exact answer rather than substituting an unconstrained formula.
 #[test]
 fn the_answer_is_what_bounds_a_projection() {
-    // The parity of ten presences: five hundred products and no shorter sum of
-    // them. With nothing to eliminate the formula is its own answer, so what
-    // comes back still says everything it said.
     let parity = (1..10).fold(var(0), |sum, i| sum.xor(var(i)));
-    assert_eq!(sat::project(&parity, &atoms(&parity)), parity);
+    let keep = atoms(&parity);
     assert_eq!(
-        sat::project_exact(&parity, &atoms(&parity)),
-        Some(parity.clone())
+        sat::project(&parity, &keep, 256),
+        Err(sat::TermLimitExceeded { max_terms: 256 })
     );
-
-    // With something to eliminate there is no such shortcut, and the answer
-    // errs the way that costs a missed complaint rather than an invented one.
     let spare = parity.clone().and(var(10).or(var(10).not()));
-    let keep: Vec<Atom> = (0..10).map(Atom::Var).collect();
-    assert!(sat::project(&spare, &keep).is_true());
-    // Type-changing decisions must distinguish budget exhaustion from a
-    // proven `true`; otherwise they could erase a required conditional effect.
-    assert!(sat::project_exact(&spare, &keep).is_none());
-
-    // A caller's atom list is a set semantically. Repeats must neither inflate
-    // cubes nor make the budget fallback mistake a complete projection for one
-    // that eliminated something.
+    assert!(sat::project(&spare, &keep, 256).is_err());
     let repeated: Vec<Atom> = keep.iter().copied().chain(keep.iter().copied()).collect();
-    assert_eq!(sat::project(&parity, &repeated), parity);
+    assert!(sat::project(&parity, &repeated, 256).is_err());
+    // A 257-term disjunction tests an increased inclusive budget and exact
+    // elimination without an expensive fully fixed parity minimization.
+    let broad = Formula::any((0..257).map(var));
+    let with_local = broad.clone().and(var(300));
+    let answer = sat::project(&with_local, &atoms(&broad), 257).expect("exactly 257 terms fit");
+    assert!(sat::entails(&answer, &broad));
+    assert!(sat::entails(&broad, &answer));
+    assert!(sat::project(&with_local, &atoms(&broad), 256).is_err());
+    assert!(
+        sat::project(&parity, &[Atom::Var(0), Atom::Var(1)], 256)
+            .unwrap()
+            .is_true()
+    );
+}
 
-    // And eliminating enough of it leaves an answer that fits, which is
-    // answered rather than given up on: a parity says nothing about any two of
-    // its presences.
-    assert!(sat::project(&parity, &[Atom::Var(0), Atom::Var(1)]).is_true());
+#[test]
+fn projection_respects_small_and_zero_budgets() {
+    let choice = var(0).xor(var(1));
+    assert!(sat::project(&choice, &atoms(&choice), 1).is_err());
+    assert!(sat::project(&choice, &atoms(&choice), 2).is_ok());
+    assert!(sat::project(&var(0), &[Atom::Var(0)], 0).is_err());
+    assert_eq!(sat::project(&Formula::False, &[], 0), Ok(Formula::False));
 }
 
 /// The product a projection collects is read off the model by walking the
@@ -256,7 +297,9 @@ fn the_answer_is_what_bounds_a_projection() {
 fn a_projection_reads_its_product_off_the_model() {
     let canonical = |formula: Formula| -> String {
         let keep = atoms(&formula);
-        sat::project(&formula, &keep).to_string()
+        sat::project(&formula, &keep, sat::DEFAULT_MAX_TERMS)
+            .unwrap()
+            .to_string()
     };
 
     // A conjunction that has to come out false, failing on each side in turn.
@@ -299,12 +342,18 @@ fn a_cover_too_broad_to_expand_is_minimized_in_place() {
     // Nine atoms: each product leaves eight positions open, so the first fills
     // the row budget by itself and the second overruns it.
     let nine = Formula::any((0..9).map(var));
-    assert_eq!(sat::project(&nine, &atoms(&nine)), nine);
+    assert_eq!(
+        sat::project(&nine, &atoms(&nine), sat::DEFAULT_MAX_TERMS).unwrap(),
+        nine
+    );
 
     // Ten, where a single product already covers more rows than the budget
     // holds and the expansion is refused before it starts.
     let ten = Formula::any((0..10).map(var));
-    assert_eq!(sat::project(&ten, &atoms(&ten)), ten);
+    assert_eq!(
+        sat::project(&ten, &atoms(&ten), sat::DEFAULT_MAX_TERMS).unwrap(),
+        ten
+    );
 
     // Widening is what makes a product redundant, so the two steps are one
     // pass: `a and b` and `a and not b` are separate products of the cover and
@@ -314,7 +363,9 @@ fn a_cover_too_broad_to_expand_is_minimized_in_place() {
     let redundant = (2..9).fold(split, |sum, at| sum.or(var(at)));
     assert_eq!(atoms(&redundant).len(), 9);
     assert_eq!(
-        sat::project(&redundant, &atoms(&redundant)).to_string(),
+        sat::project(&redundant, &atoms(&redundant), sat::DEFAULT_MAX_TERMS)
+            .unwrap()
+            .to_string(),
         "?0 or ?2 or ?3 or ?4 or ?5 or ?6 or ?7 or ?8"
     );
 }

@@ -8,6 +8,16 @@ help: change this value to a struct, or change/remove the field access
 primary: this spread requires a struct
 help: change this value to a struct, or remove the spread
 
+## sat-term-limit
+[sat-term-limit] checking this definition needs more than 1 product term; override the limit with `@max_sat_terms <nat>` on this definition
+primary: this definition exceeds its product-term limit
+help: add or increase `@max_sat_terms <nat>` before this definition, for example `@max_sat_terms 1024n`
+
+## invalid-max-sat-terms
+[invalid-max-sat-terms] `@max_sat_terms` requires a natural number that fits the compiler's address size
+primary: expected a natural number
+help: write `@max_sat_terms 1024n` before the definition; the value must fit the compiler's address size
+
 ## type-mismatch
 [type-mismatch] a natural number and a struct cannot be the same type
 primary: Let’s call this shared value `Value` — the annotation fixes the type here
