@@ -13,7 +13,15 @@ type Schema = { id: String, version: Nat }
 type FrameKind = #Record | #Sequence | #Variant
 
 @private
-type Frame = { serial: Nat, kind: FrameKind, count: Nat, fields: [String], cases: [String] }
+@doc "One open frame. `count` is how many children have been completed, and `declared` how many were promised: a sequence says its length before its elements, and the two must meet before the frame closes."
+type Frame = {
+  serial: Nat,
+  kind: FrameKind,
+  count: Nat,
+  declared: Nat,
+  fields: [String],
+  cases: [String],
+}
 
 @private
 extern real_to_bits: fn(Real) -> Nat64 = "$prim.binary.real_to_bits"
@@ -115,7 +123,14 @@ let encode_with: codec::Encoder 'a -> Limits -> 'a -> Result [Nat8] Error =
             _ = serial := nat::add (~serial) 1n
             _ = stack
               := [
-                { serial: ~serial, kind: kind, count: 0n, fields: fields, cases: cases },
+                {
+                  serial: ~serial,
+                  kind: kind,
+                  count: 0n,
+                  declared: 0n,
+                  fields: fields,
+                  cases: cases,
+                },
                 ..~stack,
               ]
             _ = pending := false
@@ -160,6 +175,7 @@ let encode_with: codec::Encoder 'a -> Limits -> 'a -> Result [Nat8] Error =
                     serial: frame.serial,
                     kind: frame.kind,
                     count: nat::add frame.count 1n,
+                    declared: frame.declared,
                     fields: frame.fields,
                     cases: frame.cases,
                   }
@@ -177,24 +193,36 @@ let encode_with: codec::Encoder 'a -> Limits -> 'a -> Result [Nat8] Error =
         (fn frame => close (#Record) cursor (array::len frame.fields))
         (top (#Record) cursor)
     | codec::!Write.begin_sequence count =>
-      chain
-        (fn cursor => do
-          _ = emit (nat32_to_bytes count)
-          _ =
-            replace_top { serial: cursor.frame, kind: #Sequence, count: 0n, fields: [], cases: [] }
-          return #Some cursor
-        end)
-        (open (#Sequence) [] [])
+      if nat::greater_than count 4294967295n then limit "a sequence longer than the format's length"
+      else
+        chain
+          (fn cursor => do
+            _ = emit (nat32_to_bytes count)
+            _ = replace_top {
+              serial: cursor.frame,
+              kind: #Sequence,
+              count: 0n,
+              declared: count,
+              fields: [],
+              cases: [],
+            }
+            return #Some cursor
+          end)
+          (open (#Sequence) [] [])
+      end
     | codec::!Write.next_element cursor =>
       chain
         (fn frame =>
           if ~pending then protocol "a value is still expected"
+          else if nat::greater_than_or_equal frame.count frame.declared then
+            protocol "more elements than the sequence declared"
           else
             do
               _ = replace_top {
                 serial: frame.serial,
                 kind: frame.kind,
                 count: nat::add frame.count 1n,
+                declared: frame.declared,
                 fields: frame.fields,
                 cases: frame.cases,
               }
@@ -205,7 +233,7 @@ let encode_with: codec::Encoder 'a -> Limits -> 'a -> Result [Nat8] Error =
         (top (#Sequence) cursor)
     | codec::!Write.end_sequence cursor =>
       chain
-        (fn frame => close (#Sequence) cursor frame.count)
+        (fn frame => close (#Sequence) cursor frame.declared)
         (top (#Sequence) cursor)
     | codec::!Write.begin_variant opened =>
       match array::find_index (fn known => str::equal known opened.tag) opened.schema.cases with
@@ -217,6 +245,7 @@ let encode_with: codec::Encoder 'a -> Limits -> 'a -> Result [Nat8] Error =
               serial: cursor.frame,
               kind: #Variant,
               count: 1n,
+              declared: 1n,
               fields: [],
               cases: opened.schema.cases,
             }
@@ -304,7 +333,14 @@ let decode_with: codec::Decoder 'a -> Limits -> [Nat8] -> Result 'a Error =
             _ = serial := nat::add (~serial) 1n
             _ = stack
               := [
-                { serial: ~serial, kind: kind, count: count, fields: fields, cases: cases },
+                {
+                  serial: ~serial,
+                  kind: kind,
+                  count: count,
+                  declared: count,
+                  fields: fields,
+                  cases: cases,
+                },
                 ..~stack,
               ]
             _ = pending := false
@@ -381,6 +417,7 @@ let decode_with: codec::Decoder 'a -> Limits -> [Nat8] -> Result 'a Error =
                 serial: frame.serial,
                 kind: frame.kind,
                 count: nat::add frame.count 1n,
+                declared: frame.declared,
                 fields: frame.fields,
                 cases: frame.cases,
               }
@@ -406,6 +443,7 @@ let decode_with: codec::Decoder 'a -> Limits -> [Nat8] -> Result 'a Error =
                     serial: cursor.frame,
                     kind: #Sequence,
                     count: count,
+                    declared: count,
                     fields: [],
                     cases: [],
                   }
@@ -426,6 +464,7 @@ let decode_with: codec::Decoder 'a -> Limits -> [Nat8] -> Result 'a Error =
                 serial: frame.serial,
                 kind: frame.kind,
                 count: nat::subtract frame.count 1n,
+                declared: frame.declared,
                 fields: frame.fields,
                 cases: frame.cases,
               }

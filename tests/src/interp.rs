@@ -1084,6 +1084,69 @@ let results = std::str::join "," [
     );
 }
 
+/// A sequence says its length before its elements, so a writer that emits
+/// fewer or more than it declared has not written the value it promised, and
+/// the runner says so instead of reporting success.
+#[test]
+fn a_writer_meets_the_length_it_declared() {
+    let source = r#"
+@private
+let of_length: Nat -> [Nat] -> std::codec::Encoder () = fn declared written => {
+  schema: std::reflect::describe (std::reflect::type_of [1n]),
+  run: fn _ => std::result::and_then
+    (fn cursor => std::result::and_then
+      (fn _ => std::codec::!Write.end_sequence cursor)
+      (std::array::try_fold_result
+        (fn _ element => std::result::and_then
+          (fn _ => std::codec::!Write.write_nat element)
+          (std::codec::!Write.next_element cursor))
+        ()
+        written))
+    (std::codec::!Write.begin_sequence declared),
+}
+@private
+let as_binary: std::codec::Encoder () -> String = fn encoder =>
+  match std::binary::encode_with encoder std::binary::default_limits () with
+  | #Some bytes => std::str::from_nat (std::array::len bytes)
+  | #Error _ => "refused"
+  end
+@private
+let as_json: std::codec::Encoder () -> String = fn encoder =>
+  match std::json::encode_with encoder std::json::default_limits () with
+  | #Some out => out
+  | #Error _ => "refused"
+  end
+let binary_lengths = std::str::join "," [
+  as_binary (of_length 2n []),
+  as_binary (of_length 1n [0n, 1n]),
+  as_binary (of_length 1n [0n]),
+  as_binary (of_length 0n []),
+  as_binary (of_length 3n [0n, 1n, 2n]),
+]
+let json_lengths = std::str::join "," [
+  as_json (of_length 2n []),
+  as_json (of_length 1n [0n, 1n]),
+  as_json (of_length 1n [0n]),
+  as_json (of_length 0n []),
+  as_json (of_length 3n [0n, 1n, 2n]),
+]
+-- A count past what the binary header holds is refused before the header is
+-- written, rather than silently truncated to thirty-two bits.
+let too_long = as_binary (of_length 4294967296n [])
+"#;
+    let exports = ["binary_lengths", "json_lengths", "too_long"];
+    let (node, interpreted) = both(source, &exports, None);
+    assert_eq!(node, interpreted);
+    assert_eq!(
+        interpreted,
+        vec![
+            "\"refused,refused,12,4,28\"",
+            "\"refused,refused,[0],[],[0,1,2]\"",
+            "\"refused\"",
+        ]
+    );
+}
+
 #[test]
 fn a_host_value_the_interpreter_does_not_provide_is_named() {
     let mut program = load(

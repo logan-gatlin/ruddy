@@ -22,7 +22,8 @@ let default_limits: Limits = { depth: 512n, bytes: 67108864n, members: 1000000n,
 type FrameKind = #Record | #Sequence | #Variant
 
 @private
-type Frame = { serial: Nat, kind: FrameKind, count: Nat }
+@doc "One open frame. `count` is how many children have been completed, and `declared` how many a sequence promised before its elements; the two must meet before the frame closes."
+type Frame = { serial: Nat, kind: FrameKind, count: Nat, declared: Nat }
 
 @private
 extern char_code: fn(String) -> Nat = "$prim.json.char_code"
@@ -718,7 +719,7 @@ let read_document: codec::Decoder 'a -> Limits -> String -> Result 'a Error =
           else
             do
               _ = serial := nat::add (~serial) 1n
-              _ = stack := [{ serial: ~serial, kind: kind, count: 0n }, ..~stack]
+              _ = stack := [{ serial: ~serial, kind: kind, count: 0n, declared: 0n }, ..~stack]
               _ = pos := at
               _ = pending := false
               return #Some { frame: ~serial }
@@ -846,6 +847,7 @@ let read_document: codec::Decoder 'a -> Limits -> String -> Result 'a Error =
                                 serial: frame.serial,
                                 kind: frame.kind,
                                 count: nat::add frame.count 1n,
+                                declared: frame.declared,
                               }
                               return #Some (#Some scanned.0)
                             end)
@@ -879,6 +881,7 @@ let read_document: codec::Decoder 'a -> Limits -> String -> Result 'a Error =
                           serial: frame.serial,
                           kind: frame.kind,
                           count: nat::add frame.count 1n,
+                          declared: frame.declared,
                         }
                         return #Some true
                       end)
@@ -998,23 +1001,24 @@ let encode_with: codec::Encoder 'a -> Limits -> 'a -> Result String Error =
       return #Some ()
     end
     let scalar = fn text => chain (fn _ => do _ = emit text return written () end) (expect_value ())
-    let open = fn kind opener => chain
+    let open = fn kind declared opener => chain
       (fn _ =>
         if nat::greater_than_or_equal (array::len (~stack)) limits.depth then
           limit "a value nested too deeply"
         else
           do
             _ = serial := nat::add (~serial) 1n
-            _ = stack := [{ serial: ~serial, kind: kind, count: 0n }, ..~stack]
+            _ = stack := [{ serial: ~serial, kind: kind, count: 0n, declared: declared }, ..~stack]
             _ = pending := false
             _ = emit opener
             return #Some { frame: ~serial }
           end
         end)
       (expect_value ())
-    let close = fn kind cursor closer => chain
-      (fn _ =>
+    let close = fn kind cursor expected closer => chain
+      (fn frame =>
         if ~pending then protocol "a value is still expected"
+        else if not nat::equal frame.count expected then protocol "the frame is not complete"
         else
           do
             _ = stack := match ~stack with | [_, ..rest] => rest | [] => [] end
@@ -1025,7 +1029,12 @@ let encode_with: codec::Encoder 'a -> Limits -> 'a -> Result String Error =
       (top kind cursor)
     let separate = fn frame => do
       _ = if nat::is_zero frame.count then () else emit "," end
-      _ = replace_top { serial: frame.serial, kind: frame.kind, count: nat::add frame.count 1n }
+      _ = replace_top {
+        serial: frame.serial,
+        kind: frame.kind,
+        count: nat::add frame.count 1n,
+        declared: frame.declared,
+      }
       _ = pending := true
       return #Some ()
     end
@@ -1040,7 +1049,7 @@ let encode_with: codec::Encoder 'a -> Limits -> 'a -> Result String Error =
       else range "a finite number" (real_token r)
       end
     | codec::!Write.write_text text => scalar (quote text)
-    | codec::!Write.begin_record _ => open (#Record) "{"
+    | codec::!Write.begin_record schema => open (#Record) (array::len schema.fields) "{"
     | codec::!Write.write_field field =>
       chain
         (fn frame =>
@@ -1051,14 +1060,24 @@ let encode_with: codec::Encoder 'a -> Limits -> 'a -> Result String Error =
               (separate frame)
           end)
         (top (#Record) field.cursor)
-    | codec::!Write.end_record cursor => close (#Record) cursor "}"
-    | codec::!Write.begin_sequence _ => open (#Sequence) "["
+    | codec::!Write.end_record cursor =>
+      chain
+        (fn frame => close (#Record) cursor frame.declared "}")
+        (top (#Record) cursor)
+    | codec::!Write.begin_sequence count => open (#Sequence) count "["
     | codec::!Write.next_element cursor =>
       chain
         (fn frame =>
-          if ~pending then protocol "a value is still expected" else separate frame end)
+          if ~pending then protocol "a value is still expected"
+          else if nat::greater_than_or_equal frame.count frame.declared then
+            protocol "more elements than the sequence declared"
+          else separate frame
+          end)
         (top (#Sequence) cursor)
-    | codec::!Write.end_sequence cursor => close (#Sequence) cursor "]"
+    | codec::!Write.end_sequence cursor =>
+      chain
+        (fn frame => close (#Sequence) cursor frame.declared "]")
+        (top (#Sequence) cursor)
     | codec::!Write.begin_variant opened =>
       if array::any (fn known => str::equal known opened.tag) opened.schema.cases then
         chain
@@ -1067,10 +1086,10 @@ let encode_with: codec::Encoder 'a -> Limits -> 'a -> Result String Error =
             _ = pending := true
             return #Some cursor
           end)
-          (open (#Variant) "{")
+          (open (#Variant) 0n "{")
       else protocol (str::concat "not a case of the sum: " opened.tag)
       end
-    | codec::!Write.end_variant cursor => close (#Variant) cursor "}"
+    | codec::!Write.end_variant cursor => close (#Variant) cursor 0n "}"
     end with
     | #Some _ =>
       if not ~done or not nat::is_zero (array::len (~stack)) then

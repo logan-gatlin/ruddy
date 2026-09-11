@@ -1,6 +1,6 @@
 # 24 Check declared sequence lengths before reporting encoder success
 
-Status: open
+Status: resolved
 Type: task
 Priority: P2
 
@@ -49,3 +49,24 @@ that exceeds the binary header's range. Buffered failure returns no output.
 Exercise both handlers and both executable backends with custom codecs, not
 only default derivation. Add tests under `tests/`; use only `just test` for
 Rust test execution.
+
+## Answer
+
+A frame now keeps two numbers: `count`, the children completed, and
+`declared`, the number promised. `begin_sequence` records the declared length
+instead of replacing the frame with a zero count, `next_element` refuses an
+element past it, and `end_sequence` compares the completed count against the
+declared one rather than against itself. Both handlers do this: the binary
+writer, and the JSON writer, which previously ignored the declared count
+entirely. A record declares the number of fields in its schema, which is what
+the binary writer already checked and the JSON writer now does too.
+
+A count past what the binary header holds is refused before the header is
+written, rather than truncated to thirty-two bits.
+
+Regression: `a_writer_meets_the_length_it_declared` in `tests/src/interp.rs`
+runs a custom encoder that declares one length and writes another, through
+both handlers and on both backends. Declaring two and writing none is refused;
+declaring one and writing two is refused; declaring and writing one, none, and
+three all succeed with the exact bytes and text; and a declared length of
+2^32 is refused. The ticket's own encoder is the first of those.
