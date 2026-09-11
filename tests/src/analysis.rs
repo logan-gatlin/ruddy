@@ -653,3 +653,101 @@ fn hover_includes_type_effect_and_module_declarations() {
         assert!(hover.ty.contains(expected), "{name}: {}", hover.ty);
     }
 }
+
+#[test]
+fn using_completion_obeys_lexical_imports_and_strict_module_members() {
+    for (text, expected) in [
+        (
+            "module M = let value = 1n end using M::value as renamed let y = rena",
+            "renamed",
+        ),
+        (
+            "module M = let value = 1n end using M as m let y = m::val",
+            "value",
+        ),
+        ("let value = 1n let y = bundle::val", "value"),
+        (
+            "module M = let value = 1n end let y = do using M::value as renamed return rena end",
+            "renamed",
+        ),
+        (
+            "module M = type T = Nat end using M::T as Number let y: Num",
+            "Number",
+        ),
+    ] {
+        let analysis = editor_source(text);
+        let offset = if text.ends_with(" end") {
+            text.len() - 4
+        } else {
+            text.len()
+        };
+        let completions = analysis.completions("main.rud", offset);
+        assert!(
+            completions.iter().any(|item| item.label == expected),
+            "{text}: {completions:?}"
+        );
+    }
+    for text in [
+        "module M = let value = 1n end module A = using M::value as renamed end let y = A::rena",
+        "module M = let value = 1n end let y = do using M::value as renamed return renamed end let z = rena",
+    ] {
+        let analysis = editor_source(text);
+        assert!(
+            !analysis
+                .completions("main.rud", text.len())
+                .iter()
+                .any(|item| item.label == "renamed"),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn dependency_completion_distinguishes_absolute_and_bundle_paths() {
+    let environment = ruddy::bundle::Environment::new([]);
+    let mut dep = ruddy::analysis::Host::default();
+    dep.set_file(
+        "main.rud",
+        Some("let external = 1n module Child = let nested = 1n end".into()),
+    );
+    let dep = dep
+        .analyze(
+            Bundle::new("dependency", Version::new(0, 0, 0)).unwrap(),
+            "main.rud",
+            &environment,
+        )
+        .interface();
+    for (suffix, local, expected, absent) in [
+        ("::dep::", "dep", "external", "local"),
+        ("dep::", "dep", "local", "external"),
+        ("bundle::dep::", "dep", "local", "external"),
+        ("::dep::Child::", "dep", "nested", "local"),
+        ("::", "dep", "dep", "OnlyLocal"),
+        ("bundle::", "Different", "OnlyLocal", "dep"),
+    ] {
+        let mut root = ruddy::analysis::Host::default();
+        let text = format!(
+            "module {local} = let local = true end module OnlyLocal = end let answer = {suffix}"
+        );
+        root.set_file("main.rud", Some(text.clone()));
+        let root = root.analyze_with_interfaces(
+            Bundle::new("root", Version::new(0, 0, 0)).unwrap(),
+            "main.rud",
+            &environment,
+            &[ir::InterfaceImport {
+                alias: "dep",
+                header: &dep,
+            }],
+            &[&dep],
+        );
+        let completions = root.completions("main.rud", text.len());
+        assert!(
+            completions.iter().any(|item| item.label == expected),
+            "{suffix}: {completions:?}"
+        );
+        assert!(
+            !completions.iter().any(|item| item.label == absent),
+            "{suffix}: {completions:?}"
+        );
+    }
+}

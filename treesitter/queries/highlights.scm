@@ -168,6 +168,8 @@
   "effect"
   "handle"
   "module"
+  "using"
+  "as"
 ] @keyword
 
 [

@@ -51,15 +51,16 @@ An [effect](dictionary.md#effect) describes an operation whose behavior is suppl
 Effects are tracked in function types, including when those types are inferred.
 This allows code to request operations such as console output while a handler determines how those operations are performed.
 
-For example, `main` prints a greeting through the standard library's console effect:
+For example, `main` prints a greeting through the standard library's `IO` effect:
 
 ```ruddy
 let main = fn _ => println "Hello!"
 ```
 
 An executable starts by calling `main` with `()`, the [unit](dictionary.md#unit) value.
+The [prelude](standard-library.md#prelude) makes `println` available without qualification.
 Here, `println` writes the text followed by a newline and returns `()`.
-The runtime supplies the console effect handler; a program can also supply its own handlers.
+The runtime supplies the `IO` effect handler; a program can also supply its own handlers.
 
 ## Getting started
 
@@ -69,3 +70,5 @@ The [platform API guide](platform-apis.md) covers JSON, process information, pat
 The following reading order builds on this introduction:
 
 1. [Hello, World!](hello-world.md)
+2. [Grammar](grammar.md)
+3. [Standard library](standard-library.md)

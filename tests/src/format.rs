@@ -1084,3 +1084,34 @@ fn hidden_types_and_patterns_format_as_written() {
         "type Any = hide 'a => {\n  -- the witness\n  mirror: Mirror 'a,\n  value: 'a,\n}\n"
     );
 }
+
+#[test]
+fn using_groups_and_comments_survive_formatting() {
+    assert_eq!(fmt("using ::{dep}"), "using ::{dep}\n");
+    assert_eq!(
+        fmt("using ::dep::{self as external,value}"),
+        "using ::dep::{self as external, value}\n"
+    );
+    assert_eq!(
+        fmt("using {::dep as external,local}"),
+        "using {::dep as external, local}\n"
+    );
+    assert_eq!(
+        fmt("using A::{self as a,x,B::{*,y as z}}"),
+        "using A::{self as a, x, B::{*, y as z}}\n"
+    );
+    let source = "using A::{\n  x, -- kept\n  (* nested (* note *) *) y as z\n}\nlet value = x\n";
+    let output = fmt(source);
+    assert!(output.contains("-- kept"));
+    assert!(output.contains("(* nested (* note *) *)"));
+    for source in [
+        "using A::{::dep}",
+        "using A *",
+        "using A {x}",
+        "using A::",
+        "using A::{x",
+        "using A as",
+    ] {
+        assert!(formatted(source).has_errors(), "{source}");
+    }
+}

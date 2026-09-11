@@ -33,7 +33,7 @@ No configuration changes are needed.
 
 ## Write the greeting
 
-Edit `src/main.rud` so it contains this program:
+The following greeting replaces the contents of `src/main.rud`:
 
 ```ruddy
 let main = fn _ => println "Hello, world!"
@@ -43,18 +43,18 @@ The `main` function is called with a [unit](dictionary.md#unit) parameter when t
 This function defines its argument as `_`, meaning it is ignored.
 The [standard library](dictionary.md#standard-library) provides `println`, which writes a string followed by a newline and returns `()`.
 
-Functions can may have [effects](dictionary.md#effect).
-
+The [prelude](standard-library.md#prelude) makes `println` available without an import or `std::` qualification.
+Its [effect](dictionary.md#effect), `!IO`, is handled by the runtime.
 
 ## Build and run
 
-To builds the program without running it:
+The following command builds the program without running it:
 
 ```sh
 ruddy build
 ```
 
-To build and run the program using `node`:
+The following command builds and runs the program using `node`:
 
 ```sh
 ruddy run
@@ -69,9 +69,11 @@ Hello, world!
 ## Try FizzBuzz
 
 The project can also print FizzBuzz for the natural numbers from 1 through 100.
-Replace `src/main.rud` with this program:
+The following program replaces the greeting in `src/main.rud`:
 
 ```ruddy
+using std::{nat, str}
+
 let divisible_by = fn number divisor => nat::is_zero (nat::remainder number divisor)
 
 let fizzbuzz = fn number =>
@@ -89,6 +91,7 @@ end
 let main = fn _ => count 1n
 ```
 
+The [`using` statement](grammar.md#modules-attributes-and-foreign-values) imports the `nat` and `str` modules, which are not in the prelude.
 The suffix `n` marks each number as a [natural number literal](grammar.md#literals).
 The `divisible_by` function uses `nat::remainder` and `nat::is_zero` to test whether a number divides evenly.
 The [conditional expression](grammar.md#blocks-and-choices) checks 15 first so numbers divisible by both 3 and 5 produce `FizzBuzz`.

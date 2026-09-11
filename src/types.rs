@@ -389,87 +389,27 @@ pub enum Shape {
     Effect,
 }
 
-/// What one parameter of a `type` declaration stands for, without the labels it
-/// carries.
-///
-/// Struct fields, sum cases, and arrow effects are distinct row sorts. A row
-/// parameter can only be forwarded to a position with the same sense; none is a
-/// whole type. Presence is the additional annotation-only sort.
+/// The kind of a parameter or annotation variable. Struct and sum tails share
+/// a row kind; the enclosing type determines how its labels are interpreted.
+/// Effect rows, whole types, regions, and presences remain separate kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Sense {
     Region,
     Type,
-    /// The rest of a struct's fields.
-    Fields,
-    Cases,
-    /// The effects an arrow may perform: `..'e` in `type Runner 'e = (Nat -> Nat
-    /// + ..'e) -> Nat + ..'e`.
+    Row,
     Effects,
-    /// Whether one label is there — what a `when a` names and what a `where`
-    /// clause's formula is written about.
     Presence,
 }
 
-/// What one parameter of a `type` declaration stands for.
-///
-/// Written nowhere: a parameter is a name and a sigil, and which of these it is
-/// follows from where the body uses it — `..'r` in a sum makes a rest of cases,
-/// anything else makes a type. Worked out in [`ir::build`](crate::ir::build),
-/// and carried here so that the readers who need it — lowering, inference and
-/// the debugger — agree.
-///
-/// Two of them, and no way to write a third: a type, or the rest of a sum. That
-/// is what keeps this a check rather than a language: every parameter is one of
-/// these, every declaration takes a fixed list of them, and nothing takes a
-/// declaration.
-///
-/// Both carry the labels an argument written there may not name. `'r` in
-/// `type WithX 'r = { x: Nat, ..'r }` is a [`ParamKind::Type`] whose set is
-/// `{x}`: the constructor covers the fields the declaration does not write out, so an
-/// `'r` with an `x` of its own would give the type two fields of one name, and
-/// the two copies could disagree. Carrying the set rather than a bare flag is what lets
-/// the condition be said where the argument is written, at the span the reader
-/// can act on, instead of being discovered later by whatever happened to
-/// flatten the labels — or never at all.
-///
-/// A parameter handed straight on to another declaration collects that
-/// declaration's labels too, which is why this is a fixpoint over the whole
-/// table rather than a read of one body. Insertion-ordered, so a complaint
-/// about an argument breaking the rule twice always names the same label first.
+/// A declaration parameter's inferred kind and excluded labels. Exclusions
+/// accumulate through forwarding and every use as a row tail, so a shared row
+/// must satisfy all of its enclosing structs and sums.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParamKind {
-    Region {
-        lacks: IndexSet<String>,
-    },
-    /// Stands for a whole type. `'A` in `type Pair 'A 'B`.
-    Type {
-        lacks: IndexSet<String>,
-    },
-    /// Stands for fields a struct does not name. `'r` in
-    /// `type WithX 'r = { x: Nat, ..'r }`.
-    Fields {
-        lacks: IndexSet<String>,
-    },
-    /// Stands for the cases a sum does not name — and, with them, the cases it
-    /// may therefore not name itself. `'r` in `type Or 'r = #A | ..'r`.
-    ///
-    /// The one reading that is not a type, and the reason it is enforced rather
-    /// than substituted: a sum's rest is spliced into [`Ty::Sum`]'s row, so
-    /// anything else written there would leave a row holding what no row can
-    /// hold. See [`ir::ErrorKind::NotARow`](crate::ir::ErrorKind).
-    Cases {
-        lacks: IndexSet<String>,
-    },
-    /// Stands for the effects an arrow does not name — and, with them, the
-    /// effects it may therefore not name itself. `'e` in
-    /// `type Runner 'e = (Nat -> Nat + ..'e) -> Nat + ..'e`.
-    ///
-    /// [`ParamKind::Cases`]'s twin, and enforced for the same reason: an effect
-    /// row's rest is spliced into the row [`Ty::Arrow`] carries, so anything
-    /// else written there would leave a row holding what no row can hold.
-    Effects {
-        lacks: IndexSet<String>,
-    },
+    Region { lacks: IndexSet<String> },
+    Type { lacks: IndexSet<String> },
+    Row { lacks: IndexSet<String> },
+    Effects { lacks: IndexSet<String> },
 }
 
 /// One variable a [`Formula`] names: one the solver still owns, or one a
@@ -911,8 +851,7 @@ impl ParamKind {
         match self {
             ParamKind::Region { lacks }
             | ParamKind::Type { lacks }
-            | ParamKind::Fields { lacks }
-            | ParamKind::Cases { lacks }
+            | ParamKind::Row { lacks }
             | ParamKind::Effects { lacks } => lacks,
         }
     }
@@ -922,22 +861,17 @@ impl ParamKind {
         match self {
             ParamKind::Region { .. } => Sense::Region,
             ParamKind::Type { .. } => Sense::Type,
-            ParamKind::Fields { .. } => Sense::Fields,
-            ParamKind::Cases { .. } => Sense::Cases,
+            ParamKind::Row { .. } => Sense::Row,
             ParamKind::Effects { .. } => Sense::Effects,
         }
     }
 
-    /// The labels an argument written here may not name, and the row it would
-    /// be spliced into — or `None` when the parameter stands for a type. What
-    /// the one check that is still about a shape asks: a sum's rest and an
-    /// arrow's effects are both spliced into a row, so only a row can go there.
-    pub fn row(&self) -> Option<(Shape, &IndexSet<String>)> {
+    /// The row kind and excluded labels, when this parameter expects a row.
+    pub fn row(&self) -> Option<(Sense, &IndexSet<String>)> {
         match self {
             ParamKind::Region { .. } | ParamKind::Type { .. } => None,
-            ParamKind::Fields { lacks } => Some((Shape::Struct, lacks)),
-            ParamKind::Cases { lacks } => Some((Shape::Sum, lacks)),
-            ParamKind::Effects { lacks } => Some((Shape::Effect, lacks)),
+            ParamKind::Row { lacks } => Some((Sense::Row, lacks)),
+            ParamKind::Effects { lacks } => Some((Sense::Effects, lacks)),
         }
     }
 }
@@ -958,24 +892,9 @@ impl Assigned {
         }
     }
 
-    /// This value read as a sum's cases: what a `..` at a sum's row parameter
-    /// stands for.
-    ///
-    /// Three ways to arrive, and the middle one is why this is a conversion
-    /// rather than a lookup. A row outright is the row. A *type* is what a use
-    /// site writes — `Fallible (#Ok Nat)` hands a sum where a set of cases
-    /// goes — so it is read for the cases it allows. And a type that is only a
-    /// bare variable is the commonest of the three: instantiating a scheme mints
-    /// one variable per quantified position, and a position the scheme used as a
-    /// sum's tail wants that variable standing for the rest rather than for a
-    /// type with no cases at all.
-    ///
-    /// No shape to be told any more. A struct's `..` is its row tail, and opening
-    /// one is [`as_ty`](Self::as_ty); only a sum's rest is still a row, so this
-    /// is about cases and nothing else.
-    ///
-    /// A presence cannot reach a tail, for the reason it cannot reach a type
-    /// position, and closes the row rather than inventing a rule.
+    /// Extract the row supplied by an argument or an instantiated row slot.
+    /// Argument kind checking determines whether this is a shared row or an
+    /// effect row; the containing type retains its own constructor.
     pub fn as_row(&self) -> Row {
         match self {
             Assigned::Row(row) => (**row).clone(),

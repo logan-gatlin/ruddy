@@ -24,7 +24,12 @@ Ruddy's CLI creates, checks, builds, runs, and formats projects through the `rud
 ## Standard library
 The library available by default as `std`, providing common types and functions such as console output.
 
-[Hello world](hello-world.md#write-the-greeting)
+[Standard library](standard-library.md)
+
+## Prelude
+The declarations in `std::prelude` that are available without an explicit import or module qualification when the standard library is enabled.
+
+[Standard library](standard-library.md#prelude)
 
 ## Definition
 A top-level `let`, `type`, `effect`, `extern`, or `module` that defines a value, type, effect, foreign value, or module, respectively.
@@ -72,7 +77,7 @@ A name written in source code to refer to a value, type, effect, or module.
 [Grammar](grammar.md#source-layout-and-names)
 
 ## Literal
-A value written directly in source code, such as a number, string, or Bool.
+A value written directly in source code, such as a number, string, or `Bool`.
 
 [Grammar](grammar.md#literals)
 

@@ -1,0 +1,77 @@
+==================
+Using module aliases and nested groups
+==================
+using bundle::Source::{self as source, value, Child::{*, flag as enabled}}
+
+---
+
+(source_file
+  (using_statement
+    (use_tree
+      (identifier)
+      (use_tree
+        (identifier)
+        (use_tree
+          (use_tree
+            (identifier)
+            (identifier))
+          (use_tree
+            (identifier))
+          (use_tree
+            (identifier)
+            (use_tree
+              (use_tree)
+              (use_tree
+                (identifier)
+                (identifier)))))))))
+
+==================
+Using sequential local imports
+==================
+let result = do
+  using super::Source as source
+  using source::value
+  return value
+end
+
+---
+
+(source_file
+  (let_definition
+    (identifier)
+    (do_block
+      (using_statement
+        (use_tree
+          (identifier)
+          (use_tree
+            (identifier)
+            (identifier))))
+      (using_statement
+        (use_tree
+          (identifier)
+          (use_tree
+            (identifier))))
+      (identifier))))
+
+==================
+Absolute dependency imports
+==================
+using ::dep::{self as external, value}
+using {::dep as external}
+using ::{dep}
+
+---
+
+(source_file
+  (using_statement
+    (use_tree
+      (identifier)
+      (use_tree
+        (use_tree (identifier) (identifier))
+        (use_tree (identifier)))))
+  (using_statement
+    (use_tree
+      (use_tree (identifier) (identifier))))
+  (using_statement
+    (use_tree
+      (use_tree (identifier)))))

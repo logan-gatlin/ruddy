@@ -51,10 +51,12 @@ const $instantiateType = ($template, $arguments, $partial = false) => {
       $seen.add($at);
       const $node = $nodes[$at];
       if ($partial && typeof $node === "object" && "Parameter" in $node) { $deferred = true; break; }
-      if ($node.Extend) { $work.push(...$node.Extend); continue; }
+      // The left fragment supplies the enclosing constructor; the right
+      // fragment contributes its row, regardless of its original shape.
+      if ($node.Extend) { $work.push($node.Extend[1], $node.Extend[0]); continue; }
       const $shape = Object.keys($node)[0];
-      if (($shape !== "Struct" && $shape !== "Sum") || ($kind && $kind !== $shape)) throw new TypeError("invalid runtime row extension");
-      $kind = $shape;
+      if ($shape !== "Struct" && $shape !== "Sum") throw new TypeError("invalid runtime row extension");
+      $kind ||= $shape;
       $fields.push(...$node[$shape]);
     }
     if ($deferred) continue;

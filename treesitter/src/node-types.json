@@ -2209,6 +2209,10 @@
           {
             "type": "let_definition",
             "named": true
+          },
+          {
+            "type": "using_statement",
+            "named": true
           }
         ]
       },
@@ -4883,6 +4887,10 @@
         {
           "type": "type_definition",
           "named": true
+        },
+        {
+          "type": "using_statement",
+          "named": true
         }
       ]
     }
@@ -6161,6 +6169,10 @@
         {
           "type": "type_definition",
           "named": true
+        },
+        {
+          "type": "using_statement",
+          "named": true
         }
       ]
     }
@@ -7438,6 +7450,51 @@
     "fields": {}
   },
   {
+    "type": "use_tree",
+    "named": true,
+    "fields": {
+      "alias": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "use_tree",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "using_statement",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "use_tree",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "when_clause",
     "named": true,
     "fields": {
@@ -7598,6 +7655,10 @@
     "named": false
   },
   {
+    "type": "as",
+    "named": false
+  },
+  {
     "type": "attribute_key",
     "named": true
   },
@@ -7713,6 +7774,10 @@
   {
     "type": "type_variable",
     "named": true
+  },
+  {
+    "type": "using",
+    "named": false
   },
   {
     "type": "when",

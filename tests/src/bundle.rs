@@ -86,6 +86,7 @@ fn names(stmts: &[ruddy::parse::Stmt]) -> Vec<String> {
             StmtKind::Type { name, .. } => format!("type {}", name.tracked),
             StmtKind::Effect { name, .. } => format!("effect {}", name.tracked),
             StmtKind::Module { name, .. } => format!("module {}", name.tracked),
+            StmtKind::Using(tree) => format!("using {tree}"),
         })
         .collect()
 }
@@ -648,4 +649,23 @@ fn a_root_that_is_not_there_loads_as_an_empty_file() {
     assert_eq!(paths(&out), ["main.rud"]);
     assert!(out.stmts.is_empty());
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
+}
+
+#[test]
+fn using_imports_are_inherited_by_file_modules_without_leaking_from_siblings() {
+    let (_, loaded) = load(&[
+        (
+            "main.rud",
+            "module Source = let value = 1n end using Source::value as inherited module Child module Other",
+        ),
+        (
+            "Child.rud",
+            "using super::Source as source let answer = (inherited, source::value)",
+        ),
+        ("Other.rud", "let answer = inherited"),
+    ]);
+    assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
+    let bundle = Bundle::new("test", Version::new(0, 1, 0)).unwrap();
+    ruddy::compile::compile(Mint::new(bundle), loaded.stmts, inference::Trace::Off)
+        .unwrap_or_else(|partial| panic!("{:?}", partial.errors));
 }

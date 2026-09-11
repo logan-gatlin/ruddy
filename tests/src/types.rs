@@ -483,19 +483,19 @@ fn a_parameter_says_what_an_argument_has_to_be() {
     let lacks: indexmap::IndexSet<String> = ["x".to_string()].into_iter().collect();
     // A struct's `..'r` is a type parameter with fields it may not name, which is
     // why `WithX Nat` is well-formed and `WithX { x: Nat }` is not.
-    let fielded = ParamKind::Fields {
+    let fielded = ParamKind::Row {
         lacks: lacks.clone(),
     };
-    assert_eq!(fielded.sense(), Sense::Fields);
+    assert_eq!(fielded.sense(), Sense::Row);
     assert_eq!(fielded.lacks(), &lacks);
-    assert_eq!(fielded.row(), Some((Shape::Struct, &lacks)));
+    assert_eq!(fielded.row(), Some((Sense::Row, &lacks)));
 
-    let cases = ParamKind::Cases {
+    let cases = ParamKind::Row {
         lacks: lacks.clone(),
     };
-    assert_eq!(cases.sense(), Sense::Cases);
+    assert_eq!(cases.sense(), Sense::Row);
     assert_eq!(cases.lacks(), &lacks);
-    assert_eq!(cases.row(), Some((Shape::Sum, &lacks)));
+    assert_eq!(cases.row(), Some((Sense::Row, &lacks)));
 }
 
 /// A label written into a type is simply there. The constructor exists so that
@@ -898,7 +898,7 @@ fn a_parameter_may_stand_for_an_arrows_effects() {
     };
     assert_eq!(effects.sense(), Sense::Effects);
     assert_eq!(effects.lacks(), &lacks);
-    assert_eq!(effects.row(), Some((Shape::Effect, &lacks)));
+    assert_eq!(effects.row(), Some((Sense::Effects, &lacks)));
 }
 
 /// A scheme has one index space, not two. The presences take the low

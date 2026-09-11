@@ -1688,12 +1688,12 @@ fn a_duplicate_carries_the_definition_it_repeats() {
     assert_eq!(duplicate.related[0].message, "first defined here");
 }
 
-/// A name given two rests of different shapes is the same kind of complaint:
+/// A name shared between value rows and effect rows is a kind complaint:
 /// half of what went wrong is the `..` somewhere 'else on the page, so the strip
 /// highlights that one too rather than leaving the reader to find it.
 #[test]
 fn a_mixed_tail_carries_the_use_it_clashes_with() {
-    let source = "let f : { x: Nat, ..'r } -> (#A Nat | ..'r) -> Nat = fn a => fn b => 1n\n";
+    let source = "let f : { x: Nat, ..'r } -> (() -> Nat + ..'r) -> Nat = fn a => fn b => 1n\n";
     let snapshot = snapshot(source);
     let mixed = snapshot
         .diagnostics
@@ -1709,7 +1709,7 @@ fn a_mixed_tail_carries_the_use_it_clashes_with() {
     // twice.
     assert_eq!(
         mixed.related[0].message,
-        "first used as the rest of a struct's fields here"
+        "first used as a row of fields or cases here"
     );
 }
 
@@ -3165,10 +3165,7 @@ fn the_ir_tab_shows_a_declarations_parameters() {
     // and says what it may not stand for.
     assert_eq!(
         params,
-        [
-            ("'a", at([11, 13])),
-            ("..'r (struct) without x", at([31, 33]))
-        ]
+        [("'a", at([11, 13])), ("..'r (row) without x", at([31, 33]))]
     );
 
     // And each cross-highlights, which is the whole reason the row is here.
@@ -3261,15 +3258,9 @@ fn the_types_tab_says_which_parameters_are_rows() {
         .iter()
         .map(|child| (child.label.as_str(), child.text.as_str()))
         .collect();
-    assert_eq!(
-        letters,
-        vec![("'a", "'A"), ("'b", "..'r (struct) without it")]
-    );
+    assert_eq!(letters, vec![("'a", "'A"), ("'b", "..'r (row) without it")]);
 
-    // A struct's `..` beside no fields at all forbids nothing, and there is
-    // nothing else about it to show: the rest of a struct *is* a whole type, so
-    // a parameter with an empty lacks set is a type parameter and the row says
-    // so by saying only the name.
+    // An empty exclusion set still belongs to the shared row kind.
     let snap = snapshot("type Bare 'r = { ..'r }");
     let stage = snap
         .stages
@@ -3280,7 +3271,7 @@ fn the_types_tab_says_which_parameters_are_rows() {
         .into_iter()
         .find(|node| node.label == "type Bare")
         .expect("a row for the declaration");
-    assert_eq!(bare.children[0].text, "..'r (struct)");
+    assert_eq!(bare.children[0].text, "..'r (row)");
 }
 
 /// A type parameter is a symbol like any other — minted as a local, the way a
@@ -3369,7 +3360,7 @@ fn sums_reach_every_stage() {
         .find(|node| node.label == "type Fallible")
         .expect("a row for the declaration");
     assert_eq!(fallible.text, "#Err Nat | ..'a");
-    assert_eq!(fallible.children[0].text, "..'r (sum) without #Err");
+    assert_eq!(fallible.children[0].text, "..'r (row) without Err");
 
     // And the definition's scheme is the declared type, applied to the row the
     // use site handed it.

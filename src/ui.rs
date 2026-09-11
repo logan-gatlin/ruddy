@@ -686,6 +686,7 @@ impl fmt::Display for Kind {
             Kind::Tilde => f.write_str("~"),
             Kind::Assign => f.write_str(":="),
             Kind::Not => f.write_str("not"),
+            Kind::Using => f.write_str("using"),
             Kind::Module => f.write_str("module"),
             Kind::Equal => f.write_str("="),
             Kind::FatArrow => f.write_str("=>"),
@@ -1320,6 +1321,7 @@ impl ir::ErrorKind {
             ir::ErrorKind::ExecutableDependency { .. } => "executable-dependency",
             ir::ErrorKind::DuplicateDependencyAlias { .. } => "duplicate-dependency-alias",
             ir::ErrorKind::DuplicateDependency { .. } => "duplicate-dependency",
+            ir::ErrorKind::Using { .. } => "using",
             ir::ErrorKind::Undefined { namespace, .. } => match namespace {
                 Namespace::Types => "undefined-type",
                 Namespace::Effects => "undefined-effect",
@@ -1411,6 +1413,7 @@ impl ir::Error {
         let code = self.kind.code();
         let span = source.span(self.at);
         match &self.kind {
+            E::Using { message } => Diagnostic::new(code, message.clone(), span),
             E::RuntimeTypeInformation { message } => Diagnostic::new(code, message.clone(), span)
                 .help("supply a concrete type at this use, or retain unknown foreign data as ForeignValue"),
             E::ForeignProtocol { message } => Diagnostic::new(self.kind.code(), message.clone(), source.span(self.at)),
@@ -1441,8 +1444,7 @@ impl ir::Error {
                     Sense::Type => "used here",
                     Sense::Region => "a region",
                     Sense::Presence => "a presence",
-                    Sense::Fields => "a row of struct fields",
-                    Sense::Cases => "a row of cases",
+                    Sense::Row => "a row of fields or cases",
                     Sense::Effects => "a row of effects",
                 }),
                 span,
@@ -2114,15 +2116,11 @@ impl fmt::Display for Shape {
 /// [`ir::ErrorKind::MixedParameter`] and [`ir::ErrorKind::MixedTail`] each say
 /// twice and [`ir::ErrorKind::NotARow`] once.
 ///
-/// The rest of a struct is a whole type, so it has no phrase of its own: `..'r`
-/// in a struct puts whatever is written for `'r` in the struct-row tail, and there is
-/// nothing narrower to call that.
 impl fmt::Display for Sense {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Sense::Type => "a whole type",
-            Sense::Fields => "the rest of a struct's fields",
-            Sense::Cases => "the rest of a sum's cases",
+            Sense::Row => "a row of fields or cases",
             Sense::Effects => "the rest of an arrow's effects",
             // What a `when` puts on a label, said as the reader's own word for
             // it rather than as "a presence variable": they wrote `when a`, and
@@ -3705,11 +3703,8 @@ impl inference::Error {
                     Sense::Type => diagnostic
                         .help("return or pass through the annotated value instead of replacing its type")
                         .help("or change the annotation to name the concrete type the body uses"),
-                    Sense::Fields => diagnostic
-                        .help("preserve the caller-chosen struct remainder instead of closing it")
-                        .help("or remove the open remainder from the annotation"),
-                    Sense::Cases => diagnostic
-                        .help("preserve the caller-chosen remaining cases instead of closing them")
+                    Sense::Row => diagnostic
+                        .help("preserve the caller-chosen row remainder instead of closing it")
                         .help("or remove the open remainder from the annotation"),
                     Sense::Effects if effect_row_has_specific_operation(found) => diagnostic
                         .help("handle the performed effect inside the body")
@@ -4052,20 +4047,11 @@ impl fmt::Display for inference::ErrorKind {
             inference::ErrorKind::RigidBroken {
                 found,
                 name,
-                sense: Sense::Fields,
+                sense: Sense::Row,
                 ..
             } => write!(
                 f,
-                "this is `{found}`, but `'{name}` stands for whatever the caller picks for the rest of a struct's fields",
-            ),
-            inference::ErrorKind::RigidBroken {
-                found,
-                name,
-                sense: Sense::Cases,
-                ..
-            } => write!(
-                f,
-                "this is `{found}`, but `'{name}` stands for whatever the caller picks for the remaining cases",
+                "this is `{found}`, but `'{name}` stands for whatever row of fields or cases the caller picks",
             ),
             inference::ErrorKind::RigidBroken { found, name, .. } => write!(
                 f,

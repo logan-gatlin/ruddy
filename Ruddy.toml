@@ -5,3 +5,12 @@ root = "std/lib.rud"
 
 [dependencies]
 std = false
+
+[documentation]
+target = "docs/src/std/"
+frontmatter = """
+---
+doc: true
+---
+
+"""

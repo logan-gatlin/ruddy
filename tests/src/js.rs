@@ -279,6 +279,36 @@ let shared = same first.token second.token
 }
 
 #[test]
+fn shared_rows_generic_descriptors_keep_structs_and_sums_distinct() {
+    execute_reification(
+        r#"
+type Option 'a = #Some 'a | #None
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+type Both 'r = { product: { ..'r }, choice: | ..'r }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+@private let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
+@private let unbox: Any -> Option 'a = fn any => match any with
+| hide 'x { mirror: witness, value } => match same_pair (witness, mirror ()) with
+  | #Some { forward, backward } => #Some (forward value)
+  | #None => #None
+  end
+end
+@private let pack: Both { ..'r } -> { product: Any, choice: Any } = fn p => { product: box p.product, choice: box p.choice }
+@private let packed = pack { product: { A: 7n }, choice: #A 8n }
+@private let product: Option { A: Nat } = unbox packed.product
+@private let choice: Option (#A Nat) = unbox packed.choice
+@private let wrong: Option { A: Nat } = unbox packed.choice
+let field = match product with | #Some p => p.A | #None => 0n end
+let payload = match choice with | #Some (#A n) => n | #None => 0n end
+let distinct = match wrong with | #Some _ => false | #None => true end
+"#,
+        "assert.equal(app.field, 7); assert.equal(app.payload, 8); assert.equal(app.distinct, true);",
+    );
+}
+
+#[test]
 fn reification_generic_boxing_helpers_and_higher_order_calls_preserve_each_instantiation() {
     let artifact = compiled(
         r#"
@@ -2044,5 +2074,16 @@ assert.equal(app.asking_rejected, true);
 assert.equal(app.args_matter, true);
 assert.equal(app.same_effect, true);
 "#,
+    );
+}
+
+#[test]
+fn using_aliases_execute_without_becoming_javascript_exports() {
+    execute_reification(
+        "@private module Source = let value = 42n end
+         using Source::{self as source, value as imported}
+         let answer = imported
+         let local = do using source::value as inner return inner end",
+        "assert.equal(app.answer, 42); assert.equal(app.local, 42); assert.deepEqual(Object.keys(app).sort(), ['answer', 'local']);",
     );
 }

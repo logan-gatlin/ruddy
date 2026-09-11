@@ -7,6 +7,7 @@ pub type Token = Tracked<Kind>;
 #[derive(Debug, Clone)]
 pub enum Kind {
     Let,
+    Using,
     /// `extern`, declaring a target-provided top-level value.
     Extern,
     /// `do`, opening a `do <stmts> [return <expr>] end` block. The `end`
@@ -824,6 +825,7 @@ pub fn keyword(word: &str) -> Option<Kind> {
         "not" => Kind::Not,
         "mut" => Kind::Mut,
         "module" => Kind::Module,
+        "using" => Kind::Using,
         "true" => Kind::Bool(true),
         "false" => Kind::Bool(false),
         "_" => Kind::Underscore,

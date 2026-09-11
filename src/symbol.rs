@@ -351,6 +351,12 @@ impl Mint {
         }
     }
 
+    /// A dependency root has a distinct identity from a source module with
+    /// the same name. It is installed in the dependency prelude only.
+    pub(crate) fn dependency_module(&mut self, name: &str) -> Module {
+        Module(self.local(None, Namespace::Modules, name))
+    }
+
     /// Mint a fresh local symbol that no definition wrote: an imported
     /// declaration's stand-in, or a test's. Two calls with identical arguments
     /// return unequal symbols; that is the whole point of a local.

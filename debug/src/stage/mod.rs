@@ -31,7 +31,7 @@ use ruddy::{
     ir::Param,
     symbol::{Mint, Symbol},
     tracking::FileID,
-    types::{Shape, Ty},
+    types::{Sense, Shape, Ty},
     ui,
 };
 
@@ -485,14 +485,9 @@ pub fn plural(count: usize, noun: &str) -> String {
 /// something, what kind, and what may not be in it, is nowhere else on the page.
 /// Written once so the two cannot spell it differently.
 ///
-/// A parameter that tails a *struct* stands for a whole type, so it is shown as
-/// one — with the fields it may not name beside it, since that is the whole of
-/// what its `..` still demands. A sum's rest and an arrow's effects are
-/// readings of their own, and say which they are.
-///
-/// The labels are spelled the way their own shape spells them — a field bare, a
-/// case with its `#` — through [`ui::label`], so this row and the
-/// compiler's own complaint about the same parameter name it the same way.
+/// Display a parameter's kind and excluded labels. Shared rows use bare labels
+/// because the parameter can supply either fields or cases; effects retain
+/// their own spelling.
 pub fn stands_for(mint: &Mint, param: &Param) -> String {
     // Sigil and all, the way [`stands_for_variable`](crate::stage::ir) spells
     // the other kind of variable: a parameter is written `'a` and tailed `..'a`,
@@ -501,9 +496,8 @@ pub fn stands_for(mint: &Mint, param: &Param) -> String {
     let name = format!("'{}", mint.name(param.symbol));
     let lacks = param.kind.lacks();
     let (opener, shape) = match param.kind.row() {
-        Some((shape @ Shape::Effect, _)) => (format!("..{name} (effects)"), shape),
-        Some((shape @ Shape::Struct, _)) => (format!("..{name} (struct)"), shape),
-        Some((shape, _)) => (format!("..{name} (sum)"), shape),
+        Some((Sense::Effects, _)) => (format!("..{name} (effects)"), Shape::Effect),
+        Some(_) => (format!("..{name} (row)"), Shape::Struct),
         None if lacks.is_empty() => return name,
         None => (format!("..{name} (struct)"), Shape::Struct),
     };

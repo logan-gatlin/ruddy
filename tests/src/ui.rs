@@ -312,16 +312,14 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         },
         IrError::MixedTail {
             first: Sense::Type,
-            second: Sense::Cases,
+            second: Sense::Row,
             previous: at,
         },
         IrError::MixedParameter {
             first: Sense::Type,
-            second: Sense::Cases,
+            second: Sense::Row,
         },
-        IrError::NotARow {
-            sense: Sense::Cases,
-        },
+        IrError::NotARow { sense: Sense::Row },
         IrError::RepeatedRowField {
             shape: Shape::Struct,
             field: "x".to_string(),
@@ -2655,10 +2653,11 @@ fn a_complaint_about_a_sum_says_case_and_writes_the_sigil() {
     };
     assert!(repeated.to_string().contains("cases"), "{repeated}");
     assert!(repeated.to_string().contains("`#A`"), "{repeated}");
-    let not_a_row = IrError::NotARow {
-        sense: Sense::Cases,
-    };
-    assert!(not_a_row.to_string().contains("sum's cases"), "{not_a_row}");
+    let not_a_row = IrError::NotARow { sense: Sense::Row };
+    assert!(
+        not_a_row.to_string().contains("fields or cases"),
+        "{not_a_row}"
+    );
     let effects = IrError::NotARow {
         sense: Sense::Effects,
     };
@@ -2739,11 +2738,11 @@ fn a_written_absence_is_not_printed() {
 fn a_mixed_parameter_names_both_readings() {
     let mixed = IrError::MixedParameter {
         first: Sense::Type,
-        second: Sense::Cases,
+        second: Sense::Row,
     };
     assert_eq!(
         mixed.to_string(),
-        "this parameter is used as a whole type and as the rest of a sum's cases"
+        "this parameter is used as a whole type and as a row of fields or cases"
     );
 }
 
@@ -3809,12 +3808,12 @@ fn a_mixed_tail_names_the_two_senses_it_was_given() {
         .to_string()
     };
     assert_eq!(
-        said(Sense::Type, Sense::Cases),
-        "one variable cannot stand for both a whole type and the rest of a sum's cases"
+        said(Sense::Type, Sense::Row),
+        "one variable cannot stand for both a whole type and a row of fields or cases"
     );
     assert_eq!(
-        said(Sense::Cases, Sense::Type),
-        "one variable cannot stand for both the rest of a sum's cases and a whole type"
+        said(Sense::Row, Sense::Type),
+        "one variable cannot stand for both a row of fields or cases and a whole type"
     );
     // The third sense, which only a `where 'let` variable can have: a formula is
     // written about presences, so a name in one is read as a presence.
@@ -3823,8 +3822,8 @@ fn a_mixed_tail_names_the_two_senses_it_was_given() {
         "one variable cannot stand for both a whole type and a presence"
     );
     assert_eq!(
-        said(Sense::Presence, Sense::Cases),
-        "one variable cannot stand for both a presence and the rest of a sum's cases"
+        said(Sense::Presence, Sense::Row),
+        "one variable cannot stand for both a presence and a row of fields or cases"
     );
 }
 
@@ -5619,8 +5618,7 @@ fn hidden_forms_print_and_the_unsupported_complaint_reads_plainly() {
         (Sense::Type, "used here"),
         (Sense::Region, "a region"),
         (Sense::Presence, "a presence"),
-        (Sense::Fields, "a row of struct fields"),
-        (Sense::Cases, "a row of cases"),
+        (Sense::Row, "a row of fields or cases"),
         (Sense::Effects, "a row of effects"),
     ] {
         let misused = ir::Error {
