@@ -120,7 +120,7 @@ targeting JS; `[run].js` can configure the launch command.
 
 The runtime handles `std::io::IO.write` and `write_error` (`String -> ()`),
 also available through the prelude alias `IO`. They write to stdout and
-stderr without adding a newline, and `std::Process.exit` (`Nat -> Never`). The
+stderr without adding a newline, and `std::process::Exit` (`Nat -> Never`). The
 corresponding `io::println` and `eprintln` helpers append a newline.
 `process::exit` saturates its code to
 255, never resumes, and drains pending console output before termination.
@@ -134,14 +134,20 @@ rename, and copy. Operations may suspend and return `Result` values; callers
 need no `await`. See [the filesystem module](docs/fs.md) for its signatures
 and error behavior.
 
-Local effect handlers can intercept all these operations. Platform effects
+The standard library also includes JSON parsing and typed decoding, immutable URL
+and query utilities, buffered HTTP requests, process arguments/environment, and
+Node path utilities. See [the platform API guide](docs/src/platform-apis.md) for
+signatures, effect handlers, and examples.
+
+Local effect handlers can intercept platform operations. Platform effects
 are recognized by their complete structural identity, independently of where
 they were declared. Std can still be overridden or disabled with `std = false`;
 a pure executable needs no std dependency.
 
 When a JavaScript root bundle is built, its public values receive host-callable
-adapters. On Node, exported functions run under the IO, Process, and FileSystem
-handlers, including aliases imported from std. Both `check` and
+adapters. On Node, exported functions run under the IO, Exit, FileSystem, Process,
+Path, and Http handlers, including aliases imported from std. Web libraries
+receive the Http handler. Both `check` and
 `build` reject exports whose effects cannot be handled. Dependency artifacts,
 private definitions, and internal Ruddy calls retain their effect interfaces;
 local handlers can still intercept them. See [host exports](docs/cps.md#library-exports-and-initialization).

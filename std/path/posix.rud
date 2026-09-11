@@ -1,0 +1,14 @@
+@async
+extern normalize: String -> String = "$nodePath.posix.normalize"
+@async
+extern basename: String -> String = "$nodePath.posix.basename"
+@async
+extern dirname: String -> String = "$nodePath.posix.dirname"
+@async
+extern extension: String -> String = "$nodePath.posix.extname"
+@async
+extern is_absolute: String -> Bool = "$nodePath.posix.isAbsolute"
+@async
+extern parse: String -> Parts = "$nodePath.posix.parse"
+@async
+extern join: [String] -> String = "$nodePath.posix.join"

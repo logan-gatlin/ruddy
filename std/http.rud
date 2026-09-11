@@ -1,0 +1,51 @@
+type Headers = [(String, String)]
+type Body = #Empty | #Text String | #Bytes [Nat8]
+type Redirect = #Follow | #Manual | #Error
+@doc "Buffered request. timeout_ms includes reading the body; max_bytes bounds the response body."
+type Request = {
+  url: String,
+  method: String,
+  headers: Headers,
+  body: Body,
+  timeout_ms: Nat,
+  max_bytes: Nat,
+  redirect: Redirect,
+}
+type Response = {
+  status: Nat,
+  status_text: String,
+  headers: Headers,
+  body: [Nat8],
+  url: String,
+  redirected: Bool,
+}
+type ErrorKind = #InvalidRequest | #Network | #Timeout | #TooLarge | #Unsupported
+type Error = { kind: ErrorKind, url: String, message: String }
+effect Http = { request: Request -> Result Response Error }
+let request = !Http.request
+@doc "GET defaults: follow redirects, 30-second timeout, 16 MiB response limit. Customize with a struct spread."
+let defaults: String -> Request = fn url => {
+  url: url,
+  method: "GET",
+  headers: [],
+  body: #Empty,
+  timeout_ms: 30000n,
+  max_bytes: 16777216n,
+  redirect: #Follow,
+}
+let get = fn url => request (defaults url)
+let post = fn url body => request { method: "POST", body: body, ..defaults url }
+let is_success = fn response => boolean::logical_and
+  (nat::greater_than_or_equal response.status 200n)
+  (nat::less_than response.status 300n)
+let header: String -> Headers -> Option String = fn name headers =>
+  option::map
+    (fn pair => pair.1)
+    (array::find
+      (fn pair => str::equal (str::to_lowercase name) (str::to_lowercase pair.0))
+      headers)
+@private
+extern decode_text: [Nat8] -> String = "$http.text"
+@doc "Decode UTF-8 using Fetch text semantics (replace malformed sequences and strip a BOM)."
+let text = fn response => decode_text response.body
+let json: Response -> Result 'a json::DecodeError = fn response => json::decode (text response)

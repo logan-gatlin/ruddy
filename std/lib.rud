@@ -3,6 +3,11 @@ module effects
 module fs
 module io
 module process
+module json
+module url
+module http
+@if { platform: "node" }
+module path
 module str
 module nat
 module int

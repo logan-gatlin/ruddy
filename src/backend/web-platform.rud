@@ -1,0 +1,29 @@
+module http =
+  type Headers = [(String, String)]
+  type Body = #Empty | #Text String | #Bytes [Nat8]
+  type Redirect = #Follow | #Manual | #Error
+  @doc "Buffered request. timeout_ms includes reading the body; max_bytes bounds the response body."
+  type Request = {
+    url: String,
+    method: String,
+    headers: Headers,
+    body: Body,
+    timeout_ms: Nat,
+    max_bytes: Nat,
+    redirect: Redirect,
+  }
+  type Response = {
+    status: Nat,
+    status_text: String,
+    headers: Headers,
+    body: [Nat8],
+    url: String,
+    redirected: Bool,
+  }
+  type ErrorKind = #InvalidRequest | #Network | #Timeout | #TooLarge | #Unsupported
+  type Error = { kind: ErrorKind, url: String, message: String }
+end
+
+effect Http = { request: http::Request -> #Some http::Response | #Error http::Error }
+@async
+extern http_request: http::Request -> #Some http::Response | #Error http::Error = "$http.request"

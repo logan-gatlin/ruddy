@@ -154,8 +154,10 @@ fn entry_adapter(artifact: &Artifact) -> Result<Artifact, Error> {
 // supported interfaces independently of a project's choice of std bundle.
 const NODE_ENTRY: &str = concat!(
     include_str!("node-platform.rud"),
-    "let with_platform: (() -> 'a + !IO + !Exit + !FileSystem + !Immediate) -> 'a + !Immediate = fn body => handle body () with\n",
+    include_str!("web-platform.rud"),
+    "let with_platform: (() -> 'a + !IO + !Exit + !FileSystem + !Process + !Path + !Http + !Immediate) -> 'a + !Immediate = fn body => handle body () with\n",
     include_str!("node-handler.rud"),
+    include_str!("web-handler.rud"),
     "end\n",
     include_str!("node-entry.rud")
 );
@@ -166,6 +168,7 @@ struct Generator<'a> {
     extern_names: HashSet<&'a str>,
     exports: ExportNode,
     platform_exports: bool,
+    platform: Platform,
 }
 
 impl<'a> Generator<'a> {
@@ -259,6 +262,7 @@ impl<'a> Generator<'a> {
             extern_names,
             exports,
             platform_exports: !host_exports.is_empty() && platform == Platform::Node,
+            platform,
         };
         generator.validate()?;
         Ok(generator)
@@ -296,6 +300,10 @@ impl<'a> Generator<'a> {
         out.push_str(RUNTIME);
         out.push_str(CPS_RUNTIME);
         out.push_str(include_str!("type-runtime.js"));
+        out.push_str(include_str!("web-apis.js"));
+        if self.platform == Platform::Node {
+            out.push_str(include_str!("node-apis.js"));
+        }
         if entry.is_some() || self.platform_exports {
             out.push_str(include_str!("node-fs.js"));
         }

@@ -397,7 +397,11 @@ fn key(
 }
 
 impl Graph {
-    fn build(root: &Type, declarations: &HashMap<&str, &DeclaredType>) -> Result<Self, String> {
+    fn build(
+        root: &Type,
+        declarations: &HashMap<&str, &DeclaredType>,
+        platform: Platform,
+    ) -> Result<Self, String> {
         let mut nodes = vec![Plan::Value];
         let mut work = vec![(
             0,
@@ -455,7 +459,14 @@ impl Graph {
                 Type::Arrow(_, result, row) => {
                     let fields = fields(row, view.clone(), declarations);
                     let open = !matches!(fields.rest, Rest::Closed);
-                    let handlers = include_str!("node-handler.rud")
+                    let platform_handlers = match platform {
+                        Platform::Node => concat!(
+                            include_str!("node-handler.rud"),
+                            include_str!("web-handler.rud")
+                        ),
+                        Platform::Web => include_str!("web-handler.rud"),
+                    };
+                    let handlers = platform_handlers
                         .lines()
                         .filter(|line| {
                             open || fields.labels.iter().any(|(label, presence, _)| {
@@ -674,7 +685,6 @@ impl Graph {
         &self,
         node: Node,
         value: &str,
-        platform: Platform,
         prefix: &str,
         next: &mut usize,
         expand: bool,
@@ -689,9 +699,7 @@ impl Graph {
         *next += 1;
         match &self.nodes[node] {
             Plan::Value => value.into(),
-            Plan::Alias { inner, .. } => {
-                self.expression(*inner, value, platform, prefix, next, false)
-            }
+            Plan::Alias { inner, .. } => self.expression(*inner, value, prefix, next, false),
             Plan::Function {
                 effectful,
                 handlers,
@@ -699,19 +707,12 @@ impl Graph {
                 result,
             } => {
                 let call = format!("{value} arg_{id}");
-                let call = if *effectful && platform == Platform::Node && !handlers.is_empty() {
+                let call = if *effectful && !handlers.is_empty() {
                     format!("handle {call} with\n{handlers}end")
                 } else {
                     call
                 };
-                let result = self.expression(
-                    *result,
-                    &format!("value_{id}"),
-                    platform,
-                    prefix,
-                    next,
-                    false,
-                );
+                let result = self.expression(*result, &format!("value_{id}"), prefix, next, false);
                 format!(
                     "(do let function_{id}: _ -> _{residual_effects} = fn arg_{id} => do let value_{id} = {call} return {result} end return function_{id} end)"
                 )
@@ -727,8 +728,7 @@ impl Graph {
                     let target = format!("record_{}", *next);
                     *next += 1;
                     let projected = format!("{previous}.{field}");
-                    let adapted =
-                        self.expression(*inner, &projected, platform, prefix, next, false);
+                    let adapted = self.expression(*inner, &projected, prefix, next, false);
                     let updated = format!("{{ {field}: {adapted}, ..{previous} }}");
                     let updated = if *present {
                         updated
@@ -746,21 +746,14 @@ impl Graph {
                 let mut body = format!("(match {value} with\n");
                 for (tag, _, inner) in cases {
                     let tag = Quoted(tag);
-                    let inner = self.expression(
-                        *inner,
-                        &format!("payload_{id}"),
-                        platform,
-                        prefix,
-                        next,
-                        false,
-                    );
+                    let inner =
+                        self.expression(*inner, &format!("payload_{id}"), prefix, next, false);
                     body.push_str(&format!("| #{tag} payload_{id} => #{tag} {inner}\n"));
                 }
                 format!("{body}end)")
             }
             Plan::Array(inner) => {
-                let inner =
-                    self.expression(*inner, &format!("item_{id}"), platform, prefix, next, false);
+                let inner = self.expression(*inner, &format!("item_{id}"), prefix, next, false);
                 format!(
                     "(do let array_{id} = {value}\nlet map_{id}: Nat -> [_] -> [_] = fn index_{id} output_{id} => match host_get array_{id} index_{id} with\n| #Some item_{id} => map_{id} (host_next index_{id}) (host_push output_{id} {inner})\n| #None => output_{id}\nend\nreturn map_{id} 0n [] end)"
                 )
@@ -768,12 +761,7 @@ impl Graph {
         }
     }
 
-    fn definitions(
-        &self,
-        prefix: &str,
-        raw_types: &HashMap<&str, (String, String)>,
-        platform: Platform,
-    ) -> String {
+    fn definitions(&self, prefix: &str, raw_types: &HashMap<&str, (String, String)>) -> String {
         let mut source = String::new();
         for (id, node) in self.nodes.iter().enumerate() {
             if !self.helper(id) {
@@ -804,7 +792,7 @@ impl Graph {
                     }
                 })
                 .collect::<String>();
-            let body = self.expression(id, "original", platform, prefix, &mut 0, true);
+            let body = self.expression(id, "original", prefix, &mut 0, true);
             source.push_str(&format!("let {prefix}adapt_{id}: (program::{raw}{}) -> ({prefix}Type_{id}{}) = fn original => {body}\n", arguments, holes));
         }
         source
@@ -884,9 +872,11 @@ pub(super) fn compile(
             }
         })?;
         let graph =
-            Graph::build(&value.scheme.body, &declarations).map_err(|message| Error::Export {
-                name: value.name.clone(),
-                message,
+            Graph::build(&value.scheme.body, &declarations, platform).map_err(|message| {
+                Error::Export {
+                    name: value.name.clone(),
+                    message,
+                }
             })?;
         if !graph.needed[0] {
             continue;
@@ -895,13 +885,12 @@ pub(super) fn compile(
             return Err(Error::UnresolvedPublicValue(value.name.clone()));
         };
         let helper_prefix = format!("Host_{index}_");
-        let mut source = graph.definitions(&helper_prefix, &raw_types, platform);
+        let mut source = graph.definitions(&helper_prefix, &raw_types);
         source.push_str(&format!(
             "let host_{index} = {}\n",
             graph.expression(
                 0,
                 &format!("program::{name}"),
-                platform,
                 &helper_prefix,
                 &mut 0,
                 false
@@ -916,7 +905,8 @@ pub(super) fn compile(
         Platform::Node => include_str!("node-platform.rud"),
         Platform::Web => "effect Immediate\n",
     };
-    let prelude = format!("{prelude}\n{ARRAY_HELPERS}");
+    let web = include_str!("web-platform.rud");
+    let prelude = format!("{prelude}\n{web}\n{ARRAY_HELPERS}");
     let source = format!(
         "{prelude}\n{}",
         definitions

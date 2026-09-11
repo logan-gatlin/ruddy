@@ -32,6 +32,7 @@ mod session;
 mod snapshot;
 mod stage;
 mod stdlib;
+mod stdlib_apis;
 mod stdlib_fs;
 mod symbol;
 mod token;

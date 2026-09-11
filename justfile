@@ -12,7 +12,7 @@ dev_dir := justfile_directory() / "debug/.dev"
 # handler fragment the backend splices into generated code, which is not a
 # file; and so is the debugger's demo, which ends in deliberate syntax errors
 # that a format run rightly reports.
-ruddy_sources := "std src/backend/node-platform.rud src/backend/node-entry.rud"
+ruddy_sources := "std src/backend/node-platform.rud src/backend/web-platform.rud src/backend/node-entry.rud"
 
 _default:
     @just --list --unsorted

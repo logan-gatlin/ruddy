@@ -133,3 +133,26 @@ let append_bytes = fn request =>
 
 @async
 extern host_exit: Nat -> | = "$nodeExit"
+
+module process =
+  type ErrorKind = #InvalidName | #Unavailable | #Other
+  type Error = { kind: ErrorKind, message: String }
+end
+effect Process = {
+  args: () -> [String],
+  env: String -> Result (#Some String | #None) process::Error,
+  cwd: () -> Result String process::Error,
+}
+extern process_args: () -> [String] = "$process.args"
+extern process_env: String -> Result (#Some String | #None) process::Error = "$process.env"
+extern process_cwd: () -> Result String process::Error = "$process.cwd"
+module path = type Error = { message: String } end
+effect Path = {
+  resolve: [String] -> Result String path::Error,
+  relative: { from: String, to: String } -> Result String path::Error,
+}
+@async
+extern path_resolve: [String] -> Result String path::Error = "$nodePath.resolve"
+@async
+extern path_relative: { from: String, to: String } -> Result String path::Error =
+  "$nodePath.relative"

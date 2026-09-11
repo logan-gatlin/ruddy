@@ -1,0 +1,36 @@
+@doc "An immutable snapshot of a WHATWG URL. Parse or resolve again to validate edits."
+type Url = {
+  href: String,
+  origin: String,
+  protocol: String,
+  username: String,
+  password: String,
+  host: String,
+  hostname: String,
+  port: String,
+  pathname: String,
+  search: String,
+  hash: String,
+}
+type Error = { input: String, message: String }
+type Query = [(String, String)]
+extern parse: String -> Result Url Error = "$url.parse"
+@private
+extern resolve_raw: { base: String, input: String } -> Result Url Error = "$url.resolve"
+let resolve = fn base input => resolve_raw { base: base, input: input }
+extern parse_query: String -> Query = "$url.parseQuery"
+extern stringify_query: Query -> String = "$url.stringifyQuery"
+let query = fn url => parse_query url.search
+let get: String -> Query -> Option String = fn name query =>
+  option::map (fn pair => pair.1) (array::find (fn pair => str::equal name pair.0) query)
+let get_all: String -> Query -> [String] = fn name query =>
+  array::filter_map (fn pair => if str::equal name pair.0 then #Some pair.1 else #None end) query
+let append: String -> String -> Query -> Query = fn name value query =>
+  array::push query (name, value)
+let remove: String -> Query -> Query = fn name query =>
+  array::filter (fn pair => str::not_equal name pair.0) query
+let set: String -> String -> Query -> Query = fn name value query =>
+  append name value (remove name query)
+@private
+extern with_query_raw: { href: String, search: String } -> Result Url Error = "$url.withQuery"
+let with_query = fn url query => with_query_raw { href: url.href, search: stringify_query query }

@@ -17,3 +17,8 @@
   | !FileSystem.remove_dir request => fs_remove_dir request
   | !FileSystem.rename request => fs_rename request
   | !FileSystem.copy_file request => fs_copy_file request
+  | !Process.args unit => process_args unit
+  | !Process.env name => process_env name
+  | !Process.cwd unit => process_cwd unit
+  | !Path.resolve parts => path_resolve parts
+  | !Path.relative request => path_relative request

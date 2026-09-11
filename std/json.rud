@@ -1,0 +1,48 @@
+@doc "JSON data as immutable, pattern-matchable values. Objects preserve member order."
+type Value =
+  | #Null
+  | #Bool Bool
+  | #Number Real
+  | #String String
+  | #Array [Value]
+  | #Object [(String, Value)]
+type Error = { message: String }
+type DecodeError = #Parse Error | #Decode ffi::DecodeError
+
+extern parse: String -> Result Value Error = "$json.parse"
+@private
+extern parse_raw: String -> Result ForeignValue Error = "$json.raw"
+@private
+extern quote: String -> String = "JSON.stringify"
+@private
+extern number: Real -> Result String Error = "$json.number"
+@doc "Decode JSON into the inferred result type, with a path to any invalid field."
+let decode: String -> Result 'a DecodeError = fn text => match parse_raw text with
+| #Error error => #Error (#Parse error)
+| #Some value => result::map_error (fn error => #Decode error) (ffi::decode value)
+end
+
+@doc "Serialize JSON values; non-finite numbers are errors rather than silently becoming null."
+let stringify: Value -> Result String Error = fn value => match value with
+| #Null => #Some "null"
+| #Bool b => #Some (str::from_boolean b)
+| #Number n => number n
+| #String s => #Some (quote s)
+| #Array values =>
+  result::map
+    (fn parts => str::concat "[" (str::concat (str::join "," parts) "]"))
+    (array::traverse_result stringify values)
+| #Object values => do
+  let member = fn pair =>
+    result::map (fn text => str::concat (quote pair.0) (str::concat ":" text)) (stringify pair.1)
+  return result::map
+    (fn parts => str::concat "{" (str::concat (str::join "," parts) "}"))
+    (array::traverse_result member values)
+end
+end
+
+let get: String -> Value -> Option Value = fn key value => match value with
+| #Object entries =>
+  option::map (fn pair => pair.1) (array::find (fn pair => str::equal key pair.0) entries)
+| _ => #None
+end

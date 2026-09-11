@@ -149,19 +149,19 @@ fn comments_keep_their_place() {
 }
 
 /// Every Ruddy source in the repository formats to a fixed point that
-/// re-parses to the tree it came from. The backend's handler file is a
-/// fragment spliced into generated code rather than a file, so it is left
-/// out; the demo ends in deliberately broken definitions, so its errors are
+/// re-parses to the tree it came from. The backend's handlers are fragments
+/// spliced into generated code rather than files, so they are left out; the demo ends in deliberately broken definitions, so its errors are
 /// allowed and its surviving statements compared.
 #[test]
 fn the_repository_sources_round_trip() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let mut files = Vec::new();
-    for directory in ["std", "src/backend"] {
+    for directory in ["std", "std/path", "src/backend"] {
         for entry in std::fs::read_dir(root.join(directory)).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().is_some_and(|ext| ext == "rud")
                 && !path.ends_with("node-handler.rud")
+                && !path.ends_with("web-handler.rud")
             {
                 files.push(path);
             }
