@@ -9,7 +9,7 @@ This page describes how names, values, functions, and types are written, followe
 
 ## Source layout and names
 
-A file contains [definitions](dictionary.md#definition) introduced by `let`, `type`, `effect`, `extern`, or `module`.
+A file contains [definitions](dictionary.md#definition) introduced by `let`, `type`, `effect`, `extern`, or `module`, and `using` statements that import names.
 Spaces and newlines separate code; indentation does not determine its structure.
 Definitions need no terminating punctuation.
 Blocks use keywords `do` and `end`, [tuples](dictionary.md#tuple) use parentheses, [structs](dictionary.md#struct) use curly braces, and [arrays](dictionary.md#array) use square brackets.
@@ -135,12 +135,13 @@ The following table lists expression operators from tightest to loosest grouping
 
 Parentheses override this grouping.
 The arithmetic operators work on `Real`; integer arithmetic and comparisons use functions such as `std::nat::add` and `std::nat::less_than`.
+An explicit `using std::nat` import permits the shorter names `nat::add` and `nat::less_than`.
 The form `value |> f |> g` means `g (f value)`.
 A minus immediately followed by digits is part of a number literal, so subtraction should have spaces around `-`, as in `total - 1`.
 
 ## Blocks and choices
 
-A `do` block contains local `let` bindings or `_ = expression` shortcuts followed by an optional `return expression` and a closing `end`.
+A `do` block contains local `let` bindings, `_ = expression` shortcuts, or `using` statements followed by an optional `return expression` and a closing `end`.
 The expression after `return` is the block's value; without `return`, the value is `()`.
 The keyword `return` does not return from a function; it supplies the value of its enclosing `do` block.
 The shorthand `_ = expression` evaluates an operation for its effects while discarding its result.
@@ -148,7 +149,7 @@ For example, a block can print a message before returning a status:
 
 ```ruddy
 let notify = fn message => do
-  _ = std::io::print message
+  _ = println message
   return #Sent
 end
 ```
@@ -196,6 +197,13 @@ end
 
 The shorthand `fn | pattern => expression | pattern => expression` defines a function that matches its argument directly, with no closing `end`.
 Its leading `|` is required; parentheses delimit a nested shorthand when more arms follow outside it.
+For example, a function can extract an optional address directly:
+
+```ruddy
+let email_or_default = fn
+| #Some address => address
+| #None => "support@example.com"
+```
 
 ## Types
 
@@ -236,8 +244,8 @@ For example, an open struct type accepts a contact with additional fields:
 let email: { email: String, .. } -> String = fn contact => contact.email
 ```
 
-Struct fields and sum cases share a row kind. A parameter used as a row tail
-accepts the underlying row of either a struct or a sum, including through type aliases:
+Struct fields and sum cases share a row kind.
+A parameter used as a row tail accepts the underlying row of either a struct or a sum, including through type aliases:
 
 ```ruddy
 type Sum 'r = | ..'r
@@ -249,13 +257,13 @@ type Both 'r = { product: { ..'r }, choice: | ..'r }
 
 `Choice` means `#a () | #b ()`, and `Product` means `{ A: (), B: () }`.
 Labels, payload types, presence conditions, and open tails are preserved.
-In `Both`, the struct and sum share the same row, so constraints from either use
-apply to both. A row must exclude every label already named beside any of its uses.
+In `Both`, the struct and sum share the same row, so constraints from either use apply to both.
+A row must exclude every label already named beside any of its uses.
 Empty structs and empty sums supply the same empty row.
 
-Struct and sum values remain distinct types. Row extraction happens at row
-parameters; it does not convert values. A parameter cannot stand for both a
-whole type and a row, and effect rows remain a separate kind.
+Struct and sum values remain distinct types.
+A row parameter accepts the fields or cases of a supplied type; it does not convert values.
+A parameter cannot stand for both a whole type and a row, and effect rows remain a separate kind.
 
 A [presence variable](dictionary.md#presence-variable) controls whether a field, case, or effect is present.
 A `where` clause constrains those variables with `not`, `and`, `or`, `=`, and `!=`, in that order from tightest to loosest grouping.
@@ -283,8 +291,12 @@ For example, a clock effect provides one operation for reading the current time:
 effect Clock = { now: () -> Nat }
 ```
 
+Named operation interfaces are closed: a handler supplies every operation in the interface.
+Operations take one argument; a tuple or struct groups several inputs.
+Effects with the same operation names and compatible signatures are structurally compatible.
+
 Effect definitions can take parameters, as in `effect Ask 'a = () -> 'a`.
-The form `effect IO = !Log + !Clock` combines effects, while `effect Marker` defines an effect with no operations.
+The form `effect Services = !Log + !Clock` combines effects, while `effect Marker` defines an effect with no operations.
 
 A function type lists its effects after `+`, as in `() -> Nat + !Clock`.
 Further effects are separated by `+`, an open effect row ends in `+ ..'e`, and `+ |` explicitly permits no effects.
@@ -303,6 +315,24 @@ let timestamp = handle !Clock.now () with
 | !Clock.now _ => 100n
 end
 ```
+
+A handler arm can call the effect it handles to forward an operation to an outer handler.
+That call does not re-enter the same handler, and its effect remains in the function's type until handled outside.
+For example, a handler can prefix console output before forwarding it to the runtime:
+
+```ruddy
+using std::io::IO
+
+let report = fn message => handle println message with
+| !IO.write text => !IO.write (std::str::concat "Report: " text)
+| !IO.write_error text => !IO.write_error text
+end
+```
+
+The import selects the concrete `IO` declaration; the prelude's `IO` is an alias usable in types, but does not declare operations.
+
+Repeating the same effect in a row does not create another layer of that effect.
+Repeated applications must have compatible arguments.
 
 ## Mutable cells
 
@@ -327,10 +357,9 @@ A [module](dictionary.md#module) groups names under a shared name.
 An inline module uses `module Name =`, its contents, and `end`.
 The form `module name` loads the module from a separate file.
 A path uses `::` between module names, as in `std::io::print`; effect paths put `!` before the final effect name, as in `std::io::!IO.write`.
-Paths normally resolve their first name from the surrounding lexical scope, then
-fall back to dependency aliases. A leading `::` selects a dependency directly,
-so `::std::io::println` names the dependency even when a local module is named
-`std`. Use `bundle::std` to select a local root module with that name.
+Paths normally resolve their first name from the surrounding lexical scope, then fall back to dependency aliases.
+A leading `::` selects a dependency directly, so `::std::io::println` names the dependency even when a local module is named `std`.
+The path `bundle::std` selects a local root module with that name.
 Dependencies and local modules may share a name without a conflict.
 For example, an inline module groups application defaults:
 
@@ -341,8 +370,8 @@ end
 ```
 
 A `using` statement makes existing declarations available under shorter names.
-`using Defaults` binds the module name; `using Defaults::*` brings its declarations
-into scope. Use `as` to rename a binding and braces to group imports:
+`using Defaults` binds the module name; `using Defaults::*` brings its declarations into scope.
+The keyword `as` renames a binding, and braces group imports:
 
 ```ruddy
 module Defaults =
@@ -360,10 +389,10 @@ These imports remain lexical aliases and do not become bundle exports.
 
 Groups can nest and include globs, such as `using App::{Settings::{self, *}}`.
 An import brings in every matching value, type, effect, and module namespace.
-Write an effect's declaration name in the import, then use its usual `!` spelling.
+An effect is imported by its declaration name, then used with its usual `!` spelling.
 
-Module-level imports apply throughout the containing module and its nested
-scopes, including before the statement. They can refer to later imports.
+Module-level imports apply throughout the containing module and its nested scopes, including before the statement.
+They can refer to later imports.
 Inside a `do` block, imports apply only from their statement onward:
 
 ```ruddy
@@ -377,25 +406,28 @@ let limit = do
 end
 ```
 
-`bundle::` starts at the current bundle's root, `self::` at the containing module,
-and `super::` at its parent. Repeat `super::` to climb further; climbing above the
-root is an error. These prefixes also work in ordinary value, type, and effect
-paths. Importing an anchor itself requires an alias, such as
-`using bundle as root` or `using super as parent`.
+`bundle::` starts at the current bundle's root, `self::` at the containing module, and `super::` at its parent.
+Repeating `super::` climbs further; climbing above the root is an error.
+These prefixes also work in ordinary value, type, and effect paths.
+Importing an anchor itself requires an alias, such as `using bundle as root` or `using super as parent`.
 
-Explicit imports cannot duplicate an explicit import or declaration in the same
-namespace and scope. Explicit names override glob imports. Two globs exposing
-different declarations under the same name are ambiguous only when that name is
-used. Inner scopes can shadow outer names, and imports override the standard
-prelude. An invalid import is an error even when unused.
+Explicit imports cannot duplicate an explicit import or declaration in the same namespace and scope.
+Explicit names override glob imports.
+Two globs exposing different declarations under the same name are ambiguous only when that name is used.
+Inner scopes can shadow outer names, and imports override the standard prelude.
+An invalid import is an error even when unused.
 
-Imports do not add bundle exports or qualified members to their containing
-module. If `A` imports `B::item`, that alone does not make `A::item` available.
-Likewise, `using A::*` imports A's accessible declarations, not A's imported
-names. Existing bundle-private access rules still apply.
+Imports do not add bundle exports or qualified members to their containing module.
+If `A` imports `B::item`, that alone does not make `A::item` available.
+Likewise, `using A::*` imports `A`'s accessible declarations, not `A`'s imported names.
+Existing bundle-private access rules still apply.
+
+The [prelude](standard-library.md#prelude) supplies names such as `println`, `Option`, and `IO` without a `using` statement.
+Other standard library names need a qualified path or an explicit import.
 
 An [attribute](dictionary.md#attribute) precedes a definition as `@key` or `@key literal`.
-Several attributes can appear together, and their values may contain literal structs, tuples, arrays, or tags.
+Several attributes can appear together.
+Attribute values may contain natural numbers, strings, `Bool` values, unit, and literal structs, tuples, arrays, or tags.
 An omitted value means `()`.
 For example, an attribute can record a version on a value:
 
@@ -433,4 +465,12 @@ For example, a JavaScript foreign function can expose a string's uppercase conve
 
 ```ruddy
 extern uppercase: fn(String) -> String = "text => text.toUpperCase()"
+```
+
+A foreign operation that directly changes or observes external state declares `std::ffi::!Immediate` on its function type.
+This effect cannot be handled by Ruddy code.
+For example, reading the host clock has an immediate effect:
+
+```ruddy
+extern now: fn(()) -> Real + std::ffi::!Immediate = "() => Date.now()"
 ```
