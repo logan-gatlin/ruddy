@@ -13,6 +13,60 @@ pub(super) struct Adapters {
     pub exports: HashMap<String, String>,
 }
 
+/// Which way a value crosses the JavaScript boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Direction {
+    ToJs,
+    FromJs,
+}
+
+/// A conversion shape for one boundary crossing: the finite graph of the
+/// type under the host's policy, and the fields the host may leave out. It
+/// can inspect optional fields without claiming an exact runtime identity
+/// for an abstract presence package, which is why it is not a descriptor.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeTemplate {
+    pub descriptor: crate::reification::Descriptor,
+    pub optional_fields: crate::reification::OptionalFields,
+}
+
+impl NativeTemplate {
+    pub fn template(
+        ty: &Arc<crate::types::Ty>,
+        aliases: &indexmap::IndexMap<crate::symbol::Symbol, crate::types::Scheme>,
+    ) -> Result<(Self, Vec<u32>), String> {
+        let (root, graph) = crate::ir::representation_graph(ty, aliases);
+        let (descriptor, optional_fields, parameters) =
+            crate::reification::Descriptor::from_graph_policy(root, &graph, true)?;
+        Ok((
+            Self {
+                descriptor,
+                optional_fields,
+            },
+            parameters,
+        ))
+    }
+
+    pub fn validate(&self, parameters: usize) -> Result<(), &'static str> {
+        self.descriptor.validate(parameters)?;
+        for (index, optional) in &self.optional_fields {
+            let Some(crate::reification::Node::Struct(fields)) =
+                self.descriptor.nodes.get(*index as usize)
+            else {
+                return Err("native optional fields require a record shape");
+            };
+            if optional
+                .iter()
+                .any(|name| !fields.iter().any(|(field, _)| field == name))
+            {
+                return Err("native optional field is absent from its record shape");
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 struct View<'a> {
     ty: &'a Type,
@@ -44,7 +98,7 @@ type Node = usize;
 pub(super) fn native_descriptor(
     root: &Type,
     declarations: &HashMap<&str, &DeclaredType>,
-) -> Result<crate::reification::NativeTemplate, String> {
+) -> Result<NativeTemplate, String> {
     use crate::reification::{Descriptor, Node as Runtime};
     let mut nodes = vec![Runtime::ForeignValue];
     let mut optional_fields =
@@ -94,10 +148,12 @@ pub(super) fn native_descriptor(
                         "{path} has an effectful callback contract that cannot be supplied by a native JavaScript caller"
                     ));
                 }
-                Runtime::Arrow([
-                    child(view.child(from), format!("{path} argument"), true),
-                    child(view.child(to), format!("{path} result"), incoming),
-                ])
+                let argument = child(view.child(from), format!("{path} argument"), true);
+                let result = child(view.child(to), format!("{path} result"), incoming);
+                // A host callable performs nothing: its row is empty.
+                let effects = nodes.len() as u32;
+                nodes.push(Runtime::Effects(Vec::new()));
+                Runtime::Arrow([argument, result, effects])
             }
             Type::Array(inner) => Runtime::Array(child(
                 view.child(inner),
@@ -174,7 +230,7 @@ pub(super) fn native_descriptor(
             }
         };
     }
-    Ok(crate::reification::NativeTemplate {
+    Ok(NativeTemplate {
         descriptor: Descriptor { nodes },
         optional_fields,
     })

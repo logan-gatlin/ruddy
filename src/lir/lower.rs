@@ -156,7 +156,7 @@ pub enum Op {
     Convert {
         descriptor: Temp,
         value: Temp,
-        direction: crate::reification::Direction,
+        direction: crate::backend::host::Direction,
     },
     TypeProjection {
         descriptor: Temp,
@@ -167,7 +167,7 @@ pub enum Op {
         arguments: Vec<Temp>,
     },
     NativePlan {
-        template: crate::reification::NativeTemplate,
+        template: crate::backend::host::NativeTemplate,
         arguments: Vec<Temp>,
     },
     Reflect {
@@ -1249,7 +1249,7 @@ impl Lower<'_> {
         &mut self,
         ty: &Arc<Ty>,
         value: Temp,
-        direction: crate::reification::Direction,
+        direction: crate::backend::host::Direction,
         body: &mut Body,
     ) -> Temp {
         if !self.native_values {
@@ -1260,7 +1260,7 @@ impl Lower<'_> {
         }
         let descriptor = {
             let (template, parameters) =
-                crate::reification::NativeTemplate::template(ty, self.inference.aliases())
+                crate::backend::host::NativeTemplate::template(ty, self.inference.aliases())
                     .expect("reviewed native conversion shape");
             let arguments = parameters
                 .into_iter()
@@ -1287,8 +1287,8 @@ impl Lower<'_> {
             )
         };
         let rep = match direction {
-            crate::reification::Direction::ToJs => Rep::HostValue,
-            crate::reification::Direction::FromJs => self.rep(ty),
+            crate::backend::host::Direction::ToJs => Rep::HostValue,
+            crate::backend::host::Direction::FromJs => self.rep(ty),
         };
         self.emit(
             body,
@@ -1561,7 +1561,7 @@ impl Lower<'_> {
                 )
             }
             crate::externs::Conversion::Value | crate::externs::Conversion::OrdinaryFunction => {
-                self.convert_value(ty, raw, crate::reification::Direction::FromJs, body)
+                self.convert_value(ty, raw, crate::backend::host::Direction::FromJs, body)
             }
         }
     }
@@ -1803,7 +1803,7 @@ impl Lower<'_> {
                 )
             }
             crate::externs::Conversion::Value | crate::externs::Conversion::OrdinaryFunction => {
-                self.convert_value(ty, value, crate::reification::Direction::ToJs, body)
+                self.convert_value(ty, value, crate::backend::host::Direction::ToJs, body)
             }
         }
     }

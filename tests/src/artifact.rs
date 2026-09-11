@@ -3092,3 +3092,77 @@ fn artifact_headers_record_the_bound_domains() {
             .contains("invalid target domains")
     );
 }
+
+#[test]
+fn effect_rows_in_descriptors_validate_their_references() {
+    let artifact = built(
+        r#"
+effect Tick = () -> ()
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+let ticking: () -> Nat + !Tick = fn _ => do _ = !Tick () return 2n end
+let mirror = type_of ticking
+"#,
+    );
+    let descriptor = artifact
+        .lir()
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instrs)
+        .find_map(|instruction| {
+            match &instruction.op {
+            Op::TypeDescriptor { template, .. } if template.nodes.iter().any(|node| {
+                matches!(node, ruddy::reification::Node::Effects(effects) if !effects.is_empty())
+            }) =>
+            {
+                Some(template.clone())
+            }
+            _ => None,
+        }
+        })
+        .expect("the effectful function's descriptor carries its row");
+    let effects = descriptor
+        .nodes
+        .iter()
+        .find_map(|node| match node {
+            ruddy::reification::Node::Effects(effects) => Some(effects.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(effects.len(), 1);
+    assert!(
+        effects[0].identity.starts_with("effect:"),
+        "{:?}",
+        effects[0]
+    );
+    assert!(artifact::parse(&artifact.print()).validate().is_ok());
+    for corruption in 0..2 {
+        let mut changed = artifact.clone().to_unchecked();
+        let template = changed
+            .lir
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.blocks)
+            .flat_map(|block| &mut block.instrs)
+            .find_map(|instruction| match &mut instruction.op {
+                Op::TypeDescriptor { template, .. } if template.nodes.iter().any(|node| {
+                    matches!(node, ruddy::reification::Node::Effects(effects) if !effects.is_empty())
+                }) =>
+                {
+                    Some(template)
+                }
+                _ => None,
+            })
+            .unwrap();
+        for node in &mut template.nodes {
+            if let ruddy::reification::Node::Effects(effects) = node {
+                if corruption == 0 {
+                    effects[0].payload = u32::MAX;
+                } else {
+                    effects[0].args.push(u32::MAX);
+                }
+            }
+        }
+        assert!(changed.validate().is_err(), "corruption {corruption}");
+    }
+}

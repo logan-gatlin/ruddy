@@ -2001,3 +2001,48 @@ assert.equal(app.wider_rejected, true);
 "#,
     );
 }
+
+#[test]
+fn function_mirrors_carry_their_effect_contracts() {
+    execute_reification(
+        r#"
+type Option 'a = #Some 'a | #None
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+effect Tick = () -> ()
+effect Ask 'a = () -> 'a
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern fresh_mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+@private let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
+@private let unbox: Any -> Option 'a = fn any => match any with
+| hide 'x { mirror, value } => match same_pair (mirror, fresh_mirror ()) with
+  | #Some { forward, backward } => #Some (forward value)
+  | #None => #None
+  end
+end
+@private let pure: () -> Nat = fn _ => 1n
+@private let ticking: () -> Nat + !Tick = fn _ => do _ = !Tick () return 2n end
+@private let asking: () -> Nat + !Ask Nat = fn _ => !Ask ()
+@private let asking_text: () -> Nat + !Ask String = fn _ => do _ = !Ask () return 3n end
+@private let boxed = box ticking
+@private let as_pure: Option (() -> Nat) = unbox boxed
+@private let as_ticking: Option (() -> Nat + !Tick) = unbox boxed
+@private let as_asking: Option (() -> Nat + !Ask Nat) = unbox boxed
+let pure_rejected = match as_pure with | #Some _ => false | #None => true end
+let ticking_recovered = match as_ticking with
+| #Some f => handle f () with | !Tick _ => () end
+| #None => 0n
+end
+let asking_rejected = match as_asking with | #Some _ => false | #None => true end
+let args_matter = match same_pair (type_of asking, type_of asking_text) with | #Some _ => false | #None => true end
+let same_effect = match same_pair (type_of ticking, type_of ticking) with | #Some _ => true | #None => false end
+"#,
+        r#"
+assert.equal(app.pure_rejected, true);
+assert.equal(app.ticking_recovered, 2);
+assert.equal(app.asking_rejected, true);
+assert.equal(app.args_matter, true);
+assert.equal(app.same_effect, true);
+"#,
+    );
+}

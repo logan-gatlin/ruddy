@@ -870,3 +870,36 @@ assert.ok(Object.is(await app.echo_int(-0), 0));
 "#,
     );
 }
+
+#[test]
+fn descriptions_list_a_function_effects() {
+    let project = project(
+        r#"
+effect Tick = () -> ()
+@private
+let ticking: () -> Nat + !Tick = fn _ => do _ = !Tick () return 2n end
+@private
+let pure: () -> Nat = fn _ => 1n
+let described = std::reflect::describe (std::reflect::type_of ticking)
+let described_pure = std::reflect::describe (std::reflect::type_of pure)
+let same_as_pure = match std::reflect::same (std::reflect::type_of ticking) (std::reflect::type_of pure) with
+| #Some _ => true
+| #None => false
+end
+"#,
+        "node",
+        "library",
+    );
+    run(
+        project.path(),
+        r#"
+const root = JSON.parse(JSON.stringify(app.described.nodes[app.described.root]));
+assert.equal(root.tag, 'Function');
+assert.equal(root.value.effects.length, 1);
+assert.ok(root.value.effects[0].name.startsWith('effect:'), root.value.effects[0].name);
+const pureRoot = JSON.parse(JSON.stringify(app.described_pure.nodes[app.described_pure.root]));
+assert.deepEqual(pureRoot.value.effects, []);
+assert.equal(app.same_as_pure, false);
+"#,
+    );
+}

@@ -152,7 +152,7 @@ pub enum Op {
     Convert {
         descriptor: Temp,
         value: Temp,
-        direction: crate::reification::Direction,
+        direction: crate::backend::host::Direction,
     },
     TypeProjection {
         descriptor: Temp,
@@ -163,7 +163,7 @@ pub enum Op {
         arguments: Vec<Temp>,
     },
     NativePlan {
-        template: crate::reification::NativeTemplate,
+        template: crate::backend::host::NativeTemplate,
         arguments: Vec<Temp>,
     },
     Reflect {

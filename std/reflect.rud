@@ -14,7 +14,8 @@ type Node =
   | #Foreign
   | #Fixed Domain
   | #Array Nat
-  | #Function { argument: Nat, result: Nat }
+  | #Function { argument: Nat, result: Nat, effects: [Field] }
+  | #Effects [Field]
   | #Record [Field]
   | #Sum [Field]
   | #Alias Nat

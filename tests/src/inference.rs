@@ -11740,3 +11740,35 @@ fn an_introduction_waits_for_its_term_type_and_passes_an_undecided_one_through()
         "{ value: Nat, show: Nat -> String } -> (Box, String)"
     );
 }
+
+#[test]
+fn function_mirrors_need_a_decided_closed_effect_row() {
+    let prelude =
+        "effect Tick = () -> ()\n@private extern type_of: 'a -> Mirror 'a = \"$typeOf\"\n";
+    let (_, _, output) = infer_src(&format!(
+        "{prelude}let closed: (() -> Nat + !Tick) -> Mirror (() -> Nat + !Tick) = fn f => type_of f"
+    ));
+    assert!(output.errors().is_empty(), "{:#?}", output.errors());
+    for (case, message) in [
+        (
+            "let open: (() -> Nat + ..'e) -> Mirror (() -> Nat + ..'e) = fn f => type_of f",
+            "closed effect row",
+        ),
+        (
+            "let undecided: (() -> Nat + !Tick (when 'p)) -> Mirror (() -> Nat + !Tick (when 'p)) = fn f => type_of f",
+            "decided effect row",
+        ),
+    ] {
+        let (_, _, output) = infer_src(&format!("{prelude}{case}"));
+        let error = output
+            .errors()
+            .iter()
+            .find(|error| error.kind.code() == "runtime-type-information")
+            .unwrap_or_else(|| panic!("{case}: {:#?}", output.errors()));
+        assert!(
+            error.kind.to_string().contains(message),
+            "{case}: {}",
+            error.kind
+        );
+    }
+}

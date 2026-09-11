@@ -54,7 +54,9 @@ pub fn projection(
             Node::Parameter(p) if *p == parameter => return Some(path),
             Node::Alias(child) => push(*child, None),
             Node::Array(child) => push(*child, Some(Projection::Element)),
-            Node::Arrow([from, to]) => {
+            // An effect row's payloads are no position a projection reaches:
+            // evidence for a parameter written only there is not derived.
+            Node::Arrow([from, to, _]) => {
                 push(*from, Some(Projection::Argument));
                 push(*to, Some(Projection::Result));
             }
@@ -337,7 +339,7 @@ pub fn native_parameters(
             ),
             "mut" => {}
             "package" => work.extend(edges.iter().map(|(_, child)| *child)),
-            _ => result.extend(Descriptor::from_graph_policy(at, &graph, true)?.1),
+            _ => result.extend(Descriptor::from_graph_policy(at, &graph, true)?.2),
         }
     }
     Ok(result)
@@ -542,12 +544,6 @@ pub const SHAPE_CASES: [&str; 20] = [
     "Int32", "Int64", "Array", "Record", "Sum", "Function", "Hidden", "Mirror", "Foreign",
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum Direction {
-    ToJs,
-    FromJs,
-}
-
 impl Intrinsic {
     /// Recognition uses resolved structural types, never source type names.
     pub fn recognize(
@@ -734,7 +730,12 @@ pub enum Node {
     /// is the nearest enclosing [`Node::Hidden`]. Depth rather than a number,
     /// so two hidden types spelled with different variables are one graph.
     HiddenBound(u32),
-    Arrow([u32; 2]),
+    /// `A -> B + E`: the argument, the result, and the effect row, which is
+    /// an [`Node::Effects`] node. Part of the identity: a callable that
+    /// performs an effect is not one that performs none.
+    Arrow([u32; 3]),
+    /// The effects of an arrow, each by its canonical identity, in order.
+    Effects(Vec<Effect>),
     Extend([u32; 2]),
     Struct(Vec<(String, u32)>),
     Sum(Vec<(String, u32)>),
@@ -742,40 +743,21 @@ pub enum Node {
     Parameter(u32),
 }
 
-/// A conversion shape can inspect optional fields without claiming an exact
-/// runtime identity for an abstract presence package.
+/// One effect of an arrow's row: the identity of the effect declaration,
+/// the payload its operation carries, and the arguments the effect was
+/// applied to, each a node of the same graph.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct NativeTemplate {
-    pub descriptor: Descriptor,
-    pub optional_fields: std::collections::BTreeMap<u32, BTreeSet<String>>,
+pub struct Effect {
+    pub identity: String,
+    pub payload: u32,
+    pub args: Vec<u32>,
 }
 
-impl NativeTemplate {
-    pub fn template(
-        ty: &Arc<Ty>,
-        aliases: &IndexMap<Symbol, Scheme>,
-    ) -> Result<(Self, Vec<u32>), String> {
-        let (root, graph) = crate::ir::representation_graph(ty, aliases);
-        Descriptor::from_graph_policy(root, &graph, true)
-    }
-
-    pub fn validate(&self, parameters: usize) -> Result<(), &'static str> {
-        self.descriptor.validate(parameters)?;
-        for (index, optional) in &self.optional_fields {
-            let Some(Node::Struct(fields)) = self.descriptor.nodes.get(*index as usize) else {
-                return Err("native optional fields require a record shape");
-            };
-            if optional
-                .iter()
-                .any(|name| !fields.iter().any(|(field, _)| field == name))
-            {
-                return Err("native optional field is absent from its record shape");
-            }
-        }
-        Ok(())
-    }
-}
+/// The fields a host conversion may find absent, by the record node they
+/// belong to. Semantic identity knows no such overlay: it is the host plan's
+/// alone, and the host's planner keeps it. See [`crate::backend::host`].
+pub type OptionalFields = std::collections::BTreeMap<u32, BTreeSet<String>>;
 
 impl Descriptor {
     pub fn of(ty: &Arc<Ty>, aliases: &IndexMap<Symbol, Scheme>) -> Result<Self, String> {
@@ -798,15 +780,20 @@ impl Descriptor {
         root: usize,
         graph: &[(String, Vec<(String, usize)>)],
     ) -> Result<(Self, Vec<u32>), String> {
-        let (template, parameters) = Self::from_graph_policy(root, graph, false)?;
-        Ok((template.descriptor, parameters))
+        let (descriptor, _, parameters) = Self::from_graph_policy(root, graph, false)?;
+        Ok((descriptor, parameters))
     }
 
-    fn from_graph_policy(
+    /// The finite graph of a type, exact or under the host's conversion
+    /// policy: exact identity carries hidden types, mirrors, and effect rows
+    /// faithfully, while a conversion shape looks through packages, seals
+    /// hidden values, needs a pure callable contract, and notes the fields a
+    /// host may leave out.
+    pub(crate) fn from_graph_policy(
         root: usize,
         graph: &[(String, Vec<(String, usize)>)],
         native: bool,
-    ) -> Result<(NativeTemplate, Vec<u32>), String> {
+    ) -> Result<(Self, OptionalFields, Vec<u32>), String> {
         let mut optional_fields = std::collections::BTreeMap::<u32, BTreeSet<String>>::new();
         let mut parameters = Vec::new();
         let mut nodes = vec![Node::ForeignValue];
@@ -863,17 +850,62 @@ impl Descriptor {
                 "array" => Node::Array(child(edge("element").expect("array graph edge"))),
                 "arrow" => {
                     let effects = &graph[edge("effects").expect("arrow effect graph edge")];
-                    if effects.0 != "effects"
-                        || effects
-                            .1
-                            .iter()
-                            .any(|(name, node)| name != "tail" || graph[*node].0 != "closed")
-                    {
-                        return Err(
-                            "runtime type information requires a pure callable contract".into()
-                        );
+                    if effects.0 != "effects" {
+                        return Err("runtime type information requires a callable contract".into());
                     }
-                    Node::Arrow([child(edge("from").unwrap()), child(edge("to").unwrap())])
+                    // A conversion needs a pure contract: the host cannot
+                    // supply an effect. Exact identity carries the row, which
+                    // has to be decided: every effect present or absent, and
+                    // nothing beyond the ones written.
+                    let mut row = Vec::new();
+                    for (name, node) in &effects.1 {
+                        let (label, edges) = &graph[*node];
+                        if name == "tail" {
+                            if label != "closed" {
+                                return Err(
+                                    "runtime type information requires a closed effect row".into(),
+                                );
+                            }
+                            continue;
+                        }
+                        match label.strip_prefix("effect-case:") {
+                            Some("+") if !native => {
+                                let member = |key: &str| {
+                                    edges
+                                        .iter()
+                                        .find_map(|(name, node)| (name == key).then_some(*node))
+                                        .expect("an effect case has its members")
+                                };
+                                let args = (0..)
+                                    .map(|index| format!("arg:{index}"))
+                                    .take_while(|key| edges.iter().any(|(name, _)| name == key))
+                                    .map(|key| child(member(&key)))
+                                    .collect();
+                                row.push(Effect {
+                                    identity: graph[member("identity")].0.clone(),
+                                    payload: child(member("payload")),
+                                    args,
+                                });
+                            }
+                            Some("\\") => {}
+                            Some("+") => {
+                                return Err(
+                                    "runtime type information requires a pure callable contract"
+                                        .into(),
+                                );
+                            }
+                            _ => {
+                                return Err(
+                                    "runtime type information requires a decided effect row".into(),
+                                );
+                            }
+                        }
+                    }
+                    let from = child(edge("from").unwrap());
+                    let to = child(edge("to").unwrap());
+                    let effects = nodes.len() as u32;
+                    nodes.push(Node::Effects(row));
+                    Node::Arrow([from, to, effects])
                 }
                 "fields" | "sum" => {
                     let record = label == "fields";
@@ -967,12 +999,11 @@ impl Descriptor {
                     .expect("collected descriptor parameter") as u32;
             }
         }
-        let template = NativeTemplate {
-            descriptor: Self { nodes },
-            optional_fields,
-        };
-        template.validate(parameters.len()).map_err(str::to_owned)?;
-        Ok((template, parameters))
+        let descriptor = Self { nodes };
+        descriptor
+            .validate(parameters.len())
+            .map_err(str::to_owned)?;
+        Ok((descriptor, optional_fields, parameters))
     }
 
     /// Descriptors are public artifact data; validate references before codegen.
@@ -991,7 +1022,14 @@ impl Descriptor {
                 | Node::Hidden(index) => {
                     vec![*index]
                 }
-                Node::Arrow(indices) | Node::Extend(indices) => indices.to_vec(),
+                Node::Arrow(indices) => indices.to_vec(),
+                Node::Extend(indices) => indices.to_vec(),
+                Node::Effects(effects) => effects
+                    .iter()
+                    .flat_map(|effect| {
+                        std::iter::once(effect.payload).chain(effect.args.iter().copied())
+                    })
+                    .collect(),
                 Node::Struct(fields) | Node::Sum(fields) => {
                     if fields.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
                         return Err("runtime type fields must be unique and sorted");

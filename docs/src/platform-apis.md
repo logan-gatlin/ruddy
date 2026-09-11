@@ -236,7 +236,9 @@ finite graph of nodes, so a program can inspect a type's primitives, fields,
 tags, and function shapes. `reflect::same : Mirror 'a -> Mirror 'b -> Option {
 forward: 'a -> 'b, backward: 'b -> 'a }` decides whether two mirrors are exactly
 one type, and on success supplies the two identity functions that let a value
-cross between the names.
+cross between the names. A function's mirror carries its effect contract,
+so a function that performs an effect is never the same type as one that
+performs none.
 
 Together with [hidden types](dictionary.md#hidden-type) this recovers a value's
 type at runtime; the standard `Any` is defined exactly this way, as

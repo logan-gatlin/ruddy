@@ -23,6 +23,7 @@ const $instantiateType = ($template, $arguments, $partial = false) => {
       else if ("Hidden" in $node) $nodes.push({ Hidden: $node.Hidden + $offset });
       else if ("Alias" in $node) $nodes.push({ Alias: $node.Alias + $offset });
       else if ("Arrow" in $node) $nodes.push({ Arrow: $node.Arrow.map($index => $index + $offset) });
+      else if ("Effects" in $node) $nodes.push({ Effects: $node.Effects.map($effect => ({ identity: $effect.identity, payload: $effect.payload + $offset, args: $effect.args.map($arg => $arg + $offset) })) });
       else {
         const $kind = Object.keys($node)[0];
         $nodes.push({ [$kind]: $node[$kind].map(([$name, $index]) => [$name, $index + $offset]) });
@@ -70,6 +71,7 @@ const $typeAt = ($descriptor, $index) => ({ nodes: [
     if ("Mirror" in $node) return { Mirror: $node.Mirror + 1 };
     if ("Hidden" in $node) return { Hidden: $node.Hidden + 1 };
     if ("Arrow" in $node) return { Arrow: $node.Arrow.map($child => $child + 1) };
+    if ("Effects" in $node) return { Effects: $node.Effects.map($effect => ({ identity: $effect.identity, payload: $effect.payload + 1, args: $effect.args.map($arg => $arg + 1) })) };
     if ("Extend" in $node) return { Extend: $node.Extend.map($child => $child + 1) };
     const $kind = Object.keys($node)[0];
     return { [$kind]: $node[$kind].map(([$name, $child]) => [$name, $child + 1]) };
@@ -132,7 +134,7 @@ const $nativeSlots = ($descriptor, $index) => {
     if (typeof $node === "string" || "Fixed" in $node || "HiddenBound" in $node) continue;
     if ("Parameter" in $node) { $slots.add($node.Parameter); continue; }
     if ($defer && "Arrow" in $node) continue;
-    const $children = "Alias" in $node ? [$node.Alias] : "Array" in $node ? [$node.Array] : "Mirror" in $node ? [$node.Mirror] : "Hidden" in $node ? [$node.Hidden] : "Arrow" in $node ? $node.Arrow : "Extend" in $node ? $node.Extend : Object.values($node)[0].map($field => $field[1]);
+    const $children = "Alias" in $node ? [$node.Alias] : "Array" in $node ? [$node.Array] : "Mirror" in $node ? [$node.Mirror] : "Hidden" in $node ? [$node.Hidden] : "Arrow" in $node ? $node.Arrow : "Extend" in $node ? $node.Extend : "Effects" in $node ? $node.Effects.flatMap($effect => [$effect.payload, ...$effect.args]) : Object.values($node)[0].map($field => $field[1]);
     for (const $child of $children) $work.push([$child, $defer]);
   }
   return [...$slots].sort(($a, $b) => $a - $b);
@@ -164,7 +166,15 @@ const $sameType = ($left, $right) => {
     } else if ($kind === "Array" || $kind === "Mirror" || $kind === "Hidden") {
       $work.push([$x[$kind], $y[$kind]]);
     } else if ($kind === "Arrow") {
-      $work.push([$x.Arrow[0], $y.Arrow[0]], [$x.Arrow[1], $y.Arrow[1]]);
+      $work.push([$x.Arrow[0], $y.Arrow[0]], [$x.Arrow[1], $y.Arrow[1]], [$x.Arrow[2], $y.Arrow[2]]);
+    } else if ($kind === "Effects") {
+      if ($x.Effects.length !== $y.Effects.length) return false;
+      for (let $i = 0; $i < $x.Effects.length; $i++) {
+        const $a = $x.Effects[$i], $b = $y.Effects[$i];
+        if ($a.identity !== $b.identity || $a.args.length !== $b.args.length) return false;
+        $work.push([$a.payload, $b.payload]);
+        for (let $j = 0; $j < $a.args.length; $j++) $work.push([$a.args[$j], $b.args[$j]]);
+      }
     } else {
       const $xs = $x[$kind], $ys = $y[$kind];
       if ($xs.length !== $ys.length) return false;
@@ -212,7 +222,7 @@ const $sameMirror = ($descriptor, $pair) => $sameType($pair["0"], $pair["1"])
 // A mirror's graph as ordinary data: one node per descriptor node, indices
 // kept, so recursion stays finite and nothing here can be turned back into
 // a mirror.
-const $describe = ($descriptor, $mirror) => {
+const $describe = ($descriptor, $of) => {
   const $node = $n => {
     if ($n === "Nat" || $n === "Int") {
       const $bounds = $n === "Nat" ? $domains.nat : $domains.int;
@@ -225,7 +235,11 @@ const $describe = ($descriptor, $mirror) => {
       return $sum("Fixed", $record([["bits", $bits], ["signed", $signed], ["min", ($signed ? -$size : 0n).toString()], ["max", ($size - 1n).toString()]]));
     }
     if ("Array" in $n) return $sum("Array", $n.Array);
-    if ("Arrow" in $n) return $sum("Function", $record([["argument", $n.Arrow[0]], ["result", $n.Arrow[1]]]));
+    if ("Arrow" in $n) {
+      const $effects = $of.nodes[$typeIndex($of, $n.Arrow[2])].Effects || [];
+      return $sum("Function", $record([["argument", $n.Arrow[0]], ["result", $n.Arrow[1]], ["effects", $array($effects.map($effect => $record([["name", $effect.identity], ["node", $effect.payload]])))]]));
+    }
+    if ("Effects" in $n) return $sum("Effects", $array($n.Effects.map($effect => $record([["name", $effect.identity], ["node", $effect.payload]]))));
     if ("Struct" in $n || "Sum" in $n) {
       const $fields = "Struct" in $n ? $n.Struct : $n.Sum;
       return $sum("Struct" in $n ? "Record" : "Sum", $array($fields.map(([$name, $index]) => $record([["name", $name], ["node", $index]]))));
@@ -237,7 +251,7 @@ const $describe = ($descriptor, $mirror) => {
     if ("Hidden" in $n) return $sum("Hidden", $n.Hidden);
     return $sum("Variable", $n.HiddenBound);
   };
-  return $record([["root", 0], ["nodes", $array($mirror.nodes.map($node))]]);
+  return $record([["root", 0], ["nodes", $array($of.nodes.map($node))]]);
 };
 // A mirror's outermost structure as `std::reflect::Shape`: typed views whose
 // operations read and make values of the mirrored type. The mirror proves

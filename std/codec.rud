@@ -129,6 +129,7 @@ let check_node:
               seen
               cases
           | #Function _ => unsupported path "a function has no default codec"
+          | #Effects _ => unsupported path "an effect row has no default codec"
           | #Hidden _ => unsupported path "a hidden type has no default codec"
           | #Mirror _ => unsupported path "a mirror has no default codec"
           | #Foreign => unsupported path "a foreign value has no default codec"

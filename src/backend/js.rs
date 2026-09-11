@@ -67,7 +67,7 @@ impl error::Error for Error {}
 
 #[derive(Default)]
 struct ExportNode {
-    descriptor: Option<crate::reification::NativeTemplate>,
+    descriptor: Option<crate::backend::host::NativeTemplate>,
     adapter: Option<crate::externs::Callback>,
     value: Option<String>,
     children: BTreeMap<String, ExportNode>,
@@ -443,8 +443,8 @@ impl<'a> Generator<'a> {
                 out.push_str(", ");
                 out.push_str(&v(*value));
                 out.push_str(match direction {
-                    crate::reification::Direction::ToJs => ", true)",
-                    crate::reification::Direction::FromJs => ", false)",
+                    crate::backend::host::Direction::ToJs => ", true)",
+                    crate::backend::host::Direction::FromJs => ", false)",
                 });
             }
             Op::TypeProjection { descriptor, path } => {
@@ -813,7 +813,7 @@ fn insert_export(
     node: &mut ExportNode,
     path: &[&str],
     qualified: &str,
-    descriptor: crate::reification::NativeTemplate,
+    descriptor: crate::backend::host::NativeTemplate,
     adapter: Option<crate::externs::Callback>,
 ) -> Result<(), Error> {
     let mut at = node;
