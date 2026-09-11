@@ -156,11 +156,18 @@ impl Conversion<'_> {
                 })))
             }
             Node::Struct(fields) if fields.is_empty() => {
-                // The unit value carries nothing, so nothing is what the host
-                // is handed and nothing is what it may supply.
-                if self.outgoing {
-                    Ok(Value::Absent)
-                } else if matches!(value, Value::Absent) || value.as_record().is_ok() {
+                // The unit value carries nothing, so nothing is what a host
+                // may supply for it, and a host handed nothing takes nothing
+                // back. A value that is there still has to be a record.
+                if matches!(value, Value::Absent) {
+                    Ok(if self.outgoing {
+                        Value::Absent
+                    } else {
+                        Value::unit()
+                    })
+                } else if !self.outgoing && self.callable {
+                    Ok(Value::unit())
+                } else if value.as_record().is_ok() {
                     Ok(Value::unit())
                 } else {
                     Err(Failure::at(path, "Struct"))
@@ -188,7 +195,7 @@ impl Conversion<'_> {
                 Ok(Value::Record(Rc::new(out)))
             }
             Node::Sum(cases) => {
-                let (tag, payload) = self.case(value, path)?;
+                let (tag, payload) = self.case(value).ok_or_else(|| Failure::at(path, "Sum"))?;
                 let Some((name, child)) = cases.iter().find(|(name, _)| *name == tag) else {
                     let names: Vec<&str> = cases.iter().map(|(name, _)| name.as_str()).collect();
                     return Err(Failure::at(path, format!("one of {}", names.join(", "))));
@@ -257,26 +264,26 @@ impl Conversion<'_> {
         })
     }
 
-    /// The tag and payload of a value crossing at a sum position. A host may
-    /// supply either a tagged record or a value this program made.
-    fn case(&self, value: &Value, path: &str) -> Result<(String, Value), Failure> {
+    /// The tag and payload of a value crossing at a sum position, or nothing
+    /// where the value is not a tagged one at all. A host may supply either a
+    /// record carrying a tag and a value or a value this program made.
+    fn case(&self, value: &Value) -> Option<(String, Value)> {
         match value {
-            Value::Sum(sum) => Ok((
+            Value::Sum(sum) => Some((
                 sum.tag.to_string(),
                 sum.payload.clone().unwrap_or(Value::Absent),
             )),
             Value::Record(record) if !self.outgoing => {
                 let tag = record
                     .get(&Key::named("tag"))
-                    .and_then(|tag| tag.as_str().ok().map(str::to_owned))
-                    .ok_or_else(|| Failure::at(path, "a tagged value"))?;
+                    .and_then(|tag| tag.as_str().ok().map(str::to_owned))?;
                 let payload = record
                     .get(&Key::named("value"))
                     .cloned()
                     .unwrap_or(Value::Absent);
-                Ok((tag, payload))
+                Some((tag, payload))
             }
-            _ => Err(Failure::at(path, "a tagged value")),
+            _ => None,
         }
     }
 

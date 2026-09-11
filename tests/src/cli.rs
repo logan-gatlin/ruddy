@@ -3144,6 +3144,26 @@ fn dependency_artifacts_cache_child() {
     build_project(&lib).unwrap();
     let entries = fs::read_dir(compilers[0].path()).unwrap().flatten().count();
     assert_eq!(entries, 2);
+
+    // So are the integer domains. A dependency compiled for the 53-bit
+    // default holds literals and guards the 32-bit build would not, so the
+    // narrower build compiles its own rather than reading that one back.
+    let manifest = fs::read_to_string(lib.join("Ruddy.toml")).unwrap();
+    fs::write(
+        lib.join("Ruddy.toml"),
+        manifest.replace("root =", "integers = 32\nroot ="),
+    )
+    .unwrap();
+    build_project(&lib).unwrap();
+    let narrow: Vec<_> = fs::read_dir(compilers[0].path())
+        .unwrap()
+        .flatten()
+        .map(|entry| ruddy::artifact::text::parse(&fs::read_to_string(entry.path()).unwrap()))
+        .filter(|artifact| artifact.header().domains == ruddy::types::Domains::Bits32)
+        .collect();
+    assert_eq!(narrow.len(), 1);
+    assert_eq!(narrow[0].header().identity.name, "dep");
+    assert_eq!(fs::read_dir(compilers[0].path()).unwrap().count(), 3);
 }
 
 /// `platform` in the manifest is the other fact a guard can name. It defaults

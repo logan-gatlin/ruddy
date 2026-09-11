@@ -576,6 +576,25 @@ let functions_need_an_adapter = do
   | #Error error => error.expected
   end
 end
+let carries_unit_and_cases = do
+  let write: { flag: (), choice: #Yes () | #No Nat } -> std::result::Result ForeignValue std::ffi::DecodeError =
+    std::ffi::encode
+  let read: ForeignValue -> std::result::Result { flag: (), choice: #Yes () | #No Nat } std::ffi::DecodeError =
+    std::ffi::decode
+  let round = fn value => match write value with
+  | #Some raw => match read raw with
+    | #Some back => match back.choice with
+      | #Yes _ => "yes"
+      | #No count => std::str::concat "no" (std::str::from_nat count)
+      end
+    | #Error error => error.message
+    end
+  | #Error error => error.message
+  end
+  return std::str::concat
+    (round { flag: (), choice: #Yes () })
+    (round { flag: (), choice: #No 7n })
+end
 let a_wrong_shape_says_where = do
   let narrow: ForeignValue -> std::result::Result { name: Nat } std::ffi::DecodeError =
     std::ffi::decode
@@ -591,6 +610,7 @@ end
     let exports = [
         "round_trip",
         "functions_need_an_adapter",
+        "carries_unit_and_cases",
         "a_wrong_shape_says_where",
     ];
     let (node, interpreted) = both(source, &exports, None);
@@ -600,6 +620,7 @@ end
         vec![
             "\"ruddy2\"",
             "\"a verifiable data type; a function contract needs an adapter\"",
+            "\"yesno7\"",
             "\"$.name\"",
         ]
     );
