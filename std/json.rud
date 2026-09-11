@@ -25,23 +25,23 @@ type FrameKind = #Record | #Sequence | #Variant
 type Frame = { serial: Nat, kind: FrameKind, count: Nat }
 
 @private
-extern char_code: fn(String) -> Nat = "text => text.charCodeAt(0)"
+extern char_code: fn(String) -> Nat = "$prim.json.char_code"
 @private
-extern char_from_code: fn(Nat) -> String = "String.fromCodePoint"
+extern char_from_code: fn(Nat) -> String = "$prim.json.char_from_code"
 @private
-extern quote: fn(String) -> String = "JSON.stringify"
+extern quote: fn(String) -> String = "$prim.json.quote"
 @private
-extern real_value: fn(String) -> Real = "Number"
+extern real_value: fn(String) -> Real = "$prim.json.real_value"
 @private
-extern real_token: fn(Real) -> String = "value => Object.is(value, -0) ? \"-0.0\" : String(value)"
+extern real_token: fn(Real) -> String = "$prim.json.real_token"
 @private
-extern nat_of_digits: fn(String) -> Nat = "Number"
+extern nat_of_digits: fn(String) -> Nat = "$prim.json.nat_of_digits"
 @private
-extern int_of_digits: fn(String) -> Int = "Number"
+extern int_of_digits: fn(String) -> Int = "$prim.json.int_of_digits"
 @private
-extern nat64_of_digits: fn(String) -> Nat64 = "BigInt"
+extern nat64_of_digits: fn(String) -> Nat64 = "$prim.json.nat64_of_digits"
 @private
-extern int64_of_digits: fn(String) -> Int64 = "BigInt"
+extern int64_of_digits: fn(String) -> Int64 = "$prim.json.int64_of_digits"
 
 @private
 let chain = result::and_then

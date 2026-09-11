@@ -16,46 +16,33 @@ type FrameKind = #Record | #Sequence | #Variant
 type Frame = { serial: Nat, kind: FrameKind, count: Nat, fields: [String], cases: [String] }
 
 @private
-extern real_to_bits: fn(Real) -> Nat64 =
-  "value => { const view = new DataView(new ArrayBuffer(8)); view.setFloat64(0, value, true); return view.getBigUint64(0, true); }"
+extern real_to_bits: fn(Real) -> Nat64 = "$prim.binary.real_to_bits"
 @private
-extern real_from_bits: fn(Nat64) -> Real =
-  "bits => { const view = new DataView(new ArrayBuffer(8)); view.setBigUint64(0, bits, true); return view.getFloat64(0, true); }"
+extern real_from_bits: fn(Nat64) -> Real = "$prim.binary.real_from_bits"
 @private
-extern utf8_encode: fn(String) -> [Nat8] = "text => Array.from(new TextEncoder().encode(text))"
+extern utf8_encode: fn(String) -> [Nat8] = "$prim.binary.utf8_encode"
 @private
-extern utf8_decode: fn([Nat8]) -> Option String =
-  "bytes => { try { return { tag: \"Some\", value: new TextDecoder(\"utf-8\", { fatal: true }).decode(new Uint8Array(bytes)) }; } catch (error) { return { tag: \"None\" }; } }"
+extern utf8_decode: fn([Nat8]) -> Option String = "$prim.binary.utf8_decode"
 @private
-extern nat64_to_bytes: fn(Nat64) -> [Nat8] =
-  "value => Array.from({ length: 8 }, (_, index) => Number((value >> BigInt(index * 8)) & 255n))"
+extern nat64_to_bytes: fn(Nat64) -> [Nat8] = "$prim.binary.nat64_to_bytes"
 @private
-extern nat64_from_bytes: fn([Nat8]) -> Nat64 =
-  "bytes => bytes.reduce((total, byte, index) => total | (BigInt(byte) << BigInt(index * 8)), 0n)"
+extern nat64_from_bytes: fn([Nat8]) -> Nat64 = "$prim.binary.nat64_from_bytes"
 @private
-extern int64_to_bytes: fn(Int64) -> [Nat8] =
-  "value => { const unsigned = BigInt.asUintN(64, value); return Array.from({ length: 8 }, (_, index) => Number((unsigned >> BigInt(index * 8)) & 255n)); }"
+extern int64_to_bytes: fn(Int64) -> [Nat8] = "$prim.binary.int64_to_bytes"
 @private
-extern int64_from_bytes: fn([Nat8]) -> Int64 =
-  "bytes => BigInt.asIntN(64, bytes.reduce((total, byte, index) => total | (BigInt(byte) << BigInt(index * 8)), 0n))"
+extern int64_from_bytes: fn([Nat8]) -> Int64 = "$prim.binary.int64_from_bytes"
 @private
-extern nat_to_bytes: fn(Nat) -> [Nat8] =
-  "value => Array.from({ length: 8 }, (_, index) => Number((BigInt(value) >> BigInt(index * 8)) & 255n))"
+extern nat_to_bytes: fn(Nat) -> [Nat8] = "$prim.binary.nat_to_bytes"
 @private
-extern int_to_bytes: fn(Int) -> [Nat8] =
-  "value => { const unsigned = BigInt.asUintN(64, BigInt(value)); return Array.from({ length: 8 }, (_, index) => Number((unsigned >> BigInt(index * 8)) & 255n)); }"
+extern int_to_bytes: fn(Int) -> [Nat8] = "$prim.binary.int_to_bytes"
 @private
-extern nat_from_bytes: fn([Nat8]) -> Option Nat =
-  "bytes => { const value = bytes.reduce((total, byte, index) => total | (BigInt(byte) << BigInt(index * 8)), 0n); return value <= BigInt(Number.MAX_SAFE_INTEGER) ? { tag: \"Some\", value: Number(value) } : { tag: \"None\" }; }"
+extern nat_from_bytes: fn([Nat8]) -> Option Nat = "$prim.binary.nat_from_bytes"
 @private
-extern int_from_bytes: fn([Nat8]) -> Option Int =
-  "bytes => { const value = BigInt.asIntN(64, bytes.reduce((total, byte, index) => total | (BigInt(byte) << BigInt(index * 8)), 0n)); return value <= BigInt(Number.MAX_SAFE_INTEGER) && value >= -BigInt(Number.MAX_SAFE_INTEGER) ? { tag: \"Some\", value: Number(value) } : { tag: \"None\" }; }"
+extern int_from_bytes: fn([Nat8]) -> Option Int = "$prim.binary.int_from_bytes"
 @private
-extern nat32_to_bytes: fn(Nat) -> [Nat8] =
-  "value => [value & 255, (value >>> 8) & 255, (value >>> 16) & 255, (value >>> 24) & 255]"
+extern nat32_to_bytes: fn(Nat) -> [Nat8] = "$prim.binary.nat32_to_bytes"
 @private
-extern nat32_from_bytes: fn([Nat8]) -> Nat =
-  "bytes => (bytes[0] | (bytes[1] << 8) | (bytes[2] << 16)) + bytes[3] * 16777216"
+extern nat32_from_bytes: fn([Nat8]) -> Nat = "$prim.binary.nat32_from_bytes"
 
 @private
 let chain = result::and_then

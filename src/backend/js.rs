@@ -314,6 +314,7 @@ impl<'a> Generator<'a> {
             bounds(domains.int())
         ));
         out.push_str(include_str!("type-runtime.js"));
+        out.push_str(include_str!("primitives.js"));
         out.push_str(include_str!("web-apis.js"));
         if self.platform == Platform::Node {
             out.push_str(include_str!("node-apis.js"));

@@ -1,30 +1,6 @@
 // Native extern conversion snapshots arrays, records, and sums at the boundary.
 const $webPair = (a, b) => $record([["0", a], ["1", b]]);
 const $webMessage = error => String(error && error.message || error);
-const $jsonError = error => $sum("Error", $record([["message", $webMessage(error)]]));
-const $jsonRead = text => {
-  const value = JSON.parse(text);
-  const pending = [value];
-  while (pending.length) {
-    const item = pending.pop();
-    if (typeof item === "number" && !Number.isFinite(item)) throw new Error("JSON number is outside the finite Real range");
-    if (item !== null && typeof item === "object") for (const key of Object.keys(item)) pending.push(item[key]);
-  }
-  return value;
-};
-const $jsonWire = value => {
-  if (value === null) return $sum("Null", undefined);
-  if (typeof value === "boolean") return $sum("Bool", value);
-  if (typeof value === "number") return $sum("Number", value);
-  if (typeof value === "string") return $sum("String", value);
-  if (Array.isArray(value)) return $sum("Array", value.map($jsonWire));
-  return $sum("Object", Object.keys(value).map(key => $webPair(key, $jsonWire(value[key]))));
-};
-const $json = {
-  raw: text => { try { return $sum("Some", $jsonRead(text)); } catch (error) { return $jsonError(error); } },
-  parse: text => { try { return $sum("Some", $jsonWire($jsonRead(text))); } catch (error) { return $jsonError(error); } },
-  number: value => Number.isFinite(value) ? $sum("Some", JSON.stringify(value)) : $jsonError("JSON numbers must be finite")
-};
 const $urlSnapshot = url => $record(["href", "origin", "protocol", "username", "password", "host", "hostname", "port", "pathname", "search", "hash"].map(key => [key, url[key]]));
 const $urlCall = (input, make) => {
   try { return $sum("Some", $urlSnapshot(make())); }
