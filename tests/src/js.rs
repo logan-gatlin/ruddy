@@ -251,6 +251,27 @@ let shared = same first.token second.token
 }
 
 #[test]
+fn shared_rows_generic_descriptors_keep_structs_and_sums_distinct() {
+    execute_reification(
+        r#"
+type Option 'a = #Some 'a | #None
+type Both 'r = { product: { ..'r }, choice: | ..'r }
+@private extern box: 'a -> Any = "$anyUpcast"
+@private extern unbox: Any -> Option 'a = "$anyDowncast"
+@private let pack: Both { ..'r } -> { product: Any, choice: Any } = fn p => { product: box p.product, choice: box p.choice }
+@private let packed = pack { product: { A: 7n }, choice: #A 8n }
+@private let product: Option { A: Nat } = unbox packed.product
+@private let choice: Option (#A Nat) = unbox packed.choice
+@private let wrong: Option { A: Nat } = unbox packed.choice
+let field = match product with | #Some p => p.A | #None => 0n end
+let payload = match choice with | #Some (#A n) => n | #None => 0n end
+let distinct = match wrong with | #Some _ => false | #None => true end
+"#,
+        "assert.equal(app.field, 7); assert.equal(app.payload, 8); assert.equal(app.distinct, true);",
+    );
+}
+
+#[test]
 fn reification_generic_boxing_helpers_and_higher_order_calls_preserve_each_instantiation() {
     let artifact = compiled(
         r#"

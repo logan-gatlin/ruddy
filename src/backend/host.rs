@@ -864,8 +864,7 @@ pub(super) fn compile(
             .iter()
             .map(|param| match param.sense {
                 crate::artifact::Sense::Effects => " (..)",
-                crate::artifact::Sense::Fields => " { .. }",
-                crate::artifact::Sense::Cases => " (| ..)",
+                crate::artifact::Sense::Row => " { .. }",
                 crate::artifact::Sense::Type | crate::artifact::Sense::Region => " _",
             })
             .collect::<String>();

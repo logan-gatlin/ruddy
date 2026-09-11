@@ -1753,9 +1753,9 @@ impl Constrain<'_> {
 
     /// One fresh argument per parameter the effect declares, of the sort the
     /// parameter stands for: a type variable for a type, and for a row a fresh
-    /// row wrapped as the type a row argument is written as — a struct for
-    /// fields, a sum for cases and effects — forbidden the labels the
-    /// declaration names beside it.
+    /// row wrapped as a type argument. Structs carry shared rows; effect
+    /// arguments retain their dedicated wrapper. The declaration's exclusions
+    /// apply to the underlying row regardless of its eventual constructor.
     fn fresh_effect_arguments(&mut self, effect: Symbol) -> Vec<Assigned> {
         let kinds = self.effect_params.get(&effect).cloned().unwrap_or_default();
         kinds
@@ -1765,14 +1765,19 @@ impl Constrain<'_> {
                     Assigned::Ty(self.table.fresh_region())
                 }
                 None => Assigned::Ty(self.table.fresh_type_for(Subject::Instance)),
-                Some((shape, lacks)) => {
+                Some((sense, lacks)) => {
                     let rest = self.table.fresh_row_for(Subject::Instance);
                     let row = Row::of(rest);
+                    let shape = if sense == crate::types::Sense::Effects {
+                        Shape::Effect
+                    } else {
+                        Shape::Struct
+                    };
                     self.table.forbid(&row, shape, lacks);
-                    Assigned::Ty(Arc::new(match shape {
-                        Shape::Struct => Ty::Struct(row),
-                        Shape::Sum => Ty::Sum(row),
-                        Shape::Effect => Ty::effects_argument(row),
+                    Assigned::Ty(Arc::new(if shape == Shape::Effect {
+                        Ty::effects_argument(row)
+                    } else {
+                        Ty::Struct(row)
                     }))
                 }
             })

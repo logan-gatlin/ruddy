@@ -2210,6 +2210,97 @@ fn a_bad_row_argument_is_absorbed_not_echoed() {
 }
 
 #[test]
+fn shared_rows_accept_either_shape_as_an_argument() {
+    let (mint, _, output) = inferred(
+        "type Sum 'r = | ..'r\n\
+         type Struct 'r = { ..'r }\n\
+         type T = Sum { a: (), b: () }\n\
+         type T2 = Struct (#A () | #B ())\n\
+         let a : T = #a ()\n\
+         let b : T = #b ()\n\
+         let record : T2 = { A: (), B: () }\n\
+         let field = record.A",
+    );
+    assert_eq!(scheme(&mint, &output, "field"), "()");
+}
+
+#[test]
+fn shared_rows_infer_across_shapes_and_generalize() {
+    let source = "type Both 'r = { product: { ..'r }, choice: | ..'r }\n\
+         let choose : { ..'r } -> (| ..'r) -> (| ..'r) = fn _ => fn choice => choice\n\
+         let first = choose { A: 1n, B: () } (#A 2n)\n\
+         let second = choose { C: true } (#C false)\n\
+         let pair : Both { A: Nat, B: () } = { product: { A: 1n, B: () }, choice: #B () }\n\
+         let field = pair.product.A";
+    let (mint, _, output) = inferred(source);
+    assert_eq!(scheme(&mint, &output, "field"), "Nat");
+    assert_eq!(scheme(&mint, &output, "first"), "#A Nat | #B");
+    assert_eq!(scheme(&mint, &output, "second"), "#C Boolean");
+
+    let (_, ir, output) = infer_src(&format!(
+        "{source}\nlet bad = choose {{ A: 1n }} (#C false)"
+    ));
+    assert!(ir.errors.is_empty(), "{:#?}", ir.errors);
+    assert!(!output.errors().is_empty(), "the shared row must reject C");
+}
+
+#[test]
+fn shared_rows_follow_aliases_and_preserve_empty_rows() {
+    let (mint, _, output) = inferred(
+        "type Sum 'r = | ..'r\n\
+         type Struct 'r = { ..'r }\n\
+         type Id 'a = 'a\n\
+         type Fields 'a = { lower: 'a, Upper: () }\n\
+         type Cases 'a = #lower 'a | #Upper\n\
+         type Forward 'r = Sum (Struct 'r)\n\
+         let a : Sum (Id (Fields Nat)) = #lower 1n\n\
+         let b : Struct (Id (Cases Nat)) = { lower: 2n, Upper: () }\n\
+         let c : Forward (Cases Nat) = a\n\
+         let empty : Struct (|) = ()\n\
+         let absurd : Sum {} -> Nat = fn x => match x with end\n\
+         let value = b.lower",
+    );
+    assert_eq!(scheme(&mint, &output, "value"), "Nat");
+}
+
+#[test]
+fn shared_rows_preserve_presence_relationships_and_exclusions() {
+    let source = "type Sum 'r = | ..'r\n\
+         type Struct 'r = { ..'r }\n\
+         let sum : Sum { A when 'p: Nat, B when 'q: () } -> (#A (when 'p) Nat | #B (when 'q)) where 'p != 'q = fn x => x\n\
+         let record : Struct (#A (when 'p) Nat | #B (when 'q)) -> { A when 'p: Nat, B when 'q: () } where 'p != 'q = fn x => x\n\
+         let absent : Struct (\\#A | #B | ..) = { B: () }\n\
+         let choice : Sum { \\A, B: (), .. } = #B";
+    inferred(source);
+    for bad in [
+        "let bad : Sum { \\A, B: (), .. } = #A 1n",
+        "let bad : Struct (\\#A | #B | ..) = { A: 1n, B: () }",
+        "let bad = record { A: 1n, B: () }",
+    ] {
+        let (_, ir, output) = infer_src(&format!("{source}\n{bad}"));
+        assert!(ir.errors.is_empty(), "{:#?}", ir.errors);
+        assert!(!output.errors().is_empty(), "accepted {bad}");
+    }
+}
+
+#[test]
+fn shared_rows_work_as_effect_parameters() {
+    inferred(
+        "effect Choose 'r = { choose: { ..'r } -> (| ..'r) }\n\
+         type Fields = { A: Nat }\n\
+         type Cases = #A Nat\n\
+         let from_fields : () -> (#A Nat) + !Choose Fields = fn _ => !Choose.choose { A: 1n }\n\
+         let from_cases : () -> (#A Nat) + !Choose Cases = from_fields\n\
+         effect Alias = !Choose (#A Nat)\n\
+         let from_alias : () -> (#A Nat) + !Alias = from_fields\n\
+         effect ViaStruct 'r = !Choose { ..'r }\n\
+         effect ViaSum 'r = !Choose (| ..'r)\n\
+         let from_struct : () -> (#A Nat) + !ViaStruct Cases = from_fields\n\
+         let from_sum : () -> (#A Nat) + !ViaSum Fields = from_fields",
+    );
+}
+
+#[test]
 fn named_sum_row_arguments_are_spliced_before_solving() {
     let (_, ir, output) = infer_src(
         "type Cases 'r = #A | ..'r\n\
@@ -5598,8 +5689,8 @@ fn positions(ty: &Ty) -> Vec<(u32, Sense)> {
             found.extend(positions(b));
             positions_row(r, Sense::Effects, &mut found)
         }
-        Ty::Struct(r) => positions_row(r, Sense::Fields, &mut found),
-        Ty::Sum(r) => positions_row(r, Sense::Cases, &mut found),
+        Ty::Struct(r) => positions_row(r, Sense::Row, &mut found),
+        Ty::Sum(r) => positions_row(r, Sense::Row, &mut found),
         Ty::Named { args, .. } => {
             for a in args.iter() {
                 found.extend(positions(a))
@@ -9024,7 +9115,7 @@ fn a_label_demanded_of_a_rigid_is_refused() {
     assert_eq!(error.kind.code(), "rigid-broken");
     assert_eq!(
         error.kind.to_string(),
-        "this is `()`, but `'r` stands for whatever the caller picks for the rest of a struct's fields"
+        "this is `()`, but `'r` stands for whatever row of fields or cases the caller picks"
     );
 
     // The same closed-row conflict on a sum describes the caller-chosen
@@ -9036,7 +9127,7 @@ fn a_label_demanded_of_a_rigid_is_refused() {
     assert_eq!(error.kind.code(), "rigid-broken");
     assert_eq!(
         error.kind.to_string(),
-        "this is `|`, but `'r` stands for whatever the caller picks for the remaining cases"
+        "this is `|`, but `'r` stands for whatever row of fields or cases the caller picks"
     );
 
     // A field the row *does* name is no demand on the rest at all.
@@ -9159,7 +9250,7 @@ fn a_declared_sum_rest_is_equal_to_itself_and_to_nothing_else() {
     assert_eq!(error.kind.code(), "rigid-broken");
     assert_eq!(
         error.kind.to_string(),
-        "this is `|`, but `'r` stands for whatever the caller picks for the remaining cases"
+        "this is `|`, but `'r` stands for whatever row of fields or cases the caller picks"
     );
 }
 

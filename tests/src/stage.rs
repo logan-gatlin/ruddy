@@ -661,8 +661,8 @@ fn the_ir_tab_says_what_each_declared_variable_stands_for() {
         [
             ("Variable a", "when 'a (a presence)"),
             ("Variable c", "'c (a whole type)"),
-            ("Variable b", "..'b (the rest of a struct's fields)"),
-            ("Variable d", "..'d (the rest of a sum's cases)"),
+            ("Variable b", "..'b (a row of fields or cases)"),
+            ("Variable d", "..'d (a row of fields or cases)"),
         ]
     );
     // Each row is spanned at the first use, which is where the variable was
@@ -1166,7 +1166,7 @@ fn the_artifact_tab_exposes_canonical_text_and_skips_with_errors() {
         .find(|node| node.label == "effect")
         .expect("artifact outline includes the effect");
     assert_eq!(effect.children[0].label, "param");
-    assert_eq!(effect.children[0].text, "fields");
+    assert_eq!(effect.children[0].text, "row");
     assert_eq!(effect.children[1].label, "selector");
     let text = unnamed.text.as_deref().expect("canonical artifact text");
     assert!(text.contains("UnnamedOperation"), "{text}");
