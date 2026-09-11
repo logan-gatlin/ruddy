@@ -59,7 +59,7 @@ pub enum Value {
     Native(Rc<Native>),
     /// A value of a hidden type sealed for the host: nothing of it is visible
     /// outside, and only a package this program made can be opened.
-    Package(Rc<Value>),
+    Package(Rc<Package>),
     /// A Ruddy function handed to the host under a fixed completion contract.
     Callback(Rc<Callback>),
 }
@@ -199,6 +199,15 @@ pub enum Builtin {
     ProjectCase(Rc<str>),
     /// Inject a payload as one case of a sum.
     InjectCase(Rc<str>),
+}
+
+/// A value sealed for the host, with the hidden type it was sealed at. The
+/// host holds only the handle; the type is what lets a boundary decide
+/// whether this is the package the position asks for.
+#[derive(Debug)]
+pub struct Package {
+    pub value: Value,
+    pub sealed: Rc<Type>,
 }
 
 #[derive(Debug)]

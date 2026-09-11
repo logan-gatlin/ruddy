@@ -851,6 +851,124 @@ end
     );
 }
 
+/// A handle a foreign boundary hands back is authentic, which says it came
+/// from this program and nothing about which type it stands for. Reading one
+/// under another type would fabricate a cast, so the type is checked too.
+#[test]
+fn a_handle_is_read_only_under_the_type_it_was_made_at() {
+    let source = r#"
+type Box 'v = hide 'a => { secret: 'a, visible: 'v }
+
+let natural: Mirror Nat = std::reflect::mirror ()
+let write_mirror: Mirror Nat -> std::result::Result ForeignValue std::ffi::DecodeError =
+  std::ffi::encode
+let read_text_mirror: ForeignValue -> std::result::Result (Mirror String) std::ffi::DecodeError =
+  std::ffi::decode
+let read_natural_mirror: ForeignValue -> std::result::Result (Mirror Nat) std::ffi::DecodeError =
+  std::ffi::decode
+
+let crossed = match write_mirror natural with
+| #Some raw => match read_text_mirror raw with
+  | #Some other => match std::reflect::same natural other with
+    | #Some _ => "cast"
+    | #None => "unequal"
+    end
+  | #Error _ => "rejected"
+  end
+| #Error _ => "unwritable"
+end
+let kept_mirror = match write_mirror natural with
+| #Some raw => match read_natural_mirror raw with
+  | #Some other => match std::reflect::same natural other with
+    | #Some _ => "same"
+    | #None => "unequal"
+    end
+  | #Error _ => "rejected"
+  end
+| #Error _ => "unwritable"
+end
+
+let box: Box Nat = { secret: true, visible: 42n }
+let write_box: Box Nat -> std::result::Result ForeignValue std::ffi::DecodeError =
+  std::ffi::encode
+let read_text_box: ForeignValue -> std::result::Result (Box String) std::ffi::DecodeError =
+  std::ffi::decode
+let read_natural_box: ForeignValue -> std::result::Result (Box Nat) std::ffi::DecodeError =
+  std::ffi::decode
+
+let opened = match write_box box with
+| #Some raw => match read_text_box raw with
+  | #Some package => match package with
+    | hide 'a { visible, .. } => visible
+    end
+  | #Error _ => "rejected"
+  end
+| #Error _ => "unwritable"
+end
+let kept_box = match write_box box with
+| #Some raw => match read_natural_box raw with
+  | #Some package => match package with
+    | hide 'a { visible, .. } => std::str::from_nat visible
+    end
+  | #Error _ => "rejected"
+  end
+| #Error _ => "unwritable"
+end
+
+-- The binder's spelling is no part of the type, so this reads the same
+-- package, and an alias of the same shape reads it too.
+type Renamed 'v = hide 'b => { secret: 'b, visible: 'v }
+type Alias = Renamed Nat
+let read_renamed: ForeignValue -> std::result::Result Alias std::ffi::DecodeError =
+  std::ffi::decode
+let renamed = match write_box box with
+| #Some raw => match read_renamed raw with
+  | #Some package => match package with
+    | hide 'a { visible, .. } => std::str::from_nat visible
+    end
+  | #Error _ => "rejected"
+  end
+| #Error _ => "unwritable"
+end
+
+-- A nested record of mirrors carries each one's own type.
+let pair: { left: Mirror Nat, right: Mirror String } = { left: natural, right: std::reflect::mirror () }
+let write_pair: { left: Mirror Nat, right: Mirror String }
+  -> std::result::Result ForeignValue std::ffi::DecodeError = std::ffi::encode
+let read_swapped: ForeignValue
+  -> std::result::Result { left: Mirror String, right: Mirror Nat } std::ffi::DecodeError =
+  std::ffi::decode
+let swapped = match write_pair pair with
+| #Some raw => match read_swapped raw with
+  | #Some _ => "read"
+  | #Error error => error.path
+  end
+| #Error _ => "unwritable"
+end
+"#;
+    let exports = [
+        "crossed",
+        "kept_mirror",
+        "opened",
+        "kept_box",
+        "renamed",
+        "swapped",
+    ];
+    let (node, interpreted) = both(source, &exports, None);
+    assert_eq!(node, interpreted);
+    assert_eq!(
+        interpreted,
+        vec![
+            "\"rejected\"",
+            "\"same\"",
+            "\"rejected\"",
+            "\"42\"",
+            "\"42\"",
+            "\"$.left\"",
+        ]
+    );
+}
+
 #[test]
 fn a_host_value_the_interpreter_does_not_provide_is_named() {
     let mut program = load(

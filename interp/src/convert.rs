@@ -70,6 +70,15 @@ pub fn convert(
     .walk(root, value, "$")
 }
 
+/// Whether a graph still has a position nothing has decided. A handle can only
+/// be held against a type that is settled, so a boundary that asks about one
+/// which is not says so rather than letting the handle through unchecked.
+fn decided(ty: &Rc<Type>) -> bool {
+    !ty.nodes
+        .iter()
+        .any(|node| matches!(node, Node::Parameter(_)))
+}
+
 /// A value's identity, where it has one a cycle could be built from.
 fn identity(value: &Value) -> Option<usize> {
     match value {
@@ -111,16 +120,44 @@ impl Conversion<'_> {
                 }
                 Ok(Value::Fixed(*kind, found))
             }
-            Node::Mirror(_) => match value {
-                Value::Type(descriptor) if descriptor.mirror.get() => Ok(value.clone()),
+            // Authentic says a descriptor came from this program. It does not
+            // say which type it mirrors, and the type here is the one the
+            // program is about to read the value under, so the two are held
+            // together.
+            Node::Mirror(mirrored) => match value {
+                Value::Type(descriptor) if descriptor.mirror.get() => {
+                    if !self.outgoing {
+                        let wanted = crate::types::at(self.plan, *mirrored);
+                        if !decided(&wanted) {
+                            return Err(Failure::at(path, "a mirror of a type settled here"));
+                        }
+                        if !crate::types::same(descriptor, &wanted) {
+                            return Err(Failure::at(path, "a mirror of this type"));
+                        }
+                    }
+                    Ok(value.clone())
+                }
                 _ => Err(Failure::at(path, "an authentic mirror")),
             },
             Node::Hidden(_) => {
+                let sealed = crate::types::at(self.plan, shape);
+                if !self.outgoing && !decided(&sealed) {
+                    return Err(Failure::at(path, "a package of a type settled here"));
+                }
                 if self.outgoing {
-                    Ok(Value::Package(Rc::new(value.clone())))
+                    Ok(Value::Package(Rc::new(crate::value::Package {
+                        value: value.clone(),
+                        sealed,
+                    })))
                 } else {
                     match value {
-                        Value::Package(inner) => Ok((**inner).clone()),
+                        Value::Package(package) => {
+                            if crate::types::same(&package.sealed, &sealed) {
+                                Ok(package.value.clone())
+                            } else {
+                                Err(Failure::at(path, "a package of this type"))
+                            }
+                        }
                         _ => Err(Failure::at(path, "a package this program made")),
                     }
                 }

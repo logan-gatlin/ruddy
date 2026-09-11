@@ -16,3 +16,18 @@ whole value. The `Read` and `Write` protocols are already the right shape for
 a streaming handler, so what is missing is a handler that owns an incremental
 source or sink, declares its I/O effects, and the session rules for a run that
 ends part-way through.
+
+## Comments
+
+Implementer handoff at `cd906cf`: also account for custom codec effects.
+`Encoder 'a` and `Decoder 'a` currently fix `run` to `!Write` and `!Read`.
+The spec allows a custom codec's additional effects to remain visible through
+the runner; discarding buffered output must not imply rolling those effects
+back. Extend the interface/evidence forwarding so a custom effect is neither
+silently erased nor rejected merely because it accompanies protocol effects.
+
+Acceptance includes a custom codec performing an application effect, a runner
+that propagates it to the caller, nested runners that leave the outer session
+unchanged, and a streaming failure that ends only its codec session without
+promising input rewind or transport closure. Use the same portable codec with
+buffered and streaming format runners.

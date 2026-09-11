@@ -7,6 +7,10 @@ const $convertedFunctions = new WeakMap();
 // package can be made outside the program.
 const $packages = new WeakMap();
 const $handles = new WeakMap();
+// Whether a graph still has a position nothing has decided. A handle can only
+// be held against a type that is settled, so a boundary that asks about one
+// which is not says so rather than letting the handle through unchecked.
+const $decided = $type => !$type.nodes.some($node => typeof $node === "object" && "Parameter" in $node);
 const $instantiateType = ($template, $arguments, $partial = false) => {
   if ($arguments.some($argument => $argument === undefined)) return undefined;
   if (!$arguments.length && !$template.nodes.some($node => typeof $node === "object" && "Extend" in $node)) return $template;
@@ -359,23 +363,45 @@ const $convertType = ($descriptor, $value, $outgoing, $rootIndex = 0, $callable 
       continue;
     }
     if ("Mirror" in $node) {
+      // Authentic says the descriptor came from this program. It does not say
+      // which type it mirrors, and coming in, the type here is the one the
+      // program is about to read the value under, so the two are held
+      // together. Going out the program is handing over its own mirror, and
+      // the plan it crosses under describes types under the host's policy
+      // rather than the exact one a mirror carries.
       if (!$mirrors.has($input)) $fail($path, "an authentic mirror");
+      if (!$outgoing) {
+        const $mirrored = $typeAt($descriptor, $node.Mirror);
+        if (!$decided($mirrored)) $fail($path, "a mirror of a type settled here");
+        if (!$sameType($input, $mirrored)) $fail($path, "a mirror of this type");
+      }
       $put($input);
       continue;
     }
     if ("Hidden" in $node) {
+      const $sealed = $typeAt($descriptor, $shapeIndex);
+      if (!$outgoing && !$decided($sealed)) $fail($path, "a package of a type settled here");
       if ($outgoing) {
         const $sealable = typeof $input === "function" || (typeof $input === "object" && $input !== null);
-        let $handle = $sealable ? $handles.get($input) : undefined;
+        // One value may be sealed at more than one hidden type, so a handle is
+        // looked up by both: reusing one across types would lend one type's
+        // authority to another.
+        let $made = $sealable ? $handles.get($input) : undefined;
+        let $handle = $made && $made.find($at => $sameType($at.type, $sealed));
         if (!$handle) {
-          $handle = Object.freeze(Object.create(null));
-          $packages.set($handle, $input);
-          if ($sealable) $handles.set($input, $handle);
+          $handle = { handle: Object.freeze(Object.create(null)), type: $sealed };
+          $packages.set($handle.handle, { value: $input, type: $sealed });
+          if ($sealable) {
+            if (!$made) { $made = []; $handles.set($input, $made); }
+            $made.push($handle);
+          }
         }
-        $put($handle);
+        $put($handle.handle);
       } else {
         if (!$packages.has($input)) $fail($path, "a package this program made");
-        $put($packages.get($input));
+        const $package = $packages.get($input);
+        if (!$sameType($package.type, $sealed)) $fail($path, "a package of this type");
+        $put($package.value);
       }
       continue;
     }

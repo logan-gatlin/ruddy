@@ -16,3 +16,23 @@ ordinary type does not authorize hiding a region lifetime." `Solve::witness`
 checks unification-variable levels only, so a witness naming a local region
 rigid is packaged without complaint. Conservative rejection, with a diagnostic
 and a fixture, is the tracked work.
+
+## Comments
+
+Implementer handoff at `cd906cf`: the safety gap is reproduced by this source,
+which currently checks successfully:
+
+```ruddy
+type Box = hide 'a => 'a
+@private let pack: 'a -> Box = fn value => value
+let escape: () -> Box = fn _ => pack (mut 0n)
+```
+
+The local cell's region disappears from the outward package and effect
+contract. Reject this case until its transitive dependencies can be retained
+safely. Test indirect packaging through generic functions, records, and
+capturing closures as well as direct introduction; preserve ordinary pure
+packages and valid closures that encapsulate hidden types without losing
+region dependencies. This conservative fix can precede the richer descriptive
+cell/region interface; neither part grants reflection permission to read a
+cell or invoke a captured function.
