@@ -1284,7 +1284,6 @@ fn declaration_variances(
                             | Ty::Real
                             | Ty::String
                             | Ty::Bool
-                            | Ty::Any
                             | Ty::ForeignValue => {}
                         }
                     }
@@ -3849,7 +3848,6 @@ fn imported_syntax(
         artifact::Type::Real => TypeKind::Prim(Prim::Real),
         artifact::Type::String => TypeKind::Prim(Prim::String),
         artifact::Type::Bool => TypeKind::Prim(Prim::Bool),
-        artifact::Type::Any => TypeKind::Prim(Prim::Any),
         artifact::Type::ForeignValue => TypeKind::Prim(Prim::ForeignValue),
         artifact::Type::Bound(index) => match params.get(*index as usize) {
             Some(symbol) => TypeKind::Param {
@@ -4170,7 +4168,6 @@ fn clamp_bounds(ty: Arc<Ty>, count: usize, presences: usize) -> Arc<Ty> {
                 Ty::Real => types.push(Arc::new(Ty::Real)),
                 Ty::String => types.push(Arc::new(Ty::String)),
                 Ty::Bool => types.push(Arc::new(Ty::Bool)),
-                Ty::Any => types.push(Arc::new(Ty::Any)),
                 Ty::ForeignValue => types.push(Arc::new(Ty::ForeignValue)),
                 Ty::Bound(index) if (*index as usize) < count && (*index as usize) >= presences => {
                     types.push(Arc::new(Ty::Bound(*index)))
@@ -4389,7 +4386,6 @@ fn drop_type_iterative(root: Arc<Ty>) {
                     | Ty::Real
                     | Ty::String
                     | Ty::Bool
-                    | Ty::Any
                     | Ty::ForeignValue
                     | Ty::Var(_)
                     | Ty::Bound(_)
@@ -4564,7 +4560,6 @@ fn import_type(
                 artifact::Type::Real => types.push(Arc::new(Ty::Real)),
                 artifact::Type::String => types.push(Arc::new(Ty::String)),
                 artifact::Type::Bool => types.push(Arc::new(Ty::Bool)),
-                artifact::Type::Any => types.push(Arc::new(Ty::Any)),
                 artifact::Type::ForeignValue => types.push(Arc::new(Ty::ForeignValue)),
                 artifact::Type::Bound(index) => types.push(Arc::new(Ty::Bound(*index))),
                 artifact::Type::Var(_)
@@ -5673,7 +5668,6 @@ impl RegularType<'_> {
                     Ty::Real => values.push(self.atom("Real")),
                     Ty::String => values.push(self.atom("String")),
                     Ty::Bool => values.push(self.atom("Bool")),
-                    Ty::Any => values.push(self.atom("Any")),
                     Ty::ForeignValue => values.push(self.atom("ForeignValue")),
                     Ty::Bound(index) if instantiation == usize::MAX => {
                         values.push(self.atom(format!("param:{index}")))
@@ -7094,7 +7088,6 @@ impl<'a> Follow<'a> {
                     | Ty::Real
                     | Ty::String
                     | Ty::Bool
-                    | Ty::Any
                     | Ty::ForeignValue
                     | Ty::Arrow(..)
                     | Ty::Mut(..)
@@ -9226,7 +9219,6 @@ fn row_summaries(
                     | Ty::Real
                     | Ty::String
                     | Ty::Bool
-                    | Ty::Any
                     | Ty::ForeignValue
                     | Ty::Arrow(..)
                     | Ty::Mut(..)

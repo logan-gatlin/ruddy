@@ -470,7 +470,6 @@ fn rep(r: lower::Rep) -> Rep {
         lower::Rep::Bool => Rep::Bool,
         lower::Rep::TypeDescriptor => Rep::TypeDescriptor,
         lower::Rep::NativePlan => Rep::NativePlan,
-        lower::Rep::BoxedAny => Rep::BoxedAny,
         lower::Rep::HostValue => Rep::HostValue,
         lower::Rep::Unit => Rep::Unit,
         lower::Rep::Struct => Rep::Struct,

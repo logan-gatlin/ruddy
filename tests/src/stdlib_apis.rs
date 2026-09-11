@@ -415,7 +415,6 @@ let print: Mirror 'a -> 'a -> String = fn mirror value => match std::reflect::sh
 | #Function description => "<function>"
 | #Hidden description => "<hidden>"
 | #Mirror description => "<mirror>"
-| #Any => "<any>"
 | #Foreign => "<foreign>"
 | _ => "<fixed>"
 end
@@ -465,14 +464,10 @@ let rebuilt = build_with person_mirror all
 let missing = build_with person_mirror (match all with | [_, ..rest] => rest | [] => [] end)
 let duplicated = build_with person_mirror (std::array::concat all all)
 let other_mirror: Mirror Other = std::reflect::mirror ()
-let string_mirror: Mirror String = std::reflect::mirror ()
 extern reown: fn(std::reflect::Binding Person, Mirror Other) -> std::reflect::Binding Person = "(binding, record) => ({ ...binding, record })"
-extern retype: fn(std::reflect::Binding Person, Mirror String) -> std::reflect::Binding Person = "(binding, mirror) => ({ ...binding, mirror })"
-extern rename: fn(std::reflect::Binding Person, String) -> std::reflect::Binding Person = "(binding, name) => ({ ...binding, name })"
 let first = match all with | [head, ..] => [head] | [] => [] end
-let foreign = build_with person_mirror (std::array::map (fn binding => reown binding other_mirror) first)
-let mismatched = build_with person_mirror (std::array::map (fn binding => retype binding string_mirror) first)
-let unknown = build_with person_mirror (std::array::map (fn binding => rename binding "nope") first)
+let forged: () -> String = fn _ =>
+  build_with person_mirror (std::array::map (fn binding => reown binding other_mirror) first)
 @private
 let make_admin: Mirror Role -> Option Role = fn mirror => match std::reflect::shape mirror with
 | #Sum view => match std::array::filter_map (fn case => match case with
@@ -509,14 +504,12 @@ assert.equal(app.printed_unit, '{}');
 assert.equal(app.printed_function, '<function>');
 assert.equal(app.printed_hidden, '<hidden>');
 assert.equal(app.printed_mirror, '<mirror>');
-assert.equal(app.printed_any, '<any>');
+assert.equal(app.printed_any, '<hidden>');
 assert.equal(app.printed_foreign, '<foreign>');
 assert.equal(app.rebuilt, 'built {age: 36, name: "Ada", role: #User 3, tags: ["x", "y"]}');
 assert.equal(app.missing, 'missing age');
 assert.equal(app.duplicated, 'duplicate age');
-assert.equal(app.foreign, 'foreign age');
-assert.equal(app.mismatched, 'mismatched age');
-assert.equal(app.unknown, 'unknown nope');
+await assert.rejects(async () => app.forged({}), /package/);
 assert.equal(app.admin, '#Admin {}');
 assert.deepEqual(app.backwards, ['y', 'x']);
 "#,

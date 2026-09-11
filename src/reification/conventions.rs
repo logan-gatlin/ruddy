@@ -916,15 +916,20 @@ impl Plan {
                 } = planner.plan.graph.exposed(root).clone()
                 {
                     match intrinsic {
-                        super::Intrinsic::Upcast | super::Intrinsic::TypeOf => {
+                        super::Intrinsic::TypeOf => {
                             planner.plan.graph.shapes[argument as usize] = Shape::Sealed
                         }
-                        super::Intrinsic::Downcast => {
+                        // The functions an equality or a shape hands back are
+                        // the runtime's own, which take no descriptors.
+                        super::Intrinsic::Same => {
                             if let Shape::Sum(fields) = planner.plan.graph.exposed(result).clone()
                                 && let Some(payload) = fields.get("Some")
                             {
                                 planner.plan.graph.shapes[*payload as usize] = Shape::Sealed;
                             }
+                        }
+                        super::Intrinsic::Shape => {
+                            planner.plan.graph.shapes[result as usize] = Shape::Sealed
                         }
                         _ => {}
                     }

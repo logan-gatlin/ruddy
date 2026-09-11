@@ -1,6 +1,6 @@
 # 05 Define `Any` as a hidden package over a mirror
 
-Status: open
+Status: resolved
 Type: task
 Blocked by: 03
 

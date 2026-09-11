@@ -1150,7 +1150,12 @@ fn mutation_region_kinds_forward_from_imported_effects() {
 fn reification_callable_interfaces_separate_initialization_and_curried_demands() {
     use ruddy::reification::conventions::Shape;
     let source = r#"
-extern box: 'a -> Any = "$anyUpcast"
+type Option 'a = #Some 'a | #None
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
 let pair = fn first => fn second => (box first, box second)
 let partial = pair 1n
 let erased = fn value => value
@@ -1261,7 +1266,12 @@ let retained = first (fn _ => token) box
 fn reification_callable_interfaces_solve_polymorphic_recursive_groups() {
     use ruddy::reification::conventions::Shape;
     let source = r#"
-extern box: 'a -> Any = "$anyUpcast"
+type Option 'a = #Some 'a | #None
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
 let left: 'a -> Any = fn value => right [value]
 let right: 'a -> Any = fn value => match true with
   | true => box value
@@ -1384,7 +1394,12 @@ let indirect = nested ()
 fn reification_callable_interfaces_follow_array_values_and_evaluation() {
     use ruddy::reification::conventions::Shape;
     let source = r#"
-extern box: 'a -> Any = "$anyUpcast"
+type Option 'a = #Some 'a | #None
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
 let array_box = fn value => [box value]
 let through_spread = fn value => [..array_box value]
 let return_rest = fn callbacks => match callbacks with
@@ -1445,7 +1460,12 @@ fn reification_callable_interfaces_survive_separate_compilation() {
     use ruddy::reification::conventions::Shape;
     let producer = exported(
         r#"
-extern box: 'a -> Any = "$anyUpcast"
+type Option 'a = #Some 'a | #None
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
 let apply = fn callback => fn value => callback value
 let identity = fn value => value
 "#,
@@ -1487,7 +1507,12 @@ fn reification_recursive_callable_interfaces_preserve_forwarded_profiles() {
     use ruddy::reification::conventions::Shape;
     let program = accepted(
         r#"
-extern box: 'a -> Any = "$anyUpcast"
+type Option 'a = #Some 'a | #None
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
 let token = box 1n
 let left: ('a -> Any) -> ('a -> Any) = fn callback => right callback
 let right: ('a -> Any) -> ('a -> Any) = fn callback => match true with
@@ -1526,7 +1551,7 @@ let dynamic = left box
 fn reification_graphs_and_forwarding_use_bounded_stack_and_artifact_space() {
     std::thread::Builder::new().name("runtime-type-graphs".into()).stack_size(256 * 1024)
         .spawn(|| {
-            let mut source = String::from("@private extern box: 'a -> Any = \"$anyUpcast\"\nlet apply = fn call value => call value\nlet forward0 = apply box\n");
+            let mut source = String::from("type Option 'a = #Some 'a | #None\ntype Any = hide 'a => { mirror: Mirror 'a, value: 'a }\n@private extern type_of: 'a -> Mirror 'a = \"$typeOf\"\n@private extern mirror: () -> Mirror 'a = \"$mirror\"\n@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = \"$sameMirror\"\n@private let box: 'a -> Any = fn value => { mirror: type_of value, value: value }\nlet apply = fn call value => call value\nlet forward0 = apply box\n");
             for at in 1..128 {
                 source.push_str(&format!("let forward{at} = fn value => forward{} value\n", at - 1));
             }

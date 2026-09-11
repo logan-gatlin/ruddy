@@ -883,7 +883,6 @@ impl Solve<'_> {
             | Ty::Real
             | Ty::String
             | Ty::Bool
-            | Ty::Any
             | Ty::ForeignValue
             | Ty::Arrow(..)
             | Ty::Mut(..)
@@ -957,7 +956,6 @@ impl Solve<'_> {
             | Ty::Real
             | Ty::String
             | Ty::Bool
-            | Ty::Any
             | Ty::ForeignValue
             | Ty::Arrow(..)
             | Ty::Array(_)
@@ -1241,7 +1239,6 @@ impl Solve<'_> {
                                 Ty::Real => values.push(tagged(2, [])),
                                 Ty::String => values.push(tagged(3, [])),
                                 Ty::Bool => values.push(tagged(4, [])),
-                                Ty::Any => values.push(tagged(50, [])),
                                 Ty::ForeignValue => values.push(tagged(51, [])),
                                 Ty::Var(var) | Ty::Bound(var) => {
                                     values.push(tagged(5, [u64::from(*var)]));
@@ -2330,7 +2327,6 @@ impl Solve<'_> {
                         | (Ty::Real, Ty::Real)
                         | (Ty::String, Ty::String)
                         | (Ty::Bool, Ty::Bool)
-                        | (Ty::Any, Ty::Any)
                         | (Ty::ForeignValue, Ty::ForeignValue) => {
                             self.step(span, Rule::Prim, goal, Effect::None);
                         }
@@ -2694,7 +2690,6 @@ impl Solve<'_> {
                         | Ty::Real
                         | Ty::String
                         | Ty::Bool
-                        | Ty::Any
                         | Ty::ForeignValue
                         | Ty::Var(_)
                         | Ty::Rigid { .. }
@@ -4113,7 +4108,6 @@ impl Solve<'_> {
                     | Ty::Real
                     | Ty::String
                     | Ty::Bool
-                    | Ty::Any
                     | Ty::ForeignValue
                     | Ty::Bound(_)
                     | Ty::Rigid { .. }

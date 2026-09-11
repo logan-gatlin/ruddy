@@ -202,7 +202,9 @@ one type, and on success supplies the two identity functions that let a value
 cross between the names.
 
 Together with [hidden types](dictionary.md#hidden-type) this recovers a value's
-type at runtime without `Any`:
+type at runtime; the standard `Any` is defined exactly this way, as
+`hide 'a => { mirror: Mirror 'a, value: 'a }`, with `any::upcast` packaging a
+value and `any::downcast` opening one:
 
 ```ruddy
 type Dynamic = hide 'a => { value: 'a, evidence: Mirror 'a }
@@ -238,5 +240,5 @@ generic printer, validator, or decoder can work on a field's value and hand a
 new one back without knowing the field's type. A record view's `build` takes
 such bindings and rejects a missing, duplicate, unknown, or mismatched field,
 or one bound for another record. A sum case's `project` observes its payload
-and `inject` makes the case; functions, hidden types, mirrors, `Any`, and
-foreign values are described only.
+and `inject` makes the case; functions, hidden types (`Any` among them),
+mirrors, and foreign values are described only.

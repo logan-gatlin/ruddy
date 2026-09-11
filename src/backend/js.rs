@@ -480,8 +480,6 @@ impl<'a> Generator<'a> {
                 value,
             } => {
                 out.push_str(match kind {
-                    crate::reification::Intrinsic::Upcast => "$anyUpcast(",
-                    crate::reification::Intrinsic::Downcast => "$anyDowncast(",
                     crate::reification::Intrinsic::Decode => "$ffiDecode(",
                     crate::reification::Intrinsic::Mirror => "$mirror(",
                     crate::reification::Intrinsic::TypeOf => "$typeOf(",

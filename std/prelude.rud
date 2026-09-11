@@ -14,3 +14,4 @@ type Maybe 't = #Nil | ..'t
 type Result 'some 'error = #Some 'some | #Error 'error
 type Fallible 'error 'rest = #Error 'error | ..'rest
 type Order = #Less | #Equal | #Greater
+type Any = any::Any

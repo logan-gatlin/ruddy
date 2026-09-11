@@ -196,7 +196,6 @@ pub fn rep(rep: Rep) -> &'static str {
         Rep::Bool => "boolean",
         Rep::TypeDescriptor => "type_descriptor",
         Rep::NativePlan => "native_plan",
-        Rep::BoxedAny => "boxed_any",
         Rep::HostValue => "host_value",
         Rep::Unit => "unit",
         Rep::Struct => "struct",

@@ -285,7 +285,6 @@ pub enum Rep {
     Bool,
     TypeDescriptor,
     NativePlan,
-    BoxedAny,
     HostValue,
     /// The value with nothing in it: the empty struct.
     Unit,
@@ -519,14 +518,6 @@ pub(super) fn validate(lir: &Lir) -> Result<(), String> {
                             return error("reflection requires a runtime type descriptor");
                         }
                         match kind {
-                            crate::reification::Intrinsic::Upcast if i.rep != Rep::BoxedAny => {
-                                return error("boxing requires an Any result");
-                            }
-                            crate::reification::Intrinsic::Downcast
-                                if available[value] != Rep::BoxedAny || i.rep != Rep::Sum =>
-                            {
-                                return error("downcasting requires Any and returns Option");
-                            }
                             crate::reification::Intrinsic::Decode
                                 if available[value] != Rep::HostValue || i.rep != Rep::Sum =>
                             {

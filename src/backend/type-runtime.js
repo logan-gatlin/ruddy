@@ -1,9 +1,12 @@
 // Adapter identity is keyed by the source value and the reviewed conversion
 // position. Recursive host interfaces reuse their wrapper on a back edge.
 const $convertedFunctions = new WeakMap();
-// Only authentic Any packages own payloads. Their visible shape carries no
-// writable descriptor that foreign code could forge or replace.
-const $anyPackages = new WeakMap();
+// A value of a hidden type crosses a foreign boundary as a sealed package:
+// the host is handed a frozen handle for it, and only such a handle is taken
+// back. Nothing of the body is visible to or writable by the host, and no
+// package can be made outside the program.
+const $packages = new WeakMap();
+const $handles = new WeakMap();
 const $instantiateType = ($template, $arguments, $partial = false) => {
   if ($arguments.some($argument => $argument === undefined)) return undefined;
   if (!$arguments.length && !$template.nodes.some($node => typeof $node === "object" && "Extend" in $node)) return $template;
@@ -236,7 +239,7 @@ const $shape = ($descriptor, $of) => {
   const $node = $of.nodes[$typeIndex($of, 0)];
   const $typed = $name => $sum($name, $record([["read", $passThrough()], ["make", $passThrough()]]));
   if (typeof $node === "string") {
-    return $node === "Any" ? $sum("Any", undefined) : $node === "ForeignValue" ? $sum("Foreign", undefined) : $typed($node);
+    return $node === "ForeignValue" ? $sum("Foreign", undefined) : $typed($node);
   }
   if ("Fixed" in $node) return $typed($node.Fixed);
   if ("Array" in $node) {
@@ -285,18 +288,6 @@ const $shape = ($descriptor, $of) => {
   if ("Mirror" in $node) return $sum("Mirror", $describe($of, $of));
   throw new TypeError("unknown runtime type node");
 };
-const $anyUpcast = ($descriptor, $value) => {
-  if (!$descriptor) throw new TypeError("missing runtime type information for Any");
-  const $package = Object.freeze(Object.create(null));
-  $anyPackages.set($package, { descriptor: $descriptor, value: $value });
-  return $package;
-};
-const $anyDowncast = ($descriptor, $value) => {
-  const $package = $anyPackages.get($value);
-  return $package && $sameType($descriptor, $package.descriptor)
-    ? $sum("Some", $package.value)
-    : $sum("None", $record([]));
-};
 
 // Conversion uses an explicit work stack, including leave tasks for cycle
 // detection. A repeated sibling reference is copied; a cyclic path is rejected.
@@ -324,7 +315,6 @@ const $convertType = ($descriptor, $value, $outgoing, $rootIndex = 0, $callable 
         case "Real": $valid = typeof $input === "number"; break;
         case "String": $valid = typeof $input === "string"; break;
         case "Bool": $valid = typeof $input === "boolean"; break;
-        case "Any": $valid = $anyPackages.has($input); break;
         case "ForeignValue": break;
         default: $valid = false;
       }
@@ -346,7 +336,22 @@ const $convertType = ($descriptor, $value, $outgoing, $rootIndex = 0, $callable 
       $put($input);
       continue;
     }
-    if ("Hidden" in $node || "HiddenBound" in $node) $fail($path, "a supported native type; hidden types cannot cross a foreign boundary exactly");
+    if ("Hidden" in $node) {
+      if ($outgoing) {
+        const $sealable = typeof $input === "function" || (typeof $input === "object" && $input !== null);
+        let $handle = $sealable ? $handles.get($input) : undefined;
+        if (!$handle) {
+          $handle = Object.freeze(Object.create(null));
+          $packages.set($handle, $input);
+          if ($sealable) $handles.set($input, $handle);
+        }
+        $put($handle);
+      } else {
+        if (!$packages.has($input)) $fail($path, "a package this program made");
+        $put($packages.get($input));
+      }
+      continue;
+    }
     if ("Arrow" in $node) {
       if (!$callable) $fail($path, "a verifiable data type; function contracts cannot be decoded");
       if (typeof $input !== "function") $fail($path, "Function");

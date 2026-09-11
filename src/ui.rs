@@ -2329,7 +2329,6 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                     Ty::Real => f.write_str(Prim::Real.name())?,
                     Ty::String => f.write_str(Prim::String.name())?,
                     Ty::Bool => f.write_str(Prim::Bool.name())?,
-                    Ty::Any => f.write_str(Prim::Any.name())?,
                     Ty::ForeignValue => f.write_str(Prim::ForeignValue.name())?,
                     Ty::Arrow(from, to, effects) => {
                         let shown = effect_row_shown(effects);
@@ -3171,7 +3170,6 @@ fn type_description(description: inference::TypeDescription) -> &'static str {
         T::DeclaredType => "a declared type",
         T::Hidden => "a hidden type",
         T::Mirror => "a mirror",
-        T::Any => "a boxed value",
         T::ForeignValue => "a foreign value",
         T::Undecided => "another type",
     }

@@ -415,7 +415,6 @@ pub enum Rep {
     Bool,
     TypeDescriptor,
     NativePlan,
-    BoxedAny,
     HostValue,
     /// The value with nothing in it: the empty struct.
     Unit,
@@ -2275,7 +2274,6 @@ impl Lower<'_> {
             Ty::Real => Rep::Real,
             Ty::String => Rep::String,
             Ty::Bool => Rep::Bool,
-            Ty::Any => Rep::BoxedAny,
             Ty::ForeignValue => Rep::HostValue,
             Ty::Arrow(..) => Rep::Fn,
             Ty::Array(_) => Rep::Array,
@@ -4287,7 +4285,6 @@ impl Lower<'_> {
             | Ty::Real
             | Ty::String
             | Ty::Bool
-            | Ty::Any
             | Ty::ForeignValue
                 if primitives =>
             {

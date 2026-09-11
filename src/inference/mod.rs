@@ -2524,7 +2524,6 @@ pub enum TypeDescription {
     RealNumber,
     Text,
     Bool,
-    Any,
     ForeignValue,
     Function,
     Struct,
@@ -4175,7 +4174,6 @@ fn describe_type(ty: &Arc<Ty>) -> TypeDescription {
         Ty::Real => TypeDescription::RealNumber,
         Ty::String => TypeDescription::Text,
         Ty::Bool => TypeDescription::Bool,
-        Ty::Any => TypeDescription::Any,
         Ty::ForeignValue => TypeDescription::ForeignValue,
         Ty::Arrow(..) => TypeDescription::Function,
         Ty::Struct(..) => TypeDescription::Struct,
@@ -4291,7 +4289,6 @@ impl MismatchFingerprints {
                         Ty::Real => values.push(tagged(2, [])),
                         Ty::String => values.push(tagged(3, [])),
                         Ty::Bool => values.push(tagged(4, [])),
-                        Ty::Any => values.push(tagged(50, [])),
                         Ty::ForeignValue => values.push(tagged(51, [])),
                         Ty::Var(id) => values.push(tagged(5, [u64::from(*id)])),
                         Ty::Bound(id) => values.push(tagged(6, [u64::from(*id)])),
@@ -4765,7 +4762,6 @@ fn smallest_incompatible_counted_with_mask(
             | (Ty::Real, Ty::Real)
             | (Ty::String, Ty::String)
             | (Ty::Bool, Ty::Bool)
-            | (Ty::Any, Ty::Any)
             | (Ty::ForeignValue, Ty::ForeignValue)
             | (Ty::Bound(_), Ty::Bound(_))
             | (Ty::Var(_), Ty::Var(_))
@@ -6212,7 +6208,6 @@ impl Fingerprint {
                     Ty::Real => self.word(0x03),
                     Ty::String => self.word(0x04),
                     Ty::Bool => self.word(0x05),
-                    Ty::Any => self.word(0x30),
                     Ty::ForeignValue => self.word(0x31),
                     Ty::Arrow(from, to, effects) => {
                         self.word(0x06);
@@ -8328,7 +8323,6 @@ impl Table {
                         | (Ty::Real, Ty::Real)
                         | (Ty::String, Ty::String)
                         | (Ty::Bool, Ty::Bool)
-                        | (Ty::Any, Ty::Any)
                         | (Ty::ForeignValue, Ty::ForeignValue)
                         | (Ty::Undecided, Ty::Undecided) => {}
                         (Ty::Var(x), Ty::Var(y)) => same &= x == y,
@@ -8573,7 +8567,6 @@ impl Table {
                             | Ty::Real
                             | Ty::String
                             | Ty::Bool
-                            | Ty::Any
                             | Ty::ForeignValue
                             | Ty::Bound(_)
                             | Ty::Rigid { .. }
@@ -8784,7 +8777,6 @@ impl Table {
                         | Ty::Real
                         | Ty::String
                         | Ty::Bool
-                        | Ty::Any
                         | Ty::ForeignValue
                         | Ty::Bound(_)
                         | Ty::Rigid { .. }
@@ -8917,7 +8909,6 @@ impl Table {
                         | Ty::Real
                         | Ty::String
                         | Ty::Bool
-                        | Ty::Any
                         | Ty::ForeignValue
                         | Ty::Var(_)
                         | Ty::Bound(_)
@@ -9594,7 +9585,6 @@ impl Table {
                         | Ty::Real
                         | Ty::String
                         | Ty::Bool
-                        | Ty::Any
                         | Ty::ForeignValue
                         | Ty::Var(_)
                         | Ty::Bound(_)

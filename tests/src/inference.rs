@@ -9509,7 +9509,7 @@ fn extern_boundary_infers_row_evidence_and_preserves_optional_fields() {
         infer_src("extern x : fn({ value when 'present: Nat }) -> () = \"host.x\"");
     assert!(presence.errors().is_empty(), "{:#?}", presence.errors());
     let (_, _, exact) = infer_src(
-        "extern box: 'a -> Any = \"$anyUpcast\"\nlet exact: { value when 'present: Nat } -> Any = fn value => box value",
+        "type Any = hide 'a => { mirror: Mirror 'a, value: 'a }\n@private extern type_of: 'a -> Mirror 'a = \"$typeOf\"\nlet box: 'a -> Any = fn value => { mirror: type_of value, value: value }\nlet exact: { value when 'present: Nat } -> Any = fn value => box value",
     );
     assert!(
         exact
@@ -10562,7 +10562,7 @@ fn sat_errors_link_directly_to_their_flipped_batches() {
 
 #[test]
 fn direct_boundary_errors_have_stable_ids_without_solve_steps() {
-    let (_, _, output) = infer_src("extern echo : fn('a) -> 'a = \"$anyUpcast\"");
+    let (_, _, output) = infer_src("extern echo : fn('a) -> 'a = \"$typeOf\"");
     let [error] = output.errors() else {
         panic!("expected one boundary error: {:#?}", output.errors());
     };
@@ -11593,7 +11593,6 @@ type Shape 'a =\n\
   | #Function Description\n\
   | #Hidden Description\n\
   | #Mirror Description\n\
-  | #Any\n\
   | #Foreign\n\
 type ArrayView 'array = hide 'element => { element: Mirror 'element, read: 'array -> ['element], make: ['element] -> 'array }\n\
 type RecordView 'record = { mirror: Mirror 'record, fields: [SomeField 'record], build: [Binding 'record] -> Result 'record BuildError }\n\
@@ -11614,8 +11613,8 @@ fn the_shape_intrinsic_is_reviewed_against_its_cases() {
         "extern shape: Mirror 'a -> Nat = \"$shape\"",
         "extern shape: Mirror 'a -> Shape 'b = \"$shape\"",
         "extern shape: Mirror 'a -> RecordView 'a = \"$shape\"",
-        "type Fewer 'a = #Nat { read: 'a -> Nat, make: Nat -> 'a } | #Any\nextern shape: Mirror 'a -> Fewer 'a = \"$shape\"",
-        "type Renamed 'a = #Natural { read: 'a -> Nat, make: Nat -> 'a } | #Int { read: 'a -> Int, make: Int -> 'a } | #Real { read: 'a -> Real, make: Real -> 'a } | #String { read: 'a -> String, make: String -> 'a } | #Bool { read: 'a -> Bool, make: Bool -> 'a } | #Nat8 () | #Nat16 () | #Nat32 () | #Nat64 () | #Int8 () | #Int16 () | #Int32 () | #Int64 () | #Array (ArrayView 'a) | #Record (RecordView 'a) | #Sum (SumView 'a) | #Function Description | #Hidden Description | #Mirror Description | #Any | #Foreign\nextern shape: Mirror 'a -> Renamed 'a = \"$shape\"",
+        "type Fewer 'a = #Nat { read: 'a -> Nat, make: Nat -> 'a } | #Foreign\nextern shape: Mirror 'a -> Fewer 'a = \"$shape\"",
+        "type Renamed 'a = #Natural { read: 'a -> Nat, make: Nat -> 'a } | #Int { read: 'a -> Int, make: Int -> 'a } | #Real { read: 'a -> Real, make: Real -> 'a } | #String { read: 'a -> String, make: String -> 'a } | #Bool { read: 'a -> Bool, make: Bool -> 'a } | #Nat8 () | #Nat16 () | #Nat32 () | #Nat64 () | #Int8 () | #Int16 () | #Int32 () | #Int64 () | #Array (ArrayView 'a) | #Record (RecordView 'a) | #Sum (SumView 'a) | #Function Description | #Hidden Description | #Mirror Description | #Foreign\nextern shape: Mirror 'a -> Renamed 'a = \"$shape\"",
     ] {
         let (_, _, output) = infer_src(&format!("{SHAPE_SOURCE}{signature}"));
         assert_eq!(

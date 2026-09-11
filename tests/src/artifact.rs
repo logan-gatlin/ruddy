@@ -50,7 +50,7 @@ fn built(source: &str) -> Artifact {
 #[test]
 fn reification_artifacts_validate_descriptor_graphs_and_evidence_layouts() {
     let artifact = built(
-        "extern box: 'a -> Any = \"$anyUpcast\"\nlet wrapped = box 1n\nlet identity = fn x => x",
+        "type Option 'a = #Some 'a | #None\ntype Any = hide 'a => { mirror: Mirror 'a, value: 'a }\n@private extern type_of: 'a -> Mirror 'a = \"$typeOf\"\n@private extern mirror: () -> Mirror 'a = \"$mirror\"\n@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = \"$sameMirror\"\nlet box: 'a -> Any = fn value => { mirror: type_of value, value: value }\nlet wrapped = box 1n\nlet identity = fn x => x",
     );
     let box_value = artifact
         .header()
@@ -2859,7 +2859,12 @@ fn reification_artifacts_validate_callable_requirement_interfaces() {
 fn reification_artifacts_validate_component_descriptor_projections() {
     let artifact = built(
         r#"
-extern box: 'a -> Any = "$anyUpcast"
+type Option 'a = #Some 'a | #None
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
 let apply = fn call value => call value
 let element = fn values => match values with | [value, ..] => box value | _ => box () end
 let consume = apply element
@@ -2907,7 +2912,7 @@ fn reification_artifacts_reject_changed_published_callable_contracts() {
         "let helper = { nested: fn value => box value }",
     ] {
         let artifact = built(&format!(
-            "@private extern box: 'a -> Any = \"$anyUpcast\"\n{source}"
+            "type Any = hide 'a => {{ mirror: Mirror 'a, value: 'a }}\n@private extern type_of: 'a -> Mirror 'a = \"$typeOf\"\n@private let box: 'a -> Any = fn value => {{ mirror: type_of value, value: value }}\n{source}"
         ));
         for corruption in 0..3 {
             let mut changed = artifact.clone().to_unchecked();

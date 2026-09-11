@@ -499,7 +499,6 @@ fn relevant_parameters(aliases: &IndexMap<Symbol, Scheme>) -> HashMap<Symbol, Ha
                     | Ty::Real
                     | Ty::String
                     | Ty::Bool
-                    | Ty::Any
                     | Ty::ForeignValue
                     | Ty::Var(_)
                     | Ty::Rigid { .. }
@@ -583,7 +582,6 @@ fn names_in(ty: &Ty, relevant: &HashMap<Symbol, HashSet<usize>>, out: &mut Vec<S
                 | Ty::Real
                 | Ty::String
                 | Ty::Bool
-                | Ty::Any
                 | Ty::ForeignValue
                 | Ty::Var(_)
                 | Ty::Bound(_)

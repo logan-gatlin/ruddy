@@ -1686,7 +1686,12 @@ fn runtime_type_stage_shows_invocation_ports_and_evaluation() {
     let output = stage(
         "reification",
         r#"
-@private extern box: 'a -> Any = "$anyUpcast"
+type Option 'a = #Some 'a | #None
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+@private let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
 @private let apply = fn call value => call value
 @private let token = box 1n
 "#,

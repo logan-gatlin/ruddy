@@ -181,14 +181,7 @@ impl Analysis {
             let binding = &self.bindings[symbol];
             if matches!(
                 declaration.value.target.anchored.as_str(),
-                "$anyUpcast"
-                    | "$anyDowncast"
-                    | "$ffiDecode"
-                    | "$mirror"
-                    | "$typeOf"
-                    | "$describe"
-                    | "$sameMirror"
-                    | "$shape"
+                "$ffiDecode" | "$mirror" | "$typeOf" | "$describe" | "$sameMirror" | "$shape"
             ) && Intrinsic::recognize(&declaration.value.target.anchored, &binding.ty, aliases)
                 .is_none()
             {
@@ -527,8 +520,6 @@ fn children<'a>(term: &'a Term, work: &mut Vec<&'a Term>) {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Intrinsic {
-    Upcast,
-    Downcast,
     Decode,
     /// `() -> Mirror 'a`: the evidence for the inferred type, as a value.
     Mirror,
@@ -546,9 +537,9 @@ pub enum Intrinsic {
 
 /// The cases of `std::reflect::Shape`, which `$shape` builds at runtime: a
 /// declaration naming the intrinsic must have exactly these.
-pub const SHAPE_CASES: [&str; 21] = [
+pub const SHAPE_CASES: [&str; 20] = [
     "Nat", "Int", "Real", "String", "Bool", "Nat8", "Nat16", "Nat32", "Nat64", "Int8", "Int16",
-    "Int32", "Int64", "Array", "Record", "Sum", "Function", "Hidden", "Mirror", "Any", "Foreign",
+    "Int32", "Int64", "Array", "Record", "Sum", "Function", "Hidden", "Mirror", "Foreign",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -599,24 +590,6 @@ impl Intrinsic {
                         })
                     }))
                 .then_some(Self::Decode)
-            }
-            "$anyUpcast" if matches!(&**from, Ty::Bound(_)) && matches!(&**to, Ty::Any) => {
-                Some(Self::Upcast)
-            }
-            "$anyDowncast" if matches!(&**from, Ty::Any) => {
-                let result = inference::unfold(aliases, to);
-                let Ty::Sum(row) = &*result else {
-                    return None;
-                };
-                let some = row.labels.get("Some")?;
-                let none = row.labels.get("None")?;
-                (row.labels.len() == 2
-                    && matches!(row.rest, Rest::Closed)
-                    && matches!(some.presence, Presence::Present)
-                    && matches!(none.presence, Presence::Present)
-                    && matches!(&*some.ty, Ty::Bound(_))
-                    && same_finite_syntax(&none.ty, &Arc::new(Ty::unit())))
-                .then_some(Self::Downcast)
             }
             "$mirror" if same_finite_syntax(from, &Arc::new(Ty::unit())) => {
                 matches!(&**to, Ty::Mirror(inner) if matches!(&**inner, Ty::Bound(_)))
@@ -719,11 +692,11 @@ impl Intrinsic {
             unreachable!("a reviewed reflection intrinsic is a function")
         };
         match self {
-            Self::Upcast | Self::TypeOf => Some(from.clone()),
-            Self::Downcast | Self::Decode => {
+            Self::TypeOf => Some(from.clone()),
+            Self::Decode => {
                 let result = inference::unfold(aliases, to);
                 let Ty::Sum(row) = &*result else {
-                    unreachable!("a reviewed downcast returns Option")
+                    unreachable!("a reviewed decode returns Result")
                 };
                 Some(row.labels["Some"].ty.clone())
             }
@@ -751,7 +724,6 @@ pub enum Node {
     Real,
     String,
     Bool,
-    Any,
     ForeignValue,
     Array(u32),
     /// Authentic evidence of the type at the index: a mirror.
@@ -865,20 +837,14 @@ impl Descriptor {
                 "Real" => Node::Real,
                 "String" => Node::String,
                 "Bool" => Node::Bool,
-                "Any" => Node::Any,
                 "ForeignValue" => Node::ForeignValue,
                 "Unit" => Node::Struct(Vec::new()),
                 "package" if native => Node::Alias(child(edge("body").expect("package body"))),
                 "mirror" => Node::Mirror(child(edge("of").expect("mirror graph edge"))),
-                // A hidden type crosses a foreign boundary as its body, and
-                // the type it hides as an opaque host value: nothing about the
-                // payload is known to convert, and nothing is. Its exact
-                // identity binds the variable over the body, numbered by depth
-                // so the spelling of the variable is no part of it.
-                name if name.starts_with("hidden:") && native => {
-                    Node::Alias(child(edge("body").expect("hidden body")))
-                }
-                name if name.starts_with("hidden-var:") && native => Node::ForeignValue,
+                // A hidden type binds its variable over its body, numbered by
+                // depth so the spelling of the variable is no part of its
+                // identity. Across a foreign boundary it is a sealed package:
+                // nothing of the body is converted, or can be made outside.
                 name if name.starts_with("hidden:") => {
                     let binder: u32 = name[7..].parse().expect("a hidden graph binder");
                     let mut inner = binders.clone();

@@ -299,7 +299,6 @@ pub enum Rep {
     Bool,
     TypeDescriptor,
     NativePlan,
-    BoxedAny,
     HostValue,
     /// The value with nothing in it: the empty struct.
     Unit,

@@ -30,8 +30,6 @@ pub enum Prim {
     String,
     /// The type with the values true and false.
     Bool,
-    /// A value packaged with its structural runtime type.
-    Any,
     /// An opaque JavaScript value.
     ForeignValue,
 }
@@ -526,8 +524,6 @@ pub enum Ty {
     Real,
     String,
     Bool,
-    /// A value packaged with its structural runtime type.
-    Any,
     /// An opaque JavaScript value.
     ForeignValue,
     /// `A -> B + E` — what it takes, what it gives back, and the effects
@@ -970,7 +966,6 @@ fn take_ty_children(ty: &mut Ty, types: &mut Vec<Arc<Ty>>, rows: &mut Vec<Arc<Ro
         | Ty::Real
         | Ty::String
         | Ty::Bool
-        | Ty::Any
         | Ty::ForeignValue
         | Ty::Var(_)
         | Ty::Bound(_)
@@ -1125,7 +1120,6 @@ pub(crate) fn same_finite_syntax_metered(
                     | (Ty::Real, Ty::Real)
                     | (Ty::String, Ty::String)
                     | (Ty::Bool, Ty::Bool)
-                    | (Ty::Any, Ty::Any)
                     | (Ty::ForeignValue, Ty::ForeignValue)
                     | (Ty::Undecided, Ty::Undecided) => {}
                     (Ty::Var(left), Ty::Var(right)) | (Ty::Bound(left), Ty::Bound(right)) => {
@@ -1359,7 +1353,6 @@ pub fn open_hidden(body: &Arc<Ty>, binder: u32, replacement: &Arc<Ty>) -> Arc<Ty
                 | Ty::Real
                 | Ty::String
                 | Ty::Bool
-                | Ty::Any
                 | Ty::ForeignValue
                 | Ty::Var(_)
                 | Ty::Bound(_)
@@ -1474,7 +1467,6 @@ impl From<Prim> for Ty {
             Prim::Real => Ty::Real,
             Prim::String => Ty::String,
             Prim::Bool => Ty::Bool,
-            Prim::Any => Ty::Any,
             Prim::ForeignValue => Ty::ForeignValue,
         }
     }
@@ -2255,7 +2247,6 @@ impl Prim {
         Prim::Real,
         Prim::String,
         Prim::Bool,
-        Prim::Any,
         Prim::ForeignValue,
     ];
 
@@ -2270,7 +2261,6 @@ impl Prim {
             Prim::Real => "Real",
             Prim::String => "String",
             Prim::Bool => "Bool",
-            Prim::Any => "Any",
             Prim::ForeignValue => "ForeignValue",
         }
     }

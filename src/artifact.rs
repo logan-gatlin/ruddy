@@ -733,7 +733,6 @@ pub enum Type {
     Real,
     String,
     Bool,
-    Any,
     ForeignValue,
     Arrow(Box<Type>, Box<Type>, Row),
     Package(Box<Type>),
@@ -843,7 +842,6 @@ fn semantic_eq(root: SemanticPair<'_>) -> bool {
                 | (Type::Real, Type::Real)
                 | (Type::String, Type::String)
                 | (Type::Bool, Type::Bool)
-                | (Type::Any, Type::Any)
                 | (Type::ForeignValue, Type::ForeignValue)
                 | (Type::Undecided, Type::Undecided) => {}
                 (Type::Var(left), Type::Var(right)) | (Type::Bound(left), Type::Bound(right))
@@ -1050,7 +1048,6 @@ fn clone_semantic(root: SemanticRef<'_>) -> (Vec<Type>, Vec<Row>) {
                 Type::Real => types.push(Type::Real),
                 Type::String => types.push(Type::String),
                 Type::Bool => types.push(Type::Bool),
-                Type::Any => types.push(Type::Any),
                 Type::ForeignValue => types.push(Type::ForeignValue),
                 Type::Arrow(from, to, effects) => {
                     work.push(CloneWork::Arrow);
@@ -1281,7 +1278,6 @@ fn drain_type(value: &mut Type, pending: &mut Vec<SemanticOwned>) {
         | Type::Real
         | Type::String
         | Type::Bool
-        | Type::Any
         | Type::ForeignValue
         | Type::Var(_)
         | Type::Bound(_)
@@ -1847,7 +1843,6 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
                 types::Ty::Real => tys.push(Type::Real),
                 types::Ty::String => tys.push(Type::String),
                 types::Ty::Bool => tys.push(Type::Bool),
-                types::Ty::Any => tys.push(Type::Any),
                 types::Ty::ForeignValue => tys.push(Type::ForeignValue),
                 types::Ty::Arrow(from, to, effects) => {
                     work.push(Work::Arrow);
@@ -2372,7 +2367,6 @@ fn rep(value: lir::Rep) -> Rep {
         lir::Rep::Bool => Rep::Bool,
         lir::Rep::TypeDescriptor => Rep::TypeDescriptor,
         lir::Rep::NativePlan => Rep::NativePlan,
-        lir::Rep::BoxedAny => Rep::BoxedAny,
         lir::Rep::HostValue => Rep::HostValue,
         lir::Rep::Unit => Rep::Unit,
         lir::Rep::Struct => Rep::Struct,
@@ -2747,7 +2741,6 @@ pub mod text {
                         Type::Real => work.push(Work::Text("real")),
                         Type::String => work.push(Work::Text("string")),
                         Type::Bool => work.push(Work::Text("boolean")),
-                        Type::Any => work.push(Work::Text("any")),
                         Type::ForeignValue => work.push(Work::Text("foreign-value")),
                         Type::Arrow(from, to, row) => {
                             out.push_str("(arrow ");
@@ -4167,7 +4160,6 @@ pub mod text {
                                 "real" => Type::Real,
                                 "string" => Type::String,
                                 "boolean" => Type::Bool,
-                                "any" => Type::Any,
                                 "foreign-value" => Type::ForeignValue,
                                 "undecided" => Type::Undecided,
                                 _ => self.invalid("invalid type", Type::Undecided),
