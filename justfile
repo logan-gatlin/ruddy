@@ -182,8 +182,10 @@ deploy:
 install:
     cargo install --locked --force --path "{{justfile_directory()}}/cli"
 
-# Line and branch coverage for the compiler library. Branch coverage is a
-# nightly-only rustc feature, hence `+nightly`.
+# Line and branch coverage for the compiler library, which is the crate the
+# 100% rule is about: the workspace's other crates — the tests themselves, the
+# debugger, the command line, and the reference interpreter — are excluded.
+# Branch coverage is a nightly-only rustc feature, hence `+nightly`.
 cov *args:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -192,7 +194,7 @@ cov *args:
     eval "$(cargo +"$coverage_toolchain" llvm-cov show-env --branch --sh)"
     cargo +"$coverage_toolchain" llvm-cov clean
     RUSTUP_TOOLCHAIN="$coverage_toolchain" just test
-    cargo +"$coverage_toolchain" llvm-cov report --ignore-filename-regex '/(tests|debug|cli|lsp)/src/|/vendor/|/rustlib/' {{args}}
+    cargo +"$coverage_toolchain" llvm-cov report --ignore-filename-regex '/(tests|debug|cli|interp|lsp)/src/|/vendor/|/rustlib/' {{args}}
 
 clippy:
     cargo clippy --workspace --all-targets

@@ -1048,6 +1048,7 @@ fn every_stage_reports_on_the_demo() {
             "entry",
             "linked",
             "js",
+            "portable",
             "symbols",
             "types-ir"
         ]
@@ -1063,7 +1064,10 @@ fn every_stage_reports_on_the_demo() {
         }
         // Recovery remains visible through semantic stages; lowering still
         // requires a fully accepted program.
-        if matches!(stage.id, "lir" | "artifact" | "entry" | "linked" | "js") {
+        if matches!(
+            stage.id,
+            "lir" | "artifact" | "entry" | "linked" | "js" | "portable"
+        ) {
             assert_eq!(stage.status, Status::Skipped, "{}", stage.id);
             assert!(stage.nodes.is_empty(), "a skipped stage rendered rows");
             assert!(!stage.summary.is_empty(), "{} counted nothing", stage.id);
@@ -1120,6 +1124,7 @@ fn every_stage_reports_on_the_demo() {
             "Entry",
             "Linked Artifact",
             "JS",
+            "Portable",
             "Symbols"
         ]
     );
@@ -1604,6 +1609,7 @@ fn frontend_errors_keep_reader_advice_and_recovered_semantic_stages() {
         "entry",
         "linked",
         "js",
+        "portable",
         "symbols",
         "types-ir",
     ] {
@@ -1612,13 +1618,59 @@ fn frontend_errors_keep_reader_advice_and_recovered_semantic_stages() {
             .iter()
             .find(|stage| stage.id == id)
             .unwrap_or_else(|| panic!("{id} is registered"));
-        let expected = if matches!(id, "lir" | "artifact" | "entry" | "linked" | "js") {
+        let expected = if matches!(
+            id,
+            "lir" | "artifact" | "entry" | "linked" | "js" | "portable"
+        ) {
             Status::Skipped
         } else {
             Status::Partial
         };
         assert_eq!(stage.status, expected, "{id}: {stage:#?}");
     }
+}
+
+/// What keeps a program on one target is the host values it reads, so the
+/// panel holds each one against the portable primitive table by name.
+#[test]
+fn the_portable_panel_separates_contract_primitives_from_javascript() {
+    let snapshot = snapshot(
+        "extern add: fn(Nat, Nat) -> Nat = \"$prim.nat.add\"\nextern now: () -> Nat = \"Date.now\"\nlet sum = add 1n 2n\nlet stamp = now ()\n",
+    );
+    let stage = snapshot
+        .stages
+        .iter()
+        .find(|stage| stage.id == "portable")
+        .expect("the portable panel is registered");
+    assert_eq!(stage.status, Status::Ok);
+    assert_eq!(stage.summary, "1 of 2 portable");
+    let rows: Vec<_> = stage
+        .nodes
+        .iter()
+        .map(|node| (node.label.as_str(), node.text.as_str()))
+        .collect();
+    assert!(
+        rows.iter()
+            .any(|(label, text)| label.ends_with("::add") && *text == "portable"),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|(label, text)| label.ends_with("::now") && *text == "JavaScript only"),
+        "{rows:?}"
+    );
+    let add = stage
+        .nodes
+        .iter()
+        .find(|node| node.label.ends_with("::add"))
+        .expect("the portable extern is listed");
+    assert_eq!(
+        add.children
+            .iter()
+            .map(|child| (child.label.as_str(), child.text.as_str()))
+            .collect::<Vec<_>>(),
+        [("Target", "$prim.nat.add"), ("Contract", "2 arguments"),]
+    );
 }
 
 /// A repeat is only legible next to what it repeats, so it has to arrive as
@@ -2751,6 +2803,7 @@ fn only_the_stages_that_own_a_phase_report_a_time() {
             "entry",
             "linked",
             "js",
+            "portable",
             "types-ir"
         ]
     );

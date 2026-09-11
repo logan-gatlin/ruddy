@@ -523,6 +523,9 @@ pub(super) fn validate(lir: &Lir) -> Result<(), String> {
                             {
                                 return error("decoding requires ForeignValue and returns Result");
                             }
+                            crate::reification::Intrinsic::Encode if i.rep != Rep::Sum => {
+                                return error("encoding returns Result");
+                            }
                             crate::reification::Intrinsic::Mirror
                             | crate::reification::Intrinsic::TypeOf
                                 if i.rep != Rep::TypeDescriptor =>

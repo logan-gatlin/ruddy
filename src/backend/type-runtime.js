@@ -378,7 +378,7 @@ const $convertType = ($descriptor, $value, $outgoing, $rootIndex = 0, $callable 
       continue;
     }
     if ("Arrow" in $node) {
-      if (!$callable) $fail($path, "a verifiable data type; function contracts cannot be decoded");
+      if (!$callable) $fail($path, "a verifiable data type; a function contract needs an adapter");
       if (typeof $input !== "function") $fail($path, "Function");
       const [$from, $to] = $node.Arrow;
       let $adapters = $convertedFunctions.get($input);
@@ -459,6 +459,19 @@ const $convertType = ($descriptor, $value, $outgoing, $rootIndex = 0, $callable 
     }
   }
   return $root.value;
+};
+
+// The other direction of the same boundary. A value of a known type is
+// written as host data; a function contract is not written at all, so what
+// comes back is inert and can be read again without this program.
+const $ffiEncode = ($descriptor, $value) => {
+  try { return $sum("Some", $convertType($descriptor, $value, true, 0, false)); }
+  catch ($error) {
+    const $failure = $conversionErrors.get($error) || { path: "$", expected: "writable native data", message: "JavaScript observation failed" };
+    return $sum("Error", $record([
+      ["path", $failure.path], ["expected", $failure.expected], ["message", $failure.message],
+    ]));
+  }
 };
 
 const $ffiDecode = ($descriptor, $value) => {

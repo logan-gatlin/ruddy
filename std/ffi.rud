@@ -4,3 +4,6 @@ effect Immediate
 type DecodeError = { path: String, expected: String, message: String }
 
 extern decode: ForeignValue -> Result 'a DecodeError = "$ffiDecode"
+
+@doc "Write a value of a known type as host data, or say where it could not be written. Function contracts are not written: an adapter owns those."
+extern encode: 'a -> Result ForeignValue DecodeError = "$ffiEncode"

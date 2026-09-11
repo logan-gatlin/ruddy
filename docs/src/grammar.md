@@ -383,3 +383,13 @@ For example, a JavaScript foreign function can expose a string's uppercase conve
 ```ruddy
 extern uppercase: fn(String) -> String = "text => text.toUpperCase()"
 ```
+
+An extern's target text is read by the target it names, so a program that
+writes JavaScript there runs on JavaScript alone.
+The standard library instead names entries of a portable primitive table,
+`$prim.<module>.<name>`, and every target implements the same table: the
+JavaScript backend ships it as `primitives.js`, and the reference interpreter
+implements it in Rust.
+The debugger's Portable panel holds a program's host values against that
+table, so what keeps a program on one target is visible before a second one
+is written.

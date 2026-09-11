@@ -19,6 +19,8 @@ mod fixed_integers;
 mod format;
 mod host_exports;
 mod inference;
+mod interp;
+mod interp_prim;
 mod ir;
 mod js;
 mod link;

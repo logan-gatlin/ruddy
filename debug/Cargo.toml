@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 ruddy = { package = "ruddy-compiler", path = ".." }
 ruddy-cli = { package = "ruddy", path = "../cli" }
+ruddy-interp = { path = "../interp" }
 indexmap = { version = "2", features = ["serde"] }
 tiny_http = "0.12"
 serde = { version = "1", features = ["derive"] }

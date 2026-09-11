@@ -17,6 +17,7 @@ pub mod js;
 pub mod linked;
 pub mod lir;
 pub mod patterns;
+pub mod portable;
 pub mod presence;
 pub mod reification;
 pub mod solve;
@@ -370,6 +371,15 @@ pub const REGISTRY: &[Spec] = &[
         scoped: false,
         annotates: None,
         build: Build::Panel(js::build),
+    },
+    Spec {
+        id: "portable",
+        title: "Portable",
+        view: View::List,
+        highlight: None,
+        scoped: false,
+        annotates: None,
+        build: Build::Panel(portable::build),
     },
     Spec {
         id: "symbols",

@@ -1,0 +1,17 @@
+[package]
+name = "ruddy-interp"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "ruddy_interp"
+
+[[bin]]
+name = "ruddy-interp"
+path = "src/main.rs"
+
+[dependencies]
+indexmap = "2"
+ruddy = { package = "ruddy-compiler", path = ".." }
+serde_json = "1"

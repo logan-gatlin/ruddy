@@ -523,6 +523,10 @@ pub(crate) fn children<'a>(term: &'a Term, work: &mut Vec<&'a Term>) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Intrinsic {
     Decode,
+    /// The other direction of the same boundary: a value of a known type
+    /// written as host data, or a recoverable error saying where it could
+    /// not be.
+    Encode,
     /// `() -> Mirror 'a`: the evidence for the inferred type, as a value.
     Mirror,
     /// `'a -> Mirror 'a`: the evidence for the argument's static type.
@@ -544,6 +548,41 @@ pub const SHAPE_CASES: [&str; 20] = [
     "Int32", "Int64", "Array", "Record", "Sum", "Function", "Hidden", "Mirror", "Foreign",
 ];
 
+/// Whether a type is `Result <carried> { path, expected, message }`, the
+/// result both directions of a checked foreign conversion hand back. Which
+/// side carries the host value is what tells the two apart.
+fn conversion(
+    ty: &Arc<Ty>,
+    aliases: &IndexMap<Symbol, Scheme>,
+    carried: &dyn Fn(&Ty) -> bool,
+) -> bool {
+    let result = inference::unfold(aliases, ty);
+    let Ty::Sum(row) = &*result else {
+        return false;
+    };
+    let (Some(some), Some(error)) = (row.labels.get("Some"), row.labels.get("Error")) else {
+        return false;
+    };
+    let error = inference::unfold(aliases, &error.ty);
+    let Ty::Struct(fields) = &*error else {
+        return false;
+    };
+    row.labels.len() == 2
+        && matches!(row.rest, Rest::Closed)
+        && row
+            .labels
+            .values()
+            .all(|field| matches!(field.presence, Presence::Present))
+        && carried(&some.ty)
+        && fields.labels.len() == 3
+        && matches!(fields.rest, Rest::Closed)
+        && ["path", "expected", "message"].iter().all(|name| {
+            fields.labels.get(*name).is_some_and(|field| {
+                matches!(field.presence, Presence::Present) && matches!(&*field.ty, Ty::String)
+            })
+        })
+}
+
 impl Intrinsic {
     /// Recognition uses resolved structural types, never source type names.
     pub fn recognize(
@@ -560,32 +599,11 @@ impl Intrinsic {
         }
         match target {
             "$ffiDecode" if matches!(&**from, Ty::ForeignValue) => {
-                let result = inference::unfold(aliases, to);
-                let Ty::Sum(row) = &*result else {
-                    return None;
-                };
-                let some = row.labels.get("Some")?;
-                let error = row.labels.get("Error")?;
-                let error = inference::unfold(aliases, &error.ty);
-                let Ty::Struct(fields) = &*error else {
-                    return None;
-                };
-                (row.labels.len() == 2
-                    && matches!(row.rest, Rest::Closed)
-                    && row
-                        .labels
-                        .values()
-                        .all(|field| matches!(field.presence, Presence::Present))
-                    && matches!(&*some.ty, Ty::Bound(_))
-                    && fields.labels.len() == 3
-                    && matches!(fields.rest, Rest::Closed)
-                    && ["path", "expected", "message"].iter().all(|name| {
-                        fields.labels.get(*name).is_some_and(|field| {
-                            matches!(field.presence, Presence::Present)
-                                && matches!(&*field.ty, Ty::String)
-                        })
-                    }))
-                .then_some(Self::Decode)
+                conversion(to, aliases, &|ty| matches!(ty, Ty::Bound(_))).then_some(Self::Decode)
+            }
+            "$ffiEncode" if matches!(&**from, Ty::Bound(_)) => {
+                conversion(to, aliases, &|ty| matches!(ty, Ty::ForeignValue))
+                    .then_some(Self::Encode)
             }
             "$mirror" if same_finite_syntax(from, &Arc::new(Ty::unit())) => {
                 matches!(&**to, Ty::Mirror(inner) if matches!(&**inner, Ty::Bound(_)))
@@ -688,7 +706,7 @@ impl Intrinsic {
             unreachable!("a reviewed reflection intrinsic is a function")
         };
         match self {
-            Self::TypeOf => Some(from.clone()),
+            Self::TypeOf | Self::Encode => Some(from.clone()),
             Self::Decode => {
                 let result = inference::unfold(aliases, to);
                 let Ty::Sum(row) = &*result else {

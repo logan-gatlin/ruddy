@@ -496,6 +496,7 @@ impl<'a> Generator<'a> {
             } => {
                 out.push_str(match kind {
                     crate::reification::Intrinsic::Decode => "$ffiDecode(",
+                    crate::reification::Intrinsic::Encode => "$ffiEncode(",
                     crate::reification::Intrinsic::Mirror => "$mirror(",
                     crate::reification::Intrinsic::TypeOf => "$typeOf(",
                     crate::reification::Intrinsic::Describe => "$describe(",
