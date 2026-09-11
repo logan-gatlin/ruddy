@@ -163,3 +163,10 @@ Metadata written with `@` before a definition or foreign function type.
 A value supplied by the target environment and made available to Ruddy through `extern`.
 
 [Grammar](grammar.md#modules-attributes-and-foreign-values)
+
+## Primitive contract
+One operation of the portable table the standard library's `extern`
+declarations name, as `$prim.<module>.<name>`. Every target implements the
+same table, so a program built from these runs wherever Ruddy runs.
+
+[Grammar](grammar.md#modules-attributes-and-foreign-values)
