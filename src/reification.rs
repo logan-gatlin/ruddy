@@ -934,7 +934,6 @@ impl Descriptor {
                     // type, and a mirror of each must say so. A row carries
                     // at most one member per identity, so this orders them
                     // completely.
-                    let mut row = row;
                     row.sort_by(|left, right| left.identity.cmp(&right.identity));
                     nodes.push(Node::Effects(row));
                     Node::Arrow([from, to, effects])
