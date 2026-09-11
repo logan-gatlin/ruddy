@@ -1,0 +1,9 @@
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+--         ^^^^ @keyword
+--              ^^ @variable.parameter
+
+let open = fn boxed => match boxed with
+  | hide 'item { mirror, value } => mirror
+--  ^^^^ @keyword
+--       ^^^^^ @variable.parameter
+  end

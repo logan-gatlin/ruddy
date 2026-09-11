@@ -1811,6 +1811,17 @@ fn every_position_that_can_fail_reports_before_it_does() {
         "type X = Nat where 'a and",
         "type X = Nat where not",
         "type X = Nat where ('a",
+        // A hidden type's variable, its arrow, and its body; a hidden
+        // pattern's variable and payload, and the bare word where a value or
+        // a name goes.
+        "let x : hide",
+        "let x : hide 'a",
+        "let x : hide 'a =>",
+        "let x : Nat -> hide",
+        "let x = match v with | hide => 1n end",
+        "let x = match v with | hide 'a => 1n end",
+        "let hide = 1n",
+        "let x = hide",
         // Match, handler, arm, and raise positions.
         "let x = match with end",
         "let x = match value end",
@@ -3998,4 +4009,82 @@ fn recovery_records_every_region_it_drops() {
         .map(|span| &src[span.start..span.end()])
         .collect();
     assert_eq!(skipped, ["@inner"]);
+}
+
+/// `hide 'a => T` binds over everything to its right, the way a lambda's body
+/// does: it takes the whole arrow after it, an arrow's result may be hidden
+/// bare, and as an arrow's input or an application's argument it needs the
+/// parentheses that delimit it, which the printer puts back.
+#[test]
+fn a_hidden_type_binds_over_everything_to_its_right() {
+    assert_eq!(
+        parse_one("type Any = hide 'a => { mirror: Mirror 'a, value: 'a }"),
+        "type Any = hide 'a => { mirror: Mirror 'a, value: 'a }"
+    );
+    assert_eq!(
+        parse_one("type F = hide 'a => 'a -> 'a"),
+        "type F = hide 'a => 'a -> 'a"
+    );
+    assert_eq!(
+        parse_one("type G = (hide 'a => 'a) -> Nat -> hide 'b => Pair 'b 'b"),
+        "type G = (hide 'a => 'a) -> Nat -> hide 'b => Pair 'b 'b"
+    );
+    assert_eq!(
+        parse_one("type H = Mirror (hide 'a => Body 'a)"),
+        "type H = Mirror (hide 'a => Body 'a)"
+    );
+    assert_eq!(
+        parse_one("type N = hide 'a => hide 'b => ('a, 'b)"),
+        "type N = hide 'a => hide 'b => ('a, 'b)"
+    );
+    assert_eq!(
+        parse_one("type S = #Some (hide 'a => 'a) | #None"),
+        "type S = #Some (hide 'a => 'a) | #None"
+    );
+    // A hidden type is not an atom, so it cannot be an argument without its
+    // parentheses: the application stops in front of it, and the word is
+    // then the unexpected token it looks like.
+    let out = parse(lex("type H = Mirror hide 'a => Body 'a", FileID::GENERATED).tokens);
+    assert!(!out.errors.is_empty());
+    let hidden = out.errors[0].span.start;
+    assert_eq!(hidden, "type H = Mirror ".len());
+}
+
+/// `hide 'a p` opens onto the pattern after its variable, taken greedily as a
+/// tag's payload is; the printer puts back the parentheses that group a
+/// carried payload, and around the whole form where it is itself carried.
+#[test]
+fn a_hidden_pattern_opens_onto_the_pattern_after_its_variable() {
+    assert_eq!(
+        parse_one("let a = match v with | hide 'item { mirror, value } => mirror end"),
+        "let a = match v with | hide 'item { mirror, value } => mirror end"
+    );
+    assert_eq!(
+        parse_one("let a = match v with | hide 'x #Some y => y end"),
+        "let a = match v with | hide 'x (#Some y) => y end"
+    );
+    assert_eq!(
+        parse_one("let a = match v with | #Some hide 'z z => z end"),
+        "let a = match v with | #Some (hide 'z z) => z end"
+    );
+    assert_eq!(
+        parse_one("let a = match v with | hide 'x hide 'y (x, y) => x end"),
+        "let a = match v with | hide 'x (hide 'y (x, y)) => x end"
+    );
+    // The word is reserved, so a struct field or a projection spelling it is
+    // quoted — and printed quoted, since bare it would be read as the
+    // keyword again.
+    assert_eq!(
+        parse_one("let r = { \"hide\": 1n }"),
+        "let r = { \"hide\": 1n }"
+    );
+    assert_eq!(parse_one("let v = r.\"hide\""), "let v = r.\"hide\"");
+    assert_eq!(
+        parse_one("let m = match r with | { \"hide\": x } => x end"),
+        "let m = match r with | { \"hide\": x } => x end"
+    );
+    let out = parse(lex("let r = { hide: 1n }", FileID::GENERATED).tokens);
+    assert!(!out.errors.is_empty());
+    let out = parse(lex("let v = f hide", FileID::GENERATED).tokens);
+    assert!(!out.errors.is_empty());
 }

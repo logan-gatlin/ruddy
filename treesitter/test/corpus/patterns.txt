@@ -291,3 +291,44 @@ let [..all] = v
       (rest_pattern
         (identifier)))
     (identifier)))
+
+================================================================================
+A hidden pattern opens onto the pattern after its variable
+================================================================================
+
+let a = match v with
+  | hide 'item { mirror, value } => mirror
+  | hide 'x #Some y => y
+  | #Some hide 'z z => z
+  end
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (match_expression
+      (identifier)
+      (match_arm
+        (hidden_pattern
+          (type_variable)
+          (struct_pattern
+            (struct_pattern_field
+              (identifier))
+            (struct_pattern_field
+              (identifier))))
+        (identifier))
+      (match_arm
+        (hidden_pattern
+          (type_variable)
+          (tag_pattern
+            (tag)
+            (identifier)))
+        (identifier))
+      (match_arm
+        (tag_pattern
+          (tag)
+          (hidden_pattern
+            (type_variable)
+            (identifier)))
+        (identifier)))))

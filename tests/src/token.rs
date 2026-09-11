@@ -1274,3 +1274,29 @@ fn comment_tokens_print_with_their_delimiters() {
     assert_eq!(Kind::LineComment(" note".into()).to_string(), "-- note");
     assert_eq!(Kind::BlockComment(" b ".into()).to_string(), "(* b *)");
 }
+
+/// `hide` is reserved everywhere, as the exact word: the hidden type and the
+/// hidden pattern both begin with it, and no position in front of either could
+/// tell the word from a name. Longer words keep being names, and the sigilled
+/// tokens keep their own rules — a variable, a tag, an effect, an attribute
+/// or a string may still spell `hide`.
+#[test]
+fn hide_is_reserved_as_an_exact_word() {
+    assert!(matches!(kinds("hide")[..], [Kind::Hide]));
+    assert!(matches!(
+        &kinds("hide 'a => 'a")[..],
+        [Kind::Hide, Kind::Variable(a), Kind::FatArrow, Kind::Variable(b)] if a == "a" && b == "a"
+    ));
+    for name in ["hidden", "hide_value", "Hide", "unhide", "HIDE", "hides"] {
+        assert!(
+            matches!(&kinds(name)[..], [Kind::Identifier(found)] if found == name),
+            "{name}"
+        );
+    }
+    assert!(matches!(&kinds("'hide")[..], [Kind::Variable(name)] if name == "hide"));
+    assert!(matches!(&kinds("#hide")[..], [Kind::Tag(name)] if name == "hide"));
+    assert!(matches!(&kinds("!hide")[..], [Kind::EffectLabel(name)] if name == "hide"));
+    assert!(matches!(&kinds("@hide")[..], [Kind::Attribute(name)] if name == "hide"));
+    assert!(matches!(&kinds("\"hide\"")[..], [Kind::String(text)] if text == "hide"));
+    assert_eq!(Kind::Hide.to_string(), "hide");
+}

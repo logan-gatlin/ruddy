@@ -116,6 +116,11 @@ A name beginning with `'` that stands for a type or another parameter used in a 
 
 [Grammar](grammar.md#types)
 
+## Hidden type
+A type written `hide 'a => T` whose variable stands for one particular type chosen where a value is made and kept from the value's consumers, who can open it in a `match` arm.
+
+[Grammar](grammar.md#types)
+
 ## Sum type
 A type describing alternative cases identified by tags, each of which can carry a value.
 

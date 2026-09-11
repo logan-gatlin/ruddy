@@ -2838,6 +2838,10 @@
         },
         {
           "type": "SYMBOL",
+          "name": "hidden_pattern"
+        },
+        {
+          "type": "SYMBOL",
           "name": "parenthesized_pattern"
         }
       ]
@@ -3245,6 +3249,35 @@
         }
       ]
     },
+    "hidden_pattern": {
+      "type": "PREC_RIGHT",
+      "value": 7,
+      "content": {
+        "type": "SEQ",
+        "members": [
+          {
+            "type": "STRING",
+            "value": "hide"
+          },
+          {
+            "type": "FIELD",
+            "name": "variable",
+            "content": {
+              "type": "SYMBOL",
+              "name": "type_variable"
+            }
+          },
+          {
+            "type": "FIELD",
+            "name": "pattern",
+            "content": {
+              "type": "SYMBOL",
+              "name": "_pattern"
+            }
+          }
+        ]
+      }
+    },
     "annotation": {
       "type": "SEQ",
       "members": [
@@ -3279,6 +3312,10 @@
       "members": [
         {
           "type": "SYMBOL",
+          "name": "hidden_type"
+        },
+        {
+          "type": "SYMBOL",
           "name": "function_type"
         },
         {
@@ -3286,6 +3323,39 @@
           "name": "_type_sum"
         }
       ]
+    },
+    "hidden_type": {
+      "type": "PREC_RIGHT",
+      "value": 0,
+      "content": {
+        "type": "SEQ",
+        "members": [
+          {
+            "type": "STRING",
+            "value": "hide"
+          },
+          {
+            "type": "FIELD",
+            "name": "variable",
+            "content": {
+              "type": "SYMBOL",
+              "name": "type_variable"
+            }
+          },
+          {
+            "type": "STRING",
+            "value": "=>"
+          },
+          {
+            "type": "FIELD",
+            "name": "body",
+            "content": {
+              "type": "SYMBOL",
+              "name": "_type"
+            }
+          }
+        ]
+      }
     },
     "function_type": {
       "type": "PREC_RIGHT",
@@ -4677,6 +4747,10 @@
       {
         "type": "STRING",
         "value": "match"
+      },
+      {
+        "type": "STRING",
+        "value": "hide"
       },
       {
         "type": "STRING",

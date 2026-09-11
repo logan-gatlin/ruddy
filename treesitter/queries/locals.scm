@@ -45,6 +45,14 @@
 
 (type_definition parameter: (type_variable) @local.definition @local.definition.variable.parameter)
 
+; A hidden type binds its variable for its body, and a hidden pattern binds
+; its variable for the arm it opens in — the arm is already a scope, so only
+; the type needs one of its own. The pattern's payload binds as a tag's does.
+(hidden_type) @local.scope
+(hidden_type variable: (type_variable) @local.definition @local.definition.variable.parameter)
+(hidden_pattern variable: (type_variable) @local.definition @local.definition.variable.parameter)
+(hidden_pattern pattern: (identifier) @local.definition @local.definition.variable)
+
 ; Only expression names resolve to value bindings. Field labels, qualified
 ; paths and type names can share a parameter's spelling without referring to
 ; it, so a catch-all identifier reference would give them its color too.

@@ -13915,3 +13915,32 @@ fn metadata_nesting_is_bounded() {
         format!("{}(){}", "[".repeat(limit), "]".repeat(limit))
     );
 }
+
+/// `hide` is reserved syntax with no meaning yet: each form is reported where
+/// it was written, once, and lowering goes on around it. The type absorbs
+/// into an error; the pattern's payload is lowered all the same, so the names
+/// it binds are declared and the arm's body resolves them.
+#[test]
+fn hidden_syntax_is_reported_as_unsupported() {
+    let src = "type Box = hide 'a => 'a";
+    let (_, out) = build_src(src);
+    let [error] = out.errors.as_slice() else {
+        panic!("expected one error: {:#?}", out.errors);
+    };
+    assert!(matches!(error.kind, ErrorKind::HiddenUnsupported));
+    assert_eq!(
+        out.source.span(error.at).start,
+        src.find("hide").expect("the keyword")
+    );
+
+    let src = "let f = fn v => match v with | hide 'a { x } => x end";
+    let (_, out) = build_src(src);
+    let [error] = out.errors.as_slice() else {
+        panic!("expected one error: {:#?}", out.errors);
+    };
+    assert!(matches!(error.kind, ErrorKind::HiddenUnsupported));
+    assert_eq!(
+        out.source.span(error.at).start,
+        src.find("hide").expect("the keyword")
+    );
+}

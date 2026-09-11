@@ -1433,6 +1433,9 @@ pub enum ErrorKind {
     },
     /// A reserved array runtime intrinsic has an incompatible signature.
     ArrayInExtern,
+    /// A `hide` type or pattern: syntax the language has reserved and not yet
+    /// given a meaning.
+    HiddenUnsupported,
     /// A dependency alias cannot be written as a source path component.
     InvalidDependencyAlias {
         alias: String,
@@ -7786,6 +7789,7 @@ fn pattern_names(pattern: &parse::Pattern, out: &mut Vec<TrackedString>) {
                 pattern_names(payload, out);
             }
         }
+        parse::PatternKind::Hidden { pattern, .. } => pattern_names(pattern, out),
         parse::PatternKind::Struct { fields, .. } => {
             for (name, sub) in fields {
                 match sub {
@@ -12341,6 +12345,13 @@ impl Builder<'_> {
         let span = ty.span;
         let here = self.anchor(span);
         match ty.tracked {
+            // Reserved syntax with no meaning yet. The body is not lowered:
+            // its variable is bound by nothing this pass knows, and every
+            // complaint about it would be about a binding that does not exist.
+            parse::TypeKind::Hidden { .. } => {
+                self.error(span, ErrorKind::HiddenUnsupported);
+                here.anchor(TypeKind::Error)
+            }
             // A row where a type goes. Lowered all the same and the result
             // dropped, the way a head that cannot be applied is: the effects it
             // names are still names, and a reader who wrote one wrong should be
@@ -13067,6 +13078,13 @@ impl Builder<'_> {
             parse::PatternKind::String(value) => here.anchor(PatternKind::String(value)),
             parse::PatternKind::Bool(value) => here.anchor(PatternKind::Bool(value)),
             parse::PatternKind::Unit => here.anchor(PatternKind::Unit),
+            // Reserved syntax with no meaning yet: reported, and the payload
+            // lowered all the same so its binders line up, position for
+            // position, with the ones the declare pass walked.
+            parse::PatternKind::Hidden { pattern, .. } => {
+                self.error(span, ErrorKind::HiddenUnsupported);
+                self.pattern(*pattern, seen, binders, dropped)
+            }
             // A bare tag keeps its `None`: what it constrains the payload to —
             // unit — is said where the type is built rather than written into
             // a tree node the reader never wrote, the convention

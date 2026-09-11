@@ -1244,3 +1244,23 @@ fn signed_literals_and_operator_negation_print_without_becoming_comments() {
         assert!(!ir.contains("--"), "{ir}");
     }
 }
+
+/// Both hidden forms print back as they were written, parentheses included
+/// where the grammar needs them, and printing is a fixed point.
+#[test]
+fn hidden_forms_print_to_a_fixed_point() {
+    for source in [
+        "type Any = hide 'a => { mirror: Mirror 'a, value: 'a }",
+        "type F = (hide 'a => 'a) -> Nat -> hide 'b => Pair 'b 'b",
+        "type G = Mirror (hide 'a => Body 'a)",
+        "let f = fn v => match v with | hide 'x (#Some y) => y | #Some (hide 'z z) => z end",
+    ] {
+        let printed = ast_of(source);
+        assert_eq!(printed, source, "{source}");
+        assert_eq!(
+            ast_of(&printed),
+            printed,
+            "{source}: printing is a fixed point"
+        );
+    }
+}

@@ -177,9 +177,11 @@ Patterns appear after `let` and in [pattern matching](dictionary.md#pattern-matc
 | `[]`, `[first, second]` | Match an exact array length |
 | `[first, ..rest]`, `[first, .., last]` | Match an array with a variable number of middle elements |
 | `#Some value`, `#None` | Match a tag and any value it carries |
+| `hide 'item pattern` | Open a [hidden type](dictionary.md#hidden-type), naming its type `'item` for the arm |
 
 A struct pattern's `..` must be last and cannot bind a name.
 An array pattern permits at most one `..`, optionally followed by a name for the remaining elements.
+A hidden pattern takes the pattern after its variable greedily, so `hide 'a #Some x` opens onto `#Some x`.
 Patterns can contain other patterns.
 Function parameters written after `fn` are names or `_`; matching their structure uses `match` instead.
 
@@ -222,9 +224,12 @@ Parentheses group a type argument that itself contains an application, as in `Op
 | `\|` | A sum type with no cases |
 | `String -> Nat` | A function type |
 | `mut 'r String` | A mutable cell type with [region](dictionary.md#region) `'r` |
+| `hide 'a => { mirror: Mirror 'a, value: 'a }` | A [hidden type](dictionary.md#hidden-type) whose variable `'a` stands for one type its producer chose |
 
 Function arrows group to the right: `String -> Nat -> String` means `String -> (Nat -> String)`.
 A tag's payload type needs parentheses when it contains an application or arrow, as in `#Some (Optional String)`.
+A hidden type's body extends to the end of the type, so `hide 'a => 'a -> 'a` hides the whole function type, and parentheses delimit a hidden type used as an argument, as in `Mirror (hide 'a => Body 'a)`.
+The word `hide` is reserved everywhere; a struct field named `hide` is written and accessed quoted, as `{ "hide": value }` and `record."hide"`.
 
 ### Open types and constraints
 

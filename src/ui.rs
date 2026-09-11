@@ -253,6 +253,10 @@ pub fn expr_ends_in_numeric_projection(kind: &parse::ExprKind) -> bool {
 pub fn type_prec(kind: &parse::TypeKind) -> Prec {
     use parse::TypeKind;
     match kind {
+        // The body runs as far right as it can, so a hidden type needs
+        // parentheses anywhere anything may follow it — as an arrow's input,
+        // as an argument, as a case's payload.
+        TypeKind::Hidden { .. } => Prec::Lambda,
         TypeKind::Arrow { .. } => Prec::Arrow,
         // A row of effects binds as a sum does: it is written with the same
         // labels and the same tail, and needs the same brackets around it.
@@ -272,6 +276,9 @@ pub fn type_prec(kind: &parse::TypeKind) -> Prec {
 pub fn pattern_prec(kind: &parse::PatternKind) -> Prec {
     use parse::PatternKind;
     match kind {
+        // A hidden pattern carries its payload the way a tag carries one,
+        // and groups as the same application.
+        PatternKind::Hidden { .. } => Prec::Apply,
         PatternKind::Tag {
             payload: Some(_), ..
         } => Prec::Apply,
@@ -595,35 +602,11 @@ fn bare_tag(name: &str) -> bool {
 }
 
 /// Whether a decoded label can be written as an ordinary identifier token.
-/// This mirrors the lexer's Unicode identifier rule and excludes every word
-/// that lexes as a keyword or another dedicated token.
+/// This mirrors the lexer's Unicode identifier rule and asks the lexer's own
+/// table which words it reserves, so a new keyword quotes its label here the
+/// day the lexer learns it.
 fn bare_identifier(name: &str) -> bool {
-    bare_tag(name)
-        && !matches!(
-            name,
-            "_" | "let"
-                | "extern"
-                | "do"
-                | "return"
-                | "if"
-                | "then"
-                | "else"
-                | "type"
-                | "end"
-                | "with"
-                | "match"
-                | "fn"
-                | "effect"
-                | "handle"
-                | "raise"
-                | "and"
-                | "or"
-                | "xor"
-                | "not"
-                | "module"
-                | "true"
-                | "false"
-        )
+    bare_tag(name) && token::keyword(name).is_none()
 }
 
 /// Write one decoded Ruddy string with the escapes accepted by the lexer.
@@ -688,6 +671,7 @@ impl fmt::Display for Kind {
             Kind::End => f.write_str("end"),
             Kind::With => f.write_str("with"),
             Kind::Match => f.write_str("match"),
+            Kind::Hide => f.write_str("hide"),
             Kind::If => f.write_str("if"),
             Kind::Then => f.write_str("then"),
             Kind::Else => f.write_str("else"),
@@ -1031,24 +1015,7 @@ impl fmt::Display for parse::Error {
 /// else closes itself.
 impl Grouped for parse::PatternKind {
     fn prec(&self) -> Prec {
-        match self {
-            parse::PatternKind::Tag {
-                payload: Some(_), ..
-            } => Prec::Apply,
-            parse::PatternKind::Tag { payload: None, .. } => Prec::Tag,
-            parse::PatternKind::Ident { .. }
-            | parse::PatternKind::Wildcard
-            | parse::PatternKind::Natural(_)
-            | parse::PatternKind::Fixed(_)
-            | parse::PatternKind::Integer(_)
-            | parse::PatternKind::Real(_)
-            | parse::PatternKind::String(_)
-            | parse::PatternKind::Bool(_)
-            | parse::PatternKind::Unit
-            | parse::PatternKind::Struct { .. }
-            | parse::PatternKind::Tuple(_)
-            | parse::PatternKind::Array { .. } => Prec::Atom,
-        }
+        pattern_prec(self)
     }
 }
 
@@ -1077,6 +1044,12 @@ impl fmt::Display for parse::PatternKind {
                 None,
                 payload.as_deref().map(|payload| &payload.tracked),
             ),
+            // The payload is grouped by the rule a tag's is: taken greedily
+            // when read, so anything but an atom needs its parentheses back.
+            parse::PatternKind::Hidden { variable, pattern } => {
+                write!(f, "hide '{} ", variable.tracked)?;
+                write_grouped(f, pattern.tracked.prec() < Prec::Atom, &pattern.tracked)
+            }
             parse::PatternKind::Struct { fields, rest } => {
                 if fields.is_empty() && rest.is_none() {
                     return f.write_str("()");
@@ -1340,6 +1313,7 @@ impl ir::ErrorKind {
             ir::ErrorKind::RuntimeTypeInformation { .. } => "runtime-type-information",
             ir::ErrorKind::ForeignProtocol { .. } => "foreign-protocol",
             ir::ErrorKind::ArrayInExtern => "array-in-extern",
+            ir::ErrorKind::HiddenUnsupported => "hidden-unsupported",
             ir::ErrorKind::InvalidDependencyAlias { .. } => "invalid-dependency-alias",
             ir::ErrorKind::ExecutableDependency { .. } => "executable-dependency",
             ir::ErrorKind::DuplicateDependencyAlias { .. } => "duplicate-dependency-alias",
@@ -1438,6 +1412,13 @@ impl ir::Error {
             E::RuntimeTypeInformation { message } => Diagnostic::new(code, message.clone(), span)
                 .help("supply a concrete type at this use, or retain unknown foreign data as ForeignValue"),
             E::ForeignProtocol { message } => Diagnostic::new(self.kind.code(), message.clone(), source.span(self.at)),
+            E::HiddenUnsupported => Diagnostic::new(
+                code,
+                "hidden types are not supported yet",
+                span,
+            )
+            .label("this `hide` form has no meaning yet")
+            .help("the syntax is reserved for an upcoming version of the language"),
             E::ArrayInExtern => Diagnostic::new(
                 code,
                 "this runtime array intrinsic has an incompatible signature",

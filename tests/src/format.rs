@@ -1040,3 +1040,35 @@ fn errors_inside_nested_blocks_stay_local() {
         format!("let p = do\n  let bad = ) {long}\n  let ok = 1n\n  return ok\nend\n")
     );
 }
+
+/// Hidden types and hidden patterns print as written: the type's body runs
+/// to the end of the type and needs no parentheses, while a hidden type as an
+/// input or an argument, and a hidden pattern's carried payload, keep theirs.
+#[test]
+fn hidden_types_and_patterns_format_as_written() {
+    assert_eq!(
+        fmt("let x : hide 'a => 'a -> 'a = f"),
+        "let x: hide 'a => 'a -> 'a = f\n"
+    );
+    assert_eq!(
+        fmt("type Any = hide 'a => { mirror: Mirror 'a, value: 'a }"),
+        "type Any = hide 'a => { mirror: Mirror 'a, value: 'a }\n"
+    );
+    assert_eq!(
+        fmt("let g : (hide 'a => 'a) -> Mirror (hide 'b => Box 'b) = f"),
+        "let g: (hide 'a => 'a) -> Mirror (hide 'b => Box 'b) = f\n"
+    );
+    assert_eq!(
+        fmt("let f = fn b => match b with | hide 'i { m, v } => m | hide 'x #Some y => y end"),
+        "let f = fn b => match b with | hide 'i { m, v } => m | hide 'x (#Some y) => y end\n"
+    );
+    assert_eq!(
+        fmt("let g = fn b => match b with | #Some hide 'z z => z end"),
+        "let g = fn b => match b with | #Some (hide 'z z) => z end\n"
+    );
+    // Comments inside both forms stay where they were written.
+    assert_eq!(
+        fmt("type Any = hide 'a => {\n  -- the witness\n  mirror: Mirror 'a,\n  value: 'a,\n}\n"),
+        "type Any = hide 'a => {\n  -- the witness\n  mirror: Mirror 'a,\n  value: 'a,\n}\n"
+    );
+}

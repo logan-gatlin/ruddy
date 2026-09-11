@@ -3918,3 +3918,31 @@ fn recovered_buffers_keep_semantics_and_requested_solver_traces() {
     }
     assert_eq!(stage_named(&snapshot, "lir").status, Status::Skipped);
 }
+
+/// The debugger shows both hidden forms: the tokens tab owns a label for the
+/// keyword, and the AST tab renders each form as a node with the variable it
+/// binds as a child of its own, beside the body or the payload.
+#[test]
+fn hidden_forms_are_shown_by_the_tokens_and_ast_tabs() {
+    let snapshot =
+        snapshot("type Box = hide 'a => 'a\nlet f = fn v => match v with | hide 'a x => x end\n");
+    assert!(snapshot.panic.is_none());
+    let tokens = stage_named(&snapshot, "tokens");
+    assert!(
+        nodes(tokens).iter().any(|node| node.label == "Hide"),
+        "the tokens tab shows no Hide"
+    );
+    let ast = stage_named(&snapshot, "ast");
+    let labels: Vec<&str> = nodes(ast).iter().map(|node| node.label.as_str()).collect();
+    assert_eq!(
+        labels.iter().filter(|label| **label == "Hidden").count(),
+        2,
+        "{labels:?}"
+    );
+    assert!(
+        nodes(ast)
+            .iter()
+            .any(|node| node.label == "Variable" && node.text == "'a"),
+        "{labels:?}"
+    );
+}

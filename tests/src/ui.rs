@@ -5495,3 +5495,47 @@ fn metadata_diagnostics_are_pinned() {
         ["metadata may nest at most 32 levels of arrays, structs, and tag payloads"]
     );
 }
+
+/// The reserved word prints as it was written, a hidden pattern prints with
+/// its payload grouped as a tag's is, and the complaint about the syntax
+/// having no meaning yet says so in plain words.
+#[test]
+fn hidden_forms_print_and_the_unsupported_complaint_reads_plainly() {
+    assert_eq!(TokenKind::Hide.to_string(), "hide");
+    let span = Span::generated(0, 1);
+    let name = |text: &str| span.track(text.to_string());
+    let carried = parse::PatternKind::Tag {
+        name: name("Some"),
+        payload: Some(Box::new(
+            span.track(parse::PatternKind::Ident { name: name("y") }),
+        )),
+    };
+    let hidden = parse::PatternKind::Hidden {
+        variable: name("x"),
+        pattern: Box::new(span.track(carried)),
+    };
+    assert_eq!(hidden.to_string(), "hide 'x (#Some y)");
+    let bare = parse::PatternKind::Hidden {
+        variable: name("w"),
+        pattern: Box::new(span.track(parse::PatternKind::Ident { name: name("w") })),
+    };
+    assert_eq!(bare.to_string(), "hide 'w w");
+
+    let mut map = SourceMap::default();
+    let at = map.record(Symbol::GENERATED, 0, Span::generated(0, 4));
+    let unsupported = ir::Error {
+        at,
+        kind: IrError::HiddenUnsupported,
+    }
+    .diagnostic(&map);
+    assert_eq!(unsupported.code, "hidden-unsupported");
+    assert_eq!(unsupported.title, "hidden types are not supported yet");
+    assert_eq!(
+        unsupported.primary.message,
+        "this `hide` form has no meaning yet"
+    );
+    assert_eq!(
+        unsupported.help,
+        ["the syntax is reserved for an upcoming version of the language"]
+    );
+}
