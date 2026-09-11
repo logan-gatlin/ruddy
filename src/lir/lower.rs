@@ -2302,6 +2302,12 @@ impl Lower<'_> {
     /// inference, but the value inside a package is stored exactly as its body.
     /// Opening aliases again after each package also handles a package whose
     /// body starts with a declared name.
+    /// Whether a type is a hidden type, once its declared names are looked
+    /// through.
+    fn hidden(&self, ty: &Arc<Ty>) -> bool {
+        matches!(&*unfold(self.inference.aliases(), ty), Ty::Hidden { .. })
+    }
+
     fn erased(&self, ty: &Arc<Ty>) -> Arc<Ty> {
         let mut ty = unfold(self.inference.aliases(), ty);
         while let Ty::Package(body) | Ty::Hidden { body, .. } = &*ty {
@@ -2343,6 +2349,12 @@ impl Lower<'_> {
     /// never listed — or does not pin its shape down, in which case the use
     /// site's own reading is all there is to go on.
     fn member_of(&self, ty: &Arc<Ty>, name: &str) -> Option<Arc<Ty>> {
+        // A hidden type says nothing about its members' shapes to a value
+        // being packaged under it: its body names the hidden variable, and the
+        // value is sealed at its own type instead.
+        if self.hidden(ty) {
+            return None;
+        }
         let ty = self.erased(ty);
         let member = match &*ty {
             Ty::Sum(row) | Ty::Struct(row) => {
@@ -2354,6 +2366,9 @@ impl Lower<'_> {
     }
 
     fn array_element(&self, ty: &Arc<Ty>) -> Option<Arc<Ty>> {
+        if self.hidden(ty) {
+            return None;
+        }
         let ty = self.erased(ty);
         match &*ty {
             Ty::Array(element) => Some(element.clone()),

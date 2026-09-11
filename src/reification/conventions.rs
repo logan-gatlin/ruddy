@@ -69,8 +69,10 @@ pub struct Edge {
 #[derive(Debug, Clone)]
 pub struct Instance {
     pub source: NeedId,
-    pub substitute: BTreeMap<u32, BTreeSet<u32>>,
-    pub ports: BTreeMap<NeedId, NeedId>,
+    /// Shared by every need of one instantiation: the map is the size of
+    /// the instantiated graph, and a copy per need would square it.
+    pub substitute: Arc<BTreeMap<u32, BTreeSet<u32>>>,
+    pub ports: Arc<BTreeMap<NeedId, NeedId>>,
 }
 
 /// A known requirement or a slot whose presence depends on a quantified port.
@@ -382,6 +384,14 @@ impl Graph {
                 (Shape::Sealed, Shape::Parameter(_)) => {
                     self.shapes[offered as usize] = Shape::Sealed
                 }
+                // A sealed callable supplied where one is asked for takes no
+                // descriptors: the port it would have supplied is decided,
+                // and decided empty, so nothing conditional on it is needed.
+                (Shape::Arrow { needs, .. }, Shape::Sealed) => {
+                    let row = &mut self.needs[needs as usize];
+                    row.variable = false;
+                    row.port = None;
+                }
                 (Shape::Sealed, Shape::Array(element)) => work.push((expected, element, false)),
                 (Shape::Sealed, Shape::Record(fields)) | (Shape::Sealed, Shape::Sum(fields)) => {
                     work.extend(fields.values().map(|member| (expected, *member, false)));
@@ -431,9 +441,21 @@ impl Graph {
         id
     }
 
+    /// The root, with every redirect on the way pointed straight at it, so a
+    /// chain of unifications is walked once rather than at every lookup.
+    fn need_root_compressing(&mut self, id: NeedId) -> NeedId {
+        let root = self.need_root(id);
+        let mut at = id;
+        while let Some(next) = self.needs[at as usize].redirect {
+            self.needs[at as usize].redirect = Some(root);
+            at = next;
+        }
+        root
+    }
+
     fn unify_needs(&mut self, expected: NeedId, offered: NeedId) {
-        let expected = self.need_root(expected);
-        let offered = self.need_root(offered);
+        let expected = self.need_root_compressing(expected);
+        let offered = self.need_root_compressing(offered);
         if expected == offered {
             return;
         }
@@ -546,6 +568,15 @@ impl Graph {
             })
             .collect();
         let mut dependents = vec![Vec::new(); self.needs.len()];
+        // The needs of one instantiation share one ports map. They depend on
+        // its targets as a group, and look a port's targets up by the port's
+        // root, so that neither the dependencies nor the lookups are the
+        // size of the instantiation per need.
+        let mut groups: HashMap<usize, usize> = HashMap::new();
+        let mut group_members: Vec<Vec<usize>> = Vec::new();
+        let mut group_targets: Vec<HashMap<NeedId, Vec<NeedId>>> = Vec::new();
+        let mut group_of: Vec<Option<usize>> = vec![None; self.needs.len()];
+        let mut dependent_groups: Vec<Vec<usize>> = vec![Vec::new(); self.needs.len()];
         for (id, needs) in self.needs.iter().enumerate() {
             for edge in &needs.edges {
                 dependents[edge.source as usize].push(id);
@@ -555,9 +586,23 @@ impl Graph {
             }
             if let Some(instance) = &needs.instance {
                 dependents[instance.source as usize].push(id);
-                for target in instance.ports.values() {
-                    dependents[*target as usize].push(id);
-                }
+                let key = Arc::as_ptr(&instance.ports) as usize;
+                let group = *groups.entry(key).or_insert_with(|| {
+                    let group = group_members.len();
+                    group_members.push(Vec::new());
+                    let mut targets: HashMap<NeedId, Vec<NeedId>> = HashMap::new();
+                    for (source, target) in instance.ports.iter() {
+                        targets
+                            .entry(self.need_root(*source))
+                            .or_default()
+                            .push(*target);
+                        dependent_groups[*target as usize].push(group);
+                    }
+                    group_targets.push(targets);
+                    group
+                });
+                group_members[group].push(id);
+                group_of[id] = Some(group);
             }
         }
         let mut pending: std::collections::VecDeque<_> = (0..self.needs.len()).collect();
@@ -598,9 +643,11 @@ impl Graph {
                         .port
                         .into_iter()
                         .flat_map(|port| {
-                            instance.ports.iter().filter_map(move |(source, target)| {
-                                (self.need_root(*source) == self.need_root(port)).then_some(*target)
-                            })
+                            group_targets[group_of[id].expect("an instance is in its group")]
+                                .get(&self.need_root(port))
+                                .into_iter()
+                                .flatten()
+                                .copied()
                         })
                         .collect();
                     if targets.is_empty() {
@@ -635,7 +682,10 @@ impl Graph {
             let old = values[id].len();
             values[id].extend(added);
             if values[id].len() != old {
-                for target in &dependents[id] {
+                let members = dependent_groups[id]
+                    .iter()
+                    .flat_map(|group| group_members[*group].iter());
+                for target in dependents[id].iter().chain(members) {
                     if !queued[*target] {
                         queued[*target] = true;
                         pending.push_back(*target);
@@ -664,10 +714,12 @@ impl Graph {
             Shape(ShapeId, ShapeId),
             Need(NeedId, NeedId),
         }
-        let substitute: BTreeMap<_, _> = types
-            .iter()
-            .map(|(index, ty)| (*index, super::parameters(ty)))
-            .collect();
+        let substitute: Arc<BTreeMap<_, _>> = Arc::new(
+            types
+                .iter()
+                .map(|(index, ty)| (*index, super::parameters(ty)))
+                .collect(),
+        );
         let mut shapes = HashMap::new();
         let mut needs = HashMap::new();
         let mut work = Vec::new();
@@ -694,7 +746,7 @@ impl Graph {
             map: &mut HashMap<NeedId, NeedId>,
             work: &mut Vec<Work>,
         ) -> NeedId {
-            let source = graph.need_root(source);
+            let source = graph.need_root_compressing(source);
             if (source as usize) < since {
                 return source;
             }
@@ -704,6 +756,10 @@ impl Graph {
                 target
             })
         }
+        // Every need of one nested instantiation shares one ports map, which
+        // lists all of them: walking it once discovers them all, where once
+        // per need would square the work.
+        let mut walked_ports = HashSet::new();
         let result = shape(self, root, since.0, &mut shapes, &mut work);
         while let Some(next) = work.pop() {
             match next {
@@ -766,7 +822,9 @@ impl Graph {
                     if let Some(source) = original.redirect {
                         need(self, source, since.1, &mut needs, &mut work);
                     }
-                    if let Some(instance) = &original.instance {
+                    if let Some(instance) = &original.instance
+                        && walked_ports.insert(Arc::as_ptr(&instance.ports) as usize)
+                    {
                         for target in instance.ports.values() {
                             need(self, *target, since.1, &mut needs, &mut work);
                         }
@@ -776,24 +834,26 @@ impl Graph {
                         port: Some(BTreeSet::new()),
                         instance: Some(Instance {
                             source,
-                            substitute: substitute.clone(),
-                            ports: BTreeMap::new(),
+                            substitute: Arc::clone(&substitute),
+                            ports: Arc::default(),
                         }),
                         ..Needs::default()
                     };
                 }
             }
         }
-        let ports = needs
-            .iter()
-            .map(|(source, target)| (*source, *target))
-            .collect::<BTreeMap<_, _>>();
+        let ports = Arc::new(
+            needs
+                .iter()
+                .map(|(source, target)| (*source, *target))
+                .collect::<BTreeMap<_, _>>(),
+        );
         for target in needs.values() {
             self.needs[*target as usize]
                 .instance
                 .as_mut()
                 .expect("instantiated demand")
-                .ports = ports.clone();
+                .ports = Arc::clone(&ports);
         }
         result
     }
@@ -1243,8 +1303,12 @@ impl Planner<'_> {
             }
             TermKind::Project { base, field } => {
                 let base = self.term(base);
+                // A member of a sealed value is sealed: a callable read out
+                // of one takes no descriptors, so it asks nothing of the
+                // arm and nothing stays conditional on its being called.
                 let value = match self.plan.graph.exposed(base.value) {
                     Shape::Record(fields) => fields.get(&field.anchored).copied(),
+                    Shape::Sealed => Some(base.value),
                     _ => None,
                 }
                 .unwrap_or_else(|| self.plan.graph.skeleton(&term.ty, self.aliases));

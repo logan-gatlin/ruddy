@@ -362,6 +362,111 @@ fn reification_survives_artifact_import_and_separate_compilation() {
     );
 }
 
+/// A closure the library stores in a record field, hands to the consumer, and
+/// receives back is invoked with the convention the library lowered, even
+/// though the library never resolved the callback port the closure feeds.
+#[test]
+fn reification_sealed_callback_records_survive_separate_compilation() {
+    let producer = compiled(
+        r#"
+type Option 'a = #Some 'a | #None
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+effect Tick = () -> ()
+type Box 'a = { run: 'a -> Any + !Tick }
+type Box2 'a = { run: () -> Option 'a + !Tick }
+type Maker 'a = hide 'm => { mirror: Mirror 'm, seed: 'm, make: 'm -> 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern fresh_mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
+let unbox: Any -> Option 'a = fn any => match any with
+| hide 'x { mirror, value } => match same_pair (mirror, fresh_mirror ()) with
+  | #Some { forward, backward } => #Some (forward value)
+  | #None => #None
+  end
+end
+let map: ('a -> 'b) -> Option 'a -> Option 'b = fn f o => match o with | #Some x => #Some (f x) | #None => #None end
+let make: Option () -> Option (Box 'a) = fn o => map (fn _ => { run: fn value => do let _ = !Tick () return box value end }) o
+let run_box: Box 'a -> 'a -> Any = fn b value => handle b.run value with | !Tick _ => () end
+let nat_maker: Maker Nat = { mirror: type_of 41n, seed: 41n, make: fn n => n }
+let make_box: Maker 'a -> Box2 'a = fn maker => match maker with
+| hide 'm { mirror, seed, make } => { run: fn _ => do let _ = !Tick () return map make (#Some seed) end }
+end
+let run_box2: Box2 'a -> Option 'a = fn b => handle b.run () with | !Tick _ => () end
+"#,
+    );
+    let producer = artifact::parse(&producer.print())
+        .validate()
+        .expect("the producer artifact round trips");
+    let source = r#"
+let simple: () -> Nat = fn _ => match dep::make (#Some ()) with
+| #Some b => match dep::unbox (dep::run_box b 23n) with | #Some n => n | #None => 0n end
+| #None => 1n
+end
+let hidden: () -> Nat = fn _ => match dep::run_box2 (dep::make_box dep::nat_maker) with | #Some n => n | #None => 0n end
+"#;
+    let mut files = FileManager::new();
+    let file = files.register_new_file("consumer.rud".into(), source.into());
+    let parsed = parse::parse(token::lex(source, file).tokens);
+    let consumer = compile::compile_with_dependencies(
+        Mint::new(Bundle::new("consumer", Version::new(1, 0, 0)).unwrap()),
+        parsed.stmts,
+        &[compile::Dependency {
+            alias: Some("dep"),
+            artifact: compile::DependencyArtifact::Checked(&producer),
+        }],
+        inference::Trace::Off,
+    )
+    .unwrap_or_else(|partial| panic!("{:#?}", partial.errors));
+    let linked = ruddy::link::link(&[producer, consumer.artifact().clone()]).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("consumer.mjs");
+    fs::write(&path, js::generate(&linked).unwrap()).unwrap();
+    let probe = format!(
+        "import assert from 'node:assert/strict'; import * as app from {}; assert.equal(await app.simple(), 23); assert.equal(await app.hidden(), 41);",
+        serde_json::to_string(path.to_str().unwrap()).unwrap()
+    );
+    let output = Command::new("node")
+        .args(["--input-type=module", "--eval", &probe])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A record holding a closure with a conditional descriptor slot passes
+/// through a generalized definition's bare type parameter unchanged: the
+/// definition only forwards it, and the callback receiving it plans the same
+/// convention the producer lowered.
+#[test]
+fn reification_forwards_callables_through_bare_type_parameters() {
+    execute_reification(
+        r#"
+type Option 'a = #Some 'a | #None
+effect Tick = () -> ()
+type Box 'a = { run: () -> Option 'a + !Tick }
+type Pair 'a = { first: Nat, box: Box 'a }
+type Maker 'a = hide 'm => { mirror: Mirror 'm, seed: 'm, make: 'm -> 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private let map: ('a -> 'b) -> Option 'a -> Option 'b = fn f o => match o with | #Some x => #Some (f x) | #None => #None end
+@private let and_then: ('a -> Option 'b) -> Option 'a -> Option 'b = fn f o => match o with | #Some x => f x | #None => #None end
+@private let nat_maker: Maker Nat = { mirror: type_of 41n, seed: 41n, make: fn n => n }
+@private let make_box: Maker 'a -> Option (Box 'a) = fn maker => match maker with
+| hide 'm { mirror, seed, make } => #Some { run: fn _ => do let _ = !Tick () return map make (#Some seed) end }
+end
+@private let make_pair: Maker 'a -> Option (Pair 'a) = fn maker =>
+  and_then (fn first => map (fn box => { first: first, box: box }) (make_box maker)) (#Some 7n)
+@private let run_box: Box 'a -> Option 'a = fn b => handle b.run () with | !Tick _ => () end
+let direct = match make_box nat_maker with | #Some b => match run_box b with | #Some n => n | #None => 0n end | #None => 1n end
+let paired = match make_pair nat_maker with | #Some p => match run_box p.box with | #Some n => n | #None => 0n end | #None => 1n end
+"#,
+        "assert.equal(app.direct, 41); assert.equal(app.paired, 41);",
+    );
+}
+
 #[test]
 fn reification_imported_recursive_descriptors_close_forwarding_arguments_and_reject_growth() {
     let original = compiled("type Id 'a = 'a\ntype Loop 'a = { next: Loop 'a }\nlet ready = true");

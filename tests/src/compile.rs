@@ -1502,6 +1502,163 @@ let forwarded = dep::identity dep::box
     }
 }
 
+/// A library whose closures hand a callable opened from a hidden payload to a
+/// quantified callback port. The port is never resolved inside the library,
+/// which used to leak into the published interface as a requirement on a
+/// port no arrow binds.
+const SEALED_CALLBACK_LIBRARY: &str = r#"
+type Option 'a = #Some 'a | #None
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+effect Tick = () -> ()
+type Box 'a = { run: 'a -> Any + !Tick }
+type Box2 'a = { run: () -> Option 'a + !Tick }
+type Maker 'a = hide 'm => { mirror: Mirror 'm, seed: 'm, make: 'm -> 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern fresh_mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
+let unbox: Any -> Option 'a = fn any => match any with
+| hide 'x { mirror, value } => match same_pair (mirror, fresh_mirror ()) with
+  | #Some { forward, backward } => #Some (forward value)
+  | #None => #None
+  end
+end
+let map: ('a -> 'b) -> Option 'a -> Option 'b = fn f o => match o with | #Some x => #Some (f x) | #None => #None end
+let make: Option () -> Option (Box 'a) = fn o => map (fn _ => { run: fn value => do let _ = !Tick () return box value end }) o
+let run_box: Box 'a -> 'a -> Any = fn b value => handle b.run value with | !Tick _ => () end
+let nat_maker: Maker Nat = { mirror: type_of 41n, seed: 41n, make: fn n => n }
+let make_box: Maker 'a -> Box2 'a = fn maker => match maker with
+| hide 'm { mirror, seed, make } => { run: fn _ => do let _ = !Tick () return map make (#Some seed) end }
+end
+let run_box2: Box2 'a -> Option 'a = fn b => handle b.run () with | !Tick _ => () end
+let both: Box2 'a -> Maker 'a -> Box2 'a = fn b maker => match run_box2 b with
+| #Some _ => make_box maker
+| #None => make_box maker
+end
+"#;
+
+/// Every published callable interface validates, and says the same as the
+/// exporter's lowering: a callable opened from a sealed package supplies the
+/// port it is handed to, so nothing stays conditional on it, while the ports
+/// incoming callables bind survive.
+#[test]
+fn reification_exported_interfaces_normalize_unexposed_ports() {
+    use ruddy::reification::interface::{Node, Requirement};
+    let producer = exported(SEALED_CALLBACK_LIBRARY);
+    let interface = |name: &str| {
+        let scheme = &producer
+            .header
+            .values
+            .iter()
+            .find(|value| value.name.ends_with(&format!("::{name}")))
+            .unwrap_or_else(|| panic!("no value named {name}"))
+            .scheme;
+        let callable = scheme.callable.as_ref().unwrap();
+        callable
+            .validate(scheme.count, scheme.presences)
+            .unwrap_or_else(|message| panic!("{name}: {message}"));
+        callable.clone()
+    };
+    let arrows = |interface: &ruddy::reification::interface::Interface| {
+        interface
+            .nodes
+            .iter()
+            .filter_map(|node| match node {
+                Node::Arrow {
+                    port, requirements, ..
+                } => Some((*port, requirements.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let unconditional = |parameter| {
+        [Requirement {
+            port: None,
+            parameter,
+        }]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>()
+    };
+    let bound = |port, parameter| {
+        [Requirement {
+            port: Some(port),
+            parameter,
+        }]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>()
+    };
+
+    let make_box = interface("make_box");
+    assert!(make_box.ports.is_empty(), "{make_box:#?}");
+    assert_eq!(
+        arrows(&make_box),
+        [(None, Default::default()), (None, Default::default())],
+        "the sealed `make` the run closure calls takes no descriptors"
+    );
+
+    let make = interface("make");
+    assert!(make.ports.is_empty(), "{make:#?}");
+    assert_eq!(
+        arrows(&make),
+        [(None, Default::default()), (None, unconditional(0))]
+    );
+
+    let run_box2 = interface("run_box2");
+    assert_eq!(run_box2.ports, [[0].into_iter().collect()]);
+    assert_eq!(
+        arrows(&run_box2),
+        [(None, bound(0, 0)), (Some(0), bound(0, 0))],
+        "an incoming callable keeps its own quantified port"
+    );
+
+    let both = interface("both");
+    assert_eq!(both.ports, [[0].into_iter().collect()]);
+    assert_eq!(
+        arrows(&both),
+        [
+            (None, Default::default()),
+            (None, bound(0, 0)),
+            (None, Default::default()),
+            (Some(0), bound(0, 0)),
+        ],
+        "the incoming callable's port is the one port there is"
+    );
+}
+
+/// A consumer of the published interface plans the same convention the
+/// library lowered: the returned closure, which calls a callable opened from
+/// a sealed package, demands no descriptor at all.
+#[test]
+fn reification_normalized_interfaces_reach_imported_closures() {
+    use ruddy::reification::conventions::Shape;
+    let producer = exported(SEALED_CALLBACK_LIBRARY);
+    let imported = accepted_with(
+        "let boxed: dep::Maker 'a -> dep::Box2 'a = fn maker => dep::make_box maker",
+        &producer,
+    );
+    let plan = &imported.reification().callables;
+    let solved = plan.graph.solve();
+    let (_, binding) = plan
+        .bindings
+        .iter()
+        .find(|(symbol, _)| imported.mint().name(**symbol) == "boxed")
+        .unwrap();
+    let Shape::Arrow { result, .. } = plan.graph.exposed(binding.value) else {
+        panic!("imported box constructor")
+    };
+    let Shape::Record(fields) = plan.graph.exposed(*result) else {
+        panic!("imported box record")
+    };
+    let Shape::Arrow { needs, .. } = plan.graph.exposed(fields["run"]) else {
+        panic!("imported run closure")
+    };
+    let row = &solved[*needs as usize];
+    assert!(
+        row.is_empty(),
+        "the imported closure demands nothing: {row:?}"
+    );
+}
+
 #[test]
 fn reification_recursive_callable_interfaces_preserve_forwarded_profiles() {
     use ruddy::reification::conventions::Shape;

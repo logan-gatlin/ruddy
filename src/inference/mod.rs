@@ -245,6 +245,15 @@ impl Output {
                         &parameters,
                         &requirements,
                     );
+                    // Every consumer, in this process or from the artifact,
+                    // plans conventions from this interface; an invalid one
+                    // would be dropped and the published closures miscalled.
+                    debug_assert!(
+                        callable
+                            .validate(scheme.count(), scheme.presences())
+                            .is_ok(),
+                        "an exported callable interface is valid"
+                    );
                     *scheme = scheme.clone().with_callable(Some(callable));
                 }
                 if let Some(binding) = reification.bindings.get(symbol) {
