@@ -476,6 +476,7 @@ fn catch_all(pattern: &Pattern) -> bool {
             rest: Some(_),
             after,
         } => before.is_empty() && after.is_empty(),
+        PatternKind::Hidden { pattern, .. } => catch_all(pattern),
         _ => false,
     }
 }
@@ -511,6 +512,9 @@ fn cell(pattern: &Pattern) -> Cell {
                 exact: true,
             })),
         },
+        // Opening a hidden type tests nothing: the payload's cell is the
+        // whole of what the arm asks of the value.
+        PatternKind::Hidden { pattern, .. } => cell(pattern),
         PatternKind::Array {
             before,
             rest,
@@ -580,7 +584,15 @@ impl Check<'_> {
     /// A type as the checks read it: the shape behind a declared name. The
     /// types are zonked, so this needs no table — only the aliases.
     fn shape(&self, ty: &Arc<Ty>) -> Arc<Ty> {
-        unfold(self.aliases, ty)
+        let mut ty = unfold(self.aliases, ty);
+        // A hidden type is matched through its body: the arms test the
+        // body's structure, and the type they open it at is one nothing
+        // tests — which is what the undecided type reads as here.
+        while let Ty::Hidden { binder, body, .. } = &*ty {
+            let opened = crate::types::open_hidden(body, *binder, &Arc::new(Ty::Undecided));
+            ty = unfold(self.aliases, &opened);
+        }
+        ty
     }
 
     /// Check one match and push its report — and whatever the checks have to

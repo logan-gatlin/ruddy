@@ -6,7 +6,7 @@ use indexmap::IndexMap;
 use ruddy::symbol::{Bundle, Mint, Namespace, Version};
 use ruddy::types::{
     Assigned, Atom, EffectId, Formula, ParamKind, Presence, Prim, Rest, Row, RowField, Scheme,
-    Sense, Shape, Ty, same_finite_syntax,
+    Sense, Shape, Ty, open_hidden, same_finite_syntax,
 };
 
 #[test]
@@ -1025,4 +1025,54 @@ fn a_rigid_is_a_leaf_that_opening_leaves_alone() {
     assert_eq!(cases.to_string(), "| ..'s");
     let opened = cases.open(&[Assigned::Ty(Arc::new(Ty::plain(Ty::Nat)))]);
     assert_eq!(opened.to_string(), "| ..'s");
+}
+
+/// Hidden types are one type up to the names of their variables: bound
+/// occurrences pair through their binders, innermost first, and a free
+/// occurrence is equal to itself alone. Opening replaces a binder's
+/// occurrences and leaves a nested binder of the same number to itself.
+#[test]
+fn hidden_types_compare_through_their_binders_and_open_with_shadowing() {
+    let var = |binder: u32| {
+        Arc::new(Ty::HiddenVar {
+            binder,
+            name: "a".into(),
+        })
+    };
+    let hidden = |binder: u32, body: Arc<Ty>| {
+        Arc::new(Ty::Hidden {
+            binder,
+            name: "a".into(),
+            body,
+        })
+    };
+    let arrow = |from: Arc<Ty>, to: Arc<Ty>| Arc::new(Ty::Arrow(from, to, Row::closed()));
+
+    let left = hidden(1, arrow(var(1), var(1)));
+    let right = hidden(2, arrow(var(2), var(2)));
+    assert!(same_finite_syntax(&left, &right));
+    let mixed = hidden(3, arrow(var(3), Arc::new(Ty::Nat)));
+    assert!(!same_finite_syntax(&left, &mixed));
+    assert!(same_finite_syntax(&var(7), &var(7)));
+    assert!(!same_finite_syntax(&var(7), &var(8)));
+    // The same allocation under two binders still pairs its variables.
+    let shared = arrow(var(1), var(1));
+    assert!(same_finite_syntax(
+        &hidden(1, shared.clone()),
+        &hidden(2, arrow(var(2), var(2)))
+    ));
+
+    let nested_left = hidden(1, hidden(2, arrow(var(1), var(2))));
+    let nested_right = hidden(3, hidden(4, arrow(var(3), var(4))));
+    assert!(same_finite_syntax(&nested_left, &nested_right));
+    let crossed = hidden(3, hidden(4, arrow(var(4), var(3))));
+    assert!(!same_finite_syntax(&nested_left, &crossed));
+
+    let body = arrow(var(1), hidden(1, arrow(var(1), Arc::new(Ty::Nat))));
+    let opened = open_hidden(&body, 1, &Arc::new(Ty::String));
+    assert_eq!(opened.to_string(), "String -> hide 'a => 'a -> Nat");
+    assert_eq!(
+        hidden(1, body.clone()).to_string(),
+        "hide 'a => 'a -> hide 'a => 'a -> Nat"
+    );
 }

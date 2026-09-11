@@ -697,6 +697,16 @@ fn pattern_node(ids: &mut Ids, cx: &Cx, mint: &Mint, pattern: &Pattern) -> Node 
         }
         // The rest's name survives normalization as the symbol it binds, so
         // its row cross-highlights the way a binder's does.
+        PatternKind::Hidden { id, name, pattern } => Node {
+            label: "Hidden".into(),
+            ..node
+        }
+        .child(linked(
+            Node::new(ids.next(), "Binder", format!("'{}", name.anchored))
+                .at(cx.source.span(name.at)),
+            Some(*id),
+        ))
+        .child(pattern_node(ids, cx, mint, pattern)),
         PatternKind::Array {
             before,
             rest,
@@ -886,6 +896,25 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type, scope: &[Variable])
             },
             link_of(scope, name),
         ),
+        // A hidden type's variable, or the type a `hide` pattern opened:
+        // linked by the binder's id, which is what groups every use of the
+        // name with the `hide` that bound it.
+        TypeKind::Scoped { id, .. } => linked(
+            Node {
+                label: "Scoped".into(),
+                ..node
+            },
+            Some(*id),
+        ),
+        TypeKind::Hidden { id, name, body } => Node {
+            label: "Hidden".into(),
+            ..node
+        }
+        .child(linked(
+            Node::new(ids.next(), "Binder", format!("'{name}")),
+            Some(*id),
+        ))
+        .child(type_node(ids, cx, mint, body, scope)),
         TypeKind::Ident(symbol) => with_symbol(
             Node {
                 label: "Ident".into(),

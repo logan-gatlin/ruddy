@@ -81,6 +81,23 @@ fn inference_error_kinds(span: Anchor) -> Vec<TypeError> {
             destination_name: "outside".into(),
             destination_span: span,
         },
+        TypeError::HiddenEscapes {
+            name: "v".into(),
+            declared: span,
+        },
+        TypeError::HiddenUnknown {
+            name: "v".into(),
+            declared: span,
+        },
+        TypeError::NotHidden {
+            name: "v".into(),
+            declared: span,
+            found: nat.clone(),
+        },
+        TypeError::HiddenWitness {
+            name: "a".into(),
+            package: nat.clone(),
+        },
         TypeError::RepeatedField {
             shape: Shape::Struct,
             field: "x".to_string(),
@@ -393,6 +410,9 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
 /// what [`every_rule_is_named_and_explained_distinctly`] exists to refuse.
 const RULES: &[Rule] = &[
     Rule::Absorb,
+    Rule::Hidden,
+    Rule::Open,
+    Rule::Witness,
     Rule::Same,
     Rule::Congruent,
     Rule::Bind,
@@ -640,7 +660,7 @@ fn every_inference_error_exposes_a_complete_structured_diagnostic() {
     let use_span = map.record(Symbol::GENERATED, 0, Span::generated(4, 5));
     let declared = map.record(Symbol::GENERATED, 0, Span::generated(1, 2));
     let kinds = inference_error_kinds(declared);
-    assert_eq!(kinds.len(), 20);
+    assert_eq!(kinds.len(), 24);
 
     for kind in kinds {
         let diagnostic = inference::Error::new(use_span, kind).diagnostic(&map);
@@ -2221,6 +2241,22 @@ fn inference_source_corpus_matches_abridged_structured_goldens() {
         (
             "long-alias",
             include_str!("../diagnostics/inference/long-alias.rud"),
+        ),
+        (
+            "hidden-escapes",
+            include_str!("../diagnostics/inference/hidden-escapes.rud"),
+        ),
+        (
+            "hidden-unknown",
+            include_str!("../diagnostics/inference/hidden-unknown.rud"),
+        ),
+        (
+            "not-hidden",
+            include_str!("../diagnostics/inference/not-hidden.rud"),
+        ),
+        (
+            "hidden-witness",
+            include_str!("../diagnostics/inference/hidden-witness.rud"),
         ),
     ];
 
@@ -5523,19 +5559,45 @@ fn hidden_forms_print_and_the_unsupported_complaint_reads_plainly() {
 
     let mut map = SourceMap::default();
     let at = map.record(Symbol::GENERATED, 0, Span::generated(0, 4));
-    let unsupported = ir::Error {
+    let outside = ir::Error {
         at,
-        kind: IrError::HiddenUnsupported,
+        kind: IrError::HiddenOutsideMatch,
     }
     .diagnostic(&map);
-    assert_eq!(unsupported.code, "hidden-unsupported");
-    assert_eq!(unsupported.title, "hidden types are not supported yet");
+    assert_eq!(outside.code, "hidden-outside-match");
     assert_eq!(
-        unsupported.primary.message,
-        "this `hide` form has no meaning yet"
+        outside.title,
+        "a hidden type can only be opened in a `match` arm"
     );
     assert_eq!(
-        unsupported.help,
-        ["the syntax is reserved for an upcoming version of the language"]
+        outside.primary.message,
+        "this `hide` pattern is in a binding"
     );
+    assert_eq!(
+        outside.help,
+        ["match on the value instead, and open it in an arm"]
+    );
+    for (sense, noun) in [
+        (Sense::Type, "used here"),
+        (Sense::Region, "a region"),
+        (Sense::Presence, "a presence"),
+        (Sense::Fields, "a row of struct fields"),
+        (Sense::Cases, "a row of cases"),
+        (Sense::Effects, "a row of effects"),
+    ] {
+        let misused = ir::Error {
+            at,
+            kind: IrError::HiddenVariableSense {
+                name: "a".to_string(),
+                sense,
+            },
+        }
+        .diagnostic(&map);
+        assert_eq!(misused.code, "hidden-variable-sense");
+        assert_eq!(
+            misused.title,
+            format!("`'a` names a hidden type, so it cannot be {noun}")
+        );
+        assert_eq!(misused.primary.message, "bound by a `hide` as a type");
+    }
 }

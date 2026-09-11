@@ -1621,3 +1621,28 @@ let second = match b with | #Some n => n | #None => 0n end
         "assert.equal(app.first, 48); assert.equal(app.second, 49);",
     );
 }
+
+/// A hidden type is stored as its body: packaging one is no conversion,
+/// opening one reads the body, and two values packaged under different
+/// witnesses sit in one array and are each shown by their own function.
+#[test]
+fn hidden_types_package_and_open_in_generated_javascript() {
+    execute_reification(
+        r#"
+type Box = hide 'a => { value: 'a, show: 'a -> String }
+extern show_nat: fn(Nat) -> String = "n => String(n)"
+extern show_bool: fn(Bool) -> String = "b => b ? \"yes\" : \"no\""
+let boxes: [Box] = [{ value: 1n, show: show_nat }, { value: true, show: show_bool }]
+let describe: Box -> String = fn box => match box with
+| hide 'item { value, show } => show value
+end
+let first = match boxes with | [head, ..] => describe head | [] => "" end
+let second = match boxes with | [_, next, ..] => describe next | _ => "" end
+let repacked: Box -> Box = fn box => match box with
+| hide 'item { value, show } => { value: value, show: fn v => show v }
+end
+let third = match boxes with | [head, ..] => describe (repacked head) | [] => "" end
+"#,
+        "assert.equal(app.first, '1'); assert.equal(app.second, 'yes'); assert.equal(app.third, '1');",
+    );
+}

@@ -3946,3 +3946,43 @@ fn hidden_forms_are_shown_by_the_tokens_and_ast_tabs() {
         "{labels:?}"
     );
 }
+
+/// The debugger shows hidden types where inference works with them: the IR
+/// tab renders the hidden type, its binder, the opened type an annotation
+/// names, and the `hide` pattern; the constraints tab shows an opening and a
+/// packaging as constraints of their own, and the solver's steps name their
+/// rules.
+#[test]
+fn hidden_types_are_shown_by_the_ir_and_constraints_tabs() {
+    let snapshot = snapshot(
+        "type Box = hide 'a => { value: 'a }\n\
+         let one: Box = { value: 1n }\n\
+         let opened = match one with | hide 'v { value } => do let held: 'v = value return 0n end end\n",
+    );
+    assert!(snapshot.panic.is_none());
+    let labels = |id: &str| -> Vec<String> {
+        nodes(stage_named(&snapshot, id))
+            .iter()
+            .map(|node| node.label.clone())
+            .collect()
+    };
+    let ir = labels("ir");
+    for label in ["Hidden", "Binder", "Scoped"] {
+        assert!(
+            ir.iter().any(|found| found == label),
+            "ir lacks {label}: {ir:?}"
+        );
+    }
+    let constraints = labels("constraints");
+    for label in ["introduce", "open", "scoped"] {
+        assert!(
+            constraints.iter().any(|found| found == label),
+            "constraints lack {label}: {constraints:?}"
+        );
+    }
+    let solve = stage_named(&snapshot, "solve");
+    let text = format!("{:?}", nodes(solve));
+    for rule in ["witness", "open"] {
+        assert!(text.contains(rule), "the solve tab shows no {rule} step");
+    }
+}

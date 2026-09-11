@@ -78,6 +78,11 @@ pub(super) fn native_descriptor(
             Type::Any => Runtime::Any,
             Type::ForeignValue => Runtime::ForeignValue,
             Type::Package(inner) => Runtime::Alias(child(view.child(inner), path, incoming)),
+            // A hidden type crosses the boundary as its body, and the type
+            // it hides as an opaque host value: nothing about the payload is
+            // known to convert, and nothing is.
+            Type::Hidden { body, .. } => Runtime::Alias(child(view.child(body), path, incoming)),
+            Type::HiddenVar { .. } => Runtime::ForeignValue,
             Type::Arrow(from, to, row) => {
                 let effects = fields(row, view.clone(), declarations);
                 if incoming

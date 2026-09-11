@@ -231,6 +231,23 @@ A tag's payload type needs parentheses when it contains an application or arrow,
 A hidden type's body extends to the end of the type, so `hide 'a => 'a -> 'a` hides the whole function type, and parentheses delimit a hidden type used as an argument, as in `Mirror (hide 'a => Body 'a)`.
 The word `hide` is reserved everywhere; a struct field named `hide` is written and accessed quoted, as `{ "hide": value }` and `record."hide"`.
 
+A value takes a hidden type from the type its context expects: an annotation, a function's result or parameter, an array or struct literal's element, or a `match` branch, each of which may hide a different type.
+The hidden variable stands for whatever the value's own type says there, so the compiler never guesses it; a value that leaves it open, such as an empty array, is an error.
+For example, a boxed value pairs a value with a function that can show it, hiding the value's type:
+
+```ruddy
+type Box = hide 'a => { value: 'a, show: 'a -> String }
+let boxed: Box = { value: 3n, show: std::str::from_nat }
+```
+
+A consumer opens a hidden value in a `match` arm with `hide 'item pattern`, which names the hidden type `'item` for that arm alone: the arm's annotations can refer to it, and its result cannot mention it.
+
+```ruddy
+let describe: Box -> String = fn box => match box with
+| hide 'item { value, show } => show value
+end
+```
+
 ### Open types and constraints
 
 A [row](dictionary.md#row) describes a collection of struct fields, sum cases, or effects.

@@ -1527,3 +1527,40 @@ fn witnesses_render_quoted_field_and_variant_names_canonically() {
     assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
     assert_eq!(witness_of(&checks), r###"#"some case" 1n"###);
 }
+
+/// A `hide` pattern is matched through the hidden type's body: opening tests
+/// nothing, and the payload's coverage is what the arm contributes, so a
+/// payload naming a case leaves the other cases unhandled.
+#[test]
+fn hidden_patterns_are_checked_through_their_payloads() {
+    let prelude = "type Boxed = hide 'a => { value: 'a, show: 'a -> String }\n\
+                   type Maybe = hide 'a => #Some 'a | #None\n\
+                   extern boxed: () -> Boxed = \"host.boxed\"\n\
+                   extern maybe: () -> Maybe = \"host.maybe\"\n";
+    let (_, checks) = clean(&format!(
+        "{prelude}let shown = match boxed () with | hide 'v {{ value, show }} => show value end\n\
+         let told = match maybe () with | hide 'v #Some _ => 1n | hide 'w #None => 0n end"
+    ));
+    assert!(checks.errors.is_empty(), "{:#?}", checks.errors);
+
+    let (out, _, checks) = checked(&format!(
+        "{prelude}let partial = match maybe () with | hide 'v #Some _ => 1n end"
+    ));
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let reported = errors(&out, &checks);
+    assert_eq!(reported.len(), 1, "{reported:?}");
+    assert!(reported[0].starts_with("unhandled-values"), "{reported:?}");
+
+    // An opening onto a binder is a catch-all, and an arm after it is
+    // unreachable.
+    let (out, _, checks) = checked(&format!(
+        "{prelude}let late = match maybe () with | hide 'v x => 1n | hide 'w #None => 0n end"
+    ));
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let reported = errors(&out, &checks);
+    assert_eq!(reported.len(), 1, "{reported:?}");
+    assert!(
+        reported[0].starts_with("misplaced-catch-all"),
+        "{reported:?}"
+    );
+}

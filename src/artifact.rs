@@ -737,6 +737,17 @@ pub enum Type {
     ForeignValue,
     Arrow(Box<Type>, Box<Type>, Row),
     Package(Box<Type>),
+    /// `hide 'a => T`, with the occurrences of its variable inside the body
+    /// as [`Type::HiddenVar`]s naming the same binder.
+    Hidden {
+        binder: u32,
+        name: String,
+        body: Box<Type>,
+    },
+    HiddenVar {
+        binder: u32,
+        name: String,
+    },
     Array(Box<Type>),
     Mut(Box<Type>, Box<Type>),
     Struct(Row),
@@ -857,6 +868,30 @@ fn semantic_eq(root: SemanticPair<'_>) -> bool {
                 (Type::Package(left), Type::Package(right)) => {
                     pending.push(SemanticPair::Type(left, right));
                 }
+                (
+                    Type::Hidden {
+                        binder: left_binder,
+                        name: left_name,
+                        body: left,
+                    },
+                    Type::Hidden {
+                        binder: right_binder,
+                        name: right_name,
+                        body: right,
+                    },
+                ) if left_binder == right_binder && left_name == right_name => {
+                    pending.push(SemanticPair::Type(left, right));
+                }
+                (
+                    Type::HiddenVar {
+                        binder: left_binder,
+                        name: left_name,
+                    },
+                    Type::HiddenVar {
+                        binder: right_binder,
+                        name: right_name,
+                    },
+                ) if left_binder == right_binder && left_name == right_name => {}
                 (Type::Mut(a, b), Type::Mut(c, d)) => {
                     pending.push(SemanticPair::Type(a, c));
                     pending.push(SemanticPair::Type(b, d));
@@ -984,6 +1019,7 @@ enum CloneWork<'a> {
     Semantic(SemanticRef<'a>),
     Arrow,
     Package,
+    Hidden(u32, String),
     Array,
     Mut,
     Struct,
@@ -1023,6 +1059,14 @@ fn clone_semantic(root: SemanticRef<'_>) -> (Vec<Type>, Vec<Row>) {
                     work.push(CloneWork::Package);
                     work.push(CloneWork::Semantic(SemanticRef::Type(body)));
                 }
+                Type::Hidden { binder, name, body } => {
+                    work.push(CloneWork::Hidden(*binder, name.clone()));
+                    work.push(CloneWork::Semantic(SemanticRef::Type(body)));
+                }
+                Type::HiddenVar { binder, name } => types.push(Type::HiddenVar {
+                    binder: *binder,
+                    name: name.clone(),
+                }),
                 Type::Array(element) => {
                     work.push(CloneWork::Array);
                     work.push(CloneWork::Semantic(SemanticRef::Type(element)));
@@ -1097,6 +1141,14 @@ fn clone_semantic(root: SemanticRef<'_>) -> (Vec<Type>, Vec<Row>) {
             CloneWork::Package => {
                 let body = types.pop().expect("cloned package body");
                 types.push(Type::Package(Box::new(body)));
+            }
+            CloneWork::Hidden(binder, name) => {
+                let body = types.pop().expect("cloned hidden body");
+                types.push(Type::Hidden {
+                    binder,
+                    name,
+                    body: Box::new(body),
+                });
             }
             CloneWork::Array => {
                 let element = types.pop().expect("cloned array element");
@@ -1174,6 +1226,10 @@ fn empty_row() -> Row {
 
 fn drain_type(value: &mut Type, pending: &mut Vec<SemanticOwned>) {
     match value {
+        Type::Hidden { body, .. } => pending.push(SemanticOwned::Type(std::mem::replace(
+            body,
+            Type::Undecided,
+        ))),
         Type::Package(body) => pending.push(SemanticOwned::Type(std::mem::replace(
             body.as_mut(),
             Type::Undecided,
@@ -1220,6 +1276,7 @@ fn drain_type(value: &mut Type, pending: &mut Vec<SemanticOwned>) {
         | Type::Var(_)
         | Type::Bound(_)
         | Type::Rigid { .. }
+        | Type::HiddenVar { .. }
         | Type::Undecided => {}
     }
 }
@@ -1733,6 +1790,7 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
         Row(&'a types::Row),
         Arrow,
         Package,
+        Hidden(u32, String),
         Array,
         Mut,
         Struct,
@@ -1790,6 +1848,14 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
                     work.push(Work::Package);
                     work.push(Work::Ty(body));
                 }
+                types::Ty::Hidden { binder, name, body } => {
+                    work.push(Work::Hidden(*binder, name.to_string()));
+                    work.push(Work::Ty(body));
+                }
+                types::Ty::HiddenVar { binder, name } => tys.push(Type::HiddenVar {
+                    binder: *binder,
+                    name: name.to_string(),
+                }),
                 types::Ty::Array(element) => {
                     work.push(Work::Array);
                     work.push(Work::Ty(element));
@@ -1849,6 +1915,14 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
             Work::Package => {
                 let body = tys.pop().expect("artifact package body");
                 tys.push(Type::Package(Box::new(body)));
+            }
+            Work::Hidden(binder, name) => {
+                let body = tys.pop().expect("hidden body");
+                tys.push(Type::Hidden {
+                    binder,
+                    name,
+                    body: Box::new(body),
+                });
             }
             Work::Array => {
                 let element = tys.pop().expect("artifact array element");
@@ -2669,6 +2743,22 @@ pub mod text {
                             out.push_str("(package ");
                             work.push(Work::Text(")"));
                             work.push(Work::Ty(body));
+                        }
+                        Type::Hidden { binder, name, body } => {
+                            out.push_str("(hidden ");
+                            out.push_str(&binder.to_string());
+                            out.push(' ');
+                            out.push_str(&quoted(name));
+                            out.push(' ');
+                            work.push(Work::Text(")"));
+                            work.push(Work::Ty(body));
+                        }
+                        Type::HiddenVar { binder, name } => {
+                            out.push_str("(hidden-var ");
+                            out.push_str(&binder.to_string());
+                            out.push(' ');
+                            out.push_str(&quoted(name));
+                            out.push(')');
                         }
                         Type::Mut(region, element) => {
                             out.push_str("(mut ");
@@ -3667,7 +3757,9 @@ pub mod text {
                                 self.fail("type bound is outside the type quantifier space");
                             }
                         }
-                        Type::Package(inner) | Type::Array(inner) => parts.push(Part::Ty(inner)),
+                        Type::Package(inner)
+                        | Type::Array(inner)
+                        | Type::Hidden { body: inner, .. } => parts.push(Part::Ty(inner)),
                         Type::Mut(region, element) => {
                             parts.push(Part::Ty(region));
                             parts.push(Part::Ty(element));
@@ -3858,6 +3950,7 @@ pub mod text {
                             package_count += 1;
                             parts.push(Part::Ty(inner, Some(here)));
                         }
+                        Type::Hidden { body, .. } => parts.push(Part::Ty(body, owner)),
                         Type::Arrow(from, to, row) => {
                             parts.push(Part::Row(row, owner));
                             parts.push(Part::Ty(to, owner));
@@ -4013,6 +4106,7 @@ pub mod text {
                 Field(S),
                 BuildArrow,
                 BuildPackage,
+                BuildHidden(u32, String),
                 BuildArray,
                 BuildMut,
                 BuildStruct,
@@ -4067,6 +4161,20 @@ pub mod text {
                                         let body = self.exact(values, 1, "package").remove(0);
                                         tasks.push(Task::BuildPackage);
                                         tasks.push(Task::Ty(body));
+                                    }
+                                    "hidden" => {
+                                        let mut values = self.exact(values, 3, "hidden");
+                                        let binder = self.number(self.take(&mut values));
+                                        let name = self.string(self.take(&mut values));
+                                        let body = self.take(&mut values);
+                                        tasks.push(Task::BuildHidden(binder, name));
+                                        tasks.push(Task::Ty(body));
+                                    }
+                                    "hidden-var" => {
+                                        let mut values = self.exact(values, 2, "hidden-var");
+                                        let binder = self.number(self.take(&mut values));
+                                        let name = self.string(self.take(&mut values));
+                                        tys.push(Type::HiddenVar { binder, name });
                                     }
                                     "mut" => {
                                         let mut values = self.exact(values, 2, "mut");
@@ -4187,6 +4295,14 @@ pub mod text {
                     Task::BuildPackage => {
                         let body = tys.pop().expect("package body");
                         tys.push(Type::Package(Box::new(body)));
+                    }
+                    Task::BuildHidden(binder, name) => {
+                        let body = tys.pop().expect("hidden body");
+                        tys.push(Type::Hidden {
+                            binder,
+                            name,
+                            body: Box::new(body),
+                        });
                     }
                     Task::BuildMut => {
                         let element = tys.pop().expect("cell element");

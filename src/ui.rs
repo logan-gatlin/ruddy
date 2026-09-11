@@ -1313,7 +1313,8 @@ impl ir::ErrorKind {
             ir::ErrorKind::RuntimeTypeInformation { .. } => "runtime-type-information",
             ir::ErrorKind::ForeignProtocol { .. } => "foreign-protocol",
             ir::ErrorKind::ArrayInExtern => "array-in-extern",
-            ir::ErrorKind::HiddenUnsupported => "hidden-unsupported",
+            ir::ErrorKind::HiddenOutsideMatch => "hidden-outside-match",
+            ir::ErrorKind::HiddenVariableSense { .. } => "hidden-variable-sense",
             ir::ErrorKind::InvalidDependencyAlias { .. } => "invalid-dependency-alias",
             ir::ErrorKind::ExecutableDependency { .. } => "executable-dependency",
             ir::ErrorKind::DuplicateDependencyAlias { .. } => "duplicate-dependency-alias",
@@ -1412,13 +1413,27 @@ impl ir::Error {
             E::RuntimeTypeInformation { message } => Diagnostic::new(code, message.clone(), span)
                 .help("supply a concrete type at this use, or retain unknown foreign data as ForeignValue"),
             E::ForeignProtocol { message } => Diagnostic::new(self.kind.code(), message.clone(), source.span(self.at)),
-            E::HiddenUnsupported => Diagnostic::new(
+            E::HiddenOutsideMatch => Diagnostic::new(
                 code,
-                "hidden types are not supported yet",
+                "a hidden type can only be opened in a `match` arm",
                 span,
             )
-            .label("this `hide` form has no meaning yet")
-            .help("the syntax is reserved for an upcoming version of the language"),
+            .label("this `hide` pattern is in a binding")
+            .help("match on the value instead, and open it in an arm"),
+            E::HiddenVariableSense { name, sense } => Diagnostic::new(
+                code,
+                format!("`'{name}` names a hidden type, so it cannot be {}", match sense {
+                    Sense::Type => "used here",
+                    Sense::Region => "a region",
+                    Sense::Presence => "a presence",
+                    Sense::Fields => "a row of struct fields",
+                    Sense::Cases => "a row of cases",
+                    Sense::Effects => "a row of effects",
+                }),
+                span,
+            )
+            .label("bound by a `hide` as a type")
+            .help("use a different name for this variable"),
             E::ArrayInExtern => Diagnostic::new(
                 code,
                 "this runtime array intrinsic has an incompatible signature",
@@ -2224,6 +2239,9 @@ fn unpackaged(mut ty: &Ty) -> &Ty {
 impl Grouped for Ty {
     fn prec(&self) -> Prec {
         match unpackaged(self) {
+            // The body runs as far right as it can, exactly as the written
+            // form's does.
+            Ty::Hidden { .. } => Prec::Lambda,
             Ty::Arrow(..) => Prec::Arrow,
             Ty::Sum(_) => Prec::Sum,
             Ty::Mut(..) => Prec::Apply,
@@ -2285,6 +2303,11 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                 }
                 match ty {
                     Ty::Package(body) => work.push(SemanticJob::Ty(body, false)),
+                    Ty::Hidden { name, body, .. } => {
+                        write!(f, "hide '{name} => ")?;
+                        work.push(SemanticJob::Ty(body, false));
+                    }
+                    Ty::HiddenVar { name, .. } => write!(f, "'{name}")?,
                     Ty::Mut(region, element) => {
                         f.write_str("mut ")?;
                         work.push(SemanticJob::Applied(element));
@@ -2826,6 +2849,9 @@ impl Rule {
     pub fn code(&self) -> &'static str {
         match self {
             Rule::Absorb => "absorb",
+            Rule::Hidden => "hidden",
+            Rule::Open => "open",
+            Rule::Witness => "witness",
             Rule::Same => "same",
             Rule::Congruent => "congruent",
             Rule::Bind => "bind",
@@ -2861,6 +2887,11 @@ impl fmt::Display for Rule {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Rule::Absorb => f.write_str("one side is undecided, which unifies with anything"),
+            Rule::Hidden => {
+                f.write_str("two hidden types: their bodies must agree at one fresh type")
+            }
+            Rule::Open => f.write_str("a hidden pattern opens its position's type for its arm"),
+            Rule::Witness => f.write_str("a value packages under a hidden type at the witness"),
             Rule::Same => f.write_str("already the same thing on both sides"),
             Rule::Congruent => f.write_str(
                 "the same declared type on both sides, and it keeps what it takes: argument against argument",
@@ -2964,6 +2995,9 @@ impl ConstraintKind {
             ConstraintKind::Match { .. } => "match",
             ConstraintKind::Performs { .. } => "performs",
             ConstraintKind::CallbackCoverage { .. } => "callback-coverage",
+            ConstraintKind::Open { .. } => "open",
+            ConstraintKind::Scoped { .. } => "scoped",
+            ConstraintKind::Introduce { .. } => "introduce",
         }
     }
 }
@@ -3062,6 +3096,26 @@ impl fmt::Display for ConstraintKind {
                 effects_shown(required),
                 effects_shown(available),
             ),
+            ConstraintKind::Open {
+                hidden,
+                name,
+                opened,
+                ..
+            } => write!(f, "open {hidden} as '{name} -> {opened}"),
+            // A header, like a `let`'s: the constraints it scopes are rows of
+            // their own.
+            ConstraintKind::Scoped { level, constraints } => write!(
+                f,
+                "scoped at level {level} over {} constraint{}",
+                constraints.len(),
+                if constraints.len() == 1 { "" } else { "s" }
+            ),
+            ConstraintKind::Introduce {
+                package,
+                name,
+                witness,
+                ..
+            } => write!(f, "introduce {package} with '{name} = {witness}"),
         }
     }
 }
@@ -3103,6 +3157,7 @@ fn type_description(description: inference::TypeDescription) -> &'static str {
         T::Mut => "a mutable cell",
         T::Array => "an array",
         T::DeclaredType => "a declared type",
+        T::Hidden => "a hidden type",
         T::Any => "a boxed value",
         T::ForeignValue => "a foreign value",
         T::Undecided => "another type",
@@ -3673,6 +3728,33 @@ impl inference::Error {
                         .help("or list this effect explicitly before the annotation's effect remainder"),
                 };
             }
+            E::HiddenEscapes { declared, .. } => {
+                diagnostic = diagnostic
+                    .label("this would carry the opened type out of its arm")
+                    .related(
+                        source.span(*declared),
+                        "the type is opened here, for this arm only",
+                    )
+                    .help("compute a result that does not mention the opened type inside the arm")
+                    .help("or repackage the value under a hidden type before it leaves");
+            }
+            E::HiddenUnknown { declared, .. } => {
+                diagnostic = diagnostic
+                    .label("this position's type must be known before the arm opens it")
+                    .related(source.span(*declared), "opened here")
+                    .help("annotate the matched value, or the function it is a parameter of, with its hidden type");
+            }
+            E::NotHidden { declared, .. } => {
+                diagnostic = diagnostic
+                    .label("only a value of a hidden type can be opened")
+                    .related(source.span(*declared), "opened here")
+                    .help("match the value's structure directly, without `hide`");
+            }
+            E::HiddenWitness { .. } => {
+                diagnostic = diagnostic
+                    .label("the hidden type is not determined by this expression or its context")
+                    .help("annotate the value being packaged, or pass in a value whose type is already known");
+            }
             E::RigidEscapes {
                 destination,
                 destination_name,
@@ -3847,6 +3929,10 @@ impl inference::ErrorKind {
             inference::ErrorKind::RigidBroken { .. } => "rigid-broken",
             inference::ErrorKind::RigidField { .. } => "rigid-field",
             inference::ErrorKind::RigidEscapes { .. } => "rigid-escapes",
+            inference::ErrorKind::HiddenEscapes { .. } => "hidden-escapes",
+            inference::ErrorKind::HiddenUnknown { .. } => "hidden-unknown",
+            inference::ErrorKind::NotHidden { .. } => "not-hidden",
+            inference::ErrorKind::HiddenWitness { .. } => "hidden-witness",
             inference::ErrorKind::RepeatedField { .. } => "repeated-field",
             inference::ErrorKind::SatTermLimit { .. } => "sat-term-limit",
             inference::ErrorKind::InvalidMaxSatTerms => "invalid-max-sat-terms",
@@ -3978,6 +4064,22 @@ impl fmt::Display for inference::ErrorKind {
             } => write!(
                 f,
                 "`'{name}` stands for whatever that annotation's caller picks, but binding `{destination_name}` would publish it as `{destination}` outside that annotation",
+            ),
+            inference::ErrorKind::HiddenEscapes { name, .. } => write!(
+                f,
+                "`'{name}` is opened by this arm and cannot be used outside it",
+            ),
+            inference::ErrorKind::HiddenUnknown { name, .. } => write!(
+                f,
+                "the type opened as `'{name}` is not yet known to be a hidden type",
+            ),
+            inference::ErrorKind::NotHidden { name, found, .. } => write!(
+                f,
+                "`hide '{name}` opens a hidden type, but this value is `{found}`",
+            ),
+            inference::ErrorKind::HiddenWitness { name, package } => write!(
+                f,
+                "nothing here says which type `{package}` hides as `'{name}`",
             ),
             // Said as what `..` means rather than as the two rows that
             // disagreed: neither of those is a type the reader wrote, and the

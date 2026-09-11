@@ -814,7 +814,7 @@ fn record_fields(
     use crate::types::{Presence, Rest, Ty};
     let ty = inference::unfold(inferred.semantics().aliases(), ty);
     let mut ty = &*ty;
-    while let Ty::Package(inner) = ty {
+    while let Ty::Package(inner) | Ty::Hidden { body: inner, .. } = ty {
         ty = inner;
     }
     let Ty::Struct(row) = ty else {

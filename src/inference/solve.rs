@@ -458,6 +458,35 @@ impl Solve<'_> {
                     operand_span,
                 } => self.spread(span, *operand_span, operand, demand, result),
                 ConstraintKind::Equal { expected, actual } => self.unify(span, expected, actual),
+                ConstraintKind::Open {
+                    hidden,
+                    binder,
+                    name,
+                    declared,
+                    opened,
+                } => self.open_hidden(span, hidden, *binder, name, *declared, opened),
+                ConstraintKind::Scoped { level, constraints } => {
+                    let outer = self.table.level;
+                    self.table.level = *level;
+                    self.run(constraints);
+                    self.table.level = outer;
+                }
+                ConstraintKind::Introduce {
+                    package,
+                    name,
+                    witness,
+                    level,
+                    fit,
+                    constraints,
+                } => self.introduce(
+                    span,
+                    package,
+                    name,
+                    witness,
+                    *level,
+                    fit.as_ref(),
+                    constraints,
+                ),
                 ConstraintKind::Let {
                     symbol,
                     bound,
@@ -946,6 +975,7 @@ impl Solve<'_> {
             Type(Arc<Ty>),
             Arrow(*const Ty, Arc<Ty>),
             Package(*const Ty, Arc<Ty>),
+            Hidden(*const Ty, Arc<Ty>),
             Array(*const Ty, Arc<Ty>),
             Mut(*const Ty, Arc<Ty>),
             Struct(*const Ty, Arc<Ty>),
@@ -1025,7 +1055,15 @@ impl Solve<'_> {
                                 Ty::Rigid { id, .. } => {
                                     values.push(tagged(6, [u64::from(*id)]));
                                 }
+                                Ty::HiddenVar { binder, .. } => {
+                                    values.push(tagged(53, [u64::from(*binder)]));
+                                }
                                 Ty::Undecided => values.push(tagged(7, [])),
+                                Ty::Hidden { body, .. } => {
+                                    work.push(FingerprintWork::Hidden(key, ty.clone()));
+                                    work.push(FingerprintWork::Type(body.clone()));
+                                    continue;
+                                }
                                 Ty::Arrow(from, to, effects) => {
                                     work.push(FingerprintWork::Arrow(key, ty.clone()));
                                     work.push(FingerprintWork::Row(effects.clone()));
@@ -1086,6 +1124,12 @@ impl Solve<'_> {
                         FingerprintWork::Package(key, ty) => {
                             let body = values.pop().expect("family package fingerprint body");
                             let hash = tagged(12, [body]);
+                            self.types.insert(key, (ty, hash));
+                            values.push(hash);
+                        }
+                        FingerprintWork::Hidden(key, ty) => {
+                            let body = values.pop().expect("family hidden fingerprint body");
+                            let hash = tagged(52, [body]);
                             self.types.insert(key, (ty, hash));
                             values.push(hash);
                         }
@@ -1988,6 +2032,28 @@ impl Solve<'_> {
                             let body = self.table.open_package(span, &rhs);
                             work.push(SolveWork::Ty(lhs.clone(), body, depth + 1));
                         }
+                        // Two hidden types are one type exactly when their
+                        // bodies are, at one type nothing else can be: a
+                        // fresh rigid, opened here and scoped to nothing, so
+                        // that a variable coming to stand for it is refused.
+                        (
+                            Ty::Hidden {
+                                binder: left,
+                                name,
+                                body: left_body,
+                            },
+                            Ty::Hidden {
+                                binder: right,
+                                body: right_body,
+                                ..
+                            },
+                        ) => {
+                            self.step(span, Rule::Hidden, goal, Effect::Decomposed);
+                            let fresh = self.table.fresh_skolem(name, span);
+                            let left = crate::types::open_hidden(left_body, *left, &fresh);
+                            let right = crate::types::open_hidden(right_body, *right, &fresh);
+                            work.push(SolveWork::Ty(left, right, depth + 1));
+                        }
                         (Ty::Undecided, _) => {
                             let absorbing = self.step(span, Rule::Absorb, goal, Effect::None);
                             self.recover_ty(span, &rhs, absorbing);
@@ -2397,7 +2463,9 @@ impl Solve<'_> {
                             work.push(Work::Ty(to.clone()));
                             work.push(Work::Ty(from.clone()));
                         }
-                        Ty::Package(body) => work.push(Work::Ty(body.clone())),
+                        Ty::Package(body) | Ty::Hidden { body, .. } => {
+                            work.push(Work::Ty(body.clone()))
+                        }
                         Ty::Array(element) => work.push(Work::Ty(element.clone())),
                         Ty::Mut(region, element) => {
                             work.push(Work::Ty(region.clone()));
@@ -2419,6 +2487,7 @@ impl Solve<'_> {
                         | Ty::ForeignValue
                         | Ty::Var(_)
                         | Ty::Rigid { .. }
+                        | Ty::HiddenVar { .. }
                         | Ty::Bound(_)
                         | Ty::Undecided => {}
                     }
@@ -2487,6 +2556,14 @@ impl Solve<'_> {
             // and is left to the binding rules below. A declared name is not
             // looked through first: what the reader wrote is the name, and
             // unfolding it would quote them a shape they never put on the page.
+            // A type opened for an arm, or for unifying two hidden types, is
+            // no caller's choice: meeting anything else is a plain mismatch
+            // of the two types, said as such.
+            (Ty::Rigid { id, .. }, _) | (_, Ty::Rigid { id, .. })
+                if self.table.scoped_rigids.contains_key(id) =>
+            {
+                self.mismatch(span, goal, lhs, rhs)
+            }
             (Ty::Rigid { name, id }, _) => {
                 let (name, id) = (name.clone(), *id);
                 self.rigid_broken(span, goal, name, id, Sense::Type, rhs)
@@ -2546,6 +2623,131 @@ impl Solve<'_> {
         let abandoned = [Assigned::Ty(found.clone())];
         self.fail(span, Rule::Mismatch, goal, error, &abandoned);
         false
+    }
+
+    /// A `hide` pattern opens the type at its position: once that type is
+    /// known to be a hidden type, its body at the arm's fresh type is what the
+    /// payload pattern demanded. Anything else is the pattern's mistake, said
+    /// at its `hide`: a type not yet known, which an annotation on the value
+    /// would settle, or a type that is not hidden at all.
+    fn open_hidden(
+        &mut self,
+        span: Anchor,
+        hidden: &Arc<Ty>,
+        binder: u32,
+        name: &Arc<str>,
+        declared: Anchor,
+        opened: &Arc<Ty>,
+    ) {
+        let resolved = self.table.resolve(hidden);
+        let shape = self.table.unfolded(self.aliases, &resolved);
+        let goal = Goal::Type {
+            expected: shape.clone(),
+            actual: opened.clone(),
+        };
+        match &*shape {
+            Ty::Hidden {
+                binder: bound,
+                body,
+                ..
+            } => {
+                let rigid = Arc::new(Ty::Rigid {
+                    id: binder,
+                    name: name.clone(),
+                });
+                let body = crate::types::open_hidden(body, *bound, &rigid);
+                self.step(span, Rule::Open, goal, Effect::Decomposed);
+                self.unify(span, &body, opened);
+            }
+            // An earlier failure already spoke, and the position absorbs.
+            Ty::Undecided => {
+                self.step(span, Rule::Absorb, goal, Effect::None);
+            }
+            Ty::Var(_) => {
+                let error = Error::new(
+                    span,
+                    ErrorKind::HiddenUnknown {
+                        name: name.clone(),
+                        declared,
+                    },
+                );
+                let abandoned = [Assigned::Ty(resolved), Assigned::Ty(opened.clone())];
+                self.fail(span, Rule::Mismatch, goal, error, &abandoned);
+            }
+            _ => {
+                let error = Error::new(
+                    span,
+                    ErrorKind::NotHidden {
+                        name: name.clone(),
+                        declared,
+                        found: shape.clone(),
+                    },
+                );
+                let abandoned = [Assigned::Ty(resolved), Assigned::Ty(opened.clone())];
+                self.fail(span, Rule::Mismatch, goal, error, &abandoned);
+            }
+        }
+    }
+
+    /// A term packaging under a hidden type: its own constraints are solved
+    /// one level in, a term that could not be pushed into is fitted to the
+    /// opened body — or passed through, when it already is a value of the
+    /// package — and the witness is then read. A witness still mentioning a
+    /// variable minted inside the term is one nothing chose: the term and its
+    /// context together said nothing about the hidden type, and the compiler
+    /// invents none.
+    #[allow(clippy::too_many_arguments)]
+    fn introduce(
+        &mut self,
+        span: Anchor,
+        package: &Arc<Ty>,
+        name: &Arc<str>,
+        witness: &Arc<Ty>,
+        level: u32,
+        fit: Option<&(Arc<Ty>, Arc<Ty>)>,
+        constraints: &[Constraint],
+    ) {
+        let outer = self.table.level;
+        self.table.level = level;
+        self.run(constraints);
+        if let Some((actual, opened)) = fit {
+            let resolved = self.table.resolve(actual);
+            let shape = self.table.unfolded(self.aliases, &resolved);
+            match &*shape {
+                // Already a value of a hidden type: it passes through as it
+                // is, and no witness is chosen here — it has one of its own.
+                Ty::Hidden { .. } => {
+                    self.table.level = outer;
+                    self.unify(span, package, actual);
+                    return;
+                }
+                _ => self.unify(span, opened, actual),
+            }
+        }
+        self.table.level = outer;
+        let resolved = self.table.resolve(witness);
+        let goal = Goal::Type {
+            expected: package.clone(),
+            actual: resolved.clone(),
+        };
+        let mut mentioned = Vec::new();
+        self.table.mentions_ty(&resolved, &mut mentioned);
+        if mentioned
+            .iter()
+            .any(|var| self.table.levels[*var as usize] > outer)
+        {
+            let error = Error::new(
+                span,
+                ErrorKind::HiddenWitness {
+                    name: name.clone(),
+                    package: package.clone(),
+                },
+            );
+            let abandoned = [Assigned::Ty(witness.clone())];
+            self.fail(span, Rule::Mismatch, goal, error, &abandoned);
+        } else {
+            self.step(span, Rule::Witness, goal, Effect::None);
+        }
     }
 
     fn mismatch(&mut self, span: Anchor, goal: Goal, lhs: &Arc<Ty>, rhs: &Arc<Ty>) -> bool {
@@ -3237,6 +3439,22 @@ impl Solve<'_> {
             self.fail_recursive(span, goal, error, &abandoned, route);
             return;
         }
+        // A variable minted outside an arm may not come to stand for a type
+        // the arm opened: the arm is the whole of that type's scope, and the
+        // level the variable was minted at says where it stands.
+        let level = self.table.levels[var as usize];
+        if let Some((id, name)) = self.table.escaping_rigid(&value, level) {
+            let error = Error::new(
+                span,
+                ErrorKind::HiddenEscapes {
+                    name,
+                    declared: self.table.declared(id),
+                },
+            );
+            let abandoned = [value.variable(var), value];
+            self.fail(span, Rule::Mismatch, goal, error, &abandoned);
+            return;
+        }
         // Binding a shared structural variable still installs the ordinary
         // row-tail shape, but no presence constant or alias from this arm may
         // hitch a ride and become global. Give every such slot a shared fresh
@@ -3659,7 +3877,9 @@ impl Solve<'_> {
                         work.push(Work::Type(to.clone()));
                         work.push(Work::Type(from.clone()));
                     }
-                    Ty::Package(body) => work.push(Work::Type(body.clone())),
+                    Ty::Package(body) | Ty::Hidden { body, .. } => {
+                        work.push(Work::Type(body.clone()))
+                    }
                     Ty::Array(element) => work.push(Work::Type(element.clone())),
                     Ty::Mut(region, element) => {
                         work.push(Work::Type(region.clone()));
@@ -3679,6 +3899,7 @@ impl Solve<'_> {
                     | Ty::ForeignValue
                     | Ty::Bound(_)
                     | Ty::Rigid { .. }
+                    | Ty::HiddenVar { .. }
                     | Ty::Undecided => {}
                 },
                 Work::Row(row) => {

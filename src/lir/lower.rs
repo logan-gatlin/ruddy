@@ -1030,6 +1030,9 @@ fn cell(pattern: &Pattern) -> Cell {
             name: name.anchored.clone(),
             payload: Box::new(payload.as_deref().map(cell).unwrap_or(Cell::Wild(None))),
         },
+        // Opening a hidden type is no test and no projection: the value is
+        // stored as its body, and the payload pattern reads it as such.
+        PatternKind::Hidden { pattern, .. } => cell(pattern),
         PatternKind::Array {
             before,
             rest,
@@ -1665,7 +1668,7 @@ impl Lower<'_> {
             // imported or recursive one), and either operation alone would
             // stop before the callback arrow.
             let mut exposed = unfold(self.inference.aliases(), &cursor);
-            while let Ty::Package(body) = &*exposed {
+            while let Ty::Package(body) | Ty::Hidden { body, .. } = &*exposed {
                 exposed = unfold(self.inference.aliases(), body);
             }
             let Ty::Arrow(_, to, row) = &*exposed else {
@@ -2287,7 +2290,7 @@ impl Lower<'_> {
     /// body starts with a declared name.
     fn erased(&self, ty: &Arc<Ty>) -> Arc<Ty> {
         let mut ty = unfold(self.inference.aliases(), ty);
-        while let Ty::Package(body) = &*ty {
+        while let Ty::Package(body) | Ty::Hidden { body, .. } = &*ty {
             ty = unfold(self.inference.aliases(), body);
         }
         ty

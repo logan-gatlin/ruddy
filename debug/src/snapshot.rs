@@ -768,6 +768,7 @@ fn wire_explanation(
             T::Mut => "mut",
             T::Array => "array",
             T::DeclaredType => "declared-type",
+            T::Hidden => "hidden",
             T::Any => "any",
             T::ForeignValue => "foreign-value",
             T::Undecided => "undecided",

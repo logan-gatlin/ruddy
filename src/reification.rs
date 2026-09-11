@@ -327,7 +327,9 @@ pub fn parameters(ty: &Arc<Ty>) -> BTreeSet<u32> {
                 work.extend([from.clone(), to.clone()]);
                 row_parameters(row, &mut work, &mut parameters);
             }
-            Ty::Array(inner) | Ty::Package(inner) => work.push(inner.clone()),
+            Ty::Array(inner) | Ty::Package(inner) | Ty::Hidden { body: inner, .. } => {
+                work.push(inner.clone())
+            }
             Ty::Mut(region, inner) => work.extend([region.clone(), inner.clone()]),
             Ty::Struct(row) | Ty::Sum(row) => row_parameters(row, &mut work, &mut parameters),
             Ty::Named { args, .. } => work.extend(args.iter().cloned()),
@@ -412,6 +414,9 @@ pub fn instantiate(
             }
             (Ty::Package(inner), _) => work.push((inner.clone(), used)),
             (_, Ty::Package(inner)) => work.push((declared, inner.clone())),
+            (Ty::Hidden { body: a, .. }, Ty::Hidden { body: b, .. }) => {
+                work.push((a.clone(), b.clone()))
+            }
             (Ty::Arrow(a, b, _), Ty::Arrow(x, y, _)) | (Ty::Mut(a, b), Ty::Mut(x, y)) => {
                 work.extend([(a.clone(), x.clone()), (b.clone(), y.clone())]);
             }
@@ -692,6 +697,14 @@ impl Descriptor {
                 "ForeignValue" => Node::ForeignValue,
                 "Unit" => Node::Struct(Vec::new()),
                 "package" if native => Node::Alias(child(edge("body").expect("package body"))),
+                // A hidden type crosses a foreign boundary as its body, and
+                // the type it hides as an opaque host value: nothing about the
+                // payload is known to convert, and nothing is. An exact
+                // identity for a hidden type is a mirror's to establish.
+                name if name.starts_with("hidden:") && native => {
+                    Node::Alias(child(edge("body").expect("hidden body")))
+                }
+                name if name.starts_with("hidden-var:") && native => Node::ForeignValue,
                 "array" => Node::Array(child(edge("element").expect("array graph edge"))),
                 "arrow" => {
                     let effects = &graph[edge("effects").expect("arrow effect graph edge")];

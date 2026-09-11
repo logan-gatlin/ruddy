@@ -1354,6 +1354,26 @@ impl Planner<'_> {
             ty = inference::unfold(self.aliases, inner);
         }
         match &pattern.anchored {
+            // The payload reads the value as the hidden type's body, at the
+            // type the arm opened it to.
+            ir::PatternKind::Hidden {
+                id,
+                name,
+                pattern: payload,
+            } => {
+                let opened = match &*ty {
+                    Ty::Hidden { binder, body, .. } => crate::types::open_hidden(
+                        body,
+                        *binder,
+                        &Arc::new(Ty::Rigid {
+                            id: *id,
+                            name: name.anchored.as_str().into(),
+                        }),
+                    ),
+                    _ => Arc::new(Ty::Undecided),
+                };
+                self.pattern(payload, value, &opened);
+            }
             ir::PatternKind::Bind(name) => {
                 self.plan.bindings.insert(
                     name.anchored,

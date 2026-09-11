@@ -1,0 +1,2 @@
+type Id = hide 'a => 'a -> 'a
+let bad: Id = fn x => x

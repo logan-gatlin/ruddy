@@ -1,6 +1,6 @@
 # 02 Hidden types: introduction, opening, and escape checks
 
-Status: open
+Status: resolved
 Type: task
 Blocked by: 01
 

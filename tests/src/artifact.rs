@@ -2957,3 +2957,22 @@ fn reification_artifacts_reject_changed_published_callable_contracts() {
         }
     }
 }
+
+/// A hidden type crosses the artifact boundary as its binder and the bound
+/// occurrences inside its body, printed as text and parsed back to the same
+/// artifact — through an alias, an extern's nested hidden result, and a
+/// definition that opens one.
+#[test]
+fn hidden_types_round_trip_through_artifact_text() {
+    let artifact = built(
+        "type Box = hide 'a => { value: 'a, show: 'a -> String }\n\
+         extern make: () -> Box = \"host.make\"\n\
+         extern nested: () -> hide 'a => hide 'b => ('a, 'b) = \"host.nested\"\n\
+         let describe: Box -> String = fn box => match box with\n\
+         | hide 'v { value, show } => show value\n\
+         end",
+    );
+    let printed = assert_round_trip(&artifact);
+    assert!(printed.contains("(hidden "), "{printed}");
+    assert!(printed.contains("(hidden-var "), "{printed}");
+}

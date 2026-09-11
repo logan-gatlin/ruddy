@@ -11226,3 +11226,251 @@ fn sat_term_override_edits_invalidate_cached_inference() {
     let after = session.infer(&mint, &lowered.program, inference::Trace::Off);
     assert!(after.errors().is_empty(), "{:?}", after.errors());
 }
+
+/// A `hide` pattern opens its position's hidden type for its arm: the payload
+/// reads the body at a type of the arm's own, which the body's annotations
+/// name and its local bindings may be instantiated at, and which never
+/// reaches the arm's result. An annotated parameter is as good a scrutinee
+/// as an extern's result.
+#[test]
+fn a_hide_pattern_opens_its_scrutinee_for_its_arm() {
+    let src = "type Box = hide 'a => { value: 'a, show: 'a -> String }\n\
+               extern make: () -> Box = \"host.make\"\n\
+               let shown = match make () with\n\
+               | hide 'v { value, show } => do let held: 'v = value return show held end\n\
+               end\n\
+               let through = match make () with\n\
+               | hide 'v { value, show } => do let id = fn x => x return show (id value) end\n\
+               end\n\
+               let describe: Box -> String = fn box => match box with\n\
+               | hide 'item { show, value } => show value\n\
+               end\n\
+               let nested: Box -> Nat = fn box => match box with\n\
+               | hide 'item { value, .. } => match make () with\n\
+                 | hide 'other { show, .. } => 1n\n\
+                 end\n\
+               end";
+    let (mint, out, inferred) = infer_src(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
+    assert_eq!(scheme(&mint, &inferred, "shown"), "String");
+    assert_eq!(scheme(&mint, &inferred, "through"), "String");
+    assert_eq!(scheme(&mint, &inferred, "describe"), "Box -> String");
+    assert_eq!(scheme(&mint, &inferred, "nested"), "Box -> Nat");
+}
+
+/// The type an arm opens is scoped to the arm: returning a value of it,
+/// wrapping one in a closure that leaves, or writing one into a cell from
+/// outside are each refused at the expression that would carry it out, and
+/// the complaint points back at the `hide` that opened it.
+#[test]
+fn an_opened_type_cannot_leave_its_arm() {
+    let prelude = "type Box = hide 'a => { value: 'a, show: 'a -> String }\n\
+                   extern make: () -> Box = \"host.make\"\n";
+    for (body, opened) in [
+        (
+            "let leak = match make () with | hide 'v { value, .. } => value end",
+            "hide 'v",
+        ),
+        (
+            "let leak = match make () with | hide 'v { value, .. } => fn _ => value end",
+            "hide 'v",
+        ),
+        (
+            "let leak = fn cell => match make () with | hide 'v { value, .. } => cell := #Some value end",
+            "hide 'v",
+        ),
+    ] {
+        let src = format!("{prelude}{body}");
+        let (_, out, inferred) = infer_src(&src);
+        let map = &out.source;
+        let escape = inferred
+            .errors()
+            .iter()
+            .find(|error| error.kind.code() == "hidden-escapes")
+            .unwrap_or_else(|| panic!("{body}: {:#?}", inferred.errors()));
+        let ErrorKind::HiddenEscapes { name, declared } = &escape.kind else {
+            unreachable!()
+        };
+        assert_eq!(&**name, "v");
+        assert_eq!(
+            map.span(*declared).start,
+            src.find(opened).unwrap(),
+            "{body}"
+        );
+    }
+}
+
+/// Opening needs a position already known to be a hidden type: an
+/// unannotated parameter is refused as not yet known, and a natural number
+/// as not hidden at all — each at the `hide` that asked.
+#[test]
+fn opening_needs_a_known_hidden_type() {
+    let src = "let f = fn b => match b with | hide 'v { value } => 0n end";
+    let (_, out, inferred) = infer_src(src);
+    let error = inferred
+        .errors()
+        .iter()
+        .find(|error| error.kind.code() == "hidden-unknown")
+        .unwrap_or_else(|| panic!("{:#?}", inferred.errors()));
+    let ErrorKind::HiddenUnknown { name, declared } = &error.kind else {
+        unreachable!()
+    };
+    assert_eq!(&**name, "v");
+    assert_eq!(out.source.span(*declared).start, src.find("hide").unwrap());
+
+    let src = "let g = match 1n with | hide 'v x => 0n end";
+    let (_, out, inferred) = infer_src(src);
+    let error = inferred
+        .errors()
+        .iter()
+        .find(|error| error.kind.code() == "not-hidden")
+        .unwrap_or_else(|| panic!("{:#?}", inferred.errors()));
+    let ErrorKind::NotHidden {
+        name,
+        declared,
+        found,
+    } = &error.kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(&**name, "v");
+    assert_eq!(found.to_string(), "Nat");
+    assert_eq!(out.source.span(*declared).start, src.find("hide").unwrap());
+}
+
+/// Two hidden types are one type exactly when their bodies agree at one
+/// fresh type: the variable's spelling is nothing, and a body that says
+/// something different of it is a mismatch of the two types.
+#[test]
+fn hidden_types_are_equal_up_to_their_variable_names() {
+    let src = "type A = hide 'a => 'a -> 'a\n\
+               type B = hide 'b => 'b -> 'b\n\
+               type C = hide 'c => 'c -> Nat\n\
+               extern a: () -> A = \"host.a\"\n\
+               let b: B = a ()";
+    let (mint, out, inferred) = infer_src(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
+    assert_eq!(scheme(&mint, &inferred, "b"), "B");
+
+    let src = format!("{src}\nlet c: C = a ()");
+    let (_, _, inferred) = infer_src(&src);
+    let codes: Vec<_> = inferred
+        .errors()
+        .iter()
+        .map(|error| error.kind.code())
+        .collect();
+    assert_eq!(codes, ["type-mismatch"], "{:#?}", inferred.errors());
+}
+
+/// Checking an expression against a hidden type packages it: the compiler
+/// reads the witness — the type the hidden variable stands for — off the
+/// expression and its context, through record and array literals, a
+/// function's result, a block's result, each branch of a match on its own, a
+/// parameter already known to be hidden, and a caller-chosen type; and a
+/// value already of the hidden type passes through, opened or not.
+#[test]
+fn checking_against_a_hidden_type_packages_the_expression() {
+    let src = "type Box = hide 'a => { value: 'a, show: 'a -> String }\n\
+               extern show_nat: Nat -> String = \"host.nat\"\n\
+               extern show_bool: Bool -> String = \"host.bool\"\n\
+               let one: Box = { value: 1n, show: show_nat }\n\
+               let both: [Box] = [{ value: 1n, show: show_nat }, { value: true, show: show_bool }]\n\
+               let pick: Bool -> Box = fn c =>\n\
+                 if c then { value: 1n, show: show_nat } else { value: true, show: show_bool } end\n\
+               let made: Box = do let v = 2n return { value: v, show: show_nat } end\n\
+               let make: Nat -> Box = fn n => { value: n, show: show_nat }\n\
+               let consume: Box -> Nat = fn _ => 1n\n\
+               let used = consume { value: true, show: show_bool }\n\
+               let generic: 'a -> ('a -> String) -> Box = fn v s => { value: v, show: s }\n\
+               let inferred = fn v s => do let b: Box = { value: v, show: s } return b end\n\
+               let same: Box -> Box = fn b => b\n\
+               let repack: Box -> Box = fn b => match b with\n\
+               | hide 'v { value, show } => { value: value, show: show }\n\
+               end";
+    let (mint, out, inferred) = infer_src(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
+    assert_eq!(scheme(&mint, &inferred, "one"), "Box");
+    assert_eq!(scheme(&mint, &inferred, "both"), "[Box]");
+    assert_eq!(scheme(&mint, &inferred, "pick"), "Bool -> Box");
+    assert_eq!(scheme(&mint, &inferred, "made"), "Box");
+    assert_eq!(scheme(&mint, &inferred, "make"), "Nat -> Box");
+    assert_eq!(scheme(&mint, &inferred, "used"), "Nat");
+    assert_eq!(
+        scheme(&mint, &inferred, "generic"),
+        "'a -> ('a -> String) -> Box"
+    );
+    assert_eq!(
+        scheme(&mint, &inferred, "inferred"),
+        "'a -> ('a -> String) -> Box"
+    );
+    assert_eq!(scheme(&mint, &inferred, "same"), "Box -> Box");
+    assert_eq!(scheme(&mint, &inferred, "repack"), "Box -> Box");
+}
+
+/// A witness is what the expression and its context say and nothing more:
+/// an empty array, a bare tag, or a function's own parameter leaves the
+/// hidden type undetermined, and the compiler invents none. The complaint
+/// names the hidden type and its variable, at the expression.
+#[test]
+fn an_undetermined_witness_is_refused() {
+    let prelude = "type Box = hide 'a => { value: 'a, show: 'a -> String }\n\
+                   type Id = hide 'a => 'a -> 'a\n";
+    for (body, at) in [
+        (
+            "let bad: Box = { value: [], show: fn _ => \"\" }",
+            "{ value: []",
+        ),
+        (
+            "let bad: Box = { value: #None, show: fn _ => \"\" }",
+            "{ value: #None",
+        ),
+        // A function is anchored at its parameter.
+        ("let bad: Id = fn x => x", "x => x"),
+    ] {
+        let src = format!("{prelude}{body}");
+        let (_, out, inferred) = infer_src(&src);
+        let error = inferred
+            .errors()
+            .iter()
+            .find(|error| error.kind.code() == "hidden-witness")
+            .unwrap_or_else(|| panic!("{body}: {:#?}", inferred.errors()));
+        let ErrorKind::HiddenWitness { name, package } = &error.kind else {
+            unreachable!()
+        };
+        assert_eq!(&**name, "a", "{body}");
+        assert!(
+            matches!(package.to_string().as_str(), "Box" | "Id"),
+            "{package}"
+        );
+        assert_eq!(
+            out.source.span(error.at).start,
+            src.find(at).unwrap(),
+            "{body}"
+        );
+    }
+}
+
+/// A `hide` pattern opens wherever it sits: under a case's payload, or as
+/// an array's element, the position's type is what the arm opens, and the
+/// types opened are the arm's to name.
+#[test]
+fn hide_patterns_open_nested_positions() {
+    let src = "type Box = hide 'a => { value: 'a, show: 'a -> String }\n\
+               type Wrapped = #Some Box | #None\n\
+               let unwrap: Wrapped -> String = fn w => match w with\n\
+               | #Some hide 'v { value, show } => do let held: 'v = value return show held end\n\
+               | #None => \"\"\n\
+               end\n\
+               let first: [Box] -> String = fn boxes => match boxes with\n\
+               | [hide 'v { value, show }, ..] => show value\n\
+               | [] => \"\"\n\
+               end";
+    let (mint, out, inferred) = infer_src(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
+    assert_eq!(scheme(&mint, &inferred, "unwrap"), "Wrapped -> String");
+    assert_eq!(scheme(&mint, &inferred, "first"), "[Box] -> String");
+}

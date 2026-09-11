@@ -81,6 +81,35 @@ pub struct Constrain<'a> {
     /// It is recorded on nested annotations for their post-solve contract
     /// check; generation never asks whether it is satisfiable.
     pub presence_guard: Formula,
+    /// The hidden types the match being walked opens, one entry per `hide`
+    /// pattern, gathered by [`Constrain::position`] and emitted once the
+    /// scrutinee has been equated with the patterns' demand — the order the
+    /// solver needs, since opening reads the position's type.
+    pub opens: Vec<Open>,
+    /// How many `hide` payloads enclose the position being walked. Inside
+    /// one, a column's tags say nothing about the cases the hidden type's
+    /// body has — one arm opens the body on its own and may name one case
+    /// of many — so its row stays open, and coverage is the patterns
+    /// phase's to check across the arms together.
+    pub opening: usize,
+}
+
+/// A type the context already knows for a term, with what to call it in a
+/// complaint about the term not meeting it.
+#[derive(Clone, Copy)]
+pub(super) struct Expected<'a> {
+    pub ty: &'a Arc<Ty>,
+    pub subject: Subject,
+    pub span: Option<Anchor>,
+}
+
+/// One `hide` pattern's opening, waiting to become [`ConstraintKind::Open`].
+pub struct Open {
+    hidden: Arc<Ty>,
+    binder: u32,
+    name: Arc<str>,
+    declared: Anchor,
+    opened: Arc<Ty>,
 }
 
 /// What every effect's operations were declared to be, by the effect and the
@@ -330,6 +359,20 @@ impl Constrain<'_> {
     /// Infer a type for `term` and write it into `term.ty`.
     pub(super) fn infer_term(&mut self, term: &mut Term) {
         crate::cancellation::checkpoint();
+        // A block and a match are walked by methods of their own, because
+        // checking reaches into them: the block's result and every arm's body
+        // may each be checked against a type the context knows.
+        match term.kind {
+            TermKind::Let { .. } => {
+                term.ty = self.let_term(term, None);
+                return;
+            }
+            TermKind::Match { .. } => {
+                term.ty = self.match_term(term, None);
+                return;
+            }
+            _ => {}
+        }
         let span = term.at;
         term.ty = match &mut term.kind {
             // The error term absorbs: it unifies with anything, so the one
@@ -424,120 +467,31 @@ impl Constrain<'_> {
             // body, so a variable is minted at the level it was written at —
             // which is the whole of what decides, later, whether the value is
             // entitled to quantify it.
-            TermKind::Let {
-                name,
-                annotation,
-                value,
-                body,
-            } => {
-                self.table.level += 1;
-                let level = self.table.level;
-                // What the name is bound to inside its own value. An annotation
-                // is the contract, so the value is checked against it and the
-                // recursive uses the annotation exists for are checked against
-                // it too; without one it is a variable the value decides.
-                let expected_subject = if annotation.is_some() {
-                    Subject::Annotation
-                } else {
-                    Subject::LocalBinding
-                };
-                let expected_span = annotation.as_ref().map(|annotation| annotation.ty.at);
-                let (bound, promised, rigids) = match annotation {
-                    Some(annotation) => {
-                        let lowered = lower_annotation(self.mint, self.table, annotation);
-                        // The clause is the contract, said in the store: what a
-                        // use of this name sees, and what the value under it is
-                        // held to.
-                        if !lowered.formula.is_true() {
-                            let origin = Origin::Annotation(Named {
-                                labels: lowered.names.clone(),
-                                shape: None,
-                            });
-                            self.table.require(
-                                annotation.ty.at,
-                                origin,
-                                lowered.assumptions.clone(),
-                            );
-                        }
-                        self.annotated.push(Annotated {
-                            span: annotation.ty.at,
-                            guard: self.presence_guard.clone(),
-                            promised: lowered.formula.clone(),
-                            names: lowered.names,
-                        });
-                        // A recursive use inside the value is a copy of what the
-                        // annotation declared, sharing what it left to
-                        // inference: the same rule a top-level annotated
-                        // definition follows, about a smaller scope.
-                        self.table.authoritative_bindings.insert(name.anchored);
-                        self.table
-                            .authoritative_spans
-                            .insert(name.anchored, annotation.ty.at);
-                        self.env.insert(
-                            name.anchored,
-                            Binding::Poly(ExplainedScheme::imported(lowered.scheme)),
-                        );
-                        (lowered.ty, lowered.formula, lowered.rigids)
-                    }
-                    None => {
-                        // Monomorphically, the same rule a binding group
-                        // follows: a use of the name inside its own value is
-                        // the one type being decided rather than a copy of a
-                        // scheme that does not exist yet.
-                        let bound = self.table.fresh_type_for(Subject::LocalBinding);
-                        self.env.insert(name.anchored, Binding::Mono(bound.clone()));
-                        (bound, Formula::True, Vec::new())
-                    }
-                };
-                let outer = std::mem::take(&mut self.out);
-                let initializer_effects =
-                    Row::of(self.table.fresh_row_for(Subject::AmbientEffects));
-                let enclosing = self.enter(Ambient {
-                    row: initializer_effects.clone(),
-                    ..self.ambient.clone()
-                });
-                self.check_term(value, &bound, expected_subject, expected_span);
-                self.leave(enclosing);
-                let required = std::mem::replace(&mut self.out, outer);
-
-                self.table.level -= 1;
-                // And polymorphically in the body, where the scheme exists.
-                // Nothing is put back afterwards: a symbol is unique, so the
-                // name a nested `let` binds can never be one anything outside
-                // its body could have meant — the scope was decided by
-                // lowering, and this map only says what each symbol is.
-                self.env.insert(name.anchored, Binding::Local);
-                let outer = std::mem::take(&mut self.out);
-                self.infer_term(body);
-                let rest = std::mem::replace(&mut self.out, outer);
-
-                self.table
-                    .local_names
-                    .insert(name.anchored, Arc::from(self.mint.name(name.anchored)));
-                self.emit(
-                    name.at,
-                    ConstraintOrigin::Binding,
-                    ConstraintSubjects::one(Subject::Binding),
-                    ConstraintKind::Let {
-                        symbol: name.anchored,
-                        bound,
-                        level,
-                        promised,
-                        rigids,
-                        initializer_effects,
-                        ambient: self.ambient.row.clone(),
-                        inside: self.ambient.inside,
-                        value: required,
-                        body: rest,
-                    },
-                );
-                body.ty.clone()
+            TermKind::Let { .. } | TermKind::Match { .. } => {
+                unreachable!("blocks and matches are walked by their own methods")
             }
             TermKind::Apply { func, arg } => {
                 let opened = self.table.store.batches.len();
                 self.infer_term(func);
                 let at = func.at;
-                self.infer_term(arg);
+                // A parameter the function already knows to be a hidden type
+                // reaches the argument as its context: the argument packages
+                // under it, as it would under an annotation.
+                let hidden_parameter = match &*self.table.unfolded(self.aliases, &func.ty) {
+                    Ty::Arrow(from, ..)
+                        if matches!(
+                            &*self.table.unfolded(self.aliases, from),
+                            Ty::Hidden { .. }
+                        ) =>
+                    {
+                        Some(from.clone())
+                    }
+                    _ => None,
+                };
+                match hidden_parameter {
+                    Some(from) => self.check_term(arg, &from, Subject::Parameter, Some(at)),
+                    None => self.infer_term(arg),
+                }
                 // A constrained scheme opened by the function is a demand on
                 // the argument: what the function requires among its fields is
                 // required of the value written here, so that is where a
@@ -881,158 +835,17 @@ impl Constrain<'_> {
                     },
                 );
                 result
-            }
-            // The scrutinee is what the written matrix, read column-wise,
-            // says it is: at every position, the union over all arms of what
-            // is tested there — never any one arm's view. The demand that
-            // builds is checked against the scrutinee, each binder is bound
-            // monomorphically to its position's type — refined so a case the
-            // earlier arms fully handle is absent in its view — and every
-            // arm's body unifies with the match's own type. Zero arms close
-            // the row over nothing: the scrutinee is the empty sum, and the
-            // match's own type stays the fresh variable minted below — the
-            // empty sum's eliminator. See [`Constrain::position`] for the
-            // column rule.
-            TermKind::Match { scrutinee, arms } => {
-                self.infer_term(scrutinee);
-                let result = self.table.fresh_type_for(Subject::MatchResult);
-                let mut qualifying = None;
-                let expected = match arms.is_empty() {
-                    true => Arc::new(Ty::plain(Ty::Sum(Row {
-                        labels: IndexMap::new(),
-                        rest: Rest::Closed,
-                    }))),
-                    false => {
-                        let columns = Columns {
-                            matrix: ir::Matrix::new(arms.iter().map(|(pattern, _)| pattern)),
-                            patterns: arms.iter().map(|(pattern, _)| pattern).collect(),
-                            at: scrutinee.at,
-                        };
-                        let root: Vec<(usize, Col)> = columns
-                            .patterns
-                            .iter()
-                            .enumerate()
-                            .map(|(arm, pattern)| (arm, Col::Pattern(pattern)))
-                            .collect();
-                        let (demand, cover) = self.position(&columns, &mut Vec::new(), &root);
-                        // The column-to-constraint conversion: what the arms
-                        // cover between them, over the finite presences the
-                        // demand just minted. Its ordered per-arm forms also
-                        // become the explicit guarded constraint below.
-                        if let Some(cover) = cover {
-                            let raw: Vec<Formula> = (0..arms.len())
-                                .map(|arm| cover.get(&arm).cloned().unwrap_or(Formula::True))
-                                .collect();
-                            let fields = match &*demand {
-                                Ty::Struct(row) => row
-                                    .labels
-                                    .iter()
-                                    .map(|(name, field)| (name.clone(), field.presence.clone()))
-                                    .collect(),
-                                _ => Vec::new(),
-                            };
-                            let paths = structural_presence_paths(&demand);
-                            let formula = Formula::any(raw.clone());
-                            let premise_reason = self.table.require(
-                                span,
-                                Origin::Coverage(Coverage {
-                                    arms: raw.clone(),
-                                    fields,
-                                    paths,
-                                }),
-                                formula,
-                            );
-                            qualifying = Some((raw, premise_reason));
-                        }
-                        demand
-                    }
-                };
-                let actual = scrutinee.ty.clone();
-                self.checks(
-                    scrutinee.at,
-                    &actual,
-                    &expected,
-                    ConstraintOrigin::MatchScrutinee,
-                    Subject::PatternDemand,
-                    None,
-                    Subject::MatchScrutinee,
-                );
-
-                match qualifying {
-                    Some((raw, premise_reason)) => {
-                        let effective = effective_conditions(&raw);
-                        let mut guarded = Vec::with_capacity(arms.len());
-                        for (((pattern, body), raw), effective) in
-                            arms.iter_mut().zip(raw).zip(effective)
-                        {
-                            // The arm is a scope in the generated constraint
-                            // tree. Store batches emitted while walking it are
-                            // held inert in their source-order slots and travel
-                            // with it, so solving can put the premise around them.
-                            let outer = std::mem::take(&mut self.out);
-                            let required = self.table.store.batches.len();
-                            let combined = self.presence_guard.clone().and(effective.clone());
-                            let enclosing = std::mem::replace(&mut self.presence_guard, combined);
-                            self.infer_term(body);
-                            self.presence_guard = enclosing;
-                            let constraints = std::mem::replace(&mut self.out, outer);
-                            let requirements = self.defer_requirements(required);
-                            let mut arm_result = self.constraint(
-                                body.at,
-                                ConstraintOrigin::MatchArm,
-                                ConstraintSubjects::pair(Subject::MatchResult, Subject::MatchArm),
-                                ConstraintKind::Equal {
-                                    expected: result.clone(),
-                                    actual: body.ty.clone(),
-                                },
-                            );
-                            Self::mark_branch_result(&mut arm_result, span);
-                            guarded.push(GuardedArm {
-                                at: pattern.at,
-                                raw,
-                                effective,
-                                premise_reason,
-                                constraints,
-                                requirements,
-                                result: arm_result,
-                            });
-                        }
-                        self.emit(
-                            span,
-                            ConstraintOrigin::Match,
-                            ConstraintSubjects::pair(Subject::MatchScrutinee, Subject::MatchResult),
-                            ConstraintKind::Match {
-                                scrutinee: expected,
-                                result: result.clone(),
-                                arms: guarded,
-                                store_end: self.table.store.batches.len(),
-                            },
-                        );
-                    }
-                    // A mixed tag/literal column keeps the old flat equality
-                    // constraints exactly.
-                    None => {
-                        for (_, body) in arms.iter_mut() {
-                            self.infer_term(body);
-                            let actual = body.ty.clone();
-                            self.checks(
-                                body.at,
-                                &actual,
-                                &result,
-                                ConstraintOrigin::MatchArm,
-                                Subject::MatchResult,
-                                None,
-                                Subject::MatchArm,
-                            );
-                            Self::mark_branch_result(
-                                self.out.last_mut().expect("just emitted branch result"),
-                                span,
-                            );
-                        }
-                    }
-                }
-                result
-            }
+            } // The scrutinee is what the written matrix, read column-wise,
+              // says it is: at every position, the union over all arms of what
+              // is tested there — never any one arm's view. The demand that
+              // builds is checked against the scrutinee, each binder is bound
+              // monomorphically to its position's type — refined so a case the
+              // earlier arms fully handle is absent in its view — and every
+              // arm's body unifies with the match's own type. Zero arms close
+              // the row over nothing: the scrutinee is the empty sum, and the
+              // match's own type stays the fresh variable minted below — the
+              // empty sum's eliminator. See [`Constrain::position`] for the
+              // column rule.
         };
     }
 
@@ -1249,6 +1062,9 @@ impl Constrain<'_> {
         let mut arrays = false;
         let mut elements: Vec<(usize, Col)> = Vec::new();
         let mut rests: Vec<Anchored<Symbol>> = Vec::new();
+        // The `hide` patterns at this position: each opens the position's
+        // type for its own arm, and its payload is a column of its own.
+        let mut hidden: Vec<(usize, u32, Arc<str>, Anchor, &ir::Pattern)> = Vec::new();
         // Whether the column qualifies for coverage-to-constraint conversion:
         // every entry a struct, unit, binder or wildcard, and the struct
         // entries not a mix of exact and `..`-open. A tag or a natural test is
@@ -1294,6 +1110,25 @@ impl Constrain<'_> {
                         tags.entry(name.anchored.as_str())
                             .or_default()
                             .push((*arm, payload));
+                        exact = false;
+                        qualifies = false;
+                    }
+                    // An opening is no test over finitely many presences, so
+                    // the column keeps the matrix walk, as a tag's does; and
+                    // it demands nothing of the position beyond being a
+                    // hidden type, which only the solver can ask.
+                    ir::PatternKind::Hidden {
+                        id,
+                        name,
+                        pattern: payload,
+                    } => {
+                        hidden.push((
+                            *arm,
+                            *id,
+                            name.anchored.as_str().into(),
+                            pattern.at,
+                            payload,
+                        ));
                         exact = false;
                         qualifies = false;
                     }
@@ -1349,7 +1184,7 @@ impl Constrain<'_> {
         // catch-all arm — which is what decides whether the row closes. Read
         // off the matrix rather than tracked down the recursion, so this and
         // the lowering checks answer from one place.
-        let open = columns.matrix.open(path);
+        let open = self.opening > 0 || columns.matrix.open(path);
         let mut demands: Vec<Arc<Ty>> = Vec::new();
         // The demand's own fields, and what each sub-column covers per arm:
         // the two halves the covered set is built from, kept out here because
@@ -1470,6 +1305,23 @@ impl Constrain<'_> {
             false => None,
             true => Some(covered(entries, &named, &nested, exact)),
         };
+        // Each opening registers its type at the arm's level, and its payload
+        // is walked at the same position: it tests the value as the hidden
+        // type's body, which is what the position holds at runtime.
+        for (arm, id, name, declared, payload) in hidden {
+            self.table.rigids.insert(id, declared);
+            self.table.scoped_rigids.insert(id, self.table.level);
+            self.opening += 1;
+            let (opened, _) = self.position(columns, path, &[(arm, Col::Pattern(payload))]);
+            self.opening -= 1;
+            self.opens.push(Open {
+                hidden: ty.clone(),
+                binder: id,
+                name,
+                declared,
+                opened,
+            });
+        }
         for (arm, binder) in binds {
             let view = match &listed {
                 // The refinement: every case the arms above this one fully
@@ -1504,6 +1356,378 @@ impl Constrain<'_> {
         (ty, cover)
     }
 
+    /// A nested binding — one `let` of a block — walked with its body
+    /// inferred, or checked against `expected` where the context knows the
+    /// block's type. See [`ConstraintKind::Let`] for what is decided here.
+    fn let_term(&mut self, term: &mut Term, expected: Option<Expected<'_>>) -> Arc<Ty> {
+        let TermKind::Let {
+            name,
+            annotation,
+            value,
+            body,
+        } = &mut term.kind
+        else {
+            unreachable!("a block's binding")
+        };
+        self.table.level += 1;
+        let level = self.table.level;
+        // What the name is bound to inside its own value. An annotation
+        // is the contract, so the value is checked against it and the
+        // recursive uses the annotation exists for are checked against
+        // it too; without one it is a variable the value decides.
+        let expected_subject = if annotation.is_some() {
+            Subject::Annotation
+        } else {
+            Subject::LocalBinding
+        };
+        let expected_span = annotation.as_ref().map(|annotation| annotation.ty.at);
+        let (bound, promised, rigids) = match annotation {
+            Some(annotation) => {
+                let lowered = lower_annotation(self.mint, self.table, annotation);
+                // The clause is the contract, said in the store: what a
+                // use of this name sees, and what the value under it is
+                // held to.
+                if !lowered.formula.is_true() {
+                    let origin = Origin::Annotation(Named {
+                        labels: lowered.names.clone(),
+                        shape: None,
+                    });
+                    self.table
+                        .require(annotation.ty.at, origin, lowered.assumptions.clone());
+                }
+                self.annotated.push(Annotated {
+                    span: annotation.ty.at,
+                    guard: self.presence_guard.clone(),
+                    promised: lowered.formula.clone(),
+                    names: lowered.names,
+                });
+                // A recursive use inside the value is a copy of what the
+                // annotation declared, sharing what it left to
+                // inference: the same rule a top-level annotated
+                // definition follows, about a smaller scope.
+                self.table.authoritative_bindings.insert(name.anchored);
+                self.table
+                    .authoritative_spans
+                    .insert(name.anchored, annotation.ty.at);
+                self.env.insert(
+                    name.anchored,
+                    Binding::Poly(ExplainedScheme::imported(lowered.scheme)),
+                );
+                (lowered.ty, lowered.formula, lowered.rigids)
+            }
+            None => {
+                // Monomorphically, the same rule a binding group
+                // follows: a use of the name inside its own value is
+                // the one type being decided rather than a copy of a
+                // scheme that does not exist yet.
+                let bound = self.table.fresh_type_for(Subject::LocalBinding);
+                self.env.insert(name.anchored, Binding::Mono(bound.clone()));
+                (bound, Formula::True, Vec::new())
+            }
+        };
+        let outer = std::mem::take(&mut self.out);
+        let initializer_effects = Row::of(self.table.fresh_row_for(Subject::AmbientEffects));
+        let enclosing = self.enter(Ambient {
+            row: initializer_effects.clone(),
+            ..self.ambient.clone()
+        });
+        self.check_term(value, &bound, expected_subject, expected_span);
+        self.leave(enclosing);
+        let required = std::mem::replace(&mut self.out, outer);
+
+        self.table.level -= 1;
+        // And polymorphically in the body, where the scheme exists.
+        // Nothing is put back afterwards: a symbol is unique, so the
+        // name a nested `let` binds can never be one anything outside
+        // its body could have meant — the scope was decided by
+        // lowering, and this map only says what each symbol is.
+        self.env.insert(name.anchored, Binding::Local);
+        let outer = std::mem::take(&mut self.out);
+        self.arm_body(body, expected);
+        let rest = std::mem::replace(&mut self.out, outer);
+
+        self.table
+            .local_names
+            .insert(name.anchored, Arc::from(self.mint.name(name.anchored)));
+        self.emit(
+            name.at,
+            ConstraintOrigin::Binding,
+            ConstraintSubjects::one(Subject::Binding),
+            ConstraintKind::Let {
+                symbol: name.anchored,
+                bound,
+                level,
+                promised,
+                rigids,
+                initializer_effects,
+                ambient: self.ambient.row.clone(),
+                inside: self.ambient.inside,
+                value: required,
+                body: rest,
+            },
+        );
+        body.ty.clone()
+    }
+
+    /// A match, walked with every arm's body inferred, or checked against
+    /// `expected` where the context knows the match's type — in which case
+    /// each arm meets it on its own, and two arms checked against one hidden
+    /// type may package under different witnesses.
+    fn match_term(&mut self, term: &mut Term, known: Option<Expected<'_>>) -> Arc<Ty> {
+        let span = term.at;
+        let TermKind::Match { scrutinee, arms } = &mut term.kind else {
+            unreachable!("a match")
+        };
+        self.infer_term(scrutinee);
+        let result = self.table.fresh_type_for(Subject::MatchResult);
+        // An arm that opens a hidden type is walked one level in,
+        // patterns and body alike: the type it opens is registered at
+        // that level, and a variable minted outside the arm — the
+        // match's own result above all — may then not come to stand
+        // for it. See [`Table::scoped_rigids`].
+        let opens = arms.iter().any(|(pattern, _)| ir::opens_hidden(pattern));
+        if opens {
+            self.table.level += 1;
+        }
+        let mut qualifying = None;
+        let expected = match arms.is_empty() {
+            true => Arc::new(Ty::plain(Ty::Sum(Row {
+                labels: IndexMap::new(),
+                rest: Rest::Closed,
+            }))),
+            false => {
+                let columns = Columns {
+                    matrix: ir::Matrix::new(arms.iter().map(|(pattern, _)| pattern)),
+                    patterns: arms.iter().map(|(pattern, _)| pattern).collect(),
+                    at: scrutinee.at,
+                };
+                let root: Vec<(usize, Col)> = columns
+                    .patterns
+                    .iter()
+                    .enumerate()
+                    .map(|(arm, pattern)| (arm, Col::Pattern(pattern)))
+                    .collect();
+                let (demand, cover) = self.position(&columns, &mut Vec::new(), &root);
+                // The column-to-constraint conversion: what the arms
+                // cover between them, over the finite presences the
+                // demand just minted. Its ordered per-arm forms also
+                // become the explicit guarded constraint below.
+                if let Some(cover) = cover {
+                    let raw: Vec<Formula> = (0..arms.len())
+                        .map(|arm| cover.get(&arm).cloned().unwrap_or(Formula::True))
+                        .collect();
+                    let fields = match &*demand {
+                        Ty::Struct(row) => row
+                            .labels
+                            .iter()
+                            .map(|(name, field)| (name.clone(), field.presence.clone()))
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    let paths = structural_presence_paths(&demand);
+                    let formula = Formula::any(raw.clone());
+                    let premise_reason = self.table.require(
+                        span,
+                        Origin::Coverage(Coverage {
+                            arms: raw.clone(),
+                            fields,
+                            paths,
+                        }),
+                        formula,
+                    );
+                    qualifying = Some((raw, premise_reason));
+                }
+                demand
+            }
+        };
+        let actual = scrutinee.ty.clone();
+        self.checks(
+            scrutinee.at,
+            &actual,
+            &expected,
+            ConstraintOrigin::MatchScrutinee,
+            Subject::PatternDemand,
+            None,
+            Subject::MatchScrutinee,
+        );
+        // Now that the scrutinee's type reaches every position, each
+        // `hide` pattern may open its own.
+        for open in std::mem::take(&mut self.opens) {
+            self.emit(
+                open.declared,
+                ConstraintOrigin::Pattern,
+                ConstraintSubjects::pair(Subject::MatchScrutinee, Subject::PatternDemand),
+                ConstraintKind::Open {
+                    hidden: open.hidden,
+                    binder: open.binder,
+                    name: open.name,
+                    declared: open.declared,
+                    opened: open.opened,
+                },
+            );
+        }
+
+        match qualifying {
+            Some((raw, premise_reason)) => {
+                let effective = effective_conditions(&raw);
+                let mut guarded = Vec::with_capacity(arms.len());
+                for (((pattern, body), raw), effective) in arms.iter_mut().zip(raw).zip(effective) {
+                    // The arm is a scope in the generated constraint
+                    // tree. Store batches emitted while walking it are
+                    // held inert in their source-order slots and travel
+                    // with it, so solving can put the premise around them.
+                    let outer = std::mem::take(&mut self.out);
+                    let required = self.table.store.batches.len();
+                    let combined = self.presence_guard.clone().and(effective.clone());
+                    let enclosing = std::mem::replace(&mut self.presence_guard, combined);
+                    self.arm_body(body, known);
+                    self.presence_guard = enclosing;
+                    let constraints = std::mem::replace(&mut self.out, outer);
+                    let requirements = self.defer_requirements(required);
+                    let mut arm_result = self.constraint(
+                        body.at,
+                        ConstraintOrigin::MatchArm,
+                        ConstraintSubjects::pair(Subject::MatchResult, Subject::MatchArm),
+                        ConstraintKind::Equal {
+                            expected: result.clone(),
+                            actual: body.ty.clone(),
+                        },
+                    );
+                    Self::mark_branch_result(&mut arm_result, span);
+                    guarded.push(GuardedArm {
+                        at: pattern.at,
+                        raw,
+                        effective,
+                        premise_reason,
+                        constraints,
+                        requirements,
+                        result: arm_result,
+                    });
+                }
+                self.emit(
+                    span,
+                    ConstraintOrigin::Match,
+                    ConstraintSubjects::pair(Subject::MatchScrutinee, Subject::MatchResult),
+                    ConstraintKind::Match {
+                        scrutinee: expected,
+                        result: result.clone(),
+                        arms: guarded,
+                        store_end: self.table.store.batches.len(),
+                    },
+                );
+            }
+            // A mixed tag/literal column keeps the old flat equality
+            // constraints exactly.
+            None => {
+                for (pattern, body) in arms.iter_mut() {
+                    // An arm opening a hidden type has its
+                    // constraints solved at the arm's own level, so
+                    // what the solver mints for the body is as deep
+                    // as the type the arm opened.
+                    let scoped = ir::opens_hidden(pattern).then(|| std::mem::take(&mut self.out));
+                    self.arm_body(body, known);
+                    let actual = body.ty.clone();
+                    self.checks(
+                        body.at,
+                        &actual,
+                        &result,
+                        ConstraintOrigin::MatchArm,
+                        Subject::MatchResult,
+                        None,
+                        Subject::MatchArm,
+                    );
+                    Self::mark_branch_result(
+                        self.out.last_mut().expect("just emitted branch result"),
+                        span,
+                    );
+                    if let Some(outer) = scoped {
+                        let constraints = std::mem::replace(&mut self.out, outer);
+                        self.emit(
+                            body.at,
+                            ConstraintOrigin::MatchArm,
+                            ConstraintSubjects::one(Subject::MatchArm),
+                            ConstraintKind::Scoped {
+                                level: self.table.level,
+                                constraints,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        if opens {
+            self.table.level -= 1;
+        }
+        result
+    }
+
+    /// An arm's body, or a block's result: inferred, or checked where the
+    /// context knows what it has to be.
+    fn arm_body(&mut self, body: &mut Term, expected: Option<Expected<'_>>) {
+        match expected {
+            Some(expected) => self.check_term(body, expected.ty, expected.subject, expected.span),
+            None => self.infer_term(body),
+        }
+    }
+
+    /// Check `term` against the hidden type `package`, whose body is `body`
+    /// over `binder`: the compiler infers the witness — the one type the
+    /// hidden variable stands for here — from the term and its context, and
+    /// packages the term under it.
+    ///
+    /// The term is walked one level in, so that whatever it mints for itself
+    /// is deeper than the witness; the solver then refuses a witness that
+    /// only such a variable could decide, since nothing chose the hidden
+    /// type. A form checking pushes into meets the opened body directly; any
+    /// other is inferred and fitted by the solver, which lets a value already
+    /// of this hidden type pass through unopened.
+    #[allow(clippy::too_many_arguments)]
+    fn introduce(
+        &mut self,
+        term: &mut Term,
+        package: &Arc<Ty>,
+        binder: u32,
+        name: &Arc<str>,
+        body: &Arc<Ty>,
+        expected_subject: Subject,
+        expected_span: Option<Anchor>,
+    ) {
+        let outer = self.table.level;
+        self.table.level += 1;
+        let witness = self.table.fresh_type_for(Subject::HiddenWitness);
+        let opened = crate::types::open_hidden(body, binder, &witness);
+        let held = std::mem::take(&mut self.out);
+        let fit = match &term.kind {
+            TermKind::Fn { .. }
+            | TermKind::Struct { .. }
+            | TermKind::Array(_)
+            | TermKind::Tag { .. } => {
+                self.check_term(term, &opened, expected_subject, expected_span);
+                None
+            }
+            _ => {
+                self.infer_term(term);
+                Some((term.ty.clone(), opened))
+            }
+        };
+        let constraints = std::mem::replace(&mut self.out, held);
+        self.table.level = outer;
+        self.emit(
+            term.at,
+            ConstraintOrigin::ContextualCheck,
+            ConstraintSubjects::pair(expected_subject, Subject::Term),
+            ConstraintKind::Introduce {
+                package: package.clone(),
+                name: name.clone(),
+                witness,
+                level: outer + 1,
+                fit,
+                constraints,
+            },
+        );
+        term.ty = package.clone();
+    }
+
     /// Check `term` against a type the context already knows. Checking pushes
     /// expected types *into* binders — an annotated `fn p => p.x` learns `p`'s
     /// type from the annotation before the body needs it, which inference
@@ -1528,6 +1752,31 @@ impl Constrain<'_> {
         // than from this, so the term keeps the name the user wrote and prints
         // as it.
         let shape = self.table.unfolded(self.aliases, expected);
+        if let Ty::Hidden { binder, name, body } = &*shape {
+            let (binder, name, body) = (*binder, name.clone(), body.clone());
+            let known = Expected {
+                ty: expected,
+                subject: expected_subject,
+                span: expected_span,
+            };
+            match term.kind {
+                // The context reaches into a block's result and into each
+                // arm's body, which may each package under a witness of its
+                // own.
+                TermKind::Let { .. } => term.ty = self.let_term(term, Some(known)),
+                TermKind::Match { .. } => term.ty = self.match_term(term, Some(known)),
+                _ => self.introduce(
+                    term,
+                    expected,
+                    binder,
+                    &name,
+                    &body,
+                    expected_subject,
+                    expected_span,
+                ),
+            }
+            return;
+        }
         match (&mut term.kind, &*shape) {
             // Inputs and results use the annotation immediately. Effects meet
             // that same promise after fresh local state has been isolated;

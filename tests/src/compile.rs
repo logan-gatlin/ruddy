@@ -1567,3 +1567,33 @@ fn reification_shared_generic_aliases_do_not_expand_unused_callable_fields() {
             .is_ok()
     );
 }
+
+/// A hidden type declared in a dependency is the same hidden type in the
+/// consumer: values of it open there, and the consumer's own values package
+/// under the imported alias.
+#[test]
+fn imported_hidden_types_open_and_package_like_local_ones() {
+    let dependency = exported(
+        "type Box = hide 'a => { value: 'a, show: 'a -> String }\n\
+         extern show_nat: Nat -> String = \"host.nat\"\n\
+         let one: Box = { value: 1n, show: show_nat }\n\
+         let describe: Box -> String = fn box => match box with\n\
+         | hide 'v { value, show } => show value\n\
+         end",
+    );
+    let accepted = accepted_with(
+        "let shown = dep::describe dep::one\n\
+         let own: dep::Box = { value: \"x\", show: fn s => s }\n\
+         let opened = match dep::one with | hide 'v { value, show } => show value end\n\
+         let described = dep::describe own",
+        &dependency,
+    );
+    assert_eq!(scheme(&accepted, "shown"), "String");
+    assert!(
+        scheme(&accepted, "own").ends_with("Box"),
+        "{}",
+        scheme(&accepted, "own")
+    );
+    assert_eq!(scheme(&accepted, "opened"), "String");
+    assert_eq!(scheme(&accepted, "described"), "String");
+}
