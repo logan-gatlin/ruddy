@@ -10,6 +10,18 @@ fn project(source: &str, platform: &str, kind: &str) -> tempfile::TempDir {
     project
 }
 
+/// A project whose manifest binds `Nat` and `Int` to a precision, so what the
+/// standard library accepts can be watched at more than the default domain.
+fn domain_project(source: &str, integers: u32) -> tempfile::TempDir {
+    let project = tempfile::tempdir().unwrap();
+    let standard = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    fs::write(project.path().join("Ruddy.toml"), format!(
+        "name = \"api-test\"\nversion = \"0.1.0\"\nkind = \"library\"\nroot = \"main.rud\"\ntarget = \"js\"\nplatform = \"node\"\nintegers = {integers}\n\n[dependencies]\nstd = {standard:?}\n"
+    )).unwrap();
+    fs::write(project.path().join("main.rud"), source).unwrap();
+    project
+}
+
 fn run(project: &Path, script: &str) {
     ruddy_cli::check_project(project).expect("API consumer checks");
     let artifact = ruddy_cli::build_project(project).expect("API consumer builds");
@@ -868,6 +880,80 @@ await assert.rejects(async () => app.echo_int(-9007199254740992), /Int/);
 assert.ok(Object.is(await app.echo_nat(-0), 0));
 assert.ok(Object.is(await app.echo_int(-0), 0));
 "#,
+    );
+}
+
+#[test]
+fn the_standard_library_reads_integers_within_the_bound_domain() {
+    let source = r#"
+let decode_nat: String -> Result Nat std::json::Error = std::json::decode
+let decode_int: String -> Result Int std::json::Error = std::json::decode
+let decode_nat64: String -> Result Nat64 std::json::Error = std::json::decode
+let read_nat: [Nat8] -> Result Nat std::binary::Error = std::binary::decode
+let read_int: [Nat8] -> Result Int std::binary::Error = std::binary::decode
+let widen_nat32: Nat32 -> Nat = fn value => std::nat::to_nat32 value
+let widen_nat64: Nat64 -> Nat = fn value => std::nat::to_nat64 value
+let widen_int32: Int32 -> Int = fn value => std::int::to_int32 value
+let widen_int64: Int64 -> Int = fn value => std::int::to_int64 value
+"#;
+    let helpers = r#"
+const big = (key, value) => typeof value === 'bigint' ? value.toString() + 'n' : value;
+const some = result => { assert.equal(result.tag, 'Some', JSON.stringify(result, big)); return result.value; };
+const range = result => {
+  assert.equal(result.tag, 'Error', JSON.stringify(result, big));
+  assert.equal(result.value.tag, 'Codec');
+  assert.equal(result.value.value.kind.tag, 'Range', JSON.stringify(result.value.value.kind, big));
+  return JSON.parse(JSON.stringify(result.value.value.kind.value, big));
+};
+const outside = 'a 64-bit value outside the target\'s domain';
+const out_of_range = { name: 'RangeError', message: 'integer out of range' };
+"#;
+    let narrow = domain_project(source, 32);
+    run(
+        narrow.path(),
+        &format!(
+            "{helpers}{}",
+            r#"
+assert.equal(some(await app.decode_nat('4294967295')), 4294967295);
+assert.deepEqual(range(await app.decode_nat('4294967296')), { expected: 'Nat', found: '4294967296' });
+assert.equal(some(await app.decode_int('-2147483648')), -2147483648);
+assert.deepEqual(range(await app.decode_int('-2147483649')), { expected: 'Int', found: '-2147483649' });
+assert.deepEqual(range(await app.decode_int('2147483648')), { expected: 'Int', found: '2147483648' });
+assert.equal(some(await app.decode_nat64('18446744073709551615')), 18446744073709551615n);
+assert.deepEqual(range(await app.read_nat([0, 0, 0, 0, 1, 0, 0, 0])), { expected: 'Nat', found: outside });
+assert.equal(some(await app.read_nat([255, 255, 255, 255, 0, 0, 0, 0])), 4294967295);
+assert.deepEqual(range(await app.read_int([0, 0, 0, 128, 0, 0, 0, 0])), { expected: 'Int', found: outside });
+assert.equal(some(await app.read_int([0, 0, 0, 128, 255, 255, 255, 255])), -2147483648);
+assert.equal(await app.widen_nat32(4294967295), 4294967295);
+assert.equal(await app.widen_int32(-2147483648), -2147483648);
+assert.equal(await app.widen_int64(-2147483648n), -2147483648);
+await assert.rejects(async () => app.widen_nat64(4294967296n), out_of_range);
+await assert.rejects(async () => app.widen_int64(2147483648n), out_of_range);
+"#
+        ),
+    );
+    let wide = domain_project(source, 53);
+    run(
+        wide.path(),
+        &format!(
+            "{helpers}{}",
+            r#"
+assert.equal(some(await app.decode_nat('4294967296')), 4294967296);
+assert.equal(some(await app.decode_nat('9007199254740991')), 9007199254740991);
+assert.deepEqual(range(await app.decode_nat('9007199254740992')), { expected: 'Nat', found: '9007199254740992' });
+assert.equal(some(await app.decode_int('-2147483649')), -2147483649);
+assert.equal(some(await app.decode_int('-9007199254740991')), -9007199254740991);
+assert.deepEqual(range(await app.decode_int('-9007199254740992')), { expected: 'Int', found: '-9007199254740992' });
+assert.equal(some(await app.decode_nat64('18446744073709551615')), 18446744073709551615n);
+assert.equal(some(await app.read_nat([0, 0, 0, 0, 1, 0, 0, 0])), 4294967296);
+assert.equal(some(await app.read_int([0, 0, 0, 128, 0, 0, 0, 0])), 2147483648);
+assert.equal(await app.widen_nat32(4294967295), 4294967295);
+assert.equal(await app.widen_nat64(4294967296n), 4294967296);
+await assert.rejects(async () => app.widen_nat64(9007199254740992n), out_of_range);
+await assert.rejects(async () => app.widen_nat64(18446744073709551615n), out_of_range);
+await assert.rejects(async () => app.widen_int64(-9007199254740992n), out_of_range);
+"#
+        ),
     );
 }
 

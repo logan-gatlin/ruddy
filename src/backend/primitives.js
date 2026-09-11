@@ -34,10 +34,10 @@ const $prim = {
       value => { const unsigned = BigInt.asUintN(64, BigInt(value)); return Array.from({ length: 8 }, (_, index) => Number((unsigned >> BigInt(index * 8)) & 255n)); }
     ),
     nat_from_bytes: (
-      bytes => { const value = bytes.reduce((total, byte, index) => total | (BigInt(byte) << BigInt(index * 8)), 0n); return value <= BigInt(Number.MAX_SAFE_INTEGER) ? { tag: "Some", value: Number(value) } : { tag: "None" }; }
+      bytes => { const value = bytes.reduce((total, byte, index) => total | (BigInt(byte) << BigInt(index * 8)), 0n); return value <= BigInt($domains.nat.max) ? { tag: "Some", value: Number(value) } : { tag: "None" }; }
     ),
     int_from_bytes: (
-      bytes => { const value = BigInt.asIntN(64, bytes.reduce((total, byte, index) => total | (BigInt(byte) << BigInt(index * 8)), 0n)); return value <= BigInt(Number.MAX_SAFE_INTEGER) && value >= -BigInt(Number.MAX_SAFE_INTEGER) ? { tag: "Some", value: Number(value) } : { tag: "None" }; }
+      bytes => { const value = BigInt.asIntN(64, bytes.reduce((total, byte, index) => total | (BigInt(byte) << BigInt(index * 8)), 0n)); return value >= BigInt($domains.int.min) && value <= BigInt($domains.int.max) ? { tag: "Some", value: Number(value) } : { tag: "None" }; }
     ),
     nat32_to_bytes: (
       value => [value & 255, (value >>> 8) & 255, (value >>> 16) & 255, (value >>> 24) & 255]
@@ -138,7 +138,7 @@ const $prim = {
       value => String(value)
     ),
     to_int8: (
-      value => { const result = value; if (!Number.isSafeInteger(result)) throw new RangeError("integer out of range"); return result; }
+      value => { const result = value; if (result < $domains.int.low || result > $domains.int.high) throw new RangeError("integer out of range"); return result; }
     ),
     add16: (
       (left, right) => ((left + right) << 16 >> 16)
@@ -189,7 +189,7 @@ const $prim = {
       value => String(value)
     ),
     to_int16: (
-      value => { const result = value; if (!Number.isSafeInteger(result)) throw new RangeError("integer out of range"); return result; }
+      value => { const result = value; if (result < $domains.int.low || result > $domains.int.high) throw new RangeError("integer out of range"); return result; }
     ),
     add32: (
       (left, right) => ((left + right) | 0)
@@ -240,7 +240,7 @@ const $prim = {
       value => String(value)
     ),
     to_int32: (
-      value => { const result = value; if (!Number.isSafeInteger(result)) throw new RangeError("integer out of range"); return result; }
+      value => { const result = value; if (result < $domains.int.low || result > $domains.int.high) throw new RangeError("integer out of range"); return result; }
     ),
     add64: (
       (left, right) => BigInt.asIntN(64, left + right)
@@ -291,7 +291,7 @@ const $prim = {
       value => String(value)
     ),
     to_int64: (
-      value => { const result = Number(value); if (!Number.isSafeInteger(result)) throw new RangeError("integer out of range"); return result; }
+      value => { const result = Number(value); if (value < BigInt($domains.int.min) || value > BigInt($domains.int.max) || BigInt(result) !== value) throw new RangeError("integer out of range"); return result; }
     ),
   },
   json: {
@@ -403,7 +403,7 @@ const $prim = {
       value => String(value)
     ),
     to_nat8: (
-      value => { const result = value; if (!Number.isSafeInteger(result) || result < 0) throw new RangeError("integer out of range"); return result; }
+      value => { const result = value; if (result < $domains.nat.low || result > $domains.nat.high) throw new RangeError("integer out of range"); return result; }
     ),
     add16: (
       (left, right) => ((left + right) & 65535)
@@ -448,7 +448,7 @@ const $prim = {
       value => String(value)
     ),
     to_nat16: (
-      value => { const result = value; if (!Number.isSafeInteger(result) || result < 0) throw new RangeError("integer out of range"); return result; }
+      value => { const result = value; if (result < $domains.nat.low || result > $domains.nat.high) throw new RangeError("integer out of range"); return result; }
     ),
     add32: (
       (left, right) => ((left + right) >>> 0)
@@ -493,7 +493,7 @@ const $prim = {
       value => String(value)
     ),
     to_nat32: (
-      value => { const result = value; if (!Number.isSafeInteger(result) || result < 0) throw new RangeError("integer out of range"); return result; }
+      value => { const result = value; if (result < $domains.nat.low || result > $domains.nat.high) throw new RangeError("integer out of range"); return result; }
     ),
     add64: (
       (left, right) => BigInt.asUintN(64, left + right)
@@ -538,7 +538,7 @@ const $prim = {
       value => String(value)
     ),
     to_nat64: (
-      value => { const result = Number(value); if (!Number.isSafeInteger(result) || result < 0) throw new RangeError("integer out of range"); return result; }
+      value => { const result = Number(value); if (value < BigInt($domains.nat.min) || value > BigInt($domains.nat.max) || BigInt(result) !== value) throw new RangeError("integer out of range"); return result; }
     ),
   },
   real: {

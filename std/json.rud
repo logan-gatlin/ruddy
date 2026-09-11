@@ -343,12 +343,40 @@ let digits_at_most: String -> String -> Bool = fn digits maximum =>
   end
 
 @private
+let nat_mirror: Mirror Nat = reflect::mirror ()
+
+@private
+let int_mirror: Mirror Int = reflect::mirror ()
+
+@doc "The domain the root node of a description carries, when that node is an integer kind. `Nat` and `Int` are described as the target bound them, so the reader accepts exactly what this program's integers hold."
+@private
+let root_domain: reflect::Description -> reflect::Domain = fn description =>
+  match array::get description.nodes description.root with
+  | #Some (#Nat domain) => domain
+  | #Some (#Int domain) => domain
+  | _ => { bits: 53n, signed: false, min: "0", max: "9007199254740991" }
+  end
+
+@private
+let nat_domain: reflect::Domain = root_domain (reflect::describe nat_mirror)
+
+@private
+let int_domain: reflect::Domain = root_domain (reflect::describe int_mirror)
+
+@doc "The magnitude of the least `Int`, as digits: the domain's minimum without its sign."
+@private
+let int_magnitude: String = match str::strip_prefix int_domain.min "-" with
+| #Some digits => digits
+| #None => int_domain.min
+end
+
+@private
 let nat_of_token: String -> Limits -> Result Nat codec::Error = fn token limits =>
   chain
     (fn parsed => match parsed with
     | #Some { negative, digits } =>
       if negative and not str::equal digits "0" then range "Nat" token
-      else if digits_at_most digits "9007199254740991" then #Some (nat_of_digits digits)
+      else if digits_at_most digits nat_domain.max then #Some (nat_of_digits digits)
       else range "Nat" token
       end
     | #None => range "Nat" token
@@ -360,8 +388,11 @@ let int_of_token: String -> Limits -> Result Int codec::Error = fn token limits 
   chain
     (fn parsed => match parsed with
     | #Some { negative, digits } =>
-      if digits_at_most digits "9007199254740991" then
-        #Some (if negative then int::negate (int_of_digits digits) else int_of_digits digits end)
+      if negative then
+        if digits_at_most digits int_magnitude then #Some (int_of_digits (str::concat "-" digits))
+        else range "Int" token
+        end
+      else if digits_at_most digits int_domain.max then #Some (int_of_digits digits)
       else range "Int" token
       end
     | #None => range "Int" token
