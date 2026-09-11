@@ -3127,7 +3127,10 @@ end
             *value = 999;
         }
         let message = changed.validate().unwrap_err().to_string();
-        assert!(message.contains(expected), "{kind:?} {corruption}: {message}");
+        assert!(
+            message.contains(expected),
+            "{kind:?} {corruption}: {message}"
+        );
     }
 }
 
