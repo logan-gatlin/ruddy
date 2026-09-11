@@ -681,6 +681,58 @@ let ordered = std::str::join "," [
     );
 }
 
+/// `std::abi` is pure data and pure arithmetic, so the reference interpreter
+/// runs it unchanged and must reach the same verdict as the JavaScript backend
+/// on the same plan. Neither backend calls anything: a validated plan is a
+/// reading of the plan's own numbers.
+#[test]
+fn abi_plans_validate_the_same_way_on_both_backends() {
+    let source = r#"
+let owner: std::abi::Ownership = {
+  allocated_by: #Caller,
+  freed_by: #Some (#Caller),
+  free_with: #Some "free",
+  lifetime: #Call,
+}
+let byte: std::abi::Type = #Scalar (#Integer { bits: 8n, signed: false })
+let write_all: std::abi::Type -> std::abi::Plan = fn buffer => {
+  name: "write_all",
+  convention: #C,
+  address_bits: 64n,
+  parameters: [
+    { name: "buffer", shape: buffer },
+    { name: "len", shape: #Scalar (#Integer { bits: 64n, signed: false }) },
+  ],
+  result: #None,
+  obligations: [
+    { duty: #Validity, note: "the caller passes a readable region of len bytes" },
+    { duty: #Lifetime, note: "the region stays readable until the call returns" },
+    { duty: #Provenance, note: "the region comes from malloc and goes back to free" },
+  ],
+}
+let stated = write_all
+  (#Pointer { pointee: byte, ownership: #Some owner, length: #Some (#Parameter "len"), nullable: false })
+let unstated = write_all (#Pointer { pointee: byte, ownership: #None, length: #None, nullable: false })
+let accepted = match std::abi::validate stated with
+| #Some _ => true
+| #Error _ => false
+end
+let accepted_faults = std::str::join " " (std::abi::report stated)
+let refused_faults = std::str::join " " (std::abi::report unstated)
+"#;
+    let exports = ["accepted", "accepted_faults", "refused_faults"];
+    let (node, interpreted) = both(source, &exports, None);
+    assert_eq!(node, interpreted);
+    assert_eq!(
+        interpreted,
+        vec![
+            "true",
+            "\"\"",
+            r#""the parameter \"buffer\" states no owner: a plan must say which side allocates the region and which side frees it. the parameter \"buffer\" states no length: a plan must say how many elements travel with the pointer, because no type says it.""#,
+        ]
+    );
+}
+
 #[test]
 fn a_host_value_the_interpreter_does_not_provide_is_named() {
     let mut program = load(
@@ -728,6 +780,59 @@ fn an_artifact_that_names_an_unknown_definition_is_refused() {
         error.to_string(),
         "invalid artifact: no definition named `nowhere@0.0.0::missing`"
     );
+}
+
+/// What the command line does with an artifact on disk: list what a bundle
+/// exports, or render the exports it is asked for.
+#[test]
+fn the_command_line_reads_an_artifact_from_disk() {
+    let project = project(
+        "let name = \"ruddy\"\nlet count = 3n\nlet missing = ()\n",
+        false,
+        None,
+        false,
+    );
+    let artifact = ruddy_cli::build_project(project.path()).expect("the project builds");
+    let path = artifact.to_str().unwrap().to_owned();
+
+    assert_eq!(
+        ruddy_interp::run(&[path.clone()]).unwrap(),
+        ["count", "missing", "name"]
+    );
+    assert_eq!(
+        ruddy_interp::run(&[path.clone(), "name".into(), "count".into()]).unwrap(),
+        ["\"ruddy\"", "3"]
+    );
+    assert_eq!(
+        ruddy_interp::run(&[path.clone(), "absent".into()])
+            .unwrap_err()
+            .to_string(),
+        "no exported value at `absent`"
+    );
+    assert_eq!(
+        ruddy_interp::run(&[]).unwrap_err().to_string(),
+        "usage: ruddy-interp <artifact> [export...]"
+    );
+
+    let missing = project.path().join("nowhere.artifact");
+    let error = ruddy_interp::run(&[missing.to_str().unwrap().into()])
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("could not read "), "{error}");
+
+    let broken = project.path().join("broken.artifact");
+    fs::write(&broken, "(artifact").unwrap();
+    let error = ruddy_interp::run(&[broken.to_str().unwrap().into()])
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("invalid artifact: "), "{error}");
+
+    let empty = project.path().join("empty.artifact");
+    fs::write(&empty, "(artifact (header) (lir))").unwrap();
+    let error = ruddy_interp::run(&[empty.to_str().unwrap().into()])
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("invalid artifact: "), "{error}");
 }
 
 #[test]

@@ -19,7 +19,7 @@ mod reflect;
 pub mod render;
 mod types;
 
-use std::{collections::BTreeMap, fmt};
+use std::{collections::BTreeMap, fmt, fs, path::Path};
 
 use ruddy::{artifact::Artifact, types::Domains};
 
@@ -35,6 +35,10 @@ pub enum Error {
     Load(String),
     /// The program reached something the interpreter does not implement.
     Unsupported(String),
+    /// A command line that names no artifact to run.
+    Usage,
+    /// The artifact could not be read from where it was named.
+    Unreadable { path: String, message: String },
     /// The program failed while running.
     Runtime(String),
 }
@@ -46,8 +50,42 @@ impl fmt::Display for Error {
             Self::Load(message) => write!(f, "invalid artifact: {message}"),
             Self::Unsupported(message) => write!(f, "unsupported: {message}"),
             Self::Runtime(message) => f.write_str(message),
+            Self::Usage => f.write_str("usage: ruddy-interp <artifact> [export...]"),
+            Self::Unreadable { path, message } => {
+                write!(f, "could not read {path}: {message}")
+            }
         }
     }
+}
+
+/// Run what a command line asks for: load the artifact it names, and either
+/// render the exports it names or list every export there is.
+pub fn run(arguments: &[String]) -> Result<Vec<String>, Error> {
+    let Some((path, names)) = arguments.split_first() else {
+        return Err(Error::Usage);
+    };
+    let program = read(Path::new(path))?;
+    if names.is_empty() {
+        return Ok(program.exports().map(str::to_owned).collect());
+    }
+    names
+        .iter()
+        .map(|name| program.export(name).map(|value| render::json(&value)))
+        .collect()
+}
+
+/// Read a linked artifact from disk and load it, checking as strictly as a
+/// dependency admission would.
+pub fn read(path: &Path) -> Result<Program, Error> {
+    let text = fs::read_to_string(path).map_err(|error| Error::Unreadable {
+        path: path.display().to_string(),
+        message: error.to_string(),
+    })?;
+    let artifact = ruddy::artifact::try_parse(&text)
+        .map_err(|error| Error::Load(error.to_string()))?
+        .validate()
+        .map_err(|error| Error::Load(error.to_string()))?;
+    Program::load(&artifact)
 }
 
 impl std::error::Error for Error {}
