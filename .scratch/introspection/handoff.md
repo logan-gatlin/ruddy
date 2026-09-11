@@ -1,33 +1,33 @@
 # Introspection implementation handoff
 
 Reviewed baseline: `cd906cfae71235dc6df2fdfbe16737c64b330546` (`cd906cf`).
-The working tree was clean at the end of the review. This handoff adds issue
-documentation only.
+Every confirmed defect this handoff listed is fixed as of `a643494`, each with
+a regression; what remains is the tracked spec work in the second table.
 
-Implement the remaining requirements of [the agreed spec](spec.md) and fix the
-confirmed defects below. There is substantial working implementation already:
-`hide`, mirrors and typed views, library codecs, JSON and positional binary,
-JS adapters, ABI plans, and the independent interpreter. The spec's original
-implementation-pending wording predates that work. Tickets 01–11 describe
-completed milestones, not proof that every spec acceptance criterion passes.
+Implement the remaining requirements of [the agreed spec](spec.md). There is
+substantial working implementation already: `hide`, mirrors and typed views,
+library codecs, JSON and positional binary, JS adapters, ABI plans, and the
+independent interpreter. The spec's original implementation-pending wording
+predates that work. Tickets 01–11 describe completed milestones, not proof
+that every spec acceptance criterion passes.
 
 ## Verified baseline
 
-The latest review ran `just test -q` successfully. The main `ruddy-tests` crate
-reported **1,875 passed, 0 failed, 10 ignored**; the workspace command completed
-successfully. Compiler coverage was not measured in that review.
+The review that produced this handoff reported **1,875 passed, 0 failed, 10
+ignored**. After the fixes the suite reports **1,882 passed, 0 failed, 10
+ignored** through `just test`, with `just fmt-check` and `just clippy` clean.
 
-Confirmed fixes to preserve: ABI fixtures use the current `Target` API;
+Earlier fixes to preserve: ABI fixtures use the current `Target` API;
 Real-to-Int rounding and decimal Int parsing normalize integer zero; negative
 nonzero Real underflow is rejected; effect-row order does not change mirror
 identity; hidden arrow results retain the parentheses needed to keep effects
 outside `hide`; revoked-proxy classification no longer throws. Debugger integer
-settings now survive load/save/cache/session paths, but their validation still
-has the defect in ticket 20.
+settings survive load/save/cache/session paths, and their validation is now
+shared with the command line.
 
-Targeted review probes reproduced defects beyond the passing suite. Each new
-ticket includes enough source/input to recreate its case. Do not rely on the
-reviewer's temporary `/tmp` projects being present on another machine.
+Targeted review probes reproduced defects beyond the passing suite. Each
+ticket keeps the source that recreated its case, beside the answer describing
+what the behavior is now.
 
 For probes using `std`, reuse the temporary project/build helpers in
 [stdlib API tests](../../tests/src/stdlib_apis.rs) or
@@ -37,55 +37,43 @@ Node. Tickets 18, 19, and 25 also provide standalone manifests without `std`.
 
 ## Fix order and ownership
 
-P1 denotes a type/effect/representation invariant violation, nontermination,
-or silent miscompilation. P2 denotes other confirmed correctness defects.
-Each row links to the implementation instructions and acceptance checks.
+Every confirmed defect below is fixed at `a643494`. Each ticket records the
+behavior it now has and the regression that holds it there.
 
-| Order | Priority | Ticket | Required outcome |
+| Order | Priority | Ticket | Outcome |
 | --- | --- | --- | --- |
-| 1 | P1 | [18 — Mirror and package identity](issues/18-authenticate-mirror-and-package-types.md) | Checked conversion cannot change the type of an authentic mirror or hidden package, on either backend. |
-| 2 | P1 | [19 — Recursive hidden descriptors](issues/19-terminate-recursive-hidden-descriptors.md) | Recursive types crossing `hide` produce a finite graph or a supported diagnostic, never unbounded expansion. |
-| 3 | P1 | [20 — Debugger target validation](issues/20-validate-debugger-integer-targets.md) | Debugger compilation rejects JS with 64-bit target integers, matching the CLI. |
-| 4 | P1 | [21 — Host lifting effects](issues/21-make-host-lifting-effects-explicit.md) | Arbitrary getter/proxy observation is effectful; pure lifting accepts only justified inert input. |
-| 5 | P1 | [22 — Scalar string replacement](issues/22-preserve-scalar-string-replacement.md) | Replacement preserves scalar validity and has identical defined behavior on JS and the interpreter. |
-| 6 | P1 | [16 — Strict host text](issues/16-strict-host-text-ingress.md) | Reject malformed host strings, keys, and metadata at checked ingress. |
-| 7 | P2 | [14 — Hidden region safety](issues/14-regions-and-cells-in-descriptions.md) | Reject packaging that drops untracked region/presence dependencies; complete the descriptive work separately. |
-| 8 | P2 | [23 — Codec limits](issues/23-enforce-codec-resource-limits.md) | Enforce advertised input/output/member/work limits before allocation. |
-| 9 | P2 | [24 — Sequence completion](issues/24-check-declared-sequence-lengths.md) | A writer cannot report success after emitting fewer or more elements than it declared. |
-| 10 | P2 | [25 — Intrinsic signatures](issues/25-validate-reflection-intrinsic-payloads.md) | Validate complete reflection result types, not just field/case names. |
-| 11 | P2 | [26 — Observation errors](issues/26-contain-host-observation-failures.md) | Even hostile thrown values become structured host-observation errors. |
+| 1 | P1 | [18 — Mirror and package identity](issues/18-authenticate-mirror-and-package-types.md) | Fixed. A handle is held against the type the position reads it under, at ingress, on both backends; sealing records the type a value was sealed at. |
+| 2 | P1 | [19 — Recursive hidden descriptors](issues/19-terminate-recursive-hidden-descriptors.md) | Fixed. Re-entering a binder drops the occurrence it shadows, so the back edge closes; a node limit turns any remaining runaway into a diagnostic. |
+| 3 | P1 | [20 — Debugger target validation](issues/20-validate-debugger-integer-targets.md) | Fixed. `Build::resolve` is the one validated construction; a refused configuration compiles nothing. |
+| 4 | P1 | [21 — Host lifting effects](issues/21-make-host-lifting-effects-explicit.md) | Fixed. `js::lift` carries the observation effect; `js::read` is pure and accepts only a snapshot or a host primitive. |
+| 5 | P1 | [22 — Scalar string replacement](issues/22-preserve-scalar-string-replacement.md) | Fixed. One literal, non-overlapping, scalar-boundary contract, the same on both backends. |
+| 6 | P1 | [16 — Strict host text](issues/16-strict-host-text-ingress.md) | Fixed. Ingress refuses text that is not scalars; `js::text` is the explicit repair. |
+| 7 | P2 | [14 — Hidden region safety](issues/14-regions-and-cells-in-descriptions.md) | Safety half fixed: packaging a value that carries a region is refused. The descriptive half stays open below. |
+| 8 | P2 | [23 — Codec limits](issues/23-enforce-codec-resource-limits.md) | Fixed. Byte and member budgets are counted before the material is built, on both writers and both readers, in UTF-8 bytes. |
+| 9 | P2 | [24 — Sequence completion](issues/24-check-declared-sequence-lengths.md) | Fixed. A frame keeps the declared length beside the completed count, in both handlers. |
+| 10 | P2 | [25 — Intrinsic signatures](issues/25-validate-reflection-intrinsic-payloads.md) | Fixed. Recognition checks the whole resolved signature of `$describe` and `$shape`. |
+| 11 | P2 | [26 — Observation errors](issues/26-contain-host-observation-failures.md) | Fixed. Describing a thrown value is total, and its text satisfies the scalar contract. |
 
-Work can proceed in parallel: compiler/evidence work (18, 19, 25 and the safety
-part of 14), host/text work (21, 22, 16, 26), codec work (23, 24), and debugger
-validation (20). Coordinate 18 with exact descriptor equality and scope rules;
-coordinate 21/16/26 at every host boundary. Address these defects before
-expanding the codec surface.
-
-Two especially useful end-to-end regressions are:
-
-- A correctly typed `ffi::encode`/`ffi::decode` round trip must not turn
-  `Mirror Nat` into `Mirror String` and thereby supply a `Nat -> String`
-  identity cast. The same check is needed for hidden packages; authentic does
-  not imply authentic for the requested type.
-- In the debugger, selecting `target: "js", integers: 64` currently lets
-  `9007199254740993n` match the literal `9007199254740992n` without diagnostics.
-  The emitted runtime bounds are clamped to 53 bits, but the two internal
-  literals still collapse to the same Number. Validate the build configuration
-  before compilation; clamping an admitted domain does not implement it.
+Found and fixed while working through these, outside the list: the host
+export adapter was compiled with the default integer domains, so a bundle
+binding another could not link its own exports.
 
 ## Remaining spec work already tracked
 
-These are open implementation requirements, not new regressions introduced by
-the latest fix commit. Keep them visible after the immediate defects are fixed.
+These are open implementation requirements, not regressions. They are what is
+left of the spec after the defects above.
 
 | Ticket | Remaining work and scope |
 | --- | --- |
 | [12 — Streaming](issues/12-streaming-codecs.md) | Incremental sources/sinks, declared I/O effects, nested session isolation, owned output, and failure ending a streaming session. Include propagation of custom codec effects; current `Encoder`/`Decoder` types admit only `!Write`/`!Read`. |
 | [13 — Conditional presence](issues/13-conditional-presence-in-mirrors.md) | Presence evidence in descriptions and calling conventions, joint builder checks, and injectors available only when case admission is proved. |
-| [14 — Regions and cells](issues/14-regions-and-cells-in-descriptions.md) | Safe opaque descriptions for cells/regions and preservation of transitive dependencies. Conservative rejection of unsafe packaging is an immediate requirement; full scoped reflection must not precede its dependency tracking. |
+| [14 — Regions and cells](issues/14-regions-and-cells-in-descriptions.md) | Descriptive half only: safe opaque descriptions for cells and regions, and preservation of transitive dependencies. Conservative rejection of unsafe packaging is done. |
 | [15 — Codec policies and schemas](issues/15-codec-combinators-and-schema-evolution.md) | Projection/validation/record/sum/rename/default/version combinators, source-schema decoding, cycle rejection, schema/canonical work limits, and typed field lookup. Complete the shared wire vocabulary for bytes, maps, tuples, and extensions. |
-| [16 — Text ingress](issues/16-strict-host-text-ingress.md) | The immediate checked-Unicode defect, including keys and metadata, and explicit opt-in lossy conversion. |
 | [17 — Artifact identity and binding](issues/17-symbolic-artifacts-and-host-identities.md) | Symbolic target primitives bound once, incompatible specialization rejection, and alpha-equivalent hidden type identity across bundles. Distinct native/Wasm host identities belong with those future integrations; their production runtimes are not required now. |
+
+[16](issues/16-strict-host-text-ingress.md) is closed: the checked-Unicode
+defect is fixed for payloads, keys, and metadata, and the lossy conversion is
+explicit.
 
 The shared protocol currently cannot directly express several of the explicit
 wire policies promised by the spec: there are no byte-string/map/extension
