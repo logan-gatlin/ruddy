@@ -1000,7 +1000,7 @@ fn missing_dependency_paths_report_the_requested_namespace() {
 }
 
 #[test]
-fn a_local_module_cannot_shadow_a_direct_dependency_root() {
+fn a_local_module_can_shadow_a_direct_dependency_root() {
     let directory = project();
     write_project(&directory.path().join("std"), "std", "1.0.0", &[]);
     fs::write(
@@ -1010,12 +1010,29 @@ fn a_local_module_cannot_shadow_a_direct_dependency_root() {
     .unwrap();
     fs::write(
         directory.path().join("main.rud"),
-        "module std = let local = 1n end\nlet main = 0n\n",
+        "module std = let value = true end\nlet local: Bool = std::value\nlet rooted: Bool = bundle::std::value\nusing ::std::value as external\nlet main: Nat = ::std::value\n",
     )
     .unwrap();
-    let error = error(&directory);
-    assert!(error.contains("[duplicate-module] Error"), "{error}");
-    assert!(error.contains("`std` is defined more than once"), "{error}");
+    let built = compile(directory.path()).expect("local and dependency roots coexist");
+    assert!(
+        built
+            .header()
+            .values
+            .iter()
+            .all(|value| !value.name.ends_with("::external"))
+    );
+    Artifact::try_parse(&built.print())
+        .unwrap()
+        .validate()
+        .unwrap();
+    for source in [
+        "let main = bundle::std::value",
+        "using bundle::std",
+        "module std = end let main = std::value",
+    ] {
+        fs::write(directory.path().join("main.rud"), source).unwrap();
+        assert!(compile(directory.path()).is_err(), "{source}");
+    }
 }
 
 #[test]

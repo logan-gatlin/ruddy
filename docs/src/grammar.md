@@ -327,7 +327,11 @@ A [module](dictionary.md#module) groups names under a shared name.
 An inline module uses `module Name =`, its contents, and `end`.
 The form `module name` loads the module from a separate file.
 A path uses `::` between module names, as in `std::io::print`; effect paths put `!` before the final effect name, as in `std::io::!IO.write`.
-Paths normally resolve their first name from the surrounding lexical scope. A leading `::` starts at the bundle root instead, so `::std::io::println` names the same definition in every nested scope.
+Paths normally resolve their first name from the surrounding lexical scope, then
+fall back to dependency aliases. A leading `::` selects a dependency directly,
+so `::std::io::println` names the dependency even when a local module is named
+`std`. Use `bundle::std` to select a local root module with that name.
+Dependencies and local modules may share a name without a conflict.
 For example, an inline module groups application defaults:
 
 ```ruddy
@@ -335,6 +339,60 @@ module Defaults =
   let retry_limit = 3n
 end
 ```
+
+A `using` statement makes existing declarations available under shorter names.
+`using Defaults` binds the module name; `using Defaults::*` brings its declarations
+into scope. Use `as` to rename a binding and braces to group imports:
+
+```ruddy
+module Defaults =
+  type Count = Nat
+  let retry_limit = 3n
+end
+
+using Defaults::{self as defaults, Count, retry_limit as retries}
+let limit: Count = retries
+let qualified = defaults::retry_limit
+```
+
+Dependency imports can use the same prefix: `using ::std::nat::{self, *}`.
+These imports remain lexical aliases and do not become bundle exports.
+
+Groups can nest and include globs, such as `using App::{Settings::{self, *}}`.
+An import brings in every matching value, type, effect, and module namespace.
+Write an effect's declaration name in the import, then use its usual `!` spelling.
+
+Module-level imports apply throughout the containing module and its nested
+scopes, including before the statement. They can refer to later imports.
+Inside a `do` block, imports apply only from their statement onward:
+
+```ruddy
+module Defaults =
+  let retry_limit = 3n
+end
+
+let limit = do
+  using Defaults::retry_limit as retries
+  return retries
+end
+```
+
+`bundle::` starts at the current bundle's root, `self::` at the containing module,
+and `super::` at its parent. Repeat `super::` to climb further; climbing above the
+root is an error. These prefixes also work in ordinary value, type, and effect
+paths. Importing an anchor itself requires an alias, such as
+`using bundle as root` or `using super as parent`.
+
+Explicit imports cannot duplicate an explicit import or declaration in the same
+namespace and scope. Explicit names override glob imports. Two globs exposing
+different declarations under the same name are ambiguous only when that name is
+used. Inner scopes can shadow outer names, and imports override the standard
+prelude. An invalid import is an error even when unused.
+
+Imports do not add bundle exports or qualified members to their containing
+module. If `A` imports `B::item`, that alone does not make `A::item` available.
+Likewise, `using A::*` imports A's accessible declarations, not A's imported
+names. Existing bundle-private access rules still apply.
 
 An [attribute](dictionary.md#attribute) precedes a definition as `@key` or `@key literal`.
 Several attributes can appear together, and their values may contain literal structs, tuples, arrays, or tags.

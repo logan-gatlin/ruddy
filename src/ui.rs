@@ -702,6 +702,7 @@ impl fmt::Display for Kind {
             Kind::Tilde => f.write_str("~"),
             Kind::Assign => f.write_str(":="),
             Kind::Not => f.write_str("not"),
+            Kind::Using => f.write_str("using"),
             Kind::Module => f.write_str("module"),
             Kind::Equal => f.write_str("="),
             Kind::FatArrow => f.write_str("=>"),
@@ -1344,6 +1345,7 @@ impl ir::ErrorKind {
             ir::ErrorKind::ExecutableDependency { .. } => "executable-dependency",
             ir::ErrorKind::DuplicateDependencyAlias { .. } => "duplicate-dependency-alias",
             ir::ErrorKind::DuplicateDependency { .. } => "duplicate-dependency",
+            ir::ErrorKind::Using { .. } => "using",
             ir::ErrorKind::Undefined { namespace, .. } => match namespace {
                 Namespace::Types => "undefined-type",
                 Namespace::Effects => "undefined-effect",
@@ -1435,6 +1437,7 @@ impl ir::Error {
         let code = self.kind.code();
         let span = source.span(self.at);
         match &self.kind {
+            E::Using { message } => Diagnostic::new(code, message.clone(), span),
             E::RuntimeTypeInformation { message } => Diagnostic::new(code, message.clone(), span)
                 .help("supply a concrete type at this use, or retain unknown foreign data as ForeignValue"),
             E::ForeignProtocol { message } => Diagnostic::new(self.kind.code(), message.clone(), source.span(self.at)),

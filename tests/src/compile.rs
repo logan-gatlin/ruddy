@@ -1567,3 +1567,320 @@ fn reification_shared_generic_aliases_do_not_expand_unused_callable_fields() {
             .is_ok()
     );
 }
+
+#[test]
+fn using_dependency_paths_are_separate_from_bundle_modules() {
+    let dependency = exported(
+        "let value = 42n type T = Nat effect Ask = { get: () -> Nat } module Child = let value = 1n end",
+    );
+    let program = accepted_with(
+        "module dep = let value = true type T = Bool end
+         let local: bundle::dep::T = dep::value
+         let external: ::dep::T = ::dep::value
+         using ::dep::{self as external_dep, value as imported, T as Number, Ask as Query, Child::{self as child, *}}
+         let imported_value: Number = imported
+         let via_alias = external_dep::value
+         let child_value = child::value
+         let query: () -> ::dep::T + ::dep::!Ask = fn _ => ::dep::!Ask.get ()
+         let alias_query: () -> Number + !Query = fn _ => !Query.get ()
+         module Nested =
+           using ::dep as dep
+           let relative = dep::value
+           let local = bundle::dep::value
+           let external = ::dep::value
+         end
+         let sequential = do using ::dep::* return value end",
+        &dependency,
+    );
+    assert_eq!(scheme(&program, "imported_value"), "tests@0.1.0::T");
+    assert_eq!(scheme(&program, "via_alias"), "Nat");
+    assert_eq!(scheme(&program, "child_value"), "Nat");
+    assert_eq!(scheme(&program, "sequential"), "Nat");
+    accepted_with("using dep let result = dep::value", &dependency);
+    accepted_with("let result = dep::value", &dependency);
+    assert!(
+        program
+            .artifact()
+            .header()
+            .modules
+            .iter()
+            .all(|module| !module.name.ends_with("::external_dep"))
+    );
+    for source in [
+        "module local = let value = 1n end let x = ::local::value",
+        "let value = 1n let x = ::value",
+        "module local = end using ::local",
+        "let x = ::Nat",
+        "effect E 'r = ::!mut 'r",
+    ] {
+        assert!(!rejected(source).ir.errors.is_empty(), "{source}");
+    }
+}
+
+#[test]
+fn using_module_aliases_are_hoisted_and_do_not_add_exports() {
+    let program = accepted(
+        "let answer = short::value\nusing Source as short\nmodule Source = let value = 42n end",
+    );
+    let header = program.artifact().header();
+    assert_eq!(header.values.len(), 2);
+    assert!(
+        header
+            .values
+            .iter()
+            .any(|value| value.name.ends_with("::answer"))
+    );
+    assert!(
+        header
+            .values
+            .iter()
+            .all(|value| !value.name.contains("::short"))
+    );
+}
+
+#[test]
+fn using_groups_import_all_namespaces_and_preserve_public_signatures() {
+    let producer = accepted(
+        "module Source =
+           @private type Count = Nat
+           effect Ask = { get: () -> Count }
+           let value: Count = 42n
+           module Child = let flag = true end
+         end
+         using Source::{self as source, Count as Number, Ask as Query, value, Child::{self as child, *}}
+         let answer: Number = value
+         let query: () -> Number + !Query = fn _ => !Query.get ()
+         let nested = (flag, child::flag, source::Child::flag)",
+    );
+    assert_eq!(scheme(&producer, "answer"), "Count");
+    let header = producer.artifact().header();
+    assert!(
+        header
+            .types
+            .iter()
+            .all(|item| !item.name.ends_with("::Number"))
+    );
+    assert!(
+        header
+            .effects
+            .iter()
+            .all(|item| !item.name.ends_with("::Query"))
+    );
+    assert!(
+        header
+            .modules
+            .iter()
+            .all(|item| !item.name.ends_with("::child") && !item.name.ends_with("::source"))
+    );
+    let artifact = ruddy::artifact::Artifact::try_parse(&producer.artifact().print()).unwrap();
+    let consumer = accepted_with(
+        "using dep::{answer, query}\nlet result: Nat = answer\nlet ask = query",
+        &artifact,
+    );
+    assert_eq!(scheme(&consumer, "result"), "Nat");
+}
+
+#[test]
+fn using_local_imports_are_sequential_nested_and_do_not_escape() {
+    let program = accepted(
+        "module Source = let value = true type T = Bool end
+         let value = 1n
+         let result = do
+           let before = value
+           using Source::{value, T}
+           let after: T = value
+           let nested = do using bundle as root return root::value end
+           return (before, after, nested)
+         end
+         let outside = value
+         let same_module = do using self::* return value end",
+    );
+    assert_eq!(scheme(&program, "outside"), "Nat");
+    assert_eq!(scheme(&program, "same_module"), "Nat");
+    assert_eq!(scheme(&program, "result"), "(Nat, T, Nat)");
+    for source in [
+        "module M = let x = 1n end let y = do let z = x using M::x return z end",
+        "module M = let x = 1n end let y = do using M::x return x end let z = x",
+        "module M = let x = 1n end let y = do using later::x using M as later return x end",
+    ] {
+        assert!(!rejected(source).ir.errors.is_empty(), "{source}");
+    }
+}
+
+#[test]
+fn using_alias_dependencies_resolve_forward_and_cycles_are_rejected() {
+    let program = accepted(
+        "using short::value as answer
+         using middle as short
+         using Source as middle
+         module Source = let value = true end
+         module Child = let inherited = answer end
+         let result = Child::inherited",
+    );
+    assert_eq!(scheme(&program, "result"), "Bool");
+    for source in [
+        "using a as b using b as a",
+        "module Seed = module x = module y = module y = module y = let v = 3n end let v = 2n end let v = 1n end end end using Seed::* using x::y as x let got = x::v",
+        "module A = end module Child = using B as A using A as B end",
+        "using Missing::value",
+        "using Missing::{}",
+    ] {
+        assert!(codes(&rejected(source)).contains(&"using"), "{source}");
+    }
+}
+
+#[test]
+fn using_conflicts_are_namespace_sensitive_and_globs_are_lazy() {
+    for source in [
+        "module A = let x = 1n end module B = let x = true end using A::* using B::* let ok = 2n",
+        "module A = let x = 1n end using A::* using A::* let y = x",
+        "module A = let x = 1n end module B = let x = true end using A::* using B::* let x = false let y = x",
+        "module A = let x = 1n end module B = let x = true end using A::* using B::x let y = x",
+        "module A = let X = 1n end type X = Nat using A::X let y: X = X",
+        "module A = let x = 1n end using A::x let y = do using A::x return x end",
+        "module A = let x = 1n end let y = do using A::* let x = true return x end",
+    ] {
+        accepted(source);
+    }
+    for (source, code) in [
+        (
+            "module A = let x = 1n end module B = let x = true end using A::* using B::* let y = x",
+            "using",
+        ),
+        (
+            "module A = let x = 1n end using A::x using A::x",
+            "duplicate-term",
+        ),
+        (
+            "module A = let x = 1n end using A::x let x = true",
+            "duplicate-term",
+        ),
+        (
+            "module A = module B = end end using A::B module B = end",
+            "duplicate-module",
+        ),
+        (
+            "module A = let x = 1n end let y = do using A::x let x = true return x end",
+            "duplicate-term",
+        ),
+        (
+            "module A = let x = 1n end let y = do let x = true using A::x return x end",
+            "using",
+        ),
+        (
+            "module A = let x = 1n end let y = do using A::x using A::x return x end",
+            "duplicate-term",
+        ),
+    ] {
+        assert!(codes(&rejected(source)).contains(&code), "{source}");
+    }
+}
+
+#[test]
+fn using_bindings_never_become_qualified_members_or_transitive_globs() {
+    for source in [
+        "module B = let x = 1n end module A = using B::x end let y = A::x",
+        "module B = let x = 1n end module A = using B::x end using A::* let y = x",
+        "module B = end module A = using B as C end let y = A::C::x",
+    ] {
+        assert!(!rejected(source).ir.errors.is_empty(), "{source}");
+    }
+}
+
+#[test]
+fn using_path_anchors_resolve_values_types_effects_and_module_aliases() {
+    let program = accepted(
+        "type T = Nat effect E = { get: () -> T } let x = 1n
+         module Outer =
+           let x = true
+           module Inner =
+             using bundle as root
+             using super as parent
+             using self as here
+             using root::{T, E}
+             let a: bundle::T = bundle::x
+             let b = super::x
+             let c = super::super::x
+             let d = parent::x
+             let e = here::a
+             let f: () -> root::T + bundle::!E = fn _ => root::!E.get ()
+           end
+         end
+         let result = Outer::Inner::a",
+    );
+    assert_eq!(scheme(&program, "result"), "T");
+    for source in [
+        "using bundle",
+        "using self",
+        "using super",
+        "using self::*",
+        "let x = super::x",
+        "module A = let x = super::super::x end",
+    ] {
+        assert!(codes(&rejected(source)).contains(&"using"), "{source}");
+    }
+}
+
+#[test]
+fn using_pending_value_aliases_do_not_block_resolved_module_aliases() {
+    let program = accepted(
+        "module A = module M = let x = 1n end end\nusing A::M as foo\nusing foo::x as foo\nlet result = foo\nlet qualified = foo::x",
+    );
+    assert_eq!(scheme(&program, "result"), "Nat");
+    assert_eq!(scheme(&program, "qualified"), "Nat");
+}
+
+#[test]
+fn using_same_name_imports_can_copy_an_inherited_module() {
+    let program = accepted(
+        "module Source = let x = 1n end\nmodule Child = using Source let result = Source::x end\nmodule Other = using Source as Source let result = Source::x end\nlet result = Child::result",
+    );
+    assert_eq!(scheme(&program, "result"), "Nat");
+    assert!(codes(&rejected("using missing")).contains(&"using"));
+}
+
+#[test]
+fn using_value_alias_can_share_a_glob_imported_module_name() {
+    let program = accepted(
+        "module A = module M = let x = 1n end end using A::* using M::x as M let result = M let qualified = M::x",
+    );
+    assert_eq!(scheme(&program, "result"), "Nat");
+    assert_eq!(scheme(&program, "qualified"), "Nat");
+}
+
+#[test]
+fn using_grouped_self_cannot_hide_a_later_glob_ambiguity() {
+    let partial = rejected(
+        "module M = module A = end end module N = module A = end end using M::* using later::* using N as later using A::{self}",
+    );
+    assert!(codes(&partial).contains(&"using"));
+}
+
+#[test]
+fn using_explicit_imports_win_over_globs_in_either_order() {
+    for imports in [
+        "using A::* using B::x using A::*",
+        "using B::x using A::* using A::*",
+    ] {
+        let program = accepted(&format!(
+            "module A = let x = 1n end module B = let x = true end {imports} let result = x"
+        ));
+        assert_eq!(scheme(&program, "result"), "Bool");
+    }
+    accepted("module Source = module A = end end using Source::* using A using A::{}");
+    let empty = accepted("module M = end using M::{} using {}");
+    assert!(empty.artifact().header().values.is_empty());
+}
+
+#[test]
+fn using_local_effect_alias_chains_keep_the_original_effect_identity() {
+    accepted(
+        "module M = effect E = { get: () -> Nat } end
+        let result: () -> Nat + M::!E = do
+          using M::E as Local
+          using Local as Alias
+          let query: () -> Nat + !Alias = fn _ => !Alias.get ()
+          return query
+        end",
+    );
+}

@@ -67,6 +67,7 @@ struct Counts {
 impl Counts {
     fn add(&mut self, stmt: &StmtKind) {
         match stmt {
+            StmtKind::Using(_) => {}
             StmtKind::Let { .. } => self.lets += 1,
             StmtKind::Extern { .. } => self.externs += 1,
             StmtKind::Type { .. } => self.types += 1,
@@ -132,6 +133,10 @@ fn stmt_node(ids: &mut Ids, stmt: &Stmt) -> Node {
         .collect();
     let node = Node::new(ids.next(), "", print::ast::stmt(stmt).to_string()).at(stmt.span);
     let mut built = match &stmt.kind {
+        StmtKind::Using(_) => Node {
+            label: "Using".into(),
+            ..node
+        },
         // A module's own row is its name and, when the body was written inline,
         // the statements in it. A body that came from another file is left to
         // that file's own row; see [`written_in`].

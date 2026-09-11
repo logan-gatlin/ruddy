@@ -2235,7 +2235,7 @@ fn shared_rows_infer_across_shapes_and_generalize() {
     let (mint, _, output) = inferred(source);
     assert_eq!(scheme(&mint, &output, "field"), "Nat");
     assert_eq!(scheme(&mint, &output, "first"), "#A Nat | #B");
-    assert_eq!(scheme(&mint, &output, "second"), "#C Boolean");
+    assert_eq!(scheme(&mint, &output, "second"), "#C Bool");
 
     let (_, ir, output) = infer_src(&format!(
         "{source}\nlet bad = choose {{ A: 1n }} (#C false)"
