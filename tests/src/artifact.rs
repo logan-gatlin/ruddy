@@ -3066,6 +3066,71 @@ let shaped = shape of_nat
     }
 }
 
+/// The two directions of a checked foreign conversion carry the same
+/// representation contract, and an artifact that breaks it is refused.
+#[test]
+fn reflection_artifacts_validate_foreign_conversions() {
+    let artifact = built(&format!(
+        r#"
+{}
+type DecodeError = {{ path: String, expected: String, message: String }}
+@private extern read: ForeignValue -> Result 'a DecodeError = "$ffiDecode"
+@private extern write: 'a -> Result ForeignValue DecodeError = "$ffiEncode"
+let written = write {{ count: 1n }}
+let parsed: Result {{ count: Nat }} DecodeError = match written with
+| #Some raw => read raw
+| #Error error => #Error error
+end
+"#,
+        crate::inference::SHAPE_SOURCE
+    ));
+    assert!(artifact::parse(&artifact.print()).validate().is_ok());
+    use ruddy::reification::Intrinsic;
+    for (kind, corruption, expected) in [
+        (Intrinsic::Decode, 0, "decoding requires ForeignValue"),
+        (Intrinsic::Decode, 1, "decoding requires ForeignValue"),
+        (Intrinsic::Encode, 0, "encoding returns Result"),
+    ] {
+        let mut changed = artifact.clone().to_unchecked();
+        let block = changed
+            .lir
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.blocks)
+            .find(|block| {
+                block.instrs.iter().any(
+                    |instruction| matches!(&instruction.op, Op::Reflect { kind: k, .. } if *k == kind),
+                )
+            })
+            .unwrap_or_else(|| panic!("{kind:?} converts once"));
+        let at = block
+            .instrs
+            .iter()
+            .position(|instruction| matches!(&instruction.op, Op::Reflect { .. }))
+            .unwrap();
+        // A number the conversion could be handed instead of what it takes.
+        block.instrs.insert(
+            0,
+            Instr {
+                temp: 999,
+                rep: Rep::Nat,
+                op: Op::Const(Literal::Natural(0)),
+            },
+        );
+        let instruction = &mut block.instrs[at + 1];
+        let Op::Reflect { value, .. } = &mut instruction.op else {
+            unreachable!()
+        };
+        if corruption == 0 {
+            instruction.rep = Rep::Nat;
+        } else {
+            *value = 999;
+        }
+        let message = changed.validate().unwrap_err().to_string();
+        assert!(message.contains(expected), "{kind:?} {corruption}: {message}");
+    }
+}
+
 #[test]
 fn artifact_headers_record_the_bound_domains() {
     let artifact = built("let value = 1n");
