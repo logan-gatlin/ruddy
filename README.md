@@ -28,6 +28,40 @@ To refresh a cached branch or tag, remove its selection from `$RUDDY_HOME/cache/
 
 The repository's `Ruddy.toml` defines the standard-library bundle, with `std/lib.rud` as its root source. Run `ruddy check` from the repository root to check it.
 
+## API documentation
+
+Run `ruddy doc` inside a bundle to generate Markdown documentation from its
+public declarations, checked types, and `@doc` annotations. Private declarations,
+private module subtrees, and dependencies are excluded. Value implementations
+and foreign bindings are omitted; values without annotations show inferred types.
+
+The output contains `bundle.md` for the bundle and one flat file per public
+module: `foo.md`, `foo.bar.md`, and so on. Each page includes module navigation
+and nonempty Types, Effects, and Values sections. Declaration documentation is
+Markdown, and signatures appear in `ruddy` code blocks.
+
+The output directory defaults to `docs/`. Configure it relative to `Ruddy.toml`:
+
+```toml
+[documentation]
+target = "reference/"
+frontmatter = """
+---
+layout: reference
+---
+"""
+```
+
+`frontmatter` is optional. When set, its string is prepended verbatim to every
+generated Markdown file.
+
+This repository's std bundle uses `docs/src/std/` with the website's `doc: true`
+frontmatter, making its generated API reference part of the documentation site.
+A root module named `bundle` conflicts with the bundle page;
+`ruddy doc` reports filename collisions before writing any pages. Regeneration
+removes obsolete pages marked as generated for this bundle, preserving unrelated
+Markdown files.
+
 ## Editor support
 
 The [VS Code extension](editors/vscode/README.md) bundles Tree-sitter syntax
