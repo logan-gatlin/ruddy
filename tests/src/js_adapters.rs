@@ -54,21 +54,23 @@ type Role = #Admin | #User Nat
 type Home = { city: String, zip: Nat }
 type Person = { name: String, roles: [Role], home: Home }
 @private
-let read: std::js::Value -> std::result::Result Person std::js::Error = std::js::lift
+let read: std::js::Value -> std::result::Result Person std::js::Error + std::js::!Host = std::js::lift
 @private
 let write: Person -> std::result::Result std::js::Value std::js::Error = std::js::lower
 let lift_person = read
 let lower_person = write
-let round_trip: std::js::Value -> std::result::Result std::js::Value std::js::Error =
-  fn raw => match read raw with
+let round_trip: std::js::Value -> std::result::Result std::js::Value std::js::Error
+  + std::js::!Host = fn raw => match read raw with
   | #Some person => write person
   | #Error error => #Error error
   end
-let name_of: std::js::Value -> String = fn raw => match read raw with
+let name_of: std::js::Value -> String + std::js::!Host =
+  fn raw => match read raw with
 | #Some person => person.name
 | #Error error => error.message
 end
-let roles_of: std::js::Value -> Nat = fn raw => match read raw with
+let roles_of: std::js::Value -> Nat + std::js::!Host =
+  fn raw => match read raw with
 | #Some person => std::array::len person.roles
 | #Error _ => 0n
 end
@@ -116,13 +118,13 @@ fn conversion_checks_numbers_and_text() {
     let project = project(
         r#"
 @private
-let read_nat: std::js::Value -> std::result::Result Nat std::js::Error = std::js::lift
+let read_nat: std::js::Value -> std::result::Result Nat std::js::Error + std::js::!Host = std::js::lift
 @private
-let read_real: std::js::Value -> std::result::Result Real std::js::Error = std::js::lift
+let read_real: std::js::Value -> std::result::Result Real std::js::Error + std::js::!Host = std::js::lift
 @private
-let read_text: std::js::Value -> std::result::Result String std::js::Error = std::js::lift
+let read_text: std::js::Value -> std::result::Result String std::js::Error + std::js::!Host = std::js::lift
 @private
-let read_callable: std::js::Value -> std::result::Result (Nat -> Nat) std::js::Error = std::js::lift
+let read_callable: std::js::Value -> std::result::Result (Nat -> Nat) std::js::Error + std::js::!Host = std::js::lift
 @private
 let write_callable: (Nat -> Nat) -> std::result::Result std::js::Value std::js::Error =
   std::js::lower
@@ -130,7 +132,8 @@ let as_nat = read_nat
 let as_real = read_real
 let as_text = read_text
 let scalars = std::str::len
-let refused_by_lift: std::js::Value -> String = fn value => match read_callable value with
+let refused_by_lift: std::js::Value -> String + std::js::!Host =
+  fn value => match read_callable value with
 | #Some _ => "accepted"
 | #Error error => error.expected
 end
@@ -179,8 +182,9 @@ assert.equal(app.refused_by_lower, message);
 fn a_bound_integer_domain_decides_what_lifts() {
     let project = project(
         r#"
-let as_nat: std::js::Value -> std::result::Result Nat std::js::Error = std::js::lift
-let as_nat64: std::js::Value -> std::result::Result Nat64 std::js::Error = std::js::lift
+let as_nat: std::js::Value -> std::result::Result Nat std::js::Error + std::js::!Host = std::js::lift
+let as_nat64: std::js::Value -> std::result::Result Nat64 std::js::Error + std::js::!Host =
+  std::js::lift
 "#,
         "node",
         Some(32),
@@ -200,7 +204,10 @@ fn a_specialized_adapter_replaces_the_structural_one() {
     let project = project(
         r#"
 @private
-let millis: std::js::Value -> std::result::Result Nat std::js::Error = std::js::lift
+let millis: std::js::Value -> std::result::Result Nat std::js::Error + std::js::!Host =
+  std::js::lift
+@private
+let pure_millis: std::js::Value -> std::result::Result Nat std::js::Error = std::js::read
 @doc "Seconds on this side, milliseconds on the host's."
 let seconds: std::js::Adapter Nat = {
   lower: fn count => std::js::lower (std::nat::multiply count 1000n),
@@ -208,15 +215,21 @@ let seconds: std::js::Adapter Nat = {
   | #Some elapsed => #Some (std::nat::divide elapsed 1000n)
   | #Error error => #Error error
   end,
+  read: fn value => match pure_millis value with
+  | #Some elapsed => #Some (std::nat::divide elapsed 1000n)
+  | #Error error => #Error error
+  end,
 }
 @private
-let through: std::js::Adapter 'a -> 'a -> std::result::Result 'a std::js::Error =
-  fn adapter value => match adapter.lower value with
+let through: std::js::Adapter 'a -> 'a -> std::result::Result 'a std::js::Error
+  + std::js::!Host = fn adapter value => match adapter.lower value with
   | #Some raw => adapter.lift raw
   | #Error error => #Error error
   end
-let specialized: Nat -> std::result::Result Nat std::js::Error = through seconds
-let structural: Nat -> std::result::Result Nat std::js::Error = through (std::js::adapter ())
+let specialized: Nat -> std::result::Result Nat std::js::Error + std::js::!Host =
+  through seconds
+let structural: Nat -> std::result::Result Nat std::js::Error + std::js::!Host =
+  through (std::js::adapter ())
 let lowered = seconds.lower
 let lifted = seconds.lift
 "#,
@@ -263,17 +276,30 @@ let call = std::js::apply
 @doc "Forwarding a host value hands the host back the value it gave, not a copy."
 let forward: std::js::Value -> std::js::Value = fn value => value
 @private
-@doc "Reading an inert snapshot is pure: this type carries no `!Host`."
-let inert: std::js::Value -> std::result::Result { total: Nat } std::js::Error = std::js::lift
+@doc "Reading a snapshot is pure: this type carries no `!Host`."
+let inert: std::js::Value -> std::result::Result { total: Nat } std::js::Error = std::js::read
 let copy_then_read = fn value => match std::js::snapshot value with
 | #Some copy => inert copy
 | #Error error => #Error error
+end
+@doc "A live host value is refused by the pure reading, however plain it looks."
+let read_live: std::js::Value -> String = fn value => match inert value with
+| #Some _ => "read"
+| #Error error => error.expected
+end
+@doc "A host primitive carries no getter, so the pure reading takes it."
+let read_number: std::js::Value -> String = fn value => do
+  let count: std::js::Value -> std::result::Result Nat std::js::Error = std::js::read
+  return match count value with
+  | #Some value => std::str::from_nat value
+  | #Error error => error.expected
+  end
 end
 let deep_total: std::js::Value -> std::result::Result Nat std::js::Error + std::js::!Host =
   fn value => match std::js::field "counts" value with
   | #Some counts => match std::js::element 1n counts with
     | #Some second => do
-      let read: std::js::Value -> std::result::Result Nat std::js::Error = std::js::lift
+      let read: std::js::Value -> std::result::Result Nat std::js::Error + std::js::!Host = std::js::lift
       return read second
     end
     | #Error error => #Error error
@@ -297,6 +323,28 @@ assert.equal(await app.kind_of({}), 'object');
 assert.equal(await app.kind_of(() => 1), 'function');
 assert.equal(await app.kind_of(Symbol('s')), 'other');
 assert.equal(await app.kind_of(1n), 'other');
+
+// Reading a live host value purely is refused whatever its shape, and a
+// getter on it never runs. Taking a snapshot first is what makes the read
+// pure, and a primitive was never observable.
+let touched = 0;
+const watched = { get total() { touched += 1; return 3; } };
+assert.equal(await app.read_live(watched), 'a snapshot this program took');
+assert.equal(touched, 0, 'plain getter');
+const deep = { get counts() { touched += 1; return [1, 2]; } };
+assert.equal(await app.read_live(deep), 'a snapshot this program took');
+assert.equal(touched, 0, 'nested getter');
+// A proxy with a catch-all trap also sees the shared calling convention ask
+// whether an argument is one of this program's closures, which is a symbol
+// key. That probe belongs to every extern call, not to reading; what matters
+// here is that no field of the value is read.
+let trapped = 0;
+assert.equal(await app.read_live(new Proxy({ total: 1 }, { get(target, key) { if (typeof key === 'string') trapped += 1; return 1; } })), 'a snapshot this program took');
+assert.equal(touched, 0, 'after proxy');
+assert.equal(trapped, 0, 'no string key was read');
+assert.equal(await app.read_number(7), '7');
+assert.equal(some(await app.copy_then_read(watched)).total, 3);
+assert.equal(touched, 1);
 
 const record = { counts: [4, 9], name: 'Ada' };
 assert.equal(some(await (await app.field('name'))(record)), 'Ada');
@@ -334,7 +382,7 @@ fn host_failures_arrive_as_errors_rather_than_exceptions() {
         r#"
 let kind = std::js::kind
 let text = std::js::text
-let lift_text: std::js::Value -> std::result::Result String std::js::Error = std::js::lift
+let lift_text: std::js::Value -> std::result::Result String std::js::Error + std::js::!Host = std::js::lift
 let field = std::js::field
 let element = std::js::element
 let length = std::js::length
@@ -486,9 +534,10 @@ extern make_adder: fn(Nat) -> fn(Nat) -> Nat = "base => extra => base + extra"
 let add_three: Nat -> Nat = make_adder 3n
 
 @private
-let lift_callable: std::js::Value -> std::result::Result (Nat -> Nat) std::js::Error =
-  std::js::lift
-let decoder_refuses: std::js::Value -> String = fn value => match lift_callable value with
+let lift_callable: std::js::Value -> std::result::Result (Nat -> Nat) std::js::Error
+  + std::js::!Host = std::js::lift
+let decoder_refuses: std::js::Value -> String + std::js::!Host =
+  fn value => match lift_callable value with
 | #Some _ => "accepted"
 | #Error error => error.expected
 end

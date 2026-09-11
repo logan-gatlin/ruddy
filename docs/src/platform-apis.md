@@ -362,18 +362,32 @@ data, and forwarding one back hands the host the very same value, so the host's
 what that position had to be, and the host's own `message`.
 
 `js::lower : 'a -> Result Value Error` writes a value of the inferred type as
-host data and `js::lift : Value -> Result 'a Error` reads one back, checking
-every position. Both take the compiler's mirror for the type at the use site,
-exactly as `reflect::mirror ()` does. Conversion is strict: an integer position
-takes only an integral number inside the target's bound domain, so `1.5`, `-1`,
-and a value past the domain's maximum are all refused; a negative zero from the
-host becomes the one integer zero, while a `Real` keeps the sign the host gave
-it; a text position takes only a string, and an astral scalar survives it.
+host data. Reading one back has two forms, because reading a property of a
+live host value runs whatever the host put there:
+`js::lift : Value -> Result 'a Error + !Host` reads an arbitrary host value and
+says in its type that it observes the host, while
+`js::read : Value -> Result 'a Error` reads a snapshot, or a host primitive,
+and is an ordinary pure read. A live host value is refused by `read` however
+plain it looks; take a `snapshot` first, or observe it with `lift`. All three
+take the compiler's mirror for the type at the use site, exactly as
+`reflect::mirror ()` does.
 
-`js::Adapter 'a` is the pair of directions as one value:
+Conversion is strict: an integer position takes only an integral number inside
+the target's bound domain, so `1.5`, `-1`, and a value past the domain's
+maximum are all refused; a negative zero from the host becomes the one integer
+zero, while a `Real` keeps the sign the host gave it; a text position takes
+only a string of Unicode scalar values, so an astral scalar survives it and an
+unpaired surrogate half is refused. `js::text` is the conversion that repairs
+one instead, replacing each unpaired half with `U+FFFD`.
+
+`js::Adapter 'a` is the directions as one value:
 
 ```ruddy
-type Adapter 'a = { lower: 'a -> Result Value Error, lift: Value -> Result 'a Error }
+type Adapter 'a = {
+  lower: 'a -> Result Value Error,
+  lift: Value -> Result 'a Error + !Host,
+  read: Value -> Result 'a Error,
+}
 ```
 
 `js::adapter ()` is the structural adapter for the inferred type. A specialized
@@ -381,18 +395,23 @@ adapter is an ordinary record a caller writes, and goes wherever the structural
 one goes:
 
 ```ruddy
-let millis: std::js::Value -> std::result::Result Nat std::js::Error = std::js::lift
+let millis: std::js::Value -> std::result::Result Nat std::js::Error + std::js::!Host =
+  std::js::lift
 let seconds: std::js::Adapter Nat = {
   lower: fn count => std::js::lower (std::nat::multiply count 1000n),
   lift: fn value => match millis value with
   | #Some elapsed => #Some (std::nat::divide elapsed 1000n)
   | #Error error => #Error error
   end,
+  read: fn value => match pure_millis value with
+  | #Some elapsed => #Some (std::nat::divide elapsed 1000n)
+  | #Error error => #Error error
+  end,
 }
 ```
 
-Neither direction carries a function contract. A decoder that rebuilt a
-callable would be promising behavior nobody checked, so `lift` refuses one and
+No direction carries a function contract. A decoder that rebuilt a callable
+would be promising behavior nobody checked, so every reading refuses one and
 says so: `a verifiable data type; a function contract needs an adapter`.
 
 ### Observing a host value
@@ -424,9 +443,10 @@ convention every extern shares, not to this module.
 `snapshot of` copies plain data — objects, arrays, and primitives — out of the
 host. It refuses a function, a value already on the path being copied, and a
 host object that is not plain data, such as a `Date` or a `Map`. What comes back
-is inert data nobody else holds, so reading it afterwards with `lift` is pure
-and needs no `!Host`. Forwarding a `Value` instead of copying it keeps the
-host's identity.
+is inert data nobody else holds, so reading it afterwards with `read` is pure
+and needs no `!Host`. `read` is the only reading that is, and it accepts only a
+snapshot or a host primitive: membership, not shape, is what makes a value one.
+Forwarding a `Value` instead of copying it keeps the host's identity.
 
 Node executables and Node or web libraries install the handler for `Host`, as
 they do for the other platform effects. A local handler can answer these

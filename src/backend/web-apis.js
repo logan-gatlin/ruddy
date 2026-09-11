@@ -130,6 +130,10 @@ const $jsPresent = (value, what) => {
   if (value === null || value === undefined) throw new TypeError("Cannot read " + what + " of " + String(value));
   return value;
 };
+// The copies this program has taken. Membership is the authority: a snapshot
+// is data nobody else holds, so reading one runs no host code, and nothing
+// outside these operations can put a value in here.
+const $snapshots = new WeakSet();
 // An active path, not a set of everything seen: a repeated sibling is copied,
 // and only a cycle is refused, which is what conversion does as well.
 const $jsSnapshot = (value, path, active) => {
@@ -150,6 +154,7 @@ const $jsSnapshot = (value, path, active) => {
     for (const key of Object.keys(value)) copy[key] = $jsSnapshot(value[key], path + "." + key, active);
   }
   active.delete(value);
+  $snapshots.add(copy);
   return copy;
 };
 // `Array.isArray` runs on the host and can refuse — a revoked proxy answers
@@ -183,6 +188,11 @@ const $js = {
     return Object.keys(value);
   }),
   snapshot: value => $jsObserve("$", "inert data", () => $jsSnapshot(value, "$", new Set())),
+  // Whether reading this value runs no host code: a primitive, or a copy this
+  // program took. A live host object is not one, whatever its shape.
+  inert: value => value === null
+    || (typeof value !== "object" && typeof value !== "function")
+    || $snapshots.has(value),
   // The explicit lossy reading. Strict conversion refuses a host string that
   // is not scalars; this one says what to do about it instead.
   text: value => $jsObserve("$", "a string", () => {

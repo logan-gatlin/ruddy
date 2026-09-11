@@ -732,16 +732,18 @@ let refused_faults = std::str::join " " (std::abi::report unstated)
     );
 }
 
-/// `std::js`'s data layer is the two checked-conversion intrinsics and
-/// nothing else, so both backends must agree about it. Host observation is
-/// left out on purpose: the interpreter provides no JavaScript host.
+/// The data layer under `std::js` is the two checked-conversion intrinsics,
+/// and those are portable, so both backends must agree about them. `std::js`
+/// itself is not portable: reading an arbitrary host value runs host code,
+/// and the interpreter provides no JavaScript host, so those readings are
+/// covered against a real host in `tests/src/js_adapters.rs` instead.
 #[test]
-fn the_javascript_data_adapter_agrees_across_backends() {
+fn the_checked_conversion_intrinsics_agree_across_backends() {
     let source = r#"
 type Role = #Admin | #User Nat
 type Person = { name: String, roles: [Role] }
-let write: Person -> std::result::Result std::js::Value std::js::Error = std::js::lower
-let read: std::js::Value -> std::result::Result Person std::js::Error = std::js::lift
+let write: Person -> std::result::Result ForeignValue std::ffi::DecodeError = std::ffi::encode
+let read: ForeignValue -> std::result::Result Person std::ffi::DecodeError = std::ffi::decode
 let round_trip = match write { name: "ruddy", roles: [#Admin, #User 2n] } with
 | #Some raw => match read raw with
   | #Some person => std::str::concat person.name (std::str::from_nat (std::array::len person.roles))
@@ -749,39 +751,27 @@ let round_trip = match write { name: "ruddy", roles: [#Admin, #User 2n] } with
   end
 | #Error error => error.message
 end
-let through_the_adapter = do
-  let adapter: std::js::Adapter Nat = std::js::adapter ()
-  return match adapter.lower 7n with
-  | #Some raw => match adapter.lift raw with
-    | #Some value => std::str::from_nat value
-    | #Error error => error.expected
-    end
-  | #Error error => error.expected
-  end
-end
 let a_callable_is_refused = do
-  let adapter: std::js::Adapter (Nat -> Nat) = std::js::adapter ()
-  return match adapter.lower (fn value => value) with
+  let bad: (Nat -> Nat) -> std::result::Result ForeignValue std::ffi::DecodeError =
+    std::ffi::encode
+  return match bad (fn value => value) with
   | #Some _ => "written"
   | #Error error => error.expected
   end
 end
 "#;
-    let exports = ["round_trip", "through_the_adapter", "a_callable_is_refused"];
+    let exports = ["round_trip", "a_callable_is_refused"];
     let (node, interpreted) = both(source, &exports, None);
     assert_eq!(node, interpreted);
     assert_eq!(
         interpreted,
         vec![
             "\"ruddy2\"",
-            "\"7\"",
             "\"a verifiable data type; a function contract needs an adapter\"",
         ]
     );
 }
 
-/// Cases where the two backends had answered differently, or had answered at
-/// all where the specification says a value is refused.
 #[test]
 fn the_backends_agree_on_zero_underflow_and_effect_order() {
     let source = r#"

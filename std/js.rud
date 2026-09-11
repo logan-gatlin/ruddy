@@ -4,8 +4,12 @@ type Value = ForeignValue
 @doc "Why a checked conversion stopped: `path` is the position inside the value, `expected` what that position had to be, and `message` the host's own words."
 type Error = ffi::DecodeError
 
-@doc "The two directions of one checked conversion between a Ruddy type and a host value. `adapter ()` is the structural adapter for whatever type the use site infers; a specialized adapter is an ordinary record a caller writes, and is used wherever the structural one would be."
-type Adapter 'a = { lower: 'a -> Result Value Error, lift: Value -> Result 'a Error }
+@doc "The directions of one checked conversion between a Ruddy type and a host value. `lower` writes; `lift` reads an arbitrary host value, which observes it, so it carries the effect; `read` reads a snapshot, which runs no host code and so is pure. `adapter ()` is the structural adapter for whatever type the use site infers; a specialized adapter is an ordinary record a caller writes, and is used wherever the structural one would be."
+type Adapter 'a = {
+  lower: 'a -> Result Value Error,
+  lift: Value -> Result 'a Error + !Host,
+  read: Value -> Result 'a Error,
+}
 
 @doc "What a host value is, as far as JavaScript itself reports. `#Null` and `#Undefined` stay apart, as do `#Array` and `#Object`; a symbol, a bigint, or a value whose class cannot be reported is `#Other`."
 type Kind =
@@ -34,11 +38,27 @@ effect Host = {
 @doc "Write a value of the inferred type as host data, or say where it could not be written. A function contract is never written: a callable is refused, and an explicit extern or callback adapter carries one instead."
 let lower: 'a -> Result Value Error = ffi::encode
 
-@doc "Read a host value as the type this use site infers, checking every position. Integers must be integral and inside the target's domain, text must really be a string, and a callable is refused: rebuilding a function from data would be a contract nobody checked, so an extern declaration owns that."
-let lift: Value -> Result 'a Error = ffi::decode
+@private
+extern inert: Value -> Bool = "$js.inert"
 
-@doc "The structural adapter for the type this use site infers, made from the mirror the compiler supplies there. Neither direction carries a function contract."
-let adapter: () -> Adapter 'a = fn _ => { lower: lower, lift: lift }
+@private
+let refused: String -> Result 'a Error = fn message =>
+  #Error { path: "$", expected: "a snapshot this program took", message: message }
+
+@doc "Read an arbitrary host value as the type this use site infers, checking every position. Reading a property runs whatever the host put there, so this observes the host and says so in its type. Integers must be integral and inside the target's domain, text must be Unicode scalar values, and a callable is refused: rebuilding a function from data would be a contract nobody checked, so an extern declaration owns that."
+let lift: Value -> Result 'a Error + !Host = fn value => do
+  _ = !Host.kind value
+  return ffi::decode value
+end
+
+@doc "Read a snapshot, or a host primitive, as the type this use site infers. A snapshot is a copy this program took, so nothing in it can run host code and this is an ordinary pure read. A live host value is refused here however plain it looks; observe it with `lift`, or take a `snapshot` first."
+let read: Value -> Result 'a Error = fn value =>
+  if inert value then ffi::decode value
+  else refused "reading this value would run host code, so it is not read here"
+  end
+
+@doc "The structural adapter for the type this use site infers, made from the mirror the compiler supplies there. No direction carries a function contract."
+let adapter: () -> Adapter 'a = fn _ => { lower: lower, lift: lift, read: read }
 
 -- Callbacks
 --

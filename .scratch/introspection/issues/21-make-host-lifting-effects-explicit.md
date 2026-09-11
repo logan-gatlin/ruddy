@@ -1,6 +1,6 @@
 # 21 Make arbitrary host lifting effects explicit
 
-Status: open
+Status: resolved
 Type: task
 Priority: P1
 
@@ -64,3 +64,37 @@ declares its effect and that any supported pure snapshot conversion cannot
 accept the live input shown above. Preserve normal inert-data round trips.
 Extend [adapter tests](../../../tests/src/js_adapters.rs) and run Rust tests
 only through `just test`.
+
+## Answer
+
+Both readings exist, and the pure one accepts only input that justifies it.
+
+`std::js::lift` reads an arbitrary host value and carries `!Host`, so the
+ticket's signature — a pure `Value -> Result { count: Nat } Error` bound to
+`lift` — no longer compiles: the effect is required by the use and excluded by
+the annotation. It observes for real, not by declaration: it asks the host what
+the value is before converting it.
+
+`std::js::read` is the pure reading. It accepts a host primitive, which carries
+no getter, and a snapshot, which is a copy this program took; anything else is
+refused with `a snapshot this program took`. Membership decides, not shape: the
+runtime keeps the copies `snapshot` made, so a live host object of exactly the
+right shape, and a proxy that answers every property, are both refused. Nothing
+outside `snapshot` can put a value in that set, so the capability cannot be
+forged, and because a snapshot is a fresh tree with no getters anywhere,
+reading it runs no host code at any depth.
+
+`Adapter` carries all three, so a specialized adapter writes both readings and
+goes wherever the structural one goes.
+
+Regression: `host_observation_reads_values_on_node_and_web` in
+`tests/src/js_adapters.rs` calls the pure reading on a live object with a
+getter, on one with a nested getter, and on a proxy, and asserts no getter ran
+at all — the proxy's catch-all trap sees only the symbol probe the shared
+calling convention makes of every extern argument, which is counted separately
+and is not a field read. It then reads a primitive purely, snapshots the live
+object, reads the copy purely, and only then does the getter run, once.
+
+Fixed on the way: the host export adapter was compiled with the default
+integer domains, so a bundle binding another could not link its own exports.
+It now binds the root's.
