@@ -1987,6 +1987,7 @@ pub struct Output {
 #[derive(Debug, Clone, Default)]
 pub struct ScopeNames {
     imports: using::Imports,
+    dependencies: HashMap<String, Module>,
     globals: HashMap<(Option<Module>, Namespace, String), Symbol>,
     modules: HashMap<(Option<Module>, String), Module>,
     pub prelude: Option<Module>,
@@ -2111,6 +2112,7 @@ struct Builder<'a> {
     /// already known to be one, and passing a term where a containing module
     /// goes is what that newtype exists to rule out.
     modules: HashMap<(Option<Module>, String), (Module, Span)>,
+    dependencies: HashMap<String, Module>,
     module_scopes: Vec<(Span, Module)>,
     /// The immediate `prelude` module of the direct dependency imported under
     /// the source alias `std`. Bare lookup consults its direct members only,
@@ -2887,6 +2889,7 @@ pub fn build_with_interfaces(
         bases: HashMap::new(),
         modules: HashMap::new(),
         std_prelude: None,
+        dependencies: HashMap::new(),
         module_scopes: Vec::new(),
         expanded: HashMap::new(),
         operations: HashMap::new(),
@@ -3540,6 +3543,7 @@ pub fn build_with_interfaces(
     Output {
         names: ScopeNames {
             imports: b.using,
+            dependencies: b.dependencies,
             globals: b
                 .globals
                 .into_iter()
@@ -9910,9 +9914,8 @@ impl Builder<'_> {
     }
 
     /// Install direct dependency headers before local declarations are
-    /// flattened. The dependency bundle name is an ordinary root module, so
-    /// the existing strict path walk handles nested modules without a second
-    /// resolver.
+    /// flattened. Dependency roots live in a separate prelude; their members
+    /// use the same strict module lookup as source declarations.
     fn import_dependencies(
         &mut self,
         dependencies: &[InterfaceImport<'_>],
@@ -10073,15 +10076,8 @@ impl Builder<'_> {
         for import in &valid {
             let dependency = import.header;
             let root_name = import.alias;
-            // Valid dependency aliases are unique, and imports are installed
-            // before source modules are flattened, so this root is necessarily
-            // new. Modeling an existing branch here only hid that invariant.
-            let root = self
-                .mint
-                .module(None, root_name)
-                .expect("a dependency root was checked before minting");
-            self.modules
-                .insert((None, root_name.to_string()), (root, Span::default()));
+            let root = self.mint.dependency_module(root_name);
+            self.dependencies.insert(root_name.to_string(), root);
             for (namespace, qualified) in dependency
                 .values
                 .iter()
@@ -10494,21 +10490,12 @@ impl Builder<'_> {
     /// segments are none at all.
     ///
     /// R10 in one loop. A relative first segment resolves by the R9 walk; an
-    /// absolute one resolves at the bundle root. Every later segment resolves
+    /// absolute one resolves in the dependency prelude. Every later segment resolves
     /// strictly inside the module the previous one named, with no outward step,
     /// because a path says where to look and a walk would let it mean somewhere
     /// else.
     fn segments(&mut self, path: &parse::Path) -> Option<Option<Module>> {
-        let module = if path.absolute.is_some() {
-            path.modules.iter().try_fold(None, |at, segment| {
-                self.modules
-                    .get(&(at, segment.tracked.clone()))
-                    .map(|&(module, _)| Some(module))
-                    .ok_or_else(|| using::PathError::Missing(segment.clone()))
-            })
-        } else {
-            self.import_modules(&path.modules)
-        };
+        let module = self.import_modules_from(&path.modules, path.absolute.is_some());
         match module {
             Ok(module) => Some(module),
             Err(using::PathError::Missing(name)) => {
@@ -10529,7 +10516,10 @@ impl Builder<'_> {
     }
 
     fn find(&mut self, path: &parse::Path, namespace: Namespace) -> Result<Symbol, Missing> {
-        let found = if path.absolute.is_none() && path.modules.is_empty() {
+        if path.absolute.is_some() && path.modules.is_empty() {
+            return Err(Missing::Name);
+        }
+        let found = if path.modules.is_empty() {
             self.lookup_import_name(namespace, &path.name.tracked, true)
         } else {
             let Some(module) = self.segments(path) else {
@@ -10596,7 +10586,10 @@ impl Builder<'_> {
     /// module does not declare is reported at the name, in the namespace the
     /// position it was written at demands.
     fn resolve(&mut self, path: &parse::Path, namespace: Namespace) -> Option<Symbol> {
-        if namespace == Namespace::Effects && path.modules.is_empty() && path.name.tracked == "mut"
+        if namespace == Namespace::Effects
+            && path.absolute.is_none()
+            && path.modules.is_empty()
+            && path.name.tracked == "mut"
         {
             return Some(self.mutation_symbol());
         }
@@ -11939,7 +11932,10 @@ impl Builder<'_> {
                 // a type that exists and gave it too much. Only a bare name can
                 // be one — a primitive lives in no module, so a path can never
                 // reach it.
-                if name.modules.is_empty() && Prim::from_name(&name.name.tracked).is_some() {
+                if name.absolute.is_none()
+                    && name.modules.is_empty()
+                    && Prim::from_name(&name.name.tracked).is_some()
+                {
                     self.error(
                         span,
                         ErrorKind::Arity {

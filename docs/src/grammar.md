@@ -327,7 +327,11 @@ A [module](dictionary.md#module) groups names under a shared name.
 An inline module uses `module Name =`, its contents, and `end`.
 The form `module name` loads the module from a separate file.
 A path uses `::` between module names, as in `std::io::print`; effect paths put `!` before the final effect name, as in `std::io::!IO.write`.
-Paths normally resolve their first name from the surrounding lexical scope. A leading `::` starts at the bundle root instead, so `::std::io::println` names the same definition in every nested scope.
+Paths normally resolve their first name from the surrounding lexical scope, then
+fall back to dependency aliases. A leading `::` selects a dependency directly,
+so `::std::io::println` names the dependency even when a local module is named
+`std`. Use `bundle::std` to select a local root module with that name.
+Dependencies and local modules may share a name without a conflict.
 For example, an inline module groups application defaults:
 
 ```ruddy
@@ -350,6 +354,9 @@ using Defaults::{self as defaults, Count, retry_limit as retries}
 let limit: Count = retries
 let qualified = defaults::retry_limit
 ```
+
+Dependency imports can use the same prefix: `using ::std::nat::{self, *}`.
+These imports remain lexical aliases and do not become bundle exports.
 
 Groups can nest and include globs, such as `using App::{Settings::{self, *}}`.
 An import brings in every matching value, type, effect, and module namespace.

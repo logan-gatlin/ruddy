@@ -459,6 +459,91 @@
           "type": "SEQ",
           "members": [
             {
+              "type": "STRING",
+              "value": "::"
+            },
+            {
+              "type": "SYMBOL",
+              "name": "_nested_use_tree"
+            }
+          ]
+        },
+        {
+          "type": "SYMBOL",
+          "name": "_use_path"
+        },
+        {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "{"
+            },
+            {
+              "type": "CHOICE",
+              "members": [
+                {
+                  "type": "SEQ",
+                  "members": [
+                    {
+                      "type": "SEQ",
+                      "members": [
+                        {
+                          "type": "SYMBOL",
+                          "name": "use_tree"
+                        },
+                        {
+                          "type": "REPEAT",
+                          "content": {
+                            "type": "SEQ",
+                            "members": [
+                              {
+                                "type": "STRING",
+                                "value": ","
+                              },
+                              {
+                                "type": "SYMBOL",
+                                "name": "use_tree"
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "type": "CHOICE",
+                      "members": [
+                        {
+                          "type": "STRING",
+                          "value": ","
+                        },
+                        {
+                          "type": "BLANK"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "BLANK"
+                }
+              ]
+            },
+            {
+              "type": "STRING",
+              "value": "}"
+            }
+          ]
+        }
+      ]
+    },
+    "_use_path": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "SEQ",
+          "members": [
+            {
               "type": "SYMBOL",
               "name": "identifier"
             },
@@ -493,8 +578,13 @@
                           "value": "::"
                         },
                         {
-                          "type": "SYMBOL",
-                          "name": "use_tree"
+                          "type": "ALIAS",
+                          "content": {
+                            "type": "SYMBOL",
+                            "name": "_nested_use_tree"
+                          },
+                          "named": true,
+                          "value": "use_tree"
                         }
                       ]
                     }
@@ -510,6 +600,15 @@
         {
           "type": "STRING",
           "value": "*"
+        }
+      ]
+    },
+    "_nested_use_tree": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "SYMBOL",
+          "name": "_use_path"
         },
         {
           "type": "SEQ",
@@ -528,8 +627,13 @@
                       "type": "SEQ",
                       "members": [
                         {
-                          "type": "SYMBOL",
-                          "name": "use_tree"
+                          "type": "ALIAS",
+                          "content": {
+                            "type": "SYMBOL",
+                            "name": "_nested_use_tree"
+                          },
+                          "named": true,
+                          "value": "use_tree"
                         },
                         {
                           "type": "REPEAT",
@@ -541,8 +645,13 @@
                                 "value": ","
                               },
                               {
-                                "type": "SYMBOL",
-                                "name": "use_tree"
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "_nested_use_tree"
+                                },
+                                "named": true,
+                                "value": "use_tree"
                               }
                             ]
                           }

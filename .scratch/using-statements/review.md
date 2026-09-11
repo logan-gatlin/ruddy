@@ -32,3 +32,19 @@ Static review totals: Standards 0 hard violations and 1 optional refactoring sug
 - The full suite through `just cov` (which invokes `just test`) passed: 1,854 tests, 0 failures, 10 ignored. The run used `RUSTC_BOOTSTRAP=1 RUDDY_COVERAGE_TOOLCHAIN=stable RUST_TEST_THREADS=4 CARGO_BUILD_JOBS=4` for branch instrumentation and bounded concurrency.
 - Compiler coverage: 96.16% lines and 88.35% branches. The new `ir/using.rs` resolver measured 96.03% lines and 83.52% branches. The repository's 100% line and branch coverage requirement remains unmet; passing tests and static review do not establish compliance with that requirement.
 - Staged whitespace validation passed.
+
+## Dependency path follow-up
+
+Dependency roots now have their own prelude and symbol identities. Explicit
+`::` paths select that prelude; `bundle::` traverses local declarations only.
+Lexical lookup falls back to dependencies after local declarations/imports.
+The parser, formatter/debugger printer, Tree-sitter grammar, and editor
+completion retain the same distinction for grouped and ordinary imports.
+
+Validation: `just build`, `just clippy`, `just fmt-check`, `just grammar`
+(134 corpus cases), `just test` (1,873 passed, 10 ignored), and final
+`just test using_` (20 matching integration tests) passed. Tests cover a
+same-name local module/dependency, value/type/effect resolution, aliases,
+groups/globs, strict root lookup, completion, and artifact export ownership.
+The old CLI test requiring this collision to fail now verifies coexistence.
+Coverage was not remeasured for this follow-up.

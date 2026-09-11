@@ -701,3 +701,53 @@ fn using_completion_obeys_lexical_imports_and_strict_module_members() {
         );
     }
 }
+
+#[test]
+fn dependency_completion_distinguishes_absolute_and_bundle_paths() {
+    let environment = ruddy::bundle::Environment::new([]);
+    let mut dep = ruddy::analysis::Host::default();
+    dep.set_file(
+        "main.rud",
+        Some("let external = 1n module Child = let nested = 1n end".into()),
+    );
+    let dep = dep
+        .analyze(
+            Bundle::new("dependency", Version::new(0, 0, 0)).unwrap(),
+            "main.rud",
+            &environment,
+        )
+        .interface();
+    for (suffix, local, expected, absent) in [
+        ("::dep::", "dep", "external", "local"),
+        ("dep::", "dep", "local", "external"),
+        ("bundle::dep::", "dep", "local", "external"),
+        ("::dep::Child::", "dep", "nested", "local"),
+        ("::", "dep", "dep", "OnlyLocal"),
+        ("bundle::", "Different", "OnlyLocal", "dep"),
+    ] {
+        let mut root = ruddy::analysis::Host::default();
+        let text = format!(
+            "module {local} = let local = true end module OnlyLocal = end let answer = {suffix}"
+        );
+        root.set_file("main.rud", Some(text.clone()));
+        let root = root.analyze_with_interfaces(
+            Bundle::new("root", Version::new(0, 0, 0)).unwrap(),
+            "main.rud",
+            &environment,
+            &[ir::InterfaceImport {
+                alias: "dep",
+                header: &dep,
+            }],
+            &[&dep],
+        );
+        let completions = root.completions("main.rud", text.len());
+        assert!(
+            completions.iter().any(|item| item.label == expected),
+            "{suffix}: {completions:?}"
+        );
+        assert!(
+            !completions.iter().any(|item| item.label == absent),
+            "{suffix}: {completions:?}"
+        );
+    }
+}

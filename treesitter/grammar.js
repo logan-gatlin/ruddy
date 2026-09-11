@@ -239,12 +239,22 @@ module.exports = grammar({
     using_statement: $ => seq('using', $.use_tree),
 
     use_tree: $ => choice(
+      seq('::', $._nested_use_tree),
+      $._use_path,
+      seq('{', optional(seq(sepBy1(',', $.use_tree), optional(','))), '}'),
+    ),
+
+    _use_path: $ => choice(
       seq($.identifier, optional(choice(
         seq('as', field('alias', $.identifier)),
-        seq('::', $.use_tree),
+        seq('::', alias($._nested_use_tree, $.use_tree)),
       ))),
       '*',
-      seq('{', optional(seq(sepBy1(',', $.use_tree), optional(','))), '}'),
+    ),
+
+    _nested_use_tree: $ => choice(
+      $._use_path,
+      seq('{', optional(seq(sepBy1(',', alias($._nested_use_tree, $.use_tree)), optional(','))), '}'),
     ),
 
     module_definition: $ => seq(
@@ -417,7 +427,7 @@ module.exports = grammar({
 
     /**
      * `Math::double`, `Math::Vec::zero`, or `::root_name` — a name and the
-     * modules it is reached through. A leading `::` starts at the bundle root.
+     * modules it is reached through. A leading `::` selects a dependency.
      *
      * Only the qualified form is a node: a bare name is an [`identifier`] and
      * stays one, so every position that takes a path writes the choice out.

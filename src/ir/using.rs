@@ -55,6 +55,7 @@ impl LocalScope {
 
 #[derive(Clone)]
 struct Import {
+    absolute: bool,
     path: Vec<TrackedString>,
     alias: Option<TrackedString>,
     glob: bool,
@@ -62,11 +63,13 @@ struct Import {
     span: Span,
 }
 
-fn flatten(tree: parse::UseTree, parent: &[TrackedString], out: &mut Vec<Import>) {
+fn flatten(tree: parse::UseTree, parent: &[TrackedString], absolute: bool, out: &mut Vec<Import>) {
+    let absolute = absolute || tree.absolute;
     let mut path = parent.to_vec();
     path.extend(tree.prefix);
     match tree.kind {
         parse::UseKind::Name { alias } => out.push(Import {
+            absolute,
             path,
             alias,
             glob: false,
@@ -74,6 +77,7 @@ fn flatten(tree: parse::UseTree, parent: &[TrackedString], out: &mut Vec<Import>
             span: tree.span,
         }),
         parse::UseKind::Glob => out.push(Import {
+            absolute,
             path,
             alias: None,
             glob: true,
@@ -81,6 +85,7 @@ fn flatten(tree: parse::UseTree, parent: &[TrackedString], out: &mut Vec<Import>
             span: tree.span,
         }),
         parse::UseKind::Group(children) if children.is_empty() => out.push(Import {
+            absolute,
             path,
             alias: None,
             glob: false,
@@ -89,7 +94,7 @@ fn flatten(tree: parse::UseTree, parent: &[TrackedString], out: &mut Vec<Import>
         }),
         parse::UseKind::Group(children) => {
             for child in children {
-                flatten(child, &path, out);
+                flatten(child, &path, absolute, out);
             }
         }
     }
@@ -260,30 +265,37 @@ impl Builder<'_> {
             };
             module = self.mint.parent(current.symbol());
         }
+        if namespace == Namespace::Modules
+            && let Some(module) = self.dependencies.get(name)
+        {
+            return Ok(Some(Target::Module(Some(*module))));
+        }
         Ok(self
             .std_prelude
             .and_then(|module| self.declared_target(Some(module), namespace, name)))
     }
 
-    pub(super) fn import_modules(
+    pub(super) fn import_modules_from(
         &self,
         path: &[TrackedString],
+        absolute: bool,
     ) -> Result<Option<Module>, PathError> {
-        self.import_modules_except(path, None)
+        self.import_modules_except(path, None, absolute)
     }
 
     fn import_modules_except(
         &self,
         path: &[TrackedString],
         excluded: Option<Span>,
+        absolute: bool,
     ) -> Result<Option<Module>, PathError> {
         let mut module = None;
         let mut anchors = true;
         for (index, segment) in path.iter().enumerate() {
             module = match segment.tracked.as_str() {
-                "bundle" if index == 0 => None,
-                "self" if index == 0 => self.module,
-                "super" if anchors => {
+                "bundle" if index == 0 && !absolute => None,
+                "self" if index == 0 && !absolute => self.module,
+                "super" if anchors && !absolute => {
                     let current = if index == 0 { self.module } else { module };
                     let Some(current) = current else {
                         return Err(PathError::Invalid(
@@ -294,7 +306,12 @@ impl Builder<'_> {
                 }
                 name => {
                     anchors = false;
-                    let found = if index == 0 {
+                    let found = if index == 0 && absolute {
+                        self.dependencies
+                            .get(name)
+                            .copied()
+                            .map(|module| Target::Module(Some(module)))
+                    } else if index == 0 {
                         self.lookup_import_name_except(Namespace::Modules, name, true, excluded)
                             .map_err(PathError::Invalid)?
                     } else {
@@ -325,7 +342,7 @@ impl Builder<'_> {
                     Err("a glob requires a module path".into())
                 };
             }
-            let module = self.import_modules(&import.path)?;
+            let module = self.import_modules_from(&import.path, import.absolute)?;
             if import.empty {
                 return Ok(Vec::new());
             }
@@ -364,7 +381,8 @@ impl Builder<'_> {
             path.pop();
         }
         let last = path.last().unwrap();
-        let anchor = matches!(last.tracked.as_str(), "bundle" | "self" | "super");
+        let anchor =
+            !import.absolute && matches!(last.tracked.as_str(), "bundle" | "self" | "super");
         let name = import
             .alias
             .as_ref()
@@ -380,18 +398,28 @@ impl Builder<'_> {
             return Ok(vec![(
                 Namespace::Modules,
                 name,
-                Target::Module(self.import_modules_except(&path, excluded)?),
+                Target::Module(self.import_modules_except(&path, excluded, import.absolute)?),
             )]);
         }
         let mut targets = Vec::new();
         let parent = if path.len() > 1 {
-            Some(self.import_modules(&path[..path.len() - 1])?)
+            Some(self.import_modules_from(&path[..path.len() - 1], import.absolute)?)
         } else {
             None
         };
         for namespace in namespaces {
             let target = match parent {
                 Some(module) => self.declared_target(module, namespace, &last.tracked),
+                None if import.absolute => {
+                    if namespace == Namespace::Modules {
+                        self.dependencies
+                            .get(&last.tracked)
+                            .copied()
+                            .map(|module| Target::Module(Some(module)))
+                    } else {
+                        None
+                    }
+                }
                 None => {
                     // A same-name import copies an existing lexical name; it
                     // cannot use its own output as evidence for that name.
@@ -415,7 +443,7 @@ impl Builder<'_> {
         let mut imports = Vec::new();
         for (module, tree) in trees {
             let mut flat = Vec::new();
-            flatten(tree, &[], &mut flat);
+            flatten(tree, &[], false, &mut flat);
             imports.extend(flat.into_iter().map(|import| (module, import)));
         }
         // Rebuild from the preceding round: aliases may refer forward, and a
@@ -511,7 +539,7 @@ impl Builder<'_> {
             let Some(first) = import.path.first() else {
                 continue;
             };
-            if matches!(first.tracked.as_str(), "bundle" | "self" | "super") {
+            if import.absolute || matches!(first.tracked.as_str(), "bundle" | "self" | "super") {
                 continue;
             }
             let bare = import.path.len() == 1 && !import.glob;
@@ -600,7 +628,7 @@ impl Builder<'_> {
     pub(super) fn resolve_local_import(&mut self, tree: parse::UseTree, block: Span) {
         let start = tree.span.end();
         let mut imports = Vec::new();
-        flatten(tree, &[], &mut imports);
+        flatten(tree, &[], false, &mut imports);
         for import in imports {
             match self.import_targets(&import) {
                 Err(message) => self.error(import.span, ErrorKind::Using { message }),
@@ -668,16 +696,26 @@ fn named_targets(bindings: &Bindings) -> impl Iterator<Item = (Namespace, &str, 
 }
 
 impl ScopeNames {
+    pub fn dependency_names(&self) -> impl Iterator<Item = (Namespace, &str, Option<Symbol>)> {
+        self.dependencies
+            .iter()
+            .map(|(name, module)| (Namespace::Modules, name.as_str(), Some(module.symbol())))
+    }
+
     /// Lexical candidates include imports; qualified member lookup does not.
     pub fn lexical_names(
         &self,
         module: Option<Module>,
     ) -> impl Iterator<Item = (Namespace, &str, Option<Symbol>)> {
-        self.imports
-            .modules
-            .get(&module)
-            .into_iter()
-            .flat_map(named_targets)
+        self.dependency_names()
+            .filter(move |_| module.is_none())
+            .chain(
+                self.imports
+                    .modules
+                    .get(&module)
+                    .into_iter()
+                    .flat_map(named_targets),
+            )
             .chain(
                 self.globals(module)
                     .map(|(namespace, name, symbol)| (namespace, name, Some(symbol))),
@@ -722,6 +760,13 @@ impl ScopeNames {
         offset: usize,
         path: &[&str],
     ) -> Option<Option<Module>> {
+        if path.first() == Some(&"") {
+            let mut at = *self.dependencies.get(*path.get(1)?)?;
+            for name in &path[2..] {
+                at = self.module(Some(at), name)?;
+            }
+            return Some(Some(at));
+        }
         let mut at = None;
         let mut anchors = true;
         for (index, name) in path.iter().copied().enumerate() {
@@ -761,11 +806,13 @@ impl ScopeNames {
                             };
                             scope = mint.parent(current.symbol());
                         }
-                        found.or_else(|| {
-                            self.prelude
-                                .and_then(|prelude| self.module(Some(prelude), name))
-                                .map(Some)
-                        })?
+                        found
+                            .or_else(|| self.dependencies.get(name).copied().map(Some))
+                            .or_else(|| {
+                                self.prelude
+                                    .and_then(|prelude| self.module(Some(prelude), name))
+                                    .map(Some)
+                            })?
                     }
                 }
             };

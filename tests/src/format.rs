@@ -1043,6 +1043,15 @@ fn errors_inside_nested_blocks_stay_local() {
 
 #[test]
 fn using_groups_and_comments_survive_formatting() {
+    assert_eq!(fmt("using ::{dep}"), "using ::{dep}\n");
+    assert_eq!(
+        fmt("using ::dep::{self as external,value}"),
+        "using ::dep::{self as external, value}\n"
+    );
+    assert_eq!(
+        fmt("using {::dep as external,local}"),
+        "using {::dep as external, local}\n"
+    );
     assert_eq!(
         fmt("using A::{self as a,x,B::{*,y as z}}"),
         "using A::{self as a, x, B::{*, y as z}}\n"
@@ -1052,6 +1061,7 @@ fn using_groups_and_comments_survive_formatting() {
     assert!(output.contains("-- kept"));
     assert!(output.contains("(* nested (* note *) *)"));
     for source in [
+        "using A::{::dep}",
         "using A *",
         "using A {x}",
         "using A::",

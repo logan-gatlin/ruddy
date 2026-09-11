@@ -15,3 +15,12 @@ Confirmed by the user through the design interview and implementation request.
 
 Review baseline: `74869e0b9c0f7e9edeb2cd6cc65b2c565d7cdaa5`.
 Validation boundaries: existing compiler source-language and bundle artifact/export APIs, selected within the authorized implementation scope.
+
+## Dependency path follow-up
+
+Match Rust 2018 and later: dependency aliases live in a separate prelude from
+local modules. `::dep` selects a dependency; `bundle::dep` selects a local root
+module. Unprefixed paths prefer lexical names and then fall back to dependency
+aliases. The same rules apply to `using` paths (including groups and globs),
+ordinary value/type/effect paths, and editor completion. Imports remain
+non-exporting. A dependency and a local root module may share their name.

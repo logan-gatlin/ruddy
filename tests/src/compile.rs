@@ -1569,27 +1569,49 @@ fn reification_shared_generic_aliases_do_not_expand_unused_callable_fields() {
 }
 
 #[test]
-fn using_aliases_do_not_redirect_absolute_paths() {
-    let program = accepted(
-        "let value = 42n
-         type T = Nat
-         effect Ask = { get: () -> Nat }
-         module Source = let value = 1n end
-         module Other = let value = true type T = Bool end
-         module Nested =
-           using Other::{self as Source, value, T}
-           let relative: T = Source::value
-           let absolute: ::T = ::Source::value
-           let root = do using Other::value return ::value end
-           let query: () -> ::T + ::!Ask = fn _ => ::!Ask.get ()
-         end",
+fn using_dependency_paths_are_separate_from_bundle_modules() {
+    let dependency = exported(
+        "let value = 42n type T = Nat effect Ask = { get: () -> Nat } module Child = let value = 1n end",
     );
-    assert_eq!(scheme(&program, "relative"), "T");
-    assert_eq!(scheme(&program, "absolute"), "T");
-    assert_eq!(scheme(&program, "root"), "Nat");
+    let program = accepted_with(
+        "module dep = let value = true type T = Bool end
+         let local: bundle::dep::T = dep::value
+         let external: ::dep::T = ::dep::value
+         using ::dep::{self as external_dep, value as imported, T as Number, Ask as Query, Child::{self as child, *}}
+         let imported_value: Number = imported
+         let via_alias = external_dep::value
+         let child_value = child::value
+         let query: () -> ::dep::T + ::dep::!Ask = fn _ => ::dep::!Ask.get ()
+         let alias_query: () -> Number + !Query = fn _ => !Query.get ()
+         module Nested =
+           using ::dep as dep
+           let relative = dep::value
+           let local = bundle::dep::value
+           let external = ::dep::value
+         end
+         let sequential = do using ::dep::* return value end",
+        &dependency,
+    );
+    assert_eq!(scheme(&program, "imported_value"), "tests@0.1.0::T");
+    assert_eq!(scheme(&program, "via_alias"), "Nat");
+    assert_eq!(scheme(&program, "child_value"), "Nat");
+    assert_eq!(scheme(&program, "sequential"), "Nat");
+    accepted_with("using dep let result = dep::value", &dependency);
+    accepted_with("let result = dep::value", &dependency);
+    assert!(
+        program
+            .artifact()
+            .header()
+            .modules
+            .iter()
+            .all(|module| !module.name.ends_with("::external_dep"))
+    );
     for source in [
-        "module Source = let value = 1n end using Source as alias let x = ::alias::value",
-        "module Source = let value = 1n end using Source::value as alias let x = ::alias",
+        "module local = let value = 1n end let x = ::local::value",
+        "let value = 1n let x = ::value",
+        "module local = end using ::local",
+        "let x = ::Nat",
+        "effect E 'r = ::!mut 'r",
     ] {
         assert!(!rejected(source).ir.errors.is_empty(), "{source}");
     }

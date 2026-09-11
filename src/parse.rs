@@ -78,7 +78,7 @@ pub enum DataKind {
 }
 
 /// A name, and the modules it is reached through: `Math::Vec::zero`, or
-/// `::Math::Vec::zero` when reached from the bundle root.
+/// `::Math::Vec::zero` when reached through a dependency.
 ///
 /// A bare name is a relative path with no segments, which is what makes this the one
 /// node every naming position holds — a term, a type, and the sigilled label of
@@ -90,7 +90,7 @@ pub enum DataKind {
 /// applies `Math::mk` and `Math::p.x` projects `x` out of `Math::p`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Path {
-    /// The leading `::`, when this path starts at the bundle root rather than
+    /// The leading `::`, when this path selects a dependency rather than
     /// resolving its first segment from the surrounding lexical scope.
     pub absolute: Option<Span>,
     /// The modules to walk, outermost first. Empty for a bare name.
@@ -203,6 +203,7 @@ pub enum StmtKind {
 /// One branch of a lexical import, retaining groups for formatting.
 #[derive(Debug, Clone)]
 pub struct UseTree {
+    pub absolute: bool,
     pub span: Span,
     pub prefix: Vec<TrackedString>,
     pub kind: UseKind,
@@ -217,6 +218,9 @@ pub enum UseKind {
 
 impl fmt::Display for UseTree {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.absolute {
+            f.write_str("::")?;
+        }
         for (index, segment) in self.prefix.iter().enumerate() {
             if index > 0 {
                 f.write_str("::")?;
@@ -1591,12 +1595,13 @@ impl Parser {
 
     fn using_stmt(&mut self) -> Option<Tracked<StmtKind>> {
         let keyword = self.advance()?;
-        let tree = self.use_tree()?;
+        let tree = self.use_tree(true)?;
         Some(keyword.span.merge(tree.span).track(StmtKind::Using(tree)))
     }
 
-    fn use_tree(&mut self) -> Option<UseTree> {
+    fn use_tree(&mut self, allow_absolute: bool) -> Option<UseTree> {
         let start = self.peek()?.span;
+        let absolute = allow_absolute && self.eat_if(&Kind::ColonColon).is_some();
         let mut prefix = Vec::new();
         loop {
             if self.at(&Kind::LeftBrace) || self.at(&Kind::Star) {
@@ -1614,7 +1619,7 @@ impl Parser {
         } else if suffix && self.eat_if(&Kind::LeftBrace).is_some() {
             let mut children = Vec::new();
             while !self.at(&Kind::RightBrace) {
-                children.push(self.use_tree()?);
+                children.push(self.use_tree(allow_absolute && prefix.is_empty() && !absolute)?);
                 if self.eat_if(&Kind::Comma).is_none() {
                     break;
                 }
@@ -1633,6 +1638,7 @@ impl Parser {
         };
         let end = self.toks[self.pos - 1].span;
         Some(UseTree {
+            absolute,
             span: start.merge(end),
             prefix,
             kind,

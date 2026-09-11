@@ -901,11 +901,13 @@ impl Analysis {
         }
         let effect_context = before.ends_with('!');
         let qualifier = before.strip_suffix('!').unwrap_or(before);
+        let mut dependency_root = false;
         let qualified = qualifier.strip_suffix("::").map(|before| {
             let start = before
                 .rfind(|ch: char| !(ch.is_alphanumeric() || ch == '_' || ch == ':'))
                 .map_or(0, |at| at + before[at..].chars().next().unwrap().len_utf8());
             let components: Vec<_> = before[start..].split("::").collect();
+            dependency_root = components == [""];
             let file = self
                 .paths
                 .iter()
@@ -942,6 +944,9 @@ impl Analysis {
         // Iterate outer scopes first: inner declarations shadow them when the
         // final candidate list is deduplicated.
         let mut names = Vec::new();
+        if dependency_root {
+            names.extend(self.built.names.dependency_names());
+        }
         for module in visible.into_iter().rev() {
             if qualified.is_none() {
                 names.extend(self.built.names.lexical_names(module));

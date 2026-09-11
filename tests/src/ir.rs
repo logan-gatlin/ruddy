@@ -6294,13 +6294,13 @@ fn an_unqualified_name_walks_outward_and_the_inner_one_wins() {
     assert_eq!(names("w"), term_symbol(&mint, &out, "x"));
 }
 
-/// A path beginning with `::` starts at the bundle root instead of walking out
+/// A path beginning with `bundle::` starts at the bundle root instead of walking out
 /// from its lexical scope. The unprefixed spelling keeps the ordinary walk.
 #[test]
-fn an_absolute_path_resolves_from_the_bundle_root() {
+fn a_bundle_path_resolves_from_the_bundle_root() {
     let src = "module std =\n  module console =\n    let println = 1n\n  end\nend\n\
                module nested =\n  module std =\n    module console =\n      let println = 2n\n    end\n  end\n\
-  let absolute = ::std::console::println\n\
+  let absolute = bundle::std::console::println\n\
   let relative = std::console::println\nend";
     let (mint, out) = built(src);
     let named = |path: &str| {
