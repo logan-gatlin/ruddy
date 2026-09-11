@@ -76,3 +76,76 @@ const $http = {
     }
   }
 };
+// Host observation. Reading a property can run a getter or a proxy trap, so
+// each of these is an effect operation whose failure is data: a host throw
+// becomes `#Error { path, expected, message }` carrying the host's own words,
+// and nothing thrown here crosses back into Ruddy as an exception.
+const $jsFailure = (path, expected, error) => $sum("Error", $record([
+  ["path", path], ["expected", expected], ["message", $webMessage(error)]
+]));
+const $jsObserve = (path, expected, observe) => {
+  try { return $sum("Some", observe()); }
+  catch (error) { return $jsFailure(path, expected, error); }
+};
+const $jsPresent = (value, what) => {
+  if (value === null || value === undefined) throw new TypeError("Cannot read " + what + " of " + String(value));
+  return value;
+};
+// An active path, not a set of everything seen: a repeated sibling is copied,
+// and only a cycle is refused, which is what conversion does as well.
+const $jsSnapshot = (value, path, active) => {
+  if (value === null) return null;
+  const kind = typeof value;
+  if (kind === "undefined" || kind === "boolean" || kind === "number" || kind === "string") return value;
+  if (kind !== "object") throw new TypeError("A " + kind + " at " + path + " is not inert data");
+  if (active.has(value)) throw new TypeError("The value at " + path + " refers to itself");
+  active.add(value);
+  let copy;
+  if (Array.isArray(value)) {
+    copy = [];
+    for (let index = 0; index < value.length; index++) copy.push($jsSnapshot(value[index], path + "[" + index + "]", active));
+  } else {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) throw new TypeError("The value at " + path + " is a host object, not plain data");
+    copy = Object.create(null);
+    for (const key of Object.keys(value)) copy[key] = $jsSnapshot(value[key], path + "." + key, active);
+  }
+  active.delete(value);
+  return copy;
+};
+// `Array.isArray` runs on the host and can refuse — a revoked proxy answers
+// `typeof` but nothing else — so a value that cannot report what it is is
+// `#Other`, which is what this operation promises instead of failing.
+const $jsKind = value => {
+  if (value === null) return "Null";
+  const kind = typeof value;
+  if (kind === "undefined") return "Undefined";
+  if (kind === "boolean") return "Bool";
+  if (kind === "number") return "Number";
+  if (kind === "string") return "String";
+  if (kind === "function") return "Function";
+  if (kind !== "object") return "Other";
+  try { return Array.isArray(value) ? "Array" : "Object"; }
+  catch (error) { return "Other"; }
+};
+const $js = {
+  kind: value => $sum($jsKind(value), undefined),
+  field: request => $jsObserve("$." + request.name, "a readable property", () =>
+    $jsPresent(request.of, request.name)[request.name]),
+  element: request => $jsObserve("$[" + request.at + "]", "a readable element", () =>
+    $jsPresent(request.of, "element " + request.at)[request.at]),
+  length: value => $jsObserve("$.length", "a finite non-negative integer length", () => {
+    const length = $jsPresent(value, "length").length;
+    if (!Number.isInteger(length) || length < 0 || length > $domains.nat.high) throw new TypeError("Its length is not a natural number this target can hold");
+    return length;
+  }),
+  keys: value => $jsObserve("$", "an object", () => {
+    if (value === null || (typeof value !== "object" && typeof value !== "function")) throw new TypeError("A " + (value === null ? "null" : typeof value) + " has no keys");
+    return Object.keys(value);
+  }),
+  snapshot: value => $jsObserve("$", "inert data", () => $jsSnapshot(value, "$", new Set())),
+  apply: request => $jsObserve("$", "a callable value", () => {
+    if (typeof request.of !== "function") throw new TypeError("This value is not callable");
+    return request.of(...request.arguments);
+  })
+};

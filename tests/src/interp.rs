@@ -697,8 +697,7 @@ let owner: std::abi::Ownership = {
 let byte: std::abi::Type = #Scalar (#Integer { bits: 8n, signed: false })
 let write_all: std::abi::Type -> std::abi::Plan = fn buffer => {
   name: "write_all",
-  convention: #C,
-  address_bits: 64n,
+  target: { convention: #C, address_bits: 64n, scalar_alignment: #None },
   parameters: [
     { name: "buffer", shape: buffer },
     { name: "len", shape: #Scalar (#Integer { bits: 64n, signed: false }) },
@@ -729,6 +728,54 @@ let refused_faults = std::str::join " " (std::abi::report unstated)
             "true",
             "\"\"",
             r#""the parameter \"buffer\" states no owner: a plan must say which side allocates the region and which side frees it. the parameter \"buffer\" states no length: a plan must say how many elements travel with the pointer, because no type says it.""#,
+        ]
+    );
+}
+
+/// `std::js`'s data layer is the two checked-conversion intrinsics and
+/// nothing else, so both backends must agree about it. Host observation is
+/// left out on purpose: the interpreter provides no JavaScript host.
+#[test]
+fn the_javascript_data_adapter_agrees_across_backends() {
+    let source = r#"
+type Role = #Admin | #User Nat
+type Person = { name: String, roles: [Role] }
+let write: Person -> std::result::Result std::js::Value std::js::Error = std::js::lower
+let read: std::js::Value -> std::result::Result Person std::js::Error = std::js::lift
+let round_trip = match write { name: "ruddy", roles: [#Admin, #User 2n] } with
+| #Some raw => match read raw with
+  | #Some person => std::str::concat person.name (std::str::from_nat (std::array::len person.roles))
+  | #Error error => error.message
+  end
+| #Error error => error.message
+end
+let through_the_adapter = do
+  let adapter: std::js::Adapter Nat = std::js::adapter ()
+  return match adapter.lower 7n with
+  | #Some raw => match adapter.lift raw with
+    | #Some value => std::str::from_nat value
+    | #Error error => error.expected
+    end
+  | #Error error => error.expected
+  end
+end
+let a_callable_is_refused = do
+  let adapter: std::js::Adapter (Nat -> Nat) = std::js::adapter ()
+  return match adapter.lower (fn value => value) with
+  | #Some _ => "written"
+  | #Error error => error.expected
+  end
+end
+"#;
+    let exports = ["round_trip", "through_the_adapter", "a_callable_is_refused"];
+    let (node, interpreted) = both(source, &exports, None);
+    assert_eq!(node, interpreted);
+    assert_eq!(
+        interpreted,
+        vec![
+            "\"ruddy2\"",
+            "\"7\"",
+            "\"a verifiable data type; a function contract needs an adapter\"",
         ]
     );
 }
@@ -796,7 +843,7 @@ fn the_command_line_reads_an_artifact_from_disk() {
     let path = artifact.to_str().unwrap().to_owned();
 
     assert_eq!(
-        ruddy_interp::run(&[path.clone()]).unwrap(),
+        ruddy_interp::run(std::slice::from_ref(&path)).unwrap(),
         ["count", "missing", "name"]
     );
     assert_eq!(

@@ -281,3 +281,179 @@ such bindings and rejects a missing, duplicate, unknown, or mismatched field,
 or one bound for another record. A sum case's `project` observes its payload
 and `inject` makes the case; functions, hidden types (`Any` among them),
 mirrors, and foreign values are described only.
+
+## ABI plans
+
+`std::abi` writes a foreign calling contract down as ordinary data and checks
+it. Backend-neutral ABI plans are validated against representative C and Wasm
+layouts and invocation contracts. Production native/Wasm foreign integration is
+later work; a validated plan is not a claim that those integrations already
+execute. The module names no extern and declares no effect, so validating a
+plan cannot call, allocate, or observe anything: it is a reading of the plan's
+own numbers.
+
+A `Plan` is a `Convention`, the address width in bits of the target it is
+written for, its parameters, its result, and the obligations its adapter
+contract carries. `validate : Plan -> Result () [Error]` answers with every
+fault it can decide from the plan alone, rather than the first — a plan is
+reviewed as a whole — and `report` renders those faults as plain English
+sentences, each naming the position it is about. A `Type` is a scalar of an
+explicit width and signedness, a pointer, a list, a string, a resource handle,
+or a record with a `Layout`: a size, an alignment, and fields at their byte
+offsets.
+
+A layout is written down, never computed, so a header's real numbers can be
+held against the rules. Validation rejects an alignment that is not a power of
+two, a size the alignment does not divide, and a field that is misaligned for
+its own type, overlaps the field before it, runs past the declared size, or is
+aligned more strictly than the record holding it:
+
+```ruddy
+-- struct { char a; int b; double c; } on a 64-bit target.
+let sample: std::abi::Layout = {
+  name: "Sample",
+  size: 16n,
+  alignment: 8n,
+  fields: [
+    { name: "a", offset: 0n, shape: #Scalar (#Integer { bits: 8n, signed: true }) },
+    { name: "b", offset: 4n, shape: #Scalar (#Integer { bits: 32n, signed: true }) },
+    { name: "c", offset: 8n, shape: #Scalar (#Float { bits: 64n }) },
+  ],
+}
+```
+
+Moving `b` to byte 2 answers `the field "b" of the record "Sample" starts at
+byte 2, which its own alignment of 4 bytes does not divide.`
+
+Ownership and length travel with a pointer, a list, or a string, because
+neither can be read off a type. An `Ownership` says which side allocates the
+region, which side frees it, with what function, and how long it stays valid; a
+`Length` names the parameter carrying the count, the count the contract fixes,
+the sentinel that ends the region, or the count the canonical ABI passes beside
+the pointer. A plan that omits either is refused.
+
+`#C` and `#CanonicalAbi` are external ABIs to implement, not a description of
+how Ruddy lays its own values out, and their differences are in the code rather
+than between the lines. The C ABI carries no count beside a pointer, so a C
+plan names the parameter, the fixed count, or the sentinel; the canonical ABI
+passes a pointer and a count together, so a canonical plan does not choose
+another way. The C ABI has neither a Unicode scalar value nor a resource
+handle; the canonical ABI has no raw pointer and no 128-bit integer, and is
+defined over 32-bit linear memory, with 64-bit reserved for memory64. The
+[canonical ABI specification](https://github.com/WebAssembly/component-model/blob/main/design/mvp/CanonicalABI.md)
+is the contract those rules come from.
+
+A type witness cannot make dereferencing an arbitrary C pointer safe. Validity,
+length, lifetime, and allocation provenance must be supplied by the adapter
+contract, so a plan records those obligations rather than discharging them: a
+plan that passes a region of memory and states no validity or lifetime
+obligation is refused, and one whose region is freed by a stated side must also
+state its allocation provenance. Recording an obligation is not meeting it.
+
+## JavaScript values
+
+`std::js` is the JavaScript foreign-adapter layer: checked conversion in both
+directions, and an effect for observing a host value that Ruddy has not
+converted.
+
+`js::Value` is the host's own value. It is opaque and cannot be built out of
+data, and forwarding one back hands the host the very same value, so the host's
+`===` still holds. `js::Error` is `ffi::DecodeError`: a `path` into the value,
+what that position had to be, and the host's own `message`.
+
+`js::lower : 'a -> Result Value Error` writes a value of the inferred type as
+host data and `js::lift : Value -> Result 'a Error` reads one back, checking
+every position. Both take the compiler's mirror for the type at the use site,
+exactly as `reflect::mirror ()` does. Conversion is strict: an integer position
+takes only an integral number inside the target's bound domain, so `1.5`, `-1`,
+and a value past the domain's maximum are all refused; a negative zero from the
+host becomes the one integer zero, while a `Real` keeps the sign the host gave
+it; a text position takes only a string, and an astral scalar survives it.
+
+`js::Adapter 'a` is the pair of directions as one value:
+
+```ruddy
+type Adapter 'a = { lower: 'a -> Result Value Error, lift: Value -> Result 'a Error }
+```
+
+`js::adapter ()` is the structural adapter for the inferred type. A specialized
+adapter is an ordinary record a caller writes, and goes wherever the structural
+one goes:
+
+```ruddy
+let millis: std::js::Value -> std::result::Result Nat std::js::Error = std::js::lift
+let seconds: std::js::Adapter Nat = {
+  lower: fn count => std::js::lower (std::nat::multiply count 1000n),
+  lift: fn value => match millis value with
+  | #Some elapsed => #Some (std::nat::divide elapsed 1000n)
+  | #Error error => #Error error
+  end,
+}
+```
+
+Neither direction carries a function contract. A decoder that rebuilt a
+callable would be promising behavior nobody checked, so `lift` refuses one and
+says so: `a verifiable data type; a function contract needs an adapter`.
+
+### Observing a host value
+
+Reading a property of a host object can run a getter or a proxy trap, so it is
+not a pure read. `js::Host` collects those operations, and a function that
+performs them says so in its type:
+
+```ruddy
+let name_of: std::js::Value -> std::result::Result std::js::Value std::js::Error
+  + std::js::!Host = std::js::field "name"
+```
+
+`kind value` reports what JavaScript says the value is, keeping `#Null` apart
+from `#Undefined` and `#Array` apart from `#Object`; a symbol or a bigint is
+`#Other`. `field name of` and `element at of` read a property and an index.
+`length of` requires a finite non-negative integer `length` that this target's
+`Nat` can hold. `keys of` returns the host's own enumerable string keys, in the
+host's order. `apply arguments of` calls a callable with those arguments and no
+receiver; read a method with `field` if the host must bind one. Each of these
+reports the host's failure as an `#Error` carrying the host's own message rather
+than throwing; only `kind` cannot fail, and reports `#Other` for a value it
+cannot name.
+
+A host value that throws when the runtime itself probes it, such as a revoked
+proxy, never reaches these operations: that failure belongs to the calling
+convention every extern shares, not to this module.
+
+`snapshot of` copies plain data — objects, arrays, and primitives — out of the
+host. It refuses a function, a value already on the path being copied, and a
+host object that is not plain data, such as a `Date` or a `Map`. What comes back
+is inert data nobody else holds, so reading it afterwards with `lift` is pure
+and needs no `!Host`. Forwarding a `Value` instead of copying it keeps the
+host's identity.
+
+Node executables and Node or web libraries install the handler for `Host`, as
+they do for the other platform effects. A local handler can answer these
+operations without a host at all.
+
+### Callbacks
+
+A Ruddy function crosses to the host through an `extern` declaration, which
+carries the complete per-arrow type, the effects the callback may perform, and
+how the call completes:
+
+```ruddy
+extern each: fn(fn(Nat) -> Nat, [Nat]) -> [Nat] = "(step, values) => values.map(step)"
+extern run_with: fn(fn(Nat) -> Nat + !Log) -> Nat + !Log = "step => step(21)"
+@async
+extern later: fn(fn(Nat) -> Nat, Nat) -> Nat =
+  "(step, value) => new Promise(resolve => setTimeout(() => resolve(step(value)), 0))"
+```
+
+The callback's declared effects stay in the caller's type, so the caller still
+handles them; `@async` says the host answers with a promise, and the Ruddy call
+site reads as an ordinary call either way. Completion timing grants no further
+permission. A declaration is also how a host function becomes a Ruddy one:
+`extern make_adder: fn(Nat) -> fn(Nat) -> Nat` accepts the callable that `lift`
+refuses.
+
+Foreign code and its callers are trusted to respect the declared lifetime,
+retention, thread, allocation, and effect contract; this layer adds no
+revocation tokens or scoped-only callbacks. C and Wasm adapters need their own
+opaque handle types and ABI contracts, which are not part of this module.

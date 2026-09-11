@@ -1,0 +1,722 @@
+-- Backend-neutral ABI plans are validated against representative C and Wasm layouts and invocation
+-- contracts. Production native/Wasm foreign integration is later work; a validated plan is not a
+-- claim that those integrations already execute.
+--
+-- A plan is ordinary data. This module performs no effect and names no extern: nothing here calls a
+-- foreign function, reads foreign memory, or observes a host. `validate` checks what is decidable
+-- from the plan alone.
+--
+-- A type witness cannot make dereferencing an arbitrary C pointer safe. Validity, length, lifetime,
+-- and allocation provenance must be supplied by the adapter contract, so a plan records those
+-- obligations rather than discharging them.
+--
+-- `#C` and `#CanonicalAbi` are external ABIs to implement, not a description of how Ruddy lays its
+-- own values out. The canonical ABI is specified at
+-- https://github.com/WebAssembly/component-model/blob/main/design/mvp/CanonicalABI.md
+
+@doc "The external ABI a plan is written against. `#C` is a platform C ABI, and `#CanonicalAbi` is the WebAssembly component model's canonical ABI. Both are external ABIs to implement; neither describes how Ruddy lays its own values out."
+type Convention = #C | #CanonicalAbi
+
+@doc "The target a plan is written for: the ABI it follows, the address width in bits, and the largest alignment that target gives a scalar. `scalar_alignment` is `#Some 4n` for i386 System V, which aligns a double to 4 bytes rather than to its own 8, and `#None` for a target such as x86-64 or AArch64 that aligns every scalar to its own width. It is stated rather than derived because no rule recovers it from the address width."
+type Target = { convention: Convention, address_bits: Nat, scalar_alignment: Option Nat }
+
+@doc "Which side of a foreign call a duty falls on: the Ruddy caller, or the foreign callee."
+type Side = #Caller | #Callee
+
+@doc "A scalar as the ABI spells it, with its width in bits and its signedness written down rather than inferred from a Ruddy type. `#Char` is the component model's Unicode scalar value; the C ABI has no such type."
+type Scalar =
+  | #Integer { bits: Nat, signed: Bool }
+  | #Float { bits: Nat }
+  | #Bool
+  | #Char
+
+@doc "How text is spelled in memory. The canonical ABI's own encodings are UTF-8, UTF-16, and latin1-or-UTF-16, and a canonical plan states one of those; C has no encoding of its own, so a C contract states with `#Other` the one it actually uses."
+type Encoding = #Utf8 | #Utf16 | #Latin1OrUtf16 | #Other String
+
+@doc "How long a region stays valid: for the call only, until whoever frees it does, or for the life of the program."
+type Lifetime = #Call | #UntilFreed | #Static
+
+@doc "Who allocates a region, who frees it, and with what, since none of it follows from a type. `free_with` names the foreign function that releases the region, because a region taken from one allocator and returned to another is a fault no witness catches. A region nobody frees states `#None`, which is a claim about static or arena storage rather than a guess."
+type Ownership = {
+  allocated_by: Side,
+  freed_by: Option Side,
+  free_with: Option String,
+  lifetime: Lifetime,
+}
+
+@doc "How the callee learns how many elements travel with a pointer. Every pointer, list, and string states one; a pointer to a single object states `#Fixed 1n`, because a pointer whose readable extent nobody wrote down is exactly what this plan is for. `#Parameter` names another parameter of the same plan that carries the count, `#Field` names a field beside it in the same record, as `struct iovec` counts `iov_base` by `iov_len`, `#Fixed` states a count the contract fixes, `#Sentinel` names the terminator that ends the region, and `#Canonical` is the count the canonical ABI passes beside the pointer."
+type Length = #Parameter String | #Field String | #Fixed Nat | #Sentinel String | #Canonical
+
+@doc "What a position carries across the boundary. A pointer, list, or string carries its ownership and its length with it, because neither can be read off a type."
+type Type =
+  | #Scalar Scalar
+  | #Pointer { pointee: Type, ownership: Option Ownership, length: Option Length, nullable: Bool }
+  | #List { element: Type, ownership: Option Ownership, length: Option Length }
+  | #Text { encoding: Encoding, ownership: Option Ownership, length: Option Length }
+  | #Handle { resource: String, owned: Bool }
+  | #Record Layout
+
+@doc "One field of a record, at its byte offset from the start of the record. Fields are written in offset order."
+type Field = { name: String, offset: Nat, shape: Type }
+
+@doc "A record's layout as a foreign header really declares it: the total size in bytes including trailing padding, the alignment in bytes, and the fields at their offsets. A layout is written down and checked, never computed, so that a plan can be held against the numbers the other side already uses."
+type Layout = { name: String, size: Nat, alignment: Nat, fields: [Field] }
+
+@doc "One parameter of a call, by name so that a length can refer to it."
+type Parameter = { name: String, shape: Type }
+
+@doc "A duty the adapter contract must supply, because no type witness supplies it."
+type Duty = #Validity | #Length | #Lifetime | #Provenance | #Thread | #Completion
+
+@doc "An obligation the adapter contract carries, with the note that says how it is met. Recording an obligation is not discharging it; validating a plan only checks that the plan states the ones its own shapes require."
+type Obligation = { duty: Duty, note: String }
+
+@doc "A foreign calling contract as data: the target it is written for, the parameters, the result, and the obligations the adapter must supply. Nothing here executes a call."
+type Plan = {
+  name: String,
+  target: Target,
+  parameters: [Parameter],
+  result: Option Type,
+  obligations: [Obligation],
+}
+
+@doc "What is wrong with a plan, as data. Each case is decidable from the plan alone: nothing here reports anything a foreign call would have to run to discover."
+type Reason =
+  | #Alignment Nat
+  | #ScalarAlignment Nat
+  | #Size { size: Nat, alignment: Nat }
+  | #Offset { offset: Nat, alignment: Nat }
+  | #Overlap { offset: Nat, previous: String, ends: Nat }
+  | #PastEnd { offset: Nat, size: Nat, declared: Nat }
+  | #UnderAligned { needs: Nat, declared: Nat }
+  | #NoOwner
+  | #NoLength
+  | #UnknownLength String
+  | #UnknownField String
+  | #ZeroWidth
+  | #Width { bits: Nat, convention: Convention }
+  | #Unsupported { construct: String, convention: Convention, instead: String }
+  | #LengthConvention Convention
+  | #NoLayout { construct: String, convention: Convention }
+  | #MissingDuty Duty
+  | #AddressWidth { bits: Nat, convention: Convention }
+
+@doc "One fault in a plan and the position it is about, such as `the field \"b\" of the record \"Sample\"`. `message` renders it as a plain English sentence; the reason is the machine-readable part."
+type Error = { position: String, reason: Reason }
+
+-- `parameters` is `#None` when no plan encloses the shape, as when a layout is checked on its own:
+-- a length that names a parameter is then unresolvable rather than wrong. `fields` holds the names
+-- beside the shape in the record that encloses it, and is empty outside a record.
+@private
+type Context = { target: Target, parameters: Option [String], fields: [String] }
+
+@doc "A convention's name, as a sentence uses it."
+let convention_name: Convention -> String = fn convention => match convention with
+| #C => "the C ABI"
+| #CanonicalAbi => "the canonical ABI"
+end
+
+@private
+let quoted: String -> String = fn text => str::concat "\"" (str::concat text "\"")
+
+@private
+let bytes: Nat -> String = fn count =>
+  if nat::equal count 1n then "1 byte" else str::concat (str::from_nat count) " bytes" end
+
+@private
+let is_power_of_two: Nat -> Bool = fn value =>
+  if nat::equal value 1n then true
+  else if nat::less_than value 2n then false
+  else if nat::is_zero (nat::remainder value 2n) then is_power_of_two (nat::divide value 2n)
+  else false
+  end
+
+@private
+let divides: Nat -> Nat -> Bool = fn divisor value =>
+  if nat::is_zero divisor then false else nat::is_zero (nat::remainder value divisor) end
+
+@private
+let when_error: Bool -> Error -> [Error] = fn bad error => if bad then [error] else [] end
+
+@private
+let named: [String] -> String -> Bool = fn names name =>
+  array::any (fn other => str::equal other name) names
+
+-- Whether a field of this size at this offset reaches past a record of the declared size, decided
+-- without adding the two, so that a plan stating a wild offset is reported rather than pushing the
+-- sum out of the `Nat` domain.
+@private
+let runs_past: Nat -> Nat -> Nat -> Bool = fn declared offset size =>
+  nat::greater_than size declared or nat::greater_than offset (nat::subtract declared size)
+
+@private
+let ends_at: Nat -> Nat -> Nat -> Nat = fn declared offset size =>
+  if runs_past declared offset size then declared else nat::add offset size end
+
+@doc "A duty's name, as a sentence uses it."
+let duty_name: Duty -> String = fn duty => match duty with
+| #Validity => "validity"
+| #Length => "a length"
+| #Lifetime => "a lifetime"
+| #Provenance => "allocation provenance"
+| #Thread => "thread confinement"
+| #Completion => "callback completion"
+end
+
+@doc "What a position is, as a sentence names it."
+let construct_name: Type -> String = fn shape => match shape with
+| #Scalar scalar =>
+  match scalar with
+  | #Integer _ => "an integer"
+  | #Float _ => "a floating-point number"
+  | #Bool => "a boolean"
+  | #Char => "a Unicode scalar value"
+  end
+| #Pointer _ => "a raw pointer"
+| #List _ => "a list"
+| #Text _ => "a string"
+| #Handle _ => "a resource handle"
+| #Record _ => "a record"
+end
+
+@doc "The integer widths in bits a convention passes. The component model has u8, u16, u32, and u64 and no wider integer; a C target that has `__int128` passes it in a register pair."
+let integer_widths: Convention -> [Nat] = fn convention => match convention with
+| #C => [8n, 16n, 32n, 64n, 128n]
+| #CanonicalAbi => [8n, 16n, 32n, 64n]
+end
+
+@doc "The floating-point widths in bits a convention passes."
+let float_widths: Convention -> [Nat] = fn convention => match convention with
+| #C => [32n, 64n]
+| #CanonicalAbi => [32n, 64n]
+end
+
+@doc "The address widths in bits a convention is defined over. The canonical ABI's MVP is defined over 32-bit linear memory, with 64-bit reserved for memory64. A C target narrower than 64 bits usually caps scalar alignment as well, which its target states."
+let address_widths: Convention -> [Nat] = fn convention => match convention with
+| #C => [16n, 32n, 64n]
+| #CanonicalAbi => [32n, 64n]
+end
+
+@doc "How many bytes a value of this shape occupies in memory on a target, or nothing when that target's convention lays it out nowhere. A list or a string is one object under the canonical ABI, a pointer beside a separate count under C."
+let size_of: Target -> Type -> Option Nat = fn target shape => do
+  let address = target.address_bits
+  return match shape with
+  | #Scalar scalar =>
+    match scalar with
+    | #Integer integer =>
+      if divides 8n integer.bits then #Some (nat::divide integer.bits 8n) else #None end
+    | #Float float => if divides 8n float.bits then #Some (nat::divide float.bits 8n) else #None end
+    | #Bool => #Some 1n
+    | #Char =>
+      match target.convention with
+      | #C => #None
+      | #CanonicalAbi => #Some 4n
+      end
+    end
+  | #Pointer _ => if divides 8n address then #Some (nat::divide address 8n) else #None end
+  | #List _ =>
+    match target.convention with
+    | #C => #None
+    | #CanonicalAbi =>
+      if divides 8n address then #Some (nat::multiply 2n (nat::divide address 8n)) else #None end
+    end
+  | #Text _ =>
+    match target.convention with
+    | #C => #None
+    | #CanonicalAbi =>
+      if divides 8n address then #Some (nat::multiply 2n (nat::divide address 8n)) else #None end
+    end
+  | #Handle _ =>
+    match target.convention with
+    | #C => #None
+    | #CanonicalAbi => #Some 4n
+    end
+  | #Record layout => #Some layout.size
+  end
+end
+
+@private
+let capped: Option Nat -> Option Nat -> Option Nat = fn limit alignment =>
+  match (limit, alignment) with
+  | (#Some cap, #Some value) => #Some (nat::min cap value)
+  | _ => alignment
+  end
+
+@doc "How many bytes a value of this shape is aligned to on a target, or nothing when that target's convention lays it out nowhere. A record is aligned as its layout declares. Everything else is aligned to its own width, capped by the target's `scalar_alignment`, which is how i386 System V aligns a double to 4 bytes and not to 8."
+let alignment_of: Target -> Type -> Option Nat = fn target shape => do
+  let address = target.address_bits
+  return match shape with
+  | #Record layout => #Some layout.alignment
+  | #List _ =>
+    match target.convention with
+    | #C => #None
+    | #CanonicalAbi =>
+      capped
+        target.scalar_alignment
+        (if divides 8n address then #Some (nat::divide address 8n) else #None end)
+    end
+  | #Text _ =>
+    match target.convention with
+    | #C => #None
+    | #CanonicalAbi =>
+      capped
+        target.scalar_alignment
+        (if divides 8n address then #Some (nat::divide address 8n) else #None end)
+    end
+  | _ => capped target.scalar_alignment (size_of target shape)
+  end
+end
+
+@doc "A plain English sentence for one fault, naming the position it is about."
+let message: Error -> String = fn error => do
+  let rest = match error.reason with
+  | #Alignment alignment =>
+    str::concat
+      (str::concat " declares an alignment of " (bytes alignment))
+      ", which is not a power of two"
+  | #ScalarAlignment alignment =>
+    str::concat
+      (str::concat " caps scalar alignment at " (bytes alignment))
+      ", which is not a power of two"
+  | #Size size =>
+    str::concat
+      (str::concat
+        (str::concat " declares a size of " (bytes size.size))
+        ", which its alignment of ")
+      (str::concat (bytes size.alignment) " does not divide")
+  | #Offset offset =>
+    str::concat
+      (str::concat
+        (str::concat " starts at byte " (str::from_nat offset.offset))
+        ", which its own alignment of ")
+      (str::concat (bytes offset.alignment) " does not divide")
+  | #Overlap overlap =>
+    str::concat
+      (str::concat
+        (str::concat " starts at byte " (str::from_nat overlap.offset))
+        ", but the field ")
+      (str::concat
+        (quoted overlap.previous)
+        (str::concat " before it runs to byte " (str::from_nat overlap.ends)))
+  | #PastEnd past =>
+    str::concat
+      (str::concat
+        (str::concat " starts at byte " (str::from_nat past.offset))
+        (str::concat " and is " (bytes past.size)))
+      (str::concat
+        " wide, running past the "
+        (str::concat (bytes past.declared) " the record declares"))
+  | #UnderAligned under =>
+    str::concat
+      (str::concat (str::concat " needs an alignment of " (bytes under.needs)) ", more than the ")
+      (str::concat (bytes under.declared) " the record it is in declares")
+  | #NoOwner =>
+    " states no owner: a plan must say which side allocates the region and which side frees it"
+  | #NoLength =>
+    " states no length: a plan must say how many elements travel with the pointer, because no type says it"
+  | #UnknownLength name =>
+    str::concat
+      " takes its length from a parameter named "
+      (str::concat (quoted name) ", and this plan has no parameter of that name")
+  | #UnknownField name =>
+    str::concat
+      " takes its length from a field named "
+      (str::concat (quoted name) ", and no field of that name is beside it")
+  | #ZeroWidth => " is a scalar of zero width, which no calling convention passes"
+  | #Width width =>
+    str::concat
+      (str::concat (str::concat " is " (str::from_nat width.bits)) " bits wide, a width ")
+      (str::concat (convention_name width.convention) " does not have")
+  | #Unsupported unsupported =>
+    str::concat
+      (str::concat (str::concat " is " unsupported.construct) ", which ")
+      (str::concat
+        (convention_name unsupported.convention)
+        (str::concat " does not have; " unsupported.instead))
+  | #LengthConvention convention =>
+    match convention with
+    | #CanonicalAbi =>
+      " states a length of its own, which the canonical ABI does not leave to a plan: it passes a pointer and a count together, and that count is the length"
+    | #C =>
+      " leaves its length to the ABI, which the C ABI does not carry: name the parameter or the field beside it holding the count, the count the contract fixes, or the sentinel that ends the region"
+    end
+  | #NoLayout no_layout =>
+    str::concat
+      (str::concat (str::concat " is " no_layout.construct) ", which ")
+      (str::concat
+        (convention_name no_layout.convention)
+        " does not lay out inside a record; state a pointer and the field that carries its length instead")
+  | #MissingDuty duty =>
+    str::concat
+      " passes a region of memory, so its adapter contract must supply "
+      (str::concat (duty_name duty) ", and this plan states no such obligation")
+  | #AddressWidth address =>
+    str::concat
+      (str::concat
+        (str::concat " states an address width of " (str::from_nat address.bits))
+        " bits, which ")
+      (str::concat (convention_name address.convention) " is not defined over")
+  end
+  return str::concat error.position (str::concat rest ".")
+end
+
+@private
+let owner_errors: String -> Option Ownership -> [Error] = fn position ownership =>
+  match ownership with
+  | #Some _ => []
+  | #None => [{ position: position, reason: #NoOwner }]
+  end
+
+@private
+let length_errors: Context -> String -> Bool -> Option Length -> [Error] =
+  fn context position required length => match length with
+  | #None => when_error required { position: position, reason: #NoLength }
+  | #Some stated =>
+    match context.target.convention with
+    | #CanonicalAbi =>
+      match stated with
+      | #Canonical => []
+      | _ => [{ position: position, reason: #LengthConvention (#CanonicalAbi) }]
+      end
+    | #C =>
+      match stated with
+      | #Canonical => [{ position: position, reason: #LengthConvention (#C) }]
+      | #Parameter name =>
+        match context.parameters with
+        | #Some names =>
+          when_error (not named names name) { position: position, reason: #UnknownLength name }
+        | #None => []
+        end
+      | #Field name =>
+        when_error
+          (not named context.fields name)
+          { position: position, reason: #UnknownField name }
+      | _ => []
+      end
+    end
+  end
+
+@private
+let encoding_errors: Context -> String -> Encoding -> [Error] = fn context position encoding =>
+  match context.target.convention with
+  | #C => []
+  | #CanonicalAbi =>
+    match encoding with
+    | #Other _ =>
+      [
+        {
+          position: position,
+          reason: #Unsupported {
+            construct: "a string in an encoding of its own",
+            convention: #CanonicalAbi,
+            instead: "the canonical ABI lifts UTF-8, UTF-16, or latin1-or-UTF-16",
+          },
+        },
+      ]
+    | _ => []
+    end
+  end
+
+@private
+let scalar_errors: Context -> String -> Scalar -> [Error] = fn context position scalar => do
+  let convention = context.target.convention
+  return match scalar with
+  | #Integer integer =>
+    if nat::is_zero integer.bits then [{ position: position, reason: #ZeroWidth }]
+    else
+      when_error
+        (not array::any (fn width => nat::equal width integer.bits) (integer_widths convention))
+        { position: position, reason: #Width { bits: integer.bits, convention: convention } }
+    end
+  | #Float float =>
+    if nat::is_zero float.bits then [{ position: position, reason: #ZeroWidth }]
+    else
+      when_error
+        (not array::any (fn width => nat::equal width float.bits) (float_widths convention))
+        { position: position, reason: #Width { bits: float.bits, convention: convention } }
+    end
+  | #Bool => []
+  | #Char =>
+    match convention with
+    | #CanonicalAbi => []
+    | #C =>
+      [
+        {
+          position: position,
+          reason: #Unsupported {
+            construct: "a Unicode scalar value",
+            convention: #C,
+            instead: "a C plan states an integer of a width and the encoding its contract uses",
+          },
+        },
+      ]
+    end
+  end
+end
+
+@private
+let field_position: String -> String -> String = fn name parent =>
+  str::concat "the field " (str::concat (quoted name) (str::concat " of " parent))
+
+@private
+let record_position: String -> Layout -> String = fn parent layout =>
+  if str::is_empty layout.name then parent
+  else str::concat "the record " (quoted layout.name)
+  end
+
+@private
+let shape_errors: Context -> String -> Type -> [Error] = fn context position shape =>
+  match shape with
+  | #Scalar scalar => scalar_errors context position scalar
+  | #Pointer pointer =>
+    match context.target.convention with
+    | #CanonicalAbi =>
+      [
+        {
+          position: position,
+          reason: #Unsupported {
+            construct: "a raw pointer",
+            convention: #CanonicalAbi,
+            instead: "it passes lists, strings, records, and resource handles, and lowers them itself",
+          },
+        },
+      ]
+    | #C => [
+      ..owner_errors position pointer.ownership,
+      ..length_errors context position true pointer.length,
+      ..shape_errors
+        context
+        (str::concat "what " (str::concat position " points at"))
+        pointer.pointee,
+    ]
+    end
+  | #List list => [
+    ..owner_errors position list.ownership,
+    ..length_errors context position true list.length,
+    ..shape_errors context (str::concat "the element of " position) list.element,
+  ]
+  | #Text text => [
+    ..encoding_errors context position text.encoding,
+    ..owner_errors position text.ownership,
+    ..length_errors context position true text.length,
+  ]
+  | #Handle _ =>
+    match context.target.convention with
+    | #CanonicalAbi => []
+    | #C =>
+      [
+        {
+          position: position,
+          reason: #Unsupported {
+            construct: "a resource handle",
+            convention: #C,
+            instead: "a C plan passes an opaque pointer and states who owns it",
+          },
+        },
+      ]
+    end
+  | #Record layout => layout_errors context position layout
+  end
+
+@private
+let layout_errors: Context -> String -> Layout -> [Error] = fn context parent layout => do
+  let position = record_position parent layout
+  let inside = { fields: array::map (fn field => field.name) layout.fields, ..context }
+  let alignment =
+    when_error
+      (not is_power_of_two layout.alignment)
+      { position: position, reason: #Alignment layout.alignment }
+  let size =
+    when_error
+      (is_power_of_two layout.alignment and not divides layout.alignment layout.size)
+      {
+        position: position,
+        reason: #Size { size: layout.size, alignment: layout.alignment },
+      }
+  return [..alignment, ..size, ..field_errors inside position layout 0n "" layout.fields]
+end
+
+@private
+let field_errors: Context -> String -> Layout -> Nat -> String -> [Field] -> [Error] =
+  fn context position layout previous_end previous_name fields => match fields with
+  | [] => []
+  | [field, ..rest] => do
+    let here = field_position field.name position
+    let own = shape_errors context here field.shape
+    let own_size = size_of context.target field.shape
+    let own_alignment = alignment_of context.target field.shape
+    let placement = match (own_size, own_alignment) with
+    | (#Some size, #Some alignment) => do
+      let misaligned =
+        when_error
+          (not divides alignment field.offset)
+          { position: here, reason: #Offset { offset: field.offset, alignment: alignment } }
+      let overlapping =
+        when_error
+          (nat::less_than field.offset previous_end)
+          {
+            position: here,
+            reason: #Overlap {
+              offset: field.offset,
+              previous: previous_name,
+              ends: previous_end,
+            },
+          }
+      let past =
+        when_error
+          (runs_past layout.size field.offset size)
+          {
+            position: here,
+            reason: #PastEnd { offset: field.offset, size: size, declared: layout.size },
+          }
+      let under =
+        when_error
+          (nat::greater_than alignment layout.alignment)
+          {
+            position: here,
+            reason: #UnderAligned { needs: alignment, declared: layout.alignment },
+          }
+      return [..misaligned, ..overlapping, ..past, ..under]
+    end
+    | _ =>
+      when_error
+        (nat::is_zero (array::len own))
+        {
+          position: here,
+          reason: #NoLayout {
+            construct: construct_name field.shape,
+            convention: context.target.convention,
+          },
+        }
+    end
+    -- A field the convention lays out nowhere has no extent, so the field before it stays the one a
+    -- later overlap is reported against, and its name travels with its end byte.
+    let next_end = match own_size with
+    | #Some size => ends_at layout.size field.offset size
+    | #None => previous_end
+    end
+    let next_name = match own_size with
+    | #Some _ => field.name
+    | #None => previous_name
+    end
+    return [
+      ..placement,
+      ..own,
+      ..field_errors context position layout next_end next_name rest,
+    ]
+  end
+  end
+
+@doc "Every fault a record's layout has on a target: an alignment that is not a power of two, a size the alignment does not divide, and any field that is misaligned for its own type, overlaps the field before it, runs past the declared size, or is aligned more strictly than the record that holds it. A layout is checked here without a plan around it, so a field whose length names a parameter is left alone; a field whose length names another field is still resolved, because its siblings are right here."
+let check_layout: Target -> Layout -> [Error] = fn target layout =>
+  layout_errors { target: target, parameters: #None, fields: [] } "the record" layout
+
+@private
+let carries_region: Type -> Bool = fn shape => match shape with
+| #Pointer _ => true
+| #List _ => true
+| #Text _ => true
+| #Record layout => array::any (fn field => carries_region field.shape) layout.fields
+| _ => false
+end
+
+@private
+let frees_a_region: Type -> Bool = fn shape => do
+  let stated: Option Ownership -> Bool = fn ownership => match ownership with
+  | #Some owner => option::is_some owner.freed_by
+  | #None => false
+  end
+  return match shape with
+  | #Pointer pointer => stated pointer.ownership or frees_a_region pointer.pointee
+  | #List list => stated list.ownership or frees_a_region list.element
+  | #Text text => stated text.ownership
+  | #Record layout => array::any (fn field => frees_a_region field.shape) layout.fields
+  | _ => false
+  end
+end
+
+@private
+let states: [Obligation] -> Duty -> Bool = fn obligations duty =>
+  array::any
+    (fn obligation => str::equal (duty_name obligation.duty) (duty_name duty))
+    obligations
+
+@private
+let obligation_errors: Plan -> [Type] -> [Error] = fn plan shapes => do
+  let position = str::concat "the plan " (quoted plan.name)
+  let regions = array::any carries_region shapes
+  let frees = array::any frees_a_region shapes
+  let required: Duty -> [Error] = fn duty =>
+    when_error
+      (not states plan.obligations duty)
+      { position: position, reason: #MissingDuty duty }
+  return
+    if regions then
+      [
+        ..required #Validity,
+        ..required #Lifetime,
+        ..if frees then required #Provenance else [] end,
+      ]
+    else []
+    end
+end
+
+@private
+let target_errors: Plan -> [Error] = fn plan => do
+  let position = str::concat "the plan " (quoted plan.name)
+  let target = plan.target
+  let address =
+    when_error
+      (not array::any
+        (fn width => nat::equal width target.address_bits)
+        (address_widths target.convention))
+      {
+        position: position,
+        reason: #AddressWidth { bits: target.address_bits, convention: target.convention },
+      }
+  let scalar = match target.scalar_alignment with
+  | #Some cap =>
+    when_error (not is_power_of_two cap) { position: position, reason: #ScalarAlignment cap }
+  | #None => []
+  end
+  return [..address, ..scalar]
+end
+
+@doc "Every fault a plan has that can be decided from the plan alone, or nothing. All of them are reported at once, not the first: a plan is reviewed as a whole, and a reviewer who is told about one bad offset at a time fixes the same layout four times. A plan that validates is a plan whose own numbers and ownership hold together. It is not a working foreign call: production native and Wasm integration is later work, and nothing here executes anything."
+let validate: Plan -> Result () [Error] = fn plan => do
+  let context = {
+    target: plan.target,
+    parameters: #Some (array::map (fn parameter => parameter.name) plan.parameters),
+    fields: [],
+  }
+  let parameters =
+    array::flat_map
+      (fn parameter =>
+        shape_errors
+          context
+          (str::concat "the parameter " (quoted parameter.name))
+          parameter.shape)
+      plan.parameters
+  let returned = match plan.result with
+  | #Some shape => [shape]
+  | #None => []
+  end
+  let result = array::flat_map (fn shape => shape_errors context "the result" shape) returned
+  let shapes = [..array::map (fn parameter => parameter.shape) plan.parameters, ..returned]
+  let errors = [
+    ..target_errors plan,
+    ..parameters,
+    ..result,
+    ..obligation_errors plan shapes,
+  ]
+  return match errors with
+  | [] => #Some ()
+  | _ => #Error errors
+  end
+end
+
+@doc "Every fault of a plan as plain English sentences, one per fault, in the order `validate` reports them."
+let report: Plan -> [String] = fn plan => match validate plan with
+| #Some _ => []
+| #Error errors => array::map message errors
+end

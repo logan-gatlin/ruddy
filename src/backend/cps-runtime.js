@@ -20,6 +20,13 @@ const $resume = (k, value) => ({ kind: "resume", k, value });
 const $enter = (tag, k, next) => ({ kind: "enter", tag, k, next });
 const $leave = (tag, value, h) => ({ kind: "leave", tag, value, h });
 const $inside = (h, tag) => { for (; h; h = h.parent) if (h === tag) return true; return false; };
+// Whether a value is one of this program's closures. A foreign value reaching
+// a boundary may refuse to be read at all — a revoked proxy answers `typeof`
+// and nothing else — and refusing to be read is not being a Ruddy function.
+const $isClosure = value => {
+  if (!value || (typeof value !== "object" && typeof value !== "function")) return false;
+  try { return value[$closureMark] === true; } catch (error) { return false; }
+};
 const $fromHost = value => typeof value === "function" && $wrapped.has(value) ? $wrapped.get(value) : value;
 const $expire = (h, stop) => {
   for (; h && h !== stop; h = h.parent) {
@@ -54,7 +61,7 @@ function $promise(state) {
 // Each foreign request has one settlement. A synchronous throw is consumed by
 // the running driver; Promise settlement schedules a fresh turn.
 function $foreign(state, s) {
-  const args = s.a.map(value => value && value[$closureMark] ? $callback(value, "Sync") : value);
+  const args = s.a.map(value => $isClosure(value) ? $callback(value, "Sync") : value);
   if (s.completion === "Immediate") {
     state.next = $resume(s.k, s.c(...args));
     return;
@@ -170,7 +177,7 @@ function $start(c, args, parent, allowSuspend = true, foreign = false) {
     args = [...Array(count - 1).fill(null).map(() => $record([])), args[0]];
   } else args = [];
   args = args.map(value => {
-    if (value && value[$closureMark]) $hostFunctions.add(value);
+    if ($isClosure(value)) $hostFunctions.add(value);
     return value;
   });
   state.next = $call(c, args, { root: true }, parent);
