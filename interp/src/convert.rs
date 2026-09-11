@@ -165,9 +165,9 @@ impl Conversion<'_> {
                     } else {
                         Value::unit()
                     })
-                } else if !self.outgoing && self.callable {
-                    Ok(Value::unit())
-                } else if value.as_record().is_ok() {
+                } else if (!self.outgoing && self.callable) || value.as_record().is_ok() {
+                    // Coming in through a reviewed contract, whatever the host
+                    // put there stands for the value that carries nothing.
                     Ok(Value::unit())
                 } else {
                     Err(Failure::at(path, "Struct"))
