@@ -1,6 +1,6 @@
 # 25 Validate complete reflection intrinsic signatures
 
-Status: open
+Status: resolved
 Type: task
 Priority: P2
 
@@ -93,3 +93,42 @@ recognition code cannot distinguish that invalid contract from the valid one.
   interpreter after adding these stricter compiler checks.
 - Preserve trusted ordinary extern behavior and existing valid exact-cast
   declarations. Run the regression suite only through `just test`.
+
+## Answer
+
+`src/reification.rs` gained a `contract` module: small predicates over a
+resolved type — a closed record with exactly these fields all present, a
+closed sum with exactly these cases, a pure arrow, an array, a mirror, a
+hidden type checked against the variable it binds, and an occurrence of that
+variable. They read through aliases, so an equivalent type spelled differently
+is the same contract, and a type that merely has the right names is not.
+
+`$describe` is now checked against the whole of `Description`: `root: Nat`,
+`nodes` an array of the eighteen-case node sum with each payload — the integer
+domains as `{ bits, signed, min, max }`, the function node's argument, result,
+and effect fields, the row nodes as arrays of `{ name, node }`, and the rest.
+The ticket's reproduction is a compiler diagnostic before any code is written.
+
+`$shape` is checked against the whole of `Shape 'a`: each primitive view
+reading and making the primitive its case is named for, so `Nat8` and `Nat16`
+are different contracts; the array view's element mirror, read, and make all
+about the one hidden element type; the record view's mirror, its fields each
+hiding their own type with a `read` that observes it and a `bind` that answers
+the hidden binding; the builder taking those bindings and answering the record
+or a `BuildError`; the sum view's cases with `project` and an optional
+`inject`; the three descriptive cases; and `Foreign`. A view operation that
+performs an effect is a different contract too.
+
+The test fixture in `tests/src/inference.rs` carried a two-case `Node`, which
+the old recognition accepted; it is the complete contract now.
+
+Regressions: `mirror_intrinsics_are_reviewed_by_their_signatures` refuses a
+description whose `root` and `nodes` have the wrong types, one whose `nodes`
+are not an array, one whose node sum is short, long, or has one payload
+changed, and one whose domain record is missing fields.
+`the_shape_intrinsic_is_reviewed_against_its_cases` builds the twenty cases
+and substitutes exactly one at a time: a primitive accessor reading another
+primitive, a fixed width that is not its case's, a broken array element
+relationship, a field binding naming the wrong record, a builder answering
+something else, a case view that hides nothing, and a view operation with an
+effect. Each is refused; the real standard library declarations are accepted.

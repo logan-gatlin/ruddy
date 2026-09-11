@@ -595,6 +595,437 @@ fn conversion(
         })
 }
 
+/// The structural contracts the compiler-owned reflection intrinsics have.
+/// A declaration of one is checked against the whole of its type, not against
+/// the names it happens to use: an equivalent type spelled differently is the
+/// same contract, and a type that merely has the right field names is not.
+// Each contract is one closure over a type, and a record or sum's contracts
+// are those paired with their names. Naming the pair would need a lifetime of
+// its own on every use, which reads worse than the type it replaces.
+#[allow(clippy::type_complexity)]
+mod contract {
+    use super::{Presence, Rest, Row, Scheme, Symbol, Ty, flattened, inference};
+    use indexmap::IndexMap;
+    use std::sync::Arc;
+
+    type Aliases = IndexMap<Symbol, Scheme>;
+
+    pub(super) fn unfold(ty: &Arc<Ty>, aliases: &Aliases) -> Arc<Ty> {
+        inference::unfold(aliases, ty)
+    }
+
+    /// A closed row whose every label is present, and its labels.
+    fn settled(row: &Row) -> Option<IndexMap<String, Arc<Ty>>> {
+        let row = flattened(row);
+        if !matches!(row.rest, Rest::Closed) {
+            return None;
+        }
+        row.labels
+            .iter()
+            .map(|(name, field)| {
+                matches!(field.presence, Presence::Present)
+                    .then(|| (name.clone(), field.ty.clone()))
+            })
+            .collect()
+    }
+
+    /// A record with exactly these fields, each satisfying its own contract.
+    pub(super) fn record(
+        ty: &Arc<Ty>,
+        aliases: &Aliases,
+        fields: &[(&str, &dyn Fn(&Arc<Ty>, &Aliases) -> bool)],
+    ) -> bool {
+        let Ty::Struct(row) = &*unfold(ty, aliases) else {
+            return false;
+        };
+        let Some(labels) = settled(row) else {
+            return false;
+        };
+        labels.len() == fields.len()
+            && fields
+                .iter()
+                .all(|(name, holds)| labels.get(*name).is_some_and(|ty| holds(ty, aliases)))
+    }
+
+    /// A sum with exactly these cases, each payload satisfying its contract.
+    pub(super) fn sum(
+        ty: &Arc<Ty>,
+        aliases: &Aliases,
+        cases: &[(&str, &dyn Fn(&Arc<Ty>, &Aliases) -> bool)],
+    ) -> bool {
+        let Ty::Sum(row) = &*unfold(ty, aliases) else {
+            return false;
+        };
+        let Some(labels) = settled(row) else {
+            return false;
+        };
+        labels.len() == cases.len()
+            && cases
+                .iter()
+                .all(|(name, holds)| labels.get(*name).is_some_and(|ty| holds(ty, aliases)))
+    }
+
+    pub(super) fn unit(ty: &Arc<Ty>, aliases: &Aliases) -> bool {
+        record(ty, aliases, &[])
+    }
+    pub(super) fn nat(ty: &Arc<Ty>, aliases: &Aliases) -> bool {
+        matches!(&*unfold(ty, aliases), Ty::Nat)
+    }
+    pub(super) fn text(ty: &Arc<Ty>, aliases: &Aliases) -> bool {
+        matches!(&*unfold(ty, aliases), Ty::String)
+    }
+    pub(super) fn boolean(ty: &Arc<Ty>, aliases: &Aliases) -> bool {
+        matches!(&*unfold(ty, aliases), Ty::Bool)
+    }
+
+    /// An array of values each satisfying a contract.
+    pub(super) fn array(
+        element: &'static dyn Fn(&Arc<Ty>, &Aliases) -> bool,
+    ) -> impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy {
+        move |ty, aliases| match &*unfold(ty, aliases) {
+            Ty::Array(inner) => element(inner, aliases),
+            _ => false,
+        }
+    }
+
+    /// A pure arrow between two contracts.
+    pub(super) fn arrow(
+        from: impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy,
+        to: impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy,
+    ) -> impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy {
+        move |ty, aliases| match &*unfold(ty, aliases) {
+            Ty::Arrow(a, b, effects) => {
+                effects.labels.is_empty()
+                    && matches!(effects.rest, Rest::Closed)
+                    && from(a, aliases)
+                    && to(b, aliases)
+            }
+            _ => false,
+        }
+    }
+
+    /// The bound variable a scheme quantified, by its own index.
+    pub(super) fn bound(index: u32) -> impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy {
+        move |ty, aliases| matches!(&*unfold(ty, aliases), Ty::Bound(found) if *found == index)
+    }
+
+    /// An occurrence of an enclosing hidden type's own variable.
+    pub(super) fn opened(binder: u32) -> impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy {
+        move |ty, aliases| matches!(&*unfold(ty, aliases), Ty::HiddenVar { binder: found, .. } if *found == binder)
+    }
+
+    /// A mirror of a type satisfying a contract.
+    pub(super) fn mirror(
+        of: impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy,
+    ) -> impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy {
+        move |ty, aliases| match &*unfold(ty, aliases) {
+            Ty::Mirror(inner) => of(inner, aliases),
+            _ => false,
+        }
+    }
+
+    /// A hidden type, with its body checked against the variable it binds.
+    pub(super) fn hidden(
+        body: impl Fn(u32, &Arc<Ty>, &Aliases) -> bool + Copy,
+    ) -> impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy {
+        move |ty, aliases| match &*unfold(ty, aliases) {
+            Ty::Hidden {
+                binder,
+                body: inner,
+                ..
+            } => body(*binder, inner, aliases),
+            _ => false,
+        }
+    }
+
+    /// `Option 'a`, whose payload satisfies a contract.
+    pub(super) fn option(
+        some: impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy,
+    ) -> impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy {
+        move |ty, aliases| {
+            sum(
+                ty,
+                aliases,
+                &[("Some", &|ty, aliases| some(ty, aliases)), ("None", &unit)],
+            )
+        }
+    }
+
+    /// `{ bits: Nat, signed: Bool, min: String, max: String }`.
+    pub(super) fn domain(ty: &Arc<Ty>, aliases: &Aliases) -> bool {
+        record(
+            ty,
+            aliases,
+            &[
+                ("bits", &nat),
+                ("signed", &boolean),
+                ("min", &text),
+                ("max", &text),
+            ],
+        )
+    }
+
+    /// `{ name: String, node: Nat }`.
+    pub(super) fn field(ty: &Arc<Ty>, aliases: &Aliases) -> bool {
+        record(ty, aliases, &[("name", &text), ("node", &nat)])
+    }
+
+    /// One node of a description: every case the compiler builds, with the
+    /// payload it builds there.
+    pub(super) fn node(ty: &Arc<Ty>, aliases: &Aliases) -> bool {
+        let fields = array(&field);
+        sum(
+            ty,
+            aliases,
+            &[
+                ("Nat", &domain),
+                ("Int", &domain),
+                ("Fixed", &domain),
+                ("Real", &unit),
+                ("String", &unit),
+                ("Bool", &unit),
+                ("Foreign", &unit),
+                ("Array", &nat),
+                ("Function", &|ty: &Arc<Ty>, aliases: &Aliases| {
+                    record(
+                        ty,
+                        aliases,
+                        &[
+                            ("argument", &nat),
+                            ("result", &nat),
+                            ("effects", &array(&field)),
+                        ],
+                    )
+                }),
+                ("Effects", &fields),
+                ("Record", &fields),
+                ("Sum", &fields),
+                ("Alias", &nat),
+                ("Extend", &|ty: &Arc<Ty>, aliases: &Aliases| {
+                    record(ty, aliases, &[("base", &nat), ("rest", &nat)])
+                }),
+                ("Parameter", &nat),
+                ("Mirror", &nat),
+                ("Hidden", &nat),
+                ("Variable", &nat),
+            ],
+        )
+    }
+
+    /// `{ root: Nat, nodes: [Node] }`.
+    pub(super) fn description(ty: &Arc<Ty>, aliases: &Aliases) -> bool {
+        record(ty, aliases, &[("root", &nat), ("nodes", &array(&node))])
+    }
+
+    /// A fixed-width integer by its own kind, so `Nat8` and `Int8` stay apart.
+    fn fixed(kind: crate::types::FixedInt) -> impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy {
+        move |ty, aliases| matches!(&*unfold(ty, aliases), Ty::Fixed(found) if *found == kind)
+    }
+
+    /// A primitive view: `{ read: 'a -> P, make: P -> 'a }`, where `'a` is the
+    /// mirrored type and `P` the primitive the case is named for. Reading and
+    /// making the wrong primitive is a different contract, whatever the case
+    /// is called.
+    fn view(
+        mirrored: u32,
+        primitive: impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy,
+    ) -> impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy {
+        move |ty, aliases| {
+            record(
+                ty,
+                aliases,
+                &[
+                    ("read", &arrow(bound(mirrored), primitive)),
+                    ("make", &arrow(primitive, bound(mirrored))),
+                ],
+            )
+        }
+    }
+
+    /// `std::reflect::Shape 'a`: every case the compiler builds, with the
+    /// operations it builds there.
+    pub(super) fn shape(ty: &Arc<Ty>, aliases: &Aliases, mirrored: u32) -> bool {
+        use crate::types::FixedInt;
+        let of = bound(mirrored);
+        let primitives: [(&str, &dyn Fn(&Arc<Ty>, &Aliases) -> bool); 13] = [
+            ("Nat", &view(mirrored, nat)),
+            (
+                "Int",
+                &view(mirrored, |ty: &Arc<Ty>, aliases: &Aliases| {
+                    matches!(&*unfold(ty, aliases), Ty::Int)
+                }),
+            ),
+            (
+                "Real",
+                &view(mirrored, |ty: &Arc<Ty>, aliases: &Aliases| {
+                    matches!(&*unfold(ty, aliases), Ty::Real)
+                }),
+            ),
+            ("String", &view(mirrored, text)),
+            ("Bool", &view(mirrored, boolean)),
+            ("Nat8", &view(mirrored, fixed(FixedInt::Nat8))),
+            ("Nat16", &view(mirrored, fixed(FixedInt::Nat16))),
+            ("Nat32", &view(mirrored, fixed(FixedInt::Nat32))),
+            ("Nat64", &view(mirrored, fixed(FixedInt::Nat64))),
+            ("Int8", &view(mirrored, fixed(FixedInt::Int8))),
+            ("Int16", &view(mirrored, fixed(FixedInt::Int16))),
+            ("Int32", &view(mirrored, fixed(FixedInt::Int32))),
+            ("Int64", &view(mirrored, fixed(FixedInt::Int64))),
+        ];
+        // A field and a case each hide their own type, and everything the view
+        // carries is about that one type: the mirror proves it, `read` observes
+        // it, and `bind` or `inject` accepts it.
+        let some_field = hidden(move |binder, body, aliases| {
+            record(
+                body,
+                aliases,
+                &[
+                    ("name", &text),
+                    ("mirror", &mirror(opened(binder))),
+                    ("presence", &|ty: &Arc<Ty>, aliases: &Aliases| {
+                        sum(ty, aliases, &[("Required", &unit), ("Optional", &unit)])
+                    }),
+                    ("read", &arrow(bound(mirrored), option(opened(binder)))),
+                    // `bind` answers the hidden binding, which is what a
+                    // builder takes: the field type it was made at is the
+                    // one thing a caller must not see.
+                    ("bind", &arrow(opened(binder), binding_of(mirrored))),
+                ],
+            )
+        });
+        let some_case = hidden(move |binder, body, aliases| {
+            record(
+                body,
+                aliases,
+                &[
+                    ("name", &text),
+                    ("mirror", &mirror(opened(binder))),
+                    ("project", &arrow(bound(mirrored), option(opened(binder)))),
+                    ("inject", &option(arrow(opened(binder), bound(mirrored)))),
+                ],
+            )
+        });
+        let build_error = |ty: &Arc<Ty>, aliases: &Aliases| {
+            sum(
+                ty,
+                aliases,
+                &[
+                    ("Missing", &text),
+                    ("Duplicate", &text),
+                    ("Unknown", &text),
+                    ("Foreign", &text),
+                    ("Mismatched", &text),
+                ],
+            )
+        };
+        let record_view = move |ty: &Arc<Ty>, aliases: &Aliases| {
+            record(
+                ty,
+                aliases,
+                &[
+                    ("mirror", &mirror(bound(mirrored))),
+                    ("fields", &array_of(&some_field)),
+                    (
+                        "build",
+                        &arrow(
+                            array_of(&binding_of(mirrored)),
+                            result(bound(mirrored), build_error),
+                        ),
+                    ),
+                ],
+            )
+        };
+        let sum_view = move |ty: &Arc<Ty>, aliases: &Aliases| {
+            record(
+                ty,
+                aliases,
+                &[
+                    ("mirror", &mirror(bound(mirrored))),
+                    ("cases", &array_of(&some_case)),
+                ],
+            )
+        };
+        let array_view = hidden(move |binder, body, aliases| {
+            record(
+                body,
+                aliases,
+                &[
+                    ("element", &mirror(opened(binder))),
+                    ("read", &arrow(bound(mirrored), array_of(&opened(binder)))),
+                    ("make", &arrow(array_of(&opened(binder)), bound(mirrored))),
+                ],
+            )
+        });
+        let mut cases: Vec<(&str, &dyn Fn(&Arc<Ty>, &Aliases) -> bool)> = primitives
+            .iter()
+            .map(|(name, holds)| (*name, *holds))
+            .collect();
+        let rest: [(&str, &dyn Fn(&Arc<Ty>, &Aliases) -> bool); 7] = [
+            ("Array", &array_view),
+            ("Record", &record_view),
+            ("Sum", &sum_view),
+            ("Function", &description),
+            ("Hidden", &description),
+            ("Mirror", &description),
+            ("Foreign", &unit),
+        ];
+        cases.extend(rest);
+        let _ = of;
+        sum(ty, aliases, &cases)
+    }
+
+    /// `[T]` where the element satisfies a contract given by reference.
+    fn array_of<'a>(
+        element: &'a dyn Fn(&Arc<Ty>, &Aliases) -> bool,
+    ) -> impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy + 'a {
+        move |ty, aliases| match &*unfold(ty, aliases) {
+            Ty::Array(inner) => element(inner, aliases),
+            _ => false,
+        }
+    }
+
+    /// `Result 'some 'error`.
+    fn result(
+        some: impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy,
+        error: impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy,
+    ) -> impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy {
+        move |ty, aliases| {
+            sum(
+                ty,
+                aliases,
+                &[
+                    ("Some", &|ty: &Arc<Ty>, aliases: &Aliases| some(ty, aliases)),
+                    ("Error", &|ty: &Arc<Ty>, aliases: &Aliases| {
+                        error(ty, aliases)
+                    }),
+                ],
+            )
+        }
+    }
+
+    /// `Binding 'record` opened at a known field variable: the record it was
+    /// made for, the field it names, and the value under that field's type.
+    fn binding(mirrored: u32, field: u32) -> impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy {
+        move |ty, aliases| {
+            record(
+                ty,
+                aliases,
+                &[
+                    ("record", &mirror(bound(mirrored))),
+                    ("name", &text),
+                    ("mirror", &mirror(opened(field))),
+                    ("value", &opened(field)),
+                ],
+            )
+        }
+    }
+
+    /// `Binding 'record` still hiding its field type, as a builder takes it.
+    fn binding_of(mirrored: u32) -> impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy {
+        hidden(move |binder, body, aliases| binding(mirrored, binder)(body, aliases))
+    }
+}
+
 impl Intrinsic {
     /// Recognition uses resolved structural types, never source type names.
     pub fn recognize(
@@ -632,32 +1063,12 @@ impl Intrinsic {
                     if let Ty::Bound(mirrored) = &**inner
                         && matches!(&**args, [arg] if matches!(&**arg, Ty::Bound(index) if index == mirrored)) =>
                 {
-                    let result = inference::unfold(aliases, to);
-                    let Ty::Sum(row) = &*result else {
-                        return None;
-                    };
-                    let row = flattened(row);
-                    (row.labels.len() == SHAPE_CASES.len()
-                        && SHAPE_CASES
-                            .iter()
-                            .all(|name| row.labels.contains_key(*name)))
-                    .then_some(Self::Shape)
+                    contract::shape(to, aliases, *mirrored).then_some(Self::Shape)
                 }
                 _ => None,
             },
             "$describe" if matches!(&**from, Ty::Mirror(_)) => {
-                let result = inference::unfold(aliases, to);
-                let Ty::Struct(row) = &*result else {
-                    return None;
-                };
-                (matches!(row.rest, Rest::Closed)
-                    && row.labels.len() == 2
-                    && ["root", "nodes"].iter().all(|name| {
-                        row.labels
-                            .get(*name)
-                            .is_some_and(|field| matches!(field.presence, Presence::Present))
-                    }))
-                .then_some(Self::Describe)
+                contract::description(to, aliases).then_some(Self::Describe)
             }
             "$sameMirror" => {
                 let pair = inference::unfold(aliases, from);

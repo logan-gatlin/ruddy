@@ -11477,7 +11477,17 @@ fn hide_patterns_open_nested_positions() {
 
 #[test]
 fn mirror_intrinsics_are_reviewed_by_their_signatures() {
-    let description = "type Description = { root: Nat, nodes: [Node] }\ntype Node = #Nat | #Record [{ name: String, node: Nat }]\n";
+    // The whole contract, because recognition checks the whole of it: a record
+    // that merely has fields called `root` and `nodes` is not a description.
+    let description = "type Description = { root: Nat, nodes: [Node] }\n\
+type Domain = { bits: Nat, signed: Bool, min: String, max: String }\n\
+type Field = { name: String, node: Nat }\n\
+type Node = #Nat Domain | #Int Domain | #Real | #String | #Bool | #Foreign\n\
+  | #Fixed Domain | #Array Nat\n\
+  | #Function { argument: Nat, result: Nat, effects: [Field] }\n\
+  | #Effects [Field] | #Record [Field] | #Sum [Field] | #Alias Nat\n\
+  | #Extend { base: Nat, rest: Nat }\n\
+  | #Parameter Nat | #Mirror Nat | #Hidden Nat | #Variable Nat\n";
     let accepted = [
         "extern mirror: () -> Mirror 'a = \"$mirror\"",
         "extern type_of: 'a -> Mirror 'a = \"$typeOf\"",
@@ -11507,6 +11517,14 @@ fn mirror_intrinsics_are_reviewed_by_their_signatures() {
         "extern describe: Mirror 'a -> { root: Nat, nodes: [Node], ..'r } = \"$describe\"",
         "extern describe: Mirror 'a -> { root: Nat, tail: [Node] } = \"$describe\"",
         "extern describe: Mirror 'a -> { root when 'p: Nat, nodes: [Node] } = \"$describe\"",
+        // The payloads are part of the contract, not only the field names.
+        "extern describe: Mirror 'a -> { root: String, nodes: String } = \"$describe\"",
+        "extern describe: Mirror 'a -> { root: Nat, nodes: Node } = \"$describe\"",
+        "extern describe: Mirror 'a -> { root: Nat, nodes: [Nat] } = \"$describe\"",
+        "type Thin = #Nat Domain | #Record [Field]\nextern describe: Mirror 'a -> { root: Nat, nodes: [Thin] } = \"$describe\"",
+        "type Wide = #Nat Domain | #Int Domain | #Real | #String | #Bool | #Foreign | #Fixed Domain | #Array Nat | #Function { argument: Nat, result: Nat, effects: [Field] } | #Effects [Field] | #Record [Field] | #Sum [Field] | #Alias Nat | #Extend { base: Nat, rest: Nat } | #Parameter Nat | #Mirror Nat | #Hidden Nat | #Variable Nat | #Extra\nextern describe: Mirror 'a -> { root: Nat, nodes: [Wide] } = \"$describe\"",
+        "type Loose = #Nat Domain | #Int Domain | #Real | #String | #Bool | #Foreign | #Fixed Domain | #Array String | #Function { argument: Nat, result: Nat, effects: [Field] } | #Effects [Field] | #Record [Field] | #Sum [Field] | #Alias Nat | #Extend { base: Nat, rest: Nat } | #Parameter Nat | #Mirror Nat | #Hidden Nat | #Variable Nat\nextern describe: Mirror 'a -> { root: Nat, nodes: [Loose] } = \"$describe\"",
+        "type Half = { bits: Nat, signed: Bool }\ntype Short = #Nat Half | #Int Half | #Real | #String | #Bool | #Foreign | #Fixed Half | #Array Nat | #Function { argument: Nat, result: Nat, effects: [Field] } | #Effects [Field] | #Record [Field] | #Sum [Field] | #Alias Nat | #Extend { base: Nat, rest: Nat } | #Parameter Nat | #Mirror Nat | #Hidden Nat | #Variable Nat\nextern describe: Mirror 'a -> { root: Nat, nodes: [Short] } = \"$describe\"",
         "extern same: Nat -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = \"$sameMirror\"",
         "extern same: (Nat, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = \"$sameMirror\"",
         "extern same: (Mirror Nat, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = \"$sameMirror\"",
@@ -11571,7 +11589,27 @@ fn mirror_intrinsics_are_reviewed_by_their_signatures() {
 pub(crate) const SHAPE_SOURCE: &str = "type Option 'a = #Some 'a | #None\n\
 type Result 'some 'error = #Some 'some | #Error 'error\n\
 type Description = { root: Nat, nodes: [Node] }\n\
-type Node = #Nat | #Record [{ name: String, node: Nat }]\n\
+type Domain = { bits: Nat, signed: Bool, min: String, max: String }\n\
+type Field = { name: String, node: Nat }\n\
+type Node =\n\
+  | #Nat Domain\n\
+  | #Int Domain\n\
+  | #Real\n\
+  | #String\n\
+  | #Bool\n\
+  | #Foreign\n\
+  | #Fixed Domain\n\
+  | #Array Nat\n\
+  | #Function { argument: Nat, result: Nat, effects: [Field] }\n\
+  | #Effects [Field]\n\
+  | #Record [Field]\n\
+  | #Sum [Field]\n\
+  | #Alias Nat\n\
+  | #Extend { base: Nat, rest: Nat }\n\
+  | #Parameter Nat\n\
+  | #Mirror Nat\n\
+  | #Hidden Nat\n\
+  | #Variable Nat\n\
 type Presence = #Required | #Optional\n\
 type Shape 'a =\n\
   | #Nat { read: 'a -> Nat, make: Nat -> 'a }\n\
@@ -11615,6 +11653,89 @@ fn the_shape_intrinsic_is_reviewed_against_its_cases() {
         "extern shape: Mirror 'a -> RecordView 'a = \"$shape\"",
         "type Fewer 'a = #Nat { read: 'a -> Nat, make: Nat -> 'a } | #Foreign\nextern shape: Mirror 'a -> Fewer 'a = \"$shape\"",
         "type Renamed 'a = #Natural { read: 'a -> Nat, make: Nat -> 'a } | #Int { read: 'a -> Int, make: Int -> 'a } | #Real { read: 'a -> Real, make: Real -> 'a } | #String { read: 'a -> String, make: String -> 'a } | #Bool { read: 'a -> Bool, make: Bool -> 'a } | #Nat8 () | #Nat16 () | #Nat32 () | #Nat64 () | #Int8 () | #Int16 () | #Int32 () | #Int64 () | #Array (ArrayView 'a) | #Record (RecordView 'a) | #Sum (SumView 'a) | #Function Description | #Hidden Description | #Mirror Description | #Foreign\nextern shape: Mirror 'a -> Renamed 'a = \"$shape\"",
+    ] {
+        let (_, _, output) = infer_src(&format!("{SHAPE_SOURCE}{signature}"));
+        assert_eq!(
+            output
+                .errors()
+                .iter()
+                .map(|error| error.kind.code())
+                .collect::<Vec<_>>(),
+            ["runtime-type-information"],
+            "{signature}"
+        );
+    }
+
+    // Every case name kept and one payload changed. The cases are spelled out
+    // here so that exactly one of them differs from the contract: a shape that
+    // merely has the right case names is not the shape this compiler builds.
+    let cases = [
+        "#Nat { read: 'a -> Nat, make: Nat -> 'a }",
+        "#Int { read: 'a -> Int, make: Int -> 'a }",
+        "#Real { read: 'a -> Real, make: Real -> 'a }",
+        "#String { read: 'a -> String, make: String -> 'a }",
+        "#Bool { read: 'a -> Bool, make: Bool -> 'a }",
+        "#Nat8 { read: 'a -> Nat8, make: Nat8 -> 'a }",
+        "#Nat16 { read: 'a -> Nat16, make: Nat16 -> 'a }",
+        "#Nat32 { read: 'a -> Nat32, make: Nat32 -> 'a }",
+        "#Nat64 { read: 'a -> Nat64, make: Nat64 -> 'a }",
+        "#Int8 { read: 'a -> Int8, make: Int8 -> 'a }",
+        "#Int16 { read: 'a -> Int16, make: Int16 -> 'a }",
+        "#Int32 { read: 'a -> Int32, make: Int32 -> 'a }",
+        "#Int64 { read: 'a -> Int64, make: Int64 -> 'a }",
+        "#Array (Bad 'a)",
+        "#Record (RecordView 'a)",
+        "#Sum (SumView 'a)",
+        "#Function Description",
+        "#Hidden Description",
+        "#Mirror Description",
+        "#Foreign",
+    ];
+    let with_case = |at: usize, case: &str, helper: &str| {
+        let mut written: Vec<String> = cases.iter().map(|case| (*case).to_string()).collect();
+        written[13] = "#Array (ArrayView 'a)".to_string();
+        written[at] = case.to_string();
+        format!(
+            "{helper}type Altered 'a =\n  | {}\nextern shape: Mirror 'a -> Altered 'a = \"$shape\"",
+            written.join("\n  | ")
+        )
+    };
+    for signature in [
+        // A primitive accessor that reads another primitive.
+        with_case(0, "#Nat { read: 'a -> String, make: String -> 'a }", ""),
+        // A fixed width that is not the one the case is named for.
+        with_case(5, "#Nat8 { read: 'a -> Nat16, make: Nat16 -> 'a }", ""),
+        // An array view whose element relationship is broken.
+        with_case(
+            13,
+            "#Array (Bad 'a)",
+            "type Bad 'array = hide 'element => { element: Mirror 'element, read: 'array -> ['array], make: ['element] -> 'array }\n",
+        ),
+        // A field binding that names the field's own type as the record.
+        with_case(
+            14,
+            "#Record (Bad 'a)",
+            "type Bad 'record = { mirror: Mirror 'record, fields: [Wrong 'record], build: [Binding 'record] -> Result 'record BuildError }\n\
+type Wrong 'record = hide 'field => { name: String, mirror: Mirror 'field, presence: Presence, read: 'record -> Option 'field, bind: 'field -> Binding 'field }\n",
+        ),
+        // A builder that answers something other than the record.
+        with_case(
+            14,
+            "#Record (Bad 'a)",
+            "type Bad 'record = { mirror: Mirror 'record, fields: [SomeField 'record], build: [Binding 'record] -> Result Nat BuildError }\n",
+        ),
+        // A case view that hides nothing, so its payload type escapes.
+        with_case(
+            15,
+            "#Sum (Bad 'a)",
+            "type Bad 'sum = { mirror: Mirror 'sum, cases: [{ name: String, mirror: Mirror 'sum, project: 'sum -> Option 'sum, inject: Option ('sum -> 'sum) }] }\n",
+        ),
+        // A view operation that performs an effect.
+        with_case(
+            2,
+            "#Real { read: 'a -> Real + !Log, make: Real -> 'a }",
+            "effect Log = { note: String -> () }\n",
+        ),
     ] {
         let (_, _, output) = infer_src(&format!("{SHAPE_SOURCE}{signature}"));
         assert_eq!(
