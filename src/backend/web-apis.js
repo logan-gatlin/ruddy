@@ -1,6 +1,45 @@
 // Native extern conversion snapshots arrays, records, and sums at the boundary.
 const $webPair = (a, b) => $record([["0", a], ["1", b]]);
-const $webMessage = error => String(error && error.message || error);
+// A host string may hold an unpaired surrogate half, which is no Unicode
+// scalar value and so is not Ruddy text. Where text is taken in strictly that
+// is a refusal; where it is taken in lossily, and in a message that has to
+// exist either way, each unpaired half becomes the replacement character.
+const $webScalars = value => {
+  let out = "";
+  for (let at = 0; at < value.length; at++) {
+    const code = value.charCodeAt(at);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const low = value.charCodeAt(at + 1);
+      if (low >= 0xdc00 && low <= 0xdfff) { out += value[at] + value[at + 1]; at += 1; continue; }
+      out += "\ufffd";
+      continue;
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) { out += "\ufffd"; continue; }
+    out += value[at];
+  }
+  return out;
+};
+const $webValid = value => {
+  for (let at = 0; at < value.length; at++) {
+    const code = value.charCodeAt(at);
+    if (code >= 0xdc00 && code <= 0xdfff) return false;
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const low = value.charCodeAt(at + 1);
+      if (!(low >= 0xdc00 && low <= 0xdfff)) return false;
+      at += 1;
+    }
+  }
+  return true;
+};
+// Reading a thrown value to describe it observes it, and that observation can
+// throw again. A value that cannot be read is the constant below rather than
+// a second failure escaping the boundary that promised a recoverable one.
+const $webMessage = error => {
+  try {
+    const written = (error !== null && error !== undefined && error.message) || error;
+    return $webScalars(typeof written === "string" ? written : String(written));
+  } catch (unreadable) { return "the host threw a value that cannot be read"; }
+};
 const $urlSnapshot = url => $record(["href", "origin", "protocol", "username", "password", "host", "hostname", "port", "pathname", "search", "hash"].map(key => [key, url[key]]));
 const $urlCall = (input, make) => {
   try { return $sum("Some", $urlSnapshot(make())); }
@@ -144,6 +183,12 @@ const $js = {
     return Object.keys(value);
   }),
   snapshot: value => $jsObserve("$", "inert data", () => $jsSnapshot(value, "$", new Set())),
+  // The explicit lossy reading. Strict conversion refuses a host string that
+  // is not scalars; this one says what to do about it instead.
+  text: value => $jsObserve("$", "a string", () => {
+    if (typeof value !== "string") throw new TypeError("This value is not a string");
+    return $webScalars(value);
+  }),
   apply: request => $jsObserve("$", "a callable value", () => {
     if (typeof request.of !== "function") throw new TypeError("This value is not callable");
     return request.of(...request.arguments);

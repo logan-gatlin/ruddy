@@ -55,8 +55,10 @@ effect Host = {
   keys: ForeignValue -> #Some [String] | #Error js::Error,
   snapshot: ForeignValue -> #Some ForeignValue | #Error js::Error,
   apply: js::Call -> #Some ForeignValue | #Error js::Error,
+  text: ForeignValue -> #Some String | #Error js::Error,
 }
 extern js_kind: ForeignValue -> js::Kind = "$js.kind"
+extern js_text: ForeignValue -> #Some String | #Error js::Error = "$js.text"
 extern js_field: js::Property -> #Some ForeignValue | #Error js::Error = "$js.field"
 extern js_element: js::Element -> #Some ForeignValue | #Error js::Error = "$js.element"
 extern js_length: ForeignValue -> #Some Nat | #Error js::Error = "$js.length"

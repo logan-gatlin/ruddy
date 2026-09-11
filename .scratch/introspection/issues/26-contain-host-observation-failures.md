@@ -1,6 +1,6 @@
 # 26 Contain failures while formatting host observation errors
 
-Status: open
+Status: resolved
 Type: task
 Priority: P2
 
@@ -62,3 +62,24 @@ proxy; include malformed host message text in the coordinated ingress tests.
 All observation operations retain recoverable failures, useful path metadata,
 and valid scalar error text. A secondary formatting exception must never
 escape. Run Rust tests only through `just test`.
+
+## Answer
+
+`$webMessage` in `src/backend/web-apis.js` reads the thrown value inside its
+own `try`, so a `message` getter that throws, or a `Symbol.toPrimitive` that
+refuses coercion, produces the constant "the host threw a value that cannot be
+read" rather than a second exception escaping the boundary that promised a
+recoverable error. The path and the expected description are unchanged, so a
+caller still learns where the observation stopped.
+
+The message is also brought into the scalar-text contract: whatever the host
+wrote, each unpaired surrogate half becomes `U+FFFD`, so an error message is
+always valid Ruddy text. Every user of the formatter gets this, including the
+URL and HTTP error conversions, which share it.
+
+Regression: `host_failures_arrive_as_errors_rather_than_exceptions` in
+`tests/src/js_adapters.rs` throws a value whose `message` getter raises, one
+whose coercion raises, and one whose message carries an unpaired half. Each
+comes back as `#Error` with a readable path, and the last is repaired to
+valid scalars with its length asserted. The revoked-proxy cases already there
+still pass.

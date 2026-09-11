@@ -138,7 +138,9 @@ fn whole_file_errors_are_results_and_invalid_text_does_not_overwrite_files() {
     let project = project(
         r#"
 extern invalid_path: String = "'bad' + String.fromCharCode(0) + 'path'"
-extern invalid_text: String = "String.fromCharCode(55296)"
+extern invalid_text: ForeignValue = "String.fromCharCode(55296)"
+let read_text_value: ForeignValue -> std::result::Result String std::ffi::DecodeError =
+  std::ffi::decode
 let main = fn _ => do
   let _ = expect_error "NotFound" (std::fs::read_bytes "missing")
   let _ = expect_error "NotFound" (std::fs::write_bytes "missing/child" [0n8])
@@ -160,10 +162,13 @@ let main = fn _ => do
   let _ = expect_error "NotDirectory" (std::fs::exists "file/child")
   let _ = expect_error "IsDirectory" (std::fs::read_text "directory")
   let _ = expect_error "InvalidEncoding" (std::fs::read_text "invalid-utf8")
-  let _ = expect_error "InvalidEncoding" (std::fs::write_text "file" invalid_text)
-  let _ = expect_error "InvalidEncoding" (std::fs::append_text "file" invalid_text)
+  -- Text that is not Unicode scalar values never becomes a Ruddy String, so
+  -- there is no such text to write to a file in the first place.
+  let _ = assert (match read_text_value invalid_text with
+    | #Some _ => false
+    | #Error error => std::str::equal error.expected "String"
+    end) "A lone surrogate is not a String"
   let _ = expect_error "InvalidPath" (std::fs::exists invalid_path)
-  let _ = expect_error "InvalidPath" (std::fs::read_text invalid_text)
   let _ = expect_error "InvalidPath" (std::fs::rename "file" invalid_path)
   let _ = expect_error "InvalidPath" (std::fs::copy_file "file" invalid_path)
   let _ = assert (std::str::equal (expect (std::fs::read_text "file")) "original") "Invalid writes leave file intact"

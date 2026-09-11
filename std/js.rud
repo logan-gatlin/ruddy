@@ -28,6 +28,7 @@ effect Host = {
   keys: Value -> Result [String] Error,
   snapshot: Value -> Result Value Error,
   apply: { of: Value, arguments: [Value] } -> Result Value Error,
+  text: Value -> Result String Error,
 }
 
 @doc "Write a value of the inferred type as host data, or say where it could not be written. A function contract is never written: a callable is refused, and an explicit extern or callback adapter carries one instead."
@@ -79,3 +80,6 @@ let snapshot = !Host.snapshot
 
 @doc "Call a host function with the given arguments: `apply [x] target`. A non-callable is refused. The call has no receiver, so read a method with `field` and let the host bind it if it needs one."
 let apply = fn arguments of => !Host.apply { of: of, arguments: arguments }
+
+@doc "Read a host string, repairing it. Ruddy text is Unicode scalar values and a host string need not be, so `lift` refuses one that is not; this is the conversion that says instead what to do about it, replacing each unpaired half with `U+FFFD`. A value that is not a string at all is still refused."
+let text = !Host.text

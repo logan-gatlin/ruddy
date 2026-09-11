@@ -101,6 +101,10 @@ impl Conversion<'_> {
                 Value::Int(value) => Ok(Value::Real(*value as f64)),
                 _ => Err(Failure::at(path, "Real")),
             },
+            // Ruddy text is Unicode scalar values, which a Rust string
+            // already is, so a host that hands one over has nothing left to
+            // check. The other backend has to look, because a JavaScript
+            // string may hold an unpaired surrogate half.
             Node::String => match value {
                 Value::Str(text) => Ok(Value::Str(text.clone())),
                 _ => Err(Failure::at(path, "String")),

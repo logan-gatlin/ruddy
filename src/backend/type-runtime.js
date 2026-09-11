@@ -195,6 +195,19 @@ const $sameType = ($left, $right) => {
 // Mirrors are the descriptors the compiler already passes as evidence, made
 // authentic: only a descriptor that came through one of these operations is
 // a mirror, so foreign data cannot forge one.
+// Whether every code unit of a host string pairs into a Unicode scalar value.
+const $scalarText = $value => {
+  for (let $at = 0; $at < $value.length; $at++) {
+    const $code = $value.charCodeAt($at);
+    if ($code >= 0xdc00 && $code <= 0xdfff) return false;
+    if ($code >= 0xd800 && $code <= 0xdbff) {
+      const $low = $value.charCodeAt($at + 1);
+      if (!($low >= 0xdc00 && $low <= 0xdfff)) return false;
+      $at += 1;
+    }
+  }
+  return true;
+};
 const $mirrors = new WeakSet();
 const $mirror = ($descriptor, $value) => {
   if (!$descriptor) throw new TypeError("missing runtime type information for a mirror");
@@ -344,7 +357,11 @@ const $convertType = ($descriptor, $value, $outgoing, $rootIndex = 0, $callable 
         case "Nat": $valid = Number.isInteger($input) && $input >= 0 && $input <= $domains.nat.high; if ($valid) $value = $input + 0; break;
         case "Int": $valid = Number.isInteger($input) && $input >= $domains.int.low && $input <= $domains.int.high; if ($valid) $value = $input + 0; break;
         case "Real": $valid = typeof $input === "number"; break;
-        case "String": $valid = typeof $input === "string"; break;
+        // Ruddy text is Unicode scalar values. A host string holding an
+        // unpaired surrogate half is not that, and taking it in strictly is a
+        // refusal rather than a silent repair; a caller that wants the repair
+        // asks for it.
+        case "String": $valid = typeof $input === "string" && ($outgoing || $scalarText($input)); break;
         case "Bool": $valid = typeof $input === "boolean"; break;
         case "ForeignValue": break;
         default: $valid = false;

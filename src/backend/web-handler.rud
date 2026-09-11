@@ -6,3 +6,4 @@
   | !Host.keys value => js_keys value
   | !Host.snapshot value => js_snapshot value
   | !Host.apply request => js_apply request
+  | !Host.text value => js_text value

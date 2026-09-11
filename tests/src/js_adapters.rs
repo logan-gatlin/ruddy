@@ -333,6 +333,8 @@ fn host_failures_arrive_as_errors_rather_than_exceptions() {
     let project = project(
         r#"
 let kind = std::js::kind
+let text = std::js::text
+let lift_text: std::js::Value -> std::result::Result String std::js::Error = std::js::lift
 let field = std::js::field
 let element = std::js::element
 let length = std::js::length
@@ -404,6 +406,41 @@ assert.match(failure(await (await app.field('a'))(revoked)).message, /revoked/);
 assert.match(failure(await app.keys(revoked)).message, /revoked/);
 assert.match(failure(await app.snapshot(revoked)).message, /revoked/);
 assert.match(failure(await (await app.call([]))(revokedCallable)).message, /revoked/);
+
+// A thrown value that refuses to describe itself. Reading it to write the
+// message is another observation, and it must not become a second failure
+// outside the boundary that promised a recoverable one.
+const silent = { get message() { throw new Error("message lookup failed"); } };
+const hiding = { get boom() { throw silent; } };
+const quiet = failure(await (await app.field("boom"))(hiding));
+assert.equal(quiet.path, "$.boom");
+assert.equal(quiet.expected, "a readable property");
+assert.equal(quiet.message, "the host threw a value that cannot be read");
+
+const uncoercible = { get message() { return undefined; }, [Symbol.toPrimitive]() { throw new Error("no"); } };
+const coercing = { get boom() { throw uncoercible; } };
+assert.equal(
+  failure(await (await app.field("boom"))(coercing)).message,
+  "the host threw a value that cannot be read"
+);
+
+// Host text is Unicode scalar values. An unpaired half is refused where text
+// is taken in strictly, and repaired only where a caller asks for that.
+const lone = "a" + String.fromCharCode(0xd800) + "b";
+assert.equal(failure(await app.lift_text(lone)).expected, "String");
+assert.equal(some(await app.lift_text("a😀b")), "a😀b");
+const repaired = some(await app.text(lone));
+assert.equal(repaired, "a\ufffdb");
+assert.equal([...repaired].length, 3);
+assert.equal(some(await app.text("a😀b")), "a😀b");
+assert.equal(failure(await app.text(7)).message, "This value is not a string");
+
+// An error message the host wrote with an unpaired half is repaired too: a
+// message has to exist, and it has to be text.
+const shouting = { get boom() { throw new Error("bad " + String.fromCharCode(0xdc00)); } };
+const shouted = failure(await (await app.field("boom"))(shouting)).message;
+assert.equal(shouted, "bad \ufffd");
+assert.equal([...shouted].length, 5);
 "#,
     );
 }
