@@ -52,6 +52,15 @@ impl Files for Host {
     }
 }
 
+/// The domains a build's `integers` fact binds `Nat` and `Int` to, as the
+/// manifest does for a compilation; without one they are the default.
+fn bound(environment: &bundle::Environment) -> crate::types::Domains {
+    environment
+        .fact("integers")
+        .and_then(crate::types::Domains::from_name)
+        .unwrap_or_default()
+}
+
 impl Host {
     /// `None` records deletion. Setting unchanged text does not create a revision.
     pub fn set_file(&mut self, path: &str, text: Option<String>) {
@@ -164,7 +173,7 @@ impl Host {
     ) -> Analysis {
         let mut files = FileManager::new();
         let loaded = bundle::load(&mut files, self, root, environment);
-        self.finish_analysis(identity, loaded, imports, linked)
+        self.finish_analysis(identity, loaded, imports, linked, bound(environment))
     }
 
     /// Acquire inputs through a driver before invoking any syntax query. Module
@@ -198,10 +207,13 @@ impl Host {
             provider,
         };
         let loaded = bundle::load(&mut files, &inputs, root, environment);
-        inputs
-            .host
-            .into_inner()
-            .finish_analysis(identity, loaded, imports, linked)
+        inputs.host.into_inner().finish_analysis(
+            identity,
+            loaded,
+            imports,
+            linked,
+            bound(environment),
+        )
     }
 
     fn finish_analysis(
@@ -210,6 +222,7 @@ impl Host {
         loaded: bundle::Output,
         imports: &[ir::InterfaceImport<'_>],
         linked: &[&artifact::Header],
+        domains: crate::types::Domains,
     ) -> Analysis {
         self.generation += 1;
         let paths: HashMap<_, _> = loaded
@@ -239,6 +252,9 @@ impl Host {
                 crate::externs::export_request(&declaration.metadata).err()
             }),
         );
+        built
+            .errors
+            .extend(ir::literals_outside(&built.program, domains));
         diagnostics.extend(
             built
                 .errors
@@ -286,6 +302,7 @@ impl Host {
                 reports: Vec::new(),
             },
             syntax_clean,
+            domains,
             linked: linked.iter().map(|header| (*header).clone()).collect(),
             dependencies: imports
                 .iter()
@@ -326,6 +343,8 @@ pub struct Analysis {
     complete: bool,
     generation: u64,
     owner: std::sync::Arc<()>,
+    /// The domains `Nat` and `Int` are bound to for this analysis.
+    domains: crate::types::Domains,
     linked: Vec<artifact::Header>,
     dependencies: Vec<artifact::Dependency>,
     pub diagnostics: Vec<ui::Diagnostic>,
@@ -410,6 +429,7 @@ impl Analysis {
             self.inferred.clone(),
             self.checks.clone(),
             self.dependencies.clone(),
+            self.domains,
             summaries,
         ) {
             Ok(accepted) => (Some(accepted.artifact().clone()), Vec::new()),
@@ -437,6 +457,7 @@ impl Analysis {
             &self.built.program,
             self.inferred.semantics(),
             Vec::new(),
+            self.domains,
         )
     }
 
@@ -814,7 +835,7 @@ fn record_fields(
     use crate::types::{Presence, Rest, Ty};
     let ty = inference::unfold(inferred.semantics().aliases(), ty);
     let mut ty = &*ty;
-    while let Ty::Package(inner) = ty {
+    while let Ty::Package(inner) | Ty::Hidden { body: inner, .. } = ty {
         ty = inner;
     }
     let Ty::Struct(row) = ty else {

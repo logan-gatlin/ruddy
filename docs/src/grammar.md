@@ -38,6 +38,12 @@ A [literal](dictionary.md#literal) writes a value directly in source code.
 | Bool | `true`, `false` | `Bool` |
 | [Unit](dictionary.md#unit) | `()` or `{}` | `()` |
 
+Integers have a precision chosen by the target, measured in bits, with exact bounds: on JavaScript `Nat` holds `0` to `9007199254740991` and `Int` holds `-9007199254740991` to `9007199254740991`, the safe integers, while `Nat64` and `Int64` have their fixed 64-bit domains everywhere.
+A literal outside the target's domain is a compile error, and integers have one zero.
+A project's `Ruddy.toml` may set `integers = 32` for the conventional 32-bit domains; `53` is the JavaScript default, and `64` is for targets that hold 64-bit integers.
+`Real` is an IEEE binary64 number with its signed zeros, infinities, and NaNs.
+A `String` is a sequence of Unicode scalar values: `std::str::len "😀"` is one, and character positions, slicing, search, and ordering count scalars the same way.
+
 The fixed-width suffixes support widths of `8`, `16`, `32`, and `64`.
 Number literals use decimal digits; a decimal point requires digits on both sides.
 The `n` and `i` suffixes require whole numbers, and natural numbers cannot be negative.
@@ -178,9 +184,11 @@ Patterns appear after `let` and in [pattern matching](dictionary.md#pattern-matc
 | `[]`, `[first, second]` | Match an exact array length |
 | `[first, ..rest]`, `[first, .., last]` | Match an array with a variable number of middle elements |
 | `#Some value`, `#None` | Match a tag and any value it carries |
+| `hide 'item pattern` | Open a [hidden type](dictionary.md#hidden-type), naming its type `'item` for the arm |
 
 A struct pattern's `..` must be last and cannot bind a name.
 An array pattern permits at most one `..`, optionally followed by a name for the remaining elements.
+A hidden pattern takes the pattern after its variable greedily, so `hide 'a #Some x` opens onto `#Some x`.
 Patterns can contain other patterns.
 Function parameters written after `fn` are names or `_`; matching their structure uses `match` instead.
 
@@ -230,9 +238,29 @@ Parentheses group a type argument that itself contains an application, as in `Op
 | `\|` | A sum type with no cases |
 | `String -> Nat` | A function type |
 | `mut 'r String` | A mutable cell type with [region](dictionary.md#region) `'r` |
+| `hide 'a => { mirror: Mirror 'a, value: 'a }` | A [hidden type](dictionary.md#hidden-type) whose variable `'a` stands for one type its producer chose |
 
 Function arrows group to the right: `String -> Nat -> String` means `String -> (Nat -> String)`.
 A tag's payload type needs parentheses when it contains an application or arrow, as in `#Some (Optional String)`.
+A hidden type's body extends to the end of the type, so `hide 'a => 'a -> 'a` hides the whole function type, and parentheses delimit a hidden type used as an argument, as in `Mirror (hide 'a => Body 'a)`.
+The word `hide` is reserved everywhere; a struct field named `hide` is written and accessed quoted, as `{ "hide": value }` and `record."hide"`.
+
+A value takes a hidden type from the type its context expects: an annotation, a function's result or parameter, an array or struct literal's element, or a `match` branch, each of which may hide a different type.
+The hidden variable stands for whatever the value's own type says there, so the compiler never guesses it; a value that leaves it open, such as an empty array, is an error.
+For example, a boxed value pairs a value with a function that can show it, hiding the value's type:
+
+```ruddy
+type Box = hide 'a => { value: 'a, show: 'a -> String }
+let boxed: Box = { value: 3n, show: std::str::from_nat }
+```
+
+A consumer opens a hidden value in a `match` arm with `hide 'item pattern`, which names the hidden type `'item` for that arm alone: the arm's annotations can refer to it, and its result cannot mention it.
+
+```ruddy
+let describe: Box -> String = fn box => match box with
+| hide 'item { value, show } => show value
+end
+```
 
 ### Open types and constraints
 
@@ -474,3 +502,13 @@ For example, reading the host clock has an immediate effect:
 ```ruddy
 extern now: fn(()) -> Real + std::ffi::!Immediate = "() => Date.now()"
 ```
+
+An extern's target text is read by the target it names, so a program that
+writes JavaScript there runs on JavaScript alone.
+The standard library instead names entries of a portable primitive table,
+`$prim.<module>.<name>`, and every target implements the same table: the
+JavaScript backend ships it as `primitives.js`, and the reference interpreter
+implements it in Rust.
+The debugger's Portable panel holds a program's host values against that
+table, so what keeps a program on one target is visible before a second one
+is written.

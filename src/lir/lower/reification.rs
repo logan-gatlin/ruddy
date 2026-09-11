@@ -182,26 +182,35 @@ impl Lower<'_> {
         body: &mut Body,
         adapters: &mut Vec<ReifiedAdapter>,
     ) -> Temp {
-        if matches!(
-            self.reification.callables.graph.exposed(want_shape),
-            CallableShape::Lazy
-        ) || matches!(
-            self.reification.callables.graph.exposed(have_shape),
-            CallableShape::Lazy
-        ) {
+        // A value packaged under a hidden type is sealed at its own type:
+        // the package's body names the hidden variable, which no descriptor
+        // stands for, and the descriptors the value's callables need are the
+        // packaging site's to bake in. The wanted shape is the sealed one.
+        let packaged;
+        let want = if self.hidden(want) && !self.hidden(have) {
+            packaged = have.clone();
+            &packaged
+        } else {
+            want
+        };
+        let unobserved = |low: &Self, shape: ShapeId| {
+            matches!(
+                low.reification.callables.graph.exposed(shape),
+                CallableShape::Lazy | CallableShape::Parameter(_)
+            )
+        };
+        if unobserved(self, want_shape) || unobserved(self, have_shape) {
             // Unobserved components are forwarded with the convention supplied
             // by the caller. No code in this function inspects their layout.
+            // A generalized definition's bare type parameter is one: the
+            // definition only forwards such a value, and its instantiation
+            // aliases the parameter to the shape the caller supplied.
             let value = self.fitted(want, have, temp, body);
-            self.callable_held[value as usize] = Some(
-                if matches!(
-                    self.reification.callables.graph.exposed(want_shape),
-                    CallableShape::Lazy
-                ) {
-                    have_shape
-                } else {
-                    want_shape
-                },
-            );
+            self.callable_held[value as usize] = Some(if unobserved(self, want_shape) {
+                have_shape
+            } else {
+                want_shape
+            });
             return value;
         }
         if matches!(self.rep(want), Rep::Struct | Rep::Array | Rep::Sum)

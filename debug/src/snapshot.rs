@@ -86,17 +86,38 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     // The build every phase follows: what the document is configured for, or
     // the defaults. `@if` guards are judged against it, dependencies are
     // compiled for it, and generation runs a backend for its target.
-    let output = ruddy_cli::Build {
-        target: req
-            .target
+    // The same validated construction the command line uses: a target and an
+    // integer precision the compiler cannot bind together is a diagnostic
+    // here too, rather than a silent fall back to the default, which would
+    // compile for a contract nobody asked for. A refused configuration
+    // compiles nothing, so every phase after this reports that it did not run.
+    let requested = ruddy_cli::Build::resolve(
+        req.target
             .unwrap_or_else(|| ruddy_cli::Target::default_for(req.kind)),
-        platform: req.platform.unwrap_or_default(),
-    };
+        req.platform.unwrap_or_default(),
+        req.integers,
+    );
+    let refused = requested.as_ref().err().map(|error| {
+        error
+            .messages()
+            .first()
+            .cloned()
+            .unwrap_or_else(|| error.to_string())
+    });
+    if let Some(message) = &refused {
+        diagnostics.push(raw("project", "manifest-invalid", message.clone(), None));
+    }
+    let output = requested.unwrap_or_default();
     let fs = Requested(&req.files);
     let started = Instant::now();
-    let loaded = guard("bundle", &mut panicked, || {
-        bundle::load(&mut files, &fs, &req.root, &output.environment())
-    });
+    let loaded = refused
+        .is_none()
+        .then(|| {
+            guard("bundle", &mut panicked, || {
+                bundle::load(&mut files, &fs, &req.root, &output.environment())
+            })
+        })
+        .flatten();
     micros.load = started.elapsed().as_micros() as u64;
     // Lexing and parsing happen inside the load, once per file, so the two tabs
     // that render their output report the sum rather than a figure of their
@@ -301,12 +322,16 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
                     .map(|(alias, artifact)| ir::DependencyImport { alias, artifact })
                     .collect();
                 let linked: Vec<&artifact::Artifact> = linked_interfaces.iter().collect();
-                ir::build_with_dependency_imports(
+                let mut built = ir::build_with_dependency_imports(
                     &mut mint,
                     loaded.stmts.clone(),
                     &imports,
                     &linked,
-                )
+                );
+                built
+                    .errors
+                    .extend(ir::literals_outside(&built.program, output.domains));
+                built
             });
             micros.build = started.elapsed().as_micros() as u64;
             out
@@ -450,11 +475,12 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
                     artifact: ruddy::compile::DependencyArtifact::Checked(artifact),
                 })
                 .collect();
-            ruddy::compile::compile_with_dependencies(
+            ruddy::compile::compile_bound(
                 Mint::new(mint.bundle().clone()),
                 loaded.stmts.clone(),
                 &dependencies,
                 inference::Trace::Complete,
+                output.domains,
             )
             .ok()
         });
@@ -768,7 +794,8 @@ fn wire_explanation(
             T::Mut => "mut",
             T::Array => "array",
             T::DeclaredType => "declared-type",
-            T::Any => "any",
+            T::Hidden => "hidden",
+            T::Mirror => "mirror",
             T::ForeignValue => "foreign-value",
             T::Undecided => "undecided",
         }
@@ -987,6 +1014,7 @@ mod tests {
             kind: ruddy::artifact::Kind::Library,
             target: None,
             platform: None,
+            integers: None,
             name: "test".into(),
             version: "0.1.0".into(),
             root: ROOT.into(),

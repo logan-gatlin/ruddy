@@ -121,6 +121,14 @@ A name beginning with `'` that stands for a type or another parameter used in a 
 
 [Grammar](grammar.md#types)
 
+## Hidden type
+A type written `hide 'a => T` whose variable stands for one particular type chosen where a value is made and kept from the value's consumers, who can open it in a `match` arm.
+
+[Grammar](grammar.md#types)
+
+## Mirror
+A value of type `Mirror T` that is authentic evidence for the type `T`. Only the compiler makes one, at a position whose type it knows; the standard `reflect` module reads it as data and decides whether two mirrors are one type.
+
 ## Sum type
 A type describing alternative cases identified by tags, each of which can carry a value.
 
@@ -158,5 +166,12 @@ Metadata written with `@` before a definition or foreign function type.
 
 ## Foreign value
 A value supplied by the target environment and made available to Ruddy through `extern`.
+
+[Grammar](grammar.md#modules-attributes-and-foreign-values)
+
+## Primitive contract
+One operation of the portable table the standard library's `extern`
+declarations name, as `$prim.<module>.<name>`. Every target implements the
+same table, so a program built from these runs wherever Ruddy runs.
 
 [Grammar](grammar.md#modules-attributes-and-foreign-values)

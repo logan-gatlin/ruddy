@@ -2642,6 +2642,12 @@ impl<'a> Printer<'a> {
                 }
                 concat(parts)
             }
+            PatternKind::Hidden { variable, pattern } => concat(vec![
+                text("hide "),
+                text(self.slice(variable.span)),
+                Doc::Space,
+                self.pattern_in(pattern, ui::pattern_prec(&pattern.tracked) < Prec::Atom),
+            ]),
         }
     }
 
@@ -2698,7 +2704,7 @@ impl<'a> Printer<'a> {
                 let last_effects = steps.last().and_then(|(_, _, effects)| *effects);
                 parts.push(self.ty_after(
                     result,
-                    last_effects.is_some() && prec(result) == Prec::Arrow,
+                    last_effects.is_some() && prec(result) <= Prec::Arrow,
                 ));
                 if let Some(row) = last_effects {
                     parts.push(text(" + "));
@@ -2841,6 +2847,14 @@ impl<'a> Printer<'a> {
             TypeKind::Ident { name } => self.path(name),
             TypeKind::Variable { name } => text(self.slice(name.span)),
             TypeKind::Effects(row) => self.effect_row(row),
+            // The body needs no parentheses: it runs to the end of the type,
+            // which is where the parser stopped reading it.
+            TypeKind::Hidden { variable, body } => concat(vec![
+                text("hide "),
+                text(self.slice(variable.span)),
+                text(" => "),
+                self.ty(body),
+            ]),
             TypeKind::Hole => text("_"),
             TypeKind::Unit => self.empty("(", ty.span, ")"),
         }
@@ -3230,12 +3244,14 @@ fn hugs_in_arm(expr: &Expr) -> bool {
 }
 
 /// [`hugs`] for a written type: a braced or bracketed one opens on the line
-/// of the `=` in front of it.
+/// of the `=` in front of it, and so does a hidden type whose body does —
+/// `hide 'a => {` is one line's worth of opener, the way `fn x => {` is.
 fn hugs_type(ty: &Type) -> bool {
-    matches!(
-        ty.tracked,
-        TypeKind::Struct { .. } | TypeKind::Tuple(_) | TypeKind::Array(_)
-    )
+    match &ty.tracked {
+        TypeKind::Struct { .. } | TypeKind::Tuple(_) | TypeKind::Array(_) => true,
+        TypeKind::Hidden { body, .. } => hugs_type(body),
+        _ => false,
+    }
 }
 
 /// Whether a following `|` would be claimed by a shorthand nested at the
@@ -3403,6 +3419,9 @@ fn pattern_skeleton(pattern: &Pattern) -> Skel {
                 .map(|payload| pattern_skeleton(payload))
                 .collect(),
         ),
+        PatternKind::Hidden { pattern: inner, .. } => {
+            Skel::new(pattern.span, vec![pattern_skeleton(inner)])
+        }
         PatternKind::Unit => Skel::leaf(pattern.span).closed(),
         _ => Skel::leaf(pattern.span),
     }
@@ -3466,6 +3485,7 @@ fn type_skeleton(ty: &Type) -> Skel {
         }
         TypeKind::Effects(row) => Skel::new(ty.span, row_skeleton(row)),
         TypeKind::Unit => Skel::leaf(ty.span).closed(),
+        TypeKind::Hidden { body, .. } => Skel::new(ty.span, vec![type_skeleton(body)]),
         TypeKind::Ident { .. } | TypeKind::Variable { .. } | TypeKind::Hole => Skel::leaf(ty.span),
     }
 }

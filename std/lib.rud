@@ -3,6 +3,13 @@ module effects
 module fs
 module io
 module process
+module codec
+module json
+module binary
+module url
+module http
+@if { platform: "node" }
+module path
 module str
 module nat
 module int
@@ -14,6 +21,9 @@ module array
 module cell
 module any
 module ffi
+module abi
+module js
+module reflect
 module function
 module tuple
 module order

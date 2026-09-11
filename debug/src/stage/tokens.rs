@@ -82,6 +82,7 @@ pub fn label(kind: &Kind) -> &'static str {
         Kind::End => "End",
         Kind::With => "With",
         Kind::Match => "Match",
+        Kind::Hide => "Hide",
         Kind::Fn => "Fn",
         Kind::Effect => "Effect",
         Kind::Handle => "Handle",

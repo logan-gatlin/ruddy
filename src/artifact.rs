@@ -153,6 +153,7 @@ pub(crate) fn empty() -> Artifact {
                 version: String::new(),
             },
             compiler: Stamp::current(),
+            domains: types::Domains::default(),
             dependencies: Vec::new(),
             values: Vec::new(),
             types: Vec::new(),
@@ -335,6 +336,7 @@ fn recover_parts(header: Header, lir: Lir) -> (Artifact, Vec<RecoveryFact>) {
         kind: header.kind,
         identity: header.identity,
         compiler: header.compiler,
+        domains: header.domains,
         dependencies: header.dependencies,
         values: Vec::new(),
         types: Vec::new(),
@@ -440,6 +442,9 @@ pub struct Header {
     pub identity: Identity,
     /// The compiler that wrote this artifact.
     pub compiler: Stamp,
+    /// The domains `Nat` and `Int` were bound to. A linked program binds them
+    /// once, and an artifact bound to others cannot join it.
+    pub domains: types::Domains,
     /// The bundles this artifact depends on.
     pub dependencies: Vec<Dependency>,
     /// Every source-addressable top-level value exported by the bundle. Externs
@@ -732,11 +737,22 @@ pub enum Type {
     Real,
     String,
     Bool,
-    Any,
     ForeignValue,
     Arrow(Box<Type>, Box<Type>, Row),
     Package(Box<Type>),
+    /// `hide 'a => T`, with the occurrences of its variable inside the body
+    /// as [`Type::HiddenVar`]s naming the same binder.
+    Hidden {
+        binder: u32,
+        name: String,
+        body: Box<Type>,
+    },
+    HiddenVar {
+        binder: u32,
+        name: String,
+    },
     Array(Box<Type>),
+    Mirror(Box<Type>),
     Mut(Box<Type>, Box<Type>),
     Struct(Row),
     Sum(Row),
@@ -830,7 +846,6 @@ fn semantic_eq(root: SemanticPair<'_>) -> bool {
                 | (Type::Real, Type::Real)
                 | (Type::String, Type::String)
                 | (Type::Bool, Type::Bool)
-                | (Type::Any, Type::Any)
                 | (Type::ForeignValue, Type::ForeignValue)
                 | (Type::Undecided, Type::Undecided) => {}
                 (Type::Var(left), Type::Var(right)) | (Type::Bound(left), Type::Bound(right))
@@ -856,11 +871,36 @@ fn semantic_eq(root: SemanticPair<'_>) -> bool {
                 (Type::Package(left), Type::Package(right)) => {
                     pending.push(SemanticPair::Type(left, right));
                 }
+                (
+                    Type::Hidden {
+                        binder: left_binder,
+                        name: left_name,
+                        body: left,
+                    },
+                    Type::Hidden {
+                        binder: right_binder,
+                        name: right_name,
+                        body: right,
+                    },
+                ) if left_binder == right_binder && left_name == right_name => {
+                    pending.push(SemanticPair::Type(left, right));
+                }
+                (
+                    Type::HiddenVar {
+                        binder: left_binder,
+                        name: left_name,
+                    },
+                    Type::HiddenVar {
+                        binder: right_binder,
+                        name: right_name,
+                    },
+                ) if left_binder == right_binder && left_name == right_name => {}
                 (Type::Mut(a, b), Type::Mut(c, d)) => {
                     pending.push(SemanticPair::Type(a, c));
                     pending.push(SemanticPair::Type(b, d));
                 }
-                (Type::Array(left), Type::Array(right)) => {
+                (Type::Array(left), Type::Array(right))
+                | (Type::Mirror(left), Type::Mirror(right)) => {
                     pending.push(SemanticPair::Type(left, right));
                 }
                 (Type::Struct(left), Type::Struct(right)) | (Type::Sum(left), Type::Sum(right)) => {
@@ -983,7 +1023,9 @@ enum CloneWork<'a> {
     Semantic(SemanticRef<'a>),
     Arrow,
     Package,
+    Hidden(u32, String),
     Array,
+    Mirror,
     Mut,
     Struct,
     Sum,
@@ -1010,7 +1052,6 @@ fn clone_semantic(root: SemanticRef<'_>) -> (Vec<Type>, Vec<Row>) {
                 Type::Real => types.push(Type::Real),
                 Type::String => types.push(Type::String),
                 Type::Bool => types.push(Type::Bool),
-                Type::Any => types.push(Type::Any),
                 Type::ForeignValue => types.push(Type::ForeignValue),
                 Type::Arrow(from, to, effects) => {
                     work.push(CloneWork::Arrow);
@@ -1022,8 +1063,20 @@ fn clone_semantic(root: SemanticRef<'_>) -> (Vec<Type>, Vec<Row>) {
                     work.push(CloneWork::Package);
                     work.push(CloneWork::Semantic(SemanticRef::Type(body)));
                 }
+                Type::Hidden { binder, name, body } => {
+                    work.push(CloneWork::Hidden(*binder, name.clone()));
+                    work.push(CloneWork::Semantic(SemanticRef::Type(body)));
+                }
+                Type::HiddenVar { binder, name } => types.push(Type::HiddenVar {
+                    binder: *binder,
+                    name: name.clone(),
+                }),
                 Type::Array(element) => {
                     work.push(CloneWork::Array);
+                    work.push(CloneWork::Semantic(SemanticRef::Type(element)));
+                }
+                Type::Mirror(element) => {
+                    work.push(CloneWork::Mirror);
                     work.push(CloneWork::Semantic(SemanticRef::Type(element)));
                 }
                 Type::Mut(region, element) => {
@@ -1097,9 +1150,21 @@ fn clone_semantic(root: SemanticRef<'_>) -> (Vec<Type>, Vec<Row>) {
                 let body = types.pop().expect("cloned package body");
                 types.push(Type::Package(Box::new(body)));
             }
+            CloneWork::Hidden(binder, name) => {
+                let body = types.pop().expect("cloned hidden body");
+                types.push(Type::Hidden {
+                    binder,
+                    name,
+                    body: Box::new(body),
+                });
+            }
             CloneWork::Array => {
                 let element = types.pop().expect("cloned array element");
                 types.push(Type::Array(Box::new(element)));
+            }
+            CloneWork::Mirror => {
+                let element = types.pop().expect("cloned mirror type");
+                types.push(Type::Mirror(Box::new(element)));
             }
             CloneWork::Mut => {
                 let element = types.pop().expect("cell element");
@@ -1173,6 +1238,10 @@ fn empty_row() -> Row {
 
 fn drain_type(value: &mut Type, pending: &mut Vec<SemanticOwned>) {
     match value {
+        Type::Hidden { body, .. } => pending.push(SemanticOwned::Type(std::mem::replace(
+            body,
+            Type::Undecided,
+        ))),
         Type::Package(body) => pending.push(SemanticOwned::Type(std::mem::replace(
             body.as_mut(),
             Type::Undecided,
@@ -1187,10 +1256,9 @@ fn drain_type(value: &mut Type, pending: &mut Vec<SemanticOwned>) {
                 Type::Undecided,
             )));
         }
-        Type::Array(element) => pending.push(SemanticOwned::Type(std::mem::replace(
-            element.as_mut(),
-            Type::Undecided,
-        ))),
+        Type::Array(element) | Type::Mirror(element) => pending.push(SemanticOwned::Type(
+            std::mem::replace(element.as_mut(), Type::Undecided),
+        )),
         Type::Arrow(from, to, effects) => {
             pending.push(SemanticOwned::Type(std::mem::replace(
                 from.as_mut(),
@@ -1214,11 +1282,11 @@ fn drain_type(value: &mut Type, pending: &mut Vec<SemanticOwned>) {
         | Type::Real
         | Type::String
         | Type::Bool
-        | Type::Any
         | Type::ForeignValue
         | Type::Var(_)
         | Type::Bound(_)
         | Type::Rigid { .. }
+        | Type::HiddenVar { .. }
         | Type::Undecided => {}
     }
 }
@@ -1391,6 +1459,7 @@ pub(crate) fn build_lowered(
             accepted.ir(),
             accepted.semantics(),
             dependencies,
+            accepted.domains(),
         ),
         lir: lower_lir(accepted.mint(), lir),
     }
@@ -1403,6 +1472,7 @@ pub fn interface(
     program: &ir::Program,
     inference: &crate::inference::Semantics,
     dependencies: Vec<Dependency>,
+    domains: types::Domains,
 ) -> Header {
     Header {
         kind: Kind::Library,
@@ -1411,6 +1481,7 @@ pub fn interface(
             version: mint.bundle().version().to_string(),
         },
         compiler: Stamp::current(),
+        domains,
         dependencies,
         values: program
             .externs
@@ -1730,7 +1801,9 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
         Row(&'a types::Row),
         Arrow,
         Package,
+        Hidden(u32, String),
         Array,
+        Mirror,
         Mut,
         Struct,
         Sum,
@@ -1775,7 +1848,6 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
                 types::Ty::Real => tys.push(Type::Real),
                 types::Ty::String => tys.push(Type::String),
                 types::Ty::Bool => tys.push(Type::Bool),
-                types::Ty::Any => tys.push(Type::Any),
                 types::Ty::ForeignValue => tys.push(Type::ForeignValue),
                 types::Ty::Arrow(from, to, effects) => {
                     work.push(Work::Arrow);
@@ -1787,8 +1859,20 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
                     work.push(Work::Package);
                     work.push(Work::Ty(body));
                 }
+                types::Ty::Hidden { binder, name, body } => {
+                    work.push(Work::Hidden(*binder, name.to_string()));
+                    work.push(Work::Ty(body));
+                }
+                types::Ty::HiddenVar { binder, name } => tys.push(Type::HiddenVar {
+                    binder: *binder,
+                    name: name.to_string(),
+                }),
                 types::Ty::Array(element) => {
                     work.push(Work::Array);
+                    work.push(Work::Ty(element));
+                }
+                types::Ty::Mirror(element) => {
+                    work.push(Work::Mirror);
                     work.push(Work::Ty(element));
                 }
                 types::Ty::Mut(region, element) => {
@@ -1847,9 +1931,21 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
                 let body = tys.pop().expect("artifact package body");
                 tys.push(Type::Package(Box::new(body)));
             }
+            Work::Hidden(binder, name) => {
+                let body = tys.pop().expect("hidden body");
+                tys.push(Type::Hidden {
+                    binder,
+                    name,
+                    body: Box::new(body),
+                });
+            }
             Work::Array => {
                 let element = tys.pop().expect("artifact array element");
                 tys.push(Type::Array(Box::new(element)));
+            }
+            Work::Mirror => {
+                let element = tys.pop().expect("artifact mirror type");
+                tys.push(Type::Mirror(Box::new(element)));
             }
             Work::Mut => {
                 let element = tys.pop().expect("cell element");
@@ -2276,7 +2372,6 @@ fn rep(value: lir::Rep) -> Rep {
         lir::Rep::Bool => Rep::Bool,
         lir::Rep::TypeDescriptor => Rep::TypeDescriptor,
         lir::Rep::NativePlan => Rep::NativePlan,
-        lir::Rep::BoxedAny => Rep::BoxedAny,
         lir::Rep::HostValue => Rep::HostValue,
         lir::Rep::Unit => Rep::Unit,
         lir::Rep::Struct => Rep::Struct,
@@ -2426,6 +2521,7 @@ pub mod text {
                 A("compiler".into()),
                 Q(value.compiler.as_str().to_string()),
             ]),
+            L(vec![A("domains".into()), A(value.domains.name().into())]),
             L(std::iter::once(A("dependencies".into()))
                 .chain(value.dependencies.iter().map(dependency))
                 .collect()),
@@ -2650,7 +2746,6 @@ pub mod text {
                         Type::Real => work.push(Work::Text("real")),
                         Type::String => work.push(Work::Text("string")),
                         Type::Bool => work.push(Work::Text("boolean")),
-                        Type::Any => work.push(Work::Text("any")),
                         Type::ForeignValue => work.push(Work::Text("foreign-value")),
                         Type::Arrow(from, to, row) => {
                             out.push_str("(arrow ");
@@ -2666,6 +2761,22 @@ pub mod text {
                             work.push(Work::Text(")"));
                             work.push(Work::Ty(body));
                         }
+                        Type::Hidden { binder, name, body } => {
+                            out.push_str("(hidden ");
+                            out.push_str(&binder.to_string());
+                            out.push(' ');
+                            out.push_str(&quoted(name));
+                            out.push(' ');
+                            work.push(Work::Text(")"));
+                            work.push(Work::Ty(body));
+                        }
+                        Type::HiddenVar { binder, name } => {
+                            out.push_str("(hidden-var ");
+                            out.push_str(&binder.to_string());
+                            out.push(' ');
+                            out.push_str(&quoted(name));
+                            out.push(')');
+                        }
                         Type::Mut(region, element) => {
                             out.push_str("(mut ");
                             work.push(Work::Text(")"));
@@ -2675,6 +2786,11 @@ pub mod text {
                         }
                         Type::Array(element) => {
                             out.push_str("(array ");
+                            work.push(Work::Text(")"));
+                            work.push(Work::Ty(element));
+                        }
+                        Type::Mirror(element) => {
+                            out.push_str("(mirror ");
                             work.push(Work::Text(")"));
                             work.push(Work::Ty(element));
                         }
@@ -3362,7 +3478,7 @@ pub mod text {
             }
         }
         fn read_header(&self, value: S) -> Header {
-            let mut values = self.exact(self.list(value, "header"), 8, "header");
+            let mut values = self.exact(self.list(value, "header"), 9, "header");
             let mut kind = self.exact(self.list(self.take(&mut values), "kind"), 1, "kind");
             let kind = match self.atom(self.take(&mut kind)).as_str() {
                 "library" => Kind::Library,
@@ -3385,10 +3501,22 @@ pub mod text {
                     self.exact(self.list(self.take(&mut values), "compiler"), 1, "compiler");
                 Stamp::recorded(self.string(self.take(&mut value)))
             };
+            let domains = {
+                let mut value =
+                    self.exact(self.list(self.take(&mut values), "domains"), 1, "domains");
+                match types::Domains::from_name(&self.atom(self.take(&mut value))) {
+                    Some(domains) => domains,
+                    None => {
+                        self.fail("invalid target domains");
+                        types::Domains::default()
+                    }
+                }
+            };
             Header {
                 kind,
                 identity,
                 compiler,
+                domains,
                 dependencies: self
                     .many(self.take(&mut values), "dependencies")
                     .into_iter()
@@ -3662,7 +3790,10 @@ pub mod text {
                                 self.fail("type bound is outside the type quantifier space");
                             }
                         }
-                        Type::Package(inner) | Type::Array(inner) => parts.push(Part::Ty(inner)),
+                        Type::Package(inner)
+                        | Type::Array(inner)
+                        | Type::Mirror(inner)
+                        | Type::Hidden { body: inner, .. } => parts.push(Part::Ty(inner)),
                         Type::Mut(region, element) => {
                             parts.push(Part::Ty(region));
                             parts.push(Part::Ty(element));
@@ -3853,6 +3984,7 @@ pub mod text {
                             package_count += 1;
                             parts.push(Part::Ty(inner, Some(here)));
                         }
+                        Type::Hidden { body, .. } => parts.push(Part::Ty(body, owner)),
                         Type::Arrow(from, to, row) => {
                             parts.push(Part::Row(row, owner));
                             parts.push(Part::Ty(to, owner));
@@ -3862,7 +3994,9 @@ pub mod text {
                             parts.push(Part::Ty(region, owner));
                             parts.push(Part::Ty(element, owner));
                         }
-                        Type::Array(inner) => parts.push(Part::Ty(inner, owner)),
+                        Type::Array(inner) | Type::Mirror(inner) => {
+                            parts.push(Part::Ty(inner, owner))
+                        }
                         Type::Struct(row) | Type::Sum(row) => {
                             parts.push(Part::Row(row, owner));
                         }
@@ -4008,6 +4142,8 @@ pub mod text {
                 Field(S),
                 BuildArrow,
                 BuildPackage,
+                BuildHidden(u32, String),
+                BuildMirror,
                 BuildArray,
                 BuildMut,
                 BuildStruct,
@@ -4040,7 +4176,6 @@ pub mod text {
                                 "real" => Type::Real,
                                 "string" => Type::String,
                                 "boolean" => Type::Bool,
-                                "any" => Type::Any,
                                 "foreign-value" => Type::ForeignValue,
                                 "undecided" => Type::Undecided,
                                 _ => self.invalid("invalid type", Type::Undecided),
@@ -4063,6 +4198,20 @@ pub mod text {
                                         tasks.push(Task::BuildPackage);
                                         tasks.push(Task::Ty(body));
                                     }
+                                    "hidden" => {
+                                        let mut values = self.exact(values, 3, "hidden");
+                                        let binder = self.number(self.take(&mut values));
+                                        let name = self.string(self.take(&mut values));
+                                        let body = self.take(&mut values);
+                                        tasks.push(Task::BuildHidden(binder, name));
+                                        tasks.push(Task::Ty(body));
+                                    }
+                                    "hidden-var" => {
+                                        let mut values = self.exact(values, 2, "hidden-var");
+                                        let binder = self.number(self.take(&mut values));
+                                        let name = self.string(self.take(&mut values));
+                                        tys.push(Type::HiddenVar { binder, name });
+                                    }
                                     "mut" => {
                                         let mut values = self.exact(values, 2, "mut");
                                         let region = self.take(&mut values);
@@ -4074,6 +4223,11 @@ pub mod text {
                                     "array" => {
                                         let element = self.exact(values, 1, "array").remove(0);
                                         tasks.push(Task::BuildArray);
+                                        tasks.push(Task::Ty(element));
+                                    }
+                                    "mirror" => {
+                                        let element = self.exact(values, 1, "mirror").remove(0);
+                                        tasks.push(Task::BuildMirror);
                                         tasks.push(Task::Ty(element));
                                     }
                                     "struct" => {
@@ -4183,6 +4337,14 @@ pub mod text {
                         let body = tys.pop().expect("package body");
                         tys.push(Type::Package(Box::new(body)));
                     }
+                    Task::BuildHidden(binder, name) => {
+                        let body = tys.pop().expect("hidden body");
+                        tys.push(Type::Hidden {
+                            binder,
+                            name,
+                            body: Box::new(body),
+                        });
+                    }
                     Task::BuildMut => {
                         let element = tys.pop().expect("cell element");
                         let region = tys.pop().expect("cell region");
@@ -4191,6 +4353,10 @@ pub mod text {
                     Task::BuildArray => {
                         let element = tys.pop().expect("array element");
                         tys.push(Type::Array(Box::new(element)));
+                    }
+                    Task::BuildMirror => {
+                        let element = tys.pop().expect("mirror type");
+                        tys.push(Type::Mirror(Box::new(element)));
                     }
                     Task::BuildStruct => {
                         let row = rows.pop().expect("struct row");
@@ -4345,6 +4511,7 @@ mod tests {
                     version: "1".into(),
                 },
                 compiler: Stamp::current(),
+                domains: types::Domains::default(),
                 dependencies: Vec::new(),
                 values: Vec::new(),
                 types: Vec::new(),

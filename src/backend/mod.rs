@@ -1,4 +1,4 @@
 //! Code generation backends.
 
-mod host;
+pub mod host;
 pub mod js;

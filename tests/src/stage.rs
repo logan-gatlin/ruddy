@@ -971,6 +971,7 @@ fn artifact_stage_renders_one_dependency() {
         header: Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: Identity {
                 name: "demo".to_string(),
@@ -1470,6 +1471,7 @@ fn bundle(files: &[(&str, &str)]) -> Snapshot {
             kind: ruddy::artifact::Kind::Library,
             target: Some(ruddy_cli::Target::Js),
             platform: None,
+            integers: None,
             name: "demo".to_string(),
             version: "0.1.0".to_string(),
             root: ROOT.to_string(),
@@ -1686,7 +1688,12 @@ fn runtime_type_stage_shows_invocation_ports_and_evaluation() {
     let output = stage(
         "reification",
         r#"
-@private extern box: 'a -> Any = "$anyUpcast"
+type Option 'a = #Some 'a | #None
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+@private let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
 @private let apply = fn call value => call value
 @private let token = box 1n
 "#,

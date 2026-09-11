@@ -253,6 +253,10 @@ pub fn expr_ends_in_numeric_projection(kind: &parse::ExprKind) -> bool {
 pub fn type_prec(kind: &parse::TypeKind) -> Prec {
     use parse::TypeKind;
     match kind {
+        // The body runs as far right as it can, so a hidden type needs
+        // parentheses anywhere anything may follow it — as an arrow's input,
+        // as an argument, as a case's payload.
+        TypeKind::Hidden { .. } => Prec::Lambda,
         TypeKind::Arrow { .. } => Prec::Arrow,
         // A row of effects binds as a sum does: it is written with the same
         // labels and the same tail, and needs the same brackets around it.
@@ -272,6 +276,9 @@ pub fn type_prec(kind: &parse::TypeKind) -> Prec {
 pub fn pattern_prec(kind: &parse::PatternKind) -> Prec {
     use parse::PatternKind;
     match kind {
+        // A hidden pattern carries its payload the way a tag carries one,
+        // and groups as the same application.
+        PatternKind::Hidden { .. } => Prec::Apply,
         PatternKind::Tag {
             payload: Some(_), ..
         } => Prec::Apply,
@@ -595,35 +602,11 @@ fn bare_tag(name: &str) -> bool {
 }
 
 /// Whether a decoded label can be written as an ordinary identifier token.
-/// This mirrors the lexer's Unicode identifier rule and excludes every word
-/// that lexes as a keyword or another dedicated token.
+/// This mirrors the lexer's Unicode identifier rule and asks the lexer's own
+/// table which words it reserves, so a new keyword quotes its label here the
+/// day the lexer learns it.
 fn bare_identifier(name: &str) -> bool {
-    bare_tag(name)
-        && !matches!(
-            name,
-            "_" | "let"
-                | "extern"
-                | "do"
-                | "return"
-                | "if"
-                | "then"
-                | "else"
-                | "type"
-                | "end"
-                | "with"
-                | "match"
-                | "fn"
-                | "effect"
-                | "handle"
-                | "raise"
-                | "and"
-                | "or"
-                | "xor"
-                | "not"
-                | "module"
-                | "true"
-                | "false"
-        )
+    bare_tag(name) && token::keyword(name).is_none()
 }
 
 /// Write one decoded Ruddy string with the escapes accepted by the lexer.
@@ -688,6 +671,7 @@ impl fmt::Display for Kind {
             Kind::End => f.write_str("end"),
             Kind::With => f.write_str("with"),
             Kind::Match => f.write_str("match"),
+            Kind::Hide => f.write_str("hide"),
             Kind::If => f.write_str("if"),
             Kind::Then => f.write_str("then"),
             Kind::Else => f.write_str("else"),
@@ -1032,24 +1016,7 @@ impl fmt::Display for parse::Error {
 /// else closes itself.
 impl Grouped for parse::PatternKind {
     fn prec(&self) -> Prec {
-        match self {
-            parse::PatternKind::Tag {
-                payload: Some(_), ..
-            } => Prec::Apply,
-            parse::PatternKind::Tag { payload: None, .. } => Prec::Tag,
-            parse::PatternKind::Ident { .. }
-            | parse::PatternKind::Wildcard
-            | parse::PatternKind::Natural(_)
-            | parse::PatternKind::Fixed(_)
-            | parse::PatternKind::Integer(_)
-            | parse::PatternKind::Real(_)
-            | parse::PatternKind::String(_)
-            | parse::PatternKind::Bool(_)
-            | parse::PatternKind::Unit
-            | parse::PatternKind::Struct { .. }
-            | parse::PatternKind::Tuple(_)
-            | parse::PatternKind::Array { .. } => Prec::Atom,
-        }
+        pattern_prec(self)
     }
 }
 
@@ -1078,6 +1045,12 @@ impl fmt::Display for parse::PatternKind {
                 None,
                 payload.as_deref().map(|payload| &payload.tracked),
             ),
+            // The payload is grouped by the rule a tag's is: taken greedily
+            // when read, so anything but an atom needs its parentheses back.
+            parse::PatternKind::Hidden { variable, pattern } => {
+                write!(f, "hide '{} ", variable.tracked)?;
+                write_grouped(f, pattern.tracked.prec() < Prec::Atom, &pattern.tracked)
+            }
             parse::PatternKind::Struct { fields, rest } => {
                 if fields.is_empty() && rest.is_none() {
                     return f.write_str("()");
@@ -1341,6 +1314,9 @@ impl ir::ErrorKind {
             ir::ErrorKind::RuntimeTypeInformation { .. } => "runtime-type-information",
             ir::ErrorKind::ForeignProtocol { .. } => "foreign-protocol",
             ir::ErrorKind::ArrayInExtern => "array-in-extern",
+            ir::ErrorKind::HiddenOutsideMatch => "hidden-outside-match",
+            ir::ErrorKind::LiteralOutsideDomain { .. } => "literal-outside-domain",
+            ir::ErrorKind::HiddenVariableSense { .. } => "hidden-variable-sense",
             ir::ErrorKind::InvalidDependencyAlias { .. } => "invalid-dependency-alias",
             ir::ErrorKind::ExecutableDependency { .. } => "executable-dependency",
             ir::ErrorKind::DuplicateDependencyAlias { .. } => "duplicate-dependency-alias",
@@ -1441,6 +1417,40 @@ impl ir::Error {
             E::RuntimeTypeInformation { message } => Diagnostic::new(code, message.clone(), span)
                 .help("supply a concrete type at this use, or retain unknown foreign data as ForeignValue"),
             E::ForeignProtocol { message } => Diagnostic::new(self.kind.code(), message.clone(), source.span(self.at)),
+            E::HiddenOutsideMatch => Diagnostic::new(
+                code,
+                "a hidden type can only be opened in a `match` arm",
+                span,
+            )
+            .label("this `hide` pattern is in a binding")
+            .help("match on the value instead, and open it in an arm"),
+            E::LiteralOutsideDomain {
+                literal,
+                primitive,
+                bounds,
+            } => Diagnostic::new(
+                code,
+                format!(
+                    "the literal `{literal}` is outside the target's {primitive} domain, {} to {}",
+                    bounds.min, bounds.max
+                ),
+                span,
+            )
+            .label(format!("{primitive} has {} bits of precision on this target", bounds.bits))
+            .help("write a value the target holds, or use a fixed-width integer type such as Nat64 or Int64"),
+            E::HiddenVariableSense { name, sense } => Diagnostic::new(
+                code,
+                format!("`'{name}` names a hidden type, so it cannot be {}", match sense {
+                    Sense::Type => "used here",
+                    Sense::Region => "a region",
+                    Sense::Presence => "a presence",
+                    Sense::Row => "a row of fields or cases",
+                    Sense::Effects => "a row of effects",
+                }),
+                span,
+            )
+            .label("bound by a `hide` as a type")
+            .help("use a different name for this variable"),
             E::ArrayInExtern => Diagnostic::new(
                 code,
                 "this runtime array intrinsic has an incompatible signature",
@@ -2242,9 +2252,12 @@ fn unpackaged(mut ty: &Ty) -> &Ty {
 impl Grouped for Ty {
     fn prec(&self) -> Prec {
         match unpackaged(self) {
+            // The body runs as far right as it can, exactly as the written
+            // form's does.
+            Ty::Hidden { .. } => Prec::Lambda,
             Ty::Arrow(..) => Prec::Arrow,
             Ty::Sum(_) => Prec::Sum,
-            Ty::Mut(..) => Prec::Apply,
+            Ty::Mut(..) | Ty::Mirror(_) => Prec::Apply,
             Ty::Named { args, .. } if !args.is_empty() => Prec::Apply,
             _ => Prec::Atom,
         }
@@ -2303,6 +2316,11 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                 }
                 match ty {
                     Ty::Package(body) => work.push(SemanticJob::Ty(body, false)),
+                    Ty::Hidden { name, body, .. } => {
+                        write!(f, "hide '{name} => ")?;
+                        work.push(SemanticJob::Ty(body, false));
+                    }
+                    Ty::HiddenVar { name, .. } => write!(f, "'{name}")?,
                     Ty::Mut(region, element) => {
                         f.write_str("mut ")?;
                         work.push(SemanticJob::Applied(element));
@@ -2314,13 +2332,16 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                         work.push(SemanticJob::Text("]"));
                         work.push(SemanticJob::Ty(element, false));
                     }
+                    Ty::Mirror(inner) => {
+                        f.write_str("Mirror ")?;
+                        work.push(SemanticJob::Applied(inner));
+                    }
                     Ty::Nat => f.write_str(Prim::Nat.name())?,
                     Ty::Int => f.write_str(Prim::Int.name())?,
                     Ty::Fixed(kind) => f.write_str(kind.name())?,
                     Ty::Real => f.write_str(Prim::Real.name())?,
                     Ty::String => f.write_str(Prim::String.name())?,
                     Ty::Bool => f.write_str(Prim::Bool.name())?,
-                    Ty::Any => f.write_str(Prim::Any.name())?,
                     Ty::ForeignValue => f.write_str(Prim::ForeignValue.name())?,
                     Ty::Arrow(from, to, effects) => {
                         let shown = effect_row_shown(effects);
@@ -2330,7 +2351,7 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                         }
                         work.push(SemanticJob::Ty(
                             to,
-                            shown && matches!(unpackaged(to), Ty::Arrow(..)),
+                            shown && matches!(unpackaged(to), Ty::Arrow(..) | Ty::Hidden { .. }),
                         ));
                         work.push(SemanticJob::Text(" -> "));
                         work.push(SemanticJob::Ty(from, from.prec() < Prec::Sum));
@@ -2844,6 +2865,10 @@ impl Rule {
     pub fn code(&self) -> &'static str {
         match self {
             Rule::Absorb => "absorb",
+            Rule::Hidden => "hidden",
+            Rule::Open => "open",
+            Rule::Witness => "witness",
+            Rule::Mirror => "mirror",
             Rule::Same => "same",
             Rule::Congruent => "congruent",
             Rule::Bind => "bind",
@@ -2879,6 +2904,12 @@ impl fmt::Display for Rule {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Rule::Absorb => f.write_str("one side is undecided, which unifies with anything"),
+            Rule::Hidden => {
+                f.write_str("two hidden types: their bodies must agree at one fresh type")
+            }
+            Rule::Open => f.write_str("a hidden pattern opens its position's type for its arm"),
+            Rule::Witness => f.write_str("a value packages under a hidden type at the witness"),
+            Rule::Mirror => f.write_str("two mirrors: the types they mirror must agree"),
             Rule::Same => f.write_str("already the same thing on both sides"),
             Rule::Congruent => f.write_str(
                 "the same declared type on both sides, and it keeps what it takes: argument against argument",
@@ -2982,6 +3013,9 @@ impl ConstraintKind {
             ConstraintKind::Match { .. } => "match",
             ConstraintKind::Performs { .. } => "performs",
             ConstraintKind::CallbackCoverage { .. } => "callback-coverage",
+            ConstraintKind::Open { .. } => "open",
+            ConstraintKind::Scoped { .. } => "scoped",
+            ConstraintKind::Introduce { .. } => "introduce",
         }
     }
 }
@@ -3080,6 +3114,32 @@ impl fmt::Display for ConstraintKind {
                 effects_shown(required),
                 effects_shown(available),
             ),
+            ConstraintKind::Open {
+                hidden,
+                name,
+                opened,
+                ..
+            } => write!(f, "open {hidden} as '{name} -> {opened}"),
+            // A header, like a `let`'s: the constraints it scopes are rows of
+            // their own.
+            ConstraintKind::Scoped {
+                level,
+                opens,
+                constraints,
+            } => write!(
+                f,
+                "scoped at level {level} over {} opening{} and {} constraint{}",
+                opens.len(),
+                if opens.len() == 1 { "" } else { "s" },
+                constraints.len(),
+                if constraints.len() == 1 { "" } else { "s" }
+            ),
+            ConstraintKind::Introduce {
+                package,
+                name,
+                witness,
+                ..
+            } => write!(f, "introduce {package} with '{name} = {witness}"),
         }
     }
 }
@@ -3121,7 +3181,8 @@ fn type_description(description: inference::TypeDescription) -> &'static str {
         T::Mut => "a mutable cell",
         T::Array => "an array",
         T::DeclaredType => "a declared type",
-        T::Any => "a boxed value",
+        T::Hidden => "a hidden type",
+        T::Mirror => "a mirror",
         T::ForeignValue => "a foreign value",
         T::Undecided => "another type",
     }
@@ -3688,6 +3749,38 @@ impl inference::Error {
                         .help("or list this effect explicitly before the annotation's effect remainder"),
                 };
             }
+            E::HiddenEscapes { declared, .. } => {
+                diagnostic = diagnostic
+                    .label("this would carry the opened type out of its arm")
+                    .related(
+                        source.span(*declared),
+                        "the type is opened here, for this arm only",
+                    )
+                    .help("compute a result that does not mention the opened type inside the arm")
+                    .help("or repackage the value under a hidden type before it leaves");
+            }
+            E::HiddenUnknown { declared, .. } => {
+                diagnostic = diagnostic
+                    .label("this position's type must be known before the arm opens it")
+                    .related(source.span(*declared), "opened here")
+                    .help("annotate the matched value, or the function it is a parameter of, with its hidden type");
+            }
+            E::NotHidden { declared, .. } => {
+                diagnostic = diagnostic
+                    .label("only a value of a hidden type can be opened")
+                    .related(source.span(*declared), "opened here")
+                    .help("match the value's structure directly, without `hide`");
+            }
+            E::HiddenWitness { .. } => {
+                diagnostic = diagnostic
+                    .label("the hidden type is not determined by this expression or its context")
+                    .help("annotate the value being packaged, or pass in a value whose type is already known");
+            }
+            E::HiddenRegion { .. } => {
+                diagnostic = diagnostic
+                    .label("this value depends on a region, which a hidden type does not carry")
+                    .help("read the cell and package what it holds, or keep the value in the scope its region belongs to");
+            }
             E::RigidEscapes {
                 destination,
                 destination_name,
@@ -3862,6 +3955,11 @@ impl inference::ErrorKind {
             inference::ErrorKind::RigidBroken { .. } => "rigid-broken",
             inference::ErrorKind::RigidField { .. } => "rigid-field",
             inference::ErrorKind::RigidEscapes { .. } => "rigid-escapes",
+            inference::ErrorKind::HiddenEscapes { .. } => "hidden-escapes",
+            inference::ErrorKind::HiddenUnknown { .. } => "hidden-unknown",
+            inference::ErrorKind::NotHidden { .. } => "not-hidden",
+            inference::ErrorKind::HiddenWitness { .. } => "hidden-witness",
+            inference::ErrorKind::HiddenRegion { .. } => "hidden-region",
             inference::ErrorKind::RepeatedField { .. } => "repeated-field",
             inference::ErrorKind::SatTermLimit { .. } => "sat-term-limit",
             inference::ErrorKind::InvalidMaxSatTerms => "invalid-max-sat-terms",
@@ -3984,6 +4082,30 @@ impl fmt::Display for inference::ErrorKind {
             } => write!(
                 f,
                 "`'{name}` stands for whatever that annotation's caller picks, but binding `{destination_name}` would publish it as `{destination}` outside that annotation",
+            ),
+            inference::ErrorKind::HiddenEscapes { name, .. } => write!(
+                f,
+                "`'{name}` is opened by this arm and cannot be used outside it",
+            ),
+            inference::ErrorKind::HiddenUnknown { name, .. } => write!(
+                f,
+                "the type opened as `'{name}` is not yet known to be a hidden type",
+            ),
+            inference::ErrorKind::NotHidden { name, found, .. } => write!(
+                f,
+                "`hide '{name}` opens a hidden type, but this value is `{found}`",
+            ),
+            inference::ErrorKind::HiddenWitness { name, package } => write!(
+                f,
+                "nothing here says which type `{package}` hides as `'{name}`",
+            ),
+            inference::ErrorKind::HiddenRegion {
+                name,
+                package,
+                witness,
+            } => write!(
+                f,
+                "`{package}` would hide `{witness}` as `'{name}`, and a mutable cell's region cannot be hidden",
             ),
             // Said as what `..` means rather than as the two rows that
             // disagreed: neither of those is a type the reader wrote, and the
@@ -4240,9 +4362,11 @@ pub fn write_arrow(
 ) -> fmt::Result {
     write_grouped(f, from.prec() < Prec::Sum, from)?;
     f.write_str(" -> ")?;
-    // An arrow is the one node at this level, in all three printers, so
-    // comparing against it is asking exactly "is the result an arrow".
-    write_grouped(f, effects.is_some() && to.prec() == Prec::Arrow, to)?;
+    // A row written after the result belongs to this arrow. An arrow result
+    // would take it as its own, and a hidden result would take it inside the
+    // body, so both are grouped: those are the two levels at or under an
+    // arrow's.
+    write_grouped(f, effects.is_some() && to.prec() <= Prec::Arrow, to)?;
     match effects {
         Some(effects) => write!(f, " + {effects}"),
         None => Ok(()),

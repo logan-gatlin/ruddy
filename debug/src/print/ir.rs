@@ -420,7 +420,8 @@ impl Grouped for Show<'_, PatternKind> {
         match self.node {
             PatternKind::Tag {
                 payload: Some(_), ..
-            } => Prec::Apply,
+            }
+            | PatternKind::Hidden { .. } => Prec::Apply,
             PatternKind::Tag { payload: None, .. } => Prec::Tag,
             PatternKind::Bind(_)
             | PatternKind::Wildcard
@@ -461,6 +462,14 @@ impl fmt::Display for Show<'_, PatternKind> {
                 None,
                 payload.as_deref().map(|payload| self.show(payload)),
             ),
+            PatternKind::Hidden { name, pattern, .. } => {
+                write!(f, "hide '{} ", name.anchored)?;
+                let payload = self.show(&**pattern);
+                match payload.prec() < Prec::Atom {
+                    true => write!(f, "({payload})"),
+                    false => write!(f, "{payload}"),
+                }
+            }
             PatternKind::Array {
                 before,
                 rest,
@@ -515,13 +524,16 @@ impl Grouped for Show<'_, TypeKind> {
             // A row of effects binds as a sum does: same labels, same tail,
             // same brackets around it.
             TypeKind::Sum { .. } | TypeKind::Effects(_) => Prec::Sum,
-            TypeKind::Apply { .. } | TypeKind::Mut(..) => Prec::Apply,
+            TypeKind::Apply { .. } | TypeKind::Mut(..) | TypeKind::Mirror(_) => Prec::Apply,
+            // The body runs as far right as it can, as the written form's does.
+            TypeKind::Hidden { .. } => Prec::Lambda,
             TypeKind::Struct { .. }
             | TypeKind::Array(_)
             | TypeKind::Ident(_)
             | TypeKind::Param { .. }
             | TypeKind::Prim(_)
             | TypeKind::Var(_)
+            | TypeKind::Scoped { .. }
             | TypeKind::Hole
             | TypeKind::Error => Prec::Atom,
         }
@@ -729,6 +741,13 @@ impl fmt::Display for Show<'_, TypeKind> {
             // A variable, as the name it was declared with — which
             // is what the reader wrote and what re-parses to the same use.
             TypeKind::Var(name) => write!(f, "'{name}"),
+            // A hidden type's binder and a `hide` pattern's opened type both
+            // print as the name they were written with: what re-parses to
+            // the same binding under the same `hide`.
+            TypeKind::Scoped { name, .. } => write!(f, "'{name}"),
+            TypeKind::Hidden { name, body, .. } => {
+                write!(f, "hide '{name} => {}", self.show(&**body))
+            }
             TypeKind::Ident(symbol) => f.write_str(self.mint.name(*symbol)),
             // A parameter prints as the name it was declared with, sigil and
             // all, which is what makes this printer's output match the parse
@@ -777,6 +796,9 @@ impl fmt::Display for Show<'_, TypeKind> {
                 self.show(&**element)
             ),
             TypeKind::Array(element) => write!(f, "[{}]", self.show(&**element)),
+            TypeKind::Mirror(element) => {
+                write_applied(f, "Mirror", std::iter::once(self.show(&**element)))
+            }
             TypeKind::Arrow { from, to, effects } => {
                 let row = self.effect_row(effects);
                 write_arrow(

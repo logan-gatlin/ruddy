@@ -30,10 +30,109 @@ pub enum Prim {
     String,
     /// The type with the values true and false.
     Bool,
-    /// A value packaged with its structural runtime type.
-    Any,
     /// An opaque JavaScript value.
     ForeignValue,
+}
+
+/// The exact bounds of one integer domain: its precision in bits, its
+/// signedness, and its least and greatest values as decimal text, which is
+/// exact even where the inspecting target's own integers cannot hold them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct Bounds {
+    pub bits: u32,
+    pub signed: bool,
+    pub min: &'static str,
+    pub max: &'static str,
+}
+
+/// The domains a target binds `Nat` and `Int` to. Fixed-width integers have
+/// their widths everywhere; these two have the precision the target chooses,
+/// bound once for a whole linked program and recorded in its artifacts.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+pub enum Domains {
+    /// JavaScript's safe integers: 53 bits of integer precision in a `number`.
+    #[default]
+    Js53,
+    /// Conventional unsigned and signed 32-bit domains.
+    Bits32,
+    /// Conventional unsigned and signed 64-bit domains.
+    Bits64,
+}
+
+impl Domains {
+    pub const ALL: [Self; 3] = [Self::Js53, Self::Bits32, Self::Bits64];
+
+    /// The spelling a manifest and an artifact use for the domains.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Js53 => "53",
+            Self::Bits32 => "32",
+            Self::Bits64 => "64",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|domains| domains.name() == name)
+    }
+
+    /// The precision of `Nat` and `Int`, in bits of integer value.
+    pub const fn bits(self) -> u32 {
+        match self {
+            Self::Js53 => 53,
+            Self::Bits32 => 32,
+            Self::Bits64 => 64,
+        }
+    }
+
+    pub const fn nat(self) -> Bounds {
+        Bounds {
+            bits: self.bits(),
+            signed: false,
+            min: "0",
+            max: match self {
+                Self::Js53 => "9007199254740991",
+                Self::Bits32 => "4294967295",
+                Self::Bits64 => "18446744073709551615",
+            },
+        }
+    }
+
+    pub const fn int(self) -> Bounds {
+        Bounds {
+            bits: self.bits(),
+            signed: true,
+            min: match self {
+                Self::Js53 => "-9007199254740991",
+                Self::Bits32 => "-2147483648",
+                Self::Bits64 => "-9223372036854775808",
+            },
+            max: match self {
+                Self::Js53 => "9007199254740991",
+                Self::Bits32 => "2147483647",
+                Self::Bits64 => "9223372036854775807",
+            },
+        }
+    }
+
+    /// Whether a `Nat` literal is in the domain.
+    pub const fn holds_natural(self, value: u64) -> bool {
+        match self {
+            Self::Js53 => value <= 9007199254740991,
+            Self::Bits32 => value <= 4294967295,
+            Self::Bits64 => true,
+        }
+    }
+
+    /// Whether an `Int` literal is in the domain.
+    pub const fn holds_integer(self, value: i64) -> bool {
+        match self {
+            Self::Js53 => value >= -9007199254740991 && value <= 9007199254740991,
+            Self::Bits32 => value >= -2147483648 && value <= 2147483647,
+            Self::Bits64 => true,
+        }
+    }
 }
 
 /// A target-independent integer width and signedness.
@@ -466,8 +565,6 @@ pub enum Ty {
     Real,
     String,
     Bool,
-    /// A value packaged with its structural runtime type.
-    Any,
     /// An opaque JavaScript value.
     ForeignValue,
     /// `A -> B + E` — what it takes, what it gives back, and the effects
@@ -486,8 +583,39 @@ pub enum Ty {
     /// annotation result boundary at which hidden presence identities are
     /// opened; it is otherwise representation-transparent.
     Package(Arc<Ty>),
+    /// `hide 'a => T` — a hidden type: one type variable bound over the body,
+    /// standing for a type the value's producer chose and its consumers do
+    /// not learn. The bound occurrences inside the body are
+    /// [`Ty::HiddenVar`]s naming this binder.
+    ///
+    /// `binder` is unique per written `hide` across the program, so two
+    /// hidden types nested inside one another can never confuse their
+    /// variables; alpha-equivalence is what equality decides, so the number
+    /// itself is no part of a type's identity. `name` is the spelling, carried
+    /// for the reason [`Ty::Rigid`] carries one.
+    ///
+    /// Representation-transparent, like a package: a value of a hidden type
+    /// is stored exactly as its body says.
+    Hidden {
+        binder: u32,
+        name: Arc<str>,
+        body: Arc<Ty>,
+    },
+    /// An occurrence of an enclosing [`Ty::Hidden`]'s variable inside its
+    /// body. A leaf; nothing supplies a value for it until the hidden type is
+    /// opened, at which point every occurrence becomes one fresh
+    /// [`Ty::Rigid`] for the scope that opened it.
+    HiddenVar {
+        binder: u32,
+        name: Arc<str>,
+    },
     /// An immutable homogeneous array.
     Array(Arc<Ty>),
+    /// `Mirror T` — authentic evidence of the type `T`: opaque, compiler-made,
+    /// and invariant in its type, so two mirrors are one type exactly when the
+    /// types they mirror are. Its values are the runtime type information the
+    /// compiler already passes as hidden evidence, made a first-class value.
+    Mirror(Arc<Ty>),
     /// A cell with a fixed region and invariant element type.
     Mut(Arc<Ty>, Arc<Ty>),
     /// A structural record and its true field-row tail.
@@ -838,14 +966,14 @@ fn take_ty_children(ty: &mut Ty, types: &mut Vec<Arc<Ty>>, rows: &mut Vec<Arc<Ro
             types.push(std::mem::replace(to, Arc::new(Ty::Undecided)));
             take_row_children(effects, types, rows);
         }
-        Ty::Package(body) => {
+        Ty::Package(body) | Ty::Hidden { body, .. } => {
             types.push(std::mem::replace(body, Arc::new(Ty::Undecided)));
         }
         Ty::Mut(region, element) => {
             types.push(std::mem::replace(region, Arc::new(Ty::Undecided)));
             types.push(std::mem::replace(element, Arc::new(Ty::Undecided)));
         }
-        Ty::Array(element) => {
+        Ty::Array(element) | Ty::Mirror(element) => {
             types.push(std::mem::replace(element, Arc::new(Ty::Undecided)));
         }
         Ty::Struct(row) | Ty::Sum(row) => take_row_children(row, types, rows),
@@ -858,11 +986,11 @@ fn take_ty_children(ty: &mut Ty, types: &mut Vec<Arc<Ty>>, rows: &mut Vec<Arc<Ro
         | Ty::Real
         | Ty::String
         | Ty::Bool
-        | Ty::Any
         | Ty::ForeignValue
         | Ty::Var(_)
         | Ty::Bound(_)
         | Ty::Rigid { .. }
+        | Ty::HiddenVar { .. }
         | Ty::Undecided => {}
     }
 }
@@ -923,9 +1051,32 @@ pub(crate) fn same_finite_syntax_metered(
     right: &Arc<Ty>,
     work_left: &mut usize,
 ) -> Option<bool> {
+    /// The hidden binders in scope at a pair, innermost first, pairing the
+    /// left side's binder with the right side's: what makes `hide 'a => 'a`
+    /// and `hide 'b => 'b` the one type they are.
+    struct Scope {
+        left: u32,
+        right: u32,
+        outer: Option<std::rc::Rc<Scope>>,
+    }
+    type Env = Option<std::rc::Rc<Scope>>;
+
+    fn same_hidden_var(env: &Env, left: u32, right: u32) -> bool {
+        let mut scope = env.as_deref();
+        while let Some(here) = scope {
+            // The innermost binder of either variable decides: a variable
+            // bound here is equal exactly to the one bound beside it.
+            if here.left == left || here.right == right {
+                return here.left == left && here.right == right;
+            }
+            scope = here.outer.as_deref();
+        }
+        left == right
+    }
+
     enum Pair<'a> {
-        Ty(&'a Ty, &'a Ty),
-        Row(&'a Row, &'a Row),
+        Ty(&'a Ty, &'a Ty, Env),
+        Row(&'a Row, &'a Row, Env),
     }
 
     fn charge(work_left: &mut usize) -> Option<()> {
@@ -963,18 +1114,22 @@ pub(crate) fn same_finite_syntax_metered(
         }
     }
 
-    let mut pending = vec![Pair::Ty(left, right)];
+    let mut pending = vec![Pair::Ty(left, right, None)];
     let mut seen_types = std::collections::HashSet::new();
     let mut seen_rows = std::collections::HashSet::new();
+    let scope_key = |env: &Env| env.as_ref().map_or(std::ptr::null(), std::rc::Rc::as_ptr);
     while let Some(pair) = pending.pop() {
         if *work_left == 0 {
             return None;
         }
         *work_left -= 1;
         match pair {
-            Pair::Ty(left, right) => {
-                if std::ptr::eq(left, right)
-                    || !seen_types.insert((left as *const Ty, right as *const Ty))
+            Pair::Ty(left, right, env) => {
+                // Two bound occurrences are compared through their scope even
+                // when one allocation is shared by both sides: the same node
+                // under different binders may pair its variables differently.
+                if (std::ptr::eq(left, right) && !matches!(left, Ty::HiddenVar { .. }))
+                    || !seen_types.insert((left as *const Ty, right as *const Ty, scope_key(&env)))
                 {
                     continue;
                 }
@@ -985,7 +1140,6 @@ pub(crate) fn same_finite_syntax_metered(
                     | (Ty::Real, Ty::Real)
                     | (Ty::String, Ty::String)
                     | (Ty::Bool, Ty::Bool)
-                    | (Ty::Any, Ty::Any)
                     | (Ty::ForeignValue, Ty::ForeignValue)
                     | (Ty::Undecided, Ty::Undecided) => {}
                     (Ty::Var(left), Ty::Var(right)) | (Ty::Bound(left), Ty::Bound(right)) => {
@@ -998,22 +1152,50 @@ pub(crate) fn same_finite_syntax_metered(
                             return Some(false);
                         }
                     }
+                    (Ty::HiddenVar { binder: left, .. }, Ty::HiddenVar { binder: right, .. }) => {
+                        if !same_hidden_var(&env, *left, *right) {
+                            return Some(false);
+                        }
+                    }
+                    (
+                        Ty::Hidden {
+                            binder: left_binder,
+                            body: left,
+                            ..
+                        },
+                        Ty::Hidden {
+                            binder: right_binder,
+                            body: right,
+                            ..
+                        },
+                    ) => {
+                        let scope = Some(std::rc::Rc::new(Scope {
+                            left: *left_binder,
+                            right: *right_binder,
+                            outer: env,
+                        }));
+                        pending.push(Pair::Ty(left, right, scope));
+                    }
                     (
                         Ty::Arrow(left_from, left_to, left_row),
                         Ty::Arrow(right_from, right_to, right_row),
                     ) => {
-                        pending.push(Pair::Row(left_row, right_row));
-                        pending.push(Pair::Ty(left_to, right_to));
-                        pending.push(Pair::Ty(left_from, right_from));
+                        pending.push(Pair::Row(left_row, right_row, env.clone()));
+                        pending.push(Pair::Ty(left_to, right_to, env.clone()));
+                        pending.push(Pair::Ty(left_from, right_from, env));
                     }
-                    (Ty::Package(left), Ty::Package(right)) => pending.push(Pair::Ty(left, right)),
+                    (Ty::Package(left), Ty::Package(right)) => {
+                        pending.push(Pair::Ty(left, right, env))
+                    }
                     (Ty::Mut(a, b), Ty::Mut(c, d)) => {
-                        pending.push(Pair::Ty(a, c));
-                        pending.push(Pair::Ty(b, d));
+                        pending.push(Pair::Ty(a, c, env.clone()));
+                        pending.push(Pair::Ty(b, d, env));
                     }
-                    (Ty::Array(left), Ty::Array(right)) => pending.push(Pair::Ty(left, right)),
+                    (Ty::Array(left), Ty::Array(right)) | (Ty::Mirror(left), Ty::Mirror(right)) => {
+                        pending.push(Pair::Ty(left, right, env))
+                    }
                     (Ty::Struct(left), Ty::Struct(right)) | (Ty::Sum(left), Ty::Sum(right)) => {
-                        pending.push(Pair::Row(left, right))
+                        pending.push(Pair::Row(left, right, env))
                     }
                     (
                         Ty::Named {
@@ -1034,16 +1216,14 @@ pub(crate) fn same_finite_syntax_metered(
                             left_args
                                 .iter()
                                 .zip(right_args.iter())
-                                .map(|(left, right)| Pair::Ty(left, right)),
+                                .map(|(left, right)| Pair::Ty(left, right, env.clone())),
                         );
                     }
                     _ => return Some(false),
                 }
             }
-            Pair::Row(left, right) => {
-                if std::ptr::eq(left, right)
-                    || !seen_rows.insert((left as *const Row, right as *const Row))
-                {
+            Pair::Row(left, right, env) => {
+                if !seen_rows.insert((left as *const Row, right as *const Row, scope_key(&env))) {
                     continue;
                 }
                 let (left_labels, left_rest) = flatten(left, work_left)?;
@@ -1068,7 +1248,7 @@ pub(crate) fn same_finite_syntax_metered(
                         left_field.presence,
                         Presence::Present | Presence::Var(_) | Presence::Bound(_)
                     ) {
-                        pending.push(Pair::Ty(&left_field.ty, &right_field.ty));
+                        pending.push(Pair::Ty(&left_field.ty, &right_field.ty, env.clone()));
                     }
                 }
                 match (left_rest, right_rest) {
@@ -1092,6 +1272,202 @@ pub(crate) fn same_finite_syntax_metered(
     Some(true)
 }
 
+/// The body of a hidden type with every occurrence of its variable replaced:
+/// what opening `hide 'a => T` at a type `X` comes to. Occurrences under a
+/// nested `hide` that binds the same number belong to that inner binder and
+/// are left alone, so a hidden type nested inside its own unfolding still
+/// means what it says.
+///
+/// Iterative, like every walk over a type: a hidden body may hold deeply
+/// nested imported types, and no native frame is spent per constructor.
+pub fn open_hidden(body: &Arc<Ty>, binder: u32, replacement: &Arc<Ty>) -> Arc<Ty> {
+    enum Work<'a> {
+        Ty(&'a Arc<Ty>),
+        Row(&'a Row),
+        Arrow,
+        Package,
+        Hidden(u32, Arc<str>),
+        Shadow,
+        Unshadow,
+        Array,
+        Mirror,
+        Mut,
+        Struct,
+        Sum,
+        Named {
+            symbol: Symbol,
+            name: Arc<str>,
+            args: usize,
+        },
+        BuiltRow(&'a Row, usize),
+    }
+
+    let mut work = vec![Work::Ty(body)];
+    let mut types: Vec<Arc<Ty>> = Vec::new();
+    let mut rows: Vec<Row> = Vec::new();
+    // How many binders of the same number enclose the current position: an
+    // occurrence under one is the inner binder's, not the one being opened.
+    let mut shadowed = 0usize;
+    while let Some(part) = work.pop() {
+        match part {
+            Work::Ty(ty) => match &**ty {
+                Ty::HiddenVar { binder: found, .. } if *found == binder && shadowed == 0 => {
+                    types.push(replacement.clone());
+                }
+                Ty::Hidden {
+                    binder: inner,
+                    name,
+                    body,
+                } => {
+                    work.push(Work::Hidden(*inner, name.clone()));
+                    if *inner == binder {
+                        work.push(Work::Unshadow);
+                        work.push(Work::Ty(body));
+                        work.push(Work::Shadow);
+                    } else {
+                        work.push(Work::Ty(body));
+                    }
+                }
+                Ty::Arrow(from, to, effects) => {
+                    work.push(Work::Arrow);
+                    work.push(Work::Row(effects));
+                    work.push(Work::Ty(to));
+                    work.push(Work::Ty(from));
+                }
+                Ty::Package(inner) => {
+                    work.push(Work::Package);
+                    work.push(Work::Ty(inner));
+                }
+                Ty::Array(element) => {
+                    work.push(Work::Array);
+                    work.push(Work::Ty(element));
+                }
+                Ty::Mirror(element) => {
+                    work.push(Work::Mirror);
+                    work.push(Work::Ty(element));
+                }
+                Ty::Mut(region, element) => {
+                    work.push(Work::Mut);
+                    work.push(Work::Ty(element));
+                    work.push(Work::Ty(region));
+                }
+                Ty::Struct(row) => {
+                    work.push(Work::Struct);
+                    work.push(Work::Row(row));
+                }
+                Ty::Sum(row) => {
+                    work.push(Work::Sum);
+                    work.push(Work::Row(row));
+                }
+                Ty::Named { symbol, name, args } => {
+                    work.push(Work::Named {
+                        symbol: *symbol,
+                        name: name.clone(),
+                        args: args.len(),
+                    });
+                    work.extend(args.iter().rev().map(Work::Ty));
+                }
+                Ty::Nat
+                | Ty::Int
+                | Ty::Fixed(_)
+                | Ty::Real
+                | Ty::String
+                | Ty::Bool
+                | Ty::ForeignValue
+                | Ty::Var(_)
+                | Ty::Bound(_)
+                | Ty::Rigid { .. }
+                | Ty::HiddenVar { .. }
+                | Ty::Undecided => types.push(ty.clone()),
+            },
+            Work::Shadow => shadowed += 1,
+            Work::Unshadow => shadowed -= 1,
+            Work::Row(row) => {
+                let mut nested = 0;
+                if let Rest::More(more) = &row.rest {
+                    work.push(Work::BuiltRow(row, 1));
+                    work.push(Work::Row(more));
+                    nested = 1;
+                }
+                if nested == 0 {
+                    work.push(Work::BuiltRow(row, 0));
+                }
+                work.extend(row.labels.values().rev().map(|field| Work::Ty(&field.ty)));
+            }
+            Work::Arrow => {
+                let effects = rows.pop().expect("row postorder");
+                let to = types.pop().expect("result postorder");
+                let from = types.pop().expect("argument postorder");
+                types.push(Arc::new(Ty::Arrow(from, to, effects)));
+            }
+            Work::Package => {
+                let body = types.pop().expect("package postorder");
+                types.push(Arc::new(Ty::Package(body)));
+            }
+            Work::Hidden(binder, name) => {
+                let body = types.pop().expect("hidden postorder");
+                types.push(Arc::new(Ty::Hidden { binder, name, body }));
+            }
+            Work::Array => {
+                let element = types.pop().expect("array postorder");
+                types.push(Arc::new(Ty::Array(element)));
+            }
+            Work::Mirror => {
+                let element = types.pop().expect("mirror postorder");
+                types.push(Arc::new(Ty::Mirror(element)));
+            }
+            Work::Mut => {
+                let element = types.pop().expect("cell element");
+                let region = types.pop().expect("cell region");
+                types.push(Arc::new(Ty::Mut(region, element)));
+            }
+            Work::Struct => {
+                let row = rows.pop().expect("struct postorder");
+                types.push(Arc::new(Ty::Struct(row)));
+            }
+            Work::Sum => {
+                let row = rows.pop().expect("sum postorder");
+                types.push(Arc::new(Ty::Sum(row)));
+            }
+            Work::Named { symbol, name, args } => {
+                let mut opened = Vec::with_capacity(args);
+                for _ in 0..args {
+                    opened.push(types.pop().expect("named postorder"));
+                }
+                opened.reverse();
+                types.push(Arc::new(Ty::Named {
+                    symbol,
+                    name,
+                    args: opened.into(),
+                }));
+            }
+            Work::BuiltRow(row, nested) => {
+                let rest = match nested {
+                    0 => row.rest.clone(),
+                    _ => Rest::More(Arc::new(rows.pop().expect("nested row postorder"))),
+                };
+                let mut labels = Vec::with_capacity(row.labels.len());
+                for (name, field) in row.labels.iter().rev() {
+                    let ty = types.pop().expect("field postorder");
+                    labels.push((
+                        name.clone(),
+                        RowField {
+                            presence: field.presence.clone(),
+                            ty,
+                        },
+                    ));
+                }
+                labels.reverse();
+                rows.push(Row {
+                    labels: labels.into_iter().collect(),
+                    rest,
+                });
+            }
+        }
+    }
+    types.pop().expect("an opened type")
+}
+
 impl Ty {
     /// `from -> to`, performing nothing: [`Row::closed`] with no labels, which
     /// is what a bare `A -> B` means and what the printer writes as nothing at
@@ -1111,7 +1487,6 @@ impl From<Prim> for Ty {
             Prim::Real => Ty::Real,
             Prim::String => Ty::String,
             Prim::Bool => Ty::Bool,
-            Prim::Any => Ty::Any,
             Prim::ForeignValue => Ty::ForeignValue,
         }
     }
@@ -1381,7 +1756,10 @@ fn existential_outside_package(body: &Arc<Ty>, existentials: &IndexSet<u32>) -> 
         match part {
             Work::Ty(ty, packaged) => match &*ty {
                 Ty::Package(inner) => work.push(Work::Ty(inner.clone(), true)),
-                Ty::Array(element) => work.push(Work::Ty(element.clone(), packaged)),
+                Ty::Hidden { body, .. } => work.push(Work::Ty(body.clone(), packaged)),
+                Ty::Array(element) | Ty::Mirror(element) => {
+                    work.push(Work::Ty(element.clone(), packaged))
+                }
                 Ty::Mut(region, element) => {
                     work.push(Work::Ty(element.clone(), packaged));
                     work.push(Work::Ty(region.clone(), packaged));
@@ -1438,7 +1816,10 @@ fn partition_package_formula(
                     package_count += 1;
                     work.push(Work::Ty(inner.clone(), Some(here)));
                 }
-                Ty::Array(element) => work.push(Work::Ty(element.clone(), owner)),
+                Ty::Hidden { body, .. } => work.push(Work::Ty(body.clone(), owner)),
+                Ty::Array(element) | Ty::Mirror(element) => {
+                    work.push(Work::Ty(element.clone(), owner))
+                }
                 Ty::Mut(region, element) => {
                     work.push(Work::Ty(element.clone(), owner));
                     work.push(Work::Ty(region.clone(), owner));
@@ -1886,7 +2267,6 @@ impl Prim {
         Prim::Real,
         Prim::String,
         Prim::Bool,
-        Prim::Any,
         Prim::ForeignValue,
     ];
 
@@ -1901,7 +2281,6 @@ impl Prim {
             Prim::Real => "Real",
             Prim::String => "String",
             Prim::Bool => "Bool",
-            Prim::Any => "Any",
             Prim::ForeignValue => "ForeignValue",
         }
     }

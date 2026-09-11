@@ -1,9 +1,16 @@
 // Adapter identity is keyed by the source value and the reviewed conversion
 // position. Recursive host interfaces reuse their wrapper on a back edge.
 const $convertedFunctions = new WeakMap();
-// Only authentic Any packages own payloads. Their visible shape carries no
-// writable descriptor that foreign code could forge or replace.
-const $anyPackages = new WeakMap();
+// A value of a hidden type crosses a foreign boundary as a sealed package:
+// the host is handed a frozen handle for it, and only such a handle is taken
+// back. Nothing of the body is visible to or writable by the host, and no
+// package can be made outside the program.
+const $packages = new WeakMap();
+const $handles = new WeakMap();
+// Whether a graph still has a position nothing has decided. A handle can only
+// be held against a type that is settled, so a boundary that asks about one
+// which is not says so rather than letting the handle through unchecked.
+const $decided = $type => !$type.nodes.some($node => typeof $node === "object" && "Parameter" in $node);
 const $instantiateType = ($template, $arguments, $partial = false) => {
   if ($arguments.some($argument => $argument === undefined)) return undefined;
   if (!$arguments.length && !$template.nodes.some($node => typeof $node === "object" && "Extend" in $node)) return $template;
@@ -14,10 +21,13 @@ const $instantiateType = ($template, $arguments, $partial = false) => {
   const $offsets = $arguments.map($argument => {
     const $offset = $nodes.length;
     for (const $node of $argument.nodes) {
-      if (typeof $node === "string" || "Fixed" in $node || "Parameter" in $node) $nodes.push($node);
+      if (typeof $node === "string" || "Fixed" in $node || "Parameter" in $node || "HiddenBound" in $node) $nodes.push($node);
       else if ("Array" in $node) $nodes.push({ Array: $node.Array + $offset });
+      else if ("Mirror" in $node) $nodes.push({ Mirror: $node.Mirror + $offset });
+      else if ("Hidden" in $node) $nodes.push({ Hidden: $node.Hidden + $offset });
       else if ("Alias" in $node) $nodes.push({ Alias: $node.Alias + $offset });
       else if ("Arrow" in $node) $nodes.push({ Arrow: $node.Arrow.map($index => $index + $offset) });
+      else if ("Effects" in $node) $nodes.push({ Effects: $node.Effects.map($effect => ({ identity: $effect.identity, payload: $effect.payload + $offset, args: $effect.args.map($arg => $arg + $offset) })) });
       else {
         const $kind = Object.keys($node)[0];
         $nodes.push({ [$kind]: $node[$kind].map(([$name, $index]) => [$name, $index + $offset]) });
@@ -61,10 +71,13 @@ const $instantiateType = ($template, $arguments, $partial = false) => {
 const $typeAt = ($descriptor, $index) => ({ nodes: [
   { Alias: $index + 1 },
   ...$descriptor.nodes.map($node => {
-    if (typeof $node === "string" || "Fixed" in $node || "Parameter" in $node) return $node;
+    if (typeof $node === "string" || "Fixed" in $node || "Parameter" in $node || "HiddenBound" in $node) return $node;
     if ("Alias" in $node) return { Alias: $node.Alias + 1 };
     if ("Array" in $node) return { Array: $node.Array + 1 };
+    if ("Mirror" in $node) return { Mirror: $node.Mirror + 1 };
+    if ("Hidden" in $node) return { Hidden: $node.Hidden + 1 };
     if ("Arrow" in $node) return { Arrow: $node.Arrow.map($child => $child + 1) };
+    if ("Effects" in $node) return { Effects: $node.Effects.map($effect => ({ identity: $effect.identity, payload: $effect.payload + 1, args: $effect.args.map($arg => $arg + 1) })) };
     if ("Extend" in $node) return { Extend: $node.Extend.map($child => $child + 1) };
     const $kind = Object.keys($node)[0];
     return { [$kind]: $node[$kind].map(([$name, $child]) => [$name, $child + 1]) };
@@ -124,10 +137,10 @@ const $nativeSlots = ($descriptor, $index) => {
     if ($seen.has($key)) continue;
     $seen.add($key);
     const $node = $nodes[$index];
-    if (typeof $node === "string" || "Fixed" in $node) continue;
+    if (typeof $node === "string" || "Fixed" in $node || "HiddenBound" in $node) continue;
     if ("Parameter" in $node) { $slots.add($node.Parameter); continue; }
     if ($defer && "Arrow" in $node) continue;
-    const $children = "Alias" in $node ? [$node.Alias] : "Array" in $node ? [$node.Array] : "Arrow" in $node ? $node.Arrow : "Extend" in $node ? $node.Extend : Object.values($node)[0].map($field => $field[1]);
+    const $children = "Alias" in $node ? [$node.Alias] : "Array" in $node ? [$node.Array] : "Mirror" in $node ? [$node.Mirror] : "Hidden" in $node ? [$node.Hidden] : "Arrow" in $node ? $node.Arrow : "Extend" in $node ? $node.Extend : "Effects" in $node ? $node.Effects.flatMap($effect => [$effect.payload, ...$effect.args]) : Object.values($node)[0].map($field => $field[1]);
     for (const $child of $children) $work.push([$child, $defer]);
   }
   return [...$slots].sort(($a, $b) => $a - $b);
@@ -154,12 +167,22 @@ const $sameType = ($left, $right) => {
     }
     const $kind = Object.keys($x)[0];
     if ($kind !== Object.keys($y)[0]) return false;
-    if ($kind === "Fixed") {
-      if ($x.Fixed !== $y.Fixed) return false;
-    } else if ($kind === "Array") {
-      $work.push([$x.Array, $y.Array]);
+    if ($kind === "Fixed" || $kind === "Parameter" || $kind === "HiddenBound") {
+      if ($x[$kind] !== $y[$kind]) return false;
+    } else if ($kind === "Array" || $kind === "Mirror" || $kind === "Hidden") {
+      $work.push([$x[$kind], $y[$kind]]);
     } else if ($kind === "Arrow") {
-      $work.push([$x.Arrow[0], $y.Arrow[0]], [$x.Arrow[1], $y.Arrow[1]]);
+      $work.push([$x.Arrow[0], $y.Arrow[0]], [$x.Arrow[1], $y.Arrow[1]], [$x.Arrow[2], $y.Arrow[2]]);
+    } else if ($kind === "Effects") {
+      if ($x.Effects.length !== $y.Effects.length) return false;
+      for (let $i = 0; $i < $x.Effects.length; $i++) {
+        const $a = $x.Effects[$i], $b = $y.Effects[$i];
+        if ($a.identity !== $b.identity || $a.args.length !== $b.args.length) return false;
+        $work.push([$a.payload, $b.payload]);
+        for (let $j = 0; $j < $a.args.length; $j++) $work.push([$a.args[$j], $b.args[$j]]);
+      }
+    } else if ($kind === "Extend") {
+      $work.push([$x.Extend[0], $y.Extend[0]], [$x.Extend[1], $y.Extend[1]]);
     } else {
       const $xs = $x[$kind], $ys = $y[$kind];
       if ($xs.length !== $ys.length) return false;
@@ -171,17 +194,142 @@ const $sameType = ($left, $right) => {
   }
   return true;
 };
-const $anyUpcast = ($descriptor, $value) => {
-  if (!$descriptor) throw new TypeError("missing runtime type information for Any");
-  const $package = Object.freeze(Object.create(null));
-  $anyPackages.set($package, { descriptor: $descriptor, value: $value });
-  return $package;
+// Mirrors are the descriptors the compiler already passes as evidence, made
+// authentic: only a descriptor that came through one of these operations is
+// a mirror, so foreign data cannot forge one.
+// Whether every code unit of a host string pairs into a Unicode scalar value.
+const $scalarText = $value => {
+  for (let $at = 0; $at < $value.length; $at++) {
+    const $code = $value.charCodeAt($at);
+    if ($code >= 0xdc00 && $code <= 0xdfff) return false;
+    if ($code >= 0xd800 && $code <= 0xdbff) {
+      const $low = $value.charCodeAt($at + 1);
+      if (!($low >= 0xdc00 && $low <= 0xdfff)) return false;
+      $at += 1;
+    }
+  }
+  return true;
 };
-const $anyDowncast = ($descriptor, $value) => {
-  const $package = $anyPackages.get($value);
-  return $package && $sameType($descriptor, $package.descriptor)
-    ? $sum("Some", $package.value)
-    : $sum("None", $record([]));
+const $mirrors = new WeakSet();
+const $mirror = ($descriptor, $value) => {
+  if (!$descriptor) throw new TypeError("missing runtime type information for a mirror");
+  $mirrors.add($descriptor);
+  return $descriptor;
+};
+const $typeOf = $mirror;
+// A Ruddy function implemented here: it is handed the value as it is and
+// hands back what it makes, with nothing converted in either direction.
+const $nativeType = { nodes: [{ Arrow: [1, 1, 2] }, "ForeignValue", { Effects: [] }] };
+const $native = $function => {
+  const $value = $argument => $invoke($value, "Sync", [$argument]);
+  $value[$closureMark] = true;
+  $value.nativeType = { descriptor: $nativeType, from: 1, to: 1, function: $function, slots: [] };
+  return $value;
+};
+// A function of one value handed back unchanged: what an established equality
+// of two mirrors supplies in each direction. It converts nothing, so it keeps
+// the value's identity as well as its type.
+const $passThrough = () => $native($x => $x);
+// A mirror of one node of a mirror's graph: the field, element, or payload
+// type, authentic because the whole was.
+const $mirrorAt = ($of, $index) => {
+  const $part = $typeAt($of, $index);
+  $mirrors.add($part);
+  return $part;
+};
+const $sameMirror = ($descriptor, $pair) => $sameType($pair["0"], $pair["1"])
+  ? $sum("Some", $record([["forward", $passThrough()], ["backward", $passThrough()]]))
+  : $sum("None", undefined);
+// A mirror's graph as ordinary data: one node per descriptor node, indices
+// kept, so recursion stays finite and nothing here can be turned back into
+// a mirror.
+const $describe = ($descriptor, $of) => {
+  const $node = $n => {
+    if ($n === "Nat" || $n === "Int") {
+      const $bounds = $n === "Nat" ? $domains.nat : $domains.int;
+      return $sum($n, $record([["bits", $bounds.bits], ["signed", $bounds.signed], ["min", $bounds.min], ["max", $bounds.max]]));
+    }
+    if (typeof $n === "string") return $sum($n === "ForeignValue" ? "Foreign" : $n, undefined);
+    if ("Fixed" in $n) {
+      const $bits = Number($n.Fixed.match(/\d+/)[0]), $signed = $n.Fixed.startsWith("Int");
+      const $size = 1n << BigInt($bits - ($signed ? 1 : 0));
+      return $sum("Fixed", $record([["bits", $bits], ["signed", $signed], ["min", ($signed ? -$size : 0n).toString()], ["max", ($size - 1n).toString()]]));
+    }
+    if ("Array" in $n) return $sum("Array", $n.Array);
+    if ("Arrow" in $n) {
+      const $effects = $of.nodes[$typeIndex($of, $n.Arrow[2])].Effects || [];
+      return $sum("Function", $record([["argument", $n.Arrow[0]], ["result", $n.Arrow[1]], ["effects", $array($effects.map($effect => $record([["name", $effect.identity], ["node", $effect.payload]])))]]));
+    }
+    if ("Effects" in $n) return $sum("Effects", $array($n.Effects.map($effect => $record([["name", $effect.identity], ["node", $effect.payload]]))));
+    if ("Struct" in $n || "Sum" in $n) {
+      const $fields = "Struct" in $n ? $n.Struct : $n.Sum;
+      return $sum("Struct" in $n ? "Record" : "Sum", $array($fields.map(([$name, $index]) => $record([["name", $name], ["node", $index]]))));
+    }
+    if ("Alias" in $n) return $sum("Alias", $n.Alias);
+    if ("Extend" in $n) return $sum("Extend", $record([["base", $n.Extend[0]], ["rest", $n.Extend[1]]]));
+    if ("Parameter" in $n) return $sum("Parameter", $n.Parameter);
+    if ("Mirror" in $n) return $sum("Mirror", $n.Mirror);
+    if ("Hidden" in $n) return $sum("Hidden", $n.Hidden);
+    return $sum("Variable", $n.HiddenBound);
+  };
+  return $record([["root", 0], ["nodes", $array($of.nodes.map($node))]]);
+};
+// A mirror's outermost structure as `std::reflect::Shape`: typed views whose
+// operations read and make values of the mirrored type. The mirror proves
+// the type, so the operations convert nothing; they only take values apart
+// and put them together.
+const $shape = ($descriptor, $of) => {
+  const $node = $of.nodes[$typeIndex($of, 0)];
+  const $typed = $name => $sum($name, $record([["read", $passThrough()], ["make", $passThrough()]]));
+  if (typeof $node === "string") {
+    return $node === "ForeignValue" ? $sum("Foreign", undefined) : $typed($node);
+  }
+  if ("Fixed" in $node) return $typed($node.Fixed);
+  if ("Array" in $node) {
+    return $sum("Array", $record([["element", $mirrorAt($of, $node.Array)], ["read", $passThrough()], ["make", $passThrough()]]));
+  }
+  if ("Struct" in $node) {
+    const $fields = $node.Struct.map(([$name, $index]) => {
+      const $field = $mirrorAt($of, $index);
+      return $record([
+        ["name", $name], ["mirror", $field], ["presence", $sum("Required", undefined)],
+        ["read", $native($value => $sum("Some", $value[$name]))],
+        ["bind", $native($value => $record([["record", $of], ["name", $name], ["mirror", $field], ["value", $value]]))],
+      ]);
+    });
+    // A binding is accepted on what it proves, not where it came from: an
+    // equivalent mirror of this record and of the field it names.
+    const $build = $native($bindings => {
+      const $bound = new Map();
+      for (const $binding of $arrayValues($bindings)) {
+        const $name = $binding.name, $field = $node.Struct.find(([$known]) => $known === $name);
+        const $reject = $reason => $sum("Error", $sum($reason, $name));
+        if (!$sameType($binding.record, $of)) return $reject("Foreign");
+        if (!$field) return $reject("Unknown");
+        if (!$sameType($binding.mirror, $typeAt($of, $field[1]))) return $reject("Mismatched");
+        if ($bound.has($name)) return $reject("Duplicate");
+        $bound.set($name, $binding.value);
+      }
+      const $missing = $node.Struct.find(([$name]) => !$bound.has($name));
+      if ($missing) return $sum("Error", $sum("Missing", $missing[0]));
+      return $sum("Some", $record($node.Struct.map(([$name]) => [$name, $bound.get($name)])));
+    });
+    return $sum("Record", $record([["mirror", $of], ["fields", $array($fields)], ["build", $build]]));
+  }
+  if ("Sum" in $node) {
+    const $cases = $node.Sum.map(([$name, $index]) => $record([
+      ["name", $name], ["mirror", $mirrorAt($of, $index)],
+      ["project", $native($value => $value[$tag] === $name
+        ? $sum("Some", $value[$payload] === undefined ? $record([]) : $value[$payload])
+        : $sum("None", undefined))],
+      ["inject", $sum("Some", $native($value => $sum($name, $value)))],
+    ]));
+    return $sum("Sum", $record([["mirror", $of], ["cases", $array($cases)]]));
+  }
+  if ("Arrow" in $node) return $sum("Function", $describe($of, $of));
+  if ("Hidden" in $node) return $sum("Hidden", $describe($of, $of));
+  if ("Mirror" in $node) return $sum("Mirror", $describe($of, $of));
+  throw new TypeError("unknown runtime type node");
 };
 
 // Conversion uses an explicit work stack, including leave tasks for cycle
@@ -204,18 +352,24 @@ const $convertType = ($descriptor, $value, $outgoing, $rootIndex = 0, $callable 
     const $node = $descriptor.nodes[$shapeIndex];
     if (typeof $node === "string") {
       let $valid = true;
+      // A target integer is checked against the bound domain, and integers
+      // have one zero: a negative zero from outside becomes zero.
+      let $value = $input;
       switch ($node) {
-        case "Nat": $valid = Number.isInteger($input) && $input >= 0; break;
-        case "Int": $valid = Number.isInteger($input); break;
+        case "Nat": $valid = Number.isInteger($input) && $input >= 0 && $input <= $domains.nat.high; if ($valid) $value = $input + 0; break;
+        case "Int": $valid = Number.isInteger($input) && $input >= $domains.int.low && $input <= $domains.int.high; if ($valid) $value = $input + 0; break;
         case "Real": $valid = typeof $input === "number"; break;
-        case "String": $valid = typeof $input === "string"; break;
+        // Ruddy text is Unicode scalar values. A host string holding an
+        // unpaired surrogate half is not that, and taking it in strictly is a
+        // refusal rather than a silent repair; a caller that wants the repair
+        // asks for it.
+        case "String": $valid = typeof $input === "string" && ($outgoing || $scalarText($input)); break;
         case "Bool": $valid = typeof $input === "boolean"; break;
-        case "Any": $valid = $anyPackages.has($input); break;
         case "ForeignValue": break;
         default: $valid = false;
       }
       if (!$valid) $fail($path, $node);
-      $put($input);
+      $put($value);
       continue;
     }
     if ("Fixed" in $node) {
@@ -227,8 +381,51 @@ const $convertType = ($descriptor, $value, $outgoing, $rootIndex = 0, $callable 
       $put($input);
       continue;
     }
+    if ("Mirror" in $node) {
+      // Authentic says the descriptor came from this program. It does not say
+      // which type it mirrors, and coming in, the type here is the one the
+      // program is about to read the value under, so the two are held
+      // together. Going out the program is handing over its own mirror, and
+      // the plan it crosses under describes types under the host's policy
+      // rather than the exact one a mirror carries.
+      if (!$mirrors.has($input)) $fail($path, "an authentic mirror");
+      if (!$outgoing) {
+        const $mirrored = $typeAt($descriptor, $node.Mirror);
+        if (!$decided($mirrored)) $fail($path, "a mirror of a type settled here");
+        if (!$sameType($input, $mirrored)) $fail($path, "a mirror of this type");
+      }
+      $put($input);
+      continue;
+    }
+    if ("Hidden" in $node) {
+      const $sealed = $typeAt($descriptor, $shapeIndex);
+      if (!$outgoing && !$decided($sealed)) $fail($path, "a package of a type settled here");
+      if ($outgoing) {
+        const $sealable = typeof $input === "function" || (typeof $input === "object" && $input !== null);
+        // One value may be sealed at more than one hidden type, so a handle is
+        // looked up by both: reusing one across types would lend one type's
+        // authority to another.
+        let $made = $sealable ? $handles.get($input) : undefined;
+        let $handle = $made && $made.find($at => $sameType($at.type, $sealed));
+        if (!$handle) {
+          $handle = { handle: Object.freeze(Object.create(null)), type: $sealed };
+          $packages.set($handle.handle, { value: $input, type: $sealed });
+          if ($sealable) {
+            if (!$made) { $made = []; $handles.set($input, $made); }
+            $made.push($handle);
+          }
+        }
+        $put($handle.handle);
+      } else {
+        if (!$packages.has($input)) $fail($path, "a package this program made");
+        const $package = $packages.get($input);
+        if (!$sameType($package.type, $sealed)) $fail($path, "a package of this type");
+        $put($package.value);
+      }
+      continue;
+    }
     if ("Arrow" in $node) {
-      if (!$callable) $fail($path, "a verifiable data type; function contracts cannot be decoded");
+      if (!$callable) $fail($path, "a verifiable data type; a function contract needs an adapter");
       if (typeof $input !== "function") $fail($path, "Function");
       const [$from, $to] = $node.Arrow;
       let $adapters = $convertedFunctions.get($input);
@@ -309,6 +506,19 @@ const $convertType = ($descriptor, $value, $outgoing, $rootIndex = 0, $callable 
     }
   }
   return $root.value;
+};
+
+// The other direction of the same boundary. A value of a known type is
+// written as host data; a function contract is not written at all, so what
+// comes back is inert and can be read again without this program.
+const $ffiEncode = ($descriptor, $value) => {
+  try { return $sum("Some", $convertType($descriptor, $value, true, 0, false)); }
+  catch ($error) {
+    const $failure = $conversionErrors.get($error) || { path: "$", expected: "writable native data", message: "JavaScript observation failed" };
+    return $sum("Error", $record([
+      ["path", $failure.path], ["expected", $failure.expected], ["message", $failure.message],
+    ]));
+  }
 };
 
 const $ffiDecode = ($descriptor, $value) => {

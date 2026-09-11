@@ -1,0 +1,105 @@
+@doc "A JavaScript value exactly as the host holds it. Ruddy never looks inside one: it is opaque, it cannot be built out of data, and forwarding it back to the host hands over the very same value, so the host's own `===` still holds. To read anything out of one, convert it with `lift` or observe it with `Host`."
+type Value = ForeignValue
+
+@doc "Why a checked conversion stopped: `path` is the position inside the value, `expected` what that position had to be, and `message` the host's own words."
+type Error = ffi::DecodeError
+
+@doc "The directions of one checked conversion between a Ruddy type and a host value. `lower` writes; `lift` reads an arbitrary host value, which observes it, so it carries the effect; `read` reads a snapshot, which runs no host code and so is pure. `adapter ()` is the structural adapter for whatever type the use site infers; a specialized adapter is an ordinary record a caller writes, and is used wherever the structural one would be."
+type Adapter 'a = {
+  lower: 'a -> Result Value Error,
+  lift: Value -> Result 'a Error + !Host,
+  read: Value -> Result 'a Error,
+}
+
+@doc "What a host value is, as far as JavaScript itself reports. `#Null` and `#Undefined` stay apart, as do `#Array` and `#Object`; a symbol, a bigint, or a value whose class cannot be reported is `#Other`."
+type Kind =
+  | #Null
+  | #Undefined
+  | #Bool
+  | #Number
+  | #String
+  | #Array
+  | #Object
+  | #Function
+  | #Other
+
+@doc "Observing a host value. Reading a property can run a getter or a proxy trap, so none of these is a pure read: they are operations of this effect, and a program that observes host values says so in its type. Every operation that can fail reports the host's own failure as an `Error` rather than throwing: a getter that raises, a proxy trap that refuses, or a value of the wrong shape comes back as `#Error`. `kind` cannot fail; a value it cannot report is `#Other`. `snapshot` copies inert data out of the host, and that copy can afterwards be read purely with `lift`; forwarding a `Value` instead keeps the host's identity."
+effect Host = {
+  kind: Value -> Kind,
+  field: { of: Value, name: String } -> Result Value Error,
+  element: { of: Value, at: Nat } -> Result Value Error,
+  length: Value -> Result Nat Error,
+  keys: Value -> Result [String] Error,
+  snapshot: Value -> Result Value Error,
+  apply: { of: Value, arguments: [Value] } -> Result Value Error,
+  text: Value -> Result String Error,
+}
+
+@doc "Write a value of the inferred type as host data, or say where it could not be written. A function contract is never written: a callable is refused, and an explicit extern or callback adapter carries one instead."
+let lower: 'a -> Result Value Error = ffi::encode
+
+@private
+extern inert: Value -> Bool = "$js.inert"
+
+@private
+let refused: String -> Result 'a Error = fn message =>
+  #Error { path: "$", expected: "a snapshot this program took", message: message }
+
+@doc "Read an arbitrary host value as the type this use site infers, checking every position. Reading a property runs whatever the host put there, so this observes the host and says so in its type. Integers must be integral and inside the target's domain, text must be Unicode scalar values, and a callable is refused: rebuilding a function from data would be a contract nobody checked, so an extern declaration owns that."
+let lift: Value -> Result 'a Error + !Host = fn value => do
+  _ = !Host.kind value
+  return ffi::decode value
+end
+
+@doc "Read a snapshot, or a host primitive, as the type this use site infers. A snapshot is a copy this program took, so nothing in it can run host code and this is an ordinary pure read. A live host value is refused here however plain it looks; observe it with `lift`, or take a `snapshot` first."
+let read: Value -> Result 'a Error = fn value =>
+  if inert value then ffi::decode value
+  else refused "reading this value would run host code, so it is not read here"
+  end
+
+@doc "The structural adapter for the type this use site infers, made from the mirror the compiler supplies there. No direction carries a function contract."
+let adapter: () -> Adapter 'a = fn _ => { lower: lower, lift: lift, read: read }
+
+-- Callbacks
+--
+-- A Ruddy function crosses to the host through an extern declaration, never through `lift`: the
+-- declaration carries the complete per-arrow type, the effects the callback is allowed to perform,
+-- and how the call completes.
+--
+--   extern each: fn(fn(Nat) -> Nat, [Nat]) -> [Nat] = "(step, values) => values.map(step)"
+--
+-- The callback's own effects stay in the caller's type, so the caller still handles them, and
+-- completion timing grants no further permission:
+--
+--   extern run_with: fn(fn(Nat) -> Nat + !Log) -> Nat + !Log = "step => step(21)"
+--   @async
+--   extern later: fn(fn(Nat) -> Nat, Nat) -> Nat = "(step, value) => Promise.resolve(step(value))"
+--
+-- `@async` says the host answers with a promise, which the runtime awaits; either way the Ruddy
+-- call site reads as an ordinary call. A declaration is also how a host function becomes a Ruddy
+-- one, as in `extern make_adder: fn(Nat) -> fn(Nat) -> Nat`. `lift` refuses a callable, so a
+-- decoder can never invent one of these contracts.
+
+@doc "What JavaScript reports this value to be."
+let kind = !Host.kind
+
+@doc "The named property of a host value: `field \"length\" value`. The read runs whatever the host has put there."
+let field = fn name of => !Host.field { of: of, name: name }
+
+@doc "The element at an index: `element 0n value`."
+let element = fn at of => !Host.element { of: of, at: at }
+
+@doc "The `length` property, which must be a finite non-negative integer inside this target's `Nat` domain."
+let length = !Host.length
+
+@doc "The host value's own enumerable string keys, in the host's order."
+let keys = !Host.keys
+
+@doc "An inert deep copy of plain host data: objects, arrays, and primitives. A function, a value already on the path being copied, and a host object that is not plain data are all refused. The copy is data nobody else holds, so reading it afterwards with `lift` is pure."
+let snapshot = !Host.snapshot
+
+@doc "Call a host function with the given arguments: `apply [x] target`. A non-callable is refused. The call has no receiver, so read a method with `field` and let the host bind it if it needs one."
+let apply = fn arguments of => !Host.apply { of: of, arguments: arguments }
+
+@doc "Read a host string, repairing it. Ruddy text is Unicode scalar values and a host string need not be, so `lift` refuses one that is not; this is the conversion that says instead what to do about it, replacing each unpaired half with `U+FFFD`. A value that is not a string at all is still refused."
+let text = !Host.text

@@ -149,19 +149,19 @@ fn comments_keep_their_place() {
 }
 
 /// Every Ruddy source in the repository formats to a fixed point that
-/// re-parses to the tree it came from. The backend's handler file is a
-/// fragment spliced into generated code rather than a file, so it is left
-/// out; the demo ends in deliberately broken definitions, so its errors are
+/// re-parses to the tree it came from. The backend's handlers are fragments
+/// spliced into generated code rather than files, so they are left out; the demo ends in deliberately broken definitions, so its errors are
 /// allowed and its surviving statements compared.
 #[test]
 fn the_repository_sources_round_trip() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let mut files = Vec::new();
-    for directory in ["std", "src/backend"] {
+    for directory in ["std", "std/path", "src/backend"] {
         for entry in std::fs::read_dir(root.join(directory)).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().is_some_and(|ext| ext == "rud")
                 && !path.ends_with("node-handler.rud")
+                && !path.ends_with("web-handler.rud")
             {
                 files.push(path);
             }
@@ -1038,6 +1038,50 @@ fn errors_inside_nested_blocks_stay_local() {
             "let p = do let bad = ) {long} let ok = 1n return ok end"
         )),
         format!("let p = do\n  let bad = ) {long}\n  let ok = 1n\n  return ok\nend\n")
+    );
+}
+
+/// Hidden types and hidden patterns print as written: the type's body runs
+/// to the end of the type and needs no parentheses, while a hidden type as an
+/// input or an argument, and a hidden pattern's carried payload, keep theirs.
+#[test]
+fn hidden_types_and_patterns_format_as_written() {
+    assert_eq!(
+        fmt("let x : hide 'a => 'a -> 'a = f"),
+        "let x: hide 'a => 'a -> 'a = f\n"
+    );
+    assert_eq!(
+        fmt("type Any = hide 'a => { mirror: Mirror 'a, value: 'a }"),
+        "type Any = hide 'a => { mirror: Mirror 'a, value: 'a }\n"
+    );
+    assert_eq!(
+        fmt("let g : (hide 'a => 'a) -> Mirror (hide 'b => Box 'b) = f"),
+        "let g: (hide 'a => 'a) -> Mirror (hide 'b => Box 'b) = f\n"
+    );
+    // A row written after the result belongs to the arrow. A hidden result
+    // would take it inside its body, so it keeps its parentheses; with
+    // nothing after it, the body running to the end is the same type and
+    // the parentheses go.
+    assert_eq!(
+        fmt("let h : Nat -> (hide 'a => Nat -> 'a) + !Log = f"),
+        "let h: Nat -> (hide 'a => Nat -> 'a) + !Log = f\n"
+    );
+    assert_eq!(
+        fmt("let i : Nat -> (hide 'a => Nat -> 'a) = f"),
+        "let i: Nat -> hide 'a => Nat -> 'a = f\n"
+    );
+    assert_eq!(
+        fmt("let f = fn b => match b with | hide 'i { m, v } => m | hide 'x #Some y => y end"),
+        "let f = fn b => match b with | hide 'i { m, v } => m | hide 'x (#Some y) => y end\n"
+    );
+    assert_eq!(
+        fmt("let g = fn b => match b with | #Some hide 'z z => z end"),
+        "let g = fn b => match b with | #Some (hide 'z z) => z end\n"
+    );
+    // Comments inside both forms stay where they were written.
+    assert_eq!(
+        fmt("type Any = hide 'a => {\n  -- the witness\n  mirror: Mirror 'a,\n  value: 'a,\n}\n"),
+        "type Any = hide 'a => {\n  -- the witness\n  mirror: Mirror 'a,\n  value: 'a,\n}\n"
     );
 }
 

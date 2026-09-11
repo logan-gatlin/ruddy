@@ -156,7 +156,7 @@ pub enum Op {
     Convert {
         descriptor: Temp,
         value: Temp,
-        direction: crate::reification::Direction,
+        direction: crate::backend::host::Direction,
     },
     TypeProjection {
         descriptor: Temp,
@@ -167,7 +167,7 @@ pub enum Op {
         arguments: Vec<Temp>,
     },
     NativePlan {
-        template: crate::reification::NativeTemplate,
+        template: crate::backend::host::NativeTemplate,
         arguments: Vec<Temp>,
     },
     Reflect {
@@ -415,7 +415,6 @@ pub enum Rep {
     Bool,
     TypeDescriptor,
     NativePlan,
-    BoxedAny,
     HostValue,
     /// The value with nothing in it: the empty struct.
     Unit,
@@ -1030,6 +1029,9 @@ fn cell(pattern: &Pattern) -> Cell {
             name: name.anchored.clone(),
             payload: Box::new(payload.as_deref().map(cell).unwrap_or(Cell::Wild(None))),
         },
+        // Opening a hidden type is no test and no projection: the value is
+        // stored as its body, and the payload pattern reads it as such.
+        PatternKind::Hidden { pattern, .. } => cell(pattern),
         PatternKind::Array {
             before,
             rest,
@@ -1247,7 +1249,7 @@ impl Lower<'_> {
         &mut self,
         ty: &Arc<Ty>,
         value: Temp,
-        direction: crate::reification::Direction,
+        direction: crate::backend::host::Direction,
         body: &mut Body,
     ) -> Temp {
         if !self.native_values {
@@ -1258,7 +1260,7 @@ impl Lower<'_> {
         }
         let descriptor = {
             let (template, parameters) =
-                crate::reification::NativeTemplate::template(ty, self.inference.aliases())
+                crate::backend::host::NativeTemplate::template(ty, self.inference.aliases())
                     .expect("reviewed native conversion shape");
             let arguments = parameters
                 .into_iter()
@@ -1285,8 +1287,8 @@ impl Lower<'_> {
             )
         };
         let rep = match direction {
-            crate::reification::Direction::ToJs => Rep::HostValue,
-            crate::reification::Direction::FromJs => self.rep(ty),
+            crate::backend::host::Direction::ToJs => Rep::HostValue,
+            crate::backend::host::Direction::FromJs => self.rep(ty),
         };
         self.emit(
             body,
@@ -1301,13 +1303,13 @@ impl Lower<'_> {
     }
 
     fn representation(&mut self, ty: &Arc<Ty>, body: &mut Body) -> Temp {
-        if let Ty::Bound(parameter) = &**ty {
+        if let Some(parameter) = crate::reification::evidence_slot(ty) {
             let at = self
                 .frames
                 .iter()
-                .rposition(|frame| frame.representations.contains_key(parameter))
+                .rposition(|frame| frame.representations.contains_key(&parameter))
                 .expect("accepted reflection has evidence for each type parameter");
-            return self.thread(at, self.frames[at].representations[parameter]);
+            return self.thread(at, self.frames[at].representations[&parameter]);
         }
         let (template, parameters) =
             crate::reification::Descriptor::template(ty, self.inference.aliases())
@@ -1372,8 +1374,23 @@ impl Lower<'_> {
             rep: self.rep(&from),
         });
         let mut body = Body::default();
-        let descriptor =
-            self.representation(&kind.represented(ty, self.inference.aliases()), &mut body);
+        // The descriptor an intrinsic works with: evidence for the type it
+        // represents, or, for one handed a mirror, the mirror itself.
+        let descriptor = match kind.represented(ty, self.inference.aliases()) {
+            Some(represented) => self.representation(&represented, &mut body),
+            None => match kind {
+                crate::reification::Intrinsic::Same => self.emit(
+                    &mut body,
+                    Span::default(),
+                    Rep::TypeDescriptor,
+                    Op::Project {
+                        base: argument,
+                        field: FieldKey::named("0".to_owned()),
+                    },
+                ),
+                _ => argument,
+            },
+        };
         let value = self.emit(
             &mut body,
             Span::default(),
@@ -1544,7 +1561,7 @@ impl Lower<'_> {
                 )
             }
             crate::externs::Conversion::Value | crate::externs::Conversion::OrdinaryFunction => {
-                self.convert_value(ty, raw, crate::reification::Direction::FromJs, body)
+                self.convert_value(ty, raw, crate::backend::host::Direction::FromJs, body)
             }
         }
     }
@@ -1665,7 +1682,7 @@ impl Lower<'_> {
             // imported or recursive one), and either operation alone would
             // stop before the callback arrow.
             let mut exposed = unfold(self.inference.aliases(), &cursor);
-            while let Ty::Package(body) = &*exposed {
+            while let Ty::Package(body) | Ty::Hidden { body, .. } = &*exposed {
                 exposed = unfold(self.inference.aliases(), body);
             }
             let Ty::Arrow(_, to, row) = &*exposed else {
@@ -1786,7 +1803,7 @@ impl Lower<'_> {
                 )
             }
             crate::externs::Conversion::Value | crate::externs::Conversion::OrdinaryFunction => {
-                self.convert_value(ty, value, crate::reification::Direction::ToJs, body)
+                self.convert_value(ty, value, crate::backend::host::Direction::ToJs, body)
             }
         }
     }
@@ -2257,10 +2274,10 @@ impl Lower<'_> {
             Ty::Real => Rep::Real,
             Ty::String => Rep::String,
             Ty::Bool => Rep::Bool,
-            Ty::Any => Rep::BoxedAny,
             Ty::ForeignValue => Rep::HostValue,
             Ty::Arrow(..) => Rep::Fn,
             Ty::Array(_) => Rep::Array,
+            Ty::Mirror(_) => Rep::TypeDescriptor,
             Ty::Mut(..) => Rep::Any,
             Ty::Sum(_) => Rep::Sum,
             Ty::Struct(row) => {
@@ -2285,9 +2302,15 @@ impl Lower<'_> {
     /// inference, but the value inside a package is stored exactly as its body.
     /// Opening aliases again after each package also handles a package whose
     /// body starts with a declared name.
+    /// Whether a type is a hidden type, once its declared names are looked
+    /// through.
+    fn hidden(&self, ty: &Arc<Ty>) -> bool {
+        matches!(&*unfold(self.inference.aliases(), ty), Ty::Hidden { .. })
+    }
+
     fn erased(&self, ty: &Arc<Ty>) -> Arc<Ty> {
         let mut ty = unfold(self.inference.aliases(), ty);
-        while let Ty::Package(body) = &*ty {
+        while let Ty::Package(body) | Ty::Hidden { body, .. } = &*ty {
             ty = unfold(self.inference.aliases(), body);
         }
         ty
@@ -2326,6 +2349,12 @@ impl Lower<'_> {
     /// never listed — or does not pin its shape down, in which case the use
     /// site's own reading is all there is to go on.
     fn member_of(&self, ty: &Arc<Ty>, name: &str) -> Option<Arc<Ty>> {
+        // A hidden type says nothing about its members' shapes to a value
+        // being packaged under it: its body names the hidden variable, and the
+        // value is sealed at its own type instead.
+        if self.hidden(ty) {
+            return None;
+        }
         let ty = self.erased(ty);
         let member = match &*ty {
             Ty::Sum(row) | Ty::Struct(row) => {
@@ -2337,6 +2366,9 @@ impl Lower<'_> {
     }
 
     fn array_element(&self, ty: &Arc<Ty>) -> Option<Arc<Ty>> {
+        if self.hidden(ty) {
+            return None;
+        }
         let ty = self.erased(ty);
         match &*ty {
             Ty::Array(element) => Some(element.clone()),
@@ -4215,6 +4247,11 @@ impl Lower<'_> {
     fn leaf(&mut self, line: Line, assumed: Formula, tree: &Tree, body: &mut Body) -> Temp {
         for (symbol, temp) in &line.binds {
             self.top().locals.insert(*symbol, *temp);
+            // A mirror the pattern bound is the arm's evidence for the type
+            // it opened, installed before anything in the arm can need it.
+            if let Some(slot) = self.reification.callables.evidence.get(symbol).copied() {
+                self.top().representations.insert(slot, *temp);
+            }
         }
         // Every leaf yields to the one temp the whole match stands at, so a
         // function value is fitted from the shape it holds to the match's own
@@ -4263,7 +4300,6 @@ impl Lower<'_> {
             | Ty::Real
             | Ty::String
             | Ty::Bool
-            | Ty::Any
             | Ty::ForeignValue
                 if primitives =>
             {

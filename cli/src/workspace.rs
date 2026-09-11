@@ -94,7 +94,7 @@ impl Workspace {
         for selection in &mut self.git_selections {
             selection.used = false;
         }
-        let build = self.manifest(&self.root)?.build();
+        let build = self.manifest(&self.root)?.build()?;
         let mut resolver = None;
         let mut active = Vec::new();
         let mut projects = Vec::new();

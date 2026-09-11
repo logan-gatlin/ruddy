@@ -114,7 +114,7 @@ fn nonreturning_main_preserves_in_range_exit_codes_and_saturates_large_naturals(
         (17, 17),
         (255, 255),
         (256, 255),
-        (u64::MAX, 255),
+        (9007199254740991, 255),
     ] {
         let project = tempfile::tempdir().unwrap();
         executable_project(
@@ -392,6 +392,7 @@ fn inference_diagnostics_keep_structured_parity_across_real_consumers() {
             kind: ruddy::artifact::Kind::Library,
             target: None,
             platform: None,
+            integers: None,
             name: "diagnostics".into(),
             version: "0.1.0".into(),
             root: DEBUG_ROOT.into(),
@@ -3160,6 +3161,26 @@ fn dependency_artifacts_cache_child() {
     build_project(&lib).unwrap();
     let entries = fs::read_dir(compilers[0].path()).unwrap().flatten().count();
     assert_eq!(entries, 2);
+
+    // So are the integer domains. A dependency compiled for the 53-bit
+    // default holds literals and guards the 32-bit build would not, so the
+    // narrower build compiles its own rather than reading that one back.
+    let manifest = fs::read_to_string(lib.join("Ruddy.toml")).unwrap();
+    fs::write(
+        lib.join("Ruddy.toml"),
+        manifest.replace("root =", "integers = 32\nroot ="),
+    )
+    .unwrap();
+    build_project(&lib).unwrap();
+    let narrow: Vec<_> = fs::read_dir(compilers[0].path())
+        .unwrap()
+        .flatten()
+        .map(|entry| ruddy::artifact::text::parse(&fs::read_to_string(entry.path()).unwrap()))
+        .filter(|artifact| artifact.header().domains == ruddy::types::Domains::Bits32)
+        .collect();
+    assert_eq!(narrow.len(), 1);
+    assert_eq!(narrow[0].header().identity.name, "dep");
+    assert_eq!(fs::read_dir(compilers[0].path()).unwrap().count(), 3);
 }
 
 /// `platform` in the manifest is the other fact a guard can name. It defaults
@@ -3491,6 +3512,47 @@ fn fmt_formats_around_syntax_errors_and_reports_them() {
 }
 
 #[test]
+fn manifests_bind_the_integer_domains() {
+    for (integers, source, expected) in [
+        (
+            "integers = 64\n",
+            "let value = 1n\n",
+            Some("[manifest-invalid] Error"),
+        ),
+        (
+            "integers = 7\n",
+            "let value = 1n\n",
+            Some("[manifest-invalid] Error"),
+        ),
+        (
+            "integers = 32\n",
+            "let value = 4294967296n\n",
+            Some("[literal-outside-domain] Error"),
+        ),
+        ("integers = 32\n", "let value = 4294967295n\n", None),
+        ("", "let value = 4294967296n\n", None),
+    ] {
+        let directory = project();
+        fs::write(
+            directory.path().join("Ruddy.toml"),
+            format!(
+                "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\ntarget = \"js\"\n{integers}[dependencies]\nstd = false\n"
+            ),
+        )
+        .unwrap();
+        fs::write(directory.path().join("main.rud"), source).unwrap();
+        match (compile(directory.path()), expected) {
+            (Ok(_), None) => {}
+            (Err(error), Some(expected)) => {
+                let error = error.to_string();
+                assert!(error.contains(expected), "{integers}{source}: {error}");
+            }
+            (result, expected) => panic!("{integers}{source}: {expected:?} but {}", result.is_ok()),
+        }
+    }
+}
+
+#[test]
 fn doc_renders_flat_pages_including_empty_modules() {
     let directory = tempfile::tempdir().unwrap();
     write_project(directory.path(), "example", "1.0.0", &[]);
@@ -3704,21 +3766,21 @@ fn doc_standard_library_uses_its_configured_directory_and_file_modules() {
         directory.path().join("Ruddy.toml"),
     )
     .unwrap();
-    fs::create_dir(directory.path().join("std")).unwrap();
-    for entry in fs::read_dir(repository.join("std")).unwrap() {
-        let entry = entry.unwrap();
-        if entry
-            .path()
-            .extension()
-            .is_some_and(|extension| extension == "rud")
-        {
-            fs::copy(
-                entry.path(),
-                directory.path().join("std").join(entry.file_name()),
-            )
-            .unwrap();
+    // A module written without a body reads its own file, and those files sit
+    // in directories under `std`, so the sources are copied as a tree.
+    fn copy_sources(from: &Path, to: &Path) {
+        fs::create_dir_all(to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.is_dir() {
+                copy_sources(&path, &to.join(entry.file_name()));
+            } else if path.extension().is_some_and(|extension| extension == "rud") {
+                fs::copy(&path, to.join(entry.file_name())).unwrap();
+            }
         }
     }
+    copy_sources(&repository.join("std"), &directory.path().join("std"));
     fs::create_dir(directory.path().join("docs")).unwrap();
     fs::write(directory.path().join("docs/index.md"), "Existing website").unwrap();
     run(["doc"], directory.path()).unwrap();

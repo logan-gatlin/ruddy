@@ -140,9 +140,18 @@ fn compiled(source: &str) -> Artifact {
 fn reification_preserves_the_boxed_type_instead_of_the_javascript_numeric_representation() {
     let artifact = compiled(
         r#"
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern fresh_mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
 type Option 'a = #Some 'a | #None
-@private extern upcast: 'a -> Any = "$anyUpcast"
-@private extern downcast: Any -> Option 'a = "$anyDowncast"
+@private let upcast: 'a -> Any = fn value => { mirror: type_of value, value: value }
+@private let downcast: Any -> Option 'a = fn any => match any with
+| hide 'x { mirror, value } => match same_pair (mirror, fresh_mirror ()) with
+  | #Some { forward, backward } => #Some (forward value)
+  | #None => #None
+  end
+end
 let boxed = upcast 42n
 let natural: Option Nat = downcast boxed
 let integer: Option Int = downcast boxed
@@ -172,9 +181,18 @@ let rejected = match integer with | #Some _ => false | #None => true end
 fn reification_concrete_artifact_row_extensions_normalize_before_identity_comparison() {
     let mut artifact = compiled(
         r#"
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern fresh_mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
 type Option 'a = #Some 'a | #None
-@private extern box: 'a -> Any = "$anyUpcast"
-@private extern unbox: Any -> Option 'a = "$anyDowncast"
+@private let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
+@private let unbox: Any -> Option 'a = fn any => match any with
+| hide 'x { mirror, value } => match same_pair (mirror, fresh_mirror ()) with
+  | #Some { forward, backward } => #Some (forward value)
+  | #None => #None
+  end
+end
 @private let saved = box { left: 1n, right: 2n }
 @private let restored: Option { left: Nat, right: Nat } = unbox saved
 let matched = match restored with | #Some _ => true | #None => false end
@@ -220,7 +238,12 @@ let matched = match restored with | #Some _ => true | #None => false end
 fn reification_generalized_initializers_preserve_eager_allocation_identity() {
     execute_reification(
         r#"
-@private extern box: 'a -> Any = "$anyUpcast"
+type Option 'a = #Some 'a | #None
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+@private let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
 @private extern same: Any -> Any -> Bool = "a => b => a === b"
 @private let make: 'a -> { boxed: Any, token: Any } = do
   let token = box 1n
@@ -238,7 +261,12 @@ let shared = same first.token second.token
 fn reification_generalized_partial_application_evaluates_its_argument_once() {
     execute_reification(
         r#"
-@private extern box: 'a -> Any = "$anyUpcast"
+type Option 'a = #Some 'a | #None
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+@private let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
 @private extern same: Any -> Any -> Bool = "a => b => a === b"
 @private let pair = fn token => fn x => { boxed: box x, token: token }
 @private let partial = pair (box 1n)
@@ -255,9 +283,18 @@ fn shared_rows_generic_descriptors_keep_structs_and_sums_distinct() {
     execute_reification(
         r#"
 type Option 'a = #Some 'a | #None
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
 type Both 'r = { product: { ..'r }, choice: | ..'r }
-@private extern box: 'a -> Any = "$anyUpcast"
-@private extern unbox: Any -> Option 'a = "$anyDowncast"
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+@private let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
+@private let unbox: Any -> Option 'a = fn any => match any with
+| hide 'x { mirror: witness, value } => match same_pair (witness, mirror ()) with
+  | #Some { forward, backward } => #Some (forward value)
+  | #None => #None
+  end
+end
 @private let pack: Both { ..'r } -> { product: Any, choice: Any } = fn p => { product: box p.product, choice: box p.choice }
 @private let packed = pack { product: { A: 7n }, choice: #A 8n }
 @private let product: Option { A: Nat } = unbox packed.product
@@ -275,9 +312,18 @@ let distinct = match wrong with | #Some _ => false | #None => true end
 fn reification_generic_boxing_helpers_and_higher_order_calls_preserve_each_instantiation() {
     let artifact = compiled(
         r#"
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern fresh_mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
 type Option 'a = #Some 'a | #None
-@private extern upcast: 'a -> Any = "$anyUpcast"
-@private extern downcast: Any -> Option 'a = "$anyDowncast"
+@private let upcast: 'a -> Any = fn value => { mirror: type_of value, value: value }
+@private let downcast: Any -> Option 'a = fn any => match any with
+| hide 'x { mirror, value } => match same_pair (mirror, fresh_mirror ()) with
+  | #Some { forward, backward } => #Some (forward value)
+  | #None => #None
+  end
+end
 @private let box: 'a -> Any = fn value => upcast value
 @private let apply = fn f => fn x => f x
 @private let forward = fn value => apply box value
@@ -308,7 +354,7 @@ let text = match second with | #Some s => s | #None => "failed" end
 #[test]
 fn reification_survives_artifact_import_and_separate_compilation() {
     let producer = compiled(
-        "type Option 'a = #Some 'a | #None\nextern box: 'a -> Any = \"$anyUpcast\"\nextern unbox: Any -> Option 'a = \"$anyDowncast\"\nlet wrap = fn x => box x",
+        "type Any = hide 'a => { mirror: Mirror 'a, value: 'a }\n@private extern type_of: 'a -> Mirror 'a = \"$typeOf\"\n@private extern fresh_mirror: () -> Mirror 'a = \"$mirror\"\n@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = \"$sameMirror\"\ntype Option 'a = #Some 'a | #None\nlet box: 'a -> Any = fn value => { mirror: type_of value, value: value }\nlet unbox: Any -> Option 'a = fn any => match any with\n| hide 'x { mirror, value } => match same_pair (mirror, fresh_mirror ()) with\n  | #Some { forward, backward } => #Some (forward value)\n  | #None => #None\n  end\nend\nlet wrap = fn x => box x",
     );
     let producer = artifact::parse(&producer.print())
         .validate()
@@ -346,6 +392,111 @@ fn reification_survives_artifact_import_and_separate_compilation() {
     );
 }
 
+/// A closure the library stores in a record field, hands to the consumer, and
+/// receives back is invoked with the convention the library lowered, even
+/// though the library never resolved the callback port the closure feeds.
+#[test]
+fn reification_sealed_callback_records_survive_separate_compilation() {
+    let producer = compiled(
+        r#"
+type Option 'a = #Some 'a | #None
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+effect Tick = () -> ()
+type Box 'a = { run: 'a -> Any + !Tick }
+type Box2 'a = { run: () -> Option 'a + !Tick }
+type Maker 'a = hide 'm => { mirror: Mirror 'm, seed: 'm, make: 'm -> 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern fresh_mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
+let unbox: Any -> Option 'a = fn any => match any with
+| hide 'x { mirror, value } => match same_pair (mirror, fresh_mirror ()) with
+  | #Some { forward, backward } => #Some (forward value)
+  | #None => #None
+  end
+end
+let map: ('a -> 'b) -> Option 'a -> Option 'b = fn f o => match o with | #Some x => #Some (f x) | #None => #None end
+let make: Option () -> Option (Box 'a) = fn o => map (fn _ => { run: fn value => do let _ = !Tick () return box value end }) o
+let run_box: Box 'a -> 'a -> Any = fn b value => handle b.run value with | !Tick _ => () end
+let nat_maker: Maker Nat = { mirror: type_of 41n, seed: 41n, make: fn n => n }
+let make_box: Maker 'a -> Box2 'a = fn maker => match maker with
+| hide 'm { mirror, seed, make } => { run: fn _ => do let _ = !Tick () return map make (#Some seed) end }
+end
+let run_box2: Box2 'a -> Option 'a = fn b => handle b.run () with | !Tick _ => () end
+"#,
+    );
+    let producer = artifact::parse(&producer.print())
+        .validate()
+        .expect("the producer artifact round trips");
+    let source = r#"
+let simple: () -> Nat = fn _ => match dep::make (#Some ()) with
+| #Some b => match dep::unbox (dep::run_box b 23n) with | #Some n => n | #None => 0n end
+| #None => 1n
+end
+let hidden: () -> Nat = fn _ => match dep::run_box2 (dep::make_box dep::nat_maker) with | #Some n => n | #None => 0n end
+"#;
+    let mut files = FileManager::new();
+    let file = files.register_new_file("consumer.rud".into(), source.into());
+    let parsed = parse::parse(token::lex(source, file).tokens);
+    let consumer = compile::compile_with_dependencies(
+        Mint::new(Bundle::new("consumer", Version::new(1, 0, 0)).unwrap()),
+        parsed.stmts,
+        &[compile::Dependency {
+            alias: Some("dep"),
+            artifact: compile::DependencyArtifact::Checked(&producer),
+        }],
+        inference::Trace::Off,
+    )
+    .unwrap_or_else(|partial| panic!("{:#?}", partial.errors));
+    let linked = ruddy::link::link(&[producer, consumer.artifact().clone()]).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("consumer.mjs");
+    fs::write(&path, js::generate(&linked).unwrap()).unwrap();
+    let probe = format!(
+        "import assert from 'node:assert/strict'; import * as app from {}; assert.equal(await app.simple(), 23); assert.equal(await app.hidden(), 41);",
+        serde_json::to_string(path.to_str().unwrap()).unwrap()
+    );
+    let output = Command::new("node")
+        .args(["--input-type=module", "--eval", &probe])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A record holding a closure with a conditional descriptor slot passes
+/// through a generalized definition's bare type parameter unchanged: the
+/// definition only forwards it, and the callback receiving it plans the same
+/// convention the producer lowered.
+#[test]
+fn reification_forwards_callables_through_bare_type_parameters() {
+    execute_reification(
+        r#"
+type Option 'a = #Some 'a | #None
+effect Tick = () -> ()
+type Box 'a = { run: () -> Option 'a + !Tick }
+type Pair 'a = { first: Nat, box: Box 'a }
+type Maker 'a = hide 'm => { mirror: Mirror 'm, seed: 'm, make: 'm -> 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private let map: ('a -> 'b) -> Option 'a -> Option 'b = fn f o => match o with | #Some x => #Some (f x) | #None => #None end
+@private let and_then: ('a -> Option 'b) -> Option 'a -> Option 'b = fn f o => match o with | #Some x => f x | #None => #None end
+@private let nat_maker: Maker Nat = { mirror: type_of 41n, seed: 41n, make: fn n => n }
+@private let make_box: Maker 'a -> Option (Box 'a) = fn maker => match maker with
+| hide 'm { mirror, seed, make } => #Some { run: fn _ => do let _ = !Tick () return map make (#Some seed) end }
+end
+@private let make_pair: Maker 'a -> Option (Pair 'a) = fn maker =>
+  and_then (fn first => map (fn box => { first: first, box: box }) (make_box maker)) (#Some 7n)
+@private let run_box: Box 'a -> Option 'a = fn b => handle b.run () with | !Tick _ => () end
+let direct = match make_box nat_maker with | #Some b => match run_box b with | #Some n => n | #None => 0n end | #None => 1n end
+let paired = match make_pair nat_maker with | #Some p => match run_box p.box with | #Some n => n | #None => 0n end | #None => 1n end
+"#,
+        "assert.equal(app.direct, 41); assert.equal(app.paired, 41);",
+    );
+}
+
 #[test]
 fn reification_imported_recursive_descriptors_close_forwarding_arguments_and_reject_growth() {
     let original = compiled("type Id 'a = 'a\ntype Loop 'a = { next: Loop 'a }\nlet ready = true");
@@ -374,7 +525,7 @@ fn reification_imported_recursive_descriptors_close_forwarding_arguments_and_rej
         let producer = changed
             .validate()
             .expect("a structurally checked portable alias graph");
-        let source = "@private extern box: 'a -> Any = \"$anyUpcast\"\nlet wrap: dep::Loop Nat -> Any = fn x => box x";
+        let source = "type Option 'a = #Some 'a | #None\ntype Any = hide 'a => { mirror: Mirror 'a, value: 'a }\n@private extern type_of: 'a -> Mirror 'a = \"$typeOf\"\n@private extern mirror: () -> Mirror 'a = \"$mirror\"\n@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = \"$sameMirror\"\n@private let box: 'a -> Any = fn value => { mirror: type_of value, value: value }\nlet wrap: dep::Loop Nat -> Any = fn x => box x";
         let mut files = FileManager::new();
         let file = files.register_new_file("consumer.rud".into(), source.into());
         let parsed = parse::parse(token::lex(source, file).tokens);
@@ -492,9 +643,18 @@ let rejected = match cycle with | #Some _ => false | #Error _ => true end
 fn reification_local_helpers_independent_parameters_and_partial_application() {
     execute_reification(
         r#"
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern fresh_mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
 type Option 'a = #Some 'a | #None
-@private extern upcast: 'a -> Any = "$anyUpcast"
-@private extern downcast: Any -> Option 'a = "$anyDowncast"
+@private let upcast: 'a -> Any = fn value => { mirror: type_of value, value: value }
+@private let downcast: Any -> Option 'a = fn any => match any with
+| hide 'x { mirror, value } => match same_pair (mirror, fresh_mirror ()) with
+  | #Some { forward, backward } => #Some (forward value)
+  | #None => #None
+  end
+end
 @private let pair = fn a b => (upcast a, upcast b)
 @private let first = pair 5n
 let both = first "second"
@@ -513,11 +673,20 @@ let label = match text with | #Some s => s | #None => "failed" end
 fn reification_structural_rows_recursive_aliases_and_callable_payloads() {
     execute_reification(
         r#"
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern fresh_mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
 type Option 'a = #Some 'a | #None
 type Left = #Cons (Nat, Left) | #Nil
 type Right = #Cons (Nat, Right) | #Nil
-@private extern upcast: 'a -> Any = "$anyUpcast"
-@private extern downcast: Any -> Option 'a = "$anyDowncast"
+@private let upcast: 'a -> Any = fn value => { mirror: type_of value, value: value }
+@private let downcast: Any -> Option 'a = fn any => match any with
+| hide 'x { mirror, value } => match same_pair (mirror, fresh_mirror ()) with
+  | #Some { forward, backward } => #Some (forward value)
+  | #None => #None
+  end
+end
 @private let row: { value: 'a, ..'rest } -> Any = fn r => upcast r
 @private let data: Left = #Cons (6n, #Nil)
 @private let boxed = upcast data
@@ -539,9 +708,18 @@ let boxed_function = match roundtrip with | #Some f => f 9n | #None => 0n end
 fn reification_recursive_generic_functions_and_captured_descriptors() {
     execute_reification(
         r#"
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern fresh_mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
 type Option 'a = #Some 'a | #None
-@private extern upcast: 'a -> Any = "$anyUpcast"
-@private extern downcast: Any -> Option 'a = "$anyDowncast"
+@private let upcast: 'a -> Any = fn value => { mirror: type_of value, value: value }
+@private let downcast: Any -> Option 'a = fn any => match any with
+| hide 'x { mirror, value } => match same_pair (mirror, fresh_mirror ()) with
+  | #Some { forward, backward } => #Some (forward value)
+  | #None => #None
+  end
+end
 @private extern dec: Nat -> Nat = "n => n - 1"
 @private let recur = fn value n => match n with | 0n => upcast value | _ => other value (dec n) end
 @private let other = fn value n => recur value n
@@ -564,7 +742,12 @@ let c = match third with | #Some n => n | #None => 0n end
 #[test]
 fn reification_js_exports_require_concrete_interfaces() {
     for source in [
-        r#"@private extern upcast: 'a -> Any = "$anyUpcast"
+        r#"type Option 'a = #Some 'a | #None
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+@private let upcast: 'a -> Any = fn value => { mirror: type_of value, value: value }
 let box = fn value => upcast value"#,
         "let identity = fn value => value",
         "let nested = { factory: fn x => fn y => (x, y) }",
@@ -581,7 +764,12 @@ let box = fn value => upcast value"#,
     }
     execute_reification(
         r#"
-@private extern upcast: 'a -> Any = "$anyUpcast"
+type Option 'a = #Some 'a | #None
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+@private let upcast: 'a -> Any = fn value => { mirror: type_of value, value: value }
 let dynamic: ForeignValue -> Any = fn value => upcast value
 let native: [Nat] -> [Nat] = fn value => value
 let identity: ForeignValue -> ForeignValue = fn value => value
@@ -594,11 +782,20 @@ let identity: ForeignValue -> ForeignValue = fn value => value
 fn reification_opaque_transport_preserves_payloads_and_rejects_forgeries() {
     execute_reification(
         r#"
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern fresh_mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
 type Option 'a = #Some 'a | #None
 type Result 'a 'e = #Some 'a | #Error 'e
 type DecodeError = { path: String, expected: String, message: String }
-@private extern upcast: 'a -> Any = "$anyUpcast"
-@private extern downcast: Any -> Option 'a = "$anyDowncast"
+@private let upcast: 'a -> Any = fn value => { mirror: type_of value, value: value }
+@private let downcast: Any -> Option 'a = fn any => match any with
+| hide 'x { mirror, value } => match same_pair (mirror, fresh_mirror ()) with
+  | #Some { forward, backward } => #Some (forward value)
+  | #None => #None
+  end
+end
 @private extern decode: ForeignValue -> Result 'a DecodeError = "$ffiDecode"
 @private extern store: Any -> () = "value => { globalThis.savedAny = value; }"
 @private extern load: () -> Any = "() => globalThis.savedAny"
@@ -613,7 +810,7 @@ let rejected = match checked with | #Error _ => true | #Some _ => false end
 let different_width = match width with | #None => true | #Some _ => false end
 let bad: () -> Any = fn _ => forged ()
 "#,
-        "assert.equal(app.result, 19); assert.equal(app.rejected, true); assert.equal(app.different_width, true); assert.throws(() => app.bad({}), /Any/);",
+        "assert.equal(app.result, 19); assert.equal(app.rejected, true); assert.equal(app.different_width, true); assert.throws(() => app.bad({}), /package/);",
     );
 }
 
@@ -1280,8 +1477,13 @@ let nested_text = container.apply ["nested"]
 fn reification_recursive_callable_adapters_are_finite() {
     execute_reification(
         r#"
+type Option 'a = #Some 'a | #None
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
 type Loop 'a = 'a -> Loop 'a
-@private extern box: 'a -> Any = "$anyUpcast"
+@private let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
 @private let loop: Loop 'a = fn value => do
   let token = box value
   return loop
@@ -1310,9 +1512,18 @@ let result = apply { first: [7n, 8n], second: "kept" }
 fn reification_generic_callable_payloads_seal_their_evidence_layout() {
     execute_reification(
         r#"
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern fresh_mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
 type Option 'a = #Some 'a | #None
-@private extern box: 'a -> Any = "$anyUpcast"
-@private extern downcast: Any -> Option 'a = "$anyDowncast"
+@private let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
+@private let downcast: Any -> Option 'a = fn any => match any with
+| hide 'x { mirror, value } => match same_pair (mirror, fresh_mirror ()) with
+  | #Some { forward, backward } => #Some (forward value)
+  | #None => #None
+  end
+end
 @private let pack = fn value => box value
 @private let preserve = fn value => do let boxed = box value return value end
 @private let generic = fn value => do
@@ -1349,9 +1560,18 @@ end
 fn reification_callable_profiles_survive_aggregate_patterns_and_joins() {
     execute_reification(
         r#"
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern fresh_mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
 type Option 'a = #Some 'a | #None
-@private extern box: 'a -> Any = "$anyUpcast"
-@private extern downcast: Any -> Option 'a = "$anyDowncast"
+@private let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
+@private let downcast: Any -> Option 'a = fn any => match any with
+| hide 'x { mirror, value } => match same_pair (mirror, fresh_mirror ()) with
+  | #Some { forward, backward } => #Some (forward value)
+  | #None => #None
+  end
+end
 @private let reified = fn value => do let token = box value return value end
 @private let erased = fn value => value
 @private let functions = [erased, reified]
@@ -1384,8 +1604,13 @@ let flags = first [true]
 fn reification_native_generic_callable_conversion_uses_a_sealed_convention() {
     execute_reification(
         r#"
+type Option 'a = #Some 'a | #None
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
 @private extern native: 'a -> 'a = "value => value"
-@private extern box: 'a -> Any = "$anyUpcast"
+@private let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
 @private let make = fn value => do
  let function = fn next => do let token = box next let same = [value, next] return next end
  return native function
@@ -1401,7 +1626,12 @@ let result = apply [2n, 3n]
 fn reification_generic_selection_joins_both_value_profiles() {
     execute_reification(
         r#"
-@private extern box: 'a -> Any = "$anyUpcast"
+type Option 'a = #Some 'a | #None
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+@private let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
 @private let choose = fn flag first second => match flag with | true => first | false => second end
 @private let erased = fn value => value
 @private let reified = fn value => do let token = box value return value end
@@ -1417,9 +1647,18 @@ let reversed = (choose false reified erased) 23n
 fn reification_callback_adapters_extract_component_type_evidence() {
     execute_reification(
         r#"
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern fresh_mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
 type Option 'a = #Some 'a | #None
-@private extern box: 'a -> Any = "$anyUpcast"
-@private extern downcast: Any -> Option 'a = "$anyDowncast"
+@private let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
+@private let downcast: Any -> Option 'a = fn any => match any with
+| hide 'x { mirror, value } => match same_pair (mirror, fresh_mirror ()) with
+  | #Some { forward, backward } => #Some (forward value)
+  | #None => #None
+  end
+end
 @private let apply = fn call value => call value
 @private let element = fn values => match values with | [value, ..] => box value | _ => box () end
 @private let consume = apply element
@@ -1435,7 +1674,12 @@ let result = match recovered with | #Some n => n | #None => 0n end
 fn reification_mutable_callable_cells_share_their_storage_convention() {
     execute_reification(
         r#"
-@private extern box: 'a -> Any = "$anyUpcast"
+type Option 'a = #Some 'a | #None
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+@private let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
 @private let run = fn initial => do
  let cell = mut (fn value => value)
  let assigned = cell := (fn value => do let token = box value return value end)
@@ -1452,9 +1696,18 @@ let result = run 39n
 fn reification_callback_adapters_extract_record_evidence() {
     execute_reification(
         r#"
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern fresh_mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
 type Option 'a = #Some 'a | #None
-@private extern box: 'a -> Any = "$anyUpcast"
-@private extern downcast: Any -> Option 'a = "$anyDowncast"
+@private let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
+@private let downcast: Any -> Option 'a = fn any => match any with
+| hide 'x { mirror, value } => match same_pair (mirror, fresh_mirror ()) with
+  | #Some { forward, backward } => #Some (forward value)
+  | #None => #None
+  end
+end
 @private let apply = fn call value => call value
 @private let field = fn record => box record.value
 @private let consume_field = apply field
@@ -1469,7 +1722,12 @@ let first = match a with | #Some n => n | #None => 0n end
 fn reification_effect_payloads_preserve_callable_evidence() {
     execute_reification(
         r#"
-@private extern box: 'a -> Any = "$anyUpcast"
+type Option 'a = #Some 'a | #None
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+@private let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
 effect Apply 'a = ('a -> 'a) -> 'a
 effect Get 'a = () -> ('a -> 'a)
 @private let run = fn value => handle !Apply (fn next => do let token = box next return next end) with
@@ -1494,7 +1752,12 @@ let third = as_value 47n
 fn reification_raised_callables_join_normal_and_return_arm_conventions() {
     execute_reification(
         r#"
-@private extern box: 'a -> Any = "$anyUpcast"
+type Option 'a = #Some 'a | #None
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+@private let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
 effect Get = () -> Nat
 @private let choose = fn abort => handle
   do let n = !Get () return fn next => next end
@@ -1537,7 +1800,12 @@ let select: Pair 'a -> ('a -> 'a) = fn value => value.right.call
     );
     let producer = artifact::parse(&producer.print()).validate().unwrap();
     let source = r#"
-@private extern box: 'a -> Any = "$anyUpcast"
+type Option 'a = #Some 'a | #None
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+@private let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
 @private let reified = fn value => do let token = box value return value end
 @private let erased = fn value => value
 @private let first = dep::forward {left: {call: reified}, right: {call: erased}}
@@ -1626,9 +1894,18 @@ assert.equal(app.fetch().f(17), 17);
 fn reification_callback_adapters_project_row_remainders_and_function_results() {
     execute_reification(
         r#"
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern fresh_mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
 type Option 'a = #Some 'a | #None
-@private extern box: 'a -> Any = "$anyUpcast"
-@private extern downcast: Any -> Option 'a = "$anyDowncast"
+@private let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
+@private let downcast: Any -> Option 'a = fn any => match any with
+| hide 'x { mirror, value } => match same_pair (mirror, fresh_mirror ()) with
+  | #Some { forward, backward } => #Some (forward value)
+  | #None => #None
+  end
+end
 @private let apply = fn call value => call value
 @private let row: {head: Nat, ..'a} -> Any = fn record => box record
 @private let invoke: (() -> 'a) -> Any = fn call => box (call ())
@@ -1640,6 +1917,163 @@ let first = match a with | #Some {head, extra} => head | #None => 0n end
 let second = match b with | #Some n => n | #None => 0n end
 "#,
         "assert.equal(app.first, 48); assert.equal(app.second, 49);",
+    );
+}
+
+/// A hidden type is stored as its body: packaging one is no conversion,
+/// opening one reads the body, and two values packaged under different
+/// witnesses sit in one array and are each shown by their own function.
+#[test]
+fn hidden_types_package_and_open_in_generated_javascript() {
+    execute_reification(
+        r#"
+type Box = hide 'a => { value: 'a, show: 'a -> String }
+extern show_nat: fn(Nat) -> String = "n => String(n)"
+extern show_bool: fn(Bool) -> String = "b => b ? \"yes\" : \"no\""
+let boxes: [Box] = [{ value: 1n, show: show_nat }, { value: true, show: show_bool }]
+let describe: Box -> String = fn box => match box with
+| hide 'item { value, show } => show value
+end
+let first = match boxes with | [head, ..] => describe head | [] => "" end
+let second = match boxes with | [_, next, ..] => describe next | _ => "" end
+let repacked: Box -> Box = fn box => match box with
+| hide 'item { value, show } => { value: value, show: fn v => show v }
+end
+let third = match boxes with | [head, ..] => describe (repacked head) | [] => "" end
+"#,
+        "assert.equal(app.first, '1'); assert.equal(app.second, 'yes'); assert.equal(app.third, '1');",
+    );
+}
+
+#[test]
+fn mirrors_authenticate_types_and_open_hidden_values_in_generated_javascript() {
+    execute_reification(
+        r#"
+type Option 'a = #Some 'a | #None
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+type Dyn = hide 'a => { value: 'a, evidence: Mirror 'a }
+let items: [Dyn] = [{ value: 1n, evidence: mirror () }, { value: "two", evidence: mirror () }]
+let as_nat: Dyn -> Option Nat = fn item => match item with
+| hide 'x { value, evidence } => match same_pair (evidence, mirror ()) with
+  | #Some { forward, backward } => #Some (forward value)
+  | #None => #None
+  end
+end
+let echo: Dyn -> Dyn = fn item => match item with
+| hide 'x { value, evidence } => { value: value, evidence: type_of value }
+end
+let first = match items with | [head, ..] => as_nat head | [] => #None end
+let second = match items with | [_, next, ..] => as_nat next | _ => #None end
+let third = match items with | [head, ..] => as_nat (echo head) | [] => #None end
+let strings = same_pair (type_of "a", type_of "b")
+let round_trip = match strings with
+| #Some { forward, backward } => backward (forward "kept")
+| #None => "lost"
+end
+"#,
+        r#"
+assert.deepEqual(app.first, { tag: 'Some', value: 1 });
+assert.equal(app.second.tag, 'None');
+assert.deepEqual(app.third, { tag: 'Some', value: 1 });
+assert.equal(app.round_trip, 'kept');
+"#,
+    );
+}
+
+#[test]
+fn mirrors_and_hidden_types_have_exact_identities_through_any() {
+    execute_reification(
+        r#"
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern fresh_mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+type Option 'a = #Some 'a | #None
+@private let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
+@private let unbox: Any -> Option 'a = fn any => match any with
+| hide 'x { mirror, value } => match same_pair (mirror, fresh_mirror ()) with
+  | #Some { forward, backward } => #Some (forward value)
+  | #None => #None
+  end
+end
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+type Shown = hide 'a => { value: 'a, show: 'a -> String }
+type Renamed = hide 'item => { value: 'item, show: 'item -> String }
+type Wider = hide 'a => { value: 'a, show: 'a -> String, extra: Nat }
+extern show_nat: fn(Nat) -> String = "n => String(n)"
+let boxed_mirror = box (type_of 1n)
+let mirror_of_nat: Option (Mirror Nat) = unbox boxed_mirror
+let mirror_of_string: Option (Mirror String) = unbox boxed_mirror
+let mirror_recovered = match mirror_of_nat with | #Some _ => true | #None => false end
+let mirror_rejected = match mirror_of_string with | #Some _ => false | #None => true end
+let shown: Shown = { value: 1n, show: show_nat }
+let boxed_shown = box shown
+let as_shown: Option Shown = unbox boxed_shown
+let as_renamed: Option Renamed = unbox boxed_shown
+let as_wider: Option Wider = unbox boxed_shown
+let shown_recovered = match as_shown with
+| #Some (hide 'a { value, show }) => show value
+| #None => "lost"
+end
+let renamed_recovered = match as_renamed with
+| #Some (hide 'a { value, show }) => show value
+| #None => "lost"
+end
+let wider_rejected = match as_wider with | #Some _ => false | #None => true end
+"#,
+        r#"
+assert.equal(app.mirror_recovered, true);
+assert.equal(app.mirror_rejected, true);
+assert.equal(app.shown_recovered, '1');
+assert.equal(app.renamed_recovered, '1');
+assert.equal(app.wider_rejected, true);
+"#,
+    );
+}
+
+#[test]
+fn function_mirrors_carry_their_effect_contracts() {
+    execute_reification(
+        r#"
+type Option 'a = #Some 'a | #None
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+effect Tick = () -> ()
+effect Ask 'a = () -> 'a
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern fresh_mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+@private let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
+@private let unbox: Any -> Option 'a = fn any => match any with
+| hide 'x { mirror, value } => match same_pair (mirror, fresh_mirror ()) with
+  | #Some { forward, backward } => #Some (forward value)
+  | #None => #None
+  end
+end
+@private let pure: () -> Nat = fn _ => 1n
+@private let ticking: () -> Nat + !Tick = fn _ => do _ = !Tick () return 2n end
+@private let asking: () -> Nat + !Ask Nat = fn _ => !Ask ()
+@private let asking_text: () -> Nat + !Ask String = fn _ => do _ = !Ask () return 3n end
+@private let boxed = box ticking
+@private let as_pure: Option (() -> Nat) = unbox boxed
+@private let as_ticking: Option (() -> Nat + !Tick) = unbox boxed
+@private let as_asking: Option (() -> Nat + !Ask Nat) = unbox boxed
+let pure_rejected = match as_pure with | #Some _ => false | #None => true end
+let ticking_recovered = match as_ticking with
+| #Some f => handle f () with | !Tick _ => () end
+| #None => 0n
+end
+let asking_rejected = match as_asking with | #Some _ => false | #None => true end
+let args_matter = match same_pair (type_of asking, type_of asking_text) with | #Some _ => false | #None => true end
+let same_effect = match same_pair (type_of ticking, type_of ticking) with | #Some _ => true | #None => false end
+"#,
+        r#"
+assert.equal(app.pure_rejected, true);
+assert.equal(app.ticking_recovered, 2);
+assert.equal(app.asking_rejected, true);
+assert.equal(app.args_matter, true);
+assert.equal(app.same_effect, true);
+"#,
     );
 }
 

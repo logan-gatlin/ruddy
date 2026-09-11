@@ -598,6 +598,14 @@ pub enum PatternKind {
         name: TrackedString,
         payload: Option<Box<Pattern>>,
     },
+    /// `hide 'a <pattern>` — open a hidden type, naming the type it hid `'a`
+    /// for the arm this is the pattern of, and match its payload against the
+    /// pattern after the variable. The payload is taken greedily, exactly as
+    /// a tag's is, so `hide 'a #Some x` opens onto `(#Some x)`.
+    Hidden {
+        variable: TrackedString,
+        pattern: Box<Pattern>,
+    },
 }
 
 pub type Type = Tracked<TypeKind>;
@@ -725,6 +733,19 @@ pub enum TypeKind {
     /// where the one position that still refuses a hole says so.
     Hole,
     Unit,
+    /// `hide 'a => T` — a hidden type: one type variable bound over the body
+    /// after the `=>`, standing for a type the value's producer chose and its
+    /// consumers do not learn.
+    ///
+    /// The body extends as far right as it can, the way a lambda's does, so a
+    /// hidden type written as an arrow's input, an application's argument or
+    /// a case's payload takes parentheses — see [`ui::type_prec`]. Written
+    /// where an arrow's result goes it needs none: `A -> hide 'b => B` is the
+    /// arrow whose result is hidden.
+    Hidden {
+        variable: TrackedString,
+        body: Box<Type>,
+    },
 }
 
 /// One field of a struct type: its type and the `when` clause it may wear, or
@@ -1369,6 +1390,7 @@ impl Parser {
             Kind::End => Expected::Keyword("end"),
             Kind::With => Expected::Keyword("with"),
             Kind::Match => Expected::Keyword("match"),
+            Kind::Hide => Expected::Keyword("hide"),
             Kind::If => Expected::Keyword("if"),
             Kind::Then => Expected::Keyword("then"),
             Kind::Else => Expected::Keyword("else"),
@@ -3406,12 +3428,14 @@ impl Parser {
                     | Kind::LeftBracket
                     | Kind::LeftParen
                     | Kind::Underscore
+                    | Kind::Hide
             )
         )
     }
 
     /// One pattern: a name, a natural, `()`, a parenthesized pattern, a struct
-    /// pattern, or a tag pattern carrying another. See [`PatternKind`].
+    /// pattern, a tag pattern carrying another, or a hidden pattern opening
+    /// onto another. See [`PatternKind`].
     fn pattern(&mut self) -> Option<Pattern> {
         let Some(tok) = self.peek() else {
             return self.expected(Expected::Pattern);
@@ -3474,6 +3498,21 @@ impl Parser {
             Kind::LeftBrace => self.struct_pattern(),
             Kind::LeftBracket => self.array_pattern(),
             Kind::LeftParen => self.paren_pattern(),
+            // The payload is taken greedily, like a tag's: a hidden pattern
+            // opens onto one pattern, and the recursion through `pattern` is
+            // what makes `hide 'a #Some x` open onto `(#Some x)`.
+            Kind::Hide => {
+                let hide = self.advance().expect("the caller peeked `hide`");
+                let Some(variable) = self.variable() else {
+                    return self.expected(Expected::Name);
+                };
+                let inner = self.pattern()?;
+                let span = hide.span.merge(inner.span);
+                Some(span.track(PatternKind::Hidden {
+                    variable,
+                    pattern: Box::new(inner),
+                }))
+            }
             // Nothing here begins a pattern — an arm written `=> 1` is missing
             // one, and this is where it is told so.
             _ => self.expected(Expected::Pattern),
@@ -3945,6 +3984,24 @@ impl Parser {
     /// other call returns a `+` to the caller that is about to build the arrow
     /// it belongs to.
     fn arrow(&mut self, outermost: bool) -> Option<Type> {
+        // `hide 'a => <type>` binds over everything to its right, the way a
+        // lambda's body runs to the end: read here, above the arrow, so the
+        // body takes the whole arrow after it and an arrow's result may be
+        // hidden without parentheses. Only a full type position reaches this
+        // — an application's argument is an atom, so `Mirror (hide 'a => T)`
+        // needs the parentheses that delimit it.
+        if let Some(hide) = self.eat_if(&Kind::Hide) {
+            let Some(variable) = self.variable() else {
+                return self.expected(Expected::Name);
+            };
+            self.eat(&Kind::FatArrow)?;
+            let body = self.arrow(outermost)?;
+            let span = hide.span.merge(body.span);
+            return Some(span.track(TypeKind::Hidden {
+                variable,
+                body: Box::new(body),
+            }));
+        }
         let from = self.type_sum()?;
         if self.eat_if(&Kind::Arrow).is_none() {
             if outermost && self.at_plus() {

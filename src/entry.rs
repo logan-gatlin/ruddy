@@ -194,11 +194,15 @@ pub(crate) fn compile_adapter(
             .map(|error| error.diagnostic().title)
             .collect());
     }
-    compile::compile_with_dependencies(
+    // The adapter is linked into the artifact it adapts, so it binds the same
+    // integer domains: one compiled for the default would be refused by the
+    // linker under a root that binds another.
+    compile::compile_bound(
         Mint::new(Bundle::new(&name, Version::new(0, 0, 0)).expect("valid internal bundle name")),
         parsed.stmts,
         &imports,
         inference::Trace::Off,
+        artifact.header().domains,
     )
     .map(|accepted| accepted.artifact().clone())
     .map_err(|partial| {

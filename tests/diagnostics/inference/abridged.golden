@@ -216,3 +216,32 @@ primary: Let’s call this shared value `Value` — the annotation fixes the typ
 related: this expression supplies its type here; this is another requirement on `Value`
 help: change the first use so it agrees with the other one
 help: or change the other use so it agrees with the first one
+
+## hidden-escapes
+[hidden-escapes] `'v` is opened by this arm and cannot be used outside it
+primary: this would carry the opened type out of its arm
+related: the type is opened here, for this arm only
+help: compute a result that does not mention the opened type inside the arm
+help: or repackage the value under a hidden type before it leaves
+
+## hidden-unknown
+[hidden-unknown] the type opened as `'v` is not yet known to be a hidden type
+primary: this position's type must be known before the arm opens it
+related: opened here
+help: annotate the matched value, or the function it is a parameter of, with its hidden type
+
+## not-hidden
+[not-hidden] `hide 'v` opens a hidden type, but this value is `Nat`
+primary: only a value of a hidden type can be opened
+related: opened here
+help: match the value's structure directly, without `hide`
+
+## hidden-witness
+[hidden-witness] nothing here says which type `Id` hides as `'a`
+primary: the hidden type is not determined by this expression or its context
+help: annotate the value being packaged, or pass in a value whose type is already known
+
+## hidden-region
+[hidden-region] `Held` would hide `mut ? Nat` as `'a`, and a mutable cell's region cannot be hidden
+primary: this value depends on a region, which a hidden type does not carry
+help: read the cell and package what it holds, or keep the value in the scope its region belongs to

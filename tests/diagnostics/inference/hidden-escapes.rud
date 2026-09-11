@@ -1,0 +1,3 @@
+type Box = hide 'a => { value: 'a, show: 'a -> String }
+extern make: () -> Box = "host.make"
+let leak = match make () with | hide 'v { value, .. } => value end

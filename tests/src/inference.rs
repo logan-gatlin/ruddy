@@ -9600,7 +9600,7 @@ fn extern_boundary_infers_row_evidence_and_preserves_optional_fields() {
         infer_src("extern x : fn({ value when 'present: Nat }) -> () = \"host.x\"");
     assert!(presence.errors().is_empty(), "{:#?}", presence.errors());
     let (_, _, exact) = infer_src(
-        "extern box: 'a -> Any = \"$anyUpcast\"\nlet exact: { value when 'present: Nat } -> Any = fn value => box value",
+        "type Any = hide 'a => { mirror: Mirror 'a, value: 'a }\n@private extern type_of: 'a -> Mirror 'a = \"$typeOf\"\nlet box: 'a -> Any = fn value => { mirror: type_of value, value: value }\nlet exact: { value when 'present: Nat } -> Any = fn value => box value",
     );
     assert!(
         exact
@@ -10653,7 +10653,7 @@ fn sat_errors_link_directly_to_their_flipped_batches() {
 
 #[test]
 fn direct_boundary_errors_have_stable_ids_without_solve_steps() {
-    let (_, _, output) = infer_src("extern echo : fn('a) -> 'a = \"$anyUpcast\"");
+    let (_, _, output) = infer_src("extern echo : fn('a) -> 'a = \"$typeOf\"");
     let [error] = output.errors() else {
         panic!("expected one boundary error: {:#?}", output.errors());
     };
@@ -11316,4 +11316,717 @@ fn sat_term_override_edits_invalidate_cached_inference() {
     declaration.metadata["max_sat_terms"].value.anchored = ir::DataKind::Natural(2);
     let after = session.infer(&mint, &lowered.program, inference::Trace::Off);
     assert!(after.errors().is_empty(), "{:?}", after.errors());
+}
+
+/// A `hide` pattern opens its position's hidden type for its arm: the payload
+/// reads the body at a type of the arm's own, which the body's annotations
+/// name and its local bindings may be instantiated at, and which never
+/// reaches the arm's result. An annotated parameter is as good a scrutinee
+/// as an extern's result.
+#[test]
+fn a_hide_pattern_opens_its_scrutinee_for_its_arm() {
+    let src = "type Box = hide 'a => { value: 'a, show: 'a -> String }\n\
+               extern make: () -> Box = \"host.make\"\n\
+               let shown = match make () with\n\
+               | hide 'v { value, show } => do let held: 'v = value return show held end\n\
+               end\n\
+               let through = match make () with\n\
+               | hide 'v { value, show } => do let id = fn x => x return show (id value) end\n\
+               end\n\
+               let describe: Box -> String = fn box => match box with\n\
+               | hide 'item { show, value } => show value\n\
+               end\n\
+               let nested: Box -> Nat = fn box => match box with\n\
+               | hide 'item { value, .. } => match make () with\n\
+                 | hide 'other { show, .. } => 1n\n\
+                 end\n\
+               end";
+    let (mint, out, inferred) = infer_src(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
+    assert_eq!(scheme(&mint, &inferred, "shown"), "String");
+    assert_eq!(scheme(&mint, &inferred, "through"), "String");
+    assert_eq!(scheme(&mint, &inferred, "describe"), "Box -> String");
+    assert_eq!(scheme(&mint, &inferred, "nested"), "Box -> Nat");
+}
+
+/// The type an arm opens is scoped to the arm: returning a value of it,
+/// wrapping one in a closure that leaves, or writing one into a cell from
+/// outside are each refused at the expression that would carry it out, and
+/// the complaint points back at the `hide` that opened it.
+#[test]
+fn an_opened_type_cannot_leave_its_arm() {
+    let prelude = "type Box = hide 'a => { value: 'a, show: 'a -> String }\n\
+                   extern make: () -> Box = \"host.make\"\n";
+    for (body, opened) in [
+        (
+            "let leak = match make () with | hide 'v { value, .. } => value end",
+            "hide 'v",
+        ),
+        (
+            "let leak = match make () with | hide 'v { value, .. } => fn _ => value end",
+            "hide 'v",
+        ),
+        (
+            "let leak = fn cell => match make () with | hide 'v { value, .. } => cell := #Some value end",
+            "hide 'v",
+        ),
+    ] {
+        let src = format!("{prelude}{body}");
+        let (_, out, inferred) = infer_src(&src);
+        let map = &out.source;
+        let escape = inferred
+            .errors()
+            .iter()
+            .find(|error| error.kind.code() == "hidden-escapes")
+            .unwrap_or_else(|| panic!("{body}: {:#?}", inferred.errors()));
+        let ErrorKind::HiddenEscapes { name, declared } = &escape.kind else {
+            unreachable!()
+        };
+        assert_eq!(&**name, "v");
+        assert_eq!(
+            map.span(*declared).start,
+            src.find(opened).unwrap(),
+            "{body}"
+        );
+    }
+}
+
+/// Opening needs a position already known to be a hidden type: an
+/// unannotated parameter is refused as not yet known, and a natural number
+/// as not hidden at all — each at the `hide` that asked.
+#[test]
+fn opening_needs_a_known_hidden_type() {
+    let src = "let f = fn b => match b with | hide 'v { value } => 0n end";
+    let (_, out, inferred) = infer_src(src);
+    let error = inferred
+        .errors()
+        .iter()
+        .find(|error| error.kind.code() == "hidden-unknown")
+        .unwrap_or_else(|| panic!("{:#?}", inferred.errors()));
+    let ErrorKind::HiddenUnknown { name, declared } = &error.kind else {
+        unreachable!()
+    };
+    assert_eq!(&**name, "v");
+    assert_eq!(out.source.span(*declared).start, src.find("hide").unwrap());
+
+    let src = "let g = match 1n with | hide 'v x => 0n end";
+    let (_, out, inferred) = infer_src(src);
+    let error = inferred
+        .errors()
+        .iter()
+        .find(|error| error.kind.code() == "not-hidden")
+        .unwrap_or_else(|| panic!("{:#?}", inferred.errors()));
+    let ErrorKind::NotHidden {
+        name,
+        declared,
+        found,
+    } = &error.kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(&**name, "v");
+    assert_eq!(found.to_string(), "Nat");
+    assert_eq!(out.source.span(*declared).start, src.find("hide").unwrap());
+}
+
+/// Two hidden types are one type exactly when their bodies agree at one
+/// fresh type: the variable's spelling is nothing, and a body that says
+/// something different of it is a mismatch of the two types.
+#[test]
+fn hidden_types_are_equal_up_to_their_variable_names() {
+    let src = "type A = hide 'a => 'a -> 'a\n\
+               type B = hide 'b => 'b -> 'b\n\
+               type C = hide 'c => 'c -> Nat\n\
+               extern a: () -> A = \"host.a\"\n\
+               let b: B = a ()";
+    let (mint, out, inferred) = infer_src(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
+    assert_eq!(scheme(&mint, &inferred, "b"), "B");
+
+    let src = format!("{src}\nlet c: C = a ()");
+    let (_, _, inferred) = infer_src(&src);
+    let codes: Vec<_> = inferred
+        .errors()
+        .iter()
+        .map(|error| error.kind.code())
+        .collect();
+    assert_eq!(codes, ["type-mismatch"], "{:#?}", inferred.errors());
+}
+
+/// Checking an expression against a hidden type packages it: the compiler
+/// reads the witness — the type the hidden variable stands for — off the
+/// expression and its context, through record and array literals, a
+/// function's result, a block's result, each branch of a match on its own, a
+/// parameter already known to be hidden, and a caller-chosen type; and a
+/// value already of the hidden type passes through, opened or not.
+#[test]
+fn checking_against_a_hidden_type_packages_the_expression() {
+    let src = "type Box = hide 'a => { value: 'a, show: 'a -> String }\n\
+               extern show_nat: Nat -> String = \"host.nat\"\n\
+               extern show_bool: Bool -> String = \"host.bool\"\n\
+               let one: Box = { value: 1n, show: show_nat }\n\
+               let both: [Box] = [{ value: 1n, show: show_nat }, { value: true, show: show_bool }]\n\
+               let pick: Bool -> Box = fn c =>\n\
+                 if c then { value: 1n, show: show_nat } else { value: true, show: show_bool } end\n\
+               let made: Box = do let v = 2n return { value: v, show: show_nat } end\n\
+               let make: Nat -> Box = fn n => { value: n, show: show_nat }\n\
+               let consume: Box -> Nat = fn _ => 1n\n\
+               let used = consume { value: true, show: show_bool }\n\
+               let generic: 'a -> ('a -> String) -> Box = fn v s => { value: v, show: s }\n\
+               let inferred = fn v s => do let b: Box = { value: v, show: s } return b end\n\
+               let same: Box -> Box = fn b => b\n\
+               let repack: Box -> Box = fn b => match b with\n\
+               | hide 'v { value, show } => { value: value, show: show }\n\
+               end";
+    let (mint, out, inferred) = infer_src(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
+    assert_eq!(scheme(&mint, &inferred, "one"), "Box");
+    assert_eq!(scheme(&mint, &inferred, "both"), "[Box]");
+    assert_eq!(scheme(&mint, &inferred, "pick"), "Bool -> Box");
+    assert_eq!(scheme(&mint, &inferred, "made"), "Box");
+    assert_eq!(scheme(&mint, &inferred, "make"), "Nat -> Box");
+    assert_eq!(scheme(&mint, &inferred, "used"), "Nat");
+    assert_eq!(
+        scheme(&mint, &inferred, "generic"),
+        "'a -> ('a -> String) -> Box"
+    );
+    assert_eq!(
+        scheme(&mint, &inferred, "inferred"),
+        "'a -> ('a -> String) -> Box"
+    );
+    assert_eq!(scheme(&mint, &inferred, "same"), "Box -> Box");
+    assert_eq!(scheme(&mint, &inferred, "repack"), "Box -> Box");
+}
+
+/// A witness is what the expression and its context say and nothing more:
+/// an empty array, a bare tag, or a function's own parameter leaves the
+/// hidden type undetermined, and the compiler invents none. The complaint
+/// names the hidden type and its variable, at the expression.
+#[test]
+fn an_undetermined_witness_is_refused() {
+    let prelude = "type Box = hide 'a => { value: 'a, show: 'a -> String }\n\
+                   type Id = hide 'a => 'a -> 'a\n";
+    for (body, at) in [
+        (
+            "let bad: Box = { value: [], show: fn _ => \"\" }",
+            "{ value: []",
+        ),
+        (
+            "let bad: Box = { value: #None, show: fn _ => \"\" }",
+            "{ value: #None",
+        ),
+        // A function is anchored at its parameter.
+        ("let bad: Id = fn x => x", "x => x"),
+    ] {
+        let src = format!("{prelude}{body}");
+        let (_, out, inferred) = infer_src(&src);
+        let error = inferred
+            .errors()
+            .iter()
+            .find(|error| error.kind.code() == "hidden-witness")
+            .unwrap_or_else(|| panic!("{body}: {:#?}", inferred.errors()));
+        let ErrorKind::HiddenWitness { name, package } = &error.kind else {
+            unreachable!()
+        };
+        assert_eq!(&**name, "a", "{body}");
+        assert!(
+            matches!(package.to_string().as_str(), "Box" | "Id"),
+            "{package}"
+        );
+        assert_eq!(
+            out.source.span(error.at).start,
+            src.find(at).unwrap(),
+            "{body}"
+        );
+    }
+}
+
+/// A `hide` pattern opens wherever it sits: under a case's payload, or as
+/// an array's element, the position's type is what the arm opens, and the
+/// types opened are the arm's to name.
+#[test]
+fn hide_patterns_open_nested_positions() {
+    let src = "type Box = hide 'a => { value: 'a, show: 'a -> String }\n\
+               type Wrapped = #Some Box | #None\n\
+               let unwrap: Wrapped -> String = fn w => match w with\n\
+               | #Some hide 'v { value, show } => do let held: 'v = value return show held end\n\
+               | #None => \"\"\n\
+               end\n\
+               let first: [Box] -> String = fn boxes => match boxes with\n\
+               | [hide 'v { value, show }, ..] => show value\n\
+               | [] => \"\"\n\
+               end";
+    let (mint, out, inferred) = infer_src(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(inferred.errors().is_empty(), "{:#?}", inferred.errors());
+    assert_eq!(scheme(&mint, &inferred, "unwrap"), "Wrapped -> String");
+    assert_eq!(scheme(&mint, &inferred, "first"), "[Box] -> String");
+}
+
+/// A mutable cell carries the region it lives in, and a hidden type carries
+/// no regions: opening the package gives a fresh scope that could not name
+/// the region, and a description has no node for one. Packaging a cell is
+/// refused rather than quietly dropping what the value depends on.
+#[test]
+fn a_package_will_not_hide_a_cell_region() {
+    let prelude = "type Held = hide 'a => { value: 'a }\ntype Bare = hide 'a => 'a\n";
+    // The cell is made and packaged inside a function, which is where its
+    // region is discharged.
+    for body in [
+        "let keep = fn _ => do\n  let cell = mut 0n\n  let held: Held = { value: cell }\n  return held\nend",
+        "let keep = fn _ => do\n  let cell = mut 0n\n  let held: Held = { value: { inner: cell } }\n  return held\nend",
+        "let keep = fn _ => do\n  let cell = mut 0n\n  let held: Held = { value: [cell] }\n  return held\nend",
+        "let keep = fn _ => do\n  let cell = mut 0n\n  let held: Bare = cell\n  return held\nend",
+    ] {
+        let (_, _, inferred) = infer_src(&format!("{prelude}{body}"));
+        let error = inferred
+            .errors()
+            .iter()
+            .find(|error| error.kind.code() == "hidden-region")
+            .unwrap_or_else(|| panic!("{body}: {:#?}", inferred.errors()));
+        let ErrorKind::HiddenRegion { name, .. } = &error.kind else {
+            unreachable!()
+        };
+        assert_eq!(&**name, "a", "{body}");
+    }
+
+    // What the cell holds has no region of its own, so packaging that is the
+    // ordinary case and still works.
+    for body in [
+        "let keep = fn _ => do\n  let cell = mut 0n\n  let held: Held = { value: ~cell }\n  return held\nend",
+        "let held: Held = { value: 1n }",
+        "let held: Bare = \"text\"",
+    ] {
+        let (_, _, inferred) = infer_src(&format!("{prelude}{body}"));
+        assert!(
+            inferred
+                .errors()
+                .iter()
+                .all(|error| error.kind.code() != "hidden-region"),
+            "{body}: {:#?}",
+            inferred.errors()
+        );
+    }
+}
+
+#[test]
+fn mirror_intrinsics_are_reviewed_by_their_signatures() {
+    // The whole contract, because recognition checks the whole of it: a record
+    // that merely has fields called `root` and `nodes` is not a description.
+    let description = "type Description = { root: Nat, nodes: [Node] }\n\
+type Domain = { bits: Nat, signed: Bool, min: String, max: String }\n\
+type Field = { name: String, node: Nat }\n\
+type Node = #Nat Domain | #Int Domain | #Real | #String | #Bool | #Foreign\n\
+  | #Fixed Domain | #Array Nat\n\
+  | #Function { argument: Nat, result: Nat, effects: [Field] }\n\
+  | #Effects [Field] | #Record [Field] | #Sum [Field] | #Alias Nat\n\
+  | #Extend { base: Nat, rest: Nat }\n\
+  | #Parameter Nat | #Mirror Nat | #Hidden Nat | #Variable Nat\n";
+    let accepted = [
+        "extern mirror: () -> Mirror 'a = \"$mirror\"",
+        "extern type_of: 'a -> Mirror 'a = \"$typeOf\"",
+        "extern describe: Mirror 'a -> Description = \"$describe\"",
+        "extern same: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = \"$sameMirror\"",
+    ];
+    for signature in accepted {
+        let (_, _, output) = infer_src(&format!(
+            "type Option 'a = #Some 'a | #None\n{description}{signature}"
+        ));
+        assert!(
+            output.errors().is_empty(),
+            "{signature}: {:#?}",
+            output.errors()
+        );
+    }
+    let refused = [
+        "extern mirror: Nat -> Mirror 'a = \"$mirror\"",
+        "extern mirror: () -> Mirror Nat = \"$mirror\"",
+        "extern mirror: () -> Nat = \"$mirror\"",
+        "extern type_of: 'a -> Mirror 'b = \"$typeOf\"",
+        "extern type_of: 'a -> Mirror Nat = \"$typeOf\"",
+        "extern type_of: Nat -> Mirror Nat = \"$typeOf\"",
+        "extern describe: Nat -> Description = \"$describe\"",
+        "extern describe: Mirror 'a -> Nat = \"$describe\"",
+        "extern describe: Mirror 'a -> { root: Nat } = \"$describe\"",
+        "extern describe: Mirror 'a -> { root: Nat, nodes: [Node], ..'r } = \"$describe\"",
+        "extern describe: Mirror 'a -> { root: Nat, tail: [Node] } = \"$describe\"",
+        "extern describe: Mirror 'a -> { root when 'p: Nat, nodes: [Node] } = \"$describe\"",
+        // The payloads are part of the contract, not only the field names.
+        "extern describe: Mirror 'a -> { root: String, nodes: String } = \"$describe\"",
+        "extern describe: Mirror 'a -> { root: Nat, nodes: Node } = \"$describe\"",
+        "extern describe: Mirror 'a -> { root: Nat, nodes: [Nat] } = \"$describe\"",
+        "type Thin = #Nat Domain | #Record [Field]\nextern describe: Mirror 'a -> { root: Nat, nodes: [Thin] } = \"$describe\"",
+        "type Wide = #Nat Domain | #Int Domain | #Real | #String | #Bool | #Foreign | #Fixed Domain | #Array Nat | #Function { argument: Nat, result: Nat, effects: [Field] } | #Effects [Field] | #Record [Field] | #Sum [Field] | #Alias Nat | #Extend { base: Nat, rest: Nat } | #Parameter Nat | #Mirror Nat | #Hidden Nat | #Variable Nat | #Extra\nextern describe: Mirror 'a -> { root: Nat, nodes: [Wide] } = \"$describe\"",
+        "type Loose = #Nat Domain | #Int Domain | #Real | #String | #Bool | #Foreign | #Fixed Domain | #Array String | #Function { argument: Nat, result: Nat, effects: [Field] } | #Effects [Field] | #Record [Field] | #Sum [Field] | #Alias Nat | #Extend { base: Nat, rest: Nat } | #Parameter Nat | #Mirror Nat | #Hidden Nat | #Variable Nat\nextern describe: Mirror 'a -> { root: Nat, nodes: [Loose] } = \"$describe\"",
+        "type Half = { bits: Nat, signed: Bool }\ntype Short = #Nat Half | #Int Half | #Real | #String | #Bool | #Foreign | #Fixed Half | #Array Nat | #Function { argument: Nat, result: Nat, effects: [Field] } | #Effects [Field] | #Record [Field] | #Sum [Field] | #Alias Nat | #Extend { base: Nat, rest: Nat } | #Parameter Nat | #Mirror Nat | #Hidden Nat | #Variable Nat\nextern describe: Mirror 'a -> { root: Nat, nodes: [Short] } = \"$describe\"",
+        "extern same: Nat -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = \"$sameMirror\"",
+        "extern same: (Nat, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = \"$sameMirror\"",
+        "extern same: (Mirror Nat, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = \"$sameMirror\"",
+        "extern same: (Mirror 'a, Mirror 'b, Nat) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = \"$sameMirror\"",
+        "extern same: { 0: Mirror 'a, 1: Mirror 'b, ..'r } -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = \"$sameMirror\"",
+        "extern same: (Mirror 'a, Mirror 'b) -> Nat = \"$sameMirror\"",
+        "extern same: (Mirror 'a, Mirror 'b) -> #Some { forward: 'a -> 'b, backward: 'b -> 'a } = \"$sameMirror\"",
+        "extern same: (Mirror 'a, Mirror 'b) -> #None = \"$sameMirror\"",
+        "extern same: (Mirror 'a, Mirror 'b) -> Option Nat = \"$sameMirror\"",
+        "extern same: (Mirror 'a, Mirror 'b) -> #Some { forward: 'a -> 'b, backward: 'b -> 'a } | #None | #Other = \"$sameMirror\"",
+        "extern same: (Mirror 'a, Mirror 'b) -> #Some { forward: 'a -> 'b, backward: 'b -> 'a } | #None Nat = \"$sameMirror\"",
+        "extern same: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b } = \"$sameMirror\"",
+        "extern same: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a, ..'r } = \"$sameMirror\"",
+        "extern same: (Mirror 'a, Mirror 'b) -> Option { forward: 'b -> 'a, backward: 'b -> 'a } = \"$sameMirror\"",
+        "extern same: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'a -> 'b } = \"$sameMirror\"",
+        "extern same: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a -> 'a } = \"$sameMirror\"",
+        "extern same: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, sideways: 'b -> 'a } = \"$sameMirror\"",
+        "extern same: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: Nat } = \"$sameMirror\"",
+        "effect Tick = () -> ()\nextern same: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b + !Tick, backward: 'b -> 'a } = \"$sameMirror\"",
+        "extern same: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a + ..'e } = \"$sameMirror\"",
+    ];
+    for signature in refused {
+        let (_, _, output) = infer_src(&format!(
+            "type Option 'a = #Some 'a | #None\n{description}{signature}"
+        ));
+        let kinds = output
+            .errors()
+            .iter()
+            .map(|error| error.kind.code())
+            .collect::<Vec<_>>();
+        assert!(
+            kinds.contains(&"runtime-type-information") || !kinds.is_empty(),
+            "{signature} was accepted"
+        );
+    }
+    // A mirror-consuming intrinsic needs no evidence of its own: a generic
+    // wrapper over it is a plain polymorphic function.
+    let (_, _, output) = infer_src(
+        "type Option 'a = #Some 'a | #None\n\
+         @private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = \"$sameMirror\"\n\
+         let same = fn left right => same_pair (left, right)\n\
+         let apply = fn call value => call value\n\
+         let forward = apply same",
+    );
+    assert!(output.errors().is_empty(), "{:#?}", output.errors());
+    // One that makes evidence does: a generalized value has nobody to supply it.
+    let (_, _, output) = infer_src(
+        "@private extern mirror: () -> Mirror 'a = \"$mirror\"\nlet unpinned = mirror ()",
+    );
+    assert_eq!(
+        output
+            .errors()
+            .iter()
+            .map(|error| error.kind.code())
+            .collect::<Vec<_>>(),
+        ["runtime-type-information"]
+    );
+}
+
+/// `std::reflect::Shape` and the views it carries, for programs compiled
+/// without the standard library.
+pub(crate) const SHAPE_SOURCE: &str = "type Option 'a = #Some 'a | #None\n\
+type Result 'some 'error = #Some 'some | #Error 'error\n\
+type Description = { root: Nat, nodes: [Node] }\n\
+type Domain = { bits: Nat, signed: Bool, min: String, max: String }\n\
+type Field = { name: String, node: Nat }\n\
+type Node =\n\
+  | #Nat Domain\n\
+  | #Int Domain\n\
+  | #Real\n\
+  | #String\n\
+  | #Bool\n\
+  | #Foreign\n\
+  | #Fixed Domain\n\
+  | #Array Nat\n\
+  | #Function { argument: Nat, result: Nat, effects: [Field] }\n\
+  | #Effects [Field]\n\
+  | #Record [Field]\n\
+  | #Sum [Field]\n\
+  | #Alias Nat\n\
+  | #Extend { base: Nat, rest: Nat }\n\
+  | #Parameter Nat\n\
+  | #Mirror Nat\n\
+  | #Hidden Nat\n\
+  | #Variable Nat\n\
+type Presence = #Required | #Optional\n\
+type Shape 'a =\n\
+  | #Nat { read: 'a -> Nat, make: Nat -> 'a }\n\
+  | #Int { read: 'a -> Int, make: Int -> 'a }\n\
+  | #Real { read: 'a -> Real, make: Real -> 'a }\n\
+  | #String { read: 'a -> String, make: String -> 'a }\n\
+  | #Bool { read: 'a -> Bool, make: Bool -> 'a }\n\
+  | #Nat8 { read: 'a -> Nat8, make: Nat8 -> 'a }\n\
+  | #Nat16 { read: 'a -> Nat16, make: Nat16 -> 'a }\n\
+  | #Nat32 { read: 'a -> Nat32, make: Nat32 -> 'a }\n\
+  | #Nat64 { read: 'a -> Nat64, make: Nat64 -> 'a }\n\
+  | #Int8 { read: 'a -> Int8, make: Int8 -> 'a }\n\
+  | #Int16 { read: 'a -> Int16, make: Int16 -> 'a }\n\
+  | #Int32 { read: 'a -> Int32, make: Int32 -> 'a }\n\
+  | #Int64 { read: 'a -> Int64, make: Int64 -> 'a }\n\
+  | #Array (ArrayView 'a)\n\
+  | #Record (RecordView 'a)\n\
+  | #Sum (SumView 'a)\n\
+  | #Function Description\n\
+  | #Hidden Description\n\
+  | #Mirror Description\n\
+  | #Foreign\n\
+type ArrayView 'array = hide 'element => { element: Mirror 'element, read: 'array -> ['element], make: ['element] -> 'array }\n\
+type RecordView 'record = { mirror: Mirror 'record, fields: [SomeField 'record], build: [Binding 'record] -> Result 'record BuildError }\n\
+type SomeField 'record = hide 'field => { name: String, mirror: Mirror 'field, presence: Presence, read: 'record -> Option 'field, bind: 'field -> Binding 'record }\n\
+type Binding 'record = hide 'field => { record: Mirror 'record, name: String, mirror: Mirror 'field, value: 'field }\n\
+type BuildError = #Missing String | #Duplicate String | #Unknown String | #Foreign String | #Mismatched String\n\
+type SumView 'sum = { mirror: Mirror 'sum, cases: [SomeCase 'sum] }\n\
+type SomeCase 'sum = hide 'payload => { name: String, mirror: Mirror 'payload, project: 'sum -> Option 'payload, inject: Option ('payload -> 'sum) }\n";
+
+#[test]
+fn the_shape_intrinsic_is_reviewed_against_its_cases() {
+    let (_, _, output) = infer_src(&format!(
+        "{SHAPE_SOURCE}extern shape: Mirror 'a -> Shape 'a = \"$shape\""
+    ));
+    assert!(output.errors().is_empty(), "{:#?}", output.errors());
+    for signature in [
+        "extern shape: 'a -> Shape 'a = \"$shape\"",
+        "extern shape: Mirror 'a -> Nat = \"$shape\"",
+        "extern shape: Mirror 'a -> Shape 'b = \"$shape\"",
+        "extern shape: Mirror 'a -> RecordView 'a = \"$shape\"",
+        "type Fewer 'a = #Nat { read: 'a -> Nat, make: Nat -> 'a } | #Foreign\nextern shape: Mirror 'a -> Fewer 'a = \"$shape\"",
+        "type Renamed 'a = #Natural { read: 'a -> Nat, make: Nat -> 'a } | #Int { read: 'a -> Int, make: Int -> 'a } | #Real { read: 'a -> Real, make: Real -> 'a } | #String { read: 'a -> String, make: String -> 'a } | #Bool { read: 'a -> Bool, make: Bool -> 'a } | #Nat8 () | #Nat16 () | #Nat32 () | #Nat64 () | #Int8 () | #Int16 () | #Int32 () | #Int64 () | #Array (ArrayView 'a) | #Record (RecordView 'a) | #Sum (SumView 'a) | #Function Description | #Hidden Description | #Mirror Description | #Foreign\nextern shape: Mirror 'a -> Renamed 'a = \"$shape\"",
+    ] {
+        let (_, _, output) = infer_src(&format!("{SHAPE_SOURCE}{signature}"));
+        assert_eq!(
+            output
+                .errors()
+                .iter()
+                .map(|error| error.kind.code())
+                .collect::<Vec<_>>(),
+            ["runtime-type-information"],
+            "{signature}"
+        );
+    }
+
+    // Every case name kept and one payload changed. The cases are spelled out
+    // here so that exactly one of them differs from the contract: a shape that
+    // merely has the right case names is not the shape this compiler builds.
+    let cases = [
+        "#Nat { read: 'a -> Nat, make: Nat -> 'a }",
+        "#Int { read: 'a -> Int, make: Int -> 'a }",
+        "#Real { read: 'a -> Real, make: Real -> 'a }",
+        "#String { read: 'a -> String, make: String -> 'a }",
+        "#Bool { read: 'a -> Bool, make: Bool -> 'a }",
+        "#Nat8 { read: 'a -> Nat8, make: Nat8 -> 'a }",
+        "#Nat16 { read: 'a -> Nat16, make: Nat16 -> 'a }",
+        "#Nat32 { read: 'a -> Nat32, make: Nat32 -> 'a }",
+        "#Nat64 { read: 'a -> Nat64, make: Nat64 -> 'a }",
+        "#Int8 { read: 'a -> Int8, make: Int8 -> 'a }",
+        "#Int16 { read: 'a -> Int16, make: Int16 -> 'a }",
+        "#Int32 { read: 'a -> Int32, make: Int32 -> 'a }",
+        "#Int64 { read: 'a -> Int64, make: Int64 -> 'a }",
+        "#Array (Bad 'a)",
+        "#Record (RecordView 'a)",
+        "#Sum (SumView 'a)",
+        "#Function Description",
+        "#Hidden Description",
+        "#Mirror Description",
+        "#Foreign",
+    ];
+    let with_case = |at: usize, case: &str, helper: &str| {
+        let mut written: Vec<String> = cases.iter().map(|case| (*case).to_string()).collect();
+        written[13] = "#Array (ArrayView 'a)".to_string();
+        written[at] = case.to_string();
+        format!(
+            "{helper}type Altered 'a =\n  | {}\nextern shape: Mirror 'a -> Altered 'a = \"$shape\"",
+            written.join("\n  | ")
+        )
+    };
+    for signature in [
+        // A primitive accessor that reads another primitive.
+        with_case(0, "#Nat { read: 'a -> String, make: String -> 'a }", ""),
+        // A fixed width that is not the one the case is named for.
+        with_case(5, "#Nat8 { read: 'a -> Nat16, make: Nat16 -> 'a }", ""),
+        // An array view whose element relationship is broken.
+        with_case(
+            13,
+            "#Array (Bad 'a)",
+            "type Bad 'array = hide 'element => { element: Mirror 'element, read: 'array -> ['array], make: ['element] -> 'array }\n",
+        ),
+        // A field binding that names the field's own type as the record.
+        with_case(
+            14,
+            "#Record (Bad 'a)",
+            "type Bad 'record = { mirror: Mirror 'record, fields: [Wrong 'record], build: [Binding 'record] -> Result 'record BuildError }\n\
+type Wrong 'record = hide 'field => { name: String, mirror: Mirror 'field, presence: Presence, read: 'record -> Option 'field, bind: 'field -> Binding 'field }\n",
+        ),
+        // A builder that answers something other than the record.
+        with_case(
+            14,
+            "#Record (Bad 'a)",
+            "type Bad 'record = { mirror: Mirror 'record, fields: [SomeField 'record], build: [Binding 'record] -> Result Nat BuildError }\n",
+        ),
+        // A case view that hides nothing, so its payload type escapes.
+        with_case(
+            15,
+            "#Sum (Bad 'a)",
+            "type Bad 'sum = { mirror: Mirror 'sum, cases: [{ name: String, mirror: Mirror 'sum, project: 'sum -> Option 'sum, inject: Option ('sum -> 'sum) }] }\n",
+        ),
+        // A view operation that performs an effect.
+        with_case(
+            2,
+            "#Real { read: 'a -> Real + !Log, make: Real -> 'a }",
+            "effect Log = { note: String -> () }\n",
+        ),
+    ] {
+        let (_, _, output) = infer_src(&format!("{SHAPE_SOURCE}{signature}"));
+        assert_eq!(
+            output
+                .errors()
+                .iter()
+                .map(|error| error.kind.code())
+                .collect::<Vec<_>>(),
+            ["runtime-type-information"],
+            "{signature}"
+        );
+    }
+}
+
+#[test]
+fn opened_views_share_one_scoped_type_between_their_operations() {
+    // What `read` observes is what `bind` accepts, at a type the arm cannot
+    // name: the field's, opened by the pattern.
+    let (_, _, output) = infer_src(&format!(
+        "{SHAPE_SOURCE}\
+         let rebind: SomeField 'r -> 'r -> Option (Binding 'r) = fn field record => match field with\n\
+         | hide 'f {{ read, bind, .. }} => match read record with\n\
+           | #Some value => #Some (bind value)\n\
+           | #None => #None\n\
+           end\n\
+         end"
+    ));
+    assert!(output.errors().is_empty(), "{:#?}", output.errors());
+    // A value of another type is not the field's, however it is spelled.
+    let (_, _, output) = infer_src(&format!(
+        "{SHAPE_SOURCE}\
+         let forge: SomeField 'r -> Binding 'r = fn field => match field with\n\
+         | hide 'f {{ bind, .. }} => bind 1n\n\
+         end"
+    ));
+    assert_eq!(
+        output
+            .errors()
+            .iter()
+            .map(|error| error.kind.code())
+            .collect::<Vec<_>>(),
+        ["type-mismatch"]
+    );
+    // The field's type stays inside the arm: its mirror is evidence there,
+    // and nowhere else.
+    let (_, _, output) = infer_src(&format!(
+        "{SHAPE_SOURCE}\
+         extern field: SomeField Nat = \"host.field\"\n\
+         let leak = match field with\n\
+         | hide 'f {{ mirror, .. }} => mirror\n\
+         end"
+    ));
+    assert_eq!(
+        output
+            .errors()
+            .iter()
+            .map(|error| error.kind.code())
+            .collect::<Vec<_>>(),
+        ["hidden-escapes"]
+    );
+}
+
+#[test]
+fn an_arm_waits_for_the_type_it_opens_until_the_run_is_over() {
+    let prelude = "type Box = hide 'a => { value: 'a, show: 'a -> String }\n\
+                   let map: ('a -> 'b) -> ['a] -> ['b] = fn f xs => match xs with | [] => [] | [x, ..rest] => [f x, ..map f rest] end\n\
+                   extern boxes: [Box] = \"host.boxes\"\n";
+    // The function is an argument before the array that decides its
+    // parameter's type is: the arm opens once the call has been related.
+    let (mint, _, output) = infer_src(&format!(
+        "{prelude}let shown = map (fn box => match box with | hide 'v {{ value, show }} => show value end) boxes"
+    ));
+    assert!(output.errors().is_empty(), "{:#?}", output.errors());
+    assert_eq!(scheme(&mint, &output, "shown"), "[String]");
+    // One arm's type is decided by another arm that was waiting too: the
+    // outer function's parameter is what the inner function makes.
+    let (mint, _, output) = infer_src(&format!(
+        "{prelude}extern rebox: {{ value: String, show: String -> String }} -> Box = \"host.rebox\"\n\
+         let twice = map (fn box => match box with | hide 'v {{ value, show }} => show value end) (map (fn box => match box with | hide 'w {{ value, show }} => rebox {{ value: show value, show: fn text => text }} end) boxes)"
+    ));
+    assert!(output.errors().is_empty(), "{:#?}", output.errors());
+    assert_eq!(scheme(&mint, &output, "twice"), "[String]");
+    // Nothing in the run decides it: the arm says so at its `hide`, as it
+    // would have straight away.
+    let (_, _, output) = infer_src(&format!(
+        "{prelude}let show = fn box => match box with | hide 'v {{ value, show }} => show value end\nlet shown = map show boxes"
+    ));
+    assert_eq!(
+        output
+            .errors()
+            .iter()
+            .map(|error| error.kind.code())
+            .collect::<Vec<_>>(),
+        ["hidden-unknown"]
+    );
+}
+
+#[test]
+fn an_introduction_waits_for_its_term_type_and_passes_an_undecided_one_through() {
+    let prelude = "type Box = hide 'a => { value: 'a, show: 'a -> String }\n\
+                   let map: ('a -> 'b) -> ['a] -> ['b] = fn f xs => match xs with | [] => [] | [x, ..rest] => [f x, ..map f rest] end\n\
+                   extern boxes: [Box] = \"host.boxes\"\n\
+                   extern keep: Box -> Box = \"host.keep\"\n";
+    // The parameter's type is decided after the call that packages it: a
+    // value of the package, passed through.
+    let (mint, _, output) = infer_src(&format!(
+        "{prelude}let kept = map (fn box => keep box) boxes"
+    ));
+    assert!(output.errors().is_empty(), "{:#?}", output.errors());
+    assert_eq!(scheme(&mint, &output, "kept"), "[Box]");
+    // Nothing decides it at all: the one type it is known to have is the
+    // package, so that is what the function takes.
+    let (mint, _, output) = infer_src(&format!("{prelude}let keeper = fn box => keep box"));
+    assert!(output.errors().is_empty(), "{:#?}", output.errors());
+    assert_eq!(scheme(&mint, &output, "keeper"), "Box -> Box");
+    // Decided to be the body: packaged, with the witness its fields fix.
+    let (mint, _, output) = infer_src(&format!(
+        "{prelude}extern digits: Nat -> String = \"host.digits\"\nlet packer = fn raw => (keep raw, digits raw.value)"
+    ));
+    assert!(output.errors().is_empty(), "{:#?}", output.errors());
+    assert_eq!(
+        scheme(&mint, &output, "packer"),
+        "{ value: Nat, show: Nat -> String } -> (Box, String)"
+    );
+}
+
+#[test]
+fn function_mirrors_need_a_decided_closed_effect_row() {
+    let prelude =
+        "effect Tick = () -> ()\n@private extern type_of: 'a -> Mirror 'a = \"$typeOf\"\n";
+    let (_, _, output) = infer_src(&format!(
+        "{prelude}let closed: (() -> Nat + !Tick) -> Mirror (() -> Nat + !Tick) = fn f => type_of f"
+    ));
+    assert!(output.errors().is_empty(), "{:#?}", output.errors());
+    for (case, message) in [
+        (
+            "let open: (() -> Nat + ..'e) -> Mirror (() -> Nat + ..'e) = fn f => type_of f",
+            "closed effect row",
+        ),
+        (
+            "let undecided: (() -> Nat + !Tick (when 'p)) -> Mirror (() -> Nat + !Tick (when 'p)) = fn f => type_of f",
+            "decided effect row",
+        ),
+    ] {
+        let (_, _, output) = infer_src(&format!("{prelude}{case}"));
+        let error = output
+            .errors()
+            .iter()
+            .find(|error| error.kind.code() == "runtime-type-information")
+            .unwrap_or_else(|| panic!("{case}: {:#?}", output.errors()));
+        assert!(
+            error.kind.to_string().contains(message),
+            "{case}: {}",
+            error.kind
+        );
+    }
 }

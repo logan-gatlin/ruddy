@@ -171,7 +171,48 @@ impl Interface {
             };
             output.nodes[target as usize] = copied;
         }
+        output.normalize();
         output
+    }
+
+    /// Only an incoming callable's own port can be communicated across the
+    /// bundle boundary. A requirement qualified by any other port, one an
+    /// instantiation left unresolved inside the exporting bundle, still
+    /// reserves an evidence slot in the exporter's lowering, so publish it
+    /// unconditionally and keep only the ports an arrow binds.
+    fn normalize(&mut self) {
+        let bound: BTreeSet<u32> = self
+            .nodes
+            .iter()
+            .filter_map(|node| match node {
+                Node::Arrow {
+                    port: Some(port), ..
+                } => Some(*port),
+                _ => None,
+            })
+            .collect();
+        let mut renumbered = vec![None; self.ports.len()];
+        let mut ports = Vec::with_capacity(bound.len());
+        for port in bound {
+            renumbered[port as usize] = Some(ports.len() as u32);
+            ports.push(std::mem::take(&mut self.ports[port as usize]));
+        }
+        self.ports = ports;
+        for node in &mut self.nodes {
+            if let Node::Arrow {
+                port, requirements, ..
+            } = node
+            {
+                *port = port.and_then(|port| renumbered[port as usize]);
+                *requirements = std::mem::take(requirements)
+                    .into_iter()
+                    .map(|need| Requirement {
+                        port: need.port.and_then(|port| renumbered[port as usize]),
+                        parameter: need.parameter,
+                    })
+                    .collect();
+            }
+        }
     }
 
     /// Validate references and quantified positions before an imported graph

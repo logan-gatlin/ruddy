@@ -206,6 +206,7 @@ fn bundle(files: &[(&str, &str)]) -> Snapshot {
             kind: ruddy::artifact::Kind::Library,
             target: Some(ruddy_cli::Target::Js),
             platform: None,
+            integers: None,
             name: "demo".to_string(),
             version: "0.1.0".to_string(),
             root: ROOT.to_string(),
@@ -308,6 +309,7 @@ fn dependency_paths_without_a_scratch_root_are_recoverable() {
             kind: ruddy::artifact::Kind::Library,
             target: None,
             platform: None,
+            integers: None,
             name: "debugger".to_string(),
             version: "1.2.3".to_string(),
             root: ROOT.to_string(),
@@ -366,6 +368,7 @@ fn custom_standard_library_is_source_visible_rendered_and_sandboxed() {
         kind: ruddy::artifact::Kind::Library,
         target: None,
         platform: None,
+        integers: None,
         name: "app".into(),
         version: "1.0.0".into(),
         root: ROOT.into(),
@@ -427,6 +430,7 @@ fn a_remembered_dependency_graph_follows_edits_to_its_sources() {
         kind: ruddy::artifact::Kind::Library,
         target: None,
         platform: None,
+        integers: None,
         name: "app".into(),
         version: "1.0.0".into(),
         root: ROOT.into(),
@@ -499,6 +503,7 @@ fn cached_standard_library_child() {
         kind: ruddy::artifact::Kind::Library,
         target: None,
         platform: None,
+        integers: None,
         name: "app".into(),
         version: "1.0.0".into(),
         root: ROOT.into(),
@@ -557,6 +562,7 @@ fn saved_dependency_projects_supply_artifact_identity_and_gate_lir() {
         kind: ruddy::artifact::Kind::Library,
         target: None,
         platform: None,
+        integers: None,
         name: "app".to_string(),
         version: "1.0.0".to_string(),
         root: ROOT.to_string(),
@@ -704,6 +710,7 @@ fn dependencies_tab_correlates_same_bundle_versions_by_request_alias() {
         kind: ruddy::artifact::Kind::Library,
         target: None,
         platform: None,
+        integers: None,
         name: "app".into(),
         version: "1.0.0".into(),
         root: ROOT.into(),
@@ -1002,6 +1009,7 @@ fn dependency_request(dependencies: IndexMap<String, String>) -> CompileRequest 
         kind: ruddy::artifact::Kind::Library,
         target: None,
         platform: None,
+        integers: None,
         name: "app".to_string(),
         version: "1.0.0".to_string(),
         root: ROOT.to_string(),
@@ -1040,6 +1048,7 @@ fn every_stage_reports_on_the_demo() {
             "entry",
             "linked",
             "js",
+            "portable",
             "symbols",
             "types-ir"
         ]
@@ -1055,7 +1064,10 @@ fn every_stage_reports_on_the_demo() {
         }
         // Recovery remains visible through semantic stages; lowering still
         // requires a fully accepted program.
-        if matches!(stage.id, "lir" | "artifact" | "entry" | "linked" | "js") {
+        if matches!(
+            stage.id,
+            "lir" | "artifact" | "entry" | "linked" | "js" | "portable"
+        ) {
             assert_eq!(stage.status, Status::Skipped, "{}", stage.id);
             assert!(stage.nodes.is_empty(), "a skipped stage rendered rows");
             assert!(!stage.summary.is_empty(), "{} counted nothing", stage.id);
@@ -1112,6 +1124,7 @@ fn every_stage_reports_on_the_demo() {
             "Entry",
             "Linked Artifact",
             "JS",
+            "Portable",
             "Symbols"
         ]
     );
@@ -1596,6 +1609,7 @@ fn frontend_errors_keep_reader_advice_and_recovered_semantic_stages() {
         "entry",
         "linked",
         "js",
+        "portable",
         "symbols",
         "types-ir",
     ] {
@@ -1604,13 +1618,59 @@ fn frontend_errors_keep_reader_advice_and_recovered_semantic_stages() {
             .iter()
             .find(|stage| stage.id == id)
             .unwrap_or_else(|| panic!("{id} is registered"));
-        let expected = if matches!(id, "lir" | "artifact" | "entry" | "linked" | "js") {
+        let expected = if matches!(
+            id,
+            "lir" | "artifact" | "entry" | "linked" | "js" | "portable"
+        ) {
             Status::Skipped
         } else {
             Status::Partial
         };
         assert_eq!(stage.status, expected, "{id}: {stage:#?}");
     }
+}
+
+/// What keeps a program on one target is the host values it reads, so the
+/// panel holds each one against the portable primitive table by name.
+#[test]
+fn the_portable_panel_separates_contract_primitives_from_javascript() {
+    let snapshot = snapshot(
+        "extern add: fn(Nat, Nat) -> Nat = \"$prim.nat.add\"\nextern now: () -> Nat = \"Date.now\"\nlet sum = add 1n 2n\nlet stamp = now ()\n",
+    );
+    let stage = snapshot
+        .stages
+        .iter()
+        .find(|stage| stage.id == "portable")
+        .expect("the portable panel is registered");
+    assert_eq!(stage.status, Status::Ok);
+    assert_eq!(stage.summary, "1 of 2 portable");
+    let rows: Vec<_> = stage
+        .nodes
+        .iter()
+        .map(|node| (node.label.as_str(), node.text.as_str()))
+        .collect();
+    assert!(
+        rows.iter()
+            .any(|(label, text)| label.ends_with("::add") && *text == "portable"),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|(label, text)| label.ends_with("::now") && *text == "JavaScript only"),
+        "{rows:?}"
+    );
+    let add = stage
+        .nodes
+        .iter()
+        .find(|node| node.label.ends_with("::add"))
+        .expect("the portable extern is listed");
+    assert_eq!(
+        add.children
+            .iter()
+            .map(|child| (child.label.as_str(), child.text.as_str()))
+            .collect::<Vec<_>>(),
+        [("Target", "$prim.nat.add"), ("Contract", "2 arguments"),]
+    );
 }
 
 /// A repeat is only legible next to what it repeats, so it has to arrive as
@@ -2373,6 +2433,7 @@ fn a_bad_bundle_is_reported_rather_than_fatal() {
                 kind: ruddy::artifact::Kind::Library,
                 target: None,
                 platform: None,
+                integers: None,
                 name: name.to_string(),
                 version: version.to_string(),
                 root: ROOT.to_string(),
@@ -2411,6 +2472,7 @@ fn a_nested_debugger_root_resolves_module_files_beside_its_root() {
             kind: ruddy::artifact::Kind::Library,
             target: None,
             platform: None,
+            integers: None,
             name: "demo".into(),
             version: "0.1.0".into(),
             root: "src/main.rud".into(),
@@ -2741,6 +2803,7 @@ fn only_the_stages_that_own_a_phase_report_a_time() {
             "entry",
             "linked",
             "js",
+            "portable",
             "types-ir"
         ]
     );
@@ -3908,4 +3971,207 @@ fn recovered_buffers_keep_semantics_and_requested_solver_traces() {
         assert_eq!(stage.status, Status::Partial);
     }
     assert_eq!(stage_named(&snapshot, "lir").status, Status::Skipped);
+}
+
+/// The debugger shows both hidden forms: the tokens tab owns a label for the
+/// keyword, and the AST tab renders each form as a node with the variable it
+/// binds as a child of its own, beside the body or the payload.
+#[test]
+fn hidden_forms_are_shown_by_the_tokens_and_ast_tabs() {
+    let snapshot =
+        snapshot("type Box = hide 'a => 'a\nlet f = fn v => match v with | hide 'a x => x end\n");
+    assert!(snapshot.panic.is_none());
+    let tokens = stage_named(&snapshot, "tokens");
+    assert!(
+        nodes(tokens).iter().any(|node| node.label == "Hide"),
+        "the tokens tab shows no Hide"
+    );
+    let ast = stage_named(&snapshot, "ast");
+    let labels: Vec<&str> = nodes(ast).iter().map(|node| node.label.as_str()).collect();
+    assert_eq!(
+        labels.iter().filter(|label| **label == "Hidden").count(),
+        2,
+        "{labels:?}"
+    );
+    assert!(
+        nodes(ast)
+            .iter()
+            .any(|node| node.label == "Variable" && node.text == "'a"),
+        "{labels:?}"
+    );
+}
+
+/// The debugger shows hidden types where inference works with them: the IR
+/// tab renders the hidden type, its binder, the opened type an annotation
+/// names, and the `hide` pattern; the constraints tab shows an opening and a
+/// packaging as constraints of their own, and the solver's steps name their
+/// rules.
+#[test]
+fn hidden_types_are_shown_by_the_ir_and_constraints_tabs() {
+    let snapshot = snapshot(
+        "type Box = hide 'a => { value: 'a }\n\
+         let one: Box = { value: 1n }\n\
+         let opened = match one with | hide 'v { value } => do let held: 'v = value return 0n end end\n",
+    );
+    assert!(snapshot.panic.is_none());
+    let labels = |id: &str| -> Vec<String> {
+        nodes(stage_named(&snapshot, id))
+            .iter()
+            .map(|node| node.label.clone())
+            .collect()
+    };
+    let ir = labels("ir");
+    for label in ["Hidden", "Binder", "Scoped"] {
+        assert!(
+            ir.iter().any(|found| found == label),
+            "ir lacks {label}: {ir:?}"
+        );
+    }
+    let constraints = labels("constraints");
+    for label in ["introduce", "open", "scoped"] {
+        assert!(
+            constraints.iter().any(|found| found == label),
+            "constraints lack {label}: {constraints:?}"
+        );
+    }
+    let solve = stage_named(&snapshot, "solve");
+    let text = format!("{:?}", nodes(solve));
+    for rule in ["witness", "open"] {
+        assert!(text.contains(rule), "the solve tab shows no {rule} step");
+    }
+}
+
+#[test]
+fn pattern_bound_mirrors_are_shown_by_the_reification_tab() {
+    let snapshot = snapshot(
+        "@private extern type_of: 'a -> Mirror 'a = \"$typeOf\"\n\
+         type Dyn = hide 'a => { value: 'a, evidence: Mirror 'a }\n\
+         let echo: Dyn -> Dyn = fn item => match item with\n\
+         | hide 'x { value, evidence } => { value: value, evidence: type_of value }\n\
+         end\n",
+    );
+    assert!(
+        snapshot.diagnostics.is_empty(),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+    let stage = stage_named(&snapshot, "reification");
+    assert!(
+        nodes(stage)
+            .iter()
+            .any(|node| node.label == "evidence" && node.text.contains("evidence for type")),
+        "{:#?}",
+        stage.nodes
+    );
+}
+
+#[test]
+fn a_request_may_bind_the_integer_domains() {
+    let request = |integers: Option<u32>| CompileRequest {
+        kind: ruddy::artifact::Kind::Library,
+        target: Some(ruddy_cli::Target::Js),
+        platform: None,
+        integers,
+        name: "demo".to_string(),
+        version: "0.1.0".to_string(),
+        root: ROOT.to_string(),
+        document: "demo".to_string(),
+        files: vec![FileSpec {
+            path: ROOT.to_string(),
+            source: "let value = 4294967296n\n".to_string(),
+        }],
+        std: StdConfig::Disabled,
+        dependencies: IndexMap::new(),
+        revision: 3,
+    };
+    let wide = compile(&request(None), 1);
+    assert!(wide.diagnostics.is_empty(), "{:#?}", wide.diagnostics);
+    let narrow = compile(&request(Some(32)), 1);
+    assert_eq!(
+        narrow
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code.to_string())
+            .collect::<Vec<_>>(),
+        ["literal-outside-domain"]
+    );
+}
+
+/// A target and an integer precision the compiler cannot bind together is a
+/// refused configuration, not a silent fall back to the default. JavaScript
+/// holds no 64-bit `Nat`, and two literals a 64-bit domain tells apart would
+/// collapse to one `number` if the build went ahead.
+#[test]
+fn a_request_the_compiler_cannot_bind_compiles_nothing() {
+    let request = |target: ruddy_cli::Target, integers: Option<u32>, source: &str| CompileRequest {
+        kind: ruddy::artifact::Kind::Library,
+        target: Some(target),
+        platform: None,
+        integers,
+        name: "demo".to_string(),
+        version: "0.1.0".to_string(),
+        root: ROOT.to_string(),
+        document: "demo".to_string(),
+        files: vec![FileSpec {
+            path: ROOT.to_string(),
+            source: source.to_string(),
+        }],
+        std: StdConfig::Disabled,
+        dependencies: IndexMap::new(),
+        revision: 3,
+    };
+    // Two literals a 64-bit domain tells apart, which one JavaScript number
+    // cannot.
+    let distinct = "let distinct = match 9007199254740993n with\n| 9007199254740992n => false\n| _ => true\nend\n";
+    let codes = |snapshot: &ruddy_debug::wire::Snapshot| -> Vec<String> {
+        snapshot
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code.to_string())
+            .collect()
+    };
+    let compiled = |snapshot: &ruddy_debug::wire::Snapshot| -> bool {
+        snapshot
+            .stages
+            .iter()
+            .any(|stage| stage.id == "js" && stage.status != Status::Skipped)
+    };
+
+    for integers in [Some(64), Some(17)] {
+        let refused = compile(&request(ruddy_cli::Target::Js, integers, distinct), 1);
+        assert_eq!(codes(&refused), ["manifest-invalid"], "{integers:?}");
+        assert!(!compiled(&refused), "{integers:?} produced JavaScript");
+        // Nothing was compiled at all, so no phase over source reports a
+        // result. The error strip and the dependency list are about the
+        // request rather than about compiling it.
+        assert!(
+            refused.stages.iter().all(|stage| {
+                stage.status == Status::Skipped
+                    || stage.id == "errors"
+                    || stage.id == "dependencies"
+            }),
+            "{integers:?}: {:#?}",
+            refused
+                .stages
+                .iter()
+                .map(|stage| (stage.id, stage.status))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // The supported combinations still compile: 32- and 53-bit JavaScript,
+    // and 64-bit for a target that holds it.
+    for (target, integers) in [
+        (ruddy_cli::Target::Js, Some(32)),
+        (ruddy_cli::Target::Js, Some(53)),
+        (ruddy_cli::Target::Js, None),
+        (ruddy_cli::Target::Artifact, Some(64)),
+    ] {
+        let built = compile(&request(target, integers, "let value = 1n\n"), 1);
+        assert!(
+            codes(&built).is_empty(),
+            "{target:?} {integers:?}: {:#?}",
+            built.diagnostics
+        );
+    }
 }

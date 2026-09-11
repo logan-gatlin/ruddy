@@ -6775,6 +6775,7 @@ fn prelude_artifact(bundle: &str) -> a::UncheckedArtifact {
         header: a::Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: bundle.into(),
@@ -7080,6 +7081,7 @@ fn effect_artifact(bundle: &str, interface: &str) -> a::UncheckedArtifact {
         header: a::Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: bundle.into(),
@@ -7605,6 +7607,7 @@ fn a_direct_only_interface_with_a_transitive_type_recovers_without_panicking() {
         header: a::Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".to_string(),
@@ -7658,6 +7661,7 @@ fn missing_transitive_type_applications_keep_distinct_effect_identities() {
         header: a::Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
@@ -7745,6 +7749,7 @@ fn direct_only_transitive_effects_keep_qualified_recovery_identity() {
         header: a::Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
@@ -8704,6 +8709,7 @@ fn row_composition_is_flattened_across_local_and_imported_types() {
         header: a::Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
@@ -8811,6 +8817,7 @@ fn structural_rows_mask_inner_duplicates_and_preserve_ordinary_separator_labels(
         header: a::Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
@@ -8927,6 +8934,7 @@ fn absent_semantic_payloads_do_not_affect_structural_identity() {
         header: a::Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
@@ -9089,6 +9097,7 @@ fn local_and_imported_structural_types_share_one_canonical_encoding() {
         header: a::Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
@@ -9162,6 +9171,7 @@ fn imported_interfaces_keep_applied_types_effects_and_alias_overlap_structural()
         header: a::Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
@@ -9431,6 +9441,7 @@ fn imported_declared_types_exercise_every_semantic_identity_form() {
         header: a::Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
@@ -9524,6 +9535,7 @@ fn imported_alias_cycles_recover_without_a_spurious_structural_identity() {
         header: a::Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
@@ -9798,6 +9810,7 @@ fn dependency_interfaces_import_every_semantic_form() {
         header: a::Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".to_string(),
@@ -13926,4 +13939,121 @@ fn metadata_nesting_is_bounded() {
         printed[0].1,
         format!("{}(){}", "[".repeat(limit), "]".repeat(limit))
     );
+}
+
+/// A hidden type binds its variable for its body and nowhere else, with an
+/// id of its own; the type an arm's `hide` pattern opens is what the body's
+/// annotations name; and the nearest `hide` wins over a declaration's
+/// parameter of the same spelling.
+#[test]
+fn hidden_types_and_patterns_lower_with_scoped_variables() {
+    let src = "type Box 'a = hide 'a => { value: 'a, show: 'a -> String }\n\
+               let f = fn b => match b with\n\
+               | hide 'v { value, show } => do let held: 'v = value return show held end\n\
+               end";
+    let (mint, out) = built(src);
+    let symbol = type_symbol(&mint, &out, "Box");
+    let TypeKind::Hidden { id, name, body } = &out.program.types[&symbol].value.anchored else {
+        panic!("expected a hidden type");
+    };
+    assert_eq!(name, "a");
+    let TypeKind::Struct { fields, .. } = &body.anchored else {
+        panic!("expected a struct body");
+    };
+    let TypeField::Written { value, .. } = &fields["value"] else {
+        panic!("expected a written field");
+    };
+    assert!(
+        matches!(&value.anchored, TypeKind::Scoped { id: bound, name } if bound == id && name == "a")
+    );
+    let TypeField::Written { value: show, .. } = &fields["show"] else {
+        panic!("expected a written field");
+    };
+    let TypeKind::Arrow { from, .. } = &show.anchored else {
+        panic!("expected an arrow");
+    };
+    assert!(matches!(&from.anchored, TypeKind::Scoped { id: bound, .. } if bound == id));
+
+    // The arm's pattern opens `'v`, and the annotation on `held` names it.
+    let f = term_symbol(&mint, &out, "f");
+    let TermKind::Fn { body, .. } = &out.program.terms[&f].value.kind else {
+        panic!("expected a function");
+    };
+    let TermKind::Match { arms, .. } = &body.kind else {
+        panic!("expected a match");
+    };
+    let [(pattern, arm)] = arms.as_slice() else {
+        panic!("expected one arm");
+    };
+    let PatternKind::Hidden {
+        id: opened,
+        name,
+        pattern: payload,
+    } = &pattern.anchored
+    else {
+        panic!("expected a hidden pattern");
+    };
+    assert_eq!(name.anchored, "v");
+    assert_ne!(opened, id);
+    assert!(matches!(&payload.anchored, PatternKind::Struct { .. }));
+    let TermKind::Let { annotation, .. } = &arm.kind else {
+        panic!("expected the block's binding");
+    };
+    let annotation = annotation.as_ref().expect("the annotation on `held`");
+    assert!(
+        matches!(&annotation.ty.anchored, TypeKind::Scoped { id, name } if id == opened && name == "v")
+    );
+    assert!(annotation.variables.is_empty());
+}
+
+/// A binding cannot open a hidden type — the type an opening introduces is
+/// scoped to a match arm — and the name a `hide` binds is a type and nothing
+/// else: as a row's tail, a presence, or a region it is refused.
+#[test]
+fn hidden_openings_and_misused_hidden_names_are_reported() {
+    let src = "let hide 'a x = 1n";
+    let (_, out) = build_src(src);
+    let [error] = out.errors.as_slice() else {
+        panic!("expected one error: {:#?}", out.errors);
+    };
+    assert!(matches!(error.kind, ErrorKind::HiddenOutsideMatch));
+    assert_eq!(
+        out.source.span(error.at).start,
+        src.find("hide").expect("the keyword")
+    );
+
+    let src =
+        "let f = fn b => match b with | hide 'a { x } => do let y: { ..'a } = x return y end end";
+    let (_, out) = build_src(src);
+    let [error] = out.errors.as_slice() else {
+        panic!("expected one error: {:#?}", out.errors);
+    };
+    assert!(matches!(
+        &error.kind,
+        ErrorKind::HiddenVariableSense { name, sense: Sense::Row } if name == "a"
+    ));
+    assert_eq!(
+        out.source.span(error.at).start,
+        src.find("'a }").expect("the tail")
+    );
+
+    for (src, sense) in [
+        ("type T = hide 'a => mut 'a Nat", Sense::Region),
+        ("let f: hide 'a => { x when 'a: Nat } = 1n", Sense::Presence),
+        ("type T = hide 'a => #A | ..'a", Sense::Row),
+        ("type T = hide 'a => () -> () + ..'a", Sense::Effects),
+    ] {
+        let (_, out) = build_src(src);
+        let [error] = out.errors.as_slice() else {
+            panic!("{src}: expected one error: {:#?}", out.errors);
+        };
+        assert!(
+            matches!(
+                &error.kind,
+                ErrorKind::HiddenVariableSense { name, sense: found } if name == "a" && *found == sense
+            ),
+            "{src}: {:#?}",
+            error.kind
+        );
+    }
 }

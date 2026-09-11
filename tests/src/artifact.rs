@@ -102,13 +102,13 @@ fn shared_rows_round_trip_and_import_with_their_exclusions() {
 #[test]
 fn shared_rows_reify_with_the_enclosing_constructor() {
     let artifact = built(
-        "extern box : 'a -> Any = \"$anyUpcast\"\n\
+        "@private extern type_of : 'a -> Mirror 'a = \"$typeOf\"\n\
          type Sum 'r = | ..'r\n\
          type Struct 'r = { ..'r }\n\
          let choice : Sum { A: Nat } = #A 1n\n\
          let product : Struct (#A Nat) = { A: 2n }\n\
-         let boxed_choice = box choice\n\
-         let boxed_product = box product",
+         let mirrored_choice = type_of choice\n\
+         let mirrored_product = type_of product",
     );
     assert_round_trip(&artifact);
     let descriptors: Vec<_> = artifact
@@ -129,7 +129,7 @@ fn shared_rows_reify_with_the_enclosing_constructor() {
 #[test]
 fn reification_artifacts_validate_descriptor_graphs_and_evidence_layouts() {
     let artifact = built(
-        "extern box: 'a -> Any = \"$anyUpcast\"\nlet wrapped = box 1n\nlet identity = fn x => x",
+        "type Option 'a = #Some 'a | #None\ntype Any = hide 'a => { mirror: Mirror 'a, value: 'a }\n@private extern type_of: 'a -> Mirror 'a = \"$typeOf\"\n@private extern mirror: () -> Mirror 'a = \"$mirror\"\n@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = \"$sameMirror\"\nlet box: 'a -> Any = fn value => { mirror: type_of value, value: value }\nlet wrapped = box 1n\nlet identity = fn x => x",
     );
     let box_value = artifact
         .header()
@@ -223,6 +223,7 @@ fn exporting(mint: &Mint, scheme: &types::Scheme) -> Artifact {
         header: artifact::Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: artifact::Identity {
                 name: name.clone(),
@@ -466,6 +467,7 @@ fn model_artifact() -> Artifact {
         header: artifact::Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: artifact::Identity {
                 name: "bundle".to_string(),
@@ -1149,6 +1151,7 @@ fn canonical_pretty_layout_is_pinned_at_its_unicode_width_boundary() {
             header: artifact::Header {
                 kind: ruddy::artifact::Kind::Library,
                 compiler: ruddy::artifact::Stamp::current(),
+                domains: ruddy::types::Domains::default(),
                 modules: Vec::new(),
                 identity: artifact::Identity {
                     name,
@@ -1182,6 +1185,7 @@ fn canonical_pretty_layout_is_pinned_at_its_unicode_width_boundary() {
          \x20   (kind library)\n\
          \x20   (identity \"界界界界界界界界界界界界\" \"1\")\n\
          \x20   (compiler \"{compiler}\")\n\
+         \x20   (domains 53)\n\
          \x20   (dependencies)\n\
          \x20   (values)\n\
          \x20   (types)\n\
@@ -1198,6 +1202,7 @@ fn canonical_pretty_layout_is_pinned_at_its_unicode_width_boundary() {
          \x20   (kind library)\n\
          \x20   (identity \"界界界界界界界界界界界界界\" \"1\")\n\
          \x20   (compiler \"{compiler}\")\n\
+         \x20   (domains 53)\n\
          \x20   (dependencies)\n\
          \x20   (values)\n\
          \x20   (types)\n\
@@ -1727,6 +1732,7 @@ fn deeply_nested_artifact_semantics_decode_on_a_small_stack() {
         header: artifact::Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: artifact::Identity {
                 name: "deep".to_string(),
@@ -1961,6 +1967,7 @@ fn recursive_artifact_ownership_clones_and_drops_on_a_small_stack() {
                 header: artifact::Header {
                     kind: ruddy::artifact::Kind::Library,
                     compiler: ruddy::artifact::Stamp::current(),
+                    domains: ruddy::types::Domains::default(),
                     modules: Vec::new(),
                     identity: artifact::Identity {
                         name: "deep".into(),
@@ -2105,7 +2112,7 @@ fn valid_deep_artifact_parses_and_drops_on_a_small_stack() {
         serde_json::to_string(r#"{"externs":[],"functions":[],"globals":[]}"#).unwrap()
     );
     let valid = format!(
-        "(artifact (header (kind library) (identity \"deep\" \"1\") (compiler \"0000000000000000\") (dependencies) \
+        "(artifact (header (kind library) (identity \"deep\" \"1\") (compiler \"0000000000000000\") (domains 53) (dependencies) \
          (values (value \"deep@1::value\" (scheme 0 0 (existentials) {formula} (ty nat)) (metadata))) \
          (types) (effects) (modules)) {empty_lir})"
     );
@@ -2167,7 +2174,7 @@ fn rejected_deep_semantic_model_is_destroyed_on_a_small_stack() {
     const DEPTH: usize = 30_000;
     let formula = format!("{}true{}", "(not ".repeat(DEPTH), ")".repeat(DEPTH));
     let malformed = format!(
-        "(artifact (header (kind library) (identity \"deep\" \"1\") (compiler \"0000000000000000\") (dependencies) \
+        "(artifact (header (kind library) (identity \"deep\" \"1\") (compiler \"0000000000000000\") (domains 53) (dependencies) \
          (values (value \"deep@1::value\" (scheme 0 0 (existentials) {formula} (ty (struct (row (labels) closed)))) (metadata))) \
          (types) (effects) (modules)) (cps-lir wrong))"
     );
@@ -2933,7 +2940,12 @@ fn reification_artifacts_validate_callable_requirement_interfaces() {
 fn reification_artifacts_validate_component_descriptor_projections() {
     let artifact = built(
         r#"
-extern box: 'a -> Any = "$anyUpcast"
+type Option 'a = #Some 'a | #None
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
 let apply = fn call value => call value
 let element = fn values => match values with | [value, ..] => box value | _ => box () end
 let consume = apply element
@@ -2981,7 +2993,7 @@ fn reification_artifacts_reject_changed_published_callable_contracts() {
         "let helper = { nested: fn value => box value }",
     ] {
         let artifact = built(&format!(
-            "@private extern box: 'a -> Any = \"$anyUpcast\"\n{source}"
+            "type Any = hide 'a => {{ mirror: Mirror 'a, value: 'a }}\n@private extern type_of: 'a -> Mirror 'a = \"$typeOf\"\n@private let box: 'a -> Any = fn value => {{ mirror: type_of value, value: value }}\n{source}"
         ));
         for corruption in 0..3 {
             let mut changed = artifact.clone().to_unchecked();
@@ -3029,6 +3041,271 @@ fn reification_artifacts_reject_changed_published_callable_contracts() {
                 "changed executable contract: {source}, {corruption}"
             );
         }
+    }
+}
+
+/// A hidden type crosses the artifact boundary as its binder and the bound
+/// occurrences inside its body, printed as text and parsed back to the same
+/// artifact — through an alias, an extern's nested hidden result, and a
+/// definition that opens one.
+#[test]
+fn hidden_types_round_trip_through_artifact_text() {
+    let artifact = built(
+        "type Box = hide 'a => { value: 'a, show: 'a -> String }\n\
+         extern make: () -> Box = \"host.make\"\n\
+         extern nested: () -> hide 'a => hide 'b => ('a, 'b) = \"host.nested\"\n\
+         let describe: Box -> String = fn box => match box with\n\
+         | hide 'v { value, show } => show value\n\
+         end",
+    );
+    let printed = assert_round_trip(&artifact);
+    assert!(printed.contains("(hidden "), "{printed}");
+    assert!(printed.contains("(hidden-var "), "{printed}");
+}
+
+#[test]
+fn reflection_artifacts_validate_mirror_intrinsics() {
+    let artifact = built(&format!(
+        r#"
+{}
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern describe: Mirror 'a -> Description = "$describe"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option {{ forward: 'a -> 'b, backward: 'b -> 'a }} = "$sameMirror"
+@private extern shape: Mirror 'a -> Shape 'a = "$shape"
+let of_nat: Mirror Nat = mirror ()
+let of_value = type_of "text"
+let described = describe of_nat
+let compared = same_pair (of_nat, of_value)
+let shaped = shape of_nat
+"#,
+        crate::inference::SHAPE_SOURCE
+    ));
+    assert!(artifact::parse(&artifact.print()).validate().is_ok());
+    use ruddy::reification::Intrinsic;
+    for (kind, corruption) in [
+        (Intrinsic::Mirror, 0),
+        (Intrinsic::TypeOf, 0),
+        (Intrinsic::Describe, 0),
+        (Intrinsic::Describe, 1),
+        (Intrinsic::Same, 0),
+        (Intrinsic::Same, 1),
+        (Intrinsic::Same, 2),
+        (Intrinsic::Shape, 0),
+        (Intrinsic::Shape, 1),
+    ] {
+        let mut changed = artifact.clone().to_unchecked();
+        let block = changed
+            .lir
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.blocks)
+            .find(|block| {
+                block.instrs.iter().any(
+                    |instruction| matches!(&instruction.op, Op::Reflect { kind: k, .. } if *k == kind),
+                )
+            })
+            .expect("each mirror intrinsic reflects once");
+        let at = block
+            .instrs
+            .iter()
+            .position(|instruction| matches!(&instruction.op, Op::Reflect { .. }))
+            .unwrap();
+        // A number the intrinsic could be handed instead of what it takes.
+        block.instrs.insert(
+            0,
+            Instr {
+                temp: 999,
+                rep: Rep::Nat,
+                op: Op::Const(Literal::Natural(0)),
+            },
+        );
+        let instruction = &mut block.instrs[at + 1];
+        let Op::Reflect {
+            descriptor, value, ..
+        } = &mut instruction.op
+        else {
+            unreachable!()
+        };
+        match corruption {
+            0 => instruction.rep = Rep::Nat,
+            1 => *value = 999,
+            _ => *descriptor = *value,
+        }
+        let message = changed.validate().unwrap_err().to_string();
+        assert!(
+            message.contains("mirror") || message.contains("descriptor"),
+            "{kind:?} {corruption}: {message}"
+        );
+    }
+}
+
+/// The two directions of a checked foreign conversion carry the same
+/// representation contract, and an artifact that breaks it is refused.
+#[test]
+fn reflection_artifacts_validate_foreign_conversions() {
+    let artifact = built(&format!(
+        r#"
+{}
+type DecodeError = {{ path: String, expected: String, message: String }}
+@private extern read: ForeignValue -> Result 'a DecodeError = "$ffiDecode"
+@private extern write: 'a -> Result ForeignValue DecodeError = "$ffiEncode"
+let written = write {{ count: 1n }}
+let parsed: Result {{ count: Nat }} DecodeError = match written with
+| #Some raw => read raw
+| #Error error => #Error error
+end
+"#,
+        crate::inference::SHAPE_SOURCE
+    ));
+    assert!(artifact::parse(&artifact.print()).validate().is_ok());
+    use ruddy::reification::Intrinsic;
+    for (kind, corruption, expected) in [
+        (Intrinsic::Decode, 0, "decoding requires ForeignValue"),
+        (Intrinsic::Decode, 1, "decoding requires ForeignValue"),
+        (Intrinsic::Encode, 0, "encoding returns Result"),
+    ] {
+        let mut changed = artifact.clone().to_unchecked();
+        let block = changed
+            .lir
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.blocks)
+            .find(|block| {
+                block.instrs.iter().any(
+                    |instruction| matches!(&instruction.op, Op::Reflect { kind: k, .. } if *k == kind),
+                )
+            })
+            .unwrap_or_else(|| panic!("{kind:?} converts once"));
+        let at = block
+            .instrs
+            .iter()
+            .position(|instruction| matches!(&instruction.op, Op::Reflect { .. }))
+            .unwrap();
+        // A number the conversion could be handed instead of what it takes.
+        block.instrs.insert(
+            0,
+            Instr {
+                temp: 999,
+                rep: Rep::Nat,
+                op: Op::Const(Literal::Natural(0)),
+            },
+        );
+        let instruction = &mut block.instrs[at + 1];
+        let Op::Reflect { value, .. } = &mut instruction.op else {
+            unreachable!()
+        };
+        if corruption == 0 {
+            instruction.rep = Rep::Nat;
+        } else {
+            *value = 999;
+        }
+        let message = changed.validate().unwrap_err().to_string();
+        assert!(
+            message.contains(expected),
+            "{kind:?} {corruption}: {message}"
+        );
+    }
+}
+
+#[test]
+fn artifact_headers_record_the_bound_domains() {
+    let artifact = built("let value = 1n");
+    assert_eq!(artifact.header().domains, ruddy::types::Domains::Js53);
+    let text = artifact.print();
+    assert!(text.contains("(domains 53)"), "{text}");
+    let mut wide = artifact.clone().to_unchecked();
+    wide.header.domains = ruddy::types::Domains::Bits32;
+    let wide = wide.validate().unwrap();
+    assert_eq!(wide.print().matches("(domains 32)").count(), 1);
+    assert_eq!(
+        artifact::parse(&wide.print())
+            .validate()
+            .unwrap()
+            .header()
+            .domains,
+        ruddy::types::Domains::Bits32
+    );
+    let broken = text.replace("(domains 53)", "(domains 48)");
+    assert!(
+        artifact::text::try_parse(&broken)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid target domains")
+    );
+}
+
+#[test]
+fn effect_rows_in_descriptors_validate_their_references() {
+    let artifact = built(
+        r#"
+effect Tick = () -> ()
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+let ticking: () -> Nat + !Tick = fn _ => do _ = !Tick () return 2n end
+let mirror = type_of ticking
+"#,
+    );
+    let descriptor = artifact
+        .lir()
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instrs)
+        .find_map(|instruction| {
+            match &instruction.op {
+            Op::TypeDescriptor { template, .. } if template.nodes.iter().any(|node| {
+                matches!(node, ruddy::reification::Node::Effects(effects) if !effects.is_empty())
+            }) =>
+            {
+                Some(template.clone())
+            }
+            _ => None,
+        }
+        })
+        .expect("the effectful function's descriptor carries its row");
+    let effects = descriptor
+        .nodes
+        .iter()
+        .find_map(|node| match node {
+            ruddy::reification::Node::Effects(effects) => Some(effects.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(effects.len(), 1);
+    assert!(
+        effects[0].identity.starts_with("effect:"),
+        "{:?}",
+        effects[0]
+    );
+    assert!(artifact::parse(&artifact.print()).validate().is_ok());
+    for corruption in 0..2 {
+        let mut changed = artifact.clone().to_unchecked();
+        let template = changed
+            .lir
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.blocks)
+            .flat_map(|block| &mut block.instrs)
+            .find_map(|instruction| match &mut instruction.op {
+                Op::TypeDescriptor { template, .. } if template.nodes.iter().any(|node| {
+                    matches!(node, ruddy::reification::Node::Effects(effects) if !effects.is_empty())
+                }) =>
+                {
+                    Some(template)
+                }
+                _ => None,
+            })
+            .unwrap();
+        for node in &mut template.nodes {
+            if let ruddy::reification::Node::Effects(effects) = node {
+                if corruption == 0 {
+                    effects[0].payload = u32::MAX;
+                } else {
+                    effects[0].args.push(u32::MAX);
+                }
+            }
+        }
+        assert!(changed.validate().is_err(), "corruption {corruption}");
     }
 }
 

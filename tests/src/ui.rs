@@ -81,6 +81,28 @@ fn inference_error_kinds(span: Anchor) -> Vec<TypeError> {
             destination_name: "outside".into(),
             destination_span: span,
         },
+        TypeError::HiddenEscapes {
+            name: "v".into(),
+            declared: span,
+        },
+        TypeError::HiddenUnknown {
+            name: "v".into(),
+            declared: span,
+        },
+        TypeError::NotHidden {
+            name: "v".into(),
+            declared: span,
+            found: nat.clone(),
+        },
+        TypeError::HiddenWitness {
+            name: "a".into(),
+            package: nat.clone(),
+        },
+        TypeError::HiddenRegion {
+            name: "a".into(),
+            package: nat.clone(),
+            witness: nat.clone(),
+        },
         TypeError::RepeatedField {
             shape: Shape::Struct,
             field: "x".to_string(),
@@ -221,6 +243,11 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         all.push(("ir", kind.code(), kind.to_string()));
     }
     for kind in [
+        IrError::LiteralOutsideDomain {
+            literal: "4294967296n".to_string(),
+            primitive: "Nat",
+            bounds: ruddy::types::Domains::Bits32.nat(),
+        },
         IrError::InvalidDependencyAlias {
             alias: "bad-alias".to_string(),
         },
@@ -391,6 +418,9 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
 /// what [`every_rule_is_named_and_explained_distinctly`] exists to refuse.
 const RULES: &[Rule] = &[
     Rule::Absorb,
+    Rule::Hidden,
+    Rule::Open,
+    Rule::Witness,
     Rule::Same,
     Rule::Congruent,
     Rule::Bind,
@@ -638,7 +668,7 @@ fn every_inference_error_exposes_a_complete_structured_diagnostic() {
     let use_span = map.record(Symbol::GENERATED, 0, Span::generated(4, 5));
     let declared = map.record(Symbol::GENERATED, 0, Span::generated(1, 2));
     let kinds = inference_error_kinds(declared);
-    assert_eq!(kinds.len(), 20);
+    assert_eq!(kinds.len(), 25);
 
     for kind in kinds {
         let diagnostic = inference::Error::new(use_span, kind).diagnostic(&map);
@@ -2219,6 +2249,26 @@ fn inference_source_corpus_matches_abridged_structured_goldens() {
         (
             "long-alias",
             include_str!("../diagnostics/inference/long-alias.rud"),
+        ),
+        (
+            "hidden-escapes",
+            include_str!("../diagnostics/inference/hidden-escapes.rud"),
+        ),
+        (
+            "hidden-unknown",
+            include_str!("../diagnostics/inference/hidden-unknown.rud"),
+        ),
+        (
+            "not-hidden",
+            include_str!("../diagnostics/inference/not-hidden.rud"),
+        ),
+        (
+            "hidden-witness",
+            include_str!("../diagnostics/inference/hidden-witness.rud"),
+        ),
+        (
+            "hidden-region",
+            include_str!("../diagnostics/inference/hidden-region.rud"),
         ),
     ];
 
@@ -5493,4 +5543,97 @@ fn metadata_diagnostics_are_pinned() {
         deep.help,
         ["metadata may nest at most 32 levels of arrays, structs, and tag payloads"]
     );
+}
+
+/// The reserved word prints as it was written, a hidden pattern prints with
+/// its payload grouped as a tag's is, and the complaint about the syntax
+/// having no meaning yet says so in plain words.
+#[test]
+fn hidden_forms_print_and_the_unsupported_complaint_reads_plainly() {
+    assert_eq!(TokenKind::Hide.to_string(), "hide");
+    let span = Span::generated(0, 1);
+    let name = |text: &str| span.track(text.to_string());
+    let carried = parse::PatternKind::Tag {
+        name: name("Some"),
+        payload: Some(Box::new(
+            span.track(parse::PatternKind::Ident { name: name("y") }),
+        )),
+    };
+    let hidden = parse::PatternKind::Hidden {
+        variable: name("x"),
+        pattern: Box::new(span.track(carried)),
+    };
+    assert_eq!(hidden.to_string(), "hide 'x (#Some y)");
+    let bare = parse::PatternKind::Hidden {
+        variable: name("w"),
+        pattern: Box::new(span.track(parse::PatternKind::Ident { name: name("w") })),
+    };
+    assert_eq!(bare.to_string(), "hide 'w w");
+
+    let mut map = SourceMap::default();
+    let at = map.record(Symbol::GENERATED, 0, Span::generated(0, 4));
+    let outside = ir::Error {
+        at,
+        kind: IrError::HiddenOutsideMatch,
+    }
+    .diagnostic(&map);
+    assert_eq!(outside.code, "hidden-outside-match");
+    assert_eq!(
+        outside.title,
+        "a hidden type can only be opened in a `match` arm"
+    );
+    assert_eq!(
+        outside.primary.message,
+        "this `hide` pattern is in a binding"
+    );
+    assert_eq!(
+        outside.help,
+        ["match on the value instead, and open it in an arm"]
+    );
+    let literal = ir::Error {
+        at,
+        kind: IrError::LiteralOutsideDomain {
+            literal: "-9007199254740992i".to_string(),
+            primitive: "Int",
+            bounds: ruddy::types::Domains::Js53.int(),
+        },
+    }
+    .diagnostic(&map);
+    assert_eq!(literal.code, "literal-outside-domain");
+    assert_eq!(
+        literal.title,
+        "the literal `-9007199254740992i` is outside the target's Int domain, -9007199254740991 to 9007199254740991"
+    );
+    assert_eq!(
+        literal.primary.message,
+        "Int has 53 bits of precision on this target"
+    );
+    assert_eq!(
+        literal.help,
+        [
+            "write a value the target holds, or use a fixed-width integer type such as Nat64 or Int64"
+        ]
+    );
+    for (sense, noun) in [
+        (Sense::Type, "used here"),
+        (Sense::Region, "a region"),
+        (Sense::Presence, "a presence"),
+        (Sense::Row, "a row of fields or cases"),
+        (Sense::Effects, "a row of effects"),
+    ] {
+        let misused = ir::Error {
+            at,
+            kind: IrError::HiddenVariableSense {
+                name: "a".to_string(),
+                sense,
+            },
+        }
+        .diagnostic(&map);
+        assert_eq!(misused.code, "hidden-variable-sense");
+        assert_eq!(
+            misused.title,
+            format!("`'a` names a hidden type, so it cannot be {noun}")
+        );
+        assert_eq!(misused.primary.message, "bound by a `hide` as a type");
+    }
 }

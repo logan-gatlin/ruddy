@@ -1,1 +1,15 @@
 effect Exit = Nat -> |
+let exit = !Exit
+
+type ErrorKind = #InvalidName | #Unavailable | #Other
+type Error = { kind: ErrorKind, message: String }
+@doc "Read the host process. A local handler can supply arguments, environment, and a working directory."
+effect Process = {
+  args: () -> [String],
+  env: String -> Result (Option String) Error,
+  cwd: () -> Result String Error,
+}
+@doc "Application arguments, excluding the Node executable and script path."
+let args = !Process.args
+let env = !Process.env
+let cwd = !Process.cwd

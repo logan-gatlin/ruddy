@@ -155,7 +155,7 @@ impl Validator<'_> {
                             work.push(Work::Ty(region, Some(Sense::Region)));
                             work.push(Work::Ty(element, Some(Sense::Type)));
                         }
-                        Type::Package(inner) | Type::Array(inner) => {
+                        Type::Package(inner) | Type::Array(inner) | Type::Mirror(inner) => {
                             work.push(Work::Ty(inner, Some(Sense::Type)))
                         }
                         Type::Arrow(from, to, row) => {

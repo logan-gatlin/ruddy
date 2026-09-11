@@ -163,6 +163,7 @@
   "end"
   "with"
   "match"
+  "hide"
   "fn"
   "effect"
   "handle"

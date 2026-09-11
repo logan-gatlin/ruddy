@@ -2948,10 +2948,19 @@ dependencies = [
  "indexmap",
  "ruddy",
  "ruddy-compiler",
+ "ruddy-interp",
  "serde",
  "serde_json",
  "tiny_http",
  "toml",
+]
+
+[[package]]
+name = "ruddy-interp"
+version = "0.1.0"
+dependencies = [
+ "indexmap",
+ "ruddy-compiler",
 ]
 
 [[package]]
@@ -2965,6 +2974,7 @@ dependencies = [
  "ruddy",
  "ruddy-compiler",
  "ruddy-debug",
+ "ruddy-interp",
  "serde_json",
  "tempfile",
  "toml",

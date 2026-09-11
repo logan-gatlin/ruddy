@@ -579,6 +579,7 @@ fn deep_alias_chains_and_generic_interfaces_use_bounded_stack() {
                 header: ruddy::artifact::Header {
                     kind: ruddy::artifact::Kind::Library,
                     compiler: ruddy::artifact::Stamp::current(),
+                    domains: ruddy::types::Domains::default(),
                     modules: Vec::new(),
                     identity: ruddy::artifact::Identity {
                         name: "dep".into(),
@@ -1150,7 +1151,12 @@ fn mutation_region_kinds_forward_from_imported_effects() {
 fn reification_callable_interfaces_separate_initialization_and_curried_demands() {
     use ruddy::reification::conventions::Shape;
     let source = r#"
-extern box: 'a -> Any = "$anyUpcast"
+type Option 'a = #Some 'a | #None
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
 let pair = fn first => fn second => (box first, box second)
 let partial = pair 1n
 let erased = fn value => value
@@ -1261,7 +1267,12 @@ let retained = first (fn _ => token) box
 fn reification_callable_interfaces_solve_polymorphic_recursive_groups() {
     use ruddy::reification::conventions::Shape;
     let source = r#"
-extern box: 'a -> Any = "$anyUpcast"
+type Option 'a = #Some 'a | #None
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
 let left: 'a -> Any = fn value => right [value]
 let right: 'a -> Any = fn value => match true with
   | true => box value
@@ -1384,7 +1395,12 @@ let indirect = nested ()
 fn reification_callable_interfaces_follow_array_values_and_evaluation() {
     use ruddy::reification::conventions::Shape;
     let source = r#"
-extern box: 'a -> Any = "$anyUpcast"
+type Option 'a = #Some 'a | #None
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
 let array_box = fn value => [box value]
 let through_spread = fn value => [..array_box value]
 let return_rest = fn callbacks => match callbacks with
@@ -1445,7 +1461,12 @@ fn reification_callable_interfaces_survive_separate_compilation() {
     use ruddy::reification::conventions::Shape;
     let producer = exported(
         r#"
-extern box: 'a -> Any = "$anyUpcast"
+type Option 'a = #Some 'a | #None
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
 let apply = fn callback => fn value => callback value
 let identity = fn value => value
 "#,
@@ -1482,12 +1503,174 @@ let forwarded = dep::identity dep::box
     }
 }
 
+/// A library whose closures hand a callable opened from a hidden payload to a
+/// quantified callback port. The port is never resolved inside the library,
+/// which used to leak into the published interface as a requirement on a
+/// port no arrow binds.
+const SEALED_CALLBACK_LIBRARY: &str = r#"
+type Option 'a = #Some 'a | #None
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+effect Tick = () -> ()
+type Box 'a = { run: 'a -> Any + !Tick }
+type Box2 'a = { run: () -> Option 'a + !Tick }
+type Maker 'a = hide 'm => { mirror: Mirror 'm, seed: 'm, make: 'm -> 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern fresh_mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
+let unbox: Any -> Option 'a = fn any => match any with
+| hide 'x { mirror, value } => match same_pair (mirror, fresh_mirror ()) with
+  | #Some { forward, backward } => #Some (forward value)
+  | #None => #None
+  end
+end
+let map: ('a -> 'b) -> Option 'a -> Option 'b = fn f o => match o with | #Some x => #Some (f x) | #None => #None end
+let make: Option () -> Option (Box 'a) = fn o => map (fn _ => { run: fn value => do let _ = !Tick () return box value end }) o
+let run_box: Box 'a -> 'a -> Any = fn b value => handle b.run value with | !Tick _ => () end
+let nat_maker: Maker Nat = { mirror: type_of 41n, seed: 41n, make: fn n => n }
+let make_box: Maker 'a -> Box2 'a = fn maker => match maker with
+| hide 'm { mirror, seed, make } => { run: fn _ => do let _ = !Tick () return map make (#Some seed) end }
+end
+let run_box2: Box2 'a -> Option 'a = fn b => handle b.run () with | !Tick _ => () end
+let both: Box2 'a -> Maker 'a -> Box2 'a = fn b maker => match run_box2 b with
+| #Some _ => make_box maker
+| #None => make_box maker
+end
+"#;
+
+/// Every published callable interface validates, and says the same as the
+/// exporter's lowering: a callable opened from a sealed package supplies the
+/// port it is handed to, so nothing stays conditional on it, while the ports
+/// incoming callables bind survive.
+#[test]
+fn reification_exported_interfaces_normalize_unexposed_ports() {
+    use ruddy::reification::interface::{Node, Requirement};
+    let producer = exported(SEALED_CALLBACK_LIBRARY);
+    let interface = |name: &str| {
+        let scheme = &producer
+            .header
+            .values
+            .iter()
+            .find(|value| value.name.ends_with(&format!("::{name}")))
+            .unwrap_or_else(|| panic!("no value named {name}"))
+            .scheme;
+        let callable = scheme.callable.as_ref().unwrap();
+        callable
+            .validate(scheme.count, scheme.presences)
+            .unwrap_or_else(|message| panic!("{name}: {message}"));
+        callable.clone()
+    };
+    let arrows = |interface: &ruddy::reification::interface::Interface| {
+        interface
+            .nodes
+            .iter()
+            .filter_map(|node| match node {
+                Node::Arrow {
+                    port, requirements, ..
+                } => Some((*port, requirements.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let unconditional = |parameter| {
+        [Requirement {
+            port: None,
+            parameter,
+        }]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>()
+    };
+    let bound = |port, parameter| {
+        [Requirement {
+            port: Some(port),
+            parameter,
+        }]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>()
+    };
+
+    let make_box = interface("make_box");
+    assert!(make_box.ports.is_empty(), "{make_box:#?}");
+    assert_eq!(
+        arrows(&make_box),
+        [(None, Default::default()), (None, Default::default())],
+        "the sealed `make` the run closure calls takes no descriptors"
+    );
+
+    let make = interface("make");
+    assert!(make.ports.is_empty(), "{make:#?}");
+    assert_eq!(
+        arrows(&make),
+        [(None, Default::default()), (None, unconditional(0))]
+    );
+
+    let run_box2 = interface("run_box2");
+    assert_eq!(run_box2.ports, [[0].into_iter().collect()]);
+    assert_eq!(
+        arrows(&run_box2),
+        [(None, bound(0, 0)), (Some(0), bound(0, 0))],
+        "an incoming callable keeps its own quantified port"
+    );
+
+    let both = interface("both");
+    assert_eq!(both.ports, [[0].into_iter().collect()]);
+    assert_eq!(
+        arrows(&both),
+        [
+            (None, Default::default()),
+            (None, bound(0, 0)),
+            (None, Default::default()),
+            (Some(0), bound(0, 0)),
+        ],
+        "the incoming callable's port is the one port there is"
+    );
+}
+
+/// A consumer of the published interface plans the same convention the
+/// library lowered: the returned closure, which calls a callable opened from
+/// a sealed package, demands no descriptor at all.
+#[test]
+fn reification_normalized_interfaces_reach_imported_closures() {
+    use ruddy::reification::conventions::Shape;
+    let producer = exported(SEALED_CALLBACK_LIBRARY);
+    let imported = accepted_with(
+        "let boxed: dep::Maker 'a -> dep::Box2 'a = fn maker => dep::make_box maker",
+        &producer,
+    );
+    let plan = &imported.reification().callables;
+    let solved = plan.graph.solve();
+    let (_, binding) = plan
+        .bindings
+        .iter()
+        .find(|(symbol, _)| imported.mint().name(**symbol) == "boxed")
+        .unwrap();
+    let Shape::Arrow { result, .. } = plan.graph.exposed(binding.value) else {
+        panic!("imported box constructor")
+    };
+    let Shape::Record(fields) = plan.graph.exposed(*result) else {
+        panic!("imported box record")
+    };
+    let Shape::Arrow { needs, .. } = plan.graph.exposed(fields["run"]) else {
+        panic!("imported run closure")
+    };
+    let row = &solved[*needs as usize];
+    assert!(
+        row.is_empty(),
+        "the imported closure demands nothing: {row:?}"
+    );
+}
+
 #[test]
 fn reification_recursive_callable_interfaces_preserve_forwarded_profiles() {
     use ruddy::reification::conventions::Shape;
     let program = accepted(
         r#"
-extern box: 'a -> Any = "$anyUpcast"
+type Option 'a = #Some 'a | #None
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+@private extern type_of: 'a -> Mirror 'a = "$typeOf"
+@private extern mirror: () -> Mirror 'a = "$mirror"
+@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = "$sameMirror"
+let box: 'a -> Any = fn value => { mirror: type_of value, value: value }
 let token = box 1n
 let left: ('a -> Any) -> ('a -> Any) = fn callback => right callback
 let right: ('a -> Any) -> ('a -> Any) = fn callback => match true with
@@ -1526,7 +1709,7 @@ let dynamic = left box
 fn reification_graphs_and_forwarding_use_bounded_stack_and_artifact_space() {
     std::thread::Builder::new().name("runtime-type-graphs".into()).stack_size(256 * 1024)
         .spawn(|| {
-            let mut source = String::from("@private extern box: 'a -> Any = \"$anyUpcast\"\nlet apply = fn call value => call value\nlet forward0 = apply box\n");
+            let mut source = String::from("type Option 'a = #Some 'a | #None\ntype Any = hide 'a => { mirror: Mirror 'a, value: 'a }\n@private extern type_of: 'a -> Mirror 'a = \"$typeOf\"\n@private extern mirror: () -> Mirror 'a = \"$mirror\"\n@private extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } = \"$sameMirror\"\n@private let box: 'a -> Any = fn value => { mirror: type_of value, value: value }\nlet apply = fn call value => call value\nlet forward0 = apply box\n");
             for at in 1..128 {
                 source.push_str(&format!("let forward{at} = fn value => forward{} value\n", at - 1));
             }
@@ -1566,6 +1749,84 @@ fn reification_shared_generic_aliases_do_not_expand_unused_callable_fields() {
             .validate()
             .is_ok()
     );
+}
+
+/// A hidden type declared in a dependency is the same hidden type in the
+/// consumer: values of it open there, and the consumer's own values package
+/// under the imported alias.
+#[test]
+fn imported_hidden_types_open_and_package_like_local_ones() {
+    let dependency = exported(
+        "type Box = hide 'a => { value: 'a, show: 'a -> String }\n\
+         extern show_nat: Nat -> String = \"host.nat\"\n\
+         let one: Box = { value: 1n, show: show_nat }\n\
+         let describe: Box -> String = fn box => match box with\n\
+         | hide 'v { value, show } => show value\n\
+         end",
+    );
+    let accepted = accepted_with(
+        "let shown = dep::describe dep::one\n\
+         let own: dep::Box = { value: \"x\", show: fn s => s }\n\
+         let opened = match dep::one with | hide 'v { value, show } => show value end\n\
+         let described = dep::describe own",
+        &dependency,
+    );
+    assert_eq!(scheme(&accepted, "shown"), "String");
+    assert!(
+        scheme(&accepted, "own").ends_with("Box"),
+        "{}",
+        scheme(&accepted, "own")
+    );
+    assert_eq!(scheme(&accepted, "opened"), "String");
+    assert_eq!(scheme(&accepted, "described"), "String");
+}
+
+/// Binding the target's domains refuses a literal they cannot hold, in a
+/// term or a pattern, and says which domain and what its bounds are.
+#[test]
+fn literals_outside_the_bound_domains_are_refused() {
+    use ruddy::types::Domains;
+    let bound = |source: &str, domains| {
+        let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
+        assert!(parsed.errors.is_empty(), "{source}: {:#?}", parsed.errors);
+        compile::compile_bound(
+            Mint::new(Bundle::new("tests", Version::new(0, 1, 0)).unwrap()),
+            parsed.stmts,
+            &[],
+            inference::Trace::Off,
+            domains,
+        )
+        .map_err(Box::new)
+    };
+    let wide = "let big = 9007199254740992n\nlet low = -9007199254740992i\nlet fixed = 18446744073709551615n64\nlet arm = fn n => match n with | 4294967296n => true | _ => false end\nlet nested = fn v => match v with | #Some { at: 2147483648i } => true | _ => false end";
+    let accepted =
+        bound(wide, Domains::Bits64).unwrap_or_else(|partial| panic!("{:#?}", partial.errors));
+    assert_eq!(accepted.domains(), Domains::Bits64);
+    assert_eq!(accepted.artifact().header().domains, Domains::Bits64);
+    let refused = bound(wide, Domains::Js53).expect_err("53 bits cannot hold the literals");
+    assert_eq!(
+        codes(&refused),
+        ["literal-outside-domain", "literal-outside-domain"]
+    );
+    let refused = bound(wide, Domains::Bits32).expect_err("32 bits cannot hold the literals");
+    assert_eq!(codes(&refused).len(), 4);
+    let Error::Ir(error) = &refused.errors[0] else {
+        panic!("an IR error")
+    };
+    let diagnostic = error.diagnostic(&refused.ir.source);
+    assert_eq!(
+        diagnostic.title,
+        "the literal `9007199254740992n` is outside the target's Nat domain, 0 to 4294967295"
+    );
+    assert_eq!(
+        diagnostic.primary.message,
+        "Nat has 32 bits of precision on this target"
+    );
+    let ok = bound(
+        "let fits = 4294967295n\nlet low = -2147483648i\nlet high = 2147483647i",
+        Domains::Bits32,
+    );
+    assert!(ok.is_ok());
 }
 
 #[test]

@@ -9,6 +9,7 @@ gix = { version = "0.85.0", default-features = false, features = ["sha1"] }
 ruddy = { package = "ruddy-compiler", path = ".." }
 ruddy-cli = { package = "ruddy", path = "../cli" }
 ruddy-debug = { path = "../debug" }
+ruddy-interp = { path = "../interp" }
 indexmap = "2"
 regex = "1"
 serde_json = "1"

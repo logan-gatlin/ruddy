@@ -32,6 +32,7 @@ fn artifact(
         header: a::Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: name.into(),
@@ -429,4 +430,25 @@ fn empty_input_reports_the_only_link_error() {
     assert_eq!(error, LinkError::EmptyGraph);
     assert_eq!(error.to_string(), "cannot link an empty artifact graph");
     let _: &dyn std::error::Error = &error;
+}
+
+#[test]
+fn linking_rejects_a_dependency_bound_to_other_domains() {
+    let mut dependency = artifact("dep", &[], Vec::new(), Vec::new()).to_unchecked();
+    dependency.header.domains = ruddy::types::Domains::Bits32;
+    let dependency = validated(dependency);
+    let root = artifact("root", &[("dep", "1.0.0")], Vec::new(), Vec::new());
+    let error = link::link(&[dependency, root]).unwrap_err();
+    assert!(matches!(
+        error,
+        LinkError::Domains {
+            expected: ruddy::types::Domains::Js53,
+            found: ruddy::types::Domains::Bits32,
+            ..
+        }
+    ));
+    assert_eq!(
+        error.to_string(),
+        "bundle `dep` was compiled with 32-bit integers, and this program binds 53-bit integers"
+    );
 }

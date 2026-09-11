@@ -303,3 +303,73 @@ type Record = { 001 when 'p: Nat, \02, 3: String }
         (struct_type_field
           (numeric_field)
           (identifier))))))
+
+================================================================================
+A hidden type binds one variable over everything to its right
+================================================================================
+
+type Any = hide 'a => { mirror: Mirror 'a, value: 'a }
+let f : (hide 'a => 'a) -> Nat -> hide 'b => Pair 'b 'b + !Log = g
+let g : Mirror (hide 'a => Body 'a) = m
+let h : hide 'a => hide 'b => ('a, 'b) = p
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (type_definition
+    (identifier)
+    (annotation
+      (hidden_type
+        (type_variable)
+        (struct_type
+          (struct_type_field
+            (identifier)
+            (type_application
+              (identifier)
+              (type_variable)))
+          (struct_type_field
+            (identifier)
+            (type_variable))))))
+  (let_definition
+    (identifier)
+    (annotation
+      (function_type
+        (parenthesized_type
+          (hidden_type
+            (type_variable)
+            (type_variable)))
+        (function_type
+          (identifier)
+          (hidden_type
+            (type_variable)
+            (type_application
+              (identifier)
+              (type_variable)
+              (type_variable)))
+          (effect_row
+            (effect_case
+              (effect_label))))))
+    (identifier))
+  (let_definition
+    (identifier)
+    (annotation
+      (type_application
+        (identifier)
+        (parenthesized_type
+          (hidden_type
+            (type_variable)
+            (type_application
+              (identifier)
+              (type_variable))))))
+    (identifier))
+  (let_definition
+    (identifier)
+    (annotation
+      (hidden_type
+        (type_variable)
+        (hidden_type
+          (type_variable)
+          (tuple_type
+            (type_variable)
+            (type_variable)))))
+    (identifier)))

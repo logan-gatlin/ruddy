@@ -596,6 +596,14 @@ fn pattern_node(ids: &mut Ids, pattern: &Pattern) -> Node {
                 None => tag_node,
             }
         }
+        PatternKind::Hidden { variable, pattern } => Node {
+            label: "Hidden".into(),
+            ..node
+        }
+        .child(
+            Node::new(ids.next(), "Variable", format!("'{}", variable.tracked)).at(variable.span),
+        )
+        .child(pattern_node(ids, pattern)),
         PatternKind::Tuple(elements) => Node {
             label: "Tuple".into(),
             ..node
@@ -904,6 +912,17 @@ fn type_node(ids: &mut Ids, ty: &Type) -> Node {
                 .map(|arg| type_node(ids, arg))
                 .collect::<Vec<_>>(),
         ),
+        // The variable is a child of its own, the way a declaration's
+        // parameters are: it is what the body's `'a` resolves to, so it sits
+        // beside the body rather than folding into the node's text.
+        TypeKind::Hidden { variable, body } => Node {
+            label: "Hidden".into(),
+            ..node
+        }
+        .child(
+            Node::new(ids.next(), "Variable", format!("'{}", variable.tracked)).at(variable.span),
+        )
+        .child(type_node(ids, body)),
         TypeKind::Ident { name } => Node {
             label: "Ident".into(),
             ..node

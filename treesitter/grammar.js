@@ -88,6 +88,7 @@ module.exports = grammar({
       'end',
       'with',
       'match',
+      'hide',
       'fn',
       'effect',
       'handle',
@@ -784,6 +785,7 @@ module.exports = grammar({
       $.tuple_pattern,
       $.array_pattern,
       $.tag_pattern,
+      $.hidden_pattern,
       $.parenthesized_pattern,
     ),
 
@@ -869,6 +871,17 @@ module.exports = grammar({
 
     parenthesized_pattern: $ => seq('(', $._pattern, ')'),
 
+    /**
+     * `hide 'a <pattern>` — open a hidden type, naming it `'a` for the arm.
+     * The payload is taken greedily, as a tag pattern's is, so `hide 'a #Some
+     * x` opens onto `(#Some x)`; `Parser::pattern` reads it the same way.
+     */
+    hidden_pattern: $ => prec.right(PREC.tag, seq(
+      'hide',
+      field('variable', $.type_variable),
+      field('pattern', $._pattern),
+    )),
+
     // ── Types ─────────────────────────────────────────────────────────────
 
     /** `<type> [where <clause> (';' <clause>)*]` — what a definition is ascribed. */
@@ -877,7 +890,20 @@ module.exports = grammar({
       optional(field('clause', $.where_clause)),
     ),
 
-    _type: $ => choice($.function_type, $._type_sum),
+    _type: $ => choice($.hidden_type, $.function_type, $._type_sum),
+
+    /**
+     * `hide 'a => <type>` — a hidden type. The body extends as far right as
+     * it can, the way a lambda's does, so it takes the whole arrow after it
+     * and needs parentheses as an arrow's input or an application's argument;
+     * `Parser::arrow` reads it above the arrow for the same reason.
+     */
+    hidden_type: $ => prec.right(seq(
+      'hide',
+      field('variable', $.type_variable),
+      '=>',
+      field('body', $._type),
+    )),
 
     /**
      * `A -> B [+ <effects>]`, right-associative. The effect row binds to the

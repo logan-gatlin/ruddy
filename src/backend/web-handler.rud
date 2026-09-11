@@ -1,0 +1,9 @@
+  | !Http.request request => http_request request
+  | !Host.kind value => js_kind value
+  | !Host.field request => js_field request
+  | !Host.element request => js_element request
+  | !Host.length value => js_length value
+  | !Host.keys value => js_keys value
+  | !Host.snapshot value => js_snapshot value
+  | !Host.apply request => js_apply request
+  | !Host.text value => js_text value

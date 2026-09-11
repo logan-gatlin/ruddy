@@ -54,7 +54,9 @@ pub fn projection(
             Node::Parameter(p) if *p == parameter => return Some(path),
             Node::Alias(child) => push(*child, None),
             Node::Array(child) => push(*child, Some(Projection::Element)),
-            Node::Arrow([from, to]) => {
+            // An effect row's payloads are no position a projection reaches:
+            // evidence for a parameter written only there is not derived.
+            Node::Arrow([from, to, _]) => {
                 push(*from, Some(Projection::Argument));
                 push(*to, Some(Projection::Result));
             }
@@ -104,6 +106,27 @@ pub fn explain(scheme: &Scheme) -> Option<String> {
                 .join(", ")
         )
     })
+}
+
+/// The evidence slot of a type a `hide` pattern opened, by the rigid's id.
+/// Above every quantified parameter's index, so the two share one key space
+/// in the demand solver and in a frame's descriptors without colliding.
+pub const SCOPED: u32 = 1 << 31;
+
+/// Whether a rigid is one a `hide` pattern opened, as opposed to a local
+/// region's, whose ids are minted from the top of the space.
+pub fn scoped_rigid(id: u32) -> bool {
+    id < (1 << 30)
+}
+
+/// The evidence slot a type stands for: a quantified parameter's index, or
+/// the slot of an opened type. See [`SCOPED`].
+pub fn evidence_slot(ty: &Ty) -> Option<u32> {
+    match ty {
+        Ty::Bound(index) => Some(*index),
+        Ty::Rigid { id, .. } if scoped_rigid(*id) => Some(SCOPED | id),
+        _ => None,
+    }
 }
 
 /// Row substitutions use an empty record/sum around their remainder, while
@@ -160,7 +183,13 @@ impl Analysis {
             let binding = &self.bindings[symbol];
             if matches!(
                 declaration.value.target.anchored.as_str(),
-                "$anyUpcast" | "$anyDowncast" | "$ffiDecode"
+                "$ffiDecode"
+                    | "$ffiEncode"
+                    | "$mirror"
+                    | "$typeOf"
+                    | "$describe"
+                    | "$sameMirror"
+                    | "$shape"
             ) && Intrinsic::recognize(&declaration.value.target.anchored, &binding.ty, aliases)
                 .is_none()
             {
@@ -205,8 +234,6 @@ impl Analysis {
                         }
                     }
                 }
-                let mut nested = Vec::new();
-                children(term, &mut nested);
                 let mut available = available;
                 if let conventions::Shape::Arrow { needs, .. } =
                     self.callables.graph.exposed(flow.value)
@@ -214,6 +241,19 @@ impl Analysis {
                 {
                     available.extend(solved[*needs as usize].iter().map(|need| need.parameter));
                 }
+                // An arm has what its pattern's mirrors are evidence for,
+                // from the moment the pattern matched.
+                if let TermKind::Match { scrutinee, arms } = &term.kind {
+                    work.push((scrutinee, available.clone()));
+                    for (pattern, body) in arms {
+                        let mut extended = available.clone();
+                        extended.extend(self.callables.arm_evidence(pattern));
+                        work.push((body, extended));
+                    }
+                    continue;
+                }
+                let mut nested = Vec::new();
+                children(term, &mut nested);
                 work.extend(nested.into_iter().map(|term| (term, available.clone())));
             }
         }
@@ -305,7 +345,7 @@ pub fn native_parameters(
             ),
             "mut" => {}
             "package" => work.extend(edges.iter().map(|(_, child)| *child)),
-            _ => result.extend(Descriptor::from_graph_policy(at, &graph, true)?.1),
+            _ => result.extend(Descriptor::from_graph_policy(at, &graph, true)?.2),
         }
     }
     Ok(result)
@@ -323,11 +363,17 @@ pub fn parameters(ty: &Arc<Ty>) -> BTreeSet<u32> {
             Ty::Bound(index) => {
                 parameters.insert(*index);
             }
+            Ty::Rigid { id, .. } if scoped_rigid(*id) => {
+                parameters.insert(SCOPED | id);
+            }
             Ty::Arrow(from, to, row) => {
                 work.extend([from.clone(), to.clone()]);
                 row_parameters(row, &mut work, &mut parameters);
             }
-            Ty::Array(inner) | Ty::Package(inner) => work.push(inner.clone()),
+            Ty::Array(inner)
+            | Ty::Mirror(inner)
+            | Ty::Package(inner)
+            | Ty::Hidden { body: inner, .. } => work.push(inner.clone()),
             Ty::Mut(region, inner) => work.extend([region.clone(), inner.clone()]),
             Ty::Struct(row) | Ty::Sum(row) => row_parameters(row, &mut work, &mut parameters),
             Ty::Named { args, .. } => work.extend(args.iter().cloned()),
@@ -369,8 +415,8 @@ pub fn instantiate(
     let mut visited = Vec::new();
     let mut aliases_seen = HashSet::new();
     while let Some((declared, used)) = work.pop() {
-        if let Ty::Bound(index) = &*declared {
-            result.entry(*index).or_insert(used);
+        if let Some(slot) = evidence_slot(&declared) {
+            result.entry(slot).or_insert(used);
             continue;
         }
         if visited
@@ -412,10 +458,15 @@ pub fn instantiate(
             }
             (Ty::Package(inner), _) => work.push((inner.clone(), used)),
             (_, Ty::Package(inner)) => work.push((declared, inner.clone())),
+            (Ty::Hidden { body: a, .. }, Ty::Hidden { body: b, .. }) => {
+                work.push((a.clone(), b.clone()))
+            }
             (Ty::Arrow(a, b, _), Ty::Arrow(x, y, _)) | (Ty::Mut(a, b), Ty::Mut(x, y)) => {
                 work.extend([(a.clone(), x.clone()), (b.clone(), y.clone())]);
             }
-            (Ty::Array(a), Ty::Array(b)) => work.push((a.clone(), b.clone())),
+            (Ty::Array(a), Ty::Array(b)) | (Ty::Mirror(a), Ty::Mirror(b)) => {
+                work.push((a.clone(), b.clone()))
+            }
             (Ty::Struct(a), Ty::Struct(b)) | (Ty::Sum(a), Ty::Sum(b)) => {
                 let a = flattened(a);
                 let mut b = flattened(b);
@@ -440,7 +491,7 @@ pub fn instantiate(
     result
 }
 
-fn children<'a>(term: &'a Term, work: &mut Vec<&'a Term>) {
+pub(crate) fn children<'a>(term: &'a Term, work: &mut Vec<&'a Term>) {
     match &term.kind {
         TermKind::Unary { value, .. } => work.push(value),
         TermKind::Binary { left, right, .. } => work.extend([&**left, &**right]),
@@ -477,15 +528,502 @@ fn children<'a>(term: &'a Term, work: &mut Vec<&'a Term>) {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Intrinsic {
-    Upcast,
-    Downcast,
     Decode,
+    /// The other direction of the same boundary: a value of a known type
+    /// written as host data, or a recoverable error saying where it could
+    /// not be.
+    Encode,
+    /// `() -> Mirror 'a`: the evidence for the inferred type, as a value.
+    Mirror,
+    /// `'a -> Mirror 'a`: the evidence for the argument's static type.
+    TypeOf,
+    /// `Mirror 'a -> Description`: the mirror's finite graph as ordinary data.
+    Describe,
+    /// `(Mirror 'a, Mirror 'b) -> Option { forward, backward }`: exact
+    /// structural equality of two mirrors, with identity functions on success.
+    Same,
+    /// `Mirror 'a -> Shape 'a`: the mirror's outermost structure as typed
+    /// views, whose operations read and make values of the mirrored type.
+    Shape,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum Direction {
-    ToJs,
-    FromJs,
+/// The cases of `std::reflect::Shape`, which `$shape` builds at runtime: a
+/// declaration naming the intrinsic must have exactly these.
+/// How large a type's finite graph may grow before the compiler reports that
+/// it does not have one. A graph is finite by construction; this bounds the
+/// damage of a form whose construction is not yet finite, so a program gets a
+/// diagnostic rather than an exhausted process.
+const NODE_LIMIT: usize = 1 << 16;
+
+pub const SHAPE_CASES: [&str; 20] = [
+    "Nat", "Int", "Real", "String", "Bool", "Nat8", "Nat16", "Nat32", "Nat64", "Int8", "Int16",
+    "Int32", "Int64", "Array", "Record", "Sum", "Function", "Hidden", "Mirror", "Foreign",
+];
+
+/// Whether a type is `Result <carried> { path, expected, message }`, the
+/// result both directions of a checked foreign conversion hand back. Which
+/// side carries the host value is what tells the two apart.
+fn conversion(
+    ty: &Arc<Ty>,
+    aliases: &IndexMap<Symbol, Scheme>,
+    carried: &dyn Fn(&Ty) -> bool,
+) -> bool {
+    let result = inference::unfold(aliases, ty);
+    let Ty::Sum(row) = &*result else {
+        return false;
+    };
+    let (Some(some), Some(error)) = (row.labels.get("Some"), row.labels.get("Error")) else {
+        return false;
+    };
+    let error = inference::unfold(aliases, &error.ty);
+    let Ty::Struct(fields) = &*error else {
+        return false;
+    };
+    row.labels.len() == 2
+        && matches!(row.rest, Rest::Closed)
+        && row
+            .labels
+            .values()
+            .all(|field| matches!(field.presence, Presence::Present))
+        && carried(&some.ty)
+        && fields.labels.len() == 3
+        && matches!(fields.rest, Rest::Closed)
+        && ["path", "expected", "message"].iter().all(|name| {
+            fields.labels.get(*name).is_some_and(|field| {
+                matches!(field.presence, Presence::Present) && matches!(&*field.ty, Ty::String)
+            })
+        })
+}
+
+/// The structural contracts the compiler-owned reflection intrinsics have.
+/// A declaration of one is checked against the whole of its type, not against
+/// the names it happens to use: an equivalent type spelled differently is the
+/// same contract, and a type that merely has the right field names is not.
+// Each contract is one closure over a type, and a record or sum's contracts
+// are those paired with their names. Naming the pair would need a lifetime of
+// its own on every use, which reads worse than the type it replaces.
+#[allow(clippy::type_complexity)]
+mod contract {
+    use super::{Presence, Rest, Row, Scheme, Symbol, Ty, flattened, inference};
+    use indexmap::IndexMap;
+    use std::sync::Arc;
+
+    type Aliases = IndexMap<Symbol, Scheme>;
+
+    pub(super) fn unfold(ty: &Arc<Ty>, aliases: &Aliases) -> Arc<Ty> {
+        inference::unfold(aliases, ty)
+    }
+
+    /// A closed row whose every label is present, and its labels.
+    fn settled(row: &Row) -> Option<IndexMap<String, Arc<Ty>>> {
+        let row = flattened(row);
+        if !matches!(row.rest, Rest::Closed) {
+            return None;
+        }
+        row.labels
+            .iter()
+            .map(|(name, field)| {
+                matches!(field.presence, Presence::Present)
+                    .then(|| (name.clone(), field.ty.clone()))
+            })
+            .collect()
+    }
+
+    /// A record with exactly these fields, each satisfying its own contract.
+    pub(super) fn record(
+        ty: &Arc<Ty>,
+        aliases: &Aliases,
+        fields: &[(&str, &dyn Fn(&Arc<Ty>, &Aliases) -> bool)],
+    ) -> bool {
+        let Ty::Struct(row) = &*unfold(ty, aliases) else {
+            return false;
+        };
+        let Some(labels) = settled(row) else {
+            return false;
+        };
+        labels.len() == fields.len()
+            && fields
+                .iter()
+                .all(|(name, holds)| labels.get(*name).is_some_and(|ty| holds(ty, aliases)))
+    }
+
+    /// A sum with exactly these cases, each payload satisfying its contract.
+    pub(super) fn sum(
+        ty: &Arc<Ty>,
+        aliases: &Aliases,
+        cases: &[(&str, &dyn Fn(&Arc<Ty>, &Aliases) -> bool)],
+    ) -> bool {
+        let Ty::Sum(row) = &*unfold(ty, aliases) else {
+            return false;
+        };
+        let Some(labels) = settled(row) else {
+            return false;
+        };
+        labels.len() == cases.len()
+            && cases
+                .iter()
+                .all(|(name, holds)| labels.get(*name).is_some_and(|ty| holds(ty, aliases)))
+    }
+
+    pub(super) fn unit(ty: &Arc<Ty>, aliases: &Aliases) -> bool {
+        record(ty, aliases, &[])
+    }
+    pub(super) fn nat(ty: &Arc<Ty>, aliases: &Aliases) -> bool {
+        matches!(&*unfold(ty, aliases), Ty::Nat)
+    }
+    pub(super) fn text(ty: &Arc<Ty>, aliases: &Aliases) -> bool {
+        matches!(&*unfold(ty, aliases), Ty::String)
+    }
+    pub(super) fn boolean(ty: &Arc<Ty>, aliases: &Aliases) -> bool {
+        matches!(&*unfold(ty, aliases), Ty::Bool)
+    }
+
+    /// An array of values each satisfying a contract.
+    pub(super) fn array(
+        element: &'static dyn Fn(&Arc<Ty>, &Aliases) -> bool,
+    ) -> impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy {
+        move |ty, aliases| match &*unfold(ty, aliases) {
+            Ty::Array(inner) => element(inner, aliases),
+            _ => false,
+        }
+    }
+
+    /// A pure arrow between two contracts.
+    pub(super) fn arrow(
+        from: impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy,
+        to: impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy,
+    ) -> impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy {
+        move |ty, aliases| match &*unfold(ty, aliases) {
+            Ty::Arrow(a, b, effects) => {
+                effects.labels.is_empty()
+                    && matches!(effects.rest, Rest::Closed)
+                    && from(a, aliases)
+                    && to(b, aliases)
+            }
+            _ => false,
+        }
+    }
+
+    /// The bound variable a scheme quantified, by its own index.
+    pub(super) fn bound(index: u32) -> impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy {
+        move |ty, aliases| matches!(&*unfold(ty, aliases), Ty::Bound(found) if *found == index)
+    }
+
+    /// An occurrence of an enclosing hidden type's own variable.
+    pub(super) fn opened(binder: u32) -> impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy {
+        move |ty, aliases| matches!(&*unfold(ty, aliases), Ty::HiddenVar { binder: found, .. } if *found == binder)
+    }
+
+    /// A mirror of a type satisfying a contract.
+    pub(super) fn mirror(
+        of: impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy,
+    ) -> impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy {
+        move |ty, aliases| match &*unfold(ty, aliases) {
+            Ty::Mirror(inner) => of(inner, aliases),
+            _ => false,
+        }
+    }
+
+    /// A hidden type, with its body checked against the variable it binds.
+    pub(super) fn hidden(
+        body: impl Fn(u32, &Arc<Ty>, &Aliases) -> bool + Copy,
+    ) -> impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy {
+        move |ty, aliases| match &*unfold(ty, aliases) {
+            Ty::Hidden {
+                binder,
+                body: inner,
+                ..
+            } => body(*binder, inner, aliases),
+            _ => false,
+        }
+    }
+
+    /// `Option 'a`, whose payload satisfies a contract.
+    pub(super) fn option(
+        some: impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy,
+    ) -> impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy {
+        move |ty, aliases| {
+            sum(
+                ty,
+                aliases,
+                &[("Some", &|ty, aliases| some(ty, aliases)), ("None", &unit)],
+            )
+        }
+    }
+
+    /// `{ bits: Nat, signed: Bool, min: String, max: String }`.
+    pub(super) fn domain(ty: &Arc<Ty>, aliases: &Aliases) -> bool {
+        record(
+            ty,
+            aliases,
+            &[
+                ("bits", &nat),
+                ("signed", &boolean),
+                ("min", &text),
+                ("max", &text),
+            ],
+        )
+    }
+
+    /// `{ name: String, node: Nat }`.
+    pub(super) fn field(ty: &Arc<Ty>, aliases: &Aliases) -> bool {
+        record(ty, aliases, &[("name", &text), ("node", &nat)])
+    }
+
+    /// One node of a description: every case the compiler builds, with the
+    /// payload it builds there.
+    pub(super) fn node(ty: &Arc<Ty>, aliases: &Aliases) -> bool {
+        let fields = array(&field);
+        sum(
+            ty,
+            aliases,
+            &[
+                ("Nat", &domain),
+                ("Int", &domain),
+                ("Fixed", &domain),
+                ("Real", &unit),
+                ("String", &unit),
+                ("Bool", &unit),
+                ("Foreign", &unit),
+                ("Array", &nat),
+                ("Function", &|ty: &Arc<Ty>, aliases: &Aliases| {
+                    record(
+                        ty,
+                        aliases,
+                        &[
+                            ("argument", &nat),
+                            ("result", &nat),
+                            ("effects", &array(&field)),
+                        ],
+                    )
+                }),
+                ("Effects", &fields),
+                ("Record", &fields),
+                ("Sum", &fields),
+                ("Alias", &nat),
+                ("Extend", &|ty: &Arc<Ty>, aliases: &Aliases| {
+                    record(ty, aliases, &[("base", &nat), ("rest", &nat)])
+                }),
+                ("Parameter", &nat),
+                ("Mirror", &nat),
+                ("Hidden", &nat),
+                ("Variable", &nat),
+            ],
+        )
+    }
+
+    /// `{ root: Nat, nodes: [Node] }`.
+    pub(super) fn description(ty: &Arc<Ty>, aliases: &Aliases) -> bool {
+        record(ty, aliases, &[("root", &nat), ("nodes", &array(&node))])
+    }
+
+    /// A fixed-width integer by its own kind, so `Nat8` and `Int8` stay apart.
+    fn fixed(kind: crate::types::FixedInt) -> impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy {
+        move |ty, aliases| matches!(&*unfold(ty, aliases), Ty::Fixed(found) if *found == kind)
+    }
+
+    /// A primitive view: `{ read: 'a -> P, make: P -> 'a }`, where `'a` is the
+    /// mirrored type and `P` the primitive the case is named for. Reading and
+    /// making the wrong primitive is a different contract, whatever the case
+    /// is called.
+    fn view(
+        mirrored: u32,
+        primitive: impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy,
+    ) -> impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy {
+        move |ty, aliases| {
+            record(
+                ty,
+                aliases,
+                &[
+                    ("read", &arrow(bound(mirrored), primitive)),
+                    ("make", &arrow(primitive, bound(mirrored))),
+                ],
+            )
+        }
+    }
+
+    /// `std::reflect::Shape 'a`: every case the compiler builds, with the
+    /// operations it builds there.
+    pub(super) fn shape(ty: &Arc<Ty>, aliases: &Aliases, mirrored: u32) -> bool {
+        use crate::types::FixedInt;
+        let of = bound(mirrored);
+        let primitives: [(&str, &dyn Fn(&Arc<Ty>, &Aliases) -> bool); 13] = [
+            ("Nat", &view(mirrored, nat)),
+            (
+                "Int",
+                &view(mirrored, |ty: &Arc<Ty>, aliases: &Aliases| {
+                    matches!(&*unfold(ty, aliases), Ty::Int)
+                }),
+            ),
+            (
+                "Real",
+                &view(mirrored, |ty: &Arc<Ty>, aliases: &Aliases| {
+                    matches!(&*unfold(ty, aliases), Ty::Real)
+                }),
+            ),
+            ("String", &view(mirrored, text)),
+            ("Bool", &view(mirrored, boolean)),
+            ("Nat8", &view(mirrored, fixed(FixedInt::Nat8))),
+            ("Nat16", &view(mirrored, fixed(FixedInt::Nat16))),
+            ("Nat32", &view(mirrored, fixed(FixedInt::Nat32))),
+            ("Nat64", &view(mirrored, fixed(FixedInt::Nat64))),
+            ("Int8", &view(mirrored, fixed(FixedInt::Int8))),
+            ("Int16", &view(mirrored, fixed(FixedInt::Int16))),
+            ("Int32", &view(mirrored, fixed(FixedInt::Int32))),
+            ("Int64", &view(mirrored, fixed(FixedInt::Int64))),
+        ];
+        // A field and a case each hide their own type, and everything the view
+        // carries is about that one type: the mirror proves it, `read` observes
+        // it, and `bind` or `inject` accepts it.
+        let some_field = hidden(move |binder, body, aliases| {
+            record(
+                body,
+                aliases,
+                &[
+                    ("name", &text),
+                    ("mirror", &mirror(opened(binder))),
+                    ("presence", &|ty: &Arc<Ty>, aliases: &Aliases| {
+                        sum(ty, aliases, &[("Required", &unit), ("Optional", &unit)])
+                    }),
+                    ("read", &arrow(bound(mirrored), option(opened(binder)))),
+                    // `bind` answers the hidden binding, which is what a
+                    // builder takes: the field type it was made at is the
+                    // one thing a caller must not see.
+                    ("bind", &arrow(opened(binder), binding_of(mirrored))),
+                ],
+            )
+        });
+        let some_case = hidden(move |binder, body, aliases| {
+            record(
+                body,
+                aliases,
+                &[
+                    ("name", &text),
+                    ("mirror", &mirror(opened(binder))),
+                    ("project", &arrow(bound(mirrored), option(opened(binder)))),
+                    ("inject", &option(arrow(opened(binder), bound(mirrored)))),
+                ],
+            )
+        });
+        let build_error = |ty: &Arc<Ty>, aliases: &Aliases| {
+            sum(
+                ty,
+                aliases,
+                &[
+                    ("Missing", &text),
+                    ("Duplicate", &text),
+                    ("Unknown", &text),
+                    ("Foreign", &text),
+                    ("Mismatched", &text),
+                ],
+            )
+        };
+        let record_view = move |ty: &Arc<Ty>, aliases: &Aliases| {
+            record(
+                ty,
+                aliases,
+                &[
+                    ("mirror", &mirror(bound(mirrored))),
+                    ("fields", &array_of(&some_field)),
+                    (
+                        "build",
+                        &arrow(
+                            array_of(&binding_of(mirrored)),
+                            result(bound(mirrored), build_error),
+                        ),
+                    ),
+                ],
+            )
+        };
+        let sum_view = move |ty: &Arc<Ty>, aliases: &Aliases| {
+            record(
+                ty,
+                aliases,
+                &[
+                    ("mirror", &mirror(bound(mirrored))),
+                    ("cases", &array_of(&some_case)),
+                ],
+            )
+        };
+        let array_view = hidden(move |binder, body, aliases| {
+            record(
+                body,
+                aliases,
+                &[
+                    ("element", &mirror(opened(binder))),
+                    ("read", &arrow(bound(mirrored), array_of(&opened(binder)))),
+                    ("make", &arrow(array_of(&opened(binder)), bound(mirrored))),
+                ],
+            )
+        });
+        let mut cases: Vec<(&str, &dyn Fn(&Arc<Ty>, &Aliases) -> bool)> = primitives
+            .iter()
+            .map(|(name, holds)| (*name, *holds))
+            .collect();
+        let rest: [(&str, &dyn Fn(&Arc<Ty>, &Aliases) -> bool); 7] = [
+            ("Array", &array_view),
+            ("Record", &record_view),
+            ("Sum", &sum_view),
+            ("Function", &description),
+            ("Hidden", &description),
+            ("Mirror", &description),
+            ("Foreign", &unit),
+        ];
+        cases.extend(rest);
+        let _ = of;
+        sum(ty, aliases, &cases)
+    }
+
+    /// `[T]` where the element satisfies a contract given by reference.
+    fn array_of<'a>(
+        element: &'a dyn Fn(&Arc<Ty>, &Aliases) -> bool,
+    ) -> impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy + 'a {
+        move |ty, aliases| match &*unfold(ty, aliases) {
+            Ty::Array(inner) => element(inner, aliases),
+            _ => false,
+        }
+    }
+
+    /// `Result 'some 'error`.
+    fn result(
+        some: impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy,
+        error: impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy,
+    ) -> impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy {
+        move |ty, aliases| {
+            sum(
+                ty,
+                aliases,
+                &[
+                    ("Some", &|ty: &Arc<Ty>, aliases: &Aliases| some(ty, aliases)),
+                    ("Error", &|ty: &Arc<Ty>, aliases: &Aliases| {
+                        error(ty, aliases)
+                    }),
+                ],
+            )
+        }
+    }
+
+    /// `Binding 'record` opened at a known field variable: the record it was
+    /// made for, the field it names, and the value under that field's type.
+    fn binding(mirrored: u32, field: u32) -> impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy {
+        move |ty, aliases| {
+            record(
+                ty,
+                aliases,
+                &[
+                    ("record", &mirror(bound(mirrored))),
+                    ("name", &text),
+                    ("mirror", &mirror(opened(field))),
+                    ("value", &opened(field)),
+                ],
+            )
+        }
+    }
+
+    /// `Binding 'record` still hiding its field type, as a builder takes it.
+    fn binding_of(mirrored: u32) -> impl Fn(&Arc<Ty>, &Aliases) -> bool + Copy {
+        hidden(move |binder, body, aliases| binding(mirrored, binder)(body, aliases))
+    }
 }
 
 impl Intrinsic {
@@ -504,69 +1042,106 @@ impl Intrinsic {
         }
         match target {
             "$ffiDecode" if matches!(&**from, Ty::ForeignValue) => {
-                let result = inference::unfold(aliases, to);
-                let Ty::Sum(row) = &*result else {
+                conversion(to, aliases, &|ty| matches!(ty, Ty::Bound(_))).then_some(Self::Decode)
+            }
+            "$ffiEncode" if matches!(&**from, Ty::Bound(_)) => {
+                conversion(to, aliases, &|ty| matches!(ty, Ty::ForeignValue))
+                    .then_some(Self::Encode)
+            }
+            "$mirror" if same_finite_syntax(from, &Arc::new(Ty::unit())) => {
+                matches!(&**to, Ty::Mirror(inner) if matches!(&**inner, Ty::Bound(_)))
+                    .then_some(Self::Mirror)
+            }
+            "$typeOf" => match (&**from, &**to) {
+                (Ty::Bound(argument), Ty::Mirror(inner)) if matches!(&**inner, Ty::Bound(mirrored) if mirrored == argument) => {
+                    Some(Self::TypeOf)
+                }
+                _ => None,
+            },
+            "$shape" => match (&**from, &**to) {
+                (Ty::Mirror(inner), Ty::Named { args, .. })
+                    if let Ty::Bound(mirrored) = &**inner
+                        && matches!(&**args, [arg] if matches!(&**arg, Ty::Bound(index) if index == mirrored)) =>
+                {
+                    contract::shape(to, aliases, *mirrored).then_some(Self::Shape)
+                }
+                _ => None,
+            },
+            "$describe" if matches!(&**from, Ty::Mirror(_)) => {
+                contract::description(to, aliases).then_some(Self::Describe)
+            }
+            "$sameMirror" => {
+                let pair = inference::unfold(aliases, from);
+                let Ty::Struct(pair) = &*pair else {
                     return None;
                 };
-                let some = row.labels.get("Some")?;
-                let error = row.labels.get("Error")?;
-                let error = inference::unfold(aliases, &error.ty);
-                let Ty::Struct(fields) = &*error else {
-                    return None;
+                let mirrored = |name: &str| match &*pair.labels.get(name)?.ty {
+                    Ty::Mirror(inner) => match &**inner {
+                        Ty::Bound(index) => Some(*index),
+                        _ => None,
+                    },
+                    _ => None,
                 };
-                (row.labels.len() == 2
-                    && matches!(row.rest, Rest::Closed)
-                    && row
-                        .labels
-                        .values()
-                        .all(|field| matches!(field.presence, Presence::Present))
-                    && matches!(&*some.ty, Ty::Bound(_))
-                    && fields.labels.len() == 3
-                    && matches!(fields.rest, Rest::Closed)
-                    && ["path", "expected", "message"].iter().all(|name| {
-                        fields.labels.get(*name).is_some_and(|field| {
-                            matches!(field.presence, Presence::Present)
-                                && matches!(&*field.ty, Ty::String)
-                        })
-                    }))
-                .then_some(Self::Decode)
-            }
-            "$anyUpcast" if matches!(&**from, Ty::Bound(_)) && matches!(&**to, Ty::Any) => {
-                Some(Self::Upcast)
-            }
-            "$anyDowncast" if matches!(&**from, Ty::Any) => {
+                let (left, right) = (mirrored("0")?, mirrored("1")?);
+                if pair.labels.len() != 2 || !matches!(pair.rest, Rest::Closed) {
+                    return None;
+                }
                 let result = inference::unfold(aliases, to);
                 let Ty::Sum(row) = &*result else {
                     return None;
                 };
                 let some = row.labels.get("Some")?;
                 let none = row.labels.get("None")?;
+                let casts = inference::unfold(aliases, &some.ty);
+                let Ty::Struct(casts) = &*casts else {
+                    return None;
+                };
+                let arrow = |name: &str, from: u32, to: u32| {
+                    casts.labels.get(name).is_some_and(|field| {
+                        matches!(&*field.ty, Ty::Arrow(a, b, effects)
+                            if matches!(&**a, Ty::Bound(x) if *x == from)
+                                && matches!(&**b, Ty::Bound(y) if *y == to)
+                                && effects.labels.is_empty()
+                                && matches!(effects.rest, Rest::Closed))
+                    })
+                };
                 (row.labels.len() == 2
                     && matches!(row.rest, Rest::Closed)
                     && matches!(some.presence, Presence::Present)
                     && matches!(none.presence, Presence::Present)
-                    && matches!(&*some.ty, Ty::Bound(_))
-                    && same_finite_syntax(&none.ty, &Arc::new(Ty::unit())))
-                .then_some(Self::Downcast)
+                    && same_finite_syntax(&none.ty, &Arc::new(Ty::unit()))
+                    && casts.labels.len() == 2
+                    && matches!(casts.rest, Rest::Closed)
+                    && arrow("forward", left, right)
+                    && arrow("backward", right, left))
+                .then_some(Self::Same)
             }
             _ => None,
         }
     }
 
-    pub fn represented(self, ty: &Arc<Ty>, aliases: &IndexMap<Symbol, Scheme>) -> Arc<Ty> {
+    /// The type the intrinsic needs runtime information for, if any. A
+    /// mirror-consuming intrinsic needs none: the mirror it is handed is that
+    /// information already.
+    pub fn represented(self, ty: &Arc<Ty>, aliases: &IndexMap<Symbol, Scheme>) -> Option<Arc<Ty>> {
         let ty = inference::unfold(aliases, ty);
         let Ty::Arrow(from, to, _) = &*ty else {
             unreachable!("a reviewed reflection intrinsic is a function")
         };
         match self {
-            Self::Upcast => from.clone(),
-            Self::Downcast | Self::Decode => {
+            Self::TypeOf | Self::Encode => Some(from.clone()),
+            Self::Decode => {
                 let result = inference::unfold(aliases, to);
                 let Ty::Sum(row) = &*result else {
-                    unreachable!("a reviewed downcast returns Option")
+                    unreachable!("a reviewed decode returns Result")
                 };
-                row.labels["Some"].ty.clone()
+                Some(row.labels["Some"].ty.clone())
             }
+            Self::Mirror => match &**to {
+                Ty::Mirror(inner) => Some(inner.clone()),
+                _ => unreachable!("a reviewed mirror intrinsic returns a mirror"),
+            },
+            Self::Describe | Self::Same | Self::Shape => None,
         }
     }
 }
@@ -586,10 +1161,22 @@ pub enum Node {
     Real,
     String,
     Bool,
-    Any,
     ForeignValue,
     Array(u32),
-    Arrow([u32; 2]),
+    /// Authentic evidence of the type at the index: a mirror.
+    Mirror(u32),
+    /// `hide 'a => T`, binding a variable over the body at the index.
+    Hidden(u32),
+    /// A hidden type's variable, by how many binders out it was bound: zero
+    /// is the nearest enclosing [`Node::Hidden`]. Depth rather than a number,
+    /// so two hidden types spelled with different variables are one graph.
+    HiddenBound(u32),
+    /// `A -> B + E`: the argument, the result, and the effect row, which is
+    /// an [`Node::Effects`] node. Part of the identity: a callable that
+    /// performs an effect is not one that performs none.
+    Arrow([u32; 3]),
+    /// The effects of an arrow, each by its canonical identity, in order.
+    Effects(Vec<Effect>),
     Extend([u32; 2]),
     Struct(Vec<(String, u32)>),
     Sum(Vec<(String, u32)>),
@@ -597,40 +1184,21 @@ pub enum Node {
     Parameter(u32),
 }
 
-/// A conversion shape can inspect optional fields without claiming an exact
-/// runtime identity for an abstract presence package.
+/// One effect of an arrow's row: the identity of the effect declaration,
+/// the payload its operation carries, and the arguments the effect was
+/// applied to, each a node of the same graph.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct NativeTemplate {
-    pub descriptor: Descriptor,
-    pub optional_fields: std::collections::BTreeMap<u32, BTreeSet<String>>,
+pub struct Effect {
+    pub identity: String,
+    pub payload: u32,
+    pub args: Vec<u32>,
 }
 
-impl NativeTemplate {
-    pub fn template(
-        ty: &Arc<Ty>,
-        aliases: &IndexMap<Symbol, Scheme>,
-    ) -> Result<(Self, Vec<u32>), String> {
-        let (root, graph) = crate::ir::representation_graph(ty, aliases);
-        Descriptor::from_graph_policy(root, &graph, true)
-    }
-
-    pub fn validate(&self, parameters: usize) -> Result<(), &'static str> {
-        self.descriptor.validate(parameters)?;
-        for (index, optional) in &self.optional_fields {
-            let Some(Node::Struct(fields)) = self.descriptor.nodes.get(*index as usize) else {
-                return Err("native optional fields require a record shape");
-            };
-            if optional
-                .iter()
-                .any(|name| !fields.iter().any(|(field, _)| field == name))
-            {
-                return Err("native optional field is absent from its record shape");
-            }
-        }
-        Ok(())
-    }
-}
+/// The fields a host conversion may find absent, by the record node they
+/// belong to. Semantic identity knows no such overlay: it is the host plan's
+/// alone, and the host's planner keeps it. See [`crate::backend::host`].
+pub type OptionalFields = std::collections::BTreeMap<u32, BTreeSet<String>>;
 
 impl Descriptor {
     pub fn of(ty: &Arc<Ty>, aliases: &IndexMap<Symbol, Scheme>) -> Result<Self, String> {
@@ -653,30 +1221,44 @@ impl Descriptor {
         root: usize,
         graph: &[(String, Vec<(String, usize)>)],
     ) -> Result<(Self, Vec<u32>), String> {
-        let (template, parameters) = Self::from_graph_policy(root, graph, false)?;
-        Ok((template.descriptor, parameters))
+        let (descriptor, _, parameters) = Self::from_graph_policy(root, graph, false)?;
+        Ok((descriptor, parameters))
     }
 
-    fn from_graph_policy(
+    /// The finite graph of a type, exact or under the host's conversion
+    /// policy: exact identity carries hidden types, mirrors, and effect rows
+    /// faithfully, while a conversion shape looks through packages, seals
+    /// hidden values, needs a pure callable contract, and notes the fields a
+    /// host may leave out.
+    pub(crate) fn from_graph_policy(
         root: usize,
         graph: &[(String, Vec<(String, usize)>)],
         native: bool,
-    ) -> Result<(NativeTemplate, Vec<u32>), String> {
+    ) -> Result<(Self, OptionalFields, Vec<u32>), String> {
         let mut optional_fields = std::collections::BTreeMap::<u32, BTreeSet<String>>::new();
         let mut parameters = Vec::new();
         let mut nodes = vec![Node::ForeignValue];
-        let mut shared = HashMap::from([(root, 0u32)]);
-        let mut work = vec![(0, root)];
-        while let Some((at, source)) = work.pop() {
+        // A graph node is shared per enclosing hidden binder list: the same
+        // body under different binders would number its variables differently.
+        let binders: Vec<u32> = Vec::new();
+        let mut shared = HashMap::from([((root, binders.clone()), 0u32)]);
+        let mut work = vec![(0, root, binders)];
+        while let Some((at, source, binders)) = work.pop() {
+            if nodes.len() > NODE_LIMIT {
+                return Err(
+                    "runtime type information for this type does not fit a finite graph".into(),
+                );
+            }
             let (label, edges) = &graph[source];
-            let mut child = |source: usize| {
-                *shared.entry(source).or_insert_with(|| {
+            let mut child_under = |source: usize, binders: Vec<u32>| {
+                *shared.entry((source, binders.clone())).or_insert_with(|| {
                     let index = nodes.len() as u32;
                     nodes.push(Node::ForeignValue);
-                    work.push((index as usize, source));
+                    work.push((index as usize, source, binders));
                     index
                 })
             };
+            let mut child = |source: usize| child_under(source, binders.clone());
             let edge = |name: &str| {
                 edges
                     .iter()
@@ -688,24 +1270,108 @@ impl Descriptor {
                 "Real" => Node::Real,
                 "String" => Node::String,
                 "Bool" => Node::Bool,
-                "Any" => Node::Any,
                 "ForeignValue" => Node::ForeignValue,
                 "Unit" => Node::Struct(Vec::new()),
                 "package" if native => Node::Alias(child(edge("body").expect("package body"))),
+                "mirror" => Node::Mirror(child(edge("of").expect("mirror graph edge"))),
+                // A hidden type binds its variable over its body, numbered by
+                // depth so the spelling of the variable is no part of its
+                // identity. Across a foreign boundary it is a sealed package:
+                // nothing of the body is converted, or can be made outside.
+                name if name.starts_with("hidden:") => {
+                    let binder: u32 = name[7..].parse().expect("a hidden graph binder");
+                    // A variable always names the nearest enclosing binder of
+                    // its own, so re-entering a binder through recursion
+                    // shadows the occurrence already in scope and that one can
+                    // never be named again. Dropping it keeps every depth a
+                    // variable resolves to and bounds the list by the number of
+                    // distinct binders, which is what closes the back edge: a
+                    // list that only grew would give every turn of the
+                    // recursion a key of its own and the graph would never
+                    // finish.
+                    let mut inner: Vec<u32> = binders
+                        .iter()
+                        .copied()
+                        .filter(|bound| *bound != binder)
+                        .collect();
+                    inner.push(binder);
+                    Node::Hidden(child_under(edge("body").expect("hidden body"), inner))
+                }
+                name if name.starts_with("hidden-var:") => {
+                    let binder: u32 = name[11..].parse().expect("a hidden graph variable");
+                    let depth = binders
+                        .iter()
+                        .rev()
+                        .position(|bound| *bound == binder)
+                        .expect("a hidden variable is written under its binder");
+                    Node::HiddenBound(depth as u32)
+                }
                 "array" => Node::Array(child(edge("element").expect("array graph edge"))),
                 "arrow" => {
                     let effects = &graph[edge("effects").expect("arrow effect graph edge")];
-                    if effects.0 != "effects"
-                        || effects
-                            .1
-                            .iter()
-                            .any(|(name, node)| name != "tail" || graph[*node].0 != "closed")
-                    {
-                        return Err(
-                            "runtime type information requires a pure callable contract".into()
-                        );
+                    if effects.0 != "effects" {
+                        return Err("runtime type information requires a callable contract".into());
                     }
-                    Node::Arrow([child(edge("from").unwrap()), child(edge("to").unwrap())])
+                    // A conversion needs a pure contract: the host cannot
+                    // supply an effect. Exact identity carries the row, which
+                    // has to be decided: every effect present or absent, and
+                    // nothing beyond the ones written.
+                    let mut row = Vec::new();
+                    for (name, node) in &effects.1 {
+                        let (label, edges) = &graph[*node];
+                        if name == "tail" {
+                            if label != "closed" {
+                                return Err(
+                                    "runtime type information requires a closed effect row".into(),
+                                );
+                            }
+                            continue;
+                        }
+                        match label.strip_prefix("effect-case:") {
+                            Some("+") if !native => {
+                                let member = |key: &str| {
+                                    edges
+                                        .iter()
+                                        .find_map(|(name, node)| (name == key).then_some(*node))
+                                        .expect("an effect case has its members")
+                                };
+                                let args = (0..)
+                                    .map(|index| format!("arg:{index}"))
+                                    .take_while(|key| edges.iter().any(|(name, _)| name == key))
+                                    .map(|key| child(member(&key)))
+                                    .collect();
+                                row.push(Effect {
+                                    identity: graph[member("identity")].0.clone(),
+                                    payload: child(member("payload")),
+                                    args,
+                                });
+                            }
+                            Some("\\") => {}
+                            Some("+") => {
+                                return Err(
+                                    "runtime type information requires a pure callable contract"
+                                        .into(),
+                                );
+                            }
+                            _ => {
+                                return Err(
+                                    "runtime type information requires a decided effect row".into(),
+                                );
+                            }
+                        }
+                    }
+                    let from = child(edge("from").unwrap());
+                    let to = child(edge("to").unwrap());
+                    let effects = nodes.len() as u32;
+                    // A row is unordered, and a descriptor is compared member
+                    // by member, so the members are put in one order here:
+                    // two arrows written `+ !A + !B` and `+ !B + !A` are one
+                    // type, and a mirror of each must say so. A row carries
+                    // at most one member per identity, so this orders them
+                    // completely.
+                    row.sort_by(|left, right| left.identity.cmp(&right.identity));
+                    nodes.push(Node::Effects(row));
+                    Node::Arrow([from, to, effects])
                 }
                 "fields" | "sum" => {
                     let record = label == "fields";
@@ -799,12 +1465,11 @@ impl Descriptor {
                     .expect("collected descriptor parameter") as u32;
             }
         }
-        let template = NativeTemplate {
-            descriptor: Self { nodes },
-            optional_fields,
-        };
-        template.validate(parameters.len()).map_err(str::to_owned)?;
-        Ok((template, parameters))
+        let descriptor = Self { nodes };
+        descriptor
+            .validate(parameters.len())
+            .map_err(str::to_owned)?;
+        Ok((descriptor, optional_fields, parameters))
     }
 
     /// Descriptors are public artifact data; validate references before codegen.
@@ -817,8 +1482,20 @@ impl Descriptor {
                 Node::Parameter(index) if *index as usize >= parameters => {
                     return Err("invalid runtime type parameter");
                 }
-                Node::Array(index) | Node::Alias(index) => vec![*index],
-                Node::Arrow(indices) | Node::Extend(indices) => indices.to_vec(),
+                Node::Array(index)
+                | Node::Alias(index)
+                | Node::Mirror(index)
+                | Node::Hidden(index) => {
+                    vec![*index]
+                }
+                Node::Arrow(indices) => indices.to_vec(),
+                Node::Extend(indices) => indices.to_vec(),
+                Node::Effects(effects) => effects
+                    .iter()
+                    .flat_map(|effect| {
+                        std::iter::once(effect.payload).chain(effect.args.iter().copied())
+                    })
+                    .collect(),
                 Node::Struct(fields) | Node::Sum(fields) => {
                     if fields.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
                         return Err("runtime type fields must be unique and sorted");

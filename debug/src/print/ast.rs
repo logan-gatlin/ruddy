@@ -610,6 +610,16 @@ impl fmt::Display for Ast<'_, PatternKind> {
                 None,
                 payload.as_deref().map(|payload| Ast(&payload.tracked)),
             ),
+            // The payload is grouped by the rule a tag's is: taken greedily
+            // when read, so anything but an atom needs its parentheses back.
+            PatternKind::Hidden { variable, pattern } => {
+                write!(f, "hide '{} ", variable.tracked)?;
+                let payload = Ast(&pattern.tracked);
+                match payload.prec() < Prec::Atom {
+                    true => write!(f, "({payload})"),
+                    false => write!(f, "{payload}"),
+                }
+            }
             PatternKind::Tuple(elements) => {
                 write_tuple(f, elements.iter().map(|element| Ast(&element.tracked)))
             }
@@ -764,6 +774,10 @@ impl fmt::Display for Ast<'_, TypeKind> {
                 args.iter().map(|arg| Ast(&arg.tracked)),
             ),
             TypeKind::Ident { name } => write!(f, "{name}"),
+            // The body runs to the end of the type, so it is never grouped.
+            TypeKind::Hidden { variable, body } => {
+                write!(f, "hide '{} => {}", variable.tracked, Ast(&body.tracked))
+            }
             // The sigil is written back on: it is how the name was spelled, and
             // a variable printing bare would come back as a type's name.
             TypeKind::Variable { name } => write!(f, "'{}", name.tracked),

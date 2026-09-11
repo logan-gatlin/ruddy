@@ -12,7 +12,7 @@ dev_dir := justfile_directory() / "debug/.dev"
 # handler fragment the backend splices into generated code, which is not a
 # file; and so is the debugger's demo, which ends in deliberate syntax errors
 # that a format run rightly reports.
-ruddy_sources := "std src/backend/node-platform.rud src/backend/node-entry.rud"
+ruddy_sources := "std src/backend/node-platform.rud src/backend/web-platform.rud src/backend/node-entry.rud"
 
 _default:
     @just --list --unsorted
@@ -182,7 +182,10 @@ deploy:
 install:
     cargo install --locked --force --path "{{justfile_directory()}}/cli"
 
-# Line and branch coverage for the compiler library. Branch coverage is a
+# Line and branch coverage for the compiler library, which is the crate the
+# 100% rule is about. Every other crate in the workspace is excluded: the
+# tests themselves, the debugger, the command line, the reference
+# interpreter, and the JavaScript recognizer. Branch coverage is a
 # nightly-only rustc feature, hence `+nightly`.
 cov *args:
     #!/usr/bin/env bash
@@ -192,7 +195,7 @@ cov *args:
     eval "$(cargo +"$coverage_toolchain" llvm-cov show-env --branch --sh)"
     cargo +"$coverage_toolchain" llvm-cov clean
     RUSTUP_TOOLCHAIN="$coverage_toolchain" just test
-    cargo +"$coverage_toolchain" llvm-cov report --ignore-filename-regex '/(tests|debug|cli|lsp)/src/|/vendor/|/rustlib/' {{args}}
+    cargo +"$coverage_toolchain" llvm-cov report --ignore-filename-regex '/(tests|debug|cli|interp|esparse)/src/|/vendor/|/rustlib/' {{args}}
 
 clippy:
     cargo clippy --workspace --all-targets

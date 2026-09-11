@@ -24,6 +24,15 @@ pub enum Kind {
     /// around it were reserved long before this keyword existed; this is what
     /// they were reserved for.
     Match,
+    /// `hide`, binding a hidden type over the type after its `=>`, or opening
+    /// one in a match arm's pattern: `hide 'a => T` and `hide 'a p`.
+    ///
+    /// Reserved rather than contextual, like `raise`: a type and a pattern
+    /// both begin with it, and nothing in front of either position could tell
+    /// the word from a name. Only the exact word — `hidden` and `Hide` remain
+    /// names, and `'hide`, `#hide`, `!hide` and `@hide` keep their sigils'
+    /// rules, the way every reserved word does.
+    Hide,
     /// `if`, `then`, and `else` delimit a conditional expression.
     If,
     Then,
@@ -520,37 +529,9 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                 // `ident` was built from the source chars, so its UTF-8 byte
                 // length is exactly the span width.
                 let span = file_id.span(start, ident.len());
-                let kind = match ident.as_str() {
-                    "let" => Kind::Let,
-                    "extern" => Kind::Extern,
-                    "do" => Kind::Do,
-                    "return" => Kind::Return,
-                    "type" => Kind::Type,
-                    "end" => Kind::End,
-                    "with" => Kind::With,
-                    "match" => Kind::Match,
-                    "if" => Kind::If,
-                    "then" => Kind::Then,
-                    "else" => Kind::Else,
-                    "fn" => Kind::Fn,
-                    "effect" => Kind::Effect,
-                    "handle" => Kind::Handle,
-                    "raise" => Kind::Raise,
-                    "and" => Kind::And,
-                    "or" => Kind::Or,
-                    "xor" => Kind::Xor,
-                    "not" => Kind::Not,
-                    "mut" => Kind::Mut,
-                    "module" => Kind::Module,
-                    "using" => Kind::Using,
-                    "true" => Kind::Bool(true),
-                    "false" => Kind::Bool(false),
-                    // `return` is deliberately absent: it heads a handler arm
-                    // and is an ordinary name everywhere else, so the parser
-                    // recognizes it by spelling at the one position that reads
-                    // it — the rule `when` and `where` already keep.
-                    "_" => Kind::Underscore,
-                    _ => Kind::Identifier(ident),
+                let kind = match keyword(&ident) {
+                    Some(kind) => kind,
+                    None => Kind::Identifier(ident),
                 };
                 tokens.push(span.track(kind));
             }
@@ -811,6 +792,45 @@ fn block_comment(chars: &mut Peekable<CharIndices<'_>>) -> (Result<String, Error
     // The closing `*` was pushed before it was recognized.
     text.pop();
     (Ok(text), width)
+}
+
+/// The token a whole word lexes as when it is reserved, or `None` for an
+/// ordinary name. The one table of reserved words: the lexer reads it, and so
+/// does every printer that has to decide whether a label can be written bare
+/// — a field spelled like a keyword takes quotes, and this is what says so.
+///
+/// `when` and `where` are deliberately absent: they are contextual, read by
+/// spelling at the few positions that want them and names everywhere else.
+pub fn keyword(word: &str) -> Option<Kind> {
+    Some(match word {
+        "let" => Kind::Let,
+        "extern" => Kind::Extern,
+        "do" => Kind::Do,
+        "return" => Kind::Return,
+        "type" => Kind::Type,
+        "end" => Kind::End,
+        "with" => Kind::With,
+        "match" => Kind::Match,
+        "hide" => Kind::Hide,
+        "if" => Kind::If,
+        "then" => Kind::Then,
+        "else" => Kind::Else,
+        "fn" => Kind::Fn,
+        "effect" => Kind::Effect,
+        "handle" => Kind::Handle,
+        "raise" => Kind::Raise,
+        "and" => Kind::And,
+        "or" => Kind::Or,
+        "xor" => Kind::Xor,
+        "not" => Kind::Not,
+        "mut" => Kind::Mut,
+        "module" => Kind::Module,
+        "using" => Kind::Using,
+        "true" => Kind::Bool(true),
+        "false" => Kind::Bool(false),
+        "_" => Kind::Underscore,
+        _ => return None,
+    })
 }
 
 fn word(chars: &mut Peekable<CharIndices<'_>>) -> String {

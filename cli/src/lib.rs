@@ -1170,19 +1170,62 @@ impl Platform {
 /// What a build is: the target it emits and the platform it runs on. Every
 /// project in a graph is compiled for the root's build, so a dependency's
 /// guards see the build its consumer is making.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Build {
     pub target: Target,
     pub platform: Platform,
+    /// The domains `Nat` and `Int` are bound to, from the root's `integers`.
+    pub domains: ruddy::types::Domains,
 }
 
 impl Build {
+    /// The build a target, a platform, and a requested integer precision
+    /// describe, or why they describe none. Every way into compilation comes
+    /// through here, so a combination one entry point refuses cannot reach a
+    /// backend through another. An omitted precision takes the default; one
+    /// that is written and unsupported is an error rather than the default.
+    pub fn resolve(
+        target: Target,
+        platform: Platform,
+        integers: Option<u32>,
+    ) -> Result<Self, CompileError> {
+        let Some(bits) = integers else {
+            return Ok(Self {
+                target,
+                platform,
+                domains: ruddy::types::Domains::default(),
+            });
+        };
+        let domains = ruddy::types::Domains::from_name(&bits.to_string()).ok_or_else(|| {
+            CompileError::report(
+                "manifest-invalid",
+                format!("`integers = {bits}` is not a precision the compiler binds"),
+            )
+            .with_help("set `integers` to 53, 32, or 64")
+        })?;
+        if target == Target::Js && domains == ruddy::types::Domains::Bits64 {
+            return Err(CompileError::report(
+                "manifest-invalid",
+                "the JavaScript target cannot hold 64-bit `Nat` and `Int`",
+            )
+            .with_help(
+                "set `integers` to 53 or 32, or use Nat64 and Int64 where 64 bits are needed",
+            ));
+        }
+        Ok(Self {
+            target,
+            platform,
+            domains,
+        })
+    }
+
     /// The facts source may ask about this build, in the order a complaint
     /// lists them.
     pub fn environment(self) -> bundle::Environment {
         bundle::Environment::new([
             ("target", self.target.name()),
             ("platform", self.platform.name()),
+            ("integers", self.domains.name()),
         ])
     }
 }
@@ -1212,6 +1255,10 @@ struct Manifest {
     target: Option<Target>,
     #[serde(default)]
     platform: Option<Platform>,
+    /// The precision of `Nat` and `Int` in bits: `53`, JavaScript's safe
+    /// integers and the default, `32`, or `64`.
+    #[serde(default)]
+    integers: Option<u32>,
     #[serde(default)]
     run: RunConfig,
     #[serde(default)]
@@ -1237,11 +1284,8 @@ impl Manifest {
     }
 
     /// The build this manifest asks for, when it is the root.
-    fn build(&self) -> Build {
-        Build {
-            target: self.target(),
-            platform: self.platform(),
-        }
+    fn build(&self) -> Result<Build, CompileError> {
+        Build::resolve(self.target(), self.platform(), self.integers)
     }
 }
 
@@ -1616,7 +1660,7 @@ fn compile_graph_output(
 ) -> Result<(CompiledGraph, Vec<documentation::Page>), CompileError> {
     let root = canonical_project(directory)?;
     let resolver = git::Resolver::new(&root)?;
-    let build = load_manifest(&root, None)?.build();
+    let build = load_manifest(&root, None)?.build()?;
     let mut compiler = GraphCompiler {
         document,
         root: Some(root.clone()),
@@ -2211,7 +2255,10 @@ impl GraphCompiler {
         let run = manifest.run.clone();
         // What this project is compiled for: the root's build when there is
         // one root, and its own otherwise.
-        let build = self.build.unwrap_or_else(|| manifest.build());
+        let build = match self.build {
+            Some(build) => build,
+            None => manifest.build()?,
+        };
         // A dependency is compiled only when the cache has no artifact for
         // this compiler, these sources, these dependencies and this build.
         // The root is what the run is for, and always compiled.
@@ -2467,11 +2514,12 @@ fn compile_one(
         })
         .collect();
     let doc_statements = documentation.as_ref().map(|_| loaded.stmts.clone());
-    let accepted = ruddy::compile::compile_with_dependencies(
+    let accepted = ruddy::compile::compile_bound(
         mint,
         loaded.stmts,
         &dependencies,
         inference::Trace::Off,
+        build.domains,
     );
     let accepted = match accepted {
         Ok(accepted) => accepted,

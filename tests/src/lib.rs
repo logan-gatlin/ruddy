@@ -9,6 +9,7 @@
 //! reach a release build.
 #![cfg(test)]
 
+mod abi_plans;
 mod artifact;
 mod bundle;
 mod cli;
@@ -19,8 +20,11 @@ mod fixed_integers;
 mod format;
 mod host_exports;
 mod inference;
+mod interp;
+mod interp_prim;
 mod ir;
 mod js;
+mod js_adapters;
 mod link;
 mod lir;
 mod parse;
@@ -32,6 +36,7 @@ mod session;
 mod snapshot;
 mod stage;
 mod stdlib;
+mod stdlib_apis;
 mod stdlib_fs;
 mod symbol;
 mod token;

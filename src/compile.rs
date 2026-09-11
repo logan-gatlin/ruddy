@@ -12,6 +12,7 @@ use crate::{
     ir, lir, parse, patterns,
     symbol::Mint,
     tracking::SourceMap,
+    types,
 };
 
 /// Every checking error produced by a completed compiler phase.
@@ -69,6 +70,8 @@ pub enum DependencyArtifact<'a> {
 /// The coherent program that has passed every checking phase.
 #[derive(Debug)]
 pub struct AcceptedProgram {
+    /// The domains `Nat` and `Int` were bound to for this compilation.
+    domains: types::Domains,
     reification: crate::reification::Analysis,
     mint: Mint,
     ir: ir::Output,
@@ -116,6 +119,11 @@ impl AcceptedProgram {
         &self.artifact
     }
 
+    /// The domains `Nat` and `Int` were bound to.
+    pub fn domains(&self) -> types::Domains {
+        self.domains
+    }
+
     /// Consume accepted state for phase-specific debugger/test inspection.
     /// It cannot be passed back to lowering or artifact construction.
     pub fn into_parts(self) -> (Mint, ir::Output, inference::Output, patterns::Output) {
@@ -136,6 +144,7 @@ pub fn compile(
         trace,
         Vec::new(),
         Default::default(),
+        types::Domains::default(),
         ir::build,
     )
 }
@@ -152,6 +161,20 @@ pub fn compile_with_dependencies(
     stmts: Vec<parse::Stmt>,
     dependencies: &[Dependency<'_>],
     trace: Trace,
+) -> Result<AcceptedProgram, PartialCompilation> {
+    compile_bound(mint, stmts, dependencies, trace, types::Domains::default())
+}
+
+/// Compile a parsed source bundle against its dependencies with `Nat` and
+/// `Int` bound to the target's domains: a literal outside them is refused,
+/// and the artifact records them for the linker to check against.
+#[allow(clippy::result_large_err)]
+pub fn compile_bound(
+    mint: Mint,
+    stmts: Vec<parse::Stmt>,
+    dependencies: &[Dependency<'_>],
+    trace: Trace,
+    domains: types::Domains,
 ) -> Result<AcceptedProgram, PartialCompilation> {
     let recovered: Vec<(Cow<'_, artifact::Artifact>, Vec<artifact::RecoveryFact>)> = dependencies
         .iter()
@@ -201,6 +224,7 @@ pub fn compile_with_dependencies(
         trace,
         artifact_dependencies,
         imported_summaries,
+        domains,
         |mint, stmts| ir::build_with_dependency_imports(mint, stmts, &imports, &linked),
     );
     match &mut result {
@@ -217,6 +241,7 @@ fn compile_with(
     trace: Trace,
     artifact_dependencies: Vec<artifact::Dependency>,
     imported_summaries: std::collections::HashMap<String, lir::Suspension>,
+    domains: types::Domains,
     build: impl FnOnce(&mut Mint, Vec<parse::Stmt>) -> ir::Output,
 ) -> Result<AcceptedProgram, PartialCompilation> {
     let mut ir = build(&mut mint, stmts);
@@ -226,6 +251,7 @@ fn compile_with(
             .values()
             .filter_map(|declaration| externs::export_request(&declaration.metadata).err()),
     );
+    ir.errors.extend(ir::literals_outside(&ir.program, domains));
     let inference = inference::infer(&mint, &ir.program, trace);
     // Inference reads the program and answers with typed copies of its
     // declarations; the program every later phase reads is the one with
@@ -238,6 +264,7 @@ fn compile_with(
         inference,
         patterns,
         artifact_dependencies,
+        domains,
         imported_summaries,
     )
 }
@@ -250,6 +277,7 @@ pub(crate) fn accept(
     inference: inference::Output,
     patterns: patterns::Output,
     artifact_dependencies: Vec<artifact::Dependency>,
+    domains: types::Domains,
     imported_summaries: std::collections::HashMap<String, lir::Suspension>,
 ) -> Result<AcceptedProgram, PartialCompilation> {
     if inference.errors().is_empty() {
@@ -275,6 +303,7 @@ pub(crate) fn accept(
     // coherent result, so the public compile seam runs all the way to the
     // validated target-neutral persistence boundary.
     let mut accepted = AcceptedProgram {
+        domains,
         reification,
         mint,
         ir,

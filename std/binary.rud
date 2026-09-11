@@ -1,0 +1,633 @@
+@doc "Why a binary document could not be read or written: the type has no default codec, or the codec or the input failed, at a path."
+type Error = #Derive codec::DeriveError | #Codec codec::Error
+
+@doc "What a reader refuses before it allocates: input longer than `bytes`, nesting deeper than `depth`, or a sequence longer than `members`."
+type Limits = { depth: Nat, bytes: Nat, members: Nat }
+
+let default_limits: Limits = { depth: 512n, bytes: 67108864n, members: 1000000n }
+
+@doc "An application-owned identity for a wire schema, written before a versioned document and checked when one is read. Editing a type does not change it: the application says when its schema changed."
+type Schema = { id: String, version: Nat }
+
+@private
+type FrameKind = #Record | #Sequence | #Variant
+
+@private
+@doc "One open frame. `count` is how many children have been completed, and `declared` how many were promised: a sequence says its length before its elements, and the two must meet before the frame closes."
+type Frame = {
+  serial: Nat,
+  kind: FrameKind,
+  count: Nat,
+  declared: Nat,
+  fields: [String],
+  cases: [String],
+}
+
+@private
+extern real_to_bits: fn(Real) -> Nat64 = "$prim.binary.real_to_bits"
+@private
+extern real_from_bits: fn(Nat64) -> Real = "$prim.binary.real_from_bits"
+@private
+extern utf8_encode: fn(String) -> [Nat8] = "$prim.binary.utf8_encode"
+@private
+extern utf8_decode: fn([Nat8]) -> Option String = "$prim.binary.utf8_decode"
+@private
+extern nat64_to_bytes: fn(Nat64) -> [Nat8] = "$prim.binary.nat64_to_bytes"
+@private
+extern nat64_from_bytes: fn([Nat8]) -> Nat64 = "$prim.binary.nat64_from_bytes"
+@private
+extern int64_to_bytes: fn(Int64) -> [Nat8] = "$prim.binary.int64_to_bytes"
+@private
+extern int64_from_bytes: fn([Nat8]) -> Int64 = "$prim.binary.int64_from_bytes"
+@private
+extern nat_to_bytes: fn(Nat) -> [Nat8] = "$prim.binary.nat_to_bytes"
+@private
+extern int_to_bytes: fn(Int) -> [Nat8] = "$prim.binary.int_to_bytes"
+@private
+extern nat_from_bytes: fn([Nat8]) -> Option Nat = "$prim.binary.nat_from_bytes"
+@private
+extern int_from_bytes: fn([Nat8]) -> Option Int = "$prim.binary.int_from_bytes"
+@private
+extern nat32_to_bytes: fn(Nat) -> [Nat8] = "$prim.binary.nat32_to_bytes"
+@private
+extern nat32_from_bytes: fn([Nat8]) -> Nat = "$prim.binary.nat32_from_bytes"
+
+@private
+let chain = result::and_then
+
+@private
+let protocol: String -> Result 'a codec::Error = fn message =>
+  #Error { path: [], kind: #Protocol message }
+
+@private
+let limit: String -> Result 'a codec::Error = fn message =>
+  #Error { path: [], kind: #Limit message }
+
+@private
+let truncated: Nat -> Result 'a codec::Error = fn offset =>
+  #Error { path: [], kind: #Parse { message: "the input ends early", offset: offset } }
+
+@private
+let range: String -> String -> Result 'a codec::Error = fn expected found =>
+  #Error { path: [], kind: #Range { expected: expected, found: found } }
+
+-- ── The writer ─────────────────────────────────────────────────────────────
+
+@doc "Write a value with an encoder as positional binary, within the limits: no names or tags, only what the schema says comes next, little-endian, with `Nat` and `Int` as 64 bits, `Real` as its bits, text as a 32-bit length and UTF-8, sequences as a 32-bit count and their elements, and cases as their 32-bit index in the schema. On failure there is no output."
+let encode_with: codec::Encoder 'a -> Limits -> 'a -> Result [Nat8] Error =
+  fn encoder limits value => do
+    let out = mut []
+    let stack = mut []
+    let serial = mut 0n
+    let pending = mut false
+    let done = mut false
+    let written_bytes = mut 0n
+    let members = mut 0n
+    -- The budget is counted before the bytes are kept, so nothing past it is ever held, and a
+    -- failure leaves no output at all.
+    let emit = fn bytes =>
+      if nat::greater_than (nat::add (~written_bytes) (array::len bytes)) limits.bytes then
+        limit "more output than the byte limit"
+      else
+        do
+          _ = written_bytes := nat::add (~written_bytes) (array::len bytes)
+          _ = out := array::concat (~out) bytes
+          return #Some ()
+        end
+      end
+    let counted = fn _ =>
+      if nat::greater_than_or_equal (~members) limits.members then
+        limit "more members than the limit"
+      else
+        do
+          _ = members := nat::add (~members) 1n
+          return #Some ()
+        end
+      end
+    let top = fn kind cursor => match ~stack with
+    | [frame, ..] =>
+      if nat::equal frame.serial cursor.frame then
+        match (frame.kind, kind) with
+        | (#Record, #Record) => #Some frame
+        | (#Sequence, #Sequence) => #Some frame
+        | (#Variant, #Variant) => #Some frame
+        | _ => protocol "the cursor is for another kind of frame"
+        end
+      else protocol "the cursor is not the innermost open frame"
+      end
+    | [] => protocol "no frame is open"
+    end
+    let replace_top = fn frame => match ~stack with
+    | [_, ..rest] => stack := [frame, ..rest]
+    | [] => ~stack
+    end
+    let expect_value = fn _ =>
+      if ~pending then #Some ()
+      else if nat::is_zero (array::len (~stack)) and not ~done then #Some ()
+      else protocol "no value is expected here"
+      end
+    let written = fn _ => do
+      _ = pending := false
+      _ = if nat::is_zero (array::len (~stack)) then done := true else ~done end
+      return #Some ()
+    end
+    let scalar = fn bytes =>
+      chain (fn _ => chain (fn _ => written ()) (emit bytes)) (expect_value ())
+    let open = fn kind fields cases => chain
+      (fn _ =>
+        if nat::greater_than_or_equal (array::len (~stack)) limits.depth then
+          limit "a value nested too deeply"
+        else
+          do
+            _ = serial := nat::add (~serial) 1n
+            _ = stack
+              := [
+                {
+                  serial: ~serial,
+                  kind: kind,
+                  count: 0n,
+                  declared: 0n,
+                  fields: fields,
+                  cases: cases,
+                },
+                ..~stack,
+              ]
+            _ = pending := false
+            return #Some { frame: ~serial }
+          end
+        end)
+      (expect_value ())
+    let close = fn kind cursor expected => chain
+      (fn frame =>
+        if ~pending then protocol "a value is still expected"
+        else if not nat::equal frame.count expected then protocol "the frame is not complete"
+        else
+          do
+            _ = stack := match ~stack with | [_, ..rest] => rest | [] => [] end
+            return written ()
+          end
+        end)
+      (top kind cursor)
+    return match handle encoder.run value with
+    | codec::!Write.write_bool b => scalar [if b then 1n8 else 0n8 end]
+    | codec::!Write.write_nat n => scalar (nat_to_bytes n)
+    | codec::!Write.write_int i => scalar (int_to_bytes i)
+    | codec::!Write.write_nat64 n => scalar (nat64_to_bytes n)
+    | codec::!Write.write_int64 i => scalar (int64_to_bytes i)
+    | codec::!Write.write_real r => scalar (nat64_to_bytes (real_to_bits r))
+    | codec::!Write.write_text text =>
+      do
+        let bytes = utf8_encode text
+        return scalar (array::concat (nat32_to_bytes (array::len bytes)) bytes)
+      end
+    | codec::!Write.begin_record schema => open (#Record) schema.fields []
+    | codec::!Write.write_field field =>
+      chain
+        (fn frame =>
+          if ~pending then protocol "a value is still expected"
+          else
+            match array::get frame.fields frame.count with
+            | #Some expected =>
+              if str::equal expected field.name then
+                chain
+                  (fn _ => do
+                    _ = replace_top {
+                      serial: frame.serial,
+                      kind: frame.kind,
+                      count: nat::add frame.count 1n,
+                      declared: frame.declared,
+                      fields: frame.fields,
+                      cases: frame.cases,
+                    }
+                    _ = pending := true
+                    return #Some ()
+                  end)
+                  (counted ())
+              else protocol (str::concat "the field is out of the schema's order: " field.name)
+              end
+            | #None => protocol (str::concat "the field is not in the schema: " field.name)
+            end
+          end)
+        (top (#Record) field.cursor)
+    | codec::!Write.end_record cursor =>
+      chain
+        (fn frame => close (#Record) cursor (array::len frame.fields))
+        (top (#Record) cursor)
+    | codec::!Write.begin_sequence count =>
+      if nat::greater_than count 4294967295n then limit "a sequence longer than the format's length"
+      else
+        chain
+          (fn cursor => chain
+            (fn _ => do
+              _ = replace_top {
+                serial: cursor.frame,
+                kind: #Sequence,
+                count: 0n,
+                declared: count,
+                fields: [],
+                cases: [],
+              }
+              return #Some cursor
+            end)
+            (emit (nat32_to_bytes count)))
+          (open (#Sequence) [] [])
+      end
+    | codec::!Write.next_element cursor =>
+      chain
+        (fn frame =>
+          if ~pending then protocol "a value is still expected"
+          else if nat::greater_than_or_equal frame.count frame.declared then
+            protocol "more elements than the sequence declared"
+          else
+            chain
+              (fn _ => do
+                _ = replace_top {
+                  serial: frame.serial,
+                  kind: frame.kind,
+                  count: nat::add frame.count 1n,
+                  declared: frame.declared,
+                  fields: frame.fields,
+                  cases: frame.cases,
+                }
+                _ = pending := true
+                return #Some ()
+              end)
+              (counted ())
+          end)
+        (top (#Sequence) cursor)
+    | codec::!Write.end_sequence cursor =>
+      chain
+        (fn frame => close (#Sequence) cursor frame.declared)
+        (top (#Sequence) cursor)
+    | codec::!Write.begin_variant opened =>
+      match array::find_index (fn known => str::equal known opened.tag) opened.schema.cases with
+      | #Some index =>
+        chain
+          (fn cursor => chain
+            (fn _ => do
+              _ = replace_top {
+                serial: cursor.frame,
+                kind: #Variant,
+                count: 1n,
+                declared: 1n,
+                fields: [],
+                cases: opened.schema.cases,
+              }
+              _ = pending := true
+              return #Some cursor
+            end)
+            (emit (nat32_to_bytes index)))
+          (open (#Variant) [] opened.schema.cases)
+      | #None => protocol (str::concat "not a case of the sum: " opened.tag)
+      end
+    | codec::!Write.end_variant cursor => close (#Variant) cursor 1n
+    end with
+    | #Some _ =>
+      if not ~done or not nat::is_zero (array::len (~stack)) then
+        #Error (#Codec { path: [], kind: #Protocol "the encoder did not write a whole document" })
+      else #Some (~out)
+      end
+    | #Error error => #Error (#Codec error)
+    end
+  end
+
+@doc "Write a value as positional binary with its type's default codec. See `encode_with`."
+let encode: 'a -> Result [Nat8] Error = fn value =>
+  match codec::derive_encoder (reflect::type_of value) with
+  | #Some encoder => encode_with encoder default_limits value
+  | #Error error => #Error (#Derive error)
+  end
+
+-- ── The reader ─────────────────────────────────────────────────────────────
+
+@doc "Read a value with a decoder from positional binary, within the limits. The decoder's schema says what comes next: nothing in the input does. The input is measured before any of it is read, so a document past the byte budget costs nothing to refuse."
+let decode_with: codec::Decoder 'a -> Limits -> [Nat8] -> Result 'a Error =
+  fn decoder limits input =>
+    do
+      let within: Result () Error =
+        if nat::greater_than (array::len input) limits.bytes then
+          #Error (#Codec { path: [], kind: #Limit "more input than the byte limit" })
+        else #Some ()
+        end
+      let pos = mut 0n
+      let stack = mut []
+      let serial = mut 0n
+      let pending = mut false
+      let done = mut false
+      let take = fn count => do
+        let stop = nat::add (~pos) count
+        return
+          if nat::greater_than stop (array::len input) then truncated (~pos)
+          else
+            match array::slice input (~pos) stop with
+            | #Some bytes => do _ = pos := stop return #Some bytes end
+            | #None => truncated (~pos)
+            end
+          end
+      end
+      let top = fn kind cursor => match ~stack with
+      | [frame, ..] =>
+        if nat::equal frame.serial cursor.frame then
+          match (frame.kind, kind) with
+          | (#Record, #Record) => #Some frame
+          | (#Sequence, #Sequence) => #Some frame
+          | (#Variant, #Variant) => #Some frame
+          | _ => protocol "the cursor is for another kind of frame"
+          end
+        else protocol "the cursor is not the innermost open frame"
+        end
+      | [] => protocol "no frame is open"
+      end
+      let replace_top = fn frame => match ~stack with
+      | [_, ..rest] => stack := [frame, ..rest]
+      | [] => ~stack
+      end
+      let expect_value = fn _ =>
+        if ~pending then #Some ()
+        else if nat::is_zero (array::len (~stack)) and not ~done then #Some ()
+        else protocol "no value is expected here"
+        end
+      let consumed = fn _ => do
+        _ = pending := false
+        _ = if nat::is_zero (array::len (~stack)) then done := true else ~done end
+        return ()
+      end
+      let scalar = fn read => chain
+        (fn _ => chain (fn value => do _ = consumed () return #Some value end) (read ()))
+        (expect_value ())
+      let open = fn kind fields cases count => chain
+        (fn _ =>
+          if nat::greater_than_or_equal (array::len (~stack)) limits.depth then
+            limit "a document nested too deeply"
+          else
+            do
+              _ = serial := nat::add (~serial) 1n
+              _ = stack
+                := [
+                  {
+                    serial: ~serial,
+                    kind: kind,
+                    count: count,
+                    declared: count,
+                    fields: fields,
+                    cases: cases,
+                  },
+                  ..~stack,
+                ]
+              _ = pending := false
+              return #Some { frame: ~serial }
+            end
+          end)
+        (expect_value ())
+      let close = fn kind cursor => chain
+        (fn frame =>
+          if ~pending then protocol "a value is still expected"
+          else
+            do
+              _ = stack := match ~stack with | [_, ..rest] => rest | [] => [] end
+              _ = consumed ()
+              return #Some ()
+            end
+          end)
+        (top kind cursor)
+      return chain
+        (fn _ => match handle decoder.run () with
+        | codec::!Read.read_bool _ =>
+          scalar
+            (fn _ => chain
+              (fn bytes => match bytes with
+              | [0n8] => #Some false
+              | [1n8] => #Some true
+              | _ => range "a boolean byte" "another byte"
+              end)
+              (take 1n))
+        | codec::!Read.read_nat _ =>
+          scalar
+            (fn _ => chain
+              (fn bytes => match nat_from_bytes bytes with
+              | #Some value => #Some value
+              | #None => range "Nat" "a 64-bit value outside the target's domain"
+              end)
+              (take 8n))
+        | codec::!Read.read_int _ =>
+          scalar
+            (fn _ => chain
+              (fn bytes => match int_from_bytes bytes with
+              | #Some value => #Some value
+              | #None => range "Int" "a 64-bit value outside the target's domain"
+              end)
+              (take 8n))
+        | codec::!Read.read_nat64 _ => scalar (fn _ => result::map nat64_from_bytes (take 8n))
+        | codec::!Read.read_int64 _ => scalar (fn _ => result::map int64_from_bytes (take 8n))
+        | codec::!Read.read_real _ =>
+          scalar
+            (fn _ => result::map (fn bytes => real_from_bits (nat64_from_bytes bytes)) (take 8n))
+        | codec::!Read.read_text _ =>
+          scalar
+            (fn _ => chain
+              (fn header => chain
+                (fn bytes => match utf8_decode bytes with
+                | #Some text => #Some text
+                | #None =>
+                  #Error {
+                    path: [],
+                    kind: #Parse { message: "text that is not UTF-8", offset: ~pos },
+                  }
+                end)
+                (take (nat32_from_bytes header)))
+              (take 4n))
+        | codec::!Read.skip_value _ =>
+          #Error {
+            path: [],
+            kind: #Unsupported "positional binary cannot skip a value without its schema",
+          }
+        | codec::!Read.begin_record schema => open (#Record) schema.fields [] 0n
+        | codec::!Read.next_field cursor =>
+          chain
+            (fn frame =>
+              if ~pending then protocol "a value is still expected"
+              else
+                match array::get frame.fields frame.count with
+                | #Some name => do
+                  _ = replace_top {
+                    serial: frame.serial,
+                    kind: frame.kind,
+                    count: nat::add frame.count 1n,
+                    declared: frame.declared,
+                    fields: frame.fields,
+                    cases: frame.cases,
+                  }
+                  _ = pending := true
+                  return #Some (#Some name)
+                end
+                | #None => #Some (#None)
+                end
+              end)
+            (top (#Record) cursor)
+        | codec::!Read.end_record cursor => close (#Record) cursor
+        | codec::!Read.begin_sequence _ =>
+          chain
+            (fn cursor => chain
+              (fn header => do
+                let count = nat32_from_bytes header
+                return
+                  if nat::greater_than count limits.members then
+                    limit "a sequence longer than the limit"
+                  else
+                    do
+                      _ = replace_top {
+                        serial: cursor.frame,
+                        kind: #Sequence,
+                        count: count,
+                        declared: count,
+                        fields: [],
+                        cases: [],
+                      }
+                      return #Some cursor
+                    end
+                  end
+              end)
+              (take 4n))
+            (open (#Sequence) [] [] 0n)
+        | codec::!Read.next_element cursor =>
+          chain
+            (fn frame =>
+              if ~pending then protocol "a value is still expected"
+              else if nat::is_zero frame.count then #Some false
+              else
+                do
+                  _ = replace_top {
+                    serial: frame.serial,
+                    kind: frame.kind,
+                    count: nat::subtract frame.count 1n,
+                    declared: frame.declared,
+                    fields: frame.fields,
+                    cases: frame.cases,
+                  }
+                  _ = pending := true
+                  return #Some true
+                end
+              end)
+            (top (#Sequence) cursor)
+        | codec::!Read.end_sequence cursor =>
+          chain
+            (fn frame =>
+              if nat::is_zero frame.count then close (#Sequence) cursor
+              else protocol "the sequence has elements left"
+              end)
+            (top (#Sequence) cursor)
+        | codec::!Read.begin_variant schema =>
+          chain
+            (fn cursor => chain
+              (fn header => match array::get schema.cases (nat32_from_bytes header) with
+              | #Some tag => do
+                _ = pending := true
+                return #Some { cursor: cursor, tag: tag }
+              end
+              | #None =>
+                #Error {
+                  path: [],
+                  kind: #Unexpected {
+                    expected: "a case of the sum",
+                    found: "a case index outside the schema",
+                  },
+                }
+              end)
+              (take 4n))
+            (open (#Variant) [] schema.cases 0n)
+        | codec::!Read.end_variant cursor => close (#Variant) cursor
+        end with
+        | #Some value =>
+          if not ~done or not nat::is_zero (array::len (~stack)) then
+            #Error (#Codec {
+              path: [],
+              kind: #Protocol "the decoder did not read the whole document",
+            })
+          else if nat::less_than (~pos) (array::len input) then
+            #Error (#Codec {
+              path: [],
+              kind: #Parse { message: "unexpected trailing input", offset: ~pos },
+            })
+          else #Some value
+          end
+        | #Error error => #Error (#Codec error)
+        end)
+        within
+    end
+
+@doc "Read a value of the inferred type from positional binary with its default codec. See `decode_with`."
+let decode: [Nat8] -> Result 'a Error = fn input =>
+  match codec::derive_decoder (reflect::mirror ()) with
+  | #Some decoder => decode_with decoder default_limits input
+  | #Error error => #Error (#Derive error)
+  end
+
+-- ── Versioned documents ────────────────────────────────────────────────────
+
+@private
+let schema_encoder: codec::Encoder Schema = {
+  schema: reflect::describe (reflect::type_of { id: "", version: 0n }),
+  run: fn schema =>
+    chain
+      (fn cursor =>
+        chain
+          (fn _ => chain
+            (fn _ => chain
+              (fn _ => chain
+                (fn _ => codec::!Write.end_record cursor)
+                (codec::!Write.write_nat schema.version))
+              (codec::!Write.write_field { cursor: cursor, name: "version" }))
+            (codec::!Write.write_text schema.id))
+          (codec::!Write.write_field { cursor: cursor, name: "id" }))
+      (codec::!Write.begin_record { fields: ["id", "version"] }),
+}
+
+@doc "Write a value with an encoder after its schema's identity and version, so a reader can tell what it holds before reading it."
+let encode_versioned: Schema -> codec::Encoder 'a -> Limits -> 'a -> Result [Nat8] Error =
+  fn schema encoder limits value =>
+    chain
+      (fn header =>
+        -- The header is part of the document, so the body has the rest of the budget rather than a
+        -- second one of its own.
+        result::map
+          (fn body => array::concat header body)
+          (encode_with
+            encoder
+            { bytes: nat::subtract limits.bytes (array::len header), ..limits }
+            value))
+      (encode_with schema_encoder limits schema)
+
+@doc "Read a value with a decoder after checking the schema written before it: another identity or version is refused before any of the value is read."
+let decode_versioned: Schema -> codec::Decoder 'a -> Limits -> [Nat8] -> Result 'a Error =
+  fn schema decoder limits input => do
+    let header = array::concat
+      (nat32_to_bytes (array::len (utf8_encode schema.id)))
+      (array::concat (utf8_encode schema.id) (nat_to_bytes schema.version))
+    let length = array::len header
+    return
+      if nat::less_than (array::len input) length then
+        #Error (#Codec {
+          path: [],
+          kind: #Parse { message: "the input ends early", offset: array::len input },
+        })
+      else
+        match (array::slice input 0n length, array::slice input length (array::len input)) with
+        | (#Some found, #Some body) =>
+          if array::all (fn pair => nat::equal8 pair.0 pair.1) (array::zip found header) then
+            decode_with decoder limits body
+          else
+            #Error (#Codec {
+              path: [],
+              kind: #Unexpected {
+                expected: str::concat
+                  "schema "
+                  (str::concat schema.id (str::concat " version " (str::from_nat schema.version))),
+                found: "another schema",
+              },
+            })
+          end
+        | _ =>
+          #Error (#Codec { path: [], kind: #Parse { message: "the input ends early", offset: 0n } })
+        end
+      end
+  end

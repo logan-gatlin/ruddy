@@ -1,22 +1,21 @@
-extern add: fn(Nat, Nat) -> Nat = "(left, right) => left + right"
-extern subtract: fn(Nat, Nat) -> Nat = "(left, right) => Math.max(0, left - right)"
-extern multiply: fn(Nat, Nat) -> Nat = "(left, right) => left * right"
-extern divide: fn(Nat, Nat) -> Nat = "(left, right) => Math.trunc(left / right)"
-extern remainder: fn(Nat, Nat) -> Nat = "(left, right) => left % right"
+extern add: fn(Nat, Nat) -> Nat = "$prim.nat.add"
+extern subtract: fn(Nat, Nat) -> Nat = "$prim.nat.subtract"
+extern multiply: fn(Nat, Nat) -> Nat = "$prim.nat.multiply"
+extern divide: fn(Nat, Nat) -> Nat = "$prim.nat.divide"
+extern remainder: fn(Nat, Nat) -> Nat = "$prim.nat.remainder"
 
 @private
-extern ordering_less_than: fn(Nat, Nat) -> Bool = "(left, right) => left < right"
+extern ordering_less_than: fn(Nat, Nat) -> Bool = "$prim.nat.ordering_less_than"
 @private
-extern ordering_greater_than: fn(Nat, Nat) -> Bool = "(left, right) => left > right"
+extern ordering_greater_than: fn(Nat, Nat) -> Bool = "$prim.nat.ordering_greater_than"
 
-extern min: fn(Nat, Nat) -> Nat = "Math.min"
-extern max: fn(Nat, Nat) -> Nat = "Math.max"
-extern clamp: fn(Nat, Nat, Nat) -> Nat =
-  "(value, minimum, maximum) => Math.min(Math.max(value, minimum), maximum)"
+extern min: fn(Nat, Nat) -> Nat = "$prim.nat.min"
+extern max: fn(Nat, Nat) -> Nat = "$prim.nat.max"
+extern clamp: fn(Nat, Nat, Nat) -> Nat = "$prim.nat.clamp"
 let is_zero: Nat -> Bool = fn value => match value with | 0n => true | _ => false end
 
-extern from_int: fn(Int) -> Nat = "value => Math.max(0, value)"
-extern from_real: fn(Real) -> Nat = "value => Math.max(0, Math.trunc(value))"
+extern from_int: fn(Int) -> Nat = "$prim.nat.from_int"
+extern from_real: fn(Real) -> Nat = "$prim.nat.from_real"
 
 let compare: order::Ordering Nat = fn left right =>
   if ordering_less_than left right then #Less
@@ -36,29 +35,23 @@ let {
 -- Nat8: arithmetic wraps modulo 2^8; division truncates toward zero.
 let min_value8: Nat8 = 0n8
 let max_value8: Nat8 = 255n8
-extern add8: fn(Nat8, Nat8) -> Nat8 = "(left, right) => ((left + right) & 255)"
-extern subtract8: fn(Nat8, Nat8) -> Nat8 = "(left, right) => ((left - right) & 255)"
-extern multiply8: fn(Nat8, Nat8) -> Nat8 = "(left, right) => ((left * right) & 255)"
-extern divide8: fn(Nat8, Nat8) -> Nat8 =
-  "(left, right) => { if (right === 0) throw new RangeError(\"division by zero\"); return ((Math.trunc(left / right)) & 255); }"
-extern remainder8: fn(Nat8, Nat8) -> Nat8 =
-  "(left, right) => { if (right === 0) throw new RangeError(\"division by zero\"); return ((left % right) & 255); }"
+extern add8: fn(Nat8, Nat8) -> Nat8 = "$prim.nat.add8"
+extern subtract8: fn(Nat8, Nat8) -> Nat8 = "$prim.nat.subtract8"
+extern multiply8: fn(Nat8, Nat8) -> Nat8 = "$prim.nat.multiply8"
+extern divide8: fn(Nat8, Nat8) -> Nat8 = "$prim.nat.divide8"
+extern remainder8: fn(Nat8, Nat8) -> Nat8 = "$prim.nat.remainder8"
 @private
-extern ordering_less_than8: fn(Nat8, Nat8) -> Bool = "(left, right) => left < right"
+extern ordering_less_than8: fn(Nat8, Nat8) -> Bool = "$prim.nat.ordering_less_than8"
 @private
-extern ordering_greater_than8: fn(Nat8, Nat8) -> Bool = "(left, right) => left > right"
-extern min8: fn(Nat8, Nat8) -> Nat8 = "(left, right) => left < right ? left : right"
-extern max8: fn(Nat8, Nat8) -> Nat8 = "(left, right) => left > right ? left : right"
-extern clamp8: fn(Nat8, Nat8, Nat8) -> Nat8 =
-  "(value, minimum, maximum) => value < minimum ? minimum : value > maximum ? maximum : value"
-extern is_zero8: fn(Nat8) -> Bool = "value => value === 0"
-extern from_nat8: fn(Nat) -> Nat8 =
-  "value => { if (!Number.isSafeInteger(value)) throw new RangeError(\"expected a safe integer\"); return ((value) & 255); }"
-extern from_int8: fn(Int) -> Nat8 =
-  "value => { if (!Number.isSafeInteger(value)) throw new RangeError(\"expected a safe integer\"); return ((value) & 255); }"
-extern to_string8: fn(Nat8) -> String = "value => String(value)"
-extern to_nat8: fn(Nat8) -> Nat =
-  "value => { const result = value; if (!Number.isSafeInteger(result) || result < 0) throw new RangeError(\"integer out of range\"); return result; }"
+extern ordering_greater_than8: fn(Nat8, Nat8) -> Bool = "$prim.nat.ordering_greater_than8"
+extern min8: fn(Nat8, Nat8) -> Nat8 = "$prim.nat.min8"
+extern max8: fn(Nat8, Nat8) -> Nat8 = "$prim.nat.max8"
+extern clamp8: fn(Nat8, Nat8, Nat8) -> Nat8 = "$prim.nat.clamp8"
+extern is_zero8: fn(Nat8) -> Bool = "$prim.nat.is_zero8"
+extern from_nat8: fn(Nat) -> Nat8 = "$prim.nat.from_nat8"
+extern from_int8: fn(Int) -> Nat8 = "$prim.nat.from_int8"
+extern to_string8: fn(Nat8) -> String = "$prim.nat.to_string8"
+extern to_nat8: fn(Nat8) -> Nat = "$prim.nat.to_nat8"
 let compare8: order::Ordering Nat8 = fn left right =>
   if ordering_less_than8 left right then #Less
   else if ordering_greater_than8 left right then #Greater
@@ -76,29 +69,23 @@ let {
 -- Nat16: arithmetic wraps modulo 2^16; division truncates toward zero.
 let min_value16: Nat16 = 0n16
 let max_value16: Nat16 = 65535n16
-extern add16: fn(Nat16, Nat16) -> Nat16 = "(left, right) => ((left + right) & 65535)"
-extern subtract16: fn(Nat16, Nat16) -> Nat16 = "(left, right) => ((left - right) & 65535)"
-extern multiply16: fn(Nat16, Nat16) -> Nat16 = "(left, right) => ((left * right) & 65535)"
-extern divide16: fn(Nat16, Nat16) -> Nat16 =
-  "(left, right) => { if (right === 0) throw new RangeError(\"division by zero\"); return ((Math.trunc(left / right)) & 65535); }"
-extern remainder16: fn(Nat16, Nat16) -> Nat16 =
-  "(left, right) => { if (right === 0) throw new RangeError(\"division by zero\"); return ((left % right) & 65535); }"
+extern add16: fn(Nat16, Nat16) -> Nat16 = "$prim.nat.add16"
+extern subtract16: fn(Nat16, Nat16) -> Nat16 = "$prim.nat.subtract16"
+extern multiply16: fn(Nat16, Nat16) -> Nat16 = "$prim.nat.multiply16"
+extern divide16: fn(Nat16, Nat16) -> Nat16 = "$prim.nat.divide16"
+extern remainder16: fn(Nat16, Nat16) -> Nat16 = "$prim.nat.remainder16"
 @private
-extern ordering_less_than16: fn(Nat16, Nat16) -> Bool = "(left, right) => left < right"
+extern ordering_less_than16: fn(Nat16, Nat16) -> Bool = "$prim.nat.ordering_less_than16"
 @private
-extern ordering_greater_than16: fn(Nat16, Nat16) -> Bool = "(left, right) => left > right"
-extern min16: fn(Nat16, Nat16) -> Nat16 = "(left, right) => left < right ? left : right"
-extern max16: fn(Nat16, Nat16) -> Nat16 = "(left, right) => left > right ? left : right"
-extern clamp16: fn(Nat16, Nat16, Nat16) -> Nat16 =
-  "(value, minimum, maximum) => value < minimum ? minimum : value > maximum ? maximum : value"
-extern is_zero16: fn(Nat16) -> Bool = "value => value === 0"
-extern from_nat16: fn(Nat) -> Nat16 =
-  "value => { if (!Number.isSafeInteger(value)) throw new RangeError(\"expected a safe integer\"); return ((value) & 65535); }"
-extern from_int16: fn(Int) -> Nat16 =
-  "value => { if (!Number.isSafeInteger(value)) throw new RangeError(\"expected a safe integer\"); return ((value) & 65535); }"
-extern to_string16: fn(Nat16) -> String = "value => String(value)"
-extern to_nat16: fn(Nat16) -> Nat =
-  "value => { const result = value; if (!Number.isSafeInteger(result) || result < 0) throw new RangeError(\"integer out of range\"); return result; }"
+extern ordering_greater_than16: fn(Nat16, Nat16) -> Bool = "$prim.nat.ordering_greater_than16"
+extern min16: fn(Nat16, Nat16) -> Nat16 = "$prim.nat.min16"
+extern max16: fn(Nat16, Nat16) -> Nat16 = "$prim.nat.max16"
+extern clamp16: fn(Nat16, Nat16, Nat16) -> Nat16 = "$prim.nat.clamp16"
+extern is_zero16: fn(Nat16) -> Bool = "$prim.nat.is_zero16"
+extern from_nat16: fn(Nat) -> Nat16 = "$prim.nat.from_nat16"
+extern from_int16: fn(Int) -> Nat16 = "$prim.nat.from_int16"
+extern to_string16: fn(Nat16) -> String = "$prim.nat.to_string16"
+extern to_nat16: fn(Nat16) -> Nat = "$prim.nat.to_nat16"
 let compare16: order::Ordering Nat16 = fn left right =>
   if ordering_less_than16 left right then #Less
   else if ordering_greater_than16 left right then #Greater
@@ -116,29 +103,23 @@ let {
 -- Nat32: arithmetic wraps modulo 2^32; division truncates toward zero.
 let min_value32: Nat32 = 0n32
 let max_value32: Nat32 = 4294967295n32
-extern add32: fn(Nat32, Nat32) -> Nat32 = "(left, right) => ((left + right) >>> 0)"
-extern subtract32: fn(Nat32, Nat32) -> Nat32 = "(left, right) => ((left - right) >>> 0)"
-extern multiply32: fn(Nat32, Nat32) -> Nat32 = "(left, right) => ((Math.imul(left, right)) >>> 0)"
-extern divide32: fn(Nat32, Nat32) -> Nat32 =
-  "(left, right) => { if (right === 0) throw new RangeError(\"division by zero\"); return ((Math.trunc(left / right)) >>> 0); }"
-extern remainder32: fn(Nat32, Nat32) -> Nat32 =
-  "(left, right) => { if (right === 0) throw new RangeError(\"division by zero\"); return ((left % right) >>> 0); }"
+extern add32: fn(Nat32, Nat32) -> Nat32 = "$prim.nat.add32"
+extern subtract32: fn(Nat32, Nat32) -> Nat32 = "$prim.nat.subtract32"
+extern multiply32: fn(Nat32, Nat32) -> Nat32 = "$prim.nat.multiply32"
+extern divide32: fn(Nat32, Nat32) -> Nat32 = "$prim.nat.divide32"
+extern remainder32: fn(Nat32, Nat32) -> Nat32 = "$prim.nat.remainder32"
 @private
-extern ordering_less_than32: fn(Nat32, Nat32) -> Bool = "(left, right) => left < right"
+extern ordering_less_than32: fn(Nat32, Nat32) -> Bool = "$prim.nat.ordering_less_than32"
 @private
-extern ordering_greater_than32: fn(Nat32, Nat32) -> Bool = "(left, right) => left > right"
-extern min32: fn(Nat32, Nat32) -> Nat32 = "(left, right) => left < right ? left : right"
-extern max32: fn(Nat32, Nat32) -> Nat32 = "(left, right) => left > right ? left : right"
-extern clamp32: fn(Nat32, Nat32, Nat32) -> Nat32 =
-  "(value, minimum, maximum) => value < minimum ? minimum : value > maximum ? maximum : value"
-extern is_zero32: fn(Nat32) -> Bool = "value => value === 0"
-extern from_nat32: fn(Nat) -> Nat32 =
-  "value => { if (!Number.isSafeInteger(value)) throw new RangeError(\"expected a safe integer\"); return ((value) >>> 0); }"
-extern from_int32: fn(Int) -> Nat32 =
-  "value => { if (!Number.isSafeInteger(value)) throw new RangeError(\"expected a safe integer\"); return ((value) >>> 0); }"
-extern to_string32: fn(Nat32) -> String = "value => String(value)"
-extern to_nat32: fn(Nat32) -> Nat =
-  "value => { const result = value; if (!Number.isSafeInteger(result) || result < 0) throw new RangeError(\"integer out of range\"); return result; }"
+extern ordering_greater_than32: fn(Nat32, Nat32) -> Bool = "$prim.nat.ordering_greater_than32"
+extern min32: fn(Nat32, Nat32) -> Nat32 = "$prim.nat.min32"
+extern max32: fn(Nat32, Nat32) -> Nat32 = "$prim.nat.max32"
+extern clamp32: fn(Nat32, Nat32, Nat32) -> Nat32 = "$prim.nat.clamp32"
+extern is_zero32: fn(Nat32) -> Bool = "$prim.nat.is_zero32"
+extern from_nat32: fn(Nat) -> Nat32 = "$prim.nat.from_nat32"
+extern from_int32: fn(Int) -> Nat32 = "$prim.nat.from_int32"
+extern to_string32: fn(Nat32) -> String = "$prim.nat.to_string32"
+extern to_nat32: fn(Nat32) -> Nat = "$prim.nat.to_nat32"
 let compare32: order::Ordering Nat32 = fn left right =>
   if ordering_less_than32 left right then #Less
   else if ordering_greater_than32 left right then #Greater
@@ -156,27 +137,23 @@ let {
 -- Nat64: arithmetic wraps modulo 2^64; division truncates toward zero.
 let min_value64: Nat64 = 0n64
 let max_value64: Nat64 = 18446744073709551615n64
-extern add64: fn(Nat64, Nat64) -> Nat64 = "(left, right) => BigInt.asUintN(64, left + right)"
-extern subtract64: fn(Nat64, Nat64) -> Nat64 = "(left, right) => BigInt.asUintN(64, left - right)"
-extern multiply64: fn(Nat64, Nat64) -> Nat64 = "(left, right) => BigInt.asUintN(64, left * right)"
-extern divide64: fn(Nat64, Nat64) -> Nat64 = "(left, right) => BigInt.asUintN(64, left / right)"
-extern remainder64: fn(Nat64, Nat64) -> Nat64 = "(left, right) => BigInt.asUintN(64, left % right)"
+extern add64: fn(Nat64, Nat64) -> Nat64 = "$prim.nat.add64"
+extern subtract64: fn(Nat64, Nat64) -> Nat64 = "$prim.nat.subtract64"
+extern multiply64: fn(Nat64, Nat64) -> Nat64 = "$prim.nat.multiply64"
+extern divide64: fn(Nat64, Nat64) -> Nat64 = "$prim.nat.divide64"
+extern remainder64: fn(Nat64, Nat64) -> Nat64 = "$prim.nat.remainder64"
 @private
-extern ordering_less_than64: fn(Nat64, Nat64) -> Bool = "(left, right) => left < right"
+extern ordering_less_than64: fn(Nat64, Nat64) -> Bool = "$prim.nat.ordering_less_than64"
 @private
-extern ordering_greater_than64: fn(Nat64, Nat64) -> Bool = "(left, right) => left > right"
-extern min64: fn(Nat64, Nat64) -> Nat64 = "(left, right) => left < right ? left : right"
-extern max64: fn(Nat64, Nat64) -> Nat64 = "(left, right) => left > right ? left : right"
-extern clamp64: fn(Nat64, Nat64, Nat64) -> Nat64 =
-  "(value, minimum, maximum) => value < minimum ? minimum : value > maximum ? maximum : value"
-extern is_zero64: fn(Nat64) -> Bool = "value => value === 0n"
-extern from_nat64: fn(Nat) -> Nat64 =
-  "value => { if (!Number.isSafeInteger(value)) throw new RangeError(\"expected a safe integer\"); return BigInt.asUintN(64, BigInt(value)); }"
-extern from_int64: fn(Int) -> Nat64 =
-  "value => { if (!Number.isSafeInteger(value)) throw new RangeError(\"expected a safe integer\"); return BigInt.asUintN(64, BigInt(value)); }"
-extern to_string64: fn(Nat64) -> String = "value => String(value)"
-extern to_nat64: fn(Nat64) -> Nat =
-  "value => { const result = Number(value); if (!Number.isSafeInteger(result) || result < 0) throw new RangeError(\"integer out of range\"); return result; }"
+extern ordering_greater_than64: fn(Nat64, Nat64) -> Bool = "$prim.nat.ordering_greater_than64"
+extern min64: fn(Nat64, Nat64) -> Nat64 = "$prim.nat.min64"
+extern max64: fn(Nat64, Nat64) -> Nat64 = "$prim.nat.max64"
+extern clamp64: fn(Nat64, Nat64, Nat64) -> Nat64 = "$prim.nat.clamp64"
+extern is_zero64: fn(Nat64) -> Bool = "$prim.nat.is_zero64"
+extern from_nat64: fn(Nat) -> Nat64 = "$prim.nat.from_nat64"
+extern from_int64: fn(Int) -> Nat64 = "$prim.nat.from_int64"
+extern to_string64: fn(Nat64) -> String = "$prim.nat.to_string64"
+extern to_nat64: fn(Nat64) -> Nat = "$prim.nat.to_nat64"
 let compare64: order::Ordering Nat64 = fn left right =>
   if ordering_less_than64 left right then #Less
   else if ordering_greater_than64 left right then #Greater

@@ -1,0 +1,1 @@
+let f = fn b => match b with | hide 'v { value } => 0n end

@@ -221,7 +221,8 @@ fn ownership_metadata(scheme: &Scheme) -> (u32, Vec<u32>) {
                     packages += 1;
                     parts.push(Part::Ty(body));
                 }
-                Ty::Array(element) => parts.push(Part::Ty(element)),
+                Ty::Hidden { body, .. } => parts.push(Part::Ty(body)),
+                Ty::Array(element) | Ty::Mirror(element) => parts.push(Part::Ty(element)),
                 Ty::Mut(region, element) => {
                     parts.push(Part::Ty(element));
                     parts.push(Part::Ty(region));
@@ -485,8 +486,8 @@ fn relevant_parameters(aliases: &IndexMap<Symbol, Scheme>) -> HashMap<Symbol, Ha
                         work.push(Work::Ty(to));
                         work.push(Work::Ty(from));
                     }
-                    Ty::Package(body) => work.push(Work::Ty(body)),
-                    Ty::Array(element) => work.push(Work::Ty(element)),
+                    Ty::Package(body) | Ty::Hidden { body, .. } => work.push(Work::Ty(body)),
+                    Ty::Array(element) | Ty::Mirror(element) => work.push(Work::Ty(element)),
                     Ty::Mut(region, element) => {
                         work.push(Work::Ty(element));
                         work.push(Work::Ty(region));
@@ -498,10 +499,10 @@ fn relevant_parameters(aliases: &IndexMap<Symbol, Scheme>) -> HashMap<Symbol, Ha
                     | Ty::Real
                     | Ty::String
                     | Ty::Bool
-                    | Ty::Any
                     | Ty::ForeignValue
                     | Ty::Var(_)
                     | Ty::Rigid { .. }
+                    | Ty::HiddenVar { .. }
                     | Ty::Undecided => {}
                 },
                 Work::Row(row) => {
@@ -568,8 +569,8 @@ fn names_in(ty: &Ty, relevant: &HashMap<Symbol, HashSet<usize>>, out: &mut Vec<S
                     work.push(Work::Ty(to));
                     work.push(Work::Ty(from));
                 }
-                Ty::Package(body) => work.push(Work::Ty(body)),
-                Ty::Array(element) => work.push(Work::Ty(element)),
+                Ty::Package(body) | Ty::Hidden { body, .. } => work.push(Work::Ty(body)),
+                Ty::Array(element) | Ty::Mirror(element) => work.push(Work::Ty(element)),
                 Ty::Mut(region, element) => {
                     work.push(Work::Ty(element));
                     work.push(Work::Ty(region));
@@ -581,11 +582,11 @@ fn names_in(ty: &Ty, relevant: &HashMap<Symbol, HashSet<usize>>, out: &mut Vec<S
                 | Ty::Real
                 | Ty::String
                 | Ty::Bool
-                | Ty::Any
                 | Ty::ForeignValue
                 | Ty::Var(_)
                 | Ty::Bound(_)
                 | Ty::Rigid { .. }
+                | Ty::HiddenVar { .. }
                 | Ty::Undecided => {}
             },
             Work::Row(row) => {

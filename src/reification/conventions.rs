@@ -69,8 +69,10 @@ pub struct Edge {
 #[derive(Debug, Clone)]
 pub struct Instance {
     pub source: NeedId,
-    pub substitute: BTreeMap<u32, BTreeSet<u32>>,
-    pub ports: BTreeMap<NeedId, NeedId>,
+    /// Shared by every need of one instantiation: the map is the size of
+    /// the instantiated graph, and a copy per need would square it.
+    pub substitute: Arc<BTreeMap<u32, BTreeSet<u32>>>,
+    pub ports: Arc<BTreeMap<NeedId, NeedId>>,
 }
 
 /// A known requirement or a slot whose presence depends on a quantified port.
@@ -261,6 +263,16 @@ impl Graph {
                 "array" => Shape::Array(child(self, edge("element").expect("array element"))),
                 "mut" if !native => Shape::Cell(self.shape(Shape::Sealed)),
                 "package" => Shape::Alias(child(self, edge("body").expect("package body"))),
+                // A value behind a hidden type is opened elsewhere, by code
+                // with its own evidence: every callable it carries takes the
+                // descriptor-free convention, decided where it was packaged.
+                name if name.starts_with("hidden:") => {
+                    if native {
+                        Shape::Alias(child(self, edge("body").expect("hidden body")))
+                    } else {
+                        Shape::Sealed
+                    }
+                }
                 "fields" | "sum" => {
                     let mut fields = BTreeMap::new();
                     for (label, node) in edges {
@@ -372,6 +384,14 @@ impl Graph {
                 (Shape::Sealed, Shape::Parameter(_)) => {
                     self.shapes[offered as usize] = Shape::Sealed
                 }
+                // A sealed callable supplied where one is asked for takes no
+                // descriptors: the port it would have supplied is decided,
+                // and decided empty, so nothing conditional on it is needed.
+                (Shape::Arrow { needs, .. }, Shape::Sealed) => {
+                    let row = &mut self.needs[needs as usize];
+                    row.variable = false;
+                    row.port = None;
+                }
                 (Shape::Sealed, Shape::Array(element)) => work.push((expected, element, false)),
                 (Shape::Sealed, Shape::Record(fields)) | (Shape::Sealed, Shape::Sum(fields)) => {
                     work.extend(fields.values().map(|member| (expected, *member, false)));
@@ -421,9 +441,21 @@ impl Graph {
         id
     }
 
+    /// The root, with every redirect on the way pointed straight at it, so a
+    /// chain of unifications is walked once rather than at every lookup.
+    fn need_root_compressing(&mut self, id: NeedId) -> NeedId {
+        let root = self.need_root(id);
+        let mut at = id;
+        while let Some(next) = self.needs[at as usize].redirect {
+            self.needs[at as usize].redirect = Some(root);
+            at = next;
+        }
+        root
+    }
+
     fn unify_needs(&mut self, expected: NeedId, offered: NeedId) {
-        let expected = self.need_root(expected);
-        let offered = self.need_root(offered);
+        let expected = self.need_root_compressing(expected);
+        let offered = self.need_root_compressing(offered);
         if expected == offered {
             return;
         }
@@ -536,6 +568,15 @@ impl Graph {
             })
             .collect();
         let mut dependents = vec![Vec::new(); self.needs.len()];
+        // The needs of one instantiation share one ports map. They depend on
+        // its targets as a group, and look a port's targets up by the port's
+        // root, so that neither the dependencies nor the lookups are the
+        // size of the instantiation per need.
+        let mut groups: HashMap<usize, usize> = HashMap::new();
+        let mut group_members: Vec<Vec<usize>> = Vec::new();
+        let mut group_targets: Vec<HashMap<NeedId, Vec<NeedId>>> = Vec::new();
+        let mut group_of: Vec<Option<usize>> = vec![None; self.needs.len()];
+        let mut dependent_groups: Vec<Vec<usize>> = vec![Vec::new(); self.needs.len()];
         for (id, needs) in self.needs.iter().enumerate() {
             for edge in &needs.edges {
                 dependents[edge.source as usize].push(id);
@@ -545,9 +586,23 @@ impl Graph {
             }
             if let Some(instance) = &needs.instance {
                 dependents[instance.source as usize].push(id);
-                for target in instance.ports.values() {
-                    dependents[*target as usize].push(id);
-                }
+                let key = Arc::as_ptr(&instance.ports) as usize;
+                let group = *groups.entry(key).or_insert_with(|| {
+                    let group = group_members.len();
+                    group_members.push(Vec::new());
+                    let mut targets: HashMap<NeedId, Vec<NeedId>> = HashMap::new();
+                    for (source, target) in instance.ports.iter() {
+                        targets
+                            .entry(self.need_root(*source))
+                            .or_default()
+                            .push(*target);
+                        dependent_groups[*target as usize].push(group);
+                    }
+                    group_targets.push(targets);
+                    group
+                });
+                group_members[group].push(id);
+                group_of[id] = Some(group);
             }
         }
         let mut pending: std::collections::VecDeque<_> = (0..self.needs.len()).collect();
@@ -588,9 +643,11 @@ impl Graph {
                         .port
                         .into_iter()
                         .flat_map(|port| {
-                            instance.ports.iter().filter_map(move |(source, target)| {
-                                (self.need_root(*source) == self.need_root(port)).then_some(*target)
-                            })
+                            group_targets[group_of[id].expect("an instance is in its group")]
+                                .get(&self.need_root(port))
+                                .into_iter()
+                                .flatten()
+                                .copied()
                         })
                         .collect();
                     if targets.is_empty() {
@@ -625,7 +682,10 @@ impl Graph {
             let old = values[id].len();
             values[id].extend(added);
             if values[id].len() != old {
-                for target in &dependents[id] {
+                let members = dependent_groups[id]
+                    .iter()
+                    .flat_map(|group| group_members[*group].iter());
+                for target in dependents[id].iter().chain(members) {
                     if !queued[*target] {
                         queued[*target] = true;
                         pending.push_back(*target);
@@ -654,10 +714,12 @@ impl Graph {
             Shape(ShapeId, ShapeId),
             Need(NeedId, NeedId),
         }
-        let substitute: BTreeMap<_, _> = types
-            .iter()
-            .map(|(index, ty)| (*index, super::parameters(ty)))
-            .collect();
+        let substitute: Arc<BTreeMap<_, _>> = Arc::new(
+            types
+                .iter()
+                .map(|(index, ty)| (*index, super::parameters(ty)))
+                .collect(),
+        );
         let mut shapes = HashMap::new();
         let mut needs = HashMap::new();
         let mut work = Vec::new();
@@ -684,7 +746,7 @@ impl Graph {
             map: &mut HashMap<NeedId, NeedId>,
             work: &mut Vec<Work>,
         ) -> NeedId {
-            let source = graph.need_root(source);
+            let source = graph.need_root_compressing(source);
             if (source as usize) < since {
                 return source;
             }
@@ -694,6 +756,10 @@ impl Graph {
                 target
             })
         }
+        // Every need of one nested instantiation shares one ports map, which
+        // lists all of them: walking it once discovers them all, where once
+        // per need would square the work.
+        let mut walked_ports = HashSet::new();
         let result = shape(self, root, since.0, &mut shapes, &mut work);
         while let Some(next) = work.pop() {
             match next {
@@ -756,7 +822,9 @@ impl Graph {
                     if let Some(source) = original.redirect {
                         need(self, source, since.1, &mut needs, &mut work);
                     }
-                    if let Some(instance) = &original.instance {
+                    if let Some(instance) = &original.instance
+                        && walked_ports.insert(Arc::as_ptr(&instance.ports) as usize)
+                    {
                         for target in instance.ports.values() {
                             need(self, *target, since.1, &mut needs, &mut work);
                         }
@@ -766,24 +834,26 @@ impl Graph {
                         port: Some(BTreeSet::new()),
                         instance: Some(Instance {
                             source,
-                            substitute: substitute.clone(),
-                            ports: BTreeMap::new(),
+                            substitute: Arc::clone(&substitute),
+                            ports: Arc::default(),
                         }),
                         ..Needs::default()
                     };
                 }
             }
         }
-        let ports = needs
-            .iter()
-            .map(|(source, target)| (*source, *target))
-            .collect::<BTreeMap<_, _>>();
+        let ports = Arc::new(
+            needs
+                .iter()
+                .map(|(source, target)| (*source, *target))
+                .collect::<BTreeMap<_, _>>(),
+        );
         for target in needs.values() {
             self.needs[*target as usize]
                 .instance
                 .as_mut()
                 .expect("instantiated demand")
-                .ports = ports.clone();
+                .ports = Arc::clone(&ports);
         }
         result
     }
@@ -830,9 +900,25 @@ pub struct Plan {
     pub graph: Graph,
     pub bindings: IndexMap<Symbol, Binding>,
     pub occurrences: IndexMap<Anchor, Flow>,
+    /// The binders a `hide` pattern gave an authentic mirror of the type it
+    /// opened, by the slot that mirror is evidence for. Bound explicitly, by
+    /// the pattern itself: the arm's body has this evidence from the moment
+    /// the pattern matched, before any closure in it is built.
+    pub evidence: IndexMap<Symbol, u32>,
 }
 
 impl Plan {
+    /// The evidence slots an arm's pattern supplies through the mirrors it
+    /// binds. See [`Plan::evidence`].
+    pub fn arm_evidence(&self, pattern: &ir::Pattern) -> BTreeSet<u32> {
+        let mut binders = Vec::new();
+        ir::pattern_binders(pattern, &mut binders);
+        binders
+            .iter()
+            .filter_map(|binder| self.evidence.get(&binder.anchored).copied())
+            .collect()
+    }
+
     pub fn infer(program: &Program, semantics: &inference::Semantics) -> Self {
         let mut planner = Planner {
             plan: Self::default(),
@@ -879,7 +965,10 @@ impl Plan {
                 planner.seed(
                     *symbol,
                     ty,
-                    super::parameters(&intrinsic.represented(ty, planner.aliases)),
+                    intrinsic
+                        .represented(ty, planner.aliases)
+                        .map(|ty| super::parameters(&ty))
+                        .unwrap_or_default(),
                 );
                 let root = planner.plan.bindings[symbol].value;
                 if let Shape::Arrow {
@@ -887,15 +976,20 @@ impl Plan {
                 } = planner.plan.graph.exposed(root).clone()
                 {
                     match intrinsic {
-                        super::Intrinsic::Upcast => {
+                        super::Intrinsic::TypeOf => {
                             planner.plan.graph.shapes[argument as usize] = Shape::Sealed
                         }
-                        super::Intrinsic::Downcast => {
+                        // The functions an equality or a shape hands back are
+                        // the runtime's own, which take no descriptors.
+                        super::Intrinsic::Same => {
                             if let Shape::Sum(fields) = planner.plan.graph.exposed(result).clone()
                                 && let Some(payload) = fields.get("Some")
                             {
                                 planner.plan.graph.shapes[*payload as usize] = Shape::Sealed;
                             }
+                        }
+                        super::Intrinsic::Shape => {
+                            planner.plan.graph.shapes[result as usize] = Shape::Sealed
                         }
                         _ => {}
                     }
@@ -1209,8 +1303,12 @@ impl Planner<'_> {
             }
             TermKind::Project { base, field } => {
                 let base = self.term(base);
+                // A member of a sealed value is sealed: a callable read out
+                // of one takes no descriptors, so it asks nothing of the
+                // arm and nothing stays conditional on its being called.
                 let value = match self.plan.graph.exposed(base.value) {
                     Shape::Record(fields) => fields.get(&field.anchored).copied(),
+                    Shape::Sealed => Some(base.value),
                     _ => None,
                 }
                 .unwrap_or_else(|| self.plan.graph.skeleton(&term.ty, self.aliases));
@@ -1269,7 +1367,15 @@ impl Planner<'_> {
                     self.pattern(pattern, scrutinee.value, &scrutinee_type);
                     let body = self.term(body);
                     self.plan.graph.join(value, body.value);
-                    evaluations.push(body.evaluation);
+                    // What the pattern's mirrors are evidence for, the arm
+                    // supplies itself; only the rest is asked of the context.
+                    let supplied = self.plan.arm_evidence(pattern);
+                    if supplied.is_empty() {
+                        evaluations.push(body.evaluation);
+                    } else {
+                        let asked = self.universe.difference(&supplied).copied().collect();
+                        evaluations.push(self.plan.graph.select(body.evaluation, asked));
+                    }
                 }
                 Flow {
                     value,
@@ -1342,6 +1448,23 @@ impl Planner<'_> {
                 }
             }
         };
+        // A term at a hidden type is packaged: its callables are sealed here,
+        // where the evidence they need is at hand, since where it is opened
+        // has only the evidence its own patterns bind.
+        let flow = if matches!(
+            &*inference::unfold(self.aliases, &term.ty),
+            Ty::Hidden { .. }
+        ) {
+            let sealed = self.plan.graph.shape(Shape::Sealed);
+            let sealing = self.plan.graph.sealing(flow.value);
+            self.plan.graph.supply(sealed, flow.value);
+            Flow {
+                value: sealed,
+                evaluation: self.plan.graph.union([flow.evaluation, sealing]),
+            }
+        } else {
+            flow
+        };
         self.plan.graph.reveal(flow.value, &term.ty, self.aliases);
         self.plan.occurrences.insert(term.at, flow);
         flow
@@ -1354,7 +1477,38 @@ impl Planner<'_> {
             ty = inference::unfold(self.aliases, inner);
         }
         match &pattern.anchored {
+            // The payload reads the value as the hidden type's body, at the
+            // type the arm opened it to.
+            ir::PatternKind::Hidden {
+                id,
+                name,
+                pattern: payload,
+            } => {
+                let opened = match &*ty {
+                    Ty::Hidden { binder, body, .. } => crate::types::open_hidden(
+                        body,
+                        *binder,
+                        &Arc::new(Ty::Rigid {
+                            id: *id,
+                            name: name.anchored.as_str().into(),
+                        }),
+                    ),
+                    _ => Arc::new(Ty::Undecided),
+                };
+                let sealed = self.plan.graph.shape(Shape::Sealed);
+                self.plan.graph.supply(sealed, value);
+                self.pattern(payload, sealed, &opened);
+            }
             ir::PatternKind::Bind(name) => {
+                // A mirror of an opened type, bound by name: evidence for
+                // that type within the arm. Only the mirror itself counts;
+                // a mirror of an array of it says nothing about the element.
+                if let Ty::Mirror(inner) = &*ty
+                    && let Some(slot) = super::evidence_slot(inner)
+                    && slot & super::SCOPED != 0
+                {
+                    self.plan.evidence.insert(name.anchored, slot);
+                }
                 self.plan.bindings.insert(
                     name.anchored,
                     Binding {
@@ -1366,14 +1520,16 @@ impl Planner<'_> {
                 );
             }
             ir::PatternKind::Struct { fields, .. } => {
-                if let Shape::Record(members) = self.plan.graph.exposed(value).clone() {
-                    for (name, field) in fields {
-                        if let Some(member) = members.get(name)
-                            && let Ty::Struct(row) = &*ty
-                            && let Some(field_ty) = super::flattened(row).labels.get(name)
-                        {
-                            self.pattern(&field.value, *member, &field_ty.ty);
-                        }
+                let members = match self.plan.graph.exposed(value).clone() {
+                    Shape::Record(members) => Some(members),
+                    _ => None,
+                };
+                for (name, field) in fields {
+                    if let Some(member) = self.member(value, members.as_ref(), name)
+                        && let Ty::Struct(row) = &*ty
+                        && let Some(field_ty) = super::flattened(row).labels.get(name)
+                    {
+                        self.pattern(&field.value, member, &field_ty.ty);
                     }
                 }
             }
@@ -1381,8 +1537,11 @@ impl Planner<'_> {
                 name,
                 payload: Some(payload),
             } => {
-                if let Shape::Sum(members) = self.plan.graph.exposed(value)
-                    && let Some(member) = members.get(&name.anchored).copied()
+                let members = match self.plan.graph.exposed(value).clone() {
+                    Shape::Sum(members) => Some(members),
+                    _ => None,
+                };
+                if let Some(member) = self.member(value, members.as_ref(), &name.anchored)
                     && let Ty::Sum(row) = &*ty
                     && let Some(field) = super::flattened(row).labels.get(&name.anchored)
                 {
@@ -1405,7 +1564,12 @@ impl Planner<'_> {
                         },
                     );
                 }
-                if let Shape::Array(element) = self.plan.graph.exposed(value).clone() {
+                let element = match self.plan.graph.exposed(value).clone() {
+                    Shape::Array(element) => Some(element),
+                    Shape::Value | Shape::Sealed => Some(value),
+                    _ => None,
+                };
+                if let Some(element) = element {
                     for pattern in before.iter().chain(after) {
                         if let Ty::Array(element_ty) = &*ty {
                             self.pattern(pattern, element, element_ty);
@@ -1414,6 +1578,22 @@ impl Planner<'_> {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// The shape a pattern reads a member at. A value with no structure
+    /// exposed, opaque or sealed, has every member that same shape: its
+    /// bindings still need their types recorded, mirrors most of all.
+    fn member(
+        &self,
+        value: ShapeId,
+        members: Option<&BTreeMap<String, ShapeId>>,
+        name: &str,
+    ) -> Option<ShapeId> {
+        match members {
+            Some(members) => members.get(name).copied(),
+            None => matches!(self.plan.graph.exposed(value), Shape::Value | Shape::Sealed)
+                .then_some(value),
         }
     }
 }

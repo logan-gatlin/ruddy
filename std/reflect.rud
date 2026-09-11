@@ -1,0 +1,125 @@
+@doc "A finite graph describing a type: ordinary readable data, never evidence. Node indices refer into `nodes`; a recursive type is a graph with a back edge."
+type Description = { root: Nat, nodes: [Node] }
+
+@doc "The exact domain of an integer kind: its precision in bits, its signedness, and its least and greatest values as decimal text, exact even where this target's own integers could not hold them."
+type Domain = { bits: Nat, signed: Bool, min: String, max: String }
+
+@doc "One node of a description. Integer kinds carry their domain, so `Nat` and `Nat64` stay apart even where their domains coincide; a function reports its argument and result; records and sums list their fields by name."
+type Node =
+  | #Nat Domain
+  | #Int Domain
+  | #Real
+  | #String
+  | #Bool
+  | #Foreign
+  | #Fixed Domain
+  | #Array Nat
+  | #Function { argument: Nat, result: Nat, effects: [Field] }
+  | #Effects [Field]
+  | #Record [Field]
+  | #Sum [Field]
+  | #Alias Nat
+  | #Extend { base: Nat, rest: Nat }
+  | #Parameter Nat
+  | #Mirror Nat
+  | #Hidden Nat
+  | #Variable Nat
+
+@doc "A named position of a record or sum node."
+type Field = { name: String, node: Nat }
+
+@doc "Authentic evidence for the type this position is inferred at. The compiler supplies it: an annotation, a use, or a caller decides the type, never a runtime value."
+extern mirror: () -> Mirror 'a = "$mirror"
+
+@doc "The mirror of a value's static type at this use. It does not inspect the value."
+extern type_of: 'a -> Mirror 'a = "$typeOf"
+
+@doc "A mirror's structure as ordinary data. Editing the description grants nothing: it cannot be turned back into a mirror."
+extern describe: Mirror 'a -> Description = "$describe"
+
+@private
+extern same_pair: (Mirror 'a, Mirror 'b) -> Option { forward: 'a -> 'b, backward: 'b -> 'a } =
+  "$sameMirror"
+
+@doc "Whether two mirrors are one type, exactly: equal structure, primitives, and effect contracts. On success the two functions convert nothing and return their argument unchanged."
+let same: Mirror 'a -> Mirror 'b -> Option { forward: 'a -> 'b, backward: 'b -> 'a } =
+  fn left right => same_pair (left, right)
+
+@doc "Whether a record field is always there. A mirror describes one exact type, whose fields are all required; the case is kept so a reader written against views handles absence as well."
+type Presence = #Required | #Optional
+
+@doc "The outermost structure of a mirrored type, as views whose operations read and make values of that type. Primitive cases carry the typed conversions; the descriptive cases carry the type's description and no way to make one."
+type Shape 'a =
+  | #Nat { read: 'a -> Nat, make: Nat -> 'a }
+  | #Int { read: 'a -> Int, make: Int -> 'a }
+  | #Real { read: 'a -> Real, make: Real -> 'a }
+  | #String { read: 'a -> String, make: String -> 'a }
+  | #Bool { read: 'a -> Bool, make: Bool -> 'a }
+  | #Nat8 { read: 'a -> Nat8, make: Nat8 -> 'a }
+  | #Nat16 { read: 'a -> Nat16, make: Nat16 -> 'a }
+  | #Nat32 { read: 'a -> Nat32, make: Nat32 -> 'a }
+  | #Nat64 { read: 'a -> Nat64, make: Nat64 -> 'a }
+  | #Int8 { read: 'a -> Int8, make: Int8 -> 'a }
+  | #Int16 { read: 'a -> Int16, make: Int16 -> 'a }
+  | #Int32 { read: 'a -> Int32, make: Int32 -> 'a }
+  | #Int64 { read: 'a -> Int64, make: Int64 -> 'a }
+  | #Array (ArrayView 'a)
+  | #Record (RecordView 'a)
+  | #Sum (SumView 'a)
+  | #Function Description
+  | #Hidden Description
+  | #Mirror Description
+  | #Foreign
+
+@doc "An array's element type, hidden, with the conversions between the array and a plain array of that element."
+type ArrayView 'array = hide 'element => {
+  element: Mirror 'element,
+  read: 'array -> ['element],
+  make: ['element] -> 'array,
+}
+
+@doc "A record's fields, each with its own hidden type, and a checked builder from bindings back to the record."
+type RecordView 'record = {
+  mirror: Mirror 'record,
+  fields: [SomeField 'record],
+  build: [Binding 'record] -> Result 'record BuildError,
+}
+
+@doc "One field of a record with its type hidden: opening it gives one scoped type shared by the mirror, what `read` observes, and what `bind` accepts."
+type SomeField 'record = hide 'field => {
+  name: String,
+  mirror: Mirror 'field,
+  presence: Presence,
+  read: 'record -> Option 'field,
+  bind: 'field -> Binding 'record,
+}
+
+@doc "A value for one field of a record, with the mirrors that prove which record and which field: a builder accepts it on those, never on where it was made."
+type Binding 'record = hide 'field => {
+  record: Mirror 'record,
+  name: String,
+  mirror: Mirror 'field,
+  value: 'field,
+}
+
+@doc "Why a record could not be built from bindings, naming the field."
+type BuildError =
+  | #Missing String
+  | #Duplicate String
+  | #Unknown String
+  | #Foreign String
+  | #Mismatched String
+
+@doc "A sum's cases, each with its own hidden payload type."
+type SumView 'sum = { mirror: Mirror 'sum, cases: [SomeCase 'sum] }
+
+@doc "One case of a sum with its payload type hidden. `project` observes the payload when the value is this case; `inject` makes the case, when the mirror proves it may be made."
+type SomeCase 'sum = hide 'payload => {
+  name: String,
+  mirror: Mirror 'payload,
+  project: 'sum -> Option 'payload,
+  inject: Option ('payload -> 'sum),
+}
+
+@doc "The outermost structure of a mirror, with typed operations on values of its type. Nested types are reached through the mirrors the views carry, one level per call, so a recursive type is inspected as far as a program looks."
+extern shape: Mirror 'a -> Shape 'a = "$shape"

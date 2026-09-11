@@ -702,6 +702,15 @@ pub enum PatternKind {
         name: AnchoredString,
         payload: Option<Box<Pattern>>,
     },
+    /// `hide 'a p` — open the hidden type at this position as the fresh type
+    /// `'a`, scoped to the arm, and match the value's body against `p`. `id`
+    /// is that type's identity, which the arm's annotations name through
+    /// [`TypeKind::Scoped`] and inference opens the scrutinee at.
+    Hidden {
+        id: u32,
+        name: AnchoredString,
+        pattern: Box<Pattern>,
+    },
     Natural(u64),
     Integer(i64),
     Fixed(crate::types::FixedLiteral),
@@ -726,6 +735,10 @@ pub type Type = Anchored<TypeKind>;
 pub enum TypeKind {
     /// The type of an immutable homogeneous array.
     Array(Box<Type>),
+    /// `Mirror T` — the builtin type constructor of authentic evidence for
+    /// `T`. Written as an application of the reserved bare name `Mirror`, which
+    /// no declaration shadows unless one is written; see [`Builder::apply`].
+    Mirror(Box<Type>),
     Mut(Box<Type>, Box<Type>),
     Struct {
         fields: IndexMap<String, TypeField>,
@@ -791,6 +804,25 @@ pub enum TypeKind {
     /// else it is [`ErrorKind::EffectsOutsideRow`], so a reader of the tree can
     /// take a row here as being spliced into whatever the parameter is used as.
     Effects(Box<EffectRow>),
+    /// `hide 'a => T` — a hidden type, binding `'a` over its body. `id` is
+    /// the binder's identity across the whole program, drawn from the same
+    /// count an annotation's variables are, so every occurrence of `'a` in
+    /// the body is a [`TypeKind::Scoped`] naming it and no other `hide` can
+    /// be confused with it.
+    Hidden {
+        id: u32,
+        name: String,
+        body: Box<Type>,
+    },
+    /// A use of a type some enclosing form bound: the variable of a `hide`
+    /// type this is written inside, or the type a `hide` pattern opened for
+    /// the arm this is written in. Which of the two, inference decides from
+    /// the binders in scope where it lowers the type; the id is the same
+    /// count either way.
+    Scoped {
+        id: u32,
+        name: String,
+    },
     /// A variable the annotation's an annotation introduced, used in a type
     /// position.
     ///
@@ -1013,7 +1045,10 @@ fn presence_polarities(
                         work.push(Work::Ty(to, positive, result_owner));
                         work.push(Work::Ty(from, !positive, owner));
                     }
-                    TypeKind::Array(element) => work.push(Work::Ty(element, positive, owner)),
+                    TypeKind::Array(element) | TypeKind::Mirror(element) => {
+                        work.push(Work::Ty(element, positive, owner))
+                    }
+                    TypeKind::Hidden { body, .. } => work.push(Work::Ty(body, positive, owner)),
                     TypeKind::Mut(region, element) => {
                         for polarity in [positive, !positive] {
                             work.push(Work::Ty(region, polarity, owner));
@@ -1057,6 +1092,7 @@ fn presence_polarities(
                     | TypeKind::Prim(_)
                     | TypeKind::Var(_)
                     | TypeKind::Hole
+                    | TypeKind::Scoped { .. }
                     | TypeKind::Error => {}
                 }
             }
@@ -1116,7 +1152,10 @@ fn declaration_variances(
                             *out.entry((*owner, *index)).or_default() |= bit;
                         }
                     }
-                    TypeKind::Array(element) => work.push((element, positive)),
+                    TypeKind::Array(element) | TypeKind::Mirror(element) => {
+                        work.push((element, positive))
+                    }
+                    TypeKind::Hidden { body, .. } => work.push((body, positive)),
                     TypeKind::Mut(region, element) => {
                         for polarity in [positive, !positive] {
                             work.push((region, polarity));
@@ -1176,6 +1215,7 @@ fn declaration_variances(
                     | TypeKind::Prim(_)
                     | TypeKind::Var(_)
                     | TypeKind::Hole
+                    | TypeKind::Scoped { .. }
                     | TypeKind::Error => {}
                 }
             }
@@ -1206,8 +1246,12 @@ fn declaration_variances(
                                 work.push(Semantic::Ty(to, positive));
                                 work.push(Semantic::Row(effects, positive));
                             }
-                            Ty::Package(body) => work.push(Semantic::Ty(body, positive)),
-                            Ty::Array(element) => work.push(Semantic::Ty(element, positive)),
+                            Ty::Package(body) | Ty::Hidden { body, .. } => {
+                                work.push(Semantic::Ty(body, positive))
+                            }
+                            Ty::Array(element) | Ty::Mirror(element) => {
+                                work.push(Semantic::Ty(element, positive))
+                            }
                             Ty::Mut(region, element) => {
                                 work.push(Semantic::Ty(element, positive));
                                 work.push(Semantic::Ty(region, positive));
@@ -1231,6 +1275,7 @@ fn declaration_variances(
                             }
                             Ty::Var(_)
                             | Ty::Rigid { .. }
+                            | Ty::HiddenVar { .. }
                             | Ty::Bound(_)
                             | Ty::Undecided
                             | Ty::Nat
@@ -1239,7 +1284,6 @@ fn declaration_variances(
                             | Ty::Real
                             | Ty::String
                             | Ty::Bool
-                            | Ty::Any
                             | Ty::ForeignValue => {}
                         }
                     }
@@ -1436,6 +1480,21 @@ pub enum ErrorKind {
     },
     /// A reserved array runtime intrinsic has an incompatible signature.
     ArrayInExtern,
+    /// A `hide` pattern written where only a `match` arm may open a hidden
+    /// type: a `let`, at the top level or in a block.
+    HiddenOutsideMatch,
+    /// An integer literal the target's domain for its type cannot hold.
+    LiteralOutsideDomain {
+        literal: String,
+        primitive: &'static str,
+        bounds: crate::types::Bounds,
+    },
+    /// A name a `hide` bound, used as something other than a type: a row
+    /// tail, a presence, or a region.
+    HiddenVariableSense {
+        name: String,
+        sense: Sense,
+    },
     /// A dependency alias cannot be written as a source path component.
     InvalidDependencyAlias {
         alias: String,
@@ -2189,8 +2248,14 @@ struct Builder<'a> {
     /// How many variables have been declared anywhere in the program so far,
     /// which is what the next one's id is. Program-global, so two annotations
     /// that each write `a` never collide however alike they look — see
-    /// [`Variable::id`].
+    /// [`Variable::id`]. A `hide` draws its binder's id from the same count.
     rigids: u32,
+    /// The names `hide` has bound around the position being lowered,
+    /// innermost last: the variable of every enclosing `hide` type, and the
+    /// types every enclosing arm's `hide` patterns opened. A `'a` written in a
+    /// type resolves here before it is a declaration's parameter or an
+    /// annotation's own variable, so the nearest `hide` wins.
+    scoped: Vec<(String, u32)>,
     /// Positive/negative uses of every declared-type parameter after the
     /// transparent alias graph reaches its least fixpoint. Bit 0 is covariant,
     /// bit 1 contravariant; both is invariant and neither is erased.
@@ -2906,6 +2971,7 @@ pub fn build_with_interfaces(
         params: HashMap::new(),
         vars: IndexMap::new(),
         rigids: 0,
+        scoped: Vec::new(),
         variances: HashMap::new(),
     };
     let mut program = Program {
@@ -3380,9 +3446,15 @@ pub fn build_with_interfaces(
                                 &mut program.terms,
                             ),
                             None => {
-                                let (at, found) = refuter(&pattern)
-                                    .expect("a pattern that is not calm names what refutes it");
-                                b.error_at(at, ErrorKind::RefutableBinding { found });
+                                match opens_hidden_at(&pattern) {
+                                    Some(at) => b.error_at(at, ErrorKind::HiddenOutsideMatch),
+                                    None => {
+                                        let (at, found) = refuter(&pattern).expect(
+                                            "a pattern that is not calm names what refutes it",
+                                        );
+                                        b.error_at(at, ErrorKind::RefutableBinding { found });
+                                    }
+                                }
                                 let held_at = b.anchor(pspan);
                                 let held = b.fresh("%value", held_at);
                                 program.terms.insert(
@@ -3591,7 +3663,7 @@ fn array_intrinsic_signature(
 
     fn array_variable(ty: &Type) -> Option<&str> {
         match &ty.anchored {
-            TypeKind::Array(element) => variable(element),
+            TypeKind::Array(element) | TypeKind::Mirror(element) => variable(element),
             _ => None,
         }
     }
@@ -3792,7 +3864,6 @@ fn imported_syntax(
         artifact::Type::Real => TypeKind::Prim(Prim::Real),
         artifact::Type::String => TypeKind::Prim(Prim::String),
         artifact::Type::Bool => TypeKind::Prim(Prim::Bool),
-        artifact::Type::Any => TypeKind::Prim(Prim::Any),
         artifact::Type::ForeignValue => TypeKind::Prim(Prim::ForeignValue),
         artifact::Type::Bound(index) => match params.get(*index as usize) {
             Some(symbol) => TypeKind::Param {
@@ -3804,6 +3875,23 @@ fn imported_syntax(
         artifact::Type::Package(body) => {
             return imported_syntax(mint, body, params, symbols, names, effect_rows, depth + 1);
         }
+        artifact::Type::Hidden { binder, name, body } => TypeKind::Hidden {
+            id: *binder,
+            name: name.clone(),
+            body: Box::new(imported_syntax(
+                mint,
+                body,
+                params,
+                symbols,
+                names,
+                effect_rows,
+                depth + 1,
+            )),
+        },
+        artifact::Type::HiddenVar { binder, name } => TypeKind::Scoped {
+            id: *binder,
+            name: name.clone(),
+        },
         artifact::Type::Mut(region, element) => TypeKind::Mut(
             Box::new(imported_syntax(
                 mint,
@@ -3824,6 +3912,15 @@ fn imported_syntax(
                 depth + 1,
             )),
         ),
+        artifact::Type::Mirror(element) => TypeKind::Mirror(Box::new(imported_syntax(
+            mint,
+            element,
+            params,
+            symbols,
+            names,
+            effect_rows,
+            depth + 1,
+        ))),
         artifact::Type::Array(element) => TypeKind::Array(Box::new(imported_syntax(
             mint,
             element,
@@ -4057,7 +4154,9 @@ fn clamp_bounds(ty: Arc<Ty>, count: usize, presences: usize) -> Arc<Ty> {
         Row(&'a crate::types::Row),
         Arrow,
         Package,
+        Hidden(u32, Arc<str>),
         Array,
+        Mirror,
         Mut,
         Struct,
         Sum,
@@ -4085,7 +4184,6 @@ fn clamp_bounds(ty: Arc<Ty>, count: usize, presences: usize) -> Arc<Ty> {
                 Ty::Real => types.push(Arc::new(Ty::Real)),
                 Ty::String => types.push(Arc::new(Ty::String)),
                 Ty::Bool => types.push(Arc::new(Ty::Bool)),
-                Ty::Any => types.push(Arc::new(Ty::Any)),
                 Ty::ForeignValue => types.push(Arc::new(Ty::ForeignValue)),
                 Ty::Bound(index) if (*index as usize) < count && (*index as usize) >= presences => {
                     types.push(Arc::new(Ty::Bound(*index)))
@@ -4093,6 +4191,7 @@ fn clamp_bounds(ty: Arc<Ty>, count: usize, presences: usize) -> Arc<Ty> {
                 Ty::Bound(_) | Ty::Var(_) | Ty::Rigid { .. } | Ty::Undecided => {
                     types.push(Arc::new(Ty::Undecided))
                 }
+                Ty::HiddenVar { .. } => types.push(Arc::new(value.clone())),
                 Ty::Arrow(from, to, effects) => {
                     work.push(Work::Arrow);
                     work.push(Work::Row(effects));
@@ -4103,8 +4202,16 @@ fn clamp_bounds(ty: Arc<Ty>, count: usize, presences: usize) -> Arc<Ty> {
                     work.push(Work::Package);
                     work.push(Work::Ty(body));
                 }
+                Ty::Hidden { binder, name, body } => {
+                    work.push(Work::Hidden(*binder, name.clone()));
+                    work.push(Work::Ty(body));
+                }
                 Ty::Array(element) => {
                     work.push(Work::Array);
+                    work.push(Work::Ty(element));
+                }
+                Ty::Mirror(element) => {
+                    work.push(Work::Mirror);
                     work.push(Work::Ty(element));
                 }
                 Ty::Mut(region, element) => {
@@ -4172,9 +4279,17 @@ fn clamp_bounds(ty: Arc<Ty>, count: usize, presences: usize) -> Arc<Ty> {
                 let body = types.pop().expect("package postorder stays balanced");
                 types.push(Arc::new(Ty::Package(body)));
             }
+            Work::Hidden(binder, name) => {
+                let body = types.pop().expect("hidden postorder stays balanced");
+                types.push(Arc::new(Ty::Hidden { binder, name, body }));
+            }
             Work::Array => {
                 let element = types.pop().expect("array postorder stays balanced");
                 types.push(Arc::new(Ty::Array(element)));
+            }
+            Work::Mirror => {
+                let element = types.pop().expect("mirror postorder stays balanced");
+                types.push(Arc::new(Ty::Mirror(element)));
             }
             Work::Mut => {
                 let element = types.pop().expect("cell element");
@@ -4267,8 +4382,12 @@ fn drop_type_iterative(root: Arc<Ty>) {
                         work.push(Work::Ty(to.clone()));
                         row(effects, &mut work);
                     }
-                    Ty::Package(body) => work.push(Work::Ty(body.clone())),
-                    Ty::Array(element) => work.push(Work::Ty(element.clone())),
+                    Ty::Package(body) | Ty::Hidden { body, .. } => {
+                        work.push(Work::Ty(body.clone()))
+                    }
+                    Ty::Array(element) | Ty::Mirror(element) => {
+                        work.push(Work::Ty(element.clone()))
+                    }
                     Ty::Mut(region, element) => {
                         work.push(Work::Ty(element.clone()));
                         work.push(Work::Ty(region.clone()));
@@ -4283,11 +4402,11 @@ fn drop_type_iterative(root: Arc<Ty>) {
                     | Ty::Real
                     | Ty::String
                     | Ty::Bool
-                    | Ty::Any
                     | Ty::ForeignValue
                     | Ty::Var(_)
                     | Ty::Bound(_)
                     | Ty::Rigid { .. }
+                    | Ty::HiddenVar { .. }
                     | Ty::Undecided => {}
                 }
                 drop(ty);
@@ -4431,7 +4550,9 @@ fn import_type(
         Row(&'a artifact::Row, bool),
         Arrow,
         Package,
+        Hidden(u32, Arc<str>),
         Array,
+        Mirror,
         Mut,
         Struct,
         Sum,
@@ -4455,7 +4576,6 @@ fn import_type(
                 artifact::Type::Real => types.push(Arc::new(Ty::Real)),
                 artifact::Type::String => types.push(Arc::new(Ty::String)),
                 artifact::Type::Bool => types.push(Arc::new(Ty::Bool)),
-                artifact::Type::Any => types.push(Arc::new(Ty::Any)),
                 artifact::Type::ForeignValue => types.push(Arc::new(Ty::ForeignValue)),
                 artifact::Type::Bound(index) => types.push(Arc::new(Ty::Bound(*index))),
                 artifact::Type::Var(_)
@@ -4471,8 +4591,20 @@ fn import_type(
                     work.push(Work::Package);
                     work.push(Work::Ty(body, is_effect_row));
                 }
+                artifact::Type::Hidden { binder, name, body } => {
+                    work.push(Work::Hidden(*binder, name.as_str().into()));
+                    work.push(Work::Ty(body, false));
+                }
+                artifact::Type::HiddenVar { binder, name } => types.push(Arc::new(Ty::HiddenVar {
+                    binder: *binder,
+                    name: name.as_str().into(),
+                })),
                 artifact::Type::Array(element) => {
                     work.push(Work::Array);
+                    work.push(Work::Ty(element, false));
+                }
+                artifact::Type::Mirror(element) => {
+                    work.push(Work::Mirror);
                     work.push(Work::Ty(element, false));
                 }
                 artifact::Type::Mut(region, element) => {
@@ -4520,9 +4652,17 @@ fn import_type(
                 let body = types.pop().expect("package postorder stays balanced");
                 types.push(Arc::new(Ty::Package(body)));
             }
+            Work::Hidden(binder, name) => {
+                let body = types.pop().expect("hidden postorder stays balanced");
+                types.push(Arc::new(Ty::Hidden { binder, name, body }));
+            }
             Work::Array => {
                 let element = types.pop().expect("array postorder stays balanced");
                 types.push(Arc::new(Ty::Array(element)));
+            }
+            Work::Mirror => {
+                let element = types.pop().expect("mirror postorder stays balanced");
+                types.push(Arc::new(Ty::Mirror(element)));
             }
             Work::Mut => {
                 let element = types.pop().expect("cell element");
@@ -5272,6 +5412,10 @@ impl RegularType<'_> {
                         work.push(Work::Make("array".into(), vec!["element".into()]));
                         work.push(Work::Type(element, args));
                     }
+                    TypeKind::Mirror(element) => {
+                        work.push(Work::Make("mirror".into(), vec!["of".into()]));
+                        work.push(Work::Type(element, args));
+                    }
                     TypeKind::Struct { fields, tail } => {
                         let labels = fields
                             .iter()
@@ -5353,6 +5497,13 @@ impl RegularType<'_> {
                     }
                     TypeKind::Prim(prim) => values.push(self.atom(format!("{prim:?}"))),
                     TypeKind::Effects(row) => work.push(Work::EffectRow(row, args)),
+                    TypeKind::Hidden { id, body, .. } => {
+                        work.push(Work::Make(format!("hidden:{id}"), vec!["body".into()]));
+                        work.push(Work::Type(body, args));
+                    }
+                    TypeKind::Scoped { id, .. } => {
+                        values.push(self.atom(format!("hidden-var:{id}")))
+                    }
                     TypeKind::Var(_) | TypeKind::Hole | TypeKind::Error => {
                         values.push(self.atom("?"));
                     }
@@ -5549,13 +5700,24 @@ impl RegularType<'_> {
                     Ty::Real => values.push(self.atom("Real")),
                     Ty::String => values.push(self.atom("String")),
                     Ty::Bool => values.push(self.atom("Bool")),
-                    Ty::Any => values.push(self.atom("Any")),
                     Ty::ForeignValue => values.push(self.atom("ForeignValue")),
                     Ty::Bound(index) if instantiation == usize::MAX => {
                         values.push(self.atom(format!("param:{index}")))
                     }
                     Ty::Bound(index) => values.push(self.argument(&args, *index)),
+                    // A type a `hide` pattern opened is a slot the arm's
+                    // evidence fills, exactly as a quantified parameter is.
+                    Ty::Rigid { id, .. } if crate::reification::scoped_rigid(*id) => {
+                        values.push(self.atom(format!("param:{}", crate::reification::SCOPED | id)))
+                    }
                     Ty::Var(_) | Ty::Rigid { .. } | Ty::Undecided => values.push(self.atom("?")),
+                    Ty::HiddenVar { binder, .. } => {
+                        values.push(self.atom(format!("hidden-var:{binder}")))
+                    }
+                    Ty::Hidden { binder, body, .. } => {
+                        work.push(Work::Make(format!("hidden:{binder}"), vec!["body".into()]));
+                        work.push(Work::Type(body, args, supplied_as_effects, instantiation));
+                    }
                     Ty::Package(body) => {
                         if self.retain_packages {
                             work.push(Work::Make("package".into(), vec!["body".into()]));
@@ -5578,6 +5740,10 @@ impl RegularType<'_> {
                             supplied_as_effects,
                             instantiation,
                         ));
+                    }
+                    Ty::Mirror(inner) => {
+                        work.push(Work::Make("mirror".into(), vec!["of".into()]));
+                        work.push(Work::Type(inner, args, false, instantiation));
                     }
                     Ty::Arrow(from, to, effects) => {
                         work.push(Work::Make(
@@ -6158,7 +6324,8 @@ fn type_effect_dependencies<'a>(
     let mut dependencies = Vec::new();
     while let Some(ty) = pending.pop() {
         match &ty.anchored {
-            TypeKind::Array(element) => pending.push(element),
+            TypeKind::Array(element) | TypeKind::Mirror(element) => pending.push(element),
+            TypeKind::Hidden { body, .. } => pending.push(body),
             TypeKind::Mut(region, element) => {
                 pending.push(region);
                 pending.push(element);
@@ -6221,6 +6388,7 @@ fn type_effect_dependencies<'a>(
             | TypeKind::Prim(_)
             | TypeKind::Var(_)
             | TypeKind::Hole
+            | TypeKind::Scoped { .. }
             | TypeKind::Error => {}
         }
     }
@@ -6556,7 +6724,8 @@ fn rekey_type(ty: &mut Type, ids: &IndexMap<Symbol, EffectId>, errors: &mut Vec<
                 rekey_type(arg, ids, errors);
             }
         }
-        TypeKind::Array(element) => rekey_type(element, ids, errors),
+        TypeKind::Array(element) | TypeKind::Mirror(element) => rekey_type(element, ids, errors),
+        TypeKind::Hidden { body, .. } => rekey_type(body, ids, errors),
         TypeKind::Mut(region, element) => {
             rekey_type(region, ids, errors);
             rekey_type(element, ids, errors);
@@ -6567,6 +6736,7 @@ fn rekey_type(ty: &mut Type, ids: &IndexMap<Symbol, EffectId>, errors: &mut Vec<
         | TypeKind::Prim(_)
         | TypeKind::Var(_)
         | TypeKind::Hole
+        | TypeKind::Scoped { .. }
         | TypeKind::Error => {}
     }
 }
@@ -6913,12 +7083,15 @@ impl<'a> Follow<'a> {
                     TypeKind::Struct { .. }
                     | TypeKind::Mut(..)
                     | TypeKind::Array(_)
+                    | TypeKind::Mirror(_)
                     | TypeKind::Sum { .. }
                     | TypeKind::Arrow { .. }
                     | TypeKind::Effects(_)
                     | TypeKind::Prim(_)
                     | TypeKind::Var(_)
                     | TypeKind::Hole
+                    | TypeKind::Hidden { .. }
+                    | TypeKind::Scoped { .. }
                     | TypeKind::Error => answer = Some(Stands::Shape),
                     TypeKind::Param { index, .. } => {
                         answer = Some(Stands::Param {
@@ -6986,14 +7159,16 @@ impl<'a> Follow<'a> {
                     | Ty::Real
                     | Ty::String
                     | Ty::Bool
-                    | Ty::Any
                     | Ty::ForeignValue
                     | Ty::Arrow(..)
                     | Ty::Mut(..)
                     | Ty::Array(_)
+                    | Ty::Mirror(_)
                     | Ty::Sum(_)
                     | Ty::Var(_)
                     | Ty::Rigid { .. }
+                    | Ty::Hidden { .. }
+                    | Ty::HiddenVar { .. }
                     | Ty::Undecided => answer = Some(Stands::Shape),
                 },
                 FollowWork::SelectWritten(args) => {
@@ -7320,6 +7495,8 @@ fn refuter(pattern: &Pattern) -> Option<(Anchor, Refuter)> {
     let literal = |value| Some((pattern.at, Refuter::Literal(value)));
     match &pattern.anchored {
         PatternKind::Bind(_) | PatternKind::Wildcard | PatternKind::Unit => None,
+        // Opening a hidden type always succeeds; what may fail is the payload.
+        PatternKind::Hidden { pattern, .. } => refuter(pattern),
         PatternKind::Tag { name, .. } => Some((name.at, Refuter::Case(name.anchored.clone()))),
         PatternKind::Struct { fields, .. } => {
             fields.values().find_map(|field| refuter(&field.value))
@@ -7340,6 +7517,58 @@ fn refuter(pattern: &Pattern) -> Option<(Anchor, Refuter)> {
             true => None,
             false => Some((pattern.at, Refuter::Length)),
         },
+    }
+}
+
+/// Where a pattern first opens a hidden type, if it does anywhere. A `let`
+/// cannot: the type an opening introduces is scoped to a match arm, and a
+/// binding has no arm to scope it to. See [`ErrorKind::HiddenOutsideMatch`].
+fn opens_hidden_at(pattern: &Pattern) -> Option<Anchor> {
+    match &pattern.anchored {
+        PatternKind::Hidden { .. } => Some(pattern.at),
+        PatternKind::Struct { fields, .. } => fields
+            .values()
+            .find_map(|field| opens_hidden_at(&field.value)),
+        PatternKind::Tag {
+            payload: Some(payload),
+            ..
+        } => opens_hidden_at(payload),
+        PatternKind::Array { before, after, .. } => {
+            before.iter().chain(after).find_map(opens_hidden_at)
+        }
+        _ => None,
+    }
+}
+
+/// Whether a pattern opens a hidden type anywhere inside it — whether the arm
+/// it heads introduces types of its own. See [`PatternKind::Hidden`].
+pub fn opens_hidden(pattern: &Pattern) -> bool {
+    opens_hidden_at(pattern).is_some()
+}
+
+/// Every type a pattern's `hide`s open, by name and id, in the order they are
+/// written: what the arm's body has in scope beyond what the pattern binds.
+fn hidden_binders(pattern: &Pattern, out: &mut Vec<(String, u32)>) {
+    match &pattern.anchored {
+        PatternKind::Hidden { id, name, pattern } => {
+            out.push((name.anchored.clone(), *id));
+            hidden_binders(pattern, out);
+        }
+        PatternKind::Struct { fields, .. } => {
+            for field in fields.values() {
+                hidden_binders(&field.value, out);
+            }
+        }
+        PatternKind::Tag {
+            payload: Some(payload),
+            ..
+        } => hidden_binders(payload, out),
+        PatternKind::Array { before, after, .. } => {
+            for element in before.iter().chain(after) {
+                hidden_binders(element, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -7376,7 +7605,10 @@ fn calm(pattern: &Pattern) -> Option<Calm> {
             at: pattern.at,
             name: rest.name,
         }),
+        // Opening a hidden type is a match arm's to do, not a binding's:
+        // refused where the binding is lowered, and never calm here.
         PatternKind::Tag { .. }
+        | PatternKind::Hidden { .. }
         | PatternKind::Array { .. }
         | PatternKind::Natural(_)
         | PatternKind::Fixed(_)
@@ -7390,9 +7622,97 @@ fn calm(pattern: &Pattern) -> Option<Calm> {
 /// Every name a normalized pattern binds, in the order the pattern walk met
 /// them. What a refused binding still has to bind — to error values — so
 /// downstream uses resolve.
-fn pattern_binders(pattern: &Pattern, out: &mut Vec<Anchored<Symbol>>) {
+/// Every `Nat` and `Int` literal in the program the target's domains cannot
+/// hold, in terms and in patterns. A literal's type is its own spelling, so
+/// the check needs no inference; it needs the domains bound, which is what
+/// makes it a compilation's rather than a parse's.
+pub fn literals_outside(program: &Program, domains: crate::types::Domains) -> Vec<Error> {
+    fn outside(
+        at: Anchor,
+        literal: String,
+        primitive: &'static str,
+        bounds: crate::types::Bounds,
+        errors: &mut Vec<Error>,
+    ) {
+        errors.push(Error {
+            at,
+            kind: ErrorKind::LiteralOutsideDomain {
+                literal,
+                primitive,
+                bounds,
+            },
+        });
+    }
+    fn patterns(pattern: &Pattern, domains: crate::types::Domains, errors: &mut Vec<Error>) {
+        match &pattern.anchored {
+            PatternKind::Natural(value) if !domains.holds_natural(*value) => outside(
+                pattern.at,
+                format!("{value}n"),
+                "Nat",
+                domains.nat(),
+                errors,
+            ),
+            PatternKind::Integer(value) if !domains.holds_integer(*value) => outside(
+                pattern.at,
+                format!("{value}i"),
+                "Int",
+                domains.int(),
+                errors,
+            ),
+            PatternKind::Struct { fields, .. } => {
+                for field in fields.values() {
+                    patterns(&field.value, domains, errors);
+                }
+            }
+            PatternKind::Tag {
+                payload: Some(payload),
+                ..
+            } => patterns(payload, domains, errors),
+            PatternKind::Hidden { pattern, .. } => patterns(pattern, domains, errors),
+            PatternKind::Array { before, after, .. } => {
+                for pattern in before.iter().chain(after) {
+                    patterns(pattern, domains, errors);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut errors = Vec::new();
+    for declaration in program.terms.values() {
+        let mut work = vec![&declaration.value];
+        while let Some(term) = work.pop() {
+            match &term.kind {
+                TermKind::Natural(value) if !domains.holds_natural(*value) => outside(
+                    term.at,
+                    format!("{value}n"),
+                    "Nat",
+                    domains.nat(),
+                    &mut errors,
+                ),
+                TermKind::Integer(value) if !domains.holds_integer(*value) => outside(
+                    term.at,
+                    format!("{value}i"),
+                    "Int",
+                    domains.int(),
+                    &mut errors,
+                ),
+                TermKind::Match { arms, .. } => {
+                    for (pattern, _) in arms {
+                        patterns(pattern, domains, &mut errors);
+                    }
+                }
+                _ => {}
+            }
+            crate::reification::children(term, &mut work);
+        }
+    }
+    errors
+}
+
+pub fn pattern_binders(pattern: &Pattern, out: &mut Vec<Anchored<Symbol>>) {
     match &pattern.anchored {
         PatternKind::Bind(name) => out.push(*name),
+        PatternKind::Hidden { pattern, .. } => pattern_binders(pattern, out),
         PatternKind::Wildcard
         | PatternKind::Unit
         | PatternKind::Natural(_)
@@ -7505,6 +7825,9 @@ fn demand(ty: Type) -> Annotation {
 fn mat(pattern: &Pattern) -> Mat {
     match &pattern.anchored {
         PatternKind::Bind(_) | PatternKind::Wildcard | PatternKind::Unit => Mat::Wild,
+        // The opening tests nothing and reaches into nothing: the payload
+        // is what the arm says of the value at this position.
+        PatternKind::Hidden { pattern, .. } => mat(pattern),
         PatternKind::Tag { name, payload } => Mat::Tag {
             name: name.anchored.clone(),
             payload: Box::new(payload.as_deref().map(mat).unwrap_or(Mat::Wild)),
@@ -7564,6 +7887,9 @@ impl Matrix {
         match &pattern.anchored {
             PatternKind::Bind(_) | PatternKind::Wildcard => self.binds.push(path.clone()),
             PatternKind::Unit => {}
+            // No step of its own: the payload tests the same position, read
+            // as the hidden type's body.
+            PatternKind::Hidden { pattern, .. } => self.collect(pattern, path),
             PatternKind::Tag { name, payload } => {
                 self.tests
                     .entry(path.clone())
@@ -7830,6 +8156,11 @@ fn payload_cols(pos: &[Step], name: &str, later: &[Vec<Step>]) -> Vec<Vec<Step>>
         .collect()
 }
 
+/// The bare name of the builtin type constructor of mirrors. Resolved after
+/// declarations, so a `type Mirror` of one's own shadows it as a `type Nat`
+/// shadows the primitive.
+pub const MIRROR: &str = "Mirror";
+
 /// Every name a surface pattern binds, in the order the lowering walk meets
 /// them — repeats included, so the declare pass and [`Builder::pattern`] agree
 /// position for position. See [`Binders::Declared`].
@@ -7851,6 +8182,7 @@ fn pattern_names(pattern: &parse::Pattern, out: &mut Vec<TrackedString>) {
                 pattern_names(payload, out);
             }
         }
+        parse::PatternKind::Hidden { pattern, .. } => pattern_names(pattern, out),
         parse::PatternKind::Struct { fields, .. } => {
             for (name, sub) in fields {
                 match sub {
@@ -8399,7 +8731,8 @@ fn constrain(
                 lacks: IndexSet::new(),
             },
         )),
-        TypeKind::Array(element) => constrain(element, summaries, out),
+        TypeKind::Array(element) | TypeKind::Mirror(element) => constrain(element, summaries, out),
+        TypeKind::Hidden { body, .. } => constrain(body, summaries, out),
         TypeKind::Mut(region, element) => {
             if let TypeKind::Param { index, .. } = &region.anchored {
                 out(Fact::Says(
@@ -8463,6 +8796,7 @@ fn constrain(
         | TypeKind::Prim(_)
         | TypeKind::Var(_)
         | TypeKind::Hole
+        | TypeKind::Scoped { .. }
         | TypeKind::Error => {}
     }
 }
@@ -8523,7 +8857,10 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
                     applied(label.symbol(), label.args_mut(), kinds, carries, rows, out);
                 }
             }
-            TypeKind::Array(element) => walk(element, kinds, carries, rows, out),
+            TypeKind::Array(element) | TypeKind::Mirror(element) => {
+                walk(element, kinds, carries, rows, out)
+            }
+            TypeKind::Hidden { body, .. } => walk(body, kinds, carries, rows, out),
             TypeKind::Mut(region, element) => {
                 walk(region, kinds, carries, rows, out);
                 walk(element, kinds, carries, rows, out);
@@ -8551,6 +8888,7 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
             | TypeKind::Prim(_)
             | TypeKind::Var(_)
             | TypeKind::Hole
+            | TypeKind::Scoped { .. }
             | TypeKind::Error => {}
         }
     }
@@ -8829,9 +9167,12 @@ fn row_shaped(
             }
             TypeKind::Mut(..)
             | TypeKind::Array(_)
+            | TypeKind::Mirror(_)
             | TypeKind::Arrow { .. }
             | TypeKind::Prim(_)
             | TypeKind::Var(_)
+            | TypeKind::Hidden { .. }
+            | TypeKind::Scoped { .. }
             | TypeKind::Hole => false,
         }
     }
@@ -9024,15 +9365,17 @@ fn row_summaries(
                     | Ty::Real
                     | Ty::String
                     | Ty::Bool
-                    | Ty::Any
                     | Ty::ForeignValue
                     | Ty::Arrow(..)
                     | Ty::Mut(..)
                     | Ty::Array(_)
+                    | Ty::Mirror(_)
                     | Ty::Struct(_)
                     | Ty::Sum(_)
                     | Ty::Var(_)
-                    | Ty::Rigid { .. } => work.push(Work::Value(RowSummary::default())),
+                    | Ty::Rigid { .. }
+                    | Ty::Hidden { .. }
+                    | Ty::HiddenVar { .. } => work.push(Work::Value(RowSummary::default())),
                     Ty::Undecided => work.push(Work::Value(RowSummary {
                         shaped: true,
                         ..RowSummary::default()
@@ -9071,12 +9414,15 @@ fn row_summaries(
                     TypeKind::Struct { .. }
                     | TypeKind::Mut(..)
                     | TypeKind::Array(_)
+                    | TypeKind::Mirror(_)
                     | TypeKind::Sum { .. }
                     | TypeKind::Arrow { .. }
                     | TypeKind::Effects(_)
                     | TypeKind::Prim(_)
                     | TypeKind::Var(_)
                     | TypeKind::Hole
+                    | TypeKind::Hidden { .. }
+                    | TypeKind::Scoped { .. }
                     | TypeKind::Error => work.push(Work::Value(RowSummary::default())),
                 },
                 Work::SemanticApply(supplied) => {
@@ -9247,12 +9593,15 @@ fn row_summary(ty: &Type, decls: &HashMap<Symbol, RowSummary>, shape: Sense) -> 
         TypeKind::Struct { .. }
         | TypeKind::Mut(..)
         | TypeKind::Array(_)
+        | TypeKind::Mirror(_)
         | TypeKind::Sum { .. }
         | TypeKind::Arrow { .. }
         | TypeKind::Effects(_)
         | TypeKind::Prim(_)
         | TypeKind::Var(_)
         | TypeKind::Hole
+        | TypeKind::Hidden { .. }
+        | TypeKind::Scoped { .. }
         | TypeKind::Error => RowSummary::default(),
     }
 }
@@ -9378,7 +9727,10 @@ fn relevance(types: &IndexMap<Symbol, Decl<Type>>) -> HashSet<Slot> {
     fn occurrences(ty: &Type, under: &mut Vec<Slot>, out: &mut impl FnMut(u32, &[Slot])) {
         match &ty.anchored {
             TypeKind::Param { index, .. } => out(*index, under),
-            TypeKind::Array(element) => occurrences(element, under, out),
+            TypeKind::Array(element) | TypeKind::Mirror(element) => {
+                occurrences(element, under, out)
+            }
+            TypeKind::Hidden { body, .. } => occurrences(body, under, out),
             TypeKind::Mut(region, element) => {
                 occurrences(region, under, out);
                 occurrences(element, under, out);
@@ -9447,6 +9799,7 @@ fn relevance(types: &IndexMap<Symbol, Decl<Type>>) -> HashSet<Slot> {
             | TypeKind::Prim(_)
             | TypeKind::Var(_)
             | TypeKind::Hole
+            | TypeKind::Scoped { .. }
             | TypeKind::Error => {}
         }
     }
@@ -9490,7 +9843,8 @@ fn relevance(types: &IndexMap<Symbol, Decl<Type>>) -> HashSet<Slot> {
 fn mentioned(ty: &Type, out: &mut Vec<Symbol>) {
     match &ty.anchored {
         TypeKind::Ident(symbol) => out.push(*symbol),
-        TypeKind::Array(element) => mentioned(element, out),
+        TypeKind::Array(element) | TypeKind::Mirror(element) => mentioned(element, out),
+        TypeKind::Hidden { body, .. } => mentioned(body, out),
         TypeKind::Mut(region, element) => {
             mentioned(region, out);
             mentioned(element, out);
@@ -9527,6 +9881,7 @@ fn mentioned(ty: &Type, out: &mut Vec<Symbol>) {
         | TypeKind::Prim(_)
         | TypeKind::Var(_)
         | TypeKind::Hole
+        | TypeKind::Scoped { .. }
         | TypeKind::Error => {}
     }
 }
@@ -9558,7 +9913,8 @@ fn grows(ty: &Type, group: &[Symbol], report: &mut impl FnMut(Anchor)) {
         // something, the arity check has already spoken and this would be a
         // second complaint about one mistake.
         TypeKind::Ident(_) => {}
-        TypeKind::Array(element) => grows(element, group, report),
+        TypeKind::Array(element) | TypeKind::Mirror(element) => grows(element, group, report),
+        TypeKind::Hidden { body, .. } => grows(body, group, report),
         TypeKind::Mut(region, element) => {
             grows(region, group, report);
             grows(element, group, report);
@@ -9603,6 +9959,7 @@ fn grows(ty: &Type, group: &[Symbol], report: &mut impl FnMut(Anchor)) {
         | TypeKind::Prim(_)
         | TypeKind::Var(_)
         | TypeKind::Hole
+        | TypeKind::Scoped { .. }
         | TypeKind::Error => {}
     }
 }
@@ -9618,7 +9975,8 @@ fn grows(ty: &Type, group: &[Symbol], report: &mut impl FnMut(Anchor)) {
 fn mentions_a_parameter(ty: &Type) -> bool {
     match &ty.anchored {
         TypeKind::Param { .. } => true,
-        TypeKind::Array(element) => mentions_a_parameter(element),
+        TypeKind::Array(element) | TypeKind::Mirror(element) => mentions_a_parameter(element),
+        TypeKind::Hidden { body, .. } => mentions_a_parameter(body),
         TypeKind::Mut(region, element) => {
             mentions_a_parameter(region) || mentions_a_parameter(element)
         }
@@ -9645,6 +10003,7 @@ fn mentions_a_parameter(ty: &Type) -> bool {
         | TypeKind::Prim(_)
         | TypeKind::Var(_)
         | TypeKind::Hole
+        | TypeKind::Scoped { .. }
         | TypeKind::Error => false,
     }
 }
@@ -11311,6 +11670,14 @@ impl Builder<'_> {
                 Box::new(self.substituted(element, args)),
             ),
             TypeKind::Array(element) => TypeKind::Array(Box::new(self.substituted(element, args))),
+            TypeKind::Mirror(element) => {
+                TypeKind::Mirror(Box::new(self.substituted(element, args)))
+            }
+            TypeKind::Hidden { id, name, body } => TypeKind::Hidden {
+                id: *id,
+                name: name.clone(),
+                body: Box::new(self.substituted(body, args)),
+            },
             TypeKind::Apply {
                 head,
                 head_at: head_span,
@@ -11327,6 +11694,7 @@ impl Builder<'_> {
             | TypeKind::Prim(_)
             | TypeKind::Var(_)
             | TypeKind::Hole
+            | TypeKind::Scoped { .. }
             | TypeKind::Error => ty.anchored.clone(),
         };
         span.anchor(tracked)
@@ -11460,7 +11828,13 @@ impl Builder<'_> {
             parse::Rest::Variable(name) => name,
         };
         // The parameter of the declaration this is the body of, if it is one,
-        // and a declaration's only tail is one of those.
+        // and a declaration's only tail is one of those. A name a `hide`
+        // bound comes first and binds a type, so as a tail it is refused
+        // wherever it is written.
+        if self.scoped_id(&name.tracked).is_some() {
+            self.variable(&name, sense(shape));
+            return None;
+        }
         if let Some(&(symbol, index)) = self.params.get(&name.tracked) {
             return Some(Row::Param { symbol, index });
         }
@@ -11490,7 +11864,28 @@ impl Builder<'_> {
     /// A variable is introduced by being used: `'a` is a variable wherever it
     /// is written, and the span kept is the first use's, which is where a
     /// complaint about what the rest of the annotation did with it points.
+    /// The id of the nearest enclosing `hide` binding `name`, if any.
+    fn scoped_id(&self, name: &str) -> Option<u32> {
+        self.scoped
+            .iter()
+            .rev()
+            .find_map(|(bound, id)| (bound == name).then_some(*id))
+    }
+
     fn variable(&mut self, name: &TrackedString, sense: Sense) -> bool {
+        // A `hide` binds a type and nothing else: written as a row's tail, a
+        // presence or a region, its name is refused rather than read as an
+        // annotation variable that happens to share the spelling.
+        if self.scoped_id(&name.tracked).is_some() {
+            self.error(
+                name.span,
+                ErrorKind::HiddenVariableSense {
+                    name: name.tracked.clone(),
+                    sense,
+                },
+            );
+            return false;
+        }
         if !self.vars.contains_key(&name.tracked) {
             let id = self.rigids;
             self.rigids += 1;
@@ -11904,7 +12299,9 @@ impl Builder<'_> {
             // about the name itself; a parameter is already known and needs no
             // reading.
             parse::TypeKind::Variable { name } => {
-                if !self.params.contains_key(&name.tracked) {
+                if self.scoped_id(&name.tracked).is_none()
+                    && !self.params.contains_key(&name.tracked)
+                {
                     self.variable(&name, Sense::Type);
                 }
                 self.error(
@@ -11927,6 +12324,26 @@ impl Builder<'_> {
             // A segment named no module; the complaint is already at it.
             Err(Missing::Segment) => return self.anchored(span.track(TypeKind::Error)),
             Err(Missing::Name) => {
+                // `Mirror` is the one builtin constructor that takes an
+                // argument: a bare name no declaration shadows, applied to
+                // exactly one type.
+                if name.modules.is_empty() && name.name.tracked == MIRROR {
+                    let mut args = args;
+                    if args.len() == 1 {
+                        return self.anchored(span.track(TypeKind::Mirror(Box::new(
+                            args.pop().expect("one argument"),
+                        ))));
+                    }
+                    self.error(
+                        span,
+                        ErrorKind::Arity {
+                            name: name.name.tracked.clone(),
+                            expected: 1,
+                            found,
+                        },
+                    );
+                    return self.anchored(span.track(TypeKind::Error));
+                }
                 // A primitive takes nothing, so applying one is an arity
                 // complaint rather than a "not a constructor": the reader wrote
                 // a type that exists and gave it too much. Only a bare name can
@@ -12400,10 +12817,13 @@ impl Builder<'_> {
         let span = ty.span;
         let at = self.anchor(span);
         if let parse::TypeKind::Variable { name } = ty.tracked {
-            if let Some(&(symbol, index)) = self.params.get(&name.tracked) {
+            // The nearest `hide` binding the name comes first, and binds a
+            // type: as a region the name is refused, wherever it is written.
+            if self.scoped_id(&name.tracked).is_some() {
+                self.variable(&name, Sense::Region);
+            } else if let Some(&(symbol, index)) = self.params.get(&name.tracked) {
                 return at.anchor(TypeKind::Param { symbol, index });
-            }
-            if let Some(kind) = wherever(place, &name.tracked) {
+            } else if let Some(kind) = wherever(place, &name.tracked) {
                 self.error(span, kind);
             } else if self.variable(&name, Sense::Region) {
                 return at.anchor(TypeKind::Var(name.tracked));
@@ -12479,6 +12899,21 @@ impl Builder<'_> {
         let span = ty.span;
         let here = self.anchor(span);
         match ty.tracked {
+            // The variable is bound for the body and nowhere else, with an id
+            // of its own: a `'a` under it is this `hide`'s, whatever `'a` may
+            // mean around it.
+            parse::TypeKind::Hidden { variable, body } => {
+                let id = self.rigids;
+                self.rigids += 1;
+                self.scoped.push((variable.tracked.clone(), id));
+                let body = self.ty(*body, place);
+                self.scoped.pop();
+                here.anchor(TypeKind::Hidden {
+                    id,
+                    name: variable.tracked,
+                    body: Box::new(body),
+                })
+            }
             // A row where a type goes. Lowered all the same and the result
             // dropped, the way a head that cannot be applied is: the effects it
             // names are still names, and a reader who wrote one wrong should be
@@ -12515,6 +12950,14 @@ impl Builder<'_> {
             // header and an annotation binds nothing, so the two never both
             // apply — which is what lets one sigil serve both.
             parse::TypeKind::Variable { name } => {
+                // The nearest `hide` binding the name comes first: a hidden
+                // type's variable inside its body, or the type an arm opened.
+                if let Some(id) = self.scoped_id(&name.tracked) {
+                    return here.anchor(TypeKind::Scoped {
+                        id,
+                        name: name.tracked,
+                    });
+                }
                 // A parameter stands for one type outright, so the name alone
                 // is the whole of writing one and there is nothing to count.
                 if let Some(&(symbol, index)) = self.params.get(&name.tracked) {
@@ -12569,6 +13012,20 @@ impl Builder<'_> {
                         .flatten();
                     match prim {
                         Some(prim) => here.anchor(TypeKind::Prim(prim)),
+                        // `Mirror` written bare is the builtin constructor
+                        // given nothing: an arity complaint, as for a
+                        // declaration that takes something.
+                        None if name.modules.is_empty() && name.name.tracked == MIRROR => {
+                            self.error(
+                                name.span(),
+                                ErrorKind::Arity {
+                                    name: name.name.tracked.clone(),
+                                    expected: 1,
+                                    found: 0,
+                                },
+                            );
+                            here.anchor(TypeKind::Error)
+                        }
                         None => {
                             self.error(
                                 name.name.span,
@@ -13086,9 +13543,14 @@ impl Builder<'_> {
                     // the value keeps its place, so its own mistakes are
                     // still its own complaints.
                     None => {
-                        let (at, found) = refuter(&pattern)
-                            .expect("a pattern that is not calm names what refutes it");
-                        self.error_at(at, ErrorKind::RefutableBinding { found });
+                        match opens_hidden_at(&pattern) {
+                            Some(at) => self.error_at(at, ErrorKind::HiddenOutsideMatch),
+                            None => {
+                                let (at, found) = refuter(&pattern)
+                                    .expect("a pattern that is not calm names what refutes it");
+                                self.error_at(at, ErrorKind::RefutableBinding { found });
+                            }
+                        }
                         let mut names = Vec::new();
                         pattern_binders(&pattern, &mut names);
                         let inner = bound_to_errors(names, body);
@@ -13210,6 +13672,18 @@ impl Builder<'_> {
             parse::PatternKind::String(value) => here.anchor(PatternKind::String(value)),
             parse::PatternKind::Bool(value) => here.anchor(PatternKind::Bool(value)),
             parse::PatternKind::Unit => here.anchor(PatternKind::Unit),
+            // The opened type gets an id of its own, from the count every
+            // variable's comes from. It is not in scope for the payload — a
+            // pattern writes no types — but for the arm's body, which
+            // [`match_term_with_scrutinee`](Self::match_term_with_scrutinee)
+            // arranges once the whole pattern is lowered.
+            parse::PatternKind::Hidden { variable, pattern } => {
+                let id = self.rigids;
+                self.rigids += 1;
+                let pattern = Box::new(self.pattern(*pattern, seen, binders, dropped));
+                let name = self.anchored(variable);
+                here.anchor(PatternKind::Hidden { id, name, pattern })
+            }
             // A bare tag keeps its `None`: what it constrains the payload to —
             // unit — is said where the type is built rather than written into
             // a tree node the reader never wrote, the convention
@@ -13699,7 +14173,12 @@ impl Builder<'_> {
             let mut seen = Vec::new();
             let mut dropped = Vec::new();
             let pattern = self.pattern(arm.pattern, &mut seen, &mut Binders::Local, &mut dropped);
+            // The types the pattern's `hide`s opened are in scope for the
+            // body's annotations, innermost last, and for nothing after it.
+            let scoped = self.scoped.len();
+            hidden_binders(&pattern, &mut self.scoped);
             let body = self.term(arm.body);
+            self.scoped.truncate(scoped);
             self.terms.release(mark);
             let body = bound_to_errors(dropped, body);
             lowered.push((pattern, body));

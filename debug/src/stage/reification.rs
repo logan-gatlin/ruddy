@@ -25,6 +25,18 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             *symbol,
         ));
     }
+    for (symbol, slot) in &plan.evidence {
+        nodes.push(with_symbol(
+            Node::new(
+                ids.next(),
+                mint.name(*symbol),
+                format!("mirror bound by a pattern; evidence for type {slot}"),
+            ),
+            cx,
+            mint,
+            *symbol,
+        ));
+    }
     for (index, shape) in plan.graph.shapes.iter().enumerate() {
         let text = match shape {
             Shape::Lazy => "unobserved component; forwards the supplied callable convention".into(),

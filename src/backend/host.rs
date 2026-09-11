@@ -13,6 +13,60 @@ pub(super) struct Adapters {
     pub exports: HashMap<String, String>,
 }
 
+/// Which way a value crosses the JavaScript boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Direction {
+    ToJs,
+    FromJs,
+}
+
+/// A conversion shape for one boundary crossing: the finite graph of the
+/// type under the host's policy, and the fields the host may leave out. It
+/// can inspect optional fields without claiming an exact runtime identity
+/// for an abstract presence package, which is why it is not a descriptor.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeTemplate {
+    pub descriptor: crate::reification::Descriptor,
+    pub optional_fields: crate::reification::OptionalFields,
+}
+
+impl NativeTemplate {
+    pub fn template(
+        ty: &Arc<crate::types::Ty>,
+        aliases: &indexmap::IndexMap<crate::symbol::Symbol, crate::types::Scheme>,
+    ) -> Result<(Self, Vec<u32>), String> {
+        let (root, graph) = crate::ir::representation_graph(ty, aliases);
+        let (descriptor, optional_fields, parameters) =
+            crate::reification::Descriptor::from_graph_policy(root, &graph, true)?;
+        Ok((
+            Self {
+                descriptor,
+                optional_fields,
+            },
+            parameters,
+        ))
+    }
+
+    pub fn validate(&self, parameters: usize) -> Result<(), &'static str> {
+        self.descriptor.validate(parameters)?;
+        for (index, optional) in &self.optional_fields {
+            let Some(crate::reification::Node::Struct(fields)) =
+                self.descriptor.nodes.get(*index as usize)
+            else {
+                return Err("native optional fields require a record shape");
+            };
+            if optional
+                .iter()
+                .any(|name| !fields.iter().any(|(field, _)| field == name))
+            {
+                return Err("native optional field is absent from its record shape");
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 struct View<'a> {
     ty: &'a Type,
@@ -44,7 +98,7 @@ type Node = usize;
 pub(super) fn native_descriptor(
     root: &Type,
     declarations: &HashMap<&str, &DeclaredType>,
-) -> Result<crate::reification::NativeTemplate, String> {
+) -> Result<NativeTemplate, String> {
     use crate::reification::{Descriptor, Node as Runtime};
     let mut nodes = vec![Runtime::ForeignValue];
     let mut optional_fields =
@@ -75,9 +129,12 @@ pub(super) fn native_descriptor(
             Type::Real => Runtime::Real,
             Type::String => Runtime::String,
             Type::Bool => Runtime::Bool,
-            Type::Any => Runtime::Any,
             Type::ForeignValue => Runtime::ForeignValue,
             Type::Package(inner) => Runtime::Alias(child(view.child(inner), path, incoming)),
+            // A hidden type crosses the boundary as a sealed package: the
+            // host holds it and hands it back, and cannot make one.
+            Type::Hidden { body, .. } => Runtime::Hidden(child(view.child(body), path, incoming)),
+            Type::HiddenVar { .. } => Runtime::HiddenBound(0),
             Type::Arrow(from, to, row) => {
                 let effects = fields(row, view.clone(), declarations);
                 if incoming
@@ -91,16 +148,21 @@ pub(super) fn native_descriptor(
                         "{path} has an effectful callback contract that cannot be supplied by a native JavaScript caller"
                     ));
                 }
-                Runtime::Arrow([
-                    child(view.child(from), format!("{path} argument"), true),
-                    child(view.child(to), format!("{path} result"), incoming),
-                ])
+                let argument = child(view.child(from), format!("{path} argument"), true);
+                let result = child(view.child(to), format!("{path} result"), incoming);
+                // A host callable performs nothing: its row is empty.
+                let effects = nodes.len() as u32;
+                nodes.push(Runtime::Effects(Vec::new()));
+                Runtime::Arrow([argument, result, effects])
             }
             Type::Array(inner) => Runtime::Array(child(
                 view.child(inner),
                 format!("{path} element"),
                 incoming,
             )),
+            Type::Mirror(inner) => {
+                Runtime::Mirror(child(view.child(inner), format!("{path} mirror"), incoming))
+            }
             Type::Named { name, args } => {
                 let declaration = declarations
                     .get(name.as_str())
@@ -168,7 +230,7 @@ pub(super) fn native_descriptor(
             }
         };
     }
-    Ok(crate::reification::NativeTemplate {
+    Ok(NativeTemplate {
         descriptor: Descriptor { nodes },
         optional_fields,
     })
@@ -381,11 +443,11 @@ fn key(
                     work.push(Work::Text(format!("{name:?}:{presence:?};")));
                 }
             }
-            Type::Array(inner) | Type::Package(inner) => {
-                out.push_str(if matches!(view.ty, Type::Array(_)) {
-                    "A("
-                } else {
-                    "P("
+            Type::Array(inner) | Type::Package(inner) | Type::Mirror(inner) => {
+                out.push_str(match view.ty {
+                    Type::Array(_) => "A(",
+                    Type::Mirror(_) => "M(",
+                    _ => "P(",
                 });
                 work.push(Work::Text(")".into()));
                 work.push(Work::Type(view.child(inner)));
@@ -397,7 +459,11 @@ fn key(
 }
 
 impl Graph {
-    fn build(root: &Type, declarations: &HashMap<&str, &DeclaredType>) -> Result<Self, String> {
+    fn build(
+        root: &Type,
+        declarations: &HashMap<&str, &DeclaredType>,
+        platform: Platform,
+    ) -> Result<Self, String> {
         let mut nodes = vec![Plan::Value];
         let mut work = vec![(
             0,
@@ -455,7 +521,14 @@ impl Graph {
                 Type::Arrow(_, result, row) => {
                     let fields = fields(row, view.clone(), declarations);
                     let open = !matches!(fields.rest, Rest::Closed);
-                    let handlers = include_str!("node-handler.rud")
+                    let platform_handlers = match platform {
+                        Platform::Node => concat!(
+                            include_str!("node-handler.rud"),
+                            include_str!("web-handler.rud")
+                        ),
+                        Platform::Web => include_str!("web-handler.rud"),
+                    };
+                    let handlers = platform_handlers
                         .lines()
                         .filter(|line| {
                             open || fields.labels.iter().any(|(label, presence, _)| {
@@ -494,6 +567,8 @@ impl Graph {
                     }
                 }
                 Type::Array(inner) => Plan::Array(child(view.child(inner))),
+                // A mirror crosses as the opaque value it is.
+                Type::Mirror(_) => Plan::Value,
                 Type::Struct(row) | Type::Sum(row) => {
                     let fields = fields(row, view.clone(), declarations);
                     let open = !matches!(fields.rest, Rest::Closed);
@@ -674,7 +749,6 @@ impl Graph {
         &self,
         node: Node,
         value: &str,
-        platform: Platform,
         prefix: &str,
         next: &mut usize,
         expand: bool,
@@ -689,9 +763,7 @@ impl Graph {
         *next += 1;
         match &self.nodes[node] {
             Plan::Value => value.into(),
-            Plan::Alias { inner, .. } => {
-                self.expression(*inner, value, platform, prefix, next, false)
-            }
+            Plan::Alias { inner, .. } => self.expression(*inner, value, prefix, next, false),
             Plan::Function {
                 effectful,
                 handlers,
@@ -699,19 +771,12 @@ impl Graph {
                 result,
             } => {
                 let call = format!("{value} arg_{id}");
-                let call = if *effectful && platform == Platform::Node && !handlers.is_empty() {
+                let call = if *effectful && !handlers.is_empty() {
                     format!("handle {call} with\n{handlers}end")
                 } else {
                     call
                 };
-                let result = self.expression(
-                    *result,
-                    &format!("value_{id}"),
-                    platform,
-                    prefix,
-                    next,
-                    false,
-                );
+                let result = self.expression(*result, &format!("value_{id}"), prefix, next, false);
                 format!(
                     "(do let function_{id}: _ -> _{residual_effects} = fn arg_{id} => do let value_{id} = {call} return {result} end return function_{id} end)"
                 )
@@ -727,8 +792,7 @@ impl Graph {
                     let target = format!("record_{}", *next);
                     *next += 1;
                     let projected = format!("{previous}.{field}");
-                    let adapted =
-                        self.expression(*inner, &projected, platform, prefix, next, false);
+                    let adapted = self.expression(*inner, &projected, prefix, next, false);
                     let updated = format!("{{ {field}: {adapted}, ..{previous} }}");
                     let updated = if *present {
                         updated
@@ -746,21 +810,14 @@ impl Graph {
                 let mut body = format!("(match {value} with\n");
                 for (tag, _, inner) in cases {
                     let tag = Quoted(tag);
-                    let inner = self.expression(
-                        *inner,
-                        &format!("payload_{id}"),
-                        platform,
-                        prefix,
-                        next,
-                        false,
-                    );
+                    let inner =
+                        self.expression(*inner, &format!("payload_{id}"), prefix, next, false);
                     body.push_str(&format!("| #{tag} payload_{id} => #{tag} {inner}\n"));
                 }
                 format!("{body}end)")
             }
             Plan::Array(inner) => {
-                let inner =
-                    self.expression(*inner, &format!("item_{id}"), platform, prefix, next, false);
+                let inner = self.expression(*inner, &format!("item_{id}"), prefix, next, false);
                 format!(
                     "(do let array_{id} = {value}\nlet map_{id}: Nat -> [_] -> [_] = fn index_{id} output_{id} => match host_get array_{id} index_{id} with\n| #Some item_{id} => map_{id} (host_next index_{id}) (host_push output_{id} {inner})\n| #None => output_{id}\nend\nreturn map_{id} 0n [] end)"
                 )
@@ -768,12 +825,7 @@ impl Graph {
         }
     }
 
-    fn definitions(
-        &self,
-        prefix: &str,
-        raw_types: &HashMap<&str, (String, String)>,
-        platform: Platform,
-    ) -> String {
+    fn definitions(&self, prefix: &str, raw_types: &HashMap<&str, (String, String)>) -> String {
         let mut source = String::new();
         for (id, node) in self.nodes.iter().enumerate() {
             if !self.helper(id) {
@@ -804,7 +856,7 @@ impl Graph {
                     }
                 })
                 .collect::<String>();
-            let body = self.expression(id, "original", platform, prefix, &mut 0, true);
+            let body = self.expression(id, "original", prefix, &mut 0, true);
             source.push_str(&format!("let {prefix}adapt_{id}: (program::{raw}{}) -> ({prefix}Type_{id}{}) = fn original => {body}\n", arguments, holes));
         }
         source
@@ -883,9 +935,11 @@ pub(super) fn compile(
             }
         })?;
         let graph =
-            Graph::build(&value.scheme.body, &declarations).map_err(|message| Error::Export {
-                name: value.name.clone(),
-                message,
+            Graph::build(&value.scheme.body, &declarations, platform).map_err(|message| {
+                Error::Export {
+                    name: value.name.clone(),
+                    message,
+                }
             })?;
         if !graph.needed[0] {
             continue;
@@ -894,13 +948,12 @@ pub(super) fn compile(
             return Err(Error::UnresolvedPublicValue(value.name.clone()));
         };
         let helper_prefix = format!("Host_{index}_");
-        let mut source = graph.definitions(&helper_prefix, &raw_types, platform);
+        let mut source = graph.definitions(&helper_prefix, &raw_types);
         source.push_str(&format!(
             "let host_{index} = {}\n",
             graph.expression(
                 0,
                 &format!("program::{name}"),
-                platform,
                 &helper_prefix,
                 &mut 0,
                 false
@@ -915,7 +968,8 @@ pub(super) fn compile(
         Platform::Node => include_str!("node-platform.rud"),
         Platform::Web => "effect Immediate\n",
     };
-    let prelude = format!("{prelude}\n{ARRAY_HELPERS}");
+    let web = include_str!("web-platform.rud");
+    let prelude = format!("{prelude}\n{web}\n{ARRAY_HELPERS}");
     let source = format!(
         "{prelude}\n{}",
         definitions

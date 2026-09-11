@@ -140,7 +140,7 @@ pub enum Op {
     Convert {
         descriptor: Temp,
         value: Temp,
-        direction: crate::reification::Direction,
+        direction: crate::backend::host::Direction,
     },
     TypeProjection {
         descriptor: Temp,
@@ -151,7 +151,7 @@ pub enum Op {
         arguments: Vec<Temp>,
     },
     NativePlan {
-        template: crate::reification::NativeTemplate,
+        template: crate::backend::host::NativeTemplate,
         arguments: Vec<Temp>,
     },
     Reflect {
@@ -285,7 +285,6 @@ pub enum Rep {
     Bool,
     TypeDescriptor,
     NativePlan,
-    BoxedAny,
     HostValue,
     /// The value with nothing in it: the empty struct.
     Unit,
@@ -519,18 +518,37 @@ pub(super) fn validate(lir: &Lir) -> Result<(), String> {
                             return error("reflection requires a runtime type descriptor");
                         }
                         match kind {
-                            crate::reification::Intrinsic::Upcast if i.rep != Rep::BoxedAny => {
-                                return error("boxing requires an Any result");
-                            }
-                            crate::reification::Intrinsic::Downcast
-                                if available[value] != Rep::BoxedAny || i.rep != Rep::Sum =>
-                            {
-                                return error("downcasting requires Any and returns Option");
-                            }
                             crate::reification::Intrinsic::Decode
                                 if available[value] != Rep::HostValue || i.rep != Rep::Sum =>
                             {
                                 return error("decoding requires ForeignValue and returns Result");
+                            }
+                            crate::reification::Intrinsic::Encode if i.rep != Rep::Sum => {
+                                return error("encoding returns Result");
+                            }
+                            crate::reification::Intrinsic::Mirror
+                            | crate::reification::Intrinsic::TypeOf
+                                if i.rep != Rep::TypeDescriptor =>
+                            {
+                                return error(
+                                    "a mirror intrinsic yields a runtime type descriptor",
+                                );
+                            }
+                            crate::reification::Intrinsic::Describe
+                                if available[value] != Rep::TypeDescriptor
+                                    || i.rep != Rep::Struct =>
+                            {
+                                return error("describing requires a mirror and yields a struct");
+                            }
+                            crate::reification::Intrinsic::Shape
+                                if available[value] != Rep::TypeDescriptor || i.rep != Rep::Sum =>
+                            {
+                                return error("a shape requires a mirror and yields a sum");
+                            }
+                            crate::reification::Intrinsic::Same
+                                if available[value] != Rep::Struct || i.rep != Rep::Sum =>
+                            {
+                                return error("comparing mirrors takes a pair and yields Option");
                             }
                             _ => {}
                         }

@@ -65,6 +65,7 @@ The runtime supplies the `IO` effect handler; a program can also supply its own 
 ## Getting started
 
 The [download page](download.md) covers installation and editor setup.
+The [platform API guide](platform-apis.md) covers JSON, process information, paths, HTTP requests, URLs, and mirrors.
 
 The following reading order builds on this introduction:
 

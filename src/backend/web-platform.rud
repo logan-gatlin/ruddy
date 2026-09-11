@@ -1,0 +1,67 @@
+module http =
+  type Headers = [(String, String)]
+  type Body = #Empty | #Text String | #Bytes [Nat8]
+  type Redirect = #Follow | #Manual | #Error
+  @doc "Buffered request. timeout_ms includes reading the body; max_bytes bounds the response body."
+  type Request = {
+    url: String,
+    method: String,
+    headers: Headers,
+    body: Body,
+    timeout_ms: Nat,
+    max_bytes: Nat,
+    redirect: Redirect,
+  }
+  type Response = {
+    status: Nat,
+    status_text: String,
+    headers: Headers,
+    body: [Nat8],
+    url: String,
+    redirected: Bool,
+  }
+  type ErrorKind = #InvalidRequest | #Network | #Timeout | #TooLarge | #Unsupported
+  type Error = { kind: ErrorKind, url: String, message: String }
+end
+
+effect Http = { request: http::Request -> #Some http::Response | #Error http::Error }
+@async
+extern http_request: http::Request -> #Some http::Response | #Error http::Error = "$http.request"
+
+module js =
+  type Kind =
+    | #Null
+    | #Undefined
+    | #Bool
+    | #Number
+    | #String
+    | #Array
+    | #Object
+    | #Function
+    | #Other
+  type Error = { path: String, expected: String, message: String }
+  type Property = { of: ForeignValue, name: String }
+  type Element = { of: ForeignValue, at: Nat }
+  type Call = { of: ForeignValue, arguments: [ForeignValue] }
+end
+
+-- Observing a host value can run a getter or a proxy trap, so it is an effect. Each adapter reports
+-- the host's own failure as data instead of throwing.
+effect Host = {
+  kind: ForeignValue -> js::Kind,
+  field: js::Property -> #Some ForeignValue | #Error js::Error,
+  element: js::Element -> #Some ForeignValue | #Error js::Error,
+  length: ForeignValue -> #Some Nat | #Error js::Error,
+  keys: ForeignValue -> #Some [String] | #Error js::Error,
+  snapshot: ForeignValue -> #Some ForeignValue | #Error js::Error,
+  apply: js::Call -> #Some ForeignValue | #Error js::Error,
+  text: ForeignValue -> #Some String | #Error js::Error,
+}
+extern js_kind: ForeignValue -> js::Kind = "$js.kind"
+extern js_text: ForeignValue -> #Some String | #Error js::Error = "$js.text"
+extern js_field: js::Property -> #Some ForeignValue | #Error js::Error = "$js.field"
+extern js_element: js::Element -> #Some ForeignValue | #Error js::Error = "$js.element"
+extern js_length: ForeignValue -> #Some Nat | #Error js::Error = "$js.length"
+extern js_keys: ForeignValue -> #Some [String] | #Error js::Error = "$js.keys"
+extern js_snapshot: ForeignValue -> #Some ForeignValue | #Error js::Error = "$js.snapshot"
+extern js_apply: js::Call -> #Some ForeignValue | #Error js::Error = "$js.apply"

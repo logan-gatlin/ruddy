@@ -1,0 +1,544 @@
+@doc "One step of the path to a value within a document: which field, element, or case it is under."
+type Step = #Field String | #Index Nat | #Case String
+
+@doc "Why encoding or decoding failed, and the path to the value it failed at."
+type Error = { path: [Step], kind: Failure }
+
+@doc "What went wrong: the input could not be parsed; a field was missing, repeated, or unknown; a case was not one of the type's; the input held another kind of value than the type asked for; a number was out of its domain; the protocol was misused; a limit was reached; or a codec of its own said so."
+type Failure =
+  | #Parse { message: String, offset: Nat }
+  | #Missing String
+  | #Duplicate String
+  | #Unknown String
+  | #UnexpectedCase String
+  | #Unexpected { expected: String, found: String }
+  | #Range { expected: String, found: String }
+  | #Protocol String
+  | #Limit String
+  | #Cycle
+  | #Unsupported String
+  | #Custom String
+
+@doc "One step of the path to a position within a type: where derivation stopped."
+type TypeStep = #Field String | #Element | #Case String
+
+@doc "Why a type has no default codec, with the path to the position that has none."
+type DeriveError = { path: [TypeStep], reason: String }
+
+@doc "A position within the session a reader or writer keeps. It is valid only while its frame is the innermost open one; a stale cursor is a protocol error, never a way past the session's checks."
+type Cursor = { frame: Nat }
+
+@doc "The fields a record has on the wire, in order. A format that carries names reads them; one that does not takes the order from here."
+type RecordSchema = { fields: [String] }
+
+@doc "The cases a sum has on the wire."
+type VariantSchema = { cases: [String] }
+
+@doc "The protocol a decoder reads through. Every operation is typed by what it asks for; the format's handler owns the input and a checked session stack, and answers a request out of order with a protocol error."
+effect Read = {
+  read_bool: () -> Result Bool Error,
+  read_nat: () -> Result Nat Error,
+  read_int: () -> Result Int Error,
+  read_nat64: () -> Result Nat64 Error,
+  read_int64: () -> Result Int64 Error,
+  read_real: () -> Result Real Error,
+  read_text: () -> Result String Error,
+  skip_value: () -> Result () Error,
+  begin_record: RecordSchema -> Result Cursor Error,
+  next_field: Cursor -> Result (Option String) Error,
+  end_record: Cursor -> Result () Error,
+  begin_sequence: () -> Result Cursor Error,
+  next_element: Cursor -> Result Bool Error,
+  end_sequence: Cursor -> Result () Error,
+  begin_variant: VariantSchema -> Result { cursor: Cursor, tag: String } Error,
+  end_variant: Cursor -> Result () Error,
+}
+
+@doc "The protocol an encoder writes through. The format's handler owns the output and a checked session stack."
+effect Write = {
+  write_bool: Bool -> Result () Error,
+  write_nat: Nat -> Result () Error,
+  write_int: Int -> Result () Error,
+  write_nat64: Nat64 -> Result () Error,
+  write_int64: Int64 -> Result () Error,
+  write_real: Real -> Result () Error,
+  write_text: String -> Result () Error,
+  begin_record: RecordSchema -> Result Cursor Error,
+  write_field: { cursor: Cursor, name: String } -> Result () Error,
+  end_record: Cursor -> Result () Error,
+  begin_sequence: Nat -> Result Cursor Error,
+  next_element: Cursor -> Result () Error,
+  end_sequence: Cursor -> Result () Error,
+  begin_variant: { schema: VariantSchema, tag: String } -> Result Cursor Error,
+  end_variant: Cursor -> Result () Error,
+}
+
+@doc "How to write a value through the protocol, with a description of what it writes."
+type Encoder 'a = { schema: reflect::Description, run: 'a -> Result () Error + !Write }
+
+@doc "How to read a value through the protocol, with a description of what it reads."
+type Decoder 'a = { schema: reflect::Description, run: () -> Result 'a Error + !Read }
+
+type Codec 'a = { encoder: Encoder 'a, decoder: Decoder 'a }
+
+@doc "An error at a path: what an operation reported, placed at the value being worked on."
+let at: [Step] -> Result 'a Error -> Result 'a Error = fn path result =>
+  result::map_error (fn error => { path: array::reverse path, kind: error.kind }) result
+
+@doc "An error of a codec's own, at a path."
+let fail: [Step] -> Failure -> Result 'a Error = fn path kind =>
+  #Error { path: array::reverse path, kind: kind }
+
+@private
+let chain = result::and_then
+
+-- ── Validation ─────────────────────────────────────────────────────────────
+
+@private
+let unsupported: [TypeStep] -> String -> Result 'a DeriveError = fn path reason =>
+  #Error { path: array::reverse path, reason: reason }
+
+@private
+let check_node:
+  reflect::Description -> [TypeStep] -> [Nat] -> Nat -> Result [Nat] DeriveError =
+  fn description path visited index =>
+    if array::any (fn seen => nat::equal seen index) visited then #Some visited
+    else
+      match array::get description.nodes index with
+      | #None => unsupported path "the description has no such node"
+      | #Some node =>
+        do
+          let seen = array::push visited index
+          return match node with
+          | #Nat _ => #Some seen
+          | #Int _ => #Some seen
+          | #Real => #Some seen
+          | #String => #Some seen
+          | #Bool => #Some seen
+          | #Fixed _ => #Some seen
+          | #Alias target => check_node description path seen target
+          | #Array element => check_node description [#Element, ..path] seen element
+          | #Record fields =>
+            array::try_fold_result
+              (fn seen field => check_node description [#Field field.name, ..path] seen field.node)
+              seen
+              fields
+          | #Sum cases =>
+            array::try_fold_result
+              (fn seen case => check_node description [#Case case.name, ..path] seen case.node)
+              seen
+              cases
+          | #Function _ => unsupported path "a function has no default codec"
+          | #Effects _ => unsupported path "an effect row has no default codec"
+          | #Hidden _ => unsupported path "a hidden type has no default codec"
+          | #Mirror _ => unsupported path "a mirror has no default codec"
+          | #Foreign => unsupported path "a foreign value has no default codec"
+          | #Extend _ => unsupported path "an abstract row has no default codec"
+          | #Parameter _ => unsupported path "an abstract type has no default codec"
+          | #Variable _ => unsupported path "an abstract type has no default codec"
+          end
+        end
+      end
+    end
+
+@doc "Whether a type has a default codec: primitives, arrays, records, sums, and regular recursion among them. Functions, cells, hidden types, mirrors, and foreign values do not, and the error says at which position."
+let validate: reflect::Description -> Result () DeriveError = fn description =>
+  result::map (fn _ => ()) (check_node description [] [] description.root)
+
+-- ── Encoding ───────────────────────────────────────────────────────────────
+
+@private
+let field_names: reflect::RecordView 'r -> [String] = fn view =>
+  array::map (fn field => match field with | hide 'f { name, .. } => name end) view.fields
+
+@private
+let case_names: reflect::SumView 's -> [String] = fn view =>
+  array::map (fn case => match case with | hide 'p { name, .. } => name end) view.cases
+
+@private
+let encode_elements:
+  [Step] -> Mirror 'e -> Cursor -> ['e] -> Result () Error + !Write =
+  fn path element cursor items =>
+    result::map
+      (fn _ => ())
+      (array::try_fold_result
+        (fn index item =>
+          chain
+            (fn _ =>
+              result::map
+                (fn _ => nat::add index 1n)
+                (encode_at [#Index index, ..path] element item))
+            (at path (!Write.next_element cursor)))
+        0n
+        items)
+
+@private
+let encode_fields:
+  [Step] -> reflect::RecordView 'r -> Cursor -> 'r -> Result () Error + !Write =
+  fn path view cursor value =>
+    array::try_fold_result
+      (fn _ field => match field with
+      | hide 'f { name, mirror, read, .. } =>
+        match read value with
+        | #Some inner =>
+          chain
+            (fn _ => encode_at [#Field name, ..path] mirror inner)
+            (at path (!Write.write_field { cursor: cursor, name: name }))
+        | #None => #Some ()
+        end
+      end)
+      ()
+      view.fields
+
+@private
+let encode_at: [Step] -> Mirror 'a -> 'a -> Result () Error + !Write = fn path mirror value =>
+  match reflect::shape mirror with
+  | #Nat { read, .. } => at path (!Write.write_nat (read value))
+  | #Int { read, .. } => at path (!Write.write_int (read value))
+  | #Real { read, .. } => at path (!Write.write_real (read value))
+  | #String { read, .. } => at path (!Write.write_text (read value))
+  | #Bool { read, .. } => at path (!Write.write_bool (read value))
+  | #Nat8 { read, .. } => at path (!Write.write_nat (nat::to_nat8 (read value)))
+  | #Nat16 { read, .. } => at path (!Write.write_nat (nat::to_nat16 (read value)))
+  | #Nat32 { read, .. } => at path (!Write.write_nat (nat::to_nat32 (read value)))
+  | #Nat64 { read, .. } => at path (!Write.write_nat64 (read value))
+  | #Int8 { read, .. } => at path (!Write.write_int (int::to_int8 (read value)))
+  | #Int16 { read, .. } => at path (!Write.write_int (int::to_int16 (read value)))
+  | #Int32 { read, .. } => at path (!Write.write_int (int::to_int32 (read value)))
+  | #Int64 { read, .. } => at path (!Write.write_int64 (read value))
+  | #Array view =>
+    match view with
+    | hide 'e { element, read, .. } =>
+      do
+        let items = read value
+        return chain
+          (fn cursor =>
+            chain
+              (fn _ => at path (!Write.end_sequence cursor))
+              (encode_elements path element cursor items))
+          (at path (!Write.begin_sequence (array::len items)))
+      end
+    end
+  | #Record view =>
+    chain
+      (fn cursor =>
+        chain (fn _ => at path (!Write.end_record cursor)) (encode_fields path view cursor value))
+      (at path (!Write.begin_record { fields: field_names view }))
+  | #Sum view =>
+    match array::filter_map
+      (fn case => match case with
+      | hide 'p { name, mirror, project, .. } =>
+        match project value with
+        | #Some payload => #Some (name, fn _ => encode_at [#Case name, ..path] mirror payload)
+        | #None => #None
+        end
+      end)
+      view.cases with
+    | [(tag, encode_payload), ..] =>
+      chain
+        (fn cursor => chain (fn _ => at path (!Write.end_variant cursor)) (encode_payload ()))
+        (at path (!Write.begin_variant { schema: { cases: case_names view }, tag: tag }))
+    | [] => fail path (#Custom "the value is no case of its sum")
+    end
+  | #Function _ => fail path (#Unsupported "a function has no default codec")
+  | #Hidden _ => fail path (#Unsupported "a hidden type has no default codec")
+  | #Mirror _ => fail path (#Unsupported "a mirror has no default codec")
+  | #Foreign => fail path (#Unsupported "a foreign value has no default codec")
+  end
+
+-- ── Decoding ───────────────────────────────────────────────────────────────
+
+@private
+let range: [Step] -> String -> String -> Result 'a Error = fn path expected found =>
+  fail path (#Range { expected: expected, found: found })
+
+@private
+let nat_in: [Step] -> String -> Nat -> Nat -> Result Nat Error = fn path expected limit value =>
+  if nat::less_than_or_equal value limit then #Some value
+  else range path expected (str::from_nat value)
+  end
+
+@private
+let int_in: [Step] -> String -> Int -> Int -> Int -> Result Int Error =
+  fn path expected low high value =>
+    if int::less_than value low then range path expected (str::from_int value)
+    else if int::greater_than value high then range path expected (str::from_int value)
+    else #Some value
+    end
+
+@private
+let decode_elements:
+  [Step] -> Mirror 'e -> Cursor -> Nat -> ['e] -> Result ['e] Error + !Read =
+  fn path element cursor index items =>
+    chain
+      (fn more =>
+        if more then
+          chain
+            (fn item =>
+              decode_elements path element cursor (nat::add index 1n) (array::push items item))
+            (decode_at [#Index index, ..path] element)
+        else #Some items
+        end)
+      (at path (!Read.next_element cursor))
+
+@private
+let decode_field:
+  [Step] -> reflect::RecordView 'r -> String -> Result (reflect::Binding 'r) Error + !Read =
+  fn path view name =>
+    match array::find
+      (fn field => match field with | hide 'f { name: known, .. } => str::equal known name end)
+      view.fields with
+    | #Some field =>
+      match field with
+      | hide 'f { mirror, bind, .. } => result::map bind (decode_at [#Field name, ..path] mirror)
+      end
+    | #None => fail path (#Unknown name)
+    end
+
+@private
+let decode_fields:
+  [Step]
+  -> reflect::RecordView 'r
+  -> Cursor
+  -> [reflect::Binding 'r]
+  -> Result [reflect::Binding 'r] Error + !Read =
+  fn path view cursor bindings =>
+    chain
+      (fn next => match next with
+      | #Some name =>
+        chain
+          (fn binding => decode_fields path view cursor (array::push bindings binding))
+          (decode_field path view name)
+      | #None => #Some bindings
+      end)
+      (at path (!Read.next_field cursor))
+
+@private
+let built: [Step] -> Result 'r reflect::BuildError -> Result 'r Error = fn path result =>
+  result::map_error
+    (fn error => match error with
+    | #Missing name => { path: array::reverse path, kind: #Missing name }
+    | #Duplicate name => { path: array::reverse path, kind: #Duplicate name }
+    | #Unknown name => { path: array::reverse path, kind: #Unknown name }
+    | #Foreign name => {
+      path: array::reverse path,
+      kind: #Custom (str::concat "a binding for another type: " name),
+    }
+    | #Mismatched name => {
+      path: array::reverse path,
+      kind: #Custom (str::concat "a binding of another type: " name),
+    }
+    end)
+    result
+
+@private
+let decode_case: [Step] -> reflect::SumView 's -> Cursor -> String -> Result 's Error + !Read =
+  fn path view cursor tag =>
+    match array::find
+      (fn case => match case with | hide 'p { name, .. } => str::equal name tag end)
+      view.cases with
+    | #Some case =>
+      match case with
+      | hide 'p { mirror, inject, .. } =>
+        match inject with
+        | #Some make =>
+          chain
+            (fn payload => result::map (fn _ => make payload) (at path (!Read.end_variant cursor)))
+            (decode_at [#Case tag, ..path] mirror)
+        | #None => fail path (#Unsupported "the case cannot be made here")
+        end
+      end
+    | #None => fail path (#UnexpectedCase tag)
+    end
+
+@private
+let decode_at: [Step] -> Mirror 'a -> Result 'a Error + !Read = fn path mirror =>
+  match reflect::shape mirror with
+  | #Nat { make, .. } => result::map make (at path (!Read.read_nat ()))
+  | #Int { make, .. } => result::map make (at path (!Read.read_int ()))
+  | #Real { make, .. } => result::map make (at path (!Read.read_real ()))
+  | #String { make, .. } => result::map make (at path (!Read.read_text ()))
+  | #Bool { make, .. } => result::map make (at path (!Read.read_bool ()))
+  | #Nat8 { make, .. } =>
+    chain
+      (fn value => result::map (fn n => make (nat::from_nat8 n)) (nat_in path "Nat8" 255n value))
+      (at path (!Read.read_nat ()))
+  | #Nat16 { make, .. } =>
+    chain
+      (fn value =>
+        result::map (fn n => make (nat::from_nat16 n)) (nat_in path "Nat16" 65535n value))
+      (at path (!Read.read_nat ()))
+  | #Nat32 { make, .. } =>
+    chain
+      (fn value =>
+        result::map (fn n => make (nat::from_nat32 n)) (nat_in path "Nat32" 4294967295n value))
+      (at path (!Read.read_nat ()))
+  | #Nat64 { make, .. } => result::map make (at path (!Read.read_nat64 ()))
+  | #Int8 { make, .. } =>
+    chain
+      (fn value =>
+        result::map (fn i => make (int::from_int8 i)) (int_in path "Int8" -128i 127i value))
+      (at path (!Read.read_int ()))
+  | #Int16 { make, .. } =>
+    chain
+      (fn value =>
+        result::map (fn i => make (int::from_int16 i)) (int_in path "Int16" -32768i 32767i value))
+      (at path (!Read.read_int ()))
+  | #Int32 { make, .. } =>
+    chain
+      (fn value =>
+        result::map
+          (fn i => make (int::from_int32 i))
+          (int_in path "Int32" -2147483648i 2147483647i value))
+      (at path (!Read.read_int ()))
+  | #Int64 { make, .. } => result::map make (at path (!Read.read_int64 ()))
+  | #Array view =>
+    match view with
+    | hide 'e { element, make, .. } =>
+      chain
+        (fn cursor =>
+          chain
+            (fn items => result::map (fn _ => make items) (at path (!Read.end_sequence cursor)))
+            (decode_elements path element cursor 0n []))
+        (at path (!Read.begin_sequence ()))
+    end
+  | #Record view =>
+    chain
+      (fn cursor =>
+        chain
+          (fn bindings =>
+            chain
+              (fn _ => built path (view.build bindings))
+              (at path (!Read.end_record cursor)))
+          (decode_fields path view cursor []))
+      (at path (!Read.begin_record { fields: field_names view }))
+  | #Sum view =>
+    chain
+      (fn opened => decode_case path view opened.cursor opened.tag)
+      (at path (!Read.begin_variant { cases: case_names view }))
+  | #Function _ => fail path (#Unsupported "a function has no default codec")
+  | #Hidden _ => fail path (#Unsupported "a hidden type has no default codec")
+  | #Mirror _ => fail path (#Unsupported "a mirror has no default codec")
+  | #Foreign => fail path (#Unsupported "a foreign value has no default codec")
+  end
+
+-- ── Derivation ─────────────────────────────────────────────────────────────
+
+@doc "The default encoder of a type, from its mirror: the structural one, which writes primitives as themselves, arrays as sequences, records as records of their fields, and sums as variants. A type with a function, hidden type, mirror, or foreign value in it has none, and the error says where."
+let derive_encoder: Mirror 'a -> Result (Encoder 'a) DeriveError = fn mirror => do
+  let description = reflect::describe mirror
+  return result::map
+    (fn _ => { schema: description, run: fn value => encode_at [] mirror value })
+    (validate description)
+end
+
+@doc "The default decoder of a type, from its mirror. See `derive_encoder`."
+let derive_decoder: Mirror 'a -> Result (Decoder 'a) DeriveError = fn mirror => do
+  let description = reflect::describe mirror
+  return result::map
+    (fn _ => { schema: description, run: fn _ => decode_at [] mirror })
+    (validate description)
+end
+
+@doc "The default codec of a type, from its mirror. See `derive_encoder`."
+let derive: Mirror 'a -> Result (Codec 'a) DeriveError = fn mirror =>
+  chain
+    (fn encoder =>
+      result::map (fn decoder => { encoder: encoder, decoder: decoder }) (derive_decoder mirror))
+    (derive_encoder mirror)
+
+-- ── Dynamic values ─────────────────────────────────────────────────────────
+
+@doc "One type a registry encodes and decodes dynamically, under an application-owned identity: its mirror and its codec, hidden together so that the codec is known to be the mirror's."
+type Entry = hide 'a => { id: String, mirror: Mirror 'a, codec: Codec 'a }
+
+@doc "The types a program chooses to write and read as `Any`: a wire identity never manufactures a mirror, so only a registered type can come back with its own."
+type Registry = [Entry]
+
+@doc "A registry entry with the type's default codec."
+let register: String -> Mirror 'a -> Result Entry DeriveError = fn id mirror =>
+  match derive mirror with
+  | #Some codec => #Some (entry id mirror codec)
+  | #Error error => #Error error
+  end
+
+@doc "A registry entry with an explicit codec."
+let entry: String -> Mirror 'a -> Codec 'a -> Entry = fn id mirror codec =>
+  { id: id, mirror: mirror, codec: codec }
+
+@doc "Write an `Any` as a record of the identity its type is registered under and the value, when the registry has an entry whose mirror is the same type."
+let encode_any: Registry -> any::Any -> Result () Error + !Write = fn registry any => match any with
+| hide 'v { mirror: of, value } =>
+  match array::filter_map
+    (fn entry => match entry with
+    | hide 'e { id, mirror, codec } =>
+      match reflect::same of mirror with
+      | #Some { forward, .. } => #Some (id, fn _ => codec.encoder.run (forward value))
+      | #None => #None
+      end
+    end)
+    registry with
+  | [(id, write), ..] =>
+    chain
+      (fn cursor =>
+        chain
+          (fn _ =>
+            chain
+              (fn _ =>
+                chain
+                  (fn _ => chain (fn _ => !Write.end_record cursor) (write ()))
+                  (!Write.write_field { cursor: cursor, name: "value" }))
+              (!Write.write_text id))
+          (!Write.write_field { cursor: cursor, name: "id" }))
+      (!Write.begin_record { fields: ["id", "value"] })
+  | [] => fail [] (#Unsupported "the registry has no codec for the value's type")
+  end
+end
+
+@private
+let decode_registered: Registry -> String -> Result any::Any Error + !Read = fn registry id =>
+  match array::find
+    (fn entry => match entry with | hide 'e { id: known, .. } => str::equal known id end)
+    registry with
+  | #Some entry =>
+    match entry with
+    | hide 'e { mirror, codec, .. } =>
+      result::map (fn value => any::upcast value) (codec.decoder.run ())
+    end
+  | #None => fail [] (#Unexpected { expected: "a registered identity", found: id })
+  end
+
+@doc "Read an `Any` written by `encode_any`, back as the registered type it was: the identity selects the entry, the entry's codec reads the value, and the entry's mirror is what the `Any` carries."
+let decode_any: Registry -> () -> Result any::Any Error + !Read = fn registry _ =>
+  chain
+    (fn cursor =>
+      chain
+        (fn first =>
+          match first with
+          | #Some "id" =>
+            chain
+              (fn id =>
+                chain
+                  (fn second =>
+                    match second with
+                    | #Some "value" =>
+                      chain
+                        (fn any =>
+                          chain
+                            (fn rest =>
+                              match rest with
+                              | #None => result::map (fn _ => any) (!Read.end_record cursor)
+                              | #Some name => fail [] (#Unknown name)
+                              end)
+                            (!Read.next_field cursor))
+                        (decode_registered registry id)
+                    | #Some name => fail [] (#Unknown name)
+                    | #None => fail [] (#Missing "value")
+                    end)
+                  (!Read.next_field cursor))
+              (!Read.read_text ())
+          | #Some name => fail [] (#Unknown name)
+          | #None => fail [] (#Missing "id")
+          end)
+        (!Read.next_field cursor))
+    (!Read.begin_record { fields: ["id", "value"] })
