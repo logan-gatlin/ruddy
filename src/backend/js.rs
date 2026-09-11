@@ -154,7 +154,7 @@ fn entry_adapter(artifact: &Artifact) -> Result<Artifact, Error> {
 // supported interfaces independently of a project's choice of std bundle.
 const NODE_ENTRY: &str = concat!(
     include_str!("node-platform.rud"),
-    "let with_platform: (() -> 'a + !IO + !Process + !FileSystem) -> 'a = fn body => handle body () with\n",
+    "let with_platform: (() -> 'a + !IO + !Exit + !FileSystem + !Immediate) -> 'a + !Immediate = fn body => handle body () with\n",
     include_str!("node-handler.rud"),
     "end\n",
     include_str!("node-entry.rud")

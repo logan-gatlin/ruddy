@@ -1,6 +1,6 @@
 //! Root-only host adapters. Dependency interfaces and internal global reads
 //! retain their original evidence convention. Ordinary inference checks each
-//! generated call under the platform handlers and requires a pure result.
+//! generated call under the platform handlers and permits only Immediate to remain.
 
 use std::{collections::HashMap, fmt, sync::Arc};
 
@@ -184,6 +184,7 @@ enum Plan {
     Function {
         effectful: bool,
         handlers: String,
+        residual_effects: &'static str,
         result: Node,
     },
     Struct(Vec<(String, bool, Node)>, bool),
@@ -460,14 +461,30 @@ impl Graph {
                             open || fields.labels.iter().any(|(label, presence, _)| {
                                 let name = crate::types::EffectId::parse_row_key(label)
                                     .map_or(*label, |(name, _)| name);
+                                // Named operations use `!IO.write`; unnamed ones use
+                                // `!Exit code`. Require either delimiter after the name.
                                 **presence != Presence::Absent
-                                    && line.trim_start().starts_with(&format!("| !{name}."))
+                                    && [format!("| !{name}."), format!("| !{name} ")]
+                                        .iter()
+                                        .any(|prefix| line.trim_start().starts_with(prefix))
                             })
                         })
                         .map(|line| format!("{line}\n"))
                         .collect();
                     Plan::Function {
                         handlers,
+                        // Select by name here, then let ordinary inference below
+                        // verify the complete zero-operation structural interface.
+                        residual_effects: if open
+                            || fields.labels.iter().any(|(label, presence, _)| {
+                                let name = crate::types::EffectId::parse_row_key(label)
+                                    .map_or(*label, |(name, _)| name);
+                                **presence != Presence::Absent && name == "Immediate"
+                            }) {
+                            " + !Immediate"
+                        } else {
+                            ""
+                        },
                         effectful: fields
                             .labels
                             .iter()
@@ -606,8 +623,12 @@ impl Graph {
                     .map(|p| format!(" '{p}"))
                     .collect::<String>()
             ),
-            Plan::Function { result, .. } => format!(
-                "('input_{id} -> {})",
+            Plan::Function {
+                result,
+                residual_effects,
+                ..
+            } => format!(
+                "('input_{id} -> {}{residual_effects})",
                 self.host_type(*result, group, prefix, false)
             ),
             Plan::Array(inner) => format!("[{}]", self.host_type(*inner, group, prefix, false)),
@@ -674,6 +695,7 @@ impl Graph {
             Plan::Function {
                 effectful,
                 handlers,
+                residual_effects,
                 result,
             } => {
                 let call = format!("{value} arg_{id}");
@@ -691,7 +713,7 @@ impl Graph {
                     false,
                 );
                 format!(
-                    "(do let function_{id}: _ -> _ = fn arg_{id} => do let value_{id} = {call} return {result} end return function_{id} end)"
+                    "(do let function_{id}: _ -> _{residual_effects} = fn arg_{id} => do let value_{id} = {call} return {result} end return function_{id} end)"
                 )
             }
             Plan::Struct(fields, _) => {
@@ -892,7 +914,7 @@ pub(super) fn compile(
     }
     let prelude = match platform {
         Platform::Node => include_str!("node-platform.rud"),
-        Platform::Web => "",
+        Platform::Web => "effect Immediate\n",
     };
     let prelude = format!("{prelude}\n{ARRAY_HELPERS}");
     let source = format!(

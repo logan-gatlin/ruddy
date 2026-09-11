@@ -5,6 +5,7 @@ const $wrapped = new WeakMap();
 const $exported = new WeakMap();
 const $hostFunctions = new WeakSet();
 const $promiseCallbacks = new WeakSet();
+const $foreignCallbacks = new WeakSet();
 let $active = null;
 const $closure = (f, a) => {
   const value = (...args) => $invoke(value, $f[f].suspends ? "Promise" : "Sync", args);
@@ -183,6 +184,7 @@ function $callback(value, mode, foreign = true) {
   if (modes.has(key)) return modes.get(key);
   const callback = (...args) => $invoke(value, mode, args, foreign);
   if (mode === "Promise") $promiseCallbacks.add(callback);
+  if (foreign) $foreignCallbacks.add(callback);
   $wrapped.set(callback, value); modes.set(key, callback);
   return callback;
 }

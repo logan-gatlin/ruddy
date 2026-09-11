@@ -46,19 +46,19 @@ let partitioned = std::array::partition (fn value => std::nat::greater_than valu
 let folded_right = std::array::fold_right (fn value state => std::str::concat state value) "" ["a", "b", "c"]
 let reduced = match std::array::reduce std::nat::add [1n, 2n, 3n, 4n] with | #Some value => value | #None => 0n end
 let reduced_empty = match std::array::reduce std::nat::add [] with | #Some _ => false | #None => true end
-let traversed_option: std::Option [Nat] = std::array::traverse_option (fn value => if std::nat::is_zero value then #None else #Some (std::nat::add value 1n) end) [1n, 2n, 3n]
+let traversed_option: std::option::Option [Nat] = std::array::traverse_option (fn value => if std::nat::is_zero value then #None else #Some (std::nat::add value 1n) end) [1n, 2n, 3n]
 let traversed_option_total = match traversed_option with | #Some values => std::array::fold std::nat::add 0n values | #None => 0n end
-let traversed_result: std::Result [String] String = std::array::traverse_result (fn value => if std::str::is_empty value then #Error "empty" else #Some (std::str::to_uppercase value) end) ["ok", ""]
+let traversed_result: std::result::Result [String] String = std::array::traverse_result (fn value => if std::str::is_empty value then #Error "empty" else #Some (std::str::to_uppercase value) end) ["ok", ""]
 let traversed_error = match traversed_result with | #Some _ => "none" | #Error error => error end
-let tried_option: std::Option Nat = std::array::try_fold_option (fn state value => #Some (std::nat::add state value)) 0n [1n, 2n, 3n]
+let tried_option: std::option::Option Nat = std::array::try_fold_option (fn state value => #Some (std::nat::add state value)) 0n [1n, 2n, 3n]
 let tried_option_total = std::option::unwrap_or 0n tried_option
-let tried_result: std::Result Nat String = std::array::try_fold_result (fn state value => if std::nat::is_zero value then #Error "zero" else #Some (std::nat::add state value) end) 0n [1n, 2n, 0n, 4n]
+let tried_result: std::result::Result Nat String = std::array::try_fold_result (fn state value => if std::nat::is_zero value then #Error "zero" else #Some (std::nat::add state value) end) 0n [1n, 2n, 0n, 4n]
 let tried_error = match tried_result with | #Some _ => "none" | #Error error => error end
-let option_values: [std::Option Nat] = [#Some 2n, #Some 3n]
-let sequenced_option: std::Option [Nat] = std::array::sequence_option option_values
+let option_values: [std::option::Option Nat] = [#Some 2n, #Some 3n]
+let sequenced_option: std::option::Option [Nat] = std::array::sequence_option option_values
 let sequenced_total = match sequenced_option with | #Some values => std::array::fold std::nat::add 0n values | #None => 0n end
-let result_values: [std::Result Nat String] = [#Some 2n, #Error "stop", #Some 3n]
-let sequenced_result: std::Result [Nat] String = std::array::sequence_result result_values
+let result_values: [std::result::Result Nat String] = [#Some 2n, #Error "stop", #Some 3n]
+let sequenced_result: std::result::Result [Nat] String = std::array::sequence_result result_values
 let sequenced_error = match sequenced_result with | #Some _ => "none" | #Error error => error end
 "#,
     )
@@ -289,9 +289,9 @@ let filtered_option = std::option::filter (fn value => std::nat::greater_than va
 let option_kept = std::option::is_some filtered_option
 let option_row_fallback = std::option::some_or "fallback" (#Error "ignored")
 
-let mapped_error: std::Result Nat String = std::result::map_error std::str::to_uppercase (#Error "bad")
+let mapped_error: std::result::Result Nat String = std::result::map_error std::str::to_uppercase (#Error "bad")
 let error_text = match mapped_error with | #Some _ => "ok" | #Error error => error end
-let recovered: std::Result Nat String = std::result::or_else (fn error => #Some (std::str::len error)) mapped_error
+let recovered: std::result::Result Nat String = std::result::or_else (fn error => #Some (std::str::len error)) mapped_error
 let recovered_value = std::result::unwrap_or 0n recovered
 let error_row_fallback = std::result::error_or "fallback" (#None)
 
@@ -367,9 +367,9 @@ fn reification_standard_modules_compile_decode_and_downcast_across_artifacts() {
         project.path().join("main.rud"),
         r#"
 @private extern unknown: ForeignValue = "({ tag: 'Some', value: [21, 22] })"
-@private let decoded: std::Result (std::Option [Nat]) std::ffi::DecodeError = std::ffi::decode unknown
+@private let decoded: std::result::Result (std::option::Option [Nat]) std::ffi::DecodeError = std::ffi::decode unknown
 @private let boxed = std::any::upcast [23n]
-@private let recovered: std::Option [Nat] = std::any::downcast boxed
+@private let recovered: std::option::Option [Nat] = std::any::downcast boxed
 let a = match decoded with | #Some (#Some [n, ..]) => n | _ => 0n end
 let b = match recovered with | #Some [n] => n | _ => 0n end
 "#,

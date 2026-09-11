@@ -4,7 +4,7 @@ const ASSERTIONS: &str = r#"
 extern assert: fn(Bool, String) -> () = "(ok, message) => { if (!ok) throw new Error(message); }"
 extern crash: String -> | = "message => { throw new Error(message); }"
 let fail = fn message => match crash message with end
-let expect: std::Result 'a std::fs::Error -> 'a = fn result => match result with
+let expect: std::result::Result 'a std::fs::Error -> 'a = fn result => match result with
   | #Some value => value
   | #Error error => fail error.message
 end
@@ -20,7 +20,7 @@ let kind_name = fn kind => match kind with
   | #Unsupported => "Unsupported"
   | #Other => "Other"
 end
-let expect_error: String -> std::Result 'a std::fs::Error -> () = fn expected result => match result with
+let expect_error: String -> std::result::Result 'a std::fs::Error -> () = fn expected result => match result with
   | #Some _ => fail (std::str::concat "Expected error: " expected)
   | #Error error => do
       let actual = kind_name error.kind

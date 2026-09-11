@@ -77,10 +77,10 @@ fn executable_main_drains_console_output_and_saturates_exit_codes() {
     executable_project(
         directory.path(),
         "let main = fn _ => do\n\
-           let _ = std::io::print \"hello\"\n\
+           let _ = std::io::println \"hello\"\n\
            let _ = std::io::eprint \"goodbye\"\n\
-           let _ = std::process::exit 999n\n\
-           return std::io::print \"unreachable\"\n\
+           let _ = std::process::!Exit 999n\n\
+           return std::io::println \"unreachable\"\n\
          end",
         None,
     );
@@ -120,7 +120,7 @@ fn nonreturning_main_preserves_in_range_exit_codes_and_saturates_large_naturals(
         executable_project(
             project.path(),
             &format!(
-                "type Never = |\neffect Process = {{ exit: Nat -> Never }}\nlet main : () -> Never + !Process = fn _ => !Process.exit {code}n"
+                "type Never = |\neffect Exit = Nat -> Never\nlet main : () -> Never + !Exit = fn _ => !Exit {code}n"
             ),
             None,
         );
@@ -193,7 +193,7 @@ fn executable_can_use_a_dependency_function_with_a_named_never_result() {
     let project = tempfile::tempdir().unwrap();
     let dependency = project.path().join("dep");
     write_project(&dependency, "dep", "1.0.0", &[]);
-    fs::write(dependency.join("main.rud"), "type Never = |\neffect Process = { exit: Nat -> Never }\nlet stop : () -> Never + !Process = fn _ => !Process.exit 17n").unwrap();
+    fs::write(dependency.join("main.rud"), "type Never = |\neffect Exit = Nat -> Never\nlet stop : () -> Never + !Exit = fn _ => !Exit 17n").unwrap();
     let app = project.path().join("app");
     executable_project(&app, "let main = dep::stop", None);
     let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
@@ -222,20 +222,20 @@ fn local_platform_handlers_override_runtime_behavior_and_can_escape_exit() {
     executable_project(
         project.path(),
         r#"
-        effect Console = { write: String -> (), write_error: String -> () }
-        effect Process = { exit: Nat -> | }
+        effect IO = { write: String -> (), write_error: String -> () }
+        effect Exit = Nat -> |
         let locally_handled = fn _ => handle do
-            let _ = !Console.write "hidden"
-            return !Process.exit 999n
+            let _ = !IO.write "hidden"
+            return !Exit 999n
           end with
-          | !Console.write _ => ()
-          | !Console.write_error _ => ()
-          | !Process.exit code => raise code
+          | !IO.write _ => ()
+          | !IO.write_error _ => ()
+          | !Exit code => raise code
           | return _ => 0n
           end
         let main = fn _ => do
           let code = locally_handled ()
-          let _ = !Console.write "continued"
+          let _ = !IO.write "continued"
           return ()
         end
     "#,
@@ -260,7 +260,7 @@ fn node_rejects_effects_that_only_match_a_standard_effects_name() {
     let project = tempfile::tempdir().unwrap();
     executable_project(
         project.path(),
-        "effect Console = { write: Nat -> (), write_error: String -> () }\nlet main = fn _ => !Console.write 42n",
+        "effect IO = { write: Nat -> (), write_error: String -> () }\nlet main = fn _ => !IO.write 42n",
         None,
     );
     let error = check_project(project.path()).unwrap_err();
@@ -293,13 +293,13 @@ fn exit_drains_backpressured_stdout_and_stderr_before_terminating() {
     executable_project(
         project.path(),
         r#"
-        effect Console = { write: String -> (), write_error: String -> () }
-        effect Process = { exit: Nat -> | }
+        effect IO = { write: String -> (), write_error: String -> () }
+        effect Exit = Nat -> |
         extern text : String = "'x'.repeat(1000000)"
         let main = fn _ => do
-          let _ = !Console.write text
-          let _ = !Console.write_error text
-          return !Process.exit 23n
+          let _ = !IO.write text
+          let _ = !IO.write_error text
+          return !Exit 23n
         end
     "#,
         None,
@@ -319,7 +319,7 @@ fn platform_handlers_do_not_make_top_level_initialization_effectful() {
     let project = tempfile::tempdir().unwrap();
     executable_project(
         project.path(),
-        "effect Console = { write: String -> (), write_error: String -> () }\nlet value = !Console.write \"unhandled\"\nlet main = fn _ => ()",
+        "effect IO = { write: String -> (), write_error: String -> () }\nlet value = !IO.write \"unhandled\"\nlet main = fn _ => ()",
         None,
     );
     let path = project.path().join("Ruddy.toml");
@@ -348,7 +348,7 @@ fn entry_adapter_avoids_extern_only_dependency_name_collisions() {
     let app = project.path().join("app");
     executable_project(
         &app,
-        "effect Console = { write: String -> (), write_error: String -> () }\nlet main = fn _ => !Console.write dep::write",
+        "effect IO = { write: String -> (), write_error: String -> () }\nlet main = fn _ => !IO.write dep::write",
         None,
     );
     let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
@@ -3227,10 +3227,10 @@ fn a_dependency_is_compiled_for_the_root_builds_target() {
     fs::write(
         dependency.join("main.rud"),
         "type Never = |\n\
-         effect Process = { exit: Nat -> Never }\n\
+         effect Exit = Nat -> Never\n\
          @if {target: \"js\"} module js\n\
-         @if {target: \"js\"} let stop : () -> Never + !Process = fn _ => !Process.exit js::code\n\
-         @if {target: \"artifact\"} let stop : () -> Never + !Process = fn _ => !Process.exit 3n\n",
+         @if {target: \"js\"} let stop : () -> Never + !Exit = fn _ => !Exit js::code\n\
+         @if {target: \"artifact\"} let stop : () -> Never + !Exit = fn _ => !Exit 3n\n",
     )
     .unwrap();
     fs::write(dependency.join("js.rud"), "let code = 17n\n").unwrap();

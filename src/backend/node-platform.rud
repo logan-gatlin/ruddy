@@ -41,7 +41,10 @@ effect FileSystem = {
 }
 
 effect IO = { write: String -> (), write_error: String -> () }
-effect Process = { exit: Nat -> | }
+effect Exit = Nat -> |
+
+-- External code performs this effect directly; it has no runtime operations.
+effect Immediate
 extern write: fn(String) -> () = "text => { process.stdout.write(text); }"
 extern write_error: fn(String) -> () = "text => { process.stderr.write(text); }"
 @async

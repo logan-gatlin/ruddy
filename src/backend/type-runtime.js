@@ -243,15 +243,19 @@ const $convertType = ($descriptor, $value, $outgoing, $rootIndex = 0, $callable 
         $put($value);
       };
       if ($outgoing) {
+        // Runtime intrinsics can retain a foreign callback wrapper in a
+        // container. Host exports call its source closure so hidden effect
+        // evidence is supplied, while explicit source callback modes survive.
+        const $source = $hostExport && $foreignCallbacks.has($input) ? $fromHost($input) : $input;
         $remember($argument => {
           const $converted = $convertType($descriptor, $argument, false, $from, $callable, $hostExport);
           // A descriptor supplies a pure synchronous callable contract. A
           // conservative code-level suspension summary must not turn an
           // immediately completed callback's data into a Promise.
-          const $result = $input[$closureMark] && !$hostExport
-            ? $invoke($input, "Sync", [$converted])
-            : $input($converted);
-          const $pending = $promiseCallbacks.has($input) || ($hostExport && $input[$closureMark] && !$input.nativeType && $f[$input.f].suspends);
+          const $result = $source[$closureMark] && !$hostExport
+            ? $invoke($source, "Sync", [$converted])
+            : $source($converted);
+          const $pending = $promiseCallbacks.has($source) || ($hostExport && $source[$closureMark] && !$source.nativeType && $f[$source.f].suspends);
           return $pending
             ? $result.then($value => $convertType($descriptor, $value, true, $to, $callable, $hostExport))
             : $convertType($descriptor, $result, true, $to, $callable, $hostExport);
