@@ -716,10 +716,10 @@ const $prim = {
       (value, count) => value.repeat(count)
     ),
     replace_first: (
-      (value, search, replacement) => value.replace(search, replacement)
+      (value, search, replacement) => { if (search === "") return replacement + value; const at = value.indexOf(search); return at < 0 ? value : value.slice(0, at) + replacement + value.slice(at + search.length); }
     ),
     replace_all: (
-      (value, search, replacement) => value.replaceAll(search, replacement)
+      (value, search, replacement) => { if (search === "") { let out = replacement; for (const scalar of value) out += scalar + replacement; return out; } let out = "", at = 0; for (;;) { const found = value.indexOf(search, at); if (found < 0) return out + value.slice(at); out += value.slice(at, found) + replacement; at = found + search.length; } }
     ),
     pad_start: (
       (value, length, fill) => { const units = Array.from(fill); let count = Array.from(value).length; let pad = ""; for (let i = 0; units.length && count < length; i++, count++) pad += units[i % units.length]; return pad + value; }

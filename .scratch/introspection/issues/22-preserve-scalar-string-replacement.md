@@ -1,6 +1,6 @@
 # 22 Preserve scalar string replacement semantics across backends
 
-Status: open
+Status: resolved
 Type: task
 Priority: P1
 
@@ -58,3 +58,26 @@ empty input, empty/nonempty searches, repeated or overlapping matches, and
 replacement strings containing dollar substitution spellings. Assert scalar
 validity and `str::len` on the astral-character output, not merely matching
 rendered text. Run Rust tests only through `just test`.
+
+## Answer
+
+One contract, written on the two declarations in `std/str.rud`: the
+replacement is inserted as written, so `$&`, `$$`, and the prefix and suffix
+spellings are text; a nonempty search matches left to right without
+overlapping; an empty search matches at every scalar boundary, which for
+`replace_all` includes before the first scalar and after the last, and for
+`replace_first` is the front alone.
+
+The JavaScript primitives no longer call `String.prototype.replace` or
+`replaceAll`. They index the plain substring themselves, and the empty-search
+case walks the string by scalar, so nothing is inserted between the two halves
+of an astral character. The interpreter's `replacen`/`replace` already meant
+this, and the comment calling the mismatch a deliberate departure is gone.
+
+Regression: `replacement_is_literal_and_lands_on_scalar_boundaries` in
+`tests/src/interp.rs` runs fifteen cases on both backends and asserts they
+agree. Each case carries `std::str::len` of its result, so the astral ones
+are checked for scalar validity rather than for looking right: replacing with
+an empty search in `"😀"` gives three scalars, and in `"a😀b"` gives seven.
+The three cases in the ticket now read `".😀."`, `"$&b"`, and `"$&b$&"` on
+both backends.

@@ -1040,6 +1040,60 @@ let answers = std::str::join "," [
     );
 }
 
+/// Replacement puts the replacement in as written and keeps the result
+/// valid scalar text. JavaScript's own methods do neither: they expand `$&`
+/// and its relatives, and with an empty search they insert between the two
+/// halves of an astral character.
+#[test]
+fn replacement_is_literal_and_lands_on_scalar_boundaries() {
+    let source = r#"
+let show: String -> String = fn text =>
+  std::str::concat text (std::str::concat "/" (std::str::from_nat (std::str::len text)))
+let results = std::str::join "," [
+  show (std::str::replace_all "😀" "" "."),
+  show (std::str::replace_first "😀" "" "."),
+  show (std::str::replace_first "ab" "a" "$&"),
+  show (std::str::replace_all "aba" "a" "$&"),
+  show (std::str::replace_all "ab" "b" "$$"),
+  show (std::str::replace_all "ab" "a" "$`"),
+  show (std::str::replace_all "aaa" "aa" "-"),
+  show (std::str::replace_all "abab" "ab" "x"),
+  show (std::str::replace_first "abab" "ab" "x"),
+  show (std::str::replace_all "abc" "z" "-"),
+  show (std::str::replace_first "abc" "z" "-"),
+  show (std::str::replace_all "" "" "-"),
+  show (std::str::replace_first "" "" "-"),
+  show (std::str::replace_all "" "a" "-"),
+  show (std::str::replace_all "a😀b" "" "|"),
+]
+"#;
+    let exports = ["results"];
+    let (node, interpreted) = both(source, &exports, None);
+    assert_eq!(node, interpreted);
+    assert_eq!(
+        interpreted,
+        vec![concat!(
+            "\"",
+            ".😀./3,",
+            ".😀/2,",
+            "$&b/3,",
+            "$&b$&/5,",
+            "a$$/3,",
+            "$`b/3,",
+            "-a/2,",
+            "xx/2,",
+            "xab/3,",
+            "abc/3,",
+            "abc/3,",
+            "-/1,",
+            "-/1,",
+            "/0,",
+            "|a|😀|b|/7",
+            "\""
+        )]
+    );
+}
+
 #[test]
 fn a_host_value_the_interpreter_does_not_provide_is_named() {
     let mut program = load(

@@ -23,12 +23,10 @@
 //! the same on both backends; the rest of `real`, including `sqrt`, `power`,
 //! the roundings, `min` and `max`, does agree bit for bit.
 //!
-//! Two departures from the JavaScript are deliberate. `str.replace_first`
-//! and `str.replace_all` replace a plain substring, where `String.prototype`
-//! expands `$&` and its relatives in the replacement; the standard library
-//! never relies on that. And text built by `str.repeat`, `str.pad_start` or
-//! `str.pad_end` is refused once it passes what a JavaScript string can hold,
-//! which is a contract failure there and would be exhausted memory here.
+//! One departure from the JavaScript is deliberate: text built by
+//! `str.repeat`, `str.pad_start` or `str.pad_end` is refused once it passes
+//! what a JavaScript string can hold, which is a contract failure there and
+//! would be exhausted memory here.
 
 use ruddy::types::{Bounds, Domains, FixedInt};
 
@@ -514,6 +512,9 @@ fn text(name: &str, args: &[Value]) -> Result<Value, String> {
             }
             Value::string(&value.repeat(count as usize))
         }
+        // An empty search matches at every scalar boundary; Rust's own
+        // `replace` matches at every char boundary, which is the same thing
+        // here, and `replacen` with one matches once at the front.
         "replace_first" => Value::string(&value.replacen(args[1].as_str()?, args[2].as_str()?, 1)),
         "replace_all" => Value::string(&value.replace(args[1].as_str()?, args[2].as_str()?)),
         "pad_start" => {
