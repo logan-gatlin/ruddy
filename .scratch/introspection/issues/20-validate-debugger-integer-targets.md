@@ -1,6 +1,6 @@
 # 20 Validate debugger integer target configurations
 
-Status: open
+Status: resolved
 Type: task
 Priority: P1
 
@@ -51,3 +51,24 @@ precision such as 17. Neither request produces executable code under an
 unannounced fallback. Cover valid JavaScript 32/53-bit requests and a valid
 64-bit artifact request through the shared validation path. Keep the literal
 distinction above as a regression case. Run Rust tests only through `just test`.
+
+## Answer
+
+`ruddy_cli::Build::resolve(target, platform, integers)` is the one validated
+construction. It takes the default when no precision is written, reports
+`manifest-invalid` for a precision the compiler does not bind, and reports the
+same for JavaScript with 64-bit integers. `Manifest::build` calls it, so the
+command line is unchanged, and `debug/src/snapshot.rs` calls it instead of
+building a `Build` itself.
+
+A refused configuration compiles nothing: the diagnostic is recorded and the
+bundle is never loaded, so every phase over source reports that it did not
+run and no JavaScript is generated. The debugger no longer replaces an
+invalid precision with the default.
+
+Regression: `a_request_the_compiler_cannot_bind_compiles_nothing` in
+`tests/src/snapshot.rs` sends the ticket's two-literal program at JavaScript
+with 64 bits and with 17 bits. Each reports exactly `manifest-invalid`, the
+JavaScript phase is skipped, and no phase over source reports a result. The
+supported combinations still compile: JavaScript at 32, 53, and the default,
+and an artifact at 64, where the same two literals compile without complaint.

@@ -1141,7 +1141,7 @@ impl Platform {
 /// What a build is: the target it emits and the platform it runs on. Every
 /// project in a graph is compiled for the root's build, so a dependency's
 /// guards see the build its consumer is making.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Build {
     pub target: Target,
     pub platform: Platform,
@@ -1150,6 +1150,46 @@ pub struct Build {
 }
 
 impl Build {
+    /// The build a target, a platform, and a requested integer precision
+    /// describe, or why they describe none. Every way into compilation comes
+    /// through here, so a combination one entry point refuses cannot reach a
+    /// backend through another. An omitted precision takes the default; one
+    /// that is written and unsupported is an error rather than the default.
+    pub fn resolve(
+        target: Target,
+        platform: Platform,
+        integers: Option<u32>,
+    ) -> Result<Self, CompileError> {
+        let Some(bits) = integers else {
+            return Ok(Self {
+                target,
+                platform,
+                domains: ruddy::types::Domains::default(),
+            });
+        };
+        let domains = ruddy::types::Domains::from_name(&bits.to_string()).ok_or_else(|| {
+            CompileError::report(
+                "manifest-invalid",
+                format!("`integers = {bits}` is not a precision the compiler binds"),
+            )
+            .with_help("set `integers` to 53, 32, or 64")
+        })?;
+        if target == Target::Js && domains == ruddy::types::Domains::Bits64 {
+            return Err(CompileError::report(
+                "manifest-invalid",
+                "the JavaScript target cannot hold 64-bit `Nat` and `Int`",
+            )
+            .with_help(
+                "set `integers` to 53 or 32, or use Nat64 and Int64 where 64 bits are needed",
+            ));
+        }
+        Ok(Self {
+            target,
+            platform,
+            domains,
+        })
+    }
+
     /// The facts source may ask about this build, in the order a complaint
     /// lists them.
     pub fn environment(self) -> bundle::Environment {
@@ -1205,38 +1245,9 @@ impl Manifest {
         self.platform.unwrap_or_default()
     }
 
-    /// The domains the manifest binds `Nat` and `Int` to, when they are ones
-    /// there are and the target holds them.
-    fn domains(&self) -> Result<ruddy::types::Domains, CompileError> {
-        let Some(bits) = self.integers else {
-            return Ok(ruddy::types::Domains::default());
-        };
-        let domains = ruddy::types::Domains::from_name(&bits.to_string()).ok_or_else(|| {
-            CompileError::report(
-                "manifest-invalid",
-                format!("`integers = {bits}` is not a precision the compiler binds"),
-            )
-            .with_help("set `integers` to 53, 32, or 64")
-        })?;
-        if self.target() == Target::Js && domains == ruddy::types::Domains::Bits64 {
-            return Err(CompileError::report(
-                "manifest-invalid",
-                "the JavaScript target cannot hold 64-bit `Nat` and `Int`",
-            )
-            .with_help(
-                "set `integers` to 53 or 32, or use Nat64 and Int64 where 64 bits are needed",
-            ));
-        }
-        Ok(domains)
-    }
-
     /// The build this manifest asks for, when it is the root.
     fn build(&self) -> Result<Build, CompileError> {
-        Ok(Build {
-            target: self.target(),
-            platform: self.platform(),
-            domains: self.domains()?,
-        })
+        Build::resolve(self.target(), self.platform(), self.integers)
     }
 }
 

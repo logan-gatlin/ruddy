@@ -4105,3 +4105,82 @@ fn a_request_may_bind_the_integer_domains() {
         ["literal-outside-domain"]
     );
 }
+
+/// A target and an integer precision the compiler cannot bind together is a
+/// refused configuration, not a silent fall back to the default. JavaScript
+/// holds no 64-bit `Nat`, and two literals a 64-bit domain tells apart would
+/// collapse to one `number` if the build went ahead.
+#[test]
+fn a_request_the_compiler_cannot_bind_compiles_nothing() {
+    let request = |target: ruddy_cli::Target, integers: Option<u32>, source: &str| CompileRequest {
+        kind: ruddy::artifact::Kind::Library,
+        target: Some(target),
+        platform: None,
+        integers,
+        name: "demo".to_string(),
+        version: "0.1.0".to_string(),
+        root: ROOT.to_string(),
+        document: "demo".to_string(),
+        files: vec![FileSpec {
+            path: ROOT.to_string(),
+            source: source.to_string(),
+        }],
+        std: StdConfig::Disabled,
+        dependencies: IndexMap::new(),
+        revision: 3,
+    };
+    // Two literals a 64-bit domain tells apart, which one JavaScript number
+    // cannot.
+    let distinct = "let distinct = match 9007199254740993n with\n| 9007199254740992n => false\n| _ => true\nend\n";
+    let codes = |snapshot: &ruddy_debug::wire::Snapshot| -> Vec<String> {
+        snapshot
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code.to_string())
+            .collect()
+    };
+    let compiled = |snapshot: &ruddy_debug::wire::Snapshot| -> bool {
+        snapshot
+            .stages
+            .iter()
+            .any(|stage| stage.id == "js" && stage.status != Status::Skipped)
+    };
+
+    for integers in [Some(64), Some(17)] {
+        let refused = compile(&request(ruddy_cli::Target::Js, integers, distinct), 1);
+        assert_eq!(codes(&refused), ["manifest-invalid"], "{integers:?}");
+        assert!(!compiled(&refused), "{integers:?} produced JavaScript");
+        // Nothing was compiled at all, so no phase over source reports a
+        // result. The error strip and the dependency list are about the
+        // request rather than about compiling it.
+        assert!(
+            refused.stages.iter().all(|stage| {
+                stage.status == Status::Skipped
+                    || stage.id == "errors"
+                    || stage.id == "dependencies"
+            }),
+            "{integers:?}: {:#?}",
+            refused
+                .stages
+                .iter()
+                .map(|stage| (stage.id, stage.status))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // The supported combinations still compile: 32- and 53-bit JavaScript,
+    // and 64-bit for a target that holds it.
+    for (target, integers) in [
+        (ruddy_cli::Target::Js, Some(32)),
+        (ruddy_cli::Target::Js, Some(53)),
+        (ruddy_cli::Target::Js, None),
+        (ruddy_cli::Target::Artifact, Some(64)),
+    ] {
+        let built = compile(&request(target, integers, "let value = 1n\n"), 1);
+        assert!(
+            codes(&built).is_empty(),
+            "{target:?} {integers:?}: {:#?}",
+            built.diagnostics
+        );
+    }
+}
