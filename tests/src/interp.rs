@@ -627,6 +627,61 @@ end
 }
 
 #[test]
+fn the_array_and_text_libraries_agree_on_both_backends() {
+    let source = r#"
+let numbers = [5n, 3n, 9n, 1n, 7n]
+let total = std::str::from_nat (std::array::fold std::nat::add 0n numbers)
+let sorted = std::str::join "," (std::array::map std::str::from_nat (std::array::sort_by std::nat::compare numbers))
+let sliced = match std::array::slice numbers 1n 4n with
+| #Some part => std::str::join "-" (std::array::map std::str::from_nat part)
+| #None => "none"
+end
+let last = match std::array::pop numbers with
+| #Some pair => std::str::from_nat pair.0
+| #None => "none"
+end
+let joined = std::str::join "" (std::array::reverse ["c", "b", "a"])
+let astral = do
+  let text = "a😀b"
+  return std::str::join "," [
+    std::str::from_nat (std::str::len text),
+    std::str::char_at text 1n,
+    std::str::slice text 1n 2n,
+    std::str::reverse text,
+    std::str::from_int (std::str::index_of text "b"),
+  ]
+end
+let padded = std::str::join "|" [
+  std::str::pad_start "7" 3n "0",
+  std::str::pad_end "7" 3n "·",
+  std::str::to_uppercase "straße",
+]
+let ordered = std::str::join "," [
+  std::str::from_boolean (std::str::less_than "a" "😀"),
+  std::str::from_boolean (std::str::less_than "b" "a"),
+]
+"#;
+    let exports = [
+        "total", "sorted", "sliced", "last", "joined", "astral", "padded", "ordered",
+    ];
+    let (node, interpreted) = both(source, &exports, None);
+    assert_eq!(node, interpreted);
+    assert_eq!(
+        interpreted,
+        vec![
+            "\"25\"",
+            "\"1,3,5,7,9\"",
+            "\"3-9-1\"",
+            "\"7\"",
+            "\"abc\"",
+            "\"3,😀,😀,b😀a,2\"",
+            "\"007|7··|STRASSE\"",
+            "\"true,false\"",
+        ]
+    );
+}
+
+#[test]
 fn a_host_value_the_interpreter_does_not_provide_is_named() {
     let mut program = load(
         r#"

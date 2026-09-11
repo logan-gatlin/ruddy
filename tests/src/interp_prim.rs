@@ -1031,3 +1031,28 @@ fn real_numbers_are_spelled_the_way_javascript_spells_them() {
         assert_eq!(number::to_string(value), spelling, "{value:?}");
     }
 }
+
+#[test]
+fn shortest_digits_are_settled_the_way_javascript_settles_them() {
+    for (value, spelling) in [
+        // These two are exactly halfway between two shortest runs, written
+        // as quarters and eighths so that the halfway point is plain, and
+        // the even run wins. Rust's own formatting picks the odd one and
+        // spells them `...27.3` and `...04.13`.
+        (8_725_981_186_952_109.0 / 4.0, "2181495296738027.2"),
+        (602_012_437_563_233.0 / 8.0, "75251554695404.12"),
+        (-8_725_981_186_952_109.0 / 4.0, "-2181495296738027.2"),
+        // A power of two begins a binade, so every run that reads back as it
+        // lies above it and rounding to the shortest length steps below all
+        // of them. The run that reads back is the one to write.
+        (2.0f64.powi(-24), "5.960464477539063e-8"),
+        (2.0f64.powi(-44), "5.684341886080802e-14"),
+        (2.0f64.powi(-1007), "7.291122019556398e-304"),
+        // Ordinary numbers, whose shortest run is nowhere near a tie.
+        (2.0f64.powi(-24) * 1e10, "596.0464477539062"),
+        (4.35, "4.35"),
+        (1.005, "1.005"),
+    ] {
+        assert_eq!(number::to_string(value), spelling, "{value:?}");
+    }
+}

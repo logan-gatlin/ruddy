@@ -31,12 +31,20 @@ pub(crate) fn space(ch: char) -> bool {
 /// A real number as text, the way ECMAScript's `Number.prototype.toString`
 /// spells it.
 ///
-/// The digits are the shortest that read back as the same number, which is
-/// what Rust's exponential formatting already gives; what ECMAScript settles
-/// beyond them is where the decimal point goes. A number is written plainly
-/// while its point sits within twenty-one places of the digits and no more
-/// than six zeros of the other side of it, and in exponential form with a
-/// signed exponent otherwise.
+/// The digits are the shortest run that reads back as the same number, and
+/// of two such runs the closer one, and of two equally close runs the one
+/// whose last digit is even. Rust's exponential formatting gives a shortest
+/// run but breaks a tie the other way, so only its length is taken from Rust
+/// and the digits themselves from rounding the number to that length, which
+/// is round-half-to-even. Rounding is over every run of that length rather
+/// than over the ones that read back, so it can step off the end of them
+/// where a binade begins and the runs that read back all lie above the
+/// number; Rust's run is the one to keep there.
+///
+/// What ECMAScript settles beyond the digits is where the decimal point
+/// goes. A number is written plainly while its point sits within twenty-one
+/// places of the digits and no more than six zeros of the other side of it,
+/// and in exponential form with a signed exponent otherwise.
 pub fn to_string(value: f64) -> String {
     if value.is_nan() {
         return "NaN".to_string();
@@ -52,20 +60,27 @@ pub fn to_string(value: f64) -> String {
     if value.is_infinite() {
         return "Infinity".to_string();
     }
-    let formatted = format!("{value:e}");
-    let (mantissa, exponent) = formatted
-        .split_once('e')
-        .expect("Rust writes an exponent for every finite number");
-    let exponent: i32 = exponent
-        .parse()
-        .expect("Rust writes the exponent in decimal");
-    let digits: String = mantissa.chars().filter(|ch| *ch != '.').collect();
+    // A shortest run that reads back as this number, and the number rounded
+    // to that many digits, which settles a tie the way ECMAScript settles it.
+    // The rounded run is the one to write unless it no longer reads back as
+    // this number, which leaves the run Rust wrote.
+    let shortest = format!("{value:e}");
+    let (digits, exponent) = split(&shortest);
+    let rounded = format!("{value:.*e}", digits.len() - 1);
+    let (digits, exponent) = if rounded.parse().is_ok_and(|read: f64| read == value) {
+        split(&rounded)
+    } else {
+        (digits, exponent)
+    };
+    // Rounding can carry, as ninety-nine rounds to one hundred, and leave a
+    // zero on the end that no shortest run has.
+    let digits = digits.trim_end_matches('0');
     // `count` is how many digits there are and `point` is where the decimal
     // point falls among them, counted from the left and possibly outside them.
     let count = i32::try_from(digits.len()).expect("a number has few digits");
     let point = exponent + 1;
     if count <= point && point <= 21 {
-        digits + &"0".repeat((point - count) as usize)
+        format!("{digits}{}", "0".repeat((point - count) as usize))
     } else if 0 < point && point <= 21 {
         let at = point as usize;
         format!("{}.{}", &digits[..at], &digits[at..])
@@ -150,6 +165,20 @@ pub fn sixty_four(text: &str) -> u64 {
     } else {
         wrapped
     }
+}
+
+/// The digits and the exponent of a number Rust wrote in exponential form,
+/// with the decimal point taken out of the digits: the exponent already says
+/// where it belongs.
+fn split(formatted: &str) -> (String, i32) {
+    let (mantissa, exponent) = formatted
+        .split_once('e')
+        .expect("Rust writes an exponent for every finite number");
+    let digits = mantissa.chars().filter(|ch| *ch != '.').collect();
+    let exponent = exponent
+        .parse()
+        .expect("Rust writes the exponent in decimal");
+    (digits, exponent)
 }
 
 /// A signed exponent, which ECMAScript always writes with its sign.

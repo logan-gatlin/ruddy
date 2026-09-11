@@ -285,6 +285,17 @@ let all_zeros: String -> Bool = fn digits => not (str::contains digits "1"
   or str::contains digits "8"
   or str::contains digits "9")
 
+@doc "An exponent's digits, without its sign and leading zeros, clamped to `cap`. A token carries at most `limits.digits` digits, so an exponent past `cap` moves the point further than any accepted token can spell, either way: a clamped one reaches the same answer, and stays an `Int` this target holds."
+@private
+let exponent_magnitude: String -> String -> String = fn exponent cap => do
+  let unsigned =
+    if str::starts_with exponent "+" or str::starts_with exponent "-" then str::drop exponent 1n
+    else exponent
+    end
+  let digits = strip_zeros unsigned
+  return if digits_at_most digits cap then digits else cap end
+end
+
 @doc "The digits of an integral number token, or none when the token has a fractional part: `1.0`, `1e3`, and `100e-2` are integral, `1.5` is not."
 @private
 let integral: String -> Limits -> Result (Option { negative: Bool, digits: String }) codec::Error =
@@ -301,8 +312,13 @@ let integral: String -> Limits -> Result (Option { negative: Bool, digits: Strin
     end
     let exponent = split.1
     let fraction = parts.1
-    let exponent_value = int_of_digits
-      (match str::strip_prefix exponent "+" with | #Some rest => rest | #None => exponent end)
+    let magnitude = exponent_magnitude
+      exponent
+      (str::from_nat (nat::add (nat::add limits.digits 1n) (str::len fraction)))
+    let exponent_value =
+      if str::starts_with exponent "-" then int::negate (int_of_digits magnitude)
+      else int_of_digits magnitude
+      end
     let scale = int::subtract exponent_value (int::from_nat (str::len fraction))
     let digits = str::concat parts.0 fraction
     return
@@ -348,20 +364,25 @@ let nat_mirror: Mirror Nat = reflect::mirror ()
 @private
 let int_mirror: Mirror Int = reflect::mirror ()
 
-@doc "The domain the root node of a description carries, when that node is an integer kind. `Nat` and `Int` are described as the target bound them, so the reader accepts exactly what this program's integers hold."
+@doc "The domain the root node of a description carries, when that node is an integer kind, and `narrowest` when it is not. `Nat` and `Int` are described as the target bound them, so the reader accepts exactly what this program's integers hold; a description that no longer names an integer at its root falls back to the narrowest domain a target can bind, which refuses values rather than passing on ones the target cannot hold."
 @private
-let root_domain: reflect::Description -> reflect::Domain = fn description =>
-  match array::get description.nodes description.root with
-  | #Some (#Nat domain) => domain
-  | #Some (#Int domain) => domain
-  | _ => { bits: 53n, signed: false, min: "0", max: "9007199254740991" }
-  end
+let root_domain: reflect::Description -> reflect::Domain -> reflect::Domain =
+  fn description narrowest =>
+    match array::get description.nodes description.root with
+    | #Some (#Nat domain) => domain
+    | #Some (#Int domain) => domain
+    | _ => narrowest
+    end
 
 @private
-let nat_domain: reflect::Domain = root_domain (reflect::describe nat_mirror)
+let nat_domain: reflect::Domain = root_domain
+  (reflect::describe nat_mirror)
+  { bits: 32n, signed: false, min: "0", max: "4294967295" }
 
 @private
-let int_domain: reflect::Domain = root_domain (reflect::describe int_mirror)
+let int_domain: reflect::Domain = root_domain
+  (reflect::describe int_mirror)
+  { bits: 32n, signed: true, min: "-2147483648", max: "2147483647" }
 
 @doc "The magnitude of the least `Int`, as digits: the domain's minimum without its sign."
 @private

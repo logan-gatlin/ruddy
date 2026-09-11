@@ -15,6 +15,14 @@
 //! converting a fixed width to one of them — and those are the only ones the
 //! domains reach. Everything else means the same under any target.
 //!
+//! The contract stops short of the last bit for one family. ECMAScript
+//! leaves `Math.sin` and its relatives to the implementation, so `real.sin`,
+//! `cos`, `exp`, `log`, `atan2`, `asinh`, `acosh` and `atanh` are Rust's and
+//! agree with node only to within an ulp, differing on a few arguments in
+//! every thousand. Nothing may assert that a result of one of them is spelled
+//! the same on both backends; the rest of `real`, including `sqrt`, `power`,
+//! the roundings, `min` and `max`, does agree bit for bit.
+//!
 //! Two departures from the JavaScript are deliberate. `str.replace_first`
 //! and `str.replace_all` replace a plain substring, where `String.prototype`
 //! expands `$&` and its relatives in the replacement; the standard library

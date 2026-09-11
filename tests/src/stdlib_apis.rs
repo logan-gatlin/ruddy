@@ -899,14 +899,19 @@ let widen_int64: Int64 -> Int = fn value => std::int::to_int64 value
     let helpers = r#"
 const big = (key, value) => typeof value === 'bigint' ? value.toString() + 'n' : value;
 const some = result => { assert.equal(result.tag, 'Some', JSON.stringify(result, big)); return result.value; };
-const range = result => {
+const kind = result => {
   assert.equal(result.tag, 'Error', JSON.stringify(result, big));
   assert.equal(result.value.tag, 'Codec');
-  assert.equal(result.value.value.kind.tag, 'Range', JSON.stringify(result.value.value.kind, big));
-  return JSON.parse(JSON.stringify(result.value.value.kind.value, big));
+  return JSON.parse(JSON.stringify(result.value.value.kind, big));
+};
+const range = result => {
+  const failure = kind(result);
+  assert.equal(failure.tag, 'Range', JSON.stringify(failure));
+  return failure.value;
 };
 const outside = 'a 64-bit value outside the target\'s domain';
 const out_of_range = { name: 'RangeError', message: 'integer out of range' };
+const too_many = { tag: 'Limit', value: 'a number with too many digits' };
 "#;
     let narrow = domain_project(source, 32);
     run(
@@ -918,8 +923,18 @@ assert.equal(some(await app.decode_nat('4294967295')), 4294967295);
 assert.deepEqual(range(await app.decode_nat('4294967296')), { expected: 'Nat', found: '4294967296' });
 assert.equal(some(await app.decode_int('-2147483648')), -2147483648);
 assert.deepEqual(range(await app.decode_int('-2147483649')), { expected: 'Int', found: '-2147483649' });
+assert.equal(some(await app.decode_int('2147483647')), 2147483647);
 assert.deepEqual(range(await app.decode_int('2147483648')), { expected: 'Int', found: '2147483648' });
 assert.equal(some(await app.decode_nat64('18446744073709551615')), 18446744073709551615n);
+assert.deepEqual(kind(await app.decode_nat('1e2147483648')), too_many);
+assert.deepEqual(kind(await app.decode_int('1e99999999999')), too_many);
+assert.deepEqual(kind(await app.decode_nat64('0e99999999999')), too_many);
+assert.deepEqual(range(await app.decode_nat('1e-2147483649')), { expected: 'Nat', found: '1e-2147483649' });
+assert.deepEqual(range(await app.decode_int('1e-99999999999')), { expected: 'Int', found: '1e-99999999999' });
+assert.deepEqual(range(await app.decode_nat64('1e-99999999999')), { expected: 'Nat64', found: '1e-99999999999' });
+assert.deepEqual(kind(await app.decode_nat('1.5e99999999999')), too_many);
+assert.equal(some(await app.decode_nat('100e-2')), 1);
+assert.equal(some(await app.decode_int('-1.50e1')), -15);
 assert.deepEqual(range(await app.read_nat([0, 0, 0, 0, 1, 0, 0, 0])), { expected: 'Nat', found: outside });
 assert.equal(some(await app.read_nat([255, 255, 255, 255, 0, 0, 0, 0])), 4294967295);
 assert.deepEqual(range(await app.read_int([0, 0, 0, 128, 0, 0, 0, 0])), { expected: 'Int', found: outside });
@@ -944,6 +959,11 @@ assert.deepEqual(range(await app.decode_nat('9007199254740992')), { expected: 'N
 assert.equal(some(await app.decode_int('-2147483649')), -2147483649);
 assert.equal(some(await app.decode_int('-9007199254740991')), -9007199254740991);
 assert.deepEqual(range(await app.decode_int('-9007199254740992')), { expected: 'Int', found: '-9007199254740992' });
+assert.equal(some(await app.decode_int('9007199254740991')), 9007199254740991);
+assert.deepEqual(range(await app.decode_int('9007199254740992')), { expected: 'Int', found: '9007199254740992' });
+assert.deepEqual(kind(await app.decode_nat('1e2147483648')), too_many);
+assert.deepEqual(kind(await app.decode_nat('1.5e99999999999')), too_many);
+assert.equal(some(await app.decode_nat('100e-2')), 1);
 assert.equal(some(await app.decode_nat64('18446744073709551615')), 18446744073709551615n);
 assert.equal(some(await app.read_nat([0, 0, 0, 0, 1, 0, 0, 0])), 4294967296);
 assert.equal(some(await app.read_int([0, 0, 0, 128, 0, 0, 0, 0])), 2147483648);
