@@ -2749,6 +2749,14 @@ pub enum ErrorKind {
         name: Arc<str>,
         package: Arc<Ty>,
     },
+    /// A witness a hidden type cannot carry: a mutable cell's region is a
+    /// dependency of the value, and a description carries no regions, so
+    /// hiding one would drop what the value needs to stay meaningful.
+    HiddenRegion {
+        name: Arc<str>,
+        package: Arc<Ty>,
+        witness: Arc<Ty>,
+    },
     /// A `..` was decided to stand for a label the row it tails already names.
     /// `{ x: Nat, ..'r }` says "an `x`, plus whatever else `'r` is", so `'r`
     /// standing for anything that certainly has an `x` of its own would name
@@ -5219,7 +5227,8 @@ fn attach_ordinary_explanations(
             ErrorKind::RigidEscapes { .. }
             | ErrorKind::HiddenEscapes { .. }
             | ErrorKind::HiddenUnknown { .. }
-            | ErrorKind::HiddenWitness { .. } => continue,
+            | ErrorKind::HiddenWitness { .. }
+            | ErrorKind::HiddenRegion { .. } => continue,
             ErrorKind::NotHidden { found, .. } => {
                 (TypeDescription::Hidden, describe_type(found), None, None)
             }
@@ -12038,6 +12047,15 @@ impl Table {
             ErrorKind::HiddenWitness { name, package } => ErrorKind::HiddenWitness {
                 name: name.clone(),
                 package: self.close(package, subst),
+            },
+            ErrorKind::HiddenRegion {
+                name,
+                package,
+                witness,
+            } => ErrorKind::HiddenRegion {
+                name: name.clone(),
+                package: self.close(package, subst),
+                witness: self.close(witness, subst),
             },
             // The presence complaints carry prose rather than types:
             // their formulas were already worded, at the moment the variables

@@ -36,3 +36,30 @@ packages and valid closures that encapsulate hidden types without losing
 region dependencies. This conservative fix can precede the richer descriptive
 cell/region interface; neither part grants reflection permission to read a
 cell or invoke a captured function.
+
+## Answer (safety half)
+
+The immediate requirement is met: packaging that would drop a region is
+refused rather than dropped silently.
+
+`Solve::witness` checked only that the witness mentioned no unification
+variable minted inside the term. A region is not one of those, so a value
+whose type carries a region packaged cleanly and the region went with it. The
+rule now walks the resolved witness for a mutable cell anywhere inside it —
+directly, in a field, in an element, under an arrow, inside another hidden
+type — and refuses with `hidden-region`, saying that a cell's region cannot
+be hidden and what to do instead: read the cell and package what it holds, or
+keep the value in the scope its region belongs to. Packaging what a cell
+holds is unaffected, which is the ordinary case.
+
+Regression: `a_package_will_not_hide_a_cell_region` in
+`tests/src/inference.rs` packages a cell directly, inside a record, inside an
+array, and under a bare hidden type, and refuses all four; it then packages a
+cell's contents and two ordinary values and accepts those. The diagnostic has
+a fixture and a golden beside the other inference diagnostics.
+
+Still open in this ticket, and why it is separate: `reification::Node` has no
+region node and no cell node, so a type containing `mut` cannot be described
+at all, and presence dependencies are tracked under
+[13](13-conditional-presence-in-mirrors.md). Conservative rejection precedes
+the descriptive work, which is the order the handoff asks for.

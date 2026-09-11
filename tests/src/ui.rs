@@ -98,6 +98,11 @@ fn inference_error_kinds(span: Anchor) -> Vec<TypeError> {
             name: "a".into(),
             package: nat.clone(),
         },
+        TypeError::HiddenRegion {
+            name: "a".into(),
+            package: nat.clone(),
+            witness: nat.clone(),
+        },
         TypeError::RepeatedField {
             shape: Shape::Struct,
             field: "x".to_string(),
@@ -665,7 +670,7 @@ fn every_inference_error_exposes_a_complete_structured_diagnostic() {
     let use_span = map.record(Symbol::GENERATED, 0, Span::generated(4, 5));
     let declared = map.record(Symbol::GENERATED, 0, Span::generated(1, 2));
     let kinds = inference_error_kinds(declared);
-    assert_eq!(kinds.len(), 24);
+    assert_eq!(kinds.len(), 25);
 
     for kind in kinds {
         let diagnostic = inference::Error::new(use_span, kind).diagnostic(&map);
@@ -2262,6 +2267,10 @@ fn inference_source_corpus_matches_abridged_structured_goldens() {
         (
             "hidden-witness",
             include_str!("../diagnostics/inference/hidden-witness.rud"),
+        ),
+        (
+            "hidden-region",
+            include_str!("../diagnostics/inference/hidden-region.rud"),
         ),
     ];
 

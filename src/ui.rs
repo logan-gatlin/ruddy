@@ -3781,6 +3781,11 @@ impl inference::Error {
                     .label("the hidden type is not determined by this expression or its context")
                     .help("annotate the value being packaged, or pass in a value whose type is already known");
             }
+            E::HiddenRegion { .. } => {
+                diagnostic = diagnostic
+                    .label("this value depends on a region, which a hidden type does not carry")
+                    .help("read the cell and package what it holds, or keep the value in the scope its region belongs to");
+            }
             E::RigidEscapes {
                 destination,
                 destination_name,
@@ -3959,6 +3964,7 @@ impl inference::ErrorKind {
             inference::ErrorKind::HiddenUnknown { .. } => "hidden-unknown",
             inference::ErrorKind::NotHidden { .. } => "not-hidden",
             inference::ErrorKind::HiddenWitness { .. } => "hidden-witness",
+            inference::ErrorKind::HiddenRegion { .. } => "hidden-region",
             inference::ErrorKind::RepeatedField { .. } => "repeated-field",
             inference::ErrorKind::SatTermLimit { .. } => "sat-term-limit",
             inference::ErrorKind::InvalidMaxSatTerms => "invalid-max-sat-terms",
@@ -4106,6 +4112,14 @@ impl fmt::Display for inference::ErrorKind {
             inference::ErrorKind::HiddenWitness { name, package } => write!(
                 f,
                 "nothing here says which type `{package}` hides as `'{name}`",
+            ),
+            inference::ErrorKind::HiddenRegion {
+                name,
+                package,
+                witness,
+            } => write!(
+                f,
+                "`{package}` would hide `{witness}` as `'{name}`, and a mutable cell's region cannot be hidden",
             ),
             // Said as what `..` means rather than as the two rows that
             // disagreed: neither of those is a type the reader wrote, and the

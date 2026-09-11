@@ -1,0 +1,6 @@
+type Held = hide 'a => { value: 'a }
+let keep = fn _ => do
+  let cell = mut 0n
+  let held: Held = { value: cell }
+  return held
+end

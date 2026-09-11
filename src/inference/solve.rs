@@ -2941,6 +2941,23 @@ impl Solve<'_> {
             expected: package.clone(),
             actual: resolved.clone(),
         };
+        // A cell's region is part of what the value needs to stay meaningful,
+        // and a hidden type carries no regions: a description has no node for
+        // one, and opening the package gives a fresh scope that could not name
+        // the region anyway. Packaging one is refused rather than dropped.
+        if let Some(witness_with_region) = region_in(self.table, &resolved) {
+            let error = Error::new(
+                span,
+                ErrorKind::HiddenRegion {
+                    name: name.clone(),
+                    package: package.clone(),
+                    witness: witness_with_region,
+                },
+            );
+            let abandoned = [Assigned::Ty(witness.clone())];
+            self.fail(span, Rule::Mismatch, goal, error, &abandoned);
+            return;
+        }
         let mut mentioned = Vec::new();
         self.table.mentions_ty(&resolved, &mut mentioned);
         if mentioned
@@ -4343,4 +4360,45 @@ fn row_ty(row: &Row) -> Arc<Ty> {
         Arc::new(Ty::unit()),
         row.clone(),
     )))
+}
+
+/// The first cell type inside a witness, if it has one. A cell carries the
+/// region it lives in, and that region is a dependency nothing in a hidden
+/// type or a description records, so a package that would take one is refused
+/// rather than quietly dropping it.
+fn region_in(table: &super::Table, ty: &Arc<Ty>) -> Option<Arc<Ty>> {
+    let mut work = vec![table.resolve(ty)];
+    let mut seen = 0usize;
+    while let Some(ty) = work.pop() {
+        seen += 1;
+        // A regular recursive type is finite through its aliases, and this
+        // walk is over a resolved witness, so a bound keeps a pathological
+        // one from running away.
+        if seen > 4096 {
+            return None;
+        }
+        match &*ty {
+            Ty::Mut(..) => return Some(ty.clone()),
+            Ty::Array(inner) | Ty::Package(inner) | Ty::Mirror(inner) => {
+                work.push(table.resolve(inner));
+            }
+            Ty::Hidden { body, .. } => work.push(table.resolve(body)),
+            Ty::Arrow(from, to, _) => {
+                work.push(table.resolve(from));
+                work.push(table.resolve(to));
+            }
+            Ty::Struct(row) | Ty::Sum(row) => {
+                for field in row.labels.values() {
+                    work.push(table.resolve(&field.ty));
+                }
+            }
+            Ty::Named { args, .. } => {
+                for arg in args.iter() {
+                    work.push(table.resolve(arg));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }

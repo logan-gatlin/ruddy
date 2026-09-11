@@ -11475,6 +11475,52 @@ fn hide_patterns_open_nested_positions() {
     assert_eq!(scheme(&mint, &inferred, "first"), "[Box] -> String");
 }
 
+/// A mutable cell carries the region it lives in, and a hidden type carries
+/// no regions: opening the package gives a fresh scope that could not name
+/// the region, and a description has no node for one. Packaging a cell is
+/// refused rather than quietly dropping what the value depends on.
+#[test]
+fn a_package_will_not_hide_a_cell_region() {
+    let prelude = "type Held = hide 'a => { value: 'a }\ntype Bare = hide 'a => 'a\n";
+    // The cell is made and packaged inside a function, which is where its
+    // region is discharged.
+    for body in [
+        "let keep = fn _ => do\n  let cell = mut 0n\n  let held: Held = { value: cell }\n  return held\nend",
+        "let keep = fn _ => do\n  let cell = mut 0n\n  let held: Held = { value: { inner: cell } }\n  return held\nend",
+        "let keep = fn _ => do\n  let cell = mut 0n\n  let held: Held = { value: [cell] }\n  return held\nend",
+        "let keep = fn _ => do\n  let cell = mut 0n\n  let held: Bare = cell\n  return held\nend",
+    ] {
+        let (_, _, inferred) = infer_src(&format!("{prelude}{body}"));
+        let error = inferred
+            .errors()
+            .iter()
+            .find(|error| error.kind.code() == "hidden-region")
+            .unwrap_or_else(|| panic!("{body}: {:#?}", inferred.errors()));
+        let ErrorKind::HiddenRegion { name, .. } = &error.kind else {
+            unreachable!()
+        };
+        assert_eq!(&**name, "a", "{body}");
+    }
+
+    // What the cell holds has no region of its own, so packaging that is the
+    // ordinary case and still works.
+    for body in [
+        "let keep = fn _ => do\n  let cell = mut 0n\n  let held: Held = { value: ~cell }\n  return held\nend",
+        "let held: Held = { value: 1n }",
+        "let held: Bare = \"text\"",
+    ] {
+        let (_, _, inferred) = infer_src(&format!("{prelude}{body}"));
+        assert!(
+            inferred
+                .errors()
+                .iter()
+                .all(|error| error.kind.code() != "hidden-region"),
+            "{body}: {:#?}",
+            inferred.errors()
+        );
+    }
+}
+
 #[test]
 fn mirror_intrinsics_are_reviewed_by_their_signatures() {
     // The whole contract, because recognition checks the whole of it: a record

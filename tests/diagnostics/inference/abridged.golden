@@ -240,3 +240,8 @@ help: match the value's structure directly, without `hide`
 [hidden-witness] nothing here says which type `Id` hides as `'a`
 primary: the hidden type is not determined by this expression or its context
 help: annotate the value being packaged, or pass in a value whose type is already known
+
+## hidden-region
+[hidden-region] `Held` would hide `mut ? Nat` as `'a`, and a mutable cell's region cannot be hidden
+primary: this value depends on a region, which a hidden type does not carry
+help: read the cell and package what it holds, or keep the value in the scope its region belongs to
