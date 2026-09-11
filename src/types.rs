@@ -34,6 +34,107 @@ pub enum Prim {
     ForeignValue,
 }
 
+/// The exact bounds of one integer domain: its precision in bits, its
+/// signedness, and its least and greatest values as decimal text, which is
+/// exact even where the inspecting target's own integers cannot hold them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct Bounds {
+    pub bits: u32,
+    pub signed: bool,
+    pub min: &'static str,
+    pub max: &'static str,
+}
+
+/// The domains a target binds `Nat` and `Int` to. Fixed-width integers have
+/// their widths everywhere; these two have the precision the target chooses,
+/// bound once for a whole linked program and recorded in its artifacts.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+pub enum Domains {
+    /// JavaScript's safe integers: 53 bits of integer precision in a `number`.
+    #[default]
+    Js53,
+    /// Conventional unsigned and signed 32-bit domains.
+    Bits32,
+    /// Conventional unsigned and signed 64-bit domains.
+    Bits64,
+}
+
+impl Domains {
+    pub const ALL: [Self; 3] = [Self::Js53, Self::Bits32, Self::Bits64];
+
+    /// The spelling a manifest and an artifact use for the domains.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Js53 => "53",
+            Self::Bits32 => "32",
+            Self::Bits64 => "64",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|domains| domains.name() == name)
+    }
+
+    /// The precision of `Nat` and `Int`, in bits of integer value.
+    pub const fn bits(self) -> u32 {
+        match self {
+            Self::Js53 => 53,
+            Self::Bits32 => 32,
+            Self::Bits64 => 64,
+        }
+    }
+
+    pub const fn nat(self) -> Bounds {
+        Bounds {
+            bits: self.bits(),
+            signed: false,
+            min: "0",
+            max: match self {
+                Self::Js53 => "9007199254740991",
+                Self::Bits32 => "4294967295",
+                Self::Bits64 => "18446744073709551615",
+            },
+        }
+    }
+
+    pub const fn int(self) -> Bounds {
+        Bounds {
+            bits: self.bits(),
+            signed: true,
+            min: match self {
+                Self::Js53 => "-9007199254740991",
+                Self::Bits32 => "-2147483648",
+                Self::Bits64 => "-9223372036854775808",
+            },
+            max: match self {
+                Self::Js53 => "9007199254740991",
+                Self::Bits32 => "2147483647",
+                Self::Bits64 => "9223372036854775807",
+            },
+        }
+    }
+
+    /// Whether a `Nat` literal is in the domain.
+    pub const fn holds_natural(self, value: u64) -> bool {
+        match self {
+            Self::Js53 => value <= 9007199254740991,
+            Self::Bits32 => value <= 4294967295,
+            Self::Bits64 => true,
+        }
+    }
+
+    /// Whether an `Int` literal is in the domain.
+    pub const fn holds_integer(self, value: i64) -> bool {
+        match self {
+            Self::Js53 => value >= -9007199254740991 && value <= 9007199254740991,
+            Self::Bits32 => value >= -2147483648 && value <= 2147483647,
+            Self::Bits64 => true,
+        }
+    }
+}
+
 /// A target-independent integer width and signedness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum FixedInt {

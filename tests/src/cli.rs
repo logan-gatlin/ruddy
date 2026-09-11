@@ -114,7 +114,7 @@ fn nonreturning_main_preserves_in_range_exit_codes_and_saturates_large_naturals(
         (17, 17),
         (255, 255),
         (256, 255),
-        (u64::MAX, 255),
+        (9007199254740991, 255),
     ] {
         let project = tempfile::tempdir().unwrap();
         executable_project(
@@ -392,6 +392,7 @@ fn inference_diagnostics_keep_structured_parity_across_real_consumers() {
             kind: ruddy::artifact::Kind::Library,
             target: None,
             platform: None,
+            integers: None,
             name: "diagnostics".into(),
             version: "0.1.0".into(),
             root: DEBUG_ROOT.into(),
@@ -3471,4 +3472,45 @@ fn fmt_formats_around_syntax_errors_and_reports_them() {
         "let a = 1n\nlet = broken\nlet b = 2n\n"
     );
     assert!(!FormatReport::default().failed());
+}
+
+#[test]
+fn manifests_bind_the_integer_domains() {
+    for (integers, source, expected) in [
+        (
+            "integers = 64\n",
+            "let value = 1n\n",
+            Some("[manifest-invalid] Error"),
+        ),
+        (
+            "integers = 7\n",
+            "let value = 1n\n",
+            Some("[manifest-invalid] Error"),
+        ),
+        (
+            "integers = 32\n",
+            "let value = 4294967296n\n",
+            Some("[literal-outside-domain] Error"),
+        ),
+        ("integers = 32\n", "let value = 4294967295n\n", None),
+        ("", "let value = 4294967296n\n", None),
+    ] {
+        let directory = project();
+        fs::write(
+            directory.path().join("Ruddy.toml"),
+            format!(
+                "name = \"app\"\nversion = \"1.0.0\"\nkind = \"library\"\nroot = \"main.rud\"\ntarget = \"js\"\n{integers}[dependencies]\nstd = false\n"
+            ),
+        )
+        .unwrap();
+        fs::write(directory.path().join("main.rud"), source).unwrap();
+        match (compile(directory.path()), expected) {
+            (Ok(_), None) => {}
+            (Err(error), Some(expected)) => {
+                let error = error.to_string();
+                assert!(error.contains(expected), "{integers}{source}: {error}");
+            }
+            (result, expected) => panic!("{integers}{source}: {expected:?} but {}", result.is_ok()),
+        }
+    }
 }

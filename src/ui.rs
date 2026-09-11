@@ -1314,6 +1314,7 @@ impl ir::ErrorKind {
             ir::ErrorKind::ForeignProtocol { .. } => "foreign-protocol",
             ir::ErrorKind::ArrayInExtern => "array-in-extern",
             ir::ErrorKind::HiddenOutsideMatch => "hidden-outside-match",
+            ir::ErrorKind::LiteralOutsideDomain { .. } => "literal-outside-domain",
             ir::ErrorKind::HiddenVariableSense { .. } => "hidden-variable-sense",
             ir::ErrorKind::InvalidDependencyAlias { .. } => "invalid-dependency-alias",
             ir::ErrorKind::ExecutableDependency { .. } => "executable-dependency",
@@ -1420,6 +1421,20 @@ impl ir::Error {
             )
             .label("this `hide` pattern is in a binding")
             .help("match on the value instead, and open it in an arm"),
+            E::LiteralOutsideDomain {
+                literal,
+                primitive,
+                bounds,
+            } => Diagnostic::new(
+                code,
+                format!(
+                    "the literal `{literal}` is outside the target's {primitive} domain, {} to {}",
+                    bounds.min, bounds.max
+                ),
+                span,
+            )
+            .label(format!("{primitive} has {} bits of precision on this target", bounds.bits))
+            .help("write a value the target holds, or use a fixed-width integer type such as Nat64 or Int64"),
             E::HiddenVariableSense { name, sense } => Diagnostic::new(
                 code,
                 format!("`'{name}` names a hidden type, so it cannot be {}", match sense {

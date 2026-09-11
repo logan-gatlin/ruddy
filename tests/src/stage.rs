@@ -971,6 +971,7 @@ fn artifact_stage_renders_one_dependency() {
         header: Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: Identity {
                 name: "demo".to_string(),
@@ -1470,6 +1471,7 @@ fn bundle(files: &[(&str, &str)]) -> Snapshot {
             kind: ruddy::artifact::Kind::Library,
             target: Some(ruddy_cli::Target::Js),
             platform: None,
+            integers: None,
             name: "demo".to_string(),
             version: "0.1.0".to_string(),
             root: ROOT.to_string(),

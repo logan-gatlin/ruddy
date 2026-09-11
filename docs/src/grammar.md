@@ -40,6 +40,7 @@ A [literal](dictionary.md#literal) writes a value directly in source code.
 
 Integers have a precision chosen by the target, measured in bits, with exact bounds: on JavaScript `Nat` holds `0` to `9007199254740991` and `Int` holds `-9007199254740991` to `9007199254740991`, the safe integers, while `Nat64` and `Int64` have their fixed 64-bit domains everywhere.
 A literal outside the target's domain is a compile error, and integers have one zero.
+A project's `Ruddy.toml` may set `integers = 32` for the conventional 32-bit domains; `53` is the JavaScript default, and `64` is for targets that hold 64-bit integers.
 `Real` is an IEEE binary64 number with its signed zeros, infinities, and NaNs.
 A `String` is a sequence of Unicode scalar values: `std::str::len "😀"` is one, and character positions, slicing, search, and ordering count scalars the same way.
 

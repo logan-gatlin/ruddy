@@ -206,6 +206,7 @@ fn bundle(files: &[(&str, &str)]) -> Snapshot {
             kind: ruddy::artifact::Kind::Library,
             target: Some(ruddy_cli::Target::Js),
             platform: None,
+            integers: None,
             name: "demo".to_string(),
             version: "0.1.0".to_string(),
             root: ROOT.to_string(),
@@ -308,6 +309,7 @@ fn dependency_paths_without_a_scratch_root_are_recoverable() {
             kind: ruddy::artifact::Kind::Library,
             target: None,
             platform: None,
+            integers: None,
             name: "debugger".to_string(),
             version: "1.2.3".to_string(),
             root: ROOT.to_string(),
@@ -366,6 +368,7 @@ fn custom_standard_library_is_source_visible_rendered_and_sandboxed() {
         kind: ruddy::artifact::Kind::Library,
         target: None,
         platform: None,
+        integers: None,
         name: "app".into(),
         version: "1.0.0".into(),
         root: ROOT.into(),
@@ -427,6 +430,7 @@ fn a_remembered_dependency_graph_follows_edits_to_its_sources() {
         kind: ruddy::artifact::Kind::Library,
         target: None,
         platform: None,
+        integers: None,
         name: "app".into(),
         version: "1.0.0".into(),
         root: ROOT.into(),
@@ -499,6 +503,7 @@ fn cached_standard_library_child() {
         kind: ruddy::artifact::Kind::Library,
         target: None,
         platform: None,
+        integers: None,
         name: "app".into(),
         version: "1.0.0".into(),
         root: ROOT.into(),
@@ -557,6 +562,7 @@ fn saved_dependency_projects_supply_artifact_identity_and_gate_lir() {
         kind: ruddy::artifact::Kind::Library,
         target: None,
         platform: None,
+        integers: None,
         name: "app".to_string(),
         version: "1.0.0".to_string(),
         root: ROOT.to_string(),
@@ -704,6 +710,7 @@ fn dependencies_tab_correlates_same_bundle_versions_by_request_alias() {
         kind: ruddy::artifact::Kind::Library,
         target: None,
         platform: None,
+        integers: None,
         name: "app".into(),
         version: "1.0.0".into(),
         root: ROOT.into(),
@@ -1002,6 +1009,7 @@ fn dependency_request(dependencies: IndexMap<String, String>) -> CompileRequest 
         kind: ruddy::artifact::Kind::Library,
         target: None,
         platform: None,
+        integers: None,
         name: "app".to_string(),
         version: "1.0.0".to_string(),
         root: ROOT.to_string(),
@@ -2373,6 +2381,7 @@ fn a_bad_bundle_is_reported_rather_than_fatal() {
                 kind: ruddy::artifact::Kind::Library,
                 target: None,
                 platform: None,
+                integers: None,
                 name: name.to_string(),
                 version: version.to_string(),
                 root: ROOT.to_string(),
@@ -2411,6 +2420,7 @@ fn a_nested_debugger_root_resolves_module_files_beside_its_root() {
             kind: ruddy::artifact::Kind::Library,
             target: None,
             platform: None,
+            integers: None,
             name: "demo".into(),
             version: "0.1.0".into(),
             root: "src/main.rud".into(),
@@ -4008,5 +4018,37 @@ fn pattern_bound_mirrors_are_shown_by_the_reification_tab() {
             .any(|node| node.label == "evidence" && node.text.contains("evidence for type")),
         "{:#?}",
         stage.nodes
+    );
+}
+
+#[test]
+fn a_request_may_bind_the_integer_domains() {
+    let request = |integers: Option<u32>| CompileRequest {
+        kind: ruddy::artifact::Kind::Library,
+        target: Some(ruddy_cli::Target::Js),
+        platform: None,
+        integers,
+        name: "demo".to_string(),
+        version: "0.1.0".to_string(),
+        root: ROOT.to_string(),
+        document: "demo".to_string(),
+        files: vec![FileSpec {
+            path: ROOT.to_string(),
+            source: "let value = 4294967296n\n".to_string(),
+        }],
+        std: StdConfig::Disabled,
+        dependencies: IndexMap::new(),
+        revision: 3,
+    };
+    let wide = compile(&request(None), 1);
+    assert!(wide.diagnostics.is_empty(), "{:#?}", wide.diagnostics);
+    let narrow = compile(&request(Some(32)), 1);
+    assert_eq!(
+        narrow
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code.to_string())
+            .collect::<Vec<_>>(),
+        ["literal-outside-domain"]
     );
 }

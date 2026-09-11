@@ -483,7 +483,7 @@ pub fn instantiate(
     result
 }
 
-fn children<'a>(term: &'a Term, work: &mut Vec<&'a Term>) {
+pub(crate) fn children<'a>(term: &'a Term, work: &mut Vec<&'a Term>) {
     match &term.kind {
         TermKind::Unary { value, .. } => work.push(value),
         TermKind::Binary { left, right, .. } => work.extend([&**left, &**right]),

@@ -579,6 +579,7 @@ fn deep_alias_chains_and_generic_interfaces_use_bounded_stack() {
                 header: ruddy::artifact::Header {
                     kind: ruddy::artifact::Kind::Library,
                     compiler: ruddy::artifact::Stamp::current(),
+                    domains: ruddy::types::Domains::default(),
                     modules: Vec::new(),
                     identity: ruddy::artifact::Identity {
                         name: "dep".into(),
@@ -1778,4 +1779,52 @@ fn imported_hidden_types_open_and_package_like_local_ones() {
     );
     assert_eq!(scheme(&accepted, "opened"), "String");
     assert_eq!(scheme(&accepted, "described"), "String");
+}
+
+/// Binding the target's domains refuses a literal they cannot hold, in a
+/// term or a pattern, and says which domain and what its bounds are.
+#[test]
+fn literals_outside_the_bound_domains_are_refused() {
+    use ruddy::types::Domains;
+    let bound = |source: &str, domains| {
+        let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
+        assert!(parsed.errors.is_empty(), "{source}: {:#?}", parsed.errors);
+        compile::compile_bound(
+            Mint::new(Bundle::new("tests", Version::new(0, 1, 0)).unwrap()),
+            parsed.stmts,
+            &[],
+            inference::Trace::Off,
+            domains,
+        )
+        .map_err(Box::new)
+    };
+    let wide = "let big = 9007199254740992n\nlet low = -9007199254740992i\nlet fixed = 18446744073709551615n64\nlet arm = fn n => match n with | 4294967296n => true | _ => false end\nlet nested = fn v => match v with | #Some { at: 2147483648i } => true | _ => false end";
+    let accepted =
+        bound(wide, Domains::Bits64).unwrap_or_else(|partial| panic!("{:#?}", partial.errors));
+    assert_eq!(accepted.domains(), Domains::Bits64);
+    assert_eq!(accepted.artifact().header().domains, Domains::Bits64);
+    let refused = bound(wide, Domains::Js53).expect_err("53 bits cannot hold the literals");
+    assert_eq!(
+        codes(&refused),
+        ["literal-outside-domain", "literal-outside-domain"]
+    );
+    let refused = bound(wide, Domains::Bits32).expect_err("32 bits cannot hold the literals");
+    assert_eq!(codes(&refused).len(), 4);
+    let Error::Ir(error) = &refused.errors[0] else {
+        panic!("an IR error")
+    };
+    let diagnostic = error.diagnostic(&refused.ir.source);
+    assert_eq!(
+        diagnostic.title,
+        "the literal `9007199254740992n` is outside the target's Nat domain, 0 to 4294967295"
+    );
+    assert_eq!(
+        diagnostic.primary.message,
+        "Nat has 32 bits of precision on this target"
+    );
+    let ok = bound(
+        "let fits = 4294967295n\nlet low = -2147483648i\nlet high = 2147483647i",
+        Domains::Bits32,
+    );
+    assert!(ok.is_ok());
 }

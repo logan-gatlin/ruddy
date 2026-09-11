@@ -35,6 +35,9 @@ pub struct CompileRequest {
     pub target: Option<ruddy_cli::Target>,
     #[serde(default)]
     pub platform: Option<ruddy_cli::Platform>,
+    /// The precision of `Nat` and `Int` in bits, when the project binds one.
+    #[serde(default)]
+    pub integers: Option<u32>,
     /// The bundle identity supplied by project configuration in a normal
     /// compilation. Defaults keep cached requests from older debugger pages
     /// usable after identity moved out of source files.

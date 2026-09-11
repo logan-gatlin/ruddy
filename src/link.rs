@@ -15,6 +15,12 @@ use crate::artifact::{self, Artifact, Callee, Op};
 pub enum LinkError {
     EmptyGraph,
     ExecutableDependency(String),
+    /// A dependency bound `Nat` and `Int` to other domains than the root.
+    Domains {
+        name: String,
+        expected: crate::types::Domains,
+        found: crate::types::Domains,
+    },
 }
 
 impl fmt::Display for LinkError {
@@ -24,6 +30,16 @@ impl fmt::Display for LinkError {
             Self::ExecutableDependency(name) => {
                 write!(f, "executable bundle `{name}` cannot be a dependency")
             }
+            Self::Domains {
+                name,
+                expected,
+                found,
+            } => write!(
+                f,
+                "bundle `{name}` was compiled with {}-bit integers, and this program binds {}-bit integers",
+                found.bits(),
+                expected.bits()
+            ),
         }
     }
 }
@@ -48,6 +64,13 @@ pub fn link(artifacts: &[Artifact]) -> Result<Artifact, LinkError> {
             return Err(LinkError::ExecutableDependency(
                 dependency.header().identity.name.clone(),
             ));
+        }
+        if dependency.header().domains != root.header().domains {
+            return Err(LinkError::Domains {
+                name: dependency.header().identity.name.clone(),
+                expected: root.header().domains,
+                found: dependency.header().domains,
+            });
         }
     }
 

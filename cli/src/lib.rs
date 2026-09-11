@@ -1145,6 +1145,8 @@ impl Platform {
 pub struct Build {
     pub target: Target,
     pub platform: Platform,
+    /// The domains `Nat` and `Int` are bound to, from the root's `integers`.
+    pub domains: ruddy::types::Domains,
 }
 
 impl Build {
@@ -1154,6 +1156,7 @@ impl Build {
         bundle::Environment::new([
             ("target", self.target.name()),
             ("platform", self.platform.name()),
+            ("integers", self.domains.name()),
         ])
     }
 }
@@ -1183,6 +1186,10 @@ struct Manifest {
     target: Option<Target>,
     #[serde(default)]
     platform: Option<Platform>,
+    /// The precision of `Nat` and `Int` in bits: `53`, JavaScript's safe
+    /// integers and the default, `32`, or `64`.
+    #[serde(default)]
+    integers: Option<u32>,
     #[serde(default)]
     run: RunConfig,
     dependencies: ManifestDependencies,
@@ -1198,12 +1205,38 @@ impl Manifest {
         self.platform.unwrap_or_default()
     }
 
+    /// The domains the manifest binds `Nat` and `Int` to, when they are ones
+    /// there are and the target holds them.
+    fn domains(&self) -> Result<ruddy::types::Domains, CompileError> {
+        let Some(bits) = self.integers else {
+            return Ok(ruddy::types::Domains::default());
+        };
+        let domains = ruddy::types::Domains::from_name(&bits.to_string()).ok_or_else(|| {
+            CompileError::report(
+                "manifest-invalid",
+                format!("`integers = {bits}` is not a precision the compiler binds"),
+            )
+            .with_help("set `integers` to 53, 32, or 64")
+        })?;
+        if self.target() == Target::Js && domains == ruddy::types::Domains::Bits64 {
+            return Err(CompileError::report(
+                "manifest-invalid",
+                "the JavaScript target cannot hold 64-bit `Nat` and `Int`",
+            )
+            .with_help(
+                "set `integers` to 53 or 32, or use Nat64 and Int64 where 64 bits are needed",
+            ));
+        }
+        Ok(domains)
+    }
+
     /// The build this manifest asks for, when it is the root.
-    fn build(&self) -> Build {
-        Build {
+    fn build(&self) -> Result<Build, CompileError> {
+        Ok(Build {
             target: self.target(),
             platform: self.platform(),
-        }
+            domains: self.domains()?,
+        })
     }
 }
 
@@ -1571,7 +1604,7 @@ pub fn compile(directory: impl AsRef<Path>) -> Result<Artifact, CompileError> {
 pub fn compile_graph(directory: impl AsRef<Path>) -> Result<CompiledGraph, CompileError> {
     let root = canonical_project(directory.as_ref())?;
     let resolver = git::Resolver::new(&root)?;
-    let build = load_manifest(&root, None)?.build();
+    let build = load_manifest(&root, None)?.build()?;
     let mut compiler = GraphCompiler {
         root: Some(root.clone()),
         resolver: Some(resolver),
@@ -2158,7 +2191,10 @@ impl GraphCompiler {
         let run = manifest.run.clone();
         // What this project is compiled for: the root's build when there is
         // one root, and its own otherwise.
-        let build = self.build.unwrap_or_else(|| manifest.build());
+        let build = match self.build {
+            Some(build) => build,
+            None => manifest.build()?,
+        };
         // A dependency is compiled only when the cache has no artifact for
         // this compiler, these sources, these dependencies and this build.
         // The root is what the run is for, and always compiled.
@@ -2406,11 +2442,12 @@ fn compile_one(
             artifact: ruddy::compile::DependencyArtifact::Checked(artifact),
         })
         .collect();
-    let accepted = ruddy::compile::compile_with_dependencies(
+    let accepted = ruddy::compile::compile_bound(
         mint,
         loaded.stmts,
         &dependencies,
         inference::Trace::Off,
+        build.domains,
     );
     let accepted = match accepted {
         Ok(accepted) => accepted,

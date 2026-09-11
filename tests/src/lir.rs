@@ -304,6 +304,7 @@ fn imported_forwarding_cycles_recover_before_lir_representation() {
                 header: a::Header {
                     kind: ruddy::artifact::Kind::Library,
                     compiler: ruddy::artifact::Stamp::current(),
+                    domains: ruddy::types::Domains::default(),
                     modules: Vec::new(),
                     identity: a::Identity {
                         name: "dep".into(),
@@ -1183,6 +1184,7 @@ fn imported_and_local_handler_arms_build_one_complete_evidence_record() {
         header: a::Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),

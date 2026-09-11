@@ -149,6 +149,7 @@ fn exporting(mint: &Mint, scheme: &types::Scheme) -> Artifact {
         header: artifact::Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: artifact::Identity {
                 name: name.clone(),
@@ -392,6 +393,7 @@ fn model_artifact() -> Artifact {
         header: artifact::Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: artifact::Identity {
                 name: "bundle".to_string(),
@@ -1075,6 +1077,7 @@ fn canonical_pretty_layout_is_pinned_at_its_unicode_width_boundary() {
             header: artifact::Header {
                 kind: ruddy::artifact::Kind::Library,
                 compiler: ruddy::artifact::Stamp::current(),
+                domains: ruddy::types::Domains::default(),
                 modules: Vec::new(),
                 identity: artifact::Identity {
                     name,
@@ -1108,6 +1111,7 @@ fn canonical_pretty_layout_is_pinned_at_its_unicode_width_boundary() {
          \x20   (kind library)\n\
          \x20   (identity \"界界界界界界界界界界界界\" \"1\")\n\
          \x20   (compiler \"{compiler}\")\n\
+         \x20   (domains 53)\n\
          \x20   (dependencies)\n\
          \x20   (values)\n\
          \x20   (types)\n\
@@ -1124,6 +1128,7 @@ fn canonical_pretty_layout_is_pinned_at_its_unicode_width_boundary() {
          \x20   (kind library)\n\
          \x20   (identity \"界界界界界界界界界界界界界\" \"1\")\n\
          \x20   (compiler \"{compiler}\")\n\
+         \x20   (domains 53)\n\
          \x20   (dependencies)\n\
          \x20   (values)\n\
          \x20   (types)\n\
@@ -1653,6 +1658,7 @@ fn deeply_nested_artifact_semantics_decode_on_a_small_stack() {
         header: artifact::Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: artifact::Identity {
                 name: "deep".to_string(),
@@ -1887,6 +1893,7 @@ fn recursive_artifact_ownership_clones_and_drops_on_a_small_stack() {
                 header: artifact::Header {
                     kind: ruddy::artifact::Kind::Library,
                     compiler: ruddy::artifact::Stamp::current(),
+                    domains: ruddy::types::Domains::default(),
                     modules: Vec::new(),
                     identity: artifact::Identity {
                         name: "deep".into(),
@@ -2031,7 +2038,7 @@ fn valid_deep_artifact_parses_and_drops_on_a_small_stack() {
         serde_json::to_string(r#"{"externs":[],"functions":[],"globals":[]}"#).unwrap()
     );
     let valid = format!(
-        "(artifact (header (kind library) (identity \"deep\" \"1\") (compiler \"0000000000000000\") (dependencies) \
+        "(artifact (header (kind library) (identity \"deep\" \"1\") (compiler \"0000000000000000\") (domains 53) (dependencies) \
          (values (value \"deep@1::value\" (scheme 0 0 (existentials) {formula} (ty nat)) (metadata))) \
          (types) (effects) (modules)) {empty_lir})"
     );
@@ -2093,7 +2100,7 @@ fn rejected_deep_semantic_model_is_destroyed_on_a_small_stack() {
     const DEPTH: usize = 30_000;
     let formula = format!("{}true{}", "(not ".repeat(DEPTH), ")".repeat(DEPTH));
     let malformed = format!(
-        "(artifact (header (kind library) (identity \"deep\" \"1\") (compiler \"0000000000000000\") (dependencies) \
+        "(artifact (header (kind library) (identity \"deep\" \"1\") (compiler \"0000000000000000\") (domains 53) (dependencies) \
          (values (value \"deep@1::value\" (scheme 0 0 (existentials) {formula} (ty (struct (row (labels) closed)))) (metadata))) \
          (types) (effects) (modules)) (cps-lir wrong))"
     );
@@ -3057,4 +3064,31 @@ let shaped = shape of_nat
             "{kind:?} {corruption}: {message}"
         );
     }
+}
+
+#[test]
+fn artifact_headers_record_the_bound_domains() {
+    let artifact = built("let value = 1n");
+    assert_eq!(artifact.header().domains, ruddy::types::Domains::Js53);
+    let text = artifact.print();
+    assert!(text.contains("(domains 53)"), "{text}");
+    let mut wide = artifact.clone().to_unchecked();
+    wide.header.domains = ruddy::types::Domains::Bits32;
+    let wide = wide.validate().unwrap();
+    assert_eq!(wide.print().matches("(domains 32)").count(), 1);
+    assert_eq!(
+        artifact::parse(&wide.print())
+            .validate()
+            .unwrap()
+            .header()
+            .domains,
+        ruddy::types::Domains::Bits32
+    );
+    let broken = text.replace("(domains 53)", "(domains 48)");
+    assert!(
+        artifact::text::try_parse(&broken)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid target domains")
+    );
 }

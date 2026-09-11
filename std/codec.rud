@@ -110,8 +110,8 @@ let check_node:
         do
           let seen = array::push visited index
           return match node with
-          | #Nat => #Some seen
-          | #Int => #Some seen
+          | #Nat _ => #Some seen
+          | #Int _ => #Some seen
           | #Real => #Some seen
           | #String => #Some seen
           | #Bool => #Some seen

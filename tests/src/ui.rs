@@ -238,6 +238,11 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         all.push(("ir", kind.code(), kind.to_string()));
     }
     for kind in [
+        IrError::LiteralOutsideDomain {
+            literal: "4294967296n".to_string(),
+            primitive: "Nat",
+            bounds: ruddy::types::Domains::Bits32.nat(),
+        },
         IrError::InvalidDependencyAlias {
             alias: "bad-alias".to_string(),
         },
@@ -5576,6 +5581,30 @@ fn hidden_forms_print_and_the_unsupported_complaint_reads_plainly() {
     assert_eq!(
         outside.help,
         ["match on the value instead, and open it in an arm"]
+    );
+    let literal = ir::Error {
+        at,
+        kind: IrError::LiteralOutsideDomain {
+            literal: "-9007199254740992i".to_string(),
+            primitive: "Int",
+            bounds: ruddy::types::Domains::Js53.int(),
+        },
+    }
+    .diagnostic(&map);
+    assert_eq!(literal.code, "literal-outside-domain");
+    assert_eq!(
+        literal.title,
+        "the literal `-9007199254740992i` is outside the target's Int domain, -9007199254740991 to 9007199254740991"
+    );
+    assert_eq!(
+        literal.primary.message,
+        "Int has 53 bits of precision on this target"
+    );
+    assert_eq!(
+        literal.help,
+        [
+            "write a value the target holds, or use a fixed-width integer type such as Nat64 or Int64"
+        ]
     );
     for (sense, noun) in [
         (Sense::Type, "used here"),

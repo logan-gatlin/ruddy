@@ -840,3 +840,33 @@ assert.equal(some(await app.canon('{"b": {"y":1,"x":[{"q":1,"p":2}]}, "a":2, "a"
 "#,
     );
 }
+
+#[test]
+fn target_domains_are_reported_by_mirrors_and_checked_at_the_boundary() {
+    let project = project(
+        r#"
+type Sizes = { count: Nat, delta: Int, small: Nat8, wide: Int64 }
+let described = std::reflect::describe (std::reflect::type_of { count: 1n, delta: 1i, small: 1n8, wide: 1i64 })
+let echo_nat: Nat -> Nat = fn n => n
+let echo_int: Int -> Int = fn i => i
+"#,
+        "node",
+        "library",
+    );
+    run(
+        project.path(),
+        r#"
+const nodes = app.described.nodes;
+const field = name => JSON.parse(JSON.stringify(nodes[nodes[app.described.root].value.find(f => f.name === name).node]));
+assert.deepEqual(field('count'), { tag: 'Nat', value: { bits: 53, signed: false, min: '0', max: '9007199254740991' } });
+assert.deepEqual(field('delta'), { tag: 'Int', value: { bits: 53, signed: true, min: '-9007199254740991', max: '9007199254740991' } });
+assert.deepEqual(field('small'), { tag: 'Fixed', value: { bits: 8, signed: false, min: '0', max: '255' } });
+assert.deepEqual(field('wide'), { tag: 'Fixed', value: { bits: 64, signed: true, min: '-9223372036854775808', max: '9223372036854775807' } });
+assert.equal(await app.echo_nat(9007199254740991), 9007199254740991);
+await assert.rejects(async () => app.echo_nat(9007199254740992), /Nat/);
+await assert.rejects(async () => app.echo_int(-9007199254740992), /Int/);
+assert.ok(Object.is(await app.echo_nat(-0), 0));
+assert.ok(Object.is(await app.echo_int(-0), 0));
+"#,
+    );
+}

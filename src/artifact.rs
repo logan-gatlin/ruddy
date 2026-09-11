@@ -153,6 +153,7 @@ pub(crate) fn empty() -> Artifact {
                 version: String::new(),
             },
             compiler: Stamp::current(),
+            domains: types::Domains::default(),
             dependencies: Vec::new(),
             values: Vec::new(),
             types: Vec::new(),
@@ -335,6 +336,7 @@ fn recover_parts(header: Header, lir: Lir) -> (Artifact, Vec<RecoveryFact>) {
         kind: header.kind,
         identity: header.identity,
         compiler: header.compiler,
+        domains: header.domains,
         dependencies: header.dependencies,
         values: Vec::new(),
         types: Vec::new(),
@@ -440,6 +442,9 @@ pub struct Header {
     pub identity: Identity,
     /// The compiler that wrote this artifact.
     pub compiler: Stamp,
+    /// The domains `Nat` and `Int` were bound to. A linked program binds them
+    /// once, and an artifact bound to others cannot join it.
+    pub domains: types::Domains,
     /// The bundles this artifact depends on.
     pub dependencies: Vec<Dependency>,
     /// Every source-addressable top-level value exported by the bundle. Externs
@@ -1455,6 +1460,7 @@ pub(crate) fn build_lowered(
             accepted.ir(),
             accepted.semantics(),
             dependencies,
+            accepted.domains(),
         ),
         lir: lower_lir(accepted.mint(), lir),
     }
@@ -1467,6 +1473,7 @@ pub fn interface(
     program: &ir::Program,
     inference: &crate::inference::Semantics,
     dependencies: Vec<Dependency>,
+    domains: types::Domains,
 ) -> Header {
     Header {
         kind: Kind::Library,
@@ -1475,6 +1482,7 @@ pub fn interface(
             version: mint.bundle().version().to_string(),
         },
         compiler: Stamp::current(),
+        domains,
         dependencies,
         values: program
             .externs
@@ -2516,6 +2524,7 @@ pub mod text {
                 A("compiler".into()),
                 Q(value.compiler.as_str().to_string()),
             ]),
+            L(vec![A("domains".into()), A(value.domains.name().into())]),
             L(std::iter::once(A("dependencies".into()))
                 .chain(value.dependencies.iter().map(dependency))
                 .collect()),
@@ -3473,7 +3482,7 @@ pub mod text {
             }
         }
         fn read_header(&self, value: S) -> Header {
-            let mut values = self.exact(self.list(value, "header"), 8, "header");
+            let mut values = self.exact(self.list(value, "header"), 9, "header");
             let mut kind = self.exact(self.list(self.take(&mut values), "kind"), 1, "kind");
             let kind = match self.atom(self.take(&mut kind)).as_str() {
                 "library" => Kind::Library,
@@ -3496,10 +3505,22 @@ pub mod text {
                     self.exact(self.list(self.take(&mut values), "compiler"), 1, "compiler");
                 Stamp::recorded(self.string(self.take(&mut value)))
             };
+            let domains = {
+                let mut value =
+                    self.exact(self.list(self.take(&mut values), "domains"), 1, "domains");
+                match types::Domains::from_name(&self.atom(self.take(&mut value))) {
+                    Some(domains) => domains,
+                    None => {
+                        self.fail("invalid target domains");
+                        types::Domains::default()
+                    }
+                }
+            };
             Header {
                 kind,
                 identity,
                 compiler,
+                domains,
                 dependencies: self
                     .many(self.take(&mut values), "dependencies")
                     .into_iter()
@@ -4495,6 +4516,7 @@ mod tests {
                     version: "1".into(),
                 },
                 compiler: Stamp::current(),
+                domains: types::Domains::default(),
                 dependencies: Vec::new(),
                 values: Vec::new(),
                 types: Vec::new(),

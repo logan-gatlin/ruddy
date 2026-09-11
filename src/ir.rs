@@ -1480,6 +1480,12 @@ pub enum ErrorKind {
     /// A `hide` pattern written where only a `match` arm may open a hidden
     /// type: a `let`, at the top level or in a block.
     HiddenOutsideMatch,
+    /// An integer literal the target's domain for its type cannot hold.
+    LiteralOutsideDomain {
+        literal: String,
+        primitive: &'static str,
+        bounds: crate::types::Bounds,
+    },
     /// A name a `hide` bound, used as something other than a type: a row
     /// tail, a presence, or a region.
     HiddenVariableSense {
@@ -7551,6 +7557,93 @@ fn calm(pattern: &Pattern) -> Option<Calm> {
 /// Every name a normalized pattern binds, in the order the pattern walk met
 /// them. What a refused binding still has to bind — to error values — so
 /// downstream uses resolve.
+/// Every `Nat` and `Int` literal in the program the target's domains cannot
+/// hold, in terms and in patterns. A literal's type is its own spelling, so
+/// the check needs no inference; it needs the domains bound, which is what
+/// makes it a compilation's rather than a parse's.
+pub fn literals_outside(program: &Program, domains: crate::types::Domains) -> Vec<Error> {
+    fn outside(
+        at: Anchor,
+        literal: String,
+        primitive: &'static str,
+        bounds: crate::types::Bounds,
+        errors: &mut Vec<Error>,
+    ) {
+        errors.push(Error {
+            at,
+            kind: ErrorKind::LiteralOutsideDomain {
+                literal,
+                primitive,
+                bounds,
+            },
+        });
+    }
+    fn patterns(pattern: &Pattern, domains: crate::types::Domains, errors: &mut Vec<Error>) {
+        match &pattern.anchored {
+            PatternKind::Natural(value) if !domains.holds_natural(*value) => outside(
+                pattern.at,
+                format!("{value}n"),
+                "Nat",
+                domains.nat(),
+                errors,
+            ),
+            PatternKind::Integer(value) if !domains.holds_integer(*value) => outside(
+                pattern.at,
+                format!("{value}i"),
+                "Int",
+                domains.int(),
+                errors,
+            ),
+            PatternKind::Struct { fields, .. } => {
+                for field in fields.values() {
+                    patterns(&field.value, domains, errors);
+                }
+            }
+            PatternKind::Tag {
+                payload: Some(payload),
+                ..
+            } => patterns(payload, domains, errors),
+            PatternKind::Hidden { pattern, .. } => patterns(pattern, domains, errors),
+            PatternKind::Array { before, after, .. } => {
+                for pattern in before.iter().chain(after) {
+                    patterns(pattern, domains, errors);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut errors = Vec::new();
+    for declaration in program.terms.values() {
+        let mut work = vec![&declaration.value];
+        while let Some(term) = work.pop() {
+            match &term.kind {
+                TermKind::Natural(value) if !domains.holds_natural(*value) => outside(
+                    term.at,
+                    format!("{value}n"),
+                    "Nat",
+                    domains.nat(),
+                    &mut errors,
+                ),
+                TermKind::Integer(value) if !domains.holds_integer(*value) => outside(
+                    term.at,
+                    format!("{value}i"),
+                    "Int",
+                    domains.int(),
+                    &mut errors,
+                ),
+                TermKind::Match { arms, .. } => {
+                    for (pattern, _) in arms {
+                        patterns(pattern, domains, &mut errors);
+                    }
+                }
+                _ => {}
+            }
+            crate::reification::children(term, &mut work);
+        }
+    }
+    errors
+}
+
 pub fn pattern_binders(pattern: &Pattern, out: &mut Vec<Anchored<Symbol>>) {
     match &pattern.anchored {
         PatternKind::Bind(name) => out.push(*name),

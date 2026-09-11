@@ -1076,3 +1076,35 @@ fn hidden_types_compare_through_their_binders_and_open_with_shadowing() {
         "hide 'a => 'a -> hide 'a => 'a -> Nat"
     );
 }
+
+#[test]
+fn target_domains_have_exact_bounds() {
+    use ruddy::types::Domains;
+    assert_eq!(Domains::default(), Domains::Js53);
+    for domains in Domains::ALL {
+        assert_eq!(Domains::from_name(domains.name()), Some(domains));
+        assert_eq!(domains.nat().bits, domains.bits());
+        assert!(!domains.nat().signed);
+        assert!(domains.int().signed);
+        assert_eq!(domains.nat().min, "0");
+        assert!(domains.holds_natural(0));
+        assert!(domains.holds_integer(0));
+    }
+    assert_eq!(Domains::from_name("48"), None);
+    assert_eq!(Domains::Js53.nat().max, "9007199254740991");
+    assert_eq!(Domains::Js53.int().min, "-9007199254740991");
+    assert!(Domains::Js53.holds_natural(9007199254740991));
+    assert!(!Domains::Js53.holds_natural(9007199254740992));
+    assert!(Domains::Js53.holds_integer(-9007199254740991));
+    assert!(!Domains::Js53.holds_integer(-9007199254740992));
+    assert_eq!(Domains::Bits32.nat().max, "4294967295");
+    assert_eq!(Domains::Bits32.int().min, "-2147483648");
+    assert_eq!(Domains::Bits32.int().max, "2147483647");
+    assert!(!Domains::Bits32.holds_natural(4294967296));
+    assert!(!Domains::Bits32.holds_integer(2147483648));
+    assert!(!Domains::Bits32.holds_integer(-2147483649));
+    assert_eq!(Domains::Bits64.nat().max, "18446744073709551615");
+    assert_eq!(Domains::Bits64.int().min, "-9223372036854775808");
+    assert!(Domains::Bits64.holds_natural(u64::MAX));
+    assert!(Domains::Bits64.holds_integer(i64::MIN));
+}

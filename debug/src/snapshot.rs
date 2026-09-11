@@ -91,6 +91,10 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
             .target
             .unwrap_or_else(|| ruddy_cli::Target::default_for(req.kind)),
         platform: req.platform.unwrap_or_default(),
+        domains: req
+            .integers
+            .and_then(|bits| ruddy::types::Domains::from_name(&bits.to_string()))
+            .unwrap_or_default(),
     };
     let fs = Requested(&req.files);
     let started = Instant::now();
@@ -301,12 +305,16 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
                     .map(|(alias, artifact)| ir::DependencyImport { alias, artifact })
                     .collect();
                 let linked: Vec<&artifact::Artifact> = linked_interfaces.iter().collect();
-                ir::build_with_dependency_imports(
+                let mut built = ir::build_with_dependency_imports(
                     &mut mint,
                     loaded.stmts.clone(),
                     &imports,
                     &linked,
-                )
+                );
+                built
+                    .errors
+                    .extend(ir::literals_outside(&built.program, output.domains));
+                built
             });
             micros.build = started.elapsed().as_micros() as u64;
             out
@@ -450,11 +458,12 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
                     artifact: ruddy::compile::DependencyArtifact::Checked(artifact),
                 })
                 .collect();
-            ruddy::compile::compile_with_dependencies(
+            ruddy::compile::compile_bound(
                 Mint::new(mint.bundle().clone()),
                 loaded.stmts.clone(),
                 &dependencies,
                 inference::Trace::Complete,
+                output.domains,
             )
             .ok()
         });
@@ -988,6 +997,7 @@ mod tests {
             kind: ruddy::artifact::Kind::Library,
             target: None,
             platform: None,
+            integers: None,
             name: "test".into(),
             version: "0.1.0".into(),
             root: ROOT.into(),

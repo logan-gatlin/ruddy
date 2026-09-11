@@ -6807,6 +6807,7 @@ fn prelude_artifact(bundle: &str) -> a::UncheckedArtifact {
         header: a::Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: bundle.into(),
@@ -7112,6 +7113,7 @@ fn effect_artifact(bundle: &str, interface: &str) -> a::UncheckedArtifact {
         header: a::Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: bundle.into(),
@@ -7637,6 +7639,7 @@ fn a_direct_only_interface_with_a_transitive_type_recovers_without_panicking() {
         header: a::Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".to_string(),
@@ -7690,6 +7693,7 @@ fn missing_transitive_type_applications_keep_distinct_effect_identities() {
         header: a::Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
@@ -7777,6 +7781,7 @@ fn direct_only_transitive_effects_keep_qualified_recovery_identity() {
         header: a::Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
@@ -8687,6 +8692,7 @@ fn row_composition_is_flattened_across_local_and_imported_types() {
         header: a::Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
@@ -8794,6 +8800,7 @@ fn structural_rows_mask_inner_duplicates_and_preserve_ordinary_separator_labels(
         header: a::Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
@@ -8910,6 +8917,7 @@ fn absent_semantic_payloads_do_not_affect_structural_identity() {
         header: a::Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
@@ -9072,6 +9080,7 @@ fn local_and_imported_structural_types_share_one_canonical_encoding() {
         header: a::Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
@@ -9145,6 +9154,7 @@ fn imported_interfaces_keep_applied_types_effects_and_alias_overlap_structural()
         header: a::Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
@@ -9414,6 +9424,7 @@ fn imported_declared_types_exercise_every_semantic_identity_form() {
         header: a::Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
@@ -9507,6 +9518,7 @@ fn imported_alias_cycles_recover_without_a_spurious_structural_identity() {
         header: a::Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".into(),
@@ -9781,6 +9793,7 @@ fn dependency_interfaces_import_every_semantic_form() {
         header: a::Header {
             kind: ruddy::artifact::Kind::Library,
             compiler: ruddy::artifact::Stamp::current(),
+            domains: ruddy::types::Domains::default(),
             modules: Vec::new(),
             identity: a::Identity {
                 name: "dep".to_string(),

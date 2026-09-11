@@ -214,8 +214,16 @@ const $sameMirror = ($descriptor, $pair) => $sameType($pair["0"], $pair["1"])
 // a mirror.
 const $describe = ($descriptor, $mirror) => {
   const $node = $n => {
+    if ($n === "Nat" || $n === "Int") {
+      const $bounds = $n === "Nat" ? $domains.nat : $domains.int;
+      return $sum($n, $record([["bits", $bounds.bits], ["signed", $bounds.signed], ["min", $bounds.min], ["max", $bounds.max]]));
+    }
     if (typeof $n === "string") return $sum($n === "ForeignValue" ? "Foreign" : $n, undefined);
-    if ("Fixed" in $n) return $sum("Fixed", $record([["bits", Number($n.Fixed.match(/\d+/)[0])], ["signed", $n.Fixed.startsWith("Int")]]));
+    if ("Fixed" in $n) {
+      const $bits = Number($n.Fixed.match(/\d+/)[0]), $signed = $n.Fixed.startsWith("Int");
+      const $size = 1n << BigInt($bits - ($signed ? 1 : 0));
+      return $sum("Fixed", $record([["bits", $bits], ["signed", $signed], ["min", ($signed ? -$size : 0n).toString()], ["max", ($size - 1n).toString()]]));
+    }
     if ("Array" in $n) return $sum("Array", $n.Array);
     if ("Arrow" in $n) return $sum("Function", $record([["argument", $n.Arrow[0]], ["result", $n.Arrow[1]]]));
     if ("Struct" in $n || "Sum" in $n) {
@@ -309,9 +317,12 @@ const $convertType = ($descriptor, $value, $outgoing, $rootIndex = 0, $callable 
     const $node = $descriptor.nodes[$shapeIndex];
     if (typeof $node === "string") {
       let $valid = true;
+      // A target integer is checked against the bound domain, and integers
+      // have one zero: a negative zero from outside becomes zero.
+      let $value = $input;
       switch ($node) {
-        case "Nat": $valid = Number.isInteger($input) && $input >= 0; break;
-        case "Int": $valid = Number.isInteger($input); break;
+        case "Nat": $valid = Number.isInteger($input) && $input >= 0 && $input <= $domains.nat.high; if ($valid) $value = $input + 0; break;
+        case "Int": $valid = Number.isInteger($input) && $input >= $domains.int.low && $input <= $domains.int.high; if ($valid) $value = $input + 0; break;
         case "Real": $valid = typeof $input === "number"; break;
         case "String": $valid = typeof $input === "string"; break;
         case "Bool": $valid = typeof $input === "boolean"; break;
@@ -319,7 +330,7 @@ const $convertType = ($descriptor, $value, $outgoing, $rootIndex = 0, $callable 
         default: $valid = false;
       }
       if (!$valid) $fail($path, $node);
-      $put($input);
+      $put($value);
       continue;
     }
     if ("Fixed" in $node) {

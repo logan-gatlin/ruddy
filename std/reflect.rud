@@ -1,15 +1,18 @@
 @doc "A finite graph describing a type: ordinary readable data, never evidence. Node indices refer into `nodes`; a recursive type is a graph with a back edge."
 type Description = { root: Nat, nodes: [Node] }
 
-@doc "One node of a description. Numeric kinds keep their exact primitive; a function reports its argument and result; records and sums list their fields by name."
+@doc "The exact domain of an integer kind: its precision in bits, its signedness, and its least and greatest values as decimal text, exact even where this target's own integers could not hold them."
+type Domain = { bits: Nat, signed: Bool, min: String, max: String }
+
+@doc "One node of a description. Integer kinds carry their domain, so `Nat` and `Nat64` stay apart even where their domains coincide; a function reports its argument and result; records and sums list their fields by name."
 type Node =
-  | #Nat
-  | #Int
+  | #Nat Domain
+  | #Int Domain
   | #Real
   | #String
   | #Bool
   | #Foreign
-  | #Fixed { bits: Nat, signed: Bool }
+  | #Fixed Domain
   | #Array Nat
   | #Function { argument: Nat, result: Nat }
   | #Record [Field]
